@@ -1,0 +1,90 @@
+#!/usr/bin/env node
+// reeve — the control plane's front door.
+//
+// Node >=24 is a hard floor: node:sqlite still emits an ExperimentalWarning on
+// 22.x and the state layer is the authority, so it must not run under a warning
+// it might one day become.
+import { runDoctor, render } from "../src/doctor.mjs";
+import { open } from "../src/db/ops.mjs";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
+
+const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+const [major] = process.versions.node.split(".").map(Number);
+if (major < 24) {
+  console.error(`reeve: node ${process.versions.node} — node:sqlite is only unflagged and unwarned from 24. Use 24 or newer.`);
+  process.exit(1);
+}
+
+const argv = process.argv.slice(2);
+const cmd = argv.shift();
+const flag = n => argv.includes(`--${n}`);
+const opt = n => { const i = argv.indexOf(`--${n}`); return i < 0 ? null : argv[i + 1]; };
+const VALUED = new Set(["db", "plugin-cache", "plugin-repo", "profile"]);
+// Positionals only. A valued flag consumes the token after it, so that token is
+// never mistaken for a repo name however much it looks like one.
+const positionals = (() => {
+  const out = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith("--")) { if (VALUED.has(a.slice(2))) i++; continue; }
+    out.push(a);
+  }
+  return out;
+})();
+
+/** Repo identity is the remote, never the path: one repo can sit at two paths on two commits. */
+function detectNwo() {
+  try {
+    const url = execFileSync("git", ["remote", "get-url", "origin"], { encoding: "utf8" }).trim();
+    const m = url.match(/[:/]([^/:]+\/[^/]+?)(?:\.git)?$/);
+    return m ? m[1] : null;
+  } catch { return null; }
+}
+
+function loadProfile(nwo) {
+  const sidecar = join(homedir(), ".reeve", "profiles", `${nwo}.json`);
+  const inRepo = join(process.cwd(), ".ops", "profile.json");
+  for (const p of [inRepo, sidecar]) {
+    if (existsSync(p)) {
+      try { return { path: p, ...JSON.parse(execFileSync("cat", [p], { encoding: "utf8" })) }; }
+      catch (e) { console.error(`reeve: ${p} is not valid JSON — ${e.message}`); process.exit(1); }
+    }
+  }
+  return null;
+}
+
+switch (cmd) {
+  case "doctor": {
+    const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
+    if (!nwo) { console.error("reeve doctor: no repo. Pass owner/repo or run inside a git checkout."); process.exit(1); }
+    const profile = loadProfile(nwo) ?? {};
+    const dbPath = opt("db") ?? profile.statePath ?? null;
+    const db = dbPath && existsSync(dbPath) ? open(dbPath) : null;
+    const result = runDoctor({
+      nwo, profile, db,
+      pluginCacheRoot: opt("plugin-cache"),
+      repoPluginDir: opt("plugin-repo"),
+    });
+    if (flag("json")) console.log(JSON.stringify(result, null, 2));
+    else console.log(render(result, nwo));
+    if (!profile.path && !flag("json")) {
+      console.log(`\nno profile for ${nwo}. Checks that need one were skipped.\n-> reeve init`);
+    }
+    process.exit(result.exitCode);
+  }
+  default:
+    console.log(`reeve ${JSON.parse(execFileSync("cat", [join(ROOT, "package.json")], { encoding: "utf8" })).version}
+
+  doctor [owner/repo]   what is actually true right now   (0 ok · 1 broken · 3 degraded)
+      --db <path>           state database to inspect
+      --plugin-cache <dir>  plugin cache root, to detect running-vs-reviewed drift
+      --plugin-repo <dir>   the reviewed copy to compare it against
+      --json                machine-readable
+
+not yet built: status · next · why · plan · init · watch · lane · pr`);
+    process.exit(cmd ? 1 : 0);
+}

@@ -9,6 +9,7 @@ import { open } from "../src/db/ops.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick } from "../src/daemon.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
+import { init } from "../src/init.mjs";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -26,7 +27,7 @@ const argv = process.argv.slice(2);
 const cmd = argv.shift();
 const flag = n => argv.includes(`--${n}`);
 const opt = n => { const i = argv.indexOf(`--${n}`); return i < 0 ? null : argv[i + 1]; };
-const VALUED = new Set(["db", "plugin-cache", "plugin-repo", "profile"]);
+const VALUED = new Set(["db", "plugin-cache", "plugin-repo", "profile", "set", "log", "halt", "interval", "last"]);
 // Positionals only. A valued flag consumes the token after it, so that token is
 // never mistaken for a repo name however much it looks like one.
 const positionals = (() => {
@@ -90,6 +91,22 @@ switch (cmd) {
     }
     process.exit(result.exitCode);
   }
+  case "init": {
+    // --set key=value, repeatable. Answers only the questions detection could not
+    // settle; everything else comes from the repo and is not negotiable.
+    const answers = {};
+    for (let i = 0; i < argv.length; i++) {
+      if (argv[i] !== "--set") continue;
+      const kv = argv[++i] ?? "";
+      const eq = kv.indexOf("=");
+      if (eq < 0) { console.error(`reeve init: --set expects key=value, got ${JSON.stringify(kv)}`); process.exit(1); }
+      answers[kv.slice(0, eq)] = kv.slice(eq + 1);
+    }
+    const r = init({ root: process.cwd(), answers, write: flag("write") });
+    console.log(r.output);
+    process.exit(r.code);
+  }
+
   case "status":
   case "statusline":
   case "why": {
@@ -156,6 +173,10 @@ switch (cmd) {
       --plugin-cache <dir>  plugin cache root, to detect running-vs-reviewed drift
       --plugin-repo <dir>   the reviewed copy to compare it against
       --json                machine-readable
+
+  init                  detect this repo, preview a profile, then --write it
+      --set k=v             answer a question detection could not settle
+      --write               apply  (exit 0 no-op · 2 changed · 1 needs an answer)
 
   status [owner/repo]   what is happening now  (--health measures clean-merge, --json)
   why <pr>              why reeve decided what it decided, newest first

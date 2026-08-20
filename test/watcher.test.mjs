@@ -6,7 +6,11 @@ let fail = 0;
 const check = (n, got, want) => { const ok = got === want;
   console.log(`${ok ? "PASS" : "FAIL"}  ${n}`); if (!ok) { console.log(`        got ${JSON.stringify(got)} want ${JSON.stringify(want)}`); fail++; } };
 
-const P = { rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 }, authority: { policy: "propose_and_merge" } };
+// reviewActions is ON here so these cases still exercise the underlying decision
+// logic. It is OFF by default in production until review ingest exists, and that
+// default is covered by test/review-gate.test.mjs rather than weakened here.
+const P = { rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+            authority: { policy: "propose_and_merge" }, watch: { reviewActions: true } };
 const cl = (id, state, detail = "") => ({ id, state, detail });
 const ev = (clauses, extra = {}) => ({
   pr: 1, state: "open",

@@ -38,10 +38,38 @@ const clause = (v, id) => v.clauses.find(c => c.id === id);
  * @param {object} p   the profile
  * @param {object} h   history: {fixAttempts: Map<fingerprint,int>, unknownSince: epoch|null, now: epoch}
  */
+/**
+ * Review actions are gated OFF until review ingest exists.
+ *
+ * The data they depend on is not real: `unspilledCritical` is hard-coded to zero,
+ * so the clause enforcing "criticals are never spilled" cannot fire while SPILL
+ * fires on exactly that value -- reeve would have moved P0 findings to a follow-up
+ * and called it policy. `rounds.n` counts the latest reviewed head per reviewer,
+ * so one reviewer completing twenty rounds still reads as one.
+ *
+ * Escalating instead is not a smaller version of doing the work; it is the honest
+ * one. "Not built" must not look like "nothing to do".
+ */
+const REVIEW_ACTIONS = new Set([ACTIONS.REQUEST_REVIEW, ACTIONS.FIX_FINDINGS, ACTIONS.SPILL]);
+
+function gateReviewActions(decision, p) {
+  if (!REVIEW_ACTIONS.has(decision.action)) return decision;
+  if (p.watch?.reviewActions === true) return decision;
+  return {
+    ...decision,
+    action: ACTIONS.ESCALATE,
+    why: `needs a human: the review half is not built, so reeve cannot act on "${decision.why}"`,
+    gated: decision.action,
+  };
+}
+
 export function nextAction(e, p, h = {}) {
   const v = e.verdict;
   const now = h.now ?? Math.floor(Date.now() / 1000);
-  const act = (action, why, extra = {}) => ({ action, why, ...extra });
+  // Every branch returns through here, so the review gate is applied once, at the
+  // single exit, rather than at each of the six call sites where one would
+  // eventually be missed.
+  const act = (action, why, extra = {}) => gateReviewActions({ action, why, ...extra }, p);
 
   // A closed or merged PR is finished, whatever its checks say. Reviewing or
   // pushing into one strands the work silently.
@@ -120,7 +148,9 @@ export function nextAction(e, p, h = {}) {
   const findings = clause(v, "findings");
   if (threads?.state === "BLOCK" || findings?.state === "BLOCK") {
     const R = e.rounds ?? {};
-    if ((R.n ?? 0) >= (R.softCap ?? 5) && (R.unspilledCritical ?? 0) === 0)
+    // `?? 0` here would read an UNKNOWN critical count as "no criticals" and spill
+    // on it, which is the standing ruling inverted. Only a known zero may spill.
+    if ((R.n ?? 0) >= (R.softCap ?? 5) && R.unspilledCritical === 0)
       return act(ACTIONS.SPILL, `past the soft cap with only non-critical findings open`, { round: R.n });
     const blocking = [threads, findings].filter(c => c?.state === "BLOCK");
     return act(ACTIONS.FIX_FINDINGS, blocking.map(c => c.detail).filter(Boolean).join("; ") || "findings block this PR",

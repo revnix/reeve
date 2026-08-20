@@ -140,7 +140,9 @@ export function evaluatePr({ nwo, pr, profile, db = null }) {
   // API rather than a local counter, so a restart cannot lose it.
   const judged = new Set(reviewers.filter(r => r.reviewedHead).map(r => r.reviewedHead.slice(0, 10)));
   const rounds = { n: judged.size, softCap: profile.rounds?.softCap ?? 5,
-                   hardCap: profile.rounds?.hardCap ?? 10, unspilledCritical: 0 };
+                   // null, not 0. Severity is not ingested yet, and claiming "no criticals open"
+                   // is a fact reeve does not have -- one that would license spilling a P0.
+                   hardCap: profile.rounds?.hardCap ?? 10, unspilledCritical: null };
 
   let ledgerBlockers = null;
   if (db) {

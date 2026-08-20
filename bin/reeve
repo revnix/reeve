@@ -4,7 +4,7 @@
 // Node >=24 is a hard floor: node:sqlite still emits an ExperimentalWarning on
 // 22.x and the state layer is the authority, so it must not run under a warning
 // it might one day become.
-import { runDoctor, render } from "../src/doctor.mjs";
+import { runDoctor, render, checkAppIdentity } from "../src/doctor.mjs";
 import { open } from "../src/db/ops.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick } from "../src/daemon.mjs";
@@ -78,10 +78,14 @@ switch (cmd) {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     if (!nwo) { console.error("reeve doctor: no repo. Pass owner/repo or run inside a git checkout."); process.exit(1); }
     const profile = loadProfile(nwo) ?? {};
-    const dbPath = opt("db") ?? profile.statePath ?? null;
+    // `state.location` is the schema's name for this. `profile.statePath` was read
+    // here and declared nowhere, so the fallback silently never fired.
+    const dbPath = opt("db") ?? profile.state?.location ?? null;
     const db = dbPath && existsSync(dbPath) ? open(dbPath) : null;
+    // Documented in docs/github-app-setup.md as the step that proves the App works.
+    const appCheck = flag("as-app") ? await checkAppIdentity(nwo) : null;
     const result = runDoctor({
-      nwo, profile, db,
+      nwo, profile, db, appCheck,
       pluginCacheRoot: opt("plugin-cache"),
       repoPluginDir: opt("plugin-repo"),
     });
@@ -171,7 +175,11 @@ switch (cmd) {
       intervalMs: Number(opt("interval") ?? 90) * 1000,
       dashPath: opt("dash") ?? join(home, `${nwo.split("/")[1]}.html`),
     };
-    if (cmd === "tick") { const r = await tick(ctx); process.exit(r.halted ? 3 : 0); }
+    // Honour the FLAG as well as the command. The help has always documented
+    // `run --tick` as "one pass and exit" while only the separate `tick` command
+    // did that, so `reeve run --tick` started the long-running daemon -- the
+    // opposite of what it promised.
+    if (cmd === "tick" || flag("tick")) { const r = await tick(ctx); process.exit(r.halted ? 3 : 0); }
     await run(ctx);
     process.exit(0);
   }

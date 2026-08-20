@@ -42,28 +42,67 @@ function ago(seconds) {
  * unresolved threads. This is the hero number precisely because it was 0% when
  * measured on the system this replaces, while every vanity metric looked healthy.
  */
-export function cleanMergeRate(nwo, n = 20) {
-  const list = sh(["pr", "list", "--repo", nwo, "--state", "merged", "--limit", String(n),
-                   "--json", "number,mergeCommit", "--jq", ".[] | [.number, (.mergeCommit.oid // \"\")] | @tsv"]);
-  if (!list.ok) return { ok: false, why: list.err.split("\n")[0] };
-  const rows = list.out.split("\n").filter(Boolean).map(l => l.split("\t"));
-  let clean = 0, judged = 0;
+/**
+ * How often a merge landed with its evidence actually green.
+ *
+ * The previous version asked how many check runs at the merge commit were NOT
+ * passing and called zero "clean" — so a merge with no check runs at all scored
+ * identically to one that passed everything. That is absence read as success, in
+ * the single number the dashboard leads with, and it is the same shape as every
+ * fail-open defect in the gate this replaces.
+ *
+ * A merge is now UNJUDGED unless there is evidence to judge: at least one check,
+ * and every required context present. Unjudged merges are counted and reported
+ * rather than folded into either side, because "we do not know" is a finding in
+ * its own right.
+ *
+ * `probe` exists so this can be driven without the network.
+ */
+export function cleanMergeRate(nwo, n = 20, probe = null, { required = [] } = {}) {
+  const io = probe ?? {
+    merged: () => {
+      const list = sh(["pr", "list", "--repo", nwo, "--state", "merged", "--limit", String(n),
+                       "--json", "number,mergeCommit", "--jq", ".[] | [.number, (.mergeCommit.oid // \"\")] | @tsv"]);
+      if (!list.ok) return null;
+      return list.out.split("\n").filter(Boolean)
+        .map(l => l.split("\t")).filter(([, sha]) => sha)
+        .map(([number, sha]) => ({ number: Number(number), sha }));
+    },
+    checks: sha => {
+      const r = sh(["api", `repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`,
+                    "--jq", "[.check_runs[] | {name, conclusion}]"]);
+      if (!r.ok) return null;
+      try { return JSON.parse(r.out || "[]"); } catch { return null; }
+    },
+  };
+
+  const rows = io.merged();
+  if (!rows) return { ok: false, why: "could not list merged pull requests" };
+
+  let clean = 0, judged = 0, unjudged = 0;
   const series = [];
-  for (const [num, sha] of rows) {
-    if (!sha) continue;
-    const checks = sh(["api", `repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`,
-                       "--jq", '[.check_runs[] | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")] | length']);
-    if (!checks.ok) continue;
+  for (const { sha } of rows) {
+    const checks = io.checks(sha);
+    // null is "could not ask". Skipping it silently would let a rate be computed
+    // from whichever merges happened to be readable.
+    if (checks === null) { unjudged++; continue; }
+    // No checks is no evidence. It is not a pass.
+    if (!checks.length) { unjudged++; continue; }
+    const names = new Set(checks.map(c => c.name));
+    if (required.some(c => !names.has(c))) { unjudged++; continue; }
+
     judged++;
-    const bad = Number(checks.out || 0);
+    const bad = checks.filter(c => !["success", "skipped", "neutral"].includes(String(c.conclusion))).length;
     const isClean = bad === 0;
     if (isClean) clean++;
     series.push(isClean ? 1 : 0);
   }
-  // Never report a rate from nothing: an empty sample is not 100%.
-  if (!judged) return { ok: false, why: "no merged PRs could be judged" };
-  return { ok: true, clean, judged, rate: clean / judged, series: series.reverse() };
+
+  // An empty sample is not 100%.
+  if (!judged) return { ok: false, unjudged, why: `no merged PR could be judged (${unjudged} had no usable evidence)` };
+  return { ok: true, clean, judged, unjudged, rate: clean / judged, series: series.reverse() };
 }
+
 
 /** Everything the screen needs, read from the store. Fast, no network. */
 
@@ -128,7 +167,12 @@ export function readState(db, { limit = 12, freshWindow = 900, now = Math.floor(
 
   let pending = [];
   try {
-    pending = db.prepare(`SELECT id, title FROM node WHERE kind='decision' AND status='pending'`).all();
+    // 'open', not 'pending'. The node.status CHECK constraint permits
+    // open/ready/running/blocked/review/done/decided/refuted/cancelled/dead_letter
+    // and has never permitted 'pending', so this query could only ever return
+    // nothing -- and an empty result rendered as "nothing needs you". A band that
+    // is structurally incapable of showing anything is worse than no band.
+    pending = db.prepare(`SELECT id, title FROM node WHERE kind='decision' AND status='open'`).all();
   } catch { /* same */ }
 
   return { prs: [...prs.values()], runs, pending, daemon: daemonLiveness(db, now, freshWindow) };

@@ -22,7 +22,7 @@ import { promptFor } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, causeKey } from "./ci-rootcause.mjs";
-import { readState, noteTick } from "./status.mjs";
+import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { countFixAttempts, recordFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { execFileSync } from "node:child_process";
@@ -95,7 +95,7 @@ export function log(logPath, line) {
   if (!appended || !stdoutAlreadyWrites(logPath)) console.log(stamped);
 }
 
-function openPrs(nwo, limit = 20) {
+function openPrs(nwo, limit = 20) {   // bounded; the caller LOGS when the bound bites
   try {
     const out = execFileSync("gh", ["pr", "list", "--repo", nwo, "--state", "open",
       "--limit", String(limit), "--json", "number", "--jq", ".[].number"], { encoding: "utf8" }).trim();
@@ -151,14 +151,20 @@ export async function tick(ctx) {
     return { decisions, escalations, halted: true };
   }
 
-  const prs = (ctx.openPrs ?? openPrs)(nwo);
+  const prs = (ctx.openPrs ?? openPrs)(nwo, profile.watch?.maxOpenPrs ?? 20);
   if (prs === null) {
     // Could not ask is not none. Returning an empty list here would look exactly
     // like a quiet, healthy fleet.
     log(logPath, `tick: could not list PRs for ${nwo} — skipping this pass rather than assuming zero`);
     return { decisions, escalations, halted: false, unreadable: true };
   }
-  log(logPath, `tick: ${nwo} — ${prs.length} open PR(s)`);
+  // A cap that does not say it capped reads as "covered everything". The portfolio
+  // includes repositories with 100 open pull requests against a bound of 20, and
+  // it is always the SAME 20 -- so the remainder would never be looked at once,
+  // silently, forever.
+  const CAP = profile.watch?.maxOpenPrs ?? 20;
+  log(logPath, `tick: ${nwo} — ${prs.length} open PR(s)` +
+      (prs.length >= CAP ? ` — AT THE ${CAP} CAP: any beyond this are not being watched at all` : ""));
 
   const evaluated = new Set();
   for (const pr of prs) {
@@ -348,6 +354,19 @@ export async function tick(ctx) {
   // Regenerate the glance surface every tick. A dashboard that is only refreshed
   // on request is one that shows a state that stopped being true hours ago.
   if (ctx.dashPath) {
+    // Computed here rather than left to the CLI, which is why the dashboard's
+    // headline was permanently blank: nothing ever set ctx.health. Recomputed only
+    // when the open set has SHRUNK, because that is the only moment a merge can
+    // have happened and the rate can have moved -- a per-tick recount would spend
+    // API calls to learn nothing.
+    if (ctx.lastOpenCount == null || prs.length < ctx.lastOpenCount) {
+      const clean = cleanMergeRate(nwo, 20, null, { required: profile.ci?.requiredChecks ?? [] });
+      ctx.health = { clean };
+      log(logPath, `health: clean-merge ${clean.ok ? Math.round(clean.rate * 100) + "% over " + clean.judged + " judged" : clean.why}` +
+                   (clean.unjudged ? `, ${clean.unjudged} unjudged` : ""));
+    }
+    ctx.lastOpenCount = prs.length;
+
     try { writeDash(ctx.dashPath, { nwo, state: readState(db), health: ctx.health ?? {} }); }
     catch (e) { log(logPath, `could not write the dashboard: ${e.message}`); }
   }

@@ -260,3 +260,90 @@ export function recordFixAttempt(db, nwo, pr, cause, sha, at = Math.floor(Date.n
     .run(nwo, pr, cause, at, at, sha ?? null);
   return countFixAttempts(db, nwo, pr, cause);
 }
+
+// ------------------------------------------------------------- runs for a PR
+// `claim` answers "what should I work on next?" by pulling from v_ready. The
+// daemon asks a different question: it already knows the pull request and the
+// action, and needs the exclusive right to act on it. Binding the run to the PR
+// node makes the schema's one-live-run-per-task index do that work, so duplicate
+// dispatch becomes impossible rather than merely unlikely -- the service log
+// shows the same fix dispatched twice, ten minutes apart, for want of this.
+
+const LIVE = "('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')";
+
+/** The live run for this PR, or null. */
+export function liveRunFor(db, nwo, pr) {
+  return db.prepare(`SELECT id, status, attempt, owner_pid, owner_boot, lease_expires_at
+                     FROM run WHERE task_id=? AND status IN ${LIVE}`).get(`pr:${pr}`) ?? null;
+}
+
+/**
+ * Take the exclusive right to act on a pull request.
+ *
+ * Returns {ok:false} when another run already holds it, which is the answer a
+ * restarted daemon needs. The PR node is created if absent, because a run must
+ * reference one and the decision log only ever wrote events.
+ */
+// The lease length is LEASE_SECONDS, the same value heartbeat() renews to.
+// Choosing a longer one here would be silently undone by the first heartbeat,
+// and a long lease defeats the point anyway: a dead worker should be reapable
+// in lease-time, not in half an hour.
+export function startRun(db, { nwo, pr, action, head, lane = "fixer", cause = null, leaseSeconds = LEASE_SECONDS }) {
+  const taskId = `pr:${pr}`;
+  // Sortable and collision-resistant without needing Math.random: the clock gives
+  // ordering, the monotonic counter separates two runs started in the same ms.
+  const runId = `${Date.now().toString(36)}-${(process.hrtime.bigint() % 1000000n).toString(36)}`;
+  try {
+    return tx(db, () => {
+      db.prepare(`INSERT INTO node(id,kind,title,status,created_at,updated_at)
+                  VALUES(?,'pr',?,'running',unixepoch(),unixepoch())
+                  ON CONFLICT(id) DO UPDATE SET status='running', updated_at=unixepoch()`)
+        .run(taskId, `${nwo}#${pr}`);
+      const prior = db.prepare("SELECT COALESCE(MAX(attempt),0) a FROM run WHERE task_id=?").get(taskId).a;
+      db.prepare(`INSERT INTO run(id,task_id,lane,status,attempt,lease_expires_at,heartbeat_at,
+                                  owner_host,cursor,started_at)
+                  VALUES(?,?,?,'leased',?,unixepoch()+?,unixepoch(),?,?,unixepoch())`)
+        .run(runId, taskId, lane, prior + 1, leaseSeconds, hostname(),
+             canonical({ nwo, pr, action, head, cause: cause?.job ?? null }));
+      emit(db, { actor: "daemon", op: "run.start", subject: taskId, run_id: runId,
+                 payload: { action, head, attempt: prior + 1, lane } });
+      return { ok: true, runId, attempt: prior + 1 };
+    });
+  } catch (e) {
+    // 2067/1555 = the one-live-run index refused: someone already holds this PR.
+    if (e.errcode === 2067 || e.errcode === 1555)
+      return { ok: false, why: `a run is already live for ${nwo}#${pr}` };
+    return { ok: false, why: `could not record the run: ${e.message}` };
+  }
+}
+
+/**
+ * Bind the operating-system process to the run, the moment it exists.
+ *
+ * The pid alone is not identity: pids churn here at roughly 963 a second and a
+ * genuine wrap-around was forced in 192 seconds, so the process start time is
+ * stored beside it. Written before the worker can touch anything, so a crash
+ * leaves a run that can be probed rather than a mystery.
+ */
+export function notePid(db, { runId, pid, boot }) {
+  return tx(db, () => {
+    db.prepare(`UPDATE run SET owner_pid=?, owner_boot=?, status='running',
+                heartbeat_at=unixepoch() WHERE id=?`).run(pid, boot ?? "", runId);
+    emit(db, { actor: "daemon", op: "run.spawned", run_id: runId, payload: { pid, boot } });
+  });
+}
+
+/** Close a run. An outcome that is not "ok" is a failure with its reason kept. */
+export function finishRun(db, { runId, outcome, why = null, ms = null, cost = null, sessionId = null }) {
+  const status = outcome === "ok" ? "succeeded" : "failed";
+  return tx(db, () => {
+    const r = db.prepare("SELECT task_id FROM run WHERE id=?").get(runId);
+    db.prepare(`UPDATE run SET status=?, ended_at=unixepoch(), error=? WHERE id=?`)
+      .run(status, why, runId);
+    if (r) db.prepare(`UPDATE node SET status=?, updated_at=unixepoch(), version=version+1 WHERE id=?`)
+      .run(status === "succeeded" ? "done" : "blocked", r.task_id);
+    emit(db, { actor: "daemon", op: "run.finish", subject: r?.task_id ?? null, run_id: runId,
+               payload: { outcome, why, ms, cost, sessionId } });
+    return { ok: true, status };
+  });
+}

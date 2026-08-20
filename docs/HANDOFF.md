@@ -195,7 +195,7 @@ Six phases, all complete. Measured at the time of writing:
 - **1,067 lines of tests** across 10 `test/*.test.mjs` — excludes 4 helper files in `test/`
   that are fixtures, not tests (`claimworker2.mjs`, `crashdrain.mjs`, `reconcile.demo.mjs`,
   `seed.mjs`)
-- **478 assertions passing, 0 failing** across 30 test files
+- **520 assertions passing, 0 failing** across 32 test files
 - **4 profiles** written (nextly, rext-backend, 21century, reeve)
 - **The launchd agent is installed and running** as of 2026-08-20 16:29 UTC — shadow mode,
   `--execute` off, watching `nextlyhq/nextly`. See §7.
@@ -467,7 +467,43 @@ Three of these were harder than they looked, and the difficulty is the useful pa
   location the code had stopped using and reported the daemon broken while it was
   fine.
 
-**Still open from the audit, in the order it recommends:**
+**The audit list is closed.** The last two — an external alert sink and
+`inheritedOrCaused` comparing names rather than failures — landed 2026-08-20.
+Escalations now push to ntfy on the topic `revnix-reeve`, redacted, and only when
+they arrive.
+
+**What the first real `--execute` dispatch taught, which no test had:**
+
+The worker failed with **eleven denied tool calls**, and the sandbox was the
+reason. reeve's own profile declares `npm test`, but that script is a shell loop
+over `node <file>`, and the worker reasonably reached for the file directly to
+check a one-line change. A fixer that cannot run one test gives up, and it did.
+
+The premise was wrong, not just the list. The sandbox was built as if restricting
+**execution** were the control. It is not and cannot be: a worker holding `Write`
+can write a script and run it through any granted runner, so denying `node -e`
+bought nothing and made the failure illegible. That is the same error as denying
+`Write` while granting a bare shell — which had already been measured, and which I
+had thought I had learned.
+
+What a sandbox can enforce against a process whose job is to change code is
+**authority, network and paths**, and those are unchanged. Each unit now gets its
+own language's runtime.
+
+Two smaller findings from the same run:
+
+- A refusal reported git's **progress** line as its reason, because git narrates on
+  stderr and the first line is rarely the failure. A wrong reason is worse than a
+  vague one.
+- A denied dispatch **consumed the PR's single repair**, so the next tick escalated
+  "the same failure survived a second fix" when no fix had been attempted. DENIED
+  is now refunded: nothing was attempted, so nothing is charged.
+
+Worth recording that the failure was legible at all only because the layers around
+it held: the denial was detected, the run was marked failed rather than
+successful, and nothing was pushed.
+
+**Still open:**
 
 4. P1 `inheritedOrCaused` compares check NAMES, not failures.
 9. P1 caps: 20 open PRs silently, no pagination past 100, `doctor` hard-codes `main`.

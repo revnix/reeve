@@ -6,8 +6,9 @@
 // it might one day become.
 import { runDoctor, render } from "../src/doctor.mjs";
 import { open } from "../src/db/ops.mjs";
+import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -49,10 +50,21 @@ function loadProfile(nwo) {
   const sidecar = join(homedir(), ".reeve", "profiles", `${nwo}.json`);
   const inRepo = join(process.cwd(), ".ops", "profile.json");
   for (const p of [inRepo, sidecar]) {
-    if (existsSync(p)) {
-      try { return { path: p, ...JSON.parse(execFileSync("cat", [p], { encoding: "utf8" })) }; }
-      catch (e) { console.error(`reeve: ${p} is not valid JSON — ${e.message}`); process.exit(1); }
+    if (!existsSync(p)) continue;
+    let raw;
+    try { raw = JSON.parse(readFileSync(p, "utf8")); }
+    catch (e) { console.error(`reeve: ${p} is not valid JSON — ${e.message}`); process.exit(1); }
+    const profile = withDefaults(raw);
+    const r = validate(profile);
+    if (!r.ok) {
+      // A profile that does not validate is refused, never partially applied: a
+      // half-loaded profile is how a gate ends up judging the wrong check name.
+      console.error(`reeve: ${p} is invalid`);
+      for (const e of r.errors) console.error("  error:", e);
+      process.exit(1);
     }
+    for (const w of r.warnings) console.error("  warn:", w);
+    return { path: p, ...profile };
   }
   return null;
 }

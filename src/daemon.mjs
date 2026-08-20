@@ -366,11 +366,19 @@ export async function tick(ctx) {
       // A worker whose tools were denied wrote a plausible answer it could not
       // support. Treating that as progress is the fail-open this exists to close.
       if (r.outcome === OUTCOMES.DENIED) {
+        // WHAT was denied, not just how many. "4 tool call(s) denied" is a number
+        // to guess at; the commands are the diagnosis. Two rounds of this were
+        // spent reproducing by hand what the run already knew and had discarded.
+        const what = (r.denials ?? []).map(x => {
+          const i = x.tool_input ?? {};
+          return String(i.command ?? i.file_path ?? x.tool_name ?? "?").replace(/\s+/g, " ").slice(0, 100);
+        });
+        for (const w of new Set(what)) log(logPath, `  #${e.pr}: DENIED -> ${w}`);
         // Nothing was attempted, so nothing is charged. The sandbox refused the
         // worker's tools, which is a fault on reeve's side, and letting it consume
         // the pull request's only repair would punish the PR for reeve's mistake.
         if (fp) refundFixAttempt(db, nwo, e.pr, fp);
-        escalations.set(`#${e.pr}: worker tool calls were denied — its answer is not trustworthy, and reeve's sandbox is the likely cause`, 1);
+        escalations.set(`#${e.pr}: worker tool calls were denied — its answer is not trustworthy. Refused: ${[...new Set(what)].slice(0, 3).join(" · ") || "unrecorded"}`, 1);
       }
       if (r.outcome === OUTCOMES.RATE_LIMITED) { escalations.set("the provider is rate limiting; work is paused", 1); break; }
     }

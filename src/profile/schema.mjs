@@ -109,6 +109,9 @@ export const FIELDS = {
   "identity.defaultBranch": [true,  isStr],
   "identity.baseBranch":    [false, isStr],            // rext promotes feature -> stage -> main
   "identity.visibility":    [true,  oneOf(["public", "private"])],
+  // The main clone. A worktree is created FROM it, and it cannot be derived from
+  // worktreeRoot -- they are siblings by convention, not by rule.
+  "identity.checkout":      [false, isAbsPath],
   "identity.worktreeRoot":  [false, isAbsPath],
   "identity.cloneStrategy": [false, oneOf(["full", "blobless", "treeless", "shallow"])],
 

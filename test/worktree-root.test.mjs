@@ -55,8 +55,20 @@ const withRoot = v => { const p = structuredClone(base); p.identity.worktreeRoot
 
 // --- the dispatch-time resolution -------------------------------------------
 {
-  const r = resolveWorktree({}, withRoot(real), { pr: 1 });
-  check(r.path === real, "control: an existing absolute root resolves to itself", JSON.stringify(r));
+  // worktreeRoot is now the ROOT under which a per-PR worktree is created, not the
+  // directory a worker runs in. Creating one needs a real clone, which
+  // test/worktree.test.mjs drives against actual git repositories; here the
+  // contract under test is that the profile must name that clone at all.
+  const r = resolveWorktree({}, withRoot(real), { pr: 1, headRef: "feature", head: "a".repeat(40) });
+  check(r.path === null && /identity\.checkout/.test(r.why ?? ""),
+    "a worktreeRoot with no identity.checkout refuses — a worktree is created FROM a clone",
+    JSON.stringify(r));
+}
+{
+  // The explicit override is the seam a caller uses to hand over a directory it
+  // has already prepared, and it must still be checked.
+  const r = resolveWorktree({ worktreeFor: () => real }, withRoot(real), { pr: 1 });
+  check(r.path === real, "control: an explicit, existing worktree is accepted", JSON.stringify(r));
 }
 {
   const r = resolveWorktree({}, structuredClone(base), { pr: 1 });
@@ -68,8 +80,10 @@ const withRoot = v => { const p = structuredClone(base); p.identity.worktreeRoot
   check(r.path === null && /relative/i.test(r.why ?? ""), "a relative root refuses", JSON.stringify(r));
 }
 {
-  const r = resolveWorktree({}, withRoot(join(real, "nope")), { pr: 1 });
-  check(r.path === null && /exist/i.test(r.why ?? ""), "a root that does not exist refuses", JSON.stringify(r));
+  const p = withRoot(real); p.identity.checkout = join(real, "no-such-clone");
+  const r = resolveWorktree({}, p, { pr: 1, headRef: "feature", head: "a".repeat(40) });
+  check(r.path === null && /exist/i.test(r.why ?? ""),
+    "a checkout that does not exist refuses", JSON.stringify(r));
 }
 {
   // An explicit per-PR override still wins, because that is how the worktree

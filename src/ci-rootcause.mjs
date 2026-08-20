@@ -114,8 +114,12 @@ export function logSlice(nwo, checkRunId, step, { maxLines = 120 } = {}) {
   };
 }
 
-/** Lines a human or an agent would actually act on. */
-export function salientLines(text, limit = 0) {
+/**
+ * Lines a human or an agent would actually act on. `limit` is a cap, and the
+ * loop stops the moment hits reach it, so the default must be positive: a
+ * default of 0 stops before the first line and reports no cause at all.
+ */
+export function salientLines(text, limit = 25) {
   const patterns = [
     /^\s*[✖✗×]\s/, /\bError\b/, /\bERROR\b/, /^\s*FAIL\b/, /\bfailed\b/i,
     /\bexpect\(/, /\bAssertionError\b/, /\bTraceback\b/, /^\s*at .*\(\S+:\d+:\d+\)/,

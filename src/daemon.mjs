@@ -23,16 +23,40 @@ import { rootCause, fingerprint } from "./ci-rootcause.mjs";
 import { readState } from "./status.mjs";
 import { writeDash } from "./dash.mjs";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, fstatSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 
 const now = () => Math.floor(Date.now() / 1000);
 
-function log(logPath, line) {
+// Whether this process's stdout already points at the log file. launchd's
+// StandardOutPath names the very file the daemon appends to, so echoing as well
+// writes every line twice — and the shadow week counts its evidence from this
+// file, which makes a quiet night read as a busy one. Compared by (dev, ino)
+// rather than by path, because a redirect leaves no path to compare. Cached per
+// path: a daemon's stdout does not change underneath it.
+const stdoutIsFile = new Map();
+function stdoutAlreadyWrites(logPath) {
+  if (stdoutIsFile.has(logPath)) return stdoutIsFile.get(logPath);
+  let same = false;
+  try {
+    const out = fstatSync(1), file = statSync(logPath);
+    same = out.dev === file.dev && out.ino === file.ino;
+  } catch { same = false; }   // a pipe, a tty or an unreadable path is never the log
+  stdoutIsFile.set(logPath, same);
+  return same;
+}
+
+export function log(logPath, line) {
   const stamped = `${new Date().toISOString()} ${line}`;
-  console.log(stamped);
-  if (!logPath) return;
-  try { mkdirSync(dirname(logPath), { recursive: true }); appendFileSync(logPath, stamped + "\n"); } catch { /* logging must never kill the loop */ }
+  if (!logPath) { console.log(stamped); return; }
+  let appended = false;
+  try {
+    mkdirSync(dirname(logPath), { recursive: true });
+    appendFileSync(logPath, stamped + "\n");
+    appended = true;
+  } catch { /* logging must never kill the loop */ }
+  // Stat after the append, so the first line of a fresh log has a file to compare.
+  if (!appended || !stdoutAlreadyWrites(logPath)) console.log(stamped);
 }
 
 function openPrs(nwo, limit = 20) {

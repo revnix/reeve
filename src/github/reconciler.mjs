@@ -173,6 +173,30 @@ export function classify(allRows, requiredChecks = []) {
   return { verdict: "GREEN", why: `${rows.length} check(s) all passing`, failing: [], running: [], malformed };
 }
 
+
+/**
+ * Has the CI provider finished everything it was going to do at this revision?
+ *
+ * Scoped to the provider's own App on purpose. Measured at one live head: all 13
+ * `github-actions` suites reached `completed`, while the `coderabbitai`,
+ * `greptile-apps` and `vercel` suites sat at `queued` with zero runs
+ * indefinitely. Waiting for every suite therefore never terminates, and a gate
+ * that never terminates is a gate that blocks forever.
+ *
+ * Returns null when the question cannot be asked. Null is not false and it is not
+ * true: it means the caller has no basis to conclude anything.
+ */
+export function suitesComplete(nwo, sha, { app = "github-actions" } = {}) {
+  const r = gh(`repos/${nwo}/commits/${sha}/check-suites?per_page=100`, ".check_suites");
+  if (!r.ok || !r.out) return null;
+  let suites; try { suites = JSON.parse(r.out); } catch { return null; }
+  const mine = suites.filter(s => (s.app?.slug ?? null) === app);
+  // No suite at all from the provider is not "finished": on a repository with CI
+  // it means nothing has been created yet, which is the very state being waited on.
+  if (!mine.length) return false;
+  return mine.every(s => s.status === "completed");
+}
+
 /**
  * Settlement across polls. A single green reading is not settlement: a workflow
  * that has not yet scheduled its jobs reports an empty, unfailing set that is
@@ -207,8 +231,19 @@ export function settle(prior, reading) {
   // is the same absence-read-as-fact error pointed the other way.
   if (reading.verdict === "RED")
     return { ...next, settled: true, verdict: reading.verdict, why: reading.why };
+  // A required check that has not appeared is an ABSENCE, and an absence needs a
+  // REASON to be believed rather than a number of looks. Counting was measured to
+  // be wrong on the one real case: #1127's checks arrived 698 seconds after the
+  // first reading, while three observations settle at 352 -- so a count still
+  // pages a human almost six minutes early.
+  //
+  // What terminates is the CI provider's own check-suites. `suitesComplete` is
+  // true only when every suite belonging to the provider has completed, and it is
+  // null when the question could not be asked -- which is not an answer, so it
+  // does not settle either. Terminal evidence needs no corroboration, so one
+  // reading of a finished provider is enough.
   if (reading.verdict === "MISSING_REQUIRED")
-    return { ...next, settled: streak >= 3, verdict: reading.verdict, why: reading.why };
+    return { ...next, settled: reading.suitesComplete === true, verdict: reading.verdict, why: reading.why };
   if (reading.verdict !== "GREEN") return { ...next, settled: false, verdict: reading.verdict, why: reading.why };
   if (names.length < floor) return { ...next, settled: false, verdict: "UNKNOWN", why: `only ${names.length} checks reported where ${floor} were seen before` };
   if (streak < 3) return { ...next, settled: false, verdict: "SETTLING", why: `green reading ${streak} of 3` };

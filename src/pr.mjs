@@ -6,7 +6,7 @@
 // publishes `neutral`, which GitHub renders but never blocks on, so a week of
 // them says exactly what the gate WOULD have refused.
 
-import { pinHead, readChecks, classify, settle, inheritedOrCaused, readTimeline, lastForcePush } from "./github/reconciler.mjs";
+import { pinHead, readChecks, classify, settle, inheritedOrCaused, readTimeline, lastForcePush, suitesComplete } from "./github/reconciler.mjs";
 import { loadSettlement, saveSettlement } from "./db/ops.mjs";
 import { computeVerdict, renderVerdict, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
@@ -102,7 +102,12 @@ export function evaluatePr({ nwo, pr, profile, db = null }) {
   // the check SET being stable ACROSS TIME, so it can only be established by
   // successive ticks -- this used to call settle() three times over the same
   // snapshot, which declared every set stable the first time it was seen.
-  const reading = { ...c, sha: pin.sha, rows };
+  // Only asked when a required check is missing, because that is the only branch
+  // whose answer depends on it and each call is an extra API round trip.
+  const reading = { ...c, sha: pin.sha, rows,
+    suitesComplete: c.verdict === "MISSING_REQUIRED"
+      ? suitesComplete(nwo, pin.sha, { app: profile.ci?.appSlug ?? "github-actions" })
+      : null };
   let s;
   if (db) {
     s = saveSettlement(db, nwo, pr, settle(loadSettlement(db, nwo, pr), reading));

@@ -98,15 +98,22 @@ let db = open(path);
 // created it yet, and calling that "never reported" on first sight is the same
 // absence-read-as-fact error in the opposite direction.
 {
-  const m = { verdict: "MISSING_REQUIRED", sha: "ccc", rows: [run("a", "success")], why: "required check(s) never reported: CI Gate" };
+  const m = { verdict: "MISSING_REQUIRED", sha: "ccc", rows: [run("a", "success")], why: "required check(s) never reported: CI Gate", suitesComplete: false };
   const first = tick(db, "o/r", 3, m, 800);
   check(first.settled === false,
     "a missing required check is NOT settled on its first observation", JSON.stringify(first));
   check(first.why === m.why, "and it still carries its reason", JSON.stringify(first.why));
   tick(db, "o/r", 3, m, 900);
   const third = tick(db, "o/r", 3, m, 1000);
-  check(third.settled === true && third.verdict === "MISSING_REQUIRED",
-    "three consecutive observations do settle it", JSON.stringify(third));
+  // Counting was measured to be the WRONG rule here, not merely a weak one: the
+  // one real case took 698 seconds for its checks to appear, and three
+  // observations settle at 352. What settles an absence is the CI provider having
+  // finished -- see test/missing-required.test.mjs.
+  check(third.settled === false,
+    "and three observations do NOT settle it either, because a count is not a reason",
+    JSON.stringify(third));
+  const done = tick(db, "o/r", 3, { ...m, suitesComplete: true }, 1100);
+  check(done.settled === true, "the provider finishing is what settles it", JSON.stringify(done));
 }
 {
   // A failing check is PRESENT evidence. More looks will not un-fail it, so it

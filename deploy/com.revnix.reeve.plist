@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.revnix.reeve</string>
+
+  <!-- An ABSOLUTE node path is mandatory. launchd is not a login shell: it never
+       sources a profile, its PATH is only /usr/bin:/bin:/usr/sbin:/sbin, and nvm
+       is purely a shell function. A bare `node` here fails with exit 78 EX_CONFIG
+       and writes NOTHING to the stderr log, so the log cannot tell you why.
+       Diagnose with: launchctl print gui/$(id -u)/com.revnix.reeve -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/mobeen/.nvm/versions/node/v24.17.0/bin/node</string>
+    <string>/Users/mobeen/Work/Products/reeve/bin/reeve</string>
+    <string>run</string>
+  </array>
+
+  <!-- v24 is required for node:sqlite to be unflagged and unwarned. The shell
+       default here is v22, so it must not be inherited. ~/.local/bin carries the
+       claude binary the workers are spawned from. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/mobeen/.nvm/versions/node/v24.17.0/bin:/Users/mobeen/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>REEVE_HOME</key>
+    <string>/Users/mobeen/.reeve</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Start-to-start floor, not crash-to-start: a daemon that dies 3s in still
+       restarts on this cadence. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/mobeen/Work/Products/reeve</string>
+  <key>StandardOutPath</key>
+  <string>/Users/mobeen/.reeve/reeve.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/mobeen/.reeve/reeve.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

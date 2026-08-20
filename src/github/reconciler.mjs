@@ -60,6 +60,21 @@ export const POLICY_CONTEXT = "ops/merge-policy";
 export const POLICY_APP = "merge-policy";
 
 /**
+ * What counts as a check, versioned.
+ *
+ * The settlement floor is a high-water mark of how many checks a revision has
+ * reported, and it is only meaningful against a FIXED notion of what a check is.
+ * Excluding reeve's own policy row dropped every head's count by exactly one --
+ * measured live: five open PRs, every one of them one short of its stored floor
+ * -- so no revision could ever reach it again and every pull request would have
+ * blocked forever.
+ *
+ * Bump this whenever the set of things counted changes. A stored floor recorded
+ * under an older number is discarded rather than compared against.
+ */
+export const CHECK_ACCOUNTING = 2;
+
+/**
  * Remove reeve's own opinion from the evidence.
  *
  * A verdict published at a head is a CONCLUSION about that head, so reading it

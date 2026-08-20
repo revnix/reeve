@@ -1,0 +1,182 @@
+// verdict — the single answer to "may this revision merge?"
+//
+// The whole design rests on one inversion: reeve does not merge. It computes this
+// verdict, publishes it bound to an exact head_sha, and GitHub refuses. A stale or
+// crashed reeve then fails to publish and the merge blocks, where the previous
+// design merged on stale logic and merged 0 of 10 correctly-gated PRs.
+//
+// Three outcomes, and only one of them merges:
+//   PASS   every clause satisfied at the pinned head
+//   BLOCK  a clause is definitely unsatisfied
+//   UNKNOWN a clause could not be evaluated
+//
+// UNKNOWN never merges. Every fail-open defect measured in the previous system was
+// an UNKNOWN silently rendered as PASS: an absent gate script read as a pass, a
+// rate-limited reviewer reporting state=success, a fork PR with zero check runs.
+
+export const PASS = "PASS";
+export const BLOCK = "BLOCK";
+export const UNKNOWN = "UNKNOWN";
+
+/**
+ * Does a reviewer's named revision cover the head under test? Prefix in either
+ * direction, minimum 7 hex, because the two surfaces abbreviate differently.
+ */
+export function coversHead(reviewedHead, head) {
+  if (!reviewedHead || !head) return false;
+  const a = String(reviewedHead).toLowerCase();
+  const b = String(head).toLowerCase();
+  if (a.length < 7 || b.length < 7) return false;
+  return a.startsWith(b) || b.startsWith(a);
+}
+
+/** Worst wins. UNKNOWN outranks PASS so a clause that could not answer cannot be outvoted. */
+function worst(a, b) {
+  if (a === BLOCK || b === BLOCK) return BLOCK;
+  if (a === UNKNOWN || b === UNKNOWN) return UNKNOWN;
+  return PASS;
+}
+
+/**
+ * @param {object} i
+ * @param {string} i.head            the sha this verdict is ABOUT, pinned once
+ * @param {object} i.checks          {verdict, settled, failing[]} from the reconciler
+ * @param {object} i.base            {verdict} for the base branch's own head
+ * @param {object[]} i.reviewers     [{login, kind, state, reviewedHead}]
+ * @param {object} i.rounds          {n, softCap, hardCap, unspilledCritical}
+ * @param {object} i.threads         {unresolved, total, readable}
+ * @param {number} i.ledgerBlockers  count of active findings blocking this PR, or null if unreadable
+ * @param {string} i.mergeState      GitHub mergeStateStatus
+ * @param {object} i.profile
+ */
+export function computeVerdict(i) {
+  const clauses = [];
+  const add = (id, state, detail) => clauses.push({ id, state, detail });
+
+  // 1. CI at the pinned head, settled. An unsettled green is a workflow that has
+  //    not scheduled its jobs yet, which reads identically to a clean run.
+  if (!i.checks) add("ci", UNKNOWN, "no check reading");
+  else if (!i.checks.settled) add("ci", UNKNOWN, `checks not settled: ${i.checks.verdict}${i.checks.why ? ` (${i.checks.why})` : ""}`);
+  else if (i.checks.verdict === "GREEN") add("ci", PASS, "all checks passing at the pinned head");
+  else if (i.checks.verdict === "MISSING_REQUIRED") add("ci", BLOCK, i.checks.why);
+  else if (i.checks.verdict === "RED") {
+    const names = (i.checks.failing ?? []).map(f => f.name).join(", ");
+    // Inherited red is still red for THIS gate: merging it does not make the base
+    // worse, but it also cannot be called green. The scheduler decides whether to
+    // proceed; the verdict only reports.
+    add("ci", BLOCK, `failing: ${names}${i.checks.inherited?.length ? ` (inherited from base: ${i.checks.inherited.join(", ")})` : ""}`);
+  } else add("ci", UNKNOWN, `check verdict ${i.checks.verdict}`);
+
+  // 2. The base's own health. GitHub does not check this when strict is false, so
+  //    a PR can merge cleanly into a branch that is already broken.
+  if (!i.base) add("base", UNKNOWN, "base health not read");
+  else if (i.base.verdict === "GREEN") add("base", PASS, "base is green");
+  else if (i.base.verdict === "RED") add("base", BLOCK, "the base branch is red; merging into it hides the next failure");
+  else add("base", UNKNOWN, `base verdict ${i.base.verdict}`);
+
+  // 3. Review coverage AT THIS HEAD, per blocking reviewer. Four states, never two:
+  //    a refusal is ABSENT, never a pass. 65 of 65 Codex comments on the last 40
+  //    merged PRs were quota refusals; treating that as "found nothing" is what
+  //    produced 116 unreviewed merges.
+  const blocking = (i.reviewers ?? []).filter(r => r.kind === "blocking");
+  if (!blocking.length) {
+    add("review", PASS, "no blocking reviewer configured");
+  } else {
+    const covered = blocking.filter(r => r.state === "CLEAN" || r.state === "VERDICT");
+    // Codex names the revision it read as an ABBREVIATED sha ("**Reviewed commit:**
+    // `8356918648`"), so coverage is a prefix comparison in either direction, never
+    // string equality. A reviewer that names no revision has not demonstrated
+    // coverage of THIS one, whatever it says.
+    const atHead = covered.filter(r => coversHead(r.reviewedHead, i.head));
+    const unreachable = blocking.filter(r => r.state === "REFUSED" || r.state === "NOT_INSTALLED");
+    const notRun = blocking.filter(r => r.state === "NOT_RUN");
+
+    if (atHead.length === blocking.length) add("review", PASS, `${blocking.length} blocking reviewer(s) covered at ${i.head?.slice(0, 8)}`);
+    else if (unreachable.length) add("review", UNKNOWN, `unreachable: ${unreachable.map(r => `${r.login}=${r.state}`).join(", ")} — absence is not approval`);
+    else if (notRun.length) add("review", UNKNOWN, `not yet run: ${notRun.map(r => r.login).join(", ")}`);
+    else add("review", BLOCK, `covered at a different revision: ${covered.map(r => `${r.login}@${(r.reviewedHead ?? "?").slice(0, 8)}`).join(", ")}`);
+  }
+
+  // 4. Round budget. Past the soft cap only P0/P1 keep the loop running, and a
+  //    critical finding is never spilled to a follow-up.
+  const R = i.rounds;
+  if (!R) add("rounds", PASS, "no round accounting");
+  else if (R.n >= R.hardCap && R.unspilledCritical > 0)
+    add("rounds", BLOCK, `hard cap ${R.hardCap} reached with ${R.unspilledCritical} P0/P1 finding(s) open — escalate, never spill a critical`);
+  else if (R.n >= R.softCap && R.unspilledCritical > 0)
+    add("rounds", BLOCK, `past soft cap ${R.softCap} with ${R.unspilledCritical} critical finding(s) still open`);
+  else add("rounds", PASS, `round ${R.n} of ${R.softCap}/${R.hardCap}`);
+
+  // 5. Unresolved threads. A truncated read is not zero: reviewThreads(first:100)
+  //    has produced four consecutive false "zero unresolved" reports.
+  if (!i.threads || i.threads.readable === false) add("threads", UNKNOWN, "thread state not readable");
+  else if (i.threads.unresolved > 0) add("threads", BLOCK, `${i.threads.unresolved} of ${i.threads.total} thread(s) unresolved`);
+  else add("threads", PASS, `0 of ${i.threads.total} threads unresolved`);
+
+  // 6. Ledger blockers. null means the store could not answer, which is not zero.
+  //    The previous gate skipped this check entirely when the read failed.
+  if (i.ledgerBlockers === null || i.ledgerBlockers === undefined) add("findings", UNKNOWN, "could not read blocking findings");
+  else if (i.ledgerBlockers > 0) add("findings", BLOCK, `${i.ledgerBlockers} active finding(s) block this PR`);
+  else add("findings", PASS, "no active blocking findings");
+
+  // 7. GitHub's own mergeability. UNKNOWN is GitHub still computing; retry.
+  const MS = String(i.mergeState ?? "").toUpperCase();
+  if (!MS) add("mergeable", UNKNOWN, "mergeStateStatus not read");
+  else if (MS === "CLEAN" || MS === "UNSTABLE") add("mergeable", PASS, MS);
+  else if (MS === "UNKNOWN") add("mergeable", UNKNOWN, "GitHub is still computing mergeability");
+  else add("mergeable", BLOCK, `mergeStateStatus ${MS}`);
+
+  const state = clauses.reduce((acc, c) => worst(acc, c.state), PASS);
+  return {
+    state, head: i.head, clauses,
+    summary: state === PASS ? "every clause satisfied at this revision"
+           : state === BLOCK ? clauses.filter(c => c.state === BLOCK).map(c => c.id).join(", ") + " blocked"
+           : clauses.filter(c => c.state === UNKNOWN).map(c => c.id).join(", ") + " could not be determined",
+  };
+}
+
+/** Render for a check-run output body, and for humans. Machine-readable block included. */
+export function renderVerdict(v) {
+  const mark = s => (s === PASS ? "PASS " : s === BLOCK ? "BLOCK" : "?????");
+  const lines = [
+    `${v.state} at ${v.head?.slice(0, 8) ?? "unknown"} — ${v.summary}`,
+    "",
+    ...v.clauses.map(c => `  ${mark(c.state)}  ${c.id.padEnd(10)} ${c.detail}`),
+  ];
+  if (v.state === UNKNOWN) {
+    lines.push("", "A clause that could not be evaluated does not pass. Every fail-open defect",
+                   "measured in the previous system was an UNKNOWN rendered as a PASS.");
+  }
+  // The verdict is an artifact, not prose: a consumer parses this rather than the text.
+  lines.push("", "```json", JSON.stringify({ state: v.state, head: v.head, clauses: v.clauses }, null, 2), "```");
+  return lines.join("\n");
+}
+
+/**
+ * Publish. A check run is the real surface but requires a GitHub App; a user
+ * token gets 403. Falls back to a commit status, which is weaker but still
+ * bindable as a required context, and a required context that never reports
+ * BLOCKS rather than merges — which is the fail-closed primitive.
+ */
+export function publishArgs(v, { nwo, context = "ops/merge-policy", asApp = false }) {
+  const conclusion = v.state === PASS ? "success" : v.state === BLOCK ? "failure" : "action_required";
+  if (asApp) {
+    return {
+      surface: "check_run",
+      method: "POST", path: `repos/${nwo}/check-runs`,
+      body: {
+        name: context, head_sha: v.head, status: "completed", conclusion,
+        output: { title: `${v.state}: ${v.summary}`, summary: renderVerdict(v) },
+      },
+    };
+  }
+  return {
+    surface: "status",
+    method: "POST", path: `repos/${nwo}/statuses/${v.head}`,
+    body: {
+      state: v.state === PASS ? "success" : v.state === BLOCK ? "failure" : "pending",
+      context,
+      description: `${v.state}: ${v.summary}`.slice(0, 140),
+    },
+  };
+}

@@ -195,7 +195,7 @@ Six phases, all complete. Measured at the time of writing:
 - **1,067 lines of tests** across 10 `test/*.test.mjs` — excludes 4 helper files in `test/`
   that are fixtures, not tests (`claimworker2.mjs`, `crashdrain.mjs`, `reconcile.demo.mjs`,
   `seed.mjs`)
-- **379 assertions passing, 0 failing** across 22 test files
+- **432 assertions passing, 0 failing** across 26 test files
 - **4 profiles** written (nextly, rext-backend, 21century, reeve)
 - **The launchd agent is installed and running** as of 2026-08-20 16:29 UTC — shadow mode,
   `--execute` off, watching `nextlyhq/nextly`. See §7.
@@ -411,21 +411,40 @@ is the single most useful thing that happened all session:
 - Escalations were **retired on absence** — a PR a tick could not evaluate read as
   resolved.
 
+**Closed later the same day**, after the verification pass:
+
+| Audit finding | State |
+|---|---|
+| P0 worker safety was a prompt boundary | **fixed** — `src/sandbox.mjs`, measured against the CLI before it was designed |
+| P1 a cancelled ancillary job vetoed the base forever | **fixed** — the required set decides which absences veto |
+| P1 the review actions were executable on data that is not real | **gated off**, and `unspilledCritical` no longer claims a zero it cannot know |
+| P1 MISSING_REQUIRED settled on a count | **fixed** — settles on the CI provider's suites being terminal |
+
+The sandbox is the one worth reading the code for. Five things were measured
+against the installed CLI *before* designing it:
+
+- `permissions.deny` blocks in headless mode.
+- Denying `Write`/`Edit` while allowing bare `Bash` is **theatre** — asked to write
+  a denied file the model used `printf > file` and succeeded next turn.
+- A **scoped allowlist contains Bash on its own**: granted only
+  `Bash(git status:*)`, `git status` ran while `git push`, `printf >`,
+  `printf | tee` and a chained `git remote -v` were each refused.
+- Path-scoped denies work, verified with a control file that *did* change.
+- **`deny: ["Bash"]` removes the tool entirely, scoped grants included.** The first
+  version of the sandbox did that and would have shipped a fixer that could edit
+  code but never run a test — reporting success on work nothing had checked. That
+  cost a redesign and is recorded in the file rather than smoothed over.
+
+The worker also no longer holds push or merge authority. reeve pushes after
+`reviewDiff` checks what **git** says changed — not what the worker says it did —
+against quarantine, sensitive paths, the files that judge the work, and the lane's
+territory. An empty diff refuses; an unreadable one refuses with its own reason.
+
 **Still open from the audit, in the order it recommends:**
 
-1. **P0 — worker safety is still a prompt boundary.** Risk paths, forbidden
-   commands and lane territory are rendered as prose into the worker's prompt,
-   and fix workers get unrestricted `Read,Edit,Write,Grep,Glob,Bash`. Nothing
-   deterministic stops a forbidden command, a write outside its territory, an
-   edit to `.github`, or a push that was never diff-checked. **This is the last
-   thing standing between here and `--execute`.**
 2. P1 worktree lifecycle — reeve validates a path, it does not create, verify,
    own or reap a per-PR checkout.
-3. P1 the review actions (`REQUEST_REVIEW`, `FIX_FINDINGS`, `SPILL`) are
-   executable but their data is not ready — `rounds.n` counts one reviewer's
-   latest head, `unspilledCritical` is hard-coded zero. **Feature-gate them off.**
 4. P1 `inheritedOrCaused` compares check NAMES, not failures.
-5. P1 a cancelled ancillary job vetoes the base forever.
 6. P1 clean-merge rate reads only check runs, counts an empty set as clean, and
    **is never computed by the daemon at all** — the dashboard headline is always
    blank.

@@ -201,6 +201,6 @@ switch (cmd) {
       --interval <seconds>  default 90
       --halt <path>         marker file that stops everything (default ~/.reeve/HALT)
 
-not yet built: status · next · why · plan · init · lane`);
+not yet built: next · plan · lane`);
     process.exit(cmd ? 1 : 0);
 }

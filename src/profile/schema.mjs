@@ -133,6 +133,17 @@ export const FIELDS = {
   "risk.quarantinePaths":   [false, isArr(isStr)],     // never touched: prod dumps, other clients' creds
   "risk.forbiddenCommands": [false, isArr(isStr)],     // db:migrate:fresh, store submit, publish
 
+  // Read by the daemon and the watcher. Declared here because the validator
+  // refused a profile using them and `reeve doctor` exited before doing anything:
+  // code that reads undeclared config is config that drifts from its schema
+  // unnoticed. See daemon.mjs (maxWorkers, workerBudgetMinutes, maxTurns) and
+  // watcher.mjs (unknownEscalateSeconds).
+  "watch.maxWorkers":            [false, isInt],
+  "watch.workerBudgetMinutes":   [false, isInt],
+  "watch.maxTurns":              [false, isInt],
+  "watch.unknownEscalateSeconds":[false, isInt],
+  "watch.intervalSeconds":       [false, isInt],
+
   "tools.codeHealth":       [false, isArr(isStr)],     // fallow is JS-only; Python needs ruff+vulture
 };
 

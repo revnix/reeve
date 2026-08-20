@@ -165,10 +165,32 @@ export function classify(allRows, requiredChecks = []) {
   if (missing.length) return { verdict: "MISSING_REQUIRED", why: `required check(s) never reported: ${missing.join(", ")}`, failing, running, missing, malformed };
   if (failing.length) return { verdict: "RED", why: `${failing.length} check(s) not passing`, failing, running, malformed };
   if (running.length) return { verdict: "RUNNING", why: `${running.length} check(s) still in flight`, failing, running, malformed };
-  if (uninformative.length) return {
-    verdict: "UNKNOWN", failing: [], running: [], uninformative,
-    why: `${uninformative.length} check(s) cancelled or stale — superseded, not failed`,
-  };
+  // A cancelled or stale run is a SUPERSEDED run, and superseding is normal: a new
+  // push cancels the old workflow. What matters is whether the superseded thing was
+  // one the gate requires.
+  //
+  // Measured live: nextlyhq/nextly main had both required checks green and one
+  // non-required job cancelled, and that single row made the whole branch
+  // UNKNOWN -- which blocked all five open pull requests for hours through the
+  // base clause. An obsolete job nobody requires cannot be allowed to veto forever.
+  //
+  // Where NO required set is declared, reeve has no basis to call anything
+  // ancillary, so every cancellation still refuses. Fail closed where the profile
+  // is silent.
+  if (uninformative.length) {
+    const req = new Set(requiredChecks);
+    const blocking = req.size ? uninformative.filter(r => req.has(r.name)) : uninformative;
+    if (blocking.length) return {
+      verdict: "UNKNOWN", failing: [], running: [], uninformative: blocking,
+      why: `${blocking.length} required check(s) cancelled or stale — superseded, not failed`,
+    };
+    // Reported rather than dropped: it is still worth seeing that a job was
+    // cancelled, it simply is not a reason to refuse a merge.
+    if (malformed) return { verdict: "UNKNOWN", failing: [], running: [], malformed, ancillaryUninformative: uninformative,
+      why: `${malformed} check row(s) could not be parsed, so this revision is not checkable` };
+    return { verdict: "GREEN", failing: [], running: [], ancillaryUninformative: uninformative,
+      why: `${rows.length - uninformative.length} required and ancillary check(s) passing; ${uninformative.length} ancillary cancelled or stale` };
+  }
   if (malformed) return { verdict: "UNKNOWN", failing: [], running: [], malformed, why: `${malformed} check row(s) could not be parsed, so this revision is not checkable` };
   return { verdict: "GREEN", why: `${rows.length} check(s) all passing`, failing: [], running: [], malformed };
 }

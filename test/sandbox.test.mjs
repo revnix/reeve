@@ -98,9 +98,21 @@ const deny = s.settings.permissions.deny.join(" | ");
 {
   check(/vendor-dumps/.test(deny), "quarantined paths are denied");
   check(/drizzle/.test(deny), "sensitive paths are denied");
+  // Quarantine is data that must never be SEEN — every verb, reads included.
   for (const verb of ["Read", "Edit", "Write"])
     check(new RegExp(`${verb}\\(\\./vendor-dumps`).test(deny),
       `quarantine is denied for ${verb} — one unguarded verb is the whole hole`, deny);
+
+  // Sensitive paths are the opposite case: a fixer must not CHANGE auth code, a
+  // migration or the workflow judging it, but reading them is how it works out
+  // what went wrong. Denying the read left a worker unable to see what CI ran,
+  // and it spent its turns guessing.
+  check(/Write\(\.\/packages\/\*\/drizzle/.test(deny), "a sensitive path is write-denied", deny);
+  check(!/Read\(\.\/packages\/\*\/drizzle/.test(deny),
+    "but NOT read-denied — understanding a failure requires reading what failed", deny);
+  check(!/Read\(\.\/\.github/.test(deny),
+    "and the workflow that judges the work is readable, just not writable", deny);
+  check(/Write\(\.\/\.github/.test(deny), "it is still write-denied", deny);
 }
 
 // --- the authority the worker must never hold -------------------------------

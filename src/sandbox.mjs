@@ -65,7 +65,8 @@ const NEVER = [
   "Bash(npm publish:*)", "Bash(pnpm publish:*)", "Bash(yarn publish:*)",
 ];
 
-/** The paths that judge the work. A worker editing these grades its own exam. */
+/** The paths that judge the work. A worker EDITING these grades its own exam;
+ * reading them is how it understands the exam. */
 const SELF_GOVERNING = [".github/**", ".git/**"];
 
 /** What a project of each language is actually run with. */
@@ -78,6 +79,22 @@ const RUNTIMES = {
 
 const denyAllVerbs = glob =>
   ["Read", "Edit", "Write", "NotebookEdit"].map(v => `${v}(./${glob.replace(/^\.\//, "")})`);
+
+/**
+ * Writing only, for paths a worker must not CHANGE but does need to understand.
+ *
+ * The distinction is deliberate and the two are not interchangeable:
+ *
+ *   quarantine — deny every verb, READS INCLUDED. This is data that must never be
+ *   seen at all: another client's credentials, a production dump.
+ *
+ *   sensitive and self-governing — deny writes only. Auth code, a migration, the
+ *   workflow that is failing: reading these is how a fixer works out what went
+ *   wrong, and changing them is what needs a human. Denying the read left the
+ *   worker unable to see what CI even ran, and it spent its turns guessing.
+ */
+const denyWriteVerbs = glob =>
+  ["Edit", "Write", "NotebookEdit"].map(v => `${v}(./${glob.replace(/^\.\//, "")})`);
 
 /**
  * The deterministic policy for one worker.
@@ -141,8 +158,8 @@ export function sandboxFor({ profile, action, worktree, lane = null }) {
     ...NEVER,
     ...(risk.forbiddenCommands ?? []).map(c => `Bash(${c}:*)`),
     ...(risk.quarantinePaths ?? []).flatMap(denyAllVerbs),
-    ...(risk.sensitivePaths ?? []).flatMap(denyAllVerbs),
-    ...SELF_GOVERNING.flatMap(denyAllVerbs),
+    ...(risk.sensitivePaths ?? []).flatMap(denyWriteVerbs),
+    ...SELF_GOVERNING.flatMap(denyWriteVerbs),
   ];
 
   return {

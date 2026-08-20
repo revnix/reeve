@@ -52,6 +52,36 @@ export function isSameProcess(pid, storedStart) {
   return now !== null && now === storedStart;
 }
 
+/**
+ * Every worker group this process has started and not yet reaped.
+ *
+ * Workers are spawned DETACHED so their own grandchildren can be group-killed,
+ * but detachment cuts both ways: if the supervisor dies, the worker survives it.
+ * Measured directly — a supervisor killed mid-dispatch leaves a claude worker,
+ * its shell, and whatever build it was running with no parent to stop them.
+ * These handlers close that, and they are idempotent because a process can be
+ * signalled and then exit normally.
+ */
+const LIVE_GROUPS = new Set();
+let reaperInstalled = false;
+
+function installReaper() {
+  if (reaperInstalled) return;
+  reaperInstalled = true;
+  const reap = () => {
+    for (const pid of LIVE_GROUPS) {
+      try { process.kill(-pid, "SIGTERM"); } catch { /* already gone */ }
+    }
+    LIVE_GROUPS.clear();
+  };
+  process.on("exit", reap);
+  // A signalled supervisor must take its workers with it, then die itself.
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.on(sig, () => { reap(); process.exit(sig === "SIGINT" ? 130 : 143); });
+  }
+  process.on("uncaughtException", e => { reap(); throw e; });
+}
+
 /** Kill a whole process group, swallowing ESRCH. Always the NEGATIVE pid. */
 function killGroup(pid, signal) {
   try { process.kill(-pid, signal); return true; }
@@ -123,6 +153,10 @@ export function runWorker({
   graceMs = 5000,
   maxRetries = 1,
   onEvent = () => {},
+  // Called once with the worker's pid and identity token, before any output.
+  // Without it a caller cannot observe or record a worker until it has already
+  // exited, which is exactly when a supervisor most needs to know about it.
+  onSpawn = () => {},
   isHalted = () => false,
 } = {}) {
   return new Promise(resolve => {
@@ -136,8 +170,11 @@ export function runWorker({
         ...env,
       },
     });
+    installReaper();
+    LIVE_GROUPS.add(child.pid);
     const startedAt = Date.now();
     const lstart = readStart(child.pid);
+    try { onSpawn({ pid: child.pid, lstart }); } catch { /* an observer must not kill the worker */ }
 
     let result = null, sessionId = null, rateLimit = null;
     let killedByUs = false, settled = false;
@@ -181,12 +218,13 @@ export function runWorker({
       if (isHalted() && !settled) { killedByUs = true; killGroup(child.pid, "SIGTERM"); }
     }, 2000);
 
-    child.on("error", err => finish({
+    child.on("error", err => { LIVE_GROUPS.delete(child.pid); return finish({
       outcome: OUTCOMES.CRASHED, why: `could not spawn ${bin}: ${err.message}`,
       pid: child.pid, lstart, ms: Date.now() - startedAt, stderr,
-    }));
+    }); });
 
     child.on("exit", (code, signal) => {
+      LIVE_GROUPS.delete(child.pid);
       // The leader can exit while a grandchild lingers, so sweep the group.
       killGroup(child.pid, "SIGKILL");
       const c = classifyResult(result, { code, signal, killedByUs });

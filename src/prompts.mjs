@@ -64,6 +64,30 @@ function verification(profile) {
   return out.length ? out.join("\n") : "This project declares no verification commands. Say so in your report rather than inventing one.";
 }
 
+/**
+ * How a worker lands its change. Kept out of the invariants because only the
+ * repairing tasks push at all — a review request writes a comment and nothing else.
+ */
+function landing(profile) {
+  return [
+    "WHEN YOU HAVE A FIX",
+    "",
+    "  Commit only the files your fix touches. Do not commit build output, lockfile",
+    "  churn you did not intend, or unrelated formatting.",
+    "",
+    "  The commit message follows Conventional Commits: a lowercase subject of at",
+    "  most 72 characters, then a body saying what was wrong and why the change is",
+    "  right. Describe the CODE, not the process: no task ids, no mention of a review,",
+    "  no mention of what tool wrote it, and no attribution trailer of any kind.",
+    "",
+    "  Then push to the existing branch. Never force-push: this branch may already",
+    "  carry work you did not make.",
+    "",
+    "  If your commit is rejected by a pre-commit hook, fix what the hook objects to.",
+    "  Never pass --no-verify.",
+  ].join("\n");
+}
+
 const OUTPUT_CONTRACT = `
 Finish with a single fenced json block, and nothing after it:
 
@@ -74,7 +98,9 @@ Finish with a single fenced json block, and nothing after it:
   "change": "one sentence: what you changed, or why you changed nothing",
   "test": {"added": true|false, "failedBefore": true|false, "passedAfter": true|false, "command": "..."},
   "needsHuman": false|"why",
-  "filesTouched": ["..."]
+  "filesTouched": ["..."],
+  "pushed": true|false,
+  "commit": "sha or null"
 }
 \`\`\`
 
@@ -110,6 +136,8 @@ ${verification(profile)}
 
 Run the narrowest command that reproduces this failure before you change anything.
 If you cannot reproduce it locally, say so and explain what you would need.
+
+${landing(profile)}
 ${OUTPUT_CONTRACT}`;
 }
 
@@ -140,6 +168,8 @@ thread on their behalf.
 
 HOW TO VERIFY
 ${verification(profile)}
+
+${landing(profile)}
 ${OUTPUT_CONTRACT}`;
 }
 

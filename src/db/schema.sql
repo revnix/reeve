@@ -155,6 +155,17 @@ CREATE TABLE IF NOT EXISTS fact (
   scope_sha TEXT, expires_at INTEGER, supersedes_fact_id INTEGER) STRICT;
 CREATE INDEX IF NOT EXISTS fact_node ON fact(node_id, observed_at);
 
+-- An escalation is an event, not a state. This table holds the set currently
+-- STANDING, so the daemon can announce a cause when it starts and when it
+-- changes rather than on every tick. It must be durable: KeepAlive restarts the
+-- daemon, and an in-memory set would re-announce everything on each restart.
+CREATE TABLE IF NOT EXISTS escalation (
+  why TEXT PRIMARY KEY,
+  count INTEGER NOT NULL,
+  first_seen_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  announced_count INTEGER NOT NULL) STRICT;
+
 -- ---------------------------------------------------------------- views
 CREATE VIEW IF NOT EXISTS v_dead AS
   SELECT DISTINCT dst AS id FROM edge WHERE type IN ('SUPERSEDES','REFUTES');

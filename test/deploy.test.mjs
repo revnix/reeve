@@ -12,6 +12,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { homedir, platform } from "node:os";
+import { statePathFor } from "../src/paths.mjs";
 import { join } from "node:path";
 
 const PLIST = new URL("../deploy/com.revnix.reeve.plist", import.meta.url).pathname;
@@ -107,8 +108,11 @@ if (!onThisMac) {
     const profile = join(HOME, ".reeve", "profiles", owner, `${repo}.json`);
     check(existsSync(profile), `a profile exists for ${nwo}`,
       "reeve run exits 1 without one, and KeepAlive then restarts it forever");
-    check(existsSync(join(HOME, ".reeve", "state", `${repo}.db`)), `a state database exists for ${nwo}`,
-      "reeve run exits 1 without one, and KeepAlive then restarts it forever");
+    // Resolved through the same function the CLI uses. Spelling the path out here
+    // meant this guard checked a location the code had stopped using, and it
+    // reported the daemon broken when the daemon was fine.
+    check(existsSync(statePathFor(join(HOME, ".reeve"), nwo)), `a state database exists for ${nwo}`,
+      `looked at ${statePathFor(join(HOME, ".reeve"), nwo)} — reeve run exits 1 without one, and KeepAlive then restarts it forever`);
     // Watching a repo the App cannot reach means every tick ends in a 404.
     try {
       const p = JSON.parse(readFileSync(profile, "utf8"));

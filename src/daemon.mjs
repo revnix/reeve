@@ -223,8 +223,52 @@ export async function tick(ctx) {
     catch (e) { log(logPath, `could not write the dashboard: ${e.message}`); }
   }
 
-  for (const [why, n] of escalations) log(logPath, `NEEDS YOU: ${why}${n > 1 ? ` (${n} PRs)` : ""}`);
+  // Announce what STARTED or CHANGED, and what went away. Repeating a standing
+  // cause every tick is how an operator learns to ignore the channel.
+  const { fresh, cleared } = announceable(db, escalations);
+  for (const { why, count } of fresh) log(logPath, `NEEDS YOU: ${why}${count > 1 ? ` (${count} PRs)` : ""}`);
+  for (const why of cleared) log(logPath, `CLEARED: ${why}`);
   return { decisions, escalations, halted: false };
+}
+
+/**
+ * Reduce this tick's escalations against the standing set, so a cause is
+ * announced when it arrives and when its shape changes, never on every tick.
+ * Clearing is announced too: an operator who is only ever told about problems
+ * cannot distinguish "resolved" from "reeve stopped looking".
+ *
+ * @param {Map<string, number>} escalations  cause -> how many PRs share it
+ * @returns {{fresh: {why: string, count: number}[], cleared: string[]}}
+ */
+export function announceable(db, escalations, at = Math.floor(Date.now() / 1000)) {
+  const fresh = [], cleared = [];
+  const standing = new Map(
+    db.prepare("SELECT why, count, announced_count FROM escalation").all().map(r => [r.why, r]));
+
+  for (const [why, count] of escalations) {
+    const prev = standing.get(why);
+    if (!prev) {
+      db.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count)
+                  VALUES(?,?,?,?,?)`).run(why, count, at, at, count);
+      fresh.push({ why, count });
+    } else {
+      db.prepare("UPDATE escalation SET count=?, last_seen_at=? WHERE why=?").run(count, at, why);
+      // The count is the shape of a shared cause: 1 PR on a red base and 4 PRs
+      // on it are different situations and both deserve saying.
+      if (prev.announced_count !== count) {
+        db.prepare("UPDATE escalation SET announced_count=? WHERE why=?").run(count, why);
+        fresh.push({ why, count });
+      }
+    }
+  }
+
+  for (const why of standing.keys()) {
+    if (!escalations.has(why)) {
+      db.prepare("DELETE FROM escalation WHERE why=?").run(why);
+      cleared.push(why);
+    }
+  }
+  return { fresh, cleared };
 }
 
 /** The long-running loop. Ticks until halted or stopped. */

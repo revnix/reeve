@@ -195,7 +195,7 @@ Six phases, all complete. Measured at the time of writing:
 - **1,067 lines of tests** across 10 `test/*.test.mjs` — excludes 4 helper files in `test/`
   that are fixtures, not tests (`claimworker2.mjs`, `crashdrain.mjs`, `reconcile.demo.mjs`,
   `seed.mjs`)
-- **432 assertions passing, 0 failing** across 26 test files
+- **478 assertions passing, 0 failing** across 30 test files
 - **4 profiles** written (nextly, rext-backend, 21century, reeve)
 - **The launchd agent is installed and running** as of 2026-08-20 16:29 UTC — shadow mode,
   `--execute` off, watching `nextlyhq/nextly`. See §7.
@@ -440,22 +440,38 @@ The worker also no longer holds push or merge authority. reeve pushes after
 against quarantine, sensitive paths, the files that judge the work, and the lane's
 territory. An empty diff refuses; an unreadable one refuses with its own reason.
 
+**Also closed:**
+
+| Audit finding | State |
+|---|---|
+| P1 worktree lifecycle | **built** — acquire / verify / publish / release, driven against real git repos |
+| P1 clean-merge counted an empty check set as clean, and the daemon never computed it | **fixed** — unjudged is reported; computed when the open set shrinks |
+| P1 `node.status` had no `pending`, so the decisions band was a dead query | **fixed** — it now surfaces a real open decision that had been invisible |
+| P1 state keyed by short repo name | **fixed** — owner-scoped, with a one-time move of the existing store |
+| P1 the 20-PR cap was silent | **fixed** — it says when it bites |
+| P2 `run --tick` inert, `doctor --as-app` inert, `statePath` vs `state.location` | **fixed** — the code now honours what the docs promised |
+| P2 no README or runbook | **written** |
+
+Three of these were harder than they looked, and the difficulty is the useful part:
+
+- **Quarantining a worktree moved the directory and told git nothing**, so git
+  still believed the branch was checked out there and refused every later worktree
+  on it. One quarantine would have wedged that branch permanently. Found by the
+  test, which drives real repositories rather than mocks.
+- **The status-vocabulary guard took three attempts**, and each earlier version
+  would have passed the bug it was written to catch: unioning every table's
+  vocabulary (`pending` is valid on `outbox`, just never on `node`), then a table
+  regex that silently skipped everything declared `) STRICT, WITHOUT ROWID;`, then
+  a magic-minimum control instead of a count derived from the schema.
+- **The deploy guard hard-coded the state path**, so when state moved it checked a
+  location the code had stopped using and reported the daemon broken while it was
+  fine.
+
 **Still open from the audit, in the order it recommends:**
 
-2. P1 worktree lifecycle — reeve validates a path, it does not create, verify,
-   own or reap a per-PR checkout.
 4. P1 `inheritedOrCaused` compares check NAMES, not failures.
-6. P1 clean-merge rate reads only check runs, counts an empty set as clean, and
-   **is never computed by the daemon at all** — the dashboard headline is always
-   blank.
-7. P1 `node.status` has no `pending`, so the founder-decisions band is a
-   permanently empty query.
-8. P1 state is keyed by short repo name — `owner-a/api` and `owner-b/api` collide.
 9. P1 caps: 20 open PRs silently, no pagination past 100, `doctor` hard-codes `main`.
-10. P2 CLI/doc contradictions: `run --tick` is documented but inert,
-    `doctor --as-app` does nothing, `profile.statePath` vs `state.location`.
 11. P2 no external alert sink — "needs you" reaches a local log and nothing else.
-12. P2 no README, install guide, architecture note or runbook at the repo root.
 
 ### 8.2 Real remaining code, roughly in order
 

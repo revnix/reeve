@@ -23,8 +23,8 @@ import { rootCause, fingerprint } from "./ci-rootcause.mjs";
 import { readState } from "./status.mjs";
 import { writeDash } from "./dash.mjs";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, fstatSync, statSync } from "node:fs";
-import { dirname } from "node:path";
+import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync } from "node:fs";
+import { dirname, isAbsolute } from "node:path";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -192,7 +192,13 @@ export async function tick(ctx) {
       const spec = promptFor(decision, promptCtx);
       if (!spec) continue;
 
-      const worktree = ctx.worktreeFor?.(e) ?? profile.identity?.worktreeRoot ?? process.cwd();
+      const wt = resolveWorktree(ctx, profile, e);
+      if (!wt.path) {
+        escalations.set(`#${e.pr}: cannot dispatch — ${wt.why}`, 1);
+        log(logPath, `  #${e.pr}: NOT dispatching — ${wt.why}`);
+        continue;
+      }
+      const worktree = wt.path;
       log(logPath, `  #${e.pr}: dispatching ${decision.action} in ${worktree}`);
       started++;
       const r = await runWorker({
@@ -269,6 +275,23 @@ export function announceable(db, escalations, at = Math.floor(Date.now() / 1000)
     }
   }
   return { fresh, cleared };
+}
+
+/**
+ * Where a worker for this escalation should run.
+ *
+ * Returns `{path: null, why}` rather than a default, because the previous
+ * default was `process.cwd()` -- which under launchd is the daemon's
+ * WorkingDirectory, so a worker sent to fix a pull request in one repository
+ * would have run inside another. A wrong directory is not a smaller version of
+ * the right one, and refusing is the only safe answer.
+ */
+export function resolveWorktree(ctx, profile, e) {
+  const p = ctx.worktreeFor?.(e) ?? profile.identity?.worktreeRoot ?? null;
+  if (!p) return { path: null, why: "no identity.worktreeRoot in the profile" };
+  if (!isAbsolute(p)) return { path: null, why: `identity.worktreeRoot is relative (${p}); it must be absolute` };
+  if (!existsSync(p)) return { path: null, why: `identity.worktreeRoot does not exist: ${p}` };
+  return { path: p, why: null };
 }
 
 /** The long-running loop. Ticks until halted or stopped. */

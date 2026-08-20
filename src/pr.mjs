@@ -123,7 +123,12 @@ export function evaluatePr({ nwo, pr, profile, db = null }) {
   }
 
   const baseHead = pinHead(nwo, baseRef);
-  const base = baseHead.ok ? classify(readChecks(nwo, baseHead.sha).rows, []) : { verdict: "UNKNOWN" };
+  // Judged against the SAME required set as the head. Passing an empty list here
+  // meant every check on the base counted equally, so one cancelled ancillary job
+  // made the branch uncheckable and every open PR waited on it.
+  const base = baseHead.ok
+    ? classify(readChecks(nwo, baseHead.sha).rows, profile.ci?.requiredChecks ?? [])
+    : { verdict: "UNKNOWN" };
 
   const threads = readThreads(nwo, pr);
   const reviewers = readReviewerStates(nwo, pr, pin.sha, profile.reviewers ?? []);

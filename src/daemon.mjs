@@ -321,6 +321,24 @@ export async function tick(ctx) {
       // different question of whether the change is inside the work it was given.
       // A model that argued its way to a plausible edit outside its territory
       // still does not get it published.
+      // A worker that did not finish still leaves its work behind, and the next
+      // attempt cannot use a dirty checkout -- verifyWorktree refuses it, correctly,
+      // and the pull request is then stuck forever with no path out.
+      //
+      // Measured: a worker repaired the planted bug and then hit its turn limit
+      // before committing. The fix was correct, cost real money, and would have
+      // blocked every later attempt while looking like nothing had happened.
+      if (r.outcome !== OUTCOMES.OK) {
+        const left = changedFiles(worktree);
+        if (left?.length) {
+          const rel = releaseWorktree({ path: worktree, pr: e.pr });
+          log(logPath, `  #${e.pr}: the worker left ${left.length} changed file(s) unfinished — ${rel.quarantined ? `preserved at ${rel.path}` : "released"}`);
+          escalations.set(`#${e.pr}: an unfinished candidate fix was preserved rather than published — ${left.slice(0, 3).join(", ")}`, 1);
+        } else {
+          releaseWorktree({ path: worktree, pr: e.pr });
+        }
+      }
+
       if (r.outcome === OUTCOMES.OK) {
         const changed = changedFiles(worktree);
         const gate = reviewDiff({ files: changed, profile, lane });

@@ -6,13 +6,14 @@
 // it might one day become.
 import { runDoctor, render, checkAppIdentity } from "../src/doctor.mjs";
 import { open } from "../src/db/ops.mjs";
+import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor } from "../src/paths.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick } from "../src/daemon.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
 import { writeDash } from "../src/dash.mjs";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -42,6 +43,26 @@ const positionals = (() => {
 })();
 
 /** Repo identity is the remote, never the path: one repo can sit at two paths on two commits. */
+/**
+ * Move a store from its old short-name path to the owner-scoped one, once.
+ *
+ * Returns the new path either way. Copying rather than moving would leave two
+ * databases that both look live, and the daemon would keep writing to whichever
+ * one it opened first.
+ */
+function adoptLegacy(next, legacy) {
+  try {
+    if (!existsSync(next) && existsSync(legacy)) {
+      mkdirSync(dirname(next), { recursive: true });
+      for (const suffix of ["", "-wal", "-shm"]) {
+        if (existsSync(legacy + suffix)) renameSync(legacy + suffix, next + suffix);
+      }
+      console.error(`reeve: moved ${legacy} -> ${next}`);
+    }
+  } catch (e) { console.error(`reeve: could not move the legacy store (${e.message}); using ${legacy}`); return legacy; }
+  return next;
+}
+
 function detectNwo() {
   try {
     const url = execFileSync("git", ["remote", "get-url", "origin"], { encoding: "utf8" }).trim();
@@ -118,8 +139,11 @@ switch (cmd) {
   case "why": {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     const home = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
-    const short = nwo ? nwo.split("/")[1] : null;
-    const dbPath = opt("db") ?? (short ? join(home, "state", `${short}.db`) : null);
+    const short = nwo ? nwo.split("/")[1] : null;   // display only, never a path
+    // Same resolution as the daemon, or the two would read different databases:
+    // one would adopt the legacy store and the other would keep opening it in
+    // place, and they would drift without either ever failing.
+    const dbPath = opt("db") ?? (nwo ? adoptLegacy(statePathFor(home, nwo), legacyStatePathFor(home, nwo)) : null);
     if (!dbPath || !existsSync(dbPath)) {
       // A statusline must never be noisy or slow, so it degrades to one quiet word.
       if (cmd === "statusline") { console.log("reeve: no state"); process.exit(0); }
@@ -129,7 +153,7 @@ switch (cmd) {
 
     if (cmd === "statusline") { console.log(statusline(db, { nwo })); process.exit(0); }
     if (cmd === "dash") {
-      const out = opt("out") ?? join(home, `${short}.html`);
+      const out = opt("out") ?? dashPathFor(home, nwo);
       const health = flag("health") && nwo ? { clean: cleanMergeRate(nwo, Number(opt("last") ?? 20)) } : {};
       writeDash(out, { nwo, state: readState(db), health });
       console.log(out);
@@ -161,7 +185,10 @@ switch (cmd) {
     const profile = loadProfile(nwo);
     if (!profile) { console.error(`reeve run: no profile for ${nwo}.\n-> reeve init`); process.exit(1); }
     const home = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
-    const dbPath = opt("db") ?? join(home, "state", `${nwo.split("/")[1]}.db`);
+    // Keyed by owner AND repo. An existing store at the old short-name path is
+    // moved rather than abandoned: opening a fresh empty database instead is how
+    // real history stops being read without anything appearing to fail.
+    const dbPath = opt("db") ?? adoptLegacy(statePathFor(home, nwo), legacyStatePathFor(home, nwo));
     if (!existsSync(dbPath)) { console.error(`reeve run: no state database at ${dbPath}`); process.exit(1); }
     const ctx = {
       nwo, profile, db: open(dbPath),
@@ -173,7 +200,7 @@ switch (cmd) {
       // Shadow until the week's evidence says otherwise. --enforce is the flip.
       shadow: !flag("enforce"),
       intervalMs: Number(opt("interval") ?? 90) * 1000,
-      dashPath: opt("dash") ?? join(home, `${nwo.split("/")[1]}.html`),
+      dashPath: opt("dash") ?? dashPathFor(home, nwo),
     };
     // Honour the FLAG as well as the command. The help has always documented
     // `run --tick` as "one pass and exit" while only the separate `tick` command

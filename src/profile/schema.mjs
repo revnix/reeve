@@ -155,6 +155,7 @@ export const FIELDS = {
   // OFF until review ingest exists. With it on, reeve can dispatch review actions
   // whose data model is incomplete -- see the gate in watcher.mjs.
   "watch.reviewActions":   [false, isBool],
+  "watch.maxOpenPrs":      [false, isInt],
   "watch.maxWorkers":            [false, isInt],
   "watch.workerBudgetMinutes":   [false, isInt],
   "watch.maxTurns":              [false, isInt],

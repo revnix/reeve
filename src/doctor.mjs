@@ -241,9 +241,57 @@ function checkLeases(db) {
   return { id: "R-06", level: OK, title: "leases", lines };
 }
 
+
+/**
+ * Can the App actually act here?
+ *
+ * docs/github-app-setup.md has always told the operator to run
+ * `reeve doctor <repo> --as-app` and promised it would report the installation
+ * id, the granted permissions, and that check-run creation succeeds. The flag was
+ * inert and did nothing at all, so the one verification step after a fiddly manual
+ * setup silently confirmed nothing. Making the code honour the documented contract
+ * is the safer direction of the two.
+ *
+ * Async because it mints a JWT and exchanges it; the driver stays synchronous and
+ * takes the result.
+ */
+export async function checkAppIdentity(nwo) {
+  const { authenticate, checkPermissions } = await import("./github/app.mjs");
+  const auth = await authenticate(nwo).catch(e => ({ ok: false, why: e.message }));
+  if (!auth.ok) return {
+    id: "R-07", level: BROKEN, title: "App identity",
+    lines: [String(auth.why).split("\n")[0],
+            "-> the verdict cannot be published, so nothing reeve decides can reach GitHub"],
+  };
+
+  // Synchronous, and it takes the GRANTED map that authenticate() returns on the
+  // installation token -- not the auth object.
+  const perms = checkPermissions(auth.permissions ?? {});
+  const lines = [`installation ${auth.installationId}`,
+                 `repository selection: ${auth.repositorySelection ?? "unknown"}`];
+
+  if (perms.missing.length) {
+    for (const m of perms.missing) lines.push(`missing: ${m}`);
+    lines.push("-> reinstall the App with these granted, or publishing fails at the moment it matters");
+    return { id: "R-07", level: BROKEN, title: "App identity", lines };
+  }
+
+  // An over-grant is a finding in its own right, not a convenience. The whole
+  // safety argument is that the actuator CANNOT bypass the rules that judge it,
+  // and administration:write would hand it exactly that.
+  if (perms.excess.length) {
+    for (const e of perms.excess) lines.push(`over-granted: ${e}`);
+    lines.push("-> reeve is meant to be unable to change the rules that judge it; narrow these");
+    return { id: "R-07", level: DEGRADED, title: "App identity", lines };
+  }
+
+  lines.push("every required permission granted, and nothing beyond them");
+  return { id: "R-07", level: OK, title: "App identity", lines };
+}
+
 // ── driver ────────────────────────────────────────────────────────────────
 
-export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null }) {
+export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null }) {
   const checks = [
     checkMergeAuthority(nwo),
     pluginCacheRoot ? checkArtifactDrift(pluginCacheRoot, repoPluginDir) : null,
@@ -252,6 +300,7 @@ export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null
                     profile.identity?.baseBranch ?? profile.identity?.defaultBranch ?? "main"),
     profile.reviewers?.length ? checkReviewerSupply(nwo, profile.reviewers) : null,
     checkLeases(db),
+    appCheck,
   ].filter(Boolean);
 
   const broken = checks.filter(c => c.level === BROKEN);

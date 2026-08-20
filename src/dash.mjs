@@ -116,6 +116,7 @@ export function renderHtml({ nwo, state, health, generatedAt = new Date() }) {
   <div>
     <div class="lbl">clean-merge rate${health?.clean?.ok ? `, last ${health.clean.judged} merged` : ""}</div>
     <div class="lbl">merged with every check green at the merged head</div>
+    ${health?.clean?.unjudged ? `<div class="lbl">${health.clean.unjudged} merge(s) could not be judged and are excluded, not counted as clean</div>` : ""}
   </div>
   ${health?.clean?.ok ? `<div class="sparkline">${esc(spark(health.clean.series))}</div>` : ""}
 </div>

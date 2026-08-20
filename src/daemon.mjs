@@ -20,7 +20,7 @@ import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, OUTCOMES } from "./supervisor.mjs";
 import { promptFor } from "./prompts.mjs";
 import { rootCause, causeKey } from "./ci-rootcause.mjs";
-import { readState } from "./status.mjs";
+import { readState, noteTick } from "./status.mjs";
 import { countFixAttempts, recordFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { execFileSync } from "node:child_process";
@@ -297,6 +297,11 @@ export async function tick(ctx) {
   // Announce what STARTED or CHANGED, and what went away. Repeating a standing
   // cause every tick is how an operator learns to ignore the channel.
   const { fresh, cleared } = announceable(db, escalations, { covered: evaluated, complete: evaluated.size === prs.length });
+  // Recorded last, so it means "a tick completed" rather than "a tick began".
+  // That is the difference between a daemon that is working and one that is
+  // wedged part-way through every pass.
+  noteTick(db);
+
   for (const { why, count } of fresh) log(logPath, `NEEDS YOU: ${why}${count > 1 ? ` (${count} PRs)` : ""}`);
   for (const why of cleared) log(logPath, `CLEARED: ${why}`);
   return { decisions, escalations, halted: false };

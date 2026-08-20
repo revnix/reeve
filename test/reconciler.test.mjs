@@ -122,5 +122,22 @@ check("a clean set reports zero malformed rows", classify([run("a", "success")])
 check("a genuinely unknown conclusion on a NAMED row still blocks",
   classify([{ name: "real", source: "status", state: "completed", conclusion: "weird" }]).verdict, "RED");
 
+
+// settle must carry the reading's reason. Dropping it made checks.why undefined,
+// which the verdict's MISSING_REQUIRED branch passed through as a clause detail,
+// which every consumer then rendered as the literal string "undefined". That was
+// the cause behind three separate symptoms.
+{
+  const red = settle(null, { verdict: "RED", sha: "aaa", rows: [run("a", "failure")], why: "1 check(s) not passing" });
+  check("a RED settle carries its reason", red.why, "1 check(s) not passing");
+  const missing = settle(null, { verdict: "MISSING_REQUIRED", sha: "aaa", rows: [run("a", "success")], why: "required check(s) never reported: CI Gate" });
+  check("a MISSING_REQUIRED settle carries its reason", missing.why, "required check(s) never reported: CI Gate");
+  const running = settle(null, { verdict: "RUNNING", sha: "aaa", rows: [run("a", null)], why: "1 check(s) still in flight" });
+  check("a RUNNING settle carries its reason", running.why, "1 check(s) still in flight");
+  // The whole point: no settle result may render as "undefined".
+  for (const [name, r] of [["RED", red], ["MISSING_REQUIRED", missing], ["RUNNING", running]])
+    check(`a ${name} reason is never the string 'undefined'`, String(r.why) === "undefined", false);
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

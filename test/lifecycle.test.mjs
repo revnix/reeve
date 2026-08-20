@@ -1,9 +1,21 @@
 import { open, claim, heartbeat, reap, checkpoint, resume, tx, emit,
          enqueue, leaseOutbox, settleOutbox, recoverOutbox, exportJsonl, backoffSeconds } from "../src/db/ops.mjs";
-import { rmSync } from "node:fs";
-const P="./life.db"; for(const s of ["","-wal","-shm"]) { try{rmSync(P+s)}catch{} }
+import { rmSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+// A temp directory, not the current one. This wrote ./life.db wherever the suite
+// was started, and running the default and TZ=Asia/Karachi suites concurrently
+// made both processes delete and recreate the SAME file.
+const DIR=mkdtempSync(join(tmpdir(),"reeve-life-"));
+const P=join(DIR,"life.db"); for(const s of ["","-wal","-shm"]) { try{rmSync(P+s)}catch{} }
+process.on("exit", () => { try { rmSync(DIR,{recursive:true,force:true}); } catch {} });
 const db = open(P);
-const ok=(n,c)=>console.log((c?"PASS":"FAIL")+"  "+n);
+// Counted, not just printed. Without this the file exits 0 whatever it finds,
+// and the runner's `node "$f" || exit 1` cannot see a failure at all -- a whole
+// test file that was structurally incapable of failing CI.
+let failures=0;
+const ok=(n,c)=>{ if(!c) failures++; console.log((c?"PASS":"FAIL")+"  "+n); };
+process.on("exit", () => { if (failures) process.exitCode = 1; });
 
 tx(db,()=>{ db.prepare(`INSERT INTO node(id,kind,title,status,created_at,updated_at)
   VALUES('task:a','task','a','ready',unixepoch(),unixepoch())`).run();

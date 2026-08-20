@@ -80,14 +80,22 @@ const green = sha => ({ verdict: "GREEN", sha, rows: [run("a", "success"), run("
   check("and is not settled", s.settled, false);
 }
 {
-  // The floor rule: fewer checks than were seen before means jobs have gone
-  // missing, not that the run is clean.
+  // The floor rule, scoped to ONE revision: jobs are added as they schedule and
+  // never removed, so a count that drops means something has yet to report.
+  //
+  // This assertion used to shrink the set at a DIFFERENT sha and expect the same
+  // answer, which pinned a latch rather than a rule: path filters make a new head
+  // run a legitimately different set, and carrying the floor across heads left a
+  // PR whose new revision runs fewer workflows permanently unsettleable.
   let s = null;
   for (let i = 0; i < 3; i++) s = settle(s, { verdict: "GREEN", sha: "aaa", rows: [run("a", "success"), run("b", "success"), run("c", "success")] });
   check("three checks settle", s.settled, true);
-  const shrunk = settle(s, { verdict: "GREEN", sha: "ccc", rows: [run("a", "success")] });
-  check("a shrunken check set does not settle", shrunk.settled, false);
+  const shrunk = settle(s, { verdict: "GREEN", sha: "aaa", rows: [run("a", "success")] });
+  check("a shrunken check set at the same head does not settle", shrunk.settled, false);
   check("and reports UNKNOWN rather than GREEN", shrunk.verdict, "UNKNOWN");
+  const moved = settle(s, { verdict: "GREEN", sha: "ccc", rows: [run("a", "success")] });
+  check("but a smaller set at a NEW head is not UNKNOWN", moved.verdict === "UNKNOWN", false);
+  check("and its floor is what that head reported", moved.floor, 1);
 }
 {
   // Red settles immediately: there is nothing to wait for.

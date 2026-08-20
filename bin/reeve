@@ -8,6 +8,7 @@ import { runDoctor, render } from "../src/doctor.mjs";
 import { open } from "../src/db/ops.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick } from "../src/daemon.mjs";
+import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -89,6 +90,39 @@ switch (cmd) {
     }
     process.exit(result.exitCode);
   }
+  case "status":
+  case "statusline":
+  case "why": {
+    const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
+    const home = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
+    const short = nwo ? nwo.split("/")[1] : null;
+    const dbPath = opt("db") ?? (short ? join(home, "state", `${short}.db`) : null);
+    if (!dbPath || !existsSync(dbPath)) {
+      // A statusline must never be noisy or slow, so it degrades to one quiet word.
+      if (cmd === "statusline") { console.log("reeve: no state"); process.exit(0); }
+      console.error(`reeve ${cmd}: no state database${dbPath ? ` at ${dbPath}` : ""}`); process.exit(1);
+    }
+    const db = open(dbPath);
+
+    if (cmd === "statusline") { console.log(statusline(db, { nwo })); process.exit(0); }
+    if (cmd === "why") {
+      const target = positionals.find(a => /^#?\d+$/.test(a) || a.startsWith("pr:"));
+      if (!target) { console.error("reeve why <pr-number>"); process.exit(1); }
+      console.log(why(db, target));
+      process.exit(0);
+    }
+
+    const state = readState(db);
+    // The health band costs network calls, so it is opt-in on a screen that must
+    // stay instant by default.
+    const health = flag("health") && nwo
+      ? { clean: cleanMergeRate(nwo, Number(opt("last") ?? 20)) }
+      : { clean: { ok: false, why: "pass --health to measure (costs API calls)" } };
+    if (flag("json")) console.log(JSON.stringify({ state, health }, null, 2));
+    else console.log(renderStatus({ nwo, state, health }));
+    process.exit(0);
+  }
+
   case "run":
   case "tick": {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
@@ -122,6 +156,10 @@ switch (cmd) {
       --plugin-cache <dir>  plugin cache root, to detect running-vs-reviewed drift
       --plugin-repo <dir>   the reviewed copy to compare it against
       --json                machine-readable
+
+  status [owner/repo]   what is happening now  (--health measures clean-merge, --json)
+  why <pr>              why reeve decided what it decided, newest first
+  statusline            one line for the terminal statusline; reads state only
 
   run [owner/repo]      the daemon: watch, publish, decide, on a loop
       --tick                one pass and exit

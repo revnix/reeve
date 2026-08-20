@@ -10,6 +10,7 @@ import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick } from "../src/daemon.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
+import { writeDash } from "../src/dash.mjs";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -27,7 +28,7 @@ const argv = process.argv.slice(2);
 const cmd = argv.shift();
 const flag = n => argv.includes(`--${n}`);
 const opt = n => { const i = argv.indexOf(`--${n}`); return i < 0 ? null : argv[i + 1]; };
-const VALUED = new Set(["db", "plugin-cache", "plugin-repo", "profile", "set", "log", "halt", "interval", "last"]);
+const VALUED = new Set(["db", "plugin-cache", "plugin-repo", "profile", "set", "log", "halt", "interval", "last", "out", "dash"]);
 // Positionals only. A valued flag consumes the token after it, so that token is
 // never mistaken for a repo name however much it looks like one.
 const positionals = (() => {
@@ -109,6 +110,7 @@ switch (cmd) {
 
   case "status":
   case "statusline":
+  case "dash":
   case "why": {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     const home = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
@@ -122,6 +124,14 @@ switch (cmd) {
     const db = open(dbPath);
 
     if (cmd === "statusline") { console.log(statusline(db, { nwo })); process.exit(0); }
+    if (cmd === "dash") {
+      const out = opt("out") ?? join(home, `${short}.html`);
+      const health = flag("health") && nwo ? { clean: cleanMergeRate(nwo, Number(opt("last") ?? 20)) } : {};
+      writeDash(out, { nwo, state: readState(db), health });
+      console.log(out);
+      if (flag("open")) { try { execFileSync("open", [out]); } catch { /* not macOS */ } }
+      process.exit(0);
+    }
     if (cmd === "why") {
       const target = positionals.find(a => /^#?\d+$/.test(a) || a.startsWith("pr:"));
       if (!target) { console.error("reeve why <pr-number>"); process.exit(1); }
@@ -159,6 +169,7 @@ switch (cmd) {
       // Shadow until the week's evidence says otherwise. --enforce is the flip.
       shadow: !flag("enforce"),
       intervalMs: Number(opt("interval") ?? 90) * 1000,
+      dashPath: opt("dash") ?? join(home, `${nwo.split("/")[1]}.html`),
     };
     if (cmd === "tick") { const r = await tick(ctx); process.exit(r.halted ? 3 : 0); }
     await run(ctx);
@@ -181,6 +192,7 @@ switch (cmd) {
   status [owner/repo]   what is happening now  (--health measures clean-merge, --json)
   why <pr>              why reeve decided what it decided, newest first
   statusline            one line for the terminal statusline; reads state only
+  dash                  write the one-page view  (--health, --out <path>, --open)
 
   run [owner/repo]      the daemon: watch, publish, decide, on a loop
       --tick                one pass and exit

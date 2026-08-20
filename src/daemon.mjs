@@ -20,6 +20,8 @@ import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, OUTCOMES } from "./supervisor.mjs";
 import { promptFor } from "./prompts.mjs";
 import { rootCause, fingerprint } from "./ci-rootcause.mjs";
+import { readState } from "./status.mjs";
+import { writeDash } from "./dash.mjs";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -188,6 +190,13 @@ export async function tick(ctx) {
       if (r.outcome === OUTCOMES.DENIED) escalations.set(`#${e.pr}: worker tool calls were denied — its answer is not trustworthy`, 1);
       if (r.outcome === OUTCOMES.RATE_LIMITED) { escalations.set("the provider is rate limiting; work is paused", 1); break; }
     }
+  }
+
+  // Regenerate the glance surface every tick. A dashboard that is only refreshed
+  // on request is one that shows a state that stopped being true hours ago.
+  if (ctx.dashPath) {
+    try { writeDash(ctx.dashPath, { nwo, state: readState(db), health: ctx.health ?? {} }); }
+    catch (e) { log(logPath, `could not write the dashboard: ${e.message}`); }
   }
 
   for (const [why, n] of escalations) log(logPath, `NEEDS YOU: ${why}${n > 1 ? ` (${n} PRs)` : ""}`);

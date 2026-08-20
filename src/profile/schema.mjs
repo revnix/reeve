@@ -47,6 +47,13 @@ const isArr = inner => v => {
   return null;
 };
 const oneOf = list => v => (list.includes(v) ? null : `must be one of ${list.join(" | ")}`);
+// A path a daemon will hand to spawn() must not depend on who started the daemon.
+// Every profile written before this check set worktreeRoot relatively, and under
+// launchd "../nextly-worktrees" resolved from the daemon's WorkingDirectory to a
+// directory that does not exist.
+const isAbsPath = v => (typeof v === "string" && v.startsWith("/")
+  ? null
+  : "must be an absolute path: a relative one resolves against whatever directory the daemon was started in");
 const optional = f => v => (v === undefined || v === null ? null : f(v));
 
 const COMMAND = v => {
@@ -102,7 +109,7 @@ export const FIELDS = {
   "identity.defaultBranch": [true,  isStr],
   "identity.baseBranch":    [false, isStr],            // rext promotes feature -> stage -> main
   "identity.visibility":    [true,  oneOf(["public", "private"])],
-  "identity.worktreeRoot":  [false, isStr],
+  "identity.worktreeRoot":  [false, isAbsPath],
   "identity.cloneStrategy": [false, oneOf(["full", "blobless", "treeless", "shallow"])],
 
   "authority.permission":   [true,  oneOf(["admin", "write", "triage", "read"])],

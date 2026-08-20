@@ -120,6 +120,12 @@ export function renderHtml({ nwo, state, health, generatedAt = new Date() }) {
   ${health?.clean?.ok ? `<div class="sparkline">${esc(spark(health.clean.series))}</div>` : ""}
 </div>
 
+${state.daemon && state.daemon.alive !== true ? `<div class="hero" style="border-color:var(--bad)">
+  <div class="n bad">⚠</div>
+  <div><div class="lbl">${esc(state.daemon.why ?? "daemon liveness unknown")}</div>
+  <div class="lbl">everything below is history, not status</div></div>
+</div>` : ""}
+
 <section class="needs">
   <h2>Needs you ${needs.length ? `<span class="pill bad">${needs.length}</span>` : `<span class="target">target state: empty</span>`}</h2>
   ${needs.length ? `<ul>${needs.map(n => `<li>${

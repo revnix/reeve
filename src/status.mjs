@@ -66,7 +66,37 @@ export function cleanMergeRate(nwo, n = 20) {
 }
 
 /** Everything the screen needs, read from the store. Fast, no network. */
-export function readState(db, { limit = 12, freshWindow = 900 } = {}) {
+
+/**
+ * Record that a tick completed. Without this there is no way to distinguish a
+ * quiet fleet from a stopped daemon, and those look identical on every screen.
+ */
+export function noteTick(db, at = Math.floor(Date.now() / 1000)) {
+  try {
+    db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+      .run(at, "daemon", "daemon.tick", null, "{}");
+  } catch { /* a store that cannot record must not stop the loop */ }
+}
+
+/**
+ * Is the daemon alive? Returns `alive: null` when it has never recorded a tick,
+ * because "no record" is not "healthy" -- it is the absence of information, and
+ * absence is never success.
+ */
+function daemonLiveness(db, now, window) {
+  let row = null;
+  try { row = db.prepare("SELECT MAX(at) at FROM event WHERE op='daemon.tick'").get(); }
+  catch { return { lastTickAt: null, alive: null, why: "the store could not be read" }; }
+  const at = row?.at ?? null;
+  if (!at) return { lastTickAt: null, alive: null, why: "no tick has ever been recorded" };
+  const age = now - at;
+  return age <= window
+    ? { lastTickAt: at, alive: true, why: null, ageSeconds: age }
+    : { lastTickAt: at, alive: false, ageSeconds: age,
+        why: `the daemon has not ticked for ${Math.floor(age / 60)} minute(s) — everything below is history, not status` };
+}
+
+export function readState(db, { limit = 12, freshWindow = 900, now = Math.floor(Date.now() / 1000) } = {}) {
   const prs = new Map();
   try {
     const rows = db.prepare(
@@ -75,11 +105,14 @@ export function readState(db, { limit = 12, freshWindow = 900 } = {}) {
     // A PR that stopped appearing in ticks is closed, merged, or no longer being
     // watched. Its last decision is history, not status, and showing it as live
     // is how a screen reports a state that has not been true for hours.
-    const newest = rows[0]?.at ?? 0;
     for (const r of rows) {
       if (prs.has(r.subject)) continue;           // most recent decision per PR wins
       let p; try { p = JSON.parse(r.payload); } catch { continue; }
-      const stale = newest - r.at > freshWindow;
+      // Against the CLOCK, not against the newest stored row. Comparing rows to
+      // each other meant that when the daemon stopped, every decision stayed
+      // "fresh" forever -- the screen looked calmest exactly when the thing that
+      // watches had died.
+      const stale = now - r.at > freshWindow;
       prs.set(r.subject, { id: r.subject, at: r.at, stale, ...p });
       if (prs.size >= limit) break;
     }
@@ -98,7 +131,7 @@ export function readState(db, { limit = 12, freshWindow = 900 } = {}) {
     pending = db.prepare(`SELECT id, title FROM node WHERE kind='decision' AND status='pending'`).all();
   } catch { /* same */ }
 
-  return { prs: [...prs.values()], runs, pending };
+  return { prs: [...prs.values()], runs, pending, daemon: daemonLiveness(db, now, freshWindow) };
 }
 
 /** The escalations band: what genuinely needs a person. */
@@ -128,6 +161,11 @@ export function render({ nwo, state, health, width = 78 }) {
   const mid = label => `├ ${label} ${"─".repeat(Math.max(0, width - label.length - 4))}`;
 
   const needs = needsYou(state);
+  // A dead watcher is the first thing to say. Everything under it is history
+  // rather than status, and a screen that does not lead with that is inviting
+  // someone to act on a picture that stopped being true hours ago.
+  if (state.daemon && state.daemon.alive === false) L.push(`  ⚠ ${state.daemon.why}`);
+  if (state.daemon && state.daemon.alive === null) L.push(`  ⚠ daemon liveness unknown: ${state.daemon.why}`);
   L.push(bar("NEEDS YOU") + (needs.length ? "" : "   target state: EMPTY"));
   if (!needs.length) L.push("│  (nothing)");
   for (const n of needs) {

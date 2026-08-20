@@ -8,6 +8,7 @@
 
 import { pinHead, readChecks, classify, settle, inheritedOrCaused, readTimeline, lastForcePush, suitesComplete } from "./github/reconciler.mjs";
 import { loadSettlement, saveSettlement } from "./db/ops.mjs";
+import { rootCause } from "./ci-rootcause.mjs";
 import { computeVerdict, renderVerdict, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
 import { execFileSync } from "node:child_process";
@@ -118,8 +119,10 @@ export function evaluatePr({ nwo, pr, profile, db = null }) {
           why: "settlement needs a state store to compare readings across ticks" };
   }
   if (c.failing.length) {
-    const io = inheritedOrCaused(nwo, baseRef, c.failing.map(f => f.name));
-    c.inherited = io.inherited; c.caused = io.caused;
+    // Rows, not names, so causes can be compared; and the resolver is handed in
+    // because a shared job name is not a shared failure.
+    const io = inheritedOrCaused(nwo, baseRef, c.failing, { resolveCause: rootCause });
+    c.inherited = io.inherited; c.caused = io.caused; c.unverified = io.unverified;
   }
 
   const baseHead = pinHead(nwo, baseRef);

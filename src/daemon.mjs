@@ -21,7 +21,7 @@ import { capacity, stayAwake, halted, runWorker, workerArgs, OUTCOMES } from "./
 import { promptFor } from "./prompts.mjs";
 import { rootCause, causeKey } from "./ci-rootcause.mjs";
 import { readState } from "./status.mjs";
-import { countFixAttempts, recordFixAttempt } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync } from "node:fs";
@@ -46,6 +46,11 @@ function stdoutAlreadyWrites(logPath) {
   stdoutIsFile.set(logPath, same);
   return same;
 }
+
+// Beat at a quarter of the lease: frequent enough that a live worker never lets
+// its lease lapse, rare enough to cost nothing. Derived from LEASE_SECONDS rather
+// than chosen, so the two cannot drift apart.
+const HEARTBEAT_MS = (LEASE_SECONDS / 4) * 1000;
 
 export function log(logPath, line) {
   const stamped = `${new Date().toISOString()} ${line}`;
@@ -207,21 +212,43 @@ export async function tick(ctx) {
         continue;
       }
       const worktree = wt.path;
-      log(logPath, `  #${e.pr}: dispatching ${decision.action} in ${worktree}`);
+
+      // A durable run is the ONLY way a worker may start. The exclusive right to
+      // act on this PR is taken FIRST, so a restarted daemon cannot re-dispatch
+      // work already in flight -- the log shows exactly that happening, the same
+      // fix launched at 15:02 and again at 15:12.
+      const run = startRun(db, { nwo, pr: e.pr, action: decision.action, head: e.head, cause });
+      if (!run.ok) {
+        // Refusing to act is the only safe answer when the transition cannot be
+        // recorded: an unrecorded worker is one nothing can reason about later.
+        log(logPath, `  #${e.pr}: NOT dispatching — ${run.why}`);
+        continue;
+      }
+
+      log(logPath, `  #${e.pr}: dispatching ${decision.action} in ${worktree} (run ${run.runId}, attempt ${run.attempt})`);
       started++;
-      const r = await runWorker({
-        args: workerArgs({ prompt: spec.prompt, allowedTools: spec.tools, maxTurns: profile.watch?.maxTurns ?? 40 }),
-        cwd: worktree,
-        budgetMs: (profile.watch?.workerBudgetMinutes ?? 20) * 60_000,
-        isHalted: () => halted(ctx.haltMarker),
-      });
-      log(logPath, `  #${e.pr}: ${decision.action} -> ${r.outcome} (${r.why}) in ${Math.round(r.ms / 1000)}s${r.cost != null ? `, ${r.cost.toFixed(3)}` : ""}`);
+      const beat = setInterval(() => { try { heartbeat(db, { runId: run.runId }); } catch { /* a missed beat must not kill the worker */ } },
+                               HEARTBEAT_MS);
+      let r;
       try {
-        db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
-          .run(now(), "worker", "worker.finished", `pr:${e.pr}`, JSON.stringify({
-            action: decision.action, outcome: r.outcome, why: r.why, ms: r.ms, cost: r.cost, sessionId: r.sessionId,
-          }));
-      } catch { /* recording must not stop the loop */ }
+        r = await runWorker({
+          args: workerArgs({ prompt: spec.prompt, allowedTools: spec.tools, maxTurns: profile.watch?.maxTurns ?? 40 }),
+          cwd: worktree,
+          budgetMs: (profile.watch?.workerBudgetMinutes ?? 20) * 60_000,
+          isHalted: () => halted(ctx.haltMarker),
+          // Bind the process to the run the instant it exists, before it can
+          // touch anything, so a crash leaves something probeable.
+          onSpawn: ({ pid, lstart }) => notePid(db, { runId: run.runId, pid, boot: lstart }),
+        });
+      } finally {
+        clearInterval(beat);
+        // Closed in `finally`: a throw between spawn and result would otherwise
+        // leave the run leased forever, and the PR unworkable until it expired.
+        finishRun(db, { runId: run.runId, outcome: r?.outcome ?? "failed",
+                        why: r?.why ?? "the worker threw before returning a result",
+                        ms: r?.ms, cost: r?.cost, sessionId: r?.sessionId });
+      }
+      log(logPath, `  #${e.pr}: ${decision.action} -> ${r.outcome} (${r.why}) in ${Math.round(r.ms / 1000)}s${r.cost != null ? `, ${r.cost.toFixed(3)}` : ""}`);
 
       // A worker whose tools were denied wrote a plausible answer it could not
       // support. Treating that as progress is the fail-open this exists to close.

@@ -149,6 +149,9 @@ export const FIELDS = {
   // code that reads undeclared config is config that drifts from its schema
   // unnoticed. See daemon.mjs (maxWorkers, workerBudgetMinutes, maxTurns) and
   // watcher.mjs (unknownEscalateSeconds).
+  // OFF until review ingest exists. With it on, reeve can dispatch review actions
+  // whose data model is incomplete -- see the gate in watcher.mjs.
+  "watch.reviewActions":   [false, isBool],
   "watch.maxWorkers":            [false, isInt],
   "watch.workerBudgetMinutes":   [false, isInt],
   "watch.maxTurns":              [false, isInt],

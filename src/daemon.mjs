@@ -24,7 +24,7 @@ import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, causeKey } from "./ci-rootcause.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync } from "node:fs";
@@ -347,7 +347,13 @@ export async function tick(ctx) {
 
       // A worker whose tools were denied wrote a plausible answer it could not
       // support. Treating that as progress is the fail-open this exists to close.
-      if (r.outcome === OUTCOMES.DENIED) escalations.set(`#${e.pr}: worker tool calls were denied — its answer is not trustworthy`, 1);
+      if (r.outcome === OUTCOMES.DENIED) {
+        // Nothing was attempted, so nothing is charged. The sandbox refused the
+        // worker's tools, which is a fault on reeve's side, and letting it consume
+        // the pull request's only repair would punish the PR for reeve's mistake.
+        if (fp) refundFixAttempt(db, nwo, e.pr, fp);
+        escalations.set(`#${e.pr}: worker tool calls were denied — its answer is not trustworthy, and reeve's sandbox is the likely cause`, 1);
+      }
       if (r.outcome === OUTCOMES.RATE_LIMITED) { escalations.set("the provider is rate limiting; work is paused", 1); break; }
     }
   }

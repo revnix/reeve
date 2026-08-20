@@ -111,6 +111,24 @@ const ev = (extra = {}) => ({
     JSON.stringify(d.action));
 }
 
+
+// An attempt the worker was never ALLOWED to make must not be charged. The first
+// real dispatch failed with eleven denied tool calls because reeve's own sandbox
+// was wrong, and that consumed the pull request's single repair -- so the next
+// tick escalated "the same failure survived a second fix" when no fix had ever
+// been attempted. Punishing the PR for reeve's misconfiguration is the wrong
+// direction, and DENIED escalates anyway, so refunding cannot loop.
+{
+  const { refundFixAttempt } = await import("../src/db/ops.mjs");
+  const K2 = causeKey("o/r", other);
+  recordFixAttempt(db, "o/r", 21, K2, "a".repeat(40), 300);
+  check(countFixAttempts(db, "o/r", 21, K2) === 1, "control: the attempt was charged");
+  refundFixAttempt(db, "o/r", 21, K2);
+  check(countFixAttempts(db, "o/r", 21, K2) === 0, "a denied attempt is refunded");
+  refundFixAttempt(db, "o/r", 21, K2);
+  check(countFixAttempts(db, "o/r", 21, K2) === 0, "and a refund cannot drive the count negative");
+}
+
 db.close();
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

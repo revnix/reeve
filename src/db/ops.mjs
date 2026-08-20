@@ -381,3 +381,21 @@ export function finishRun(db, { runId, outcome, why = null, ms = null, cost = nu
     return { ok: true, status };
   });
 }
+
+/**
+ * Give back an attempt the worker was never allowed to make.
+ *
+ * The cap exists to stop a fixer guessing at the same failure forever. A DENIED
+ * outcome is not a guess: the sandbox refused the worker's tools, so nothing was
+ * attempted and nothing was learned. Charging it means one misconfiguration on
+ * reeve's side permanently consumes a pull request's only repair -- which is
+ * exactly what happened on the first real dispatch.
+ *
+ * Safe against looping because DENIED escalates on the spot: a persistently wrong
+ * sandbox reaches a human rather than a retry.
+ */
+export function refundFixAttempt(db, nwo, pr, cause) {
+  db.prepare(`UPDATE fix_attempt SET attempts = MAX(0, attempts - 1)
+              WHERE nwo=? AND pr=? AND cause=?`).run(nwo, pr, cause);
+  return countFixAttempts(db, nwo, pr, cause);
+}

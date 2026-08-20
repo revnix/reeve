@@ -133,8 +133,21 @@ export function sandboxFor({ profile, action, worktree, lane = null }) {
   // guessing at filenames.
   for (const r of ["ls", "cat", "head", "tail", "wc", "find", "which", "pwd"]) runners.add(r);
 
-  const gitTools = [...GIT_READ, ...GIT_WRITE].map(g => `Bash(git ${g}:*)`);
-  const runnerTools = [...runners].map(r => `Bash(${r}:*)`);
+  // `git` as a whole, not subcommand by subcommand. The matcher compares from the
+  // start of the command, and a worker handed a worktree path writes
+  // `git -C <path> log …` — where the flag sits BEFORE the subcommand, so
+  // `Bash(git log:*)` never matches it. Six denials in one run were this.
+  //
+  // Safe because deny beats allow, measured: `deny: ["Bash"]` with a narrow allow
+  // blocked everything. The dangerous subcommands stay denied below, so widening
+  // the grant does not widen the authority.
+  const gitTools = ["Bash(git:*)"];
+
+  // The interpreter by its absolute path as well as its name. The worker reached
+  // for /Users/…/node because that is what reeve itself runs as, and a bare-name
+  // grant does not match a path.
+  const selfInterpreter = `Bash(${process.execPath}:*)`;
+  const runnerTools = [...[...runners].map(r => `Bash(${r}:*)`), selfInterpreter];
 
   // A closed set. Nothing reaches the network, nothing spawns a shell, and Bash
   // appears only with a scope attached.

@@ -122,5 +122,24 @@ check("an unrecognised merge state escalates with the state named",
   check("every decision carries a reason", missingWhy, 0);
 }
 
+
+// A decision reason must never contain the literal string "undefined". This shape
+// appeared twice — "FIX_CI failing: undefined" — and patching where it surfaced
+// did not stop it, so an unnamed failure is now undispatchable by construction:
+// a fixer cannot be told to repair a check nobody can name.
+{
+  const e = ev(swap("ci", "BLOCK", "failing: an unnamed check"), { checks: { caused: [undefined], inherited: [] } });
+  const d = nextAction(e, P, { fixAttempts: new Map() });
+  check("an unnamed failure escalates rather than dispatching", d.action, ACTIONS.ESCALATE);
+  check("and says so plainly", /could not name it/.test(d.why), true);
+  check("no decision reason ever contains 'undefined'", /undefined/.test(d.why), false);
+}
+{
+  const e = ev(swap("ci", "BLOCK", "failing: unit"), { checks: { caused: ["unit", undefined, ""], inherited: [] } });
+  const d = nextAction(e, P, { fixAttempts: new Map() });
+  check("a mixed list keeps only the named entries", d.why, "failing: unit");
+  check("and dispatches on them", d.action, ACTIONS.FIX_CI);
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

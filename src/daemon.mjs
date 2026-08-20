@@ -17,7 +17,9 @@
 import { evaluatePr, publishVerdict } from "./pr.mjs";
 import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
-import { capacity, stayAwake, halted, runWorker } from "./supervisor.mjs";
+import { capacity, stayAwake, halted, runWorker, workerArgs, OUTCOMES } from "./supervisor.mjs";
+import { promptFor } from "./prompts.mjs";
+import { rootCause, fingerprint } from "./ci-rootcause.mjs";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -127,11 +129,65 @@ export async function tick(ctx) {
 
   if (execute) {
     const cap = capacity({ maxWorkers: profile.watch?.maxWorkers ?? 5, running: ctx.running ?? 0 });
-    log(logPath, `execute: capacity allows ${cap.canStart} worker(s) (load ${cap.load1?.toFixed?.(2)}, ${cap.perfCores} perf cores)`);
-    // Worker dispatch lands with the lane prompts. Until then a tick observes,
-    // publishes and reports, which is the same discipline as shadow-publishing:
-    // watch the decisions before letting them act.
-    log(logPath, "execute: worker dispatch is not wired yet — decisions reported only");
+    log(logPath, `execute: capacity allows ${cap.canStart} worker(s) (load ${cap.load1?.toFixed?.(2) ?? "?"}, ${cap.perfCores} perf cores)`);
+    let started = 0;
+
+    for (const { e, decision } of decisions) {
+      if (started >= cap.canStart) { log(logPath, `  capacity reached; ${decisions.length - started} decision(s) deferred to the next tick`); break; }
+      if (halted(ctx.haltMarker)) { log(logPath, "HALTED before dispatch"); break; }
+
+      // Only some decisions are worker tasks. WAIT, PARK, MERGE and ESCALATE are
+      // not: two of them are for a human and one is the gate's own job.
+      let promptCtx = { profile, nwo, pr: e.pr, head: e.head, branch: e.headRef };
+      if (decision.action === "FIX_CI") {
+        const failing = (e.checks?.failing ?? []).find(f => (decision.caused ?? []).includes(f.name)) ?? (e.checks?.failing ?? [])[0];
+        if (!failing?.id) { log(logPath, `  #${e.pr}: cannot dispatch FIX_CI — the failing check has no job behind it`); continue; }
+        const cause = rootCause(nwo, failing);
+        if (!cause.ok) { log(logPath, `  #${e.pr}: cannot dispatch FIX_CI — ${cause.why}`); continue; }
+        // One attempt per fingerprint, keyed on the revision: the same failure at
+        // a NEW head is a fresh attempt, not a repeat.
+        const fp = fingerprint(nwo, e.head, cause);
+        const tried = (ctx.fixAttempts?.get(fp) ?? 0);
+        if (tried >= (profile.rounds?.maxFixAttemptsPerFinding ?? 1)) {
+          log(logPath, `  #${e.pr}: already attempted this failure ${tried}x — escalating rather than guessing again`);
+          escalations.set(`#${e.pr}: the same failure survived a fix`, 1);
+          continue;
+        }
+        ctx.fixAttempts?.set(fp, tried + 1);
+        promptCtx = { ...promptCtx, cause, attempt: tried + 1 };
+      } else if (decision.action === "FIX_FINDINGS") {
+        promptCtx = { ...promptCtx, threads: e.threadDetails ?? [] };
+      } else if (decision.action === "REQUEST_REVIEW") {
+        promptCtx = { ...promptCtx, reviewers: (profile.reviewers ?? []).filter(r => r.trigger) };
+      } else if (decision.action === "SPILL") {
+        promptCtx = { ...promptCtx, findings: e.threadDetails ?? [] };
+      }
+
+      const spec = promptFor(decision, promptCtx);
+      if (!spec) continue;
+
+      const worktree = ctx.worktreeFor?.(e) ?? profile.identity?.worktreeRoot ?? process.cwd();
+      log(logPath, `  #${e.pr}: dispatching ${decision.action} in ${worktree}`);
+      started++;
+      const r = await runWorker({
+        args: workerArgs({ prompt: spec.prompt, allowedTools: spec.tools, maxTurns: profile.watch?.maxTurns ?? 40 }),
+        cwd: worktree,
+        budgetMs: (profile.watch?.workerBudgetMinutes ?? 20) * 60_000,
+        isHalted: () => halted(ctx.haltMarker),
+      });
+      log(logPath, `  #${e.pr}: ${decision.action} -> ${r.outcome} (${r.why}) in ${Math.round(r.ms / 1000)}s${r.cost != null ? `, ${r.cost.toFixed(3)}` : ""}`);
+      try {
+        db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+          .run(now(), "worker", "worker.finished", `pr:${e.pr}`, JSON.stringify({
+            action: decision.action, outcome: r.outcome, why: r.why, ms: r.ms, cost: r.cost, sessionId: r.sessionId,
+          }));
+      } catch { /* recording must not stop the loop */ }
+
+      // A worker whose tools were denied wrote a plausible answer it could not
+      // support. Treating that as progress is the fail-open this exists to close.
+      if (r.outcome === OUTCOMES.DENIED) escalations.set(`#${e.pr}: worker tool calls were denied — its answer is not trustworthy`, 1);
+      if (r.outcome === OUTCOMES.RATE_LIMITED) { escalations.set("the provider is rate limiting; work is paused", 1); break; }
+    }
   }
 
   for (const [why, n] of escalations) log(logPath, `NEEDS YOU: ${why}${n > 1 ? ` (${n} PRs)` : ""}`);

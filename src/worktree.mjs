@@ -24,7 +24,21 @@ import { join, basename, dirname } from "node:path";
 function git(cwd, args) {
   try {
     return { ok: true, out: execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() };
-  } catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
+  } catch (e) { return { ok: false, out: "", err: reason(String(e.stderr || e.message)) }; }
+}
+
+/**
+ * The line of git's stderr that says what actually went wrong.
+ *
+ * git narrates on stderr as it works, so the FIRST line is usually progress, not
+ * the failure. Reporting it gave "Preparing worktree (resetting branch …)" as the
+ * reason a worktree could not be created, when the real cause two lines down was
+ * "cannot force update the branch … used by worktree at /tmp/…". A wrong reason
+ * is worse than a vague one: it sends the reader somewhere else entirely.
+ */
+function reason(stderr) {
+  const lines = stderr.split("\n").map(l => l.trim()).filter(Boolean);
+  return lines.find(l => /^(fatal|error):/i.test(l)) ?? lines.at(-1) ?? "git failed with no message";
 }
 
 /** The conventional directory for one pull request's work. */
@@ -93,12 +107,12 @@ export function acquireWorktree({ repoRoot, root, pr, branch, head = null }) {
   // Fetch the branch before checking it out. Without this a worktree can be
   // created on a stale local ref that resolves fine and is simply the wrong code.
   const fetched = git(repoRoot, ["fetch", "-q", "origin", branch]);
-  if (!fetched.ok) return { ok: false, path: null, why: `could not fetch ${branch}: ${fetched.err.split("\n")[0]}` };
+  if (!fetched.ok) return { ok: false, path: null, why: `could not fetch ${branch}: ${fetched.err}` };
 
   // A local branch may already exist and be stale, so track the remote ref
   // explicitly rather than relying on whatever the local name currently points at.
   const add = git(repoRoot, ["worktree", "add", "--force", "-B", branch, path, `origin/${branch}`]);
-  if (!add.ok) return { ok: false, path: null, why: `could not create the worktree: ${add.err.split("\n")[0]}` };
+  if (!add.ok) return { ok: false, path: null, why: `could not create the worktree: ${add.err}` };
 
   const v = verifyWorktree({ path, branch, head });
   if (!v.ok) return { ok: false, path, why: `created but did not verify: ${v.why}` };
@@ -158,7 +172,7 @@ export function releaseWorktree({ path, pr, quarantineRoot = null }) {
   // `git worktree remove`, never rm -rf: the latter leaves administrative files
   // in .git/worktrees pointing at a directory that no longer exists.
   const removed = git(repoRoot, ["worktree", "remove", path]);
-  if (!removed.ok) return refuse(`git refused to remove the worktree: ${removed.err.split("\n")[0]}`);
+  if (!removed.ok) return refuse(`git refused to remove the worktree: ${removed.err}`);
   git(repoRoot, ["worktree", "prune"]);
   return { ok: true, why: null, quarantined: false };
 }
@@ -174,12 +188,12 @@ export function releaseWorktree({ path, pr, quarantineRoot = null }) {
 export function pushWorktree({ path, branch, expectedRemote = null }) {
   if (expectedRemote) {
     const ls = git(path, ["ls-remote", "origin", `refs/heads/${branch}`]);
-    if (!ls.ok) return { ok: false, why: `could not read the remote head: ${ls.err.split("\n")[0]}` };
+    if (!ls.ok) return { ok: false, why: `could not read the remote head: ${ls.err}` };
     const now = ls.out.split(/\s+/)[0] ?? "";
     if (now && now !== expectedRemote)
       return { ok: false, why: `the remote moved while the worker ran: expected ${expectedRemote.slice(0, 10)}, found ${now.slice(0, 10)}` };
   }
   const pushed = git(path, ["push", "origin", `HEAD:${branch}`]);
-  if (!pushed.ok) return { ok: false, why: `push refused: ${pushed.err.split("\n")[0]}` };
+  if (!pushed.ok) return { ok: false, why: `push refused: ${pushed.err}` };
   return { ok: true, why: null };
 }

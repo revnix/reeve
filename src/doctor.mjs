@@ -160,7 +160,12 @@ function checkMergeShape(nwo, declared) {
   const counts = r.out.split("\n").filter(Boolean).map(Number);
   const twoParent = counts.filter(n => n === 2).length;
   const lines = [`last ${counts.length} commits on main: ${twoParent} merge commits, ${counts.length - twoParent} single-parent`];
-  if (declared) lines.push(`gate declares: ${declared}`);
+  if (!declared) {
+    lines.push("the profile names no merge method");
+    lines.push("-> a gate cannot pin a shape the profile has not chosen");
+    return { id: "R-03", level: DEGRADED, title: "merge shape", lines };
+  }
+  lines.push(`gate declares: ${declared}`);
   if (declared === "squash" && twoParent > 0) {
     lines.push("-> a squash-matching gate cannot have produced these merges");
     return { id: "R-03", level: BROKEN, title: "merge shape", lines };
@@ -242,8 +247,9 @@ export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null
   const checks = [
     checkMergeAuthority(nwo),
     pluginCacheRoot ? checkArtifactDrift(pluginCacheRoot, repoPluginDir) : null,
-    checkMergeShape(nwo, profile.mergeMethod ?? "squash"),
-    checkBaseHealth(nwo, profile.ciWorkflow ?? "ci.yml", profile.baseBranch ?? "main"),
+    checkMergeShape(nwo, profile.merge?.method ?? null),
+    checkBaseHealth(nwo, profile.ci?.workflow ?? "ci.yml",
+                    profile.identity?.baseBranch ?? profile.identity?.defaultBranch ?? "main"),
     profile.reviewers?.length ? checkReviewerSupply(nwo, profile.reviewers) : null,
     checkLeases(db),
   ].filter(Boolean);

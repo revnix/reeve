@@ -37,6 +37,19 @@ jobs:
           done
           exit $fail
 
+      # The runner is UTC, where a timestamp parsed without its trailing Z is
+      # accidentally correct. A test that only ever runs in UTC therefore cannot
+      # see an entire class of offset bug — and the first version of this suite
+      # had one in the opposite direction, asserting the author's +05:00 offset.
+      - name: Run the suite again in a non-UTC timezone
+        env:
+          TZ: Asia/Karachi
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in test/*.test.mjs; do node "$f" >/dev/null || { echo "FAILED under TZ=$TZ: $f"; fail=1; }; done
+          exit $fail
+
   gate:
     # The aggregate. `if: always()` plus an explicit failure check is what makes a
     # skipped or cancelled dependency block rather than silently pass: a needs:

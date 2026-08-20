@@ -115,7 +115,7 @@ export function logSlice(nwo, checkRunId, step, { maxLines = 120 } = {}) {
 }
 
 /** Lines a human or an agent would actually act on. */
-export function salientLines(text, limit = 25) {
+export function salientLines(text, limit = 0) {
   const patterns = [
     /^\s*[✖✗×]\s/, /\bError\b/, /\bERROR\b/, /^\s*FAIL\b/, /\bfailed\b/i,
     /\bexpect\(/, /\bAssertionError\b/, /\bTraceback\b/, /^\s*at .*\(\S+:\d+:\d+\)/,

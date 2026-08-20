@@ -69,11 +69,14 @@ let db = open(path);
 
 // --- a new head restarts the streak but keeps the floor ----------------------
 {
+  // The floor is per HEAD. Carrying it across heads made a PR whose new revision
+  // legitimately runs fewer workflows -- a docs-only push, say, where path filters
+  // skip most jobs -- permanently unsettleable. My first version of this test
+  // asserted that latch as if it were the intent.
   const e = tick(db, "o/r", 1, { verdict: "GREEN", sha: "bbb", rows: [run("a", "success")], why: "1 check" }, 500);
-  check(e.settled === false && e.floor === 2,
-    "a new head restarts the streak and keeps the floor, so a shrinking check set cannot pass",
-    JSON.stringify(e));
-  check(e.verdict === "UNKNOWN", "fewer checks than the floor is UNKNOWN, not green", JSON.stringify(e));
+  check(e.settled === false && e.streak === 1, "a new head restarts the streak", JSON.stringify(e));
+  check(e.floor === 1, "and the floor resets to what THIS head reported", JSON.stringify(e.floor));
+  check(e.verdict !== "UNKNOWN", "a smaller but complete set at a new head is not UNKNOWN", JSON.stringify(e));
 }
 
 // --- two PRs must not share one row -----------------------------------------
@@ -119,6 +122,17 @@ let db = open(path);
   const s = loadSettlement(db, "o/r", 1);
   check(s.firstSeenAt === 500 && s.lastSeenAt === 500,
     "the row records when this head was first and last observed", JSON.stringify(s));
+}
+
+
+// Within ONE head the floor still bites, which is what it is actually for: jobs
+// are added as they schedule and never removed, so a count that drops means
+// something has yet to report.
+{
+  tick(db, "o/r", 9, { verdict: "GREEN", sha: "kkk", rows: [run("a", "success"), run("b", "success"), run("c", "success")], why: "3" }, 2000);
+  const shrunk = tick(db, "o/r", 9, { verdict: "GREEN", sha: "kkk", rows: [run("a", "success")], why: "1" }, 2100);
+  check(shrunk.verdict === "UNKNOWN" && shrunk.settled === false,
+    "a shrinking set at the SAME head is still UNKNOWN", JSON.stringify(shrunk));
 }
 
 db.close();

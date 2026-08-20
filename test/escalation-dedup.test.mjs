@@ -76,6 +76,32 @@ let db = open(path);
     "only the newly-arrived cause announces", JSON.stringify(r));
 }
 
+
+// A cause absent from THIS tick is not a cause that went away. When a tick cannot
+// evaluate a PR -- a network blip, a rate limit, an early `continue` -- its
+// escalation simply is not in the map, and clearing on that absence announces
+// "resolved" for a problem nobody touched. Absence is not success here either.
+{
+  announceable(db, m({ "#500: a": 1, "#501: b": 1 }), { covered: new Set([500, 501]), complete: true });
+  // A tick that only managed to look at 500.
+  const r = announceable(db, m({ "#500: a": 1 }), { covered: new Set([500]), complete: false });
+  check(r.cleared.length === 0,
+    "a PR the tick never evaluated is NOT announced as cleared", JSON.stringify(r.cleared));
+  // And when it is genuinely looked at and gone, it clears.
+  const r2 = announceable(db, m({ "#500: a": 1 }), { covered: new Set([500, 501]), complete: true });
+  check(r2.cleared.length === 1 && r2.cleared[0].startsWith("#501"),
+    "but once it IS evaluated and absent, it clears", JSON.stringify(r2.cleared));
+}
+{
+  // A shared cause names no PR, so only a tick that completed can retire it.
+  announceable(db, m({ "the base branch is red": 4 }), { covered: new Set([1]), complete: true });
+  const partial = announceable(db, m({}), { covered: new Set(), complete: false });
+  check(partial.cleared.length === 0,
+    "a shared cause survives an incomplete tick", JSON.stringify(partial.cleared));
+  const done = announceable(db, m({}), { covered: new Set([1]), complete: true });
+  check(done.cleared.length === 1, "and retires on a complete one", JSON.stringify(done.cleared));
+}
+
 db.close();
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

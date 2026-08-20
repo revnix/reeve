@@ -52,6 +52,19 @@ function stdoutAlreadyWrites(logPath) {
 // than chosen, so the two cannot drift apart.
 const HEARTBEAT_MS = (LEASE_SECONDS / 4) * 1000;
 
+/**
+ * Attempts already spent on this cause. A store that cannot be read does not
+ * report zero: an unknown count returns the cap, so the decision blocks rather
+ * than handing out a retry it cannot justify.
+ */
+function attemptsFor(db, nwo, pr, fp, logPath) {
+  try { return countFixAttempts(db, nwo, pr, fp); }
+  catch (err) {
+    log(logPath, `  #${pr}: could not read fix attempts (${err.message}) — treating as exhausted`);
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
 export function log(logPath, line) {
   const stamped = `${new Date().toISOString()} ${line}`;
   if (!logPath) { console.log(stamped); return; }
@@ -107,6 +120,10 @@ function unknownSince(db, pr) {
  * One pass over one project.
  * @returns {{decisions: object[], escalations: Map, halted: boolean}}
  */
+// `ctx` may override evaluate, publish, spawnWorker, openPrs and resolveCause. The dispatch
+// path is the one place where a mistake costs real work, and it was the only
+// path with no test at all -- because driving it otherwise needs GitHub and a
+// live `claude`. A ReferenceError sat in it undetected for exactly that reason.
 export async function tick(ctx) {
   const { nwo, profile, db, logPath, execute = false, shadow = true } = ctx;
   const decisions = [];
@@ -117,7 +134,7 @@ export async function tick(ctx) {
     return { decisions, escalations, halted: true };
   }
 
-  const prs = openPrs(nwo);
+  const prs = (ctx.openPrs ?? openPrs)(nwo);
   if (prs === null) {
     // Could not ask is not none. Returning an empty list here would look exactly
     // like a quiet, healthy fleet.
@@ -126,14 +143,16 @@ export async function tick(ctx) {
   }
   log(logPath, `tick: ${nwo} — ${prs.length} open PR(s)`);
 
+  const evaluated = new Set();
   for (const pr of prs) {
     if (halted(ctx.haltMarker)) { log(logPath, "HALTED mid-tick"); return { decisions, escalations, halted: true }; }
 
-    const e = evaluatePr({ nwo, pr, profile, db });
+    const e = (ctx.evaluate ?? evaluatePr)({ nwo, pr, profile, db });
     if (!e.ok) { log(logPath, `  #${pr}: could not evaluate — ${e.why}`); continue; }
 
     // GitHub is authoritative for PR facts; this is also what releases a lease
     // when a PR merges.
+    evaluated.add(pr);
     const rec = reconcilePr(db, { nwo, pr, profile });
     if (rec.ok && rec.released) log(logPath, `  #${pr}: released ${rec.released} lease(s) — PR merged`);
 
@@ -146,7 +165,7 @@ export async function tick(ctx) {
     let cause = null, fp = null;
     if (red) {
       const failing = (e.checks.failing).find(f => (e.checks.caused ?? []).includes(f.name)) ?? e.checks.failing[0];
-      const rc = failing?.id ? rootCause(nwo, failing) : { ok: false, why: "the failing check has no job behind it" };
+      const rc = failing?.id ? (ctx.resolveCause ?? rootCause)(nwo, failing) : { ok: false, why: "the failing check has no job behind it" };
       if (rc.ok) { cause = rc; fp = causeKey(nwo, rc); }
     }
 
@@ -155,17 +174,23 @@ export async function tick(ctx) {
       unknownSince: unknownSince(db, pr),
       // From the store, not from a map rebuilt empty on every tick.
       fingerprint: fp,
-      fixAttempts: fp ? new Map([[fp, countFixAttempts(db, nwo, pr, fp)]]) : new Map(),
+      // Guarded: an unreadable store must not take down the whole tick, and a
+      // count that cannot be read is not zero. Unknown attempts block rather
+      // than grant a free retry.
+      fixAttempts: fp ? new Map([[fp, attemptsFor(db, nwo, pr, fp, logPath)]]) : new Map(),
     });
 
     record(db, { pr, head: e.head, verdict: e.verdict, decision });
-    decisions.push({ e, decision });
+    // Carried on the entry rather than left in this block's scope: the dispatch
+    // loop below is a SEPARATE block, and reaching for these there threw a
+    // ReferenceError on every FIX_CI the moment --execute was on.
+    decisions.push({ e, decision, cause, fp });
     log(logPath, "  " + describe(e, decision));
 
     // Republish on every tick: a verdict is bound to a revision, so when the head
     // moves the old check stops applying to anything. Without this the shadow
     // record silently decays to nothing.
-    const pub = await publishVerdict({ nwo, verdict: e.verdict, shadow });
+    const pub = await (ctx.publish ?? publishVerdict)({ nwo, verdict: e.verdict, shadow });
     if (!pub.ok) log(logPath, `    could not publish: ${pub.why}`);
 
     // A shared cause is one problem, not N. Four PRs blocked on a red base is a
@@ -179,7 +204,7 @@ export async function tick(ctx) {
     log(logPath, `execute: capacity allows ${cap.canStart} worker(s) (load ${cap.load1?.toFixed?.(2) ?? "?"}, ${cap.perfCores} perf cores)`);
     let started = 0;
 
-    for (const { e, decision } of decisions) {
+    for (const { e, decision, cause, fp } of decisions) {
       if (started >= cap.canStart) { log(logPath, `  capacity reached; ${decisions.length - started} decision(s) deferred to the next tick`); break; }
       if (halted(ctx.haltMarker)) { log(logPath, "HALTED before dispatch"); break; }
 
@@ -190,10 +215,11 @@ export async function tick(ctx) {
         // Already resolved above, where it gated the decision. If it could not be
         // resolved there, there is nothing to tell a fixer to repair.
         if (!cause) { log(logPath, `  #${e.pr}: cannot dispatch FIX_CI — no resolvable root cause`); continue; }
-        // Counted against the cause and written before the worker starts, so a
-        // crash mid-fix still costs an attempt rather than granting a free retry.
-        const tried = recordFixAttempt(db, nwo, e.pr, fp, e.head);
-        promptCtx = { ...promptCtx, cause, attempt: tried };
+        // The attempt is NOT spent here. Several refusals still lie between this
+        // point and a running worker -- no prompt, no worktree, no run -- and
+        // spending an attempt on a dispatch that never happened burns the one
+        // retry the design allows.
+        promptCtx = { ...promptCtx, cause, attempt: countFixAttempts(db, nwo, e.pr, fp) + 1 };
       } else if (decision.action === "FIX_FINDINGS") {
         promptCtx = { ...promptCtx, threads: e.threadDetails ?? [] };
       } else if (decision.action === "REQUEST_REVIEW") {
@@ -218,6 +244,10 @@ export async function tick(ctx) {
       // work already in flight -- the log shows exactly that happening, the same
       // fix launched at 15:02 and again at 15:12.
       const run = startRun(db, { nwo, pr: e.pr, action: decision.action, head: e.head, cause });
+      // Spent here, beside the run: past every refusal, before any work. A crash
+      // after this point costs an attempt, which is the correct direction --
+      // a crashed fix that silently earns a free retry is the runaway loop.
+      if (run.ok && decision.action === "FIX_CI" && fp) recordFixAttempt(db, nwo, e.pr, fp, e.head);
       if (!run.ok) {
         // Refusing to act is the only safe answer when the transition cannot be
         // recorded: an unrecorded worker is one nothing can reason about later.
@@ -231,7 +261,7 @@ export async function tick(ctx) {
                                HEARTBEAT_MS);
       let r;
       try {
-        r = await runWorker({
+        r = await (ctx.spawnWorker ?? runWorker)({
           args: workerArgs({ prompt: spec.prompt, allowedTools: spec.tools, maxTurns: profile.watch?.maxTurns ?? 40 }),
           cwd: worktree,
           budgetMs: (profile.watch?.workerBudgetMinutes ?? 20) * 60_000,
@@ -266,7 +296,7 @@ export async function tick(ctx) {
 
   // Announce what STARTED or CHANGED, and what went away. Repeating a standing
   // cause every tick is how an operator learns to ignore the channel.
-  const { fresh, cleared } = announceable(db, escalations);
+  const { fresh, cleared } = announceable(db, escalations, { covered: evaluated, complete: evaluated.size === prs.length });
   for (const { why, count } of fresh) log(logPath, `NEEDS YOU: ${why}${count > 1 ? ` (${count} PRs)` : ""}`);
   for (const why of cleared) log(logPath, `CLEARED: ${why}`);
   return { decisions, escalations, halted: false };
@@ -281,7 +311,7 @@ export async function tick(ctx) {
  * @param {Map<string, number>} escalations  cause -> how many PRs share it
  * @returns {{fresh: {why: string, count: number}[], cleared: string[]}}
  */
-export function announceable(db, escalations, at = Math.floor(Date.now() / 1000)) {
+export function announceable(db, escalations, { covered = null, complete = true, at = Math.floor(Date.now() / 1000) } = {}) {
   const fresh = [], cleared = [];
   const standing = new Map(
     db.prepare("SELECT why, count, announced_count FROM escalation").all().map(r => [r.why, r]));
@@ -304,10 +334,21 @@ export function announceable(db, escalations, at = Math.floor(Date.now() / 1000)
   }
 
   for (const why of standing.keys()) {
-    if (!escalations.has(why)) {
-      db.prepare("DELETE FROM escalation WHERE why=?").run(why);
-      cleared.push(why);
-    }
+    if (escalations.has(why)) continue;
+    // Absent from THIS tick is not the same as gone. A tick that could not
+    // evaluate a PR -- a rate limit, a network blip, an early continue -- simply
+    // does not produce its escalation, and retiring it on that silence announces
+    // "resolved" for a problem nobody looked at. Absence is not success here
+    // either, and this is the surface a human trusts to tell them it is over.
+    const subject = why.match(/^#(\d+):/)?.[1];
+    const looked = subject
+      ? (covered === null || covered.has(Number(subject)))
+      // A shared cause names no PR, so only a tick that finished what it set out
+      // to do is entitled to retire it.
+      : complete;
+    if (!looked) continue;
+    db.prepare("DELETE FROM escalation WHERE why=?").run(why);
+    cleared.push(why);
   }
   return { fresh, cleared };
 }

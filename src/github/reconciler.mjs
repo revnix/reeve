@@ -169,8 +169,15 @@ export function classify(allRows, requiredChecks = []) {
 export function settle(prior, reading) {
   const names = [...new Set(reading.rows.map(r => r.name))].sort();
   const key = names.join("\0");
-  const floor = prior?.floor ?? 0;
-  const same = prior && prior.sha === reading.sha && prior.key === key;
+  // The floor guards against a set that has not finished SCHEDULING: within one
+  // revision, jobs are added and never removed, so a count below the highest seen
+  // means something has yet to report. Across revisions it means nothing -- path
+  // filters make a different head run a legitimately different set -- and
+  // carrying it made a PR whose new head runs fewer workflows permanently
+  // unsettleable. It resets with the head.
+  const sameHead = Boolean(prior) && prior.sha === reading.sha;
+  const floor = sameHead ? (prior.floor ?? 0) : 0;
+  const same = sameHead && prior.key === key;
   const streak = same ? (prior.streak ?? 0) + 1 : 1;
   const next = { sha: reading.sha, key, streak, floor: Math.max(floor, names.length), names };
 

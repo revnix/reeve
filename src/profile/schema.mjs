@@ -123,6 +123,10 @@ export const FIELDS = {
   "units":                  [true,  isArr(UNIT)],
   "lanes":                  [false, isArr(LANE)],
 
+  // Which App publishes this project's CI. Used to decide when the provider has
+  // FINISHED, which is the only honest way to call a required check absent --
+  // other apps' suites were measured parking at queued indefinitely.
+  "ci.appSlug":            [false, isStr],
   "ci.provider":            [true,  isStr],            // "github-actions" | "none"
   "ci.requiredChecks":      [false, isArr(isStr)],     // LITERAL names: matrix names expand at runtime
   "ci.flakePatterns":       [false, isArr(isStr)],

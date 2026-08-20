@@ -187,7 +187,7 @@ These falsify assumptions that were hard-coded in the old system:
 
 Six phases, all complete. Measured at the time of writing:
 
-- **16 commits**, CI green *now*. Over the repo's 10 runs, 8 succeeded and 2 failed: one on
+- **21 commits**, CI green *now*. Over the repo's 10 runs, 8 succeeded and 2 failed: one on
   main (fixed by the next commit) and one on PR #1 (the deliberately planted bug). "CI is green"
   is true; "CI has always been green" is not
 - **3,711 lines of source** across 18 `.mjs` files — this figure EXCLUDES `src/db/schema.sql`
@@ -195,9 +195,10 @@ Six phases, all complete. Measured at the time of writing:
 - **1,067 lines of tests** across 10 `test/*.test.mjs` — excludes 4 helper files in `test/`
   that are fixtures, not tests (`claimworker2.mjs`, `crashdrain.mjs`, `reconcile.demo.mjs`,
   `seed.mjs`)
-- **254 assertions passing, 0 failing**
+- **277 assertions passing, 0 failing** across 13 test files
 - **4 profiles** written (nextly, rext-backend, 21century, reeve)
-- **0 launchd agents installed** — the daemon has never been run as a service
+- **The launchd agent is installed and running** as of 2026-08-20 16:29 UTC — shadow mode,
+  `--execute` off, watching `nextlyhq/nextly`. See §7.
 
 | File | What it does |
 |---|---|
@@ -325,8 +326,23 @@ but do not cite a `status` screen as current truth without re-ticking.
 
 ### NOT proven — say so, do not assume
 
-- **The daemon has never run unattended for hours.** This is the entire point of the project. The
-  plist is validated but **never installed**. `launchctl list | grep reeve` returns nothing.
+- **The daemon is running unattended as of 2026-08-20 16:29 UTC**, but a full night has not yet
+  elapsed. Installed via `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.revnix.reeve.plist`.
+  Read `~/.reeve/reeve.log` and confirm `launchctl list | grep reeve` shows a live pid before
+  claiming anything about it.
+
+  Installing it exposed **three real defects that only appear as a service**, all now fixed:
+
+  1. **The plist watched the wrong repository.** It passed no positional, so `reeve run` detected the
+     repo from `WorkingDirectory`'s git remote and spent every tick on `revnix/reeve`, where the App
+     is not installed, so every publish returned HTTP 404. "Validated" had meant `plutil -lint`
+     passed, which proves nothing about the command inside. `test/deploy.test.mjs` now asserts the
+     agent names a repo that has a profile and a state database.
+  2. **Every log line was written twice**, because `StandardOutPath` names the file `log()` already
+     appends to. `log()` now compares stdout's `(dev, ino)` against the log's.
+  3. **The same escalation was announced on every tick** — five ticks, five notifications per PR,
+     which is ~576 overnight for two unchanged conditions. The standing set is now durable in the
+     store, and clearing is announced as well as arrival.
 - **The ops CI guard has never fired.** It triggers on PRs touching `plugins/**` and everything was
   pushed to main directly.
 - **`--execute` has only ever run once**, on one PR, watched.
@@ -348,8 +364,9 @@ but do not cite a `status` screen as current truth without re-ticking.
 
 ### 8.2 Real remaining code, roughly in order
 
-1. **Prove the daemon overnight.** Install the launchd agent, run in shadow with `--execute` off,
-   read the log in the morning. Needs nothing from the founder.
+1. ~~**Prove the daemon overnight.**~~ **IN PROGRESS since 2026-08-20 16:29 UTC.** Installed, in
+   shadow, `--execute` off. Read `~/.reeve/reeve.log` in the morning. Three service-only defects
+   were found and fixed in the first fifteen minutes (§7).
 2. **Fix the three reviewer lenses.** They read `origin/main` instead of the PR diff
    (`git fetch origin main "pull/N/head"` then `FETCH_HEAD` is ambiguous), their frontmatter is
    inert because `review-fleet` invokes plain `claude -p` rather than `--agent`, and two of three
@@ -395,6 +412,9 @@ discovery; contributor mode beyond the four fields already in the schema.
 
 ## 10. How to verify the whole thing still works
 
+**Run these separately, not as one block.** Two `doctor` calls plus a `tick` exceed the Bash
+tool's two-minute timeout — a full tick against nextly's four open PRs takes ~60s on its own.
+
 ```sh
 N=~/.nvm/versions/node/v24.17.0/bin/node
 cd ~/Work/Products/reeve
@@ -428,4 +448,9 @@ until §8.1 is done.
 - `~/Work/Products/nextly-workspace/nextly-ops/docs/2026-08-20-nextly-ops-comprehensive-audit.md` —
   the original independent audit that started this.
 - `~/Work/Products/reeve/docs/github-app-setup.md` — App setup, already done.
+- `~/Work/Products/reeve/docs/2026-08-20-portfolio-readiness.md` — whether reeve can serve the other
+  27 active repos. Short answer: the engine generalises, the environment does not. Every org is on
+  GitHub's **free plan**, so enforcement is impossible outside the one public repo; the App reaches
+  one repo; and outside nextly and Comfy-Org **no workflow triggers on a pull request**, so every PR
+  would read UNKNOWN and block forever.
 - `~/Work/Products/nextly-workspace/nextly-ops/telemetry/README.md` — the telemetry fix and its trap.

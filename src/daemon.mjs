@@ -20,6 +20,7 @@ import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, OUTCOMES } from "./supervisor.mjs";
 import { promptFor } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff } from "./sandbox.mjs";
+import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, causeKey } from "./ci-rootcause.mjs";
 import { readState, noteTick } from "./status.mjs";
 import { countFixAttempts, recordFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
@@ -320,7 +321,20 @@ export async function tick(ctx) {
           log(logPath, `  #${e.pr}: NOT published — ${gate.why}`);
           escalations.set(`#${e.pr}: a fix was produced but refused publication — ${gate.why}`, 1);
         } else {
-          log(logPath, `  #${e.pr}: diff accepted (${changed.length} file(s)) — ready to publish`);
+          // reeve publishes, not the worker: the actor and the only claim that
+          // the action was allowed must not be the same party.
+          const pushed = pushWorktree({ path: worktree, branch: e.headRef, expectedRemote: e.head });
+          if (!pushed.ok) {
+            log(logPath, `  #${e.pr}: NOT published — ${pushed.why}`);
+            escalations.set(`#${e.pr}: a fix was produced but could not be published — ${pushed.why}`, 1);
+          } else {
+            log(logPath, `  #${e.pr}: published ${changed.length} file(s)`);
+            // Only ever release what pushed cleanly. Anything else quarantines,
+            // because a directory holding work nobody has a copy of is not spare
+            // disk space.
+            const rel = releaseWorktree({ path: worktree, pr: e.pr });
+            if (!rel.ok) log(logPath, `  #${e.pr}: worktree quarantined — ${rel.why}`);
+          }
         }
       }
 
@@ -412,11 +426,27 @@ export function announceable(db, escalations, { covered = null, complete = true,
  * the right one, and refusing is the only safe answer.
  */
 export function resolveWorktree(ctx, profile, e) {
-  const p = ctx.worktreeFor?.(e) ?? profile.identity?.worktreeRoot ?? null;
-  if (!p) return { path: null, why: "no identity.worktreeRoot in the profile" };
-  if (!isAbsolute(p)) return { path: null, why: `identity.worktreeRoot is relative (${p}); it must be absolute` };
-  if (!existsSync(p)) return { path: null, why: `identity.worktreeRoot does not exist: ${p}` };
-  return { path: p, why: null };
+  // An explicit override still wins: that is how a test, or a human working a PR
+  // by hand, hands a specific directory to a worker.
+  const override = ctx.worktreeFor?.(e) ?? null;
+  if (override) {
+    if (!isAbsolute(override)) return { path: null, why: `worktree path is relative (${override})` };
+    if (!existsSync(override)) return { path: null, why: `worktree does not exist: ${override}` };
+    return { path: override, why: null };
+  }
+
+  const root = profile.identity?.worktreeRoot ?? null;
+  const checkout = profile.identity?.checkout ?? null;
+  if (!root) return { path: null, why: "no identity.worktreeRoot in the profile" };
+  if (!isAbsolute(root)) return { path: null, why: `identity.worktreeRoot is relative (${root}); it must be absolute` };
+  if (!checkout) return { path: null, why: "no identity.checkout in the profile — a worktree is created FROM a clone" };
+  if (!existsSync(checkout)) return { path: null, why: `identity.checkout does not exist: ${checkout}` };
+
+  // A dedicated, verified checkout of THIS pull request's branch at the revision
+  // reeve pinned. Refusing is the whole point: a worktree holding somebody's
+  // unsaved work is not a worktree a worker may reset.
+  const w = acquireWorktree({ repoRoot: checkout, root, pr: e.pr, branch: e.headRef, head: e.head });
+  return w.ok ? { path: w.path, why: null, reused: w.reused } : { path: null, why: w.why };
 }
 
 /** The long-running loop. Ticks until halted or stopped. */

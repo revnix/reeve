@@ -187,8 +187,14 @@ These falsify assumptions that were hard-coded in the old system:
 
 Six phases, all complete. Measured at the time of writing:
 
-- **16 commits**, CI green
-- **3,711 lines of source** across 18 files, **1,067 lines of tests**
+- **16 commits**, CI green *now*. Over the repo's 10 runs, 8 succeeded and 2 failed: one on
+  main (fixed by the next commit) and one on PR #1 (the deliberately planted bug). "CI is green"
+  is true; "CI has always been green" is not
+- **3,711 lines of source** across 18 `.mjs` files — this figure EXCLUDES `src/db/schema.sql`
+  (184 lines) and `bin/reeve` (206). All shipped code is ~4,100 lines
+- **1,067 lines of tests** across 10 `test/*.test.mjs` — excludes 4 helper files in `test/`
+  that are fixtures, not tests (`claimworker2.mjs`, `crashdrain.mjs`, `reconcile.demo.mjs`,
+  `seed.mjs`)
 - **254 assertions passing, 0 failing**
 - **4 profiles** written (nextly, rext-backend, 21century, reeve)
 - **0 launchd agents installed** — the daemon has never been run as a service
@@ -301,6 +307,21 @@ rather than guessing again.
 - `doctor`, `status`, `why`, `init`, `dash` all run against real repos.
 - The GitHub App authenticates and publishes check runs.
 - The shadow check is live on the open PRs.
+
+### Found by an independent fact-check at the end of the session, and FIXED
+
+Two defects that a fresh session would otherwise have hit immediately:
+
+- **`reeve doctor` refused its own profile.** `daemon.mjs` and `watcher.mjs` read
+  `profile.watch.*`, and the schema never declared those keys, so the validator rejected them
+  and `doctor` exited before doing anything. A test now asserts that every profile key the code
+  reads is declared in the schema, so this cannot silently regress.
+- **The CLI help advertised four working commands as "not yet built"** (`status`, `why`, `init`,
+  `dash`). Corrected.
+
+Also noted, not fixed: a stray `life.db` (110 KB) sits at the repo root; `reeve status` reads
+the local store, so it can show a PR state that GitHub has since moved past. Neither is a defect,
+but do not cite a `status` screen as current truth without re-ticking.
 
 ### NOT proven — say so, do not assume
 

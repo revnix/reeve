@@ -1,7 +1,7 @@
 // The validator must REFUSE. Each case below is a real shape from the portfolio
 // that would have caused a gate to judge the wrong thing, so each must produce an
 // error rather than a default.
-import { validate, withDefaults } from "../src/profile/schema.mjs";
+import { validate, withDefaults, FIELDS } from "../src/profile/schema.mjs";
 
 const base = {
   schemaVersion: 1,
@@ -99,6 +99,22 @@ expectRefusal("the wrong schemaVersion",
   const ok = d.rounds.softCap === 7;
   console.log(`${ok ? "PASS" : "FAIL"}  defaults never override an explicit value`);
   if (!ok) fail++;
+}
+
+
+// The schema must declare every key the code READS. daemon.mjs and watcher.mjs
+// consume profile.watch.*, and when the schema omitted them the validator
+// refused reeve's own profile and `reeve doctor` exited before doing anything.
+// Code that reads undeclared config is config that drifts unnoticed.
+{
+  const { readFileSync } = await import("node:fs");
+  const src = ["../src/daemon.mjs", "../src/watcher.mjs", "../src/pr.mjs"]
+    .map(f => { try { return readFileSync(new URL(f, import.meta.url), "utf8"); } catch { return ""; } }).join("\n");
+  const read = new Set([...src.matchAll(/\b(?:profile|p|ctx\.profile)\?\.(\w+)\?\.(\w+)/g)].map(m => `${m[1]}.${m[2]}`));
+  const declared = new Set(Object.keys(FIELDS));
+  const missing = [...read].filter(k => !declared.has(k));
+  console.log(`${missing.length === 0 ? "PASS" : "FAIL"}  every profile key the code reads is declared in the schema`);
+  if (missing.length) { console.log("        undeclared:", missing.join(", ")); fail++; }
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

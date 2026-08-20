@@ -89,8 +89,10 @@ function landing(profile) {
     "  right. Describe the CODE, not the process: no task ids, no mention of a review,",
     "  no mention of what tool wrote it, and no attribution trailer of any kind.",
     "",
-    "  Then push to the existing branch. Never force-push: this branch may already",
-    "  carry work you did not make.",
+    "  STOP after committing. Do not push — you are not able to, and reeve does it",
+    "  once it has checked what you actually changed against the work you were given.",
+    "  Being told to push while the sandbox refuses it is how a finished fix gets",
+    "  marked untrustworthy and thrown away.",
     "",
     "  If your commit is rejected by a pre-commit hook, fix what the hook objects to.",
     "  Never pass --no-verify.",
@@ -108,7 +110,7 @@ Finish with a single fenced json block, and nothing after it:
   "test": {"added": true|false, "failedBefore": true|false, "passedAfter": true|false, "command": "..."},
   "needsHuman": false|"why",
   "filesTouched": ["..."],
-  "pushed": true|false,
+  "committed": true|false,
   "commit": "sha or null"
 }
 \`\`\`

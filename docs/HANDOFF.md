@@ -195,7 +195,7 @@ Six phases, all complete. Measured at the time of writing:
 - **1,067 lines of tests** across 10 `test/*.test.mjs` — excludes 4 helper files in `test/`
   that are fixtures, not tests (`claimworker2.mjs`, `crashdrain.mjs`, `reconcile.demo.mjs`,
   `seed.mjs`)
-- **277 assertions passing, 0 failing** across 13 test files
+- **291 assertions passing, 0 failing** across 15 test files
 - **4 profiles** written (nextly, rext-backend, 21century, reeve)
 - **The launchd agent is installed and running** as of 2026-08-20 16:29 UTC — shadow mode,
   `--execute` off, watching `nextlyhq/nextly`. See §7.
@@ -331,7 +331,7 @@ but do not cite a `status` screen as current truth without re-ticking.
   Read `~/.reeve/reeve.log` and confirm `launchctl list | grep reeve` shows a live pid before
   claiming anything about it.
 
-  Installing it exposed **three real defects that only appear as a service**, all now fixed:
+  Installing it exposed **five real defects that only appear when it actually runs**, all now fixed:
 
   1. **The plist watched the wrong repository.** It passed no positional, so `reeve run` detected the
      repo from `WorkingDirectory`'s git remote and spent every tick on `revnix/reeve`, where the App
@@ -340,7 +340,19 @@ but do not cite a `status` screen as current truth without re-ticking.
      agent names a repo that has a profile and a state database.
   2. **Every log line was written twice**, because `StandardOutPath` names the file `log()` already
      appends to. `log()` now compares stdout's `(dev, ino)` against the log's.
-  3. **The same escalation was announced on every tick** — five ticks, five notifications per PR,
+  3. **`src/github/reconciler.mjs` was a BINARY file to git.** One raw NUL byte at offset 7114 —
+     a `names.join("\0")` delimiter written as the literal byte instead of the escape. `git diff`
+     rendered it as "Binary files differ", `git grep` skipped it, and every review lens reading a
+     diff saw an empty change. The file that decides whether a check run counts was invisible to
+     review, in a system whose whole purpose is judging diffs. Found only because `git grep` said
+     "Binary file … matches" while searching for something else. `test/source-is-text.test.mjs`
+     now asserts no tracked source file contains a NUL **and** that git itself treats each as text.
+  4. **`identity.worktreeRoot` was relative in all four profiles**, and the dispatch fallback was
+     `process.cwd()`. Under launchd that meant a worker fixing a nextly PR would have run inside
+     the reeve checkout. The schema now refuses a relative value and dispatch refuses rather than
+     defaulting. Only reachable with `--execute` on, which is the next milestone.
+
+  5. **The same escalation was announced on every tick** — five ticks, five notifications per PR,
      which is ~576 overnight for two unchanged conditions. The standing set is now durable in the
      store, and clearing is announced as well as arrival.
 - **The ops CI guard has never fired.** It triggers on PRs touching `plugins/**` and everything was
@@ -367,11 +379,28 @@ but do not cite a `status` screen as current truth without re-ticking.
 1. ~~**Prove the daemon overnight.**~~ **IN PROGRESS since 2026-08-20 16:29 UTC.** Installed, in
    shadow, `--execute` off. Read `~/.reeve/reeve.log` in the morning. Three service-only defects
    were found and fixed in the first fifteen minutes (§7).
-2. **Fix the three reviewer lenses.** They read `origin/main` instead of the PR diff
-   (`git fetch origin main "pull/N/head"` then `FETCH_HEAD` is ambiguous), their frontmatter is
-   inert because `review-fleet` invokes plain `claude -p` rather than `--agent`, and two of three
-   are proper subsets of the third. **This gates the merge condition**, because Codex is 93%
-   refused.
+2. ~~**Fix the three reviewer lenses.**~~ **DONE 2026-08-20** (`nextly-ops` `ce9606d`,
+   plugin `0.4.3`). Two of this item's three original claims were **wrong**, and re-measuring
+   mattered:
+
+   - **TRUE and proven:** `git fetch origin main "pull/N/head"` leaves `FETCH_HEAD` holding both
+     refs, and `git show FETCH_HEAD:<path>` resolves to the **first** — `main`. Measured on PR
+     #925: `FETCH_HEAD` was `6c9a5ab0`, the PR head `45b423a5`. Every lens following that
+     instruction read the base while believing it read the PR. Fixed by fetching into
+     `refs/review/pr-<N>`, verified to equal the PR head.
+   - **Misstated:** `reviewer-correctness` did *not* read the base as its primary path — line 100
+     already used `gh pr diff`, which is correct. The bug was confined to file-content reads and
+     re-review diffs. The other two lenses had **no acquisition instructions at all** — both begin
+     "for every test the diff adds or changes" without saying how to obtain it, or to pin a head.
+     Both now carry it.
+   - **REFUTED:** "two of three are proper subsets of the third". Measured: 6 of 29 and 6 of 26
+     substantive lines overlap, and **all six are the citation boilerplate plus the `tools:`
+     frontmatter line**. Substantive overlap is zero; the lenses are genuinely distinct.
+   - **Deliberately not changed:** `review-fleet` still passes an explicit tool allowlist rather
+     than `--agent`. The frontmatter declares unrestricted `Bash` while the allowlist scopes it to
+     `gh pr`, `gh api`, `git`, `ledger` and `node`. Making the frontmatter live would *widen* the
+     trust boundary for agents whose input is untrusted PR and CI text. The frontmatter being inert
+     is the safer of the two states, so the invocation stays as it is.
 3. **The state migration.** JSONL → reeve's SQLite store. This is what makes the deletion of
    `bin/ledger` (371 lines), `dispatch`, `merge-gate` and `dashboard` possible. Until then they
    cannot be removed even though reeve supersedes them.

@@ -23,6 +23,7 @@ import { sandboxFor, writeSandbox, reviewDiff } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, causeKey } from "./ci-rootcause.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
+import { buildAlert, notify } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { execFileSync } from "node:child_process";
@@ -381,6 +382,18 @@ export async function tick(ctx) {
 
   for (const { why, count } of fresh) log(logPath, `NEEDS YOU: ${why}${count > 1 ? ` (${count} PRs)` : ""}`);
   for (const why of cleared) log(logPath, `CLEARED: ${why}`);
+
+  // Only what ARRIVED goes to a phone. `fresh` is already the deduplicated set,
+  // so a standing cause is pushed once rather than every two and a half minutes --
+  // which is how a channel gets muted and stops being a channel.
+  const alert = buildAlert({ nwo, escalations: fresh });
+  if (alert) {
+    const sent = (ctx.notify ?? notify)({ profile, alert });
+    // Logged either way. A push channel nobody knows is broken is the same as no
+    // push channel, so a decline is never swallowed.
+    log(logPath, sent.ok ? `pushed ${fresh.length} escalation(s) to ${profile.notify?.topic}`
+                         : `did NOT push: ${sent.why}`);
+  }
   return { decisions, escalations, halted: false };
 }
 

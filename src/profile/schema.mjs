@@ -154,6 +154,13 @@ export const FIELDS = {
   // watcher.mjs (unknownEscalateSeconds).
   // OFF until review ingest exists. With it on, reeve can dispatch review actions
   // whose data model is incomplete -- see the gate in watcher.mjs.
+  // Where an escalation goes when nobody is watching the log. Only escalations
+  // are ever sent: an over-pushing channel gets muted, and a muted channel is
+  // worse than none.
+  "notify.provider":       [false, oneOf(["ntfy", "none"])],
+  "notify.url":            [false, isStr],
+  "notify.topic":          [false, isStr],
+  "notify.credentialFile": [false, isAbsPath],
   "watch.reviewActions":   [false, isBool],
   "watch.maxOpenPrs":      [false, isInt],
   "watch.maxWorkers":            [false, isInt],

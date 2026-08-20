@@ -354,18 +354,61 @@ export function reconcilePr(db, { nwo, pr, profile = {} }) {
  * Is this red inherited from the base, or caused here? A gate that cannot tell
  * either blocks forever or merges over everything.
  */
-export function inheritedOrCaused(nwo, baseBranch, rawNames) {
+export function inheritedOrCaused(nwo, baseBranch, failingRows, io = {}) {
+  const { maxProbes = 3 } = io;
+  const pinBase = io.pinBase ?? (() => pinHead(nwo, baseBranch));
+  const readBase = io.readBase ?? (sha => readChecks(nwo, sha));
+  // Injected rather than imported: ci-rootcause imports from here, and resolving
+  // a cause is the expensive half, so it must be substitutable in a test.
+  const resolveCause = io.resolveCause ?? null;
+
+  // Accepts rows; a bare name still works, it simply cannot be cause-compared.
+  const rows = (failingRows ?? []).map(x => (typeof x === "string" ? { name: x, id: null } : x));
   // A falsy name cannot be reported to a fixer and must not travel further. This
   // surfaced twice as a decision reading "failing: undefined", and patching where
   // it appeared did not stop it, so the read itself is removed here.
-  const failingNames = (rawNames ?? []).filter(n => typeof n === "string" && n.length > 0);
-  const dropped = (rawNames ?? []).length - failingNames.length;
-  const base = pinHead(nwo, baseBranch);
-  if (!base.ok) return { verdict: "UNKNOWN", why: base.why };
-  const { rows, ok } = readChecks(nwo, base.sha);
-  if (!ok) return { verdict: "UNKNOWN", why: "could not read base checks" };
-  const baseFailing = new Set(rows.filter(r => r.state === "completed" && !PASSING.has(String(r.conclusion))).map(r => r.name));
-  const inherited = failingNames.filter(n => baseFailing.has(n));
-  const caused = failingNames.filter(n => !baseFailing.has(n));
-  return { verdict: caused.length ? "CAUSED" : "INHERITED", inherited, caused, baseSha: base.sha, dropped };
+  const named = rows.filter(r => r && typeof r.name === "string" && r.name.length > 0);
+  const dropped = rows.length - named.length;
+
+  const base = pinBase();
+  if (!base.ok) return { verdict: "UNKNOWN", why: base.why, dropped };
+  const read = readBase(base.sha);
+  if (!read.ok) return { verdict: "UNKNOWN", why: "could not read base checks", dropped };
+
+  const baseFailing = new Map();
+  for (const r of read.rows ?? [])
+    if (r.state === "completed" && !PASSING.has(String(r.conclusion))) baseFailing.set(r.name, r);
+
+  const inherited = [], caused = [], unverified = [];
+  let probes = 0;
+
+  for (const row of named) {
+    const twin = baseFailing.get(row.name);
+    // The cheap filter: a name that is not failing on the base at all cannot have
+    // been inherited from it, and needs no probe.
+    if (!twin) { caused.push(row.name); continue; }
+
+    // A shared NAME is not a shared failure. One job runs many tests, so the same
+    // job can fail on the base and on the PR for entirely unrelated reasons —
+    // and calling that "inherited" leaves a real regression unfixed.
+    if (!resolveCause || probes >= maxProbes) { unverified.push(row.name); continue; }
+    probes++;
+    const a = resolveCause(nwo, row), b = resolveCause(nwo, twin);
+    if (!a?.ok || !b?.ok) { unverified.push(row.name); continue; }
+    (sameCause(a, b) ? inherited : caused).push(row.name);
+  }
+
+  // Neither guess is safe: a false INHERITED leaves a regression unfixed, and a
+  // false CAUSED sends a worker to repair the base's problem inside a feature PR,
+  // which hides where it came from. Anything unverified is reported as that.
+  const verdict = unverified.length ? "UNVERIFIED" : caused.length ? "CAUSED" : "INHERITED";
+  return { verdict, inherited, caused, unverified, baseSha: base.sha, dropped, probes };
 }
+
+/** Two failures are the same when the job, the step and the first messages agree. */
+function sameCause(a, b) {
+  const key = c => [c.job, c.step, ...(c.cause ?? []).slice(0, 2)
+    .map(x => `${x.where ?? ""}|${String(x.message ?? "").slice(0, 120)}`)].join("::");
+  return key(a) === key(b);
+}
+

@@ -41,22 +41,40 @@ const GIT_WRITE = ["add", "commit", "checkout --", "restore"];
 /**
  * Never granted to a worker under any profile, whatever it declares.
  *
- * Push and merge are the two authorities that would let a worker be both the
- * actor and the only claim that the action was allowed. reeve pushes after
- * checking the diff, so those two facts stay in different hands. The rest are
- * ways out of the box: a network fetch, a shell that re-enters unscoped, a
- * package install that runs arbitrary lifecycle scripts.
+ * These are AUTHORITY and NETWORK, which is what a sandbox can actually enforce
+ * against a process whose job is to change code.
+ *
+ * It deliberately no longer tries to stop the worker EXECUTING things. That was
+ * the first version's mistake and it failed on its first real dispatch: eleven
+ * denied tool calls, because reeve's own `npm test` is a shell loop over
+ * `node <file>` and the worker reasonably reached for the file directly. Worse,
+ * the restriction was never real — a worker holding Write can write a script and
+ * run it through any granted runner, so denying `node -e` bought nothing and only
+ * made the failure confusing.
+ *
+ * What IS enforceable, and is enforced: it cannot push or merge, so it can never
+ * be both the actor and the only claim the action was allowed; it cannot reach the
+ * network; it cannot read or write quarantined or sensitive paths; it cannot edit
+ * the files that judge it; and whatever it produces is checked against the lane's
+ * territory before reeve publishes it.
  */
 const NEVER = [
   "Bash(git push:*)", "Bash(git remote:*)", "Bash(gh pr merge:*)", "Bash(gh api:*)",
   "Bash(gh auth:*)", "Bash(curl:*)", "Bash(wget:*)", "Bash(ssh:*)", "Bash(nc:*)",
   "Bash(sudo:*)", "Bash(chmod:*)", "Bash(rm -rf:*)",
   "Bash(npm publish:*)", "Bash(pnpm publish:*)", "Bash(yarn publish:*)",
-  "Bash(eval:*)", "Bash(bash:*)", "Bash(sh:*)", "Bash(zsh:*)", "Bash(node -e:*)",
 ];
 
 /** The paths that judge the work. A worker editing these grades its own exam. */
 const SELF_GOVERNING = [".github/**", ".git/**"];
+
+/** What a project of each language is actually run with. */
+const RUNTIMES = {
+  typescript: ["node", "npx", "tsx"],
+  python: ["python", "python3", "pytest", "uv", "ruff", "mypy"],
+  go: ["go"],
+  rust: ["cargo"],
+};
 
 const denyAllVerbs = glob =>
   ["Read", "Edit", "Write", "NotebookEdit"].map(v => `${v}(./${glob.replace(/^\.\//, "")})`);
@@ -77,22 +95,34 @@ export function sandboxFor({ profile, action, worktree, lane = null }) {
   // cannot tell whether its fix worked, so this is the minimum that makes the
   // work verifiable rather than asserted.
   const projectCmds = [];
+  const runners = new Set();
   for (const u of units) {
     for (const c of Object.values(u.commands ?? {})) {
       if (!c?.cmd) continue;
-      // The runner and its first argument, not the whole line: `pnpm test --watch`
-      // must not be reachable just because `pnpm test` is.
+      // The runner and its first argument: `pnpm test --watch` must not be
+      // reachable merely because `pnpm test` is.
       const head = c.cmd.trim().split(/\s+/).slice(0, 2).join(" ");
       if (head) projectCmds.push(`Bash(${head}:*)`);
     }
+    // The language's own runner, because a declared command is often a wrapper.
+    // reeve's `npm test` is a shell loop over `node <file>`, and a fixer that
+    // cannot run ONE test has to run the whole suite to check a one-line change,
+    // or give up -- which is what it did.
+    for (const r of RUNTIMES[u.language] ?? []) runners.add(r);
+    if (u.packageManager) runners.add(u.packageManager);
   }
 
+  // Reading the workspace. A fixer that cannot list a directory is reduced to
+  // guessing at filenames.
+  for (const r of ["ls", "cat", "head", "tail", "wc", "find", "which", "pwd"]) runners.add(r);
+
   const gitTools = [...GIT_READ, ...GIT_WRITE].map(g => `Bash(git ${g}:*)`);
+  const runnerTools = [...runners].map(r => `Bash(${r}:*)`);
 
   // A closed set. Nothing reaches the network, nothing spawns a shell, and Bash
   // appears only with a scope attached.
   const tools = action === "FIX_CI" || action === "FIX_FINDINGS"
-    ? ["Read", "Edit", "Write", "Grep", "Glob", ...gitTools, ...new Set(projectCmds)]
+    ? ["Read", "Edit", "Write", "Grep", "Glob", ...gitTools, ...runnerTools, ...new Set(projectCmds)]
     : ["Read", "Grep", "Glob", ...gitTools];
 
   const deny = [

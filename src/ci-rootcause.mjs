@@ -101,12 +101,16 @@ export function logSlice(nwo, checkRunId, step, { maxLines = 120 } = {}) {
     // cause. Widening beats reporting "no cause found".
     if (inWindow.length) { picked = inWindow; windowed = true; }
   }
-  // The cause is at the END of a failing step, not the start.
-  const tail = picked.slice(-maxLines);
+  // Keep the whole step window: the cause is often NOT at the end. reeve's own
+  // first CI failure put the FAIL line at 136 of 371, and a tail-only slice of
+  // 120 lines missed it entirely, reporting only "Process completed with exit
+  // code 1". The tail is a fallback for when nothing salient is found.
+  const tail = picked.length <= maxLines ? picked : picked.slice(-maxLines);
   return {
     ok: true, bytes: r.out.length, sliced: tail.length, total: lines.length, windowed,
     // Strip the timestamp prefix: it is noise once the window has been applied.
     text: tail.map(l => l.replace(/^\S+Z\s/, "")).join("\n"),
+    full: picked.map(l => l.replace(/^\S+Z\s/, "")).join("\n"),
   };
 }
 
@@ -157,7 +161,9 @@ export function rootCause(nwo, check) {
     return { ok: false, source: "annotations", why: `annotations were generic and the log could not be read: ${slice.why}`,
              job: step.job, step: failing?.name ?? null };
   }
-  const salient = salientLines(slice.text);
+  // Search the FULL window first; fall back to the tail only if it says nothing.
+  let salient = salientLines(slice.full ?? slice.text);
+  if (!salient.length) salient = salientLines(slice.text);
   return {
     ok: true, source: "log", bytes: slice.bytes, sliced: slice.sliced,
     job: step.job, step: failing?.name ?? null, runId: step.runId, attempt: step.attempt,

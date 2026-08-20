@@ -11,8 +11,15 @@ const LINE = "2026-08-20T04:57:56.9200172Z ✖ .changeset/x.md: missing 1 of 25"
 
 // The bug: slicing a fixed 24 chars drops the Z, so this parses as LOCAL time.
 // On a +05:00 machine that is five hours early and every step window misses.
-check("a log stamp parses as UTC", new Date(parseLogStamp(LINE)).toISOString(), "2026-08-20T04:57:56.920Z");
-check("the naive fixed slice is NOT used", Date.parse(LINE.slice(0, 24)) === parseLogStamp(LINE), false);
+// Assert the absolute instant, which is true in every timezone. An earlier
+// version compared parseLogStamp against the naive 24-char slice and expected
+// them to DIFFER — true on a +05:00 machine, false on a UTC runner, where the
+// slice is accidentally correct. That test asserted the author's timezone rather
+// than the code, and it is also exactly why the original bug is invisible in CI.
+check("a log stamp parses to the correct absolute instant",
+  parseLogStamp(LINE), Date.UTC(2026, 7, 20, 4, 57, 56, 920));
+check("and renders back as the same UTC string",
+  new Date(parseLogStamp(LINE)).toISOString(), "2026-08-20T04:57:56.920Z");
 check("a line with no stamp is NaN", Number.isNaN(parseLogStamp("no timestamp here")), true);
 check("a stamp needs the trailing Z", Number.isNaN(parseLogStamp("2026-08-20T04:57:56.920 no-z")), true);
 

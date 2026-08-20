@@ -26,8 +26,18 @@ check("anything in flight is RUNNING", classify([run("a", "success"), run("b", n
 // These two are outside the REST-documented set and fall straight through a
 // naive `conclusion === "failure"` branch into a silent pass.
 check("startup_failure blocks", classify([run("a", "success"), run("b", "startup_failure")]).verdict, "RED");
-check("stale blocks", classify([run("a", "success"), run("b", "stale")]).verdict, "RED");
-check("cancelled blocks", classify([run("a", "cancelled")]).verdict, "RED");
+check("timed_out is a real failure, not a cancellation", classify([run("a", "timed_out")]).verdict, "RED");
+
+// A cancelled run is a SUPERSEDED run, not a failing one. It still refuses a
+// merge, because UNKNOWN never merges, but it must not escalate to a human the
+// way a real failure does. Measured: this produced a false "base is red" push
+// on the first shadow tick.
+check("cancelled is uninformative, not RED", classify([run("a", "cancelled")]).verdict, "UNKNOWN");
+check("stale is uninformative, not RED", classify([run("a", "stale")]).verdict, "UNKNOWN");
+check("but a real failure alongside a cancellation is still RED",
+  classify([run("a", "cancelled"), run("b", "failure")]).verdict, "RED");
+check("and a cancellation never reads as GREEN",
+  classify([run("a", "success"), run("b", "cancelled")]).verdict, "UNKNOWN");
 check("timed_out blocks", classify([run("a", "timed_out")]).verdict, "RED");
 check("action_required blocks", classify([run("a", "action_required")]).verdict, "RED");
 
@@ -92,6 +102,25 @@ const green = sha => ({ verdict: "GREEN", sha, rows: [run("a", "success"), run("
   s = settle(s, { verdict: "GREEN", sha: "aaa", rows: [run("a", "success"), run("z", "success")] });
   check("a changed name set resets the streak", s.streak, 1);
 }
+
+
+// A commit-status description may contain a newline. Parsing these surfaces as
+// TSV split such a description into a phantom row whose name was a fragment and
+// whose conclusion was undefined — which then classified as a failure and
+// reported "failing: undefined" to the fixer.
+check("a nameless row never counts as failing",
+  classify([{ name: "", source: "status", state: "completed", conclusion: undefined },
+            run("a", "success")]).failing.length, 0);
+// It must not vanish either: an unparseable row means this revision is not
+// checkable, and not-checkable never merges.
+check("but it makes the revision UNKNOWN rather than GREEN",
+  classify([{ name: "", source: "status", state: "completed", conclusion: undefined },
+            run("a", "success")]).verdict, "UNKNOWN");
+check("and the parse defect is counted, not swallowed",
+  classify([{ name: "", state: "completed", conclusion: undefined }, run("a", "success")]).malformed, 1);
+check("a clean set reports zero malformed rows", classify([run("a", "success")]).malformed, 0);
+check("a genuinely unknown conclusion on a NAMED row still blocks",
+  classify([{ name: "real", source: "status", state: "completed", conclusion: "weird" }]).verdict, "RED");
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

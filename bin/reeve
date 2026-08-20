@@ -7,6 +7,7 @@
 import { runDoctor, render } from "../src/doctor.mjs";
 import { open } from "../src/db/ops.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
+import { run, tick } from "../src/daemon.mjs";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -88,6 +89,31 @@ switch (cmd) {
     }
     process.exit(result.exitCode);
   }
+  case "run":
+  case "tick": {
+    const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
+    if (!nwo) { console.error("reeve run: no repo. Pass owner/repo or run inside a git checkout."); process.exit(1); }
+    const profile = loadProfile(nwo);
+    if (!profile) { console.error(`reeve run: no profile for ${nwo}.\n-> reeve init`); process.exit(1); }
+    const home = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
+    const dbPath = opt("db") ?? join(home, "state", `${nwo.split("/")[1]}.db`);
+    if (!existsSync(dbPath)) { console.error(`reeve run: no state database at ${dbPath}`); process.exit(1); }
+    const ctx = {
+      nwo, profile, db: open(dbPath),
+      logPath: opt("log") ?? join(home, "reeve.log"),
+      haltMarker: opt("halt") ?? join(home, "HALT"),
+      // Execution is opt-in. A loop that acts before its decisions have been
+      // watched is how an unattended run becomes an incident.
+      execute: flag("execute"),
+      // Shadow until the week's evidence says otherwise. --enforce is the flip.
+      shadow: !flag("enforce"),
+      intervalMs: Number(opt("interval") ?? 90) * 1000,
+    };
+    if (cmd === "tick") { const r = await tick(ctx); process.exit(r.halted ? 3 : 0); }
+    await run(ctx);
+    process.exit(0);
+  }
+
   default:
     console.log(`reeve ${JSON.parse(execFileSync("cat", [join(ROOT, "package.json")], { encoding: "utf8" })).version}
 
@@ -97,6 +123,13 @@ switch (cmd) {
       --plugin-repo <dir>   the reviewed copy to compare it against
       --json                machine-readable
 
-not yet built: status · next · why · plan · init · watch · lane · pr`);
+  run [owner/repo]      the daemon: watch, publish, decide, on a loop
+      --tick                one pass and exit
+      --execute             dispatch workers (default: report only)
+      --enforce             publish real conclusions (default: shadow/neutral)
+      --interval <seconds>  default 90
+      --halt <path>         marker file that stops everything (default ~/.reeve/HALT)
+
+not yet built: status · next · why · plan · init · lane`);
     process.exit(cmd ? 1 : 0);
 }

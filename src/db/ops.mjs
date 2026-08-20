@@ -208,3 +208,35 @@ export function exportJsonl(db, { sinceSeq = 0 } = {}) {
     subject: r.subject, run: r.run_id, payload: JSON.parse(r.payload),
   })).join("\n") + (rows.length ? "\n" : "");
 }
+
+/**
+ * The settlement state this PR was left in by the previous tick, in the shape
+ * settle() expects as its `prior`. Returns null when nothing has been recorded,
+ * which settle() reads as a first observation.
+ */
+export function loadSettlement(db, nwo, pr) {
+  const r = db.prepare(`SELECT sha, key, streak, floor, first_seen_at, last_seen_at
+                        FROM settlement WHERE nwo=? AND pr=?`).get(nwo, pr);
+  if (!r) return null;
+  return {
+    sha: r.sha, key: r.key, streak: r.streak, floor: r.floor,
+    // Rebuilt from the key rather than stored twice, so the two cannot disagree.
+    // An empty key is no checks at all, not one check named "".
+    names: r.key ? r.key.split("\0") : [],
+    firstSeenAt: r.first_seen_at, lastSeenAt: r.last_seen_at,
+  };
+}
+
+/** Record what this tick observed. `first_seen_at` restarts when the head moves. */
+export function saveSettlement(db, nwo, pr, next, at = Math.floor(Date.now() / 1000)) {
+  const prior = db.prepare("SELECT sha, first_seen_at FROM settlement WHERE nwo=? AND pr=?").get(nwo, pr);
+  const firstSeen = prior && prior.sha === next.sha ? prior.first_seen_at : at;
+  db.prepare(`INSERT INTO settlement(nwo,pr,sha,key,streak,floor,first_seen_at,last_seen_at)
+              VALUES(?,?,?,?,?,?,?,?)
+              ON CONFLICT(nwo,pr) DO UPDATE SET
+                sha=excluded.sha, key=excluded.key, streak=excluded.streak,
+                floor=excluded.floor, first_seen_at=excluded.first_seen_at,
+                last_seen_at=excluded.last_seen_at`)
+    .run(nwo, pr, next.sha, next.key, next.streak, next.floor, firstSeen, at);
+  return { ...next, firstSeenAt: firstSeen, lastSeenAt: at };
+}

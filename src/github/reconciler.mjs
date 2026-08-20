@@ -136,8 +136,15 @@ export function settle(prior, reading) {
   // reading's `why`, so checks.why was undefined, the verdict's
   // MISSING_REQUIRED branch passed it through as the clause detail, and every
   // consumer downstream rendered the string "undefined". Carry it.
-  if (reading.verdict === "RED" || reading.verdict === "MISSING_REQUIRED")
+  // A failing check is PRESENT evidence: more looks will not un-fail it, so RED
+  // settles at once. A required check that has not appeared is an ABSENCE --
+  // GitHub may simply not have created it yet -- so it needs the same
+  // corroboration a green set does. Calling it "never reported" on first sight
+  // is the same absence-read-as-fact error pointed the other way.
+  if (reading.verdict === "RED")
     return { ...next, settled: true, verdict: reading.verdict, why: reading.why };
+  if (reading.verdict === "MISSING_REQUIRED")
+    return { ...next, settled: streak >= 3, verdict: reading.verdict, why: reading.why };
   if (reading.verdict !== "GREEN") return { ...next, settled: false, verdict: reading.verdict, why: reading.why };
   if (names.length < floor) return { ...next, settled: false, verdict: "UNKNOWN", why: `only ${names.length} checks reported where ${floor} were seen before` };
   if (streak < 3) return { ...next, settled: false, verdict: "SETTLING", why: `green reading ${streak} of 3` };

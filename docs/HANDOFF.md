@@ -195,7 +195,7 @@ Six phases, all complete. Measured at the time of writing:
 - **1,067 lines of tests** across 10 `test/*.test.mjs` — excludes 4 helper files in `test/`
   that are fixtures, not tests (`claimworker2.mjs`, `crashdrain.mjs`, `reconcile.demo.mjs`,
   `seed.mjs`)
-- **520 assertions passing, 0 failing** across 32 test files
+- **539 assertions passing, 0 failing** across 33 test files
 - **4 profiles** written (nextly, rext-backend, 21century, reeve)
 - **The launchd agent is installed and running** as of 2026-08-20 16:29 UTC — shadow mode,
   `--execute` off, watching `nextlyhq/nextly`. See §7.
@@ -502,6 +502,48 @@ Two smaller findings from the same run:
 Worth recording that the failure was legible at all only because the layers around
 it held: the denial was detected, the run was marked failed rather than
 successful, and nothing was pushed.
+
+### What eight `--execute` dispatches taught
+
+Run against `revnix/reeve` PR #2 with a deliberately planted failure, so that a
+mistake cost nothing. **Seven of eight failed, every one a defect in reeve.** The
+list matters less than the pattern at the end of it.
+
+| Failure | Cause |
+|---|---|
+| Wrong reason reported | git narrates on stderr; the FIRST line is progress, not the error |
+| 11 denials | The sandbox restricted **execution**, which is impossible for a code fixer |
+| 11 denials | Denied **reading** `.github`, and the matcher rejects compound commands |
+| 5 denials | The **prompt instructed a push the sandbox denies** — two halves of reeve disagreeing about who publishes |
+| 6 denials | **`git -C <path> log` does not match `Bash(git log:*)`** — the flag precedes the subcommand |
+
+**The real lesson is not about sandboxes.** `runWorker` returned the denied
+commands from the very first failure and the daemon **kept only the count**. Two
+whole rounds were spent reproducing by hand what the run already knew, from
+hand-written prompts that did not match the generated one — and both reproductions
+produced a wrong conclusion. Printing the refused commands was fifteen lines and
+named the cause immediately.
+
+> When a system reports a number where it holds the detail, whoever reads it will
+> guess. `4 tool call(s) denied` is a number to guess at; the commands are the
+> diagnosis.
+
+**Two design corrections worth keeping:**
+
+- **A sandbox for a code fixer cannot restrict execution.** A worker holding
+  `Write` can write a script and run it through any granted runner. What is
+  enforceable is authority, network and paths — and the diff gate, which sees what
+  actually happened rather than what was permitted.
+- **Quarantine and sensitive are different.** Quarantine denies every verb, reads
+  included: it is data that must never be seen. Sensitive and self-governing paths
+  deny writes only — reading the failing workflow is how a fixer diagnoses;
+  changing it is what needs a human.
+
+**And a verification note:** the check that `deny` still beats a broadened `git`
+grant was, in its first form, **incapable of showing a difference** — the worktree
+sat at the remote's head, so a push was a no-op whether refused or allowed. Rebuilt
+with a local commit that would have moved the remote, it gave a real answer: both
+attempts refused, remote unchanged.
 
 **Still open:**
 

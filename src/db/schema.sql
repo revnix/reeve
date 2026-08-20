@@ -155,6 +155,20 @@ CREATE TABLE IF NOT EXISTS fact (
   scope_sha TEXT, expires_at INTEGER, supersedes_fact_id INTEGER) STRICT;
 CREATE INDEX IF NOT EXISTS fact_node ON fact(node_id, observed_at);
 
+-- Fix attempts, counted against a HEAD-INDEPENDENT cause. The rule is one
+-- attempt per finding, then escalate; keying it by revision made every surviving
+-- failure look new, because a fix attempt pushes a new head by construction.
+-- `last_sha` is kept for the human trail, never for the count.
+CREATE TABLE IF NOT EXISTS fix_attempt (
+  nwo      TEXT NOT NULL,
+  pr       INTEGER NOT NULL,
+  cause    TEXT NOT NULL,
+  attempts INTEGER NOT NULL,
+  first_at INTEGER NOT NULL,
+  last_at  INTEGER NOT NULL,
+  last_sha TEXT,
+  PRIMARY KEY (nwo, pr, cause)) STRICT;
+
 -- Settlement across REAL ticks. settle() is a pure reducer that needs the
 -- previous reading to fold into, and evaluatePr() used to manufacture three
 -- readings from one API call -- so a check set was declared stable the first

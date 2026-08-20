@@ -179,9 +179,26 @@ export function rootCause(nwo, check) {
  * attempts per fingerprint rather than per PR.
  */
 export function fingerprint(nwo, sha, cause) {
-  const parts = [nwo, sha?.slice(0, 10), cause.job, cause.step,
-                 ...(cause.cause ?? []).slice(0, 3).map(c => `${c.where ?? ""}|${c.message.slice(0, 120)}`)];
-  return parts.join("::");
+  return [nwo, sha?.slice(0, 10), causeKey(nwo, cause)].join("::");
+}
+
+/**
+ * The same failure, wherever it appears. Deliberately excludes the revision.
+ *
+ * A fix attempt normally pushes a new head, so a revision-keyed identity makes
+ * every surviving failure look new and hands the fixer another attempt, forever
+ * -- which is the runaway the cap exists to stop. Counting against the CAUSE
+ * means a failure that outlives its fix escalates on the next round.
+ *
+ * The honest limit: this is derived from the job, the step and the first few
+ * error messages. A partial fix that changes the wording of an error reads as a
+ * new cause and earns a fresh attempt. That degrades to the old behaviour rather
+ * than to something worse, but it is not a guarantee, and a human reading an
+ * escalation should know the identity is textual.
+ */
+export function causeKey(nwo, cause) {
+  return [nwo, cause.job, cause.step,
+          ...(cause.cause ?? []).slice(0, 3).map(c => `${c.where ?? ""}|${c.message.slice(0, 120)}`)].join("::");
 }
 
 /**

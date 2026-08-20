@@ -240,3 +240,23 @@ export function saveSettlement(db, nwo, pr, next, at = Math.floor(Date.now() / 1
     .run(nwo, pr, next.sha, next.key, next.streak, next.floor, firstSeen, at);
   return { ...next, firstSeenAt: firstSeen, lastSeenAt: at };
 }
+
+/** How many times this cause has already been attempted on this PR. */
+export function countFixAttempts(db, nwo, pr, cause) {
+  const r = db.prepare("SELECT attempts FROM fix_attempt WHERE nwo=? AND pr=? AND cause=?").get(nwo, pr, cause);
+  return r ? r.attempts : 0;
+}
+
+/**
+ * Record an attempt. Keyed by cause rather than by revision, while still storing
+ * the head it was last seen at -- the count answers "has this survived a fix?",
+ * the head answers "where do I go and look?".
+ */
+export function recordFixAttempt(db, nwo, pr, cause, sha, at = Math.floor(Date.now() / 1000)) {
+  db.prepare(`INSERT INTO fix_attempt(nwo,pr,cause,attempts,first_at,last_at,last_sha)
+              VALUES(?,?,?,1,?,?,?)
+              ON CONFLICT(nwo,pr,cause) DO UPDATE SET
+                attempts = attempts + 1, last_at = excluded.last_at, last_sha = excluded.last_sha`)
+    .run(nwo, pr, cause, at, at, sha ?? null);
+  return countFixAttempts(db, nwo, pr, cause);
+}

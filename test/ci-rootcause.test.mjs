@@ -46,6 +46,13 @@ check("a compiler error IS actionable", isActionable("TS2345: Argument of type '
   check("the failing line is picked out", hits.some(h => h.includes("missing 1 of 25")), true);
   check("the error marker is picked out", hits.some(h => h.startsWith("##[error]")), true);
   check("passing noise is not", hits.some(h => h.includes("some passing test")), false);
+
+  // The second argument is a CAP, and the loop breaks the moment hits reach it.
+  // A default of 0 therefore breaks before reading the first line, and both
+  // callers in rootCause take the default: every log-tier failure came back
+  // ok:true with an empty cause. Pin the count, not just "something was found".
+  check("the default call keeps every salient line", salientLines(text).length, 2);
+  check("an explicit cap is still a cap", salientLines(text, 1).length, 1);
 }
 
 // ── fingerprint ───────────────────────────────────────────────────────────

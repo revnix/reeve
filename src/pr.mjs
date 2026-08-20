@@ -7,6 +7,7 @@
 // them says exactly what the gate WOULD have refused.
 
 import { pinHead, readChecks, classify, settle, inheritedOrCaused, readTimeline, lastForcePush } from "./github/reconciler.mjs";
+import { loadSettlement, saveSettlement } from "./db/ops.mjs";
 import { computeVerdict, renderVerdict, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
 import { execFileSync } from "node:child_process";
@@ -97,11 +98,20 @@ export function evaluatePr({ nwo, pr, profile, db = null }) {
 
   const { rows } = readChecks(nwo, pin.sha);
   const c = classify(rows, profile.ci?.requiredChecks ?? []);
-  // Three readings of the same pinned revision. Settlement is about the check SET
-  // being stable, so polling the same snapshot thrice is the honest floor here;
-  // the watcher in the daemon spaces them over real time.
-  let s = null;
-  for (let i = 0; i < 3; i++) s = settle(s, { ...c, sha: pin.sha, rows });
+  // ONE reading, folded into what the previous tick recorded. Settlement is about
+  // the check SET being stable ACROSS TIME, so it can only be established by
+  // successive ticks -- this used to call settle() three times over the same
+  // snapshot, which declared every set stable the first time it was seen.
+  const reading = { ...c, sha: pin.sha, rows };
+  let s;
+  if (db) {
+    s = saveSettlement(db, nwo, pr, settle(loadSettlement(db, nwo, pr), reading));
+  } else {
+    // No store means no memory of previous readings, and an unrememberable
+    // observation cannot be corroborated. Fail closed rather than pretend.
+    s = { ...settle(null, reading), settled: false,
+          why: "settlement needs a state store to compare readings across ticks" };
+  }
   if (c.failing.length) {
     const io = inheritedOrCaused(nwo, baseRef, c.failing.map(f => f.name));
     c.inherited = io.inherited; c.caused = io.caused;

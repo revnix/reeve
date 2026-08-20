@@ -155,6 +155,23 @@ CREATE TABLE IF NOT EXISTS fact (
   scope_sha TEXT, expires_at INTEGER, supersedes_fact_id INTEGER) STRICT;
 CREATE INDEX IF NOT EXISTS fact_node ON fact(node_id, observed_at);
 
+-- Settlement across REAL ticks. settle() is a pure reducer that needs the
+-- previous reading to fold into, and evaluatePr() used to manufacture three
+-- readings from one API call -- so a check set was declared stable the first
+-- time it was seen. One row per pull request: settle() itself resets the streak
+-- when the head changes while carrying the floor forward, which is what stops a
+-- shrinking check set from passing as a clean one.
+CREATE TABLE IF NOT EXISTS settlement (
+  nwo           TEXT NOT NULL,
+  pr            INTEGER NOT NULL,
+  sha           TEXT NOT NULL,
+  key           TEXT NOT NULL,      -- the sorted check-NAME set, NUL-joined
+  streak        INTEGER NOT NULL,
+  floor         INTEGER NOT NULL,   -- high-water check count for this PR, across heads
+  first_seen_at INTEGER NOT NULL,   -- when THIS head was first observed
+  last_seen_at  INTEGER NOT NULL,
+  PRIMARY KEY (nwo, pr)) STRICT;
+
 -- An escalation is an event, not a state. This table holds the set currently
 -- STANDING, so the daemon can announce a cause when it starts and when it
 -- changes rather than on every tick. It must be durable: KeepAlive restarts the

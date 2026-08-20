@@ -122,5 +122,38 @@ check("an unknown system subtype does not break parsing",
   check("nothing starts when already over capacity", busy.canStart, 0);
 }
 
+
+// A supervisor that is itself killed must take its workers with it. Workers are
+// spawned detached so their grandchildren can be group-killed, but detachment
+// cuts both ways: without a reaper, killing the supervisor leaves the worker, its
+// shell and whatever build it was running with no parent to stop them.
+{
+  const { writeFileSync, mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const supScript = join(mkdtempSync(join(tmpdir(), "reeve-sup-")), "sup.mjs");
+  const modPath = new URL("../src/supervisor.mjs", import.meta.url).pathname;
+  writeFileSync(supScript, [
+    'import { runWorker } from ' + JSON.stringify(modPath) + ';',
+    'runWorker({ bin: "/bin/sh", args: ["-c", "sleep 120"], budgetMs: 60000,',
+    '  onSpawn: ({ pid }) => { process.stdout.write(String(pid) + "\\n"); } });',
+    'setInterval(() => {}, 60000);',
+  ].join("\n"));
+
+  const sup = spawn(process.execPath, [supScript], { stdio: ["ignore", "pipe", "ignore"] });
+  const workerPid = await new Promise(res => sup.stdout.once("data", d => res(Number(String(d).trim().split("\n")[0]))));
+  // The piped stdout holds a handle open, which would keep this test process
+  // alive forever after the child is gone.
+  sup.stdout.destroy();
+  sup.unref();
+  await new Promise(r => setTimeout(r, 500));
+  check("the worker is running before the supervisor dies", alive(workerPid), true);
+  sup.kill("SIGTERM");
+  await new Promise(r => setTimeout(r, 1500));
+  check("killing the supervisor takes the worker with it", alive(workerPid), false);
+  try { process.kill(workerPid, "SIGKILL"); } catch {}
+  try { sup.kill("SIGKILL"); } catch {}
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

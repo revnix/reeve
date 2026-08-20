@@ -52,6 +52,41 @@ export function pinHead(nwo, branch) {
 }
 
 /**
+ * reeve's own verdict check, and the App that publishes it. Defined here, at the
+ * lowest layer that reads checks, so the exclusion below cannot be forgotten by a
+ * caller and every consumer of readChecks inherits it.
+ */
+export const POLICY_CONTEXT = "ops/merge-policy";
+export const POLICY_APP = "merge-policy";
+
+/**
+ * Remove reeve's own opinion from the evidence.
+ *
+ * A verdict published at a head is a CONCLUSION about that head, so reading it
+ * back as an input makes the gate an input to itself. In shadow the conclusion is
+ * `neutral` and classifies as passing, which hides the problem; under --enforce a
+ * BLOCK publishes `failure` and the next tick reads it as a red check, so reeve
+ * keeps failing the PR long after the original cause has cleared.
+ *
+ * Matched on the exact name OR on the publishing App, because anything reeve
+ * publishes is its own opinion whatever it happens to be called. A check wearing
+ * the policy name from some OTHER App is not evidence either, but it is returned
+ * separately: something impersonating the gate is worth saying out loud rather
+ * than quietly discarding.
+ */
+export function excludeOwnPolicy(rows, context = POLICY_CONTEXT, app = POLICY_APP) {
+  const rest = [], excluded = [], impostors = [];
+  for (const r of rows) {
+    const mine = r.app === app;
+    const named = r.name === context;
+    if (!mine && !named) { rest.push(r); continue; }
+    excluded.push(r);
+    if (named && !mine) impostors.push(r);
+  }
+  return { rows: rest, excluded, impostors };
+}
+
+/**
  * Every check at a SHA, from both surfaces. Returns rows normalised to
  * {name, source, state, conclusion, id}. `state` is "completed" or "running".
  */
@@ -71,6 +106,9 @@ export function readChecks(nwo, sha) {
     name: c.name, source: "check_run",
     state: c.status === "completed" ? "completed" : "running",
     conclusion: c.conclusion || null, id: c.id != null ? String(c.id) : null,
+    // Carried so reeve can recognise its OWN check and refuse to treat it as
+    // evidence. Excluding by name alone would miss anything else it publishes.
+    app: c.app?.slug ?? null,
   }));
   const st = gh(`repos/${nwo}/commits/${sha}/status`, ".statuses");
   if (st.ok) parse(st.out, x => ({
@@ -82,7 +120,11 @@ export function readChecks(nwo, sha) {
     // here, so the description is carried rather than discarded.
     description: x.description ?? "",
   }));
-  return { ok: cr.ok || st.ok, rows, why: cr.ok || st.ok ? null : (cr.err || st.err) };
+  // Filtered HERE rather than by each caller: the base head is read through this
+  // same function, and a caller that forgot would reintroduce the latch silently.
+  const own = excludeOwnPolicy(rows);
+  return { ok: cr.ok || st.ok, rows: own.rows, excluded: own.excluded, impostors: own.impostors,
+           why: cr.ok || st.ok ? null : (cr.err || st.err) };
 }
 
 /** Classify a set of check rows. Never returns "green" on absence. */

@@ -155,6 +155,22 @@ export function evaluatePr({ nwo, pr, profile, db = null }) {
 }
 
 /**
+ * The id of the policy check already at this head, or null. Read as the App
+ * rather than as the user, because the check the App created is the one it is
+ * allowed to update; `filter=latest` is exactly right here, since the newest run
+ * under that name is the one to supersede.
+ *
+ * A failure to look is not "there is none": returning null would then create a
+ * duplicate rather than lose anything, which is the harmless direction.
+ */
+function existingPolicyRun(token, nwo, sha, context) {
+  const r = apiAsInstallation(token,
+    [`repos/${nwo}/commits/${sha}/check-runs?per_page=100&filter=latest`,
+     "--jq", `[.check_runs[] | select(.name == "${context}") | .id] | last // empty`]);
+  return r.ok && r.out ? r.out.trim() : null;
+}
+
+/**
  * Publish. Shadow publishes `neutral`, which GitHub shows and never blocks on.
  * Enforcing publishes the real conclusion.
  */
@@ -169,13 +185,21 @@ export async function publishVerdict({ nwo, verdict, shadow = true, context = "o
     ? `**Shadow mode.** This check reports what the merge policy *would* have decided. It does not block.\n\nIf enforcing, this revision would be: **${real}**\n\n${renderVerdict(verdict)}`
     : renderVerdict(verdict);
 
-  const res = apiAsInstallation(auth.token, [
-    "-X", "POST", `repos/${nwo}/check-runs`,
-    "-f", `name=${context}`, "-f", `head_sha=${verdict.head}`,
+  // Update the run already at this head rather than adding another. One head on
+  // nextly had accumulated 38 of these in an afternoon: the API's default
+  // `filter=latest` hides that from reeve's own reads, but it is real API load and
+  // it makes the PR's check list unreadable for the human who has to act on it.
+  const fields = [
     "-f", "status=completed", "-f", `conclusion=${conclusion}`,
     "-f", `output[title]=${title.slice(0, 250)}`,
     "-f", `output[summary]=${body.slice(0, 60000)}`,
-  ]);
+  ];
+  const existing = existingPolicyRun(auth.token, nwo, verdict.head, context);
+  const res = existing
+    ? apiAsInstallation(auth.token, ["-X", "PATCH", `repos/${nwo}/check-runs/${existing}`, ...fields])
+    : apiAsInstallation(auth.token, ["-X", "POST", `repos/${nwo}/check-runs`,
+        "-f", `name=${context}`, "-f", `head_sha=${verdict.head}`, ...fields]);
   if (!res.ok) return { ok: false, why: res.err.split("\n")[0] };
-  return { ok: true, id: JSON.parse(res.out).id, conclusion, wouldBe: real, shadow };
+  return { ok: true, id: JSON.parse(res.out).id, conclusion, wouldBe: real, shadow,
+           updated: Boolean(existing) };
 }

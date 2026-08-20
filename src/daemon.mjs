@@ -19,8 +19,9 @@ import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, OUTCOMES } from "./supervisor.mjs";
 import { promptFor } from "./prompts.mjs";
-import { rootCause, fingerprint } from "./ci-rootcause.mjs";
+import { rootCause, causeKey } from "./ci-rootcause.mjs";
 import { readState } from "./status.mjs";
+import { countFixAttempts, recordFixAttempt } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync } from "node:fs";
@@ -131,10 +132,25 @@ export async function tick(ctx) {
     const rec = reconcilePr(db, { nwo, pr, profile });
     if (rec.ok && rec.released) log(logPath, `  #${pr}: released ${rec.released} lease(s) — PR merged`);
 
+    // The root cause is resolved BEFORE the decision, not after it. The watcher's
+    // retry cap reads `h.fingerprint`, and the daemon never supplied one -- so the
+    // cap read zero attempts every time and could not fire at all. Resolving it
+    // here costs nothing extra: the same cause is reused for the worker's prompt
+    // below, where it used to be computed a second time.
+    const red = e.checks?.verdict === "RED" && (e.checks?.failing ?? []).length > 0;
+    let cause = null, fp = null;
+    if (red) {
+      const failing = (e.checks.failing).find(f => (e.checks.caused ?? []).includes(f.name)) ?? e.checks.failing[0];
+      const rc = failing?.id ? rootCause(nwo, failing) : { ok: false, why: "the failing check has no job behind it" };
+      if (rc.ok) { cause = rc; fp = causeKey(nwo, rc); }
+    }
+
     const decision = nextAction(e, profile, {
       now: now(),
       unknownSince: unknownSince(db, pr),
-      fixAttempts: ctx.fixAttempts ?? new Map(),
+      // From the store, not from a map rebuilt empty on every tick.
+      fingerprint: fp,
+      fixAttempts: fp ? new Map([[fp, countFixAttempts(db, nwo, pr, fp)]]) : new Map(),
     });
 
     record(db, { pr, head: e.head, verdict: e.verdict, decision });
@@ -166,21 +182,13 @@ export async function tick(ctx) {
       // not: two of them are for a human and one is the gate's own job.
       let promptCtx = { profile, nwo, pr: e.pr, head: e.head, branch: e.headRef };
       if (decision.action === "FIX_CI") {
-        const failing = (e.checks?.failing ?? []).find(f => (decision.caused ?? []).includes(f.name)) ?? (e.checks?.failing ?? [])[0];
-        if (!failing?.id) { log(logPath, `  #${e.pr}: cannot dispatch FIX_CI — the failing check has no job behind it`); continue; }
-        const cause = rootCause(nwo, failing);
-        if (!cause.ok) { log(logPath, `  #${e.pr}: cannot dispatch FIX_CI — ${cause.why}`); continue; }
-        // One attempt per fingerprint, keyed on the revision: the same failure at
-        // a NEW head is a fresh attempt, not a repeat.
-        const fp = fingerprint(nwo, e.head, cause);
-        const tried = (ctx.fixAttempts?.get(fp) ?? 0);
-        if (tried >= (profile.rounds?.maxFixAttemptsPerFinding ?? 1)) {
-          log(logPath, `  #${e.pr}: already attempted this failure ${tried}x — escalating rather than guessing again`);
-          escalations.set(`#${e.pr}: the same failure survived a fix`, 1);
-          continue;
-        }
-        ctx.fixAttempts?.set(fp, tried + 1);
-        promptCtx = { ...promptCtx, cause, attempt: tried + 1 };
+        // Already resolved above, where it gated the decision. If it could not be
+        // resolved there, there is nothing to tell a fixer to repair.
+        if (!cause) { log(logPath, `  #${e.pr}: cannot dispatch FIX_CI — no resolvable root cause`); continue; }
+        // Counted against the cause and written before the worker starts, so a
+        // crash mid-fix still costs an attempt rather than granting a free retry.
+        const tried = recordFixAttempt(db, nwo, e.pr, fp, e.head);
+        promptCtx = { ...promptCtx, cause, attempt: tried };
       } else if (decision.action === "FIX_FINDINGS") {
         promptCtx = { ...promptCtx, threads: e.threadDetails ?? [] };
       } else if (decision.action === "REQUEST_REVIEW") {

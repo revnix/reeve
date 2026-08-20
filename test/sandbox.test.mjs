@@ -60,6 +60,19 @@ const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt" });
   check(tools.some(t => t.startsWith("Bash(")), "but scoped Bash IS granted, or nothing can be verified");
 }
 {
+  // The runtime must be granted, not just the declared command. reeve's own
+  // `npm test` is a shell loop over `node <file>`, and the first version of this
+  // sandbox granted only `Bash(npm test:*)` -- so on its first real dispatch the
+  // worker was denied eleven times trying to run one test, and the run failed.
+  const tools = s.allowedTools;
+  check(/Bash\(node:\*\)/.test(tools), "a typescript unit's runtime is granted", tools);
+  check(/Bash\(ls:\*\)/.test(tools), "and enough to read the workspace — a fixer that cannot list a directory guesses at filenames", tools);
+  const py = sandboxFor({ profile: { units: [{ id: "r", language: "python", packageManager: "uv", commands: {} }] },
+                          action: "FIX_CI", worktree: "/tmp/wt" });
+  check(/Bash\(pytest:\*\)/.test(py.allowedTools), "a python unit gets python's runtime, not node's", py.allowedTools);
+  check(!/Bash\(node:\*\)/.test(py.allowedTools), "and only its own", py.allowedTools);
+}
+{
   // The model reached for a tool nobody offered. Only what is named may run.
   check(!/(^|,)\s*(Task|Agent|WebFetch|WebSearch|Monitor|NotebookEdit)\s*(,|$)/.test(s.allowedTools),
     "no tool outside the intended set is granted", s.allowedTools);
@@ -67,6 +80,17 @@ const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt" });
 
 // --- the profile's declarations become RULES, not prose ---------------------
 const deny = s.settings.permissions.deny.join(" | ");
+{
+  // Execution is NOT what this restricts, and pretending otherwise was the first
+  // version's error: a worker holding Write can write a script and run it through
+  // any granted runner, so denying `node -e` bought nothing and only made the
+  // failure confusing. What is enforced is authority, network and paths.
+  check(!deny.includes("Bash(node -e:*)"),
+    "execution is not restricted, because with Write it cannot be",
+    JSON.stringify(deny.split(" | ").filter(d => d.includes("node"))));
+  check(/Bash\(curl/.test(deny) && /Bash\(git push/.test(deny),
+    "but the network and the authority to publish still are");
+}
 {
   check(/db:migrate:fresh/.test(deny), "a forbidden command is denied", deny);
   check(/npm publish/.test(deny), "every forbidden command is denied, not just the first", deny);

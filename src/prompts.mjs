@@ -222,9 +222,12 @@ ${invariants(profile)}
 /** Everything the supervisor needs to launch one worker for one decision. */
 export function promptFor(decision, ctx) {
   switch (decision.action) {
-    case "FIX_CI":         return { prompt: fixCiPrompt(ctx), tools: "Read,Edit,Write,Grep,Glob,Bash" };
-    case "FIX_FINDINGS":   return { prompt: fixFindingsPrompt(ctx), tools: "Read,Edit,Write,Grep,Glob,Bash" };
-    case "REQUEST_REVIEW": return { prompt: requestReviewPrompt(ctx), tools: "Bash(gh pr comment:*)" };
+    // The tool grant is no longer decided here. It comes from sandboxFor(),
+    // which derives it from the profile's own risk rules -- a prompt file is the
+    // wrong place to decide what a process may execute.
+    case "FIX_CI":         return { prompt: fixCiPrompt(ctx) };
+    case "FIX_FINDINGS":   return { prompt: fixFindingsPrompt(ctx) };
+    case "REQUEST_REVIEW": return { prompt: requestReviewPrompt(ctx), tools: "Bash(gh pr comment:*)" };  // narrow already
     case "SPILL":          return { prompt: spillPrompt(ctx), tools: "Read,Grep,Bash(gh issue:*),Bash(gh api:*)" };
     default:               return null;   // WAIT, PARK, MERGE and ESCALATE are not worker tasks
   }

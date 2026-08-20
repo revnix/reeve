@@ -19,13 +19,14 @@ import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, OUTCOMES } from "./supervisor.mjs";
 import { promptFor } from "./prompts.mjs";
+import { sandboxFor, writeSandbox, reviewDiff } from "./sandbox.mjs";
 import { rootCause, causeKey } from "./ci-rootcause.mjs";
 import { readState, noteTick } from "./status.mjs";
 import { countFixAttempts, recordFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync } from "node:fs";
-import { dirname, isAbsolute } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -63,6 +64,21 @@ function attemptsFor(db, nwo, pr, fp, logPath) {
     log(logPath, `  #${pr}: could not read fix attempts (${err.message}) — treating as exhausted`);
     return Number.MAX_SAFE_INTEGER;
   }
+}
+
+/**
+ * Files the worker actually changed, staged or not. Read from git rather than
+ * from anything the worker says about itself: the whole point of this gate is
+ * that the actor does not get to be the only witness.
+ */
+function changedFiles(worktree) {
+  try {
+    const out = execFileSync("git", ["-C", worktree, "status", "--porcelain"], { encoding: "utf8" }).trim();
+    if (!out) return [];
+    // Porcelain v1: two status columns, a space, then the path. A rename carries
+    // "old -> new"; the new name is the one that matters.
+    return out.split("\n").map(l => l.slice(3).trim().split(" -> ").pop()).filter(Boolean);
+  } catch { return null; }   // null means "could not ask", which reviewDiff refuses
 }
 
 export function log(logPath, line) {
@@ -259,10 +275,22 @@ export async function tick(ctx) {
       started++;
       const beat = setInterval(() => { try { heartbeat(db, { runId: run.runId }); } catch { /* a missed beat must not kill the worker */ } },
                                HEARTBEAT_MS);
+      // The deterministic boundary, built from the profile rather than described
+      // to the model. Measured against the CLI first: a scoped allowlist refuses
+      // `printf > file`, `| tee`, `git push` and a chained `git remote -v`, while
+      // still letting the worker run the project's own commands -- which it must,
+      // or it cannot tell whether its fix worked.
+      const lane = (profile.lanes ?? []).find(l => l.id === decision.lane) ?? null;
+      const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane });
+      const settingsPath = writeSandbox(join(dirname(ctx.logPath ?? "/tmp/x"), "sandboxes", String(e.pr)), sandbox);
+
       let r;
       try {
         r = await (ctx.spawnWorker ?? runWorker)({
-          args: workerArgs({ prompt: spec.prompt, allowedTools: spec.tools, maxTurns: profile.watch?.maxTurns ?? 40 }),
+          args: workerArgs({ prompt: spec.prompt,
+                             allowedTools: spec.tools ?? sandbox.allowedTools,
+                             settings: settingsPath,
+                             maxTurns: profile.watch?.maxTurns ?? 40 }),
           cwd: worktree,
           budgetMs: (profile.watch?.workerBudgetMinutes ?? 20) * 60_000,
           isHalted: () => halted(ctx.haltMarker),
@@ -279,6 +307,22 @@ export async function tick(ctx) {
                         ms: r?.ms, cost: r?.cost, sessionId: r?.sessionId });
       }
       log(logPath, `  #${e.pr}: ${decision.action} -> ${r.outcome} (${r.why}) in ${Math.round(r.ms / 1000)}s${r.cost != null ? `, ${r.cost.toFixed(3)}` : ""}`);
+
+      // What the worker PRODUCED, judged after it has stopped talking. The
+      // permission layer stops it reaching a forbidden path; this answers the
+      // different question of whether the change is inside the work it was given.
+      // A model that argued its way to a plausible edit outside its territory
+      // still does not get it published.
+      if (r.outcome === OUTCOMES.OK) {
+        const changed = changedFiles(worktree);
+        const gate = reviewDiff({ files: changed, profile, lane });
+        if (!gate.ok) {
+          log(logPath, `  #${e.pr}: NOT published — ${gate.why}`);
+          escalations.set(`#${e.pr}: a fix was produced but refused publication — ${gate.why}`, 1);
+        } else {
+          log(logPath, `  #${e.pr}: diff accepted (${changed.length} file(s)) — ready to publish`);
+        }
+      }
 
       // A worker whose tools were denied wrote a plausible answer it could not
       // support. Treating that as progress is the fail-open this exists to close.

@@ -93,7 +93,7 @@ function killGroup(pid, signal) {
  * an inherited setting is one a future default can silently change.
  */
 export function workerArgs({ prompt, cwd, agent = null, allowedTools = null, settingSources = null,
-                             maxTurns = null, model = null, sessionId = null, resume = null }) {
+                             settings = null, maxTurns = null, model = null, sessionId = null, resume = null }) {
   const a = ["-p", prompt, "--output-format", "stream-json",
              // Required: without --verbose the process exits 1 and writes NOTHING
              // to stdout, which is indistinguishable from a hang.
@@ -102,6 +102,10 @@ export function workerArgs({ prompt, cwd, agent = null, allowedTools = null, set
   if (model) a.push("--model", model);
   if (maxTurns != null) a.push("--max-turns", String(maxTurns));
   if (allowedTools) a.push("--allowedTools", allowedTools);
+  // The deterministic half of the boundary. The allowlist above scopes what may
+  // run; this file carries the profile's forbidden commands and quarantined paths
+  // as rules the CLI enforces, rather than as prose the model is asked to respect.
+  if (settings) a.push("--settings", settings);
   // `--setting-sources project` cuts the preamble ~8x (31,647 -> 3,845 cache-creation
   // tokens, $0.3166 -> $0.0386 for one reply) but strips plugin-shipped agents, so it
   // is only safe for a worker that needs none.

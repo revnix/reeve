@@ -10,11 +10,19 @@
        is purely a shell function. A bare `node` here fails with exit 78 EX_CONFIG
        and writes NOTHING to the stderr log, so the log cannot tell you why.
        Diagnose with: launchctl print gui/$(id -u)/com.revnix.reeve -->
+  <!-- The repository is stated, never inferred. `reeve run` with no positional
+       falls back to reading WorkingDirectory's git remote, which points the daemon
+       at whatever checkout it happens to start in: the first version of this file
+       parsed perfectly and spent every tick watching revnix/reeve, where the App
+       is not installed, so every publish returned HTTP 404 and no evidence
+       accumulated. Neither --enforce nor --execute appears: the shadow week runs
+       on neutral conclusions with no dispatch, and both are opt-in. -->
   <key>ProgramArguments</key>
   <array>
     <string>/Users/mobeen/.nvm/versions/node/v24.17.0/bin/node</string>
     <string>/Users/mobeen/Work/Products/reeve/bin/reeve</string>
     <string>run</string>
+    <string>nextlyhq/nextly</string>
   </array>
 
   <!-- v24 is required for node:sqlite to be unflagged and unwarned. The shell

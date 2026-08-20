@@ -195,7 +195,7 @@ Six phases, all complete. Measured at the time of writing:
 - **1,067 lines of tests** across 10 `test/*.test.mjs` — excludes 4 helper files in `test/`
   that are fixtures, not tests (`claimworker2.mjs`, `crashdrain.mjs`, `reconcile.demo.mjs`,
   `seed.mjs`)
-- **291 assertions passing, 0 failing** across 15 test files
+- **379 assertions passing, 0 failing** across 22 test files
 - **4 profiles** written (nextly, rext-backend, 21century, reeve)
 - **The launchd agent is installed and running** as of 2026-08-20 16:29 UTC — shadow mode,
   `--execute` off, watching `nextlyhq/nextly`. See §7.
@@ -373,6 +373,70 @@ but do not cite a `status` screen as current truth without re-ticking.
 - **The ruleset flip**, after that plus green main. This is the riskiest remaining step: work in
   flight starts blocking and it will feel like the system got worse. That is the moment a bypass
   gets reopened and the programme dies. Do not skip the shadow week.
+
+### 8.1b The Codex audit — what is closed and what is not
+
+`docs/2026-08-20-reeve-comprehensive-audit.md` is an independent audit of this
+repo. **Ten of its claims were re-verified by hand and all ten held.** It is
+accurate; treat its remaining items as real.
+
+**Closed 2026-08-20**, each with a test that failed on the broken code first:
+
+| Audit finding | State |
+|---|---|
+| P0 settlement was one API read replayed three times | **fixed** — persisted per PR, folded once per tick, proven live |
+| P0 reeve read its own verdict as CI evidence | **fixed** inside `readChecks`, so no caller can forget |
+| P0 the retry brake was non-functional | **fixed** — durable, counted against a head-independent cause |
+| P0 durable state not connected to execution | **fixed** — a run is now the only way a worker may start |
+| P1 status freshness lied when the daemon stopped | **fixed** — measured against the clock, plus a liveness banner |
+| P2 a new check run every tick | **fixed** — the run at the head is updated |
+| P2 the lifecycle test could not fail CI | **fixed** — it printed FAIL and exited 0 |
+
+**A verification pass then found the fixes themselves were partly wrong**, which
+is the single most useful thing that happened all session:
+
+- `cause`/`fp` were declared in the per-PR loop and read from the dispatch loop —
+  **every `FIX_CI` would have thrown a ReferenceError** under `--execute`. Every
+  unit test around it was green, because nothing drove the dispatch path at all.
+  `test/dispatch-e2e.test.mjs` now does, with the collaborators injectable.
+- The settlement **floor carried across heads**, so a PR whose new revision runs
+  fewer workflows could never settle. Both my new test and an older one had
+  pinned that latch as if it were the intent.
+- Excluding the policy check **dropped every head's count by one**, below floors
+  recorded when it still counted — measured live on all five open PRs. Floors now
+  carry a `CHECK_ACCOUNTING` version and are discarded when it changes.
+- That exposed a general gap: `schema.sql` is all `CREATE ... IF NOT EXISTS`, so
+  **an existing database can never gain a COLUMN**. `open()` now adds declared
+  missing columns.
+- Escalations were **retired on absence** — a PR a tick could not evaluate read as
+  resolved.
+
+**Still open from the audit, in the order it recommends:**
+
+1. **P0 — worker safety is still a prompt boundary.** Risk paths, forbidden
+   commands and lane territory are rendered as prose into the worker's prompt,
+   and fix workers get unrestricted `Read,Edit,Write,Grep,Glob,Bash`. Nothing
+   deterministic stops a forbidden command, a write outside its territory, an
+   edit to `.github`, or a push that was never diff-checked. **This is the last
+   thing standing between here and `--execute`.**
+2. P1 worktree lifecycle — reeve validates a path, it does not create, verify,
+   own or reap a per-PR checkout.
+3. P1 the review actions (`REQUEST_REVIEW`, `FIX_FINDINGS`, `SPILL`) are
+   executable but their data is not ready — `rounds.n` counts one reviewer's
+   latest head, `unspilledCritical` is hard-coded zero. **Feature-gate them off.**
+4. P1 `inheritedOrCaused` compares check NAMES, not failures.
+5. P1 a cancelled ancillary job vetoes the base forever.
+6. P1 clean-merge rate reads only check runs, counts an empty set as clean, and
+   **is never computed by the daemon at all** — the dashboard headline is always
+   blank.
+7. P1 `node.status` has no `pending`, so the founder-decisions band is a
+   permanently empty query.
+8. P1 state is keyed by short repo name — `owner-a/api` and `owner-b/api` collide.
+9. P1 caps: 20 open PRs silently, no pagination past 100, `doctor` hard-codes `main`.
+10. P2 CLI/doc contradictions: `run --tick` is documented but inert,
+    `doctor --as-app` does nothing, `profile.statePath` vs `state.location`.
+11. P2 no external alert sink — "needs you" reaches a local log and nothing else.
+12. P2 no README, install guide, architecture note or runbook at the repo root.
 
 ### 8.2 Real remaining code, roughly in order
 

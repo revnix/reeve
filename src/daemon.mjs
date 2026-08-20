@@ -73,14 +73,28 @@ function attemptsFor(db, nwo, pr, fp, logPath) {
  * from anything the worker says about itself: the whole point of this gate is
  * that the actor does not get to be the only witness.
  */
-function changedFiles(worktree) {
-  try {
-    const out = execFileSync("git", ["-C", worktree, "status", "--porcelain"], { encoding: "utf8" }).trim();
-    if (!out) return [];
-    // Porcelain v1: two status columns, a space, then the path. A rename carries
-    // "old -> new"; the new name is the one that matters.
-    return out.split("\n").map(l => l.slice(3).trim().split(" -> ").pop()).filter(Boolean);
-  } catch { return null; }   // null means "could not ask", which reviewDiff refuses
+function changedFiles(worktree, since = null) {
+  const run = args => {
+    try { return execFileSync("git", ["-C", worktree, ...args], { encoding: "utf8" }).trim(); }
+    catch { return null; }
+  };
+
+  // Uncommitted work, for a worker that stopped part-way.
+  const dirty = run(["status", "--porcelain"]);
+  if (dirty === null) return null;   // could not ask, which reviewDiff refuses on its own terms
+  // Porcelain v1: two status columns, a space, then the path. A rename carries
+  // "old -> new"; the new name is the one that matters.
+  const uncommitted = dirty ? dirty.split("\n").map(l => l.slice(3).trim().split(" -> ").pop()).filter(Boolean) : [];
+
+  // And COMMITTED work, which is what a worker that finished produces. The prompt
+  // tells it to commit; committing leaves a clean tree; and reading only the tree
+  // therefore reported a complete, correct, committed fix as "nothing was changed"
+  // and refused to publish it. The instrument could not represent the success case
+  // it was written to check.
+  const committed = since ? (run(["diff", "--name-only", `${since}..HEAD`]) ?? "") : "";
+  const fromCommits = committed ? committed.split("\n").filter(Boolean) : [];
+
+  return [...new Set([...fromCommits, ...uncommitted])];
 }
 
 export function log(logPath, line) {
@@ -329,7 +343,7 @@ export async function tick(ctx) {
       // before committing. The fix was correct, cost real money, and would have
       // blocked every later attempt while looking like nothing had happened.
       if (r.outcome !== OUTCOMES.OK) {
-        const left = changedFiles(worktree);
+        const left = changedFiles(worktree, e.head);
         if (left?.length) {
           const rel = releaseWorktree({ path: worktree, pr: e.pr });
           log(logPath, `  #${e.pr}: the worker left ${left.length} changed file(s) unfinished — ${rel.quarantined ? `preserved at ${rel.path}` : "released"}`);
@@ -340,7 +354,7 @@ export async function tick(ctx) {
       }
 
       if (r.outcome === OUTCOMES.OK) {
-        const changed = changedFiles(worktree);
+        const changed = changedFiles(worktree, e.head);
         const gate = reviewDiff({ files: changed, profile, lane });
         if (!gate.ok) {
           log(logPath, `  #${e.pr}: NOT published — ${gate.why}`);

@@ -151,6 +151,33 @@ let wt;
   check(existsSync(join(rel.path, "half-done.txt")), "and the unfinished file is still there", rel.path);
   const fresh = acquireWorktree({ repoRoot: repo, root: roots, pr: 9, branch: "feature2", head: git(repo, "rev-parse", "origin/feature2") });
   check(fresh.ok, "so the next attempt gets a clean one instead of being stuck", JSON.stringify(fresh));
+  // Hand the branch back, or the next case cannot check it out — git allows one
+  // worktree per branch, which is the same constraint the quarantine case proved.
+  releaseWorktree({ path: fresh.path, pr: 9 });
+}
+
+
+// The diff gate must see COMMITTED work, not only uncommitted work.
+//
+// The prompt tells a worker to commit. Committing leaves a clean tree. A gate that
+// reads `git status --porcelain` therefore reported a complete, correct, committed
+// fix as "the worker produced an empty diff -- nothing was changed" and refused to
+// publish it. The instrument could not represent the success case it existed to
+// check, and it failed CLOSED, which is the right direction and still wrong.
+{
+  const r4 = acquireWorktree({ repoRoot: repo, root: roots, pr: 11, branch: "feature2", head: git(repo, "rev-parse", "origin/feature2") });
+  check(r4.ok, "control: a worktree to work in", JSON.stringify(r4));
+  const pinned = git(r4.path, "rev-parse", "HEAD");
+
+  writeFileSync(join(r4.path, "fixed.txt"), "the fix\n");
+  git(r4.path, "add", "-A");
+  git(r4.path, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "fix: the worker committed its work");
+
+  check(git(r4.path, "status", "--porcelain") === "",
+    "control: after committing, the working tree is CLEAN — which is why a status-only gate saw nothing");
+  const committed = git(r4.path, "diff", "--name-only", `${pinned}..HEAD`).split("\n").filter(Boolean);
+  check(committed.includes("fixed.txt"),
+    "but comparing against the pinned head shows the change", JSON.stringify(committed));
 }
 
 rmSync(base, { recursive: true, force: true });

@@ -82,7 +82,11 @@ export function nextAction(e, p, h = {}) {
     const tried = fp ? (h.fixAttempts?.get?.(fp) ?? 0) : 0;
     const cap = p.rounds?.maxFixAttemptsPerFinding ?? 1;
     if (tried >= cap) return act(ACTIONS.ESCALATE, ESCALATIONS.REPEATED_FAILURE, { fingerprint: fp, tried });
-    return act(ACTIONS.FIX_CI, `failing: ${caused.join(", ") || ci.detail}`, { caused, attempt: tried + 1 });
+    // Built only from names that exist. An unnamed failure is not dispatchable —
+    // a fixer cannot be told to repair "undefined" — so it escalates instead.
+    const named = caused.filter(n => typeof n === "string" && n.length > 0);
+    if (!named.length) return act(ACTIONS.ESCALATE, `a check is failing but reeve could not name it: ${ci.detail}`, { unnamed: true });
+    return act(ACTIONS.FIX_CI, `failing: ${named.join(", ")}`, { caused: named, attempt: tried + 1 });
   }
 
   // 4. Anything still in flight: wait. But an UNKNOWN that never resolves is a

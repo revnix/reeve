@@ -60,7 +60,7 @@ export function computeVerdict(i) {
   else if (i.checks.verdict === "GREEN") add("ci", PASS, "all checks passing at the pinned head");
   else if (i.checks.verdict === "MISSING_REQUIRED") add("ci", BLOCK, i.checks.why);
   else if (i.checks.verdict === "RED") {
-    const names = (i.checks.failing ?? []).map(f => f.name).join(", ");
+    const names = (i.checks.failing ?? []).map(f => f?.name).filter(Boolean).join(", ") || "an unnamed check";
     // Inherited red is still red for THIS gate: merging it does not make the base
     // worse, but it also cannot be called green. The scheduler decides whether to
     // proceed; the verdict only reports.

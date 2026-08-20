@@ -1,13 +1,43 @@
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
+import { CHECK_ACCOUNTING } from "../github/reconciler.mjs";
 import { hostname } from "node:os";
 
 export const LEASE_SECONDS = 120;      // short: heartbeat is cheap, reaping should be fast
 export const HEARTBEAT_SECONDS = 30;   // renew at 1/4 lease
 
+/**
+ * Columns added to tables that already exist.
+ *
+ * schema.sql is entirely CREATE ... IF NOT EXISTS, which adds a new TABLE to an
+ * existing database and does NOTHING for a new column, because the table is
+ * already there. That gap was found only when `settlement.accounting` failed to
+ * appear on the live store -- the next daemon start would have thrown on a
+ * database holding a thousand events of real history.
+ *
+ * Additive and defaulted only. Anything that rewrites data belongs in a
+ * deliberate migration, not in the connection path.
+ */
+const ADDED_COLUMNS = [
+  ["settlement", "accounting", "INTEGER NOT NULL DEFAULT 0"],
+];
+
+function addMissingColumns(db) {
+  for (const [table, column, decl] of ADDED_COLUMNS) {
+    let names;
+    try { names = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name); }
+    catch { continue; }
+    // No rows means the table does not exist; schema.sql has just created it with
+    // the column already present, so there is nothing to add.
+    if (!names.length || names.includes(column)) continue;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  }
+}
+
 export function open(path) {
   const db = new DatabaseSync(path, { timeout: 10000 });
   db.exec(readFileSync(new URL("./schema.sql", import.meta.url), "utf8"));
+  addMissingColumns(db);
   return db;
 }
 
@@ -215,9 +245,13 @@ export function exportJsonl(db, { sinceSeq = 0 } = {}) {
  * which settle() reads as a first observation.
  */
 export function loadSettlement(db, nwo, pr) {
-  const r = db.prepare(`SELECT sha, key, streak, floor, first_seen_at, last_seen_at
+  const r = db.prepare(`SELECT sha, key, streak, floor, first_seen_at, last_seen_at, accounting
                         FROM settlement WHERE nwo=? AND pr=?`).get(nwo, pr);
   if (!r) return null;
+  // A floor recorded under a different notion of what counts as a check is not
+  // comparable. Treating it as a first observation costs three ticks of
+  // re-corroboration; comparing against it costs a PR that can never settle.
+  if (r.accounting !== CHECK_ACCOUNTING) return null;
   return {
     sha: r.sha, key: r.key, streak: r.streak, floor: r.floor,
     // Rebuilt from the key rather than stored twice, so the two cannot disagree.
@@ -231,13 +265,13 @@ export function loadSettlement(db, nwo, pr) {
 export function saveSettlement(db, nwo, pr, next, at = Math.floor(Date.now() / 1000)) {
   const prior = db.prepare("SELECT sha, first_seen_at FROM settlement WHERE nwo=? AND pr=?").get(nwo, pr);
   const firstSeen = prior && prior.sha === next.sha ? prior.first_seen_at : at;
-  db.prepare(`INSERT INTO settlement(nwo,pr,sha,key,streak,floor,first_seen_at,last_seen_at)
-              VALUES(?,?,?,?,?,?,?,?)
+  db.prepare(`INSERT INTO settlement(nwo,pr,sha,key,streak,floor,first_seen_at,last_seen_at,accounting)
+              VALUES(?,?,?,?,?,?,?,?,?)
               ON CONFLICT(nwo,pr) DO UPDATE SET
                 sha=excluded.sha, key=excluded.key, streak=excluded.streak,
                 floor=excluded.floor, first_seen_at=excluded.first_seen_at,
-                last_seen_at=excluded.last_seen_at`)
-    .run(nwo, pr, next.sha, next.key, next.streak, next.floor, firstSeen, at);
+                last_seen_at=excluded.last_seen_at, accounting=excluded.accounting`)
+    .run(nwo, pr, next.sha, next.key, next.streak, next.floor, firstSeen, at, CHECK_ACCOUNTING);
   return { ...next, firstSeenAt: firstSeen, lastSeenAt: at };
 }
 

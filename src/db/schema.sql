@@ -184,6 +184,9 @@ CREATE TABLE IF NOT EXISTS settlement (
   floor         INTEGER NOT NULL,   -- high-water check count for this PR, across heads
   first_seen_at INTEGER NOT NULL,   -- when THIS head was first observed
   last_seen_at  INTEGER NOT NULL,
+  -- Which definition of "a check" the floor was recorded under. A floor from an
+  -- older accounting is discarded, not compared against.
+  accounting    INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (nwo, pr)) STRICT;
 
 -- An escalation is an event, not a state. This table holds the set currently

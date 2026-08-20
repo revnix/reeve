@@ -131,6 +131,28 @@ let wt;
     git(repo, "worktree", "list"));
 }
 
+
+// A worker that stops mid-task leaves the checkout dirty, and the next attempt
+// cannot use it -- verifyWorktree refuses, correctly, and the pull request is then
+// stuck with no path out. Measured live: a worker repaired the planted bug and hit
+// its turn limit before committing, leaving a correct fix that cost real money and
+// blocked every later attempt while looking like nothing had happened.
+//
+// Releasing a dirty worktree preserves it instead of deleting it, which is what
+// makes recovering the work possible at all.
+{
+  const r3 = acquireWorktree({ repoRoot: repo, root: roots, pr: 9, branch: "feature2", head: git(repo, "rev-parse", "origin/feature2") });
+  check(r3.ok, "control: a worktree for an unfinished worker", JSON.stringify(r3));
+  writeFileSync(join(r3.path, "half-done.txt"), "a fix the worker never committed\n");
+  check(!verifyWorktree({ path: r3.path, branch: "feature2" }).ok,
+    "control: while dirty, the next attempt cannot use it");
+  const rel = releaseWorktree({ path: r3.path, pr: 9 });
+  check(!rel.ok && rel.quarantined, "releasing it preserves the work rather than deleting it", JSON.stringify(rel));
+  check(existsSync(join(rel.path, "half-done.txt")), "and the unfinished file is still there", rel.path);
+  const fresh = acquireWorktree({ repoRoot: repo, root: roots, pr: 9, branch: "feature2", head: git(repo, "rev-parse", "origin/feature2") });
+  check(fresh.ok, "so the next attempt gets a clean one instead of being stuck", JSON.stringify(fresh));
+}
+
 rmSync(base, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

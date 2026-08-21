@@ -303,10 +303,10 @@ fifteen lines and named the cause in one run.
 | No backup | One copy on one laptop |
 | No alert sink | "Needs you" reached a local log only |
 
-### 6.5 The third session: three more defects, all found by USING it
+### 6.5 The third session: five more defects, all found by USING it
 
-The verification in §10 and two more `--execute` dispatches found three defects
-that 576 passing assertions did not. Every one was found by running the system
+The verification in §10, three more `--execute` dispatches and one notification
+arriving on a phone found five defects that 576 passing assertions did not. Every one was found by running the system
 and reading what it actually stored, not by reading code.
 
 **The failure identity could not tell two failures apart.** The daemon
@@ -353,6 +353,17 @@ gate now refuses a repair whose entire diff is tests, because the design rule is
 that the actor is never the only witness, and "the worker chose well" is the
 actor being the only witness. Adding a test beside a source fix stays allowed:
 the prompt requires one.
+
+**A fifth, delivered by the notification channel itself.** An escalation was
+retired whenever a tick evaluated its PR and produced no escalation that round.
+But `WAIT` means "something is in flight; check again later", not "the thing a
+human was needed for is resolved". nextly #834 ran ESCALATE, seven ticks of WAIT
+while CI was in flight, then ESCALATE again -- so one unchanged condition was
+announced, retired and re-announced twice, four and twenty-five minutes apart,
+with the reason string identical each time. #1011 and #1127 did the same, and a
+third instance arrived while the fix was being written. Two pushes for one
+unchanged condition is how a channel earns being muted. **Sixth instance of the
+§4.2 class**: absence within one tick read as resolution.
 
 **What that says about the shape of the remaining risk.** Three sessions have now
 produced the same pattern: the defects that matter are not found by reading code

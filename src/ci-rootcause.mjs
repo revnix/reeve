@@ -114,6 +114,21 @@ export function logSlice(nwo, checkRunId, step, { maxLines = 120 } = {}) {
   };
 }
 
+/**
+ * A line announcing a PASS, whatever words follow it.
+ *
+ * The failure patterns match on words, and a test NAME may contain them. This
+ * repository asserts "cancelled is an absence, failed is a fact", so the PASSING
+ * line for it matched /failed/i and was recorded as a cause of a red build --
+ * measured in the fix-attempt ledger for PR #2. That is worse than noise: a
+ * worker told to change the least that fixes the cause was being pointed at
+ * green code. It also churned the failure identity, because renaming an
+ * unrelated test then changed the key and refunded the retry brake an attempt.
+ *
+ * `ok` covers TAP, where a failure reads "not ok" and so is not excluded.
+ */
+const ANNOUNCES_PASS = /^\s*(PASS|ok|✓|✔|√)\b/;
+
 /** Lines a human or an agent would actually act on. */
 export function salientLines(text, limit = 25) {
   const patterns = [
@@ -123,7 +138,9 @@ export function salientLines(text, limit = 25) {
   ];
   const hits = [];
   for (const line of text.split("\n")) {
-    if (patterns.some(re => re.test(line))) hits.push(line.replace(/\[[0-9;]*m/g, "").trimEnd());
+    const clean = line.replace(/\x1b\[[0-9;]*m/g, "");
+    if (ANNOUNCES_PASS.test(clean)) continue;
+    if (patterns.some(re => re.test(clean))) hits.push(clean.trimEnd());
     if (hits.length >= limit) break;
   }
   return hits;

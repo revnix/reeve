@@ -102,10 +102,38 @@ export function excludeOwnPolicy(rows, context = POLICY_CONTEXT, app = POLICY_AP
 }
 
 /**
+ * A reviewer's commit status is not CI evidence, whatever it says.
+ *
+ * CodeRabbit reports state=success with the truth in the description -- measured
+ * on 8 of 9 sampled final heads as "Review rate limited", and in a second shape
+ * as "Review completed" for a path-filter SKIP that reviewed no file at all. The
+ * description was carried here precisely because the truth hides in it, and
+ * nothing downstream ever read it, so a rate-limited reviewer counted as a
+ * passing check.
+ *
+ * Reading the description would be a third guess at a string the vendor is free
+ * to change. The honest rule is categorical: a reviewer's status belongs to the
+ * REVIEW pipeline, which knows how to say "refused" and "absent", and never to
+ * check classification, which only knows how to say "passing".
+ */
+export function excludeReviewerContexts(rows, contexts = []) {
+  if (!contexts.length) return { rows, reviewerRows: [] };
+  const set = new Set(contexts);
+  const rest = [], reviewerRows = [];
+  for (const r of rows) (set.has(r.name) ? reviewerRows : rest).push(r);
+  return { rows: rest, reviewerRows };
+}
+
+/**
  * Every check at a SHA, from both surfaces. Returns rows normalised to
  * {name, source, state, conclusion, id}. `state` is "completed" or "running".
+ *
+ * `reviewerContexts` comes from the profile. It is applied HERE, beside the
+ * own-policy exclusion and for the same reason: the base head is read through
+ * this same function, and a caller that forgot would reintroduce the fail-open
+ * silently. test/reviewer-status.test.mjs asserts every call site supplies it.
  */
-export function readChecks(nwo, sha) {
+export function readChecks(nwo, sha, { reviewerContexts = [] } = {}) {
   const rows = [];
   // JSON, not TSV. A commit-status description may contain a newline or a tab,
   // and a TSV parse then splits it into a phantom row whose "name" is a fragment
@@ -138,7 +166,11 @@ export function readChecks(nwo, sha) {
   // Filtered HERE rather than by each caller: the base head is read through this
   // same function, and a caller that forgot would reintroduce the latch silently.
   const own = excludeOwnPolicy(rows);
-  return { ok: cr.ok || st.ok, rows: own.rows, excluded: own.excluded, impostors: own.impostors,
+  // Reviewer rows are RETURNED, never dropped: the review pipeline reads them as
+  // evidence about the reviewer, and a signal that vanishes cannot be reported.
+  const rev = excludeReviewerContexts(own.rows, reviewerContexts);
+  return { ok: cr.ok || st.ok, rows: rev.rows, reviewerRows: rev.reviewerRows,
+           excluded: own.excluded, impostors: own.impostors,
            why: cr.ok || st.ok ? null : (cr.err || st.err) };
 }
 
@@ -357,7 +389,7 @@ export function reconcilePr(db, { nwo, pr, profile = {} }) {
 export function inheritedOrCaused(nwo, baseBranch, failingRows, io = {}) {
   const { maxProbes = 3 } = io;
   const pinBase = io.pinBase ?? (() => pinHead(nwo, baseBranch));
-  const readBase = io.readBase ?? (sha => readChecks(nwo, sha));
+  const readBase = io.readBase ?? (sha => readChecks(nwo, sha, { reviewerContexts: io.reviewerContexts ?? [] }));
   // Injected rather than imported: ci-rootcause imports from here, and resolving
   // a cause is the expensive half, so it must be substitutable in a test.
   const resolveCause = io.resolveCause ?? null;

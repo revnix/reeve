@@ -89,6 +89,14 @@ const REVIEWER = v => {
   // state=success, and an uninstalled Greptile reports nothing at all. Both are
   // byte-identical to "found no problems" unless something counts refusals.
   const r = isStr(v.refusal); if (r) return `refusal ${r} (required: absence must be distinguishable from approval)`;
+  // Optional, and each a regex the core compiles: commitPattern names the
+  // revision a clean pass claims to have read; clean recognises the pass itself.
+  for (const k of ["commitPattern", "clean", "trigger"]) {
+    if (v[k] !== undefined) { const e = isStr(v[k]); if (e) return `${k} ${e}`; }
+    if (typeof v[k] === "string") {
+      try { new RegExp(v[k]); } catch (err) { return `${k} is not a valid regex: ${err.message}`; }
+    }
+  }
   return null;
 };
 
@@ -132,6 +140,12 @@ export const FIELDS = {
   "ci.appSlug":            [false, isStr],
   "ci.provider":            [true,  isStr],            // "github-actions" | "none"
   "ci.requiredChecks":      [false, isArr(isStr)],     // LITERAL names: matrix names expand at runtime
+  // Commit-status contexts published by REVIEWERS. Excluded from check
+  // classification entirely: a rate-limited CodeRabbit reports state=success with
+  // the truth in the description, so a reviewer's status read as CI is a fail-open
+  // by construction. These rows still reach the review pipeline, which can say
+  // "refused"; classification only knows how to say "passing".
+  "ci.reviewerStatusContexts": [false, isArr(isStr)],
   "ci.flakePatterns":       [false, isArr(isStr)],
 
   "merge.method":           [true,  oneOf(MERGE_METHOD)],  // MEASURED from parent counts, not settings
@@ -171,6 +185,10 @@ export const FIELDS = {
   "watch.workerBudgetMinutes":   [false, isInt],
   "watch.maxTurns":              [false, isInt],
   "watch.unknownEscalateSeconds":[false, isInt],
+  // How old evidence may be before a clause refuses to answer from it. Defaulted
+  // rather than optional: an unset staleness bound is an INFINITE one, and a
+  // gate that will answer from evidence of any age is not a freshness gate.
+  "watch.staleSeconds":     [false, isInt],
   "watch.intervalSeconds":       [false, isInt],
 
   "tools.codeHealth":       [false, isArr(isStr)],     // fallow is JS-only; Python needs ruff+vulture
@@ -280,9 +298,15 @@ export function validate(profile) {
 }
 
 /** Apply kind defaults for fields the profile left unset. Never overrides. */
+/**
+ * Defaults that hold whatever the project is. A per-kind default would leave the
+ * key unset for any kind that forgot it, and unset here means Infinity.
+ */
+const UNIVERSAL_DEFAULTS = { "watch.staleSeconds": 900 };
+
 export function withDefaults(profile) {
   const kind = get(profile, "project.kind");
-  const defaults = KIND_DEFAULTS[kind] ?? {};
+  const defaults = { ...UNIVERSAL_DEFAULTS, ...(KIND_DEFAULTS[kind] ?? {}) };
   const out = structuredClone(profile);
   for (const [path, value] of Object.entries(defaults)) {
     if (get(out, path) !== undefined) continue;

@@ -167,6 +167,7 @@ CREATE TABLE IF NOT EXISTS fix_attempt (
   first_at INTEGER NOT NULL,
   last_at  INTEGER NOT NULL,
   last_sha TEXT,
+  note     TEXT,                              -- what the last worker needed a human FOR
   PRIMARY KEY (nwo, pr, cause)) STRICT;
 
 -- Settlement across REAL ticks. settle() is a pure reducer that needs the

@@ -20,6 +20,10 @@ export const HEARTBEAT_SECONDS = 30;   // renew at 1/4 lease
  */
 const ADDED_COLUMNS = [
   ["settlement", "accounting", "INTEGER NOT NULL DEFAULT 0"],
+  // What the last worker said it needed a human FOR. Carried so the escalation
+  // after the retry cap can say why no fix was possible, rather than claiming a
+  // fix was tried and survived when the worker never attempted one.
+  ["fix_attempt", "note", "TEXT"],
 ];
 
 function addMissingColumns(db) {
@@ -286,13 +290,38 @@ export function countFixAttempts(db, nwo, pr, cause) {
  * the head it was last seen at -- the count answers "has this survived a fix?",
  * the head answers "where do I go and look?".
  */
-export function recordFixAttempt(db, nwo, pr, cause, sha, at = Math.floor(Date.now() / 1000)) {
-  db.prepare(`INSERT INTO fix_attempt(nwo,pr,cause,attempts,first_at,last_at,last_sha)
-              VALUES(?,?,?,1,?,?,?)
+export function recordFixAttempt(db, nwo, pr, cause, sha, at = Math.floor(Date.now() / 1000), note = null) {
+  db.prepare(`INSERT INTO fix_attempt(nwo,pr,cause,attempts,first_at,last_at,last_sha,note)
+              VALUES(?,?,?,1,?,?,?,?)
               ON CONFLICT(nwo,pr,cause) DO UPDATE SET
-                attempts = attempts + 1, last_at = excluded.last_at, last_sha = excluded.last_sha`)
-    .run(nwo, pr, cause, at, at, sha ?? null);
+                attempts = attempts + 1, last_at = excluded.last_at, last_sha = excluded.last_sha,
+                -- An attempt that said nothing must not erase what the last one said.
+                note = COALESCE(excluded.note, fix_attempt.note)`)
+    .run(nwo, pr, cause, at, at, sha ?? null, note);
   return countFixAttempts(db, nwo, pr, cause);
+}
+
+/**
+ * Attach the reason a worker gave for stopping, after the fact.
+ *
+ * The attempt itself is spent at DISPATCH -- before any worker exists -- so the
+ * reason cannot be written with it. Reading a not-yet-assigned result there threw
+ * a ReferenceError on every FIX_CI, which is the same shape as the cause/fp bug
+ * the dispatch end-to-end test was written for, and the same test caught it.
+ */
+export function noteFixAttempt(db, nwo, pr, cause, note) {
+  if (!note) return;
+  try {
+    db.prepare("UPDATE fix_attempt SET note=? WHERE nwo=? AND pr=? AND cause=?").run(note, nwo, pr, cause);
+  } catch { /* a note is an explanation, never a reason to fail a tick */ }
+}
+
+/** What the last worker on this cause said it needed a human for, or null. */
+export function fixAttemptNote(db, nwo, pr, cause) {
+  try {
+    const r = db.prepare("SELECT note FROM fix_attempt WHERE nwo=? AND pr=? AND cause=?").get(nwo, pr, cause);
+    return r?.note ?? null;
+  } catch { return null; }
 }
 
 // ------------------------------------------------------------- runs for a PR

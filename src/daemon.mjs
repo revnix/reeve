@@ -17,14 +17,14 @@
 import { evaluatePr, publishVerdict } from "./pr.mjs";
 import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
-import { capacity, stayAwake, halted, runWorker, workerArgs, OUTCOMES } from "./supervisor.mjs";
+import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
 import { promptFor } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, resolveFailureCause } from "./ci-rootcause.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { snapshot } from "./backup.mjs";
 import { execFileSync } from "node:child_process";
@@ -282,7 +282,15 @@ export async function tick(ctx) {
     // A shared cause is one problem, not N. Four PRs blocked on a red base is a
     // single escalation, or the phone becomes noise and gets muted.
     if (decision.shared) escalations.set(decision.why, (escalations.get(decision.why) ?? 0) + 1);
-    else if (decision.action === ACTIONS.ESCALATE) escalations.set(`#${pr}: ${decision.why}`, 1);
+    else if (decision.action === ACTIONS.ESCALATE) {
+      // "The same failure survived a second fix" assumes a fix was attempted. When
+      // the previous worker declined -- because the change belonged to a human --
+      // nothing survived anything, and a founder reading that goes looking for a
+      // bad fix that was never made. The reason it gave is carried on the ledger
+      // row for exactly this moment.
+      const note = fp ? fixAttemptNote(db, nwo, pr, fp) : null;
+      escalations.set(note ? `#${pr}: needs a human — ${note}` : `#${pr}: ${decision.why}`, 1);
+    }
   }
 
   if (execute) {
@@ -423,12 +431,25 @@ export async function tick(ctx) {
         }
       }
 
+      // Attached now rather than at dispatch: the reason only exists once the
+      // worker has spoken, and it is what the retry cap will quote when it fires.
+      if (decision.action === "FIX_CI" && fp) noteFixAttempt(db, nwo, e.pr, fp, statedBlocker(r.report));
+
       if (r.outcome === OUTCOMES.OK) {
         const changed = changedFiles(worktree, e.head);
         const gate = reviewDiff({ files: changed, profile, lane, action: decision.action });
         if (!gate.ok) {
           log(logPath, `  #${e.pr}: NOT published — ${gate.why}`);
-          escalations.set(`#${e.pr}: a fix was produced but refused publication — ${gate.why}`, 1);
+          // A worker that DECLINED is not a worker that failed. Told to stop when
+          // a fix belongs in a sensitive path, it stops and says why -- and
+          // reporting that as "a fix was produced but refused publication --
+          // empty diff" states two things that cannot both be true, about the
+          // one outcome the rules asked for. Its own reason is the only witness
+          // to why it stopped, so it is the one a human is given.
+          const blocker = statedBlocker(r.report);
+          escalations.set(blocker
+            ? `#${e.pr}: needs a human — ${blocker}`
+            : `#${e.pr}: a fix was produced but refused publication — ${gate.why}`, 1);
         } else {
           // reeve publishes, not the worker: the actor and the only claim that
           // the action was allowed must not be the same party.

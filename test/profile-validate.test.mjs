@@ -117,5 +117,46 @@ expectRefusal("the wrong schemaVersion",
   if (missing.length) { console.log("        undeclared:", missing.join(", ")); fail++; }
 }
 
+
+// ── a lane that can never act ────────────────────────────────────────────────
+//
+// Measured live: the release lane's whole territory sat in sensitivePaths, and
+// sensitive refuses before territory is read -- a mechanism dead by
+// construction, visible to nobody. The validator now names it. sensitiveOk is
+// the explicit way out, and it must be a boolean, not a truthy accident.
+{
+  const dead = clone(base);
+  dead.risk = { sensitivePaths: [".changeset/**", "scripts/release/**"] };
+  dead.lanes = [{ id: "release", territory: [".changeset/**", "scripts/release/**"] }];
+  const r = validate(withDefaults(dead));
+  const hit = r.warnings.some(w => /release.*can never act/.test(w));
+  console.log(`${hit ? "PASS" : "FAIL"}  warns: a lane wholly inside sensitivePaths can never act`);
+  if (!hit) { console.log("        warnings:", JSON.stringify(r.warnings)); fail++; }
+
+  dead.lanes[0].sensitiveOk = true;
+  const ok = validate(withDefaults(dead));
+  const silent = !ok.warnings.some(w => /can never act/.test(w));
+  console.log(`${silent ? "PASS" : "FAIL"}  and sensitiveOk silences exactly that warning`);
+  if (!silent) fail++;
+
+  // A PARTLY sensitive territory is not dead -- the lane can still act on the
+  // rest -- so it must not warn.
+  const part = clone(base);
+  part.risk = { sensitivePaths: [".changeset/**"] };
+  part.lanes = [{ id: "release", territory: [".changeset/**", "scripts/release/**"] }];
+  const pr = validate(withDefaults(part));
+  const quiet = !pr.warnings.some(w => /can never act/.test(w));
+  console.log(`${quiet ? "PASS" : "FAIL"}  a partly-sensitive territory does not warn`);
+  if (!quiet) fail++;
+}
+
+expectRefusal("a lane whose sensitiveOk is not a boolean",
+  (() => { const p = clone(base); p.lanes = [{ id: "release", territory: ["x/**"], sensitiveOk: "yes" }]; return p; })(),
+  /sensitiveOk/);
+
+expectOk("a lane declaring sensitiveOk true",
+  (() => { const p = clone(base); p.lanes = [{ id: "release", territory: ["x/**"], sensitiveOk: true }]; return p; })());
+
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

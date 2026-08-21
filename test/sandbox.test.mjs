@@ -246,5 +246,59 @@ const lane = { id: "schema", territory: ["packages/nextly/**"] };
     "and it passes an action, without which the test-only rule never runs", String(call));
 }
 
+// ── a lane whose territory IS sensitive ──────────────────────────────────────
+//
+// Measured on the live nextly profile: the release lane's whole territory
+// (.changeset/**, scripts/release/**) also sat in risk.sensitivePaths, and the
+// lane was dead at BOTH layers -- the tool layer denied the write that would
+// have produced the file, and the diff gate refused the file before territory
+// was ever consulted. The exemption is explicit and narrow: lane.sensitiveOk,
+// honoured only for files inside that lane's own declared territory, and only
+// below quarantine and self-governing, which no declaration can reach.
+{
+  const relProfile = {
+    ...profile,
+    lanes: [...profile.lanes,
+      { id: "release", territory: [".changeset/**", "scripts/release/**"], sensitiveOk: true }],
+    risk: { ...profile.risk,
+      sensitivePaths: [...profile.risk.sensitivePaths, ".changeset/**", "scripts/release/**"] },
+  };
+  const release = relProfile.lanes.find(l => l.id === "release");
+  const schemaLane = relProfile.lanes.find(l => l.id === "schema");
+
+  const a = reviewDiff({ files: [".changeset/two-cats-dance.md"], profile: relProfile, lane: release });
+  check(a.ok === true, "a sensitiveOk lane may change sensitive files INSIDE its territory", JSON.stringify(a));
+
+  const b = reviewDiff({ files: ["packages/x/drizzle/0001.sql"], profile: relProfile, lane: release });
+  check(!b.ok && /sensitive/.test(b.why ?? ""),
+    "but a sensitive file OUTSIDE its territory still refuses as sensitive", JSON.stringify(b));
+
+  const c = reviewDiff({ files: [".changeset/two-cats-dance.md"], profile: relProfile, lane: schemaLane });
+  check(!c.ok && /sensitive/.test(c.why ?? ""),
+    "and the exemption grants nothing to a lane that did not declare it", JSON.stringify(c));
+
+  // No declaration reaches above sensitive in the refusal order.
+  const gh = { id: "gh", territory: [".github/**"], sensitiveOk: true };
+  const d = reviewDiff({ files: [".github/workflows/ci.yml"], profile: relProfile, lane: gh });
+  check(!d.ok && /judges/.test(d.why ?? ""), "sensitiveOk cannot reach the self-governing refusal", JSON.stringify(d));
+
+  const q = { id: "q", territory: ["vendor-dumps/**"], sensitiveOk: true };
+  const e = reviewDiff({ files: ["vendor-dumps/dump.sql"], profile: relProfile, lane: q });
+  check(!e.ok && /quarantin/i.test(e.why ?? ""), "and cannot reach quarantine", JSON.stringify(e));
+
+  // The tool layer must agree with the diff gate, or the worker is denied the
+  // write whose result the gate would have accepted. The lift is by VERBATIM
+  // glob only -- glob-subset reasoning cannot be done safely here, and the diff
+  // gate still checks every actual file afterwards.
+  const s = sandboxFor({ profile: relProfile, action: "FIX_FINDINGS", worktree: "/tmp/wt", lane: release });
+  const deny = s.settings.permissions.deny.join(" ");
+  check(!/\.changeset/.test(deny), "tool layer: the lane's own sensitive territory is writable", deny.slice(0, 200));
+  check(/drizzle/.test(deny), "while every other sensitive glob stays denied", "");
+
+  const plain = sandboxFor({ profile: relProfile, action: "FIX_FINDINGS", worktree: "/tmp/wt", lane: schemaLane });
+  check(/\.changeset/.test(plain.settings.permissions.deny.join(" ")),
+    "and a lane without sensitiveOk keeps every deny", "");
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

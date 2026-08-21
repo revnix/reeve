@@ -124,10 +124,11 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
 
 ### Founder actions pending
 
-- [ ] Add `nextly-ops` to App installation 155196718 — deferred by founder;
-      escalate a reminder when it blocks the spec-PR rollout step.
-      Step-by-step guide: `docs/action-app-install-nextly-ops.md` (~2 min, all
-      clicks; App = "Merge Policy", currently reaches nextlyhq/nextly only).
+- [x] Add `nextly-ops` to App installation 155196718 — DONE by founder
+      2026-08-21, verified by probe: the App now reaches nextlyhq/nextly AND
+      nextlyhq/nextly-ops (private), token perms include contents:write +
+      pull_requests:write + issues:write + checks:write. Guide (kept for the
+      next repo): `docs/action-app-install-nextly-ops.md`.
 
 ### Known constraints the design must answer (from measurements so far)
 

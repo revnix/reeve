@@ -13,7 +13,7 @@
 //   decide whether absence has been ruled out.
 import { compare, record, streak, divergences } from "../src/review/shadow.mjs";
 import { open } from "../src/db/ops.mjs";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -139,6 +139,39 @@ const db = open(join(dir, "s.db"));
   check(after.comparisons === 4 && after.incomparable === 1,
     "and an incomparable tick lands in its own column, inflating neither side",
     JSON.stringify(after));
+}
+
+// ── the wiring: an incomplete read must REACH the fold ───────────────────────
+//
+// Measured in production on day one of the shadow week. The daemon read
+// `ctx.lastIngestIncomplete` — a name nothing ever assigned — so `complete` was
+// always true, and a truncated observation produced a projection that answered
+// confidently from a partial view. nextly #1128 reported live 55 against derived
+// 50 and it was logged as a DIVERGENCE, when the honest answer is that nothing
+// was comparable because the read had not finished.
+//
+// The unit tests could not catch it: they pass `complete` explicitly. Only the
+// call site can be wrong, so only the call site can be asserted. This is the
+// fourth parameter in one day whose optional default silently switched its own
+// rule off.
+{
+  const src = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
+
+  const setter = (src.match(/ingestComplete[^\n]*set\([^\n]*/) ?? [null])[0];
+  check(!!setter, "control: the tick records whether an observation was whole", String(setter));
+  check(/!seen\.incomplete/.test(setter ?? ""),
+    "and records it from what observe() actually reported", String(setter));
+
+  const call = (src.match(/derivePr\)\(db, nwo, pr, profile,[\s\S]{0,180}?\}\)/) ?? [null])[0];
+  check(!!call && /complete:/.test(call), "control: found the derive call site", String(call));
+  check(/complete: ctx\.ingestComplete\?\.get\?\.\(pr\) === true/.test(call ?? ""),
+    "the fold is told, and a PR never wholly observed is NOT complete",
+    String(call));
+
+  // The name that was read and never written must be gone entirely, or the next
+  // reader finds two mechanisms and trusts the dead one.
+  check(!/lastIngestIncomplete/.test(src),
+    "and the never-assigned name it replaced is gone");
 }
 
 db.close();

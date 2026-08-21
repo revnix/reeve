@@ -91,21 +91,40 @@ function killGroup(pid, signal) {
 /**
  * Build the argv for a worker. Flags are passed EXPLICITLY, never inherited:
  * an inherited setting is one a future default can silently change.
+ *
+ * `settings` is REQUIRED. It used to default to null, and a resume that did not
+ * re-pass it relaunched a worker with no denylist and no sandbox at all -- the
+ * CLI does not carry `--settings` across `--resume`. An optional parameter that
+ * guards a safety rule is the class of defect that bit four times in one day;
+ * this one is removed rather than asserted around.
+ *
+ * The three isolation flags are unconditional: the founder's user settings carry
+ * broad permissions, plugins, and MCP servers a worker must never inherit.
  */
-export function workerArgs({ prompt, cwd, agent = null, allowedTools = null, settingSources = null,
-                             settings = null, maxTurns = null, model = null, sessionId = null, resume = null }) {
+export function workerArgs({ prompt, settings, agent = null, allowedTools = null, disallowedTools = null,
+                             settingSources = null, maxTurns = null, model = null, effort = null,
+                             maxBudgetUsd = null, jsonSchema = null, agents = null, mcpConfig = null,
+                             sessionId = null, resume = null }) {
+  if (typeof settings !== "string" || !settings.length)
+    throw new Error("workerArgs: settings is required; a worker without its settings file has no sandbox");
   const a = ["-p", prompt, "--output-format", "stream-json",
              // Required: without --verbose the process exits 1 and writes NOTHING
              // to stdout, which is indistinguishable from a hang.
-             "--verbose"];
+             "--verbose",
+             // Nothing ambient: no user CLAUDE.md, hooks, plugins, MCP servers,
+             // custom agents, or Chrome. What the worker gets is what is passed.
+             "--safe-mode", "--strict-mcp-config", "--no-chrome",
+             "--settings", settings];
+  if (mcpConfig) a.push("--mcp-config", mcpConfig);
   if (agent) a.push("--agent", agent);
+  if (agents) a.push("--agents", agents);
   if (model) a.push("--model", model);
+  if (effort) a.push("--effort", effort);
   if (maxTurns != null) a.push("--max-turns", String(maxTurns));
+  if (maxBudgetUsd != null) a.push("--max-budget-usd", String(maxBudgetUsd));
   if (allowedTools) a.push("--allowedTools", allowedTools);
-  // The deterministic half of the boundary. The allowlist above scopes what may
-  // run; this file carries the profile's forbidden commands and quarantined paths
-  // as rules the CLI enforces, rather than as prose the model is asked to respect.
-  if (settings) a.push("--settings", settings);
+  if (disallowedTools) a.push("--disallowedTools", disallowedTools);
+  if (jsonSchema) a.push("--json-schema", jsonSchema);
   // `--setting-sources project` cuts the preamble ~8x (31,647 -> 3,845 cache-creation
   // tokens, $0.3166 -> $0.0386 for one reply) but strips plugin-shipped agents, so it
   // is only safe for a worker that needs none.

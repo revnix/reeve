@@ -12,12 +12,12 @@ const alive = pid => { try { process.kill(pid, 0); return true; } catch { return
 
 // ── argv ──────────────────────────────────────────────────────────────────
 {
-  const a = workerArgs({ prompt: "hi" });
+  const a = workerArgs({ prompt: "hi", settings: "/tmp/s.json" });
   // Without --verbose the CLI exits 1 having written NOTHING to stdout, which is
   // indistinguishable from a hang. It must never be optional.
   check("--verbose is always present", a.includes("--verbose"), true);
   check("stream-json is always present", a.includes("stream-json"), true);
-  const b = workerArgs({ prompt: "hi", agent: "reviewer", model: "opus", maxTurns: 5, allowedTools: "Read" });
+  const b = workerArgs({ prompt: "hi", settings: "/tmp/s.json", agent: "reviewer", model: "opus", maxTurns: 5, allowedTools: "Read" });
   check("flags are passed explicitly, never inherited",
     ["--agent", "--model", "--max-turns", "--allowedTools"].every(f => b.includes(f)), true);
 }

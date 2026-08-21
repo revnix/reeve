@@ -475,9 +475,10 @@ export function notePid(db, { runId, pid, boot }) {
 
 /** Close a run. An outcome that is not "ok" is a failure with its reason kept. */
 export function finishRun(db, { runId, outcome, why = null, ms = null, cost = null, sessionId = null }) {
-  // A cancelled run was stopped on request: abandoned, with the PR node left
-  // exactly as it was, because nothing was learned about the PR.
-  const status = outcome === "ok" ? "succeeded" : outcome === "cancelled" ? "abandoned" : "failed";
+  // A cancelled run was stopped on request and a lease-lost run was stopped by
+  // the infrastructure: both are abandoned, with the node returned to ready,
+  // because nothing was learned about the PR and neither is the worker's fault.
+  const status = outcome === "ok" ? "succeeded" : (outcome === "cancelled" || outcome === "lease_lost") ? "abandoned" : "failed";
   return tx(db, () => {
     // Only a run this process still owns may be finished. A run another actor
     // reaped or abandoned has moved on; a stale worker's verdict must not
@@ -503,7 +504,10 @@ export function finishRun(db, { runId, outcome, why = null, ms = null, cost = nu
       return { applied: false, why };
     };
     if (outcome !== "cancelled" && r.cancel_requested) return retire("a cancel was requested for the run; its outcome is not accepted");
-    if (outcome === "ok" && r.lease_expires_at <= Math.floor(Date.now() / 1000))
+    // Every outcome but a cancellation is refused after expiry: a success could
+    // publish under a lapsed claim, and a failure would be recorded as the
+    // worker's when the claim, not the worker, was what lapsed.
+    if (outcome !== "cancelled" && outcome !== "lease_lost" && r.lease_expires_at <= Math.floor(Date.now() / 1000))
       return retire("the run's lease expired before it finished; its outcome is not accepted");
     db.prepare(`UPDATE run SET status=?, ended_at=unixepoch(), error=? WHERE id=?`)
       .run(status, why, runId);

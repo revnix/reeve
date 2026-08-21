@@ -99,6 +99,25 @@ check(row.lease_expires_at < Math.floor(Date.now() / 1000), "and the lapsed leas
   check(r9b.ok === true && !threw, "a consumed cancellation does not refuse the next run's binding", String(threw?.message));
 }
 
+
+// Lease loss is infrastructure, never the worker's failure: a lease_lost
+// outcome retires the run as abandoned and leaves the node ready, and the
+// expiry refusal applies to every outcome that is not a cancellation.
+{
+  const r10 = startRun(db, { nwo: "o/r", pr: 10, action: "FIX_CI", head: "j".repeat(40) });
+  db.prepare("UPDATE run SET lease_expires_at = unixepoch() - 5 WHERE id = ?").run(r10.runId);
+  finishRun(db, { runId: r10.runId, outcome: "lease_lost", why: "lease revoked: lease-expired" });
+  const run10 = db.prepare("SELECT status FROM run WHERE id = ?").get(r10.runId);
+  const node10 = db.prepare("SELECT status FROM node WHERE id = 'pr:10'").get();
+  check(run10?.status === "abandoned" && node10?.status === "ready", "a lease-lost finish after expiry is abandoned with the node ready, never failed and blocked", JSON.stringify([run10, node10]));
+
+  const r11 = startRun(db, { nwo: "o/r", pr: 11, action: "FIX_CI", head: "k".repeat(40) });
+  db.prepare("UPDATE run SET lease_expires_at = unixepoch() - 5 WHERE id = ?").run(r11.runId);
+  const fin11 = finishRun(db, { runId: r11.runId, outcome: "failed", why: "the worker reported is_error" });
+  const run11 = db.prepare("SELECT status FROM run WHERE id = ?").get(r11.runId);
+  check(fin11.applied === false && run11?.status === "abandoned", "a failed outcome after expiry is refused and retired, not recorded as the worker's failure", JSON.stringify([fin11, run11]));
+}
+
 db.close(); rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

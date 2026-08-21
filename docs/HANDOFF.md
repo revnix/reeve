@@ -1,6 +1,7 @@
 # reeve — handoff
 
 **Written:** 2026-08-21, end of the second build session.
+**Updated:** 2026-08-21, third session. See §6.5 for what that session changed.
 **Audience:** the next session, which will have none of this in context.
 **Rule for reading it:** every number here was measured, not remembered. Where
 something is unproven it says so. Trust the "unproven" labels as much as the
@@ -30,13 +31,13 @@ it is short, and it is the document that states what reeve is *not*.
 
 | | |
 |---|---|
-| Commits | **61**, `HEAD == origin/main`, CI green |
-| Source | 23 `.mjs` files, ~5,500 lines |
-| Tests | **35 files, 576 assertions, 0 failing** |
+| Commits | **66**, `HEAD == origin/main`, CI green |
+| Source | 23 `.mjs` files, ~5,600 lines |
+| Tests | **37 files, 0 failing** |
 | Daemon | running as `com.revnix.reeve` on `nextlyhq/nextly`, **observe-only** |
-| Ticks | 252 since 2026-08-20 14:04 UTC |
+| Ticks | 260+ since 2026-08-20 14:04 UTC |
 | Backups | hourly snapshots, restore verified against the live store |
-| Dispatch | **one complete clean run**, CI-verified, on `revnix/reeve` only |
+| Dispatch | **two complete clean runs**, both CI-verified, on `revnix/reeve` only |
 
 ### Where everything lives
 
@@ -302,7 +303,55 @@ fifteen lines and named the cause in one run.
 | No backup | One copy on one laptop |
 | No alert sink | "Needs you" reached a local log only |
 
-### 6.5 Verification lessons worth keeping
+### 6.5 The third session: three more defects, all found by USING it
+
+The verification in §10 and two more `--execute` dispatches found three defects
+that 576 passing assertions did not. Every one was found by running the system
+and reading what it actually stored, not by reading code.
+
+**The failure identity could not tell two failures apart.** The daemon
+root-caused `failing[0]`, which where CI ends in an aggregate gate is the GATE.
+Its annotation is the same sentence whatever broke -- measured in the
+`fix_attempt` table as `CI Gate refuses: test concluded 'failure'`. So every
+failure in the repository shared one identity. Two things followed: the retry
+brake refused work it had never attempted (run 13 escalated "the same failure
+survived a second fix" about a fix it had not tried), and the worker's WHAT
+FAILED section was a tautology. Run 12 succeeded only because the prompt
+separately tells a worker to reproduce the failure itself, so the most
+engineered tier in the pipeline had contributed nothing to the one dispatch that
+had ever worked. Every failing check is now read, caused ones first.
+
+**`doctor` could not find its own state database.** It resolved the path from
+`profile.state.location`, which the schema defines as the sibling REPOSITORY
+holding a project's ledger -- `nextlyhq/nextly-ledger`. `existsSync` said no and
+doctor rendered that as UNKNOWN `no state database`, with 3,600 events sitting at
+the canonical path. The lease check had therefore never run against a real store.
+This is the fifth instance of §4.2's class in reeve's own surfaces, and it was in
+the command the founder-facing guide tells you to run. Five commands resolved
+that path independently; there is now one resolver. `loadProfile` was also
+reading `homedir()` rather than `REEVE_HOME`, so a scratch home moved a project's
+state but not the profile describing it.
+
+**A PASSING test was recorded as the cause of a red build.** The salience
+patterns match on words and a test NAME may contain them: this suite asserts
+"cancelled is an absence, failed is a fact", so its PASS line matched
+`/failed/i`. A worker told to change the least that fixes the cause was being
+pointed at green code, and the identity churned whenever an unrelated test was
+renamed -- refunding the brake an attempt.
+
+Beside it, an ANSI stripper written with a **literal ESC byte**. Invisible to an
+editor, unmatchable by search: two separate attempts to edit that line silently
+found nothing, and the second only resolved because an octal dump showed the
+byte. Same family as the raw NUL in §6.4. The guard that keeps NUL out of source
+now keeps ESC out with it.
+
+**What that says about the shape of the remaining risk.** Three sessions have now
+produced the same pattern: the defects that matter are not found by reading code
+or by adding assertions, but by running the thing and reading what it wrote down.
+Two of these three were only visible in stored state -- the `fix_attempt` row and
+doctor's rendered output. Budget for use, not for review.
+
+### 6.6 Verification lessons worth keeping
 
 - **A fixture that cannot exhibit the defect proves nothing.** Two of my
   verifications were like this — the push deny, and a diff-gate check where the
@@ -327,9 +376,13 @@ fifteen lines and named the cause in one run.
 
 - The daemon runs unattended: **252 ticks since 2026-08-20 14:04 UTC**, survived a
   network outage to `api.github.com`, escalated to ntfy overnight.
-- **One complete dispatch**: red CI → root cause → fix in an isolated worktree →
-  commit → diff gate → **reeve published** → **CI green**. 202s, $1.92, no human.
-  Verified on GitHub, not from reeve's own account of itself.
+- **Two complete dispatches**: red CI → root cause → fix in an isolated worktree
+  → commit → diff gate → **reeve published** → **CI green**. Run 12 at 202s/$1.92,
+  run 14 at 159s/$1.50. Both verified on GitHub -- the remote head, the published
+  diff and the check conclusions -- not from reeve's own account of itself.
+- **The retry brake fires, and correctly refuses.** Run 13 declined to dispatch
+  and escalated rather than guessing. It was refusing for the WRONG reason (§6.5),
+  but the mechanism itself was exercised end to end for the first time.
 - Backups restore: a real snapshot restored to a scratch path matched the live
   store exactly (3,637 events, 265 nodes, 5 settlements, 5 escalations).
 - The state layer passes its lifecycle suite including exactly-once-across-crash.
@@ -338,9 +391,16 @@ fifteen lines and named the cause in one run.
 
 ### NOT proven — say so, do not assume
 
-- **`--execute` has ONE clean run out of twelve.** That is first evidence the
-  chain can complete, not proof that it does. Several consecutive clean dispatches
-  is the bar before arming nextly.
+- **`--execute` has TWO clean runs out of fourteen, and both used the SAME
+  planted failure** -- a constant changed so an assertion fails, in the file the
+  assertion names. That is the easiest possible root-cause. Nothing has yet tested
+  a failure whose fix is in a different file from the failing test, an
+  intermittent failure, or a failure with more than one cause. Varying the failure
+  shape is worth more than repeating this one.
+- **The App reaches nextly only.** Every dispatch run on `revnix/reeve` logs
+  `could not publish: no installation ... 404`, so those runs exercise the WORKER
+  chain and never the verdict-publication chain. The two halves have never been
+  proven together on one repository.
 - **`--enforce` has never been on.** The shadow week has not completed.
 - **Nothing proven on a second project.** Four profiles exist; only nextly and
   reeve have been driven.
@@ -363,8 +423,12 @@ fifteen lines and named the cause in one run.
 
 ### 8.2 Code, roughly in order
 
-1. **More `--execute` dispatches on `revnix/reeve`.** The only way to earn the
-   right to arm nextly. Re-arm the planted failure, run, read the WHOLE log.
+1. **Dispatches against DIFFERENT failure shapes on `revnix/reeve`.** Repeating
+   the one planted failure is now cheap evidence: two clean runs used it and the
+   third revealed the brake trips on a repeat by design. What is untested is a
+   failure whose fix is in a different file from the failing test, a failure with
+   two independent causes, and an intermittent one. Re-arm, run, read the WHOLE
+   log. §10 has the recipe and the caveat about the brake.
 2. **Self-audit on a schedule** — reeve running `doctor` on itself and escalating
    when its own health degrades. The first real step toward "watch its own work".
 3. **Second project**: `rextaihq/rext-backend` — 85 merges in 90 days, real
@@ -402,6 +466,19 @@ Founder-preference learning; product-mode discovery; contributor mode.
 9. **`git config --get` exits 1 when a key is unset** — that is not an error.
 10. **Scripted multi-line edits to `daemon.mjs` have tangled it twice.** Prefer the
     Edit tool with a unique anchor, and re-read after.
+11. **An edit that silently changes nothing usually means an invisible byte.**
+    `ci-rootcause.mjs` held a literal ESC inside an ANSI stripper: both the editor
+    and a hand-written anchor matched the VISIBLE characters and found nothing.
+    `od -c` on the line names it in one command. `test/source-is-text.test.mjs`
+    now guards NUL and ESC, but only under `src bin test deploy`.
+12. **`od -c | grep 033` is a BROKEN detector** -- it matches byte offsets, so it
+    reports a hit for every file. Scan bytes in python and carry a positive
+    control. This one cost a wrong conclusion about 68 files.
+13. **`launchctl kickstart -k` leaves last-exit `-9`.** That is the documented
+    restart, not a crash. Do not read `-9` in `launchctl list` as a fault.
+14. **Re-planting the SAME failure trips the retry brake**, which is correct
+    behaviour: reeve escalates rather than dispatching. Vary the failure, or the
+    PR, when gathering dispatch evidence.
 
 ---
 
@@ -445,6 +522,22 @@ $N bin/reeve tick revnix/reeve --execute --log /tmp/proofN.log
 
 Read the **whole** log and check the remote moved and CI went green. A partial
 read is how run 11 was reported as a success when a worker had bypassed the gate.
+
+**The brake will refuse a repeat.** Re-planting the same failure on the same PR
+is counted as that failure surviving its fix, so reeve escalates rather than
+dispatching -- correctly. To gather more dispatch evidence, change the failure
+(a different file, a different assertion) or open a new PR; `fix_attempt` is keyed
+on `(nwo, pr, cause)`. Verify what it stored rather than assuming:
+
+```sh
+$N -e 'const {DatabaseSync}=require("node:sqlite");
+const db=new DatabaseSync(process.env.HOME+"/.reeve/state/revnix/reeve.db",{readOnly:true});
+for (const r of db.prepare("SELECT pr,attempts,cause FROM fix_attempt").all())
+  console.log(r.pr, r.attempts, r.cause);'
+```
+
+That table is where the failure-identity defect in §6.5 was visible, and it was
+visible nowhere else.
 
 ---
 

@@ -177,6 +177,7 @@ your phone.
 | Symptom | What to do |
 |---|---|
 | `reeve status` leads with a warning about the daemon | It has stopped ticking. `launchctl kickstart -k gui/$(id -u)/com.revnix.reeve` |
+| `launchctl list` shows `-9` next to reeve | Normal. That is the signature the restart above leaves behind, not a crash. What matters is whether a PID is shown and the log is still moving |
 | A verdict looks wrong | `reeve why <pr>` — it prints the clause table and the trail |
 | Nothing has happened for a while | `tail ~/.reeve/reeve.log`, and `~/.reeve/reeve.err.log` |
 | A worktree went missing | It is under `~/Work/Products/nextly-worktrees/_quarantine`, intact. reeve quarantines rather than deletes whenever a checkout held work it could not account for |

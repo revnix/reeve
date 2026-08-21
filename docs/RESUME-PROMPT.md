@@ -23,16 +23,19 @@ PR is safe to merge, and publishes that verdict to GitHub **so that GitHub does
 the refusing**. It must serve many projects of different stacks — that is the
 primary requirement, not a nice-to-have.
 
-## State as of 2026-08-21
+## State as of 2026-08-21, end of the third session
 
-- **61 commits, 576 assertions across 35 test files, 0 failing, CI green.**
+- **67 commits, 37 test files, 0 failing, CI green on main.**
 - **The daemon is RUNNING** as a launchd agent (`com.revnix.reeve`) on
-  `nextlyhq/nextly`, **observe-only**: no `--execute`, no `--enforce`. 252 ticks,
+  `nextlyhq/nextly`, **observe-only**: no `--execute`, no `--enforce`. 260+ ticks,
   survived a network outage, escalates to ntfy topic `revnix-reeve`.
 - **Hourly backups** with a restore verified against the real store.
 - **The Codex audit list is closed** — every finding fixed or explicitly deferred.
-- **`--execute` has ONE clean run out of twelve**, on `revnix/reeve` only, against
-  a deliberately planted failure. That is first evidence, not proof.
+- **`--execute` has TWO clean CI-verified runs out of fourteen** — but both used
+  the SAME planted failure, the easiest possible root-cause. Run 13 refused to
+  dispatch at all, correctly, and that refusal exposed a real defect.
+- The third session found **three defects that 576 passing assertions did not**,
+  all by running the system and reading what it stored. See §6.5 of the handoff.
 
 ## Rules for how you work on this
 
@@ -86,6 +89,12 @@ measuring it once.
 - **`nextly-ops` stays.** It is still the live task graph; reeve has no task
   import and the two systems track different things.
 
+## What the last session learned, in one line
+
+**The defects that matter are not found by reading code or adding assertions.**
+Two of the three were visible only in stored state — a `fix_attempt` row and
+doctor's rendered output. Budget for USE, not for review.
+
 ## First thing to do
 
 Verify the system still works using **§10 of the handoff** — run those commands
@@ -97,15 +106,19 @@ until the ruleset is repaired, which is deliberately last.
 
 ## Then
 
-The recommended next task is **more `--execute` dispatches on `revnix/reeve`**
-(§10 of the handoff has the re-arming recipe). One clean run out of twelve is not
-enough to arm nextly; several consecutive clean ones would be. Each dispatch takes
-about four minutes and costs roughly $2.
+The recommended next task is **dispatches against DIFFERENT failure shapes on
+`revnix/reeve`** (§10 of the handoff has the recipe, and the caveat that
+re-planting the SAME failure trips the retry brake by design). Two clean runs on
+one easy failure is not enough to arm nextly. What is untested: a failure whose
+fix is in a different file from the failing test, a failure with two independent
+causes, and an intermittent one. Each dispatch takes about three minutes and costs
+roughly $1.50-2.
 
 The strongest alternative is **reeve auditing itself on a schedule** — running
 `doctor` against its own health and escalating when it degrades. That is the first
 real step toward the founder's standing goal that reeve "watch its own work and
-keep improving", and it is small.
+keep improving", and it is small. It is now honest to schedule, which it was not
+before: `doctor` reported UNKNOWN for its own lease health until this session.
 
 Section 8 of the handoff has the full remaining list in order. Section 9 has the
 traps; read it before your first Bash command, particularly the archive-guard hook

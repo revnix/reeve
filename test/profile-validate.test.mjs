@@ -158,5 +158,81 @@ expectOk("a lane declaring sensitiveOk true",
   (() => { const p = clone(base); p.lanes = [{ id: "release", territory: ["x/**"], sensitiveOk: true }]; return p; })());
 
 
+
+// ── capability switches: five booleans, every one default false ─────────────
+//
+// Authority is never inferred from repository fields: the live nextly profile
+// already sets authority.policy=propose_and_merge, so that key cannot be the
+// switch for anything. These five are, and a truthy accident must not flip one.
+{
+  const p = clone(base);
+  const d = withDefaults(p);
+  const caps = d.builder?.capabilities ?? {};
+  const all = ["observe", "draftSpec", "implementLocal", "publishPr", "mergeBuilderPr"];
+  const allFalse = all.every(k => caps[k] === false);
+  console.log(`${allFalse ? "PASS" : "FAIL"}  every capability switch defaults to false`);
+  if (!allFalse) { console.log("        got:", JSON.stringify(caps)); fail++; }
+
+  const ok = d.worker?.maxOutputBytes === 67108864;
+  console.log(`${ok ? "PASS" : "FAIL"}  worker.maxOutputBytes defaults to 64 MiB`);
+  if (!ok) fail++;
+}
+
+expectRefusal("a capability switch that is not a boolean",
+  (() => { const p = clone(base); p.builder = { capabilities: { mergeBuilderPr: "yes" } }; return p; })(),
+  /builder\.capabilities\.mergeBuilderPr must be a boolean/);
+
+{
+  // A primitive container must produce a validation error, not a throw from
+  // withDefaults trying to hang properties off a string.
+  const p = clone(base); p.builder = "yes";
+  let threw = null, r = null;
+  try { r = validate(withDefaults(p)); } catch (e) { threw = e; }
+  const ok = !threw && r.ok === false && r.errors.some(e => /builder must be an object/.test(e));
+  console.log(`${ok ? "PASS" : "FAIL"}  refuses: a primitive builder container, without throwing`);
+  if (!ok) { console.log("        ", threw ? String(threw.message) : JSON.stringify(r?.errors)); fail++; }
+}
+
+{
+  // A top-level primitive profile is a validation error, never a throw from
+  // withDefaults dereferencing it.
+  let threw = null, results = [];
+  for (const prim of ["yes", 1, true, null]) {
+    try { results.push(validate(withDefaults(prim)).ok); } catch (e) { threw = e; }
+  }
+  const ok = !threw && results.length === 4 && results.every(x => x === false);
+  console.log(`${ok ? "PASS" : "FAIL"}  refuses: a primitive or null profile, without throwing`);
+  if (!ok) { console.log("        ", threw ? String(threw.message) : JSON.stringify(results)); fail++; }
+}
+
+expectRefusal("a capability container that is not an object",
+  (() => { const p = clone(base); p.builder = { capabilities: [] }; return p; })(),
+  /builder\.capabilities must be an object/);
+
+expectRefusal("a founder user id that is not positive",
+  (() => { const p = clone(base); p.builder = { founder: { userId: 0 } }; return p; })(),
+  /builder\.founder\.userId must be a positive integer/);
+
+expectRefusal("a founder user id that is not an integer",
+  (() => { const p = clone(base); p.builder = { founder: { userId: "123" } }; return p; })(),
+  /builder\.founder\.userId must be a positive integer/);
+
+{
+  // JSON null is not "absent": withDefaults must still produce the fail-closed
+  // default, and the validated profile must carry a boolean.
+  const p = clone(base); p.builder = { capabilities: { mergeBuilderPr: null } };
+  const d = withDefaults(p);
+  const ok = d.builder.capabilities.mergeBuilderPr === false && validate(d).ok;
+  console.log(`${ok ? "PASS" : "FAIL"}  a null capability switch becomes false, never a null that validates`);
+  if (!ok) { console.log("        got:", JSON.stringify(d.builder.capabilities), JSON.stringify(validate(d).errors)); fail++; }
+}
+
+expectRefusal("a worker output cap that is not positive",
+  (() => { const p = clone(base); p.worker = { maxOutputBytes: 0 }; return p; })(),
+  /worker\.maxOutputBytes must be a positive integer/);
+
+expectOk("all five switches set explicitly",
+  (() => { const p = clone(base); p.builder = { capabilities: { observe: true, draftSpec: false, implementLocal: false, publishPr: false, mergeBuilderPr: false } }; return p; })());
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

@@ -36,6 +36,11 @@ The four capabilities, measured 2026-08-21:
       `prompts.mjs`; findings lists ordered criticals-first then the measured
       top reviewer. nextly's profile carries the study; other projects render
       nothing until measured.
+- [ ] **PR-6 precondition (from PR-1 review):** REQUEST_REVIEW and SPILL prompts
+      tell the WORKER to use `gh`, but the worker contract shims `gh` and holds
+      no credential by design. Before `watch.reviewActions` arms, those GitHub
+      effects must be performed by reeve through the outbox (the design's
+      rule), never by a worker. Until then the two actions stay gated.
 - [ ] **PR-6 wiring note:** `e.threadDetails` is read at both review dispatch
       sites and written by NOTHING (the read-never-written pattern again).
       When capability 3 arms, populate it from the `review_thread` projections
@@ -62,6 +67,10 @@ The four capabilities, measured 2026-08-21:
       (`ntfy user add mobeen`; `ntfy access mobeen revnix-reeve read-only`;
       `upstream-base-url` for iOS). Desktop notifications work meanwhile.
 - [ ] **Second project** (`rextaihq/rext-backend`) — needs PR-gating CI + App install.
+- [ ] **Worker identity decision** — a dedicated macOS user for workers (the only
+      non-sandbox way to make the keychain and `~/.config/gh` unreachable) vs
+      relying on the OS sandbox's read deny once measured in PR-2. Until one is
+      proven, no worker dispatches (`guardian:containment:open`).
 - [ ] **Ruleset flip decision** (after the verdict shadow week).
 
 ### Closed by ruling — do not reopen
@@ -128,16 +137,36 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       skeleton (task/claim/checkpoint/outbox/`gh.pr.merge` reconcilers) already
       exists in reeve's schema with ZERO callers; no merge executor exists.
 - [x] Design presented; founder approved AND revised the gate (see req. 3)
-- [x] **Spec written** — `docs/2026-08-21-builder-design.md` (526 lines,
-      `3ccc734`). Fold: writer + 3 verifiers + 1 repair round (5 blocking
-      problems fixed) + a manual pass closing the 2 blocking + 13 minor
-      residuals. All 29 findings dispositioned in Appendix A. Encodes the
-      revised gate verbatim; merge clauses U1-U4 + B1-B6; 10-PR rollout.
-- [ ] **Founder reviews the spec file** — the gate before implementation
-      planning. Open ruling inside it: §16.2, should the emergency Codex
-      waiver (`--waive-codex`) exist at all.
-- [ ] Implementation plan (9 PRs, each with its own verification — in the spec)
-- [ ] Build
+- [x] **Spec written and founder-approved** — `docs/2026-08-21-builder-design.md`
+      v2 (989 lines, `f2cda32`): the audit's 20 accepted items folded as
+      mechanisms, 3 not adopted with reasons (Appendix B), the Codex-
+      unavailable ruling (row 7, no waiver flag), the platform ruling. Status:
+      approved direction; implementation gated by P0 closure. Merge stays dark
+      behind `builder.capabilities.mergeBuilderPr` + `--actuate-merges`.
+- [x] Implementation plan for S0 + S1: `docs/superpowers/plans/2026-08-21-s1-worker-contract.md`
+- [ ] **PR-1 (S0 + S1 core) — revnix/reeve #3, in review** — capability
+      switches (all false on the live profile), baseline fixture + drift check,
+      workerArgs hard-fail + isolation flags, env allowlist + credential-less
+      git, bounded durable streams, fail-closed spawn binding, lease revocation
+      in the daemon, `worker_run` contract rows, worktree pre-push hook.
+      Measured before the fix: an explicit-URL push from a worktree SUCCEEDED.
+      **Review rounds (Codex 7 findings, adversarial 17 confirmed) closed**:
+      spawn-error crash, late revocation, preparation inside cleanup scope,
+      reuse hardening, run dir scoping, baseline fail-closed, reserved env +
+      full git strip list, `--setting-sources local`, truncation is failure,
+      R-13 drift check MOUNTED in doctor (live: matches), refusing gh/ssh shims.
+      **MEASURED AND KNOWN-OPEN** (`test/escape.test.mjs`): with a real HOME the
+      worker can read the founder's token (`git -c credential.helper=`,
+      absolute-path `gh auth token`), bypass the hook (`--no-verify`,
+      `-c core.hooksPath`), and move the clone's shared refs. Therefore the
+      daemon now REFUSES every dispatch under `--execute` while
+      `CONTAINMENT.credentialRead === "open"` (escalation
+      `guardian:containment:open`). PR-2 must close the read (sandbox deny of
+      keychain + ~/.config/gh, measured) or the founder decides on a dedicated
+      worker user; only a measured closure may flip the constant.
+- [ ] **PR-2 (S1 sandbox)** — the two CLI measurements (sandbox under `-p`,
+      invalid settings under `-p`), `sandbox.*` settings + validation,
+      per-start canary, doctor R-13/R-14/R-15, escape test.
 
 ### Founder actions pending
 

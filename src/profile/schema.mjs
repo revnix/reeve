@@ -193,6 +193,24 @@ export const FIELDS = {
   // repair whose whole diff lands in here changed the exam rather than the code.
   "risk.testPaths":         [false, isArr(isStr)],
 
+  // The builder's capability switches. Authority is never inferred from the
+  // repository fields above: the live nextly profile already carries
+  // authority.policy=propose_and_merge, so that key cannot gate anything new.
+  // Five independent booleans, every one false until the rollout stage that
+  // proves it turns it on. A truthy string is refused, not coerced.
+  "builder.capabilities.observe":        [false, isBool],
+  "builder.capabilities.draftSpec":      [false, isBool],
+  "builder.capabilities.implementLocal": [false, isBool],
+  "builder.capabilities.publishPr":      [false, isBool],
+  "builder.capabilities.mergeBuilderPr": [false, isBool],
+  // The founder's GitHub identity, by immutable numeric id with the login as a
+  // snapshot: every founder-event rule (silence, overrides, approvals) matches
+  // the id, and a renamed login must not silently become a stranger.
+  "builder.founder.userId":              [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
+  "builder.founder.login":               [false, isStr],
+  // Cap on a worker's durable stdout/stderr files. Read by both daemons.
+  "worker.maxOutputBytes":               [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
+
   // Read by the daemon and the watcher. Declared here because the validator
   // refused a profile using them and `reeve doctor` exited before doing anything:
   // code that reads undeclared config is config that drifts from its schema
@@ -293,6 +311,13 @@ export function validate(profile) {
     if (e) errors.push(`${path} ${e}`);
   }
 
+  // A container that is not a plain object (an array, a string) would take
+  // the defaults as named properties and validate, then serialize to nothing.
+  for (const c of ["builder", "builder.capabilities", "builder.founder", "worker"]) {
+    const v = get(profile, c);
+    if (v !== undefined && v !== null && (typeof v !== "object" || Array.isArray(v))) errors.push(`${c} must be an object`);
+  }
+
   // Unknown keys are refused, not ignored.
   const known = new Set(Object.keys(FIELDS));
   const containers = new Set();
@@ -365,17 +390,38 @@ export function validate(profile) {
  * Defaults that hold whatever the project is. A per-kind default would leave the
  * key unset for any kind that forgot it, and unset here means Infinity.
  */
-const UNIVERSAL_DEFAULTS = { "watch.staleSeconds": 900 };
+const UNIVERSAL_DEFAULTS = {
+  "watch.staleSeconds": 900,
+  // Every capability is off until its rollout stage turns it on, explicitly.
+  "builder.capabilities.observe": false,
+  "builder.capabilities.draftSpec": false,
+  "builder.capabilities.implementLocal": false,
+  "builder.capabilities.publishPr": false,
+  "builder.capabilities.mergeBuilderPr": false,
+  "worker.maxOutputBytes": 64 * 1024 * 1024,
+};
 
 export function withDefaults(profile) {
+  // A primitive or null profile has nothing to default into; it is returned as
+  // is for validate() to refuse, rather than thrown at by a dereference here.
+  if (profile === null || typeof profile !== "object" || Array.isArray(profile)) return profile;
   const kind = get(profile, "project.kind");
   const defaults = { ...UNIVERSAL_DEFAULTS, ...(KIND_DEFAULTS[kind] ?? {}) };
   const out = structuredClone(profile);
   for (const [path, value] of Object.entries(defaults)) {
-    if (get(out, path) !== undefined) continue;
+    // JSON null is not a value here: a switch written as null must become its
+    // fail-closed default, never a null the validator would wave through.
+    const cur = get(out, path);
+    if (cur !== undefined && cur !== null) continue;
     const parts = path.split(".");
-    let node = out;
-    for (const k of parts.slice(0, -1)) node = node[k] ??= {};
+    let node = out, blocked = false;
+    for (const k of parts.slice(0, -1)) {
+      // A primitive or array where a container belongs is left for validate()
+      // to refuse; hanging defaults off it would throw or be serialized away.
+      if (node[k] !== undefined && node[k] !== null && (typeof node[k] !== "object" || Array.isArray(node[k]))) { blocked = true; break; }
+      node = node[k] ??= {};
+    }
+    if (blocked) continue;
     node[parts.at(-1)] = value;
   }
   return out;

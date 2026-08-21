@@ -12,17 +12,25 @@ const alive = pid => { try { process.kill(pid, 0); return true; } catch { return
 
 // ── argv ──────────────────────────────────────────────────────────────────
 {
-  const a = workerArgs({ prompt: "hi" });
+  const a = workerArgs({ prompt: "hi", settings: "/tmp/s.json" });
   // Without --verbose the CLI exits 1 having written NOTHING to stdout, which is
   // indistinguishable from a hang. It must never be optional.
   check("--verbose is always present", a.includes("--verbose"), true);
   check("stream-json is always present", a.includes("stream-json"), true);
-  const b = workerArgs({ prompt: "hi", agent: "reviewer", model: "opus", maxTurns: 5, allowedTools: "Read" });
+  const b = workerArgs({ prompt: "hi", settings: "/tmp/s.json", agent: "reviewer", model: "opus", maxTurns: 5, allowedTools: "Read" });
   check("flags are passed explicitly, never inherited",
     ["--agent", "--model", "--max-turns", "--allowedTools"].every(f => b.includes(f)), true);
 }
 
 // ── result classification ─────────────────────────────────────────────────
+// Every worker now takes an exact environment and durable output files.
+const WENV = { PATH: "/usr/bin:/bin" };
+const { mkdtempSync: _mk } = await import("node:fs");
+const { tmpdir: _tmp } = await import("node:os");
+const { join: _join } = await import("node:path");
+const _wdir = _mk(_join(_tmp(), "reeve-sup-files-"));
+const wfiles = name => ({ outPath: _join(_wdir, `${name}.out`), errPath: _join(_wdir, `${name}.err`) });
+
 const R = o => classifyResult(o, { code: 0, signal: null, killedByUs: false }).outcome;
 
 check("a clean result is ok", R({ is_error: false, subtype: "success", permission_denials: [] }), OUTCOMES.OK);
@@ -88,7 +96,7 @@ check("an unknown system subtype does not break parsing",
   const r = await runWorker({
     bin: "/bin/sh",
     args: ["-c", 'sleep 300 & echo "GRANDCHILD=$!"; wait'],
-    budgetMs: 1500, graceMs: 800,
+    budgetMs: 1500, graceMs: 800, env: WENV, ...wfiles("group"),
   });
   check("an overrunning worker is a timeout", r.outcome, OUTCOMES.TIMEOUT);
   const gc = Number(String(r.text ?? "").match(/GRANDCHILD=(\d+)/)?.[1] ?? 0);
@@ -111,7 +119,7 @@ check("an unknown system subtype does not break parsing",
 }
 {
   // A worker inside its budget is not killed.
-  const r = await runWorker({ bin: "/bin/sh", args: ["-c", 'echo hi; exit 0'], budgetMs: 5000 });
+  const r = await runWorker({ bin: "/bin/sh", args: ["-c", 'echo hi; exit 0'], budgetMs: 5000, env: WENV, ...wfiles("clean") });
   // No result event from /bin/sh, so this is CRASHED by design: the classifier
   // requires a result event and does not infer success from exit 0.
   check("exit 0 without a result event is still not 'ok'", r.outcome, OUTCOMES.CRASHED);
@@ -119,7 +127,7 @@ check("an unknown system subtype does not break parsing",
 }
 {
   // The halt switch terminates work in flight rather than letting it finish.
-  const r = await runWorker({ bin: "/bin/sh", args: ["-c", "sleep 60"], budgetMs: 60000, isHalted: () => true });
+  const r = await runWorker({ bin: "/bin/sh", args: ["-c", "sleep 60"], budgetMs: 60000, isHalted: () => true, env: WENV, ...wfiles("halt") });
   check("the halt switch stops a worker in flight", r.outcome, OUTCOMES.TIMEOUT);
 }
 
@@ -145,7 +153,7 @@ check("an unknown system subtype does not break parsing",
   const modPath = new URL("../src/supervisor.mjs", import.meta.url).pathname;
   writeFileSync(supScript, [
     'import { runWorker } from ' + JSON.stringify(modPath) + ';',
-    'runWorker({ bin: "/bin/sh", args: ["-c", "sleep 120"], budgetMs: 60000,',
+    'runWorker({ bin: "/bin/sh", args: ["-c", "sleep 120"], budgetMs: 60000, env: { PATH: "/usr/bin:/bin" }, outPath: ' + JSON.stringify(supScript + ".out") + ', errPath: ' + JSON.stringify(supScript + ".err") + ',',
     '  onSpawn: ({ pid }) => { process.stdout.write(String(pid) + "\\n"); } });',
     'setInterval(() => {}, 60000);',
   ].join("\n"));

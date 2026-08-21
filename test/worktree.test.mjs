@@ -211,6 +211,64 @@ let wt;
   const after = git(repo, "ls-remote", "origin", "refs/heads/feature").split(/\s+/)[0];
   check(after === before, "and the remote did not move", `${before.slice(0,10)} -> ${after.slice(0,10)}`);
 
+  // The bogus pushurl stops a push to origin. A push to an explicit file:// or
+  // https:// URL never consults it; the worktree's own hook is the layer that
+  // catches that shape. Git's error text is asserted so the refusing layer is
+  // named, not inferred.
+  {
+    const bare = mkdtempSync(join(tmpdir(), "reeve-bare-escape-"));
+    execFileSync("git", ["init", "--bare", "-q", bare]);
+    let code = 0, err = "";
+    try { execFileSync("git", ["-C", r5.path, "push", bare, "HEAD:refs/heads/escape"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (e) { code = e.status; err = String(e.stderr); }
+    check(code !== 0 && /does not publish/.test(err),
+      "a push to an explicit URL is refused by the worktree's own hook", `code=${code} ${err.slice(0, 200)}`);
+    const refs = execFileSync("git", ["-C", bare, "for-each-ref"], { encoding: "utf8" }).trim();
+    check(refs === "", "and nothing reached the destination", refs);
+    const hooksPath = git(r5.path, "config", "--worktree", "core.hooksPath");
+    check(hooksPath === `${r5.path}.hooks` && existsSync(join(hooksPath, "pre-push")),
+      "the hooks path is this worktree's own sibling directory, set with --worktree", hooksPath);
+    let mainHooks = "(unset)";
+    try { mainHooks = git(repo, "config", "--get", "core.hooksPath") || "(unset)"; } catch { mainHooks = "(unset)"; }
+    check(mainHooks === "(unset)", "and the main checkout's hooks are untouched", mainHooks);
+    rmSync(bare, { recursive: true, force: true });
+  }
+
+  // A worktree that predates the hook (a daemon upgrade finds a verified
+  // worktree from before) must be hardened on REUSE, not only on creation.
+  {
+    rmSync(`${r5.path}.hooks`, { recursive: true, force: true });
+    git(r5.path, "config", "--worktree", "--unset", "core.hooksPath");
+    const again = acquireWorktree({ repoRoot: repo, root: roots, pr: 12, branch: "feature", head: git(repo, "rev-parse", "origin/feature") });
+    check(again.ok && again.reused === true, "control: the worktree was reused, not recreated", JSON.stringify(again));
+    let hp = "(unset)";
+    try { hp = git(r5.path, "config", "--worktree", "core.hooksPath"); } catch { hp = "(unset)"; }
+    check(hp === `${r5.path}.hooks` && existsSync(join(hp, "pre-push")),
+      "a reused worktree is hardened again: hook present and configured", hp);
+  }
+
+  // A hook file that lost its executable bit is silently ignored by git; reuse
+  // must restore and verify the mode, not merely rewrite the bytes.
+  {
+    const { chmodSync, statSync: st } = await import("node:fs");
+    chmodSync(join(`${r5.path}.hooks`, "pre-push"), 0o644);
+    const again = acquireWorktree({ repoRoot: repo, root: roots, pr: 12, branch: "feature", head: git(repo, "rev-parse", "origin/feature") });
+    check(again.ok && (st(join(`${r5.path}.hooks`, "pre-push")).mode & 0o111) !== 0, "a reused hook has its executable bit restored", JSON.stringify(again));
+  }
+
+  // Hardening that cannot be applied must refuse the worktree, never hand it
+  // back with a layer missing. A regular file where the hooks directory must
+  // go is the cheapest way to make the hook step fail.
+  {
+    const { pathFor } = await import("../src/worktree.mjs");
+    const p13 = pathFor(roots, 13);
+    writeFileSync(`${p13}.hooks`, "not a directory\n");
+    git(repo, "push", "-q", "origin", "origin/feature:refs/heads/feature13");   // a branch no worktree holds
+    const r13 = acquireWorktree({ repoRoot: repo, root: roots, pr: 13, branch: "feature13", head: git(repo, "rev-parse", "origin/feature13") });
+    check(r13.ok === false && /harden/i.test(r13.why ?? ""), "a worktree whose hardening fails is refused, with the reason", JSON.stringify(r13));
+    rmSync(`${p13}.hooks`, { force: true });
+  }
+
   // The confinement must be per-worktree. A plain `git config` write from inside a
   // worktree lands in the SHARED clone config and disables push everywhere,
   // including the main checkout — which is how the first version of this broke the

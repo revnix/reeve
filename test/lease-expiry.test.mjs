@@ -1,0 +1,123 @@
+// A heartbeat after the lease deadline must not revive the lease.
+//
+// If the daemon's event loop stalls past LEASE_SECONDS while its detached
+// worker keeps running, the lease has lapsed; the next heartbeat used to
+// update the row regardless and answer alive, so the worker finished and
+// published under a claim that had already expired.
+import { open, startRun, heartbeat, finishRun, bindRun } from "../src/db/ops.mjs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+let fail = 0;
+const check = (ok, name, detail) => {
+  console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+  if (!ok) { if (detail) console.log("        " + detail); fail++; }
+};
+const dir = mkdtempSync(join(tmpdir(), "reeve-lease-"));
+const db = open(join(dir, "l.db"));
+
+const run = startRun(db, { nwo: "o/r", pr: 1, action: "FIX_CI", head: "a".repeat(40) });
+check(heartbeat(db, { runId: run.runId }).alive === true, "control: a fresh lease heartbeats alive");
+
+db.prepare("UPDATE run SET lease_expires_at = unixepoch() - 5 WHERE id = ?").run(run.runId);
+const late = heartbeat(db, { runId: run.runId });
+check(late.alive === false && /expired/.test(late.reason ?? ""), "a heartbeat after the deadline is refused, with the reason", JSON.stringify(late));
+const row = db.prepare("SELECT lease_expires_at FROM run WHERE id = ?").get(run.runId);
+check(row.lease_expires_at < Math.floor(Date.now() / 1000), "and the lapsed lease was not revived", JSON.stringify(row));
+
+
+// Completion revalidates the claim atomically: a worker that exits after its
+// lease expired, or after a cancel was requested, between two heartbeats must
+// not be finished as succeeded, whatever its last heartbeat said.
+{
+  const r2 = startRun(db, { nwo: "o/r", pr: 2, action: "FIX_CI", head: "b".repeat(40) });
+  db.prepare("UPDATE run SET lease_expires_at = unixepoch() - 5 WHERE id = ?").run(r2.runId);
+  const fin = finishRun(db, { runId: r2.runId, outcome: "ok", why: "done" });
+  check(fin.applied === false && /expired/.test(fin.why), "finishing a run whose lease expired is refused, with the reason", JSON.stringify(fin));
+  check(db.prepare("SELECT status FROM run WHERE id = ?").get(r2.runId).status !== "succeeded", "and the run is not marked succeeded", "");
+
+  const r3 = startRun(db, { nwo: "o/r", pr: 3, action: "FIX_CI", head: "c".repeat(40) });
+  db.prepare("INSERT OR REPLACE INTO task_exec (task_id, cancel_requested) VALUES ('pr:3', 1)").run();
+  const fin3 = finishRun(db, { runId: r3.runId, outcome: "ok", why: "done" });
+  check(fin3.applied === false && /cancel/.test(fin3.why), "finishing a run whose cancel was requested is refused, with the reason", JSON.stringify(fin3));
+}
+
+
+// A cancelled run settles its PR node: startRun marked it running, and a run
+// that no longer exists must not leave the node reading that way.
+{
+  const r4 = startRun(db, { nwo: "o/r", pr: 4, action: "FIX_CI", head: "d".repeat(40) });
+  const fin4 = finishRun(db, { runId: r4.runId, outcome: "cancelled", why: "cancelled: operator" });
+  const node4 = db.prepare("SELECT status FROM node WHERE id = 'pr:4'").get();
+  check(fin4.applied === true && db.prepare("SELECT status FROM run WHERE id = ?").get(r4.runId).status === "abandoned", "a cancelled run is abandoned", JSON.stringify(fin4));
+  check(node4?.status === "ready", "and its PR node returns to ready, never left running", JSON.stringify(node4));
+}
+
+
+// The binding itself revalidates the claim: a cancel or an expiry that lands
+// between startRun and the binding must withhold the gate, not release a
+// worker that then runs until the next heartbeat notices.
+{
+  const r5 = startRun(db, { nwo: "o/r", pr: 5, action: "FIX_CI", head: "e".repeat(40) });
+  let threw = null;
+  try { bindRun(db, { runId: r5.runId, pid: 1234, boot: "x" }); } catch (e) { threw = e; }
+  check(!threw && db.prepare("SELECT owner_pid FROM run WHERE id = ?").get(r5.runId).owner_pid === 1234, "control: a live, uncancelled run binds", String(threw?.message));
+
+  const r6 = startRun(db, { nwo: "o/r", pr: 6, action: "FIX_CI", head: "f".repeat(40) });
+  db.prepare("INSERT OR REPLACE INTO task_exec (task_id, cancel_requested) VALUES ('pr:6', 1)").run();
+  threw = null;
+  try { bindRun(db, { runId: r6.runId, pid: 1235, boot: "x" }); } catch (e) { threw = e; }
+  check(threw && /cancel/.test(threw.message), "a cancel requested before the binding refuses it", String(threw?.message));
+
+  const r7 = startRun(db, { nwo: "o/r", pr: 7, action: "FIX_CI", head: "g".repeat(40) });
+  db.prepare("UPDATE run SET lease_expires_at = unixepoch() - 5 WHERE id = ?").run(r7.runId);
+  threw = null;
+  try { bindRun(db, { runId: r7.runId, pid: 1236, boot: "x" }); } catch (e) { threw = e; }
+  check(threw && /expired/.test(threw.message), "an expired lease refuses the binding", String(threw?.message));
+}
+
+
+// A refused completion must not strand the claim: the expired run is retired
+// (abandoned) so the PR can be dispatched again, and a consumed cancellation
+// is cleared so the next run is not refused as already cancelled.
+{
+  const r8 = startRun(db, { nwo: "o/r", pr: 8, action: "FIX_CI", head: "h".repeat(40) });
+  db.prepare("UPDATE run SET lease_expires_at = unixepoch() - 5 WHERE id = ?").run(r8.runId);
+  const fin8 = finishRun(db, { runId: r8.runId, outcome: "ok", why: "done" });
+  check(fin8.applied === false && db.prepare("SELECT status FROM run WHERE id = ?").get(r8.runId).status === "abandoned",
+    "a run refused for an expired lease is retired, not left live", JSON.stringify(fin8));
+  const again8 = startRun(db, { nwo: "o/r", pr: 8, action: "FIX_CI", head: "h".repeat(40) });
+  check(again8.ok === true, "and the PR can be dispatched again", JSON.stringify(again8));
+
+  const r9 = startRun(db, { nwo: "o/r", pr: 9, action: "FIX_CI", head: "i".repeat(40) });
+  db.prepare("INSERT OR REPLACE INTO task_exec (task_id, cancel_requested) VALUES ('pr:9', 1)").run();
+  finishRun(db, { runId: r9.runId, outcome: "cancelled", why: "cancelled: operator" });
+  const r9b = startRun(db, { nwo: "o/r", pr: 9, action: "FIX_CI", head: "i".repeat(40) });
+  let threw = null;
+  try { bindRun(db, { runId: r9b.runId, pid: 99, boot: "x" }); } catch (e) { threw = e; }
+  check(r9b.ok === true && !threw, "a consumed cancellation does not refuse the next run's binding", String(threw?.message));
+}
+
+
+// Lease loss is infrastructure, never the worker's failure: a lease_lost
+// outcome retires the run as abandoned and leaves the node ready, and the
+// expiry refusal applies to every outcome that is not a cancellation.
+{
+  const r10 = startRun(db, { nwo: "o/r", pr: 10, action: "FIX_CI", head: "j".repeat(40) });
+  db.prepare("UPDATE run SET lease_expires_at = unixepoch() - 5 WHERE id = ?").run(r10.runId);
+  finishRun(db, { runId: r10.runId, outcome: "lease_lost", why: "lease revoked: lease-expired" });
+  const run10 = db.prepare("SELECT status FROM run WHERE id = ?").get(r10.runId);
+  const node10 = db.prepare("SELECT status FROM node WHERE id = 'pr:10'").get();
+  check(run10?.status === "abandoned" && node10?.status === "ready", "a lease-lost finish after expiry is abandoned with the node ready, never failed and blocked", JSON.stringify([run10, node10]));
+
+  const r11 = startRun(db, { nwo: "o/r", pr: 11, action: "FIX_CI", head: "k".repeat(40) });
+  db.prepare("UPDATE run SET lease_expires_at = unixepoch() - 5 WHERE id = ?").run(r11.runId);
+  const fin11 = finishRun(db, { runId: r11.runId, outcome: "failed", why: "the worker reported is_error" });
+  const run11 = db.prepare("SELECT status FROM run WHERE id = ?").get(r11.runId);
+  check(fin11.applied === false && run11?.status === "abandoned", "a failed outcome after expiry is refused and retired, not recorded as the worker's failure", JSON.stringify([fin11, run11]));
+}
+
+db.close(); rmSync(dir, { recursive: true, force: true });
+console.log(fail ? `\nfailed=${fail}` : "\nall green");
+process.exit(fail ? 1 : 0);

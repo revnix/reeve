@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import { CHECK_ACCOUNTING } from "../github/reconciler.mjs";
 import { hostname } from "node:os";
+import { createHash } from "node:crypto";
 
 export const LEASE_SECONDS = 120;      // short: heartbeat is cheap, reaping should be fast
 export const HEARTBEAT_SECONDS = 30;   // renew at 1/4 lease
@@ -150,11 +151,21 @@ export function claim(db, { lane, actor = lane, territory = null, pid = process.
 // the caller must then stop, because another run may already own the task.
 export function heartbeat(db, { runId, actor = "lane" }) {
   return tx(db, () => {
+    // An expired lease is not renewed by a late heartbeat: a daemon that stalled
+    // past the deadline while its worker kept running has already lost the
+    // claim, and reviving it here would let that worker finish and publish
+    // under a lease that had lapsed.
     const r = db.prepare(`
       UPDATE run SET heartbeat_at=unixepoch(), lease_expires_at=unixepoch()+?
       WHERE id=? AND status IN ('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')
+        AND lease_expires_at > unixepoch()
       RETURNING task_id`).get(LEASE_SECONDS, runId);
-    if (!r) return { alive: false, reason: "lease-lost" };
+    if (!r) {
+      const row = db.prepare(`SELECT status, lease_expires_at FROM run WHERE id=?`).get(runId);
+      const expired = row && row.lease_expires_at <= Math.floor(Date.now() / 1000)
+        && ['leased','running','blocked_on_ci','blocked_on_review','awaiting_founder'].includes(row.status);
+      return { alive: false, reason: expired ? "lease-expired" : "lease-lost" };
+    }
     const c = db.prepare(`SELECT cancel_requested FROM task_exec WHERE task_id=?`).get(r.task_id);
     if (c?.cancel_requested) return { alive: false, reason: "cancelled" };
     return { alive: true };
@@ -429,6 +440,31 @@ export function startRun(db, { nwo, pr, action, head, lane = "fixer", cause = nu
  * stored beside it. Written before the worker can touch anything, so a crash
  * leaves a run that can be probed rather than a mystery.
  */
+/**
+ * Bind a worker to its run, revalidating the claim in the same transaction: a
+ * cancel or an expiry that landed between startRun and this call withholds
+ * the gate (the caller's onSpawn throws), instead of releasing a worker that
+ * then runs until the next heartbeat notices. Throws when the claim is gone.
+ */
+export function bindRun(db, { runId, pid, boot }) {
+  return tx(db, () => {
+    const r = db.prepare(`SELECT r.task_id, r.lease_expires_at, COALESCE(x.cancel_requested, 0) AS cancel_requested
+                            FROM run r LEFT JOIN task_exec x ON x.task_id = r.task_id
+                           WHERE r.id=? AND r.status IN ('leased','running')`).get(runId);
+    if (!r) throw new Error("the run is no longer leased; the worker is not bound");
+    if (r.cancel_requested) throw new Error("a cancel was requested before the worker was bound");
+    if (r.lease_expires_at <= Math.floor(Date.now() / 1000)) throw new Error("the run's lease expired before the worker was bound");
+    db.prepare(`UPDATE run SET owner_pid=?, owner_boot=?, status='running', heartbeat_at=unixepoch() WHERE id=?`).run(pid, boot ?? "", runId);
+    emit(db, { actor: "daemon", op: "run.spawned", run_id: runId, payload: { pid, boot } });
+  });
+}
+
+/** Has a cooperative cancel been requested for this run's task? Cheap enough to ask every poll. */
+export function cancelRequested(db, runId) {
+  const r = db.prepare(`SELECT COALESCE(x.cancel_requested, 0) AS c FROM run r LEFT JOIN task_exec x ON x.task_id = r.task_id WHERE r.id=?`).get(runId);
+  return !!r?.c;
+}
+
 export function notePid(db, { runId, pid, boot }) {
   return tx(db, () => {
     db.prepare(`UPDATE run SET owner_pid=?, owner_boot=?, status='running',
@@ -439,16 +475,52 @@ export function notePid(db, { runId, pid, boot }) {
 
 /** Close a run. An outcome that is not "ok" is a failure with its reason kept. */
 export function finishRun(db, { runId, outcome, why = null, ms = null, cost = null, sessionId = null }) {
-  const status = outcome === "ok" ? "succeeded" : "failed";
+  // A cancelled run was stopped on request and a lease-lost run was stopped by
+  // the infrastructure: both are abandoned, with the node returned to ready,
+  // because nothing was learned about the PR and neither is the worker's fault.
+  const status = outcome === "ok" ? "succeeded" : (outcome === "cancelled" || outcome === "lease_lost" || outcome === "unbound") ? "abandoned" : "failed";
   return tx(db, () => {
-    const r = db.prepare("SELECT task_id FROM run WHERE id=?").get(runId);
+    // Only a run this process still owns may be finished. A run another actor
+    // reaped or abandoned has moved on; a stale worker's verdict must not
+    // overwrite that state or flip the PR node under a replacement run. The
+    // claim is revalidated HERE, atomically: a worker that exits after its
+    // lease lapsed, or after a cancel was requested, between two heartbeats
+    // is not accepted on the strength of the last heartbeat it got.
+    const r = db.prepare(`SELECT r.task_id, r.lease_expires_at, COALESCE(x.cancel_requested, 0) AS cancel_requested
+                            FROM run r LEFT JOIN task_exec x ON x.task_id = r.task_id
+                           WHERE r.id=? AND r.status IN
+                            ('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')`).get(runId);
+    if (!r) return { applied: false, why: "the run is no longer live under this process" };
+    // A refused outcome still retires the run: nothing else will (no reaper
+    // runs in production), and a row left live would block every later
+    // dispatch for the PR through the one-live-run index. The node returns to
+    // ready and a consumed cancellation is cleared, so the next run is neither
+    // blocked nor refused as already cancelled.
+    const retire = why => {
+      db.prepare(`UPDATE run SET status='abandoned', ended_at=unixepoch(), error=? WHERE id=?`).run(why, runId);
+      db.prepare(`UPDATE node SET status='ready', updated_at=unixepoch(), version=version+1 WHERE id=?`).run(r.task_id);
+      db.prepare(`UPDATE task_exec SET cancel_requested=0 WHERE task_id=?`).run(r.task_id);
+      emit(db, { actor: "daemon", op: "run.refused", subject: r.task_id, run_id: runId, payload: { outcome, why } });
+      return { applied: false, why };
+    };
+    if (outcome !== "cancelled" && r.cancel_requested) return retire("a cancel was requested for the run; its outcome is not accepted");
+    // Every outcome but a cancellation is refused after expiry: a success could
+    // publish under a lapsed claim, and a failure would be recorded as the
+    // worker's when the claim, not the worker, was what lapsed.
+    if (outcome !== "cancelled" && outcome !== "lease_lost" && r.lease_expires_at <= Math.floor(Date.now() / 1000))
+      return retire("the run's lease expired before it finished; its outcome is not accepted");
     db.prepare(`UPDATE run SET status=?, ended_at=unixepoch(), error=? WHERE id=?`)
       .run(status, why, runId);
-    if (r) db.prepare(`UPDATE node SET status=?, updated_at=unixepoch(), version=version+1 WHERE id=?`)
-      .run(status === "succeeded" ? "done" : "blocked", r.task_id);
+    // A cancelled run leaves its node re-dispatchable (`ready`, the reaper's own
+    // convention), never `running` for a run that no longer exists and never
+    // `blocked` for a failure that did not happen.
+    db.prepare(`UPDATE node SET status=?, updated_at=unixepoch(), version=version+1 WHERE id=?`)
+      .run(status === "succeeded" ? "done" : status === "abandoned" ? "ready" : "blocked", r.task_id);
+    // The cancellation has been honoured; it must not refuse the next run.
+    if (status === "abandoned") db.prepare(`UPDATE task_exec SET cancel_requested=0 WHERE task_id=?`).run(r.task_id);
     emit(db, { actor: "daemon", op: "run.finish", subject: r?.task_id ?? null, run_id: runId,
                payload: { outcome, why, ms, cost, sessionId } });
-    return { ok: true, status };
+    return { ok: true, applied: true, status };
   });
 }
 
@@ -468,4 +540,37 @@ export function refundFixAttempt(db, nwo, pr, cause) {
   db.prepare(`UPDATE fix_attempt SET attempts = MAX(0, attempts - 1)
               WHERE nwo=? AND pr=? AND cause=?`).run(nwo, pr, cause);
   return countFixAttempts(db, nwo, pr, cause);
+}
+
+// ------------------------------------------------------------------ worker contracts
+export const sha256 = s => createHash("sha256").update(String(s)).digest("hex");
+
+/** Record the contract a worker is about to run under. Written before spawn, beside the run. */
+export function recordWorkerContract(db, { runId, cliVersion, modelRequested = null, effort = null, argvHash, promptHash,
+                                           settingsHash, envHash = null, toolContract = null, agentsHash = null, maxTurns = null,
+                                           maxBudgetUsd = null, canaryId = null, outPath, errPath, pid = null, lstart = null,
+                                           contractDrift = null }) {
+  return tx(db, () => {
+    db.prepare(`INSERT INTO worker_run (run_id,cli_version,model_requested,effort,argv_hash,prompt_hash,settings_hash,env_hash,
+                  tool_contract,agents_hash,max_turns,max_budget_usd,canary_id,out_path,err_path,pid,lstart,contract_drift,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,unixepoch())`)
+      .run(runId, cliVersion, modelRequested, effort, argvHash, promptHash, settingsHash, envHash, toolContract, agentsHash,
+           maxTurns, maxBudgetUsd, canaryId, outPath, errPath, pid, lstart, contractDrift == null ? null : canonical(contractDrift));
+    emit(db, { actor: "daemon", op: "worker.contract", run_id: runId, payload: { cliVersion, modelRequested, argvHash, settingsHash } });
+  });
+}
+
+/** The process identity, written the instant the fail-closed binding succeeds. */
+export function noteWorkerBinding(db, { runId, pid, lstart }) {
+  db.prepare(`UPDATE worker_run SET pid=?, lstart=? WHERE run_id=?`).run(pid, lstart, runId);
+}
+
+/** What the worker announced it ran as, and whether its durable record is whole. */
+export function noteWorkerResult(db, { runId, modelResolved = null, truncated = false, stdoutBytes = null }) {
+  db.prepare(`UPDATE worker_run SET model_resolved=COALESCE(?, model_resolved), truncated=?, stdout_bytes=? WHERE run_id=?`)
+    .run(modelResolved, truncated ? 1 : 0, stdoutBytes, runId);
+}
+
+export function workerContractFor(db, runId) {
+  return db.prepare(`SELECT * FROM worker_run WHERE run_id=?`).get(runId) ?? null;
 }

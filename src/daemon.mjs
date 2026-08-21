@@ -18,13 +18,14 @@ import { evaluatePr, publishVerdict } from "./pr.mjs";
 import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
-import { promptFor } from "./prompts.mjs";
+import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
+import { workerEnv, writeGitConfig, CONTAINMENT } from "./workerenv.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256 } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { snapshot, snapshotAll } from "./backup.mjs";
 import { selfAudit } from "./selfaudit.mjs";
@@ -32,11 +33,53 @@ import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync } from "node:fs";
+import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 
 const now = () => Math.floor(Date.now() / 1000);
+
+// Read once per binary: the CLI version is part of every worker's contract,
+// and asking on every dispatch would be a subprocess per tick for an answer
+// that does not change. Resolved under the WORKER's environment, because the
+// daemon's own PATH (launchd's) may not even hold the binary the worker runs;
+// a version that cannot be read is a refusal, never the string "unknown".
+// Keyed by the binary's real path and modification time, so an upgrade under a
+// running daemon is re-read on the next dispatch rather than recorded as the
+// version that was true at startup.
+const CLI_VERSION = new Map();
+// A PR whose worker could not be PREPARED (no binary, no contract table) would
+// otherwise be leased, failed, refunded, and retried on every tick forever,
+// with no one told. Failures back off per PR (doubling, capped at an hour)
+// and stand as one escalation until a preparation succeeds. The map lives on
+// the daemon's context: one per daemon, not one per module.
+const PREP_BACKOFF_BASE_MS = 60_000, PREP_BACKOFF_CAP_MS = 3_600_000;
+function binaryIdentity(bin) {
+  try { const real = realpathSync(bin); const st = statSync(real); return `${real}@${st.mtimeMs}`; }
+  catch { return bin; }
+}
+// The worker's PATH is pinned and does not contain the CLI's install dir (it
+// lives under ~/.local/bin here), and spawn resolves a bare command through the
+// CHILD's PATH. So the binary is resolved once on the daemon's PATH and passed
+// by absolute path; a CLI that cannot be found is a refusal, not a guess.
+let CLAUDE_BIN = null;
+function resolveClaude(bin) {
+  if (bin.startsWith("/")) return bin;
+  if (CLAUDE_BIN) return CLAUDE_BIN;
+  const out = execFileSync("which", [bin], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 15000 }).trim();
+  if (!out) throw new Error(`${bin} is not on the daemon's PATH`);
+  CLAUDE_BIN = out;
+  return out;
+}
+function cliVersion(bin, env) {
+  const key = binaryIdentity(bin);
+  if (CLI_VERSION.has(key)) return CLI_VERSION.get(key);
+  // Bounded: a stalled probe would freeze the tick and let the run's lease lapse.
+  const out = execFileSync(bin, ["--version"], { encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"], timeout: 15000 }).trim();
+  if (!out) throw new Error(`${bin} --version printed nothing`);
+  CLI_VERSION.set(key, out);
+  return out;
+}
 
 // Whether this process's stdout already points at the log file. launchd's
 // StandardOutPath names the very file the daemon appends to, so echoing as well
@@ -356,12 +399,40 @@ export async function tick(ctx) {
     }
   }
 
-  if (execute) {
+  // A worker that can read the founder's credentials is not dispatched, whatever
+  // --execute says. workerenv.mjs declares what its environment can promise;
+  // until a measured mechanism closes the credential read (the OS sandbox
+  // canary or a dedicated worker user), the honest capability is none, and the
+  // founder is told once, by identity. The declaration is injectable for tests
+  // only; the default is the module's own, which refuses.
+  const containment = ctx.containment ?? CONTAINMENT;
+  if (execute && containment.credentialRead !== "closed") {
+    const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action));
+    if (wanted.length) {
+      log(logPath, `execute: NOT dispatching ${wanted.length} worker task(s) — worker containment is open: ${containment.why}`);
+      escalations.set("guardian:containment:open", 1);
+    }
+  }
+
+  if (execute && containment.credentialRead === "closed") {
     const cap = capacity({ maxWorkers: profile.watch?.maxWorkers ?? 5, running: ctx.running ?? 0 });
     log(logPath, `execute: capacity allows ${cap.canStart} worker(s) (load ${cap.load1?.toFixed?.(2) ?? "?"}, ${cap.perfCores} perf cores)`);
     let started = 0;
 
+    const PREP_BACKOFF = (ctx.prepBackoff ??= new Map());   // pr -> { until, failures }
     for (const { e, decision, cause, fp } of decisions) {
+      if (UNBUILT_ACTIONS[decision.action]) {
+        log(logPath, `  #${e.pr}: NOT dispatching ${decision.action} — ${UNBUILT_ACTIONS[decision.action]}`);
+        escalations.set(`#${e.pr}: ${decision.action.toLowerCase().replace("_", " ")} needs a GitHub effect reeve does not yet perform`, 1);
+        continue;
+      }
+      const prepKey = e.pr;
+      const backoff = PREP_BACKOFF.get(prepKey);
+      if (backoff && backoff.until > Date.now() && WORKER_ACTIONS.includes(decision.action)) {
+        log(logPath, `  #${e.pr}: NOT dispatching — worker preparation failed ${backoff.failures} time(s); backing off until ${new Date(backoff.until).toISOString()}`);
+        escalations.set(`#${e.pr}: the worker could not be prepared; reeve is backing off`, 1);
+        continue;
+      }
       if (started >= cap.canStart) { log(logPath, `  capacity reached; ${decisions.length - started} decision(s) deferred to the next tick`); break; }
       if (halted(ctx.haltMarker)) { log(logPath, "HALTED before dispatch"); break; }
 
@@ -431,8 +502,17 @@ export async function tick(ctx) {
 
       log(logPath, `  #${e.pr}: dispatching ${decision.action} in ${worktree} (run ${run.runId}, attempt ${run.attempt})`);
       started++;
-      const beat = setInterval(() => { try { heartbeat(db, { runId: run.runId }); } catch { /* a missed beat must not kill the worker */ } },
-                               HEARTBEAT_MS);
+      // The heartbeat's answer is read, not discarded. `heartbeat` already
+      // reports a lost lease; the interval used to swallow it, so a worker kept
+      // acting with no claim on its run. A failed write is the same: unknown is
+      // not alive.
+      let revoked = null;
+      const beat = setInterval(() => {
+        try {
+          const hb = (ctx.heartbeat ?? heartbeat)(db, { runId: run.runId });
+          if (!hb.alive) revoked = hb.reason ?? "lease not alive";
+        } catch (err) { revoked = `heartbeat write failed: ${err.message}`; }
+      }, ctx.heartbeatMs ?? HEARTBEAT_MS);
       // The deterministic boundary, built from the profile rather than described
       // to the model. Measured against the CLI first: a scoped allowlist refuses
       // `printf > file`, `| tee`, `git push` and a chained `git remote -v`, while
@@ -440,29 +520,131 @@ export async function tick(ctx) {
       // or it cannot tell whether its fix worked.
       const lane = (profile.lanes ?? []).find(l => l.id === decision.lane) ?? null;
       const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane });
-      const settingsPath = writeSandbox(join(dirname(ctx.logPath ?? "/tmp/x"), "sandboxes", String(e.pr)), sandbox);
 
-      let r;
+      let r, prepFailed = false;
       try {
+        // Everything from here runs inside the cleanup scope: the run is
+        // already leased and its heartbeat already ticking, so a failure in
+        // preparing the worker must release both, exactly as a failure in the
+        // worker would. Measured: a contract write that threw outside this
+        // block left the interval renewing a lease for a worker that never
+        // ran, refusing every later dispatch for the PR until a restart.
+        //
+        // The worker's environment is built, never inherited: no token, no ssh
+        // agent, no founder git config. Its output streams to files beside the
+        // run so a restart can read the report the worker left. The run dir is
+        // keyed by repository, PR, and run id: the log dir is shared by every
+        // repo's daemon, and two repos can share a PR number.
+        const stateDir = dirname(ctx.logPath ?? "/tmp/x");
+        const runDir = join(stateDir, "runs", nwo.replace("/", "-"), String(e.pr), run.runId);
+        const budgetMs = (profile.watch?.workerBudgetMinutes ?? 20) * 60_000;
+        const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
+        const env = workerEnv({ gitConfigPath: writeGitConfig(join(stateDir, "git")),
+                                tmpDir: join(runDir, "tmp"), bgWaitMs: budgetMs,
+                                extraPath: [dirname(claudeBin)] });
+        const outPath = join(runDir, "worker.out"), errPath = join(runDir, "worker.err");
+        // The settings file is immutable per run, in the run's own directory:
+        // a path keyed by PR alone was shared by every daemon on the host, and
+        // one could overwrite it between this run's hash and its spawn.
+        const settingsPath = writeSandbox(runDir, sandbox);
+        const maxTurns = profile.watch?.maxTurns ?? 40;
+        const tools = spec.tools ?? sandbox.allowedTools;
+        const argv = workerArgs({ prompt: spec.prompt, allowedTools: tools, settings: settingsPath, maxTurns });
+        // The complete argv is kept beside the hash: a hash proves what ran, the
+        // file lets a later attempt run the same thing.
+        mkdirSync(runDir, { recursive: true });
+        writeFileSync(join(runDir, "argv.json"), JSON.stringify(argv));
+        // The contract is recorded before the process exists, so that a crash
+        // between here and the first heartbeat still leaves the answer to "what
+        // was this worker asked to run as".
+        recordWorkerContract(db, {
+          runId: run.runId, cliVersion: ctx.cliVersion ?? cliVersion(claudeBin, env),
+          argvHash: sha256(JSON.stringify(argv)), promptHash: sha256(spec.prompt),
+          settingsHash: sha256(readFileSync(settingsPath, "utf8")),
+          toolContract: tools, maxTurns, outPath, errPath,
+          envHash: sha256(JSON.stringify(Object.keys(env).sort().map(k => [k, env[k]]))),
+        });
+
         r = await (ctx.spawnWorker ?? runWorker)({
-          args: workerArgs({ prompt: spec.prompt,
-                             allowedTools: spec.tools ?? sandbox.allowedTools,
-                             settings: settingsPath,
-                             maxTurns: profile.watch?.maxTurns ?? 40 }),
-          cwd: worktree,
-          budgetMs: (profile.watch?.workerBudgetMinutes ?? 20) * 60_000,
+          bin: claudeBin,
+          args: argv,
+          cwd: worktree, env, outPath, errPath,
+          maxOutputBytes: profile.worker?.maxOutputBytes ?? 64 * 1024 * 1024,
+          budgetMs,
           isHalted: () => halted(ctx.haltMarker),
+          // The heartbeat answers every 30 seconds; a cancel must not wait for
+          // it. The poll asks the store directly, so a cancel requested after
+          // the binding ends the worker within one poll interval.
+          isRevoked: () => revoked ?? (cancelRequested(db, run.runId) ? "cancelled" : null),
           // Bind the process to the run the instant it exists, before it can
           // touch anything, so a crash leaves something probeable.
-          onSpawn: ({ pid, lstart }) => notePid(db, { runId: run.runId, pid, boot: lstart }),
+          onSpawn: ({ pid, lstart }) => { bindRun(db, { runId: run.runId, pid, boot: lstart }); noteWorkerBinding(db, { runId: run.runId, pid, lstart }); },
         });
+      } catch (err) {
+        // A worker that could not be prepared or launched is a failed attempt
+        // with its reason, never a thrown tick: the run below is closed, the
+        // lease released, and the next PR still gets its turn. The attempt
+        // spent above is refunded: this failure is reeve's, not the fix's.
+        r = { outcome: OUTCOMES.FAILED, why: `could not prepare the worker: ${err.message}`, ms: 0, cost: null, sessionId: null };
+        prepFailed = true;
+        if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+        const prev = PREP_BACKOFF.get(prepKey)?.failures ?? 0;
+        PREP_BACKOFF.set(prepKey, { failures: prev + 1, until: Date.now() + Math.min(PREP_BACKOFF_CAP_MS, PREP_BACKOFF_BASE_MS * 2 ** prev) });
+        escalations.set(`#${e.pr}: the worker could not be prepared; reeve is backing off`, 1);
       } finally {
         clearInterval(beat);
+        // Classified FIRST, before anything is recorded: a binding refused
+        // because a cancel landed first is a cancellation, not a preparation
+        // failure, and the audit trail must say so (run.finish, cancelled),
+        // not record a refused unbound worker. Nothing ran, so the fixer's
+        // attempt is given back as well.
+        if (r?.outcome === OUTCOMES.UNBOUND && /cancel/.test(r?.why ?? "")) {
+          r = { ...r, outcome: OUTCOMES.CANCELLED, why: r.why };
+          if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+        }
+        // Pre-execution outcomes are classified BEFORE the recorder and the
+        // finish, so a recorder that fails cannot rewrite them into a spent
+        // failure. A worker that never executed (the gate refused its binding) spent no
+        // fixer's attempt; it is refunded like any pre-execution failure, and it
+        // backs off like one: a binding that keeps failing would otherwise
+        // lease and refuse the PR on every tick with nobody told.
+        if (r?.outcome === OUTCOMES.UNBOUND) {
+          prepFailed = true;
+          if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+          const prev = PREP_BACKOFF.get(prepKey)?.failures ?? 0;
+          PREP_BACKOFF.set(prepKey, { failures: prev + 1, until: Date.now() + Math.min(PREP_BACKOFF_CAP_MS, PREP_BACKOFF_BASE_MS * 2 ** prev) });
+          escalations.set(`#${e.pr}: the worker could not be prepared; reeve is backing off`, 1);
+        }
+        // The flag, not the reason string: a recorder that fails for the same
+        // cause rewrites the reason, and a backoff inferred from it vanished.
+        // What the worker said it ran as, and whether its durable record is whole.
+        // Facts that cannot be recorded are facts nobody can audit later, so a
+        // run whose facts did not land is not a successful run, whatever the
+        // worker said: the outcome becomes failed before the run is closed.
+        try { (ctx.noteWorkerResult ?? noteWorkerResult)(db, { runId: run.runId, modelResolved: r?.model ?? null, truncated: r?.truncated === true || r?.stderrTruncated === true, stdoutBytes: r?.stdoutBytes ?? null }); }
+        catch (err) {
+          // A pre-execution outcome stays what it is (nothing ran, nothing to
+          // publish); only an outcome that could have been published is
+          // downgraded to failed when its facts did not land.
+          const pre = r?.outcome === OUTCOMES.UNBOUND || r?.outcome === OUTCOMES.CANCELLED || r?.outcome === OUTCOMES.LEASE_LOST;
+          r = pre ? { ...r, why: `${r.why}; result facts could not be recorded: ${err.message}` }
+                  : { ...(r ?? {}), outcome: OUTCOMES.FAILED, why: `the run's result facts could not be recorded: ${err.message}` };
+        }
         // Closed in `finally`: a throw between spawn and result would otherwise
         // leave the run leased forever, and the PR unworkable until it expired.
-        finishRun(db, { runId: run.runId, outcome: r?.outcome ?? "failed",
-                        why: r?.why ?? "the worker threw before returning a result",
-                        ms: r?.ms, cost: r?.cost, sessionId: r?.sessionId });
+        // finishRun itself refuses a run this process no longer owns (a lost
+        // lease means another actor already moved it), so a stale outcome can
+        // never overwrite the newer state.
+        const fin = finishRun(db, { runId: run.runId, outcome: r?.outcome ?? "failed",
+                                    why: r?.why ?? "the worker threw before returning a result",
+                                    ms: r?.ms, cost: r?.cost, sessionId: r?.sessionId });
+        if (!prepFailed) PREP_BACKOFF.delete(prepKey);
+        if (fin?.applied === false) {
+          // The store refused the outcome: the claim was gone or withdrawn by
+          // the time the worker finished. Whatever it produced is not published.
+          log(logPath, `  #${e.pr}: run ${run.runId} not finished by this process: ${fin.why}`);
+          r = { ...(r ?? {}), outcome: /cancel/.test(fin.why) ? OUTCOMES.CANCELLED : OUTCOMES.LEASE_LOST, why: fin.why };
+        }
       }
       log(logPath, `  #${e.pr}: ${decision.action} -> ${r.outcome} (${r.why}) in ${Math.round(r.ms / 1000)}s${r.cost != null ? `, ${r.cost.toFixed(3)}` : ""}`);
 

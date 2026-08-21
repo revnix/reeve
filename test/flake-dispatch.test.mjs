@@ -69,7 +69,7 @@ const scenario = async ({ failing, probe }) => {
   const spawned = [];
   const ctx = {
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
-    execute: true, shadow: true, running: 0,
+    execute: true, shadow: true, running: 0, containment: { credentialRead: "closed", why: "test" }, claudeBin: "/bin/sh", cliVersion: "test",
     profile: {
       identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir },
       authority: { policy: "propose_and_merge" },

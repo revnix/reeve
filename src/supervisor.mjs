@@ -21,7 +21,8 @@
 //     retries internally. CLAUDE_CODE_MAX_RETRIES bounds it.
 
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, writeSync, closeSync, readSync, fstatSync } from "node:fs";
+import { dirname } from "node:path";
 
 export const OUTCOMES = {
   OK: "ok",
@@ -31,6 +32,8 @@ export const OUTCOMES = {
   RATE_LIMITED: "rate_limited",   // the provider refused
   CRASHED: "crashed",             // died without a result event
   CANCELLED: "cancelled",         // halt switch or explicit cancel
+  UNBOUND: "unbound",             // pid+lstart could not be recorded; the worker was killed unobserved
+  LEASE_LOST: "lease_lost",       // the run lease expired or was taken; the worker was terminated
 };
 
 /** Identity token for a pid. Non-zero exit means dead; a differing string means reused. */
@@ -39,6 +42,20 @@ export function readStart(pid) {
   // out-of-range pid, and a liveness probe must not print anything.
   try { return execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() || null; }
   catch { return null; }
+}
+
+/** The last `n` bytes of a file, read from the end: a 64 MiB stderr must not be decoded whole for a 4 KB tail. */
+function tailOf(path, n) {
+  let fd = null;
+  try {
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    const len = Math.min(n, size);
+    const b = Buffer.alloc(len);
+    readSync(fd, b, 0, len, size - len);
+    return b.toString("utf8");
+  } catch { return ""; }
+  finally { if (fd !== null) { try { closeSync(fd); } catch { /* already closed */ } } }
 }
 
 /**
@@ -84,32 +101,60 @@ function installReaper() {
 
 /** Kill a whole process group, swallowing ESRCH. Always the NEGATIVE pid. */
 function killGroup(pid, signal) {
+  // A child whose spawn failed has no pid; there is no group to kill, and
+  // `process.kill(-NaN)` would throw inside whatever called us.
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(-pid, signal); return true; }
-  catch (e) { if (e.code !== "ESRCH") throw e; return false; }
+  // ESRCH: no such group. EPERM here means the group leader is already gone
+  // and the id belongs to nobody this process may signal: also gone.
+  catch (e) { if (e.code !== "ESRCH" && e.code !== "EPERM") throw e; return false; }
 }
 
 /**
  * Build the argv for a worker. Flags are passed EXPLICITLY, never inherited:
  * an inherited setting is one a future default can silently change.
+ *
+ * `settings` is REQUIRED. It used to default to null, and a resume that did not
+ * re-pass it relaunched a worker with no denylist and no sandbox at all -- the
+ * CLI does not carry `--settings` across `--resume`. An optional parameter that
+ * guards a safety rule is the class of defect that bit four times in one day;
+ * this one is removed rather than asserted around.
+ *
+ * The three isolation flags are unconditional: the founder's user settings carry
+ * broad permissions, plugins, and MCP servers a worker must never inherit.
  */
-export function workerArgs({ prompt, cwd, agent = null, allowedTools = null, settingSources = null,
-                             settings = null, maxTurns = null, model = null, sessionId = null, resume = null }) {
+export function workerArgs({ prompt, settings, agent = null, allowedTools = null, disallowedTools = null,
+                             settingSources = "", maxTurns = null, model = null, effort = null,
+                             maxBudgetUsd = null, jsonSchema = null, agents = null, mcpConfig = null,
+                             sessionId = null, resume = null }) {
+  if (typeof settings !== "string" || !settings.length)
+    throw new Error("workerArgs: settings is required; a worker without its settings file has no sandbox");
   const a = ["-p", prompt, "--output-format", "stream-json",
              // Required: without --verbose the process exits 1 and writes NOTHING
              // to stdout, which is indistinguishable from a hang.
-             "--verbose"];
+             "--verbose",
+             // Nothing ambient: no user CLAUDE.md, hooks, plugins, MCP servers,
+             // custom agents, or Chrome. What the worker gets is what is passed.
+             "--safe-mode", "--strict-mcp-config", "--no-chrome",
+             "--settings", settings];
+  if (mcpConfig) a.push("--mcp-config", mcpConfig);
   if (agent) a.push("--agent", agent);
+  if (agents) a.push("--agents", agents);
   if (model) a.push("--model", model);
+  if (effort) a.push("--effort", effort);
   if (maxTurns != null) a.push("--max-turns", String(maxTurns));
+  if (maxBudgetUsd != null) a.push("--max-budget-usd", String(maxBudgetUsd));
   if (allowedTools) a.push("--allowedTools", allowedTools);
-  // The deterministic half of the boundary. The allowlist above scopes what may
-  // run; this file carries the profile's forbidden commands and quarantined paths
-  // as rules the CLI enforces, rather than as prose the model is asked to respect.
-  if (settings) a.push("--settings", settings);
-  // `--setting-sources project` cuts the preamble ~8x (31,647 -> 3,845 cache-creation
-  // tokens, $0.3166 -> $0.0386 for one reply) but strips plugin-shipped agents, so it
-  // is only safe for a worker that needs none.
-  if (settingSources) a.push("--setting-sources", settingSources);
+  if (disallowedTools) a.push("--disallowedTools", disallowedTools);
+  if (jsonSchema) a.push("--json-schema", jsonSchema);
+  // `--safe-mode` leaves permissions alone by the CLI's own description, so the
+  // founder's user-level allow rules would still merge into the worker, and
+  // `local` was measured to load the checkout's own .claude/settings.local.json,
+  // which a pull request can carry (docs/measured/2026-08-22-setting-sources.md).
+  // The empty value is accepted and means no ambient source at all: the
+  // worker's rules come from the --settings file above and nothing else. A
+  // caller that wants a source must name it.
+  a.push("--setting-sources", settingSources ?? "");
   if (resume) a.push("--resume", resume);
   else if (sessionId) a.push("--session-id", sessionId);
   return a;
@@ -120,7 +165,7 @@ export function readEvent(line) {
   let e;
   try { e = JSON.parse(line); } catch { return null; }
   if (e.type === "rate_limit_event") return { kind: "rate_limit", info: e.rate_limit_info ?? {} };
-  if (e.type === "system" && e.subtype === "init") return { kind: "init", sessionId: e.session_id };
+  if (e.type === "system" && e.subtype === "init") return { kind: "init", sessionId: e.session_id, model: e.model ?? null };
   if (e.type === "result") return { kind: "result", result: e };
   if (e.type === "assistant") return { kind: "assistant" };
   return { kind: "other", type: e.type };
@@ -202,94 +247,219 @@ export function classifyResult(result, { code, signal, killedByUs }) {
  * Resolves with an outcome; never throws for a worker failure.
  */
 export function runWorker({
-  bin = "claude", args, cwd, env = {},
+  bin = "claude", args, cwd, env,
+  outPath = null, errPath = null, maxOutputBytes = 64 * 1024 * 1024,
   budgetMs = 20 * 60 * 1000,
   graceMs = 5000,
-  maxRetries = 1,
   onEvent = () => {},
   // Called once with the worker's pid and identity token, before any output.
   // Without it a caller cannot observe or record a worker until it has already
   // exited, which is exactly when a supervisor most needs to know about it.
   onSpawn = () => {},
   isHalted = () => false,
+  // Asked every poll: a non-null answer is the reason the worker's lease is
+  // gone, and the worker is terminated with it. A probe that THROWS is the
+  // same answer with the error as its reason: a store that cannot be asked
+  // cannot vouch for the lease, and the exception must not escape a timer.
+  isRevoked = () => null,
+  // The identity reader, injectable for the test that makes it fail; the
+  // default is the real `ps` read and a null answer is a refused binding.
+  readStart: readStartOf = readStart,
 } = {}) {
+  // The environment is EXACT. It used to be `{...process.env, ...env}`, which
+  // handed every worker the founder's tokens and the ssh agent; see workerenv.mjs.
+  if (!env || typeof env !== "object") throw new Error("runWorker: env is required; a worker never inherits the supervisor's environment");
+  if (!outPath || !errPath) throw new Error("runWorker: outPath and errPath are required; a worker's output must survive the supervisor");
   return new Promise(resolve => {
-    const child = spawn(bin, args, {
-      cwd, detached: true, stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        // Without this a 429 hangs indefinitely: the CLI retries internally with
-        // no output, which reads as a stuck worker rather than a rate limit.
-        CLAUDE_CODE_MAX_RETRIES: String(maxRetries),
-        ...env,
-      },
-    });
-    installReaper();
-    LIVE_GROUPS.add(child.pid);
-    const startedAt = Date.now();
-    const lstart = readStart(child.pid);
-    try { onSpawn({ pid: child.pid, lstart }); } catch { /* an observer must not kill the worker */ }
+    // Output goes to durable files, not memory: a restart reads the report from
+    // the file, and a worker that prints without end cannot take the supervisor
+    // down. Past the cap, bytes are dropped and the drop is recorded.
+    mkdirSync(dirname(outPath), { recursive: true });
+    mkdirSync(dirname(errPath), { recursive: true });
+    // Both or neither: a second open that fails (disk full between two inode
+    // creations, a directory where a file should be) must not leak the first
+    // descriptor once per retry until the daemon runs out of them.
+    const outFd = openSync(outPath, "w");
+    let errFd;
+    try { errFd = openSync(errPath, "w"); }
+    catch (err) { try { closeSync(outFd); } catch { /* already closed */ } throw err; }
+    // Each stream has its own cap and its own count: a chatty stderr must not
+    // spend stdout's budget, and stdoutBytes must mean stdout.
+    const streams = { out: { fd: outFd, written: 0, truncated: false }, err: { fd: errFd, written: 0, truncated: false } };
+    let buf = "", writeError = null;
+    const write = (s, chunk) => {
+      if (writeError) return;
+      if (s.written + chunk.length > maxOutputBytes) { s.truncated = true; return; }
+      // A write that fails (disk full, a mount gone) throws inside a stream
+      // callback, where nothing awaits it; unhandled, it would take the daemon
+      // down. It ends this worker instead, with the reason.
+      // writeSync may write less than the chunk; a short write that was
+      // counted as whole would leave the durable record silently incomplete.
+      try { let off = 0; while (off < chunk.length) { off += writeSync(s.fd, chunk, off, chunk.length - off); } s.written += chunk.length; }
+      catch (err) { writeError = err.message; killedByUs = true; killGroup(child.pid, "SIGTERM"); setTimeout(() => { if (!settled) killGroup(child.pid, "SIGKILL"); }, graceMs); }
+    };
 
-    let result = null, sessionId = null, rateLimit = null;
+    // The worker is held behind a gate until its binding is durable. A child
+    // starts executing at spawn, so a binding that failed afterwards would be
+    // killing a worker that may already have acted (a `touch` finished in that
+    // window). The gate is a shell that reads one line from stdin and then
+    // execs the real binary in place: same pid, same start time, no action
+    // until released. A binding that fails closes stdin instead, and the
+    // shell exits having run nothing.
+    const child = spawn("/bin/sh", ["-c", 'read -r _gate || exit 97; exec "$0" "$@"', bin, ...args],
+                        { cwd, detached: true, stdio: ["pipe", "pipe", "pipe"], env });
+    const startedAt = Date.now();
+    // The gate's pipe can close under us: a shell killed between binding and
+    // release makes the write fail asynchronously with EPIPE on a stream that
+    // had no listener, which is an uncaught exception and a dead daemon
+    // (reproduced). The exit path reports the outcome; the stream error is noise.
+    child.stdin.on("error", () => {});
+    const release = () => { try { child.stdin.write("go\n"); child.stdin.end(); } catch { /* the exit path reports it */ } };
+    const withhold = () => { try { child.stdin.end(); } catch { /* already closed */ } };
+
+    let result = null, sessionId = null, rateLimit = null, initModel = null, revokedWhy = null;
     let killedByUs = false, settled = false;
-    let stdout = "", stderr = "", buf = "";
+    let termTimer = null, killTimer = null, haltTimer = null;
 
     const finish = payload => {
       if (settled) return;
       settled = true;
       clearTimeout(termTimer); clearTimeout(killTimer); clearInterval(haltTimer);
+      try { closeSync(outFd); closeSync(errFd); } catch { /* already closed */ }
       resolve(payload);
     };
 
+    // The error listener goes on FIRST. A binary that cannot be spawned emits
+    // its error asynchronously, and a child with no listener for it takes the
+    // whole daemon down; measured once, with launchd ready to restart it into
+    // the same death.
+    // A spawn that fails ran nothing (a vanished worktree, EAGAIN): it is a
+    // pre-execution outcome, so the daemon refunds and backs off rather than
+    // spending a fixer's attempt on a worker that never existed.
+    child.on("error", err => { if (child.pid) LIVE_GROUPS.delete(child.pid); return finish({
+      outcome: OUTCOMES.UNBOUND, why: `could not spawn ${bin}: ${err.message}`,
+      pid: child.pid ?? null, lstart: null, ms: Date.now() - startedAt, stderr: tailOf(errPath, 4000), outPath, errPath, truncated: false,
+    }); });
+
+    // No pid means the spawn already failed and the error event is on its way;
+    // there is nothing to bind, observe, or kill.
+    if (!child.pid) { withhold(); return; }
+
+    installReaper();
+    LIVE_GROUPS.add(child.pid);
+    const lstart = readStartOf(child.pid);
+
+    // The binding is not an observer. A worker whose pid and start time could
+    // not be written is one a restart can neither adopt nor kill with
+    // confidence, so it does not get to run at all. A start time that could
+    // not be READ is the same failure from the other side: pid alone names a
+    // stranger after the first reuse, so an empty token is no binding.
+    try {
+      if (!lstart) throw new Error("the worker's start time could not be read, so its pid cannot be told from a reused one");
+      onSpawn({ pid: child.pid, lstart });
+    }
+    catch (err) {
+      withhold();
+      killGroup(child.pid, "SIGKILL");
+      LIVE_GROUPS.delete(child.pid);
+      child.on("exit", () => {});
+      return finish({ outcome: OUTCOMES.UNBOUND, why: `run binding failed: ${err.message}`,
+                      pid: child.pid, lstart, ms: Date.now() - startedAt, stderr: "", outPath, errPath, truncated: false });
+    }
+    release();
+
     child.stdout.on("data", d => {
-      stdout += d;
-      buf += d;
+      write(streams.out, d);
+      // The partial-line buffer is bounded too: a newline-free stream would
+      // otherwise grow it without limit while the file stayed capped. No
+      // stream-json line approaches a megabyte, so dropping one that does
+      // loses nothing the parser could have used.
+      buf = buf.length > 1024 * 1024 ? "" : buf + d;
       const lines = buf.split("\n");
       buf = lines.pop() ?? "";
       for (const line of lines) {
         if (!line.trim()) continue;
         const ev = readEvent(line);
         if (!ev) continue;
-        if (ev.kind === "init") sessionId = ev.sessionId;
+        if (ev.kind === "init") { sessionId = ev.sessionId; initModel = ev.model ?? null; }
         if (ev.kind === "result") result = ev.result;
         if (ev.kind === "rate_limit") rateLimit = ev.info;
         onEvent(ev);
       }
     });
-    child.stderr.on("data", d => { stderr += d; });
+    child.stderr.on("data", d => { write(streams.err, d); });
 
-    const termTimer = setTimeout(() => {
+    termTimer = setTimeout(() => {
       killedByUs = true;
       // SIGTERM to the GROUP: the negative pid is what reaches the grandchildren.
       killGroup(child.pid, "SIGTERM");
     }, budgetMs);
 
     // Escalation only after grace. SIGKILL first would skip SessionEnd entirely.
-    const killTimer = setTimeout(() => { if (!settled) killGroup(child.pid, "SIGKILL"); }, budgetMs + graceMs);
+    killTimer = setTimeout(() => { if (!settled) killGroup(child.pid, "SIGKILL"); }, budgetMs + graceMs);
 
-    // The halt switch fails CLOSED: a worker in flight is terminated, not left running.
-    const haltTimer = setInterval(() => {
-      if (isHalted() && !settled) { killedByUs = true; killGroup(child.pid, "SIGTERM"); }
+    // The halt switch and the lease both fail CLOSED: a worker in flight is
+    // terminated, not left running. A lease that cannot be proven live is the
+    // same as no lease; the former posture ("a missed beat must not kill the
+    // worker") left workers acting with no durable claim on anything. A
+    // revoked worker gets the same grace as a timed-out one before SIGKILL.
+    const probeRevoked = () => { try { return isRevoked(); } catch (err) { return `the revocation probe failed: ${err.message}`; } };
+    haltTimer = setInterval(() => {
+      if (settled) return;
+      if (isHalted()) { killedByUs = true; killGroup(child.pid, "SIGTERM"); return; }
+      const why = probeRevoked();
+      if (why && !revokedWhy) {
+        revokedWhy = String(why); killedByUs = true; killGroup(child.pid, "SIGTERM");
+        setTimeout(() => { if (!settled) killGroup(child.pid, "SIGKILL"); }, graceMs);
+      }
     }, 2000);
 
-    child.on("error", err => { LIVE_GROUPS.delete(child.pid); return finish({
-      outcome: OUTCOMES.CRASHED, why: `could not spawn ${bin}: ${err.message}`,
-      pid: child.pid, lstart, ms: Date.now() - startedAt, stderr,
-    }); });
-
-    child.on("exit", (code, signal) => {
+    // Classification waits for `close`, which fires after stdout and stderr have
+    // drained; `exit` can precede the final result line and would classify a
+    // finished worker as CRASHED. `exit` only sweeps the group.
+    child.on("exit", () => { killGroup(child.pid, "SIGKILL"); });
+    child.on("close", (code, signal) => {
       LIVE_GROUPS.delete(child.pid);
-      // The leader can exit while a grandchild lingers, so sweep the group.
-      killGroup(child.pid, "SIGKILL");
-      const c = classifyResult(result, { code, signal, killedByUs });
+      // Sampled once more here: a lease revoked between the last poll and a
+      // normal exit would otherwise be classified OK and its result published
+      // under a claim the worker no longer held.
+      const lateWhy = revokedWhy ?? probeRevoked();
+      // A cooperative cancel is a cancellation, not a lost lease: the operator
+      // asked, and the record must say so rather than call the worker failed.
+      const cancelled = typeof lateWhy === "string" && /^cancelled\b/.test(lateWhy);
+      // A truncated record is an incomplete record: the result parsed from the
+      // stream may describe an event the durable file no longer holds, and a
+      // store that says OK beside a file that cannot show why is absence read
+      // as success. Truncation and a failed write therefore outrank everything
+      // but a lost lease.
+      const truncated = streams.out.truncated;
+      // The gate's exec failing (126: not executable, 127: not found) after a
+      // successful binding ran no worker: a pre-execution outcome, like a
+      // refused binding, so the attempt is refunded and the PR backs off.
+      const execFailed = !result && !killedByUs && (code === 126 || code === 127);
+      const c = cancelled
+        ? { outcome: OUTCOMES.CANCELLED, why: `cancelled: ${lateWhy}` }
+        : execFailed
+        ? { outcome: OUTCOMES.UNBOUND, why: `could not exec ${bin}: the gate exited ${code}` }
+        : lateWhy
+        ? { outcome: OUTCOMES.LEASE_LOST, why: `lease revoked: ${lateWhy}` }
+        : writeError
+          ? { outcome: OUTCOMES.FAILED, why: `durable output write failed: ${writeError}` }
+          : truncated
+            ? { outcome: OUTCOMES.FAILED, why: `output truncated at ${maxOutputBytes} bytes; the durable record is incomplete` }
+            : streams.err.truncated
+              ? { outcome: OUTCOMES.FAILED, why: `stderr truncated at ${maxOutputBytes} bytes; the durable record is incomplete` }
+              : classifyResult(result, { code, signal, killedByUs });
       finish({
         ...c, pid: child.pid, lstart, sessionId, code, signal,
         ms: Date.now() - startedAt, rateLimit,
         cost: result?.total_cost_usd ?? null,
         usage: result?.usage ?? null,
         text: result?.result ?? null,
-        stderr: stderr.slice(0, 4000),
-        stdoutBytes: stdout.length,
+        model: initModel,
+        stderr: tailOf(errPath, 4000),
+        stdoutBytes: streams.out.written, stderrBytes: streams.err.written, outPath, errPath,
+        truncated, stderrTruncated: streams.err.truncated,
       });
     });
   });

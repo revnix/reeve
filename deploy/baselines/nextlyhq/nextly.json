@@ -1,0 +1,44 @@
+{
+  "capturedAt": "2026-08-21T22:33:40.617Z",
+  "nwo": "nextlyhq/nextly",
+  "branch": "main",
+  "liveDefaultBranch": "main",
+  "rulesetNames": [
+    "protect-main"
+  ],
+  "rulesetSnapshot": [
+    "protect-main|bypass:[\"OrganizationAdmin::always\"]|rules:[\"deletion:{}\",\"non_fast_forward:{}\",\"pull_request:{\\\"allowed_merge_methods\\\":[\\\"merge\\\",\\\"rebase\\\",\\\"squash\\\"],\\\"dismiss_stale_reviews_on_push\\\":false,\\\"dismissal_restriction\\\":{\\\"allowed_actors\\\":[],\\\"enabled\\\":false},\\\"require_code_owner_review\\\":true,\\\"require_extra_approval_for_unattributed_changes\\\":true,\\\"require_last_push_approval\\\":false,\\\"required_approving_review_count\\\":1,\\\"required_review_thread_resolution\\\":false,\\\"required_reviewers\\\":[]}\"]"
+  ],
+  "ruleSnapshot": [
+    "deletion:{}",
+    "non_fast_forward:{}",
+    "pull_request:{\"allowed_merge_methods\":[\"merge\",\"rebase\",\"squash\"],\"dismiss_stale_reviews_on_push\":false,\"dismissal_restriction\":{\"allowed_actors\":[],\"enabled\":false},\"require_code_owner_review\":true,\"require_extra_approval_for_unattributed_changes\":true,\"require_last_push_approval\":false,\"required_approving_review_count\":1,\"required_review_thread_resolution\":false,\"required_reviewers\":[]}"
+  ],
+  "rulesetRequiredChecks": [],
+  "rulesetBypassActors": [
+    "OrganizationAdmin::always"
+  ],
+  "branchProtectionRequiredChecks": [
+    "Decide what this commit can affect@15368"
+  ],
+  "classicBypassAllowances": [],
+  "strictRequiredChecks": false,
+  "enforceAdmins": false,
+  "classicSnapshot": "{\"allow_deletions\":{\"enabled\":false},\"allow_force_pushes\":{\"enabled\":false},\"allow_fork_syncing\":{\"enabled\":false},\"block_creations\":{\"enabled\":false},\"enforce_admins\":{\"enabled\":false},\"lock_branch\":{\"enabled\":false},\"required_conversation_resolution\":{\"enabled\":true},\"required_linear_history\":{\"enabled\":false},\"required_signatures\":{\"enabled\":false},\"required_status_checks\":{\"checks\":[{\"app_id\":15368,\"context\":\"Decide what this commit can affect\"}],\"contexts\":[\"Decide what this commit can affect\"],\"strict\":false}}",
+  "requiredApprovals": 1,
+  "codeOwnerReview": true,
+  "dismissStaleReviews": false,
+  "requireLastPushApproval": false,
+  "requireThreadResolution": true,
+  "profile": {
+    "authorityPolicy": "propose_and_merge",
+    "mergeEnforcement": "enforced",
+    "capabilities": {
+      "observe": false,
+      "draftSpec": false,
+      "implementLocal": false,
+      "publishPr": false,
+      "mergeBuilderPr": false
+    }
+  }
+}

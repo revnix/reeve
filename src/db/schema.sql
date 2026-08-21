@@ -352,3 +352,35 @@ CREATE VIEW IF NOT EXISTS v_ready AS
     AND COALESCE(x.not_before,0) <= unixepoch()
     AND COALESCE(x.cancel_requested,0) = 0
     AND COALESCE(x.attempts,0) < COALESCE(x.max_attempts,5);
+
+-- ---------------------------------------------------------------- worker contracts
+-- One row per claude worker the daemon dispatches: the immutable contract it
+-- ran under, so "what did this worker actually run as" has an answer after the
+-- process is gone. The guardian's attempts are independent dispatches, each
+-- with its own row; reusing a recorded contract verbatim on a retry is the
+-- builder's phase behaviour and reads these columns plus the argv file kept
+-- beside the run. The lease stays on `run`; this row never carries a second one.
+CREATE TABLE IF NOT EXISTS worker_run (
+  run_id          TEXT PRIMARY KEY REFERENCES run(id) ON DELETE CASCADE,
+  cli_version     TEXT NOT NULL,
+  model_requested TEXT,
+  model_resolved  TEXT,                       -- from the worker's init event, once it speaks
+  effort          TEXT,
+  argv_hash       TEXT NOT NULL,
+  prompt_hash     TEXT NOT NULL,
+  settings_hash   TEXT NOT NULL,
+  env_hash        TEXT,                       -- the exact environment, canonical; PATH, git config, caps included
+  tool_contract   TEXT,
+  agents_hash     TEXT,
+  max_turns       INTEGER,
+  max_budget_usd  REAL,
+  canary_id       TEXT,
+  out_path        TEXT NOT NULL,
+  err_path        TEXT NOT NULL,
+  pid             INTEGER,
+  lstart          TEXT,
+  contract_drift  TEXT,                       -- JSON; null when the live environment matched
+  truncated       INTEGER NOT NULL DEFAULT 0, -- the durable output hit its cap; the run is never OK
+  stdout_bytes    INTEGER,
+  created_at      INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;

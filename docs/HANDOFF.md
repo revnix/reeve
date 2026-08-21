@@ -14,8 +14,19 @@ design and adversarial-attack ledger for the review half.
 
 ## 0. The single most important thing to understand
 
-**reeve is a GUARDIAN, not a BUILDER.** It does not pick work, research, design,
-or write features. It watches pull requests that already exist and guards them.
+> **SUPERSEDED IN PART, 2026-08-21 (after this document was written).** The
+> founder was shown this section and the recommendation against a builder, and
+> ruled the other way: reeve WILL become a builder — task intake, research,
+> design, a spec-PR approval gate, implementation, and merging on a PASS
+> verdict. Requirements and programme state live in `docs/TRACKER.md`
+> ("Programme 2"). What survives unchanged: the guardian capabilities, their
+> shadow-week gates, and every invariant in §4 — the builder is being designed
+> ON TOP of them, not instead of them. The table below still correctly
+> describes what exists TODAY.
+
+**reeve is TODAY a GUARDIAN, not yet a BUILDER.** It does not pick work,
+research, design, or write features. It watches pull requests that already
+exist and guards them.
 
 The founder asked directly whether reeve would eventually implement a feature end
 to end. The answer is no, and not after the remaining work either:
@@ -30,10 +41,9 @@ to end. The answer is no, and not after the remaining work either:
 | Work review threads | the founder, by hand | ✓ capability 3 |
 | Refuse an unsafe merge | nobody | ✓ capability 4 |
 
-The intended shape is: a Claude session (Prompt A/B) builds and opens the PR,
-then reeve takes over. If a future session is asked to make reeve a builder, that
-is a NEW programme — weeks, undesigned — and worth pushing back on until the
-guardian is trusted.
+The shape TODAY is: a Claude session (Prompt A/B) builds and opens the PR, then
+reeve takes over. The builder programme that changes this is now founder-ruled
+and in design — do not push back on it; see `docs/TRACKER.md` Programme 2.
 
 ---
 

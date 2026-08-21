@@ -1,0 +1,119 @@
+# reeve tracker
+
+The one file that says what reeve has, what is in flight, and what remains.
+Update it the moment a decision lands or a state changes — never in batches.
+Rule of the house: every claim here is either **measured** (say when) or marked
+**intent**. Absence from this file means "not planned", not "done".
+
+Last full re-verification: 2026-08-21 (suite 45/45, daemon observe-only,
+`HEAD == origin/main`).
+
+---
+
+## Programme 1 — the GUARDIAN (built, partly armed)
+
+The four capabilities, measured 2026-08-21:
+
+| # | Capability | Switch | State | Unblocks when |
+|---|---|---|---|---|
+| 1 | Watch, judge, escalate | — | **ON** | live on nextlyhq/nextly |
+| 2 | Fix red CI itself | `--execute` | off | dispatch evidence (not time-bound) |
+| 3 | Work review threads | `watch.reviewActions` | off | PR-5 → PR-6 after the shadow week |
+| 4 | Refuse an unsafe merge | `--enforce` + ruleset | off | 7 clean shadow days + founder decision |
+
+### Time-blocked (do not try to shortcut)
+
+- [ ] **Review shadow week** — 5 clean days from 22 Aug → PR-5 ≈ 26 Aug.
+      Day 0 (21 Aug) diverged once: #1128, live 55 vs derived 50, caused by a
+      bug fixed the same day. History, not a veto.
+- [ ] **Verdict shadow week** — 7 days zero false blocks → ruleset flip ≈ 28 Aug
+      earliest, and it is the founder's decision.
+
+### Unblocked code (guardian tail)
+
+- [ ] Feed the 500-PR study into worker prompts (`prompts.mjs`) — founder-approved;
+      Codex weighted highest. *Folds into the builder's implementation-phase
+      prompts too.*
+- [ ] Wire flake detection — `flakeEvidence` has ZERO callers; nextly main red
+      6 of last 9 runs. ~2h.
+- [ ] Dispatch evidence: the wrong-worker shape (a confidently bad fix). ~$2, 1h.
+- [ ] `release` lane is dead by construction — its territory sits inside
+      `sensitivePaths`, and sensitive refuses first. ~30m.
+- [ ] *Optional (founder: "if beneficial")* — PR-open size warning (>10 files →
+      expect 4+ rounds), reinstate Greptile (best critical hit rate, out of credits).
+
+### Needs the founder
+
+- [ ] **ntfy read user** — all 5 tokens write-only; needs shell on 95.217.11.127
+      (`ntfy user add mobeen`; `ntfy access mobeen revnix-reeve read-only`;
+      `upstream-base-url` for iOS). Desktop notifications work meanwhile.
+- [ ] **Second project** (`rextaihq/rext-backend`) — needs PR-gating CI + App install.
+- [ ] **Ruleset flip decision** (after the verdict shadow week).
+
+### Closed by ruling — do not reopen
+
+Go/Rust/PHP command tables (not now) · SPILL (off indefinitely) · paid reviewer
+(declined) · CodeRabbit Pro Plus (never raise again).
+
+---
+
+## Programme 2 — the BUILDER (ruled 2026-08-21, in design)
+
+**Founder ruling, 2026-08-21:** reeve becomes a BUILDER as well — runs a task end
+to end: pick → research → design → spec → implement → PR → fix CI → work review
+threads → gate → **merge**. This supersedes the guardian-only scope in
+HANDOFF §0 and re-opens ruling 16 (ledger import).
+
+### Requirements — settled with the founder, do not re-litigate
+
+1. **Architecture A** — deterministic per-task phase state machine inside the
+   existing daemon; each phase a bounded `claude` worker via the existing
+   supervisor/sandbox; multi-agent fan-out happens INSIDE a phase (Claude's own
+   subagents); artifacts durable before every transition; crash-resumable.
+2. **Intake: both in v1** — founder-filed tasks AND ledger import/pick from
+   nextly-ops. (Sequencing intent: filed-task path proven first, ledger pick
+   lands before v1 is called done.)
+3. **The gate** — a very detailed, plain-language spec PR (examples/references/
+   steps) in a PRIVATE repo, @codex review requested, then:
+   founder approves → proceed · founder requests changes → revise ·
+   founder silent 30 min + Codex substantive GO → proceed ·
+   founder silent + Codex findings → revise + resubmit ·
+   founder silent + **Codex silent → wait, re-request, escalate — NEVER proceed**.
+   Approval binds to the spec PR's exact head SHA.
+4. **Depth dial** — research/design effort scales to the task; the sizing
+   decision is visible and overridable in the spec PR.
+5. **Concurrency** — many tasks at once, across projects and directories;
+   leases prevent territory collisions; the guardian must never starve.
+6. **reeve merges** builder-run PRs on a PASS verdict. Replacement invariant:
+   reeve merges only what independent witnesses (CI, external reviewers, the
+   deterministic verdict) have judged — never on a worker's word.
+
+### In flight
+
+- [x] Requirements brainstorm with the founder (2026-08-21)
+- [ ] **Deep research pass** — 15-agent workflow (5 measurers, 3 designs,
+      3 judges, synthesis, 3 adversarial verifiers) — RUNNING 2026-08-21
+- [ ] Sectioned design presented to the founder
+- [ ] Spec written to `docs/` and founder-reviewed
+- [ ] Implementation plan (PR-by-PR, each with its own verification)
+- [ ] Build
+
+### Known constraints the design must answer (from measurements so far)
+
+- Codex refused **79%** of review requests this week (doctor R-05, 21 Aug) —
+  the gate's "Codex GO" arm will often be absent; the rule table already refuses
+  to treat silence as approval.
+- The App reaches **one repo** (nextlyhq/nextly). Spec-PR host and builder-PR
+  targets need App installs.
+- nextlyhq/nextly is **public** — rule 15 forbids reeve's name there; spec PRs
+  live in a private repo.
+- 500-PR study: crossing ~10 changed files ≈ triples review rounds — the
+  implementation phase must bias to small PRs.
+
+---
+
+## Defect log (append-only, newest first)
+
+| Date | Defect | Fix |
+|---|---|---|
+| 2026-08-21 | `shadow`'s case label captured `status`/`statusline`/`dash` — all three printed the shadow report since PR-4 landed; no test covered CLI routing | `c80f0a3` + `test/cli-routing.test.mjs` |

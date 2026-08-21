@@ -203,15 +203,20 @@ your phone.
 
 ---
 
-## 9. reeve is a GUARDIAN, not a BUILDER
+## 9. reeve is a GUARDIAN today — and a BUILDER is being designed
 
-The most important thing to be clear about. reeve does **not** pick what to build,
-research it, design it, or write it. It watches pull requests that already exist.
+TODAY reeve does **not** pick what to build, research it, design it, or write it.
+It watches pull requests that already exist. The shape today is: **you (or a
+Claude session running Prompt A/B) build the feature and open the PR — then reeve
+takes over.** It fixes the CI, works the reviewer findings, and refuses an unsafe
+merge.
 
-The intended shape is: **you (or a Claude session running Prompt A/B) build the
-feature and open the PR — then reeve takes over.** It fixes the CI, works the
-reviewer findings, and refuses an unsafe merge. Making reeve the builder as well
-would be a separate programme, weeks of work, and none of it is designed.
+**Ruled 2026-08-21:** reeve will also become a builder — you file a task (or it
+picks one from the ledger), it researches and designs, opens a plain-language
+spec PR for your approval (with a 30-minute window and a Codex-reviewed
+fallback), implements, and merges when the verdict passes. That programme is in
+design; its requirements and state live in `docs/TRACKER.md`, Programme 2.
+Nothing in this document's guardian half changes.
 
 ## 9b. What reeve is NOT, yet
 

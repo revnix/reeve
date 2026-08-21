@@ -183,6 +183,10 @@ export async function tick(ctx) {
       (prs.length >= CAP ? ` — AT THE ${CAP} CAP: any beyond this are not being watched at all` : ""));
 
   const evaluated = new Set();
+  // Evaluated is not the same as settled. A PR whose decision this tick is WAIT
+  // was looked at and found to be IN FLIGHT, which says nothing about whether the
+  // human-needed condition behind its escalation still holds.
+  const waiting = new Set();
   for (const pr of prs) {
     if (halted(ctx.haltMarker)) { log(logPath, "HALTED mid-tick"); return { decisions, escalations, halted: true }; }
 
@@ -220,6 +224,7 @@ export async function tick(ctx) {
     });
 
     record(db, { pr, head: e.head, verdict: e.verdict, decision });
+    if (decision.action === ACTIONS.WAIT) waiting.add(pr);
     // Carried on the entry rather than left in this block's scope: the dispatch
     // loop below is a SEPARATE block, and reaching for these there threw a
     // ReferenceError on every FIX_CI the moment --execute was on.
@@ -433,7 +438,8 @@ export async function tick(ctx) {
 
   // Announce what STARTED or CHANGED, and what went away. Repeating a standing
   // cause every tick is how an operator learns to ignore the channel.
-  const { fresh, cleared } = announceable(db, escalations, { covered: evaluated, complete: evaluated.size === prs.length });
+  const { fresh, cleared } = announceable(db, escalations,
+    { covered: evaluated, waiting, complete: evaluated.size === prs.length });
   // Recorded last, so it means "a tick completed" rather than "a tick began".
   // That is the difference between a daemon that is working and one that is
   // wedged part-way through every pass.
@@ -478,7 +484,7 @@ export async function tick(ctx) {
  * @param {Map<string, number>} escalations  cause -> how many PRs share it
  * @returns {{fresh: {why: string, count: number}[], cleared: string[]}}
  */
-export function announceable(db, escalations, { covered = null, complete = true, at = Math.floor(Date.now() / 1000) } = {}) {
+export function announceable(db, escalations, { covered = null, waiting = null, complete = true, at = Math.floor(Date.now() / 1000) } = {}) {
   const fresh = [], cleared = [];
   const standing = new Map(
     db.prepare("SELECT why, count, announced_count FROM escalation").all().map(r => [r.why, r]));
@@ -507,9 +513,20 @@ export function announceable(db, escalations, { covered = null, complete = true,
     // does not produce its escalation, and retiring it on that silence announces
     // "resolved" for a problem nobody looked at. Absence is not success here
     // either, and this is the surface a human trusts to tell them it is over.
+    //
+    // Nor is being LOOKED at the same as being settled. Measured on nextly #834:
+    // its decisions ran ESCALATE, then seven ticks of WAIT while CI was in
+    // flight, then ESCALATE again -- and because a waiting tick produces no
+    // escalation, the standing cause was retired and re-announced twice, four
+    // and twenty-five minutes apart, with the reason string identical each time.
+    // WAIT means "something is in flight; check again later", never "the thing a
+    // human was needed for is resolved". Two pushes for one unchanged condition
+    // is how the channel earns being muted, and a muted channel is worse than
+    // none.
     const subject = why.match(/^#(\d+):/)?.[1];
+    const pr = subject ? Number(subject) : null;
     const looked = subject
-      ? (covered === null || covered.has(Number(subject)))
+      ? (covered === null || covered.has(pr)) && !(waiting?.has(pr) ?? false)
       // A shared cause names no PR, so only a tick that finished what it set out
       // to do is entitled to retire it.
       : complete;

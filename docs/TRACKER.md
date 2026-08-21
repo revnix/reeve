@@ -144,26 +144,26 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       approved direction; implementation gated by P0 closure. Merge stays dark
       behind `builder.capabilities.mergeBuilderPr` + `--actuate-merges`.
 - [x] Implementation plan for S0 + S1: `docs/superpowers/plans/2026-08-21-s1-worker-contract.md`
-- [ ] **PR-1 (S0 + S1 core) — revnix/reeve #3, in review** — capability
-      switches (all false on the live profile), baseline fixture + drift check,
-      workerArgs hard-fail + isolation flags, env allowlist + credential-less
-      git, bounded durable streams, fail-closed spawn binding, lease revocation
-      in the daemon, `worker_run` contract rows, worktree pre-push hook.
-      Measured before the fix: an explicit-URL push from a worktree SUCCEEDED.
-      **Review rounds (Codex 7 findings, adversarial 17 confirmed) closed**:
-      spawn-error crash, late revocation, preparation inside cleanup scope,
-      reuse hardening, run dir scoping, baseline fail-closed, reserved env +
-      full git strip list, `--setting-sources local`, truncation is failure,
-      R-13 drift check MOUNTED in doctor (live: matches), refusing gh/ssh shims.
-      **MEASURED AND KNOWN-OPEN** (`test/escape.test.mjs`): with a real HOME the
-      worker can read the founder's token (`git -c credential.helper=`,
-      absolute-path `gh auth token`), bypass the hook (`--no-verify`,
-      `-c core.hooksPath`), and move the clone's shared refs. Therefore the
-      daemon now REFUSES every dispatch under `--execute` while
+- [x] **PR-1 (S0 + S1 core) — LANDED 2026-08-21, revnix/reeve #3, merge
+      `0d313502`.** Capability switches (all false on the live profile),
+      authority baseline + doctor R-13 (live: matches), workerArgs hard-fail +
+      no ambient setting source (measured: `local` loads the checkout's
+      settings.local.json), env allowlist + credential-less git + the App's bot
+      identity in GIT_AUTHOR_*/GIT_COMMITTER_*, refusing gh/ssh shims, bounded
+      durable streams (separate caps), exec gate released only after a
+      revalidated binding (bindRun), lease revocation at every layer (heartbeat
+      expiry refused, completion revalidated, refused completions retired),
+      pre-execution outcomes never spend an attempt or block a PR, worker_run
+      contract rows, worktree-scoped pre-push hook read back on every acquire.
+      **17 Codex rounds (99 findings) + 1 adversarial review (17 confirmed)
+      closed; Codex clean at 053688f.** Suite 54/54.
+      **STILL KNOWN-OPEN, by code** (`test/escape.test.mjs`): with a real
+      HOME the worker can read the founder's token and bypass the hook
+      (`--no-verify`, `-c core.hooksPath`, shared refs); so the daemon
+      REFUSES every dispatch under `--execute` while
       `CONTAINMENT.credentialRead === "open"` (escalation
-      `guardian:containment:open`). PR-2 must close the read (sandbox deny of
-      keychain + ~/.config/gh, measured) or the founder decides on a dedicated
-      worker user; only a measured closure may flip the constant.
+      `guardian:containment:open`). PR-2 closes it or the founder picks a
+      dedicated worker user.
 - [ ] **PR-2 (S1 sandbox)** — the two CLI measurements (sandbox under `-p`,
       invalid settings under `-p`), `sandbox.*` settings + validation,
       per-start canary, doctor R-13/R-14/R-15, escape test.

@@ -25,16 +25,18 @@ primary requirement, not a nice-to-have.
 
 ## State as of 2026-08-21, end of the third session
 
-- **67 commits, 37 test files, 0 failing, CI green on main.**
+- **69 commits, 37 test files, 0 failing, CI green on main.**
 - **The daemon is RUNNING** as a launchd agent (`com.revnix.reeve`) on
   `nextlyhq/nextly`, **observe-only**: no `--execute`, no `--enforce`. 260+ ticks,
   survived a network outage, escalates to ntfy topic `revnix-reeve`.
 - **Hourly backups** with a restore verified against the real store.
 - **The Codex audit list is closed** — every finding fixed or explicitly deferred.
-- **`--execute` has TWO clean CI-verified runs out of fourteen** — but both used
-  the SAME planted failure, the easiest possible root-cause. Run 13 refused to
-  dispatch at all, correctly, and that refusal exposed a real defect.
-- The third session found **three defects that 576 passing assertions did not**,
+- **`--execute` has THREE clean CI-verified runs out of fifteen**, across two
+  failure shapes. Run 15 is the one worth trusting: a logic inversion in
+  `src/db/ops.mjs` failing three assertions in `test/lifecycle.test.mjs`, so the
+  failing test did not name the module at fault. Run 13 refused to dispatch at
+  all, correctly, and that refusal exposed a real defect.
+- The third session found **four defects that 576 passing assertions did not**,
   all by running the system and reading what it stored. See §6.5 of the handoff.
 
 ## Rules for how you work on this
@@ -106,13 +108,15 @@ until the ruleset is repaired, which is deliberately last.
 
 ## Then
 
-The recommended next task is **dispatches against DIFFERENT failure shapes on
-`revnix/reeve`** (§10 of the handoff has the recipe, and the caveat that
-re-planting the SAME failure trips the retry brake by design). Two clean runs on
-one easy failure is not enough to arm nextly. What is untested: a failure whose
-fix is in a different file from the failing test, a failure with two independent
-causes, and an intermittent one. Each dispatch takes about three minutes and costs
-roughly $1.50-2.
+The recommended next task is **the failure shapes still untested** (§10 of the
+handoff has the recipe, and the caveat that re-planting the SAME failure trips the
+retry brake by design). Three clean runs across two shapes is real evidence, but
+what remains untested is the harder half: an INTERMITTENT failure, one with two
+independent causes, one whose fix spans several files, and — most importantly —
+**what happens when a worker is WRONG.** Every run so far produced a correct fix,
+so the second-attempt path and the escalation after it have never been exercised
+by a genuine bad fix. Each dispatch takes about three minutes and costs roughly
+$1.50-2.
 
 The strongest alternative is **reeve auditing itself on a schedule** — running
 `doctor` against its own health and escalating when it degrades. That is the first

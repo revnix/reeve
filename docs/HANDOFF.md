@@ -31,13 +31,13 @@ it is short, and it is the document that states what reeve is *not*.
 
 | | |
 |---|---|
-| Commits | **66**, `HEAD == origin/main`, CI green |
+| Commits | **68**, `HEAD == origin/main`, CI green |
 | Source | 23 `.mjs` files, ~5,600 lines |
 | Tests | **37 files, 0 failing** |
 | Daemon | running as `com.revnix.reeve` on `nextlyhq/nextly`, **observe-only** |
 | Ticks | 260+ since 2026-08-20 14:04 UTC |
 | Backups | hourly snapshots, restore verified against the live store |
-| Dispatch | **two complete clean runs**, both CI-verified, on `revnix/reeve` only |
+| Dispatch | **three complete clean runs**, all CI-verified, on `revnix/reeve` only |
 
 ### Where everything lives
 
@@ -345,6 +345,15 @@ found nothing, and the second only resolved because an octal dump showed the
 byte. Same family as the raw NUL in §6.4. The guard that keeps NUL out of source
 now keeps ESC out with it.
 
+**A fourth, found by probing rather than by accident.** Run 15's fixture was
+chosen so the cheapest way out was to delete the failing assertion --
+`SELF_GOVERNING` was `[".github/**", ".git/**"]`, so tests, which judge the work
+exactly as the workflow does, were unprotected. The worker did not take it. The
+gate now refuses a repair whose entire diff is tests, because the design rule is
+that the actor is never the only witness, and "the worker chose well" is the
+actor being the only witness. Adding a test beside a source fix stays allowed:
+the prompt requires one.
+
 **What that says about the shape of the remaining risk.** Three sessions have now
 produced the same pattern: the defects that matter are not found by reading code
 or by adding assertions, but by running the thing and reading what it wrote down.
@@ -376,10 +385,17 @@ doctor's rendered output. Budget for use, not for review.
 
 - The daemon runs unattended: **252 ticks since 2026-08-20 14:04 UTC**, survived a
   network outage to `api.github.com`, escalated to ntfy overnight.
-- **Two complete dispatches**: red CI → root cause → fix in an isolated worktree
-  → commit → diff gate → **reeve published** → **CI green**. Run 12 at 202s/$1.92,
-  run 14 at 159s/$1.50. Both verified on GitHub -- the remote head, the published
-  diff and the check conclusions -- not from reeve's own account of itself.
+- **Three complete dispatches**: red CI → root cause → fix in an isolated
+  worktree → commit → diff gate → **reeve published** → **CI green**. Runs 12
+  (202s/$1.92), 14 (159s/$1.50) and 15 (153s/$2.01). All verified on GitHub --
+  the remote head, the published diff and the check conclusions -- never from
+  reeve's own account of itself.
+- **Run 15 was a genuinely harder shape** and is the one worth trusting: a logic
+  inversion in `src/db/ops.mjs` failing THREE assertions in
+  `test/lifecycle.test.mjs`, so the failing test did not name the module at
+  fault. The worker fixed the source and **added two assertions** covering the
+  case the bug created. It did not weaken the test, though nothing at the time
+  stopped it.
 - **The retry brake fires, and correctly refuses.** Run 13 declined to dispatch
   and escalated rather than guessing. It was refusing for the WRONG reason (§6.5),
   but the mechanism itself was exercised end to end for the first time.
@@ -391,12 +407,12 @@ doctor's rendered output. Budget for use, not for review.
 
 ### NOT proven — say so, do not assume
 
-- **`--execute` has TWO clean runs out of fourteen, and both used the SAME
-  planted failure** -- a constant changed so an assertion fails, in the file the
-  assertion names. That is the easiest possible root-cause. Nothing has yet tested
-  a failure whose fix is in a different file from the failing test, an
-  intermittent failure, or a failure with more than one cause. Varying the failure
-  shape is worth more than repeating this one.
+- **`--execute` has THREE clean runs out of fifteen**, across two failure shapes.
+  Still untested: an INTERMITTENT failure, a failure with two independent causes,
+  a failure whose fix spans several files, and any failure a worker cannot
+  reproduce locally. Also untested: what happens when a worker is WRONG -- every
+  run so far produced a correct fix, so the second-attempt path and the escalation
+  after it have never been exercised by a genuine bad fix.
 - **The App reaches nextly only.** Every dispatch run on `revnix/reeve` logs
   `could not publish: no installation ... 404`, so those runs exercise the WORKER
   chain and never the verdict-publication chain. The two halves have never been

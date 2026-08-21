@@ -266,6 +266,11 @@ export async function tick(ctx) {
           // Only a COMPLETE read updates the watermark. Skipping a PR on the
           // strength of a partial read is how a gap becomes permanent.
           if (!seen.incomplete) (ctx.lastIngest ??= new Map()).set(pr, e.updatedAt);
+          // And whether it was whole is carried to the fold. Positively named and
+          // fail-closed: a pull request reeve has never wholly observed is NOT
+          // complete, so it answers UNKNOWN rather than confidently from a
+          // partial view.
+          (ctx.ingestComplete ??= new Map()).set(pr, !seen.incomplete);
         } catch (err) {
           log(logPath, `  #${pr}: ingest failed — ${err.message}`);
         }
@@ -275,7 +280,7 @@ export async function tick(ctx) {
       // answer -- it un-clears everything until a reviewer speaks at the new head.
       try {
         const d = (ctx.derivePr ?? derivePr)(db, nwo, pr, profile,
-          { at: now(), head: e.head, complete: !ctx.lastIngestIncomplete?.get?.(pr) });
+          { at: now(), head: e.head, complete: ctx.ingestComplete?.get?.(pr) === true });
         const st = (ctx.reviewState ?? reviewState)(db, nwo, pr, profile, { at: now() });
         if (st.readable && (st.open || st.unspilledCritical)) {
           log(logPath, `  #${pr}: review ${st.open}/${st.total} open, ` +

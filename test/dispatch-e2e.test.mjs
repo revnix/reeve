@@ -280,6 +280,48 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(dir10, { recursive: true, force: true });
 }
 
+
+// --- a cancel before the binding is a cancellation, not a preparation failure
+{
+  const dir11 = mkdtempSync(join(tmpdir(), "reeve-e2e-prebind-"));
+  const ctx11 = { ...baseCtx(), db: open(join(dir11, "b.db")), logPath: join(dir11, "log.txt"), worktreeFor: () => mkdtempSync(join(dir11, "wt-")) };
+  ctx11.db.prepare("INSERT OR REPLACE INTO node (id, kind, title, status, created_at, updated_at) VALUES ('pr:42','pr','t','open',unixepoch(),unixepoch())").run();
+  ctx11.db.prepare("INSERT OR REPLACE INTO task_exec (task_id, cancel_requested) VALUES ('pr:42', 1)").run();
+  ctx11.spawnWorker = async (args) => {
+    // What runWorker does: bind first; a refused binding is UNBOUND with the reason.
+    try { args.onSpawn({ pid: 4321, lstart: "x" }); } catch (err) { return { outcome: "unbound", why: `run binding failed: ${err.message}`, ms: 0, cost: null, sessionId: null }; }
+    return { outcome: "ok", why: "ran", ms: 1, cost: 0, sessionId: "s" };
+  };
+  const r11 = await tick(ctx11);
+  const keys11 = [...(r11.escalations?.keys() ?? [])];
+  check(!keys11.some(k => /could not be prepared/.test(k)), "a pre-bind cancellation raises no preparation escalation", keys11.join(" | "));
+  const run11 = ctx11.db.prepare("SELECT status FROM run ORDER BY started_at DESC LIMIT 1").get();
+  check(run11?.status === "abandoned", "the run is abandoned as a cancellation", JSON.stringify(run11));
+  let dispatchedAgain = 0;
+  ctx11.spawnWorker = async () => { dispatchedAgain++; return { outcome: "ok", why: "ran", ms: 1, cost: 0, sessionId: "s" }; };
+  await tick(ctx11);
+  check(dispatchedAgain === 1, "and the next tick dispatches again with no backoff", String(dispatchedAgain));
+  ctx11.db.close();
+  rmSync(dir11, { recursive: true, force: true });
+}
+
+// --- a cancel after the binding is seen by the 2-second poll, not the next heartbeat
+{
+  const dir12 = mkdtempSync(join(tmpdir(), "reeve-e2e-postbind-"));
+  const ctx12 = { ...baseCtx(), db: open(join(dir12, "c.db")), logPath: join(dir12, "log.txt"), worktreeFor: () => mkdtempSync(join(dir12, "wt-")), heartbeatMs: 3_600_000 };
+  let seen = null;
+  ctx12.spawnWorker = async (args) => {
+    args.onSpawn({ pid: 4322, lstart: "x" });
+    ctx12.db.prepare("INSERT OR REPLACE INTO task_exec (task_id, cancel_requested) VALUES ('pr:42', 1)").run();
+    seen = args.isRevoked?.();
+    return { outcome: "cancelled", why: `cancelled: ${seen}`, ms: 1, cost: 0, sessionId: "s" };
+  };
+  await tick(ctx12);
+  check(typeof seen === "string" && /^cancelled/.test(seen), "a cancel requested after the binding is visible to the revocation poll before any heartbeat", String(seen));
+  ctx12.db.close();
+  rmSync(dir12, { recursive: true, force: true });
+}
+
 ctx.db.close();
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

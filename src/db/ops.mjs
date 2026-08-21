@@ -459,6 +459,12 @@ export function bindRun(db, { runId, pid, boot }) {
   });
 }
 
+/** Has a cooperative cancel been requested for this run's task? Cheap enough to ask every poll. */
+export function cancelRequested(db, runId) {
+  const r = db.prepare(`SELECT COALESCE(x.cancel_requested, 0) AS c FROM run r LEFT JOIN task_exec x ON x.task_id = r.task_id WHERE r.id=?`).get(runId);
+  return !!r?.c;
+}
+
 export function notePid(db, { runId, pid, boot }) {
   return tx(db, () => {
     db.prepare(`UPDATE run SET owner_pid=?, owner_boot=?, status='running',

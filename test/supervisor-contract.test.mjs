@@ -230,6 +230,13 @@ const ENV = { PATH: "/usr/bin:/bin" };
   check(after - before < 5, "twenty failed setups do not leak twenty descriptors", `before=${before} after=${after}`);
 }
 
+
+// ── a gate that cannot be spawned never ran anything: pre-execution, not a crash
+{
+  const r = await runWorker({ bin: "/bin/sh", args: ["-c", "true"], env: ENV, ...files("nocwd"), budgetMs: 3000, cwd: "/nonexistent/worktree" });
+  check(r.outcome === OUTCOMES.UNBOUND && /could not spawn/.test(r.why), "a spawn failure (vanished worktree) is UNBOUND with the reason, so the attempt is refunded and backed off", JSON.stringify({ o: r.outcome, w: r.why }));
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

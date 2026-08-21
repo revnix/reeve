@@ -331,8 +331,11 @@ export function runWorker({
     // its error asynchronously, and a child with no listener for it takes the
     // whole daemon down; measured once, with launchd ready to restart it into
     // the same death.
+    // A spawn that fails ran nothing (a vanished worktree, EAGAIN): it is a
+    // pre-execution outcome, so the daemon refunds and backs off rather than
+    // spending a fixer's attempt on a worker that never existed.
     child.on("error", err => { if (child.pid) LIVE_GROUPS.delete(child.pid); return finish({
-      outcome: OUTCOMES.CRASHED, why: `could not spawn ${bin}: ${err.message}`,
+      outcome: OUTCOMES.UNBOUND, why: `could not spawn ${bin}: ${err.message}`,
       pid: child.pid ?? null, lstart: null, ms: Date.now() - startedAt, stderr: tailOf(errPath, 4000), outPath, errPath, truncated: false,
     }); });
 

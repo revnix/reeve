@@ -25,7 +25,7 @@ import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.
 import { workerEnv, writeGitConfig, CONTAINMENT } from "./workerenv.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, sha256 } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256 } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { snapshot, snapshotAll } from "./backup.mjs";
 import { selfAudit } from "./selfaudit.mjs";
@@ -572,7 +572,10 @@ export async function tick(ctx) {
           maxOutputBytes: profile.worker?.maxOutputBytes ?? 64 * 1024 * 1024,
           budgetMs,
           isHalted: () => halted(ctx.haltMarker),
-          isRevoked: () => revoked,
+          // The heartbeat answers every 30 seconds; a cancel must not wait for
+          // it. The poll asks the store directly, so a cancel requested after
+          // the binding ends the worker within one poll interval.
+          isRevoked: () => revoked ?? (cancelRequested(db, run.runId) ? "cancelled" : null),
           // Bind the process to the run the instant it exists, before it can
           // touch anything, so a crash leaves something probeable.
           onSpawn: ({ pid, lstart }) => { bindRun(db, { runId: run.runId, pid, boot: lstart }); noteWorkerBinding(db, { runId: run.runId, pid, lstart }); },
@@ -608,6 +611,13 @@ export async function tick(ctx) {
         // fixer's attempt; it is refunded like any pre-execution failure, and it
         // backs off like one: a binding that keeps failing would otherwise
         // lease and refuse the PR on every tick with nobody told.
+        // A binding refused because a cancel landed first is a cancellation,
+        // not a preparation failure: no backoff, no escalation about preparing.
+        if (r?.outcome === OUTCOMES.UNBOUND && /cancel/.test(r?.why ?? "")) {
+          r = { ...r, outcome: OUTCOMES.CANCELLED, why: r.why };
+          // Nothing ran, so the fixer's attempt is given back as well.
+          if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+        }
         if (r?.outcome === OUTCOMES.UNBOUND) {
           prepFailed = true;
           if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }

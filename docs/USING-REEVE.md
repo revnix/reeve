@@ -130,6 +130,13 @@ These are enforced by the tool layer, not by asking the model nicely. That
 distinction was measured: told not to write a file but given a plain shell, the
 model wrote it with `printf >` on the very next turn.
 
+One thing reeve deliberately does NOT try to do: stop the worker running code. It
+cannot — anything that can write a file can write a script and run it. What it
+enforces instead is what the worker may *reach* (paths, the network) and what it
+may *do to the world* (it holds no push or merge authority at all). A worker's own
+account of itself is never trusted; the diff comes from git, and CI re-runs on
+whatever reeve publishes.
+
 Before anything is published, reeve checks what **git** says changed — not what
 the worker claims — against the lane's territory and the risk rules. A change
 outside its territory is refused even if the worker was certain it was right.

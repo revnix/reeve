@@ -2,7 +2,7 @@
 // argv, prompt, settings, tools, and caps. A retry must reuse it verbatim, and
 // an alias like `fable` must not drift under a retry. Without the row, "what did
 // this worker actually run as" has no answer after the process is gone.
-import { open, startRun, recordWorkerContract, noteWorkerModel, workerContractFor, sha256 } from "../src/db/ops.mjs";
+import { open, startRun, recordWorkerContract, noteWorkerResult, workerContractFor, sha256 } from "../src/db/ops.mjs";
 import { tick } from "../src/daemon.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -26,7 +26,7 @@ const db = open(join(dir, "c.db"));
   const row = workerContractFor(db, run.runId);
   check(row?.cli_version === "2.1.237" && row.model_requested === "fable" && row.model_resolved === null,
     "a contract row is written at dispatch with the model still unresolved", JSON.stringify(row));
-  noteWorkerModel(db, { runId: run.runId, modelResolved: "claude-fable-5" });
+  noteWorkerResult(db, { runId: run.runId, modelResolved: "claude-fable-5" });
   check(workerContractFor(db, run.runId).model_resolved === "claude-fable-5",
     "the resolved model is recorded when the worker announces it");
   check(sha256("a") !== sha256("b") && sha256("a").length === 64, "control: sha256 is a real hash");
@@ -46,7 +46,7 @@ const db = open(join(dir, "c.db"));
     reviewers: [], threads: {}, settled: { settled: true },
   };
   var ctxFor = (db_, logPath) => ({
-    nwo: "o/r", db: db_, logPath, execute: true, shadow: true, running: 0, cliVersion: "2.1.237",
+    nwo: "o/r", db: db_, logPath, execute: true, shadow: true, running: 0, containment: { credentialRead: "closed", why: "test" }, cliVersion: "2.1.237",
     profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir }, authority: { policy: "propose_and_merge" },
                rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 }, ci: { provider: "github-actions", requiredChecks: [] },
                watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 } },
@@ -57,13 +57,14 @@ const db = open(join(dir, "c.db"));
   });
   var seenEnv = null;
   const ctx = { ...ctxFor(db, join(dir, "log.txt")),
-    spawnWorker: async (args) => { seenEnv = args.env; return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", model: "claude-x-resolved" }; } };
+    spawnWorker: async (args) => { seenEnv = args.env; return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", model: "claude-x-resolved", truncated: true, stdoutBytes: 12345 }; } };
   await tick(ctx);
   const row = db.prepare("SELECT w.* FROM worker_run w JOIN run r ON r.id = w.run_id WHERE r.task_id='pr:42'").get();
   check(!!row, "the daemon writes a contract row for its dispatch", JSON.stringify(row));
   check(row?.cli_version === "2.1.237" && /^[0-9a-f]{64}$/.test(row?.argv_hash ?? "") && /^[0-9a-f]{64}$/.test(row?.settings_hash ?? ""),
     "with the CLI version and real hashes", JSON.stringify(row));
   check(row?.model_resolved === "claude-x-resolved", "and the model the worker announced", String(row?.model_resolved));
+  check(row?.truncated === 1 && row?.stdout_bytes === 12345, "and whether its durable record was cut, with the byte count", JSON.stringify([row?.truncated, row?.stdout_bytes]));
   check(!!row?.out_path && !!row?.err_path, "and the durable output paths", JSON.stringify([row?.out_path, row?.err_path]));
   check(/runs\/o-r\/42\/[^/]+\/worker\.out$/.test(row?.out_path ?? ""),
     "the run dir is keyed by repository, PR, and run id, never PR alone", String(row?.out_path));
@@ -88,6 +89,10 @@ const db = open(join(dir, "c.db"));
   check(spawned === 0, "and no worker was launched without its contract", String(spawned));
   const run = db2.prepare("SELECT status FROM run ORDER BY started_at DESC LIMIT 1").get();
   check(run?.status === "failed", "the leased run is closed as failed, not left live", JSON.stringify(run));
+  // The attempt was spent before preparation; a failure that is reeve's own
+  // must not cost the PR one of its retries.
+  const spent = db2.prepare("SELECT COALESCE(SUM(attempts),0) n FROM fix_attempt").get().n;
+  check(spent === 0, "and the fix attempt spent for it is refunded", String(spent));
   db2.close(); rmSync(dir2, { recursive: true, force: true });
 }
 

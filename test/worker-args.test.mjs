@@ -20,13 +20,19 @@ const valueOf = (a, flag) => a[a.indexOf(flag) + 1];
     "no settings is a hard failure, never a default", String(threw?.message));
   threw = null;
   try { workerArgs({ prompt: "hi", settings: "" }); } catch (e) { threw = e; }
-  check(!!threw, "an empty settings path is refused too");
+  check(threw && /settings is required/.test(threw.message), "an empty settings path is refused too", String(threw?.message));
 }
 {
   const a = workerArgs({ prompt: "hi", settings: "/tmp/s.json" });
   check(has(a, "--safe-mode") && has(a, "--strict-mcp-config") && has(a, "--no-chrome"),
     "the isolation flags are always present", a.join(" "));
   check(valueOf(a, "--settings") === "/tmp/s.json", "and the settings path is passed", a.join(" "));
+  // --safe-mode leaves permissions alone by the CLI's own description, so the
+  // founder's user-level allow rules would still merge in. `local` is the one
+  // source that names neither the user file nor the target repo's project file.
+  check(valueOf(a, "--setting-sources") === "local", "only local settings are loaded by default, never the founder's or the repo's", a.join(" "));
+  const b = workerArgs({ prompt: "hi", settings: "/tmp/s.json", settingSources: "project" });
+  check(valueOf(b, "--setting-sources") === "project", "a caller may widen the sources explicitly", b.join(" "));
   check(has(a, "-p") && has(a, "--verbose") && valueOf(a, "--output-format") === "stream-json",
     "control: the proven print-mode flags survive", a.join(" "));
 }

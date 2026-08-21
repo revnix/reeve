@@ -85,10 +85,12 @@ function harden(repoRoot, path) {
   // hooks path (the clone's own hooks stay untouched) refuses every push from
   // inside this checkout. The directory is a SIBLING of the worktree, not
   // inside it: inside, it is an untracked path that fails verification and
-  // would need an exclude written into the clone's shared git dir. Hooks can
-  // be bypassed with --no-verify, which is why the credential-less environment
-  // and the sandbox's network deny sit underneath this; each layer covers a
-  // shape the others do not.
+  // would need an exclude written into the clone's shared git dir. It is a
+  // layer, not a boundary: `--no-verify`, `-c core.hooksPath=`, and a worker
+  // rewriting the sibling file all walk around it (test/escape.test.mjs
+  // records each as known-open). What closes those is the OS sandbox denying
+  // writes outside the worktree and the network, which a later stage proves;
+  // until then the daemon refuses to dispatch at all (workerenv.mjs CONTAINMENT).
   const hooks = `${path}.hooks`;
   mkdirSync(hooks, { recursive: true });
   writeFileSync(join(hooks, "pre-push"), REFUSING_HOOK, { mode: 0o755 });

@@ -22,10 +22,10 @@ import { promptFor } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
-import { workerEnv, writeGitConfig } from "./workerenv.mjs";
+import { workerEnv, writeGitConfig, CONTAINMENT } from "./workerenv.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerModel, sha256 } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, sha256 } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { snapshot, snapshotAll } from "./backup.mjs";
 import { selfAudit } from "./selfaudit.mjs";
@@ -367,7 +367,22 @@ export async function tick(ctx) {
     }
   }
 
-  if (execute) {
+  // A worker that can read the founder's credentials is not dispatched, whatever
+  // --execute says. workerenv.mjs declares what its environment can promise;
+  // until a measured mechanism closes the credential read (the OS sandbox
+  // canary or a dedicated worker user), the honest capability is none, and the
+  // founder is told once, by identity. The declaration is injectable for tests
+  // only; the default is the module's own, which refuses.
+  const containment = ctx.containment ?? CONTAINMENT;
+  if (execute && containment.credentialRead !== "closed") {
+    const wanted = decisions.filter(d => [ACTIONS.FIX_CI, ACTIONS.FIX_FINDINGS, ACTIONS.REQUEST_REVIEW].includes(d.decision.action));
+    if (wanted.length) {
+      log(logPath, `execute: NOT dispatching ${wanted.length} worker task(s) — worker containment is open: ${containment.why}`);
+      escalations.set("guardian:containment:open", 1);
+    }
+  }
+
+  if (execute && containment.credentialRead === "closed") {
     const cap = capacity({ maxWorkers: profile.watch?.maxWorkers ?? 5, running: ctx.running ?? 0 });
     log(logPath, `execute: capacity allows ${cap.canStart} worker(s) (load ${cap.load1?.toFixed?.(2) ?? "?"}, ${cap.perfCores} perf cores)`);
     let started = 0;
@@ -449,7 +464,7 @@ export async function tick(ctx) {
       let revoked = null;
       const beat = setInterval(() => {
         try {
-          const hb = heartbeat(db, { runId: run.runId });
+          const hb = (ctx.heartbeat ?? heartbeat)(db, { runId: run.runId });
           if (!hb.alive) revoked = hb.reason ?? "lease not alive";
         } catch (err) { revoked = `heartbeat write failed: ${err.message}`; }
       }, ctx.heartbeatMs ?? HEARTBEAT_MS);
@@ -513,12 +528,15 @@ export async function tick(ctx) {
       } catch (err) {
         // A worker that could not be prepared or launched is a failed attempt
         // with its reason, never a thrown tick: the run below is closed, the
-        // lease released, and the next PR still gets its turn.
+        // lease released, and the next PR still gets its turn. The attempt
+        // spent above is refunded: this failure is reeve's, not the fix's.
         r = { outcome: OUTCOMES.FAILED, why: `could not prepare the worker: ${err.message}`, ms: 0, cost: null, sessionId: null };
+        if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
       } finally {
         clearInterval(beat);
-        // The alias was requested; this is what the worker said it actually ran as.
-        if (r?.model) { try { noteWorkerModel(db, { runId: run.runId, modelResolved: r.model }); } catch { /* the run still finishes */ } }
+        // What the worker said it ran as, and whether its durable record is whole.
+        try { noteWorkerResult(db, { runId: run.runId, modelResolved: r?.model ?? null, truncated: r?.truncated === true, stdoutBytes: r?.stdoutBytes ?? null }); }
+        catch { /* the run still finishes */ }
         // Closed in `finally`: a throw between spawn and result would otherwise
         // leave the run leased forever, and the PR unworkable until it expired.
         finishRun(db, { runId: run.runId, outcome: r?.outcome ?? "failed",

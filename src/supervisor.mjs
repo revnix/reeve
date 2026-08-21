@@ -113,7 +113,7 @@ function killGroup(pid, signal) {
  * broad permissions, plugins, and MCP servers a worker must never inherit.
  */
 export function workerArgs({ prompt, settings, agent = null, allowedTools = null, disallowedTools = null,
-                             settingSources = null, maxTurns = null, model = null, effort = null,
+                             settingSources = "local", maxTurns = null, model = null, effort = null,
                              maxBudgetUsd = null, jsonSchema = null, agents = null, mcpConfig = null,
                              sessionId = null, resume = null }) {
   if (typeof settings !== "string" || !settings.length)
@@ -136,9 +136,12 @@ export function workerArgs({ prompt, settings, agent = null, allowedTools = null
   if (allowedTools) a.push("--allowedTools", allowedTools);
   if (disallowedTools) a.push("--disallowedTools", disallowedTools);
   if (jsonSchema) a.push("--json-schema", jsonSchema);
-  // `--setting-sources project` cuts the preamble ~8x (31,647 -> 3,845 cache-creation
-  // tokens, $0.3166 -> $0.0386 for one reply) but strips plugin-shipped agents, so it
-  // is only safe for a worker that needs none.
+  // `--safe-mode` leaves permissions alone by the CLI's own description, so the
+  // founder's user-level allow rules (and the target repo's project file) would
+  // still merge into the worker. `local` is the one source that names neither;
+  // the worker's rules come from the --settings file above and nothing else.
+  // (`project` was measured to cut the preamble ~8x but also loads the repo's
+  // own permissions; a caller that wants it must ask.)
   if (settingSources) a.push("--setting-sources", settingSources);
   if (resume) a.push("--resume", resume);
   else if (sessionId) a.push("--session-id", sessionId);
@@ -309,7 +312,11 @@ export function runWorker({
 
     child.stdout.on("data", d => {
       write(outFd, d);
-      buf += d;
+      // The partial-line buffer is bounded too: a newline-free stream would
+      // otherwise grow it without limit while the file stayed capped. No
+      // stream-json line approaches a megabyte, so dropping one that does
+      // loses nothing the parser could have used.
+      buf = buf.length > 1024 * 1024 ? "" : buf + d;
       const lines = buf.split("\n");
       buf = lines.pop() ?? "";
       for (const line of lines) {
@@ -356,9 +363,15 @@ export function runWorker({
       // normal exit would otherwise be classified OK and its result published
       // under a claim the worker no longer held.
       const lateWhy = revokedWhy ?? isRevoked();
+      // A truncated record is an incomplete record: the result parsed from the
+      // stream may describe an event the durable file no longer holds, and a
+      // store that says OK beside a file that cannot show why is absence read
+      // as success. Truncation therefore outranks everything but a lost lease.
       const c = lateWhy
         ? { outcome: OUTCOMES.LEASE_LOST, why: `lease revoked: ${lateWhy}` }
-        : classifyResult(result, { code, signal, killedByUs });
+        : truncated
+          ? { outcome: OUTCOMES.FAILED, why: `output truncated at ${maxOutputBytes} bytes; the durable record is incomplete` }
+          : classifyResult(result, { code, signal, killedByUs });
       finish({
         ...c, pid: child.pid, lstart, sessionId, code, signal,
         ms: Date.now() - startedAt, rateLimit,

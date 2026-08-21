@@ -127,12 +127,23 @@ Worth knowing, because it runs unattended.
 | — | Read quarantined data at all (production dumps, other clients' credentials) |
 
 A FIX_CI worker also runs with a **built environment**, not your shell's: no
-`GH_TOKEN`, no ssh agent, no cloud or proxy variables, and a git that is told to
-read no system config and use no credential helper. Its output streams to files
-under `~/.reeve/state/.../runs/<pr>/` so a crashed daemon can still read what the
-worker said, and every run records the exact CLI version, model, and settings it
-ran under (`worker_run`). If the daemon cannot prove the worker's lease is still
-live, the worker is terminated rather than trusted.
+`GH_TOKEN`, no ssh agent, no cloud or proxy variables, a git that is told to read
+no system config and use no credential helper, and a `gh`/`ssh` that refuse. Its
+output streams to files under `~/.reeve/runs/<owner>-<repo>/<pr>/<run>/` so a
+crashed daemon can still read what the worker said, and every run records the
+exact CLI version, model, and settings it ran under (`worker_run`). If the
+daemon cannot prove the worker's lease is still live, the worker is terminated
+rather than trusted.
+
+**What that does not yet guarantee, stated plainly.** The worker still runs as
+you, with your real home directory, so your keychain and `~/.config/gh` are on
+disk in front of it; a worker that asked `git` or `gh` the right way would get
+your token, and `git push --no-verify <url>` walks around the worktree's hook.
+That is measured, not theoretical (`test/escape.test.mjs` records each shape as
+known-open). **Until the OS sandbox stage proves those reads and writes are
+denied, the daemon refuses to dispatch any worker even with `--execute`**, and
+says so once as `guardian:containment:open`. Capability 2 stays off by code,
+not by memory.
 
 These are enforced by the tool layer, not by asking the model nicely. That
 distinction was measured: told not to write a file but given a plain shell, the

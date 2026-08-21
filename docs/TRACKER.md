@@ -62,6 +62,10 @@ The four capabilities, measured 2026-08-21:
       (`ntfy user add mobeen`; `ntfy access mobeen revnix-reeve read-only`;
       `upstream-base-url` for iOS). Desktop notifications work meanwhile.
 - [ ] **Second project** (`rextaihq/rext-backend`) — needs PR-gating CI + App install.
+- [ ] **Worker identity decision** — a dedicated macOS user for workers (the only
+      non-sandbox way to make the keychain and `~/.config/gh` unreachable) vs
+      relying on the OS sandbox's read deny once measured in PR-2. Until one is
+      proven, no worker dispatches (`guardian:containment:open`).
 - [ ] **Ruleset flip decision** (after the verdict shadow week).
 
 ### Closed by ruling — do not reopen
@@ -141,6 +145,20 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       git, bounded durable streams, fail-closed spawn binding, lease revocation
       in the daemon, `worker_run` contract rows, worktree pre-push hook.
       Measured before the fix: an explicit-URL push from a worktree SUCCEEDED.
+      **Review rounds (Codex 7 findings, adversarial 17 confirmed) closed**:
+      spawn-error crash, late revocation, preparation inside cleanup scope,
+      reuse hardening, run dir scoping, baseline fail-closed, reserved env +
+      full git strip list, `--setting-sources local`, truncation is failure,
+      R-13 drift check MOUNTED in doctor (live: matches), refusing gh/ssh shims.
+      **MEASURED AND KNOWN-OPEN** (`test/escape.test.mjs`): with a real HOME the
+      worker can read the founder's token (`git -c credential.helper=`,
+      absolute-path `gh auth token`), bypass the hook (`--no-verify`,
+      `-c core.hooksPath`), and move the clone's shared refs. Therefore the
+      daemon now REFUSES every dispatch under `--execute` while
+      `CONTAINMENT.credentialRead === "open"` (escalation
+      `guardian:containment:open`). PR-2 must close the read (sandbox deny of
+      keychain + ~/.config/gh, measured) or the founder decides on a dedicated
+      worker user; only a measured closure may flip the constant.
 - [ ] **PR-2 (S1 sandbox)** — the two CLI measurements (sandbox under `-p`,
       invalid settings under `-p`), `sandbox.*` settings + validation,
       per-start canary, doctor R-13/R-14/R-15, escape test.

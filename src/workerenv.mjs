@@ -4,38 +4,82 @@
 // it the founder's GH_TOKEN, the ssh agent socket, cloud credentials, and git
 // overrides. None of the sandbox's string-pattern denies can stop a worker that
 // holds a token, because `git -C . push https://<token>@host/...` matches no
-// `git push` prefix and needs no helper. Containment is by AUTHORITY: the
-// worker simply has no credential, and git is told to look for none.
+// `git push` prefix and needs no helper. This module removes every credential
+// VARIABLE and every git entry point that could re-introduce one.
 //
-// HOME stays real on purpose. The CLI reads ~/.claude and ~/.claude.json for the
-// founder's subscription authentication; a per-run home would leave every
-// worker unauthenticated. Everything else isolates around that one fact.
-import { writeFileSync, mkdirSync } from "node:fs";
+// What it does not do, stated plainly because the first version claimed
+// otherwise: it does not make the founder's credentials unreachable. HOME
+// stays real (the CLI reads ~/.claude and ~/.claude.json for subscription
+// authentication, and a per-run home would leave every worker unauthenticated),
+// so the keychain, ~/.config/gh, and ~/.ssh are on disk in front of a process
+// running as the founder. Measured under exactly this environment:
+// `git -c credential.helper=osxkeychain credential fill` and `gh auth token`
+// both returned the founder's token. Closing that needs the OS sandbox to deny
+// those reads, or a separate worker user; until one of them is proven, the
+// daemon reads CONTAINMENT below and refuses to dispatch a worker at all.
+import { writeFileSync, mkdirSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 
-// Node and pnpm pinned by absolute path: `node` on PATH is v22 here and must
-// never reach a worker, and a worker that cannot find pnpm cannot run the gates.
+/**
+ * What this environment can and cannot promise, read by the daemon before any
+ * dispatch. `credentialRead` flips to "closed" only when a measured mechanism
+ * (the OS sandbox canary denying keychain and gh-config reads, or a dedicated
+ * worker user) proves it; a comment cannot flip it.
+ */
+export const CONTAINMENT = Object.freeze({
+  credentialRead: "open",
+  why: "the worker runs as the founder with a real HOME; the keychain, ~/.config/gh and ~/.ssh are readable, " +
+       "and `git -c credential.helper=...` or `gh auth token` returns the founder's token",
+});
+
+// Node pinned by absolute path: `node` on PATH is v22 here and must never reach
+// a worker. Other tools (pnpm) are appended by the caller from where the profile
+// resolves them; nothing else is searched.
 const NODE_BIN = join(homedir(), ".nvm", "versions", "node", "v24.17.0", "bin");
 const SYSTEM_PATH = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
 // Names that must never reach a worker, however they arrive. Matched exactly,
-// by prefix, or by suffix; a phase's `extra` cannot reintroduce them.
-const STRIP_EXACT = new Set(["GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "GIT_SSH_COMMAND", "GIT_ASKPASS",
-                             "GIT_CONFIG_COUNT", "REEVE_APP_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]);
-const STRIP_PREFIX = ["AWS_", "GOOGLE_", "GCLOUD_", "AZURE_", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
+// by prefix, or by suffix; a phase's `extra` cannot reintroduce them. The git
+// entries are every documented way to point git at another config, another
+// repository, or a credential source.
+const STRIP_EXACT = new Set(["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "SSH_AUTH_SOCK", "SSH_AGENT_PID",
+                             "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
+                             "GIT_CONFIG_SYSTEM", "GIT_EXEC_PATH", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+                             "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES",
+                             "XDG_CONFIG_HOME", "NODE_OPTIONS", "REEVE_APP_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]);
+const STRIP_PREFIX = ["AWS_", "GOOGLE_", "GCLOUD_", "AZURE_", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_", "GIT_CREDENTIAL_"];
 const STRIP_SUFFIX = ["_PROXY", "_proxy"];
 
 function stripped(name) {
   return STRIP_EXACT.has(name) || STRIP_PREFIX.some(p => name.startsWith(p)) || STRIP_SUFFIX.some(s => name.endsWith(s));
 }
 
+// Commands the worker has no business running, refused by a shim that leads
+// the PATH. A layer, not a boundary: an absolute path walks around it, which is
+// why CONTAINMENT above stays "open" regardless of these.
+const SHIMMED = ["gh", "ssh", "ssh-add", "scp", "sftp", "security"];
+const SHIM = name => `#!/bin/sh\necho '${name}: refused; a reeve worker holds no credentials and publishes nothing' >&2\nexit 1\n`;
+
+/** Write the refusing shims once and return their directory. */
+export function writeShims(dir) {
+  const shims = join(dir, "shims");
+  mkdirSync(shims, { recursive: true });
+  for (const name of SHIMMED) {
+    const path = join(shims, name);
+    writeFileSync(path, SHIM(name));
+    chmodSync(path, 0o755);
+  }
+  return shims;
+}
+
 /**
  * Write the credential-less global git config a worker runs under, and return
- * its path. An EMPTY `credential.helper` disables every helper git would
- * otherwise consult (the founder's osxkeychain included, which lives in the
- * system config this environment also refuses to read). No URL rewrites: an
- * `insteadOf` could route a push somewhere a bogus pushurl does not cover.
+ * its path. An EMPTY `credential.helper` resets the helper list git would
+ * otherwise consult (the founder's ~/.gitconfig and the system config are both
+ * out of reach through GIT_CONFIG_GLOBAL and GIT_CONFIG_NOSYSTEM). It is a
+ * default, not a lock: a `-c credential.helper=...` on the command line appends
+ * after it, which is one of the shapes CONTAINMENT records as open.
  */
 export function writeGitConfig(dir) {
   mkdirSync(dir, { recursive: true });
@@ -46,13 +90,17 @@ export function writeGitConfig(dir) {
 
 /**
  * The complete environment for one worker. Callers pass it to `runWorker` as
- * `env` and it is used verbatim: nothing from this process is merged in.
+ * `env` and it is used verbatim: nothing from this process is merged in. The
+ * base variables are RESERVED: `extra` may add names, never replace these.
  */
-export function workerEnv({ gitConfigPath, tmpDir, bgWaitMs, maxRetries = 1, extra = {} }) {
+export function workerEnv({ gitConfigPath, tmpDir, bgWaitMs, maxRetries = 1, extra = {}, extraPath = [] }) {
   if (!gitConfigPath) throw new Error("workerEnv: gitConfigPath is required; a worker must not find the founder's git config");
   mkdirSync(tmpDir, { recursive: true });
+  // The shims live beside reeve's own git config, never under the per-run
+  // TMPDIR: the PATH must be the same for every run under one contract.
+  const shims = writeShims(dirname(gitConfigPath));
   const env = {
-    PATH: [NODE_BIN, ...SYSTEM_PATH].join(":"),
+    PATH: [shims, NODE_BIN, ...extraPath, ...SYSTEM_PATH].join(":"),
     HOME: homedir(),
     TMPDIR: tmpDir,
     LANG: process.env.LANG ?? "en_US.UTF-8",
@@ -66,8 +114,9 @@ export function workerEnv({ gitConfigPath, tmpDir, bgWaitMs, maxRetries = 1, ext
     GIT_CONFIG_GLOBAL: gitConfigPath,
     GIT_TERMINAL_PROMPT: "0",
   };
+  const reserved = new Set(Object.keys(env));
   for (const [k, v] of Object.entries(extra)) {
-    if (stripped(k)) continue;   // a phase may add variables, never credentials
+    if (stripped(k) || reserved.has(k)) continue;   // a phase may add variables, never credentials or the base
     env[k] = String(v);
   }
   return env;

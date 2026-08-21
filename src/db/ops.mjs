@@ -489,9 +489,10 @@ export function recordWorkerContract(db, { runId, cliVersion, modelRequested = n
   });
 }
 
-/** The model the worker actually announced in its init event. */
-export function noteWorkerModel(db, { runId, modelResolved }) {
-  db.prepare(`UPDATE worker_run SET model_resolved=? WHERE run_id=?`).run(modelResolved, runId);
+/** What the worker announced it ran as, and whether its durable record is whole. */
+export function noteWorkerResult(db, { runId, modelResolved = null, truncated = false, stdoutBytes = null }) {
+  db.prepare(`UPDATE worker_run SET model_resolved=COALESCE(?, model_resolved), truncated=?, stdout_bytes=? WHERE run_id=?`)
+    .run(modelResolved, truncated ? 1 : 0, stdoutBytes, runId);
 }
 
 export function workerContractFor(db, runId) {

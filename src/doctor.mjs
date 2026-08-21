@@ -10,6 +10,7 @@
 //   0 healthy · 1 broken · 3 degraded
 // A check that cannot answer reports UNKNOWN and degrades; it never passes.
 
+import { checkBaseline } from "./baseline.mjs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
@@ -380,7 +381,7 @@ function checkDetectors(db, profile) {
 
 // ── driver ────────────────────────────────────────────────────────────────
 
-export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null }) {
+export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {} }) {
   const checks = [
     checkMergeAuthority(nwo),
     pluginCacheRoot ? checkArtifactDrift(pluginCacheRoot, repoPluginDir) : null,
@@ -391,6 +392,7 @@ export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null
     checkLeases(db),
     profile.reviewers?.length ? checkDetectors(db, profile) : null,
     appCheck,
+    checkBaseline(nwo, profile, baselineIo),
   ].filter(Boolean);
 
   const broken = checks.filter(c => c.level === BROKEN);

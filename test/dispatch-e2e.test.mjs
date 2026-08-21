@@ -10,7 +10,7 @@
 import { tick } from "../src/daemon.mjs";
 import { open, liveRunFor, countFixAttempts } from "../src/db/ops.mjs";
 import { causeKey } from "../src/ci-rootcause.mjs";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -50,6 +50,9 @@ let spawned = [];
 const baseCtx = () => ({
   nwo: "o/r", profile, db: open(dbPath), logPath,
   execute: true, shadow: true, running: 0,
+  // The tests below exercise dispatch, so they declare what the real module
+  // cannot yet: a closed credential read. The default refuses; see the last case.
+  containment: { credentialRead: "closed", why: "test" },
   openPrs: () => [42],
   evaluate: () => evaluation,
   publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
@@ -104,7 +107,10 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // whether it knows.
 {
   const dir3 = mkdtempSync(join(tmpdir(), "reeve-e2e-lease-"));
-  const ctx3 = { ...baseCtx(), db: open(join(dir3, "l.db")), logPath: join(dir3, "log.txt"), heartbeatMs: 100 };
+  // Its own worktree dir: the daemon quarantines (moves) a worktree after a
+  // failed run, and a block that lent the shared dir would strand every later one.
+  const ctx3 = { ...baseCtx(), db: open(join(dir3, "l.db")), logPath: join(dir3, "log.txt"), heartbeatMs: 100,
+                 worktreeFor: () => mkdtempSync(join(dir3, "wt-")) };
   let sawRevoked = null;
   ctx3.spawnWorker = async (args) => {
     ctx3.db.prepare("UPDATE run SET status='abandoned' WHERE status IN ('leased','running')").run();
@@ -117,6 +123,51 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
     "the daemon tells the worker its lease is gone", String(sawRevoked));
   ctx3.db.close();
   rmSync(dir3, { recursive: true, force: true });
+}
+
+
+// --- the default refuses to dispatch while the credential read is open ------
+//
+// workerenv.mjs declares CONTAINMENT.credentialRead = "open" until a measured
+// mechanism closes it. A daemon started with --execute must not launch a worker
+// that can read the founder's token; it says so, once, as an identity.
+{
+  const dir4 = mkdtempSync(join(tmpdir(), "reeve-e2e-contain-"));
+  const ctx4 = { ...baseCtx(), db: open(join(dir4, "c.db")), logPath: join(dir4, "log.txt"), worktreeFor: () => mkdtempSync(join(dir4, "wt-")) };
+  delete ctx4.containment;          // the real module's declaration applies
+  let launched = 0;
+  ctx4.spawnWorker = async () => { launched++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  const r4 = await tick(ctx4);
+  check(launched === 0, "no worker launches under the real containment declaration", String(launched));
+  const keys = [...(r4.escalations?.keys() ?? [])];
+  check(keys.includes("guardian:containment:open"), "and the refusal is a standing escalation with an identity key", keys.join(" | "));
+  check(!/open \d|\d+ worker/.test(keys.join(" ")), "the key carries no counts", keys.join(" | "));
+  const log4 = readFileSync(join(dir4, "log.txt"), "utf8");
+  check(/NOT dispatching/.test(log4) && /credential/.test(log4), "the log names the reason", log4.split("\n").filter(l => /dispatch/.test(l)).join(" | ").slice(0, 300));
+  ctx4.db.close();
+  rmSync(dir4, { recursive: true, force: true });
+}
+
+// --- a heartbeat that cannot be written revokes too ---------------------------
+//
+// "Unknown is not alive": a store that refuses the write is treated exactly
+// like a lease that is gone, with the write failure as the reason.
+{
+  const dir5 = mkdtempSync(join(tmpdir(), "reeve-e2e-hbfail-"));
+  const ctx5 = { ...baseCtx(), db: open(join(dir5, "h.db")), logPath: join(dir5, "log.txt"), heartbeatMs: 100,
+                 worktreeFor: () => mkdtempSync(join(dir5, "wt-")),
+                 heartbeat: () => { throw new Error("database is locked"); } };
+  let sawRevoked = null;
+  ctx5.spawnWorker = async (args) => {
+    await new Promise(r => setTimeout(r, 400));
+    sawRevoked = args.isRevoked?.();
+    return { outcome: "lease_lost", why: `lease revoked: ${sawRevoked}`, ms: 400, cost: 0, sessionId: "s5" };
+  };
+  await tick(ctx5);
+  check(typeof sawRevoked === "string" && /heartbeat write failed: database is locked/.test(sawRevoked),
+    "a failed heartbeat write revokes with its own reason", String(sawRevoked));
+  ctx5.db.close();
+  rmSync(dir5, { recursive: true, force: true });
 }
 
 ctx.db.close();

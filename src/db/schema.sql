@@ -379,5 +379,7 @@ CREATE TABLE IF NOT EXISTS worker_run (
   pid             INTEGER,
   lstart          TEXT,
   contract_drift  TEXT,                       -- JSON; null when the live environment matched
+  truncated       INTEGER NOT NULL DEFAULT 0, -- the durable output hit its cap; the run is never OK
+  stdout_bytes    INTEGER,
   created_at      INTEGER NOT NULL
 ) STRICT, WITHOUT ROWID;

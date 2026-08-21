@@ -481,15 +481,17 @@ never silence.
    App answering to two logins (`coderabbitai[bot]` over REST, `coderabbitai`
    over GraphQL), which would have halved every reviewer's evidence at derivation
    time and errored nowhere.
-3. **PR-3 projections + fold** + classifier_version + doctor detector controls.
-   Verify: DELETE projections, re-fold, byte-identical; taxonomy-change drill
-   (edit a marker regex → version changes → rebuild observed).
-4. **PR-4 shadow-compare**: `status --review-shadow` prints projection-derived
-   counts beside today's live-read counts for every open PR. Runs until they
-   agree for **5 consecutive days** where comparable (thread totals/unresolved),
-   with every divergence explained in writing. This is the CI-settlement proof
-   pattern applied to review data.
-5. **PR-5 verdict consumes projections** (§7.7, §8, typed causes, real
+3. **PR-3 projections + fold — DONE** (`d6e2634`). Severity markers MEASURED
+   from the shadow data rather than guessed; all 83 real findings classify, none
+   fall through to `unknown`. Re-derivation byte-identical on fixtures and live.
+   doctor gained R-08, a positive control over every detector. The resolution
+   rule was wrong twice on live data before it was right — see §12 V-1/V-2.
+4. **PR-4 shadow-compare — DONE and RUNNING** (`b370be8`). `reeve shadow <repo>`;
+   exits 0 only when the bar is met. Day one: 5/5 agreed, 35 threads compared on
+   #1128, with the 5-thread gap between uncleared and unresolved reported as a
+   note rather than a divergence — which is the whole design of the instrument.
+   **PR-5 is time-blocked on this reaching 5 consecutive days.**
+5. **PR-5 verdict consumes projections** — BLOCKED until `reeve shadow` exits 0 (§7.7, §8, typed causes, real
    unspilledCritical). Still all actions gated. Verify: #1128's verdict
    recomputed from projections matches the hand-read truth; the V-1 and V-4
    attack scenarios replayed as tests.

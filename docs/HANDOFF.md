@@ -303,10 +303,10 @@ fifteen lines and named the cause in one run.
 | No backup | One copy on one laptop |
 | No alert sink | "Needs you" reached a local log only |
 
-### 6.5 The third session: five more defects, all found by USING it
+### 6.5 The third session: six more defects, all found by USING it
 
-The verification in §10, three more `--execute` dispatches and one notification
-arriving on a phone found five defects that 576 passing assertions did not. Every one was found by running the system
+The verification in §10, three more `--execute` dispatches and two notifications
+arriving on a phone found six defects that 576 passing assertions did not. Every one was found by running the system
 and reading what it actually stored, not by reading code.
 
 **The failure identity could not tell two failures apart.** The daemon
@@ -364,6 +364,22 @@ with the reason string identical each time. #1011 and #1127 did the same, and a
 third instance arrived while the fix was being written. Two pushes for one
 unchanged condition is how a channel earns being muted. **Sixth instance of the
 §4.2 class**: absence within one tick read as resolution.
+
+**A sixth, the exact mirror of the fifth.** The guard above refuses to retire an
+escalation for a PR a tick did not look at. A MERGED pull request leaves the open
+list and is never looked at again -- so its escalation had no way out at all.
+nextly #1127 merged and its cause stood on in NEEDS YOU with the PR long gone. A
+surface whose target state is EMPTY, filling with finished work, stops being read:
+the same muting as the flap, arriving from the other direction. Absence from the
+open list is not the evidence used, because that list is capped and a PR beyond
+the cap is unread rather than gone; each orphan is confirmed against GitHub and
+only a clear MERGED or CLOSED retires it. **Verified in production**, not only in
+a test: `#1127: is merged or closed — retiring what it was escalating`.
+
+Worth noting what the two together mean. Escalation retirement had a defect in
+BOTH directions -- retiring what still stood, and never retiring what was over --
+and neither was reachable by any test written against the function, because both
+needed a real PR moving through real states over real ticks.
 
 **What that says about the shape of the remaining risk.** Three sessions have now
 produced the same pattern: the defects that matter are not found by reading code

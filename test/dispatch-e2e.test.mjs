@@ -297,6 +297,11 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   check(!keys11.some(k => /could not be prepared/.test(k)), "a pre-bind cancellation raises no preparation escalation", keys11.join(" | "));
   const run11 = ctx11.db.prepare("SELECT status FROM run ORDER BY started_at DESC LIMIT 1").get();
   check(run11?.status === "abandoned", "the run is abandoned as a cancellation", JSON.stringify(run11));
+  // The audit trail must say cancellation too: classified before the run is
+  // closed, so the store emits run.finish with outcome cancelled, not a
+  // refusal of an unbound worker.
+  const ev11 = ctx11.db.prepare("SELECT op, payload FROM event WHERE op IN ('run.finish','run.refused') ORDER BY seq DESC LIMIT 1").get();
+  check(ev11?.op === "run.finish" && /"outcome":"cancelled"/.test(ev11?.payload ?? ""), "and the audit event records a cancelled finish, not an unbound refusal", JSON.stringify(ev11));
   let dispatchedAgain = 0;
   ctx11.spawnWorker = async () => { dispatchedAgain++; return { outcome: "ok", why: "ran", ms: 1, cost: 0, sessionId: "s" }; };
   await tick(ctx11);

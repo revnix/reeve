@@ -339,5 +339,30 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
   check(diffBaseline(x, y).drifted === true && /ruleset/.test(diffBaseline(x, y).lines.join(" ")), "but moving a bypass between rulesets is drift", JSON.stringify(diffBaseline(x, y).lines));
 }
 
+
+// ── unordered API arrays and malformed fixture types ─────────────────────────
+{
+  const { readLiveBaseline } = await import("../src/baseline.mjs");
+  const mk = order => path => {
+    if (path === "repos/o/r") return { default_branch: "main" };
+    if (path.endsWith("/rulesets")) return [{ id: 1, name: "r", enforcement: "active", target: "branch" }];
+    if (path.endsWith("/rulesets/1")) return { target: "branch", rules: [{ type: "required_status_checks", parameters: { required_status_checks: order === "a" ? [{ context: "x" }, { context: "y" }] : [{ context: "y" }, { context: "x" }] } }],
+      bypass_actors: order === "a" ? [{ actor_type: "Team", actor_id: 1, bypass_mode: "always" }, { actor_type: "Team", actor_id: 2, bypass_mode: "always" }] : [{ actor_type: "Team", actor_id: 2, bypass_mode: "always" }, { actor_type: "Team", actor_id: 1, bypass_mode: "always" }] };
+    if (/protection$/.test(path)) return { restrictions: { users: order === "a" ? [{ login: "a" }, { login: "b" }] : [{ login: "b" }, { login: "a" }], teams: [], apps: [] } };
+    throw new Error("unexpected " + path);
+  };
+  const prof = { identity: { defaultBranch: "main" }, authority: {}, merge: {}, builder: {} };
+  const a = readLiveBaseline("o/r", prof, { gh: mk("a") }), b2 = readLiveBaseline("o/r", prof, { gh: mk("b") });
+  check(diffBaseline(a, b2).drifted === false, "the same authority returned in a different order is not drift", JSON.stringify(diffBaseline(a, b2).lines));
+
+  const { writeFileSync: wf, mkdtempSync: md } = await import("node:fs");
+  const { tmpdir: td } = await import("node:os");
+  const { join: jn } = await import("node:path");
+  const badtype = jn(md(jn(td(), "reeve-badtype-")), "x.json"); wf(badtype, JSON.stringify({ ...fixture, ruleSnapshot: {} }));
+  let r = null, threw = null;
+  try { r = checkBaseline("nextlyhq/nextly", { identity: { defaultBranch: "main" } }, { fixturePath: badtype, readLive: () => fixture }); } catch (e2) { threw = e2; }
+  check(!threw && r?.level === "UNKNOWN" && /ruleSnapshot/.test(r.lines.join(" ")), "a fixture field of the wrong type is UNKNOWN, never a crash", threw ? String(threw.message) : JSON.stringify(r));
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

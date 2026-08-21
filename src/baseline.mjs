@@ -38,9 +38,15 @@ const ghApi = (path, { list = false } = {}) => {
  * taken during an auth failure or a rate limit must never become a baseline,
  * and must never be compared as if it were one.
  */
-/** Deterministic JSON: keys sorted at every depth, nothing filtered. A replacer array would drop nested keys. */
+/**
+ * Deterministic JSON: keys sorted at every depth, nothing filtered (a replacer
+ * array would drop nested keys), and ARRAYS SORTED as sets: every array the
+ * authority APIs return (checks, actors, users, teams, apps) is a set whose
+ * order GitHub does not promise, and an order change is not an authority
+ * change.
+ */
 function canonicalJson(v) {
-  if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
+  if (Array.isArray(v)) return "[" + v.map(canonicalJson).sort().join(",") + "]";
   if (v && typeof v === "object") return "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + canonicalJson(v[k])).join(",") + "}";
   return JSON.stringify(v);
 }
@@ -200,8 +206,12 @@ export function checkBaseline(nwo, profile, io = {}) {
     if (!fixture || typeof fixture !== "object") throw new Error("not an object");
     // A baseline without its identity certifies nothing: the repository and
     // branch it was captured for, when, and the snapshot it compares.
-    for (const k of ["nwo", "branch", "capturedAt", "ruleSnapshot"])
-      if (fixture[k] === undefined || fixture[k] === null) throw new Error(`missing identity field ${k}`);
+    for (const k of ["nwo", "branch", "capturedAt"])
+      if (typeof fixture[k] !== "string" || !fixture[k]) throw new Error(`missing or malformed identity field ${k}`);
+    for (const k of ["ruleSnapshot", "rulesetSnapshot", "rulesetNames", "rulesetRequiredChecks", "rulesetBypassActors", "branchProtectionRequiredChecks", "classicBypassAllowances"])
+      if (fixture[k] !== undefined && !Array.isArray(fixture[k])) throw new Error(`field ${k} is not an array`);
+    if (fixture.ruleSnapshot === undefined) throw new Error("missing identity field ruleSnapshot");
+    if (fixture.profile !== undefined && (typeof fixture.profile !== "object" || fixture.profile === null || Array.isArray(fixture.profile))) throw new Error("field profile is not an object");
     if (fixture.nwo !== nwo) throw new Error(`captured for ${fixture.nwo}, not ${nwo}`);
   }
   catch (e) { return { id: "R-13", level: "UNKNOWN", title: "authority baseline", lines: [`the baseline at ${path} could not be used: ${e.message}`] }; }
@@ -221,7 +231,7 @@ export function checkBaseline(nwo, profile, io = {}) {
   return { id: "R-13", level: "OK", title: "authority baseline", lines: [`matches the baseline captured ${fixture.capturedAt}`] };
 }
 
-const sortedEq = (a, b) => JSON.stringify([...(a ?? [])].sort()) === JSON.stringify([...(b ?? [])].sort());
+const sortedEq = (a, b) => Array.isArray(a) && Array.isArray(b) && JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
 
 /** Compare a live reading against the checked fixture. Returns {drifted, lines}. */
 export function diffBaseline(live, fixture) {

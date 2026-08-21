@@ -593,6 +593,15 @@ export async function tick(ctx) {
         escalations.set(`#${e.pr}: the worker could not be prepared; reeve is backing off`, 1);
       } finally {
         clearInterval(beat);
+        // Classified FIRST, before anything is recorded: a binding refused
+        // because a cancel landed first is a cancellation, not a preparation
+        // failure, and the audit trail must say so (run.finish, cancelled),
+        // not record a refused unbound worker. Nothing ran, so the fixer's
+        // attempt is given back as well.
+        if (r?.outcome === OUTCOMES.UNBOUND && /cancel/.test(r?.why ?? "")) {
+          r = { ...r, outcome: OUTCOMES.CANCELLED, why: r.why };
+          if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+        }
         // What the worker said it ran as, and whether its durable record is whole.
         // Facts that cannot be recorded are facts nobody can audit later, so a
         // run whose facts did not land is not a successful run, whatever the
@@ -611,13 +620,6 @@ export async function tick(ctx) {
         // fixer's attempt; it is refunded like any pre-execution failure, and it
         // backs off like one: a binding that keeps failing would otherwise
         // lease and refuse the PR on every tick with nobody told.
-        // A binding refused because a cancel landed first is a cancellation,
-        // not a preparation failure: no backoff, no escalation about preparing.
-        if (r?.outcome === OUTCOMES.UNBOUND && /cancel/.test(r?.why ?? "")) {
-          r = { ...r, outcome: OUTCOMES.CANCELLED, why: r.why };
-          // Nothing ran, so the fixer's attempt is given back as well.
-          if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
-        }
         if (r?.outcome === OUTCOMES.UNBOUND) {
           prepFailed = true;
           if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }

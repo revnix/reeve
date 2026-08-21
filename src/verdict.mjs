@@ -33,7 +33,7 @@ export function coversHead(reviewedHead, head) {
 /** Worst wins. UNKNOWN outranks PASS so a clause that could not answer cannot be outvoted. */
 function worst(a, b) {
   if (a === BLOCK || b === BLOCK) return BLOCK;
-  if (a === UNKNOWN && b === UNKNOWN) return UNKNOWN;
+  if (a === UNKNOWN || b === UNKNOWN) return UNKNOWN;
   return PASS;
 }
 

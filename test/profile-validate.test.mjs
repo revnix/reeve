@@ -193,6 +193,18 @@ expectRefusal("a capability switch that is not a boolean",
   if (!ok) { console.log("        ", threw ? String(threw.message) : JSON.stringify(r?.errors)); fail++; }
 }
 
+{
+  // A top-level primitive profile is a validation error, never a throw from
+  // withDefaults dereferencing it.
+  let threw = null, results = [];
+  for (const prim of ["yes", 1, true, null]) {
+    try { results.push(validate(withDefaults(prim)).ok); } catch (e) { threw = e; }
+  }
+  const ok = !threw && results.length === 4 && results.every(x => x === false);
+  console.log(`${ok ? "PASS" : "FAIL"}  refuses: a primitive or null profile, without throwing`);
+  if (!ok) { console.log("        ", threw ? String(threw.message) : JSON.stringify(results)); fail++; }
+}
+
 expectRefusal("a capability container that is not an object",
   (() => { const p = clone(base); p.builder = { capabilities: [] }; return p; })(),
   /builder\.capabilities must be an object/);

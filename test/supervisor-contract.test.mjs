@@ -110,8 +110,11 @@ const ENV = { PATH: "/usr/bin:/bin" };
   let r2 = null, threw2 = null;
   try { r2 = await runWorker({ bin: "/nonexistent/claude", args: [], env: ENV, ...files("nobin2"), budgetMs: 3000 }); }
   catch (e) { threw2 = e; }
-  check(!threw2 && r2?.outcome === OUTCOMES.CRASHED && /exited 12[67]/.test(r2?.why ?? ""),
-    "with a good binding, a missing binary is CRASHED from the gate's exec failure, never an uncaught error", threw2 ? String(threw2.message) : JSON.stringify({ o: r2?.outcome, w: r2?.why }));
+  // The gate's exec failing (binary removed or unexecutable after the version
+  // probe) ran no worker either: a pre-execution outcome, so the attempt is
+  // refunded and the PR backs off, never a crash charged to a fixer.
+  check(!threw2 && r2?.outcome === OUTCOMES.UNBOUND && /could not exec/.test(r2?.why ?? "") && /12[67]/.test(r2?.why ?? ""),
+    "with a good binding, a missing binary is UNBOUND from the gate's exec failure, never a crash or an uncaught error", threw2 ? String(threw2.message) : JSON.stringify({ o: r2?.outcome, w: r2?.why }));
 }
 
 // ── revocation that lands between the last poll and exit still counts ────────

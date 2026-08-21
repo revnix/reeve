@@ -402,6 +402,9 @@ const UNIVERSAL_DEFAULTS = {
 };
 
 export function withDefaults(profile) {
+  // A primitive or null profile has nothing to default into; it is returned as
+  // is for validate() to refuse, rather than thrown at by a dereference here.
+  if (profile === null || typeof profile !== "object" || Array.isArray(profile)) return profile;
   const kind = get(profile, "project.kind");
   const defaults = { ...UNIVERSAL_DEFAULTS, ...(KIND_DEFAULTS[kind] ?? {}) };
   const out = structuredClone(profile);

@@ -433,8 +433,14 @@ export function runWorker({
       // as success. Truncation and a failed write therefore outrank everything
       // but a lost lease.
       const truncated = streams.out.truncated;
+      // The gate's exec failing (126: not executable, 127: not found) after a
+      // successful binding ran no worker: a pre-execution outcome, like a
+      // refused binding, so the attempt is refunded and the PR backs off.
+      const execFailed = !result && !killedByUs && (code === 126 || code === 127);
       const c = cancelled
         ? { outcome: OUTCOMES.CANCELLED, why: `cancelled: ${lateWhy}` }
+        : execFailed
+        ? { outcome: OUTCOMES.UNBOUND, why: `could not exec ${bin}: the gate exited ${code}` }
         : lateWhy
         ? { outcome: OUTCOMES.LEASE_LOST, why: `lease revoked: ${lateWhy}` }
         : writeError

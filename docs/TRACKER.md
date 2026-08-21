@@ -116,9 +116,14 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       skeleton (task/claim/checkpoint/outbox/`gh.pr.merge` reconcilers) already
       exists in reeve's schema with ZERO callers; no merge executor exists.
 - [x] Design presented; founder approved AND revised the gate (see req. 3)
-- [ ] **Spec fold in flight** — writer + 3 verifiers folding all 29 fixes and
-      the revised gate into `docs/2026-08-21-builder-design.md`
-- [ ] Founder reviews the spec file
+- [x] **Spec written** — `docs/2026-08-21-builder-design.md` (526 lines,
+      `3ccc734`). Fold: writer + 3 verifiers + 1 repair round (5 blocking
+      problems fixed) + a manual pass closing the 2 blocking + 13 minor
+      residuals. All 29 findings dispositioned in Appendix A. Encodes the
+      revised gate verbatim; merge clauses U1-U4 + B1-B6; 10-PR rollout.
+- [ ] **Founder reviews the spec file** — the gate before implementation
+      planning. Open ruling inside it: §16.2, should the emergency Codex
+      waiver (`--waive-codex`) exist at all.
 - [ ] Implementation plan (9 PRs, each with its own verification — in the spec)
 - [ ] Build
 

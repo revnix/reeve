@@ -183,6 +183,36 @@ const ENV = { PATH: "/usr/bin:/bin" };
   }
 }
 
+
+// ── a child that dies between binding and release must not crash the daemon ─
+//
+// `release()` writes one line to the gate's stdin. If the shell has already
+// exited (killed, crashed), the write fails asynchronously with EPIPE on a
+// stream that had no error listener: an uncaught exception, and the daemon's
+// reaper rethrows it. Reproduced by killing the group from inside onSpawn.
+{
+  let r = null, threw = null;
+  try {
+    r = await runWorker({ bin: "/bin/sh", args: ["-c", "sleep 5"], env: ENV, ...files("epipe"), budgetMs: 10000,
+                          onSpawn: ({ pid }) => {
+                            try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
+                            // Hold the thread until the shell is truly gone, so the
+                            // release write meets a closed pipe, not a dying one.
+                            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+                          } });
+  } catch (e) { threw = e; }
+  await new Promise(res => setTimeout(res, 200));   // let any stray async error surface
+  check(!threw && r && r.outcome !== OUTCOMES.OK, "a worker killed before the gate released resolves with a non-OK outcome and nothing is thrown", threw ? String(threw.message) : JSON.stringify({ o: r?.outcome, w: r?.why }));
+}
+
+// ── a cooperative cancel is a cancellation, not a failure ────────────────────
+{
+  let revoked = null;
+  setTimeout(() => { revoked = "cancelled"; }, 300);
+  const r = await runWorker({ bin: "/bin/sh", args: ["-c", "sleep 30"], env: ENV, ...files("cancel"), budgetMs: 60000, isRevoked: () => revoked });
+  check(r.outcome === OUTCOMES.CANCELLED && /cancelled/.test(r.why), "a revocation whose reason is a cancel is reported as CANCELLED", JSON.stringify({ o: r.outcome, w: r.why }));
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

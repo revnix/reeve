@@ -111,6 +111,8 @@ const env = workerEnv({ gitConfigPath, tmpDir: join(dir, "tmp"), bgWaitMs: 12000
   check(code === 0 && out === "merge-policy[bot] <319037914+merge-policy[bot]@users.noreply.github.com>", "a worker commit carries the App's bot identity", out.slice(0, 160));
 }
 
+
+
 for (const k of Object.keys(planted)) delete process.env[k];
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

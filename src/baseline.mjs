@@ -20,7 +20,14 @@ export function baselinePathFor(nwo) {
   return join(PKG_ROOT, "deploy", "baselines", `${nwo.replace("/", "-")}.json`);
 }
 
-const ghApi = (path) => JSON.parse(execFileSync("gh", ["api", path], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
+// Every list endpoint is paginated and slurped, so a repository with more
+// rulesets than one page does not lose the later ones from its baseline;
+// `--slurp` wraps the pages in one outer array, which is flattened here.
+const ghApi = (path, { list = false } = {}) => {
+  const args = list ? ["api", "--paginate", "--slurp", path] : ["api", path];
+  const out = JSON.parse(execFileSync("gh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60000 }));
+  return list ? out.flat() : out;
+};
 
 /**
  * Read the live authority facts for a repo. Every failure throws except the
@@ -62,12 +69,15 @@ export function rulesetCoversBranch(detail, branch, defaultBranch) {
 export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {}) {
   const defaultBranch = profile.identity?.defaultBranch ?? "main";
   const target = branch ?? profile.identity?.baseBranch ?? defaultBranch;
-  const rulesets = gh(`repos/${nwo}/rulesets`);
-  const activeAll = rulesets.filter(r => r.enforcement === "active");
+  const rulesets = gh(`repos/${nwo}/rulesets`, { list: true });
+  // Branch rulesets only: a tag or push ruleset with no ref condition would
+  // otherwise read as covering every branch, and its policy changes would be
+  // false drift for a branch it never governed.
+  const activeAll = rulesets.filter(r => r.enforcement === "active" && (r.target ?? "branch") === "branch");
   // Only rulesets whose ref condition covers the target branch count: a
   // release-branch ruleset must neither protect main on paper nor drift it.
   const detailAll = activeAll.map(r => ({ meta: r, detail: gh(`repos/${nwo}/rulesets/${r.id}`) }));
-  const covering = detailAll.filter(({ detail }) => rulesetCoversBranch(detail, target, defaultBranch));
+  const covering = detailAll.filter(({ detail }) => (detail.target ?? "branch") === "branch" && rulesetCoversBranch(detail, target, defaultBranch));
   const active = covering.map(c => c.meta);
   const detail = covering.map(c => c.detail);
   const rules = detail.flatMap(r => r.rules ?? []);
@@ -94,10 +104,18 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {
   // Classic protection enforces reviews too; the effective requirement is the
   // strictest across rulesets and classic protection alike.
   const classic = bp?.required_pull_request_reviews ?? null;
+  // Who may bypass classic review: as much authority as a ruleset bypass actor.
+  const allowances = classic?.bypass_pull_request_allowances ?? {};
+  const classicBypassAllowances = [
+    ...(allowances.apps ?? []).map(a => `app:${a.slug}`),
+    ...(allowances.teams ?? []).map(t => `team:${t.slug}`),
+    ...(allowances.users ?? []).map(u => `user:${u.login}`),
+  ].sort();
   const requiredApprovals = Math.max(pr.required_approving_review_count ?? 0, classic?.required_approving_review_count ?? 0);
   const codeOwnerReview = (pr.require_code_owner_review ?? false) || (classic?.require_code_owner_reviews ?? false);
   return {
     nwo, branch: target, rulesetNames: active.map(r => r.name), rulesetRequiredChecks, rulesetBypassActors, branchProtectionRequiredChecks,
+    classicBypassAllowances,
     requiredApprovals, codeOwnerReview,
     dismissStaleReviews: pr.dismiss_stale_reviews_on_push || (classic?.dismiss_stale_reviews ?? false),
     requireLastPushApproval: pr.require_last_push_approval || (classic?.require_last_push_approval ?? false),
@@ -138,7 +156,8 @@ export function diffBaseline(live, fixture) {
   for (const [key, label] of [["rulesetNames", "active rulesets"],
                               ["rulesetRequiredChecks", "required checks (ruleset)"],
                               ["branchProtectionRequiredChecks", "required checks (branch protection)"],
-                              ["rulesetBypassActors", "bypass actors"]]) {
+                              ["rulesetBypassActors", "bypass actors"],
+                              ["classicBypassAllowances", "classic review bypass allowances"]]) {
     if (!sortedEq(live[key], fixture[key]))
       lines.push(`${label} differ: live ${JSON.stringify(live[key] ?? null)} vs baseline ${JSON.stringify(fixture[key] ?? null)}`);
   }

@@ -440,7 +440,9 @@ export function notePid(db, { runId, pid, boot }) {
 
 /** Close a run. An outcome that is not "ok" is a failure with its reason kept. */
 export function finishRun(db, { runId, outcome, why = null, ms = null, cost = null, sessionId = null }) {
-  const status = outcome === "ok" ? "succeeded" : "failed";
+  // A cancelled run was stopped on request: abandoned, with the PR node left
+  // exactly as it was, because nothing was learned about the PR.
+  const status = outcome === "ok" ? "succeeded" : outcome === "cancelled" ? "abandoned" : "failed";
   return tx(db, () => {
     // Only a run this process still owns may be finished. A run another actor
     // reaped or abandoned has moved on; a stale worker's verdict must not
@@ -450,8 +452,9 @@ export function finishRun(db, { runId, outcome, why = null, ms = null, cost = nu
     if (!r) return { applied: false, why: "the run is no longer live under this process" };
     db.prepare(`UPDATE run SET status=?, ended_at=unixepoch(), error=? WHERE id=?`)
       .run(status, why, runId);
-    db.prepare(`UPDATE node SET status=?, updated_at=unixepoch(), version=version+1 WHERE id=?`)
-      .run(status === "succeeded" ? "done" : "blocked", r.task_id);
+    if (status !== "abandoned")
+      db.prepare(`UPDATE node SET status=?, updated_at=unixepoch(), version=version+1 WHERE id=?`)
+        .run(status === "succeeded" ? "done" : "blocked", r.task_id);
     emit(db, { actor: "daemon", op: "run.finish", subject: r?.task_id ?? null, run_id: runId,
                payload: { outcome, why, ms, cost, sessionId } });
     return { ok: true, status };

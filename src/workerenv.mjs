@@ -17,7 +17,7 @@
 // both returned the founder's token. Closing that needs the OS sandbox to deny
 // those reads, or a separate worker user; until one of them is proven, the
 // daemon reads CONTAINMENT below and refuses to dispatch a worker at all.
-import { writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import { writeFileSync, mkdirSync, chmodSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 
@@ -92,7 +92,13 @@ export const WORKER_GIT_IDENTITY = Object.freeze({
 export function writeGitConfig(dir, identity = WORKER_GIT_IDENTITY) {
   mkdirSync(dir, { recursive: true });
   const path = join(dir, "gitconfig");
-  writeFileSync(path, `[credential]\n\thelper = \n[core]\n\taskPass = \n[user]\n\tname = ${identity.name}\n\temail = ${identity.email}\n`);
+  const content = `[credential]\n\thelper = \n[core]\n\taskPass = \n[user]\n\tname = ${identity.name}\n\temail = ${identity.email}\n`;
+  // Replaced atomically: every daemon on this host rewrites the same file at
+  // each dispatch while another daemon's worker may be reading it, and a
+  // truncate-then-write would hand that worker an empty config.
+  const tmp = join(dir, `.gitconfig.${process.pid}.${Date.now()}.tmp`);
+  writeFileSync(tmp, content);
+  renameSync(tmp, path);
   return path;
 }
 

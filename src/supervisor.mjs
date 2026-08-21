@@ -299,6 +299,11 @@ export function runWorker({
     const child = spawn("/bin/sh", ["-c", 'read -r _gate || exit 97; exec "$0" "$@"', bin, ...args],
                         { cwd, detached: true, stdio: ["pipe", "pipe", "pipe"], env });
     const startedAt = Date.now();
+    // The gate's pipe can close under us: a shell killed between binding and
+    // release makes the write fail asynchronously with EPIPE on a stream that
+    // had no listener, which is an uncaught exception and a dead daemon
+    // (reproduced). The exit path reports the outcome; the stream error is noise.
+    child.stdin.on("error", () => {});
     const release = () => { try { child.stdin.write("go\n"); child.stdin.end(); } catch { /* the exit path reports it */ } };
     const withhold = () => { try { child.stdin.end(); } catch { /* already closed */ } };
 
@@ -405,13 +410,18 @@ export function runWorker({
       // normal exit would otherwise be classified OK and its result published
       // under a claim the worker no longer held.
       const lateWhy = revokedWhy ?? isRevoked();
+      // A cooperative cancel is a cancellation, not a lost lease: the operator
+      // asked, and the record must say so rather than call the worker failed.
+      const cancelled = typeof lateWhy === "string" && /^cancelled\b/.test(lateWhy);
       // A truncated record is an incomplete record: the result parsed from the
       // stream may describe an event the durable file no longer holds, and a
       // store that says OK beside a file that cannot show why is absence read
       // as success. Truncation and a failed write therefore outrank everything
       // but a lost lease.
       const truncated = streams.out.truncated;
-      const c = lateWhy
+      const c = cancelled
+        ? { outcome: OUTCOMES.CANCELLED, why: `cancelled: ${lateWhy}` }
+        : lateWhy
         ? { outcome: OUTCOMES.LEASE_LOST, why: `lease revoked: ${lateWhy}` }
         : writeError
           ? { outcome: OUTCOMES.FAILED, why: `durable output write failed: ${writeError}` }

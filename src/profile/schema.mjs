@@ -399,7 +399,10 @@ export function withDefaults(profile) {
   const defaults = { ...UNIVERSAL_DEFAULTS, ...(KIND_DEFAULTS[kind] ?? {}) };
   const out = structuredClone(profile);
   for (const [path, value] of Object.entries(defaults)) {
-    if (get(out, path) !== undefined) continue;
+    // JSON null is not a value here: a switch written as null must become its
+    // fail-closed default, never a null the validator would wave through.
+    const cur = get(out, path);
+    if (cur !== undefined && cur !== null) continue;
     const parts = path.split(".");
     let node = out;
     for (const k of parts.slice(0, -1)) node = node[k] ??= {};

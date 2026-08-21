@@ -186,6 +186,16 @@ expectRefusal("a founder user id that is not an integer",
   (() => { const p = clone(base); p.builder = { founder: { userId: "123" } }; return p; })(),
   /builder\.founder\.userId must be an integer/);
 
+{
+  // JSON null is not "absent": withDefaults must still produce the fail-closed
+  // default, and the validated profile must carry a boolean.
+  const p = clone(base); p.builder = { capabilities: { mergeBuilderPr: null } };
+  const d = withDefaults(p);
+  const ok = d.builder.capabilities.mergeBuilderPr === false && validate(d).ok;
+  console.log(`${ok ? "PASS" : "FAIL"}  a null capability switch becomes false, never a null that validates`);
+  if (!ok) { console.log("        got:", JSON.stringify(d.builder.capabilities), JSON.stringify(validate(d).errors)); fail++; }
+}
+
 expectRefusal("a worker output cap that is not positive",
   (() => { const p = clone(base); p.worker = { maxOutputBytes: 0 }; return p; })(),
   /worker\.maxOutputBytes must be a positive integer/);

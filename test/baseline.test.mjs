@@ -162,5 +162,36 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
   check(d.drifted === true && /thread resolution/.test(d.lines.join(" ")), "dropping one of them is drift, and is named", JSON.stringify(d.lines));
 }
 
+
+// ── tag and push rulesets are not branch authority ───────────────────────────
+{
+  const { readLiveBaseline } = await import("../src/baseline.mjs");
+  const gh = path => {
+    if (path.endsWith("/rulesets")) return [{ id: 1, name: "branches", enforcement: "active", target: "branch" }, { id: 2, name: "tags", enforcement: "active", target: "tag" }];
+    if (path.endsWith("/rulesets/1")) return { target: "branch", rules: [], bypass_actors: [] };
+    if (path.endsWith("/rulesets/2")) return { target: "tag", rules: [{ type: "pull_request", parameters: { required_approving_review_count: 9 } }], bypass_actors: [{ actor_type: "Team", actor_id: 1, bypass_mode: "always" }] };
+    const e = new Error("HTTP 404"); e.stderr = "HTTP 404"; throw e;
+  };
+  const live = readLiveBaseline("o/r", { identity: { defaultBranch: "main" }, authority: {}, merge: {}, builder: {} }, { gh });
+  check(JSON.stringify(live.rulesetNames) === JSON.stringify(["branches"]) && live.requiredApprovals === 0 && live.rulesetBypassActors.length === 0,
+    "a tag ruleset contributes nothing to a branch's baseline", JSON.stringify([live.rulesetNames, live.requiredApprovals, live.rulesetBypassActors]));
+}
+
+// ── classic protection's bypass allowances are authority too ─────────────────
+{
+  const { readLiveBaseline } = await import("../src/baseline.mjs");
+  const gh = path => {
+    if (path.endsWith("/rulesets")) return [];
+    if (/protection$/.test(path)) return { required_pull_request_reviews: { required_approving_review_count: 1,
+      bypass_pull_request_allowances: { users: [{ login: "alice" }], teams: [{ slug: "core" }], apps: [{ slug: "merge-policy" }] } } };
+    throw new Error("unexpected " + path);
+  };
+  const live = readLiveBaseline("o/r", { identity: { defaultBranch: "main" }, authority: {}, merge: {}, builder: {} }, { gh });
+  check(JSON.stringify(live.classicBypassAllowances) === JSON.stringify(["app:merge-policy", "team:core", "user:alice"]),
+    "users, teams, and apps allowed to bypass classic review are captured", JSON.stringify(live.classicBypassAllowances));
+  const widened = { ...live, classicBypassAllowances: [...live.classicBypassAllowances, "user:mallory"] };
+  check(diffBaseline(widened, live).drifted === true && /bypass allowances/.test(diffBaseline(widened, live).lines.join(" ")), "a new allowance is drift, and is named", "");
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

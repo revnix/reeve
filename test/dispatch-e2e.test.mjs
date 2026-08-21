@@ -206,6 +206,22 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(dir6, { recursive: true, force: true });
 }
 
+
+// --- a cooperative cancel closes the run as abandoned, never as failed ------
+{
+  const dir7 = mkdtempSync(join(tmpdir(), "reeve-e2e-cancel-"));
+  const ctx7 = { ...baseCtx(), db: open(join(dir7, "c.db")), logPath: join(dir7, "log.txt"), heartbeatMs: 100,
+                 worktreeFor: () => mkdtempSync(join(dir7, "wt-")), heartbeat: () => ({ alive: false, reason: "cancelled" }) };
+  ctx7.spawnWorker = async (args) => { await new Promise(r => setTimeout(r, 400)); const why = args.isRevoked?.(); return { outcome: why === "cancelled" ? "cancelled" : "ok", why: `lease revoked: ${why}`, ms: 400, cost: 0, sessionId: "s7" }; };
+  await tick(ctx7);
+  const run7 = ctx7.db.prepare("SELECT status FROM run ORDER BY started_at DESC LIMIT 1").get();
+  check(run7?.status === "abandoned", "a cancelled worker's run is abandoned, not failed", JSON.stringify(run7));
+  const node7 = ctx7.db.prepare("SELECT status FROM node WHERE id='pr:42'").get();
+  check(node7?.status !== "blocked", "and the PR node is not marked blocked by a cancellation", JSON.stringify(node7));
+  ctx7.db.close();
+  rmSync(dir7, { recursive: true, force: true });
+}
+
 ctx.db.close();
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

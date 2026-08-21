@@ -303,10 +303,10 @@ fifteen lines and named the cause in one run.
 | No backup | One copy on one laptop |
 | No alert sink | "Needs you" reached a local log only |
 
-### 6.5 The third session: six more defects, all found by USING it
+### 6.5 The third session: seven more defects, all found by USING it
 
-The verification in §10, three more `--execute` dispatches and two notifications
-arriving on a phone found six defects that 576 passing assertions did not. Every one was found by running the system
+The verification in §10, five more `--execute` dispatches and two notifications
+arriving on a phone found seven defects that 576 passing assertions did not. Every one was found by running the system
 and reading what it actually stored, not by reading code.
 
 **The failure identity could not tell two failures apart.** The daemon
@@ -380,6 +380,33 @@ Worth noting what the two together mean. Escalation retirement had a defect in
 BOTH directions -- retiring what still stood, and never retiring what was over --
 and neither was reachable by any test written against the function, because both
 needed a real PR moving through real states over real ticks.
+
+**A seventh, found by deliberately making a worker unable to succeed.** Every
+prompt ends by asking the worker for a fenced json block -- what was wrong, what
+changed, and `needsHuman` when the work belongs to a person. **Nothing parsed it.**
+It was written into every prompt and read by no code at all.
+
+Measured by planting a failure in `src/verdict.mjs`, a sensitive path, so the
+worker had to decline. It did exactly what rule 8 requires and said why. reeve
+discarded that and pushed *"a fix was produced but refused publication -- the
+worker produced an empty diff"*: two statements that cannot both be true, about a
+worker that had behaved correctly. The next tick's retry cap replaced it with
+*"the same failure survived a second fix"*, and because a clearing retires the
+earlier message, the ONLY one left standing claimed a fix had been tried when none
+ever was.
+
+The report is now trusted for exactly one question -- **why did you stop**. What
+was fixed is still answered by git and by CI, because the actor is never the
+witness; but nothing else witnesses a worker's reason for stopping. The same
+scenario now pushes: *"needs a human — the fix is confined to src/verdict.mjs, a
+path this task forbids editing... A human should revert line 36 to `if (a ===
+UNKNOWN || b === UNKNOWN) return UNKNOWN;`"* -- one push, `announced=1`, and the
+retry cap quotes it rather than contradicting it.
+
+Writing that fix introduced a ReferenceError on every FIX_CI -- the attempt is
+spent at DISPATCH, before any worker exists, so the result was read in its
+temporal dead zone. `test/dispatch-e2e.test.mjs` caught it. That test exists
+because the same shape shipped once before.
 
 **What that says about the shape of the remaining risk.** Three sessions have now
 produced the same pattern: the defects that matter are not found by reading code

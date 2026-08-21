@@ -119,7 +119,10 @@ so the second-attempt path and the escalation after it have never been exercised
 by a genuine bad fix. Each dispatch takes about three minutes and costs roughly
 $1.50-2.
 
-The strongest alternative is **reeve auditing itself on a schedule** — running
+(**Self-audit is now DONE** — `src/selfaudit.mjs`, four checks every tick,
+verified in production. What follows was written before that landed.)
+
+The former alternative was **reeve auditing itself on a schedule** — running
 `doctor` against its own health and escalating when it degrades. That is the first
 real step toward the founder's standing goal that reeve "watch its own work and
 keep improving", and it is small. It is now honest to schedule, which it was not

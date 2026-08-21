@@ -54,7 +54,15 @@ function fnmatchRe(pat) {
       } else re += "[^/]*";
     }
     else if (c === "?") re += "[^/]";
-    else if (c === "[") { const j = pat.indexOf("]", i + 1); if (j > i) { re += "[" + pat.slice(i + 1, j).replace(/\\/g, "\\\\") + "]"; i = j; } else re += "\\["; }
+    else if (c === "[") {
+      const j = pat.indexOf("]", i + 1);
+      if (j > i) {
+        // fnmatch negates with `!`; a JavaScript class negates with `^`.
+        let body = pat.slice(i + 1, j).replace(/\\/g, "\\\\");
+        if (body.startsWith("!")) body = "^" + body.slice(1);
+        re += "[" + body + "]"; i = j;
+      } else re += "\\[";
+    }
     else re += c.replace(/[.+^${}()|\\]/g, "\\$&");
   }
   return new RegExp(re + "$");
@@ -129,6 +137,9 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {
     nwo, branch: target, rulesetNames: active.map(r => r.name), rulesetRequiredChecks, rulesetBypassActors, branchProtectionRequiredChecks,
     classicBypassAllowances,
     strictRequiredChecks: strictRequiredChecks || (bp?.required_status_checks?.strict ?? false),
+    // Classic protection's own admin switch: off means administrators bypass
+    // every rule above, which is as wide as authority gets.
+    enforceAdmins: bp?.enforce_admins?.enabled ?? null,
     requiredApprovals, codeOwnerReview,
     dismissStaleReviews: pr.dismiss_stale_reviews_on_push || (classic?.dismiss_stale_reviews ?? false),
     requireLastPushApproval: pr.require_last_push_approval || (classic?.require_last_push_approval ?? false),
@@ -173,6 +184,10 @@ const sortedEq = (a, b) => JSON.stringify([...(a ?? [])].sort()) === JSON.string
 export function diffBaseline(live, fixture) {
   if (!live || typeof live !== "object") return { drifted: true, lines: ["could not read the live state; drift is assumed, not excluded"] };
   const lines = [];
+  // A baseline certifies exactly one repository. A file copied to another
+  // repository's path must not pass on matching summaries.
+  if (fixture?.nwo && live.nwo && fixture.nwo !== live.nwo)
+    lines.push(`the baseline was captured for repository ${fixture.nwo}, not ${live.nwo}`);
   for (const [key, label] of [["rulesetNames", "active rulesets"],
                               ["rulesetRequiredChecks", "required checks (ruleset)"],
                               ["branchProtectionRequiredChecks", "required checks (branch protection)"],
@@ -185,7 +200,7 @@ export function diffBaseline(live, fixture) {
     lines.push(`required approvals: live ${live.requiredApprovals} vs baseline ${fixture.requiredApprovals}`);
   if (live.codeOwnerReview !== fixture.codeOwnerReview)
     lines.push(`code-owner review: live ${live.codeOwnerReview} vs baseline ${fixture.codeOwnerReview}`);
-  for (const [key, label] of [["dismissStaleReviews", "stale-review dismissal"], ["requireLastPushApproval", "last-push approval"], ["requireThreadResolution", "review thread resolution"], ["strictRequiredChecks", "strict up-to-date policy on required checks"]]) {
+  for (const [key, label] of [["dismissStaleReviews", "stale-review dismissal"], ["requireLastPushApproval", "last-push approval"], ["requireThreadResolution", "review thread resolution"], ["strictRequiredChecks", "strict up-to-date policy on required checks"], ["enforceAdmins", "classic admin enforcement"]]) {
     if ((live[key] ?? false) !== (fixture[key] ?? false))
       lines.push(`${label}: live ${live[key] ?? false} vs baseline ${fixture[key] ?? false}`);
   }

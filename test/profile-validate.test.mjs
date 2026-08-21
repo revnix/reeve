@@ -182,9 +182,13 @@ expectRefusal("a capability switch that is not a boolean",
   (() => { const p = clone(base); p.builder = { capabilities: { mergeBuilderPr: "yes" } }; return p; })(),
   /builder\.capabilities\.mergeBuilderPr must be a boolean/);
 
+expectRefusal("a founder user id that is not positive",
+  (() => { const p = clone(base); p.builder = { founder: { userId: 0 } }; return p; })(),
+  /builder\.founder\.userId must be a positive integer/);
+
 expectRefusal("a founder user id that is not an integer",
   (() => { const p = clone(base); p.builder = { founder: { userId: "123" } }; return p; })(),
-  /builder\.founder\.userId must be an integer/);
+  /builder\.founder\.userId must be a positive integer/);
 
 {
   // JSON null is not "absent": withDefaults must still produce the fail-closed

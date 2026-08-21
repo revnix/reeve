@@ -226,5 +226,29 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
   check(probed === null || probed === "develop", "and the probe, if any, targets the profiled branch, never the stale fixture's", String(probed));
 }
 
+
+// ── negated classes, admin enforcement, and the fixture's own repository ─────
+{
+  const { rulesetCoversBranch, readLiveBaseline } = await import("../src/baseline.mjs");
+  const cond = include => ({ conditions: { ref_name: { include, exclude: [] } } });
+  check(rulesetCoversBranch(cond(["refs/heads/release/[!0-9]*"]), "release/foo", "main") === true
+     && rulesetCoversBranch(cond(["refs/heads/release/[!0-9]*"]), "release/1foo", "main") === false,
+    "a negated class [!...] excludes what it names, as fnmatch does");
+
+  const gh = path => {
+    if (path.endsWith("/rulesets")) return [];
+    if (/protection$/.test(path)) return { enforce_admins: { enabled: true }, required_status_checks: { checks: [] } };
+    throw new Error("unexpected " + path);
+  };
+  const live = readLiveBaseline("o/r", { identity: { defaultBranch: "main" }, authority: {}, merge: {}, builder: {} }, { gh });
+  check(live.enforceAdmins === true, "classic admin enforcement is captured", JSON.stringify(live.enforceAdmins));
+  const relaxed = { ...live, enforceAdmins: false };
+  check(diffBaseline(relaxed, live).drifted === true && /admin/.test(diffBaseline(relaxed, live).lines.join(" ")), "relaxing it is drift, and is named", "");
+
+  const other = { ...fixture, nwo: "someone/else" };
+  const d = diffBaseline(fixture, other);
+  check(d.drifted === true && /repository/.test(d.lines.join(" ")), "a baseline recorded for another repository never certifies this one", JSON.stringify(d.lines));
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

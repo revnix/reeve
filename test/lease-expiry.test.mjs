@@ -43,6 +43,17 @@ check(row.lease_expires_at < Math.floor(Date.now() / 1000), "and the lapsed leas
   check(fin3.applied === false && /cancel/.test(fin3.why), "finishing a run whose cancel was requested is refused, with the reason", JSON.stringify(fin3));
 }
 
+
+// A cancelled run settles its PR node: startRun marked it running, and a run
+// that no longer exists must not leave the node reading that way.
+{
+  const r4 = startRun(db, { nwo: "o/r", pr: 4, action: "FIX_CI", head: "d".repeat(40) });
+  const fin4 = finishRun(db, { runId: r4.runId, outcome: "cancelled", why: "cancelled: operator" });
+  const node4 = db.prepare("SELECT status FROM node WHERE id = 'pr:4'").get();
+  check(fin4.applied === true && db.prepare("SELECT status FROM run WHERE id = ?").get(r4.runId).status === "abandoned", "a cancelled run is abandoned", JSON.stringify(fin4));
+  check(node4?.status === "ready", "and its PR node returns to ready, never left running", JSON.stringify(node4));
+}
+
 db.close(); rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

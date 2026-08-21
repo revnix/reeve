@@ -206,7 +206,7 @@ export const FIELDS = {
   // The founder's GitHub identity, by immutable numeric id with the login as a
   // snapshot: every founder-event rule (silence, overrides, approvals) matches
   // the id, and a renamed login must not silently become a stranger.
-  "builder.founder.userId":              [false, isInt],
+  "builder.founder.userId":              [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
   "builder.founder.login":               [false, isStr],
   // Cap on a worker's durable stdout/stderr files. Read by both daemons.
   "worker.maxOutputBytes":               [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],

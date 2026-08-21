@@ -242,6 +242,35 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(dir8, { recursive: true, force: true });
 }
 
+
+// --- a persistent preparation failure backs off and is escalated once --------
+{
+  const dir9 = mkdtempSync(join(tmpdir(), "reeve-e2e-prep-"));
+  const ctx9 = { ...baseCtx(), db: open(join(dir9, "p.db")), logPath: join(dir9, "log.txt"), worktreeFor: () => mkdtempSync(join(dir9, "wt-")),
+                 claudeBin: "/nonexistent/claude" };
+  delete ctx9.cliVersion;
+  const r9a = await tick(ctx9);
+  const r9b = await tick(ctx9);
+  const runs = ctx9.db.prepare("SELECT COUNT(*) n FROM run").get().n;
+  check(runs === 1, "a second tick during the backoff does not lease and fail the PR again", `runs=${runs}`);
+  const keys = [...(r9b.escalations?.keys() ?? [])];
+  check(keys.some(k => /could not be prepared/.test(k)) && !keys.some(k => /prepared.*\d{2,}/.test(k)), "and the failure stands as one escalation with an identity key", keys.join(" | "));
+  ctx9.db.close();
+  rmSync(dir9, { recursive: true, force: true });
+}
+
+// --- an UNBOUND worker refunds the attempt like any pre-execution failure ---
+{
+  const dir10 = mkdtempSync(join(tmpdir(), "reeve-e2e-unbound-"));
+  const ctx10 = { ...baseCtx(), db: open(join(dir10, "u.db")), logPath: join(dir10, "log.txt"), worktreeFor: () => mkdtempSync(join(dir10, "wt-")) };
+  ctx10.spawnWorker = async () => ({ outcome: "unbound", why: "run binding failed: x", ms: 1, cost: null, sessionId: null });
+  await tick(ctx10);
+  const spent = ctx10.db.prepare("SELECT COALESCE(SUM(attempts),0) n FROM fix_attempt").get().n;
+  check(spent === 0, "no fixer ran, so no attempt is spent", String(spent));
+  ctx10.db.close();
+  rmSync(dir10, { recursive: true, force: true });
+}
+
 ctx.db.close();
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

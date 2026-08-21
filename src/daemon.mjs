@@ -48,6 +48,12 @@ const now = () => Math.floor(Date.now() / 1000);
 // running daemon is re-read on the next dispatch rather than recorded as the
 // version that was true at startup.
 const CLI_VERSION = new Map();
+// A PR whose worker could not be PREPARED (no binary, no contract table) would
+// otherwise be leased, failed, refunded, and retried on every tick forever,
+// with no one told. Failures back off per PR (doubling, capped at an hour)
+// and stand as one escalation until a preparation succeeds. The map lives on
+// the daemon's context: one per daemon, not one per module.
+const PREP_BACKOFF_BASE_MS = 60_000, PREP_BACKOFF_CAP_MS = 3_600_000;
 function binaryIdentity(bin) {
   try { const real = realpathSync(bin); const st = statSync(real); return `${real}@${st.mtimeMs}`; }
   catch { return bin; }
@@ -413,7 +419,15 @@ export async function tick(ctx) {
     log(logPath, `execute: capacity allows ${cap.canStart} worker(s) (load ${cap.load1?.toFixed?.(2) ?? "?"}, ${cap.perfCores} perf cores)`);
     let started = 0;
 
+    const PREP_BACKOFF = (ctx.prepBackoff ??= new Map());   // pr -> { until, failures }
     for (const { e, decision, cause, fp } of decisions) {
+      const prepKey = e.pr;
+      const backoff = PREP_BACKOFF.get(prepKey);
+      if (backoff && backoff.until > Date.now() && WORKER_ACTIONS.includes(decision.action)) {
+        log(logPath, `  #${e.pr}: NOT dispatching — worker preparation failed ${backoff.failures} time(s); backing off until ${new Date(backoff.until).toISOString()}`);
+        escalations.set(`#${e.pr}: the worker could not be prepared; reeve is backing off`, 1);
+        continue;
+      }
       if (started >= cap.canStart) { log(logPath, `  capacity reached; ${decisions.length - started} decision(s) deferred to the next tick`); break; }
       if (halted(ctx.haltMarker)) { log(logPath, "HALTED before dispatch"); break; }
 
@@ -564,6 +578,9 @@ export async function tick(ctx) {
         // spent above is refunded: this failure is reeve's, not the fix's.
         r = { outcome: OUTCOMES.FAILED, why: `could not prepare the worker: ${err.message}`, ms: 0, cost: null, sessionId: null };
         if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+        const prev = PREP_BACKOFF.get(prepKey)?.failures ?? 0;
+        PREP_BACKOFF.set(prepKey, { failures: prev + 1, until: Date.now() + Math.min(PREP_BACKOFF_CAP_MS, PREP_BACKOFF_BASE_MS * 2 ** prev) });
+        escalations.set(`#${e.pr}: the worker could not be prepared; reeve is backing off`, 1);
       } finally {
         clearInterval(beat);
         // What the worker said it ran as, and whether its durable record is whole.
@@ -580,6 +597,10 @@ export async function tick(ctx) {
         const fin = finishRun(db, { runId: run.runId, outcome: r?.outcome ?? "failed",
                                     why: r?.why ?? "the worker threw before returning a result",
                                     ms: r?.ms, cost: r?.cost, sessionId: r?.sessionId });
+        // A worker that never executed (the gate refused its binding) spent no
+        // fixer's attempt; it is refunded like any pre-execution failure.
+        if (r?.outcome === OUTCOMES.UNBOUND && decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+        if (r?.outcome !== OUTCOMES.FAILED || !/could not prepare/.test(r?.why ?? "")) PREP_BACKOFF.delete(prepKey);
         if (fin?.applied === false) {
           // The store refused the outcome: the claim was gone or withdrawn by
           // the time the worker finished. Whatever it produced is not published.

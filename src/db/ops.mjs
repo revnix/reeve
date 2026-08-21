@@ -470,12 +470,14 @@ export function finishRun(db, { runId, outcome, why = null, ms = null, cost = nu
       return { applied: false, why: "the run's lease expired before it finished; its outcome is not accepted" };
     db.prepare(`UPDATE run SET status=?, ended_at=unixepoch(), error=? WHERE id=?`)
       .run(status, why, runId);
-    if (status !== "abandoned")
-      db.prepare(`UPDATE node SET status=?, updated_at=unixepoch(), version=version+1 WHERE id=?`)
-        .run(status === "succeeded" ? "done" : "blocked", r.task_id);
+    // A cancelled run leaves its node re-dispatchable (`ready`, the reaper's own
+    // convention), never `running` for a run that no longer exists and never
+    // `blocked` for a failure that did not happen.
+    db.prepare(`UPDATE node SET status=?, updated_at=unixepoch(), version=version+1 WHERE id=?`)
+      .run(status === "succeeded" ? "done" : status === "abandoned" ? "ready" : "blocked", r.task_id);
     emit(db, { actor: "daemon", op: "run.finish", subject: r?.task_id ?? null, run_id: runId,
                payload: { outcome, why, ms, cost, sessionId } });
-    return { ok: true, status };
+    return { ok: true, applied: true, status };
   });
 }
 

@@ -114,6 +114,24 @@ export function acquireWorktree({ repoRoot, root, pr, branch, head = null }) {
   const add = git(repoRoot, ["worktree", "add", "--force", "-B", branch, path, `origin/${branch}`]);
   if (!add.ok) return { ok: false, path: null, why: `could not create the worktree: ${add.err}` };
 
+  // Make the worktree PHYSICALLY unable to publish, rather than trusting a
+  // permission pattern to refuse it.
+  //
+  // The permission layer matches command prefixes, and git accepts flags BEFORE
+  // the subcommand: `git -C <path> push` does not match a `git push` rule. That
+  // is not a gap to patch — it is the shape of the mechanism, and any deny
+  // written as a subcommand pattern has the same hole. A worker exploited exactly
+  // this and published its own fix, bypassing the diff gate entirely.
+  //
+  // A pushurl git cannot resolve fails the same way whatever the command spells,
+  // and reeve pushes from the main checkout where the real URL still lives.
+  // `--worktree`, not a plain config write. Worktrees SHARE the clone's config by
+  // default, so setting this without it disables push for the main checkout and
+  // every other worktree too — which is exactly what happened the first time and
+  // broke the test's own setup two cases later.
+  git(repoRoot, ["config", "extensions.worktreeConfig", "true"]);
+  git(path, ["config", "--worktree", "remote.origin.pushurl", "reeve://refused-the-worker-does-not-publish"]);
+
   const v = verifyWorktree({ path, branch, head });
   if (!v.ok) return { ok: false, path, why: `created but did not verify: ${v.why}` };
   return { ok: true, path, reused: false, why: null };
@@ -185,15 +203,28 @@ export function releaseWorktree({ path, pr, quarantineRoot = null }) {
  * worked" is reported as that, rather than as an opaque rejection. Force is never
  * used: a worker's fix is never worth discarding somebody else's commit.
  */
-export function pushWorktree({ path, branch, expectedRemote = null }) {
+export function pushWorktree({ path, branch, expectedRemote = null, repoRoot = null }) {
+  // From the MAIN checkout: the worktree's pushurl is deliberately unresolvable,
+  // so that a worker cannot publish whatever spelling it reaches for. reeve holds
+  // the real remote, which is the whole point — the actor and the only claim the
+  // action was allowed must not be the same party.
+  const from = repoRoot ?? (() => {
+    const c = git(path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    return c.ok ? dirname(c.out) : null;
+  })();
+  if (!from) return { ok: false, why: "could not locate the main checkout to publish from" };
+
   if (expectedRemote) {
-    const ls = git(path, ["ls-remote", "origin", `refs/heads/${branch}`]);
+    const ls = git(from, ["ls-remote", "origin", `refs/heads/${branch}`]);
     if (!ls.ok) return { ok: false, why: `could not read the remote head: ${ls.err}` };
     const now = ls.out.split(/\s+/)[0] ?? "";
     if (now && now !== expectedRemote)
       return { ok: false, why: `the remote moved while the worker ran: expected ${expectedRemote.slice(0, 10)}, found ${now.slice(0, 10)}` };
   }
-  const pushed = git(path, ["push", "origin", `HEAD:${branch}`]);
+
+  // The worktree's branch by name, read from the main checkout's ref store, which
+  // both share. Never force: a worker's fix is not worth another party's commit.
+  const pushed = git(from, ["push", "origin", `${branch}:${branch}`]);
   if (!pushed.ok) return { ok: false, why: `push refused: ${pushed.err}` };
   return { ok: true, why: null };
 }

@@ -57,10 +57,45 @@ let db = open(path);
   check(!!call && /covered:/.test(call), "control: found the daemon's announceable call site", String(call));
   check(/\bwaiting\b/.test(call ?? ""),
     "and it passes the waiting set, without which WAIT still clears escalations", String(call));
+  check(/\bfinished\b/.test(call ?? ""),
+    "and the finished set, without which a merged PR's escalation stands forever", String(call));
 
   // And that the set is actually filled, not merely declared and passed empty.
   check(/waiting\.add\(pr\)/.test(src) && /ACTIONS\.WAIT/.test(src),
     "and the tick adds a PR to it when its decision is WAIT");
+}
+
+// ── a PR that is over ────────────────────────────────────────────────────────
+//
+// The guard above refuses to retire an escalation for a PR this tick did not
+// look at. A MERGED pull request leaves the open list, so it is never looked at
+// again -- and its escalation could therefore never retire. Measured on nextly
+// #1127: it merged, and "unclassified verdict BLOCK: mergeable blocked" stayed in
+// NEEDS YOU with no way out.
+//
+// A surface whose target state is empty, filling with finished work, stops being
+// read. That is the same muting the repeat-push guard exists to prevent, arriving
+// from the other direction.
+{
+  announceable(db, m({ "#1127: mergeable blocked": 1 }), { covered: new Set([1127]), complete: true });
+
+  // Control: the fixture must be able to exhibit the defect. The PR is absent
+  // from the open set, so without `finished` nothing can ever clear it.
+  const stuck = announceable(db, m({}), { covered: new Set([308, 834]), complete: true });
+  check(stuck.cleared.length === 0,
+    "control: a PR missing from the open set cannot retire on absence alone", JSON.stringify(stuck));
+
+  const done = announceable(db, m({}),
+    { covered: new Set([308, 834]), finished: new Set([1127]), complete: true });
+  check(done.cleared.length === 1 && done.cleared[0].startsWith("#1127"),
+    "but GitHub saying it is merged or closed does retire it", JSON.stringify(done));
+
+  // Being finished outranks being in flight: a PR cannot be both, and if the two
+  // ever disagree the positive fact about the subject is the truthful one.
+  announceable(db, m({ "#1200: something": 1 }), { covered: new Set([1200]), complete: true });
+  const both = announceable(db, m({}),
+    { covered: new Set(), waiting: new Set([1200]), finished: new Set([1200]), complete: true });
+  check(both.cleared.length === 1, "merged outranks waiting", JSON.stringify(both));
 }
 
 db.close();

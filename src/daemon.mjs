@@ -111,6 +111,48 @@ export function log(logPath, line) {
   if (!appended || !stdoutAlreadyWrites(logPath)) console.log(stamped);
 }
 
+/**
+ * Is this pull request finished -- merged or closed?
+ *
+ * Asked ONLY about a PR that already holds a standing escalation and is missing
+ * from the open list, and answered by GitHub rather than by that absence. The
+ * open list is capped, so a PR beyond the cap is unread rather than gone, and
+ * retiring a human's escalation on that would be absence read as success again.
+ *
+ * Anything other than a clear MERGED or CLOSED leaves the escalation standing.
+ */
+function prIsFinished(nwo, pr) {
+  try {
+    const out = execFileSync("gh", ["pr", "view", String(pr), "--repo", nwo,
+      "--json", "state", "--jq", ".state"], { encoding: "utf8" }).trim();
+    return out === "MERGED" || out === "CLOSED";
+  } catch { return false; }
+}
+
+/**
+ * PRs whose escalation should retire because the PR itself is over.
+ *
+ * Measured on nextly #1127: it merged, left the open list, and could therefore
+ * never be evaluated again -- so its escalation could never be retired and sat in
+ * NEEDS YOU permanently. A surface whose target state is empty fills up with
+ * finished work, and an operator stops reading it. That is the same muting the
+ * repeat-push guard exists to prevent, arriving from the other direction.
+ */
+function finishedSubjects(db, nwo, open, io = {}) {
+  const isFinished = io.prIsFinished ?? prIsFinished;
+  const gone = new Set();
+  let rows = [];
+  try { rows = db.prepare("SELECT why FROM escalation").all(); } catch { return gone; }
+  for (const { why } of rows) {
+    const m = why.match(/^#(\d+):/);
+    if (!m) continue;
+    const pr = Number(m[1]);
+    if (open.has(pr) || gone.has(pr)) continue;
+    if (isFinished(nwo, pr)) gone.add(pr);
+  }
+  return gone;
+}
+
 function openPrs(nwo, limit = 20) {   // bounded; the caller LOGS when the bound bites
   try {
     const out = execFileSync("gh", ["pr", "list", "--repo", nwo, "--state", "open",
@@ -438,8 +480,12 @@ export async function tick(ctx) {
 
   // Announce what STARTED or CHANGED, and what went away. Repeating a standing
   // cause every tick is how an operator learns to ignore the channel.
+  // A PR that merged or closed will never be evaluated again, so its escalation
+  // needs a positive answer about the PR itself or it stands forever.
+  const finished = finishedSubjects(db, nwo, new Set(prs), ctx);
+  for (const pr of finished) log(logPath, `  #${pr}: is merged or closed — retiring what it was escalating`);
   const { fresh, cleared } = announceable(db, escalations,
-    { covered: evaluated, waiting, complete: evaluated.size === prs.length });
+    { covered: evaluated, waiting, finished, complete: evaluated.size === prs.length });
   // Recorded last, so it means "a tick completed" rather than "a tick began".
   // That is the difference between a daemon that is working and one that is
   // wedged part-way through every pass.
@@ -484,7 +530,7 @@ export async function tick(ctx) {
  * @param {Map<string, number>} escalations  cause -> how many PRs share it
  * @returns {{fresh: {why: string, count: number}[], cleared: string[]}}
  */
-export function announceable(db, escalations, { covered = null, waiting = null, complete = true, at = Math.floor(Date.now() / 1000) } = {}) {
+export function announceable(db, escalations, { covered = null, waiting = null, finished = null, complete = true, at = Math.floor(Date.now() / 1000) } = {}) {
   const fresh = [], cleared = [];
   const standing = new Map(
     db.prepare("SELECT why, count, announced_count FROM escalation").all().map(r => [r.why, r]));
@@ -525,11 +571,17 @@ export function announceable(db, escalations, { covered = null, waiting = null, 
     // none.
     const subject = why.match(/^#(\d+):/)?.[1];
     const pr = subject ? Number(subject) : null;
-    const looked = subject
-      ? (covered === null || covered.has(pr)) && !(waiting?.has(pr) ?? false)
+    const looked = !subject
       // A shared cause names no PR, so only a tick that finished what it set out
       // to do is entitled to retire it.
-      : complete;
+      ? complete
+      // GitHub says the pull request is over. That is a positive fact about the
+      // subject, not an absence, and it is the ONLY way an escalation for a PR
+      // that has left the open list can ever retire.
+      : finished?.has(pr) ? true
+      // In flight this tick, which says nothing either way.
+      : waiting?.has(pr) ? false
+      : (covered === null || covered.has(pr));
     if (!looked) continue;
     db.prepare("DELETE FROM escalation WHERE why=?").run(why);
     cleared.push(why);

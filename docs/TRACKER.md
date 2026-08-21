@@ -41,11 +41,18 @@ The four capabilities, measured 2026-08-21:
       When capability 3 arms, populate it from the `review_thread` projections
       (reviewer/severity/path/line/excerpt all exist there) — the new prompt
       ordering activates only then.
-- [ ] Wire flake detection — `flakeEvidence` has ZERO callers; nextly main red
-      6 of last 9 runs. ~2h.
+- [x] Wire flake detection — DONE 2026-08-21 (`39a5ce9`). Only DEMONSTRATED
+      flake changes the decision: wholly-flaky causes escalate (identity key,
+      no attempt spent); mixed causes dispatch with the flaky job named as
+      noise. Follow-up noted: `ci.flakePatterns` is declared in the schema with
+      ZERO readers — wire or remove when the builder design lands.
 - [ ] Dispatch evidence: the wrong-worker shape (a confidently bad fix). ~$2, 1h.
-- [ ] `release` lane is dead by construction — its territory sits inside
-      `sensitivePaths`, and sensitive refuses first. ~30m.
+- [x] `release` lane dead-by-construction — DONE 2026-08-21 (`4998f66`).
+      `lanes[].sensitiveOk` lifts the tool-layer deny (verbatim globs only) and
+      the diff-gate sensitive refusal (territory-scoped, per file); quarantine
+      and self-governing stay unreachable. Validator warns on the dead shape.
+      Live nextly profile updated. NOTE: nothing assigns `decision.lane` yet —
+      lanes go live with the builder's implementation phase.
 - [ ] *Optional (founder: "if beneficial")* — PR-open size warning (>10 files →
       expect 4+ rounds), reinstate Greptile (best critical hit rate, out of credits).
 

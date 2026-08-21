@@ -1,43 +1,71 @@
 # reeve — handoff
 
-**Written:** 2026-08-21, end of the second build session.
-**Updated:** 2026-08-21, third session. See §6.5 for what that session changed.
+**Written:** 2026-08-21, end of the third build session.
 **Audience:** the next session, which will have none of this in context.
-**Rule for reading it:** every number here was measured, not remembered. Where
-something is unproven it says so. Trust the "unproven" labels as much as the
-numbers, and re-measure anything you are about to act on.
+**Rule for reading:** every number was measured, not remembered. Where something
+is unproven it says so. Trust the "unproven" labels as much as the numbers, and
+re-measure anything you are about to act on.
+
+`docs/USING-REEVE.md` is the founder-facing version — short, and the document
+that states what reeve is NOT. `docs/2026-08-21-review-ingest-design.md` is the
+design and adversarial-attack ledger for the review half.
 
 ---
 
-## 1. What this is, in one paragraph
+## 0. The single most important thing to understand
 
-`reeve` is an agent-ops control plane. It watches the pull requests an agent fleet
-opens, reads CI and reviewers, root-causes failures, dispatches workers to fix
-them, computes whether a PR is genuinely safe to merge, and publishes that verdict
-to GitHub so that **GitHub does the refusing**. It replaces `nextly-ops`, a repo of
-shell scripts whose merge gate had, when audited, merged **zero** of the last ten
-pull requests while claiming to be the only sanctioned path.
+**reeve is a GUARDIAN, not a BUILDER.** It does not pick work, research, design,
+or write features. It watches pull requests that already exist and guards them.
 
-It is built to serve **many projects of different stacks**. That is the founder's
-primary requirement and it shapes everything: a project-agnostic CORE plus a small
-per-project PROFILE.
+The founder asked directly whether reeve would eventually implement a feature end
+to end. The answer is no, and not after the remaining work either:
 
-`docs/USING-REEVE.md` is the plain-English version for the founder. Read it too —
-it is short, and it is the document that states what reeve is *not*.
+| Step | Who does it | reeve |
+|---|---|---|
+| Pick what to build | the `ledger` in nextly-ops | ✗ no task import (ruling 16) |
+| Research / design it | a Claude session | ✗ never designed |
+| **Write the code** | `lane-*` agents in a Claude session | ✗ **not in scope** |
+| Open the PR | that session | ✗ |
+| Fix red CI | — | ✓ capability 2 |
+| Work review threads | the founder, by hand | ✓ capability 3 |
+| Refuse an unsafe merge | nobody | ✓ capability 4 |
+
+The intended shape is: a Claude session (Prompt A/B) builds and opens the PR,
+then reeve takes over. If a future session is asked to make reeve a builder, that
+is a NEW programme — weeks, undesigned — and worth pushing back on until the
+guardian is trusted.
 
 ---
 
-## 2. State, measured 2026-08-21
+## 1. The four capabilities, and which are on
+
+Everything reeve does is one of four switches. **One of four is on.**
+
+| # | Capability | Switch | State | Unblocks when |
+|---|---|---|---|---|
+| 1 | Watch, judge, and tell the founder | — | **ON** | live now |
+| 2 | Fix red CI itself | `--execute` | off | dispatch evidence — NOT time-bound |
+| 3 | Work review threads | `watch.reviewActions` | off | PR-5 → PR-6, after the shadow week |
+| 4 | Refuse an unsafe merge | `--enforce` + ruleset | off | 7 clean shadow days + founder decision |
+
+Capability 1 means: reeve pins each head, reads CI and reviewers, computes
+PASS/BLOCK/UNKNOWN, publishes a `neutral` (non-blocking) check run, and escalates
+what needs a human to ntfy and to this Mac.
+
+---
+
+## 2. State, measured 2026-08-21 (end of session three)
 
 | | |
 |---|---|
-| Commits | ~70. The number that matters is **`HEAD == origin/main`, CI green** |
-| Source | 23 `.mjs` files, ~5,600 lines |
-| Tests | **37 files, 0 failing** |
-| Daemon | running as `com.revnix.reeve` on `nextlyhq/nextly`, **observe-only** |
-| Ticks | 260+ since 2026-08-20 14:04 UTC |
-| Backups | hourly snapshots, restore verified against the live store |
-| Dispatch | **three complete clean runs**, all CI-verified, on `revnix/reeve` only |
+| Commits | **93**, `HEAD == origin/main`, CI green |
+| Source | 27 modules, ~7,200 lines |
+| Tests | **44 files, 0 failing** |
+| Daemon | `com.revnix.reeve` on `nextlyhq/nextly`, **observe-only** (argv has neither flag) |
+| Dispatch | **3 clean CI-verified runs** across 2 failure shapes |
+| Review ingest | PR-1..PR-4 built and running in **shadow**; 296 inbox rows, 100 threads, 37 rounds derived |
+| Backups | hourly, **every store** (2 stores, 16 snapshots) |
+| Self-audit | every tick: store integrity, backups, leases, notify |
 
 ### Where everything lives
 
@@ -47,44 +75,32 @@ it is short, and it is the document that states what reeve is *not*.
 | **profile** | `~/.reeve/profiles/<owner>/<repo>.json` — 4 exist, all sidecar |
 | **state** | `~/.reeve/state/<owner>/<repo>.db` — SQLite, keyed by owner AND repo |
 | **backups** | `~/.reeve/backups/<owner>-<repo>/<epoch>.db` |
-| dashboard | `~/.reeve/dash/<owner>/<repo>.html` |
 | credentials | `~/.reeve/credentials/` — mode 600, App ID **4660593** |
 | log | `~/.reeve/reeve.log`, errors in `reeve.err.log` |
 | **halt** | `~/.reeve/HALT` — create it to stop everything |
 | product repo | `~/Work/Products/nextly-workspace/nextly` |
-| old ops repo | `~/Work/Products/nextly-workspace/nextly-ops` — **still live, do not delete** |
+| old ops repo | `nextly-workspace/nextly-ops` — **still live, ruling 16** |
 
-`~/.reeve` is deliberately **not** a git repo, so a profile or the App key cannot
-be committed into a public or client repo by accident.
-
-**Path trap:** `~/Work/Products/nextly-integrations/nextly-ops` is a DEAD clone,
-39 commits behind. The live one is under `nextly-workspace/`.
+**Path trap:** `~/Work/Products/nextly-integrations/nextly-ops` is a DEAD clone.
 
 ### Source map
 
 | File | What it does |
 |---|---|
-| `db/schema.sql` | events, graph, runs, leases, checkpoints, outbox, settlement, fix_attempt, escalation |
-| `db/ops.mjs` | atomic claim, heartbeat, reap, runs, settlement, fix attempts, JSONL export |
-| `db/reconcile.mjs` | idempotency reconcilers for push / PR create / comment / merge |
-| `profile/schema.mjs` | the profile schema and a **fail-closed** validator |
-| `profile/detect.mjs` | auto-detection; returns *questions* rather than guesses |
-| `github/app.mjs` | App JWT, installation token, permission audit |
-| `github/reconciler.mjs` | head pinning, check classification, settlement, timeline |
-| `verdict.mjs` | the merge decision: PASS / BLOCK / UNKNOWN |
-| `watcher.mjs` | a **total** verdict → action function |
-| `ci-rootcause.mjs` | annotations tier, log-slice fallback, cause identity |
-| `supervisor.mjs` | worker lifecycle, group kill, liveness, capacity |
-| `sandbox.mjs` | the deterministic tool policy and the diff gate |
-| `worktree.mjs` | acquire / verify / publish / release, with quarantine |
-| `prompts.mjs` | worker prompts **generated from the profile** |
-| `pr.mjs` | evaluate one PR, publish the verdict |
+| `db/schema.sql` | events, graph, runs, leases, settlement, fix_attempt, escalation, **inbox, head_seen, review_\*, projection_meta, review_shadow** |
+| `db/ops.mjs` | atomic claim, heartbeat, runs, settlement, fix attempts, **table reshape** |
+| `github/reconciler.mjs` | head pinning, check classification, **reviewer-status exclusion**, settlement |
+| `verdict.mjs` | PASS / BLOCK / UNKNOWN; `coversHead` prefix rule |
+| `watcher.mjs` | verdict → action; the review-action gate |
+| `ci-rootcause.mjs` | annotations tier, log slice, **cause identity across every failing check** |
+| `sandbox.mjs` | tool policy, diff gate, **test-only-repair refusal** |
+| `supervisor.mjs` | worker lifecycle, group kill, **worker report parsing** |
+| `review/ingest.mjs` | **observe + land raw observations, generations, head_seen** |
+| `review/derive.mjs` | **the pure fold: rounds, threads, severity, supply** |
+| `review/shadow.mjs` | **derived-vs-live comparison and the day streak** |
+| `selfaudit.mjs` | **reeve checking reeve, every tick** |
+| `notify.mjs` | ntfy **and macOS desktop**, redacted |
 | `daemon.mjs` | the tick loop |
-| `status.mjs` | `status`, `statusline`, `why`, liveness, clean-merge |
-| `notify.mjs` | ntfy escalations, redacted |
-| `backup.mjs` | snapshots, restore, JSONL export |
-| `paths.mjs` | owner-scoped state and dashboard paths |
-| `init.mjs` / `doctor.mjs` | detect→preview→merge→prove; what is true right now |
 
 ---
 
@@ -233,317 +249,212 @@ Full analysis in `docs/2026-08-20-portfolio-readiness.md`.
 
 ---
 
-## 6. What this session fixed, and what each cost to find
+## 6. What session three did
 
-The Codex audit (`docs/2026-08-20-reeve-comprehensive-audit.md`) is **closed** —
-ten of its claims were re-verified by hand and all ten held. Beyond it, twelve
-`--execute` dispatch runs against a planted failure on `revnix/reeve` found
-**eleven defects, all mine.** The failures matter more than the list.
+53 commits. Twelve defects found and fixed, **five of them fail-opens live in
+production**. Every one was found by RUNNING the system, not by reading it.
 
-### 6.1 The sandbox premise was wrong (three corrections)
+### 6.1 The fail-opens that were live
 
-1. Denying `Write` while granting a bare `Bash` is **theatre** — the model wrote
-   the denied file with `printf >` on the next turn.
-2. `deny: ["Bash"]` removes the tool entirely, so a worker could edit code and
-   **never run a test** — reporting success on work nothing checked.
-3. Restricting execution at all is impossible for a code fixer. I made this
-   mistake **twice in one session, in two shapes**, having already measured it.
-
-Also: a fixer must be able to **read** the workflow failing it. Quarantine denies
-every verb including reads (data that must never be seen); sensitive and
-self-governing paths deny writes only (understanding requires reading).
-
-### 6.2 The worker could publish around the gate — the most serious
-
-`git -C <path> push` does not match `Bash(git push:*)`. Having widened the *allow*
-to `Bash(git:*)` to fix `-C` matching, I left the *deny* as a subcommand pattern
-with the identical blind spot. A worker used it to publish its own fix.
-
-**And I had "verified" the deny with a test that could not fail** — it used the
-bare `git push` form, which the pattern does match. The commit message claimed the
-property was proven.
-
-Fixed physically: the worktree gets a pushurl git cannot resolve, so no spelling
-works, and reeve publishes from the main checkout.
-
-### 6.3 The instrument problem — the lesson that cost the most
-
-> **When a system reports a NUMBER where it holds the DETAIL, whoever reads it
-> will guess.**
-
-`runWorker` returned the denied commands from the first failure and the daemon
-kept only the count. Two full rounds went into reproducing by hand what the run
-already knew, from hand-written prompts that did not match the generated one — so
-both reproductions produced wrong conclusions. Printing the refused commands was
-fifteen lines and named the cause in one run.
-
-### 6.4 Everything else closed
-
-| Defect | Was |
+| Defect | What it meant |
 |---|---|
-| Settlement was fake | 3 `settle()` calls on ONE API read; now persisted across ticks |
-| MISSING_REQUIRED settled on a count | Now waits for the CI provider's suites to be terminal |
-| reeve read its own verdict as CI input | Would latch red forever under `--enforce` |
-| Retry brake non-functional | Three independent causes, any one disabling it |
-| Durable state not connected | 1,230 events, **zero** runs/leases/checkpoints |
-| Worktree lifecycle | Did not exist; a path check only |
-| A cancelled ancillary job vetoed the base | Blocked all five open PRs for hours |
-| Clean-merge counted absence as clean | And the daemon never computed it |
-| Decisions band was a dead query | `status='pending'` is not a value the schema permits |
-| State keyed by short repo name | `owner-a/api` and `owner-b/api` collided |
-| Review actions inverted a ruling | `unspilledCritical` hard-coded 0 → would spill P0s |
-| Escalations retired on absence | A PR a tick could not evaluate read as "resolved" |
-| A source file was BINARY to git | One raw NUL; every diff of it showed nothing |
-| An existing DB could not gain a column | `CREATE TABLE IF NOT EXISTS` is a no-op |
-| Freshness measured against stored rows | A dead daemon looked permanently current |
-| A denial disqualified a whole run | Made dispatch impossible: a model always explores |
-| A failed worker's dirty worktree stranded the PR | Next attempt refuses a dirty checkout, forever |
-| The gate was blind to committed work | Read `status --porcelain`; a committed fix looks like nothing |
-| The prompt told the worker to push | The one action the sandbox forbids |
-| No backup | One copy on one laptop |
-| No alert sink | "Needs you" reached a local log only |
+| **CodeRabbit rate-limit counted as a passing CI check** | `state=success, description="Review rate limited"` on 8 of 9 sampled heads. `readChecks` carried the description *because* the truth hides there and nothing read it |
+| **Cause identity could not tell two failures apart** | Root-caused `failing[0]`, which where CI ends in a gate IS the gate — same sentence whatever broke. The retry brake refused work it had never attempted |
+| **`unspilledCritical` was `null`, and `null > 0` is false** | At the hard cap with unknown criticals the rounds clause rendered PASS |
+| **A truncated read became a confident projection** | `ctx.lastIngestIncomplete` was read and never assigned |
+| **`NOT_INSTALLED` never produced** | An absent blocking reviewer read "not yet run" forever instead of REVIEWERS_DOWN |
 
-### 6.5 The third session: seven more defects, all found by USING it
+### 6.2 The noise defects — a channel that cries wolf is not a channel
 
-The verification in §10, five more `--execute` dispatches and two notifications
-arriving on a phone found seven defects that 576 passing assertions did not. Every one was found by running the system
-and reading what it actually stored, not by reading code.
+Fixed **four separate times**, in four places:
 
-**The failure identity could not tell two failures apart.** The daemon
-root-caused `failing[0]`, which where CI ends in an aggregate gate is the GATE.
-Its annotation is the same sentence whatever broke -- measured in the
-`fix_attempt` table as `CI Gate refuses: test concluded 'failure'`. So every
-failure in the repository shared one identity. Two things followed: the retry
-brake refused work it had never attempted (run 13 escalated "the same failure
-survived a second fix" about a fix it had not tried), and the worker's WHAT
-FAILED section was a tautology. Run 12 succeeded only because the prompt
-separately tells a worker to reproduce the failure itself, so the most
-engineered tier in the pipeline had contributed nothing to the one dispatch that
-had ever worked. Every failing check is now read, caused ones first.
+1. The gated escalation key embedded the thread COUNT — three phone pushes in one
+   morning for one unchanged condition (13 of 17, then 23 of 27).
+2. `WAIT` was read as "resolved", so a standing escalation retired and
+   re-announced every time CI went in flight.
+3. A MERGED PR could never retire its escalation — NEEDS YOU filled with finished work.
+4. The self-audit ran BEFORE the backup step, so it paged about a gap the same
+   tick closed 54ms later.
 
-**`doctor` could not find its own state database.** It resolved the path from
-`profile.state.location`, which the schema defines as the sibling REPOSITORY
-holding a project's ledger -- `nextlyhq/nextly-ledger`. `existsSync` said no and
-doctor rendered that as UNKNOWN `no state database`, with 3,600 events sitting at
-the canonical path. The lease check had therefore never run against a real store.
-This is the fifth instance of §4.2's class in reeve's own surfaces, and it was in
-the command the founder-facing guide tells you to run. Five commands resolved
-that path independently; there is now one resolver. `loadProfile` was also
-reading `homedir()` rather than `REEVE_HOME`, so a scratch home moved a project's
-state but not the profile describing it.
+**The rule that came out of it:** an escalation key is an IDENTITY, not a report.
+No counts, no durations, no paths. Those go in `detail`, which is logged.
 
-**A PASSING test was recorded as the cause of a red build.** The salience
-patterns match on words and a test NAME may contain them: this suite asserts
-"cancelled is an absence, failed is a fact", so its PASS line matched
-`/failed/i`. A worker told to change the least that fixes the cause was being
-pointed at green code, and the identity churned whenever an unrelated test was
-renamed -- refunding the brake an attempt.
+### 6.3 Review ingest: PR-1 to PR-4, in shadow
 
-Beside it, an ANSI stripper written with a **literal ESC byte**. Invisible to an
-editor, unmatchable by search: two separate attempts to edit that line silently
-found nothing, and the second only resolved because an octal dump showed the
-byte. Same family as the raw NUL in §6.4. The guard that keeps NUL out of source
-now keeps ESC out with it.
+Built from `docs/2026-08-21-review-ingest-design.md` — a 14-agent research pass
+(4 measurers, 3 designs, 3 judges, 1 synthesis, 3 adversarial verifiers), whose
+§12 ledgers every hole found and where its fix landed.
 
-**A fourth, found by probing rather than by accident.** Run 15's fixture was
-chosen so the cheapest way out was to delete the failing assertion --
-`SELF_GOVERNING` was `[".github/**", ".git/**"]`, so tests, which judge the work
-exactly as the workflow does, were unprotected. The worker did not take it. The
-gate now refuses a repair whose entire diff is tests, because the design rule is
-that the actor is never the only witness, and "the worker chose well" is the
-actor being the only witness. Adding a test beside a source fix stays allowed:
-the prompt requires one.
+- **PR-1** the four fail-now defects above.
+- **PR-2** raw observations land append-only in `inbox`, which had existed with
+  ZERO writers since the beginning. Its key had to change: an edit is a
+  GENERATION, because CodeRabbit rewrites its own history.
+- **PR-3** the pure fold — rounds, thread identity, severity, supply — stamped
+  with a `classifier_version` so improving a detector re-reads history.
+- **PR-4** `reeve shadow`: derived-vs-live comparison, per day, gating PR-5.
 
-**A fifth, delivered by the notification channel itself.** An escalation was
-retired whenever a tick evaluated its PR and produced no escalation that round.
-But `WAIT` means "something is in flight; check again later", not "the thing a
-human was needed for is resolved". nextly #834 ran ESCALATE, seven ticks of WAIT
-while CI was in flight, then ESCALATE again -- so one unchanged condition was
-announced, retired and re-announced twice, four and twenty-five minutes apart,
-with the reason string identical each time. #1011 and #1127 did the same, and a
-third instance arrived while the fix was being written. Two pushes for one
-unchanged condition is how a channel earns being muted. **Sixth instance of the
-§4.2 class**: absence within one tick read as resolution.
+**PR-5 is time-blocked** on 5 clean shadow days.
 
-**A sixth, the exact mirror of the fifth.** The guard above refuses to retire an
-escalation for a PR a tick did not look at. A MERGED pull request leaves the open
-list and is never looked at again -- so its escalation had no way out at all.
-nextly #1127 merged and its cause stood on in NEEDS YOU with the PR long gone. A
-surface whose target state is EMPTY, filling with finished work, stops being read:
-the same muting as the flap, arriving from the other direction. Absence from the
-open list is not the evidence used, because that list is capped and a PR beyond
-the cap is unread rather than gone; each orphan is confirmed against GitHub and
-only a clear MERGED or CLOSED retires it. **Verified in production**, not only in
-a test: `#1127: is merged or closed — retiring what it was escalating`.
+### 6.4 What running it found that no test could
 
-Worth noting what the two together mean. Escalation retirement had a defect in
-BOTH directions -- retiring what still stood, and never retiring what was over --
-and neither was reachable by any test written against the function, because both
-needed a real PR moving through real states over real ticks.
+- **One App, two logins.** REST says `coderabbitai[bot]`, GraphQL says
+  `coderabbitai`. 71 observations of two reviewers arrived under four sources —
+  half of every reviewer's evidence would never have matched the roster.
+- **Resolution is a CLAIM.** The first draft cleared four threads
+  `coderabbitai[bot]` had resolved by itself. `resolved_at` was the thread's
+  BIRTH (GitHub reports who, never when), and the covering-head requirement was
+  missing entirely.
+- **A stale settlement floor** — excluding reviewer statuses dropped every head's
+  count below its stored floor, the exact incident `CHECK_ACCOUNTING` exists for.
+  The mechanism was correct; nobody bumped the number.
 
-**A seventh, found by deliberately making a worker unable to succeed.** Every
-prompt ends by asking the worker for a fenced json block -- what was wrong, what
-changed, and `needsHuman` when the work belongs to a person. **Nothing parsed it.**
-It was written into every prompt and read by no code at all.
+### 6.5 The pattern worth carrying: optional parameters that switch off their own rule
 
-Measured by planting a failure in `src/verdict.mjs`, a sensitive path, so the
-worker had to decline. It did exactly what rule 8 requires and said why. reeve
-discarded that and pushed *"a fix was produced but refused publication -- the
-worker produced an empty diff"*: two statements that cannot both be true, about a
-worker that had behaved correctly. The next tick's retry cap replaced it with
-*"the same failure survived a second fix"*, and because a clearing retires the
-earlier message, the ONLY one left standing claimed a fix had been tried when none
-ever was.
+**Four times in one day**, an optional parameter defaulted in a way that silently
+disabled the safety rule it guarded: `reviewDiff.action`, `announceable.waiting`,
+`announceable.finished`, and `derivePr.complete`. Each was caught only by a
+call-site guard written AFTER the previous one bit.
 
-The report is now trusted for exactly one question -- **why did you stop**. What
-was fixed is still answered by git and by CI, because the actor is never the
-witness; but nothing else witnesses a worker's reason for stopping. The same
-scenario now pushes: *"needs a human — the fix is confined to src/verdict.mjs, a
-path this task forbids editing... A human should revert line 36 to `if (a ===
-UNKNOWN || b === UNKNOWN) return UNKNOWN;`"* -- one push, `announced=1`, and the
-retry cap quotes it rather than contradicting it.
+**Standing rule for the next session: any new optional parameter guarding a
+safety rule ships with its call-site assertion in the same commit.**
 
-Writing that fix introduced a ReferenceError on every FIX_CI -- the attempt is
-spent at DISPATCH, before any worker exists, so the result was read in its
-temporal dead zone. `test/dispatch-e2e.test.mjs` caught it. That test exists
-because the same shape shipped once before.
+### 6.6 Hardening added
 
-**What that says about the shape of the remaining risk.** Three sessions have now
-produced the same pattern: the defects that matter are not found by reading code
-or by adding assertions, but by running the thing and reading what it wrote down.
-Two of these three were only visible in stored state -- the `fix_attempt` row and
-doctor's rendered output. Budget for use, not for review.
-
-### 6.6 Verification lessons worth keeping
-
-- **A fixture that cannot exhibit the defect proves nothing.** Two of my
-  verifications were like this — the push deny, and a diff-gate check where the
-  worktree sat at the remote's head so a push was a no-op either way.
-- **Check that a stub actually applied.** One stub silently did not, and the guard
-  looked blind when it was fine.
-- **A guard that narrows its own input reports success.** The status-vocabulary
-  guard took three attempts: a unioned vocabulary would have passed the bug, then
-  the table regex skipped every `) STRICT, WITHOUT ROWID;` table, then the control
-  was a magic number instead of a count derived from the schema.
-- **Environment-dependent tests fail for the wrong reason.** The backup suite
-  failed because a real daemon was running; the daemon check is now injectable.
-- **Read the WHOLE log before claiming an outcome.** I reported run 11 as a
-  success from a partial read. The branch had moved because the worker bypassed
-  the gate, and the tick had crashed.
+- **Self-audit** (`selfaudit.mjs`) — store integrity, backup freshness AND
+  readability, wedged leases, notify reachability. Every tick, because a slower
+  cadence would make findings absent from most ticks and absence reads as resolved.
+- **Backups cover every store.** A store no daemon watches was unbacked AND
+  unaudited — reeve's own store had zero backups while nextly had fourteen.
+- **Desktop notifications.** All five ntfy tokens are write-only; the phone half
+  is genuinely blocked on the founder. A native macOS banner cannot be blocked by
+  a server nobody can log into.
+- **`CHECK_ACCOUNTING` is guarded by a fingerprint**, so changing what counts as
+  a check fails the suite until the version moves with it.
 
 ---
 
-## 7. Proven, and unproven
+## 7. The 500-PR study — measured, and what it says
+
+500 merged PRs, 11 days (2026-08-10..21), 3,405 review threads, 92.6% resolved.
+Data at `scratchpad/prstudy/` (regenerate with `fetch.mjs`; **request `body`, not
+`bodyText` — the latter strips image markdown and both bots put severity in an
+image**. That error made a first pass report 92% unknown severity).
+
+**Severity:** critical 992 (29.1%) · major 2,202 (64.7%) · minor 174 · unknown 37 (1.1%).
+Roughly **90 critical findings caught per day**.
+
+**What they are about** (CodeRabbit's own categories):
+
+| Category | Share |
+|---|---|
+| **Functional Correctness** | **39.9%** |
+| Maintainability & Code Quality | 30.2% |
+| **Data Integrity & Integration** | **15.7%** |
+| Stability & Availability | 9.7% |
+| Security & Privacy | 4.1% |
+| Performance | 0.4% |
+
+**Correctness plus data integrity is 56% of everything.** Not style.
+
+**The reviewers have different lenses, and Codex is the workhorse:**
+
+| Reviewer | Threads | Critical | Note |
+|---|---|---|---|
+| **chatgpt-codex-connector** | **3,042** | **946** | volume AND severity. **Founder ruling: give Codex more weight** |
+| coderabbitai | 268 | 1 | categorises well, rarely alarms |
+| greptile-apps | 58 | 45 (78%) | best hit rate, **paused — out of credits** |
+
+**Size predicts pain, sharply:**
+
+| PR size | Avg rounds | Avg threads |
+|---|---|---|
+| 1–3 files | 1.34 | 4.3 |
+| 4–10 files | 1.72 | 6.1 |
+| **11–30 files** | **4.29** | **15.9** |
+| 31+ files | 5.71 | 26.9 |
+
+Crossing ~10 files roughly **triples** review cost. Worst PR: 19 rounds. Another
+drew 149 threads.
+
+---
+
+## 8. Proven, and unproven
 
 ### Proven
 
-- The daemon runs unattended: **252 ticks since 2026-08-20 14:04 UTC**, survived a
-  network outage to `api.github.com`, escalated to ntfy overnight.
-- **The retry brake, the diff-gate refusal and the REPEATED_FAILURE escalation
-  have all now run on a REAL dispatch** (runs 16-19). Exercised by planting a
-  failure whose correct fix lands in a sensitive path, so the worker had to
-  decline -- which is realistic, since plenty of real fixes need a change a human
-  must approve.
-- **Three complete dispatches**: red CI → root cause → fix in an isolated
-  worktree → commit → diff gate → **reeve published** → **CI green**. Runs 12
-  (202s/$1.92), 14 (159s/$1.50) and 15 (153s/$2.01). All verified on GitHub --
-  the remote head, the published diff and the check conclusions -- never from
-  reeve's own account of itself.
-- **Run 15 was a genuinely harder shape** and is the one worth trusting: a logic
-  inversion in `src/db/ops.mjs` failing THREE assertions in
-  `test/lifecycle.test.mjs`, so the failing test did not name the module at
-  fault. The worker fixed the source and **added two assertions** covering the
-  case the bug created. It did not weaken the test, though nothing at the time
-  stopped it.
-- **The retry brake fires, and correctly refuses.** Run 13 declined to dispatch
-  and escalated rather than guessing. It was refusing for the WRONG reason (§6.5),
-  but the mechanism itself was exercised end to end for the first time.
-- Backups restore: a real snapshot restored to a scratch path matched the live
-  store exactly (3,637 events, 265 nodes, 5 settlements, 5 escalations).
-- The state layer passes its lifecycle suite including exactly-once-across-crash.
-- The GitHub App authenticates and publishes check runs.
-- ntfy receives escalations on topic `revnix-reeve`.
+- The daemon runs unattended for days, survives outages, restarts cleanly.
+- **Three complete dispatches**, CI-verified on GitHub: red CI → root cause → fix
+  in an isolated worktree → diff gate → reeve published → green.
+- **The retry brake, the diff-gate refusal and REPEATED_FAILURE have all fired on
+  a real dispatch**, exercised by planting a failure whose fix lands in a
+  sensitive path so the worker had to decline.
+- Backups restore; a snapshot matched the live store exactly.
+- The self-audit catches real gaps — it found reeve's own unbacked store.
+- Ingest is idempotent on live data; re-derivation is byte-identical.
 
-### NOT proven — say so, do not assume
+### NOT proven — say so
 
-- **`--execute` has THREE clean runs out of fifteen**, across two failure shapes.
-  Still untested: an INTERMITTENT failure, a failure with two independent causes,
-  a failure whose fix spans several files, and any failure a worker cannot
-  reproduce locally. Also untested: what happens when a worker is WRONG -- every
-  run so far produced a correct fix, so the second-attempt path and the escalation
-  after it have never been exercised by a genuine bad fix.
-- **The App reaches nextly only.** Every dispatch run on `revnix/reeve` logs
-  `could not publish: no installation ... 404`, so those runs exercise the WORKER
-  chain and never the verdict-publication chain. The two halves have never been
-  proven together on one repository.
-- **`--enforce` has never been on.** The shadow week has not completed.
-- **Nothing proven on a second project.** Four profiles exist; only nextly and
-  reeve have been driven.
-- **The ops CI guard has never fired.**
-- reeve cannot pick its own work, research, or review a PR.
+- **Dispatch: 3 clean runs, 2 shapes.** Untested: an INTERMITTENT failure, a
+  failure with two independent causes, and **what happens when a worker is
+  WRONG** — every run so far produced a correct fix, so the second-attempt path
+  has never been exercised by a genuinely bad one.
+- **`--enforce` has never been on.**
+- **The review shadow week has 0 clean days** (today diverged, from a bug since
+  fixed). The clock starts 22 Aug.
+- **Nothing proven on a second project.**
+- **`flakeEvidence` is written and called by NOTHING** — zero callers, zero log
+  mentions. nextly's main is red on 6 of its last 9 runs, so on the day
+  capability 2 is armed, reeve will pay an agent to "fix" randomness and then
+  page about a failure that never existed.
+- reeve cannot pick work, research, or review a PR.
 
 ---
 
-## 8. What remains
+## 9. What remains
 
-### 8.1 Time, not code
+### 9.1 Unblocked code — roughly 2 days
 
-- **The shadow week.** Seven days of `neutral` verdicts with zero false blocks.
-  The clock should run from **2026-08-21**, because settlement was fake until then
-  and anything earlier cannot count.
-- **The ruleset flip**, after that plus green main. The riskiest remaining step:
-  work in flight starts blocking and it will feel like the system got worse. That
-  is the moment a bypass gets reopened and the programme dies. **Do not skip the
-  shadow week.**
+1. **Feed the study into the worker prompts** — FOUNDER-APPROVED. Correctness and
+   data integrity are 56% of findings; Codex gets more weight. Measured guidance
+   into `prompts.mjs`, not guesses.
+2. **Wire flake detection** — `flakeEvidence` exists; nothing calls it. ~2h.
+3. **Dispatch evidence: the wrong-worker shape** — ~$2, 1h.
+4. **`release` lane is dead by construction** — its whole territory
+   (`.changeset/**`, `scripts/release/**`) is in `sensitivePaths`, and sensitive
+   refuses BEFORE territory is checked. ~30m.
+5. *Optional, founder said "if beneficial":* a size warning at PR-open (>10 files
+   → expect 4+ rounds), and reinstating Greptile (78% critical hit rate, dark for
+   want of credits).
 
-### 8.2 Code, roughly in order
+### 9.2 Time-blocked
 
-1. **Dispatches against DIFFERENT failure shapes on `revnix/reeve`.** Repeating
-   the one planted failure is now cheap evidence: two clean runs used it and the
-   third revealed the brake trips on a repeat by design. What is untested is a
-   failure whose fix is in a different file from the failing test, a failure with
-   two independent causes, and an intermittent one. Re-arm, run, read the WHOLE
-   log. §10 has the recipe and the caveat about the brake.
-2. ~~Self-audit on a schedule~~ **DONE** — `src/selfaudit.mjs`. Four local checks
-   on every tick: store integrity, snapshot freshness AND readability, wedged
-   leases, and whether the last push to the phone was accepted. Findings ride the
-   existing escalation dedup, so a standing fault is said once and clears when it
-   goes. Verified in production by planting a wedged lease: detected, pushed,
-   silent on the second tick, cleared on removal.
+- **Review shadow week** — 5 clean days from 22 Aug → PR-5 ≈ **26 Aug**.
+- **Verdict shadow week** — 7 days zero false blocks. The clock starts NOW, not
+  earlier: what the verdict SEES changed today (reviewer-status exclusion, check
+  accounting bumped twice). → **~28 Aug earliest**.
+- **The ruleset flip** — the riskiest step. Work in flight starts blocking and it
+  WILL feel like reeve got worse. That is the moment a bypass gets reopened and
+  the programme dies. **Do not skip the shadow week.**
 
-   Two properties are load-bearing and tested as hard as the checks. It runs on
-   EVERY tick, never on a cadence of its own -- on a slower schedule its findings
-   would be absent from most ticks, and absence within a tick is what the
-   escalation layer reads as resolved. And the `why` string is an identity, not a
-   report: a key carrying "3h" changes every tick, and a changed key is a new push.
+### 9.3 Needs the founder
 
-   `doctor` is deliberately NOT on this path. Its checks concern a repository's
-   merge authority, cost many API calls, and on nextly answer BROKEN until the
-   ruleset is repaired -- scheduling that would report a known, accepted condition
-   forever. It stays a command a human runs.
-3. **Second project**: `rextaihq/rext-backend` — 85 merges in 90 days, real
-   workflows, a different stack (python/uv + typescript). Anything that must be
-   edited in the core to make it work was misfiled.
-4. **Go and PHP command tables** in `detectCommands`. Roughly a day each.
-5. **Review ingest** — PR-1 to PR-4 BUILT and running in shadow; PR-5 is
-   time-blocked on `reeve shadow nextlyhq/nextly` reaching 5 consecutive days of
-   agreement (exits 0 when met). Design and the attack ledger:
-   `docs/2026-08-21-review-ingest-design.md`
-   (14-agent research pass, three adversarial verifiers, every hole disposed in
-   its §12 ledger). `watch.reviewActions` stays off until PR-6, and SPILL
-   indefinitely per the settled decision in its §15.
-6. **Task import** — the thing that would let `nextly-ops` retire. **Deliberately
-   deferred**: the ledger works, the two systems track different things, and the
-   trigger for doing it is reeve needing to pick its own work.
-7. **Recurring cadences** — only needed when ranknaut starts.
+- **ntfy read user.** All 5 tokens are write-only, account role `user`, no read
+  grants; `/v1/users` returns 401. Needs shell on `95.217.11.127`:
+  `ntfy user add mobeen` then `ntfy access mobeen revnix-reeve read-only`, plus
+  `upstream-base-url: "https://ntfy.sh"` in server.yml for iOS background push.
+  Desktop notifications work meanwhile.
+- **Second project** (`rextaihq/rext-backend`) — needs PR-gating CI written and
+  the App installed.
+- **The ruleset flip decision.**
 
-### 8.3 Deferred by ruling
+### 9.4 Closed by ruling
 
-Founder-preference learning; product-mode discovery; contributor mode.
+Go / Rust / PHP command tables (**founder: not now**) · SPILL (off indefinitely) ·
+task import (deferred; `nextly-ops` stays) · paid reviewer (declined).
 
 ---
 
-## 9. Traps that will bite a fresh session
+## 10. Traps that will bite a fresh session
 
 1. **The archive guard hook refuses any Bash command containing the frozen-history
    directory name**, even in a `grep -v`. Build searches that avoid naming it, or
@@ -574,10 +485,21 @@ Founder-preference learning; product-mode discovery; contributor mode.
 14. **Re-planting the SAME failure trips the retry brake**, which is correct
     behaviour: reeve escalates rather than dispatching. Vary the failure, or the
     PR, when gathering dispatch evidence.
+15. **Grep the ProgramArguments ARRAY, not the whole plist.** The plist carries a
+    comment reading "Neither --enforce nor --execute appears", and a naive grep
+    matches that comment and reports the daemon as ARMED when it is not. This
+    produced a false alarm in session three.
+16. **GraphQL `bodyText` strips image markdown.** Both review bots put severity in
+    an image (`![P1 Badge]`, `<img alt="P1">`), so `bodyText` loses it entirely.
+    Request `body` whenever classifying findings — this made a first pass of the
+    500-PR study report 92% unknown severity.
+17. **`gh run list --commit` needs the FULL sha**, and reading "the latest run on
+    main" reads the PREVIOUS commit's run. Always
+    `select(.headSha=="$SHA")` against your own pushed head.
 
 ---
 
-## 10. How to verify the whole thing still works
+## 11. How to verify the whole thing still works
 
 **Run these separately.** Together they exceed the two-minute tool timeout.
 
@@ -586,57 +508,41 @@ N=~/.nvm/versions/node/v24.17.0/bin/node
 cd ~/Work/Products/reeve
 
 # the suite
-for f in test/*.test.mjs; do $N "$f" || echo "FAILED $f"; done
+for f in test/*.test.mjs; do $N "$f" >/dev/null || echo "FAILED $f"; done
 
-# the daemon
+# the daemon, and that it is still observe-only (grep the ARRAY, not the file)
 launchctl list | grep reeve
+python3 -c "import re,pathlib; s=pathlib.Path('$HOME/Library/LaunchAgents/com.revnix.reeve.plist').read_text(); m=re.search(r'ProgramArguments</key>\s*<array>(.*?)</array>',s,re.S); print(re.findall(r'<string>(.*?)</string>',m.group(1)))"
 tail -20 ~/.reeve/reeve.log
 
 # the commands
-$N bin/reeve doctor nextlyhq/nextly --as-app
+$N bin/reeve doctor nextlyhq/nextly --as-app     # BROKEN on nextly is EXPECTED
 $N bin/reeve status nextlyhq/nextly
-
-# the backup
+$N bin/reeve shadow nextlyhq/nextly              # exit 3 until 5 clean days
 $N bin/reeve backup nextlyhq/nextly
 ```
 
-`doctor` is expected to report **BROKEN** on nextly: the ruleset genuinely is
-unenforced. That stays true until §8.1 is done.
+`doctor` reports **BROKEN** on nextly because the ruleset genuinely is
+unenforced. That stays true until §9.2 is done. **R-08 detectors** should read
+"N/N classified" for each reviewer; anything else means a marker grammar changed.
 
 ### Re-arming the dispatch proof
 
 ```sh
 cd ~/Work/Products/reeve
-# put the planted failure back on the proof branch
 git worktree add -q --detach /tmp/rearm origin/main
-# edit src/notify.mjs: const LIMIT = 700  ->  4000
-# commit, then: git push --force origin HEAD:test/execute-proof
+# plant a failure, commit, then: git push --force origin HEAD:test/execute-proof
 # wait for CI red, then:
 $N bin/reeve tick revnix/reeve --execute --log /tmp/proofN.log
 ```
 
-Read the **whole** log and check the remote moved and CI went green. A partial
-read is how run 11 was reported as a success when a worker had bypassed the gate.
-
-**The brake will refuse a repeat.** Re-planting the same failure on the same PR
-is counted as that failure surviving its fix, so reeve escalates rather than
-dispatching -- correctly. To gather more dispatch evidence, change the failure
-(a different file, a different assertion) or open a new PR; `fix_attempt` is keyed
-on `(nwo, pr, cause)`. Verify what it stored rather than assuming:
-
-```sh
-$N -e 'const {DatabaseSync}=require("node:sqlite");
-const db=new DatabaseSync(process.env.HOME+"/.reeve/state/revnix/reeve.db",{readOnly:true});
-for (const r of db.prepare("SELECT pr,attempts,cause FROM fix_attempt").all())
-  console.log(r.pr, r.attempts, r.cause);'
-```
-
-That table is where the failure-identity defect in §6.5 was visible, and it was
-visible nowhere else.
+Read the **whole** log; check the remote moved and CI went green. A partial read
+is how run 11 was reported as a success when a worker had bypassed the gate.
+**The brake refuses a repeat** — vary the failure or use a different PR.
 
 ---
 
-## 11. Related documents
+## 12. Related documents
 
 - `docs/USING-REEVE.md` — the founder-facing guide. What reeve is, what it is not.
 - `docs/2026-08-20-reeve-comprehensive-audit.md` — the independent audit. Closed,

@@ -39,6 +39,7 @@ Run these from anywhere — you do not need to be in any particular folder.
 | Command | What it tells you |
 |---|---|
 | `reeve status nextlyhq/nextly` | What is blocked right now, and why |
+| `reeve shadow nextlyhq/nextly` | Whether the review data is trustworthy yet |
 | `reeve why 1127` | The full decision trail for one pull request |
 | `open ~/.reeve/dash/nextlyhq/nextly.html` | The same thing as a web page |
 
@@ -144,7 +145,25 @@ outside its territory is refused even if the worker was certain it was right.
 
 ## 6. Notifications
 
-Escalations go to your phone via **ntfy**, on the topic **`revnix-reeve`**.
+Escalations go to **two places**, and both must work for reeve to call a send
+successful — a phone that did not ring is a failure even when the desk did.
+
+**This Mac: working now.** A native notification appears whenever something needs
+you. Nothing to set up.
+
+**Your phone, via ntfy on topic `revnix-reeve`: BLOCKED, and it needs you.**
+reeve's pushes succeed — the server accepts every one — but no credential on this
+machine can READ that topic. All five tokens on the publishing account are
+write-only, the account is role `user` with no read grants, and `/v1/users`
+returns 401. Creating a reader needs shell access to the server:
+
+```sh
+ntfy user add mobeen                        # prompts for a password
+ntfy access mobeen revnix-reeve read-only
+```
+
+and, for iOS background delivery, `upstream-base-url: "https://ntfy.sh"` in
+server.yml. Then subscribe in the ntfy app to `https://notify.revnix.com`.
 
 **What you need to do:** open the ntfy app, add a subscription to
 `https://notify.revnix.com` topic `revnix-reeve`. The publish credential is
@@ -184,7 +203,17 @@ your phone.
 
 ---
 
-## 9. What reeve is NOT, yet
+## 9. reeve is a GUARDIAN, not a BUILDER
+
+The most important thing to be clear about. reeve does **not** pick what to build,
+research it, design it, or write it. It watches pull requests that already exist.
+
+The intended shape is: **you (or a Claude session running Prompt A/B) build the
+feature and open the PR — then reeve takes over.** It fixes the CI, works the
+reviewer findings, and refuses an unsafe merge. Making reeve the builder as well
+would be a separate programme, weeks of work, and none of it is designed.
+
+## 9b. What reeve is NOT, yet
 
 Being clear about this saves disappointment:
 

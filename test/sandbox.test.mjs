@@ -27,6 +27,7 @@
 // was not in the allowlist at all. Any tool that can run a command is a write
 // primitive, so this must be a closed allowlist, never a denylist.
 import { sandboxFor, reviewDiff } from "../src/sandbox.mjs";
+import { readFileSync } from "node:fs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -186,6 +187,63 @@ const lane = { id: "schema", territory: ["packages/nextly/**"] };
   check(r.ok, "with no lane, territory is not enforced but the risk rules still are", JSON.stringify(r));
   const q = reviewDiff({ files: ["vendor-dumps/x"], profile, lane: null });
   check(!q.ok, "quarantine still refuses without a lane", JSON.stringify(q));
+}
+
+// ── a repair that changes only the exam ──────────────────────────────────────
+//
+// SELF_GOVERNING covers .github/**, so a worker cannot rewrite the workflow that
+// judges it. Tests judge it exactly as much, and were never covered: a FIX_CI
+// worker could have deleted the failing assertion and reeve would have published
+// the resulting green. Run 15 measured that this worker does NOT do that -- it
+// fixed the source and ADDED two assertions -- but the gate must not rest on the
+// worker choosing well.
+//
+// Tests cannot simply be denied: the prompt REQUIRES a test that fails on the
+// broken code, so a repair carrying one is the intended shape.
+{
+  const profile = { risk: {} };
+
+  // Control: the fixture must be able to pass. This is exactly run 15's diff.
+  const real = reviewDiff({ files: ["src/db/ops.mjs", "test/lifecycle.test.mjs"],
+                            profile, action: "FIX_CI" });
+  check(real.ok, "control: a source fix carrying a new test is published", real.why);
+
+  const only = reviewDiff({ files: ["test/lifecycle.test.mjs"], profile, action: "FIX_CI" });
+  check(!only.ok, "a repair whose whole diff is a test is refused", JSON.stringify(only));
+  check(/only what judges it/.test(only.why ?? ""),
+    "and says why in words a human can act on", only.why);
+
+  const many = reviewDiff({ files: ["test/a.test.mjs", "spec/b_test.py", "src/x/__tests__/c.js"],
+                            profile, action: "FIX_CI" });
+  check(!many.ok, "several test files are still only tests", JSON.stringify(many));
+
+  // A non-repairing action may legitimately produce a test-only diff.
+  const finding = reviewDiff({ files: ["test/lifecycle.test.mjs"], profile, action: "FIX_FINDINGS" });
+  check(finding.ok, "a review finding may be that the TEST is wrong, so that is not refused", finding.why);
+
+  // A project whose tests are somewhere else says so in its profile.
+  const custom = { risk: { testPaths: ["t/**"] } };
+  check(!reviewDiff({ files: ["t/x.js"], profile: custom, action: "FIX_CI" }).ok,
+    "a profile can name where its tests live");
+  check(reviewDiff({ files: ["test/x.test.mjs"], profile: custom, action: "FIX_CI" }).ok,
+    "and naming them replaces the built-in globs rather than adding to them");
+}
+
+// The rule above is inert unless the daemon PASSES an action: the parameter
+// defaults to null, and null is not a repairing action. A guard that quietly
+// stops applying because its input narrowed is the exact shape this codebase has
+// been bitten by, so the call site is asserted rather than assumed.
+{
+  const src = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
+  const call = (src.match(/reviewDiff\(\{[^}]*\}\)/) ?? [null])[0];
+
+  // Control: prove the matcher found the real call and not an empty string, or
+  // the assertion below would be testing nothing.
+  check(!!call && /files:/.test(call) && /profile/.test(call),
+    "control: found the daemon's actual reviewDiff call site", String(call));
+
+  check(/\baction:/.test(call ?? ""),
+    "and it passes an action, without which the test-only rule never runs", String(call));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

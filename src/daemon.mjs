@@ -18,7 +18,7 @@ import { evaluatePr, publishVerdict } from "./pr.mjs";
 import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
-import { promptFor, WORKER_ACTIONS } from "./prompts.mjs";
+import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
@@ -421,6 +421,11 @@ export async function tick(ctx) {
 
     const PREP_BACKOFF = (ctx.prepBackoff ??= new Map());   // pr -> { until, failures }
     for (const { e, decision, cause, fp } of decisions) {
+      if (UNBUILT_ACTIONS[decision.action]) {
+        log(logPath, `  #${e.pr}: NOT dispatching ${decision.action} — ${UNBUILT_ACTIONS[decision.action]}`);
+        escalations.set(`#${e.pr}: ${decision.action.toLowerCase().replace("_", " ")} needs a GitHub effect reeve does not yet perform`, 1);
+        continue;
+      }
       const prepKey = e.pr;
       const backoff = PREP_BACKOFF.get(prepKey);
       if (backoff && backoff.until > Date.now() && WORKER_ACTIONS.includes(decision.action)) {

@@ -411,8 +411,14 @@ export function withDefaults(profile) {
     const cur = get(out, path);
     if (cur !== undefined && cur !== null) continue;
     const parts = path.split(".");
-    let node = out;
-    for (const k of parts.slice(0, -1)) node = node[k] ??= {};
+    let node = out, blocked = false;
+    for (const k of parts.slice(0, -1)) {
+      // A primitive or array where a container belongs is left for validate()
+      // to refuse; hanging defaults off it would throw or be serialized away.
+      if (node[k] !== undefined && node[k] !== null && (typeof node[k] !== "object" || Array.isArray(node[k]))) { blocked = true; break; }
+      node = node[k] ??= {};
+    }
+    if (blocked) continue;
     node[parts.at(-1)] = value;
   }
   return out;

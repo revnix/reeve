@@ -266,5 +266,37 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
   check(diffBaseline(dropped, live).drifted === true && /rule snapshot/.test(diffBaseline(dropped, live).lines.join(" ")), "dropping a rule the projection does not name is still drift", "");
 }
 
+
+// ── nested parameters, classic snapshot, and required identity fields ────────
+{
+  const { readLiveBaseline } = await import("../src/baseline.mjs");
+  const mk = thr => path => {
+    if (path.endsWith("/rulesets")) return [{ id: 1, name: "r", enforcement: "active", target: "branch" }];
+    if (path.endsWith("/rulesets/1")) return { target: "branch", rules: [{ type: "code_scanning", parameters: { code_scanning_tools: [{ tool: "CodeQL", security_alerts_threshold: thr }] } }], bypass_actors: [] };
+    const e = new Error("HTTP 404"); e.stderr = "HTTP 404"; throw e;
+  };
+  const prof = { identity: { defaultBranch: "main" }, authority: {}, merge: {}, builder: {} };
+  const a = readLiveBaseline("o/r", prof, { gh: mk("high") }), b2 = readLiveBaseline("o/r", prof, { gh: mk("none") });
+  check(JSON.stringify(a.ruleSnapshot) !== JSON.stringify(b2.ruleSnapshot), "a nested parameter change changes the snapshot", JSON.stringify(a.ruleSnapshot));
+
+  const gh = path => {
+    if (path.endsWith("/rulesets")) return [];
+    if (/protection$/.test(path)) return { allow_force_pushes: { enabled: true }, restrictions: { users: [{ login: "x" }], teams: [], apps: [] }, url: "https://api/ignored" };
+    throw new Error("unexpected " + path);
+  };
+  const live = readLiveBaseline("o/r", prof, { gh });
+  check(typeof live.classicSnapshot === "string" && /allow_force_pushes/.test(live.classicSnapshot) && !/https:/.test(live.classicSnapshot),
+    "classic protection is snapshotted whole, minus volatile urls", String(live.classicSnapshot).slice(0, 120));
+  const widened = { ...live, classicSnapshot: live.classicSnapshot.replace('"enabled":true', '"enabled":false') };
+  check(diffBaseline(widened, live).drifted === true && /classic protection/.test(diffBaseline(widened, live).lines.join(" ")), "an unprojected classic field changing is drift", "");
+
+  const { writeFileSync: wf, mkdtempSync: md } = await import("node:fs");
+  const { tmpdir: td } = await import("node:os");
+  const { join: jn } = await import("node:path");
+  const noid = jn(md(jn(td(), "reeve-noid-")), "x.json"); wf(noid, JSON.stringify({ ...fixture, nwo: undefined, branch: undefined }));
+  const r = checkBaseline("nextlyhq/nextly", { identity: { defaultBranch: "main" } }, { fixturePath: noid, readLive: () => fixture });
+  check(r.level === "UNKNOWN" && /identity|nwo|branch/.test(r.lines.join(" ")), "a fixture without its identity fields is UNKNOWN, never compared", JSON.stringify(r));
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

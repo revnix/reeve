@@ -154,9 +154,13 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   check(/NOT dispatching/.test(log4) && /credential/.test(log4), "the log names the reason", log4.split("\n").filter(l => /dispatch/.test(l)).join(" | ").slice(0, 300));
   // Every action promptFor can dispatch is a worker task, SPILL included; the
   // refusal must count them from one shared list, not a hand-copied subset.
-  const { WORKER_ACTIONS } = await import("../src/prompts.mjs");
+  const { WORKER_ACTIONS, UNBUILT_ACTIONS } = await import("../src/prompts.mjs");
   check(WORKER_ACTIONS.includes("SPILL") && WORKER_ACTIONS.includes("FIX_CI"), "control: the shared worker-action list names SPILL", WORKER_ACTIONS.join(","));
+  // Actions whose prompts need GitHub effects a worker cannot perform (gh is
+  // shimmed; effects are reeve's) are refused at the seam, not launched.
   const dsrc = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
+  check(UNBUILT_ACTIONS.REQUEST_REVIEW && UNBUILT_ACTIONS.SPILL, "REQUEST_REVIEW and SPILL are declared unbuilt with a reason", JSON.stringify(UNBUILT_ACTIONS));
+  check(/UNBUILT_ACTIONS\[decision\.action\]/.test(dsrc), "and the daemon refuses them at dispatch", "");
   check(/WORKER_ACTIONS\.includes\(d\.decision\.action\)/.test(dsrc), "and the containment refusal filters by that list", "");
   ctx4.db.close();
   rmSync(dir4, { recursive: true, force: true });

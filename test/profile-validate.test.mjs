@@ -182,6 +182,17 @@ expectRefusal("a capability switch that is not a boolean",
   (() => { const p = clone(base); p.builder = { capabilities: { mergeBuilderPr: "yes" } }; return p; })(),
   /builder\.capabilities\.mergeBuilderPr must be a boolean/);
 
+{
+  // A primitive container must produce a validation error, not a throw from
+  // withDefaults trying to hang properties off a string.
+  const p = clone(base); p.builder = "yes";
+  let threw = null, r = null;
+  try { r = validate(withDefaults(p)); } catch (e) { threw = e; }
+  const ok = !threw && r.ok === false && r.errors.some(e => /builder must be an object/.test(e));
+  console.log(`${ok ? "PASS" : "FAIL"}  refuses: a primitive builder container, without throwing`);
+  if (!ok) { console.log("        ", threw ? String(threw.message) : JSON.stringify(r?.errors)); fail++; }
+}
+
 expectRefusal("a capability container that is not an object",
   (() => { const p = clone(base); p.builder = { capabilities: [] }; return p; })(),
   /builder\.capabilities must be an object/);

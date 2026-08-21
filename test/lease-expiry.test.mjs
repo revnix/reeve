@@ -77,6 +77,28 @@ check(row.lease_expires_at < Math.floor(Date.now() / 1000), "and the lapsed leas
   check(threw && /expired/.test(threw.message), "an expired lease refuses the binding", String(threw?.message));
 }
 
+
+// A refused completion must not strand the claim: the expired run is retired
+// (abandoned) so the PR can be dispatched again, and a consumed cancellation
+// is cleared so the next run is not refused as already cancelled.
+{
+  const r8 = startRun(db, { nwo: "o/r", pr: 8, action: "FIX_CI", head: "h".repeat(40) });
+  db.prepare("UPDATE run SET lease_expires_at = unixepoch() - 5 WHERE id = ?").run(r8.runId);
+  const fin8 = finishRun(db, { runId: r8.runId, outcome: "ok", why: "done" });
+  check(fin8.applied === false && db.prepare("SELECT status FROM run WHERE id = ?").get(r8.runId).status === "abandoned",
+    "a run refused for an expired lease is retired, not left live", JSON.stringify(fin8));
+  const again8 = startRun(db, { nwo: "o/r", pr: 8, action: "FIX_CI", head: "h".repeat(40) });
+  check(again8.ok === true, "and the PR can be dispatched again", JSON.stringify(again8));
+
+  const r9 = startRun(db, { nwo: "o/r", pr: 9, action: "FIX_CI", head: "i".repeat(40) });
+  db.prepare("INSERT OR REPLACE INTO task_exec (task_id, cancel_requested) VALUES ('pr:9', 1)").run();
+  finishRun(db, { runId: r9.runId, outcome: "cancelled", why: "cancelled: operator" });
+  const r9b = startRun(db, { nwo: "o/r", pr: 9, action: "FIX_CI", head: "i".repeat(40) });
+  let threw = null;
+  try { bindRun(db, { runId: r9b.runId, pid: 99, boot: "x" }); } catch (e) { threw = e; }
+  check(r9b.ok === true && !threw, "a consumed cancellation does not refuse the next run's binding", String(threw?.message));
+}
+
 db.close(); rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

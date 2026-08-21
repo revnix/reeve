@@ -38,6 +38,24 @@ const ghApi = (path, { list = false } = {}) => {
  * taken during an auth failure or a rate limit must never become a baseline,
  * and must never be compared as if it were one.
  */
+/** Deterministic JSON: keys sorted at every depth, nothing filtered. A replacer array would drop nested keys. */
+function canonicalJson(v) {
+  if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
+  if (v && typeof v === "object") return "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + canonicalJson(v[k])).join(",") + "}";
+  return JSON.stringify(v);
+}
+
+// Classic protection, whole, minus the fields that change without meaning.
+function classicSnapshotOf(bp) {
+  if (!bp) return null;
+  const strip = v => {
+    if (Array.isArray(v)) return v.map(strip);
+    if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).filter(([k]) => !/url$/i.test(k) && k !== "node_id").map(([k, x]) => [k, strip(x)]));
+    return v;
+  };
+  return canonicalJson(strip(bp));
+}
+
 /**
  * GitHub's ref patterns are fnmatch: `*` matches within one path segment, `**`
  * crosses segments, `?` is one character, `[...]` is a class. Translating every
@@ -101,7 +119,7 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {
   // reading; this is what guarantees that a rule the projection does not name
   // (required_signatures, merge_queue, required_deployments) cannot vanish
   // without drift.
-  const ruleSnapshot = rules.map(r => `${r.type}:${JSON.stringify(r.parameters ?? {}, Object.keys(r.parameters ?? {}).sort())}`).sort();
+  const ruleSnapshot = rules.map(r => `${r.type}:${canonicalJson(r.parameters ?? {})}`).sort();
   const checkRules = rules.filter(r => r.type === "required_status_checks");
   const rulesetRequiredChecks = checkRules
     .flatMap(r => (r.parameters?.required_status_checks ?? []).map(c => `${c.context}@${c.integration_id ?? "any"}`)).sort();
@@ -145,6 +163,10 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {
     // Classic protection's own admin switch: off means administrators bypass
     // every rule above, which is as wide as authority gets.
     enforceAdmins: bp?.enforce_admins?.enabled ?? null,
+    // The whole classic protection object, so restrictions, force-push and
+    // deletion switches, linear history, and anything added later cannot
+    // change without drift.
+    classicSnapshot: classicSnapshotOf(bp),
     requiredApprovals, codeOwnerReview,
     dismissStaleReviews: pr.dismiss_stale_reviews_on_push || (classic?.dismiss_stale_reviews ?? false),
     requireLastPushApproval: pr.require_last_push_approval || (classic?.require_last_push_approval ?? false),
@@ -165,8 +187,16 @@ export function checkBaseline(nwo, profile, io = {}) {
   if (!existsSync(path)) return { id: "R-13", level: "UNKNOWN", title: "authority baseline",
     lines: [`no baseline captured for ${nwo} at ${path}`, "-> node scripts/capture-baseline.mjs " + nwo] };
   let fixture;
-  try { fixture = JSON.parse(readFileSync(path, "utf8")); if (!fixture || typeof fixture !== "object") throw new Error("not an object"); }
-  catch (e) { return { id: "R-13", level: "UNKNOWN", title: "authority baseline", lines: [`the baseline at ${path} could not be read: ${e.message}`] }; }
+  try {
+    fixture = JSON.parse(readFileSync(path, "utf8"));
+    if (!fixture || typeof fixture !== "object") throw new Error("not an object");
+    // A baseline without its identity certifies nothing: the repository and
+    // branch it was captured for, when, and the snapshot it compares.
+    for (const k of ["nwo", "branch", "capturedAt", "ruleSnapshot"])
+      if (fixture[k] === undefined || fixture[k] === null) throw new Error(`missing identity field ${k}`);
+    if (fixture.nwo !== nwo) throw new Error(`captured for ${fixture.nwo}, not ${nwo}`);
+  }
+  catch (e) { return { id: "R-13", level: "UNKNOWN", title: "authority baseline", lines: [`the baseline at ${path} could not be used: ${e.message}`] }; }
   // The branch the profile targets now is the one that matters. A baseline
   // captured for another branch is drift in its own right: probing the stale
   // branch would report calm about protections the daemon no longer relies on.
@@ -206,6 +236,8 @@ export function diffBaseline(live, fixture) {
     lines.push(`required approvals: live ${live.requiredApprovals} vs baseline ${fixture.requiredApprovals}`);
   if (live.codeOwnerReview !== fixture.codeOwnerReview)
     lines.push(`code-owner review: live ${live.codeOwnerReview} vs baseline ${fixture.codeOwnerReview}`);
+  if ((live.classicSnapshot ?? null) !== (fixture.classicSnapshot ?? null))
+    lines.push("classic protection differs from the baseline (full snapshot)");
   for (const [key, label] of [["dismissStaleReviews", "stale-review dismissal"], ["requireLastPushApproval", "last-push approval"], ["requireThreadResolution", "review thread resolution"], ["strictRequiredChecks", "strict up-to-date policy on required checks"], ["enforceAdmins", "classic admin enforcement"]]) {
     if ((live[key] ?? false) !== (fixture[key] ?? false))
       lines.push(`${label}: live ${live[key] ?? false} vs baseline ${fixture[key] ?? false}`);

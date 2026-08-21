@@ -484,9 +484,21 @@ export function finishRun(db, { runId, outcome, why = null, ms = null, cost = nu
                            WHERE r.id=? AND r.status IN
                             ('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')`).get(runId);
     if (!r) return { applied: false, why: "the run is no longer live under this process" };
-    if (outcome !== "cancelled" && r.cancel_requested) return { applied: false, why: "a cancel was requested for the run; its outcome is not accepted" };
+    // A refused outcome still retires the run: nothing else will (no reaper
+    // runs in production), and a row left live would block every later
+    // dispatch for the PR through the one-live-run index. The node returns to
+    // ready and a consumed cancellation is cleared, so the next run is neither
+    // blocked nor refused as already cancelled.
+    const retire = why => {
+      db.prepare(`UPDATE run SET status='abandoned', ended_at=unixepoch(), error=? WHERE id=?`).run(why, runId);
+      db.prepare(`UPDATE node SET status='ready', updated_at=unixepoch(), version=version+1 WHERE id=?`).run(r.task_id);
+      db.prepare(`UPDATE task_exec SET cancel_requested=0 WHERE task_id=?`).run(r.task_id);
+      emit(db, { actor: "daemon", op: "run.refused", subject: r.task_id, run_id: runId, payload: { outcome, why } });
+      return { applied: false, why };
+    };
+    if (outcome !== "cancelled" && r.cancel_requested) return retire("a cancel was requested for the run; its outcome is not accepted");
     if (outcome === "ok" && r.lease_expires_at <= Math.floor(Date.now() / 1000))
-      return { applied: false, why: "the run's lease expired before it finished; its outcome is not accepted" };
+      return retire("the run's lease expired before it finished; its outcome is not accepted");
     db.prepare(`UPDATE run SET status=?, ended_at=unixepoch(), error=? WHERE id=?`)
       .run(status, why, runId);
     // A cancelled run leaves its node re-dispatchable (`ready`, the reaper's own
@@ -494,6 +506,8 @@ export function finishRun(db, { runId, outcome, why = null, ms = null, cost = nu
     // `blocked` for a failure that did not happen.
     db.prepare(`UPDATE node SET status=?, updated_at=unixepoch(), version=version+1 WHERE id=?`)
       .run(status === "succeeded" ? "done" : status === "abandoned" ? "ready" : "blocked", r.task_id);
+    // The cancellation has been honoured; it must not refuse the next run.
+    if (status === "abandoned") db.prepare(`UPDATE task_exec SET cancel_requested=0 WHERE task_id=?`).run(r.task_id);
     emit(db, { actor: "daemon", op: "run.finish", subject: r?.task_id ?? null, run_id: runId,
                payload: { outcome, why, ms, cost, sessionId } });
     return { ok: true, applied: true, status };

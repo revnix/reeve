@@ -297,6 +297,18 @@ ${invariants(profile)}
  */
 export const WORKER_ACTIONS = Object.freeze(["FIX_CI", "FIX_FINDINGS", "REQUEST_REVIEW", "SPILL"]);
 
+/**
+ * Actions whose prompts ask the worker for GitHub effects. A worker holds no
+ * credential and its `gh` refuses, by design: GitHub effects are reeve's to
+ * perform. Until reeve performs them, these are refused at the dispatch seam
+ * rather than launched into a worker that cannot succeed, and the founder is
+ * told by identity.
+ */
+export const UNBUILT_ACTIONS = Object.freeze({
+  REQUEST_REVIEW: "requesting a review is a GitHub effect reeve does not yet perform itself",
+  SPILL: "spilling findings to an issue is a GitHub effect reeve does not yet perform itself",
+});
+
 export function promptFor(decision, ctx) {
   switch (decision.action) {
     // The tool grant is no longer decided here. It comes from sandboxFor(),

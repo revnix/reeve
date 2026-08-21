@@ -21,7 +21,7 @@ import { capacity, stayAwake, halted, runWorker, workerArgs, OUTCOMES } from "./
 import { promptFor } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
-import { rootCause, causeKey } from "./ci-rootcause.mjs";
+import { rootCause, resolveFailureCause } from "./ci-rootcause.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
@@ -200,13 +200,13 @@ export async function tick(ctx) {
     // cap read zero attempts every time and could not fire at all. Resolving it
     // here costs nothing extra: the same cause is reused for the worker's prompt
     // below, where it used to be computed a second time.
+    // Every failing check is read, not just the first. Where CI ends in an
+    // aggregate gate, the first failure is the gate, whose message is the same
+    // sentence whatever broke -- an identity two unrelated failures would share
+    // and a cause that names nothing for the worker to reproduce.
     const red = e.checks?.verdict === "RED" && (e.checks?.failing ?? []).length > 0;
     let cause = null, fp = null;
-    if (red) {
-      const failing = (e.checks.failing).find(f => (e.checks.caused ?? []).includes(f.name)) ?? e.checks.failing[0];
-      const rc = failing?.id ? (ctx.resolveCause ?? rootCause)(nwo, failing) : { ok: false, why: "the failing check has no job behind it" };
-      if (rc.ok) { cause = rc; fp = causeKey(nwo, rc); }
-    }
+    if (red) ({ cause, fp } = resolveFailureCause(nwo, e.checks, ctx.resolveCause ?? rootCause));
 
     const decision = nextAction(e, profile, {
       now: now(),

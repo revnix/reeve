@@ -27,6 +27,7 @@ import { buildAlert, notify } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { snapshot } from "./backup.mjs";
+import { selfAudit } from "./selfaudit.mjs";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
@@ -499,6 +500,22 @@ export async function tick(ctx) {
     catch (e) { log(logPath, `could not write the dashboard: ${e.message}`); }
   }
 
+  // reeve's own health, on every tick. The checks are local and cost about a
+  // millisecond; running them on a slower cadence would make them ABSENT from
+  // most ticks, and absence within a tick is what the layer below reads as
+  // resolved. Their findings ride the same dedup, so a standing fault is said
+  // once and clears when it goes.
+  if (ctx.selfAudit !== false) {
+    for (const f of (ctx.runSelfAudit ?? selfAudit)(db, {
+      nwo, profile, at: now(),
+      backupRoot: ctx.backupRoot === false ? null
+                : (ctx.backupRoot ?? join(dirname(logPath ?? "/tmp/x"), "backups")),
+    })) {
+      log(logPath, `self: ${f.level} ${f.why}${f.detail ? ` — ${f.detail}` : ""}`);
+      escalations.set(f.why, f.count ?? 1);
+    }
+  }
+
   // Announce what STARTED or CHANGED, and what went away. Repeating a standing
   // cause every tick is how an operator learns to ignore the channel.
   // A PR that merged or closed will never be evaluated again, so its escalation
@@ -538,6 +555,14 @@ export async function tick(ctx) {
     // push channel, so a decline is never swallowed.
     log(logPath, sent.ok ? `pushed ${fresh.length} escalation(s) to ${profile.notify?.topic}`
                          : `did NOT push: ${sent.why}`);
+    // Recorded as well as logged: the self-audit reads this to notice a channel
+    // that has been refusing for days, and a log line does not survive a restart
+    // as something queryable.
+    try {
+      db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+        .run(now(), "daemon", sent.ok ? "notify.sent" : "notify.failed", `repo:${nwo}`,
+             JSON.stringify({ count: fresh.length, why: sent.why ?? null }));
+    } catch { /* recording a push must never fail a tick */ }
   }
   return { decisions, escalations, halted: false };
 }

@@ -8,7 +8,7 @@
 // dedup would re-announce everything each time.
 import { open } from "../src/db/ops.mjs";
 import { announceable } from "../src/daemon.mjs";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -47,7 +47,23 @@ let db = open(path);
 // Restart: KeepAlive gives the daemon a fresh process and a fresh Map. The
 // standing set must come from the store, not from memory.
 {
-  db.close();
+  // The rule above is inert unless the daemon PASSES `waiting`: the parameter
+// defaults to null, and null filters nothing. A guard that quietly stops applying
+// because its input narrowed is the shape this codebase keeps being bitten by.
+{
+  const src = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
+  const call = (src.match(/announceable\(db, escalations,[\s\S]{0,200}?\}\)/) ?? [null])[0];
+
+  check(!!call && /covered:/.test(call), "control: found the daemon's announceable call site", String(call));
+  check(/\bwaiting\b/.test(call ?? ""),
+    "and it passes the waiting set, without which WAIT still clears escalations", String(call));
+
+  // And that the set is actually filled, not merely declared and passed empty.
+  check(/waiting\.add\(pr\)/.test(src) && /ACTIONS\.WAIT/.test(src),
+    "and the tick adds a PR to it when its decision is WAIT");
+}
+
+db.close();
   db = open(path);
   const r = announceable(db, m({ "#925: the branch conflicts with its base": 4 }));
   check(r.fresh.length === 0,
@@ -102,7 +118,51 @@ let db = open(path);
   check(done.cleared.length === 1, "and retires on a complete one", JSON.stringify(done.cleared));
 }
 
+// ── WAIT is not "resolved" ────────────────────────────────────────────────────
+//
+// Measured on nextly #834. Its decisions ran ESCALATE, then seven consecutive
+// ticks of WAIT while CI was in flight, then ESCALATE again. A waiting tick
+// produces no escalation, so the standing cause was retired and re-announced --
+// twice, four and twenty-five minutes apart, with the reason string identical
+// every time. Nothing about the condition had changed: a review thread was still
+// unresolved and a human was still needed.
+//
+// Two phone pushes for one unchanged condition is how a channel earns being
+// muted, and a muted channel is worse than no channel at all.
+{
+  announceable(db, m({ "#834: 1 of 1 thread(s) unresolved": 1 }), { covered: new Set([834]), complete: true });
+
+  // Control: the fixture must be able to exhibit the defect. Without `waiting`,
+  // this very call is what cleared it in production.
+  const control = announceable(db, m({}), { covered: new Set([834]), complete: true });
+  check(control.cleared.length === 1, "control: a covered PR with no escalation this tick does clear",
+    JSON.stringify(control));
+
+  // Put it back, then take the same tick with the PR waiting rather than settled.
+  announceable(db, m({ "#834: 1 of 1 thread(s) unresolved": 1 }), { covered: new Set([834]), complete: true });
+  const waited = announceable(db, m({}),
+    { covered: new Set([834]), waiting: new Set([834]), complete: true });
+
+  check(waited.cleared.length === 0,
+    "a PR whose decision was WAIT does not retire its escalation", JSON.stringify(waited));
+  check(waited.fresh.length === 0,
+    "and it is not re-announced either -- it never stopped standing", JSON.stringify(waited));
+
+  // Once it settles and the cause is genuinely gone, it clears exactly once.
+  const settled = announceable(db, m({}), { covered: new Set([834]), waiting: new Set(), complete: true });
+  check(settled.cleared.length === 1, "and clears once the tick actually settles it",
+    JSON.stringify(settled));
+
+  // A waiting PR must not block an UNRELATED standing cause from retiring.
+  announceable(db, m({ "#900: something else": 1 }), { covered: new Set([900]), complete: true });
+  const other = announceable(db, m({}),
+    { covered: new Set([900, 834]), waiting: new Set([834]), complete: true });
+  check(other.cleared.length === 1 && other.cleared[0].startsWith("#900"),
+    "one PR waiting does not hold another PR's escalation open", JSON.stringify(other));
+}
+
 db.close();
 rmSync(dir, { recursive: true, force: true });
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

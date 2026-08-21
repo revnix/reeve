@@ -439,6 +439,11 @@ doctor's rendered output. Budget for use, not for review.
 
 - The daemon runs unattended: **252 ticks since 2026-08-20 14:04 UTC**, survived a
   network outage to `api.github.com`, escalated to ntfy overnight.
+- **The retry brake, the diff-gate refusal and the REPEATED_FAILURE escalation
+  have all now run on a REAL dispatch** (runs 16-19). Exercised by planting a
+  failure whose correct fix lands in a sensitive path, so the worker had to
+  decline -- which is realistic, since plenty of real fixes need a change a human
+  must approve.
 - **Three complete dispatches**: red CI → root cause → fix in an isolated
   worktree → commit → diff gate → **reeve published** → **CI green**. Runs 12
   (202s/$1.92), 14 (159s/$1.50) and 15 (153s/$2.01). All verified on GitHub --
@@ -499,8 +504,23 @@ doctor's rendered output. Budget for use, not for review.
    failure whose fix is in a different file from the failing test, a failure with
    two independent causes, and an intermittent one. Re-arm, run, read the WHOLE
    log. §10 has the recipe and the caveat about the brake.
-2. **Self-audit on a schedule** — reeve running `doctor` on itself and escalating
-   when its own health degrades. The first real step toward "watch its own work".
+2. ~~Self-audit on a schedule~~ **DONE** — `src/selfaudit.mjs`. Four local checks
+   on every tick: store integrity, snapshot freshness AND readability, wedged
+   leases, and whether the last push to the phone was accepted. Findings ride the
+   existing escalation dedup, so a standing fault is said once and clears when it
+   goes. Verified in production by planting a wedged lease: detected, pushed,
+   silent on the second tick, cleared on removal.
+
+   Two properties are load-bearing and tested as hard as the checks. It runs on
+   EVERY tick, never on a cadence of its own -- on a slower schedule its findings
+   would be absent from most ticks, and absence within a tick is what the
+   escalation layer reads as resolved. And the `why` string is an identity, not a
+   report: a key carrying "3h" changes every tick, and a changed key is a new push.
+
+   `doctor` is deliberately NOT on this path. Its checks concern a repository's
+   merge authority, cost many API calls, and on nextly answer BROKEN until the
+   ruleset is repaired -- scheduling that would report a known, accepted condition
+   forever. It stays a command a human runs.
 3. **Second project**: `rextaihq/rext-backend` — 85 merges in 90 days, real
    workflows, a different stack (python/uv + typescript). Anything that must be
    edited in the core to make it work was misfiled.

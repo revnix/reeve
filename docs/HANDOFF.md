@@ -525,8 +525,11 @@ doctor's rendered output. Budget for use, not for review.
    workflows, a different stack (python/uv + typescript). Anything that must be
    edited in the core to make it work was misfiled.
 4. **Go and PHP command tables** in `detectCommands`. Roughly a day each.
-5. **Review ingest** — round counting from distinct reviewed heads, severity from
-   finding text, thread identity. Until then `watch.reviewActions` stays false.
+5. **Review ingest** — DESIGNED, not built: `docs/2026-08-21-review-ingest-design.md`
+   (14-agent research pass, three adversarial verifiers, every hole disposed in
+   its §12 ledger). Build order is its §13: PR-1 is the fix-now list (CodeRabbit
+   fail-green exclusion, NOT_INSTALLED, refusal scan, staleSeconds default).
+   `watch.reviewActions` stays off until PR-6.
 6. **Task import** — the thing that would let `nextly-ops` retire. **Deliberately
    deferred**: the ledger works, the two systems track different things, and the
    trigger for doing it is reeve needing to pick its own work.

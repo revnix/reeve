@@ -87,13 +87,18 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
 2. **Intake: both in v1** — founder-filed tasks AND ledger import/pick from
    nextly-ops. (Sequencing intent: filed-task path proven first, ledger pick
    lands before v1 is called done.)
-3. **The gate** — a very detailed, plain-language spec PR (examples/references/
-   steps) in a PRIVATE repo, @codex review requested, then:
-   founder approves → proceed · founder requests changes → revise ·
-   founder silent 30 min + Codex substantive GO → proceed ·
-   founder silent + Codex findings → revise + resubmit ·
-   founder silent + **Codex silent → wait, re-request, escalate — NEVER proceed**.
-   Approval binds to the spec PR's exact head SHA.
+3. **The gate** (REVISED by founder 2026-08-21, supersedes the 30-min table) —
+   a very detailed, plain-language spec PR in a PRIVATE repo. **Codex clean
+   pass is a MANDATORY SERIAL WITNESS**: findings → revise → re-request, loop
+   until clean (cap 5 → escalate). Once Codex cleans at the current head, a
+   **15-minute** founder window opens (GitHub clock):
+   founder approves → proceed immediately · requests changes → revise ·
+   silent 15 min → **proceed** (their good-to-go).
+   Silence = ZERO founder events; any non-approval comment stops the clock.
+   Codex silent/refused/stale-head → wait, re-request, escalate — NEVER proceed.
+   CodeRabbit optional. Armed DAY ONE; safety is the strict measured clean-pass
+   grammar + "Reviewed commit" prefix-matching the head (measured live on
+   nextly #1129/#1130). Approval binds to the spec PR's exact head SHA.
 4. **Depth dial** — research/design effort scales to the task; the sizing
    decision is visible and overridable in the spec PR.
 5. **Concurrency** — many tasks at once, across projects and directories;
@@ -105,12 +110,22 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
 ### In flight
 
 - [x] Requirements brainstorm with the founder (2026-08-21)
-- [ ] **Deep research pass** — 15-agent workflow (5 measurers, 3 designs,
-      3 judges, synthesis, 3 adversarial verifiers) — RUNNING 2026-08-21
-- [ ] Sectioned design presented to the founder
-- [ ] Spec written to `docs/` and founder-reviewed
-- [ ] Implementation plan (PR-by-PR, each with its own verification)
+- [x] **Deep research pass** — 15 agents, 0 errors, ~28 min. Robustness-first
+      won the judges 255:244.5:241; synthesis + 29 adversarial findings
+      (8 critical) saved to the session scratchpad. KEY FINDING: the builder
+      skeleton (task/claim/checkpoint/outbox/`gh.pr.merge` reconcilers) already
+      exists in reeve's schema with ZERO callers; no merge executor exists.
+- [x] Design presented; founder approved AND revised the gate (see req. 3)
+- [ ] **Spec fold in flight** — writer + 3 verifiers folding all 29 fixes and
+      the revised gate into `docs/2026-08-21-builder-design.md`
+- [ ] Founder reviews the spec file
+- [ ] Implementation plan (9 PRs, each with its own verification — in the spec)
 - [ ] Build
+
+### Founder actions pending
+
+- [ ] Add `nextly-ops` to App installation 155196718 — deferred by founder;
+      escalate a reminder when it blocks PR-6.
 
 ### Known constraints the design must answer (from measurements so far)
 

@@ -58,6 +58,56 @@ function prune(dir, keep) {
   } catch { /* pruning must never take the loop down */ }
 }
 
+/**
+ * Every state store on this machine, watched or not.
+ *
+ * Backups happen inside a tick, and a tick is per repository -- so a store no
+ * daemon watches is never snapshotted and never audited. Measured: reeve's OWN
+ * store held every dispatch experiment, the whole fix-attempt ledger and all the
+ * settlement history, and had zero backups, while the repository it watches had
+ * fourteen. The forgotten store is exactly the one nothing reminds you about.
+ */
+export function everyStore(home) {
+  const root = join(home, "state");
+  const out = [];
+  let owners;
+  try { owners = readdirSync(root, { withFileTypes: true }); } catch { return out; }
+  for (const o of owners) {
+    if (!o.isDirectory()) continue;
+    let files;
+    try { files = readdirSync(join(root, o.name)); } catch { continue; }
+    for (const f of files) {
+      if (!f.endsWith(".db")) continue;
+      out.push({ nwo: `${o.name}/${f.slice(0, -3)}`, path: join(root, o.name, f) });
+    }
+  }
+  return out;
+}
+
+/**
+ * Snapshot every store, not only the one this tick is about.
+ *
+ * Opened read-only and copied with VACUUM INTO, which takes a read lock and is
+ * safe against a writer. A store that cannot be opened is reported rather than
+ * skipped silently: an unreadable store is the strongest possible reason to want
+ * a backup of it.
+ */
+export function snapshotAll(home, root, { at = Math.floor(Date.now() / 1000), keep = 14, open: openDb = null } = {}) {
+  const results = [];
+  for (const { nwo, path } of everyStore(home)) {
+    let db = null;
+    try {
+      db = openDb ? openDb(path) : new DatabaseSync(path, { readOnly: true });
+      results.push({ nwo, ...snapshot(db, root, nwo, at, { keep }) });
+    } catch (e) {
+      results.push({ nwo, ok: false, why: `could not open ${path}: ${e.message}` });
+    } finally {
+      try { db?.close(); } catch { /* a close that fails must not lose the result */ }
+    }
+  }
+  return results;
+}
+
 /** The newest snapshot for a repository, or null. */
 export function latestSnapshot(root, nwo) {
   const dir = join(root, slug(nwo));

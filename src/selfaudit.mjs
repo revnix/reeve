@@ -24,7 +24,7 @@
 // BROKEN until the ruleset is repaired. Escalating that hourly would report a
 // known, accepted condition forever. doctor stays a command a human runs.
 
-import { latestSnapshot } from "./backup.mjs";
+import { latestSnapshot, everyStore } from "./backup.mjs";
 import { statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
@@ -35,8 +35,24 @@ export const BROKEN = "BROKEN";
 const HOUR = 3600;
 
 /** Is the newest snapshot recent enough, and is it actually a database? */
-function checkBackups(nwo, { backupRoot, interval, at, io }) {
+function checkBackups(nwo, { backupRoot, interval, at, io, home }) {
   if (!backupRoot) return null;   // backups disabled for this run; not a fault
+
+  // Every store, not just the one this tick is about. Measured: reeve's own
+  // store -- the whole dispatch ledger -- had zero backups while the repository
+  // the daemon watches had fourteen, and the audit could not see it because it
+  // only ever looked at the repository it was running for. An unwatched store is
+  // unaudited AND unbacked, which is the pair that loses data.
+  if (home) {
+    const stores = (io.everyStore ?? everyStore)(home);
+    const missing = stores.filter(st => !(io.latestSnapshot ?? latestSnapshot)(backupRoot, st.nwo));
+    if (missing.length) {
+      return { id: "backup.missing", level: BROKEN,
+               why: "a state store on this machine has never been backed up",
+               detail: missing.map(m => m.nwo).join(", ") };
+    }
+  }
+
   const newest = (io.latestSnapshot ?? latestSnapshot)(backupRoot, nwo);
   if (!newest) {
     return { id: "backup.missing", level: BROKEN,
@@ -154,12 +170,12 @@ function checkNotify(db, { profile }) {
  *
  * @returns {{id, level, why, detail?, count?}[]} worst first; empty when healthy.
  */
-export function selfAudit(db, { nwo, profile = {}, backupRoot = null,
-                                at = Math.floor(Date.now() / 1000), io = {} } = {}) {
+export function selfAudit(db, opts = {}) {
+  const { nwo, profile = {}, backupRoot = null, at = Math.floor(Date.now() / 1000), io = {} } = opts;
   const interval = profile.watch?.backupIntervalSeconds ?? HOUR;
   const findings = [
     checkStore(db, { io }),
-    checkBackups(nwo, { backupRoot, interval, at, io }),
+    checkBackups(nwo, { backupRoot, interval, at, io, home: opts.home ?? null }),
     checkLeases(db, { at }),
     checkNotify(db, { profile }),
   ].filter(Boolean);

@@ -14,6 +14,7 @@
 // absent from most ticks, and absence within a tick is what the escalation layer
 // reads as resolved -- the defect already fixed twice in this codebase.
 import { selfAudit, BROKEN, DEGRADED } from "../src/selfaudit.mjs";
+import { everyStore, snapshotAll } from "../src/backup.mjs";
 import { open } from "../src/db/ops.mjs";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -177,6 +178,68 @@ check(healthy.length === 0, "control: a healthy reeve produces no findings", JSO
 
   check(/notify\.failed/.test(src) && /notify\.sent/.test(src),
     "and the tick records push outcomes, which the audit reads back");
+}
+
+// ── a store nothing watches ──────────────────────────────────────────────────
+//
+// Backups happen inside a tick and a tick is per repository, so a store no daemon
+// watches is never snapshotted — and the audit could not see it either, because
+// it only looked at the repository it was running FOR. Measured: reeve's own
+// store, holding every dispatch experiment and the whole fix-attempt ledger, had
+// zero backups while the watched repository had fourteen. Unwatched meant
+// unaudited AND unbacked, which is the pair that loses data.
+{
+  const twoStores = join(dir, "home-two");
+  mkdirSync(join(twoStores, "state", "owner-a"), { recursive: true });
+  mkdirSync(join(twoStores, "state", "owner-b"), { recursive: true });
+  for (const [o, r] of [["owner-a", "watched"], ["owner-b", "forgotten"]]) {
+    const s2 = open(join(twoStores, "state", o, `${r}.db`));
+    s2.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(NOW, "t", "seed", "x", "{}");
+    s2.close();
+  }
+  // Only the watched one has a snapshot.
+  const root = join(twoStores, "backups");
+  mkdirSync(join(root, "owner-a-watched"), { recursive: true });
+  const snap = open(join(root, "owner-a-watched", "1.db"));
+  snap.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(NOW, "t", "seed", "x", "{}");
+  snap.close();
+
+  // Control: WITHOUT the home, the audit is blind to the other store — which is
+  // exactly the state this fixes, so the fixture must reproduce it.
+  const blind = selfAudit(db, { nwo: "owner-a/watched", profile: PROFILE, backupRoot: root, at: NOW, io: fresh });
+  check(!blind.some(f => f.id === "backup.missing"),
+    "control: without the home, an unwatched store is invisible", JSON.stringify(blind));
+
+  const seeing = selfAudit(db, { nwo: "owner-a/watched", profile: PROFILE, backupRoot: root,
+                                 at: NOW, io: fresh, home: twoStores });
+  const miss = seeing.find(f => f.id === "backup.missing");
+  check(!!miss && miss.level === BROKEN,
+    "with it, a store that has never been backed up is BROKEN", JSON.stringify(seeing));
+  check(/owner-b\/forgotten/.test(miss.detail) && !/owner-a\/watched/.test(miss.detail),
+    "and it names the forgotten store, not the healthy one", miss.detail);
+}
+
+// ── snapshotAll covers what a per-repo backup misses ─────────────────────────
+{
+  const home3 = join(dir, "home-all");
+  mkdirSync(join(home3, "state", "o1"), { recursive: true });
+  mkdirSync(join(home3, "state", "o2"), { recursive: true });
+  for (const [o, r] of [["o1", "a"], ["o2", "b"]]) {
+    const s3 = open(join(home3, "state", o, `${r}.db`));
+    s3.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)").run(NOW, "t", "seed", "x", "{}");
+    s3.close();
+  }
+  check(everyStore(home3).length === 2,
+    "control: both stores are discovered", JSON.stringify(everyStore(home3).map(s => s.nwo)));
+
+  const out = snapshotAll(home3, join(home3, "backups"), { at: NOW });
+  check(out.length === 2 && out.every(r => r.ok),
+    "snapshotAll snapshots every store, not only a watched one", JSON.stringify(out.map(r => [r.nwo, r.ok])));
+
+  const after = selfAudit(db, { nwo: "o1/a", profile: PROFILE, backupRoot: join(home3, "backups"),
+                                at: NOW, io: fresh, home: home3 });
+  check(!after.some(f => f.id === "backup.missing"),
+    "and afterwards the audit is satisfied — the loop closes");
 }
 
 db.close();

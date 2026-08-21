@@ -119,12 +119,11 @@ Worth knowing, because it runs unattended.
 | It can | It cannot |
 |---|---|
 | Read, edit and write files in **its own copy** of the branch | Touch your working directory |
-| Run the project's own commands (`pnpm test`, `pnpm lint`) | Run any other shell command |
-| `git add`, `git commit` locally | `git push` — **reeve** pushes, after checking the diff |
-| — | Merge anything, ever |
-| — | Reach the network (`curl`, `wget`, `ssh`) |
-| — | Touch `.github/**` — the files that judge its work |
-| — | Touch sensitive paths (auth, migrations, changesets, release scripts) |
+| Run the project's own commands and language runtime (`pnpm test`, `node`, `git`) | Reach the network — `curl`, `wget`, `ssh` |
+| `git add`, `git commit` locally | **Push or merge, ever.** reeve publishes, after checking the diff |
+| **Read** the workflow that is failing it | **Change** `.github/**` — the files that judge its work |
+| Read sensitive code to understand a failure | **Change** sensitive paths (auth, migrations, changesets, release scripts) |
+| — | Read quarantined data at all (production dumps, other clients' credentials) |
 
 These are enforced by the tool layer, not by asking the model nicely. That
 distinction was measured: told not to write a file but given a plain shell, the

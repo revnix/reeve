@@ -291,7 +291,9 @@ export function runWorker({
       // A write that fails (disk full, a mount gone) throws inside a stream
       // callback, where nothing awaits it; unhandled, it would take the daemon
       // down. It ends this worker instead, with the reason.
-      try { writeSync(s.fd, chunk); s.written += chunk.length; }
+      // writeSync may write less than the chunk; a short write that was
+      // counted as whole would leave the durable record silently incomplete.
+      try { let off = 0; while (off < chunk.length) { off += writeSync(s.fd, chunk, off, chunk.length - off); } s.written += chunk.length; }
       catch (err) { writeError = err.message; killedByUs = true; killGroup(child.pid, "SIGTERM"); setTimeout(() => { if (!settled) killGroup(child.pid, "SIGKILL"); }, graceMs); }
     };
 

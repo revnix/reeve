@@ -311,6 +311,13 @@ export function validate(profile) {
     if (e) errors.push(`${path} ${e}`);
   }
 
+  // A container that is not a plain object (an array, a string) would take
+  // the defaults as named properties and validate, then serialize to nothing.
+  for (const c of ["builder", "builder.capabilities", "builder.founder", "worker"]) {
+    const v = get(profile, c);
+    if (v !== undefined && v !== null && (typeof v !== "object" || Array.isArray(v))) errors.push(`${c} must be an object`);
+  }
+
   // Unknown keys are refused, not ignored.
   const known = new Set(Object.keys(FIELDS));
   const containers = new Set();

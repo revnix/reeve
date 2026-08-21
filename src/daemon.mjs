@@ -25,7 +25,7 @@ import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.
 import { workerEnv, writeGitConfig, CONTAINMENT } from "./workerenv.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, sha256 } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, sha256 } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { snapshot, snapshotAll } from "./backup.mjs";
 import { selfAudit } from "./selfaudit.mjs";
@@ -516,7 +516,7 @@ export async function tick(ctx) {
       const lane = (profile.lanes ?? []).find(l => l.id === decision.lane) ?? null;
       const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane });
 
-      let r;
+      let r, prepFailed = false;
       try {
         // Everything from here runs inside the cleanup scope: the run is
         // already leased and its heartbeat already ticking, so a failure in
@@ -569,7 +569,7 @@ export async function tick(ctx) {
           isRevoked: () => revoked,
           // Bind the process to the run the instant it exists, before it can
           // touch anything, so a crash leaves something probeable.
-          onSpawn: ({ pid, lstart }) => { notePid(db, { runId: run.runId, pid, boot: lstart }); noteWorkerBinding(db, { runId: run.runId, pid, lstart }); },
+          onSpawn: ({ pid, lstart }) => { bindRun(db, { runId: run.runId, pid, boot: lstart }); noteWorkerBinding(db, { runId: run.runId, pid, lstart }); },
         });
       } catch (err) {
         // A worker that could not be prepared or launched is a failed attempt
@@ -577,6 +577,7 @@ export async function tick(ctx) {
         // lease released, and the next PR still gets its turn. The attempt
         // spent above is refunded: this failure is reeve's, not the fix's.
         r = { outcome: OUTCOMES.FAILED, why: `could not prepare the worker: ${err.message}`, ms: 0, cost: null, sessionId: null };
+        prepFailed = true;
         if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
         const prev = PREP_BACKOFF.get(prepKey)?.failures ?? 0;
         PREP_BACKOFF.set(prepKey, { failures: prev + 1, until: Date.now() + Math.min(PREP_BACKOFF_CAP_MS, PREP_BACKOFF_BASE_MS * 2 ** prev) });
@@ -600,7 +601,9 @@ export async function tick(ctx) {
         // A worker that never executed (the gate refused its binding) spent no
         // fixer's attempt; it is refunded like any pre-execution failure.
         if (r?.outcome === OUTCOMES.UNBOUND && decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
-        if (r?.outcome !== OUTCOMES.FAILED || !/could not prepare/.test(r?.why ?? "")) PREP_BACKOFF.delete(prepKey);
+        // The flag, not the reason string: a recorder that fails for the same
+        // cause rewrites the reason, and a backoff inferred from it vanished.
+        if (!prepFailed) PREP_BACKOFF.delete(prepKey);
         if (fin?.applied === false) {
           // The store refused the outcome: the claim was gone or withdrawn by
           // the time the worker finished. Whatever it produced is not published.

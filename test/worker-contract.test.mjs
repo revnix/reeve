@@ -4,7 +4,7 @@
 // this worker actually run as" has no answer after the process is gone.
 import { open, startRun, recordWorkerContract, noteWorkerResult, workerContractFor, sha256 } from "../src/db/ops.mjs";
 import { tick } from "../src/daemon.mjs";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -68,6 +68,9 @@ const db = open(join(dir, "c.db"));
   check(row?.model_resolved === "claude-x-resolved", "and the model the worker announced", String(row?.model_resolved));
   check(row?.truncated === 1 && row?.stdout_bytes === 12345, "and whether its durable record was cut, with the byte count", JSON.stringify([row?.truncated, row?.stdout_bytes]));
   check(row?.pid === 4242 && /2026/.test(row?.lstart ?? ""), "and the process identity once the binding succeeds", JSON.stringify([row?.pid, row?.lstart]));
+  // The daemon binds through the revalidating store call, not the plain write.
+  const dsrc2 = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
+  check(/onSpawn: \(\{ pid, lstart \}\) => \{ bindRun\(db/.test(dsrc2), "control: the daemon's binding calls bindRun", "");
   // The settings file is immutable per run: two daemons sharing the state dir
   // and a PR number must never overwrite each other's file between the hash
   // and the spawn.
@@ -94,6 +97,11 @@ const db = open(join(dir, "c.db"));
   let threw = null;
   try { await tick(ctx2); } catch (e) { threw = e; }
   check(!threw, "the tick survives a contract write failure", String(threw?.message));
+  // The recorder fails for the same reason; the backoff installed by the
+  // preparation failure must survive that, or the PR is leased and failed
+  // again on the very next tick.
+  await tick(ctx2);
+  check(ctx2.db.prepare("SELECT COUNT(*) n FROM run").get().n === 1, "a second tick stays in the preparation backoff even though the recorder failed too", String(ctx2.db.prepare("SELECT COUNT(*) n FROM run").get().n));
   check(spawned === 0, "and no worker was launched without its contract", String(spawned));
   const run = db2.prepare("SELECT status FROM run ORDER BY started_at DESC LIMIT 1").get();
   check(run?.status === "failed", "the leased run is closed as failed, not left live", JSON.stringify(run));

@@ -250,5 +250,21 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
   check(d.drifted === true && /repository/.test(d.lines.join(" ")), "a baseline recorded for another repository never certifies this one", JSON.stringify(d.lines));
 }
 
+
+// ── every applicable rule is in the snapshot, not only the projected ones ────
+{
+  const { readLiveBaseline } = await import("../src/baseline.mjs");
+  const gh = path => {
+    if (path.endsWith("/rulesets")) return [{ id: 1, name: "r", enforcement: "active", target: "branch" }];
+    if (path.endsWith("/rulesets/1")) return { target: "branch", rules: [{ type: "required_signatures" }, { type: "merge_queue", parameters: { min_entries_to_merge: 1 } }, { type: "pull_request", parameters: { required_approving_review_count: 1 } }], bypass_actors: [] };
+    const e = new Error("HTTP 404"); e.stderr = "HTTP 404"; throw e;
+  };
+  const live = readLiveBaseline("o/r", { identity: { defaultBranch: "main" }, authority: {}, merge: {}, builder: {} }, { gh });
+  check(Array.isArray(live.ruleSnapshot) && live.ruleSnapshot.some(s => /required_signatures/.test(s)) && live.ruleSnapshot.some(s => /merge_queue/.test(s)),
+    "unprojected rule types are recorded in a normalized snapshot", JSON.stringify(live.ruleSnapshot));
+  const dropped = { ...live, ruleSnapshot: live.ruleSnapshot.filter(s => !/required_signatures/.test(s)) };
+  check(diffBaseline(dropped, live).drifted === true && /rule snapshot/.test(diffBaseline(dropped, live).lines.join(" ")), "dropping a rule the projection does not name is still drift", "");
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

@@ -97,6 +97,11 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {
   const active = covering.map(c => c.meta);
   const detail = covering.map(c => c.detail);
   const rules = detail.flatMap(r => r.rules ?? []);
+  // Every applicable rule, normalized: the projected fields below are for
+  // reading; this is what guarantees that a rule the projection does not name
+  // (required_signatures, merge_queue, required_deployments) cannot vanish
+  // without drift.
+  const ruleSnapshot = rules.map(r => `${r.type}:${JSON.stringify(r.parameters ?? {}, Object.keys(r.parameters ?? {}).sort())}`).sort();
   const checkRules = rules.filter(r => r.type === "required_status_checks");
   const rulesetRequiredChecks = checkRules
     .flatMap(r => (r.parameters?.required_status_checks ?? []).map(c => `${c.context}@${c.integration_id ?? "any"}`)).sort();
@@ -134,7 +139,7 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {
   const requiredApprovals = Math.max(pr.required_approving_review_count ?? 0, classic?.required_approving_review_count ?? 0);
   const codeOwnerReview = (pr.require_code_owner_review ?? false) || (classic?.require_code_owner_reviews ?? false);
   return {
-    nwo, branch: target, rulesetNames: active.map(r => r.name), rulesetRequiredChecks, rulesetBypassActors, branchProtectionRequiredChecks,
+    nwo, branch: target, rulesetNames: active.map(r => r.name), ruleSnapshot, rulesetRequiredChecks, rulesetBypassActors, branchProtectionRequiredChecks,
     classicBypassAllowances,
     strictRequiredChecks: strictRequiredChecks || (bp?.required_status_checks?.strict ?? false),
     // Classic protection's own admin switch: off means administrators bypass
@@ -158,7 +163,7 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {
 export function checkBaseline(nwo, profile, io = {}) {
   const path = io.fixturePath ?? baselinePathFor(nwo);
   if (!existsSync(path)) return { id: "R-13", level: "UNKNOWN", title: "authority baseline",
-    lines: [`no baseline captured for ${nwo} at ${path}`, "-> node scripts/capture-baseline.mjs " + nwo + " > " + path] };
+    lines: [`no baseline captured for ${nwo} at ${path}`, "-> node scripts/capture-baseline.mjs " + nwo] };
   let fixture;
   try { fixture = JSON.parse(readFileSync(path, "utf8")); if (!fixture || typeof fixture !== "object") throw new Error("not an object"); }
   catch (e) { return { id: "R-13", level: "UNKNOWN", title: "authority baseline", lines: [`the baseline at ${path} could not be read: ${e.message}`] }; }
@@ -189,6 +194,7 @@ export function diffBaseline(live, fixture) {
   if (fixture?.nwo && live.nwo && fixture.nwo !== live.nwo)
     lines.push(`the baseline was captured for repository ${fixture.nwo}, not ${live.nwo}`);
   for (const [key, label] of [["rulesetNames", "active rulesets"],
+                              ["ruleSnapshot", "rule snapshot"],
                               ["rulesetRequiredChecks", "required checks (ruleset)"],
                               ["branchProtectionRequiredChecks", "required checks (branch protection)"],
                               ["rulesetBypassActors", "bypass actors"],

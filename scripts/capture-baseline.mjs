@@ -3,9 +3,9 @@
 // profile's merge-related fields say. Written once per programme freeze and
 // checked in under deploy/baselines/; doctor (R-13) compares every later
 // reading against it so authority cannot widen without a decision.
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { withDefaults } from "../src/profile/schema.mjs";
 import { readLiveBaseline, baselinePathFor } from "../src/baseline.mjs";
 
@@ -18,5 +18,12 @@ const profile = withDefaults(JSON.parse(readFileSync(join(HOME, "profiles", owne
 let live;
 try { live = readLiveBaseline(nwo, profile, { branch: process.argv[3] ?? null }); }
 catch (e) { console.error(`capture-baseline: ${String(e.stderr ?? e.message).trim().split("\n")[0]}`); process.exit(1); }
-process.stdout.write(JSON.stringify({ capturedAt: new Date().toISOString(), ...live }, null, 2) + "\n");
-console.error(`write this to ${baselinePathFor(nwo)}`);
+// The script writes the file itself (creating the owner directory), so the
+// documented command works for the first repository under a new owner; the
+// JSON also goes to stdout for a reader who wants to see it.
+const out = JSON.stringify({ capturedAt: new Date().toISOString(), ...live }, null, 2) + "\n";
+const dest = baselinePathFor(nwo);
+mkdirSync(dirname(dest), { recursive: true });
+writeFileSync(dest, out);
+process.stdout.write(out);
+console.error(`wrote ${dest}`);

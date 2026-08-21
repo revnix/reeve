@@ -440,6 +440,25 @@ export function startRun(db, { nwo, pr, action, head, lane = "fixer", cause = nu
  * stored beside it. Written before the worker can touch anything, so a crash
  * leaves a run that can be probed rather than a mystery.
  */
+/**
+ * Bind a worker to its run, revalidating the claim in the same transaction: a
+ * cancel or an expiry that landed between startRun and this call withholds
+ * the gate (the caller's onSpawn throws), instead of releasing a worker that
+ * then runs until the next heartbeat notices. Throws when the claim is gone.
+ */
+export function bindRun(db, { runId, pid, boot }) {
+  return tx(db, () => {
+    const r = db.prepare(`SELECT r.task_id, r.lease_expires_at, COALESCE(x.cancel_requested, 0) AS cancel_requested
+                            FROM run r LEFT JOIN task_exec x ON x.task_id = r.task_id
+                           WHERE r.id=? AND r.status IN ('leased','running')`).get(runId);
+    if (!r) throw new Error("the run is no longer leased; the worker is not bound");
+    if (r.cancel_requested) throw new Error("a cancel was requested before the worker was bound");
+    if (r.lease_expires_at <= Math.floor(Date.now() / 1000)) throw new Error("the run's lease expired before the worker was bound");
+    db.prepare(`UPDATE run SET owner_pid=?, owner_boot=?, status='running', heartbeat_at=unixepoch() WHERE id=?`).run(pid, boot ?? "", runId);
+    emit(db, { actor: "daemon", op: "run.spawned", run_id: runId, payload: { pid, boot } });
+  });
+}
+
 export function notePid(db, { runId, pid, boot }) {
   return tx(db, () => {
     db.prepare(`UPDATE run SET owner_pid=?, owner_boot=?, status='running',

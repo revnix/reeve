@@ -4,7 +4,7 @@
 // worker keeps running, the lease has lapsed; the next heartbeat used to
 // update the row regardless and answer alive, so the worker finished and
 // published under a claim that had already expired.
-import { open, startRun, heartbeat, finishRun } from "../src/db/ops.mjs";
+import { open, startRun, heartbeat, finishRun, bindRun } from "../src/db/ops.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -52,6 +52,29 @@ check(row.lease_expires_at < Math.floor(Date.now() / 1000), "and the lapsed leas
   const node4 = db.prepare("SELECT status FROM node WHERE id = 'pr:4'").get();
   check(fin4.applied === true && db.prepare("SELECT status FROM run WHERE id = ?").get(r4.runId).status === "abandoned", "a cancelled run is abandoned", JSON.stringify(fin4));
   check(node4?.status === "ready", "and its PR node returns to ready, never left running", JSON.stringify(node4));
+}
+
+
+// The binding itself revalidates the claim: a cancel or an expiry that lands
+// between startRun and the binding must withhold the gate, not release a
+// worker that then runs until the next heartbeat notices.
+{
+  const r5 = startRun(db, { nwo: "o/r", pr: 5, action: "FIX_CI", head: "e".repeat(40) });
+  let threw = null;
+  try { bindRun(db, { runId: r5.runId, pid: 1234, boot: "x" }); } catch (e) { threw = e; }
+  check(!threw && db.prepare("SELECT owner_pid FROM run WHERE id = ?").get(r5.runId).owner_pid === 1234, "control: a live, uncancelled run binds", String(threw?.message));
+
+  const r6 = startRun(db, { nwo: "o/r", pr: 6, action: "FIX_CI", head: "f".repeat(40) });
+  db.prepare("INSERT OR REPLACE INTO task_exec (task_id, cancel_requested) VALUES ('pr:6', 1)").run();
+  threw = null;
+  try { bindRun(db, { runId: r6.runId, pid: 1235, boot: "x" }); } catch (e) { threw = e; }
+  check(threw && /cancel/.test(threw.message), "a cancel requested before the binding refuses it", String(threw?.message));
+
+  const r7 = startRun(db, { nwo: "o/r", pr: 7, action: "FIX_CI", head: "g".repeat(40) });
+  db.prepare("UPDATE run SET lease_expires_at = unixepoch() - 5 WHERE id = ?").run(r7.runId);
+  threw = null;
+  try { bindRun(db, { runId: r7.runId, pid: 1236, boot: "x" }); } catch (e) { threw = e; }
+  check(threw && /expired/.test(threw.message), "an expired lease refuses the binding", String(threw?.message));
 }
 
 db.close(); rmSync(dir, { recursive: true, force: true });

@@ -182,6 +182,10 @@ expectRefusal("a capability switch that is not a boolean",
   (() => { const p = clone(base); p.builder = { capabilities: { mergeBuilderPr: "yes" } }; return p; })(),
   /builder\.capabilities\.mergeBuilderPr must be a boolean/);
 
+expectRefusal("a capability container that is not an object",
+  (() => { const p = clone(base); p.builder = { capabilities: [] }; return p; })(),
+  /builder\.capabilities must be an object/);
+
 expectRefusal("a founder user id that is not positive",
   (() => { const p = clone(base); p.builder = { founder: { userId: 0 } }; return p; })(),
   /builder\.founder\.userId must be a positive integer/);

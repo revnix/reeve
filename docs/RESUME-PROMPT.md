@@ -25,7 +25,8 @@ primary requirement, not a nice-to-have.
 
 ## State as of 2026-08-21, end of the third session
 
-- **69 commits, 37 test files, 0 failing, CI green on main.**
+- **37 test files, 0 failing, `HEAD == origin/main`, CI green.** (A commit count
+  goes stale the moment anyone commits; verify the two invariants instead.)
 - **The daemon is RUNNING** as a launchd agent (`com.revnix.reeve`) on
   `nextlyhq/nextly`, **observe-only**: no `--execute`, no `--enforce`. 260+ ticks,
   survived a network outage, escalates to ntfy topic `revnix-reeve`.

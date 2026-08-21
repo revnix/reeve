@@ -369,6 +369,7 @@ CREATE TABLE IF NOT EXISTS worker_run (
   argv_hash       TEXT NOT NULL,
   prompt_hash     TEXT NOT NULL,
   settings_hash   TEXT NOT NULL,
+  env_hash        TEXT,                       -- the exact environment, canonical; PATH, git config, caps included
   tool_contract   TEXT,
   agents_hash     TEXT,
   max_turns       INTEGER,

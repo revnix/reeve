@@ -101,8 +101,12 @@ export function rulesetCoversBranch(detail, branch, defaultBranch) {
 }
 
 export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {}) {
-  const defaultBranch = profile.identity?.defaultBranch ?? "main";
-  const target = branch ?? profile.identity?.baseBranch ?? defaultBranch;
+  // `~DEFAULT_BRANCH` means GitHub's current default, not the profile's copy
+  // of it: a default that moved before the sidecar was refreshed would make a
+  // ruleset that moved with it still appear to cover the branch reeve targets.
+  const liveDefaultBranch = gh(`repos/${nwo}`)?.default_branch ?? profile.identity?.defaultBranch ?? "main";
+  const defaultBranch = liveDefaultBranch;
+  const target = branch ?? profile.identity?.baseBranch ?? profile.identity?.defaultBranch ?? liveDefaultBranch;
   const rulesets = gh(`repos/${nwo}/rulesets`, { list: true });
   // Branch rulesets only: a tag or push ruleset with no ref condition would
   // otherwise read as covering every branch, and its policy changes would be
@@ -114,6 +118,10 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {
   const covering = detailAll.filter(({ detail }) => (detail.target ?? "branch") === "branch" && rulesetCoversBranch(detail, target, defaultBranch));
   const active = covering.map(c => c.meta);
   const detail = covering.map(c => c.detail);
+  // Each ruleset whole, with its own bypass actors beside its own rules: the
+  // flattened views below cannot tell which actor may bypass which rule, and
+  // moving a bypass between rulesets widens authority without changing them.
+  const rulesetSnapshot = covering.map(({ meta, detail }) => `${meta.name}|bypass:${canonicalJson((detail.bypass_actors ?? []).map(b => `${b.actor_type}:${b.actor_id ?? ""}:${b.bypass_mode}`).sort())}|rules:${canonicalJson((detail.rules ?? []).map(r => `${r.type}:${canonicalJson(r.parameters ?? {})}`).sort())}`).sort();
   const rules = detail.flatMap(r => r.rules ?? []);
   // Every applicable rule, normalized: the projected fields below are for
   // reading; this is what guarantees that a rule the projection does not name
@@ -157,7 +165,7 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {
   const requiredApprovals = Math.max(pr.required_approving_review_count ?? 0, classic?.required_approving_review_count ?? 0);
   const codeOwnerReview = (pr.require_code_owner_review ?? false) || (classic?.require_code_owner_reviews ?? false);
   return {
-    nwo, branch: target, rulesetNames: active.map(r => r.name), ruleSnapshot, rulesetRequiredChecks, rulesetBypassActors, branchProtectionRequiredChecks,
+    nwo, branch: target, liveDefaultBranch, rulesetNames: active.map(r => r.name), rulesetSnapshot, ruleSnapshot, rulesetRequiredChecks, rulesetBypassActors, branchProtectionRequiredChecks,
     classicBypassAllowances,
     strictRequiredChecks: strictRequiredChecks || (bp?.required_status_checks?.strict ?? false),
     // Classic protection's own admin switch: off means administrators bypass
@@ -223,7 +231,10 @@ export function diffBaseline(live, fixture) {
   // repository's path must not pass on matching summaries.
   if (fixture?.nwo && live.nwo && fixture.nwo !== live.nwo)
     lines.push(`the baseline was captured for repository ${fixture.nwo}, not ${live.nwo}`);
+  if ((live.liveDefaultBranch ?? null) !== (fixture.liveDefaultBranch ?? null))
+    lines.push(`the repository's default branch: live ${live.liveDefaultBranch ?? null} vs baseline ${fixture.liveDefaultBranch ?? null}`);
   for (const [key, label] of [["rulesetNames", "active rulesets"],
+                              ["rulesetSnapshot", "ruleset snapshot (rules with their own bypass actors)"],
                               ["ruleSnapshot", "rule snapshot"],
                               ["rulesetRequiredChecks", "required checks (ruleset)"],
                               ["branchProtectionRequiredChecks", "required checks (branch protection)"],

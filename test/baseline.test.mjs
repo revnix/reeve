@@ -69,6 +69,7 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
 {
   const { readLiveBaseline } = await import("../src/baseline.mjs");
   const gh = path => {
+    if (path === "repos/o/r") return { default_branch: "main" };
     if (path.endsWith("/rulesets")) return [{ id: 1, name: "weak", enforcement: "active" }, { id: 2, name: "strong", enforcement: "active" }, { id: 3, name: "off", enforcement: "disabled" }];
     if (path.endsWith("/rulesets/1")) return { rules: [{ type: "pull_request", parameters: { required_approving_review_count: 1, require_code_owner_review: false } }], bypass_actors: [] };
     if (path.endsWith("/rulesets/2")) return { rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2, require_code_owner_review: true } }], bypass_actors: [] };
@@ -88,7 +89,7 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
 {
   const { readLiveBaseline } = await import("../src/baseline.mjs");
   const asked = [];
-  const gh = path => { asked.push(path); if (path.endsWith("/rulesets")) return []; const e = new Error("HTTP 404"); e.stderr = "HTTP 404"; throw e; };
+  const gh = path => { asked.push(path); if (path === "repos/o/r") return { default_branch: "main" }; if (path.endsWith("/rulesets")) return []; const e = new Error("HTTP 404"); e.stderr = "HTTP 404"; throw e; };
   readLiveBaseline("o/r", { identity: { baseBranch: "develop", defaultBranch: "main" }, authority: {}, merge: {}, builder: {} }, { gh });
   check(asked.some(p => /branches\/develop\/protection/.test(p)), "the live read targets the profile's base branch, not main", asked.join(" | "));
   const live = readLiveBaseline("o/r", { identity: { defaultBranch: "trunk" }, authority: {}, merge: {}, builder: {} }, { gh });
@@ -110,6 +111,7 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
 {
   const { readLiveBaseline } = await import("../src/baseline.mjs");
   const gh = path => {
+    if (path === "repos/o/r") return { default_branch: "main" };
     if (path.endsWith("/rulesets")) return [{ id: 1, name: "main-only", enforcement: "active" }, { id: 2, name: "release-only", enforcement: "active" }, { id: 3, name: "everything", enforcement: "active" }];
     if (path.endsWith("/rulesets/1")) return { conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } }, rules: [{ type: "pull_request", parameters: { required_approving_review_count: 1 } }], bypass_actors: [] };
     if (path.endsWith("/rulesets/2")) return { conditions: { ref_name: { include: ["refs/heads/release/*"], exclude: [] } }, rules: [{ type: "pull_request", parameters: { required_approving_review_count: 5 } }], bypass_actors: [{ actor_type: "Team", actor_id: 9, bypass_mode: "always" }] };
@@ -125,6 +127,7 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
 {
   const { readLiveBaseline } = await import("../src/baseline.mjs");
   const gh = path => {
+    if (path === "repos/o/r") return { default_branch: "main" };
     if (path.endsWith("/rulesets")) return [];
     if (/protection$/.test(path)) return { required_status_checks: { checks: [] }, required_pull_request_reviews: { required_approving_review_count: 2, require_code_owner_reviews: true } };
     throw new Error("unexpected " + path);
@@ -149,6 +152,7 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
 {
   const { readLiveBaseline } = await import("../src/baseline.mjs");
   const gh = path => {
+    if (path === "repos/o/r") return { default_branch: "main" };
     if (path.endsWith("/rulesets")) return [{ id: 1, name: "r", enforcement: "active" }];
     if (path.endsWith("/rulesets/1")) return { rules: [{ type: "pull_request", parameters: { required_approving_review_count: 1, require_code_owner_review: false,
       dismiss_stale_reviews_on_push: true, require_last_push_approval: true, required_review_thread_resolution: true } }], bypass_actors: [] };
@@ -167,6 +171,7 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
 {
   const { readLiveBaseline } = await import("../src/baseline.mjs");
   const gh = path => {
+    if (path === "repos/o/r") return { default_branch: "main" };
     if (path.endsWith("/rulesets")) return [{ id: 1, name: "branches", enforcement: "active", target: "branch" }, { id: 2, name: "tags", enforcement: "active", target: "tag" }];
     if (path.endsWith("/rulesets/1")) return { target: "branch", rules: [], bypass_actors: [] };
     if (path.endsWith("/rulesets/2")) return { target: "tag", rules: [{ type: "pull_request", parameters: { required_approving_review_count: 9 } }], bypass_actors: [{ actor_type: "Team", actor_id: 1, bypass_mode: "always" }] };
@@ -181,6 +186,7 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
 {
   const { readLiveBaseline } = await import("../src/baseline.mjs");
   const gh = path => {
+    if (path === "repos/o/r") return { default_branch: "main" };
     if (path.endsWith("/rulesets")) return [];
     if (/protection$/.test(path)) return { required_pull_request_reviews: { required_approving_review_count: 1,
       bypass_pull_request_allowances: { users: [{ login: "alice" }], teams: [{ slug: "core" }], apps: [{ slug: "merge-policy" }] } } };
@@ -198,6 +204,7 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
 {
   const { readLiveBaseline, rulesetCoversBranch, baselinePathFor } = await import("../src/baseline.mjs");
   const gh = path => {
+    if (path === "repos/o/r") return { default_branch: "main" };
     if (path.endsWith("/rulesets")) return [{ id: 1, name: "r", enforcement: "active", target: "branch" }];
     if (path.endsWith("/rulesets/1")) return { target: "branch", rules: [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: "ci" }] } }], bypass_actors: [] };
     const e = new Error("HTTP 404"); e.stderr = "HTTP 404"; throw e;
@@ -236,6 +243,7 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
     "a negated class [!...] excludes what it names, as fnmatch does");
 
   const gh = path => {
+    if (path === "repos/o/r") return { default_branch: "main" };
     if (path.endsWith("/rulesets")) return [];
     if (/protection$/.test(path)) return { enforce_admins: { enabled: true }, required_status_checks: { checks: [] } };
     throw new Error("unexpected " + path);
@@ -255,6 +263,7 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
 {
   const { readLiveBaseline } = await import("../src/baseline.mjs");
   const gh = path => {
+    if (path === "repos/o/r") return { default_branch: "main" };
     if (path.endsWith("/rulesets")) return [{ id: 1, name: "r", enforcement: "active", target: "branch" }];
     if (path.endsWith("/rulesets/1")) return { target: "branch", rules: [{ type: "required_signatures" }, { type: "merge_queue", parameters: { min_entries_to_merge: 1 } }, { type: "pull_request", parameters: { required_approving_review_count: 1 } }], bypass_actors: [] };
     const e = new Error("HTTP 404"); e.stderr = "HTTP 404"; throw e;
@@ -271,6 +280,7 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
 {
   const { readLiveBaseline } = await import("../src/baseline.mjs");
   const mk = thr => path => {
+    if (path === "repos/o/r") return { default_branch: "main" };
     if (path.endsWith("/rulesets")) return [{ id: 1, name: "r", enforcement: "active", target: "branch" }];
     if (path.endsWith("/rulesets/1")) return { target: "branch", rules: [{ type: "code_scanning", parameters: { code_scanning_tools: [{ tool: "CodeQL", security_alerts_threshold: thr }] } }], bypass_actors: [] };
     const e = new Error("HTTP 404"); e.stderr = "HTTP 404"; throw e;
@@ -280,6 +290,7 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
   check(JSON.stringify(a.ruleSnapshot) !== JSON.stringify(b2.ruleSnapshot), "a nested parameter change changes the snapshot", JSON.stringify(a.ruleSnapshot));
 
   const gh = path => {
+    if (path === "repos/o/r") return { default_branch: "main" };
     if (path.endsWith("/rulesets")) return [];
     if (/protection$/.test(path)) return { allow_force_pushes: { enabled: true }, restrictions: { users: [{ login: "x" }], teams: [], apps: [] }, url: "https://api/ignored" };
     throw new Error("unexpected " + path);
@@ -296,6 +307,36 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
   const noid = jn(md(jn(td(), "reeve-noid-")), "x.json"); wf(noid, JSON.stringify({ ...fixture, nwo: undefined, branch: undefined }));
   const r = checkBaseline("nextlyhq/nextly", { identity: { defaultBranch: "main" } }, { fixturePath: noid, readLive: () => fixture });
   check(r.level === "UNKNOWN" && /identity|nwo|branch/.test(r.lines.join(" ")), "a fixture without its identity fields is UNKNOWN, never compared", JSON.stringify(r));
+}
+
+
+// ── the live default branch, and rulesets kept whole ─────────────────────────
+{
+  const { readLiveBaseline } = await import("../src/baseline.mjs");
+  const gh = path => {
+    if (path === "repos/o/r") return { default_branch: "trunk" };
+    if (path.endsWith("/rulesets")) return [{ id: 1, name: "dflt", enforcement: "active", target: "branch" }];
+    if (path.endsWith("/rulesets/1")) return { target: "branch", conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } }, rules: [{ type: "pull_request", parameters: { required_approving_review_count: 3 } }], bypass_actors: [] };
+    const e = new Error("HTTP 404"); e.stderr = "HTTP 404"; throw e;
+  };
+  const live = readLiveBaseline("o/r", { identity: { baseBranch: "main", defaultBranch: "main" }, authority: {}, merge: {}, builder: {} }, { gh });
+  check(live.liveDefaultBranch === "trunk" && live.requiredApprovals === 0,
+    "the live default branch decides ~DEFAULT_BRANCH, so a ruleset that moved with it no longer covers main", JSON.stringify([live.liveDefaultBranch, live.requiredApprovals]));
+  const moved = { ...live, liveDefaultBranch: "main" };
+  check(diffBaseline(moved, live).drifted === true && /default branch/.test(diffBaseline(moved, live).lines.join(" ")), "a default-branch change is drift, and is named", "");
+
+  const gh2 = (bypassOn) => path => {
+    if (path === "repos/o/r") return { default_branch: "main" };
+    if (path.endsWith("/rulesets")) return [{ id: 1, name: "a", enforcement: "active", target: "branch" }, { id: 2, name: "b", enforcement: "active", target: "branch" }];
+    if (path.endsWith("/rulesets/1")) return { target: "branch", rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2 } }], bypass_actors: bypassOn === "a" ? [{ actor_type: "Team", actor_id: 1, bypass_mode: "always" }] : [] };
+    if (path.endsWith("/rulesets/2")) return { target: "branch", rules: [{ type: "required_signatures" }], bypass_actors: bypassOn === "b" ? [{ actor_type: "Team", actor_id: 1, bypass_mode: "always" }] : [] };
+    const e = new Error("HTTP 404"); e.stderr = "HTTP 404"; throw e;
+  };
+  const prof = { identity: { defaultBranch: "main" }, authority: {}, merge: {}, builder: {} };
+  const x = readLiveBaseline("o/r", prof, { gh: gh2("a") }), y = readLiveBaseline("o/r", prof, { gh: gh2("b") });
+  check(JSON.stringify(x.rulesetBypassActors) === JSON.stringify(y.rulesetBypassActors) && JSON.stringify(x.ruleSnapshot) === JSON.stringify(y.ruleSnapshot),
+    "control: the flattened views cannot tell which ruleset the bypass belongs to", "");
+  check(diffBaseline(x, y).drifted === true && /ruleset/.test(diffBaseline(x, y).lines.join(" ")), "but moving a bypass between rulesets is drift", JSON.stringify(diffBaseline(x, y).lines));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

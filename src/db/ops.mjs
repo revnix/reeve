@@ -537,14 +537,14 @@ export const sha256 = s => createHash("sha256").update(String(s)).digest("hex");
 
 /** Record the contract a worker is about to run under. Written before spawn, beside the run. */
 export function recordWorkerContract(db, { runId, cliVersion, modelRequested = null, effort = null, argvHash, promptHash,
-                                           settingsHash, toolContract = null, agentsHash = null, maxTurns = null,
+                                           settingsHash, envHash = null, toolContract = null, agentsHash = null, maxTurns = null,
                                            maxBudgetUsd = null, canaryId = null, outPath, errPath, pid = null, lstart = null,
                                            contractDrift = null }) {
   return tx(db, () => {
-    db.prepare(`INSERT INTO worker_run (run_id,cli_version,model_requested,effort,argv_hash,prompt_hash,settings_hash,
+    db.prepare(`INSERT INTO worker_run (run_id,cli_version,model_requested,effort,argv_hash,prompt_hash,settings_hash,env_hash,
                   tool_contract,agents_hash,max_turns,max_budget_usd,canary_id,out_path,err_path,pid,lstart,contract_drift,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,unixepoch())`)
-      .run(runId, cliVersion, modelRequested, effort, argvHash, promptHash, settingsHash, toolContract, agentsHash,
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,unixepoch())`)
+      .run(runId, cliVersion, modelRequested, effort, argvHash, promptHash, settingsHash, envHash, toolContract, agentsHash,
            maxTurns, maxBudgetUsd, canaryId, outPath, errPath, pid, lstart, contractDrift == null ? null : canonical(contractDrift));
     emit(db, { actor: "daemon", op: "worker.contract", run_id: runId, payload: { cliVersion, modelRequested, argvHash, settingsHash } });
   });

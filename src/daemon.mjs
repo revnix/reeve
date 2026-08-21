@@ -562,6 +562,7 @@ export async function tick(ctx) {
           argvHash: sha256(JSON.stringify(argv)), promptHash: sha256(spec.prompt),
           settingsHash: sha256(readFileSync(settingsPath, "utf8")),
           toolContract: tools, maxTurns, outPath, errPath,
+          envHash: sha256(JSON.stringify(Object.keys(env).sort().map(k => [k, env[k]]))),
         });
 
         r = await (ctx.spawnWorker ?? runWorker)({
@@ -604,8 +605,16 @@ export async function tick(ctx) {
                                     why: r?.why ?? "the worker threw before returning a result",
                                     ms: r?.ms, cost: r?.cost, sessionId: r?.sessionId });
         // A worker that never executed (the gate refused its binding) spent no
-        // fixer's attempt; it is refunded like any pre-execution failure.
-        if (r?.outcome === OUTCOMES.UNBOUND && decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+        // fixer's attempt; it is refunded like any pre-execution failure, and it
+        // backs off like one: a binding that keeps failing would otherwise
+        // lease and refuse the PR on every tick with nobody told.
+        if (r?.outcome === OUTCOMES.UNBOUND) {
+          prepFailed = true;
+          if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+          const prev = PREP_BACKOFF.get(prepKey)?.failures ?? 0;
+          PREP_BACKOFF.set(prepKey, { failures: prev + 1, until: Date.now() + Math.min(PREP_BACKOFF_CAP_MS, PREP_BACKOFF_BASE_MS * 2 ** prev) });
+          escalations.set(`#${e.pr}: the worker could not be prepared; reeve is backing off`, 1);
+        }
         // The flag, not the reason string: a recorder that fails for the same
         // cause rewrites the reason, and a backoff inferred from it vanished.
         if (!prepFailed) PREP_BACKOFF.delete(prepKey);

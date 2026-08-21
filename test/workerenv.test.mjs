@@ -61,6 +61,8 @@ const env = workerEnv({ gitConfigPath, tmpDir: join(dir, "tmp"), bgWaitMs: 12000
                          extra: { AWS_ACCESS_KEY_ID: "p", ALL_PROXY: "s", no_proxy: "s2", GIT_CREDENTIAL_X: "g", NODE_OPTIONS: "--require evil" } });
   check(!("AWS_ACCESS_KEY_ID" in e4) && !("ALL_PROXY" in e4) && !("no_proxy" in e4) && !("GIT_CREDENTIAL_X" in e4) && !("NODE_OPTIONS" in e4),
     "prefix, suffix, and the node preload variable are stripped through extra too", JSON.stringify(Object.keys(e4)));
+  const e4b = workerEnv({ gitConfigPath, tmpDir: dir, bgWaitMs: 1, extra: { GITHUB_ENTERPRISE_TOKEN: "t" } });
+  check(!("GITHUB_ENTERPRISE_TOKEN" in e4b), "gh's second enterprise-token alias is stripped too", JSON.stringify(Object.keys(e4b)));
   // The base is RESERVED: a phase cannot point git back at the founder's
   // config, swap HOME or PATH, or loosen the retry bound through `extra`.
   const e5 = workerEnv({ gitConfigPath, tmpDir: dir, bgWaitMs: 1,
@@ -109,6 +111,14 @@ const env = workerEnv({ gitConfigPath, tmpDir: join(dir, "tmp"), bgWaitMs: 12000
   try { ex("git", ["-C", repo, "commit", "-q", "-m", "worker commit"], { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }); out = ex("git", ["-C", repo, "log", "-1", "--format=%an <%ae>"], { env, encoding: "utf8" }).trim(); }
   catch (e2) { code = e2.status; out = String(e2.stderr); }
   check(code === 0 && out === "merge-policy[bot] <319037914+merge-policy[bot]@users.noreply.github.com>", "a worker commit carries the App's bot identity", out.slice(0, 160));
+  // A repository-local identity outranks the global config; the environment
+  // outranks both. The worker's commits must be the bot's whatever the clone says.
+  ex("git", ["-C", repo, "config", "user.name", "Founder Person"], { env });
+  ex("git", ["-C", repo, "config", "user.email", "founder@example.com"], { env });
+  writeFileSync(join(repo, "g"), "y"); ex("git", ["-C", repo, "add", "g"], { env });
+  ex("git", ["-C", repo, "commit", "-q", "-m", "second"], { env, stdio: ["ignore", "pipe", "pipe"] });
+  const out2 = ex("git", ["-C", repo, "log", "-1", "--format=%an <%ae> %cn"], { env, encoding: "utf8" }).trim();
+  check(out2 === "merge-policy[bot] <319037914+merge-policy[bot]@users.noreply.github.com> merge-policy[bot]", "a repository-local identity cannot re-attribute a worker commit", out2);
 }
 
 

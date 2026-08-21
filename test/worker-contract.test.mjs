@@ -68,6 +68,7 @@ const db = open(join(dir, "c.db"));
   check(row?.model_resolved === "claude-x-resolved", "and the model the worker announced", String(row?.model_resolved));
   check(row?.truncated === 1 && row?.stdout_bytes === 12345, "and whether its durable record was cut, with the byte count", JSON.stringify([row?.truncated, row?.stdout_bytes]));
   check(row?.pid === 4242 && /2026/.test(row?.lstart ?? ""), "and the process identity once the binding succeeds", JSON.stringify([row?.pid, row?.lstart]));
+  check(/^[0-9a-f]{64}$/.test(row?.env_hash ?? ""), "and a hash of the exact environment it ran under", String(row?.env_hash));
   // The daemon binds through the revalidating store call, not the plain write.
   const dsrc2 = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
   check(/onSpawn: \(\{ pid, lstart \}\) => \{ bindRun\(db/.test(dsrc2), "control: the daemon's binding calls bindRun", "");

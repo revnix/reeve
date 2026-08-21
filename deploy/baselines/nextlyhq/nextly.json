@@ -1,9 +1,13 @@
 {
-  "capturedAt": "2026-08-21T21:20:43.358Z",
+  "capturedAt": "2026-08-21T21:45:36.651Z",
   "nwo": "nextlyhq/nextly",
   "branch": "main",
+  "liveDefaultBranch": "main",
   "rulesetNames": [
     "protect-main"
+  ],
+  "rulesetSnapshot": [
+    "protect-main|bypass:[\"OrganizationAdmin::always\"]|rules:[\"deletion:{}\",\"non_fast_forward:{}\",\"pull_request:{\\\"allowed_merge_methods\\\":[\\\"merge\\\",\\\"squash\\\",\\\"rebase\\\"],\\\"dismiss_stale_reviews_on_push\\\":false,\\\"dismissal_restriction\\\":{\\\"allowed_actors\\\":[],\\\"enabled\\\":false},\\\"require_code_owner_review\\\":true,\\\"require_extra_approval_for_unattributed_changes\\\":true,\\\"require_last_push_approval\\\":false,\\\"required_approving_review_count\\\":1,\\\"required_review_thread_resolution\\\":false,\\\"required_reviewers\\\":[]}\"]"
   ],
   "ruleSnapshot": [
     "deletion:{}",

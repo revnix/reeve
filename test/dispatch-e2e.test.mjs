@@ -271,6 +271,11 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   await tick(ctx10);
   const spent = ctx10.db.prepare("SELECT COALESCE(SUM(attempts),0) n FROM fix_attempt").get().n;
   check(spent === 0, "no fixer ran, so no attempt is spent", String(spent));
+  // A binding that keeps failing is a preparation failure: it backs off and
+  // stands as one escalation, instead of leasing and refusing every tick.
+  const r10b = await tick(ctx10);
+  check(ctx10.db.prepare("SELECT COUNT(*) n FROM run").get().n === 1, "a second tick after an unbound launch stays in the backoff", String(ctx10.db.prepare("SELECT COUNT(*) n FROM run").get().n));
+  check([...(r10b.escalations?.keys() ?? [])].some(k => /could not be prepared/.test(k)), "and the failure stands as the preparation escalation", [...(r10b.escalations?.keys() ?? [])].join(" | "));
   ctx10.db.close();
   rmSync(dir10, { recursive: true, force: true });
 }

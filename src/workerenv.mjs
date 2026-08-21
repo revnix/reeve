@@ -44,7 +44,7 @@ const SYSTEM_PATH = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", 
 // by prefix, or by suffix; a phase's `extra` cannot reintroduce them. The git
 // entries are every documented way to point git at another config, another
 // repository, or a credential source.
-const STRIP_EXACT = new Set(["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "SSH_AUTH_SOCK", "SSH_AGENT_PID",
+const STRIP_EXACT = new Set(["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "SSH_AUTH_SOCK", "SSH_AGENT_PID",
                              "GIT_SSH", "GIT_SSH_COMMAND", "GIT_ASKPASS", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
                              "GIT_CONFIG_SYSTEM", "GIT_EXEC_PATH", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
                              "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES",
@@ -68,8 +68,13 @@ export function writeShims(dir) {
   mkdirSync(shims, { recursive: true });
   for (const name of SHIMMED) {
     const path = join(shims, name);
-    writeFileSync(path, SHIM(name));
-    chmodSync(path, 0o755);
+    // Replaced atomically: every daemon on the host rewrites these while
+    // another daemon's worker may be resolving them, and a truncated shim
+    // would run as an empty, succeeding script instead of refusing.
+    const tmp = join(shims, `.${name}.${process.pid}.${Date.now()}.tmp`);
+    writeFileSync(tmp, SHIM(name));
+    chmodSync(tmp, 0o755);
+    renameSync(tmp, path);
   }
   return shims;
 }
@@ -127,6 +132,11 @@ export function workerEnv({ gitConfigPath, tmpDir, bgWaitMs, maxRetries = 1, ext
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_GLOBAL: gitConfigPath,
     GIT_TERMINAL_PROMPT: "0",
+    // The identity in the environment outranks every config level, so a
+    // clone's own user.name cannot re-attribute a worker's commit to the
+    // founder (measured: a repository-local identity beat the global one).
+    GIT_AUTHOR_NAME: WORKER_GIT_IDENTITY.name, GIT_AUTHOR_EMAIL: WORKER_GIT_IDENTITY.email,
+    GIT_COMMITTER_NAME: WORKER_GIT_IDENTITY.name, GIT_COMMITTER_EMAIL: WORKER_GIT_IDENTITY.email,
   };
   const reserved = new Set(Object.keys(env));
   for (const [k, v] of Object.entries(extra)) {

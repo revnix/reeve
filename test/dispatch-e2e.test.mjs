@@ -53,6 +53,9 @@ const baseCtx = () => ({
   // The tests below exercise dispatch, so they declare what the real module
   // cannot yet: a closed credential read. The default refuses; see the last case.
   containment: { credentialRead: "closed", why: "test" },
+  // The worker is stubbed, so no CLI is resolved or launched: the seam is
+  // given an absolute path and a version, which is what a real dispatch records.
+  claudeBin: "/bin/sh", cliVersion: "test",
   openPrs: () => [42],
   evaluate: () => evaluation,
   publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),

@@ -130,9 +130,12 @@ export function readReviewerStates(nwo, pr, head, reviewers, io = null) {
 
 /** Everything, for one PR, at one pinned head. */
 export function evaluatePr({ nwo, pr, profile, db = null }) {
-  const meta = ghJson([`repos/${nwo}/pulls/${pr}`, "--jq", "[.head.ref,.base.ref,.state,.title]|@tsv"]);
+  // updated_at rides along so ingest can skip a pull request that has not moved.
+  // It is GitHub's timestamp, so a change reeve has not seen yet still triggers a
+  // read -- unlike a local clock, which would skip whatever it slept through.
+  const meta = ghJson([`repos/${nwo}/pulls/${pr}`, "--jq", "[.head.ref,.base.ref,.state,.title,.updated_at]|@tsv"]);
   if (!meta.ok) return { ok: false, why: meta.err.split("\n")[0] };
-  const [headRef, baseRef, state, title] = meta.out.split("\t");
+  const [headRef, baseRef, state, title, updatedAt] = meta.out.split("\t");
 
   const pin = pinHead(nwo, headRef);
   if (!pin.ok) return { ok: false, why: `could not pin head: ${pin.why}` };
@@ -209,7 +212,7 @@ export function evaluatePr({ nwo, pr, profile, db = null }) {
   });
 
   return { ok: true, pr, title, headRef, baseRef, state, head: pin.sha, verdict,
-           reviewers, threads, rounds, forcePushedAt, checks: c, settled: s };
+           reviewers, threads, rounds, forcePushedAt, updatedAt, checks: c, settled: s };
 }
 
 /**

@@ -28,6 +28,7 @@ import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, ref
 import { writeDash } from "./dash.mjs";
 import { snapshot } from "./backup.mjs";
 import { selfAudit } from "./selfaudit.mjs";
+import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
@@ -241,6 +242,33 @@ export async function tick(ctx) {
     evaluated.add(pr);
     const rec = reconcilePr(db, { nwo, pr, profile });
     if (rec.ok && rec.released) log(logPath, `  #${pr}: released ${rec.released} lease(s) — PR merged`);
+
+    // Review ingest, in SHADOW: it writes and nothing reads. Landing raw
+    // observations now means the derivation that comes next has history to fold
+    // rather than starting from whatever it happens to see on its first tick.
+    //
+    // Skipped unless the PR moved, because re-polling a quiet PR costs API quota
+    // for rows the content key would reject anyway. `updatedAt` is GitHub's, so a
+    // change reeve has not seen yet still triggers a read.
+    if (ctx.reviewIngest !== false && e.ok) {
+      noteHead(db, nwo, pr, e.head);
+      const moved = !ctx.lastIngest?.get?.(pr) || ctx.lastIngest.get(pr) !== e.updatedAt;
+      if (moved) {
+        try {
+          const seen = (ctx.observe ?? observe)(nwo, pr);
+          const w = ingest(db, nwo, pr, seen.observations, { at: now() });
+          if (w.inserted || w.generations) {
+            log(logPath, `  #${pr}: ingest +${w.inserted} new, +${w.generations} edit(s)` +
+                         `${seen.incomplete ? " — INCOMPLETE read" : ""}`);
+          }
+          // Only a COMPLETE read updates the watermark. Skipping a PR on the
+          // strength of a partial read is how a gap becomes permanent.
+          if (!seen.incomplete) (ctx.lastIngest ??= new Map()).set(pr, e.updatedAt);
+        } catch (err) {
+          log(logPath, `  #${pr}: ingest failed — ${err.message}`);
+        }
+      }
+    }
 
     // The root cause is resolved BEFORE the decision, not after it. The watcher's
     // retry cap reads `h.fingerprint`, and the daemon never supplied one -- so the

@@ -52,13 +52,29 @@ const clause = (v, id) => v.clauses.find(c => c.id === id);
  */
 const REVIEW_ACTIONS = new Set([ACTIONS.REQUEST_REVIEW, ACTIONS.FIX_FINDINGS, ACTIONS.SPILL]);
 
+// The gated why is an IDENTITY, so it is built from WHICH action was gated,
+// never from the clause detail. The detail is a report -- for threads it reads
+// "13 of 17 thread(s) unresolved" -- and embedding it meant every resolved or
+// newly opened thread changed the key, which the escalation layer reads as a NEW
+// problem. Measured on nextly #1128: three phone pushes in one morning for one
+// unchanged condition, at 13 of 17, then 23 of 27. The founder was being paged
+// about progress.
+const GATED_WHY = {
+  [ACTIONS.FIX_FINDINGS]: "needs a human: the review half is not built, so reeve cannot work the unresolved review threads",
+  [ACTIONS.REQUEST_REVIEW]: "needs a human: the review half is not built, so reeve cannot request a review round",
+  [ACTIONS.SPILL]: "needs a human: the review half is not built, so reeve cannot spill findings past the round cap",
+};
+
 function gateReviewActions(decision, p) {
   if (!REVIEW_ACTIONS.has(decision.action)) return decision;
   if (p.watch?.reviewActions === true) return decision;
   return {
     ...decision,
     action: ACTIONS.ESCALATE,
-    why: `needs a human: the review half is not built, so reeve cannot act on "${decision.why}"`,
+    why: GATED_WHY[decision.action],
+    // The clause detail, counts and all, for the log and `reeve why` -- a report
+    // belongs on surfaces a human reads deliberately, not in the key that pages.
+    detail: decision.why,
     gated: decision.action,
   };
 }

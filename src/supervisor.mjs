@@ -139,12 +139,26 @@ export function classifyResult(result, { code, signal, killedByUs }) {
   if (!result) return { outcome: OUTCOMES.CRASHED, why: `exited ${code} without a result event` };
   if (result.api_error_status === 429) return { outcome: OUTCOMES.RATE_LIMITED, why: "provider returned 429" };
   if (result.is_error) return { outcome: OUTCOMES.FAILED, why: result.terminal_reason ?? result.result ?? "is_error" };
-  // A denied tool call still exits 0 with is_error false, and the model writes a
-  // plausible answer explaining what it could not run. Trusting that answer is
-  // the fail-open here.
+  // Denials are CARRIED, not fatal.
+  //
+  // The original rule made any refusal disqualify the run, on the grounds that a
+  // denied worker exits 0 and writes a plausible account of what it could not do.
+  // That reasoning is right about the NARRATIVE and wrong about the artifact, and
+  // it made dispatch impossible in practice: a model explores, so given a worktree
+  // it eventually reaches outside it. Run 10 was denied exactly once — for
+  // `grep … ~/Library/LaunchAgents/…`, a correct refusal — and that threw away a
+  // completed run. Waiting for zero denials is waiting for a model that never
+  // looks around.
+  //
+  // reeve never needed the narrative. The diff is reported by git, not by the
+  // worker, and CI re-runs at the head reeve publishes. Publication therefore
+  // rests on those, and the denials travel with the result so the sandbox can be
+  // tuned and a human can see what the worker could not do.
+  //
+  // What still disqualifies is not knowing what happened at all: a timeout, a
+  // crash, an error — each handled above, before this line.
   const denials = result.permission_denials ?? [];
-  if (denials.length) return { outcome: OUTCOMES.DENIED, why: `${denials.length} tool call(s) denied`, denials };
-  return { outcome: OUTCOMES.OK, why: result.terminal_reason ?? "completed" };
+  return { outcome: OUTCOMES.OK, why: result.terminal_reason ?? "completed", denials };
 }
 
 /**

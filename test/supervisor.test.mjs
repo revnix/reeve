@@ -32,9 +32,19 @@ check("is_error beats a 'success' subtype",
   R({ is_error: true, subtype: "success", terminal_reason: "auth" }), OUTCOMES.FAILED);
 
 // A denied worker exits 0, reports is_error:false, and writes a plausible answer
-// explaining what it could not run. Trusting that answer is the fail-open.
-check("denied tool calls are not a success",
-  R({ is_error: false, subtype: "success", permission_denials: [{ tool: "Bash" }] }), OUTCOMES.DENIED);
+// explaining what it could not run — so its ACCOUNT of itself is worthless. That
+// was once read as "the run is worthless", which made dispatch impossible: a model
+// explores, so given a worktree it eventually reaches outside it, and one correct
+// refusal threw away a finished run.
+//
+// The account was never what reeve relied on. The diff comes from git and CI
+// re-runs at the published head, so the artifact is checked independently.
+// Denials now travel with the result — they are how the sandbox gets tuned, and a
+// worker denied its own tests produced something nothing verified.
+//
+// See test/denial-policy.test.mjs for the whole contract.
+check("a finished run is OK even when a call was refused",
+  R({ is_error: false, subtype: "success", permission_denials: [{ tool: "Bash" }] }), OUTCOMES.OK);
 
 check("a 429 is its own outcome",
   R({ is_error: true, subtype: "success", api_error_status: 429 }), OUTCOMES.RATE_LIMITED);

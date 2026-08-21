@@ -378,7 +378,7 @@ export async function tick(ctx) {
 
       if (r.outcome === OUTCOMES.OK) {
         const changed = changedFiles(worktree, e.head);
-        const gate = reviewDiff({ files: changed, profile, lane });
+        const gate = reviewDiff({ files: changed, profile, lane, action: decision.action });
         if (!gate.ok) {
           log(logPath, `  #${e.pr}: NOT published — ${gate.why}`);
           escalations.set(`#${e.pr}: a fix was produced but refused publication — ${gate.why}`, 1);

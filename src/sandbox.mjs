@@ -69,6 +69,22 @@ const NEVER = [
  * reading them is how it understands the exam. */
 const SELF_GOVERNING = [".github/**", ".git/**"];
 
+/**
+ * Where a project's tests live, when the profile does not say.
+ *
+ * Tests judge the work exactly as the workflow does, but they cannot simply be
+ * denied: the worker prompt REQUIRES a test that fails on the broken code, so a
+ * repair that adds one is the intended shape. What is never a repair is a diff
+ * with nothing in it BUT tests -- that has changed the exam and nothing else.
+ */
+const TEST_PATHS = [
+  "test/**", "tests/**", "spec/**", "**/__tests__/**",
+  "**/*.test.*", "**/*_test.*", "**/*.spec.*", "**/test_*.py",
+];
+
+/** Actions whose whole purpose is to change code so a check goes green. */
+const REPAIRING = new Set(["FIX_CI"]);
+
 /** What a project of each language is actually run with. */
 const RUNTIMES = {
   typescript: ["node", "npx", "tsx"],
@@ -226,7 +242,7 @@ const matchesAny = (file, globs) => (globs ?? []).some(g => toRe(g).test(file));
  * An EMPTY diff refuses. A worker that changed nothing has not fixed anything,
  * and pushing nothing as though it were a repair is absence read as success.
  */
-export function reviewDiff({ files, profile, lane = null }) {
+export function reviewDiff({ files, profile, lane = null, action = null }) {
   const risk = profile?.risk ?? {};
   // null is "could not ask git", which is not the same as "nothing changed" and
   // must not be reported as it. Both refuse; only one of them is the worker's fault.
@@ -246,6 +262,20 @@ export function reviewDiff({ files, profile, lane = null }) {
   const sensitive = list.filter(f => matchesAny(f, risk.sensitivePaths));
   if (sensitive.length)
     return { ok: false, why: `sensitive path(s) changed and need a human: ${sensitive.join(", ")}`, files: sensitive };
+
+  // A repair that changed ONLY tests has repaired nothing. Either the test was
+  // genuinely wrong -- a real case, and one a human should judge rather than a
+  // fixer decide alone -- or it was weakened until it stopped objecting. Both
+  // escalate; neither is published on the strength of the resulting green.
+  //
+  // The honest limit: a diff that touches one source line and guts a suite still
+  // passes here. This refuses the whole-hog case only.
+  if (REPAIRING.has(action)) {
+    const tests = risk.testPaths ?? TEST_PATHS;
+    if (list.every(f => matchesAny(f, tests)))
+      return { ok: false, files: list,
+               why: `every changed file is a test, so nothing was repaired -- only what judges it: ${list.join(", ")}` };
+  }
 
   // No lane means territory was never assigned, which is not the same as being
   // allowed everywhere — but it is the profile's own choice, and the risk rules

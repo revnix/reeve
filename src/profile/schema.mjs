@@ -146,6 +146,9 @@ export const FIELDS = {
   "risk.sensitivePaths":    [false, isArr(isStr)],     // migrations, auth, secrets, release metadata
   "risk.quarantinePaths":   [false, isArr(isStr)],     // never touched: prod dumps, other clients' creds
   "risk.forbiddenCommands": [false, isArr(isStr)],     // db:migrate:fresh, store submit, publish
+  // Where this project's tests live, when the built-in globs do not fit it. A
+  // repair whose whole diff lands in here changed the exam rather than the code.
+  "risk.testPaths":         [false, isArr(isStr)],
 
   // Read by the daemon and the watcher. Declared here because the validator
   // refused a profile using them and `reeve doctor` exited before doing anything:

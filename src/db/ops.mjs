@@ -478,7 +478,7 @@ export function finishRun(db, { runId, outcome, why = null, ms = null, cost = nu
   // A cancelled run was stopped on request and a lease-lost run was stopped by
   // the infrastructure: both are abandoned, with the node returned to ready,
   // because nothing was learned about the PR and neither is the worker's fault.
-  const status = outcome === "ok" ? "succeeded" : (outcome === "cancelled" || outcome === "lease_lost") ? "abandoned" : "failed";
+  const status = outcome === "ok" ? "succeeded" : (outcome === "cancelled" || outcome === "lease_lost" || outcome === "unbound") ? "abandoned" : "failed";
   return tx(db, () => {
     // Only a run this process still owns may be finished. A run another actor
     // reaped or abandoned has moved on; a stale worker's verdict must not

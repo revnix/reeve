@@ -602,21 +602,9 @@ export async function tick(ctx) {
           r = { ...r, outcome: OUTCOMES.CANCELLED, why: r.why };
           if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
         }
-        // What the worker said it ran as, and whether its durable record is whole.
-        // Facts that cannot be recorded are facts nobody can audit later, so a
-        // run whose facts did not land is not a successful run, whatever the
-        // worker said: the outcome becomes failed before the run is closed.
-        try { (ctx.noteWorkerResult ?? noteWorkerResult)(db, { runId: run.runId, modelResolved: r?.model ?? null, truncated: r?.truncated === true || r?.stderrTruncated === true, stdoutBytes: r?.stdoutBytes ?? null }); }
-        catch (err) { r = { ...(r ?? {}), outcome: OUTCOMES.FAILED, why: `the run's result facts could not be recorded: ${err.message}` }; }
-        // Closed in `finally`: a throw between spawn and result would otherwise
-        // leave the run leased forever, and the PR unworkable until it expired.
-        // finishRun itself refuses a run this process no longer owns (a lost
-        // lease means another actor already moved it), so a stale outcome can
-        // never overwrite the newer state.
-        const fin = finishRun(db, { runId: run.runId, outcome: r?.outcome ?? "failed",
-                                    why: r?.why ?? "the worker threw before returning a result",
-                                    ms: r?.ms, cost: r?.cost, sessionId: r?.sessionId });
-        // A worker that never executed (the gate refused its binding) spent no
+        // Pre-execution outcomes are classified BEFORE the recorder and the
+        // finish, so a recorder that fails cannot rewrite them into a spent
+        // failure. A worker that never executed (the gate refused its binding) spent no
         // fixer's attempt; it is refunded like any pre-execution failure, and it
         // backs off like one: a binding that keeps failing would otherwise
         // lease and refuse the PR on every tick with nobody told.
@@ -629,6 +617,27 @@ export async function tick(ctx) {
         }
         // The flag, not the reason string: a recorder that fails for the same
         // cause rewrites the reason, and a backoff inferred from it vanished.
+        // What the worker said it ran as, and whether its durable record is whole.
+        // Facts that cannot be recorded are facts nobody can audit later, so a
+        // run whose facts did not land is not a successful run, whatever the
+        // worker said: the outcome becomes failed before the run is closed.
+        try { (ctx.noteWorkerResult ?? noteWorkerResult)(db, { runId: run.runId, modelResolved: r?.model ?? null, truncated: r?.truncated === true || r?.stderrTruncated === true, stdoutBytes: r?.stdoutBytes ?? null }); }
+        catch (err) {
+          // A pre-execution outcome stays what it is (nothing ran, nothing to
+          // publish); only an outcome that could have been published is
+          // downgraded to failed when its facts did not land.
+          const pre = r?.outcome === OUTCOMES.UNBOUND || r?.outcome === OUTCOMES.CANCELLED || r?.outcome === OUTCOMES.LEASE_LOST;
+          r = pre ? { ...r, why: `${r.why}; result facts could not be recorded: ${err.message}` }
+                  : { ...(r ?? {}), outcome: OUTCOMES.FAILED, why: `the run's result facts could not be recorded: ${err.message}` };
+        }
+        // Closed in `finally`: a throw between spawn and result would otherwise
+        // leave the run leased forever, and the PR unworkable until it expired.
+        // finishRun itself refuses a run this process no longer owns (a lost
+        // lease means another actor already moved it), so a stale outcome can
+        // never overwrite the newer state.
+        const fin = finishRun(db, { runId: run.runId, outcome: r?.outcome ?? "failed",
+                                    why: r?.why ?? "the worker threw before returning a result",
+                                    ms: r?.ms, cost: r?.cost, sessionId: r?.sessionId });
         if (!prepFailed) PREP_BACKOFF.delete(prepKey);
         if (fin?.applied === false) {
           // The store refused the outcome: the claim was gone or withdrawn by

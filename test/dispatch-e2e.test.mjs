@@ -327,6 +327,22 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(dir12, { recursive: true, force: true });
 }
 
+
+// --- a recorder failure cannot turn an unbound launch into a spent failure --
+{
+  const dir13 = mkdtempSync(join(tmpdir(), "reeve-e2e-unbound-rec-"));
+  const ctx13 = { ...baseCtx(), db: open(join(dir13, "r.db")), logPath: join(dir13, "log.txt"), worktreeFor: () => mkdtempSync(join(dir13, "wt-")),
+                  noteWorkerResult: () => { throw new Error("disk full"); } };
+  ctx13.spawnWorker = async () => ({ outcome: "unbound", why: "run binding failed: x", ms: 1, cost: null, sessionId: null });
+  const r13 = await tick(ctx13);
+  check(ctx13.db.prepare("SELECT COALESCE(SUM(attempts),0) n FROM fix_attempt").get().n === 0, "the attempt is still refunded when the recorder fails", "");
+  check([...(r13.escalations?.keys() ?? [])].some(k => /could not be prepared/.test(k)), "and the preparation backoff is still installed", [...(r13.escalations?.keys() ?? [])].join(" | "));
+  const node13 = ctx13.db.prepare("SELECT status FROM node WHERE id='pr:42'").get();
+  check(node13?.status !== "blocked", "and the PR is not blocked by a worker that never ran", JSON.stringify(node13));
+  ctx13.db.close();
+  rmSync(dir13, { recursive: true, force: true });
+}
+
 ctx.db.close();
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

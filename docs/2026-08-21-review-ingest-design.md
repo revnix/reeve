@@ -466,12 +466,21 @@ never silence.
 
 ## 13. Rollout — PR sequence, each with its own verification
 
-1. **PR-1 fix-now** (F-1, F-2, F-3, F-6). Verify: a fabricated success-with-
-   rate-limited status is excluded from classification; the fail-green head
-   #1128@34952fb re-classified by hand.
-2. **PR-2 ingest writers**: head_seen + inbox writers + generations. Shadow —
-   nothing consumes. Verify: two ticks produce byte-identical inbox state
-   (idempotence); an edited CodeRabbit comment appends a generation.
+1. **PR-1 fix-now — DONE** (`80aeac1`, `94f13f7`). F-1/F-2/F-3/F-6, each with a
+   stub-verified test. Confirmed live: `CodeRabbit state=success desc=Review rate
+   limited` on #1128's head no longer reaches classification. It also
+   reintroduced the stale-settlement-floor incident within a minute of shipping,
+   so CHECK_ACCOUNTING is now held by a fingerprint over the code that decides
+   what counts, rather than by remembering to bump it.
+2. **PR-2 ingest writers — DONE** (`5754691`). head_seen, inbox generations, and
+   the reshape of a table that had existed with zero writers since the beginning.
+   Live on nextly: 159 observations across five PRs; a tick over unchanged PRs
+   writes nothing; a tick where Codex filed a new review with three P2 threads
+   captured exactly those four objects, and rows still equal distinct objects, so
+   no re-hash churn. It also caught a defect no unit test would have found — one
+   App answering to two logins (`coderabbitai[bot]` over REST, `coderabbitai`
+   over GraphQL), which would have halved every reviewer's evidence at derivation
+   time and errored nowhere.
 3. **PR-3 projections + fold** + classifier_version + doctor detector controls.
    Verify: DELETE projections, re-fold, byte-identical; taxonomy-change drill
    (edit a marker regex → version changes → rebuild observed).
@@ -509,7 +518,24 @@ never silence.
 Every test lands with the stub run recorded (control green → stub applied →
 the RIGHT assertion red → restore green), per the standing verification rule.
 
-## 15. Open founder decisions
+## 15. Founder decisions — SETTLED 2026-08-21
+
+Taken on the founder's instruction to proceed on recommendations.
+
+a. **SPILL stays OFF indefinitely.** Bots auto-review every push, so round counts
+   measure PR churn rather than reeve's fix loop, and SPILL's precondition fires
+   most eagerly on the busiest PRs. Escalation at the cap was always the honest
+   behaviour. Revisit only if FIX_FINDINGS running for a while shows a real need.
+b. **Advisory criticals block.** A P0 is a P0 whoever filed it; blocking-ness
+   gates coverage, never severity. As specified in §7.3.
+c. **Supply stays repo-scoped**, revisited when a second project exists (§16).
+d. **No human resolution override.** The cost of strictness is one bot round,
+   which REQUEST_REVIEW automates.
+e. **Greptile stays unrostered.** Measured: it publishes no commit-status context
+   at all, and graceful degradation already counts its threads at severity
+   `unknown`, which fails closed.
+
+### The options as originally posed
 
 a. **SPILL semantics under auto-review.** Rounds now measure PR churn, not
    reeve's loop. Options: (1) keep SPILL off indefinitely — escalation at the

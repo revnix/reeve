@@ -187,7 +187,15 @@ export function sandboxFor({ profile, action, worktree, lane = null }) {
     ...NEVER,
     ...(risk.forbiddenCommands ?? []).map(c => `Bash(${c}:*)`),
     ...(risk.quarantinePaths ?? []).flatMap(denyAllVerbs),
-    ...(risk.sensitivePaths ?? []).flatMap(denyWriteVerbs),
+    // A lane may declare sensitiveOk to work its own territory even where that
+    // territory is sensitive -- without it the release lane was dead at both
+    // layers, this one denying the write whose result the diff gate would have
+    // refused anyway. The lift is by VERBATIM glob only, because glob-subset
+    // reasoning cannot be done safely here; the diff gate still judges every
+    // actual file, and quarantine and SELF_GOVERNING stay untouched below.
+    ...(risk.sensitivePaths ?? [])
+      .filter(p => !(lane?.sensitiveOk === true && (lane.territory ?? []).includes(p)))
+      .flatMap(denyWriteVerbs),
     ...SELF_GOVERNING.flatMap(denyWriteVerbs),
   ];
 
@@ -259,7 +267,15 @@ export function reviewDiff({ files, profile, lane = null, action = null }) {
   if (governing.length)
     return { ok: false, why: `the change edits what judges it: ${governing.join(", ")}`, files: governing };
 
-  const sensitive = list.filter(f => matchesAny(f, risk.sensitivePaths));
+  // A lane that declared sensitiveOk works its OWN territory even where that
+  // territory is sensitive -- the release lane's whole territory sat in
+  // sensitivePaths, so this refusal fired before territory was ever read and
+  // the lane could never publish anything. The exemption is per actual file,
+  // scoped to the declaring lane's territory, and sits BELOW quarantine and
+  // self-governing, which no declaration reaches.
+  const laneOwned = lane?.sensitiveOk === true && (lane.territory ?? []).length
+    ? f => matchesAny(f, lane.territory) : () => false;
+  const sensitive = list.filter(f => matchesAny(f, risk.sensitivePaths) && !laneOwned(f));
   if (sensitive.length)
     return { ok: false, why: `sensitive path(s) changed and need a human: ${sensitive.join(", ")}`, files: sensitive };
 

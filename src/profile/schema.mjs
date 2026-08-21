@@ -131,6 +131,10 @@ const LANE = v => {
   // Territories are GLOBS, not regexes. The previous system used regexes over
   // packages/*, which matched 3 of 10 repos and left 32 of 93 tasks unroutable.
   const t = isArr(isStr)(v.territory); if (t) return `territory ${t}`;
+  // The explicit way a lane works a territory that is ALSO sensitive: without
+  // it, sensitive refuses before territory is read and the lane is dead by
+  // construction. Boolean only -- a truthy accident must not relax a risk rule.
+  if (v.sensitiveOk !== undefined) { const b = isBool(v.sensitiveOk); if (b) return `sensitiveOk ${b}`; }
   return null;
 };
 
@@ -328,6 +332,20 @@ export function validate(profile) {
   for (const r of get(profile, "reviewers") ?? []) {
     if (r.kind === "blocking" && !r.trigger)
       warnings.push(`reviewer ${r.login} is blocking but has no trigger: it can never be re-requested at a new head`);
+  }
+
+  // A lane whose every territory glob sits in sensitivePaths can never act:
+  // sensitive refuses before territory is read. Measured live on the release
+  // lane, which was dead by construction and visible to nobody. Compared by
+  // verbatim glob -- the same identity the tool-layer lift uses -- so a partly
+  // sensitive territory, which can still act on its remainder, stays silent.
+  {
+    const sens = new Set(get(profile, "risk.sensitivePaths") ?? []);
+    for (const l of get(profile, "lanes") ?? []) {
+      if (l.sensitiveOk === true) continue;
+      if ((l.territory ?? []).length && l.territory.every(g => sens.has(g)))
+        warnings.push(`lane ${l.id} can never act: every territory glob is in risk.sensitivePaths and the lane does not declare sensitiveOk`);
+    }
   }
 
   if ((get(profile, "ci.provider") ?? "none") === "none" && (get(profile, "ci.requiredChecks") ?? []).length)

@@ -193,5 +193,26 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
   check(diffBaseline(widened, live).drifted === true && /bypass allowances/.test(diffBaseline(widened, live).lines.join(" ")), "a new allowance is drift, and is named", "");
 }
 
+
+// ── strict required-check policy, zero-segment doublestar, collision-free paths
+{
+  const { readLiveBaseline, rulesetCoversBranch, baselinePathFor } = await import("../src/baseline.mjs");
+  const gh = path => {
+    if (path.endsWith("/rulesets")) return [{ id: 1, name: "r", enforcement: "active", target: "branch" }];
+    if (path.endsWith("/rulesets/1")) return { target: "branch", rules: [{ type: "required_status_checks", parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: "ci" }] } }], bypass_actors: [] };
+    const e = new Error("HTTP 404"); e.stderr = "HTTP 404"; throw e;
+  };
+  const live = readLiveBaseline("o/r", { identity: { defaultBranch: "main" }, authority: {}, merge: {}, builder: {} }, { gh });
+  check(live.strictRequiredChecks === true, "the strict up-to-date policy is captured", JSON.stringify(live.strictRequiredChecks));
+  const loosened = { ...live, strictRequiredChecks: false };
+  check(diffBaseline(loosened, live).drifted === true && /strict/.test(diffBaseline(loosened, live).lines.join(" ")), "loosening it is drift, and is named", "");
+
+  const cond = include => ({ conditions: { ref_name: { include, exclude: [] } } });
+  check(rulesetCoversBranch(cond(["refs/heads/**/foo"]), "foo", "main") === true, "a doublestar may match zero segments: **/foo covers foo");
+  check(rulesetCoversBranch(cond(["refs/heads/**/foo"]), "a/b/foo", "main") === true, "and any number of them");
+
+  check(baselinePathFor("foo-bar/baz") !== baselinePathFor("foo/bar-baz"), "owner and repo stay distinct in the baseline path", baselinePathFor("foo-bar/baz"));
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

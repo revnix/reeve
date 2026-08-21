@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-08-21T20:07:52.537Z",
+  "capturedAt": "2026-08-21T20:21:52.503Z",
   "nwo": "nextlyhq/nextly",
   "branch": "main",
   "rulesetNames": [
@@ -13,6 +13,7 @@
     "Decide what this commit can affect@15368"
   ],
   "classicBypassAllowances": [],
+  "strictRequiredChecks": false,
   "requiredApprovals": 1,
   "codeOwnerReview": true,
   "dismissStaleReviews": false,

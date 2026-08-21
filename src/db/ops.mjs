@@ -151,11 +151,21 @@ export function claim(db, { lane, actor = lane, territory = null, pid = process.
 // the caller must then stop, because another run may already own the task.
 export function heartbeat(db, { runId, actor = "lane" }) {
   return tx(db, () => {
+    // An expired lease is not renewed by a late heartbeat: a daemon that stalled
+    // past the deadline while its worker kept running has already lost the
+    // claim, and reviving it here would let that worker finish and publish
+    // under a lease that had lapsed.
     const r = db.prepare(`
       UPDATE run SET heartbeat_at=unixepoch(), lease_expires_at=unixepoch()+?
       WHERE id=? AND status IN ('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')
+        AND lease_expires_at > unixepoch()
       RETURNING task_id`).get(LEASE_SECONDS, runId);
-    if (!r) return { alive: false, reason: "lease-lost" };
+    if (!r) {
+      const row = db.prepare(`SELECT status, lease_expires_at FROM run WHERE id=?`).get(runId);
+      const expired = row && row.lease_expires_at <= Math.floor(Date.now() / 1000)
+        && ['leased','running','blocked_on_ci','blocked_on_review','awaiting_founder'].includes(row.status);
+      return { alive: false, reason: expired ? "lease-expired" : "lease-lost" };
+    }
     const c = db.prepare(`SELECT cancel_requested FROM task_exec WHERE task_id=?`).get(r.task_id);
     if (c?.cancel_requested) return { alive: false, reason: "cancelled" };
     return { alive: true };

@@ -501,7 +501,6 @@ export async function tick(ctx) {
       // or it cannot tell whether its fix worked.
       const lane = (profile.lanes ?? []).find(l => l.id === decision.lane) ?? null;
       const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane });
-      const settingsPath = writeSandbox(join(dirname(ctx.logPath ?? "/tmp/x"), "sandboxes", String(e.pr)), sandbox);
 
       let r;
       try {
@@ -525,6 +524,10 @@ export async function tick(ctx) {
                                 tmpDir: join(runDir, "tmp"), bgWaitMs: budgetMs,
                                 extraPath: [dirname(claudeBin)] });
         const outPath = join(runDir, "worker.out"), errPath = join(runDir, "worker.err");
+        // The settings file is immutable per run, in the run's own directory:
+        // a path keyed by PR alone was shared by every daemon on the host, and
+        // one could overwrite it between this run's hash and its spawn.
+        const settingsPath = writeSandbox(runDir, sandbox);
         const maxTurns = profile.watch?.maxTurns ?? 40;
         const tools = spec.tools ?? sandbox.allowedTools;
         const argv = workerArgs({ prompt: spec.prompt, allowedTools: tools, settings: settingsPath, maxTurns });

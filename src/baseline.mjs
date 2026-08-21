@@ -17,7 +17,10 @@ const PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 /** Where a repo's checked-in baseline lives: committed under deploy/, never under test/. */
 export function baselinePathFor(nwo) {
-  return join(PKG_ROOT, "deploy", "baselines", `${nwo.replace("/", "-")}.json`);
+  // Owner and repository as separate path components: a hyphen join maps
+  // `foo-bar/baz` and `foo/bar-baz` to one file.
+  const [owner, repo] = nwo.split("/");
+  return join(PKG_ROOT, "deploy", "baselines", owner, `${repo}.json`);
 }
 
 // Every list endpoint is paginated and slurped, so a repository with more
@@ -44,7 +47,12 @@ function fnmatchRe(pat) {
   let re = "^";
   for (let i = 0; i < pat.length; i++) {
     const c = pat[i];
-    if (c === "*") { if (pat[i + 1] === "*") { re += ".*"; i++; } else re += "[^/]*"; }
+    if (c === "*") {
+      if (pat[i + 1] === "*") {
+        // `**/` covers zero or more whole segments, so `**/foo` matches `foo`.
+        if (pat[i + 2] === "/") { re += "(?:.*/)?"; i += 2; } else { re += ".*"; i++; }
+      } else re += "[^/]*";
+    }
     else if (c === "?") re += "[^/]";
     else if (c === "[") { const j = pat.indexOf("]", i + 1); if (j > i) { re += "[" + pat.slice(i + 1, j).replace(/\\/g, "\\\\") + "]"; i = j; } else re += "\\["; }
     else re += c.replace(/[.+^${}()|\\]/g, "\\$&");
@@ -81,8 +89,12 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {
   const active = covering.map(c => c.meta);
   const detail = covering.map(c => c.detail);
   const rules = detail.flatMap(r => r.rules ?? []);
-  const rulesetRequiredChecks = rules.filter(r => r.type === "required_status_checks")
+  const checkRules = rules.filter(r => r.type === "required_status_checks");
+  const rulesetRequiredChecks = checkRules
     .flatMap(r => (r.parameters?.required_status_checks ?? []).map(c => `${c.context}@${c.integration_id ?? "any"}`)).sort();
+  // Strict means the branch must be up to date with its base before merging;
+  // dropping it widens what can merge with the same check names.
+  const strictRequiredChecks = checkRules.some(r => r.parameters?.strict_required_status_checks_policy === true);
   // Every active ruleset applies; the EFFECTIVE requirement is the strictest
   // across them. Reading only the first rule found would let a later, stricter
   // ruleset appear or vanish without the drift check noticing.
@@ -116,6 +128,7 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {
   return {
     nwo, branch: target, rulesetNames: active.map(r => r.name), rulesetRequiredChecks, rulesetBypassActors, branchProtectionRequiredChecks,
     classicBypassAllowances,
+    strictRequiredChecks: strictRequiredChecks || (bp?.required_status_checks?.strict ?? false),
     requiredApprovals, codeOwnerReview,
     dismissStaleReviews: pr.dismiss_stale_reviews_on_push || (classic?.dismiss_stale_reviews ?? false),
     requireLastPushApproval: pr.require_last_push_approval || (classic?.require_last_push_approval ?? false),
@@ -165,7 +178,7 @@ export function diffBaseline(live, fixture) {
     lines.push(`required approvals: live ${live.requiredApprovals} vs baseline ${fixture.requiredApprovals}`);
   if (live.codeOwnerReview !== fixture.codeOwnerReview)
     lines.push(`code-owner review: live ${live.codeOwnerReview} vs baseline ${fixture.codeOwnerReview}`);
-  for (const [key, label] of [["dismissStaleReviews", "stale-review dismissal"], ["requireLastPushApproval", "last-push approval"], ["requireThreadResolution", "review thread resolution"]]) {
+  for (const [key, label] of [["dismissStaleReviews", "stale-review dismissal"], ["requireLastPushApproval", "last-push approval"], ["requireThreadResolution", "review thread resolution"], ["strictRequiredChecks", "strict up-to-date policy on required checks"]]) {
     if ((live[key] ?? false) !== (fixture[key] ?? false))
       lines.push(`${label}: live ${live[key] ?? false} vs baseline ${fixture[key] ?? false}`);
   }

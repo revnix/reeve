@@ -247,6 +247,15 @@ let wt;
       "a reused worktree is hardened again: hook present and configured", hp);
   }
 
+  // A hook file that lost its executable bit is silently ignored by git; reuse
+  // must restore and verify the mode, not merely rewrite the bytes.
+  {
+    const { chmodSync, statSync: st } = await import("node:fs");
+    chmodSync(join(`${r5.path}.hooks`, "pre-push"), 0o644);
+    const again = acquireWorktree({ repoRoot: repo, root: roots, pr: 12, branch: "feature", head: git(repo, "rev-parse", "origin/feature") });
+    check(again.ok && (st(join(`${r5.path}.hooks`, "pre-push")).mode & 0o111) !== 0, "a reused hook has its executable bit restored", JSON.stringify(again));
+  }
+
   // Hardening that cannot be applied must refuse the worktree, never hand it
   // back with a layer missing. A regular file where the hooks directory must
   // go is the cheapest way to make the hook step fail.

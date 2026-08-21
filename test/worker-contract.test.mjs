@@ -57,7 +57,7 @@ const db = open(join(dir, "c.db"));
   });
   var seenEnv = null;
   const ctx = { ...ctxFor(db, join(dir, "log.txt")),
-    spawnWorker: async (args) => { seenEnv = args.env; return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", model: "claude-x-resolved", truncated: true, stdoutBytes: 12345 }; } };
+    spawnWorker: async (args) => { seenEnv = args.env; args.onSpawn?.({ pid: 4242, lstart: "Thu Aug 21 19:00:00 2026" }); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", model: "claude-x-resolved", truncated: true, stdoutBytes: 12345 }; } };
   await tick(ctx);
   const row = db.prepare("SELECT w.* FROM worker_run w JOIN run r ON r.id = w.run_id WHERE r.task_id='pr:42'").get();
   check(!!row, "the daemon writes a contract row for its dispatch", JSON.stringify(row));
@@ -65,6 +65,7 @@ const db = open(join(dir, "c.db"));
     "with the CLI version and real hashes", JSON.stringify(row));
   check(row?.model_resolved === "claude-x-resolved", "and the model the worker announced", String(row?.model_resolved));
   check(row?.truncated === 1 && row?.stdout_bytes === 12345, "and whether its durable record was cut, with the byte count", JSON.stringify([row?.truncated, row?.stdout_bytes]));
+  check(row?.pid === 4242 && /2026/.test(row?.lstart ?? ""), "and the process identity once the binding succeeds", JSON.stringify([row?.pid, row?.lstart]));
   check(!!row?.out_path && !!row?.err_path, "and the durable output paths", JSON.stringify([row?.out_path, row?.err_path]));
   check(/runs\/o-r\/42\/[^/]+\/worker\.out$/.test(row?.out_path ?? ""),
     "the run dir is keyed by repository, PR, and run id, never PR alone", String(row?.out_path));

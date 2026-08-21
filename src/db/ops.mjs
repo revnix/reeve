@@ -494,6 +494,11 @@ export function recordWorkerContract(db, { runId, cliVersion, modelRequested = n
   });
 }
 
+/** The process identity, written the instant the fail-closed binding succeeds. */
+export function noteWorkerBinding(db, { runId, pid, lstart }) {
+  db.prepare(`UPDATE worker_run SET pid=?, lstart=? WHERE run_id=?`).run(pid, lstart, runId);
+}
+
 /** What the worker announced it ran as, and whether its durable record is whole. */
 export function noteWorkerResult(db, { runId, modelResolved = null, truncated = false, stdoutBytes = null }) {
   db.prepare(`UPDATE worker_run SET model_resolved=COALESCE(?, model_resolved), truncated=?, stdout_bytes=? WHERE run_id=?`)

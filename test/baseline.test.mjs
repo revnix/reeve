@@ -83,5 +83,55 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
   check(diffBaseline(renamed, fixture).drifted === true && /ruleset/.test(diffBaseline(renamed, fixture).lines.join(" ")), "a ruleset appearing is drift even when its rules match", "");
 }
 
+
+// ── the branch comes from the profile; a baseline names the branch it read ───
+{
+  const { readLiveBaseline } = await import("../src/baseline.mjs");
+  const asked = [];
+  const gh = path => { asked.push(path); if (path.endsWith("/rulesets")) return []; const e = new Error("HTTP 404"); e.stderr = "HTTP 404"; throw e; };
+  readLiveBaseline("o/r", { identity: { baseBranch: "develop", defaultBranch: "main" }, authority: {}, merge: {}, builder: {} }, { gh });
+  check(asked.some(p => /branches\/develop\/protection/.test(p)), "the live read targets the profile's base branch, not main", asked.join(" | "));
+  const live = readLiveBaseline("o/r", { identity: { defaultBranch: "trunk" }, authority: {}, merge: {}, builder: {} }, { gh });
+  check(live.branch === "trunk", "and records which branch it read", JSON.stringify(live.branch));
+}
+
+// ── a malformed baseline is UNKNOWN, never a crash ───────────────────────────
+{
+  const { writeFileSync: wf, mkdtempSync: md } = await import("node:fs");
+  const { tmpdir: td } = await import("node:os");
+  const { join: jn } = await import("node:path");
+  const bad = jn(md(jn(td(), "reeve-badbase-")), "x.json"); wf(bad, "{ not json");
+  let r = null, threw = null;
+  try { r = checkBaseline("o/r", {}, { fixturePath: bad, readLive: () => fixture }); } catch (e) { threw = e; }
+  check(!threw && r?.level === "UNKNOWN" && /baseline/.test(r.lines.join(" ")), "a malformed baseline reports UNKNOWN with the file error", threw ? String(threw.message) : JSON.stringify(r));
+}
+
+// ── only rulesets that target the branch count ───────────────────────────────
+{
+  const { readLiveBaseline } = await import("../src/baseline.mjs");
+  const gh = path => {
+    if (path.endsWith("/rulesets")) return [{ id: 1, name: "main-only", enforcement: "active" }, { id: 2, name: "release-only", enforcement: "active" }, { id: 3, name: "everything", enforcement: "active" }];
+    if (path.endsWith("/rulesets/1")) return { conditions: { ref_name: { include: ["~DEFAULT_BRANCH"], exclude: [] } }, rules: [{ type: "pull_request", parameters: { required_approving_review_count: 1 } }], bypass_actors: [] };
+    if (path.endsWith("/rulesets/2")) return { conditions: { ref_name: { include: ["refs/heads/release/*"], exclude: [] } }, rules: [{ type: "pull_request", parameters: { required_approving_review_count: 5 } }], bypass_actors: [{ actor_type: "Team", actor_id: 9, bypass_mode: "always" }] };
+    if (path.endsWith("/rulesets/3")) return { conditions: { ref_name: { include: ["~ALL"], exclude: ["refs/heads/main"] } }, rules: [{ type: "pull_request", parameters: { required_approving_review_count: 7 } }], bypass_actors: [] };
+    const e = new Error("HTTP 404"); e.stderr = "HTTP 404"; throw e;
+  };
+  const live = readLiveBaseline("o/r", { identity: { defaultBranch: "main" }, authority: {}, merge: {}, builder: {} }, { gh });
+  check(live.requiredApprovals === 1 && live.rulesetBypassActors.length === 0 && JSON.stringify(live.rulesetNames) === JSON.stringify(["main-only"]),
+    "a ruleset scoped to another branch, or excluding this one, is not counted", JSON.stringify([live.requiredApprovals, live.rulesetNames, live.rulesetBypassActors]));
+}
+
+// ── classic branch protection's review requirements count too ────────────────
+{
+  const { readLiveBaseline } = await import("../src/baseline.mjs");
+  const gh = path => {
+    if (path.endsWith("/rulesets")) return [];
+    if (/protection$/.test(path)) return { required_status_checks: { checks: [] }, required_pull_request_reviews: { required_approving_review_count: 2, require_code_owner_reviews: true } };
+    throw new Error("unexpected " + path);
+  };
+  const live = readLiveBaseline("o/r", { identity: { defaultBranch: "main" }, authority: {}, merge: {}, builder: {} }, { gh });
+  check(live.requiredApprovals === 2 && live.codeOwnerReview === true, "approvals and code-owner review enforced by classic protection are part of the effective value", JSON.stringify([live.requiredApprovals, live.codeOwnerReview]));
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

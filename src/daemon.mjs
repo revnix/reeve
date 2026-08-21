@@ -18,14 +18,14 @@ import { evaluatePr, publishVerdict } from "./pr.mjs";
 import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
-import { promptFor } from "./prompts.mjs";
+import { promptFor, WORKER_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig, CONTAINMENT } from "./workerenv.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, sha256 } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, sha256 } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { snapshot, snapshotAll } from "./backup.mjs";
 import { selfAudit } from "./selfaudit.mjs";
@@ -33,7 +33,7 @@ import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -44,7 +44,14 @@ const now = () => Math.floor(Date.now() / 1000);
 // that does not change. Resolved under the WORKER's environment, because the
 // daemon's own PATH (launchd's) may not even hold the binary the worker runs;
 // a version that cannot be read is a refusal, never the string "unknown".
+// Keyed by the binary's real path and modification time, so an upgrade under a
+// running daemon is re-read on the next dispatch rather than recorded as the
+// version that was true at startup.
 const CLI_VERSION = new Map();
+function binaryIdentity(bin) {
+  try { const real = realpathSync(bin); const st = statSync(real); return `${real}@${st.mtimeMs}`; }
+  catch { return bin; }
+}
 // The worker's PATH is pinned and does not contain the CLI's install dir (it
 // lives under ~/.local/bin here), and spawn resolves a bare command through the
 // CHILD's PATH. So the binary is resolved once on the daemon's PATH and passed
@@ -59,10 +66,11 @@ function resolveClaude(bin) {
   return out;
 }
 function cliVersion(bin, env) {
-  if (CLI_VERSION.has(bin)) return CLI_VERSION.get(bin);
+  const key = binaryIdentity(bin);
+  if (CLI_VERSION.has(key)) return CLI_VERSION.get(key);
   const out = execFileSync(bin, ["--version"], { encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"] }).trim();
   if (!out) throw new Error(`${bin} --version printed nothing`);
-  CLI_VERSION.set(bin, out);
+  CLI_VERSION.set(key, out);
   return out;
 }
 
@@ -392,7 +400,7 @@ export async function tick(ctx) {
   // only; the default is the module's own, which refuses.
   const containment = ctx.containment ?? CONTAINMENT;
   if (execute && containment.credentialRead !== "closed") {
-    const wanted = decisions.filter(d => [ACTIONS.FIX_CI, ACTIONS.FIX_FINDINGS, ACTIONS.REQUEST_REVIEW].includes(d.decision.action));
+    const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action));
     if (wanted.length) {
       log(logPath, `execute: NOT dispatching ${wanted.length} worker task(s) — worker containment is open: ${containment.why}`);
       escalations.set("guardian:containment:open", 1);
@@ -543,7 +551,7 @@ export async function tick(ctx) {
           isRevoked: () => revoked,
           // Bind the process to the run the instant it exists, before it can
           // touch anything, so a crash leaves something probeable.
-          onSpawn: ({ pid, lstart }) => notePid(db, { runId: run.runId, pid, boot: lstart }),
+          onSpawn: ({ pid, lstart }) => { notePid(db, { runId: run.runId, pid, boot: lstart }); noteWorkerBinding(db, { runId: run.runId, pid, lstart }); },
         });
       } catch (err) {
         // A worker that could not be prepared or launched is a failed attempt
@@ -555,7 +563,7 @@ export async function tick(ctx) {
       } finally {
         clearInterval(beat);
         // What the worker said it ran as, and whether its durable record is whole.
-        try { noteWorkerResult(db, { runId: run.runId, modelResolved: r?.model ?? null, truncated: r?.truncated === true, stdoutBytes: r?.stdoutBytes ?? null }); }
+        try { noteWorkerResult(db, { runId: run.runId, modelResolved: r?.model ?? null, truncated: r?.truncated === true || r?.stderrTruncated === true, stdoutBytes: r?.stdoutBytes ?? null }); }
         catch { /* the run still finishes */ }
         // Closed in `finally`: a throw between spawn and result would otherwise
         // leave the run leased forever, and the PR unworkable until it expired.

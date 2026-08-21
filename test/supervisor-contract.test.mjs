@@ -135,6 +135,29 @@ const ENV = { PATH: "/usr/bin:/bin" };
 }
 
 
+
+// ── stdout and stderr are capped and counted separately ──────────────────────
+{
+  const f = files("stderrheavy");
+  const r = await runWorker({ bin: "/bin/sh", args: ["-c", "head -c 150000 /dev/zero | tr '\\0' 'e' >&2; echo out-line"],
+                              env: ENV, ...f, maxOutputBytes: 100000, budgetMs: 10000 });
+  check(r.truncated === false && r.stdoutBytes === 9 && /out-line/.test(readFileSync(f.outPath, "utf8")),
+    "a stderr-heavy worker does not lose its stdout to a shared cap, and stdoutBytes counts stdout only", JSON.stringify({ t: r.truncated, b: r.stdoutBytes }));
+  check(statSync(f.errPath).size <= 100000 && r.stderrTruncated === true, "stderr has its own cap and its own truncation flag", JSON.stringify({ s: statSync(f.errPath).size, st: r.stderrTruncated }));
+}
+
+// ── a durable write that fails ends the worker as failed, not the daemon ─────
+{
+  const { existsSync: ex } = await import("node:fs");
+  if (!ex("/dev/full")) console.log("SKIP  a failing output write ends the run as failed (no /dev/full on this host)");
+  else {
+    let threw = null, r = null;
+    try { r = await runWorker({ bin: "/bin/sh", args: ["-c", "echo hello; sleep 5"], env: ENV, outPath: "/dev/full", errPath: files("wfail").errPath, budgetMs: 20000 }); }
+    catch (e) { threw = e; }
+    check(!threw && r?.outcome === OUTCOMES.FAILED && /write/.test(r?.why ?? ""), "a failing output write ends the run as failed with the reason", threw ? String(threw.message) : JSON.stringify({ o: r?.outcome, w: r?.why }));
+  }
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

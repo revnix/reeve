@@ -209,7 +209,7 @@ export const FIELDS = {
   "builder.founder.userId":              [false, isInt],
   "builder.founder.login":               [false, isStr],
   // Cap on a worker's durable stdout/stderr files. Read by both daemons.
-  "worker.maxOutputBytes":               [false, isInt],
+  "worker.maxOutputBytes":               [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
 
   // Read by the daemon and the watcher. Declared here because the validator
   // refused a profile using them and `reeve doctor` exited before doing anything:

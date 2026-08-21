@@ -12,7 +12,9 @@ import { readLiveBaseline, baselinePathFor } from "../src/baseline.mjs";
 const nwo = process.argv[2];
 if (!nwo) { console.error("usage: capture-baseline.mjs <owner/repo> [branch]"); process.exit(2); }
 const [owner, repo] = nwo.split("/");
-const profile = withDefaults(JSON.parse(readFileSync(join(homedir(), ".reeve", "profiles", owner, `${repo}.json`), "utf8")));
+// The same home every command uses: REEVE_HOME when set, ~/.reeve otherwise.
+const HOME = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
+const profile = withDefaults(JSON.parse(readFileSync(join(HOME, "profiles", owner, `${repo}.json`), "utf8")));
 let live;
 try { live = readLiveBaseline(nwo, profile, { branch: process.argv[3] ?? "main" }); }
 catch (e) { console.error(`capture-baseline: ${String(e.stderr ?? e.message).trim().split("\n")[0]}`); process.exit(1); }

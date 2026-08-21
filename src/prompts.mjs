@@ -290,6 +290,13 @@ ${invariants(profile)}
 }
 
 /** Everything the supervisor needs to launch one worker for one decision. */
+/**
+ * Every decision promptFor turns into a worker. One list, read by the daemon's
+ * containment refusal, so a gated action can never disappear from a tick
+ * without the founder being told why.
+ */
+export const WORKER_ACTIONS = Object.freeze(["FIX_CI", "FIX_FINDINGS", "REQUEST_REVIEW", "SPILL"]);
+
 export function promptFor(decision, ctx) {
   switch (decision.action) {
     // The tool grant is no longer decided here. It comes from sandboxFor(),

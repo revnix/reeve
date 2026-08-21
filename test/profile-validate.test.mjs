@@ -186,6 +186,10 @@ expectRefusal("a founder user id that is not an integer",
   (() => { const p = clone(base); p.builder = { founder: { userId: "123" } }; return p; })(),
   /builder\.founder\.userId must be an integer/);
 
+expectRefusal("a worker output cap that is not positive",
+  (() => { const p = clone(base); p.worker = { maxOutputBytes: 0 }; return p; })(),
+  /worker\.maxOutputBytes must be a positive integer/);
+
 expectOk("all five switches set explicitly",
   (() => { const p = clone(base); p.builder = { capabilities: { observe: true, draftSpec: false, implementLocal: false, publishPr: false, mergeBuilderPr: false } }; return p; })());
 

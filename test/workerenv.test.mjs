@@ -35,8 +35,9 @@ const env = workerEnv({ gitConfigPath, tmpDir: join(dir, "tmp"), bgWaitMs: 12000
 }
 {
   check(env.HOME === homedir(), "HOME is the real home: the CLI reads ~/.claude for subscription auth", env.HOME);
-  check(typeof env.PATH === "string" && /v24\.17\.0\/bin/.test(env.PATH),
-    "PATH is pinned to the v24 node bin", env.PATH);
+  const { dirname: dn } = await import("node:path");
+  check(typeof env.PATH === "string" && env.PATH.split(":")[1] === dn(process.execPath),
+    "PATH carries the running daemon's own node bin, right after the shims", env.PATH);
   check(env.TMPDIR === join(dir, "tmp"), "TMPDIR is per run", env.TMPDIR);
   check(env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS === "1200000", "the background-wait ceiling is passed", env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS);
   check(env.CLAUDE_CODE_MAX_RETRIES === "1", "the 429 retry bound is passed", env.CLAUDE_CODE_MAX_RETRIES);

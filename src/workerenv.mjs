@@ -33,10 +33,11 @@ export const CONTAINMENT = Object.freeze({
        "and `git -c credential.helper=...` or `gh auth token` returns the founder's token",
 });
 
-// Node pinned by absolute path: `node` on PATH is v22 here and must never reach
-// a worker. Other tools (pnpm) are appended by the caller from where the profile
-// resolves them; nothing else is searched.
-const NODE_BIN = join(homedir(), ".nvm", "versions", "node", "v24.17.0", "bin");
+// The worker's node is the daemon's own: `node` on the system PATH is v22 here
+// and must never reach a worker, and a pinned version directory would vanish
+// on the first patch upgrade and fall through to exactly that. Other tools
+// (pnpm, the CLI) are appended by the caller from where they resolve.
+const NODE_BIN = dirname(process.execPath);
 const SYSTEM_PATH = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
 // Names that must never reach a worker, however they arrive. Matched exactly,

@@ -18,7 +18,7 @@
 // administrative files behind pointing at nothing.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, renameSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, writeFileSync, rmSync, chmodSync, statSync } from "node:fs";
 import { join, basename, dirname } from "node:path";
 
 function git(cwd, args) {
@@ -101,6 +101,9 @@ function hardenOrThrow(repoRoot, path) {
   const hooks = `${path}.hooks`;
   mkdirSync(hooks, { recursive: true });
   writeFileSync(join(hooks, "pre-push"), REFUSING_HOOK, { mode: 0o755 });
+  // `mode` applies only to a NEW file; an existing hook that lost its bit keeps
+  // it lost, and git ignores a non-executable hook without failing the push.
+  chmodSync(join(hooks, "pre-push"), 0o755);
   const hp = git(path, ["config", "--worktree", "core.hooksPath", hooks]);
   if (!hp.ok) throw new Error(`hooksPath: ${hp.err}`);
   // Read back, never assume: a config write that silently landed elsewhere
@@ -110,6 +113,7 @@ function hardenOrThrow(repoRoot, path) {
   const readHp = git(path, ["config", "--worktree", "core.hooksPath"]);
   if (!readPu.ok || readPu.out !== "reeve://refused-the-worker-does-not-publish") throw new Error("pushurl did not read back");
   if (!readHp.ok || readHp.out !== hooks || !existsSync(join(hooks, "pre-push"))) throw new Error("hooksPath or hook did not read back");
+  if ((statSync(join(hooks, "pre-push")).mode & 0o111) === 0) throw new Error("the hook is not executable");
   return { ok: true, why: null };
 }
 

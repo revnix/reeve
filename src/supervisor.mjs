@@ -21,7 +21,7 @@
 //     retries internally. CLAUDE_CODE_MAX_RETRIES bounds it.
 
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, openSync, writeSync, closeSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, writeSync, closeSync, readSync, fstatSync } from "node:fs";
 import { dirname } from "node:path";
 
 export const OUTCOMES = {
@@ -44,9 +44,18 @@ export function readStart(pid) {
   catch { return null; }
 }
 
-/** The last `n` bytes of a file, for a result that carries a stderr tail without holding the whole file. */
+/** The last `n` bytes of a file, read from the end: a 64 MiB stderr must not be decoded whole for a 4 KB tail. */
 function tailOf(path, n) {
-  try { return readFileSync(path, "utf8").slice(-n); } catch { return ""; }
+  let fd = null;
+  try {
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    const len = Math.min(n, size);
+    const b = Buffer.alloc(len);
+    readSync(fd, b, 0, len, size - len);
+    return b.toString("utf8");
+  } catch { return ""; }
+  finally { if (fd !== null) { try { closeSync(fd); } catch { /* already closed */ } } }
 }
 
 /**
@@ -263,10 +272,18 @@ export function runWorker({
     mkdirSync(dirname(outPath), { recursive: true });
     mkdirSync(dirname(errPath), { recursive: true });
     const outFd = openSync(outPath, "w"), errFd = openSync(errPath, "w");
-    let written = 0, truncated = false, buf = "";
-    const write = (fd, chunk) => {
-      if (written + chunk.length > maxOutputBytes) { truncated = true; return; }
-      writeSync(fd, chunk); written += chunk.length;
+    // Each stream has its own cap and its own count: a chatty stderr must not
+    // spend stdout's budget, and stdoutBytes must mean stdout.
+    const streams = { out: { fd: outFd, written: 0, truncated: false }, err: { fd: errFd, written: 0, truncated: false } };
+    let buf = "", writeError = null;
+    const write = (s, chunk) => {
+      if (writeError) return;
+      if (s.written + chunk.length > maxOutputBytes) { s.truncated = true; return; }
+      // A write that fails (disk full, a mount gone) throws inside a stream
+      // callback, where nothing awaits it; unhandled, it would take the daemon
+      // down. It ends this worker instead, with the reason.
+      try { writeSync(s.fd, chunk); s.written += chunk.length; }
+      catch (err) { writeError = err.message; killedByUs = true; killGroup(child.pid, "SIGTERM"); setTimeout(() => { if (!settled) killGroup(child.pid, "SIGKILL"); }, graceMs); }
     };
 
     const child = spawn(bin, args, { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"], env });
@@ -290,7 +307,7 @@ export function runWorker({
     // the same death.
     child.on("error", err => { if (child.pid) LIVE_GROUPS.delete(child.pid); return finish({
       outcome: OUTCOMES.CRASHED, why: `could not spawn ${bin}: ${err.message}`,
-      pid: child.pid ?? null, lstart: null, ms: Date.now() - startedAt, stderr: tailOf(errPath, 4000), outPath, errPath, truncated,
+      pid: child.pid ?? null, lstart: null, ms: Date.now() - startedAt, stderr: tailOf(errPath, 4000), outPath, errPath, truncated: false,
     }); });
 
     // No pid means the spawn already failed and the error event is on its way;
@@ -319,7 +336,7 @@ export function runWorker({
     }
 
     child.stdout.on("data", d => {
-      write(outFd, d);
+      write(streams.out, d);
       // The partial-line buffer is bounded too: a newline-free stream would
       // otherwise grow it without limit while the file stayed capped. No
       // stream-json line approaches a megabyte, so dropping one that does
@@ -337,7 +354,7 @@ export function runWorker({
         onEvent(ev);
       }
     });
-    child.stderr.on("data", d => { write(errFd, d); });
+    child.stderr.on("data", d => { write(streams.err, d); });
 
     termTimer = setTimeout(() => {
       killedByUs = true;
@@ -376,12 +393,16 @@ export function runWorker({
       // A truncated record is an incomplete record: the result parsed from the
       // stream may describe an event the durable file no longer holds, and a
       // store that says OK beside a file that cannot show why is absence read
-      // as success. Truncation therefore outranks everything but a lost lease.
+      // as success. Truncation and a failed write therefore outrank everything
+      // but a lost lease.
+      const truncated = streams.out.truncated;
       const c = lateWhy
         ? { outcome: OUTCOMES.LEASE_LOST, why: `lease revoked: ${lateWhy}` }
-        : truncated
-          ? { outcome: OUTCOMES.FAILED, why: `output truncated at ${maxOutputBytes} bytes; the durable record is incomplete` }
-          : classifyResult(result, { code, signal, killedByUs });
+        : writeError
+          ? { outcome: OUTCOMES.FAILED, why: `durable output write failed: ${writeError}` }
+          : truncated
+            ? { outcome: OUTCOMES.FAILED, why: `output truncated at ${maxOutputBytes} bytes; the durable record is incomplete` }
+            : classifyResult(result, { code, signal, killedByUs });
       finish({
         ...c, pid: child.pid, lstart, sessionId, code, signal,
         ms: Date.now() - startedAt, rateLimit,
@@ -390,7 +411,8 @@ export function runWorker({
         text: result?.result ?? null,
         model: initModel,
         stderr: tailOf(errPath, 4000),
-        stdoutBytes: written, outPath, errPath, truncated,
+        stdoutBytes: streams.out.written, stderrBytes: streams.err.written, outPath, errPath,
+        truncated, stderrTruncated: streams.err.truncated,
       });
     });
   });

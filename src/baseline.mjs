@@ -28,10 +28,32 @@ const ghApi = (path) => JSON.parse(execFileSync("gh", ["api", path], { encoding:
  * taken during an auth failure or a rate limit must never become a baseline,
  * and must never be compared as if it were one.
  */
-export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = "main" } = {}) {
+/**
+ * Does a ruleset's ref condition cover this branch? GitHub's patterns are
+ * `refs/heads/<fnmatch>`, `~DEFAULT_BRANCH`, and `~ALL`; exclude beats include.
+ * A ruleset with no ref condition applies to every branch.
+ */
+export function rulesetCoversBranch(detail, branch, defaultBranch) {
+  const cond = detail?.conditions?.ref_name;
+  if (!cond) return true;
+  const ref = `refs/heads/${branch}`;
+  const matches = pat => pat === "~ALL" || (pat === "~DEFAULT_BRANCH" && branch === defaultBranch)
+    || new RegExp("^" + pat.split("*").map(s => s.replace(/[.+^${}()|[\]\\]/g, "\\$&")).join(".*") + "$").test(ref);
+  if ((cond.exclude ?? []).some(matches)) return false;
+  return (cond.include ?? []).some(matches);
+}
+
+export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {}) {
+  const defaultBranch = profile.identity?.defaultBranch ?? "main";
+  const target = branch ?? profile.identity?.baseBranch ?? defaultBranch;
   const rulesets = gh(`repos/${nwo}/rulesets`);
-  const active = rulesets.filter(r => r.enforcement === "active");
-  const detail = active.map(r => gh(`repos/${nwo}/rulesets/${r.id}`));
+  const activeAll = rulesets.filter(r => r.enforcement === "active");
+  // Only rulesets whose ref condition covers the target branch count: a
+  // release-branch ruleset must neither protect main on paper nor drift it.
+  const detailAll = activeAll.map(r => ({ meta: r, detail: gh(`repos/${nwo}/rulesets/${r.id}`) }));
+  const covering = detailAll.filter(({ detail }) => rulesetCoversBranch(detail, target, defaultBranch));
+  const active = covering.map(c => c.meta);
+  const detail = covering.map(c => c.detail);
   const rules = detail.flatMap(r => r.rules ?? []);
   const rulesetRequiredChecks = rules.filter(r => r.type === "required_status_checks")
     .flatMap(r => (r.parameters?.required_status_checks ?? []).map(c => `${c.context}@${c.integration_id ?? "any"}`)).sort();
@@ -43,14 +65,18 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = "main" } =
                require_code_owner_review: prs.some(p => p.require_code_owner_review === true) };
   const rulesetBypassActors = detail.flatMap(r => (r.bypass_actors ?? []).map(b => `${b.actor_type}:${b.actor_id ?? ""}:${b.bypass_mode}`)).sort();
   let bp = null;
-  try { bp = gh(`repos/${nwo}/branches/${encodeURIComponent(branch)}/protection`); }
+  try { bp = gh(`repos/${nwo}/branches/${encodeURIComponent(target)}/protection`); }
   catch (e) { if (!/HTTP 404/.test(String(e.stderr ?? e.message))) throw e; }
   const branchProtectionRequiredChecks = bp === null ? []
     : (bp.required_status_checks?.checks ?? []).map(c => `${c.context}@${c.app_id ?? "any"}`).sort();
+  // Classic protection enforces reviews too; the effective requirement is the
+  // strictest across rulesets and classic protection alike.
+  const classic = bp?.required_pull_request_reviews ?? null;
+  const requiredApprovals = Math.max(pr.required_approving_review_count ?? 0, classic?.required_approving_review_count ?? 0);
+  const codeOwnerReview = (pr.require_code_owner_review ?? false) || (classic?.require_code_owner_reviews ?? false);
   return {
-    nwo, rulesetNames: active.map(r => r.name), rulesetRequiredChecks, rulesetBypassActors, branchProtectionRequiredChecks,
-    requiredApprovals: pr.required_approving_review_count ?? 0,
-    codeOwnerReview: pr.require_code_owner_review ?? false,
+    nwo, branch: target, rulesetNames: active.map(r => r.name), rulesetRequiredChecks, rulesetBypassActors, branchProtectionRequiredChecks,
+    requiredApprovals, codeOwnerReview,
     profile: { authorityPolicy: profile.authority?.policy ?? null, mergeEnforcement: profile.merge?.enforcement ?? null,
                capabilities: profile.builder?.capabilities ?? {} },
   };
@@ -66,9 +92,11 @@ export function checkBaseline(nwo, profile, io = {}) {
   const path = io.fixturePath ?? baselinePathFor(nwo);
   if (!existsSync(path)) return { id: "R-13", level: "UNKNOWN", title: "authority baseline",
     lines: [`no baseline captured for ${nwo} at ${path}`, "-> node scripts/capture-baseline.mjs " + nwo + " > " + path] };
-  const fixture = JSON.parse(readFileSync(path, "utf8"));
+  let fixture;
+  try { fixture = JSON.parse(readFileSync(path, "utf8")); if (!fixture || typeof fixture !== "object") throw new Error("not an object"); }
+  catch (e) { return { id: "R-13", level: "UNKNOWN", title: "authority baseline", lines: [`the baseline at ${path} could not be read: ${e.message}`] }; }
   let live;
-  try { live = (io.readLive ?? readLiveBaseline)(nwo, profile, io); }
+  try { live = (io.readLive ?? readLiveBaseline)(nwo, profile, { ...io, branch: io.branch ?? fixture.branch ?? null }); }
   catch (e) { return { id: "R-13", level: "UNKNOWN", title: "authority baseline", lines: [`could not read the live state: ${String(e.message).split("\n")[0]}`] }; }
   const d = diffBaseline(live, fixture);
   if (d.drifted) return { id: "R-13", level: "DEGRADED", title: "authority baseline",

@@ -92,6 +92,9 @@ function installReaper() {
 
 /** Kill a whole process group, swallowing ESRCH. Always the NEGATIVE pid. */
 function killGroup(pid, signal) {
+  // A child whose spawn failed has no pid; there is no group to kill, and
+  // `process.kill(-NaN)` would throw inside whatever called us.
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(-pid, signal); return true; }
   catch (e) { if (e.code !== "ESRCH") throw e; return false; }
 }
@@ -261,10 +264,7 @@ export function runWorker({
     };
 
     const child = spawn(bin, args, { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"], env });
-    installReaper();
-    LIVE_GROUPS.add(child.pid);
     const startedAt = Date.now();
-    const lstart = readStart(child.pid);
 
     let result = null, sessionId = null, rateLimit = null, initModel = null, revokedWhy = null;
     let killedByUs = false, settled = false;
@@ -277,6 +277,23 @@ export function runWorker({
       try { closeSync(outFd); closeSync(errFd); } catch { /* already closed */ }
       resolve(payload);
     };
+
+    // The error listener goes on FIRST. A binary that cannot be spawned emits
+    // its error asynchronously, and a child with no listener for it takes the
+    // whole daemon down; measured once, with launchd ready to restart it into
+    // the same death.
+    child.on("error", err => { if (child.pid) LIVE_GROUPS.delete(child.pid); return finish({
+      outcome: OUTCOMES.CRASHED, why: `could not spawn ${bin}: ${err.message}`,
+      pid: child.pid ?? null, lstart: null, ms: Date.now() - startedAt, stderr: tailOf(errPath, 4000), outPath, errPath, truncated,
+    }); });
+
+    // No pid means the spawn already failed and the error event is on its way;
+    // there is nothing to bind, observe, or kill.
+    if (!child.pid) return;
+
+    installReaper();
+    LIVE_GROUPS.add(child.pid);
+    const lstart = readStart(child.pid);
 
     // The binding is not an observer. A worker whose pid and start time could
     // not be written is one a restart can neither adopt nor kill with
@@ -331,17 +348,16 @@ export function runWorker({
       }
     }, 2000);
 
-    child.on("error", err => { LIVE_GROUPS.delete(child.pid); return finish({
-      outcome: OUTCOMES.CRASHED, why: `could not spawn ${bin}: ${err.message}`,
-      pid: child.pid, lstart, ms: Date.now() - startedAt, stderr: tailOf(errPath, 4000), outPath, errPath, truncated,
-    }); });
-
     child.on("exit", (code, signal) => {
       LIVE_GROUPS.delete(child.pid);
       // The leader can exit while a grandchild lingers, so sweep the group.
       killGroup(child.pid, "SIGKILL");
-      const c = revokedWhy
-        ? { outcome: OUTCOMES.LEASE_LOST, why: `lease revoked: ${revokedWhy}` }
+      // Sampled once more here: a lease revoked between the last poll and a
+      // normal exit would otherwise be classified OK and its result published
+      // under a claim the worker no longer held.
+      const lateWhy = revokedWhy ?? isRevoked();
+      const c = lateWhy
+        ? { outcome: OUTCOMES.LEASE_LOST, why: `lease revoked: ${lateWhy}` }
         : classifyResult(result, { code, signal, killedByUs });
       finish({
         ...c, pid: child.pid, lstart, sessionId, code, signal,

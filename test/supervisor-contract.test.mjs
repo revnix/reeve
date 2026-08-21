@@ -82,6 +82,37 @@ const ENV = { PATH: "/usr/bin:/bin" };
   check(Date.now() - t0 < 10000, "within one poll interval, not at the budget", `${Date.now() - t0}ms`);
 }
 
+
+// ── a binary that cannot be spawned is CRASHED, never an uncaught error ──────
+//
+// Node emits the spawn error asynchronously and the child has no pid. A catch
+// that killed "the group" of an undefined pid threw inside the executor, and
+// the error event then had no listener: the daemon died, and launchd would
+// have restarted it into the same death. Measured before the fix.
+{
+  let r = null, threw = null;
+  try {
+    r = await runWorker({ bin: "/nonexistent/claude", args: [], env: ENV, ...files("nobin"), budgetMs: 3000,
+                          onSpawn: () => { throw new Error("bind"); } });
+  } catch (e) { threw = e; }
+  check(!threw && r?.outcome === OUTCOMES.CRASHED && /could not spawn/.test(r?.why ?? ""),
+    "a missing binary resolves CRASHED even when the binding would have thrown", threw ? String(threw.message) : JSON.stringify({ o: r?.outcome, w: r?.why }));
+}
+
+// ── revocation that lands between the last poll and exit still counts ────────
+//
+// The poll runs every two seconds. A lease revoked 1.9 seconds before a normal
+// exit was never seen, and a successful result was classified OK and could
+// have been published under a lease the worker no longer held.
+{
+  let revoked = null;
+  setTimeout(() => { revoked = "lost-late"; }, 100);
+  const r = await runWorker({ bin: "/bin/sh", args: ["-c", "sleep 0.4"], env: ENV, ...files("late"), budgetMs: 10000,
+                              isRevoked: () => revoked });
+  check(r.outcome === OUTCOMES.LEASE_LOST && /lost-late/.test(r.why),
+    "a revocation the poll never saw is still read at exit", JSON.stringify({ o: r.outcome, w: r.why }));
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

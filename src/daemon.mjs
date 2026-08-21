@@ -33,7 +33,7 @@ import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync, readFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -461,30 +461,44 @@ export async function tick(ctx) {
       const lane = (profile.lanes ?? []).find(l => l.id === decision.lane) ?? null;
       const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane });
       const settingsPath = writeSandbox(join(dirname(ctx.logPath ?? "/tmp/x"), "sandboxes", String(e.pr)), sandbox);
-      // The worker's environment is built, never inherited: no token, no ssh
-      // agent, no founder git config. Its output streams to files beside the
-      // run so a restart can read the report the worker left.
-      const stateDir = dirname(ctx.logPath ?? "/tmp/x");
-      const runDir = join(stateDir, "runs", String(e.pr));
-      const budgetMs = (profile.watch?.workerBudgetMinutes ?? 20) * 60_000;
-      const env = workerEnv({ gitConfigPath: writeGitConfig(join(stateDir, "git")),
-                              tmpDir: join(runDir, "tmp"), bgWaitMs: budgetMs });
-      const outPath = join(runDir, `${run.runId}.out`), errPath = join(runDir, `${run.runId}.err`);
-      const maxTurns = profile.watch?.maxTurns ?? 40;
-      const tools = spec.tools ?? sandbox.allowedTools;
-      const argv = workerArgs({ prompt: spec.prompt, allowedTools: tools, settings: settingsPath, maxTurns });
-      // The contract is recorded before the process exists, so that a crash
-      // between here and the first heartbeat still leaves the answer to "what
-      // was this worker asked to run as".
-      recordWorkerContract(db, {
-        runId: run.runId, cliVersion: ctx.cliVersion ?? cliVersion(),
-        argvHash: sha256(JSON.stringify(argv)), promptHash: sha256(spec.prompt),
-        settingsHash: sha256(readFileSync(settingsPath, "utf8")),
-        toolContract: tools, maxTurns, outPath, errPath,
-      });
 
       let r;
       try {
+        // Everything from here runs inside the cleanup scope: the run is
+        // already leased and its heartbeat already ticking, so a failure in
+        // preparing the worker must release both, exactly as a failure in the
+        // worker would. Measured: a contract write that threw outside this
+        // block left the interval renewing a lease for a worker that never
+        // ran, refusing every later dispatch for the PR until a restart.
+        //
+        // The worker's environment is built, never inherited: no token, no ssh
+        // agent, no founder git config. Its output streams to files beside the
+        // run so a restart can read the report the worker left. The run dir is
+        // keyed by repository, PR, and run id: the log dir is shared by every
+        // repo's daemon, and two repos can share a PR number.
+        const stateDir = dirname(ctx.logPath ?? "/tmp/x");
+        const runDir = join(stateDir, "runs", nwo.replace("/", "-"), String(e.pr), run.runId);
+        const budgetMs = (profile.watch?.workerBudgetMinutes ?? 20) * 60_000;
+        const env = workerEnv({ gitConfigPath: writeGitConfig(join(stateDir, "git")),
+                                tmpDir: join(runDir, "tmp"), bgWaitMs: budgetMs });
+        const outPath = join(runDir, "worker.out"), errPath = join(runDir, "worker.err");
+        const maxTurns = profile.watch?.maxTurns ?? 40;
+        const tools = spec.tools ?? sandbox.allowedTools;
+        const argv = workerArgs({ prompt: spec.prompt, allowedTools: tools, settings: settingsPath, maxTurns });
+        // The complete argv is kept beside the hash: a hash proves what ran, the
+        // file lets a later attempt run the same thing.
+        mkdirSync(runDir, { recursive: true });
+        writeFileSync(join(runDir, "argv.json"), JSON.stringify(argv));
+        // The contract is recorded before the process exists, so that a crash
+        // between here and the first heartbeat still leaves the answer to "what
+        // was this worker asked to run as".
+        recordWorkerContract(db, {
+          runId: run.runId, cliVersion: ctx.cliVersion ?? cliVersion(),
+          argvHash: sha256(JSON.stringify(argv)), promptHash: sha256(spec.prompt),
+          settingsHash: sha256(readFileSync(settingsPath, "utf8")),
+          toolContract: tools, maxTurns, outPath, errPath,
+        });
+
         r = await (ctx.spawnWorker ?? runWorker)({
           args: argv,
           cwd: worktree, env, outPath, errPath,
@@ -496,6 +510,11 @@ export async function tick(ctx) {
           // touch anything, so a crash leaves something probeable.
           onSpawn: ({ pid, lstart }) => notePid(db, { runId: run.runId, pid, boot: lstart }),
         });
+      } catch (err) {
+        // A worker that could not be prepared or launched is a failed attempt
+        // with its reason, never a thrown tick: the run below is closed, the
+        // lease released, and the next PR still gets its turn.
+        r = { outcome: OUTCOMES.FAILED, why: `could not prepare the worker: ${err.message}`, ms: 0, cost: null, sessionId: null };
       } finally {
         clearInterval(beat);
         // The alias was requested; this is what the worker said it actually ran as.

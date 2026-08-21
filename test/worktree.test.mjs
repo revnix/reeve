@@ -234,6 +234,19 @@ let wt;
     rmSync(bare, { recursive: true, force: true });
   }
 
+  // A worktree that predates the hook (a daemon upgrade finds a verified
+  // worktree from before) must be hardened on REUSE, not only on creation.
+  {
+    rmSync(`${r5.path}.hooks`, { recursive: true, force: true });
+    git(r5.path, "config", "--worktree", "--unset", "core.hooksPath");
+    const again = acquireWorktree({ repoRoot: repo, root: roots, pr: 12, branch: "feature", head: git(repo, "rev-parse", "origin/feature") });
+    check(again.ok && again.reused === true, "control: the worktree was reused, not recreated", JSON.stringify(again));
+    let hp = "(unset)";
+    try { hp = git(r5.path, "config", "--worktree", "core.hooksPath"); } catch { hp = "(unset)"; }
+    check(hp === `${r5.path}.hooks` && existsSync(join(hp, "pre-push")),
+      "a reused worktree is hardened again: hook present and configured", hp);
+  }
+
   // The confinement must be per-worktree. A plain `git config` write from inside a
   // worktree lands in the SHARED clone config and disables push everywhere,
   // including the main checkout — which is how the first version of this broke the

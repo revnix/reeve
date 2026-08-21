@@ -11,7 +11,18 @@ import { withDefaults } from "../src/profile/schema.mjs";
 const nwo = process.argv[2];
 if (!nwo) { console.error("usage: capture-baseline.mjs <owner/repo>"); process.exit(2); }
 const [owner, repo] = nwo.split("/");
-const gh = (path) => JSON.parse(execFileSync("gh", ["api", path], { encoding: "utf8" }));
+// Every failure is fatal except the one that means "none configured": a
+// baseline captured during an auth failure or a rate limit would record an
+// empty protection set as fact and hide a required check.
+const gh = (path, { noneOn404 = false } = {}) => {
+  try { return JSON.parse(execFileSync("gh", ["api", path], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })); }
+  catch (e) {
+    const err = String(e.stderr ?? e.message);
+    if (noneOn404 && /HTTP 404/.test(err)) return null;
+    console.error(`capture-baseline: ${path} failed: ${err.trim().split("\n")[0]}`);
+    process.exit(1);
+  }
+};
 
 const rulesets = gh(`repos/${nwo}/rulesets`);
 const active = rulesets.filter(r => r.enforcement === "active");
@@ -25,11 +36,9 @@ const bypass = detail.flatMap(r => (r.bypass_actors ?? []).map(b => `${b.actor_t
 // Classic branch protection is a SEPARATE mechanism from rulesets, and today it
 // is where the only required check lives; a baseline that read rulesets alone
 // would call the branch unprotected. 404 means none is configured.
-let branchProtectionRequiredChecks = [];
-try {
-  const bp = gh(`repos/${nwo}/branches/${encodeURIComponent(process.argv[3] ?? "main")}/protection`);
-  branchProtectionRequiredChecks = (bp.required_status_checks?.checks ?? []).map(c => `${c.context}@${c.app_id ?? "any"}`).sort();
-} catch { branchProtectionRequiredChecks = []; }
+const bp = gh(`repos/${nwo}/branches/${encodeURIComponent(process.argv[3] ?? "main")}/protection`, { noneOn404: true });
+const branchProtectionRequiredChecks = bp === null ? []
+  : (bp.required_status_checks?.checks ?? []).map(c => `${c.context}@${c.app_id ?? "any"}`).sort();
 
 const profile = withDefaults(JSON.parse(readFileSync(join(homedir(), ".reeve", "profiles", owner, `${repo}.json`), "utf8")));
 

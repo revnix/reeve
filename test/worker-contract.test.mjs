@@ -36,7 +36,7 @@ const db = open(join(dir, "c.db"));
 {
   const HEAD = "b".repeat(40);
   const cl = (id, state, detail = "") => ({ id, state, detail });
-  const evaluation = {
+  var evaluation = {
     ok: true, pr: 42, state: "open", head: HEAD, title: "t", headRef: "f", baseRef: "main",
     verdict: { state: "BLOCK", summary: "ci is red",
                clauses: ["ci", "base", "review", "rounds", "threads", "findings", "mergeable"]
@@ -45,17 +45,19 @@ const db = open(join(dir, "c.db"));
     checks: { verdict: "RED", caused: ["CI Gate"], failing: [{ name: "CI Gate", id: "99" }] },
     reviewers: [], threads: {}, settled: { settled: true },
   };
-  const ctx = {
-    nwo: "o/r", db, logPath: join(dir, "log.txt"), execute: true, shadow: true, running: 0, cliVersion: "2.1.237",
+  var ctxFor = (db_, logPath) => ({
+    nwo: "o/r", db: db_, logPath, execute: true, shadow: true, running: 0, cliVersion: "2.1.237",
     profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir }, authority: { policy: "propose_and_merge" },
                rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 }, ci: { provider: "github-actions", requiredChecks: [] },
                watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 } },
     openPrs: () => [42], evaluate: () => evaluation,
     publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
-    spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", model: "claude-x-resolved" }),
     resolveCause: () => ({ ok: true, job: "CI Gate", step: "Test", runId: 11, cause: [{ where: "src/x.ts:1", message: "boom" }] }),
     worktreeFor: () => dir,
-  };
+  });
+  var seenEnv = null;
+  const ctx = { ...ctxFor(db, join(dir, "log.txt")),
+    spawnWorker: async (args) => { seenEnv = args.env; return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", model: "claude-x-resolved" }; } };
   await tick(ctx);
   const row = db.prepare("SELECT w.* FROM worker_run w JOIN run r ON r.id = w.run_id WHERE r.task_id='pr:42'").get();
   check(!!row, "the daemon writes a contract row for its dispatch", JSON.stringify(row));
@@ -63,6 +65,30 @@ const db = open(join(dir, "c.db"));
     "with the CLI version and real hashes", JSON.stringify(row));
   check(row?.model_resolved === "claude-x-resolved", "and the model the worker announced", String(row?.model_resolved));
   check(!!row?.out_path && !!row?.err_path, "and the durable output paths", JSON.stringify([row?.out_path, row?.err_path]));
+  check(/runs\/o-r\/42\/[^/]+\/worker\.out$/.test(row?.out_path ?? ""),
+    "the run dir is keyed by repository, PR, and run id, never PR alone", String(row?.out_path));
+  check(typeof seenEnv?.TMPDIR === "string" && seenEnv.TMPDIR.includes("/runs/o-r/42/") && /\/tmp$/.test(seenEnv.TMPDIR),
+    "and the worker's TMPDIR is inside that run dir", String(seenEnv?.TMPDIR));
+}
+
+// ── a contract that cannot be recorded releases the lease ────────────────────
+//
+// The row is written after the run is leased and its heartbeat started. A
+// throw there escaped the cleanup, leaving the interval renewing a lease for a
+// worker that never ran, and every later dispatch for the PR refused.
+{
+  const dir2 = mkdtempSync(join(tmpdir(), "reeve-contract-fail-"));
+  const db2 = open(join(dir2, "c.db"));
+  db2.exec("DROP TABLE worker_run");   // the insert will throw
+  let spawned = 0;
+  const ctx2 = { ...ctxFor(db2, join(dir2, "log.txt")), spawnWorker: async () => { spawned++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; } };
+  let threw = null;
+  try { await tick(ctx2); } catch (e) { threw = e; }
+  check(!threw, "the tick survives a contract write failure", String(threw?.message));
+  check(spawned === 0, "and no worker was launched without its contract", String(spawned));
+  const run = db2.prepare("SELECT status FROM run ORDER BY started_at DESC LIMIT 1").get();
+  check(run?.status === "failed", "the leased run is closed as failed, not left live", JSON.stringify(run));
+  db2.close(); rmSync(dir2, { recursive: true, force: true });
 }
 
 db.close();

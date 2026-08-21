@@ -355,8 +355,11 @@ CREATE VIEW IF NOT EXISTS v_ready AS
 
 -- ---------------------------------------------------------------- worker contracts
 -- One row per claude worker the daemon dispatches: the immutable contract it
--- ran under. A retry reuses it verbatim; an alias never drifts under one.
--- The lease stays on `run`; this row never carries a second one.
+-- ran under, so "what did this worker actually run as" has an answer after the
+-- process is gone. The guardian's attempts are independent dispatches, each
+-- with its own row; reusing a recorded contract verbatim on a retry is the
+-- builder's phase behaviour and reads these columns plus the argv file kept
+-- beside the run. The lease stays on `run`; this row never carries a second one.
 CREATE TABLE IF NOT EXISTS worker_run (
   run_id          TEXT PRIMARY KEY REFERENCES run(id) ON DELETE CASCADE,
   cli_version     TEXT NOT NULL,

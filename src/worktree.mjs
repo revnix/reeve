@@ -55,6 +55,46 @@ export const pathFor = (root, pr) => join(root, `pr-${pr}`);
 /** The pre-push hook every worktree carries. It refuses unconditionally. */
 export const REFUSING_HOOK = "#!/bin/sh\necho 'this checkout does not publish; reeve publishes after the diff gate' >&2\nexit 1\n";
 
+/**
+ * Make a worktree PHYSICALLY unable to publish, on creation AND on reuse: a
+ * daemon upgraded over a worktree from before the hook existed must not hand
+ * that worktree back with only the older layer in place.
+ */
+function harden(repoRoot, path) {
+  // Make the worktree PHYSICALLY unable to publish, rather than trusting a
+  // permission pattern to refuse it.
+  //
+  // The permission layer matches command prefixes, and git accepts flags BEFORE
+  // the subcommand: `git -C <path> push` does not match a `git push` rule. That
+  // is not a gap to patch — it is the shape of the mechanism, and any deny
+  // written as a subcommand pattern has the same hole. A worker exploited exactly
+  // this and published its own fix, bypassing the diff gate entirely.
+  //
+  // A pushurl git cannot resolve fails the same way whatever the command spells,
+  // and reeve pushes from the main checkout where the real URL still lives.
+  // `--worktree`, not a plain config write. Worktrees SHARE the clone's config by
+  // default, so setting this without it disables push for the main checkout and
+  // every other worktree too — which is exactly what happened the first time and
+  // broke the test's own setup two cases later.
+  git(repoRoot, ["config", "extensions.worktreeConfig", "true"]);
+  git(path, ["config", "--worktree", "remote.origin.pushurl", "reeve://refused-the-worker-does-not-publish"]);
+
+  // Second layer, for the shape the pushurl does not cover: `git push <url>`
+  // with an explicit file:// or https:// destination never consults origin's
+  // pushurl, and measured from a worktree it succeeded. A worktree-scoped
+  // hooks path (the clone's own hooks stay untouched) refuses every push from
+  // inside this checkout. The directory is a SIBLING of the worktree, not
+  // inside it: inside, it is an untracked path that fails verification and
+  // would need an exclude written into the clone's shared git dir. Hooks can
+  // be bypassed with --no-verify, which is why the credential-less environment
+  // and the sandbox's network deny sit underneath this; each layer covers a
+  // shape the others do not.
+  const hooks = `${path}.hooks`;
+  mkdirSync(hooks, { recursive: true });
+  writeFileSync(join(hooks, "pre-push"), REFUSING_HOOK, { mode: 0o755 });
+  git(path, ["config", "--worktree", "core.hooksPath", hooks]);
+}
+
 export function verifyWorktree({ path, branch, head = null }) {
   if (!path || !existsSync(path)) return { ok: false, why: `does not exist: ${path}` };
 
@@ -101,7 +141,7 @@ export function acquireWorktree({ repoRoot, root, pr, branch, head = null }) {
   if (existsSync(path)) {
     const v = verifyWorktree({ path, branch, head });
     return v.ok
-      ? { ok: true, path, reused: true, why: null }
+      ? (harden(repoRoot, path), { ok: true, path, reused: true, why: null })
       : { ok: false, path, reused: true, why: `existing worktree unusable: ${v.why}` };
   }
 
@@ -117,38 +157,7 @@ export function acquireWorktree({ repoRoot, root, pr, branch, head = null }) {
   const add = git(repoRoot, ["worktree", "add", "--force", "-B", branch, path, `origin/${branch}`]);
   if (!add.ok) return { ok: false, path: null, why: `could not create the worktree: ${add.err}` };
 
-  // Make the worktree PHYSICALLY unable to publish, rather than trusting a
-  // permission pattern to refuse it.
-  //
-  // The permission layer matches command prefixes, and git accepts flags BEFORE
-  // the subcommand: `git -C <path> push` does not match a `git push` rule. That
-  // is not a gap to patch — it is the shape of the mechanism, and any deny
-  // written as a subcommand pattern has the same hole. A worker exploited exactly
-  // this and published its own fix, bypassing the diff gate entirely.
-  //
-  // A pushurl git cannot resolve fails the same way whatever the command spells,
-  // and reeve pushes from the main checkout where the real URL still lives.
-  // `--worktree`, not a plain config write. Worktrees SHARE the clone's config by
-  // default, so setting this without it disables push for the main checkout and
-  // every other worktree too — which is exactly what happened the first time and
-  // broke the test's own setup two cases later.
-  git(repoRoot, ["config", "extensions.worktreeConfig", "true"]);
-  git(path, ["config", "--worktree", "remote.origin.pushurl", "reeve://refused-the-worker-does-not-publish"]);
-
-  // Second layer, for the shape the pushurl does not cover: `git push <url>`
-  // with an explicit file:// or https:// destination never consults origin's
-  // pushurl, and measured from a worktree it succeeded. A worktree-scoped
-  // hooks path (the clone's own hooks stay untouched) refuses every push from
-  // inside this checkout. The directory is a SIBLING of the worktree, not
-  // inside it: inside, it is an untracked path that fails verification and
-  // would need an exclude written into the clone's shared git dir. Hooks can
-  // be bypassed with --no-verify, which is why the credential-less environment
-  // and the sandbox's network deny sit underneath this; each layer covers a
-  // shape the others do not.
-  const hooks = `${path}.hooks`;
-  mkdirSync(hooks, { recursive: true });
-  writeFileSync(join(hooks, "pre-push"), REFUSING_HOOK, { mode: 0o755 });
-  git(path, ["config", "--worktree", "core.hooksPath", hooks]);
+  harden(repoRoot, path);
 
   const v = verifyWorktree({ path, branch, head });
   if (!v.ok) return { ok: false, path, why: `created but did not verify: ${v.why}` };

@@ -95,6 +95,30 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
     "and it escalates instead", esc || JSON.stringify(r2.decisions?.[0]?.decision));
 }
 
+
+// --- lease loss reaches the worker ------------------------------------------
+//
+// The daemon's heartbeat interval ignored `heartbeat()`'s answer. The stub
+// worker here abandons the run underneath the daemon, as an expired lease
+// would, waits past one heartbeat, then asks the daemon's own `isRevoked`
+// whether it knows.
+{
+  const dir3 = mkdtempSync(join(tmpdir(), "reeve-e2e-lease-"));
+  const ctx3 = { ...baseCtx(), db: open(join(dir3, "l.db")), logPath: join(dir3, "log.txt"), heartbeatMs: 100 };
+  let sawRevoked = null;
+  ctx3.spawnWorker = async (args) => {
+    ctx3.db.prepare("UPDATE run SET status='abandoned' WHERE status IN ('leased','running')").run();
+    await new Promise(r => setTimeout(r, 400));
+    sawRevoked = args.isRevoked?.();
+    return { outcome: "lease_lost", why: `lease revoked: ${sawRevoked}`, ms: 400, cost: 0, sessionId: "s3" };
+  };
+  await tick(ctx3);
+  check(typeof sawRevoked === "string" && /lease/.test(sawRevoked),
+    "the daemon tells the worker its lease is gone", String(sawRevoked));
+  ctx3.db.close();
+  rmSync(dir3, { recursive: true, force: true });
+}
+
 ctx.db.close();
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

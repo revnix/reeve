@@ -22,6 +22,7 @@ import { promptFor } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
+import { workerEnv, writeGitConfig } from "./workerenv.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
@@ -431,8 +432,17 @@ export async function tick(ctx) {
 
       log(logPath, `  #${e.pr}: dispatching ${decision.action} in ${worktree} (run ${run.runId}, attempt ${run.attempt})`);
       started++;
-      const beat = setInterval(() => { try { heartbeat(db, { runId: run.runId }); } catch { /* a missed beat must not kill the worker */ } },
-                               HEARTBEAT_MS);
+      // The heartbeat's answer is read, not discarded. `heartbeat` already
+      // reports a lost lease; the interval used to swallow it, so a worker kept
+      // acting with no claim on its run. A failed write is the same: unknown is
+      // not alive.
+      let revoked = null;
+      const beat = setInterval(() => {
+        try {
+          const hb = heartbeat(db, { runId: run.runId });
+          if (!hb.alive) revoked = hb.reason ?? "lease not alive";
+        } catch (err) { revoked = `heartbeat write failed: ${err.message}`; }
+      }, ctx.heartbeatMs ?? HEARTBEAT_MS);
       // The deterministic boundary, built from the profile rather than described
       // to the model. Measured against the CLI first: a scoped allowlist refuses
       // `printf > file`, `| tee`, `git push` and a chained `git remote -v`, while
@@ -441,6 +451,15 @@ export async function tick(ctx) {
       const lane = (profile.lanes ?? []).find(l => l.id === decision.lane) ?? null;
       const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane });
       const settingsPath = writeSandbox(join(dirname(ctx.logPath ?? "/tmp/x"), "sandboxes", String(e.pr)), sandbox);
+      // The worker's environment is built, never inherited: no token, no ssh
+      // agent, no founder git config. Its output streams to files beside the
+      // run so a restart can read the report the worker left.
+      const stateDir = dirname(ctx.logPath ?? "/tmp/x");
+      const runDir = join(stateDir, "runs", String(e.pr));
+      const budgetMs = (profile.watch?.workerBudgetMinutes ?? 20) * 60_000;
+      const env = workerEnv({ gitConfigPath: writeGitConfig(join(stateDir, "git")),
+                              tmpDir: join(runDir, "tmp"), bgWaitMs: budgetMs });
+      const outPath = join(runDir, `${run.runId}.out`), errPath = join(runDir, `${run.runId}.err`);
 
       let r;
       try {
@@ -449,9 +468,11 @@ export async function tick(ctx) {
                              allowedTools: spec.tools ?? sandbox.allowedTools,
                              settings: settingsPath,
                              maxTurns: profile.watch?.maxTurns ?? 40 }),
-          cwd: worktree,
-          budgetMs: (profile.watch?.workerBudgetMinutes ?? 20) * 60_000,
+          cwd: worktree, env, outPath, errPath,
+          maxOutputBytes: profile.worker?.maxOutputBytes ?? 64 * 1024 * 1024,
+          budgetMs,
           isHalted: () => halted(ctx.haltMarker),
+          isRevoked: () => revoked,
           // Bind the process to the run the instant it exists, before it can
           // touch anything, so a crash leaves something probeable.
           onSpawn: ({ pid, lstart }) => notePid(db, { runId: run.runId, pid, boot: lstart }),

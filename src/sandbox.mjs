@@ -70,6 +70,50 @@ const NEVER = [
 const SELF_GOVERNING = [".github/**", ".git/**"];
 
 /**
+ * Paths a worker's shell must never read, enforced by the OS sandbox
+ * (`sandbox.filesystem.denyRead`, Seatbelt on macOS) and mirrored as `Read(...)`
+ * deny rules for the Read tool, which the OS sandbox does not cover.
+ *
+ * Measured 2026-08-22 (docs/measured/2026-08-22-claude-print-mode.md): the
+ * deny holds under -p, through symlinks, for Bash and for the Read tool. It
+ * does NOT reach the keychain -- securityd reads an item on the process's
+ * behalf and the runtime's profile hard-allows that service -- so this list
+ * closes FILE credentials only; the keychain is measured separately at daemon
+ * start (canary.mjs) and a host that holds a GitHub credential there stays
+ * refused.
+ *
+ *   ~/.reeve           the App's private key, every store, every other run's output
+ *   ~/.claude          the founder's sessions, settings and account state; the
+ *                      CLI reads these from its own (unsandboxed) process
+ *   ~/.claude.json     account state
+ *   ~/.config/gh       gh's config; a token when logged in with --insecure-storage
+ *   ~/.ssh             keys; the agent socket is already stripped from the env
+ *   ~/.gitconfig       the founder's helpers and URL rewrites
+ *   ~/.git-credentials the store helper's plaintext file
+ *   ~/.netrc           curl/git plaintext logins
+ *   ~/.npmrc           registry tokens
+ *   ~/.aws ~/.azure ~/.config/gcloud ~/.kube ~/.docker ~/.gnupg
+ *                      cloud, cluster, registry and signing credentials
+ */
+export const CREDENTIAL_PATHS = [
+  "~/.reeve", "~/.claude", "~/.claude.json", "~/.config/gh", "~/.ssh", "~/.gitconfig",
+  "~/.git-credentials", "~/.netrc", "~/.npmrc", "~/.aws", "~/.azure", "~/.config/gcloud",
+  "~/.kube", "~/.docker", "~/.gnupg",
+];
+// The same list as Read-tool rules: a file is named, a directory gets `/**`.
+const CREDENTIAL_FILES = new Set(["~/.claude.json", "~/.gitconfig", "~/.git-credentials", "~/.netrc", "~/.npmrc"]);
+const credentialReadDenies = () => CREDENTIAL_PATHS.map(p => (CREDENTIAL_FILES.has(p) ? `Read(${p})` : `Read(${p}/**)`));
+
+/**
+ * Actions whose Bash may reach the network at all, and where the domains come
+ * from. Everything else is denied outright: a fixer needs no registry (its
+ * dependencies are installed before it is dispatched) and a spec writer needs
+ * no web. Research reads the profile's list and nothing else.
+ */
+const NETWORK_DOMAINS = (profile, action) =>
+  action === "BUILD_RESEARCH" ? [...(profile?.builder?.network?.research?.allowedDomains ?? [])] : [];
+
+/**
  * Where a project's tests live, when the profile does not say.
  *
  * Tests judge the work exactly as the workflow does, but they cannot simply be
@@ -120,7 +164,7 @@ const denyWriteVerbs = glob =>
  * with its worktree as the working directory, and adding anything to that widens
  * the only boundary keeping it inside its own checkout.
  */
-export function sandboxFor({ profile, action, worktree, lane = null }) {
+export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = null }) {
   const risk = profile?.risk ?? {};
   const units = profile?.units ?? [];
 
@@ -199,6 +243,11 @@ export function sandboxFor({ profile, action, worktree, lane = null }) {
     ...SELF_GOVERNING.flatMap(denyWriteVerbs),
   ];
 
+  // The Read tool is not under the OS sandbox, so the credential paths are
+  // denied to it here as well; measured to hold for an absolute path and for a
+  // symlink inside the worktree that points at one.
+  deny.push(...credentialReadDenies());
+
   return {
     allowedTools: tools.join(","),
     settings: {
@@ -208,10 +257,106 @@ export function sandboxFor({ profile, action, worktree, lane = null }) {
         // Empty on purpose. The worktree is the boundary.
         additionalDirectories: [],
       },
+      // The OS boundary (Seatbelt on macOS, bubblewrap on Linux, refused
+      // elsewhere): every Bash subprocess runs inside it. The string-pattern
+      // denies above document intent; this enforces it. No fallback to an
+      // unsandboxed command, no auto-allow that would bypass the closed
+      // allowlist, nothing excluded. Write scope is the worktree (implicit: the
+      // CLI adds cwd) plus the run's own tmp, which sits under ~/.reeve and so
+      // must be carved back out of the deny-read. Every key is listed, because
+      // the validator is a closed allowlist and an absent key would be a
+      // default chosen by the CLI rather than by this file.
+      sandbox: {
+        enabled: true,
+        failIfUnavailable: true,
+        allowUnsandboxedCommands: false,
+        autoAllowBashIfSandboxed: false,
+        excludedCommands: [],
+        filesystem: {
+          allowWrite: tmpDir ? [tmpDir] : [],
+          denyWrite: [],
+          allowRead: tmpDir ? [tmpDir] : [],
+          denyRead: [...CREDENTIAL_PATHS],
+        },
+        network: {
+          allowedDomains: NETWORK_DOMAINS(profile, action),
+          deniedDomains: [],
+          allowUnixSockets: [],
+          allowAllUnixSockets: false,
+          allowLocalBinding: false,
+          allowMachLookup: [],
+        },
+      },
     },
     worktree,
     lane: lane?.id ?? null,
   };
+}
+
+/**
+ * Validate generated settings before spawn.
+ *
+ * Measured: under `-p` a settings file that fails the CLI's own validation is
+ * ignored IN ITS ENTIRETY, silently, exit 0 -- its deny rules included. So a
+ * supplied path proves nothing, and this is the check that turns "a file was
+ * passed" into "the file says what was meant". It is a closed allowlist of
+ * keys with exact values, not a schema of what the CLI accepts: a key this
+ * function does not know is refused, because it may be one that weakens the
+ * boundary (enableWeakerNestedSandbox, ignoreViolations, excludedCommands all
+ * do). `tmpDir` is required: the only write grant beyond cwd is the run's own
+ * tmp, and the validator cannot judge a grant without knowing what it should be.
+ */
+export function validateSettings(settings, { tmpDir = null } = {}) {
+  const errors = [];
+  if (!tmpDir) return { ok: false, errors: ["validator needs the run's tmpDir to judge the write grant"] };
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) return { ok: false, errors: ["settings absent"] };
+  const isObj = v => v && typeof v === "object" && !Array.isArray(v);
+  const strs = v => Array.isArray(v) && v.every(x => typeof x === "string");
+  const keysIn = (obj, allowed, where) => {
+    for (const k of Object.keys(obj)) if (!allowed.includes(k)) errors.push(`${where}: unexpected key: ${k}`);
+  };
+
+  keysIn(settings, ["permissions", "sandbox"], "settings");
+  const p = settings.permissions;
+  if (!isObj(p)) errors.push("permissions must be an object");
+  else {
+    keysIn(p, ["allow", "deny", "additionalDirectories"], "permissions");
+    if (!strs(p.allow)) errors.push("permissions.allow must be an array of strings");
+    if (!strs(p.deny)) errors.push("permissions.deny must be an array of strings");
+    if (!Array.isArray(p.additionalDirectories) || p.additionalDirectories.length) errors.push("permissions.additionalDirectories must be empty");
+    if (strs(p.deny)) for (const d of credentialReadDenies()) if (!p.deny.includes(d)) errors.push(`permissions.deny is missing ${d}`);
+  }
+
+  const sb = settings.sandbox;
+  if (!isObj(sb)) errors.push("sandbox block absent");
+  else {
+    keysIn(sb, ["enabled", "failIfUnavailable", "allowUnsandboxedCommands", "autoAllowBashIfSandboxed", "excludedCommands", "filesystem", "network"], "sandbox");
+    if (sb.enabled !== true) errors.push("sandbox.enabled must be true");
+    if (sb.failIfUnavailable !== true) errors.push("sandbox.failIfUnavailable must be true");
+    if (sb.allowUnsandboxedCommands !== false) errors.push("sandbox.allowUnsandboxedCommands must be false");
+    if (sb.autoAllowBashIfSandboxed !== false) errors.push("sandbox.autoAllowBashIfSandboxed must be false");
+    if (!Array.isArray(sb.excludedCommands) || sb.excludedCommands.length) errors.push("sandbox.excludedCommands must be empty");
+    const fs = sb.filesystem;
+    if (!isObj(fs)) errors.push("sandbox.filesystem must be an object");
+    else {
+      keysIn(fs, ["allowWrite", "denyWrite", "allowRead", "denyRead"], "sandbox.filesystem");
+      for (const k of ["allowWrite", "denyWrite", "allowRead", "denyRead"]) if (!strs(fs[k])) errors.push(`sandbox.filesystem.${k} must be an array of strings`);
+      if (strs(fs.allowWrite) && (fs.allowWrite.length !== 1 || fs.allowWrite[0] !== tmpDir)) errors.push(`sandbox.filesystem.allowWrite must be exactly the run's tmp (${tmpDir})`);
+      if (strs(fs.allowRead) && (fs.allowRead.length !== 1 || fs.allowRead[0] !== tmpDir)) errors.push(`sandbox.filesystem.allowRead must be exactly the run's tmp (${tmpDir})`);
+      if (strs(fs.denyRead)) for (const c of CREDENTIAL_PATHS) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
+    }
+    const net = sb.network;
+    if (!isObj(net)) errors.push("sandbox.network must be an object");
+    else {
+      keysIn(net, ["allowedDomains", "deniedDomains", "allowUnixSockets", "allowAllUnixSockets", "allowLocalBinding", "allowMachLookup"], "sandbox.network");
+      for (const k of ["allowedDomains", "deniedDomains", "allowUnixSockets", "allowMachLookup"]) if (!strs(net[k])) errors.push(`sandbox.network.${k} must be an array of strings`);
+      if (strs(net.allowUnixSockets) && net.allowUnixSockets.length) errors.push("sandbox.network.allowUnixSockets must be empty");
+      if (strs(net.allowMachLookup) && net.allowMachLookup.length) errors.push("sandbox.network.allowMachLookup must be empty");
+      if (net.allowAllUnixSockets !== false) errors.push("sandbox.network.allowAllUnixSockets must be false");
+      if (net.allowLocalBinding !== false) errors.push("sandbox.network.allowLocalBinding must be false");
+    }
+  }
+  return { ok: errors.length === 0, errors };
 }
 
 /** Write the settings a worker will run under, and return the path. */

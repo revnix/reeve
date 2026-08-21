@@ -10,7 +10,7 @@
 import { tick } from "../src/daemon.mjs";
 import { open, liveRunFor, countFixAttempts } from "../src/db/ops.mjs";
 import { causeKey } from "../src/ci-rootcause.mjs";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -210,6 +210,51 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(dir6, { recursive: true, force: true });
 }
 
+
+// --- settings that fail validation never reach a worker ----------------------
+//
+// Measured: under -p the CLI drops an invalid settings file WHOLE and silently,
+// deny rules included. A worker launched on one would run with no boundary and
+// a contract row claiming otherwise. The validator runs before the file is
+// written; a refusal is a preparation failure: no launch, refund, the reason
+// in the log.
+{
+  const dirS = mkdtempSync(join(tmpdir(), "reeve-e2e-settings-"));
+  const ctxS = { ...baseCtx(), db: open(join(dirS, "s.db")), logPath: join(dirS, "log.txt"), worktreeFor: () => mkdtempSync(join(dirS, "wt-")),
+                 settingsValidator: () => ({ ok: false, errors: ["planted: sandbox.enabled must be true"] }) };
+  let launchedS = 0;
+  ctxS.spawnWorker = async () => { launchedS++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  await tick(ctxS);
+  check(launchedS === 0, "no worker launches when the generated settings fail validation", String(launchedS));
+  const logS = readFileSync(join(dirS, "log.txt"), "utf8");
+  check(/settings invalid: planted/.test(logS), "the log carries the validator's reason", logS.split("\n").filter(l => /#42/.test(l)).slice(-2).join(" | ").slice(0, 300));
+  const prDirS = join(dirS, "runs", "o-r", "42");
+  const writtenS = existsSync(prDirS) ? readdirSync(prDirS).filter(d => existsSync(join(prDirS, d, "sandbox-settings.json"))) : [];
+  check(writtenS.length === 0, "and no settings file was written for the refused run", JSON.stringify(writtenS));
+  check((ctxS.db.prepare("SELECT COALESCE(SUM(attempts),0) n FROM fix_attempt").get().n) === 0, "the attempt is refunded", "");
+  ctxS.db.close();
+  rmSync(dirS, { recursive: true, force: true });
+}
+
+// --- and the real validator accepts what the real policy generates -----------
+//
+// A seam that is only ever stubbed proves the seam, not the pair. One dispatch
+// with the default validator, asserting that a worker WAS launched, is the
+// positive control for every stubbed case above and below.
+{
+  const dirV = mkdtempSync(join(tmpdir(), "reeve-e2e-validator-"));
+  const ctxV = { ...baseCtx(), db: open(join(dirV, "v.db")), logPath: join(dirV, "log.txt"), worktreeFor: () => mkdtempSync(join(dirV, "wt-")) };
+  let launchedV = 0, settingsSeen = null;
+  ctxV.spawnWorker = async (args) => { launchedV++; const i = args.args.indexOf("--settings"); settingsSeen = i >= 0 ? JSON.parse(readFileSync(args.args[i + 1], "utf8")) : null; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  await tick(ctxV);
+  check(launchedV === 1, "control: the default validator accepts the generated settings and a worker launches", String(launchedV));
+  check(settingsSeen?.sandbox?.enabled === true && settingsSeen?.sandbox?.failIfUnavailable === true,
+    "and the file the worker received carries the sandbox block", JSON.stringify(settingsSeen?.sandbox)?.slice(0, 200));
+  check(Array.isArray(settingsSeen?.sandbox?.filesystem?.allowWrite) && settingsSeen.sandbox.filesystem.allowWrite.length === 1 && settingsSeen.sandbox.filesystem.allowWrite[0].endsWith("/tmp"),
+    "whose only write grant is the run's own tmp", JSON.stringify(settingsSeen?.sandbox?.filesystem?.allowWrite));
+  ctxV.db.close();
+  rmSync(dirV, { recursive: true, force: true });
+}
 
 // --- a cooperative cancel closes the run as abandoned, never as failed ------
 {

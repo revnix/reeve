@@ -19,7 +19,7 @@ import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
-import { sandboxFor, writeSandbox, reviewDiff } from "./sandbox.mjs";
+import { sandboxFor, writeSandbox, reviewDiff, validateSettings } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig, CONTAINMENT } from "./workerenv.mjs";
@@ -519,7 +519,14 @@ export async function tick(ctx) {
       // still letting the worker run the project's own commands -- which it must,
       // or it cannot tell whether its fix worked.
       const lane = (profile.lanes ?? []).find(l => l.id === decision.lane) ?? null;
-      const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane });
+      // The run dir is keyed by repository, PR, and run id: the log dir is
+      // shared by every repo's daemon, and two repos can share a PR number.
+      // Known before the policy is built, because the run's own tmp is the one
+      // write grant the OS sandbox carries beyond the worktree.
+      const stateDir = dirname(ctx.logPath ?? "/tmp/x");
+      const runDir = join(stateDir, "runs", nwo.replace("/", "-"), String(e.pr), run.runId);
+      const tmpDir = join(runDir, "tmp");
+      const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane, tmpDir });
 
       let r, prepFailed = false;
       try {
@@ -535,14 +542,19 @@ export async function tick(ctx) {
         // run so a restart can read the report the worker left. The run dir is
         // keyed by repository, PR, and run id: the log dir is shared by every
         // repo's daemon, and two repos can share a PR number.
-        const stateDir = dirname(ctx.logPath ?? "/tmp/x");
-        const runDir = join(stateDir, "runs", nwo.replace("/", "-"), String(e.pr), run.runId);
         const budgetMs = (profile.watch?.workerBudgetMinutes ?? 20) * 60_000;
         const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
         const env = workerEnv({ gitConfigPath: writeGitConfig(join(stateDir, "git")),
-                                tmpDir: join(runDir, "tmp"), bgWaitMs: budgetMs,
+                                tmpDir, bgWaitMs: budgetMs,
                                 extraPath: [dirname(claudeBin)] });
         const outPath = join(runDir, "worker.out"), errPath = join(runDir, "worker.err");
+        // Validated BEFORE it is written or hashed. Measured: under -p the CLI
+        // drops an invalid settings file whole and silently, deny rules
+        // included, so a worker launched on one would run with no boundary at
+        // all and a contract row claiming otherwise. A failure here is a
+        // preparation failure: refunded, backed off, escalated, never launched.
+        const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir });
+        if (!sv.ok) throw new Error(`settings invalid: ${sv.errors.join("; ")}`);
         // The settings file is immutable per run, in the run's own directory:
         // a path keyed by PR alone was shared by every daemon on the host, and
         // one could overwrite it between this run's hash and its spawn.

@@ -26,7 +26,7 @@
 // And a sixth, unprompted: denied twice, the model reached for a THIRD tool that
 // was not in the allowlist at all. Any tool that can run a command is a write
 // primitive, so this must be a closed allowlist, never a denylist.
-import { sandboxFor, reviewDiff } from "../src/sandbox.mjs";
+import { sandboxFor, reviewDiff, validateSettings, CREDENTIAL_PATHS } from "../src/sandbox.mjs";
 import { readFileSync } from "node:fs";
 
 let fail = 0;
@@ -298,6 +298,77 @@ const lane = { id: "schema", territory: ["packages/nextly/**"] };
   const plain = sandboxFor({ profile: relProfile, action: "FIX_FINDINGS", worktree: "/tmp/wt", lane: schemaLane });
   check(/\.changeset/.test(plain.settings.permissions.deny.join(" ")),
     "and a lane without sensitiveOk keeps every deny", "");
+}
+
+
+// ── the OS sandbox is in the settings, and the settings are validated ─────────
+//
+// Measured 2026-08-22 (docs/measured/2026-08-22-claude-print-mode.md): the
+// sandbox block applies under -p; an invalid settings file is dropped WHOLE,
+// silently, exit 0 -- its deny rules included. So the block is emitted for
+// every worker and validated before spawn, and the validator is a closed
+// allowlist of keys with exact values: a key it does not know is refused,
+// because a key it does not know is a key that may weaken the boundary.
+const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
+{
+  const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: TMP });
+  const sb = s.settings.sandbox;
+  check(sb?.enabled === true && sb.failIfUnavailable === true && sb.allowUnsandboxedCommands === false && sb.autoAllowBashIfSandboxed === false,
+    "every worker's settings enable the OS sandbox with no unsandboxed fallback and no auto-allow", JSON.stringify(sb));
+  check(Array.isArray(sb?.excludedCommands) && sb.excludedCommands.length === 0, "nothing runs outside the sandbox", JSON.stringify(sb?.excludedCommands));
+  check(Array.isArray(sb?.network?.allowedDomains) && sb.network.allowedDomains.length === 0, "and deny network by default", JSON.stringify(sb?.network));
+  check(sb?.network?.allowLocalBinding === false && sb.network.allowAllUnixSockets === false && sb.network.allowUnixSockets.length === 0 && sb.network.allowMachLookup.length === 0,
+    "no local binding, no unix sockets, no extra mach services", JSON.stringify(sb?.network));
+  const fs = sb?.filesystem ?? {};
+  check(CREDENTIAL_PATHS.every(c => fs.denyRead?.includes(c)) && fs.denyRead.includes("~/.reeve") && fs.denyRead.includes("~/.ssh") && fs.denyRead.includes("~/.config/gh"),
+    "credential paths are deny-read at the OS layer", JSON.stringify(fs.denyRead));
+  check(JSON.stringify(fs.allowWrite) === JSON.stringify([TMP]) && JSON.stringify(fs.allowRead) === JSON.stringify([TMP]),
+    "the run's own tmp is the only write grant beyond cwd, carved back out of the deny-read", JSON.stringify([fs.allowWrite, fs.allowRead]));
+  const deny = s.settings.permissions.deny;
+  check(CREDENTIAL_PATHS.every(c => deny.includes(`Read(${c}/**)`) || deny.includes(`Read(${c})`)),
+    "and the Read tool, which the OS sandbox does not cover, is denied the same paths", deny.filter(d => d.startsWith("Read(")).join(" "));
+  const v = validateSettings(s.settings, { tmpDir: TMP });
+  check(v.ok === true, "control: generated settings validate", JSON.stringify(v.errors));
+  const r = sandboxFor({ profile: { ...profile, builder: { network: { research: { allowedDomains: ["docs.example.com"] } } } },
+                         action: "BUILD_RESEARCH", worktree: "/tmp/wt", tmpDir: TMP });
+  check(JSON.stringify(r.settings.sandbox.network.allowedDomains) === JSON.stringify(["docs.example.com"]),
+    "research may reach the profile's research domains", JSON.stringify(r.settings.sandbox.network.allowedDomains));
+  const f = sandboxFor({ profile: { ...profile, builder: { network: { research: { allowedDomains: ["docs.example.com"] } } } },
+                         action: "FIX_CI", worktree: "/tmp/wt", tmpDir: TMP });
+  check(f.settings.sandbox.network.allowedDomains.length === 0, "and no other action does", JSON.stringify(f.settings.sandbox.network.allowedDomains));
+}
+{
+  const good = () => structuredClone(sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: TMP }).settings);
+  const errs = s => validateSettings(s, { tmpDir: TMP }).errors.join(" | ");
+  let b = good(); b.sandbox.allowUnsandboxedCommands = true;
+  check(!validateSettings(b, { tmpDir: TMP }).ok && /allowUnsandboxedCommands/.test(errs(b)), "an unsandboxed fallback is refused", errs(b));
+  b = good(); b.sandbox.enabled = "yes";
+  check(!validateSettings(b, { tmpDir: TMP }).ok && /enabled/.test(errs(b)), "a truthy string is not enabled", errs(b));
+  b = good(); b.sandbox.failIfUnavailable = false;
+  check(!validateSettings(b, { tmpDir: TMP }).ok && /failIfUnavailable/.test(errs(b)), "a sandbox that may silently be absent is refused", errs(b));
+  b = good(); b.sandbox.autoAllowBashIfSandboxed = true;
+  check(!validateSettings(b, { tmpDir: TMP }).ok && /autoAllowBashIfSandboxed/.test(errs(b)), "auto-allowing every Bash command is refused", errs(b));
+  b = good(); b.sandbox.excludedCommands = ["docker *"];
+  check(!validateSettings(b, { tmpDir: TMP }).ok && /excludedCommands/.test(errs(b)), "an excluded command runs unsandboxed, so none is allowed", errs(b));
+  b = good(); b.hooks = {};
+  check(!validateSettings(b, { tmpDir: TMP }).ok && /hooks/.test(errs(b)), "an unexpected top-level key is refused", errs(b));
+  b = good(); b.sandbox.enableWeakerNestedSandbox = true;
+  check(!validateSettings(b, { tmpDir: TMP }).ok && /enableWeakerNestedSandbox/.test(errs(b)), "an unknown sandbox key is refused, weakening ones included", errs(b));
+  b = good(); b.sandbox.network.allowLocalBinding = true;
+  check(!validateSettings(b, { tmpDir: TMP }).ok && /allowLocalBinding/.test(errs(b)), "local binding is refused", errs(b));
+  b = good(); b.sandbox.filesystem.allowWrite = [TMP, "/Users/x"];
+  check(!validateSettings(b, { tmpDir: TMP }).ok && /allowWrite/.test(errs(b)), "a write grant outside the run's tmp is refused", errs(b));
+  b = good(); b.sandbox.filesystem.denyRead = b.sandbox.filesystem.denyRead.filter(x => x !== "~/.ssh");
+  check(!validateSettings(b, { tmpDir: TMP }).ok && /denyRead/.test(errs(b)), "a missing credential deny is refused", errs(b));
+  b = good(); b.permissions.additionalDirectories = ["/Users/x"];
+  check(!validateSettings(b, { tmpDir: TMP }).ok && /additionalDirectories/.test(errs(b)), "an additional directory widens the boundary and is refused", errs(b));
+  b = good(); b.permissions.deny = b.permissions.deny.filter(d => !d.startsWith("Read(~/.reeve"));
+  check(!validateSettings(b, { tmpDir: TMP }).ok && /Read\(/.test(errs(b)), "a missing Read deny is refused", errs(b));
+  b = good(); delete b.sandbox;
+  check(!validateSettings(b, { tmpDir: TMP }).ok && /sandbox/.test(errs(b)), "a settings object without the block is refused", errs(b));
+  check(validateSettings(null, { tmpDir: TMP }).ok === false, "absent settings are invalid, not empty");
+  check(validateSettings(good(), {}).ok === false && /tmpDir/.test(validateSettings(good(), {}).errors.join(" ")),
+    "the validator itself refuses to judge without knowing the run's tmp", validateSettings(good(), {}).errors.join(" "));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

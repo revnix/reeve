@@ -59,30 +59,70 @@ export function readThreads(nwo, pr) {
  * Reviewer state at a head. Four states, never two. A refusal is ABSENT, and a
  * declared-but-never-seen reviewer is NOT_INSTALLED rather than silently clean.
  */
-export function readReviewerStates(nwo, pr, head, reviewers) {
-  const comments = ghJson([`repos/${nwo}/issues/${pr}/comments?per_page=100`, "--jq",
-    '.[] | [.user.login, (.created_at), (.body|gsub("\n";" "))] | @tsv']);
-  const reviews = ghJson([`repos/${nwo}/pulls/${pr}/reviews?per_page=100`, "--jq",
-    '.[] | [.user.login, (.commit_id // ""), (.state), (.body|gsub("\n";" "))] | @tsv']);
-  const cRows = comments.ok ? comments.out.split("\n").filter(Boolean).map(l => l.split("\t")) : [];
-  const rRows = reviews.ok ? reviews.out.split("\n").filter(Boolean).map(l => l.split("\t")) : [];
+/**
+ * The revision a clean-pass comment names, when the profile declares no pattern.
+ * Codex-shaped, and a DEFAULT rather than a rule: a reviewer whose wording differs
+ * sets `commitPattern`. Named here so the core carries one reviewer-shaped string
+ * in one place instead of inline in a matcher.
+ */
+const CLEAN_COMMIT = "Reviewed commit:\\**\\s*`?([0-9a-f]{7,40})`?";
+
+export function readReviewerStates(nwo, pr, head, reviewers, io = null) {
+  // Injected for tests: classifying a reviewer is pure once the rows are in hand,
+  // and every branch here was previously reachable only with a live GitHub.
+  let cRows, rRows;
+  if (io) {
+    cRows = io.comments ?? [];
+    rRows = io.reviews ?? [];
+  } else {
+    const comments = ghJson([`repos/${nwo}/issues/${pr}/comments?per_page=100`, "--jq",
+      '.[] | [.user.login, (.created_at), (.body|gsub("\n";" "))] | @tsv']);
+    const reviews = ghJson([`repos/${nwo}/pulls/${pr}/reviews?per_page=100`, "--jq",
+      '.[] | [.user.login, (.commit_id // ""), (.state), (.body|gsub("\n";" "))] | @tsv']);
+    cRows = comments.ok ? comments.out.split("\n").filter(Boolean).map(l => l.split("\t")) : [];
+    rRows = reviews.ok ? reviews.out.split("\n").filter(Boolean).map(l => l.split("\t")) : [];
+  }
 
   return reviewers.map(rev => {
     const mine = l => String(l).toLowerCase().includes(rev.login.toLowerCase());
     const myComments = cRows.filter(([l]) => mine(l));
     const myReviews = rRows.filter(([l]) => mine(l));
-    if (!myComments.length && !myReviews.length) return { ...rev, state: "NOT_RUN", reviewedHead: null };
+    // NOT_INSTALLED, which the verdict consumes and this function never produced:
+    // a rostered reviewer that has said NOTHING on a PR with review activity from
+    // others is not "not yet run", it is absent, and absent must reach
+    // REVIEWERS_DOWN rather than wait forever. Silence on a PR nobody has reviewed
+    // is genuinely just early, so the distinction is whether ANYONE answered.
+    if (!myComments.length && !myReviews.length) {
+      const anyoneAnswered = rRows.length > 0 || cRows.length > 0;
+      return anyoneAnswered
+        ? { ...rev, state: "NOT_INSTALLED", reviewedHead: null,
+            detail: "rostered but silent while other reviewers answered" }
+        : { ...rev, state: "NOT_RUN", reviewedHead: null };
+    }
 
-    // A refusal is the most recent word if it is the most recent word.
-    const last = myComments.at(-1);
-    if (rev.refusal && last && new RegExp(rev.refusal, "i").test(last[2])) {
-      return { ...rev, state: "REFUSED", reviewedHead: null, detail: "quota or rate limit" };
+    // A refusal anywhere in the window counts, not only as the last word. Reading
+    // only the most recent comment made a refusal invisible the moment the same
+    // reviewer said anything after it -- and both bots comment constantly. A
+    // refusal is superseded only by a SUBSTANTIVE answer: one that names a
+    // revision, which is the same evidence coverage requires.
+    if (rev.refusal) {
+      const rx = new RegExp(rev.refusal, "i");
+      const lastRefusalAt = myComments.reduce((at, c, i) => (rx.test(c[2]) ? i : at), -1);
+      if (lastRefusalAt >= 0) {
+        const namedAfter = myComments.slice(lastRefusalAt + 1)
+          .some(([, , body]) => new RegExp(rev.commitPattern ?? CLEAN_COMMIT, "i").test(body));
+        const reviewedAfter = myReviews.some(([, sha]) => sha);
+        if (!namedAfter && !reviewedAfter) {
+          return { ...rev, state: "REFUSED", reviewedHead: null, detail: "quota or rate limit" };
+        }
+      }
     }
     // Findings carry the full sha on the review object; a clean pass names an
     // abbreviated sha in the comment body and files no review object at all.
     const withSha = myReviews.filter(([, sha]) => sha);
     if (withSha.length) return { ...rev, state: "VERDICT", reviewedHead: withSha.at(-1)[1] };
-    const named = myComments.map(([, , body]) => body.match(/Reviewed commit:\**\s*`?([0-9a-f]{7,40})`?/i)?.[1]).filter(Boolean);
+    const rx = new RegExp(rev.commitPattern ?? CLEAN_COMMIT, "i");
+    const named = myComments.map(([, , body]) => body.match(rx)?.[1]).filter(Boolean);
     if (named.length) return { ...rev, state: "CLEAN", reviewedHead: named.at(-1) };
     return { ...rev, state: "NOT_RUN", reviewedHead: null, detail: "commented without naming a revision" };
   });
@@ -97,7 +137,10 @@ export function evaluatePr({ nwo, pr, profile, db = null }) {
   const pin = pinHead(nwo, headRef);
   if (!pin.ok) return { ok: false, why: `could not pin head: ${pin.why}` };
 
-  const { rows } = readChecks(nwo, pin.sha);
+  // A reviewer's commit status is never CI evidence: a rate-limited CodeRabbit
+  // reports success. Excluded at the read, for the head AND the base alike.
+  const reviewerContexts = profile.ci?.reviewerStatusContexts ?? [];
+  const { rows } = readChecks(nwo, pin.sha, { reviewerContexts });
   const c = classify(rows, profile.ci?.requiredChecks ?? []);
   // ONE reading, folded into what the previous tick recorded. Settlement is about
   // the check SET being stable ACROSS TIME, so it can only be established by
@@ -121,7 +164,7 @@ export function evaluatePr({ nwo, pr, profile, db = null }) {
   if (c.failing.length) {
     // Rows, not names, so causes can be compared; and the resolver is handed in
     // because a shared job name is not a shared failure.
-    const io = inheritedOrCaused(nwo, baseRef, c.failing, { resolveCause: rootCause });
+    const io = inheritedOrCaused(nwo, baseRef, c.failing, { resolveCause: rootCause, reviewerContexts });
     c.inherited = io.inherited; c.caused = io.caused; c.unverified = io.unverified;
   }
 
@@ -130,7 +173,7 @@ export function evaluatePr({ nwo, pr, profile, db = null }) {
   // meant every check on the base counted equally, so one cancelled ancillary job
   // made the branch uncheckable and every open PR waited on it.
   const base = baseHead.ok
-    ? classify(readChecks(nwo, baseHead.sha).rows, profile.ci?.requiredChecks ?? [])
+    ? classify(readChecks(nwo, baseHead.sha, { reviewerContexts }).rows, profile.ci?.requiredChecks ?? [])
     : { verdict: "UNKNOWN" };
 
   const threads = readThreads(nwo, pr);

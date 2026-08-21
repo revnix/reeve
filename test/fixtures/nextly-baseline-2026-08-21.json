@@ -1,0 +1,27 @@
+{
+  "capturedAt": "2026-08-21T18:15:24.523Z",
+  "nwo": "nextlyhq/nextly",
+  "rulesetNames": [
+    "protect-main"
+  ],
+  "rulesetRequiredChecks": [],
+  "rulesetBypassActors": [
+    "OrganizationAdmin::always"
+  ],
+  "branchProtectionRequiredChecks": [
+    "Decide what this commit can affect@15368"
+  ],
+  "requiredApprovals": 1,
+  "codeOwnerReview": true,
+  "profile": {
+    "authorityPolicy": "propose_and_merge",
+    "mergeEnforcement": "enforced",
+    "capabilities": {
+      "observe": false,
+      "draftSpec": false,
+      "implementLocal": false,
+      "publishPr": false,
+      "mergeBuilderPr": false
+    }
+  }
+}

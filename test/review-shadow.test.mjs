@@ -174,6 +174,31 @@ const db = open(join(dir, "s.db"));
     "and the never-assigned name it replaced is gone");
 }
 
+// ── a past divergence is history, not a veto ─────────────────────────────────
+//
+// The gate first required BOTH N clean days and no divergence ever recorded. The
+// streak already excludes any day that diverged, so the second clause only meant
+// that one bad day blocked the gate permanently — a gate that can only ever say
+// no. Today's divergence, caused by a bug fixed an hour later, would have held
+// PR-5 shut forever.
+{
+  const d4 = mkdtempSync(join(tmpdir(), "reeve-shadow4-"));
+  const db4 = open(join(d4, "s.db"));
+
+  // Day -5 diverged. The five days since are clean.
+  record(db4, NWO, 1, compare(live(5, 2), proj(4, 2, 2)), T - 5 * DAY);
+  for (let d = 4; d >= 0; d--) record(db4, NWO, 1, compare(live(5, 2), proj(5, 2, 3)), T - d * DAY);
+
+  const s5 = streak(db4, NWO, T);
+  check(s5.days === 5,
+    "five clean days after an old divergence still counts as five", JSON.stringify(s5));
+  check(divergences(db4, NWO).length === 1,
+    "and the old divergence is still on record to read", JSON.stringify(divergences(db4, NWO).length));
+
+  db4.close();
+  rmSync(d4, { recursive: true, force: true });
+}
+
 db.close();
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

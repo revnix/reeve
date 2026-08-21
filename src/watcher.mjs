@@ -27,6 +27,9 @@ export const ESCALATIONS = {
   CAP_WITH_CRITICAL: "round cap reached with a critical finding open",
   REPEATED_FAILURE: "the same failure survived a second fix",
   DIRTY: "the branch conflicts with its base",
+  // GitHub refusing for a requirement no clause models -- on nextly this is the
+  // ruleset's approving-review demand, which reeve neither gives nor overrides.
+  PROTECTION_UNMET: "GitHub's protection requires something reeve does not provide (typically an approving review)",
   REVIEWERS_DOWN: "no blocking reviewer is reachable",
   NOT_CHECKABLE: "a clause could not be evaluated and stayed that way",
 };
@@ -189,6 +192,15 @@ export function nextAction(e, p, h = {}) {
     return act(ACTIONS.PARK, `verdict is PASS but authority.policy is '${policy}': awaiting a maintainer`,
                { awaitingMaintainer: true });
   }
+
+  // GitHub can refuse a merge for a requirement none of the clauses model.
+  // The fall-through at the top assumed a lower clause always explains BLOCKED;
+  // nextly #1129 was the counterexample -- every check green, threads clear,
+  // and mergeStateStatus BLOCKED because the ruleset demands an approving
+  // review. A routine needs-a-human state, not a gap in this function.
+  const blocking = v.clauses.filter(c => c.state === "BLOCK");
+  if (blocking.length && blocking.every(c => c.id === "mergeable"))
+    return act(ACTIONS.ESCALATE, ESCALATIONS.PROTECTION_UNMET, { detail: blocking[0].detail });
 
   // Total by construction: a BLOCK that matched no branch above is a gap in this
   // function, and saying so is better than silently waiting.

@@ -145,5 +145,23 @@ check("an unrecognised merge state escalates with the state named",
   check("and dispatches on them", d.action, ACTIONS.FIX_CI);
 }
 
+// GitHub can refuse a merge for a requirement none of the clauses model.
+// Measured on nextly #1129: every check green, no blocking threads, and
+// mergeStateStatus BLOCKED because the ruleset demands an approving review.
+// That is a routine needs-a-human state; reporting it as a gap in the
+// classifier tells the founder the code is broken when the PR just needs them.
+{
+  const d = nextAction(ev(swap("mergeable", "BLOCK", "mergeStateStatus BLOCKED")), P);
+  check("protection unmet beyond the clauses escalates by name", d.why, ESCALATIONS.PROTECTION_UNMET);
+  check("and is not reported as a classifier gap", d.gap, undefined);
+  check("and carries GitHub's own word in the detail, not the key", d.detail, "mergeStateStatus BLOCKED");
+
+  // Control: a BLOCK the watcher genuinely cannot name still reaches the
+  // catch-all -- the new branch must not swallow real gaps.
+  const g = nextAction(ev(allPass().concat(cl("zzz", "BLOCK", "??"))), P);
+  check("an unknown blocking clause still reports a gap", g.gap, true);
+  check("and says it is unclassified", /unclassified/.test(g.why), true);
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

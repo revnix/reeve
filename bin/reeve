@@ -225,9 +225,14 @@ switch (cmd) {
     } else {
       console.log("\n  nothing compared yet.");
     }
-    // Exit 0 only when the bar is met, so this can gate a decision rather than
-    // just describe one.
-    process.exit(sk.days >= need && !bad.length ? 0 : 3);
+    // The streak already EXCLUDES any day that diverged, so N consecutive clean
+    // days ending today is the whole condition. Also requiring that no divergence
+    // has ever been recorded would let one bad day -- today's, caused by a bug
+    // since fixed -- block the gate permanently, which is a gate that can only
+    // ever say no.
+    //
+    // Old divergences stay listed above. They are history to read, not a veto.
+    process.exit(sk.days >= need ? 0 : 3);
   }
 
   case "why": {

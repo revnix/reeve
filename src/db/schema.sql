@@ -251,6 +251,25 @@ CREATE TABLE IF NOT EXISTS projection_meta (
   complete   INTEGER NOT NULL,               -- 0 = a fetch failed or was truncated
   PRIMARY KEY (nwo, scope)) STRICT;
 
+-- ------------------------------------------------------------ review shadow
+-- Does the derived view tell the same story as the live read? Rolled up per day
+-- because the question is "how many consecutive DAYS has it agreed", and twenty
+-- identical rows an hour would bury the divergences that matter.
+--
+-- `incomparable` is counted separately and is neither agreement nor
+-- disagreement: a truncated read or an unbuilt projection means nothing was
+-- learned, and a streak built from those is a streak of not looking.
+CREATE TABLE IF NOT EXISTS review_shadow (
+  nwo             TEXT NOT NULL,
+  pr              INTEGER NOT NULL,
+  day             TEXT NOT NULL,            -- YYYY-MM-DD, UTC
+  comparisons     INTEGER NOT NULL DEFAULT 0,
+  agreements      INTEGER NOT NULL DEFAULT 0,
+  incomparable    INTEGER NOT NULL DEFAULT 0,
+  last_divergence TEXT,
+  last_at         INTEGER NOT NULL,
+  PRIMARY KEY (nwo, pr, day)) STRICT;
+
 -- ---------------------------------------------------------------- facts
 -- Evidence attached to a node. Defined HERE rather than in the migrator so a
 -- database opened by open() has the same shape as one built by a migration.

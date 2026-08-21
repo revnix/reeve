@@ -18,7 +18,7 @@
 // administrative files behind pointing at nothing.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, writeFileSync, rmSync } from "node:fs";
 import { join, basename, dirname } from "node:path";
 
 function git(cwd, args) {
@@ -52,6 +52,9 @@ export const pathFor = (root, pr) => join(root, `pr-${pr}`);
  * what a worker's own commit looks like, but it must still descend from it — a
  * head that does not is a different line of work.
  */
+/** The pre-push hook every worktree carries. It refuses unconditionally. */
+export const REFUSING_HOOK = "#!/bin/sh\necho 'this checkout does not publish; reeve publishes after the diff gate' >&2\nexit 1\n";
+
 export function verifyWorktree({ path, branch, head = null }) {
   if (!path || !existsSync(path)) return { ok: false, why: `does not exist: ${path}` };
 
@@ -132,6 +135,21 @@ export function acquireWorktree({ repoRoot, root, pr, branch, head = null }) {
   git(repoRoot, ["config", "extensions.worktreeConfig", "true"]);
   git(path, ["config", "--worktree", "remote.origin.pushurl", "reeve://refused-the-worker-does-not-publish"]);
 
+  // Second layer, for the shape the pushurl does not cover: `git push <url>`
+  // with an explicit file:// or https:// destination never consults origin's
+  // pushurl, and measured from a worktree it succeeded. A worktree-scoped
+  // hooks path (the clone's own hooks stay untouched) refuses every push from
+  // inside this checkout. The directory is a SIBLING of the worktree, not
+  // inside it: inside, it is an untracked path that fails verification and
+  // would need an exclude written into the clone's shared git dir. Hooks can
+  // be bypassed with --no-verify, which is why the credential-less environment
+  // and the sandbox's network deny sit underneath this; each layer covers a
+  // shape the others do not.
+  const hooks = `${path}.hooks`;
+  mkdirSync(hooks, { recursive: true });
+  writeFileSync(join(hooks, "pre-push"), REFUSING_HOOK, { mode: 0o755 });
+  git(path, ["config", "--worktree", "core.hooksPath", hooks]);
+
   const v = verifyWorktree({ path, branch, head });
   if (!v.ok) return { ok: false, path, why: `created but did not verify: ${v.why}` };
   return { ok: true, path, reused: false, why: null };
@@ -192,6 +210,8 @@ export function releaseWorktree({ path, pr, quarantineRoot = null }) {
   const removed = git(repoRoot, ["worktree", "remove", path]);
   if (!removed.ok) return refuse(`git refused to remove the worktree: ${removed.err}`);
   git(repoRoot, ["worktree", "prune"]);
+  // The hook directory is a sibling the worktree's removal does not cover.
+  rmSync(`${path}.hooks`, { recursive: true, force: true });
   return { ok: true, why: null, quarantined: false };
 }
 

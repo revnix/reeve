@@ -211,6 +211,29 @@ let wt;
   const after = git(repo, "ls-remote", "origin", "refs/heads/feature").split(/\s+/)[0];
   check(after === before, "and the remote did not move", `${before.slice(0,10)} -> ${after.slice(0,10)}`);
 
+  // The bogus pushurl stops a push to origin. A push to an explicit file:// or
+  // https:// URL never consults it; the worktree's own hook is the layer that
+  // catches that shape. Git's error text is asserted so the refusing layer is
+  // named, not inferred.
+  {
+    const bare = mkdtempSync(join(tmpdir(), "reeve-bare-escape-"));
+    execFileSync("git", ["init", "--bare", "-q", bare]);
+    let code = 0, err = "";
+    try { execFileSync("git", ["-C", r5.path, "push", bare, "HEAD:refs/heads/escape"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (e) { code = e.status; err = String(e.stderr); }
+    check(code !== 0 && /does not publish/.test(err),
+      "a push to an explicit URL is refused by the worktree's own hook", `code=${code} ${err.slice(0, 200)}`);
+    const refs = execFileSync("git", ["-C", bare, "for-each-ref"], { encoding: "utf8" }).trim();
+    check(refs === "", "and nothing reached the destination", refs);
+    const hooksPath = git(r5.path, "config", "--worktree", "core.hooksPath");
+    check(hooksPath === `${r5.path}.hooks` && existsSync(join(hooksPath, "pre-push")),
+      "the hooks path is this worktree's own sibling directory, set with --worktree", hooksPath);
+    let mainHooks = "(unset)";
+    try { mainHooks = git(repo, "config", "--get", "core.hooksPath") || "(unset)"; } catch { mainHooks = "(unset)"; }
+    check(mainHooks === "(unset)", "and the main checkout's hooks are untouched", mainHooks);
+    rmSync(bare, { recursive: true, force: true });
+  }
+
   // The confinement must be per-worktree. A plain `git config` write from inside a
   // worktree lands in the SHARED clone config and disables push everywhere,
   // including the main checkout — which is how the first version of this broke the

@@ -26,7 +26,7 @@ import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
-import { snapshot } from "./backup.mjs";
+import { snapshot, snapshotAll } from "./backup.mjs";
 import { selfAudit } from "./selfaudit.mjs";
 import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
@@ -34,6 +34,7 @@ import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
+import { homedir } from "node:os";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -571,6 +572,9 @@ export async function tick(ctx) {
       nwo, profile, at: now(),
       backupRoot: ctx.backupRoot === false ? null
                 : (ctx.backupRoot ?? join(dirname(logPath ?? "/tmp/x"), "backups")),
+      // Without this the store-wide backup check is inert, and an unwatched
+      // store stays invisible exactly as it did before.
+      home: ctx.home ?? dirname(logPath ?? join(homedir(), ".reeve", "x")),
     })) {
       log(logPath, `self: ${f.level} ${f.why}${f.detail ? ` — ${f.detail}` : ""}`);
       escalations.set(f.why, f.count ?? 1);
@@ -595,8 +599,19 @@ export async function tick(ctx) {
   if (ctx.backupRoot !== false) {
     const at = now();
     if (!ctx.lastBackupAt || at - ctx.lastBackupAt >= (profile.watch?.backupIntervalSeconds ?? 3600)) {
-      const s = snapshot(db, ctx.backupRoot ?? join(dirname(logPath ?? "/tmp/x"), "backups"), nwo, at);
-      log(logPath, s.ok ? `backup: ${s.path}` : `backup FAILED: ${s.why}`);
+      // EVERY store, not only the one this tick is about. A store no daemon
+      // watches is never snapshotted and never audited, and that is precisely
+      // the one that is lost.
+      const root = ctx.backupRoot ?? join(dirname(logPath ?? "/tmp/x"), "backups");
+      const home = ctx.home ?? dirname(logPath ?? join(homedir(), ".reeve", "x"));
+      const all = (ctx.snapshotAll ?? snapshotAll)(home, root, { at });
+      for (const r of all) {
+        if (!r.ok) log(logPath, `backup FAILED (${r.nwo}): ${r.why}`);
+      }
+      const okd = all.filter(r => r.ok);
+      if (okd.length) log(logPath, `backup: ${okd.length} store(s) — ${okd.map(r => r.nwo).join(", ")}`);
+      // A tick that snapshotted nothing at all is a backup that is not happening.
+      if (!all.length) log(logPath, "backup FAILED: no state store found to snapshot");
       ctx.lastBackupAt = at;
     }
   }

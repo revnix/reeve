@@ -26,6 +26,7 @@ import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
+import { snapshot } from "./backup.mjs";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
@@ -436,6 +437,19 @@ export async function tick(ctx) {
   // Recorded last, so it means "a tick completed" rather than "a tick began".
   // That is the difference between a daemon that is working and one that is
   // wedged part-way through every pass.
+  // A second copy, taken from the tick that just finished writing. `VACUUM INTO`
+  // holds a read lock, so this is consistent even mid-loop, and it is skipped when
+  // one was already taken within the window -- a backup every 150 seconds would
+  // fill the disk of the machine it is meant to protect.
+  if (ctx.backupRoot !== false) {
+    const at = now();
+    if (!ctx.lastBackupAt || at - ctx.lastBackupAt >= (profile.watch?.backupIntervalSeconds ?? 3600)) {
+      const s = snapshot(db, ctx.backupRoot ?? join(dirname(logPath ?? "/tmp/x"), "backups"), nwo, at);
+      log(logPath, s.ok ? `backup: ${s.path}` : `backup FAILED: ${s.why}`);
+      ctx.lastBackupAt = at;
+    }
+  }
+
   noteTick(db);
 
   for (const { why, count } of fresh) log(logPath, `NEEDS YOU: ${why}${count > 1 ? ` (${count} PRs)` : ""}`);

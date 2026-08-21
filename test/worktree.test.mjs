@@ -12,7 +12,7 @@
 // unpushed commits vanish with the directory, and the stash stack is SHARED
 // across every worktree of a clone, so a non-empty stack may hold a stranger's
 // work in progress. On any doubt it quarantines rather than deletes.
-import { acquireWorktree, verifyWorktree, releaseWorktree } from "../src/worktree.mjs";
+import { acquireWorktree, verifyWorktree, releaseWorktree, pushWorktree } from "../src/worktree.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -122,7 +122,9 @@ let wt;
   git(repo, "checkout", "-q", "main");
   const r2 = acquireWorktree({ repoRoot: repo, root: roots, pr: 8, branch: "feature2", head: f2 });
   check(r2.ok, "control: a second worktree, on its own branch", JSON.stringify(r2));
-  git(r2.path, "push", "-q", "origin", "HEAD:feature2");
+  // From the MAIN checkout, because a worktree can no longer publish — which is
+  // the point. This is how reeve does it.
+  pushWorktree({ path: r2.path, branch: "feature2", repoRoot: repo });
   const rel = releaseWorktree({ path: r2.path, pr: 8 });
   check(rel.ok, "a clean, fully pushed worktree releases", JSON.stringify(rel));
   check(!existsSync(r2.path), "and is actually gone");
@@ -178,6 +180,54 @@ let wt;
   const committed = git(r4.path, "diff", "--name-only", `${pinned}..HEAD`).split("\n").filter(Boolean);
   check(committed.includes("fixed.txt"),
     "but comparing against the pinned head shows the change", JSON.stringify(committed));
+}
+
+
+// A worker must not be able to publish, and that must NOT depend on a permission
+// pattern refusing it.
+//
+// git accepts flags before the subcommand, so `git -C <path> push` does not match
+// a `git push` rule. That is the shape of the mechanism, not a gap to patch: any
+// deny written as a subcommand pattern has the same hole. A worker used exactly
+// that to publish its own fix and bypass the diff gate entirely.
+//
+// The earlier check of this passed because it used the BARE `git push` form,
+// which the pattern does match — a fixture that could not exhibit the defect it
+// was written to rule out. This one uses the form that broke it.
+{
+  const r5 = acquireWorktree({ repoRoot: repo, root: roots, pr: 12, branch: "feature", head: git(repo, "rev-parse", "origin/feature") });
+  check(r5.ok, "control: a worktree to publish from", JSON.stringify(r5));
+
+  writeFileSync(join(r5.path, "worker-change.txt"), "something to publish\n");
+  git(r5.path, "add", "-A");
+  git(r5.path, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "a change the worker would like to publish");
+  const before = git(repo, "ls-remote", "origin", "refs/heads/feature").split(/\s+/)[0];
+
+  // The exact form that defeated the permission rule.
+  let pushed = false;
+  try { git(r5.path, "push", "origin", "HEAD:feature"); pushed = true; } catch { pushed = false; }
+  check(!pushed, "a push FROM THE WORKTREE fails, whatever the command spells", "it succeeded");
+
+  const after = git(repo, "ls-remote", "origin", "refs/heads/feature").split(/\s+/)[0];
+  check(after === before, "and the remote did not move", `${before.slice(0,10)} -> ${after.slice(0,10)}`);
+
+  // The confinement must be per-worktree. A plain `git config` write from inside a
+  // worktree lands in the SHARED clone config and disables push everywhere,
+  // including the main checkout — which is how the first version of this broke the
+  // setup of a later case rather than the case it was guarding.
+  // `git config --get` exits 1 when the key is absent, which is the expected case.
+  const mainPush = (() => {
+    try { return git(repo, "config", "--get", "remote.origin.pushurl") || "(unset)"; }
+    catch { return "(unset)"; }
+  })();
+  check(mainPush === "(unset)",
+    "the main checkout keeps a working pushurl — the crippling is confined to the worktree", mainPush);
+
+  // reeve, from the main checkout, still can.
+  const ok = pushWorktree({ path: r5.path, branch: "feature", repoRoot: repo });
+  check(ok.ok, "but reeve publishes from the main checkout", JSON.stringify(ok));
+  const final = git(repo, "ls-remote", "origin", "refs/heads/feature").split(/\s+/)[0];
+  check(final !== before, "and the remote moves when IT does", `${before.slice(0,10)} -> ${final.slice(0,10)}`);
 }
 
 rmSync(base, { recursive: true, force: true });

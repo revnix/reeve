@@ -342,6 +342,28 @@ export async function tick(ctx) {
       // Measured: a worker repaired the planted bug and then hit its turn limit
       // before committing. The fix was correct, cost real money, and would have
       // blocked every later attempt while looking like nothing had happened.
+      // WHAT was refused, on every run, and declared BEFORE anything reads it —
+      // the first version of this sat below its own use sites and threw a
+      // ReferenceError after the worker had finished, losing a completed run.
+      //
+      // A denial no longer disqualifies the work: a model explores, and a correct
+      // refusal is not a failed repair. But refusals are how the sandbox gets
+      // tuned, and a worker that could not run the tests produced something
+      // nothing verified. Both facts have to be visible.
+      const refused = [...new Set((r.denials ?? []).map(x => {
+        const i = x.tool_input ?? {};
+        return String(i.command ?? i.file_path ?? x.tool_name ?? "?").replace(/\s+/g, " ").slice(0, 100);
+      }))];
+      for (const w of refused) log(logPath, `  #${e.pr}: refused -> ${w}`);
+
+      // Being unable to VERIFY is different from being unable to explore. If the
+      // project's own check command was among the refusals, whatever was produced
+      // is unverified, and that must reach a human even when it publishes.
+      const checkCmds = (profile.units ?? []).flatMap(u2 =>
+        Object.values(u2.commands ?? {}).map(c => c?.cmd).filter(Boolean));
+      const couldNotVerify = refused.some(w =>
+        checkCmds.some(c => w.includes(c.split(/\s+/)[0])) && /test|lint|check|build/i.test(w));
+
       if (r.outcome !== OUTCOMES.OK) {
         const left = changedFiles(worktree, e.head);
         if (left?.length) {
@@ -362,7 +384,8 @@ export async function tick(ctx) {
         } else {
           // reeve publishes, not the worker: the actor and the only claim that
           // the action was allowed must not be the same party.
-          const pushed = pushWorktree({ path: worktree, branch: e.headRef, expectedRemote: e.head });
+          const pushed = pushWorktree({ path: worktree, branch: e.headRef, expectedRemote: e.head,
+                                         repoRoot: profile.identity?.checkout ?? null });
           if (!pushed.ok) {
             log(logPath, `  #${e.pr}: NOT published — ${pushed.why}`);
             escalations.set(`#${e.pr}: a fix was produced but could not be published — ${pushed.why}`, 1);
@@ -383,23 +406,6 @@ export async function tick(ctx) {
 
       // A worker whose tools were denied wrote a plausible answer it could not
       // support. Treating that as progress is the fail-open this exists to close.
-      // WHAT was refused, on every run. A denial no longer disqualifies the work
-      // — a model explores, and a correct refusal is not a failed repair — but it
-      // is exactly how the sandbox gets tuned, and a worker that could not run the
-      // tests produced something nothing verified. Both facts have to be visible.
-      const refused = [...new Set((r.denials ?? []).map(x => {
-        const i = x.tool_input ?? {};
-        return String(i.command ?? i.file_path ?? x.tool_name ?? "?").replace(/\s+/g, " ").slice(0, 100);
-      }))];
-      for (const w of refused) log(logPath, `  #${e.pr}: refused -> ${w}`);
-
-      // Being unable to VERIFY is different from being unable to explore. If the
-      // project's own test command was among the refusals, whatever was produced
-      // is unverified, and that must reach a human even when it publishes.
-      const testCmds = (profile.units ?? []).flatMap(u2 =>
-        Object.values(u2.commands ?? {}).map(c => c?.cmd).filter(Boolean));
-      const couldNotVerify = refused.some(w => testCmds.some(c => w.includes(c.split(/\s+/)[0]) && /test|lint|check/i.test(w)));
-
       if (r.outcome === OUTCOMES.RATE_LIMITED) { escalations.set("the provider is rate limiting; work is paused", 1); break; }
     }
   }

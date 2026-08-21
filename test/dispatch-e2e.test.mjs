@@ -222,6 +222,26 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(dir7, { recursive: true, force: true });
 }
 
+
+// --- an OK worker whose lease lapsed while it ran is not accepted -----------
+{
+  const dir8 = mkdtempSync(join(tmpdir(), "reeve-e2e-lapsed-"));
+  const ctx8 = { ...baseCtx(), db: open(join(dir8, "x.db")), logPath: join(dir8, "log.txt"), worktreeFor: () => mkdtempSync(join(dir8, "wt-")) };
+  ctx8.spawnWorker = async () => {
+    // The lease expires under the worker between heartbeats; the worker still
+    // reports success.
+    ctx8.db.prepare("UPDATE run SET lease_expires_at = unixepoch() - 5 WHERE status IN ('leased','running')").run();
+    return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s8" };
+  };
+  await tick(ctx8);
+  const run8 = ctx8.db.prepare("SELECT status FROM run ORDER BY started_at DESC LIMIT 1").get();
+  check(run8?.status !== "succeeded", "a worker that finished under a lapsed lease is not recorded as succeeded", JSON.stringify(run8));
+  const log8 = readFileSync(join(dir8, "log.txt"), "utf8");
+  check(/lease/.test(log8) && !/published/.test(log8), "the log names the lapsed lease and nothing was published", log8.split("\n").filter(l => /#42/.test(l)).slice(-3).join(" | ").slice(0, 300));
+  ctx8.db.close();
+  rmSync(dir8, { recursive: true, force: true });
+}
+
 ctx.db.close();
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

@@ -456,10 +456,18 @@ export function finishRun(db, { runId, outcome, why = null, ms = null, cost = nu
   return tx(db, () => {
     // Only a run this process still owns may be finished. A run another actor
     // reaped or abandoned has moved on; a stale worker's verdict must not
-    // overwrite that state or flip the PR node under a replacement run.
-    const r = db.prepare(`SELECT task_id FROM run WHERE id=? AND status IN
+    // overwrite that state or flip the PR node under a replacement run. The
+    // claim is revalidated HERE, atomically: a worker that exits after its
+    // lease lapsed, or after a cancel was requested, between two heartbeats
+    // is not accepted on the strength of the last heartbeat it got.
+    const r = db.prepare(`SELECT r.task_id, r.lease_expires_at, COALESCE(x.cancel_requested, 0) AS cancel_requested
+                            FROM run r LEFT JOIN task_exec x ON x.task_id = r.task_id
+                           WHERE r.id=? AND r.status IN
                             ('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')`).get(runId);
     if (!r) return { applied: false, why: "the run is no longer live under this process" };
+    if (outcome !== "cancelled" && r.cancel_requested) return { applied: false, why: "a cancel was requested for the run; its outcome is not accepted" };
+    if (outcome === "ok" && r.lease_expires_at <= Math.floor(Date.now() / 1000))
+      return { applied: false, why: "the run's lease expired before it finished; its outcome is not accepted" };
     db.prepare(`UPDATE run SET status=?, ended_at=unixepoch(), error=? WHERE id=?`)
       .run(status, why, runId);
     if (status !== "abandoned")

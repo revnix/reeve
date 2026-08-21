@@ -580,7 +580,12 @@ export async function tick(ctx) {
         const fin = finishRun(db, { runId: run.runId, outcome: r?.outcome ?? "failed",
                                     why: r?.why ?? "the worker threw before returning a result",
                                     ms: r?.ms, cost: r?.cost, sessionId: r?.sessionId });
-        if (fin?.applied === false) log(logPath, `  #${e.pr}: run ${run.runId} not finished by this process: ${fin.why}`);
+        if (fin?.applied === false) {
+          // The store refused the outcome: the claim was gone or withdrawn by
+          // the time the worker finished. Whatever it produced is not published.
+          log(logPath, `  #${e.pr}: run ${run.runId} not finished by this process: ${fin.why}`);
+          r = { ...(r ?? {}), outcome: /cancel/.test(fin.why) ? OUTCOMES.CANCELLED : OUTCOMES.LEASE_LOST, why: fin.why };
+        }
       }
       log(logPath, `  #${e.pr}: ${decision.action} -> ${r.outcome} (${r.why}) in ${Math.round(r.ms / 1000)}s${r.cost != null ? `, ${r.cost.toFixed(3)}` : ""}`);
 

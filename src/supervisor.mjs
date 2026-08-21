@@ -274,7 +274,13 @@ export function runWorker({
     // down. Past the cap, bytes are dropped and the drop is recorded.
     mkdirSync(dirname(outPath), { recursive: true });
     mkdirSync(dirname(errPath), { recursive: true });
-    const outFd = openSync(outPath, "w"), errFd = openSync(errPath, "w");
+    // Both or neither: a second open that fails (disk full between two inode
+    // creations, a directory where a file should be) must not leak the first
+    // descriptor once per retry until the daemon runs out of them.
+    const outFd = openSync(outPath, "w");
+    let errFd;
+    try { errFd = openSync(errPath, "w"); }
+    catch (err) { try { closeSync(outFd); } catch { /* already closed */ } throw err; }
     // Each stream has its own cap and its own count: a chatty stderr must not
     // spend stdout's budget, and stdoutBytes must mean stdout.
     const streams = { out: { fd: outFd, written: 0, truncated: false }, err: { fd: errFd, written: 0, truncated: false } };

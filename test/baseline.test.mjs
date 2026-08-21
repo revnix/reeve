@@ -214,5 +214,17 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
   check(baselinePathFor("foo-bar/baz") !== baselinePathFor("foo/bar-baz"), "owner and repo stay distinct in the baseline path", baselinePathFor("foo-bar/baz"));
 }
 
+
+// ── a baseline captured for another branch is drift, not a quiet probe ───────
+{
+  const profile = { identity: { baseBranch: "develop", defaultBranch: "main" }, authority: { policy: fixture.profile.authorityPolicy },
+                    merge: { enforcement: fixture.profile.mergeEnforcement }, builder: { capabilities: fixture.profile.capabilities } };
+  let probed = null;
+  const r = checkBaseline("nextlyhq/nextly", profile, { readLive: (nwo, p, io) => { probed = io.branch; return fixture; } });
+  check(r.level === "DEGRADED" && /branch/.test(r.lines.join(" ")) && /develop/.test(r.lines.join(" ")),
+    "a profile whose base branch moved since capture is reported as drift, naming both branches", JSON.stringify(r.lines));
+  check(probed === null || probed === "develop", "and the probe, if any, targets the profiled branch, never the stale fixture's", String(probed));
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

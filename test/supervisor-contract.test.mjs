@@ -213,6 +213,23 @@ const ENV = { PATH: "/usr/bin:/bin" };
   check(r.outcome === OUTCOMES.CANCELLED && /cancelled/.test(r.why), "a revocation whose reason is a cancel is reported as CANCELLED", JSON.stringify({ o: r.outcome, w: r.why }));
 }
 
+
+// ── a failed setup closes what it already opened ─────────────────────────────
+//
+// Opening worker.out succeeded, opening worker.err failed: the first
+// descriptor leaked, once per retry, until the daemon hit EMFILE.
+{
+  const { readdirSync: rd, mkdirSync: mk } = await import("node:fs");
+  const errDir = join(dir, "err-is-a-dir"); mk(errDir, { recursive: true });
+  const before = rd("/dev/fd").length;
+  for (let i = 0; i < 20; i++) {
+    try { await runWorker({ bin: "/bin/sh", args: ["-c", "true"], env: ENV, outPath: join(dir, `leak-${i}.out`), errPath: errDir, budgetMs: 1000 }); }
+    catch { /* expected: errPath is a directory */ }
+  }
+  const after = rd("/dev/fd").length;
+  check(after - before < 5, "twenty failed setups do not leak twenty descriptors", `before=${before} after=${after}`);
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

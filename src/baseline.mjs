@@ -151,8 +151,15 @@ export function checkBaseline(nwo, profile, io = {}) {
   let fixture;
   try { fixture = JSON.parse(readFileSync(path, "utf8")); if (!fixture || typeof fixture !== "object") throw new Error("not an object"); }
   catch (e) { return { id: "R-13", level: "UNKNOWN", title: "authority baseline", lines: [`the baseline at ${path} could not be read: ${e.message}`] }; }
+  // The branch the profile targets now is the one that matters. A baseline
+  // captured for another branch is drift in its own right: probing the stale
+  // branch would report calm about protections the daemon no longer relies on.
+  const target = io.branch ?? profile.identity?.baseBranch ?? profile.identity?.defaultBranch ?? "main";
+  if (fixture.branch && fixture.branch !== target)
+    return { id: "R-13", level: "DEGRADED", title: "authority baseline",
+      lines: [`the baseline was captured for branch ${fixture.branch}; the profile now targets ${target}`, "-> decide it, then re-capture for the profiled branch"] };
   let live;
-  try { live = (io.readLive ?? readLiveBaseline)(nwo, profile, { ...io, branch: io.branch ?? fixture.branch ?? null }); }
+  try { live = (io.readLive ?? readLiveBaseline)(nwo, profile, { ...io, branch: target }); }
   catch (e) { return { id: "R-13", level: "UNKNOWN", title: "authority baseline", lines: [`could not read the live state: ${String(e.message).split("\n")[0]}`] }; }
   const d = diffBaseline(live, fixture);
   if (d.drifted) return { id: "R-13", level: "DEGRADED", title: "authority baseline",

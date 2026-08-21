@@ -367,7 +367,11 @@ export async function tick(ctx) {
             log(logPath, `  #${e.pr}: NOT published — ${pushed.why}`);
             escalations.set(`#${e.pr}: a fix was produced but could not be published — ${pushed.why}`, 1);
           } else {
-            log(logPath, `  #${e.pr}: published ${changed.length} file(s)`);
+            log(logPath, `  #${e.pr}: published ${changed.length} file(s)` + (refused.length ? ` (${refused.length} call(s) refused along the way)` : ""));
+            // Published, and still escalated: CI at the new head is the check that
+            // matters, and a fix nothing ran the tests over should be watched.
+            if (couldNotVerify)
+              escalations.set(`#${e.pr}: a fix was published but the worker could not run the project's checks — watch CI at the new head`, 1);
             // Only ever release what pushed cleanly. Anything else quarantines,
             // because a directory holding work nobody has a copy of is not spare
             // disk space.
@@ -379,21 +383,23 @@ export async function tick(ctx) {
 
       // A worker whose tools were denied wrote a plausible answer it could not
       // support. Treating that as progress is the fail-open this exists to close.
-      if (r.outcome === OUTCOMES.DENIED) {
-        // WHAT was denied, not just how many. "4 tool call(s) denied" is a number
-        // to guess at; the commands are the diagnosis. Two rounds of this were
-        // spent reproducing by hand what the run already knew and had discarded.
-        const what = (r.denials ?? []).map(x => {
-          const i = x.tool_input ?? {};
-          return String(i.command ?? i.file_path ?? x.tool_name ?? "?").replace(/\s+/g, " ").slice(0, 100);
-        });
-        for (const w of new Set(what)) log(logPath, `  #${e.pr}: DENIED -> ${w}`);
-        // Nothing was attempted, so nothing is charged. The sandbox refused the
-        // worker's tools, which is a fault on reeve's side, and letting it consume
-        // the pull request's only repair would punish the PR for reeve's mistake.
-        if (fp) refundFixAttempt(db, nwo, e.pr, fp);
-        escalations.set(`#${e.pr}: worker tool calls were denied — its answer is not trustworthy. Refused: ${[...new Set(what)].slice(0, 3).join(" · ") || "unrecorded"}`, 1);
-      }
+      // WHAT was refused, on every run. A denial no longer disqualifies the work
+      // — a model explores, and a correct refusal is not a failed repair — but it
+      // is exactly how the sandbox gets tuned, and a worker that could not run the
+      // tests produced something nothing verified. Both facts have to be visible.
+      const refused = [...new Set((r.denials ?? []).map(x => {
+        const i = x.tool_input ?? {};
+        return String(i.command ?? i.file_path ?? x.tool_name ?? "?").replace(/\s+/g, " ").slice(0, 100);
+      }))];
+      for (const w of refused) log(logPath, `  #${e.pr}: refused -> ${w}`);
+
+      // Being unable to VERIFY is different from being unable to explore. If the
+      // project's own test command was among the refusals, whatever was produced
+      // is unverified, and that must reach a human even when it publishes.
+      const testCmds = (profile.units ?? []).flatMap(u2 =>
+        Object.values(u2.commands ?? {}).map(c => c?.cmd).filter(Boolean));
+      const couldNotVerify = refused.some(w => testCmds.some(c => w.includes(c.split(/\s+/)[0]) && /test|lint|check/i.test(w)));
+
       if (r.outcome === OUTCOMES.RATE_LIMITED) { escalations.set("the provider is rate limiting; work is paused", 1); break; }
     }
   }

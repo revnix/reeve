@@ -80,6 +80,13 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
 
 ### Requirements — settled with the founder, do not re-litigate
 
+0. **Platforms (ruled 2026-08-21):** NOT cloud-hosted in the near future. reeve
+   must run on **macOS, Windows, and Ubuntu**. Every host-specific mechanism
+   (native sandbox, service manager, pid identity + group kill, desktop
+   notifications, locks) carries a platform matrix and fails CLOSED where a
+   platform is unsupported or unmeasured. Off-device backup target is a local
+   machine/NAS/disk, not cloud.
+
 1. **Architecture A** — deterministic per-task phase state machine inside the
    existing daemon; each phase a bounded `claude` worker via the existing
    supervisor/sandbox; multi-agent fan-out happens INSIDE a phase (Claude's own

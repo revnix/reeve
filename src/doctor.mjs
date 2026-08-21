@@ -289,6 +289,95 @@ export async function checkAppIdentity(nwo) {
   return { id: "R-07", level: OK, title: "App identity", lines };
 }
 
+/**
+ * Are the profile's detectors still able to read what the reviewers write?
+ *
+ * A regex that matches nothing is indistinguishable from a reviewer that found
+ * nothing, and CodeRabbit has ALREADY replaced its taxonomy once -- so this is a
+ * thing that has happened, not a thing that might.
+ *
+ * Two failures live here and they are NOT the same, which the first version of
+ * this check got wrong by reporting both as broken:
+ *
+ *   A detector that CANNOT fire -- uncompilable -- is broken now.
+ *   A detector that has not fired YET is merely unproven. A P0 marker on a repo
+ *   with no P0 findings, or a clean-pass pattern for a reviewer that has never
+ *   passed clean, is correct and idle. Calling that broken trains an operator to
+ *   ignore the check, which is the failure it exists to prevent.
+ *
+ * The signal that actually detects rot is the RATIO: how much of a reviewer's
+ * finding text no marker could read. Those findings block as critical, so a
+ * rotted taxonomy shows up as a repository that stops merging.
+ */
+function checkDetectors(db, profile) {
+  const reviewers = profile?.reviewers ?? [];
+  if (!db) return { id: "R-08", level: UNKNOWN, title: "detectors", lines: ["no state database"] };
+  if (!reviewers.length) return null;
+
+  let rows;
+  try { rows = db.prepare("SELECT source, kind, payload FROM inbox").all(); }
+  catch { return { id: "R-08", level: UNKNOWN, title: "detectors", lines: ["inbox is not readable"] }; }
+  if (!rows.length) {
+    return { id: "R-08", level: UNKNOWN, title: "detectors",
+             lines: ["nothing ingested yet — a detector cannot be proven against nothing"] };
+  }
+
+  const bodyOf = r => { try { return String(JSON.parse(r.payload)?.body ?? ""); } catch { return ""; } };
+  const all = new Map(), findings = new Map();
+  for (const r of rows) {
+    const body = bodyOf(r);
+    if (!body) continue;
+    (all.get(r.source) ?? all.set(r.source, []).get(r.source)).push(body);
+    // Severity markers classify FINDINGS. Measuring them against trigger comments
+    // and carrier reviews made a healthy profile look two-thirds blind.
+    if (r.kind === "review_thread") (findings.get(r.source) ?? findings.set(r.source, []).get(r.source)).push(body);
+  }
+
+  const lines = [], broken = [], idle = [];
+  let unclassified = 0, total = 0;
+
+  for (const rev of reviewers) {
+    const texts = all.get(rev.login) ?? [];
+    const found = findings.get(rev.login) ?? [];
+    if (!texts.length) { lines.push(`${rev.login.padEnd(26)} nothing ingested from this reviewer yet`); continue; }
+
+    const fires = pattern => {
+      let rx; try { rx = new RegExp(pattern, "i"); } catch { return -1; }
+      return texts.filter(t => rx.test(t)).length;
+    };
+    const named = [["refusal", rev.refusal], ["clean", rev.clean], ["commitPattern", rev.commitPattern],
+                   ...(rev.severityMarkers ?? []).map(([pat], i) => [`severityMarkers[${i}]`, pat])];
+    for (const [name, pattern] of named) {
+      if (!pattern) continue;
+      const n = fires(pattern);
+      if (n === -1) broken.push(`${rev.login}.${name} does not compile`);
+      else if (n === 0) idle.push(`${rev.login}.${name}`);
+    }
+
+    const markers = rev.severityMarkers ?? [];
+    if (markers.length && found.length) {
+      const hit = found.filter(t => markers.some(([pat]) => {
+        try { return new RegExp(pat, "i").test(t); } catch { return false; }
+      })).length;
+      total += found.length; unclassified += found.length - hit;
+      lines.push(`${rev.login.padEnd(26)} ${hit}/${found.length} finding(s) classified`);
+    }
+  }
+
+  if (idle.length) lines.push(`not yet demonstrated: ${idle.slice(0, 8).join(", ")}${idle.length > 8 ? ` (+${idle.length - 8})` : ""}`);
+
+  if (broken.length) {
+    lines.push(...broken.map(b => `-> ${b}`));
+    return { id: "R-08", level: BROKEN, title: "detectors", lines };
+  }
+  if (total && unclassified / total > 0.3) {
+    lines.push(`-> ${unclassified} of ${total} findings unreadable; each blocks as critical`);
+    lines.push("-> a reviewer's marker grammar has probably changed");
+    return { id: "R-08", level: DEGRADED, title: "detectors", lines };
+  }
+  return { id: "R-08", level: OK, title: "detectors", lines };
+}
+
 // ── driver ────────────────────────────────────────────────────────────────
 
 export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null }) {
@@ -300,6 +389,7 @@ export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null
                     profile.identity?.baseBranch ?? profile.identity?.defaultBranch ?? "main"),
     profile.reviewers?.length ? checkReviewerSupply(nwo, profile.reviewers) : null,
     checkLeases(db),
+    profile.reviewers?.length ? checkDetectors(db, profile) : null,
     appCheck,
   ].filter(Boolean);
 

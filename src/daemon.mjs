@@ -29,6 +29,7 @@ import { writeDash } from "./dash.mjs";
 import { snapshot } from "./backup.mjs";
 import { selfAudit } from "./selfaudit.mjs";
 import { observe, ingest, noteHead } from "./review/ingest.mjs";
+import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
@@ -267,6 +268,23 @@ export async function tick(ctx) {
         } catch (err) {
           log(logPath, `  #${pr}: ingest failed — ${err.message}`);
         }
+      }
+      // Derived EVERY tick, even when ingest was skipped: clearing depends on the
+      // head under judgement, so a push with no new review still changes the
+      // answer -- it un-clears everything until a reviewer speaks at the new head.
+      try {
+        const d = (ctx.derivePr ?? derivePr)(db, nwo, pr, profile,
+          { at: now(), head: e.head, complete: !ctx.lastIngestIncomplete?.get?.(pr) });
+        const st = (ctx.reviewState ?? reviewState)(db, nwo, pr, profile, { at: now() });
+        if (st.readable && (st.open || st.unspilledCritical)) {
+          log(logPath, `  #${pr}: review ${st.open}/${st.total} open, ` +
+                       `${st.unspilledCritical} blocking, round ${st.rounds} (shadow)`);
+        } else if (!st.readable) {
+          log(logPath, `  #${pr}: review projection not readable — ${st.why}`);
+        }
+        void d;
+      } catch (err) {
+        log(logPath, `  #${pr}: derive failed — ${err.message}`);
       }
     }
 
@@ -566,6 +584,12 @@ export async function tick(ctx) {
       log(logPath, s.ok ? `backup: ${s.path}` : `backup FAILED: ${s.why}`);
       ctx.lastBackupAt = at;
     }
+  }
+
+  // Repo-wide, so once per tick rather than once per pull request.
+  if (ctx.reviewIngest !== false) {
+    try { (ctx.deriveSupply ?? deriveSupply)(db, nwo, profile, { at: now() }); }
+    catch (err) { log(logPath, `supply derive failed — ${err.message}`); }
   }
 
   noteTick(db);

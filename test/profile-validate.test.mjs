@@ -158,5 +158,36 @@ expectOk("a lane declaring sensitiveOk true",
   (() => { const p = clone(base); p.lanes = [{ id: "release", territory: ["x/**"], sensitiveOk: true }]; return p; })());
 
 
+
+// ── capability switches: five booleans, every one default false ─────────────
+//
+// Authority is never inferred from repository fields: the live nextly profile
+// already sets authority.policy=propose_and_merge, so that key cannot be the
+// switch for anything. These five are, and a truthy accident must not flip one.
+{
+  const p = clone(base);
+  const d = withDefaults(p);
+  const caps = d.builder?.capabilities ?? {};
+  const all = ["observe", "draftSpec", "implementLocal", "publishPr", "mergeBuilderPr"];
+  const allFalse = all.every(k => caps[k] === false);
+  console.log(`${allFalse ? "PASS" : "FAIL"}  every capability switch defaults to false`);
+  if (!allFalse) { console.log("        got:", JSON.stringify(caps)); fail++; }
+
+  const ok = d.worker?.maxOutputBytes === 67108864;
+  console.log(`${ok ? "PASS" : "FAIL"}  worker.maxOutputBytes defaults to 64 MiB`);
+  if (!ok) fail++;
+}
+
+expectRefusal("a capability switch that is not a boolean",
+  (() => { const p = clone(base); p.builder = { capabilities: { mergeBuilderPr: "yes" } }; return p; })(),
+  /builder\.capabilities\.mergeBuilderPr must be a boolean/);
+
+expectRefusal("a founder user id that is not an integer",
+  (() => { const p = clone(base); p.builder = { founder: { userId: "123" } }; return p; })(),
+  /builder\.founder\.userId must be an integer/);
+
+expectOk("all five switches set explicitly",
+  (() => { const p = clone(base); p.builder = { capabilities: { observe: true, draftSpec: false, implementLocal: false, publishPr: false, mergeBuilderPr: false } }; return p; })());
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

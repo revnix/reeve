@@ -193,6 +193,24 @@ export const FIELDS = {
   // repair whose whole diff lands in here changed the exam rather than the code.
   "risk.testPaths":         [false, isArr(isStr)],
 
+  // The builder's capability switches. Authority is never inferred from the
+  // repository fields above: the live nextly profile already carries
+  // authority.policy=propose_and_merge, so that key cannot gate anything new.
+  // Five independent booleans, every one false until the rollout stage that
+  // proves it turns it on. A truthy string is refused, not coerced.
+  "builder.capabilities.observe":        [false, isBool],
+  "builder.capabilities.draftSpec":      [false, isBool],
+  "builder.capabilities.implementLocal": [false, isBool],
+  "builder.capabilities.publishPr":      [false, isBool],
+  "builder.capabilities.mergeBuilderPr": [false, isBool],
+  // The founder's GitHub identity, by immutable numeric id with the login as a
+  // snapshot: every founder-event rule (silence, overrides, approvals) matches
+  // the id, and a renamed login must not silently become a stranger.
+  "builder.founder.userId":              [false, isInt],
+  "builder.founder.login":               [false, isStr],
+  // Cap on a worker's durable stdout/stderr files. Read by both daemons.
+  "worker.maxOutputBytes":               [false, isInt],
+
   // Read by the daemon and the watcher. Declared here because the validator
   // refused a profile using them and `reeve doctor` exited before doing anything:
   // code that reads undeclared config is config that drifts from its schema
@@ -365,7 +383,16 @@ export function validate(profile) {
  * Defaults that hold whatever the project is. A per-kind default would leave the
  * key unset for any kind that forgot it, and unset here means Infinity.
  */
-const UNIVERSAL_DEFAULTS = { "watch.staleSeconds": 900 };
+const UNIVERSAL_DEFAULTS = {
+  "watch.staleSeconds": 900,
+  // Every capability is off until its rollout stage turns it on, explicitly.
+  "builder.capabilities.observe": false,
+  "builder.capabilities.draftSpec": false,
+  "builder.capabilities.implementLocal": false,
+  "builder.capabilities.publishPr": false,
+  "builder.capabilities.mergeBuilderPr": false,
+  "worker.maxOutputBytes": 64 * 1024 * 1024,
+};
 
 export function withDefaults(profile) {
   const kind = get(profile, "project.kind");

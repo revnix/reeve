@@ -21,7 +21,8 @@
 //     retries internally. CLAUDE_CODE_MAX_RETRIES bounds it.
 
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, writeSync, closeSync, readFileSync } from "node:fs";
+import { dirname } from "node:path";
 
 export const OUTCOMES = {
   OK: "ok",
@@ -31,6 +32,8 @@ export const OUTCOMES = {
   RATE_LIMITED: "rate_limited",   // the provider refused
   CRASHED: "crashed",             // died without a result event
   CANCELLED: "cancelled",         // halt switch or explicit cancel
+  UNBOUND: "unbound",             // pid+lstart could not be recorded; the worker was killed unobserved
+  LEASE_LOST: "lease_lost",       // the run lease expired or was taken; the worker was terminated
 };
 
 /** Identity token for a pid. Non-zero exit means dead; a differing string means reused. */
@@ -39,6 +42,11 @@ export function readStart(pid) {
   // out-of-range pid, and a liveness probe must not print anything.
   try { return execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() || null; }
   catch { return null; }
+}
+
+/** The last `n` bytes of a file, for a result that carries a stderr tail without holding the whole file. */
+function tailOf(path, n) {
+  try { return readFileSync(path, "utf8").slice(-n); } catch { return ""; }
 }
 
 /**
@@ -139,7 +147,7 @@ export function readEvent(line) {
   let e;
   try { e = JSON.parse(line); } catch { return null; }
   if (e.type === "rate_limit_event") return { kind: "rate_limit", info: e.rate_limit_info ?? {} };
-  if (e.type === "system" && e.subtype === "init") return { kind: "init", sessionId: e.session_id };
+  if (e.type === "system" && e.subtype === "init") return { kind: "init", sessionId: e.session_id, model: e.model ?? null };
   if (e.type === "result") return { kind: "result", result: e };
   if (e.type === "assistant") return { kind: "assistant" };
   return { kind: "other", type: e.type };
@@ -221,47 +229,69 @@ export function classifyResult(result, { code, signal, killedByUs }) {
  * Resolves with an outcome; never throws for a worker failure.
  */
 export function runWorker({
-  bin = "claude", args, cwd, env = {},
+  bin = "claude", args, cwd, env,
+  outPath = null, errPath = null, maxOutputBytes = 64 * 1024 * 1024,
   budgetMs = 20 * 60 * 1000,
   graceMs = 5000,
-  maxRetries = 1,
   onEvent = () => {},
   // Called once with the worker's pid and identity token, before any output.
   // Without it a caller cannot observe or record a worker until it has already
   // exited, which is exactly when a supervisor most needs to know about it.
   onSpawn = () => {},
   isHalted = () => false,
+  // Asked every poll: a non-null answer is the reason the worker's lease is
+  // gone, and the worker is terminated with it.
+  isRevoked = () => null,
 } = {}) {
+  // The environment is EXACT. It used to be `{...process.env, ...env}`, which
+  // handed every worker the founder's tokens and the ssh agent; see workerenv.mjs.
+  if (!env || typeof env !== "object") throw new Error("runWorker: env is required; a worker never inherits the supervisor's environment");
+  if (!outPath || !errPath) throw new Error("runWorker: outPath and errPath are required; a worker's output must survive the supervisor");
   return new Promise(resolve => {
-    const child = spawn(bin, args, {
-      cwd, detached: true, stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        // Without this a 429 hangs indefinitely: the CLI retries internally with
-        // no output, which reads as a stuck worker rather than a rate limit.
-        CLAUDE_CODE_MAX_RETRIES: String(maxRetries),
-        ...env,
-      },
-    });
+    // Output goes to durable files, not memory: a restart reads the report from
+    // the file, and a worker that prints without end cannot take the supervisor
+    // down. Past the cap, bytes are dropped and the drop is recorded.
+    mkdirSync(dirname(outPath), { recursive: true });
+    mkdirSync(dirname(errPath), { recursive: true });
+    const outFd = openSync(outPath, "w"), errFd = openSync(errPath, "w");
+    let written = 0, truncated = false, buf = "";
+    const write = (fd, chunk) => {
+      if (written + chunk.length > maxOutputBytes) { truncated = true; return; }
+      writeSync(fd, chunk); written += chunk.length;
+    };
+
+    const child = spawn(bin, args, { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"], env });
     installReaper();
     LIVE_GROUPS.add(child.pid);
     const startedAt = Date.now();
     const lstart = readStart(child.pid);
-    try { onSpawn({ pid: child.pid, lstart }); } catch { /* an observer must not kill the worker */ }
 
-    let result = null, sessionId = null, rateLimit = null;
+    let result = null, sessionId = null, rateLimit = null, initModel = null, revokedWhy = null;
     let killedByUs = false, settled = false;
-    let stdout = "", stderr = "", buf = "";
+    let termTimer = null, killTimer = null, haltTimer = null;
 
     const finish = payload => {
       if (settled) return;
       settled = true;
       clearTimeout(termTimer); clearTimeout(killTimer); clearInterval(haltTimer);
+      try { closeSync(outFd); closeSync(errFd); } catch { /* already closed */ }
       resolve(payload);
     };
 
+    // The binding is not an observer. A worker whose pid and start time could
+    // not be written is one a restart can neither adopt nor kill with
+    // confidence, so it does not get to run at all.
+    try { onSpawn({ pid: child.pid, lstart }); }
+    catch (err) {
+      killGroup(child.pid, "SIGKILL");
+      LIVE_GROUPS.delete(child.pid);
+      child.on("exit", () => {});
+      return finish({ outcome: OUTCOMES.UNBOUND, why: `run binding failed: ${err.message}`,
+                      pid: child.pid, lstart, ms: Date.now() - startedAt, stderr: "", outPath, errPath, truncated: false });
+    }
+
     child.stdout.on("data", d => {
-      stdout += d;
+      write(outFd, d);
       buf += d;
       const lines = buf.split("\n");
       buf = lines.pop() ?? "";
@@ -269,46 +299,59 @@ export function runWorker({
         if (!line.trim()) continue;
         const ev = readEvent(line);
         if (!ev) continue;
-        if (ev.kind === "init") sessionId = ev.sessionId;
+        if (ev.kind === "init") { sessionId = ev.sessionId; initModel = ev.model ?? null; }
         if (ev.kind === "result") result = ev.result;
         if (ev.kind === "rate_limit") rateLimit = ev.info;
         onEvent(ev);
       }
     });
-    child.stderr.on("data", d => { stderr += d; });
+    child.stderr.on("data", d => { write(errFd, d); });
 
-    const termTimer = setTimeout(() => {
+    termTimer = setTimeout(() => {
       killedByUs = true;
       // SIGTERM to the GROUP: the negative pid is what reaches the grandchildren.
       killGroup(child.pid, "SIGTERM");
     }, budgetMs);
 
     // Escalation only after grace. SIGKILL first would skip SessionEnd entirely.
-    const killTimer = setTimeout(() => { if (!settled) killGroup(child.pid, "SIGKILL"); }, budgetMs + graceMs);
+    killTimer = setTimeout(() => { if (!settled) killGroup(child.pid, "SIGKILL"); }, budgetMs + graceMs);
 
-    // The halt switch fails CLOSED: a worker in flight is terminated, not left running.
-    const haltTimer = setInterval(() => {
-      if (isHalted() && !settled) { killedByUs = true; killGroup(child.pid, "SIGTERM"); }
+    // The halt switch and the lease both fail CLOSED: a worker in flight is
+    // terminated, not left running. A lease that cannot be proven live is the
+    // same as no lease; the former posture ("a missed beat must not kill the
+    // worker") left workers acting with no durable claim on anything. A
+    // revoked worker gets the same grace as a timed-out one before SIGKILL.
+    haltTimer = setInterval(() => {
+      if (settled) return;
+      if (isHalted()) { killedByUs = true; killGroup(child.pid, "SIGTERM"); return; }
+      const why = isRevoked();
+      if (why && !revokedWhy) {
+        revokedWhy = String(why); killedByUs = true; killGroup(child.pid, "SIGTERM");
+        setTimeout(() => { if (!settled) killGroup(child.pid, "SIGKILL"); }, graceMs);
+      }
     }, 2000);
 
     child.on("error", err => { LIVE_GROUPS.delete(child.pid); return finish({
       outcome: OUTCOMES.CRASHED, why: `could not spawn ${bin}: ${err.message}`,
-      pid: child.pid, lstart, ms: Date.now() - startedAt, stderr,
+      pid: child.pid, lstart, ms: Date.now() - startedAt, stderr: tailOf(errPath, 4000), outPath, errPath, truncated,
     }); });
 
     child.on("exit", (code, signal) => {
       LIVE_GROUPS.delete(child.pid);
       // The leader can exit while a grandchild lingers, so sweep the group.
       killGroup(child.pid, "SIGKILL");
-      const c = classifyResult(result, { code, signal, killedByUs });
+      const c = revokedWhy
+        ? { outcome: OUTCOMES.LEASE_LOST, why: `lease revoked: ${revokedWhy}` }
+        : classifyResult(result, { code, signal, killedByUs });
       finish({
         ...c, pid: child.pid, lstart, sessionId, code, signal,
         ms: Date.now() - startedAt, rateLimit,
         cost: result?.total_cost_usd ?? null,
         usage: result?.usage ?? null,
         text: result?.result ?? null,
-        stderr: stderr.slice(0, 4000),
-        stdoutBytes: stdout.length,
+        model: initModel,
+        stderr: tailOf(errPath, 4000),
+        stdoutBytes: written, outPath, errPath, truncated,
       });
     });
   });

@@ -31,6 +31,20 @@ for (const rel of tracked) {
 check(binary.length === 0, "no tracked source file contains a raw NUL byte",
   binary.join("\n        ") + "\n        write the escape \"\\0\" instead of the byte itself");
 
+// A raw ESC does not make a file binary, so the check above cannot see it -- but
+// it defeats a reader the same way. ci-rootcause.mjs held one inside an ANSI
+// stripper written with the byte itself, and it cost two failed edits: both the
+// editor and a hand-written anchor matched the VISIBLE characters and missed the
+// invisible one, so each replacement silently found nothing.
+const esc = [];
+for (const rel of tracked) {
+  const buf = readFileSync(ROOT + rel);
+  const at = buf.indexOf(0x1b);
+  if (at !== -1) esc.push(`${rel} (ESC at byte ${at}, line ${buf.subarray(0, at).toString("utf8").split("\n").length})`);
+}
+check(esc.length === 0, "nor a raw ESC byte, which is invisible to every editor and search",
+  esc.join("\n        ") + "\n        write the escape \"\\x1b\" instead of the byte itself");
+
 // The authority on this is git, not my byte scan: attributes or a .gitattributes
 // rule could also mark a file binary.
 const asBinary = tracked.filter(rel => {

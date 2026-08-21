@@ -60,5 +60,33 @@ check("a compiler error IS actionable", isActionable("TS2345: Argument of type '
   check("a new revision fingerprints differently", fingerprint("o/r", "abc1234567", a) === fingerprint("o/r", "def7654321", a), false);
 }
 
+// ── a PASSING line is never a cause ──────────────────────────────────────
+//
+// The failure patterns match on WORDS, and a test name may contain them. This
+// repository's own suite asserts "cancelled is an absence, failed is a fact", and
+// the PASSING line for it was recorded in the fix-attempt ledger for PR #2 as a
+// cause of the red build -- pointing a fixer at green code, and churning the
+// failure identity whenever an unrelated test was renamed.
+{
+  const passing = "PASS  a FAILING ancillary check still blocks \u2014 cancelled is an absence, failed is a fact";
+  const failing = "FAIL  an enormous message is truncated \u2014 a phone is not a log viewer";
+
+  // Control: the fixture must be able to exhibit the defect. Both lines contain a
+  // word the patterns match, so an exclusion that did nothing would let both through.
+  check("control: the passing line does contain a matched word", /\bfailed\b/i.test(passing), true);
+
+  check("a line announcing PASS is not a cause", salientLines(passing).length, 0);
+  check("and the failing line still is", salientLines(failing).length, 1);
+
+  // TAP: a failure reads "not ok", which must survive the exclusion.
+  check("TAP: 'ok 3 - handles failed input' is not a cause", salientLines("ok 3 - handles failed input").length, 0);
+  check("TAP: 'not ok 3 - handles input' still is", salientLines("not ok 3 - the thing failed").length, 1);
+
+  // A cause list drawn from a mixed run contains only the real failure.
+  check("a mixed run yields only what broke",
+    salientLines([passing, failing, "PASS  something else failed to explode"].join("\n")).join("|"),
+    failing);
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

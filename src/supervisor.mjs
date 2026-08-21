@@ -130,6 +130,41 @@ export function readEvent(line) {
  * Classify a finished worker. `subtype` is "success" even on API and auth
  * failures, so it is never the discriminator.
  */
+/**
+ * The worker's own account of itself, from the fenced json block every prompt
+ * asks it to finish with.
+ *
+ * That block was written into every prompt and parsed by NOTHING. Measured: a
+ * worker correctly declined to fix a failure because the change belonged in a
+ * sensitive path, said so in `needsHuman`, and reeve discarded it and told the
+ * founder "a fix was produced but refused publication -- the worker produced an
+ * empty diff". Two statements that cannot both be true, about a worker that had
+ * done exactly the right thing.
+ *
+ * Trusted for ONE question: why did you stop. Whether anything was actually
+ * fixed is answered by git and by CI, never by this -- the actor is not the
+ * witness, and that is the rule the whole design rests on. But "why did you
+ * stop" has no other witness, and reeve asks for it in every prompt.
+ */
+export function parseReport(text) {
+  if (typeof text !== "string") return null;
+  // The LAST block: a worker explaining itself may quote the shape earlier.
+  const blocks = [...text.matchAll(/```json\s*([\s\S]*?)```/g)];
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    try {
+      const o = JSON.parse(blocks[i][1]);
+      if (o && typeof o === "object" && !Array.isArray(o)) return o;
+    } catch { /* try the one before it */ }
+  }
+  return null;
+}
+
+/** What the worker said it needs a human for, or null. Never a bare `true`. */
+export function statedBlocker(report) {
+  const v = report?.needsHuman;
+  return typeof v === "string" && v.trim() ? v.trim() : null;
+}
+
 export function classifyResult(result, { code, signal, killedByUs }) {
   if (killedByUs) return { outcome: OUTCOMES.TIMEOUT, why: "exceeded its wall-clock budget" };
   // claude installs its own SIGTERM handler and exits deliberately, so Node
@@ -158,7 +193,8 @@ export function classifyResult(result, { code, signal, killedByUs }) {
   // What still disqualifies is not knowing what happened at all: a timeout, a
   // crash, an error — each handled above, before this line.
   const denials = result.permission_denials ?? [];
-  return { outcome: OUTCOMES.OK, why: result.terminal_reason ?? "completed", denials };
+  return { outcome: OUTCOMES.OK, why: result.terminal_reason ?? "completed", denials,
+           report: parseReport(result.result) };
 }
 
 /**

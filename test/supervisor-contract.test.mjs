@@ -122,6 +122,19 @@ const ENV = { PATH: "/usr/bin:/bin" };
     "a revocation the poll never saw is still read at exit", JSON.stringify({ o: r.outcome, w: r.why }));
 }
 
+
+// ── an identity that cannot be read is not a binding ─────────────────────────
+//
+// pid+lstart is how a restart tells this worker from a stranger that inherited
+// its pid. A worker whose start time `ps` could not read was still treated as
+// bound, with an empty token recorded; after a crash that pid is any process.
+{
+  const r = await runWorker({ bin: "/bin/sh", args: ["-c", "sleep 30"], env: ENV, ...files("nolstart"), budgetMs: 60000,
+                              readStart: () => null });
+  check(r.outcome === OUTCOMES.UNBOUND && /start time/.test(r.why), "a worker whose start time cannot be read is UNBOUND and killed", JSON.stringify({ o: r.outcome, w: r.why }));
+}
+
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

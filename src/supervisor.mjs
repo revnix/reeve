@@ -248,6 +248,9 @@ export function runWorker({
   // Asked every poll: a non-null answer is the reason the worker's lease is
   // gone, and the worker is terminated with it.
   isRevoked = () => null,
+  // The identity reader, injectable for the test that makes it fail; the
+  // default is the real `ps` read and a null answer is a refused binding.
+  readStart: readStartOf = readStart,
 } = {}) {
   // The environment is EXACT. It used to be `{...process.env, ...env}`, which
   // handed every worker the founder's tokens and the ssh agent; see workerenv.mjs.
@@ -296,12 +299,17 @@ export function runWorker({
 
     installReaper();
     LIVE_GROUPS.add(child.pid);
-    const lstart = readStart(child.pid);
+    const lstart = readStartOf(child.pid);
 
     // The binding is not an observer. A worker whose pid and start time could
     // not be written is one a restart can neither adopt nor kill with
-    // confidence, so it does not get to run at all.
-    try { onSpawn({ pid: child.pid, lstart }); }
+    // confidence, so it does not get to run at all. A start time that could
+    // not be READ is the same failure from the other side: pid alone names a
+    // stranger after the first reuse, so an empty token is no binding.
+    try {
+      if (!lstart) throw new Error("the worker's start time could not be read, so its pid cannot be told from a reused one");
+      onSpawn({ pid: child.pid, lstart });
+    }
     catch (err) {
       killGroup(child.pid, "SIGKILL");
       LIVE_GROUPS.delete(child.pid);
@@ -355,10 +363,12 @@ export function runWorker({
       }
     }, 2000);
 
-    child.on("exit", (code, signal) => {
+    // Classification waits for `close`, which fires after stdout and stderr have
+    // drained; `exit` can precede the final result line and would classify a
+    // finished worker as CRASHED. `exit` only sweeps the group.
+    child.on("exit", () => { killGroup(child.pid, "SIGKILL"); });
+    child.on("close", (code, signal) => {
       LIVE_GROUPS.delete(child.pid);
-      // The leader can exit while a grandchild lingers, so sweep the group.
-      killGroup(child.pid, "SIGKILL");
       // Sampled once more here: a lease revoked between the last poll and a
       // normal exit would otherwise be classified OK and its result published
       // under a claim the worker no longer held.

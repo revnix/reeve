@@ -35,7 +35,12 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = "main" } =
   const rules = detail.flatMap(r => r.rules ?? []);
   const rulesetRequiredChecks = rules.filter(r => r.type === "required_status_checks")
     .flatMap(r => (r.parameters?.required_status_checks ?? []).map(c => `${c.context}@${c.integration_id ?? "any"}`)).sort();
-  const pr = rules.find(r => r.type === "pull_request")?.parameters ?? {};
+  // Every active ruleset applies; the EFFECTIVE requirement is the strictest
+  // across them. Reading only the first rule found would let a later, stricter
+  // ruleset appear or vanish without the drift check noticing.
+  const prs = rules.filter(r => r.type === "pull_request").map(r => r.parameters ?? {});
+  const pr = { required_approving_review_count: Math.max(0, ...prs.map(p => p.required_approving_review_count ?? 0)),
+               require_code_owner_review: prs.some(p => p.require_code_owner_review === true) };
   const rulesetBypassActors = detail.flatMap(r => (r.bypass_actors ?? []).map(b => `${b.actor_type}:${b.actor_id ?? ""}:${b.bypass_mode}`)).sort();
   let bp = null;
   try { bp = gh(`repos/${nwo}/branches/${encodeURIComponent(branch)}/protection`); }
@@ -77,7 +82,8 @@ const sortedEq = (a, b) => JSON.stringify([...(a ?? [])].sort()) === JSON.string
 export function diffBaseline(live, fixture) {
   if (!live || typeof live !== "object") return { drifted: true, lines: ["could not read the live state; drift is assumed, not excluded"] };
   const lines = [];
-  for (const [key, label] of [["rulesetRequiredChecks", "required checks (ruleset)"],
+  for (const [key, label] of [["rulesetNames", "active rulesets"],
+                              ["rulesetRequiredChecks", "required checks (ruleset)"],
                               ["branchProtectionRequiredChecks", "required checks (branch protection)"],
                               ["rulesetBypassActors", "bypass actors"]]) {
     if (!sortedEq(live[key], fixture[key]))

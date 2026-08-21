@@ -61,6 +61,11 @@ export const REFUSING_HOOK = "#!/bin/sh\necho 'this checkout does not publish; r
  * that worktree back with only the older layer in place.
  */
 function harden(repoRoot, path) {
+  try { return hardenOrThrow(repoRoot, path); }
+  catch (e) { return { ok: false, why: `could not harden the worktree: ${e.message}` }; }
+}
+
+function hardenOrThrow(repoRoot, path) {
   // Make the worktree PHYSICALLY unable to publish, rather than trusting a
   // permission pattern to refuse it.
   //
@@ -76,8 +81,10 @@ function harden(repoRoot, path) {
   // default, so setting this without it disables push for the main checkout and
   // every other worktree too — which is exactly what happened the first time and
   // broke the test's own setup two cases later.
-  git(repoRoot, ["config", "extensions.worktreeConfig", "true"]);
-  git(path, ["config", "--worktree", "remote.origin.pushurl", "reeve://refused-the-worker-does-not-publish"]);
+  const ext = git(repoRoot, ["config", "extensions.worktreeConfig", "true"]);
+  if (!ext.ok) throw new Error(`extensions.worktreeConfig: ${ext.err}`);
+  const pu = git(path, ["config", "--worktree", "remote.origin.pushurl", "reeve://refused-the-worker-does-not-publish"]);
+  if (!pu.ok) throw new Error(`pushurl: ${pu.err}`);
 
   // Second layer, for the shape the pushurl does not cover: `git push <url>`
   // with an explicit file:// or https:// destination never consults origin's
@@ -94,7 +101,16 @@ function harden(repoRoot, path) {
   const hooks = `${path}.hooks`;
   mkdirSync(hooks, { recursive: true });
   writeFileSync(join(hooks, "pre-push"), REFUSING_HOOK, { mode: 0o755 });
-  git(path, ["config", "--worktree", "core.hooksPath", hooks]);
+  const hp = git(path, ["config", "--worktree", "core.hooksPath", hooks]);
+  if (!hp.ok) throw new Error(`hooksPath: ${hp.err}`);
+  // Read back, never assume: a config write that silently landed elsewhere
+  // (a read-only shared config, a missing extension) is exactly the case
+  // where a worker would be handed a worktree that can publish.
+  const readPu = git(path, ["config", "--worktree", "remote.origin.pushurl"]);
+  const readHp = git(path, ["config", "--worktree", "core.hooksPath"]);
+  if (!readPu.ok || readPu.out !== "reeve://refused-the-worker-does-not-publish") throw new Error("pushurl did not read back");
+  if (!readHp.ok || readHp.out !== hooks || !existsSync(join(hooks, "pre-push"))) throw new Error("hooksPath or hook did not read back");
+  return { ok: true, why: null };
 }
 
 export function verifyWorktree({ path, branch, head = null }) {
@@ -143,7 +159,7 @@ export function acquireWorktree({ repoRoot, root, pr, branch, head = null }) {
   if (existsSync(path)) {
     const v = verifyWorktree({ path, branch, head });
     return v.ok
-      ? (harden(repoRoot, path), { ok: true, path, reused: true, why: null })
+      ? (h => h.ok ? { ok: true, path, reused: true, why: null } : { ok: false, path, reused: true, why: h.why })(harden(repoRoot, path))
       : { ok: false, path, reused: true, why: `existing worktree unusable: ${v.why}` };
   }
 
@@ -159,7 +175,8 @@ export function acquireWorktree({ repoRoot, root, pr, branch, head = null }) {
   const add = git(repoRoot, ["worktree", "add", "--force", "-B", branch, path, `origin/${branch}`]);
   if (!add.ok) return { ok: false, path: null, why: `could not create the worktree: ${add.err}` };
 
-  harden(repoRoot, path);
+  const hardened = harden(repoRoot, path);
+  if (!hardened.ok) return { ok: false, path, why: hardened.why };
 
   const v = verifyWorktree({ path, branch, head });
   if (!v.ok) return { ok: false, path, why: `created but did not verify: ${v.why}` };

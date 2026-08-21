@@ -39,14 +39,31 @@ import { homedir } from "node:os";
 
 const now = () => Math.floor(Date.now() / 1000);
 
-// Read once: the CLI version is part of every worker's contract, and asking on
-// every dispatch would be a subprocess per tick for an answer that does not change.
-let CLI_VERSION = null;
-function cliVersion() {
-  if (CLI_VERSION) return CLI_VERSION;
-  try { CLI_VERSION = execFileSync("claude", ["--version"], { encoding: "utf8" }).trim(); }
-  catch { CLI_VERSION = "unknown"; }
-  return CLI_VERSION;
+// Read once per binary: the CLI version is part of every worker's contract,
+// and asking on every dispatch would be a subprocess per tick for an answer
+// that does not change. Resolved under the WORKER's environment, because the
+// daemon's own PATH (launchd's) may not even hold the binary the worker runs;
+// a version that cannot be read is a refusal, never the string "unknown".
+const CLI_VERSION = new Map();
+// The worker's PATH is pinned and does not contain the CLI's install dir (it
+// lives under ~/.local/bin here), and spawn resolves a bare command through the
+// CHILD's PATH. So the binary is resolved once on the daemon's PATH and passed
+// by absolute path; a CLI that cannot be found is a refusal, not a guess.
+let CLAUDE_BIN = null;
+function resolveClaude(bin) {
+  if (bin.startsWith("/")) return bin;
+  if (CLAUDE_BIN) return CLAUDE_BIN;
+  const out = execFileSync("which", [bin], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  if (!out) throw new Error(`${bin} is not on the daemon's PATH`);
+  CLAUDE_BIN = out;
+  return out;
+}
+function cliVersion(bin, env) {
+  if (CLI_VERSION.has(bin)) return CLI_VERSION.get(bin);
+  const out = execFileSync(bin, ["--version"], { encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"] }).trim();
+  if (!out) throw new Error(`${bin} --version printed nothing`);
+  CLI_VERSION.set(bin, out);
+  return out;
 }
 
 // Whether this process's stdout already points at the log file. launchd's
@@ -494,8 +511,10 @@ export async function tick(ctx) {
         const stateDir = dirname(ctx.logPath ?? "/tmp/x");
         const runDir = join(stateDir, "runs", nwo.replace("/", "-"), String(e.pr), run.runId);
         const budgetMs = (profile.watch?.workerBudgetMinutes ?? 20) * 60_000;
+        const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
         const env = workerEnv({ gitConfigPath: writeGitConfig(join(stateDir, "git")),
-                                tmpDir: join(runDir, "tmp"), bgWaitMs: budgetMs });
+                                tmpDir: join(runDir, "tmp"), bgWaitMs: budgetMs,
+                                extraPath: [dirname(claudeBin)] });
         const outPath = join(runDir, "worker.out"), errPath = join(runDir, "worker.err");
         const maxTurns = profile.watch?.maxTurns ?? 40;
         const tools = spec.tools ?? sandbox.allowedTools;
@@ -508,13 +527,14 @@ export async function tick(ctx) {
         // between here and the first heartbeat still leaves the answer to "what
         // was this worker asked to run as".
         recordWorkerContract(db, {
-          runId: run.runId, cliVersion: ctx.cliVersion ?? cliVersion(),
+          runId: run.runId, cliVersion: ctx.cliVersion ?? cliVersion(claudeBin, env),
           argvHash: sha256(JSON.stringify(argv)), promptHash: sha256(spec.prompt),
           settingsHash: sha256(readFileSync(settingsPath, "utf8")),
           toolContract: tools, maxTurns, outPath, errPath,
         });
 
         r = await (ctx.spawnWorker ?? runWorker)({
+          bin: claudeBin,
           args: argv,
           cwd: worktree, env, outPath, errPath,
           maxOutputBytes: profile.worker?.maxOutputBytes ?? 64 * 1024 * 1024,
@@ -539,9 +559,13 @@ export async function tick(ctx) {
         catch { /* the run still finishes */ }
         // Closed in `finally`: a throw between spawn and result would otherwise
         // leave the run leased forever, and the PR unworkable until it expired.
-        finishRun(db, { runId: run.runId, outcome: r?.outcome ?? "failed",
-                        why: r?.why ?? "the worker threw before returning a result",
-                        ms: r?.ms, cost: r?.cost, sessionId: r?.sessionId });
+        // finishRun itself refuses a run this process no longer owns (a lost
+        // lease means another actor already moved it), so a stale outcome can
+        // never overwrite the newer state.
+        const fin = finishRun(db, { runId: run.runId, outcome: r?.outcome ?? "failed",
+                                    why: r?.why ?? "the worker threw before returning a result",
+                                    ms: r?.ms, cost: r?.cost, sessionId: r?.sessionId });
+        if (fin?.applied === false) log(logPath, `  #${e.pr}: run ${run.runId} not finished by this process: ${fin.why}`);
       }
       log(logPath, `  #${e.pr}: ${decision.action} -> ${r.outcome} (${r.why}) in ${Math.round(r.ms / 1000)}s${r.cost != null ? `, ${r.cost.toFixed(3)}` : ""}`);
 

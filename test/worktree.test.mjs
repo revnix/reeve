@@ -247,6 +247,19 @@ let wt;
       "a reused worktree is hardened again: hook present and configured", hp);
   }
 
+  // Hardening that cannot be applied must refuse the worktree, never hand it
+  // back with a layer missing. A regular file where the hooks directory must
+  // go is the cheapest way to make the hook step fail.
+  {
+    const { pathFor } = await import("../src/worktree.mjs");
+    const p13 = pathFor(roots, 13);
+    writeFileSync(`${p13}.hooks`, "not a directory\n");
+    git(repo, "push", "-q", "origin", "origin/feature:refs/heads/feature13");   // a branch no worktree holds
+    const r13 = acquireWorktree({ repoRoot: repo, root: roots, pr: 13, branch: "feature13", head: git(repo, "rev-parse", "origin/feature13") });
+    check(r13.ok === false && /harden/i.test(r13.why ?? ""), "a worktree whose hardening fails is refused, with the reason", JSON.stringify(r13));
+    rmSync(`${p13}.hooks`, { force: true });
+  }
+
   // The confinement must be per-worktree. A plain `git config` write from inside a
   // worktree lands in the SHARED clone config and disables push everywhere,
   // including the main checkout — which is how the first version of this broke the

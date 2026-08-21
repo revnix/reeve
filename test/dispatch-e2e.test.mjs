@@ -121,6 +121,11 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   await tick(ctx3);
   check(typeof sawRevoked === "string" && /lease/.test(sawRevoked),
     "the daemon tells the worker its lease is gone", String(sawRevoked));
+  // The run was abandoned by another actor; a stale worker's finish must not
+  // overwrite that with its own "failed" and flip the PR node underneath a
+  // replacement run.
+  const after = ctx3.db.prepare("SELECT status FROM run ORDER BY started_at DESC LIMIT 1").get();
+  check(after?.status === "abandoned", "a lost lease leaves the newer run state untouched", JSON.stringify(after));
   ctx3.db.close();
   rmSync(dir3, { recursive: true, force: true });
 }
@@ -168,6 +173,28 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
     "a failed heartbeat write revokes with its own reason", String(sawRevoked));
   ctx5.db.close();
   rmSync(dir5, { recursive: true, force: true });
+}
+
+
+// --- a CLI whose version cannot be read is not dispatched --------------------
+//
+// The contract exists to record exactly which CLI ran. "unknown" is not a
+// version; resolution happens with the worker's own binary, and a failure to
+// resolve is a preparation failure: no launch, the run closed, the attempt refunded.
+{
+  const dir6 = mkdtempSync(join(tmpdir(), "reeve-e2e-cli-"));
+  const ctx6 = { ...baseCtx(), db: open(join(dir6, "v.db")), logPath: join(dir6, "log.txt"), worktreeFor: () => mkdtempSync(join(dir6, "wt-")),
+                 claudeBin: "/nonexistent/claude" };
+  delete ctx6.cliVersion;
+  let launched = 0;
+  ctx6.spawnWorker = async () => { launched++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  await tick(ctx6);
+  check(launched === 0, "no worker launches when the CLI version cannot be resolved", String(launched));
+  const run6 = ctx6.db.prepare("SELECT status, error FROM run ORDER BY started_at DESC LIMIT 1").get();
+  check(run6?.status === "failed" && /cli version|claude/i.test(run6?.error ?? ""), "the run is closed with the reason", JSON.stringify(run6));
+  check((ctx6.db.prepare("SELECT COALESCE(SUM(attempts),0) n FROM fix_attempt").get().n) === 0, "and the attempt is refunded", "");
+  ctx6.db.close();
+  rmSync(dir6, { recursive: true, force: true });
 }
 
 ctx.db.close();

@@ -442,10 +442,15 @@ export function notePid(db, { runId, pid, boot }) {
 export function finishRun(db, { runId, outcome, why = null, ms = null, cost = null, sessionId = null }) {
   const status = outcome === "ok" ? "succeeded" : "failed";
   return tx(db, () => {
-    const r = db.prepare("SELECT task_id FROM run WHERE id=?").get(runId);
+    // Only a run this process still owns may be finished. A run another actor
+    // reaped or abandoned has moved on; a stale worker's verdict must not
+    // overwrite that state or flip the PR node under a replacement run.
+    const r = db.prepare(`SELECT task_id FROM run WHERE id=? AND status IN
+                            ('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')`).get(runId);
+    if (!r) return { applied: false, why: "the run is no longer live under this process" };
     db.prepare(`UPDATE run SET status=?, ended_at=unixepoch(), error=? WHERE id=?`)
       .run(status, why, runId);
-    if (r) db.prepare(`UPDATE node SET status=?, updated_at=unixepoch(), version=version+1 WHERE id=?`)
+    db.prepare(`UPDATE node SET status=?, updated_at=unixepoch(), version=version+1 WHERE id=?`)
       .run(status === "succeeded" ? "done" : "blocked", r.task_id);
     emit(db, { actor: "daemon", op: "run.finish", subject: r?.task_id ?? null, run_id: runId,
                payload: { outcome, why, ms, cost, sessionId } });

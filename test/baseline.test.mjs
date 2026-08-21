@@ -64,5 +64,24 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
   check(/checkBaseline\(nwo, profile, baselineIo\)/.test(list), "control: runDoctor's check list includes the baseline check", list.slice(-120));
 }
 
+
+// ── every applicable ruleset counts, and a new ruleset is drift ──────────────
+{
+  const { readLiveBaseline } = await import("../src/baseline.mjs");
+  const gh = path => {
+    if (path.endsWith("/rulesets")) return [{ id: 1, name: "weak", enforcement: "active" }, { id: 2, name: "strong", enforcement: "active" }, { id: 3, name: "off", enforcement: "disabled" }];
+    if (path.endsWith("/rulesets/1")) return { rules: [{ type: "pull_request", parameters: { required_approving_review_count: 1, require_code_owner_review: false } }], bypass_actors: [] };
+    if (path.endsWith("/rulesets/2")) return { rules: [{ type: "pull_request", parameters: { required_approving_review_count: 2, require_code_owner_review: true } }], bypass_actors: [] };
+    if (/protection$/.test(path)) { const e = new Error("gh: Not Found (HTTP 404)"); e.stderr = "gh: Not Found (HTTP 404)"; throw e; }
+    throw new Error("unexpected " + path);
+  };
+  const live = readLiveBaseline("o/r", { authority: { policy: "p" }, merge: { enforcement: "e" }, builder: { capabilities: {} } }, { gh });
+  check(live.requiredApprovals === 2 && live.codeOwnerReview === true,
+    "the strictest pull-request rule across active rulesets is the effective one", JSON.stringify([live.requiredApprovals, live.codeOwnerReview]));
+  check(JSON.stringify(live.rulesetNames) === JSON.stringify(["weak", "strong"]), "disabled rulesets are not counted", JSON.stringify(live.rulesetNames));
+  const renamed = structuredClone(fixture); renamed.rulesetNames = [...renamed.rulesetNames, "extra"];
+  check(diffBaseline(renamed, fixture).drifted === true && /ruleset/.test(diffBaseline(renamed, fixture).lines.join(" ")), "a ruleset appearing is drift even when its rules match", "");
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

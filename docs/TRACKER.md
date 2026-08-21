@@ -36,6 +36,11 @@ The four capabilities, measured 2026-08-21:
       `prompts.mjs`; findings lists ordered criticals-first then the measured
       top reviewer. nextly's profile carries the study; other projects render
       nothing until measured.
+- [ ] **PR-6 precondition (from PR-1 review):** REQUEST_REVIEW and SPILL prompts
+      tell the WORKER to use `gh`, but the worker contract shims `gh` and holds
+      no credential by design. Before `watch.reviewActions` arms, those GitHub
+      effects must be performed by reeve through the outbox (the design's
+      rule), never by a worker. Until then the two actions stay gated.
 - [ ] **PR-6 wiring note:** `e.threadDetails` is read at both review dispatch
       sites and written by NOTHING (the read-never-written pattern again).
       When capability 3 arms, populate it from the `review_thread` projections

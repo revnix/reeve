@@ -5,7 +5,7 @@
 // test asserts the ABSENCE of each ambient credential with a positive control
 // (it plants them first), because an absence search that cannot see is not one.
 import { workerEnv, writeGitConfig, CONTAINMENT } from "../src/workerenv.mjs";
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 
@@ -94,6 +94,21 @@ const env = workerEnv({ gitConfigPath, tmpDir: join(dir, "tmp"), bgWaitMs: 12000
   // closes them; the module says so in code, and the daemon reads it.
   check(CONTAINMENT.credentialRead === "open" && typeof CONTAINMENT.why === "string",
     "the module declares the credential read OPEN, with the reason", JSON.stringify(CONTAINMENT));
+}
+
+
+{
+  // A worker must be able to commit (its prompt requires it) without the
+  // founder's identity: the reeve-owned config carries the App's bot identity,
+  // which is attributed on GitHub and names nothing private.
+  const { execFileSync: ex } = await import("node:child_process");
+  const repo = join(dir, "idrepo"); ex("git", ["init", "-q", repo], { env });
+  writeFileSync(join(repo, "f"), "x");
+  ex("git", ["-C", repo, "add", "f"], { env });
+  let out = "", code = 0;
+  try { ex("git", ["-C", repo, "commit", "-q", "-m", "worker commit"], { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }); out = ex("git", ["-C", repo, "log", "-1", "--format=%an <%ae>"], { env, encoding: "utf8" }).trim(); }
+  catch (e2) { code = e2.status; out = String(e2.stderr); }
+  check(code === 0 && out === "merge-policy[bot] <319037914+merge-policy[bot]@users.noreply.github.com>", "a worker commit carries the App's bot identity", out.slice(0, 160));
 }
 
 for (const k of Object.keys(planted)) delete process.env[k];

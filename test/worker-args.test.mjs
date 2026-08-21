@@ -30,7 +30,10 @@ const valueOf = (a, flag) => a[a.indexOf(flag) + 1];
   // --safe-mode leaves permissions alone by the CLI's own description, so the
   // founder's user-level allow rules would still merge in. `local` is the one
   // source that names neither the user file nor the target repo's project file.
-  check(valueOf(a, "--setting-sources") === "local", "only local settings are loaded by default, never the founder's or the repo's", a.join(" "));
+  // Measured 2026-08-22 (docs/measured): `local` loads the checkout's own
+  // .claude/settings.local.json, which a pull request can carry; the empty
+  // value is accepted and means no ambient source at all.
+  check(valueOf(a, "--setting-sources") === "", "no ambient setting source is loaded by default: not the founder's, not the repo's, not the checkout's local file", a.join(" "));
   const b = workerArgs({ prompt: "hi", settings: "/tmp/s.json", settingSources: "project" });
   check(valueOf(b, "--setting-sources") === "project", "a caller may widen the sources explicitly", b.join(" "));
   check(has(a, "-p") && has(a, "--verbose") && valueOf(a, "--output-format") === "stream-json",

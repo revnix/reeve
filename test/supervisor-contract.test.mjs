@@ -104,8 +104,14 @@ const ENV = { PATH: "/usr/bin:/bin" };
     r = await runWorker({ bin: "/nonexistent/claude", args: [], env: ENV, ...files("nobin"), budgetMs: 3000,
                           onSpawn: () => { throw new Error("bind"); } });
   } catch (e) { threw = e; }
-  check(!threw && r?.outcome === OUTCOMES.CRASHED && /could not spawn/.test(r?.why ?? ""),
-    "a missing binary resolves CRASHED even when the binding would have thrown", threw ? String(threw.message) : JSON.stringify({ o: r?.outcome, w: r?.why }));
+  // Behind the exec gate the binding is judged before the binary is ever
+  // exec'd, so a refused binding wins and the missing binary is never reached.
+  check(!threw && r?.outcome === OUTCOMES.UNBOUND, "with a refused binding, the gate answers UNBOUND before the binary is reached, and nothing crashes", threw ? String(threw.message) : JSON.stringify({ o: r?.outcome, w: r?.why }));
+  let r2 = null, threw2 = null;
+  try { r2 = await runWorker({ bin: "/nonexistent/claude", args: [], env: ENV, ...files("nobin2"), budgetMs: 3000 }); }
+  catch (e) { threw2 = e; }
+  check(!threw2 && r2?.outcome === OUTCOMES.CRASHED && /exited 12[67]/.test(r2?.why ?? ""),
+    "with a good binding, a missing binary is CRASHED from the gate's exec failure, never an uncaught error", threw2 ? String(threw2.message) : JSON.stringify({ o: r2?.outcome, w: r2?.why }));
 }
 
 // ── revocation that lands between the last poll and exit still counts ────────
@@ -144,7 +150,26 @@ const ENV = { PATH: "/usr/bin:/bin" };
   check(r.truncated === false && r.stdoutBytes === 9 && /out-line/.test(readFileSync(f.outPath, "utf8")),
     "a stderr-heavy worker does not lose its stdout to a shared cap, and stdoutBytes counts stdout only", JSON.stringify({ t: r.truncated, b: r.stdoutBytes }));
   check(statSync(f.errPath).size <= 100000 && r.stderrTruncated === true, "stderr has its own cap and its own truncation flag", JSON.stringify({ s: statSync(f.errPath).size, st: r.stderrTruncated }));
+  // An incomplete stderr record is as incomplete as an incomplete stdout one.
+  check(r.outcome === OUTCOMES.FAILED && /stderr/.test(r.why), "and a truncated stderr fails the run too", JSON.stringify({ o: r.outcome, w: r.why }));
 }
+
+// ── the worker does nothing until its binding has committed ──────────────────
+//
+// A child starts executing at spawn. A binding that failed afterwards could
+// kill a worker that had already touched the filesystem; a fast `touch`
+// completed in that window. The worker is now held behind an exec gate and
+// released only once the binding is durable.
+{
+  const { existsSync: ex } = await import("node:fs");
+  const mark = join(dir, "touched-before-binding");
+  const r = await runWorker({ bin: "/usr/bin/touch", args: [mark], env: ENV, ...files("gate"), budgetMs: 10000,
+                              onSpawn: () => { throw new Error("binding refused"); } });
+  check(r.outcome === OUTCOMES.UNBOUND && !ex(mark), "a worker whose binding was refused never ran its first instruction", JSON.stringify({ o: r.outcome, touched: ex(mark) }));
+  const ok = await runWorker({ bin: "/usr/bin/touch", args: [mark], env: ENV, ...files("gate-ok"), budgetMs: 10000 });
+  check(ex(mark), "control: a bound worker runs", JSON.stringify({ o: ok.outcome }));
+}
+
 
 // ── a durable write that fails ends the worker as failed, not the daemon ─────
 {

@@ -16,7 +16,7 @@ const [owner, repo] = nwo.split("/");
 const HOME = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
 const profile = withDefaults(JSON.parse(readFileSync(join(HOME, "profiles", owner, `${repo}.json`), "utf8")));
 let live;
-try { live = readLiveBaseline(nwo, profile, { branch: process.argv[3] ?? "main" }); }
+try { live = readLiveBaseline(nwo, profile, { branch: process.argv[3] ?? null }); }
 catch (e) { console.error(`capture-baseline: ${String(e.stderr ?? e.message).trim().split("\n")[0]}`); process.exit(1); }
 process.stdout.write(JSON.stringify({ capturedAt: new Date().toISOString(), ...live }, null, 2) + "\n");
 console.error(`write this to ${baselinePathFor(nwo)}`);

@@ -60,7 +60,7 @@ let CLAUDE_BIN = null;
 function resolveClaude(bin) {
   if (bin.startsWith("/")) return bin;
   if (CLAUDE_BIN) return CLAUDE_BIN;
-  const out = execFileSync("which", [bin], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  const out = execFileSync("which", [bin], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 15000 }).trim();
   if (!out) throw new Error(`${bin} is not on the daemon's PATH`);
   CLAUDE_BIN = out;
   return out;
@@ -68,7 +68,8 @@ function resolveClaude(bin) {
 function cliVersion(bin, env) {
   const key = binaryIdentity(bin);
   if (CLI_VERSION.has(key)) return CLI_VERSION.get(key);
-  const out = execFileSync(bin, ["--version"], { encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"] }).trim();
+  // Bounded: a stalled probe would freeze the tick and let the run's lease lapse.
+  const out = execFileSync(bin, ["--version"], { encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"], timeout: 15000 }).trim();
   if (!out) throw new Error(`${bin} --version printed nothing`);
   CLI_VERSION.set(key, out);
   return out;
@@ -563,8 +564,11 @@ export async function tick(ctx) {
       } finally {
         clearInterval(beat);
         // What the worker said it ran as, and whether its durable record is whole.
-        try { noteWorkerResult(db, { runId: run.runId, modelResolved: r?.model ?? null, truncated: r?.truncated === true || r?.stderrTruncated === true, stdoutBytes: r?.stdoutBytes ?? null }); }
-        catch { /* the run still finishes */ }
+        // Facts that cannot be recorded are facts nobody can audit later, so a
+        // run whose facts did not land is not a successful run, whatever the
+        // worker said: the outcome becomes failed before the run is closed.
+        try { (ctx.noteWorkerResult ?? noteWorkerResult)(db, { runId: run.runId, modelResolved: r?.model ?? null, truncated: r?.truncated === true || r?.stderrTruncated === true, stdoutBytes: r?.stdoutBytes ?? null }); }
+        catch (err) { r = { ...(r ?? {}), outcome: OUTCOMES.FAILED, why: `the run's result facts could not be recorded: ${err.message}` }; }
         // Closed in `finally`: a throw between spawn and result would otherwise
         // leave the run leased forever, and the PR unworkable until it expired.
         // finishRun itself refuses a run this process no longer owns (a lost

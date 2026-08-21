@@ -45,6 +45,8 @@ const db = open(join(dir, "c.db"));
     checks: { verdict: "RED", caused: ["CI Gate"], failing: [{ name: "CI Gate", id: "99" }] },
     reviewers: [], threads: {}, settled: { settled: true },
   };
+  // Each context gets its own worktree dir: the daemon quarantines (moves) a
+  // worktree after a failed run, and a shared one strands every later tick.
   var ctxFor = (db_, logPath) => ({
     nwo: "o/r", db: db_, logPath, execute: true, shadow: true, running: 0, containment: { credentialRead: "closed", why: "test" }, claudeBin: "/bin/sh", cliVersion: "2.1.237",
     profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir }, authority: { policy: "propose_and_merge" },
@@ -53,7 +55,7 @@ const db = open(join(dir, "c.db"));
     openPrs: () => [42], evaluate: () => evaluation,
     publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
     resolveCause: () => ({ ok: true, job: "CI Gate", step: "Test", runId: 11, cause: [{ where: "src/x.ts:1", message: "boom" }] }),
-    worktreeFor: () => dir,
+    worktreeFor: () => mkdtempSync(join(dir, "wt-")),
   });
   var seenEnv = null;
   const ctx = { ...ctxFor(db, join(dir, "log.txt")),
@@ -95,6 +97,19 @@ const db = open(join(dir, "c.db"));
   const spent = db2.prepare("SELECT COALESCE(SUM(attempts),0) n FROM fix_attempt").get().n;
   check(spent === 0, "and the fix attempt spent for it is refunded", String(spent));
   db2.close(); rmSync(dir2, { recursive: true, force: true });
+}
+
+
+// ── result facts that cannot be recorded make the run failed, not published ──
+{
+  const dir3 = mkdtempSync(join(tmpdir(), "reeve-contract-note-"));
+  const db3 = open(join(dir3, "n.db"));
+  const ctx3 = { ...ctxFor(db3, join(dir3, "log.txt")), noteWorkerResult: () => { throw new Error("disk full"); },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", model: "m" }) };
+  await tick(ctx3);
+  const run3 = db3.prepare("SELECT status, error FROM run ORDER BY started_at DESC LIMIT 1").get();
+  check(run3?.status === "failed" && /record/.test(run3?.error ?? ""), "an OK worker whose result facts could not be recorded is closed as failed, with the reason", JSON.stringify(run3));
+  db3.close(); rmSync(dir3, { recursive: true, force: true });
 }
 
 db.close();

@@ -29,6 +29,23 @@ const ghApi = (path) => JSON.parse(execFileSync("gh", ["api", path], { encoding:
  * and must never be compared as if it were one.
  */
 /**
+ * GitHub's ref patterns are fnmatch: `*` matches within one path segment, `**`
+ * crosses segments, `?` is one character, `[...]` is a class. Translating every
+ * star to `.*` let `release/*` claim `release/team/v1`.
+ */
+function fnmatchRe(pat) {
+  let re = "^";
+  for (let i = 0; i < pat.length; i++) {
+    const c = pat[i];
+    if (c === "*") { if (pat[i + 1] === "*") { re += ".*"; i++; } else re += "[^/]*"; }
+    else if (c === "?") re += "[^/]";
+    else if (c === "[") { const j = pat.indexOf("]", i + 1); if (j > i) { re += "[" + pat.slice(i + 1, j).replace(/\\/g, "\\\\") + "]"; i = j; } else re += "\\["; }
+    else re += c.replace(/[.+^${}()|\\]/g, "\\$&");
+  }
+  return new RegExp(re + "$");
+}
+
+/**
  * Does a ruleset's ref condition cover this branch? GitHub's patterns are
  * `refs/heads/<fnmatch>`, `~DEFAULT_BRANCH`, and `~ALL`; exclude beats include.
  * A ruleset with no ref condition applies to every branch.
@@ -37,8 +54,7 @@ export function rulesetCoversBranch(detail, branch, defaultBranch) {
   const cond = detail?.conditions?.ref_name;
   if (!cond) return true;
   const ref = `refs/heads/${branch}`;
-  const matches = pat => pat === "~ALL" || (pat === "~DEFAULT_BRANCH" && branch === defaultBranch)
-    || new RegExp("^" + pat.split("*").map(s => s.replace(/[.+^${}()|[\]\\]/g, "\\$&")).join(".*") + "$").test(ref);
+  const matches = pat => pat === "~ALL" || (pat === "~DEFAULT_BRANCH" && branch === defaultBranch) || fnmatchRe(pat).test(ref);
   if ((cond.exclude ?? []).some(matches)) return false;
   return (cond.include ?? []).some(matches);
 }
@@ -62,7 +78,13 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {
   // ruleset appear or vanish without the drift check noticing.
   const prs = rules.filter(r => r.type === "pull_request").map(r => r.parameters ?? {});
   const pr = { required_approving_review_count: Math.max(0, ...prs.map(p => p.required_approving_review_count ?? 0)),
-               require_code_owner_review: prs.some(p => p.require_code_owner_review === true) };
+               require_code_owner_review: prs.some(p => p.require_code_owner_review === true),
+               // Every other authority-bearing parameter: dropping any of them
+               // widens what can merge, and a count that stayed the same must
+               // not hide it.
+               dismiss_stale_reviews_on_push: prs.some(p => p.dismiss_stale_reviews_on_push === true),
+               require_last_push_approval: prs.some(p => p.require_last_push_approval === true),
+               required_review_thread_resolution: prs.some(p => p.required_review_thread_resolution === true) };
   const rulesetBypassActors = detail.flatMap(r => (r.bypass_actors ?? []).map(b => `${b.actor_type}:${b.actor_id ?? ""}:${b.bypass_mode}`)).sort();
   let bp = null;
   try { bp = gh(`repos/${nwo}/branches/${encodeURIComponent(target)}/protection`); }
@@ -77,6 +99,9 @@ export function readLiveBaseline(nwo, profile, { gh = ghApi, branch = null } = {
   return {
     nwo, branch: target, rulesetNames: active.map(r => r.name), rulesetRequiredChecks, rulesetBypassActors, branchProtectionRequiredChecks,
     requiredApprovals, codeOwnerReview,
+    dismissStaleReviews: pr.dismiss_stale_reviews_on_push || (classic?.dismiss_stale_reviews ?? false),
+    requireLastPushApproval: pr.require_last_push_approval || (classic?.require_last_push_approval ?? false),
+    requireThreadResolution: pr.required_review_thread_resolution || (bp?.required_conversation_resolution?.enabled ?? false),
     profile: { authorityPolicy: profile.authority?.policy ?? null, mergeEnforcement: profile.merge?.enforcement ?? null,
                capabilities: profile.builder?.capabilities ?? {} },
   };
@@ -121,6 +146,10 @@ export function diffBaseline(live, fixture) {
     lines.push(`required approvals: live ${live.requiredApprovals} vs baseline ${fixture.requiredApprovals}`);
   if (live.codeOwnerReview !== fixture.codeOwnerReview)
     lines.push(`code-owner review: live ${live.codeOwnerReview} vs baseline ${fixture.codeOwnerReview}`);
+  for (const [key, label] of [["dismissStaleReviews", "stale-review dismissal"], ["requireLastPushApproval", "last-push approval"], ["requireThreadResolution", "review thread resolution"]]) {
+    if ((live[key] ?? false) !== (fixture[key] ?? false))
+      lines.push(`${label}: live ${live[key] ?? false} vs baseline ${fixture[key] ?? false}`);
+  }
   for (const k of ["authorityPolicy", "mergeEnforcement"]) {
     if (live.profile?.[k] !== fixture.profile?.[k])
       lines.push(`profile.${k}: live ${live.profile?.[k]} vs baseline ${fixture.profile?.[k]}`);

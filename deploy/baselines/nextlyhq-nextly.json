@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-08-21T19:30:18.512Z",
+  "capturedAt": "2026-08-21T19:50:43.430Z",
   "nwo": "nextlyhq/nextly",
   "branch": "main",
   "rulesetNames": [
@@ -14,6 +14,9 @@
   ],
   "requiredApprovals": 1,
   "codeOwnerReview": true,
+  "dismissStaleReviews": false,
+  "requireLastPushApproval": false,
+  "requireThreadResolution": true,
   "profile": {
     "authorityPolicy": "propose_and_merge",
     "mergeEnforcement": "enforced",

@@ -105,7 +105,9 @@ function killGroup(pid, signal) {
   // `process.kill(-NaN)` would throw inside whatever called us.
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(-pid, signal); return true; }
-  catch (e) { if (e.code !== "ESRCH") throw e; return false; }
+  // ESRCH: no such group. EPERM here means the group leader is already gone
+  // and the id belongs to nobody this process may signal: also gone.
+  catch (e) { if (e.code !== "ESRCH" && e.code !== "EPERM") throw e; return false; }
 }
 
 /**
@@ -122,7 +124,7 @@ function killGroup(pid, signal) {
  * broad permissions, plugins, and MCP servers a worker must never inherit.
  */
 export function workerArgs({ prompt, settings, agent = null, allowedTools = null, disallowedTools = null,
-                             settingSources = "local", maxTurns = null, model = null, effort = null,
+                             settingSources = "", maxTurns = null, model = null, effort = null,
                              maxBudgetUsd = null, jsonSchema = null, agents = null, mcpConfig = null,
                              sessionId = null, resume = null }) {
   if (typeof settings !== "string" || !settings.length)
@@ -146,12 +148,13 @@ export function workerArgs({ prompt, settings, agent = null, allowedTools = null
   if (disallowedTools) a.push("--disallowedTools", disallowedTools);
   if (jsonSchema) a.push("--json-schema", jsonSchema);
   // `--safe-mode` leaves permissions alone by the CLI's own description, so the
-  // founder's user-level allow rules (and the target repo's project file) would
-  // still merge into the worker. `local` is the one source that names neither;
-  // the worker's rules come from the --settings file above and nothing else.
-  // (`project` was measured to cut the preamble ~8x but also loads the repo's
-  // own permissions; a caller that wants it must ask.)
-  if (settingSources) a.push("--setting-sources", settingSources);
+  // founder's user-level allow rules would still merge into the worker, and
+  // `local` was measured to load the checkout's own .claude/settings.local.json,
+  // which a pull request can carry (docs/measured/2026-08-22-setting-sources.md).
+  // The empty value is accepted and means no ambient source at all: the
+  // worker's rules come from the --settings file above and nothing else. A
+  // caller that wants a source must name it.
+  a.push("--setting-sources", settingSources ?? "");
   if (resume) a.push("--resume", resume);
   else if (sessionId) a.push("--session-id", sessionId);
   return a;
@@ -286,8 +289,18 @@ export function runWorker({
       catch (err) { writeError = err.message; killedByUs = true; killGroup(child.pid, "SIGTERM"); setTimeout(() => { if (!settled) killGroup(child.pid, "SIGKILL"); }, graceMs); }
     };
 
-    const child = spawn(bin, args, { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"], env });
+    // The worker is held behind a gate until its binding is durable. A child
+    // starts executing at spawn, so a binding that failed afterwards would be
+    // killing a worker that may already have acted (a `touch` finished in that
+    // window). The gate is a shell that reads one line from stdin and then
+    // execs the real binary in place: same pid, same start time, no action
+    // until released. A binding that fails closes stdin instead, and the
+    // shell exits having run nothing.
+    const child = spawn("/bin/sh", ["-c", 'read -r _gate || exit 97; exec "$0" "$@"', bin, ...args],
+                        { cwd, detached: true, stdio: ["pipe", "pipe", "pipe"], env });
     const startedAt = Date.now();
+    const release = () => { try { child.stdin.write("go\n"); child.stdin.end(); } catch { /* the exit path reports it */ } };
+    const withhold = () => { try { child.stdin.end(); } catch { /* already closed */ } };
 
     let result = null, sessionId = null, rateLimit = null, initModel = null, revokedWhy = null;
     let killedByUs = false, settled = false;
@@ -312,7 +325,7 @@ export function runWorker({
 
     // No pid means the spawn already failed and the error event is on its way;
     // there is nothing to bind, observe, or kill.
-    if (!child.pid) return;
+    if (!child.pid) { withhold(); return; }
 
     installReaper();
     LIVE_GROUPS.add(child.pid);
@@ -328,12 +341,14 @@ export function runWorker({
       onSpawn({ pid: child.pid, lstart });
     }
     catch (err) {
+      withhold();
       killGroup(child.pid, "SIGKILL");
       LIVE_GROUPS.delete(child.pid);
       child.on("exit", () => {});
       return finish({ outcome: OUTCOMES.UNBOUND, why: `run binding failed: ${err.message}`,
                       pid: child.pid, lstart, ms: Date.now() - startedAt, stderr: "", outPath, errPath, truncated: false });
     }
+    release();
 
     child.stdout.on("data", d => {
       write(streams.out, d);
@@ -402,7 +417,9 @@ export function runWorker({
           ? { outcome: OUTCOMES.FAILED, why: `durable output write failed: ${writeError}` }
           : truncated
             ? { outcome: OUTCOMES.FAILED, why: `output truncated at ${maxOutputBytes} bytes; the durable record is incomplete` }
-            : classifyResult(result, { code, signal, killedByUs });
+            : streams.err.truncated
+              ? { outcome: OUTCOMES.FAILED, why: `stderr truncated at ${maxOutputBytes} bytes; the durable record is incomplete` }
+              : classifyResult(result, { code, signal, killedByUs });
       finish({
         ...c, pid: child.pid, lstart, sessionId, code, signal,
         ms: Date.now() - startedAt, rateLimit,

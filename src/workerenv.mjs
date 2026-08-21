@@ -82,10 +82,17 @@ export function writeShims(dir) {
  * default, not a lock: a `-c credential.helper=...` on the command line appends
  * after it, which is one of the shapes CONTAINMENT records as open.
  */
-export function writeGitConfig(dir) {
+export const WORKER_GIT_IDENTITY = Object.freeze({
+  name: "merge-policy[bot]",
+  // The App's own bot user (id 319037914 on GitHub), so a worker's commit is
+  // attributed, names nothing private, and never borrows the founder's name.
+  email: "319037914+merge-policy[bot]@users.noreply.github.com",
+});
+
+export function writeGitConfig(dir, identity = WORKER_GIT_IDENTITY) {
   mkdirSync(dir, { recursive: true });
   const path = join(dir, "gitconfig");
-  writeFileSync(path, "[credential]\n\thelper = \n[core]\n\taskPass = \n");
+  writeFileSync(path, `[credential]\n\thelper = \n[core]\n\taskPass = \n[user]\n\tname = ${identity.name}\n\temail = ${identity.email}\n`);
   return path;
 }
 

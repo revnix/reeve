@@ -133,5 +133,34 @@ check(Array.isArray(fixture.rulesetRequiredChecks) && typeof fixture.capturedAt 
   check(live.requiredApprovals === 2 && live.codeOwnerReview === true, "approvals and code-owner review enforced by classic protection are part of the effective value", JSON.stringify([live.requiredApprovals, live.codeOwnerReview]));
 }
 
+
+// ── ruleset patterns are fnmatch: a single star never crosses a slash ────────
+{
+  const { rulesetCoversBranch } = await import("../src/baseline.mjs");
+  const cond = include => ({ conditions: { ref_name: { include, exclude: [] } } });
+  check(rulesetCoversBranch(cond(["refs/heads/release/*"]), "release/v1", "main") === true, "release/* covers release/v1");
+  check(rulesetCoversBranch(cond(["refs/heads/release/*"]), "release/team/v1", "main") === false, "but a single star does not cross a slash");
+  check(rulesetCoversBranch(cond(["refs/heads/release/**"]), "release/team/v1", "main") === true, "a double star does");
+  check(rulesetCoversBranch(cond(["refs/heads/v?"]), "v1", "main") === true && rulesetCoversBranch(cond(["refs/heads/v?"]), "v10", "main") === false, "? matches exactly one character");
+  check(rulesetCoversBranch(cond(["refs/heads/[mn]ain"]), "main", "main") === true, "character classes are honoured");
+}
+
+// ── every authority-bearing pull-request parameter is captured and compared ──
+{
+  const { readLiveBaseline } = await import("../src/baseline.mjs");
+  const gh = path => {
+    if (path.endsWith("/rulesets")) return [{ id: 1, name: "r", enforcement: "active" }];
+    if (path.endsWith("/rulesets/1")) return { rules: [{ type: "pull_request", parameters: { required_approving_review_count: 1, require_code_owner_review: false,
+      dismiss_stale_reviews_on_push: true, require_last_push_approval: true, required_review_thread_resolution: true } }], bypass_actors: [] };
+    const e = new Error("HTTP 404"); e.stderr = "HTTP 404"; throw e;
+  };
+  const live = readLiveBaseline("o/r", { identity: { defaultBranch: "main" }, authority: {}, merge: {}, builder: {} }, { gh });
+  check(live.dismissStaleReviews === true && live.requireLastPushApproval === true && live.requireThreadResolution === true,
+    "stale-dismissal, last-push approval, and thread resolution are captured", JSON.stringify(live));
+  const weakened = { ...live, requireThreadResolution: false };
+  const d = diffBaseline(weakened, live);
+  check(d.drifted === true && /thread resolution/.test(d.lines.join(" ")), "dropping one of them is drift, and is named", JSON.stringify(d.lines));
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

@@ -31,7 +31,7 @@ it is short, and it is the document that states what reeve is *not*.
 
 | | |
 |---|---|
-| Commits | **68**, `HEAD == origin/main`, CI green |
+| Commits | ~70. The number that matters is **`HEAD == origin/main`, CI green** |
 | Source | 23 `.mjs` files, ~5,600 lines |
 | Tests | **37 files, 0 failing** |
 | Daemon | running as `com.revnix.reeve` on `nextlyhq/nextly`, **observe-only** |

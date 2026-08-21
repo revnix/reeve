@@ -202,6 +202,18 @@ export const FIELDS = {
   "notify.url":            [false, isStr],
   "notify.topic":          [false, isStr],
   "notify.credentialFile": [false, isAbsPath],
+  // A native notification on the machine reeve runs on, alongside the phone
+  // rather than instead of it. The two exist for different moments: the phone for
+  // when nobody is at the desk, this for when somebody is. It also cannot be
+  // blocked by a remote server nobody can log into, which is the state the ntfy
+  // READ credential has been in since the beginning.
+  "notify.desktop":        [false, isBool],
+  // A native notification on the machine reeve runs on, alongside the phone
+  // rather than instead of it. The two exist for different moments: the phone
+  // for when nobody is at the desk, this for when somebody is. It also cannot be
+  // blocked by a remote server nobody can log into, which is the state the ntfy
+  // read credential has been in.
+  "notify.desktop":        [false, isBool],
   "watch.reviewActions":   [false, isBool],
   "watch.backupIntervalSeconds": [false, isInt],
   "watch.maxOpenPrs":      [false, isInt],

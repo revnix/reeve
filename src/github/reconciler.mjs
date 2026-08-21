@@ -72,7 +72,13 @@ export const POLICY_APP = "merge-policy";
  * Bump this whenever the set of things counted changes. A stored floor recorded
  * under an older number is discarded rather than compared against.
  */
-export const CHECK_ACCOUNTING = 2;
+export const CHECK_ACCOUNTING = 3;
+// 3: reviewer commit-status contexts (ci.reviewerStatusContexts) left the counted
+//    set. Measured the moment it shipped -- nextly #1011 read "only 34 checks
+//    reported where 35 were expected" against a floor stored under accounting 2,
+//    which is the same shape as the policy-exclusion incident this counter was
+//    added for. Changing what counts REQUIRES bumping this, and the number is the
+//    only thing standing between an exclusion and every PR stuck forever.
 
 /**
  * Remove reeve's own opinion from the evidence.

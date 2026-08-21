@@ -21,7 +21,7 @@ import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTC
 import { promptFor } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
-import { rootCause, resolveFailureCause } from "./ci-rootcause.mjs";
+import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
@@ -372,11 +372,28 @@ export async function tick(ctx) {
         // Already resolved above, where it gated the decision. If it could not be
         // resolved there, there is nothing to tell a fixer to repair.
         if (!cause) { log(logPath, `  #${e.pr}: cannot dispatch FIX_CI — no resolvable root cause`); continue; }
+        // Paying a fixer for randomness is the measured hazard on a base that
+        // is red 6 of its last 9 runs: the worker "fixes" a failure that never
+        // existed, then the founder is paged about the fix. Only DEMONSTRATED
+        // flake changes the decision — the same job passing and failing across
+        // attempts of one run — never suspicion. The escalation key stays an
+        // identity; the run ids and job names go to the log.
+        const flake = flakeAssessment(nwo, cause, ctx.flakeProbe);
+        if (flake.allFlaky) {
+          escalations.set(`#${e.pr}: every failing check is a demonstrated flake — reeve will not pay a fixer for randomness`, 1);
+          log(logPath, `  #${e.pr}: NOT dispatching — demonstrated flake: ${flake.flaky.map(p => `${p.job} (run ${p.runId})`).join(", ")}`);
+          continue;
+        }
+        // A mixed failure still gets its fixer, told which job is noise so its
+        // budget goes to the failure that exists.
+        const worked = flake.flaky.length
+          ? { ...cause, note: `${flake.flaky.map(p => p.job).join(", ")}: demonstrated flake across attempts — do not chase; fix the rest` }
+          : cause;
         // The attempt is NOT spent here. Several refusals still lie between this
         // point and a running worker -- no prompt, no worktree, no run -- and
         // spending an attempt on a dispatch that never happened burns the one
         // retry the design allows.
-        promptCtx = { ...promptCtx, cause, attempt: countFixAttempts(db, nwo, e.pr, fp) + 1 };
+        promptCtx = { ...promptCtx, cause: worked, attempt: countFixAttempts(db, nwo, e.pr, fp) + 1 };
       } else if (decision.action === "FIX_FINDINGS") {
         promptCtx = { ...promptCtx, threads: e.threadDetails ?? [] };
       } else if (decision.action === "REQUEST_REVIEW") {

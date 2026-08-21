@@ -75,5 +75,35 @@ for (const [name, clauses] of [
   check(d.action !== ACTIONS.SPILL, "and criticals are never spilled", JSON.stringify(d));
 }
 
+// ── the gated key is an identity, not a report ───────────────────────────────
+//
+// Measured on nextly #1128: the gated why embedded the threads clause detail, so
+// the escalation key read "...cannot act on \"13 of 17 thread(s) unresolved\"".
+// Another session resolving threads changed the count, the count changed the key,
+// and a changed key is a NEW escalation -- three phone pushes in one morning for
+// one unchanged condition. The founder was being paged about PROGRESS.
+{
+  const d13 = nextAction(ev(swap("threads", "BLOCK", "13 of 17 thread(s) unresolved")), OFF);
+  const d23 = nextAction(ev(swap("threads", "BLOCK", "23 of 27 thread(s) unresolved")), OFF);
+
+  // Control: the fixture must exhibit the defect's precondition — both are the
+  // gated FIX_FINDINGS path, and their clause details genuinely differ.
+  check(d13.action === ACTIONS.ESCALATE && d13.gated === ACTIONS.FIX_FINDINGS,
+    "control: an unresolved-threads block is the gated FIX_FINDINGS path", JSON.stringify(d13));
+
+  check(d13.why === d23.why,
+    "the key does not move when the thread count does", `${d13.why}\n        ${d23.why}`);
+  check(!/\d/.test(d13.why), "and carries no number at all", d13.why);
+  check(/unresolved review threads/.test(d13.why),
+    "while still saying WHICH action is missing", d13.why);
+  check(/13 of 17/.test(d13.detail ?? ""),
+    "the count survives on the detail, where a human reads it deliberately", d13.detail);
+
+  // Different GATED ACTIONS are different problems and must key differently.
+  const rr = nextAction(ev(swap("review", "UNKNOWN", "not yet run: codex")), OFF);
+  check(rr.action === ACTIONS.ESCALATE && rr.why !== d13.why,
+    "a gated review request keys differently from gated thread work", rr.why);
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

@@ -25,7 +25,7 @@ import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.
 import { workerEnv, writeGitConfig } from "./workerenv.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerModel, sha256 } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { snapshot, snapshotAll } from "./backup.mjs";
 import { selfAudit } from "./selfaudit.mjs";
@@ -33,11 +33,21 @@ import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync } from "node:fs";
+import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
 
 const now = () => Math.floor(Date.now() / 1000);
+
+// Read once: the CLI version is part of every worker's contract, and asking on
+// every dispatch would be a subprocess per tick for an answer that does not change.
+let CLI_VERSION = null;
+function cliVersion() {
+  if (CLI_VERSION) return CLI_VERSION;
+  try { CLI_VERSION = execFileSync("claude", ["--version"], { encoding: "utf8" }).trim(); }
+  catch { CLI_VERSION = "unknown"; }
+  return CLI_VERSION;
+}
 
 // Whether this process's stdout already points at the log file. launchd's
 // StandardOutPath names the very file the daemon appends to, so echoing as well
@@ -460,14 +470,23 @@ export async function tick(ctx) {
       const env = workerEnv({ gitConfigPath: writeGitConfig(join(stateDir, "git")),
                               tmpDir: join(runDir, "tmp"), bgWaitMs: budgetMs });
       const outPath = join(runDir, `${run.runId}.out`), errPath = join(runDir, `${run.runId}.err`);
+      const maxTurns = profile.watch?.maxTurns ?? 40;
+      const tools = spec.tools ?? sandbox.allowedTools;
+      const argv = workerArgs({ prompt: spec.prompt, allowedTools: tools, settings: settingsPath, maxTurns });
+      // The contract is recorded before the process exists, so that a crash
+      // between here and the first heartbeat still leaves the answer to "what
+      // was this worker asked to run as".
+      recordWorkerContract(db, {
+        runId: run.runId, cliVersion: ctx.cliVersion ?? cliVersion(),
+        argvHash: sha256(JSON.stringify(argv)), promptHash: sha256(spec.prompt),
+        settingsHash: sha256(readFileSync(settingsPath, "utf8")),
+        toolContract: tools, maxTurns, outPath, errPath,
+      });
 
       let r;
       try {
         r = await (ctx.spawnWorker ?? runWorker)({
-          args: workerArgs({ prompt: spec.prompt,
-                             allowedTools: spec.tools ?? sandbox.allowedTools,
-                             settings: settingsPath,
-                             maxTurns: profile.watch?.maxTurns ?? 40 }),
+          args: argv,
           cwd: worktree, env, outPath, errPath,
           maxOutputBytes: profile.worker?.maxOutputBytes ?? 64 * 1024 * 1024,
           budgetMs,
@@ -479,6 +498,8 @@ export async function tick(ctx) {
         });
       } finally {
         clearInterval(beat);
+        // The alias was requested; this is what the worker said it actually ran as.
+        if (r?.model) { try { noteWorkerModel(db, { runId: run.runId, modelResolved: r.model }); } catch { /* the run still finishes */ } }
         // Closed in `finally`: a throw between spawn and result would otherwise
         // leave the run leased forever, and the PR unworkable until it expired.
         finishRun(db, { runId: run.runId, outcome: r?.outcome ?? "failed",

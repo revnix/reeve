@@ -352,3 +352,29 @@ CREATE VIEW IF NOT EXISTS v_ready AS
     AND COALESCE(x.not_before,0) <= unixepoch()
     AND COALESCE(x.cancel_requested,0) = 0
     AND COALESCE(x.attempts,0) < COALESCE(x.max_attempts,5);
+
+-- ---------------------------------------------------------------- worker contracts
+-- One row per claude worker the daemon dispatches: the immutable contract it
+-- ran under. A retry reuses it verbatim; an alias never drifts under one.
+-- The lease stays on `run`; this row never carries a second one.
+CREATE TABLE IF NOT EXISTS worker_run (
+  run_id          TEXT PRIMARY KEY REFERENCES run(id) ON DELETE CASCADE,
+  cli_version     TEXT NOT NULL,
+  model_requested TEXT,
+  model_resolved  TEXT,                       -- from the worker's init event, once it speaks
+  effort          TEXT,
+  argv_hash       TEXT NOT NULL,
+  prompt_hash     TEXT NOT NULL,
+  settings_hash   TEXT NOT NULL,
+  tool_contract   TEXT,
+  agents_hash     TEXT,
+  max_turns       INTEGER,
+  max_budget_usd  REAL,
+  canary_id       TEXT,
+  out_path        TEXT NOT NULL,
+  err_path        TEXT NOT NULL,
+  pid             INTEGER,
+  lstart          TEXT,
+  contract_drift  TEXT,                       -- JSON; null when the live environment matched
+  created_at      INTEGER NOT NULL
+) STRICT, WITHOUT ROWID;

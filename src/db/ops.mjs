@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import { CHECK_ACCOUNTING } from "../github/reconciler.mjs";
 import { hostname } from "node:os";
+import { createHash } from "node:crypto";
 
 export const LEASE_SECONDS = 120;      // short: heartbeat is cheap, reaping should be fast
 export const HEARTBEAT_SECONDS = 30;   // renew at 1/4 lease
@@ -468,4 +469,31 @@ export function refundFixAttempt(db, nwo, pr, cause) {
   db.prepare(`UPDATE fix_attempt SET attempts = MAX(0, attempts - 1)
               WHERE nwo=? AND pr=? AND cause=?`).run(nwo, pr, cause);
   return countFixAttempts(db, nwo, pr, cause);
+}
+
+// ------------------------------------------------------------------ worker contracts
+export const sha256 = s => createHash("sha256").update(String(s)).digest("hex");
+
+/** Record the contract a worker is about to run under. Written before spawn, beside the run. */
+export function recordWorkerContract(db, { runId, cliVersion, modelRequested = null, effort = null, argvHash, promptHash,
+                                           settingsHash, toolContract = null, agentsHash = null, maxTurns = null,
+                                           maxBudgetUsd = null, canaryId = null, outPath, errPath, pid = null, lstart = null,
+                                           contractDrift = null }) {
+  return tx(db, () => {
+    db.prepare(`INSERT INTO worker_run (run_id,cli_version,model_requested,effort,argv_hash,prompt_hash,settings_hash,
+                  tool_contract,agents_hash,max_turns,max_budget_usd,canary_id,out_path,err_path,pid,lstart,contract_drift,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,unixepoch())`)
+      .run(runId, cliVersion, modelRequested, effort, argvHash, promptHash, settingsHash, toolContract, agentsHash,
+           maxTurns, maxBudgetUsd, canaryId, outPath, errPath, pid, lstart, contractDrift == null ? null : canonical(contractDrift));
+    emit(db, { actor: "daemon", op: "worker.contract", run_id: runId, payload: { cliVersion, modelRequested, argvHash, settingsHash } });
+  });
+}
+
+/** The model the worker actually announced in its init event. */
+export function noteWorkerModel(db, { runId, modelResolved }) {
+  db.prepare(`UPDATE worker_run SET model_resolved=? WHERE run_id=?`).run(modelResolved, runId);
+}
+
+export function workerContractFor(db, runId) {
+  return db.prepare(`SELECT * FROM worker_run WHERE run_id=?`).get(runId) ?? null;
 }

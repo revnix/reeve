@@ -237,6 +237,22 @@ const ENV = { PATH: "/usr/bin:/bin" };
   check(r.outcome === OUTCOMES.UNBOUND && /could not spawn/.test(r.why), "a spawn failure (vanished worktree) is UNBOUND with the reason, so the attempt is refunded and backed off", JSON.stringify({ o: r.outcome, w: r.why }));
 }
 
+
+// ── a revocation probe that throws is a lost lease, never a dead daemon ──────
+//
+// The probe runs inside the poll timer and again at close. A store that is
+// locked or closed throws there, with nothing to catch it but the process-level
+// reaper, which rethrows: the daemon died instead of the worker.
+{
+  let r = null, threw = null;
+  try {
+    r = await runWorker({ bin: "/bin/sh", args: ["-c", "sleep 30"], env: ENV, ...files("probe-throws"), budgetMs: 60000,
+                          isRevoked: () => { throw new Error("database is locked"); } });
+  } catch (e) { threw = e; }
+  check(!threw && r?.outcome === OUTCOMES.LEASE_LOST && /database is locked/.test(r?.why ?? ""),
+    "a throwing revocation probe ends the worker as lease-lost with the error, and nothing escapes", threw ? String(threw.message) : JSON.stringify({ o: r?.outcome, w: r?.why }));
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

@@ -258,7 +258,9 @@ export function runWorker({
   onSpawn = () => {},
   isHalted = () => false,
   // Asked every poll: a non-null answer is the reason the worker's lease is
-  // gone, and the worker is terminated with it.
+  // gone, and the worker is terminated with it. A probe that THROWS is the
+  // same answer with the error as its reason: a store that cannot be asked
+  // cannot vouch for the lease, and the exception must not escape a timer.
   isRevoked = () => null,
   // The identity reader, injectable for the test that makes it fail; the
   // default is the real `ps` read and a null answer is a refused binding.
@@ -401,10 +403,11 @@ export function runWorker({
     // same as no lease; the former posture ("a missed beat must not kill the
     // worker") left workers acting with no durable claim on anything. A
     // revoked worker gets the same grace as a timed-out one before SIGKILL.
+    const probeRevoked = () => { try { return isRevoked(); } catch (err) { return `the revocation probe failed: ${err.message}`; } };
     haltTimer = setInterval(() => {
       if (settled) return;
       if (isHalted()) { killedByUs = true; killGroup(child.pid, "SIGTERM"); return; }
-      const why = isRevoked();
+      const why = probeRevoked();
       if (why && !revokedWhy) {
         revokedWhy = String(why); killedByUs = true; killGroup(child.pid, "SIGTERM");
         setTimeout(() => { if (!settled) killGroup(child.pid, "SIGKILL"); }, graceMs);
@@ -420,7 +423,7 @@ export function runWorker({
       // Sampled once more here: a lease revoked between the last poll and a
       // normal exit would otherwise be classified OK and its result published
       // under a claim the worker no longer held.
-      const lateWhy = revokedWhy ?? isRevoked();
+      const lateWhy = revokedWhy ?? probeRevoked();
       // A cooperative cancel is a cancellation, not a lost lease: the operator
       // asked, and the record must say so rather than call the worker failed.
       const cancelled = typeof lateWhy === "string" && /^cancelled\b/.test(lateWhy);

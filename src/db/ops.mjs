@@ -38,8 +38,49 @@ function addMissingColumns(db) {
   }
 }
 
+/**
+ * Tables whose SHAPE changed, not just their columns.
+ *
+ * `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, and ALTER cannot
+ * change a UNIQUE constraint, so a table that gained a new key needs rebuilding.
+ * inbox went from UNIQUE(source, external_id) to UNIQUE(source, external_id,
+ * content_hash) so an edited comment appends a generation instead of silently
+ * doing nothing.
+ *
+ * Rebuilt ONLY when empty. Every live store held zero inbox rows when this
+ * shipped -- the table had been designed and never written to -- so this is free
+ * today. If some future store has rows, it REFUSES rather than copying between
+ * shapes it cannot reason about: a migration nobody has thought about is not
+ * something to invent silently at open() time.
+ */
+const RESHAPED = [
+  { table: "inbox", requires: "content_hash" },
+];
+
+function reshapeTables(db) {
+  for (const { table, requires } of RESHAPED) {
+    let cols;
+    try { cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name); }
+    catch { continue; }
+    if (!cols.length || cols.includes(requires)) continue;   // absent or already right
+    const n = db.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n;
+    if (n > 0) {
+      throw new Error(
+        `${table} has the old shape and ${n} row(s). Refusing to rebuild it at open(): ` +
+        `export them, drop the table, and reopen. Silently copying between shapes ` +
+        `loses whatever the new key was added to distinguish.`);
+    }
+    // Dropped only. schema.sql runs immediately after and rebuilds it, indexes
+    // and all -- which is also WHY this runs first: the new index names a column
+    // the old table lacks, so applying the schema over the old shape throws
+    // before anything gets a chance to fix it.
+    db.exec(`DROP TABLE ${table}`);
+  }
+}
+
 export function open(path) {
   const db = new DatabaseSync(path, { timeout: 10000 });
+  reshapeTables(db);
   db.exec(readFileSync(new URL("./schema.sql", import.meta.url), "utf8"));
   addMissingColumns(db);
   return db;

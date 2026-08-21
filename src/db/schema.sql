@@ -132,19 +132,50 @@ CREATE INDEX IF NOT EXISTS outbox_inflight ON outbox(lease_expires_at) WHERE sta
 -- ---------------------------------------------------------------- inbox
 -- Facts observed from the outside world (GitHub). Dedup by external id so a
 -- re-poll is free. The reviewer/CI loops consume from here.
+-- Keyed by CONTENT, not only by id. CodeRabbit rewrites its own history: the
+-- summary comment is a living document, inline findings are retro-edited to
+-- record resolution ("Addressed in commit <sha>"), and a status was edited to
+-- "Review rate limited" twenty seconds before a review for the same head. Under
+-- UNIQUE(source, external_id) every one of those edits was a silent no-op and the
+-- earlier text was simply lost. An edit is a new GENERATION of the same object.
 CREATE TABLE IF NOT EXISTS inbox (
   id           INTEGER PRIMARY KEY,
-  source       TEXT NOT NULL,                 -- 'codex'|'coderabbit'|'greptile'|'human'|'ci'
-  external_id  TEXT NOT NULL,                 -- comment node id / check-run id
+  source       TEXT NOT NULL,                 -- reviewer login, 'human', or 'ci'
+  external_id  TEXT NOT NULL,                 -- comment / review / thread / reaction id
   pr_number    INTEGER,
   head_sha     TEXT,
-  kind         TEXT NOT NULL,                 -- 'review_comment'|'check_run'|'review'
-  payload      TEXT NOT NULL,
-  observed_at  INTEGER NOT NULL,
-  processed_at INTEGER,
-  UNIQUE (source, external_id)
+  kind         TEXT NOT NULL,                 -- 'review'|'issue_comment'|'review_thread'|'reaction'|'check_run'
+  payload      TEXT NOT NULL,                 -- canonical JSON
+  content_hash TEXT NOT NULL,                 -- of payload; an edit changes it
+  generation   INTEGER NOT NULL DEFAULT 1,    -- 1, then 2 on the first edit, ...
+  observed_at  INTEGER NOT NULL,              -- when REEVE saw it
+  event_at     INTEGER,                       -- GitHub's created/submitted time
+  -- GitHub's updated_at, kept as updated_at and never used as an event ordering:
+  -- a retro-edit has no timestamp for the EDIT, only for the object, so treating
+  -- it as when-this-happened would reorder history around a rewrite.
+  edited_at    INTEGER,
+  processed_at INTEGER,                       -- unused: the fold is total, see review/ingest.mjs
+  UNIQUE (source, external_id, content_hash)
 ) STRICT;
-CREATE INDEX IF NOT EXISTS inbox_unprocessed ON inbox(pr_number) WHERE processed_at IS NULL;
+CREATE INDEX IF NOT EXISTS inbox_pr ON inbox(pr_number, kind);
+CREATE INDEX IF NOT EXISTS inbox_object ON inbox(source, external_id, generation);
+
+-- ---------------------------------------------------------------- head_seen
+-- Every head reeve has pinned, with when IT first saw it.
+--
+-- The push time is needed to judge whether a reviewer has had a chance to answer,
+-- and GitHub does not report one: the timeline carries a push event only for
+-- FORCE pushes, and committer-date is a trap -- PRs 1123 and 1124 were opened
+-- fifteen hours after their commits were authored, a 913-minute false latency.
+-- reeve's own first sighting is the only honest watermark it has.
+--
+-- It is also how an abbreviated sha in a comment body resolves to a full one.
+CREATE TABLE IF NOT EXISTS head_seen (
+  nwo           TEXT NOT NULL,
+  pr            INTEGER NOT NULL,
+  sha           TEXT NOT NULL CHECK (length(sha) = 40),
+  first_seen_at INTEGER NOT NULL,
+  PRIMARY KEY (nwo, pr, sha)) STRICT;
 
 -- ---------------------------------------------------------------- facts
 -- Evidence attached to a node. Defined HERE rather than in the migrator so a

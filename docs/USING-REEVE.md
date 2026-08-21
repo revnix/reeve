@@ -126,6 +126,14 @@ Worth knowing, because it runs unattended.
 | Read sensitive code to understand a failure | **Change** sensitive paths (auth, migrations, changesets, release scripts) |
 | — | Read quarantined data at all (production dumps, other clients' credentials) |
 
+A FIX_CI worker also runs with a **built environment**, not your shell's: no
+`GH_TOKEN`, no ssh agent, no cloud or proxy variables, and a git that is told to
+read no system config and use no credential helper. Its output streams to files
+under `~/.reeve/state/.../runs/<pr>/` so a crashed daemon can still read what the
+worker said, and every run records the exact CLI version, model, and settings it
+ran under (`worker_run`). If the daemon cannot prove the worker's lease is still
+live, the worker is terminated rather than trusted.
+
 These are enforced by the tool layer, not by asking the model nicely. That
 distinction was measured: told not to write a file but given a plain shell, the
 model wrote it with `printf >` on the very next turn.

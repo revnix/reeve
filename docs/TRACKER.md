@@ -128,16 +128,22 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       skeleton (task/claim/checkpoint/outbox/`gh.pr.merge` reconcilers) already
       exists in reeve's schema with ZERO callers; no merge executor exists.
 - [x] Design presented; founder approved AND revised the gate (see req. 3)
-- [x] **Spec written** — `docs/2026-08-21-builder-design.md` (526 lines,
-      `3ccc734`). Fold: writer + 3 verifiers + 1 repair round (5 blocking
-      problems fixed) + a manual pass closing the 2 blocking + 13 minor
-      residuals. All 29 findings dispositioned in Appendix A. Encodes the
-      revised gate verbatim; merge clauses U1-U4 + B1-B6; 10-PR rollout.
-- [ ] **Founder reviews the spec file** — the gate before implementation
-      planning. Open ruling inside it: §16.2, should the emergency Codex
-      waiver (`--waive-codex`) exist at all.
-- [ ] Implementation plan (9 PRs, each with its own verification — in the spec)
-- [ ] Build
+- [x] **Spec written and founder-approved** — `docs/2026-08-21-builder-design.md`
+      v2 (989 lines, `f2cda32`): the audit's 20 accepted items folded as
+      mechanisms, 3 not adopted with reasons (Appendix B), the Codex-
+      unavailable ruling (row 7, no waiver flag), the platform ruling. Status:
+      approved direction; implementation gated by P0 closure. Merge stays dark
+      behind `builder.capabilities.mergeBuilderPr` + `--actuate-merges`.
+- [x] Implementation plan for S0 + S1: `docs/superpowers/plans/2026-08-21-s1-worker-contract.md`
+- [ ] **PR-1 (S0 + S1 core) — revnix/reeve #3, in review** — capability
+      switches (all false on the live profile), baseline fixture + drift check,
+      workerArgs hard-fail + isolation flags, env allowlist + credential-less
+      git, bounded durable streams, fail-closed spawn binding, lease revocation
+      in the daemon, `worker_run` contract rows, worktree pre-push hook.
+      Measured before the fix: an explicit-URL push from a worktree SUCCEEDED.
+- [ ] **PR-2 (S1 sandbox)** — the two CLI measurements (sandbox under `-p`,
+      invalid settings under `-p`), `sandbox.*` settings + validation,
+      per-start canary, doctor R-13/R-14/R-15, escape test.
 
 ### Founder actions pending
 

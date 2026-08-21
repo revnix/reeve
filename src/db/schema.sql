@@ -177,6 +177,80 @@ CREATE TABLE IF NOT EXISTS head_seen (
   first_seen_at INTEGER NOT NULL,
   PRIMARY KEY (nwo, pr, sha)) STRICT;
 
+-- ------------------------------------------------------- review projections
+-- Derived from inbox by a pure fold (src/review/derive.mjs). Every row here can
+-- be deleted and rebuilt from the raw observations, which is the whole point:
+-- CodeRabbit's finding taxonomy has already been replaced once, so a classifier
+-- improvement must re-read history rather than only affecting what comes next.
+--
+-- classifier_version is hash(derivation code + the profile's detector block). A
+-- mismatch means these rows were derived by something that no longer exists, and
+-- they are rebuilt rather than trusted.
+
+-- One SUBSTANTIVE answer by one reviewer at one revision. Not one review object:
+-- every inline reply mints a 0-byte COMMENTED review (nine at a single commit on
+-- #1124), so counting review objects overstates rounds by an order of magnitude.
+CREATE TABLE IF NOT EXISTS review_round (
+  nwo        TEXT NOT NULL,
+  pr         INTEGER NOT NULL,
+  reviewer   TEXT NOT NULL,                  -- normalised login, rostered or not
+  source_id  TEXT NOT NULL,                  -- the inbox external_id it came from
+  outcome    TEXT NOT NULL CHECK (outcome IN
+               ('findings','clean','refusal','skip','unbound_clean')),
+  head_full  TEXT,                           -- 40-hex when the API gave one
+  head10     TEXT,                           -- resolved via head_seen; NULL = unbound
+  event_at   INTEGER NOT NULL,
+  classifier_version TEXT NOT NULL,
+  PRIMARY KEY (nwo, pr, reviewer, source_id)) STRICT;
+CREATE INDEX IF NOT EXISTS round_pr ON review_round(nwo, pr, reviewer, outcome);
+
+-- One review thread. Identity is GitHub's node id, which is stable across pushes
+-- AND force pushes -- a force push at most marks a thread outdated.
+CREATE TABLE IF NOT EXISTS review_thread (
+  nwo         TEXT NOT NULL,
+  pr          INTEGER NOT NULL,
+  thread_id   TEXT NOT NULL,
+  reviewer    TEXT NOT NULL,
+  path        TEXT,
+  line        INTEGER,
+  severity    TEXT NOT NULL CHECK (severity IN
+                ('critical','major','minor','nit','unknown')),
+  is_resolved INTEGER NOT NULL,
+  is_outdated INTEGER NOT NULL,
+  resolved_by TEXT,
+  resolved_at INTEGER,
+  -- Resolved is a CLAIM, not evidence: the bot resolves its own threads, and
+  -- `@coderabbitai resolve` is author-invokable and bulk-resolves. Cleared means
+  -- a LATER substantive round by the same reviewer has been and gone.
+  is_cleared  INTEGER NOT NULL DEFAULT 0,
+  excerpt     TEXT NOT NULL,
+  event_at    INTEGER,
+  classifier_version TEXT NOT NULL,
+  PRIMARY KEY (nwo, pr, thread_id)) STRICT;
+CREATE INDEX IF NOT EXISTS thread_pr ON review_thread(nwo, pr, is_cleared, severity);
+
+-- Per-reviewer availability as a BAND, not a rate. Measured: 15/15 refusals in
+-- one 7-hour window, then ~30 straight answers over 29 hours.
+CREATE TABLE IF NOT EXISTS reviewer_supply (
+  nwo          TEXT NOT NULL,
+  reviewer     TEXT NOT NULL,
+  state        TEXT NOT NULL CHECK (state IN ('up','down','never_seen')),
+  since        INTEGER NOT NULL,
+  -- Bumps on every down->up transition, and keys the re-request so a refusal
+  -- does not permanently spend the idempotency slot for a head.
+  supply_epoch INTEGER NOT NULL DEFAULT 0,
+  classifier_version TEXT NOT NULL,
+  PRIMARY KEY (nwo, reviewer)) STRICT;
+
+-- What derived the projections, and whether the observation behind them was whole.
+CREATE TABLE IF NOT EXISTS projection_meta (
+  nwo        TEXT NOT NULL,
+  scope      TEXT NOT NULL,                  -- 'pr:<n>'
+  classifier_version TEXT NOT NULL,
+  derived_at INTEGER NOT NULL,
+  complete   INTEGER NOT NULL,               -- 0 = a fetch failed or was truncated
+  PRIMARY KEY (nwo, scope)) STRICT;
+
 -- ---------------------------------------------------------------- facts
 -- Evidence attached to a node. Defined HERE rather than in the migrator so a
 -- database opened by open() has the same shape as one built by a migration.

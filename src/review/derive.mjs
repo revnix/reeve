@@ -1,0 +1,323 @@
+// review/derive — the pure fold from raw observations to what the gate reads.
+//
+// Nothing here talks to GitHub. It reads inbox rows that ingest already landed
+// and writes projections, so improving a classifier means re-reading history
+// rather than only affecting whatever happens next. That is not tidiness:
+// CodeRabbit's finding taxonomy has ALREADY been replaced once -- the
+// "Potential issue"/"Refactor suggestion" strings that a previous audit recorded
+// appear zero times in forty current bodies -- so a detector set that cannot be
+// re-run over the past is a detector set that silently stops seeing things.
+//
+// Three rules run through all of it.
+//
+//   Unknown fails CLOSED. An unclassifiable finding counts as critical, because
+//   the founder ruling is that criticals are never spilled, and a finding whose
+//   severity nobody can read is exactly the one not to gamble on.
+//
+//   A round is a SUBSTANTIVE answer at a bound revision. Every inline reply mints
+//   a 0-byte COMMENTED review -- nine at a single commit on #1124 -- so counting
+//   review objects, or distinct commit_ids across them, overstates rounds by an
+//   order of magnitude.
+//
+//   Resolved is a CLAIM. coderabbitai resolves its own threads, including ones
+//   nobody replied to, and `@coderabbitai resolve` is author-invokable and
+//   bulk-resolves. A thread is CLEARED only when a later substantive round by the
+//   same reviewer has been and gone -- the round that FILED it cannot clear it.
+
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+
+export const SEVERITIES = ["critical", "major", "minor", "nit", "unknown"];
+
+/** Severities that block and are never spillable. `unknown` is here on purpose. */
+export const BLOCKING_SEVERITIES = new Set(["critical", "unknown"]);
+
+/**
+ * The version of "how this was derived": the fold's own source plus every
+ * detector the profile supplies. A stored projection under a different version
+ * was produced by something that no longer exists, so it is rebuilt rather than
+ * trusted -- which is what makes a taxonomy change reach history.
+ */
+export function classifierVersion(profile) {
+  const code = readFileSync(new URL("./derive.mjs", import.meta.url), "utf8");
+  const detectors = (profile?.reviewers ?? []).map(r => ({
+    login: r.login, kind: r.kind, refusal: r.refusal, clean: r.clean,
+    cleanReaction: r.cleanReaction, commitPattern: r.commitPattern,
+    severityMarkers: r.severityMarkers,
+  }));
+  return createHash("sha256")
+    .update(code).update(JSON.stringify(detectors))
+    .digest("hex").slice(0, 16);
+}
+
+/**
+ * Severity of one finding body, by the reviewer's own markers.
+ *
+ * Markers are ORDERED and first-match-wins, so a profile can put the specific
+ * before the general. No match is `unknown`, which blocks: guessing "probably
+ * minor" about text nobody could read is how a P0 gets spilled.
+ */
+export function severityOf(body, markers = []) {
+  const text = String(body ?? "");
+  for (const [pattern, severity] of markers) {
+    try { if (new RegExp(pattern, "i").test(text)) return severity; }
+    catch { /* an uncompilable marker is refused at profile validation */ }
+  }
+  return "unknown";
+}
+
+/** Reviewer config by normalised login, or null when unrostered. */
+const rosterOf = profile => new Map((profile?.reviewers ?? []).map(r => [r.login, r]));
+
+/**
+ * Classify ONE observation into a round outcome, or null when it is not a round.
+ *
+ * The ordering matters and is measured. A refusal is checked before a clean pass
+ * because Codex's refusal text also contains the word "review"; a review object
+ * is trusted over a comment because its commit_id is the full forty-hex sha while
+ * bodies abbreviate.
+ */
+export function classifyObservation(o, rev, resolve) {
+  const payload = o.payload ?? {};
+  const body = String(payload.body ?? "");
+
+  if (o.kind === "issue_comment") {
+    if (rev?.refusal && new RegExp(rev.refusal, "i").test(body)) {
+      return { outcome: "refusal", head_full: null, head10: null };
+    }
+    if (rev?.clean && new RegExp(rev.clean, "i").test(body)) {
+      const abbrev = rev.commitPattern ? body.match(new RegExp(rev.commitPattern, "i"))?.[1] : null;
+      const full = abbrev ? resolve(abbrev) : null;
+      // A clean pass that names no revision, or names one reeve never pinned, has
+      // not demonstrated coverage of anything. Recorded, never coverage.
+      return full
+        ? { outcome: "clean", head_full: full, head10: full.slice(0, 10) }
+        : { outcome: "unbound_clean", head_full: null, head10: null };
+    }
+    return null;   // a trigger command, a human comment, chatter
+  }
+
+  if (o.kind === "review") {
+    // A 0-byte COMMENTED review is a carrier for an inline reply, not an answer.
+    if (!body.trim()) return null;
+    const full = payload.commit_id && payload.commit_id.length === 40 ? payload.commit_id : null;
+    if (!full) return { outcome: "unbound_clean", head_full: null, head10: null };
+    // APPROVED with no findings is a clean pass; anything else that says
+    // something at a revision is findings. CHANGES_REQUESTED is emphatically not
+    // "covered and fine", which is what discarding .state used to make it.
+    const outcome = payload.state === "APPROVED" ? "clean" : "findings";
+    return { outcome, head_full: full, head10: full.slice(0, 10) };
+  }
+
+  if (o.kind === "reaction") {
+    // Codex's push-triggered clean pass. It binds to no revision, and reactions
+    // are unique per (user, emoji, item) so a SECOND one produces no event at
+    // all -- it can never be load-bearing evidence.
+    if (rev?.cleanReaction && payload.content === rev.cleanReaction) {
+      return { outcome: "unbound_clean", head_full: null, head10: null };
+    }
+    return null;
+  }
+
+  return null;
+}
+
+/**
+ * Rebuild every projection for one pull request from the inbox, in one
+ * transaction.
+ *
+ * TOTAL, not incremental: the PR's rows are deleted and re-derived. Measured
+ * volumes are small (at most 29 threads and 5 rounds per PR), so an incremental
+ * cursor would buy nothing and cost the one property that matters -- a full fold
+ * cannot half-apply, and a half-applied projection is a gate reading a review
+ * whose thread is not there yet.
+ */
+export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 1000), complete = true, head = null } = {}) {
+  const version = classifierVersion(profile);
+  const roster = rosterOf(profile);
+  const heads = db.prepare("SELECT sha FROM head_seen WHERE nwo=? AND pr=?").all(nwo, pr).map(r => r.sha);
+  const resolve = abbrev => {
+    if (!abbrev || abbrev.length < 7) return null;
+    const hit = heads.filter(h => h.startsWith(String(abbrev).toLowerCase()));
+    return hit.length === 1 ? hit[0] : null;   // ambiguous resolves to nothing
+  };
+
+  // When reeve FIRST saw each thread claiming to be resolved. GitHub reports who
+  // resolved a thread but never WHEN, and the thread's own createdAt is its BIRTH
+  // -- using that made "a later round exists" trivially true for every thread,
+  // which collapsed the rule this exists to enforce. The flip from unresolved to
+  // resolved changes the content hash, so it lands as a new generation, and that
+  // generation's observed_at is the earliest moment reeve can prove it was true.
+  const resolvedSince = new Map();
+  for (const r of db.prepare(
+    `SELECT external_id, payload, observed_at FROM inbox
+      WHERE pr_number = ? AND kind = 'review_thread' ORDER BY generation`).all(pr)) {
+    if (resolvedSince.has(r.external_id)) continue;
+    let p; try { p = JSON.parse(r.payload); } catch { continue; }
+    if (p?.is_resolved) resolvedSince.set(r.external_id, r.observed_at);
+  }
+
+  // Latest generation per object: an edit supersedes, and the fold reads what the
+  // object says NOW while the earlier text stays on record in inbox.
+  const rows = db.prepare(`
+    SELECT i.source, i.external_id, i.kind, i.payload, i.event_at, i.generation
+      FROM inbox i
+      JOIN (SELECT source, external_id, MAX(generation) g FROM inbox
+             WHERE pr_number = ? GROUP BY source, external_id) m
+        ON m.source = i.source AND m.external_id = i.external_id AND m.g = i.generation
+     WHERE i.pr_number = ?
+     ORDER BY i.event_at, i.id`).all(pr, pr);
+
+  const rounds = [], threads = [];
+  for (const r of rows) {
+    const o = { kind: r.kind, payload: JSON.parse(r.payload) };
+    const rev = roster.get(r.source) ?? null;
+
+    if (r.kind === "review_thread") {
+      const p = o.payload;
+      threads.push({
+        thread_id: p.thread_id, reviewer: r.source,
+        path: p.path ?? null, line: p.line ?? null,
+        severity: severityOf(p.body, rev?.severityMarkers ?? []),
+        is_resolved: p.is_resolved ? 1 : 0, is_outdated: p.is_outdated ? 1 : 0,
+        resolved_by: p.resolved_by ?? null,
+        resolved_at: p.is_resolved ? (resolvedSince.get(r.external_id) ?? at) : null,
+        excerpt: String(p.body ?? "").slice(0, 400),
+        event_at: r.event_at ?? null,
+      });
+      continue;
+    }
+
+    const c = classifyObservation(o, rev, resolve);
+    if (c) rounds.push({ reviewer: r.source, source_id: r.external_id, event_at: r.event_at ?? at, ...c });
+  }
+
+  // A thread is CLEARED only when a LATER substantive round by the SAME reviewer,
+  // AT THE HEAD UNDER JUDGEMENT, has been and gone.
+  //
+  // Both halves are load-bearing and both were got wrong first time. Without
+  // "later", the round that FILED the finding clears it, so an author who resolves
+  // without changing a line passes immediately. Without "at this head", a round
+  // from three pushes ago clears threads for code it never saw.
+  //
+  // The consequence is deliberate: a new push un-clears everything until the
+  // reviewer answers again. An unreviewed revision has confirmed nothing, and
+  // saying so is the same rule that governs coverage.
+  const covers = round => head ? round.head_full === head : false;
+  const clearedBy = (reviewer, ts) => rounds.some(
+    x => x.reviewer === reviewer && (x.outcome === "findings" || x.outcome === "clean") &&
+         covers(x) && x.event_at > ts);
+  for (const t of threads) {
+    t.is_cleared = t.is_resolved && t.resolved_at != null && clearedBy(t.reviewer, t.resolved_at) ? 1 : 0;
+  }
+
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare("DELETE FROM review_round WHERE nwo=? AND pr=?").run(nwo, pr);
+    db.prepare("DELETE FROM review_thread WHERE nwo=? AND pr=?").run(nwo, pr);
+    const ir = db.prepare(`INSERT INTO review_round
+      (nwo,pr,reviewer,source_id,outcome,head_full,head10,event_at,classifier_version)
+      VALUES (?,?,?,?,?,?,?,?,?)`);
+    for (const r of rounds) ir.run(nwo, pr, r.reviewer, r.source_id, r.outcome, r.head_full, r.head10, r.event_at, version);
+    const it = db.prepare(`INSERT INTO review_thread
+      (nwo,pr,thread_id,reviewer,path,line,severity,is_resolved,is_outdated,
+       resolved_by,resolved_at,is_cleared,excerpt,event_at,classifier_version)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    for (const t of threads) it.run(nwo, pr, t.thread_id, t.reviewer, t.path, t.line, t.severity,
+      t.is_resolved, t.is_outdated, t.resolved_by, t.resolved_at, t.is_cleared, t.excerpt, t.event_at, version);
+    db.prepare(`INSERT INTO projection_meta (nwo,scope,classifier_version,derived_at,complete)
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(nwo,scope) DO UPDATE SET
+                  classifier_version=excluded.classifier_version,
+                  derived_at=excluded.derived_at, complete=excluded.complete`)
+      .run(nwo, `pr:${pr}`, version, at, complete ? 1 : 0);
+    db.exec("COMMIT");
+  } catch (e) { try { db.exec("ROLLBACK"); } catch {} throw e; }
+
+  return { rounds: rounds.length, threads: threads.length, version };
+}
+
+/**
+ * Reviewer availability, folded from every round on the repository.
+ *
+ * Repo-scoped, though the quota behind it is account-level. That is a known and
+ * recorded limitation, not an oversight: it becomes wrong the day a second
+ * project shares the account, and the fix is a home-level store.
+ */
+export function deriveSupply(db, nwo, profile, { at = Math.floor(Date.now() / 1000) } = {}) {
+  const version = classifierVersion(profile);
+  const logins = [...new Set(db.prepare("SELECT DISTINCT reviewer FROM review_round WHERE nwo=?").all(nwo).map(r => r.reviewer))];
+  const out = [];
+  for (const login of logins) {
+    const last = db.prepare(
+      `SELECT outcome, event_at FROM review_round WHERE nwo=? AND reviewer=?
+        ORDER BY event_at DESC, rowid DESC LIMIT 1`).get(nwo, login);
+    if (!last) continue;
+    const state = last.outcome === "refusal" ? "down" : "up";
+    const prev = db.prepare("SELECT state, supply_epoch FROM reviewer_supply WHERE nwo=? AND reviewer=?").get(nwo, login);
+    // The epoch advances on RECOVERY, which is what lets a re-request that was
+    // spent during a refusal band be issued again once the band ends.
+    const epoch = (prev?.supply_epoch ?? 0) + (prev?.state === "down" && state === "up" ? 1 : 0);
+    db.prepare(`INSERT INTO reviewer_supply (nwo,reviewer,state,since,supply_epoch,classifier_version)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(nwo,reviewer) DO UPDATE SET
+                  state=excluded.state,
+                  since=CASE WHEN reviewer_supply.state=excluded.state THEN reviewer_supply.since ELSE excluded.since END,
+                  supply_epoch=excluded.supply_epoch,
+                  classifier_version=excluded.classifier_version`)
+      .run(nwo, login, state, at, epoch, version);
+    out.push({ reviewer: login, state, epoch });
+  }
+  return out;
+}
+
+/**
+ * Is what is stored still derivable by the code and detectors in force now?
+ *
+ * A projection under another version was produced by something that no longer
+ * exists. Rebuilding covers EVERY row, not only open pull requests: supply and
+ * the audit aggregate over merged ones too, so a rebuild scoped to open PRs
+ * leaves a permanent island of rows nothing can re-derive.
+ */
+export function staleScopes(db, nwo, profile) {
+  const version = classifierVersion(profile);
+  return db.prepare("SELECT scope FROM projection_meta WHERE nwo=? AND classifier_version != ?")
+    .all(nwo, version).map(r => r.scope);
+}
+
+/** What the gate reads: one snapshot, already derived. */
+export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() / 1000) } = {}) {
+  const version = classifierVersion(profile);
+  const meta = db.prepare("SELECT * FROM projection_meta WHERE nwo=? AND scope=?").get(nwo, `pr:${pr}`);
+  const stale = profile?.watch?.staleSeconds ?? 900;
+  // Three ways to have no honest answer, and all of them are UNKNOWN rather than
+  // an empty one: never derived, derived by something else, or derived too long
+  // ago to still describe the pull request.
+  if (!meta) return { readable: false, why: "no projection for this pull request" };
+  if (meta.classifier_version !== version) return { readable: false, why: "projection predates the current classifier" };
+  if (!meta.complete) return { readable: false, why: "the observation behind this projection was incomplete" };
+  if (at - meta.derived_at > stale) return { readable: false, why: `projection is older than ${stale}s` };
+
+  const threads = db.prepare("SELECT * FROM review_thread WHERE nwo=? AND pr=?").all(nwo, pr);
+  const open = threads.filter(t => !t.is_cleared);
+  const blocking = open.filter(t => BLOCKING_SEVERITIES.has(t.severity));
+  const rounds = db.prepare(
+    `SELECT reviewer, COUNT(DISTINCT head10) n FROM review_round
+      WHERE nwo=? AND pr=? AND outcome IN ('findings','clean') AND head10 IS NOT NULL
+      GROUP BY reviewer`).all(nwo, pr);
+  const blockingLogins = new Set((profile?.reviewers ?? []).filter(r => r.kind === "blocking").map(r => r.login));
+  // MAX over blocking reviewers, never the sum: two reviewers each answering once
+  // is round one, not round two.
+  const n = rounds.filter(r => blockingLogins.has(r.reviewer)).reduce((m, r) => Math.max(m, r.n), 0);
+
+  return {
+    readable: true,
+    total: threads.length, open: open.length,
+    // Severity counts every reviewer, rostered or not, blocking or advisory: a
+    // P0 is a P0 whoever filed it, and blocking-ness gates coverage not severity.
+    unspilledCritical: blocking.length,
+    rounds: n,
+    threads: open.map(t => ({ id: t.thread_id, reviewer: t.reviewer, path: t.path,
+                              line: t.line, severity: t.severity, excerpt: t.excerpt })),
+  };
+}

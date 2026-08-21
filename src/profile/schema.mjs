@@ -32,6 +32,12 @@ export const ENFORCEMENT = ["enforced", "attested"];
 // protection and rulesets, so no server rule is possible and the boundary
 // degrades to a local gate plus a tamper-evident record.
 export const REVIEWER_KIND = ["blocking", "advisory"];
+// The core's severity vocabulary. Reviewer-neutral on purpose: Codex speaks in
+// P-badges, CodeRabbit in coloured words, Greptile in S3-hosted images, and the
+// mapping between each of those and what a GATE should do belongs in the profile.
+// `unknown` is not a marker anyone writes -- it is what an unreadable finding
+// becomes, and it blocks.
+export const SEVERITY = ["critical", "major", "minor", "nit", "unknown"];
 export const MERGE_METHOD = ["squash", "merge", "rebase"];
 
 /**
@@ -91,6 +97,24 @@ const REVIEWER = v => {
   const r = isStr(v.refusal); if (r) return `refusal ${r} (required: absence must be distinguishable from approval)`;
   // Optional, and each a regex the core compiles: commitPattern names the
   // revision a clean pass claims to have read; clean recognises the pass itself.
+  // Ordered [pattern, severity] pairs, first match wins, so a profile can put the
+  // specific before the general. The core vocabulary is reviewer-neutral: every
+  // P0/P1/Major/nitpick mapping lives HERE, because the taxonomies differ per bot
+  // and one of them has already been replaced wholesale once.
+  if (v.severityMarkers !== undefined) {
+    if (!Array.isArray(v.severityMarkers)) return "severityMarkers must be an array";
+    for (const [i, m] of v.severityMarkers.entries()) {
+      if (!Array.isArray(m) || m.length !== 2) return `severityMarkers[${i}] must be [pattern, severity]`;
+      const [pattern, severity] = m;
+      const e = isStr(pattern); if (e) return `severityMarkers[${i}] pattern ${e}`;
+      try { new RegExp(pattern); } catch (err) { return `severityMarkers[${i}] is not a valid regex: ${err.message}`; }
+      if (!SEVERITY.includes(severity)) return `severityMarkers[${i}] severity must be one of ${SEVERITY.join(" | ")}`;
+    }
+  }
+  // cleanReaction is NOT here: it is a literal GitHub reaction name compared with
+  // ===, and "+1" is not a valid regex ("nothing to repeat"). Validating it as one
+  // refused a correct profile.
+  if (v.cleanReaction !== undefined) { const e = isStr(v.cleanReaction); if (e) return `cleanReaction ${e}`; }
   for (const k of ["commitPattern", "clean", "trigger"]) {
     if (v[k] !== undefined) { const e = isStr(v[k]); if (e) return `${k} ${e}`; }
     if (typeof v[k] === "string") {

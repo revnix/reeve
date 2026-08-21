@@ -162,6 +162,7 @@ export const FIELDS = {
   "notify.topic":          [false, isStr],
   "notify.credentialFile": [false, isAbsPath],
   "watch.reviewActions":   [false, isBool],
+  "watch.backupIntervalSeconds": [false, isInt],
   "watch.maxOpenPrs":      [false, isInt],
   "watch.maxWorkers":            [false, isInt],
   "watch.workerBudgetMinutes":   [false, isInt],

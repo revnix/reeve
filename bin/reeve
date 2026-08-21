@@ -7,6 +7,7 @@
 import { runDoctor, render, checkAppIdentity } from "../src/doctor.mjs";
 import { open } from "../src/db/ops.mjs";
 import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor } from "../src/paths.mjs";
+import { snapshot, restore, latestSnapshot, exportEvents } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick } from "../src/daemon.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
@@ -117,6 +118,38 @@ switch (cmd) {
     }
     process.exit(result.exitCode);
   }
+  case "backup": {
+    const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
+    if (!nwo) { console.error("reeve backup: no repo."); process.exit(1); }
+    const home = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
+    const dbPath = opt("db") ?? statePathFor(home, nwo);
+    if (!existsSync(dbPath)) { console.error(`reeve backup: no state at ${dbPath}`); process.exit(1); }
+    const root = opt("to") ?? join(home, "backups");
+    const db = open(dbPath);
+    if (flag("events")) {
+      const p = opt("out") ?? join(root, `${nwo.replace("/", "-")}-events.jsonl`);
+      mkdirSync(dirname(p), { recursive: true });
+      const r = exportEvents(db, p);
+      console.log(r.ok ? `${r.count} event(s) -> ${r.path}` : `failed: ${r.why}`);
+      process.exit(r.ok ? 0 : 1);
+    }
+    const r = snapshot(db, root, nwo);
+    console.log(r.ok ? `snapshot -> ${r.path}` : `failed: ${r.why}`);
+    process.exit(r.ok ? 0 : 1);
+  }
+
+  case "restore": {
+    const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
+    if (!nwo) { console.error("reeve restore: no repo."); process.exit(1); }
+    const home = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
+    const from = opt("from") ?? latestSnapshot(opt("to") ?? join(home, "backups"), nwo);
+    if (!from) { console.error(`reeve restore: no snapshot for ${nwo}`); process.exit(1); }
+    const dbPath = opt("db") ?? statePathFor(home, nwo);
+    const r = restore(from, dbPath, { overwrite: flag("overwrite"), force: flag("force") });
+    console.log(r.ok ? `restored ${from} -> ${dbPath}` : `refused: ${r.why}`);
+    process.exit(r.ok ? 0 : 1);
+  }
+
   case "init": {
     // --set key=value, repeatable. Answers only the questions detection could not
     // settle; everything else comes from the repo and is not negotiable.
@@ -228,6 +261,9 @@ switch (cmd) {
   why <pr>              why reeve decided what it decided, newest first
   statusline            one line for the terminal statusline; reads state only
   dash                  write the one-page view  (--health, --out <path>, --open)
+
+  backup [owner/repo]   a restorable snapshot of the store  (--events for JSONL, --to <dir>)
+  restore [owner/repo]  put one back  (--from <file>, --overwrite, --force)
 
   run [owner/repo]      the daemon: watch, publish, decide, on a loop
       --tick                one pass and exit

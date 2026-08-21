@@ -187,6 +187,49 @@ switch (cmd) {
   case "status":
   case "statusline":
   case "dash":
+  case "shadow": {
+    // The gate before PR-5. It answers one question -- has the derived review
+    // view agreed with the live read, on real pull requests, for long enough --
+    // and shows every divergence rather than a pass/fail, because each one has to
+    // be explained in writing before the switch is thrown.
+    const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
+    if (!nwo) { console.error("reeve shadow: no repo."); process.exit(1); }
+    const dbPath = opt("db") ?? stateFor(nwo);
+    if (!existsSync(dbPath)) { console.error(`reeve shadow: no state at ${dbPath}`); process.exit(1); }
+    const db = open(dbPath);
+    const { streak, divergences } = await import("../src/review/shadow.mjs");
+    const need = Number(opt("days") ?? 5);
+    const sk = streak(db, nwo);
+    const bad = divergences(db, nwo);
+
+    console.log(`review shadow  ${nwo}`);
+    console.log(`  ${sk.days} consecutive day(s) agreeing, over ${sk.comparisons} comparison(s)`);
+    console.log(`  target: ${need} days with zero divergence`);
+    if (bad.length) {
+      console.log(`\n  divergences to explain (${bad.length}):`);
+      for (const d of bad) {
+        console.log(`    ${d.day}  #${d.pr}  ${d.agreements}/${d.comparisons} agreed`);
+        if (d.last_divergence) console.log(`        ${d.last_divergence}`);
+      }
+    }
+    const rows = db.prepare(
+      `SELECT day, SUM(comparisons) c, SUM(agreements) a, SUM(incomparable) i
+         FROM review_shadow WHERE nwo=? GROUP BY day ORDER BY day DESC LIMIT 10`).all(nwo);
+    if (rows.length) {
+      console.log("\n  by day:");
+      for (const r of rows) {
+        console.log(`    ${r.day}  ${r.a}/${r.c} agreed` +
+                    (r.i ? `, ${r.i} not comparable` : "") +
+                    (r.c && r.a === r.c ? "  ok" : r.c ? "  DIVERGED" : "  nothing compared"));
+      }
+    } else {
+      console.log("\n  nothing compared yet.");
+    }
+    // Exit 0 only when the bar is met, so this can gate a decision rather than
+    // just describe one.
+    process.exit(sk.days >= need && !bad.length ? 0 : 3);
+  }
+
   case "why": {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     const short = nwo ? nwo.split("/")[1] : null;   // display only, never a path

@@ -313,6 +313,9 @@ export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() /
   return {
     readable: true,
     total: threads.length, open: open.length,
+    // What GitHub itself calls resolved, which is a DIFFERENT question from
+    // cleared and is the one a live read can be compared against.
+    resolved: threads.filter(t => t.is_resolved).length,
     // Severity counts every reviewer, rostered or not, blocking or advisory: a
     // P0 is a P0 whoever filed it, and blocking-ness gates coverage not severity.
     unspilledCritical: blocking.length,

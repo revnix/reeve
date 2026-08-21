@@ -30,6 +30,7 @@ import { snapshot } from "./backup.mjs";
 import { selfAudit } from "./selfaudit.mjs";
 import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
+import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
@@ -283,6 +284,15 @@ export async function tick(ctx) {
           log(logPath, `  #${pr}: review projection not readable — ${st.why}`);
         }
         void d;
+
+        // The shadow comparison. e.threads is the LIVE read the verdict already
+        // trusts, so this asks the only question that matters before PR-5 swaps
+        // them over: does the derived view say the same thing?
+        const cmp = compare(e.threads, st);
+        recordShadow(db, nwo, pr, cmp, now());
+        if (cmp.comparable && !cmp.agree) {
+          log(logPath, `  #${pr}: SHADOW DIVERGENCE — ${cmp.why}`);
+        }
       } catch (err) {
         log(logPath, `  #${pr}: derive failed — ${err.message}`);
       }
@@ -584,6 +594,12 @@ export async function tick(ctx) {
       log(logPath, s.ok ? `backup: ${s.path}` : `backup FAILED: ${s.why}`);
       ctx.lastBackupAt = at;
     }
+  }
+
+  if (ctx.reviewIngest !== false) {
+    const sk = streak(db, nwo, now());
+    log(logPath, `shadow: ${sk.days} consecutive day(s) agreeing over ${sk.comparisons} comparison(s)` +
+                 (sk.firstDivergence ? ` — last divergence ${sk.firstDivergence.day}` : ""));
   }
 
   // Repo-wide, so once per tick rather than once per pull request.

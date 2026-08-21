@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 // "Needs you" reached a local log file and nothing else. An unattended system
 // whose only output is a file nobody is watching has not escalated anything.
 //
@@ -89,6 +90,69 @@ const check = (ok, name, detail) => {
   check(sent.url === "https://example.invalid/reeve", "to the configured topic", sent?.url);
   check(!JSON.stringify(sent).includes("user:pass") || sent.auth === "user:pass",
     "and the credential is passed as auth, not embedded in the body", JSON.stringify(sent.body));
+}
+
+// ── the desk, as well as the pocket ──────────────────────────────────────────
+//
+// reeve's ntfy server is remote and its READ credential is not on this machine —
+// all five tokens on the publishing account are write-only, and creating a reader
+// needs shell access nobody here has. So for weeks the only honest statement
+// about escalations was that they reached a log file. A local channel cannot be
+// blocked by a server nobody can log into.
+{
+  const alert = { title: "reeve · o/r", message: "something needs you" };
+  const calls = [];
+  const desktop = a => { calls.push(a); return { ok: true }; };
+  const post = () => { throw new Error("ntfy must not be called when unconfigured"); };
+
+  const only = notify({ profile: { notify: { desktop: true } }, alert, post, desktop });
+  check(only.ok === true && calls.length === 1,
+    "desktop alone delivers, with no ntfy configured", JSON.stringify(only));
+
+  // Both configured: both must be attempted, and BOTH must succeed for ok.
+  calls.length = 0;
+  const both = notify({
+    profile: { notify: { provider: "ntfy", url: "https://x", topic: "t", credentialFile: "/c", desktop: true } },
+    alert, post: () => ({ ok: true }), desktop, readCredential: () => ":tk_x",
+  });
+  check(both.ok === true && both.channels.length === 2,
+    "with both configured, both are attempted", JSON.stringify(both.channels.map(c => c.name)));
+
+  // The property that matters: a phone that did not ring is a FAILURE even when
+  // the desk did. Reporting ok because one landed is how a dead channel stays dead.
+  const phoneDown = notify({
+    profile: { notify: { provider: "ntfy", url: "https://x", topic: "t", credentialFile: "/c", desktop: true } },
+    alert, post: () => ({ ok: false, why: "the server answered HTTP 403" }),
+    desktop, readCredential: () => ":tk_x",
+  });
+  check(phoneDown.ok === false,
+    "a failed phone is a failure even though the desk succeeded", JSON.stringify(phoneDown.why));
+  check(/ntfy: .*403/.test(phoneDown.why) && phoneDown.channels.some(c => c.name === "desktop" && c.ok),
+    "and the reason names WHICH channel failed, while recording that the other worked",
+    JSON.stringify(phoneDown.channels));
+
+  // Nothing configured is still a decline with a reason, never a silent success.
+  check(notify({ profile: { notify: {} }, alert, post, desktop }).ok === false,
+    "no channel configured declines rather than passing silently");
+}
+
+// ── escalation text is UNTRUSTED input ───────────────────────────────────────
+//
+// An escalation carries reviewer prose and CI output written by other systems.
+// The desktop channel runs AppleScript, so text concatenated into the script
+// source would let a quote end the string and run the rest as code. It is passed
+// as a separate argv entry and bound to a variable instead.
+{
+  const src = readFileSync(new URL("../src/notify.mjs", import.meta.url), "utf8");
+  const fn = (src.match(/function postViaOsascript[\s\S]*?\n}/) ?? [""])[0];
+
+  check(fn.length > 0, "control: found the desktop sender", fn.slice(0, 60));
+  check(/on run \{t, b\}/.test(fn),
+    "the script takes its text as RUN ARGUMENTS, not as source", fn.slice(0, 200));
+  check(!/\$\{(title|body)\}/.test(fn),
+    "and neither title nor body is interpolated into the script string");
+  check(/\], *\n? *title, body\b|title, body\]/.test(fn) || /title, body,/.test(fn),
+    "they are passed as separate argv entries", fn.slice(fn.indexOf("execFileSync"), fn.indexOf("execFileSync") + 220));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

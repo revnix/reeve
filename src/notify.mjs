@@ -59,6 +59,32 @@ export function buildAlert({ nwo, escalations }) {
   };
 }
 
+/**
+ * The desk, as well as the pocket.
+ *
+ * The phone channel is the one that matters when nobody is here; this one matters
+ * when somebody is. They are independent on purpose -- reeve's ntfy server is
+ * remote and its read credential is not on this machine, so for weeks the only
+ * honest statement about escalations was that they reached a log file. A local
+ * channel cannot be blocked by a server nobody can log into.
+ *
+ * osascript rather than a dependency, because reeve has none and a notifier is
+ * the wrong place to acquire the first one. Text is passed as a SEPARATE argv
+ * entry and interpolated by AppleScript variable, never concatenated into the
+ * script source: an escalation carries reviewer text and CI output written by
+ * other systems, and a quote in it would otherwise end the string and run the
+ * rest as code.
+ */
+function postViaOsascript({ title, body }) {
+  try {
+    execFileSync("osascript",
+      ["-e", 'on run {t, b}\ndisplay notification b with title t sound name "Submarine"\nend run',
+       title, body],
+      { stdio: ["ignore", "ignore", "pipe"], timeout: 8000 });
+    return { ok: true };
+  } catch (e) { return { ok: false, why: String(e.message).split("\n")[0] }; }
+}
+
 function postViaCurl({ url, auth, title, priority, tags, body }) {
   try {
     const args = ["-s", "-m", "8", "-o", "/dev/null", "-w", "%{http_code}",
@@ -77,24 +103,42 @@ function postViaCurl({ url, auth, title, priority, tags, body }) {
  * network or a real secret. Declines when unconfigured or uncredentialed, and
  * never sends unauthenticated: an open topic is a public one.
  */
-export function notify({ profile, alert, post = postViaCurl, readCredential = null }) {
+export function notify({ profile, alert, post = postViaCurl, desktop = postViaOsascript, readCredential = null }) {
   if (!alert) return { ok: false, why: "nothing to send" };
   const cfg = profile?.notify ?? {};
-  if (cfg.provider !== "ntfy") return { ok: false, why: "no notify provider configured" };
-  if (!cfg.url || !cfg.topic) return { ok: false, why: "notify.url and notify.topic are both required" };
+  const channels = [];
 
-  const read = readCredential ?? (p => {
-    try { return readFileSync(p, "utf8").trim(); } catch { return null; }
-  });
-  const auth = cfg.credentialFile ? read(cfg.credentialFile) : null;
-  if (!auth) return { ok: false, why: `no credential at ${cfg.credentialFile ?? "(unset)"} — refusing to publish to an unauthenticated topic` };
+  if (cfg.provider === "ntfy") {
+    const read = readCredential ?? (p => {
+      try { return readFileSync(p, "utf8").trim(); } catch { return null; }
+    });
+    const auth = cfg.credentialFile ? read(cfg.credentialFile) : null;
+    if (!cfg.url || !cfg.topic) {
+      channels.push({ name: "ntfy", ok: false, why: "notify.url and notify.topic are both required" });
+    } else if (!auth) {
+      channels.push({ name: "ntfy", ok: false,
+                      why: `no credential at ${cfg.credentialFile ?? "(unset)"} — refusing to publish to an unauthenticated topic` });
+    } else {
+      const r = post({
+        url: `${cfg.url.replace(/\/$/, "")}/${cfg.topic}`, auth,
+        title: alert.title, priority: alert.priority ?? "default",
+        tags: alert.tags ?? "warning", body: alert.message,
+      });
+      channels.push({ name: "ntfy", ...r });
+    }
+  }
 
-  return post({
-    url: `${cfg.url.replace(/\/$/, "")}/${cfg.topic}`,
-    auth,
-    title: alert.title,
-    priority: alert.priority ?? "default",
-    tags: alert.tags ?? "warning",
-    body: alert.message,
-  });
+  if (cfg.desktop === true) {
+    channels.push({ name: "desktop", ...desktop({ title: alert.title, body: alert.message }) });
+  }
+
+  if (!channels.length) return { ok: false, why: "no notify channel configured", channels };
+
+  // Every CONFIGURED channel must have worked. A phone that did not ring is a
+  // failure even when the desk did, because the two exist for different moments
+  // -- reporting ok because one of them landed is how a dead channel stays dead.
+  const failed = channels.filter(c => !c.ok);
+  return failed.length
+    ? { ok: false, why: failed.map(c => `${c.name}: ${c.why}`).join("; "), channels }
+    : { ok: true, channels };
 }

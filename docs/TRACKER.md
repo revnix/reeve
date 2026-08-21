@@ -106,6 +106,11 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
    CodeRabbit optional. Armed DAY ONE; safety is the strict measured clean-pass
    grammar + "Reviewed commit" prefix-matching the head (measured live on
    nextly #1129/#1130). Approval binds to the spec PR's exact head SHA.
+   **Codex-unavailable (founder, later 2026-08-21): "If codex not available,
+   human approval will be enough."** When Codex is unavailable at the head
+   (refusal observed, or no response within the re-request window), a
+   SHA-bound founder approval alone advances; founder silence never does.
+   Replaces the `--waive-codex` flag idea (no flag).
 4. **Depth dial** — research/design effort scales to the task; the sizing
    decision is visible and overridable in the spec PR.
 5. **Concurrency** — many tasks at once, across projects and directories;

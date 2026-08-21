@@ -562,33 +562,7 @@ export async function tick(ctx) {
     catch (e) { log(logPath, `could not write the dashboard: ${e.message}`); }
   }
 
-  // reeve's own health, on every tick. The checks are local and cost about a
-  // millisecond; running them on a slower cadence would make them ABSENT from
-  // most ticks, and absence within a tick is what the layer below reads as
-  // resolved. Their findings ride the same dedup, so a standing fault is said
-  // once and clears when it goes.
-  if (ctx.selfAudit !== false) {
-    for (const f of (ctx.runSelfAudit ?? selfAudit)(db, {
-      nwo, profile, at: now(),
-      backupRoot: ctx.backupRoot === false ? null
-                : (ctx.backupRoot ?? join(dirname(logPath ?? "/tmp/x"), "backups")),
-      // Without this the store-wide backup check is inert, and an unwatched
-      // store stays invisible exactly as it did before.
-      home: ctx.home ?? dirname(logPath ?? join(homedir(), ".reeve", "x")),
-    })) {
-      log(logPath, `self: ${f.level} ${f.why}${f.detail ? ` — ${f.detail}` : ""}`);
-      escalations.set(f.why, f.count ?? 1);
-    }
-  }
 
-  // Announce what STARTED or CHANGED, and what went away. Repeating a standing
-  // cause every tick is how an operator learns to ignore the channel.
-  // A PR that merged or closed will never be evaluated again, so its escalation
-  // needs a positive answer about the PR itself or it stands forever.
-  const finished = finishedSubjects(db, nwo, new Set(prs), ctx);
-  for (const pr of finished) log(logPath, `  #${pr}: is merged or closed — retiring what it was escalating`);
-  const { fresh, cleared } = announceable(db, escalations,
-    { covered: evaluated, waiting, finished, complete: evaluated.size === prs.length });
   // Recorded last, so it means "a tick completed" rather than "a tick began".
   // That is the difference between a daemon that is working and one that is
   // wedged part-way through every pass.
@@ -615,6 +589,43 @@ export async function tick(ctx) {
       ctx.lastBackupAt = at;
     }
   }
+
+  // AFTER the backup, deliberately. Running it first meant the audit reported a
+  // gap that the very same tick then closed 54 milliseconds later, and escalated
+  // it -- measured on revnix/reeve, which was named as never backed up and backed
+  // up in the same breath. An audit should describe the state a tick LEAVES, not
+  // the one it found, or every fix it performs pages a human first.
+  //
+  // On EVERY tick. The checks are local and cost about a
+  // millisecond; running them on a slower cadence would make them ABSENT from
+  // most ticks, and absence within a tick is what the layer below reads as
+  // resolved. Their findings ride the same dedup, so a standing fault is said
+  // once and clears when it goes.
+  if (ctx.selfAudit !== false) {
+    for (const f of (ctx.runSelfAudit ?? selfAudit)(db, {
+      nwo, profile, at: now(),
+      backupRoot: ctx.backupRoot === false ? null
+                : (ctx.backupRoot ?? join(dirname(logPath ?? "/tmp/x"), "backups")),
+      // Without this the store-wide backup check is inert, and an unwatched
+      // store stays invisible exactly as it did before.
+      home: ctx.home ?? dirname(logPath ?? join(homedir(), ".reeve", "x")),
+    })) {
+      log(logPath, `self: ${f.level} ${f.why}${f.detail ? ` — ${f.detail}` : ""}`);
+      escalations.set(f.why, f.count ?? 1);
+    }
+  }
+
+  // Announced LAST, so it reduces the escalations this tick actually leaves --
+  // including anything the self-audit added, and excluding anything the backup
+  // step above just fixed. Running it earlier meant a gap closed 54ms later was
+  // still paged to a human.
+  //
+  // A PR that merged or closed will never be evaluated again, so its escalation
+  // needs a positive answer about the PR itself or it stands forever.
+  const finished = finishedSubjects(db, nwo, new Set(prs), ctx);
+  for (const pr of finished) log(logPath, `  #${pr}: is merged or closed — retiring what it was escalating`);
+  const { fresh, cleared } = announceable(db, escalations,
+    { covered: evaluated, waiting, finished, complete: evaluated.size === prs.length });
 
   if (ctx.reviewIngest !== false) {
     const sk = streak(db, nwo, now());

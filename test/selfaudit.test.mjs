@@ -242,6 +242,43 @@ check(healthy.length === 0, "control: a healthy reeve produces no findings", JSO
     "and afterwards the audit is satisfied — the loop closes");
 }
 
+// ── the ORDER of the tick ────────────────────────────────────────────────────
+//
+// Measured in production, 54 milliseconds apart:
+//
+//   13:24:30.870  self: BROKEN  revnix/reeve has never been backed up
+//   13:24:30.924  backup: 2 store(s) — nextlyhq/nextly, revnix/reeve
+//   13:24:30.926  NEEDS YOU: a state store has never been backed up
+//
+// The audit ran BEFORE the backup, so it reported a gap the same tick then
+// closed, and paged a human about it. The next tick would have cleared it —
+// a ping followed by a retraction, for a problem that never outlived one pass.
+//
+// An audit must describe the state a tick LEAVES, not the state it found. And
+// the announce step must come after the audit, or findings the audit adds are
+// reduced before they exist and never reach anyone at all.
+{
+  const src = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
+  const at = needle => {
+    const i = src.indexOf(needle);
+    return i < 0 ? Number.NaN : i;
+  };
+  const backup   = at("if (ctx.backupRoot !== false) {");
+  const audit    = at("if (ctx.selfAudit !== false) {");
+  const announce = at("const { fresh, cleared } = announceable(db, escalations,");
+
+  check(Number.isFinite(backup) && Number.isFinite(audit) && Number.isFinite(announce),
+    "control: found all three steps in the tick",
+    JSON.stringify({ backup, audit, announce }));
+
+  check(backup < audit,
+    "the audit runs AFTER the backup — or it reports gaps the same tick closes",
+    `backup@${backup} audit@${audit}`);
+  check(audit < announce,
+    "and the announce runs after the audit — or its findings are reduced before they exist",
+    `audit@${audit} announce@${announce}`);
+}
+
 db.close();
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

@@ -31,9 +31,16 @@ The four capabilities, measured 2026-08-21:
 
 ### Unblocked code (guardian tail)
 
-- [ ] Feed the 500-PR study into worker prompts (`prompts.mjs`) — founder-approved;
-      Codex weighted highest. *Folds into the builder's implementation-phase
-      prompts too.*
+- [x] Feed the 500-PR study into worker prompts — DONE 2026-08-21 (`a975144`).
+      Numbers live in the PROFILE (`measured.review.*`), rendered by
+      `prompts.mjs`; findings lists ordered criticals-first then the measured
+      top reviewer. nextly's profile carries the study; other projects render
+      nothing until measured.
+- [ ] **PR-6 wiring note:** `e.threadDetails` is read at both review dispatch
+      sites and written by NOTHING (the read-never-written pattern again).
+      When capability 3 arms, populate it from the `review_thread` projections
+      (reviewer/severity/path/line/excerpt all exist there) — the new prompt
+      ordering activates only then.
 - [ ] Wire flake detection — `flakeEvidence` has ZERO callers; nextly main red
       6 of last 9 runs. ~2h.
 - [ ] Dispatch evidence: the wrong-worker shape (a confidently bad fix). ~$2, 1h.
@@ -116,4 +123,5 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
 
 | Date | Defect | Fix |
 |---|---|---|
+| 2026-08-21 | Watcher reported "unclassified verdict: gap" for a PR green everywhere but refused by GitHub's approving-review requirement (live on #1129) — a routine needs-a-human state read as a broken classifier | `a5344dd` + `ESCALATIONS.PROTECTION_UNMET` |
 | 2026-08-21 | `shadow`'s case label captured `status`/`statusline`/`dash` — all three printed the shadow report since PR-4 landed; no test covered CLI routing | `c80f0a3` + `test/cli-routing.test.mjs` |

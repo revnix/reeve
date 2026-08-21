@@ -47,6 +47,7 @@ export const MERGE_METHOD = ["squash", "merge", "rebase"];
 const isStr = v => (typeof v === "string" && v.length ? null : "must be a non-empty string");
 const isBool = v => (typeof v === "boolean" ? null : "must be a boolean");
 const isInt = v => (Number.isInteger(v) ? null : "must be an integer");
+const isNum = v => (typeof v === "number" && Number.isFinite(v) ? null : "must be a finite number");
 const isArr = inner => v => {
   if (!Array.isArray(v)) return "must be an array";
   for (const [i, x] of v.entries()) { const e = inner(x); if (e) return `[${i}] ${e}`; }
@@ -208,12 +209,6 @@ export const FIELDS = {
   // blocked by a remote server nobody can log into, which is the state the ntfy
   // READ credential has been in since the beginning.
   "notify.desktop":        [false, isBool],
-  // A native notification on the machine reeve runs on, alongside the phone
-  // rather than instead of it. The two exist for different moments: the phone
-  // for when nobody is at the desk, this for when somebody is. It also cannot be
-  // blocked by a remote server nobody can log into, which is the state the ntfy
-  // read credential has been in.
-  "notify.desktop":        [false, isBool],
   "watch.reviewActions":   [false, isBool],
   "watch.backupIntervalSeconds": [false, isInt],
   "watch.maxOpenPrs":      [false, isInt],
@@ -228,6 +223,20 @@ export const FIELDS = {
   "watch.intervalSeconds":       [false, isInt],
 
   "tools.codeHealth":       [false, isArr(isStr)],     // fallow is JS-only; Python needs ruff+vulture
+
+  // What this project's own review history measured, rendered into worker
+  // prompts by prompts.mjs. Lives in the profile because the numbers are ONE
+  // project's numbers: baked into the core they would speak with authority to
+  // every other project too. All optional -- a partial measurement renders only
+  // the bullets its figures support, and no measurement renders nothing.
+  "measured.review.window":                [false, isStr],   // e.g. "500 merged PRs, 2026-08-10..21"
+  "measured.review.correctnessSharePct":   [false, isNum],
+  "measured.review.dataIntegritySharePct": [false, isNum],
+  "measured.review.roundsSmall":           [false, isNum],   // avg review rounds at <=10 changed files
+  "measured.review.roundsLarge":           [false, isNum],   // avg review rounds above ~10 files
+  "measured.review.topCriticalReviewer":   [false, isStr],   // who actually files the criticals here
+  "measured.review.topCriticalCount":      [false, isInt],
+  "measured.review.totalCriticalCount":    [false, isInt],
 };
 
 /** Defaults applied by project kind, so the mode is a table rather than a judgment. */

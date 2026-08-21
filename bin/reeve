@@ -20,6 +20,13 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+
+// One home for every command. Four of them read REEVE_HOME and loadProfile did
+// not, so a scratch home redirected a project's state database but not the
+// profile describing it -- the two halves of one project's configuration read
+// from different roots, which is unusable for a test and wrong for an operator.
+const HOME = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
+
 const [major] = process.versions.node.split(".").map(Number);
 if (major < 24) {
   console.error(`reeve: node ${process.versions.node} — node:sqlite is only unflagged and unwarned from 24. Use 24 or newer.`);
@@ -64,6 +71,19 @@ function adoptLegacy(next, legacy) {
   return next;
 }
 
+/**
+ * Where one project's state lives. The single answer for every command.
+ *
+ * Five commands resolved this independently and one of them drifted: `doctor`
+ * read `profile.state.location`, which the profile schema defines as the SIBLING
+ * REPOSITORY holding a project's ledger -- "nextlyhq/nextly-ledger" -- not a path
+ * on this disk. existsSync said no, doctor took that for "there is no state
+ * database", and its lease check silently answered UNKNOWN for a store sitting
+ * right there. A repeated resolution is a resolution that will drift again, so
+ * there is now only one.
+ */
+const stateFor = nwo => adoptLegacy(statePathFor(HOME, nwo), legacyStatePathFor(HOME, nwo));
+
 function detectNwo() {
   try {
     const url = execFileSync("git", ["remote", "get-url", "origin"], { encoding: "utf8" }).trim();
@@ -73,7 +93,7 @@ function detectNwo() {
 }
 
 function loadProfile(nwo) {
-  const sidecar = join(homedir(), ".reeve", "profiles", `${nwo}.json`);
+  const sidecar = join(HOME, "profiles", `${nwo}.json`);
   const inRepo = join(process.cwd(), ".ops", "profile.json");
   for (const p of [inRepo, sidecar]) {
     if (!existsSync(p)) continue;
@@ -100,9 +120,9 @@ switch (cmd) {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     if (!nwo) { console.error("reeve doctor: no repo. Pass owner/repo or run inside a git checkout."); process.exit(1); }
     const profile = loadProfile(nwo) ?? {};
-    // `state.location` is the schema's name for this. `profile.statePath` was read
-    // here and declared nowhere, so the fallback silently never fired.
-    const dbPath = opt("db") ?? profile.state?.location ?? null;
+    // Absent is a real answer here -- a project reeve has never run against has no
+    // store yet -- so doctor reports on what it finds rather than refusing to run.
+    const dbPath = opt("db") ?? stateFor(nwo);
     const db = dbPath && existsSync(dbPath) ? open(dbPath) : null;
     // Documented in docs/github-app-setup.md as the step that proves the App works.
     const appCheck = flag("as-app") ? await checkAppIdentity(nwo) : null;
@@ -121,10 +141,9 @@ switch (cmd) {
   case "backup": {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     if (!nwo) { console.error("reeve backup: no repo."); process.exit(1); }
-    const home = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
-    const dbPath = opt("db") ?? statePathFor(home, nwo);
+    const dbPath = opt("db") ?? stateFor(nwo);
     if (!existsSync(dbPath)) { console.error(`reeve backup: no state at ${dbPath}`); process.exit(1); }
-    const root = opt("to") ?? join(home, "backups");
+    const root = opt("to") ?? join(HOME, "backups");
     const db = open(dbPath);
     if (flag("events")) {
       const p = opt("out") ?? join(root, `${nwo.replace("/", "-")}-events.jsonl`);
@@ -141,10 +160,9 @@ switch (cmd) {
   case "restore": {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     if (!nwo) { console.error("reeve restore: no repo."); process.exit(1); }
-    const home = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
-    const from = opt("from") ?? latestSnapshot(opt("to") ?? join(home, "backups"), nwo);
+    const from = opt("from") ?? latestSnapshot(opt("to") ?? join(HOME, "backups"), nwo);
     if (!from) { console.error(`reeve restore: no snapshot for ${nwo}`); process.exit(1); }
-    const dbPath = opt("db") ?? statePathFor(home, nwo);
+    const dbPath = opt("db") ?? stateFor(nwo);
     const r = restore(from, dbPath, { overwrite: flag("overwrite"), force: flag("force") });
     console.log(r.ok ? `restored ${from} -> ${dbPath}` : `refused: ${r.why}`);
     process.exit(r.ok ? 0 : 1);
@@ -171,12 +189,11 @@ switch (cmd) {
   case "dash":
   case "why": {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
-    const home = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
     const short = nwo ? nwo.split("/")[1] : null;   // display only, never a path
     // Same resolution as the daemon, or the two would read different databases:
     // one would adopt the legacy store and the other would keep opening it in
     // place, and they would drift without either ever failing.
-    const dbPath = opt("db") ?? (nwo ? adoptLegacy(statePathFor(home, nwo), legacyStatePathFor(home, nwo)) : null);
+    const dbPath = opt("db") ?? (nwo ? stateFor(nwo) : null);
     if (!dbPath || !existsSync(dbPath)) {
       // A statusline must never be noisy or slow, so it degrades to one quiet word.
       if (cmd === "statusline") { console.log("reeve: no state"); process.exit(0); }
@@ -186,7 +203,7 @@ switch (cmd) {
 
     if (cmd === "statusline") { console.log(statusline(db, { nwo })); process.exit(0); }
     if (cmd === "dash") {
-      const out = opt("out") ?? dashPathFor(home, nwo);
+      const out = opt("out") ?? dashPathFor(HOME, nwo);
       const health = flag("health") && nwo ? { clean: cleanMergeRate(nwo, Number(opt("last") ?? 20)) } : {};
       writeDash(out, { nwo, state: readState(db), health });
       console.log(out);
@@ -217,23 +234,22 @@ switch (cmd) {
     if (!nwo) { console.error("reeve run: no repo. Pass owner/repo or run inside a git checkout."); process.exit(1); }
     const profile = loadProfile(nwo);
     if (!profile) { console.error(`reeve run: no profile for ${nwo}.\n-> reeve init`); process.exit(1); }
-    const home = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
     // Keyed by owner AND repo. An existing store at the old short-name path is
     // moved rather than abandoned: opening a fresh empty database instead is how
     // real history stops being read without anything appearing to fail.
-    const dbPath = opt("db") ?? adoptLegacy(statePathFor(home, nwo), legacyStatePathFor(home, nwo));
+    const dbPath = opt("db") ?? stateFor(nwo);
     if (!existsSync(dbPath)) { console.error(`reeve run: no state database at ${dbPath}`); process.exit(1); }
     const ctx = {
       nwo, profile, db: open(dbPath),
-      logPath: opt("log") ?? join(home, "reeve.log"),
-      haltMarker: opt("halt") ?? join(home, "HALT"),
+      logPath: opt("log") ?? join(HOME, "reeve.log"),
+      haltMarker: opt("halt") ?? join(HOME, "HALT"),
       // Execution is opt-in. A loop that acts before its decisions have been
       // watched is how an unattended run becomes an incident.
       execute: flag("execute"),
       // Shadow until the week's evidence says otherwise. --enforce is the flip.
       shadow: !flag("enforce"),
       intervalMs: Number(opt("interval") ?? 90) * 1000,
-      dashPath: opt("dash") ?? dashPathFor(home, nwo),
+      dashPath: opt("dash") ?? dashPathFor(HOME, nwo),
     };
     // Honour the FLAG as well as the command. The help has always documented
     // `run --tick` as "one pass and exit" while only the separate `tick` command

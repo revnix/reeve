@@ -184,9 +184,6 @@ switch (cmd) {
     process.exit(r.code);
   }
 
-  case "status":
-  case "statusline":
-  case "dash":
   case "shadow": {
     // The gate before PR-5. It answers one question -- has the derived review
     // view agreed with the live read, on real pull requests, for long enough --
@@ -235,6 +232,12 @@ switch (cmd) {
     process.exit(sk.days >= need ? 0 : 3);
   }
 
+  // These four share one body below. A new subcommand must get its OWN block
+  // above -- inserted between these labels and the body, its unconditional exit
+  // captures all of them, which is how `shadow` silently broke `status` for a day.
+  case "status":
+  case "statusline":
+  case "dash":
   case "why": {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     const short = nwo ? nwo.split("/")[1] : null;   // display only, never a path

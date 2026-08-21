@@ -126,8 +126,11 @@ cannot evidence is not.`;
 
 /** Repair a CI failure this PR caused. */
 export function fixCiPrompt({ profile, nwo, pr, head, branch, cause, attempt = 1 }) {
+  // The job is prefixed only when the cause was assembled from several failing
+  // checks. Six lines drawn from two jobs are not reproducible without knowing
+  // which job each came from, and a single-check failure keeps the plainer shape.
   const causeLines = (cause.cause ?? []).slice(0, 12)
-    .map(c => `  ${c.where ? c.where + "  " : ""}${c.message}`).join("\n");
+    .map(c => `  ${c.job ? `[${c.job}] ` : ""}${c.where ? c.where + "  " : ""}${c.message}`).join("\n");
   return `You are repairing one CI failure on pull request #${pr} of ${nwo}.
 
 The branch is ${branch} and its head is ${head}. Work only on that branch.

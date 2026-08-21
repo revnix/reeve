@@ -195,10 +195,85 @@ export function fingerprint(nwo, sha, cause) {
  * new cause and earns a fresh attempt. That degrades to the old behaviour rather
  * than to something worse, but it is not a guarantee, and a human reading an
  * escalation should know the identity is textual.
+ *
+ * Every part contributes, so a cause assembled from several failing checks is
+ * identified by all of them. A cause with no parts yields exactly the key it
+ * yielded before, because attempts already counted against it must keep counting.
  */
 export function causeKey(nwo, cause) {
-  return [nwo, cause.job, cause.step,
-          ...(cause.cause ?? []).slice(0, 3).map(c => `${c.where ?? ""}|${c.message.slice(0, 120)}`)].join("::");
+  const parts = cause.parts ?? [cause];
+  return [nwo, ...parts.flatMap(p => [
+    p.job, p.step,
+    ...(p.cause ?? []).slice(0, 3).map(c => `${c.where ?? ""}|${c.message.slice(0, 120)}`),
+  ])].join("::");
+}
+
+/**
+ * How many failing checks are worth reading. Each costs API requests, and past
+ * the first few the extra ones are downstream jobs repeating each other.
+ */
+const MAX_CHECKS_READ = 3;
+
+/**
+ * The cause of a red revision, read from EVERY failing check rather than the first.
+ *
+ * A pipeline that ends in an aggregate gate reports at least two failures: the job
+ * that broke, and the gate refusing because it broke. The gate's annotation is the
+ * same sentence whatever the underlying failure was -- measured on this repository
+ * as "CI Gate refuses: test concluded 'failure'" -- so a cause taken from it names
+ * nothing at all.
+ *
+ * Reading only the first check therefore gave two unrelated failures ONE identity.
+ * The retry brake counts attempts against that identity, so the second distinct
+ * failure read as the first one surviving its fix, and reeve escalated "the same
+ * failure survived a second fix" about work it had never attempted. The same empty
+ * cause reached the worker, whose WHAT FAILED section then described only the fact
+ * that something failed.
+ *
+ * Checks this pull request caused are read before inherited ones, so a tight budget
+ * is spent on the failure that belongs to this change. Parts are ordered by job name
+ * afterwards so the identity does not depend on the order GitHub returned them in --
+ * it is a database key, and one that varied with response order would hand out free
+ * retries at random.
+ */
+export function resolveFailureCause(nwo, checks, resolve = rootCause, max = MAX_CHECKS_READ) {
+  const caused = new Set(checks?.caused ?? []);
+  // A commit status has no job behind it, so there is nothing to read.
+  const readable = (checks?.failing ?? []).filter(f => f?.id);
+  if (!readable.length) return { cause: null, fp: null };
+
+  const ordered = [...readable].sort(
+    (a, b) => (caused.has(b.name) ? 1 : 0) - (caused.has(a.name) ? 1 : 0));
+
+  const parts = [];
+  for (const f of ordered.slice(0, max)) {
+    const rc = resolve(nwo, f);
+    if (rc?.ok) parts.push(rc);
+  }
+  if (!parts.length) return { cause: null, fp: null };
+
+  parts.sort((a, b) => String(a.job ?? "").localeCompare(String(b.job ?? "")));
+  const cause = parts.length === 1 ? parts[0] : mergeCauses(parts);
+  return { cause, fp: causeKey(nwo, cause) };
+}
+
+/**
+ * Several root causes presented as one.
+ *
+ * Each line keeps the job it came from: a fixer reading six lines from two jobs
+ * cannot reproduce any of them without knowing which job to run.
+ */
+function mergeCauses(parts) {
+  return {
+    ok: true,
+    source: [...new Set(parts.map(p => p.source).filter(Boolean))].join("+"),
+    job: parts.map(p => p.job).join(", "),
+    step: parts.map(p => p.step ?? "unknown").join(", "),
+    runId: parts[0].runId,
+    attempt: parts[0].attempt,
+    cause: parts.flatMap(p => (p.cause ?? []).map(c => ({ ...c, job: p.job }))),
+    parts,
+  };
 }
 
 /**

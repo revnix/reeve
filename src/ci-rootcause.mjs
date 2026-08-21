@@ -299,6 +299,28 @@ function mergeCauses(parts) {
  * deterministic: assuming flake is how a real failure gets re-run until it is
  * someone else's problem.
  */
+/**
+ * Assess every part of a resolved cause for demonstrated flake.
+ *
+ * Only demonstration counts. A part with no runId (a commit status) cannot be
+ * assessed and is assumed deterministic, because treating "cannot check" as
+ * "flaky" would let every unreadable failure skip its fixer — absence of
+ * evidence is not flake evidence, in either direction. The cause's fingerprint
+ * is left alone on purpose: flake evidence only exists after a re-run, and
+ * re-keying the failure's identity on it would read to the retry brake as a
+ * brand-new failure.
+ */
+export function flakeAssessment(nwo, cause, probe = flakeEvidence) {
+  const parts = cause?.parts ?? (cause ? [cause] : []);
+  const flaky = [], real = [];
+  for (const p of parts) {
+    if (!p?.runId || !p?.job) { real.push(p); continue; }
+    const ev = probe(nwo, p.runId, p.job);
+    (ev?.flake === true ? flaky : real).push(p);
+  }
+  return { flaky, real, allFlaky: parts.length > 0 && real.length === 0 };
+}
+
 export function flakeEvidence(nwo, runId, jobName) {
   const r = api(`repos/${nwo}/actions/runs/${runId}/attempts`, ".total_count // 0");
   const attempts = r.ok ? Number(r.out.trim() || 0) : 0;

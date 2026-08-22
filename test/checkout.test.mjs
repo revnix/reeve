@@ -1,7 +1,7 @@
 // A worker's checkout must share NOTHING with the founder's: not the ref store,
 // not the configuration, and not their uncommitted work. These assertions are
 // what makes the standalone clone a boundary rather than a convention.
-import { prepareRunCheckout, releaseRunCheckout, fetchRunWork, copyDeps, canCloneFiles, runPathFor, dependencyPathsFor } from "../src/checkout.mjs";
+import { prepareRunCheckout, releaseRunCheckout, fetchRunWork, publishRunWork, copyDeps, canCloneFiles, runPathFor, dependencyPathsFor } from "../src/checkout.mjs";
 import { verifyConfig } from "../src/gitguard.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -150,6 +150,93 @@ check(existsSync(join(r.path, "node_modules", "left-pad", "index.js")), "but the
       g(r.path, "rev-parse", "--abbrev-ref", "HEAD"));
     check(existsSync(join(r.path, "theirs.txt")), "with their work in it", "");
     releaseRunCheckout(r.path, { workFetched: true });
+  }
+}
+
+// ── the checkout carries ONLY the pinned history ─────────────────────────────
+//
+// `git clone` copies every branch and tag of the source and the objects behind
+// them, so a private local branch in the founder's checkout arrived as
+// `origin/private` in the worker's — readable with the worker's own git grant
+// and copyable into an allowed path for reeve to publish. Denying the founder's
+// checkout by path does nothing about a copy of its object database sitting
+// inside the worker's own.
+{
+  // A branch the founder has locally and has never pushed.
+  g(founder, "checkout", "-q", "-b", "private-notes", "main");
+  writeFileSync(join(founder, "SECRET-PLANS.txt"), "not for a worker\n");
+  g(founder, "add", "-A"); g(founder, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "private");
+  const secretSha = g(founder, "rev-parse", "HEAD");
+  g(founder, "checkout", "-q", "main");
+
+  const r = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 55, runId: "r55", branch: "feature", head });
+  check(r.ok, "control: a checkout is prepared while the founder holds a private branch", JSON.stringify(r.why));
+  if (r.ok) {
+    const refs = g(r.path, "for-each-ref", "--format=%(refname)");
+    check(!/private-notes/.test(refs), "the founder's other branches are NOT in the worker's checkout", refs.replace(/\n/g, " "));
+    const hasObj = (() => { try { g(r.path, "cat-file", "-e", secretSha); return true; } catch { return false; } })();
+    check(!hasObj, "nor are the objects behind them", `commit ${secretSha.slice(0, 10)} was reachable`);
+    check(existsSync(join(r.path, "app.js")), "control: and the pull request's own content IS there", "");
+    releaseRunCheckout(r.path, { workFetched: true });
+  }
+}
+
+// ── a symlinked dependency destination is refused ────────────────────────────
+//
+// The destination sits inside PR-CONTROLLED content: a pull request can commit a
+// symlink where a unit root belongs, and both mkdir and `cp -R` follow it, so
+// the copy lands wherever the link points — written by the DAEMON, outside the
+// checkout entirely.
+//
+// The SOURCE has to exist or the copy is skipped and the guard never runs. That
+// is what the first version of this got wrong: it passed while proving nothing.
+{
+  const outside = join(root, "escape-target");
+  mkdirSync(outside, { recursive: true });
+
+  // A contributor pushes a branch whose `svc` unit root is a symlink out of the
+  // tree. Built in a separate clone, so the founder's own working tree keeps the
+  // real directory below.
+  const evil = join(root, "evil-clone");
+  execFileSync("git", ["clone", "-q", origin, evil]);
+  const gE = (...a) => execFileSync("git", ["-C", evil, ...a], { encoding: "utf8" }).trim();
+  gE("checkout", "-q", "-b", "symlinked", "origin/main");
+  execFileSync("ln", ["-s", outside, join(evil, "svc")]);
+  gE("add", "-A"); gE("-c", "user.email=o@o", "-c", "user.name=o", "commit", "-qm", "a symlinked unit root");
+  gE("push", "-q", "origin", "symlinked");
+  const evilHead = gE("rev-parse", "HEAD");
+
+  // And the founder has the real dependency tree the daemon would copy FROM.
+  mkdirSync(join(founder, "svc", ".venv"), { recursive: true });
+  writeFileSync(join(founder, "svc", ".venv", "mod.py"), "x = 1\n");
+  check(existsSync(join(founder, "svc", ".venv", "mod.py")), "control: the source tree exists, so a copy would be attempted", "");
+
+  const r = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 66, runId: "r66", branch: "symlinked", head: evilHead,
+                                 depsFrom: ["svc/.venv"] });
+  check(!r.ok && /symlink/.test(r.why ?? ""), "a dependency path through a committed symlink refuses, and says so", JSON.stringify(r.why));
+  check(!existsSync(join(outside, ".venv")), "and nothing was written outside the checkout", outside);
+  check(!existsSync(runPathFor(runs, 66, "r66")), "and the half-built checkout is removed", "");
+  rmSync(join(founder, "svc"), { recursive: true, force: true });
+}
+
+// ── a branch deleted while the worker ran is not recreated ───────────────────
+//
+// `git ls-remote` exits 0 and prints NOTHING when the ref is gone, so an empty
+// result read as "unchanged" and the push recreated a branch someone deleted.
+{
+  const r = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 88, runId: "r88", branch: "feature", head: g(founder, "rev-parse", "origin/feature") });
+  check(r.ok, "control: a checkout to publish from", JSON.stringify(r.why));
+  if (r.ok) {
+    writeFileSync(join(r.path, "fix.txt"), "a fix\n");
+    g(r.path, "add", "-A"); g(r.path, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "the fix");
+    const was = g(founder, "ls-remote", "origin", "refs/heads/feature").split(/\s+/)[0];
+    g(founder, "push", "-q", "origin", "--delete", "feature");        // the contributor closes and deletes it
+    const pub = publishRunWork({ repoRoot: founder, path: r.path, branch: "feature", expectedRemote: was });
+    check(!pub.ok && /no longer exists/.test(pub.why ?? ""), "publishing to a deleted branch refuses", JSON.stringify(pub.why));
+    const after = execFileSync("git", ["-C", origin, "for-each-ref", "--format=%(refname)"], { encoding: "utf8" });
+    check(!/refs\/heads\/feature$/m.test(after), "and the branch stays deleted", after.replace(/\n/g, " "));
+    releaseRunCheckout(r.path, { workFetched: false });
+    rmSync(`${r.path}.unfetched`, { recursive: true, force: true });
   }
 }
 

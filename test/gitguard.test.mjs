@@ -10,10 +10,10 @@
 //
 // Driven against REAL git repositories rather than mocks, because every rule
 // here is about what git actually reports and a mock would simply agree with me.
-import { verifyConfig, recordConfig, configEntries, reason, GIT_NEUTRALISE, REFUSING_HOOK } from "../src/gitguard.mjs";
+import { verifyConfig, recordConfig, configEntries, reason, gitEnv, GIT_ISOLATED_ENV, GIT_NEUTRALISE, REFUSING_HOOK } from "../src/gitguard.mjs";
 import { prepareRunCheckout } from "../src/checkout.mjs";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -130,6 +130,78 @@ const mk = (pr, runId) => prepareRunCheckout({ repoRoot: founder, root: runs, pr
 {
   const w = mk(6, "r6");
   check(existsSync(join(`${w.path}.hooks`, "pre-push")), "the refusing hook is written beside the checkout, not inside it", `${w.path}.hooks`);
+}
+
+// ── a replacement ref rewrites what git SHOWS, not what a push carries ───────
+//
+// `git replace <pinned> <fake>` makes every diff the daemon takes report an
+// innocuous change while the branch it publishes holds the real commits. The
+// configuration fingerprint cannot see it: a replacement is a ref, not a config
+// key.
+{
+  const w = mk(7, "r7");
+  writeFileSync(join(w.path, "forbidden.txt"), "the change reeve must see\n");
+  g(w.path, "add", "-A"); g(w.path, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "the real change");
+  const real = g(w.path, "rev-parse", "HEAD");
+  // A decoy history whose tree does NOT contain the forbidden file.
+  g(w.path, "checkout", "-q", "--detach", head);
+  writeFileSync(join(w.path, "innocuous.txt"), "nothing to see\n");
+  g(w.path, "add", "-A"); g(w.path, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "an innocuous change");
+  const fake = g(w.path, "rev-parse", "HEAD");
+  g(w.path, "replace", real, fake);
+  check(g(w.path, "replace", "-l").length > 0, "control: the worker installed a replacement ref", g(w.path, "replace", "-l"));
+
+  const withReplace = execFileSync("git", ["-C", w.path, "diff", "--name-only", `${head}..${real}`], { encoding: "utf8" }).trim();
+  check(/innocuous/.test(withReplace) && !/forbidden/.test(withReplace),
+    "control: an ordinary git call is fooled by it — this is the attack", JSON.stringify(withReplace));
+
+  const asDaemon = execFileSync("git", ["-C", w.path, ...GIT_NEUTRALISE, "diff", "--name-only", `${head}..${real}`],
+                                { encoding: "utf8", env: gitEnv() }).trim();
+  check(/forbidden/.test(asDaemon),
+    "but the daemon's own call sees the REAL commit, because it refuses replacements", JSON.stringify(asDaemon));
+}
+
+// ── a global filter driver must not run on worker-controlled content ─────────
+//
+// `-c` can only override keys it NAMES, and a filter driver's name comes from
+// the repository's own .gitattributes. A `filter.<anything>.smudge` in the
+// founder's global config is invoked by a checkout of PR content, unsandboxed,
+// as the daemon, BEFORE the worker starts — and a fingerprint cannot protect an
+// operation that already happened.
+{
+  check(GIT_ISOLATED_ENV.GIT_CONFIG_GLOBAL === "/dev/null" && GIT_ISOLATED_ENV.GIT_CONFIG_SYSTEM === "/dev/null",
+    "daemon git calls run with no global and no system configuration", JSON.stringify(GIT_ISOLATED_ENV));
+  check(gitEnv().GIT_CONFIG_GLOBAL === "/dev/null" && typeof gitEnv().PATH === "string",
+    "and the isolation is layered onto the real environment, not a replacement for it", "");
+
+  // Measured rather than asserted: a global driver, a .gitattributes that names
+  // it, and a checkout that must NOT run it.
+  const home = mkdtempSync(join(tmpdir(), "reeve-fakehome-"));
+  const marker = join(home, "FILTER-RAN");
+  // A SCRIPT rather than an inline `sh -c`: git's own config parsing swallows
+  // the quoting, and the first version of this fixture failed its control for
+  // that reason alone — proving nothing about the attack it was written for.
+  const driver = join(home, "evil.sh");
+  writeFileSync(driver, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\ncat\n`, { mode: 0o755 });
+  chmodSync(driver, 0o755);
+  writeFileSync(join(home, ".gitconfig"), `[filter "evil"]\n\tsmudge = ${driver}\n\tclean = cat\n`);
+  const src = mkdtempSync(join(tmpdir(), "reeve-filtersrc-"));
+  execFileSync("git", ["-C", src, "init", "-q"]);
+  writeFileSync(join(src, ".gitattributes"), "*.txt filter=evil\n");
+  writeFileSync(join(src, "a.txt"), "content\n");
+  execFileSync("git", ["-C", src, "add", "-A"]);
+  execFileSync("git", ["-C", src, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "with a filter"], { env: { ...process.env, HOME: home } });
+
+  const dest = join(src, "..", `filter-dest-${process.pid}`);
+  // The control FIRST: with the global config visible, the driver runs.
+  execFileSync("git", ["clone", "-q", src, `${dest}-control`], { env: { ...process.env, HOME: home } });
+  check(existsSync(marker), "control: with the founder's global config in reach, the driver DOES run", marker);
+  rmSync(marker, { force: true });
+
+  execFileSync("git", ["clone", "-q", src, dest], { env: gitEnv({ HOME: home }) });
+  check(!existsSync(marker), "and with global and system config out of reach, it does not", marker);
+  rmSync(home, { recursive: true, force: true }); rmSync(src, { recursive: true, force: true });
+  rmSync(dest, { recursive: true, force: true }); rmSync(`${dest}-control`, { recursive: true, force: true });
 }
 
 rmSync(root, { recursive: true, force: true });

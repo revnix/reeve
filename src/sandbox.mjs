@@ -119,6 +119,17 @@ const expandTilde = p => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
  */
 export const ruleFor = p => (p.startsWith("/") ? `/${p}` : p);
 
+/** Is `p` the same path as `d`, or inside it? */
+export const under = (p, d) => typeof p === "string" && typeof d === "string" && (p === d || p.startsWith(d.endsWith("/") ? d : d + "/"));
+
+/**
+ * A read grant is legitimate only when it reopens part of something the SAME
+ * policy denies. Used to build the grant and to validate it, so the two cannot
+ * disagree — the alternative was a parameter every caller had to reconstruct,
+ * and the canary reconstructed it wrongly and denied itself its own script.
+ */
+export const carveOuts = (denyRead, paths) => paths.filter(p => p && denyRead.some(d => under(p, d)));
+
 /** The tools that touch files, and so are governed by permissions alone. */
 const FILE_TOOLS = new Set(["Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit"]);
 
@@ -205,6 +216,25 @@ const credentialReadDenies = () => credentialPaths().map(p => (isCredentialFile(
 export function sourceCheckoutOf(profile) {
   const c = profile?.identity?.checkout;
   return typeof c === "string" && c.startsWith("/") ? [c.replace(/\/+$/, "")] : [];
+}
+
+/**
+ * The roots every worker's checkout and home live under, denied so that one
+ * worker cannot read another's.
+ *
+ * Capacity runs several workers at once under one `identity.worktreeRoot`, and
+ * the OS sandbox permits reads outside the checkout: sibling `run-*` directories
+ * and `.reeve-worker-home/*` were readable, so a worker could copy another run's
+ * unreviewed changes -- or its session state -- into an allowed path and have
+ * reeve publish them. (Codex #5-[14].)
+ *
+ * The ROOT is denied and the current run's own paths are carved back out, which
+ * is the only shape that survives a new sibling appearing mid-run: an
+ * enumeration of the siblings that existed at policy time would not.
+ */
+export function siblingRootsOf(profile) {
+  const root = profile?.identity?.worktreeRoot;
+  return typeof root === "string" && root.startsWith("/") ? [root.replace(/\/+$/, "")] : [];
 }
 
 /**
@@ -299,6 +329,10 @@ const denyWriteVerbs = glob =>
  */
 export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = null, stateRoots = [] }) {
   const sourceCheckout = sourceCheckoutOf(profile);
+  // The shared root, minus this run's own checkout. A worker reads its own
+  // directory through the cwd grant and the allowRead carve-out below, so
+  // denying the parent costs it nothing and closes every sibling at once.
+  const siblingRoots = siblingRootsOf(profile).filter(r => !worktree || (worktree !== r && !r.startsWith(worktree + "/")));
   // The publishing credential the profile names by absolute path: outside every
   // hard-coded credential directory, so it must be denied explicitly or a worker
   // could copy the token into a source file. (Codex #4f-[8].)
@@ -399,6 +433,10 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
 
   const quarantine = quarantineOsDenies(worktree, risk.quarantinePaths ?? []);
 
+  // The OS deny list, built once: the read grant above is derived from it.
+
+  const osDenyRead = [...credentialPaths(), ...notifyCred, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantine.paths];
+
   // The Read tool is not under the OS sandbox, so the credential paths are
   // denied to it here as well; measured to hold for an absolute path and for a
   // symlink inside the worktree that points at one.
@@ -414,6 +452,10 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
   // Both forms, for the same reason the state roots take both: `Read(<p>/**)`
   // matches descendants, so the directory entry itself would stay readable.
   for (const c of sourceCheckout) { deny.push(`Read(${ruleFor(c)})`); deny.push(`Read(${ruleFor(c)}/**)`); }
+  // The Read tool is already scoped to this checkout, so a sibling is outside its
+  // grant; the deny is the second layer, and it is the OS list below that closes
+  // the shell.
+  for (const c of siblingRoots) { deny.push(`Read(${ruleFor(c)})`); deny.push(`Read(${ruleFor(c)}/**)`); }
 
   return {
     allowedTools: tools.join(","),
@@ -442,8 +484,13 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
         filesystem: {
           allowWrite: tmpDir ? [tmpDir] : [],
           denyWrite: [],
-          allowRead: tmpDir ? [tmpDir] : [],
-          denyRead: [...credentialPaths(), ...notifyCred, ...sourceCheckout, ...stateRoots, ...quarantine.paths],
+          // The run's tmp, then the checkout itself WHEN this policy denies
+          // something above it — which it does once the shared worktree root is
+          // denied so that no worker can read a sibling. Expressed with the same
+          // predicate the validator uses, so a grant and its justification can
+          // never drift apart.
+          allowRead: [...(tmpDir ? [tmpDir] : []), ...carveOuts(osDenyRead, [worktree])],
+          denyRead: osDenyRead,
         },
         network: {
           allowedDomains: NETWORK_DOMAINS(profile, action),
@@ -529,7 +576,8 @@ export function validateToolGrant(allowedTools, { worktree = null } = {}) {
   return { ok: errors.length === 0, errors };
 }
 
-export function validateSettings(settings, { tmpDir = null, stateRoots = [], quarantineDenies = [], extraDenies = [], sourceCheckout = [] } = {}) {
+export function validateSettings(settings, { tmpDir = null, stateRoots = [], quarantineDenies = [], extraDenies = [], sourceCheckout = [],
+                                            siblingRoots = [], worktree = null, readCarveOuts = [] } = {}) {
   const errors = [];
   if (!tmpDir) return { ok: false, errors: ["validator needs the run's tmpDir to judge the write grant"] };
   if (!settings || typeof settings !== "object" || Array.isArray(settings)) return { ok: false, errors: ["settings absent"] };
@@ -548,7 +596,7 @@ export function validateSettings(settings, { tmpDir = null, stateRoots = [], qua
     if (!strs(p.deny)) errors.push("permissions.deny must be an array of strings");
     if (!Array.isArray(p.additionalDirectories) || p.additionalDirectories.length) errors.push("permissions.additionalDirectories must be empty");
     if (strs(p.deny)) for (const d of [...credentialReadDenies(), ...extraDenies.map(c => `Read(${ruleFor(c)})`),
-                                      ...[...stateRoots, ...sourceCheckout].flatMap(r => [`Read(${ruleFor(r)})`, `Read(${ruleFor(r)}/**)`])]) if (!p.deny.includes(d)) errors.push(`permissions.deny is missing ${d}`);
+                                      ...[...stateRoots, ...sourceCheckout, ...siblingRoots].flatMap(r => [`Read(${ruleFor(r)})`, `Read(${ruleFor(r)}/**)`])]) if (!p.deny.includes(d)) errors.push(`permissions.deny is missing ${d}`);
     // A rule naming an absolute path with ONE leading slash matches nothing, and
     // says nothing while it does so. Refusing the shape is the only way a
     // regression to it cannot reach a worker. (Measured 2026-08-22.)
@@ -573,8 +621,17 @@ export function validateSettings(settings, { tmpDir = null, stateRoots = [], qua
       keysIn(fs, ["allowWrite", "denyWrite", "allowRead", "denyRead"], "sandbox.filesystem");
       for (const k of ["allowWrite", "denyWrite", "allowRead", "denyRead"]) if (!strs(fs[k])) errors.push(`sandbox.filesystem.${k} must be an array of strings`);
       if (strs(fs.allowWrite) && (fs.allowWrite.length !== 1 || fs.allowWrite[0] !== tmpDir)) errors.push(`sandbox.filesystem.allowWrite must be exactly the run's tmp (${tmpDir})`);
-      if (strs(fs.allowRead) && (fs.allowRead.length !== 1 || fs.allowRead[0] !== tmpDir)) errors.push(`sandbox.filesystem.allowRead must be exactly the run's tmp (${tmpDir})`);
-      if (strs(fs.denyRead)) for (const c of [...credentialPaths(), ...extraDenies, ...sourceCheckout, ...stateRoots, ...quarantineDenies]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
+      // The run's tmp, and THIS run's own checkout when the policy denies
+      // something above it. Nothing else, and a sibling least of all: a sibling
+      // is also "under a deny", so a rule that merely required the grant to
+      // reopen part of a denied tree would permit exactly the read this exists
+      // to stop. The worktree is named, so the check is an equality.
+      if (strs(fs.allowRead) && strs(fs.denyRead)) {
+        const want = [tmpDir, ...carveOuts(fs.denyRead, [worktree, ...readCarveOuts])];
+        if (JSON.stringify(fs.allowRead) !== JSON.stringify(want))
+          errors.push(`sandbox.filesystem.allowRead must be exactly ${want.join(", ")}`);
+      }
+      if (strs(fs.denyRead)) for (const c of [...credentialPaths(), ...extraDenies, ...sourceCheckout, ...siblingRoots, ...stateRoots, ...quarantineDenies]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
     }
     const net = sb.network;
     if (!isObj(net)) errors.push("sandbox.network must be an object");

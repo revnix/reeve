@@ -15,7 +15,7 @@
 // a write to the run's own tmp), so an absent file means "denied", not
 // "the script never ran".
 import { runWorker, workerArgs } from "./supervisor.mjs";
-import { validateSettings, ruleFor, scopedFileTools } from "./sandbox.mjs";
+import { validateSettings, ruleFor, scopedFileTools, carveOuts } from "./sandbox.mjs";
 import { createHash } from "node:crypto";
 import { createServer, connect } from "node:net";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -363,11 +363,26 @@ export async function sandboxCanary({
     // Write is granted for the probes, and DENIED on the probe script itself: the
     // canary's own instrument must not be rewritable by the thing it measures.
     permissions: { allow: [...canaryGrant(dir, decoyPath)], deny: [...permissionsDeny, "Write(./canary.sh)", "Edit(./canary.sh)"], additionalDirectories: [] },
-    sandbox: { ...sandbox, filesystem: { ...(sandbox.filesystem ?? {}), allowWrite: [tmpDir], allowRead: [tmpDir],
+    sandbox: { ...sandbox, filesystem: { ...(sandbox.filesystem ?? {}), allowWrite: [tmpDir],
+      // The canary's OWN directory is carved back out alongside its tmp. The
+      // production policy denies the shared worktree root so no worker can read
+      // a sibling, and the canary runs UNDER that root — rebuilding this block
+      // without the carve-out denied the canary its own script, and it failed
+      // for a reason that was not the boundary. Caught by a live run.
+      // Carved back out of the SAME deny list this block carries, with the same
+      // predicate the generator and the validator use — the canary runs under
+      // the shared worktree root that production denies.
+      //
+      // `outsideDir` is carved out too, and only here: the exact-file deny under
+      // test needs a READABLE NEIGHBOUR beside the denied file, and the sibling
+      // deny had made the whole directory unreadable, so the control failed and
+      // the exact-file result proved nothing. Writes there stay denied — the
+      // write grant is the tmp alone — so the outside-write probe is untouched.
+      allowRead: [tmpDir, ...carveOuts([...(sandbox.filesystem?.denyRead ?? []), fileDecoyPath], [dir, outsideDir])],
       // The exact-file deny under test. Its neighbour is deliberately NOT denied.
       denyRead: [...(sandbox.filesystem?.denyRead ?? []), fileDecoyPath] } },
   };
-  const sv = validate(settings, { tmpDir });
+  const sv = validate(settings, { tmpDir, worktree: dir, readCarveOuts: [outsideDir] });
   if (!sv.ok) return fail(`canary settings invalid: ${sv.errors.join("; ")}`);
   const settingsPath = join(dir, "canary-settings.json");
   writeFileSync(settingsPath, JSON.stringify(settings, null, 2));

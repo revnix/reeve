@@ -26,7 +26,7 @@
 // And a sixth, unprompted: denied twice, the model reached for a THIRD tool that
 // was not in the allowlist at all. Any tool that can run a command is a write
 // primitive, so this must be a closed allowlist, never a denylist.
-import { sandboxFor, reviewDiff, validateSettings, validateToolGrant, scopeGrant, credentialPaths, quarantineOsDenies, CREDENTIAL_PATHS } from "../src/sandbox.mjs";
+import { sandboxFor, reviewDiff, validateSettings, validateToolGrant, scopeGrant, credentialPaths, quarantineOsDenies, siblingRootsOf, CREDENTIAL_PATHS } from "../src/sandbox.mjs";
 import { readFileSync, mkdtempSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -327,8 +327,15 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   // expand to `<scratch>/.ssh` and protect nothing. Measured 2026-08-22.
   check(credentialPaths().every(c => fs.denyRead?.includes(c)), "credential paths are deny-read at the OS layer", JSON.stringify(fs.denyRead?.slice(0, 3)));
   check(fs.denyRead.every(p => !p.startsWith("~")), "and every one of them is an absolute path, never a tilde", JSON.stringify(fs.denyRead.filter(p => p.startsWith("~"))));
-  check(JSON.stringify(fs.allowWrite) === JSON.stringify([TMP]) && JSON.stringify(fs.allowRead) === JSON.stringify([TMP]),
-    "the run's own tmp is the only write grant beyond cwd, carved back out of the deny-read", JSON.stringify([fs.allowWrite, fs.allowRead]));
+  check(JSON.stringify(fs.allowWrite) === JSON.stringify([TMP]),
+    "the run's own tmp is the only write grant beyond cwd", JSON.stringify(fs.allowWrite));
+  // The read grant is the tmp AND the checkout itself: the shared worktree root
+  // is denied so no worker can read a sibling, and this is what keeps a worker
+  // able to read its own code.
+  // No shared worktree root in this profile, so nothing above the checkout is
+  // denied and there is nothing to carve back out.
+  check(JSON.stringify(fs.allowRead) === JSON.stringify([TMP]),
+    "and the read grant is the tmp alone when no deny sits above the checkout", JSON.stringify(fs.allowRead));
   const deny = s.settings.permissions.deny;
   check(credentialPaths().every(c => deny.includes(`Read(/${c}/**)`) || deny.includes(`Read(/${c})`)),
     "and the Read tool, which the OS sandbox does not cover, is denied the same paths", deny.filter(d => d.startsWith("Read(")).slice(0, 2).join(" "));
@@ -397,6 +404,40 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   check(!nowhere.allowedTools.split(",").some(t => /^(Read|Edit|Write|Grep|Glob)\b/.test(t)),
     "a policy built with no checkout grants no file tools at all", nowhere.allowedTools);
   rmSync(wt, { recursive: true, force: true });
+}
+
+// ── one worker must not read another's checkout ──────────────────────────────
+//
+// Capacity runs several workers at once under one identity.worktreeRoot, and the
+// OS sandbox permits reads outside the checkout. Sibling `run-*` directories and
+// `.reeve-worker-home/*` were readable, so a worker could copy another run's
+// unreviewed changes — or its session state — into an allowed path and have
+// reeve publish them.
+{
+  const ROOT = "/srv/worktrees", MINE = "/srv/worktrees/run-42-abc";
+  const prof = { ...profile, identity: { ...profile.identity, worktreeRoot: ROOT, checkout: "/srv/clone" } };
+  const s = sandboxFor({ profile: prof, action: "FIX_CI", worktree: MINE, tmpDir: TMP });
+  const fs2 = s.settings.sandbox.filesystem;
+
+  check(fs2.denyRead.includes(ROOT), "the shared worktree root is deny-read, so every sibling is closed at once", JSON.stringify(fs2.denyRead.slice(-4)));
+  check(JSON.stringify(fs2.allowRead) === JSON.stringify([TMP, MINE]),
+    "and this run's OWN checkout is carved back out, or the worker cannot read its code", JSON.stringify(fs2.allowRead));
+  check(s.settings.permissions.deny.includes(`Read(/${ROOT}/**)`),
+    "the Read tool is denied the root too", s.settings.permissions.deny.filter(d => d.includes("worktrees")).join(" "));
+  // Denying the ROOT rather than listing siblings is the only shape that
+  // survives a new run appearing after the policy was written.
+  const siblings = fs2.denyRead.filter(d => d.startsWith(ROOT + "/run-") && d !== MINE && !d.startsWith(MINE + "/"));
+  check(siblings.length === 0,
+    "no sibling is named individually — a list would go stale the moment another run starts", JSON.stringify(siblings));
+  check(validateSettings(s.settings, { tmpDir: TMP, sourceCheckout: ["/srv/clone"], siblingRoots: [ROOT], worktree: MINE }).ok === true,
+    "control: the generated settings validate against that expectation", "");
+  const widened = structuredClone(s.settings);
+  widened.sandbox.filesystem.allowRead = [TMP, MINE, "/srv/worktrees/run-43-xyz"];
+  check(validateSettings(widened, { tmpDir: TMP, sourceCheckout: ["/srv/clone"], siblingRoots: [ROOT], worktree: MINE }).ok === false,
+    "and a policy that carves a SIBLING back out is refused", "");
+
+  check(JSON.stringify(siblingRootsOf({ identity: { worktreeRoot: "relative" } })) === "[]",
+    "a relative worktreeRoot contributes no deny — a relative path in a policy protects nothing", "");
 }
 
 // ── the clone a worker's checkout was made FROM ───────────────────────────────

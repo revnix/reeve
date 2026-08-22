@@ -70,13 +70,41 @@ INCOMPARABLE: neither agreement nor disagreement, which the shadow already
 handles as "a tick where nothing was learned". It costs volume on quiet pull
 requests and buys an instrument whose every remaining comparison is sound.
 
-## What this does NOT establish
+## The second finding: `updatedAt` is not a complete change signal
 
-Whether the ingest is also **missing** threads for a reason of its own. Five
-threads on #1128 had never been ingested, and the `moved` guard skips the ingest
-entirely when a PR's `updatedAt` has not changed. That is a separate question,
-and it is now answerable: with the instrument comparing one moment against
-itself, a divergence that survives is a real one.
+The ingest is skipped when a pull request's `updatedAt` has not moved. Measured
+on revnix/reeve #4, a merged pull request where thread state is inert:
+
+| action | `pull_request.updated_at` |
+|---|---|
+| before | `2026-08-22T05:53:04Z` |
+| after **unresolving** a thread | `2026-08-22T05:53:04Z` |
+| after **re-resolving** it | `2026-08-22T05:53:04Z` |
+
+Byte-identical. **Resolving a review thread does not touch it.**
+
+So a pull request whose only activity is threads being resolved or reopened —
+which is most of a review's life — looks unchanged, the ingest is skipped
+indefinitely, and the projection keeps counts that stopped being true. That is
+the fail-OPEN direction for PR-5: the verdict would read *fewer* unresolved
+threads than exist. It also explains the direction of the `resolved differs`
+divergences, where the derived count was HIGHER than live: a thread that was
+reopened does not bump `updatedAt` either, so reeve never saw it come back.
+
+It would also have starved the fix above, since a tick that does not observe now
+has no snapshot to compare.
+
+The projection is therefore refreshed when the pull request moved **or** when
+what reeve holds is older than the window the fold itself already calls stale
+(`watch.staleSeconds`, 900 by default). A quiet pull request costs one
+observation per window rather than one per tick.
+
+## What this still does NOT establish
+
+Whether five threads on #1128 went uningested for this reason or another. The
+staleness bound makes that self-correcting rather than permanent, and with the
+instrument now comparing one moment against itself, a divergence that survives
+is a real one.
 
 Nothing here affects live judgement. The verdict reads GitHub directly; the
 projection is shadow-only until PR-5.

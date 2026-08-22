@@ -74,8 +74,25 @@ export const GIT_ISOLATED_ENV = Object.freeze({
   GIT_NO_REPLACE_OBJECTS: "1",
 });
 
-/** The env for a daemon git call, with the isolation above layered on. */
-export const gitEnv = (extra = {}) => ({ ...process.env, ...GIT_ISOLATED_ENV, ...extra });
+/**
+ * The env for a daemon git call: the real environment with the isolation above
+ * layered on, and git's CONFIGURATION-INJECTION variables removed.
+ *
+ * `GIT_CONFIG_COUNT` with its `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` pairs, and
+ * `GIT_CONFIG_PARAMETERS`, are applied by git INDEPENDENTLY of the global and
+ * system files — so pointing those files at /dev/null closes nothing if the
+ * daemon was launched with a filter driver injected that way, and a pull
+ * request's `.gitattributes` can then name it. Inheriting them is the same hole
+ * the file isolation exists to shut. (Codex #7-[1].)
+ */
+export function gitEnv(extra = {}) {
+  const env = { ...process.env };
+  for (const k of Object.keys(env)) {
+    if (k === "GIT_CONFIG_COUNT" || k === "GIT_CONFIG_PARAMETERS"
+        || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(k)) delete env[k];
+  }
+  return { ...env, ...GIT_ISOLATED_ENV, ...extra };
+}
 
 function git(cwd, args) {
   try {

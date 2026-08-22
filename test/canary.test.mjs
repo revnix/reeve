@@ -41,7 +41,7 @@ const base = {
 // The Write-tool probe is judged from the stream too: writeTool "denied"
 // (attempted + refused), "leak" (the file appears), "absent" (never attempted),
 // "not-denied" (attempted, no refusal in the stream).
-const streamFor = (readTool, writeTool = "denied") => {
+const streamFor = (readTool, writeTool = "denied", readInside = "allowed") => {
   const lines = [];
   const use = (name, id, path) => ({ type: "assistant", message: { content: [{ type: "tool_use", name, id, input: { file_path: path } }] } });
   const resultOf = (id, content, err) => ({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content, is_error: err ?? /denied/i.test(content) }] } });
@@ -56,6 +56,14 @@ const streamFor = (readTool, writeTool = "denied") => {
     if (writeTool === "denied" || writeTool === "leak") lines.push(JSON.stringify(resultOf("w1", "Permission to write outside the working directory was denied.")));
     else if (writeTool === "not-denied") lines.push(JSON.stringify(resultOf("w1", "(written)", false)));
   }
+  // The positive control: the SAME tool on the worker's own file. Without it a
+  // canary made only of refusals passes just as happily when the worker can do
+  // nothing at all — which is exactly what a deny on the checkout's parent did.
+  if (readInside !== "absent") {
+    lines.push(JSON.stringify(use("Read", "r2", join(base.dir, "inside-control.txt"))));
+    if (readInside === "denied") lines.push(JSON.stringify(resultOf("r2", "Permission to read the file was denied.")));
+    else lines.push(JSON.stringify(resultOf("r2", "reeve canary inside-control", false)));
+  }
   return lines.length ? lines.join("\n") + "\n" : "";
 };
 // The script sandboxCanary would build for this fixture. The instrument is part
@@ -65,7 +73,7 @@ const scriptOf = b => canaryScript({ tmpDir: b.tmpDir, outsideDir: b.outsideDir,
                                      fileDecoyPath: join(b.outsideDir, "FILE-DECOY.txt"),
                                      fileControlPath: join(b.outsideDir, "FILE-CONTROL.txt") });
 
-const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, decoy = false, symlink = false, results = true, outcome = "ok", readTool = "denied", writeTool = "denied", fileDecoy = false, fileControl = true, keychainReach = false, keychainByPath = null, keychainOpen = null } = {}) =>
+const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, decoy = false, symlink = false, results = true, outcome = "ok", readTool = "denied", writeTool = "denied", fileDecoy = false, fileControl = true, keychainReach = false, keychainByPath = null, keychainOpen = null, readInside = "allowed" } = {}) =>
   async ({ cwd, outPath }) => {
     const rec = [];
     if (inside) writeFileSync(join(cwd, "INSIDE"), ""); rec.push(`inside=${inside ? 0 : 1}`);
@@ -101,7 +109,7 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     const lines = results === "no-path-probes" ? rec.filter(l => !l.startsWith("kc_path_"))
       : results === "no-open-probe" ? rec.filter(l => !l.startsWith("kc_path_open")) : rec;
     if (results) writeFileSync(join(cwd, "canary-results.txt"), lines.join("\n") + "\n");
-    if (outPath) writeFileSync(outPath, streamFor(readTool, writeTool));
+    if (outPath) writeFileSync(outPath, streamFor(readTool, writeTool, readInside));
     // "leak" means the Write tool actually created the outside file.
     if (writeTool === "leak") writeFileSync(join(base.outsideDir, "TOOL-OUTSIDE"), "BLOCKED");
     if (readTool === "denied") writeFileSync(join(cwd, "read-tool-out"), "DENIED");
@@ -351,6 +359,22 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   };
   const r = await sandboxCanary({ ...base, netProbe: late, runner: runnerThat() });
   check(r.ok, "a listener whose url arrives with `ready` still gets its probe into the script", r.why);
+}
+
+// ── a boundary made only of refusals passes when nothing works ───────────────
+//
+// Every other probe measures something being REFUSED. A canary built from those
+// alone is happiest when the worker can do nothing at all — and that is not
+// hypothetical: a permission deny on the parent of the checkout refused the
+// worker every Read of its own files, for every dispatch, and this canary passed
+// because its Read-tool probe only ever read OUTSIDE.
+{
+  const denied = await sandboxCanary({ ...base, runner: runnerThat({ readInside: "denied" }) });
+  check(denied.ok === false && /OWN file/.test(denied.why ?? ""),
+    "a worker that cannot read its own file FAILS the canary, however many denials held", denied.why);
+  const absent = await sandboxCanary({ ...base, runner: runnerThat({ readInside: "absent" }) });
+  check(absent.ok === false && /never read its own file/.test(absent.why ?? ""),
+    "and a canary that never tried proves nothing rather than passing", absent.why);
 }
 
 // ── the SCRIPT is part of the boundary's identity ────────────────────────────

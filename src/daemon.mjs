@@ -14,7 +14,7 @@
 //     it WOULD do. Shipping a loop that acts before its decisions have been
 //     watched is how an unattended run becomes an incident.
 
-import { evaluatePr, publishVerdict } from "./pr.mjs";
+import { evaluatePr, publishVerdict, readThreads } from "./pr.mjs";
 import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
@@ -516,10 +516,15 @@ export async function tick(ctx) {
     if (ctx.reviewIngest !== false && e.ok) {
       noteHead(db, nwo, pr, e.head);
       const moved = !ctx.lastIngest?.get?.(pr) || ctx.lastIngest.get(pr) !== e.updatedAt;
+      // Whether this tick's ingest changed anything, which decides below whether
+      // the live read taken back in evaluate() still describes the same moment
+      // as the projection.
+      let ingestWrote = false;
       if (moved) {
         try {
           const seen = (ctx.observe ?? observe)(nwo, pr);
           const w = ingest(db, nwo, pr, seen.observations, { at: now() });
+          ingestWrote = !!(w.inserted || w.generations);
           if (w.inserted || w.generations) {
             log(logPath, `  #${pr}: ingest +${w.inserted} new, +${w.generations} edit(s)` +
                          `${seen.incomplete ? " — INCOMPLETE read" : ""}`);
@@ -554,7 +559,27 @@ export async function tick(ctx) {
         // The shadow comparison. e.threads is the LIVE read the verdict already
         // trusts, so this asks the only question that matters before PR-5 swaps
         // them over: does the derived view say the same thing?
-        const cmp = compare(e.threads, st);
+        //
+        // Both readings must describe the SAME MOMENT. They did not: the live
+        // read happens inside evaluate(), the ingest above runs after it, and
+        // the projection is built from what that ingest just wrote — so a pull
+        // request that moved in between was recorded as the derivation
+        // disagreeing, which is a different claim entirely.
+        //
+        // Measured 2026-08-22: every one of the week's four recorded
+        // divergences AGREED exactly when the pair was taken together, and the
+        // probe's own ingest was still inserting five threads on #1128 — the
+        // very count that PR's divergence reported.
+        // (docs/measured/2026-08-22-the-shadow-compared-two-moments.md)
+        //
+        // So the live read is retaken only when the ingest wrote something. A
+        // quiet pull request costs no extra call, and an unreadable retake makes
+        // the tick INCOMPARABLE rather than a disagreement, which is what a tick
+        // that learned nothing is.
+        const liveNow = ingestWrote ? (ctx.readThreads ?? readThreads)(nwo, pr) : e.threads;
+        if (ingestWrote && liveNow?.readable === false)
+          log(logPath, `  #${pr}: shadow not compared — the live re-read failed: ${liveNow.why}`);
+        const cmp = compare(liveNow, st);
         recordShadow(db, nwo, pr, cmp, now());
         if (cmp.comparable && !cmp.agree) {
           log(logPath, `  #${pr}: SHADOW DIVERGENCE — ${cmp.why}`);

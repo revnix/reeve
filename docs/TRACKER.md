@@ -164,57 +164,48 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       `CONTAINMENT.credentialRead === "open"` (escalation
       `guardian:containment:open`). PR-2 closes it or the founder picks a
       dedicated worker user.
-- [ ] **PR-2 (S1 sandbox) — IN REVIEW, branch `feat/s1-sandbox`.** Both CLI
-      measurements are recorded (`docs/measured/2026-08-22-claude-print-mode.md`):
-      the `sandbox.*` block APPLIES under `-p` (network, outside writes,
-      `denyRead` incl. through symlinks, and `Read(...)` denies all hold), and
-      an INVALID settings file is dropped WHOLE and silently, deny rules
-      included. Shipped:
-      · **`sandbox.*` in every worker's settings** (`src/sandbox.mjs`):
-        enabled, failIfUnavailable, allowUnsandboxedCommands=false,
-        autoAllowBashIfSandboxed=false, no excluded commands; write scope =
-        worktree + the run's own tmp; network denied except research; the
-        credential paths are `denyRead` at the OS layer AND `Read(...)`-denied
-        for the Read tool the OS sandbox doesn't cover.
-      · **`validateSettings` before spawn** — a closed key-allowlist with exact
-        values; a refusal is a preparation failure (refund + backoff), never a
-        launch, because an invalid file would be silently ignored.
-      · **The sandbox canary** (`src/canary.mjs`): one throwaway worker per
-        (CLI build, block) runs a fixed script; the DAEMON reads the files it
-        left (writes outside, network, decoy reads — each with a positive
-        control), never the worker's word. Cached while it passes; a failure is
-        re-measured.
-      · **Measured containment** (`src/containment.mjs`): the static
-        `CONTAINMENT` constant is SUPERSEDED. Dispatch under `--execute` is
-        gated on `measureContainment` = canary pass **AND** an empty login
-        keychain of GitHub items **AND** a measured platform. Anything
-        unmeasured is open. Keychain probe is metadata-only (no `-w`/`-g`).
-      · **Doctor R-14 (canary) / R-15 (keychain)** — R-14 UNKNOWN with no
-        record, BROKEN on a failed canary, OK on a pass; R-15 DEGRADED (not
-        broken) while the keychain holds a credential: dispatch is gated,
-        observation/review unaffected.
-      · **Escape test** (`test/escape.test.mjs`) rewritten to measure every
-        shape twice — environment-only and UNDER THE SANDBOX (via the runtime's
-        own profile, `@anthropic-ai/sandbox-runtime` as a dev dep, no model).
-        The sandbox CLOSES the env-only holes (`--no-verify`,
-        `-c core.hooksPath=` pushes cannot land: destination is outside the
-        write scope; network denied). **Two KNOWN-OPEN remain under the sandbox
-        in a LINKED worktree:** (1) the shared ref store lets a worker move the
-        checkout's own branches; (2) `git -c credential.helper=osxkeychain
-        credential fill` returns the founder's token (securityd is hard-allowed
-        by the runtime's profile; no setting closes it).
-      Suite 57/57. **Codex round 1 (10 findings, 7 P1) all worked** — see the
-      defect log below. The verdict is now strictly harder to reach: dispatch
-      requires canary + platform + keychain-clean **AND** a declared isolated
-      worker (`worker.isolation: dedicated-user`), because the keychain probe is
-      necessary-not-sufficient (a token can hide under another service name) and
-      a linked worktree shares the checkout's git dir. **The ONE closure is a
-      dedicated worker OS user** (own empty keychain + own clone); clearing the
-      founder's keychain is no longer treated as sufficient. **Not flipped:**
-      `worker.isolation` defaults to `none`, so dispatch is refused; the
-      dedicated-user DISPATCH TOPOLOGY (per-run standalone clones owned by the
-      worker user) is **PR-3** — do not set the flag to `dedicated-user` before
-      PR-3 lands it.
+- [x] **PR-2 (S1 sandbox) — LANDED 2026-08-22, revnix/reeve #4, merge `1a2fbea`.**
+      Verified: the PR head equals the head I pushed, and main's tree hash equals
+      mine, so nothing was stranded. Deployed, daemon restarted: clean tick,
+      backups of both stores, no new errors.
+      **What it ships.** Both print-mode unknowns are measured
+      (`docs/measured/2026-08-22-claude-print-mode.md`): the `sandbox.*` block
+      APPLIES under `-p`, and an INVALID settings file is dropped whole and
+      silently — so a supplied path proves nothing. On that footing:
+      · the OS sandbox in every worker's settings (network denied except
+        research, writes confined to the worktree + the run's tmp, credential
+        paths deny-read at the OS layer AND for the Read tool, quarantine paths
+        resolved to OS denies with unrepresentable globs REFUSING dispatch);
+      · `validateSettings` before spawn, because an invalid file is ignored;
+      · the **sandbox canary** — a throwaway worker per (CLI build, policy) whose
+        files the DAEMON reads: outside writes, network (against a daemon-local
+        listener as the positive control), subtree AND exact-file credential
+        reads, the Read tool and the Write tool, with a control beside each;
+      · **measured containment**: dispatch needs a canary pass AND an empty
+        keychain AND a measured platform AND a verified isolated worker, and it
+        is re-checked immediately before every spawn;
+      · the daemon's own git is neutralised in worker-controlled directories and
+        refuses to run at all where the worker changed the repo config;
+      · doctor R-14 (canary) and R-15 (credential reach).
+      **8 Codex rounds, 43 genuine findings closed.** Rounds 1-6 found new areas
+      (quarantine unenforced at the OS layer, git's XDG credential store,
+      `core.fsmonitor` as daemon-user RCE); rounds 7-8 were entirely follow-ups
+      on my own fixes — that shift, not the count, was the convergence signal.
+      **NOT flipped, by code:** `worker.isolation` defaults to `none` and
+      `isolationTopologyReady()` returns false, so dispatch is refused twice
+      over. Live doctor: R-13 OK, R-14 UNKNOWN (no canary has run), R-15
+      DEGRADED (the login keychain holds a GitHub credential).
+      **The ONE closure is a dedicated worker OS user** (own empty keychain, own
+      clone). Building that topology is **PR-3**; do not set the flag before it
+      lands, and expect the first acquire after it to quarantine any worktree
+      with no recorded config baseline (self-healing, once).
+- [ ] **PR-3 (S1 close-out): the dedicated-user dispatch topology.** The only
+      thing that closes containment: a separate OS user for workers (its own
+      empty keychain) and a per-run STANDALONE clone (its own git dir, which
+      also closes the shared-ref and shared-config holes). Ships with a real
+      `isolationTopologyReady()` (euid differs from the checkout owner; the
+      worktree is a standalone clone), replacing today's hard-false. Only after
+      it lands may `worker.isolation: dedicated-user` be set.
 
 ### Founder actions pending
 

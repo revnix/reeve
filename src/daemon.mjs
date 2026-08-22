@@ -167,10 +167,10 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     const canaryStateDir = ctx.canaryStateDir ?? stateDir;
     const canaryPaths = {
       dir: join(root, ".reeve-canary", "run"), outsideDir: join(root, ".reeve-canary", "outside"), tmpDir: join(root, ".reeve-canary", "tmp"),
-      // Under the deny-read path itself (so it is measurable), per repository AND
-      // per invocation: two daemons sharing one decoy could delete each other's
-      // and read the resulting ENOENT as a denial. (Codex #4-[1].)
-      decoyPath: join(homedir(), ".reeve", "canary", nwo.replace("/", "-"), `decoy-${process.pid}-${Date.now()}.txt`),
+      // Under the CONFIGURED state root (deny-read, so it is measurable), per
+      // repository AND per invocation: two daemons sharing one decoy could delete
+      // each other's and read the ENOENT as a denial. (Codex #4-[1], #4b-[11].)
+      decoyPath: join(process.env.REEVE_HOME ?? join(homedir(), ".reeve"), "canary", nwo.replace("/", "-"), `decoy-${process.pid}-${Date.now()}.txt`),
     };
     const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
     // The credential-less git config lives in the run's tmp, which the sandbox

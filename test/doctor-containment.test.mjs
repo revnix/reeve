@@ -41,8 +41,12 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
 
 // ── R-15 ─────────────────────────────────────────────────────────────────────
 {
-  const c = checkKeychain({ probe: () => ({ measured: true, items: [], why: null }) });
-  check(c.id === "R-15" && c.level === "OK", "an empty keychain (of GitHub items) is OK", JSON.stringify(c));
+  const c = checkKeychain({ probe: () => ({ measured: true, items: [], why: null }), isolation: "dedicated-user" });
+  check(c.id === "R-15" && c.level === "OK", "an empty keychain AND a declared isolated worker is OK", JSON.stringify(c));
+}
+{
+  const c = checkKeychain({ probe: () => ({ measured: true, items: [], why: null }), isolation: "none" });
+  check(c.level === "DEGRADED" && /shared account cannot be certified/.test(c.lines.join(" ")), "an empty keychain WITHOUT an isolated worker is DEGRADED, not OK", c.lines.join(" | "));
 }
 {
   const c = checkKeychain({ probe: () => ({ measured: true, items: ["generic password gh:github.com (gh keyring)"], why: "holds" }) });

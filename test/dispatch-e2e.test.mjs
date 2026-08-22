@@ -145,6 +145,10 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 {
   const dir4 = mkdtempSync(join(tmpdir(), "reeve-e2e-contain-"));
   const ctx4 = { ...baseCtx(), db: open(join(dir4, "c.db")), logPath: join(dir4, "log.txt"), worktreeFor: () => mkdtempSync(join(dir4, "wt-")),
+                 // No cheaper reason, so the canary is the gate that runs and fails:
+                 // measured platform, an isolated worker declared, an empty keychain.
+                 platform: "darwin",
+                 profile: { ...profile, worker: { isolation: "dedicated-user" } },
                  canary: async () => ({ ok: false, id: "planted", why: "planted: wrote outside the worktree", evidence: {} }),
                  keychain: { measured: true, items: [], why: null } };
   delete ctx4.containment;          // measured, not declared
@@ -157,7 +161,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   check(!/open \d|\d+ worker/.test(keys.join(" ")), "the key carries no counts", keys.join(" | "));
   const log4 = readFileSync(join(dir4, "log.txt"), "utf8");
   check(/NOT dispatching/.test(log4) && /canary planted failed: planted: wrote outside/.test(log4), "the log names the measured reason", log4.split("\n").filter(l => /dispatch/.test(l)).join(" | ").slice(0, 300));
-  check(existsSync(join(dir4, "canary", "o-r.json")) && JSON.parse(readFileSync(join(dir4, "canary", "o-r.json"), "utf8")).ok === false,
+  check(existsSync(join(dir4, "canary", "o", "r.json")) && JSON.parse(readFileSync(join(dir4, "canary", "o", "r.json"), "utf8")).ok === false,
     "and the canary's result is persisted for the doctor", "");
   // Every action promptFor can dispatch is a worker task, SPILL included; the
   // refusal must count them from one shared list, not a hand-copied subset.
@@ -215,7 +219,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   check(launchedC === 1, "measured closed: a worker is dispatched", String(launchedC));
   check(![...rC.escalations.keys()].includes("guardian:containment:open"), "and no containment escalation stands", [...rC.escalations.keys()].join(" | "));
   check(canaryRuns === 1, "the canary ran exactly once", String(canaryRuns));
-  const stateC = JSON.parse(readFileSync(join(dirC, "canary", "o-r.json"), "utf8"));
+  const stateC = JSON.parse(readFileSync(join(dirC, "canary", "o", "r.json"), "utf8"));
   check(stateC.ok === true && stateC.id === "good", "the passing result is persisted", JSON.stringify(stateC));
   await tick(ctxC);
   check(canaryRuns === 1, "a second tick reuses the passing canary", String(canaryRuns));

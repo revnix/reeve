@@ -404,9 +404,13 @@ export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now 
     "network, outside writes and credential-file reads denied; inside and tmp writes allowed"] };
 }
 
-/** GitHub credentials in the login keychain, by metadata only. */
-export function checkKeychain({ probe = probeKeychain } = {}) {
+/** GitHub credentials in the login keychain, and the isolation prerequisite.
+ * An empty two-item probe is necessary but NOT sufficient: dispatch also needs
+ * `worker.isolation: dedicated-user`, so doctor must not read OK while the
+ * daemon necessarily refuses. (Codex #4b-[10].) */
+export function checkKeychain({ probe = probeKeychain, isolation = "none" } = {}) {
   const id = "R-15", title = "worker credential reach";
+  const isolated = isolation === "dedicated-user";
   const kc = probe();
   if (!kc.measured) return { id, level: UNKNOWN, title, lines: [`unmeasured: ${kc.why}`, "an unmeasured keychain keeps dispatch refused"] };
   if (kc.items.length) return { id, level: DEGRADED, title, lines: [
@@ -416,7 +420,15 @@ export function checkKeychain({ probe = probeKeychain } = {}) {
     "-> run workers as a dedicated user (closes this AND the shared-ref hole), or log gh in with --insecure-storage",
     "   and delete the git osxkeychain internet-password item for github.com (closes the keychain only)",
   ] };
-  return { id, level: OK, title, lines: ["no GitHub credential in the login keychain; file credentials are deny-read by the sandbox"] };
+  // The probe found neither of the two conventional items, but that cannot
+  // certify a shared account, so an un-isolated profile is still DEGRADED.
+  if (!isolated) return { id, level: DEGRADED, title, lines: [
+    "no GitHub credential under the two conventional keychain items, but a shared account cannot be certified",
+    "(another client can store a token under a different service name), and a linked worktree shares the git dir",
+    "dispatch under --execute stays REFUSED until worker.isolation is 'dedicated-user'; observation is unaffected",
+    "-> run workers as a dedicated OS user with its own empty keychain and its own clone, then set worker.isolation",
+  ] };
+  return { id, level: OK, title, lines: ["no GitHub credential in the login keychain, and an isolated worker is declared; file credentials are deny-read by the sandbox"] };
 }
 
 // ── driver ────────────────────────────────────────────────────────────────
@@ -434,7 +446,7 @@ export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null
     appCheck,
     checkBaseline(nwo, profile, baselineIo),
     checkCanary(nwo, { stateDir, ...canaryIo }),
-    checkKeychain(keychainIo),
+    checkKeychain({ isolation: profile.worker?.isolation, ...keychainIo }),
   ].filter(Boolean);
 
   const broken = checks.filter(c => c.level === BROKEN);

@@ -28,6 +28,7 @@
 
 import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 
 /**
  * Read-only git. A fixer has to see what it is changing, and none of these can
@@ -102,7 +103,22 @@ export const CREDENTIAL_PATHS = [
 ];
 // The same list as Read-tool rules: a file is named, a directory gets `/**`.
 const CREDENTIAL_FILES = new Set(["~/.claude.json", "~/.gitconfig", "~/.git-credentials", "~/.netrc", "~/.npmrc"]);
-const credentialReadDenies = () => CREDENTIAL_PATHS.map(p => (CREDENTIAL_FILES.has(p) ? `Read(${p})` : `Read(${p}/**)`));
+
+/**
+ * The credential paths, plus the CONFIGURED reeve state root when it is not the
+ * default `~/.reeve`. `~/.reeve` (the profile, every store, every run's output)
+ * is already listed, but `REEVE_HOME` can point the state root elsewhere, and a
+ * state root the sandbox does not deny is readable — a worker could copy the
+ * profile or another run's output into its worktree for reeve to publish.
+ * (Codex #4b-[11].)
+ */
+export function credentialPaths() {
+  const root = process.env.REEVE_HOME;
+  const extra = (root && root.startsWith("/") && root.replace(/\/+$/, "") !== join(homedir(), ".reeve"))
+    ? [root.replace(/\/+$/, "")] : [];
+  return [...CREDENTIAL_PATHS, ...extra];
+}
+const credentialReadDenies = () => credentialPaths().map(p => (CREDENTIAL_FILES.has(p) ? `Read(${p})` : `Read(${p}/**)`));
 
 /**
  * Actions whose Bash may reach the network at all, and where the domains come
@@ -276,7 +292,7 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
           allowWrite: tmpDir ? [tmpDir] : [],
           denyWrite: [],
           allowRead: tmpDir ? [tmpDir] : [],
-          denyRead: [...CREDENTIAL_PATHS],
+          denyRead: credentialPaths(),
         },
         network: {
           allowedDomains: NETWORK_DOMAINS(profile, action),
@@ -343,7 +359,7 @@ export function validateSettings(settings, { tmpDir = null } = {}) {
       for (const k of ["allowWrite", "denyWrite", "allowRead", "denyRead"]) if (!strs(fs[k])) errors.push(`sandbox.filesystem.${k} must be an array of strings`);
       if (strs(fs.allowWrite) && (fs.allowWrite.length !== 1 || fs.allowWrite[0] !== tmpDir)) errors.push(`sandbox.filesystem.allowWrite must be exactly the run's tmp (${tmpDir})`);
       if (strs(fs.allowRead) && (fs.allowRead.length !== 1 || fs.allowRead[0] !== tmpDir)) errors.push(`sandbox.filesystem.allowRead must be exactly the run's tmp (${tmpDir})`);
-      if (strs(fs.denyRead)) for (const c of CREDENTIAL_PATHS) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
+      if (strs(fs.denyRead)) for (const c of credentialPaths()) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
     }
     const net = sb.network;
     if (!isObj(net)) errors.push("sandbox.network must be an object");

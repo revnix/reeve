@@ -158,6 +158,12 @@ export async function sandboxCanary({
   const settingsPath = join(dir, "canary-settings.json");
   writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
 
+  // The network control BRACKETS the sandboxed request: sampled immediately
+  // before and after the run, and trusted only when reachable in BOTH samples,
+  // so a failed sandboxed curl cannot be certified as a denial across a
+  // connectivity dip that recovered before a single later sample. (Codex #4b-[9].)
+  const netBefore = (() => { try { return netReachable(); } catch { return null; } })();
+
   let r;
   try {
     r = await runner({
@@ -168,6 +174,7 @@ export async function sandboxCanary({
   } catch (err) {
     r = { outcome: "failed", why: `the canary runner threw: ${err.message}` };
   }
+  const netAfter = (() => { try { return netReachable(); } catch { return null; } })();
   evidence.outcome = r?.outcome ?? null;
   evidence.why = r?.why ?? null;
 
@@ -178,13 +185,19 @@ export async function sandboxCanary({
   // have deleted it; the daemon now uses a per-invocation decoy, and this is the
   // backstop.)
   const decoyGone = !existsSync(decoyPath);
-  // The Read-tool probe: the worker wrote what the Read tool returned (or DENIED).
-  // The sentinel appearing here means the Read deny did not hold.
+  // The Read-tool probe judged from the worker's OWN EVENT STREAM, not a file it
+  // wrote: a model can write "DENIED" without ever calling Read. The stream must
+  // show a Read tool_use targeting the decoy AND a denied result. The written
+  // file and its sentinel are a second, corroborating check. (Codex #4b-[8].)
+  const readEv = parseReadProbe(join(dir, "canary.out"), decoyPath);
   const readOut = existsSync(join(dir, "read-tool-out")) ? readFileSync(join(dir, "read-tool-out"), "utf8") : null;
-  evidence.readTool = readOut === null ? "absent" : (readOut.includes(CANARY_SENTINEL) ? "LEAKED" : "denied");
-  // The network positive control.
-  const reachable = (() => { try { return netReachable(); } catch { return null; } })();
-  evidence.hostReachable = reachable;
+  const fileLeaked = readOut !== null && readOut.includes(CANARY_SENTINEL);
+  evidence.readTool = (readEv.leaked || fileLeaked) ? "LEAKED"
+    : !readEv.attempted ? "not-attempted"
+    : readEv.denied ? "denied" : "not-denied";
+  // The network positive control: reachable before AND after the run.
+  const reachable = netBefore === true && netAfter === true ? true : (netBefore === false || netAfter === false ? false : null);
+  evidence.hostReachable = { before: netBefore, after: netAfter, verdict: reachable };
 
   const problems = [];
   if (decoyGone) problems.push("the decoy vanished during the probe; the read-denial result is unproven");
@@ -200,9 +213,11 @@ export async function sandboxCanary({
     if (existsSync(join(dir, "decoy-copy")) || results.decoy === 0 || decoyContains(join(dir, "decoy-copy"))) problems.push("read a file under a deny-read path");
     if (existsSync(join(dir, "decoy-copy2")) || results.symlink === 0 || decoyContains(join(dir, "decoy-copy2"))) problems.push("read a deny-read file through a symlink");
   }
-  // The Read-tool boundary (separate from the OS sandbox).
+  // The Read-tool boundary (separate from the OS sandbox), judged from the
+  // worker's event stream: it must have ATTEMPTED the read and been DENIED.
   if (evidence.readTool === "LEAKED") problems.push("the Read tool returned a file under a deny-read path");
-  else if (evidence.readTool === "absent") problems.push("the Read-tool probe left no result (the worker did not complete it)");
+  else if (evidence.readTool === "not-attempted") problems.push("the canary did not attempt the Read-tool probe (no denied Read of the decoy in the event stream), so the Read-tool deny is unproven");
+  else if (evidence.readTool === "not-denied") problems.push("the Read tool was called on the decoy without a denial in the event stream");
 
   const ok = problems.length === 0;
   if (ok || !keepOnFailure) { rmSync(dir, { recursive: true, force: true }); }
@@ -210,6 +225,37 @@ export async function sandboxCanary({
   rmSync(tmpDir, { recursive: true, force: true });
   rmSync(decoyPath, { force: true });
   return ok ? { ok: true, id, why: null, evidence } : { ok: false, id, why: problems.join("; "), evidence };
+}
+
+/**
+ * Read the worker's stream-json output and decide what the Read TOOL did to the
+ * decoy. `{ attempted, denied, leaked }`: attempted is a Read tool_use whose
+ * path is the decoy; denied is a matching tool_result that is an error or names
+ * a permission denial; leaked is a result carrying the decoy's sentinel. This is
+ * evidence from the tool stream, not a file the model chose to write.
+ */
+export function parseReadProbe(outPath, decoyPath) {
+  const out = { attempted: false, denied: false, leaked: false };
+  if (!existsSync(outPath)) return out;
+  const ids = new Set();   // tool_use ids of Read calls that targeted the decoy
+  for (const line of readFileSync(outPath, "utf8").split("\n")) {
+    const s = line.trim(); if (!s) continue;
+    let ev; try { ev = JSON.parse(s); } catch { continue; }
+    const blocks = ev?.message?.content;
+    if (!Array.isArray(blocks)) continue;
+    for (const b of blocks) {
+      if (b?.type === "tool_use" && b?.name === "Read") {
+        const p = b.input?.file_path ?? b.input?.path ?? "";
+        if (p === decoyPath || p.endsWith(decoyPath) || decoyPath.endsWith(p)) { out.attempted = true; ids.add(b.id); }
+      }
+      if (b?.type === "tool_result" && ids.has(b.tool_use_id)) {
+        const text = typeof b.content === "string" ? b.content : JSON.stringify(b.content ?? "");
+        if (text.includes(CANARY_SENTINEL)) out.leaked = true;
+        else if (b.is_error === true || /(permission|denied|not permitted|no access|blocked)/i.test(text)) out.denied = true;
+      }
+    }
+  }
+  return out;
 }
 
 /** True when a worker-written file exists and contains the decoy's sentinel. */
@@ -225,9 +271,14 @@ function defaultNetReachable() {
   } catch { return null; }
 }
 
-/** Where a daemon records its last canary result, for `reeve doctor`. */
+/** Where a daemon records its last canary result, for `reeve doctor`. Owner and
+ * repository are separate path components, because `nwo.replace("/","-")` is not
+ * injective: `foo-bar/baz` and `foo/bar-baz` would collide. (Codex #4b-[13].) */
 export function canaryStatePath(stateDir, nwo) {
-  return join(stateDir, "canary", `${nwo.replace("/", "-")}.json`);
+  const slash = nwo.indexOf("/");
+  const owner = slash >= 0 ? nwo.slice(0, slash) : "_";
+  const repo = slash >= 0 ? nwo.slice(slash + 1) : nwo;
+  return join(stateDir, "canary", owner, `${repo}.json`);
 }
 export function writeCanaryState(stateDir, nwo, state) {
   const p = canaryStatePath(stateDir, nwo);

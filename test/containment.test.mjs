@@ -122,6 +122,18 @@ const base = { cliVersion: "2.1.237", sandbox, permissionsDeny: [], canaryPaths:
   check(r1.credentialRead === "closed" && r2.credentialRead === "open", "the keychain is re-probed on every ask", `${r1.credentialRead} -> ${r2.credentialRead}`);
 }
 
+// ── the paid canary is skipped when a cheaper reason already opens it ─────────
+{
+  let ran = 0;
+  const fn = async () => { ran++; return { ...pass, id: "computed" }; };
+  // isolated:false is a cheap reason; the canary FUNCTION must not be called.
+  const r = await measureContainment({ ...base, isolated: false, canary: fn, keychain: clean });
+  check(r.credentialRead === "open" && ran === 0, "an already-open verdict does not spend a canary run", `ran=${ran}`);
+  // With every cheap prerequisite met, the canary runs.
+  const r2 = await measureContainment({ ...base, isolated: true, canary: fn, keychain: clean });
+  check(r2.credentialRead === "closed" && ran === 1, "and it runs once every cheaper gate is clear", `ran=${ran}`);
+}
+
 rmSync(root, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

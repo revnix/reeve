@@ -5,7 +5,7 @@
 // assertion is on the verdict the daemon draws from those files. The real
 // boundary is measured in test/escape.test.mjs (under the runtime) and by the
 // daemon at start (under the CLI); this file proves the judge.
-import { sandboxCanary, canaryIdFor, canaryScript, writeCanaryState, readCanaryState, CANARY_SENTINEL } from "../src/canary.mjs";
+import { sandboxCanary, canaryIdFor, canaryScript, writeCanaryState, readCanaryState, canaryStatePath, CANARY_SENTINEL } from "../src/canary.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
@@ -32,8 +32,23 @@ const base = {
 };
 
 // A runner that behaves like a sandboxed script under the given boundary.
+// The Read-tool verdict is judged from the worker's EVENT STREAM (canary.out),
+// so the fake runner writes a representative stream-json plus the corroborating
+// file. readTool: "denied" (attempted + denied), "leak" (result carries the
+// sentinel), "absent" (never attempted), "not-denied" (attempted, no denial).
+const streamFor = (readTool) => {
+  const lines = [];
+  const readUse = { type: "assistant", message: { content: [{ type: "tool_use", name: "Read", id: "r1", input: { file_path: base.decoyPath } }] } };
+  const resultOf = content => ({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "r1", content, is_error: /denied/i.test(content) }] } });
+  if (readTool === "absent") return "";
+  lines.push(JSON.stringify(readUse));
+  if (readTool === "denied") lines.push(JSON.stringify(resultOf("Permission to read the file was denied.")));
+  else if (readTool === "leak") lines.push(JSON.stringify(resultOf(CANARY_SENTINEL + "\nreeve canary decoy")));
+  else if (readTool === "not-denied") lines.push(JSON.stringify(resultOf("(the file was read)")));
+  return lines.join("\n") + "\n";
+};
 const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, decoy = false, symlink = false, results = true, outcome = "ok", readTool = "denied" } = {}) =>
-  async ({ cwd, args }) => {
+  async ({ cwd, outPath }) => {
     const rec = [];
     if (inside) writeFileSync(join(cwd, "INSIDE"), ""); rec.push(`inside=${inside ? 0 : 1}`);
     if (tmp) writeFileSync(join(base.tmpDir, "TMP"), ""); rec.push(`tmp=${tmp ? 0 : 1}`);
@@ -42,10 +57,10 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     if (decoy) writeFileSync(join(cwd, "decoy-copy"), "x"); rec.push(`decoy=${decoy ? 0 : 1}`);
     if (symlink) writeFileSync(join(cwd, "decoy-copy2"), "x"); rec.push(`symlink=${symlink ? 0 : 1}`);
     if (results) writeFileSync(join(cwd, "canary-results.txt"), rec.join("\n") + "\n");
-    // The Read-tool probe: a working boundary yields DENIED; a leak writes the sentinel; "absent" writes nothing.
+    if (outPath) writeFileSync(outPath, streamFor(readTool));
     if (readTool === "denied") writeFileSync(join(cwd, "read-tool-out"), "DENIED");
-    else if (readTool === "leak") writeFileSync(join(cwd, "read-tool-out"), CANARY_SENTINEL + "\nreeve canary decoy: not a secret\n");
-    return { outcome, why: outcome === "ok" ? "completed" : "planted", ms: 1, cost: 0, sessionId: "c", args };
+    else if (readTool === "leak") writeFileSync(join(cwd, "read-tool-out"), CANARY_SENTINEL + "\n");
+    return { outcome, why: outcome === "ok" ? "completed" : "planted", ms: 1, cost: 0, sessionId: "c" };
   };
 
 // ── the id ────────────────────────────────────────────────────────────────────
@@ -151,8 +166,26 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   check(r.ok === false && /Read tool returned a file/.test(r.why), "the Read tool returning the decoy's sentinel fails it", r.why);
 }
 {
+  const r = await sandboxCanary({ ...base, runner: runnerThat({ readTool: "not-denied" }) });
+  check(r.ok === false && /without a denial in the event stream/.test(r.why), "an attempted Read with no denial in the stream fails it", r.why);
+}
+{
+  // The stream is authoritative: a worker that writes DENIED to the file but the
+  // stream shows a Read that returned the sentinel is a LEAK, not a pass.
+  const liar = async ({ cwd, outPath }) => {
+    writeFileSync(join(cwd, "INSIDE"), ""); writeFileSync(join(base.tmpDir, "TMP"), "");
+    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\ndecoy=1\nsymlink=1\n");
+    writeFileSync(join(cwd, "read-tool-out"), "DENIED");   // the model's self-report says denied
+    writeFileSync(outPath, JSON.stringify({ type:"assistant", message:{ content:[{ type:"tool_use", name:"Read", id:"r1", input:{ file_path: base.decoyPath } }] } }) + "\n" +
+                          JSON.stringify({ type:"user", message:{ content:[{ type:"tool_result", tool_use_id:"r1", content: CANARY_SENTINEL + " leaked" }] } }) + "\n");
+    return { outcome: "ok", why: "completed" };
+  };
+  const r = await sandboxCanary({ ...base, runner: liar });
+  check(r.ok === false && /Read tool returned a file/.test(r.why), "the event stream overrides a self-reported DENIED when the stream shows a leak", r.why);
+}
+{
   const r = await sandboxCanary({ ...base, runner: runnerThat({ readTool: "absent" }) });
-  check(r.ok === false && /Read-tool probe left no result/.test(r.why), "no Read-tool result is a failure, not a pass", r.why);
+  check(r.ok === false && /did not attempt the Read-tool probe/.test(r.why), "no attempted Read in the stream is a failure, not a pass", r.why);
 }
 
 // ── the network positive control ─────────────────────────────────────────────
@@ -188,6 +221,13 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     return { outcome: "ok", why: "completed" };
   } });
   check(r.ok === false && /decoy vanished/.test(r.why), "a decoy deleted during the probe makes the read-denial unproven", r.why);
+}
+
+// ── the state path keeps owner and repo distinct ─────────────────────────────
+{
+  const a = canaryStatePath("/s", "foo-bar/baz");
+  const b = canaryStatePath("/s", "foo/bar-baz");
+  check(a !== b, "foo-bar/baz and foo/bar-baz do not collide", `${a} vs ${b}`);
 }
 
 // ── state for the doctor ──────────────────────────────────────────────────────

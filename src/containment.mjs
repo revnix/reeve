@@ -85,9 +85,15 @@ export async function measureContainment({
   else if (kc.items.length) reasons.push(kc.why);
   if (!isolated) reasons.push("no isolated worker environment declared (worker.isolation): a shared account cannot be certified free of credentials and a linked worktree shares the checkout's git dir");
 
+  // The canary is a paid, minutes-long model call. When a cheaper prerequisite
+  // (platform, keychain, isolation) already makes the verdict open, do not run
+  // it: the answer is settled. (Codex #4b-[12].) An injected canary RESULT is
+  // still honoured for evidence; only the expensive RUN is skipped.
   let cn = null;
   const id = cliVersion && sandbox ? canaryIdFor({ cliVersion, sandbox, binaryId }) : null;
+  const cheapReasons = reasons.length > 0;
   if (canary && typeof canary !== "function") cn = canary;
+  else if (cheapReasons) cn = { ok: false, id, why: "not run: containment is already open for a cheaper reason", skipped: true };
   else if (id && cache.get(id)?.ok) cn = cache.get(id);
   else if (!id) cn = { ok: false, id: null, why: "no CLI version or sandbox block to run a canary under" };
   else {
@@ -97,7 +103,9 @@ export async function measureContainment({
     cache.set(id, cn);
     if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }
   }
-  if (!cn.ok) reasons.push(`sandbox canary ${cn.id ? cn.id + " " : ""}failed: ${cn.why}`);
+  // A skipped canary adds no reason of its own (the cheaper reasons already stand);
+  // a run-or-injected canary that failed does.
+  if (!cn.ok && !cn.skipped) reasons.push(`sandbox canary ${cn.id ? cn.id + " " : ""}failed: ${cn.why}`);
 
   return {
     credentialRead: reasons.length ? "open" : "closed",

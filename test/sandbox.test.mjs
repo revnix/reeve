@@ -26,7 +26,7 @@
 // And a sixth, unprompted: denied twice, the model reached for a THIRD tool that
 // was not in the allowlist at all. Any tool that can run a command is a write
 // primitive, so this must be a closed allowlist, never a denylist.
-import { sandboxFor, reviewDiff, validateSettings, CREDENTIAL_PATHS } from "../src/sandbox.mjs";
+import { sandboxFor, reviewDiff, validateSettings, credentialPaths, CREDENTIAL_PATHS } from "../src/sandbox.mjs";
 import { readFileSync } from "node:fs";
 
 let fail = 0;
@@ -369,6 +369,28 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   check(validateSettings(null, { tmpDir: TMP }).ok === false, "absent settings are invalid, not empty");
   check(validateSettings(good(), {}).ok === false && /tmpDir/.test(validateSettings(good(), {}).errors.join(" ")),
     "the validator itself refuses to judge without knowing the run's tmp", validateSettings(good(), {}).errors.join(" "));
+}
+
+
+// ── the configured REEVE_HOME state root is denied, not just ~/.reeve ─────────
+//
+// REEVE_HOME can point the state root elsewhere; a root the sandbox does not
+// deny is readable, and a worker could copy the profile or another run's output
+// into its worktree for reeve to publish. (Codex #4b-[11].)
+{
+  const saved = process.env.REEVE_HOME;
+  process.env.REEVE_HOME = "/var/lib/reeve-state";
+  try {
+    check(credentialPaths().includes("/var/lib/reeve-state"), "credentialPaths includes a non-default REEVE_HOME", credentialPaths().join(","));
+    const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: "/tmp/run/tmp" });
+    check(s.settings.sandbox.filesystem.denyRead.includes("/var/lib/reeve-state"), "and the OS denyRead denies that root", JSON.stringify(s.settings.sandbox.filesystem.denyRead.slice(-3)));
+    check(s.settings.permissions.deny.includes("Read(/var/lib/reeve-state/**)"), "and the Read tool is denied it too", "");
+    check(validateSettings(s.settings, { tmpDir: "/tmp/run/tmp" }).ok === true, "and the generated settings still validate", "");
+  } finally { if (saved === undefined) delete process.env.REEVE_HOME; else process.env.REEVE_HOME = saved; }
+  // Default REEVE_HOME (or unset) adds nothing beyond ~/.reeve.
+  const before = process.env.REEVE_HOME; delete process.env.REEVE_HOME;
+  try { check(credentialPaths().length === CREDENTIAL_PATHS.length, "an unset REEVE_HOME adds no extra deny", ""); }
+  finally { if (before !== undefined) process.env.REEVE_HOME = before; }
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

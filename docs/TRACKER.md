@@ -201,13 +201,12 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       clone). Building that topology is **PR-3**; do not set the flag before it
       lands, and expect the first acquire after it to quarantine any worktree
       with no recorded config baseline (self-healing, once).
-- [ ] **PR-3 (S1 close-out): the dedicated-user dispatch topology.** The only
-      thing that closes containment: a separate OS user for workers (its own
-      empty keychain) and a per-run STANDALONE clone (its own git dir, which
-      also closes the shared-ref and shared-config holes). Ships with a real
-      `isolationTopologyReady()` (euid differs from the checkout owner; the
-      worktree is a standalone clone), replacing today's hard-false. Only after
-      it lands may `worker.isolation: dedicated-user` be set.
+- [x] ~~**PR-3: the dedicated-user dispatch topology.**~~ SUPERSEDED 2026-08-22
+      by the founder's ruling ("I'm not going to make another user"). The
+      closure it existed for was found elsewhere: the keychain is reached
+      THROUGH `HOME`, so a scratch home closes it without a second OS account.
+      `worker.isolation: dedicated-user` stays in the schema and is refused by
+      name rather than silently downgraded to the weaker thing that is built.
 
 - [ ] **PR-3 (S1 close-out): standalone checkouts + the scratch-HOME closure.**
       IN FLIGHT on `feat/s1-standalone-clones`. Landed so far:
@@ -238,10 +237,38 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       disabled the whole file deny list — the escape test caught it), and the
       canary's results parser matched `[a-z]+`, dropping `kc_github` and friends,
       which would have failed every real canary.
-      REMAINING: `worktree.mjs`'s acquire/release/push are now unused by dispatch
-      (tests still cover them, which is false confidence — remove or re-point);
-      doctor wording; the PR itself; and a live canary pass as evidence before
-      recommending the flag.
+      · **the dead worktree lifecycle removed** (`0be4703`). acquire / verify /
+        release / push and the daemon's `resolveWorktree` had no caller, but
+        their tests still passed, which reads as coverage of the path dispatch
+        takes. What survives is about git rather than worktrees, so the module is
+        `src/gitguard.mjs` now. `verifyConfig` also stopped exempting the keys
+        reeve writes itself: that allowance existed for re-hardening a reused
+        worktree, and a run checkout is never re-hardened, so it could only ever
+        have let a worker overwrite the two keys set to stop it publishing.
+      · **a preparation failure is no longer reported as tampering** (`0fbcc82`).
+        Preparation moved inside the dispatch try-block, so a failure left the
+        checkout path null; the config check read that as "no recorded
+        configuration" and accused a worker that never started, on the most
+        ordinary failure there is. Found by writing the test the removal needed.
+      · **R-15 says what actually gates dispatch** (`756008e`). It still
+        described the keychain as refusing dispatch and advised deleting the
+        credential or making a dedicated user. It now reports the keychain and
+        gates on the isolation declared AND on the worker having a token of its
+        own — without which every dispatch fails while preparing and backs off.
+      · **the founder's clone is deny-read** (`24f7eed`). The run checkout
+        carries only committed content, so their uncommitted work and ignored
+        files are not IN it — which is not the same as out of reach. MEASURED:
+        a sandboxed worker read an uncommitted file and a `.env` straight out of
+        the founder's checkout, because the sandbox denies writes outside the
+        checkout, not reads
+        (`docs/measured/2026-08-22-the-founders-checkout-was-readable.md`).
+        `identity.checkout` now joins the denied reads and the validator requires
+        it. Three fixtures had checkout == worktreeRoot and the overlap guard
+        duly refused them.
+      · **`reeve canary`** (`ca861da`): measure the boundary on demand without
+        arming anything. The measurement is what should decide whether to arm, so
+        it must be available before --execute, not only after.
+      REMAINING: the PR itself, its Codex rounds, and the founder's merge grant.
 
 ### Founder actions pending
 
@@ -253,7 +280,7 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
 
 ### Known constraints the design must answer (from measurements so far)
 
-- Codex refused **79%** of review requests this week (doctor R-05, 21 Aug) —
+- Codex refused **57%** of review requests (doctor R-05, 22 Aug; 79% on 21 Aug) —
   the gate's "Codex GO" arm will often be absent; the rule table already refuses
   to treat silence as approval.
 - The App reaches **one repo** (nextlyhq/nextly). Spec-PR host and builder-PR

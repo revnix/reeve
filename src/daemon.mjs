@@ -541,8 +541,14 @@ export async function tick(ctx) {
       if (moved) {
         try {
           const seen = (ctx.observe ?? observe)(nwo, pr);
+          const w = (ctx.ingest ?? ingest)(db, nwo, pr, seen.observations, { at: now() });
+          // AFTER the ingest, not before it. An ingest that throws leaves the
+          // projection built from the PREVIOUS inbox, so an observation that
+          // never reached the database is not a reading of the same moment —
+          // and comparing them would record a storage failure as the derivation
+          // disagreeing, which is the exact confusion this whole change removes.
+          // (Codex #6-[2].)
           snapshot = seen.threads ?? null;
-          const w = ingest(db, nwo, pr, seen.observations, { at: now() });
           if (w.inserted || w.generations) {
             log(logPath, `  #${pr}: ingest +${w.inserted} new, +${w.generations} edit(s)` +
                          `${seen.incomplete ? " — INCOMPLETE read" : ""}`);

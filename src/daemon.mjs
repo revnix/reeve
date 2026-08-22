@@ -216,8 +216,13 @@ function branchHead(worktree, branch) {
 }
 
 function changedFiles(worktree, since = null, ref = "HEAD") {
+  // The same 64 MiB the secret scanner reads under. `execFileSync` buffers 1 MiB
+  // by default and throws ENOBUFS past it, which a per-commit path walk reaches
+  // sooner than it looks: measured 2026-08-22, one commit of 1,800 files under
+  // long directory names produced 1,123,200 bytes of pathnames on its own.
   const run = args => {
-    try { return execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args], { encoding: "utf8", env: gitEnv() }); }
+    try { return execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args],
+                              { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: gitEnv() }); }
     catch { return null; }
   };
 
@@ -263,8 +268,18 @@ function changedFiles(worktree, since = null, ref = "HEAD") {
   // rename to its DESTINATION alone: measured 2026-08-22, moving
   // `secrets/key.txt` to `public.txt` reported `public.txt` and nothing else,
   // so the gate never saw the sensitive path the commit carried away.
-  const committed = since ? (run(["log", "--no-ext-diff", "--name-only", "--no-renames", "--pretty=format:", "-m", "-z", `${since}..${ref}`]) ?? "") : "";
-  const fromCommits = committed.split("\0").filter(Boolean);
+  //
+  // A failed read is `null` here exactly as it is for the status above, and is
+  // returned as such. `?? ""` read an UNREADABLE range as an EMPTY one, so a
+  // large completed fix was refused with "the worker produced an empty diff —
+  // nothing was changed": a reason that is not true, and one that sends whoever
+  // reads it to look at the worker instead of at the read. (Codex #10-[2].)
+  let fromCommits = [];
+  if (since) {
+    const committed = run(["log", "--no-ext-diff", "--name-only", "--no-renames", "--pretty=format:", "-m", "-z", `${since}..${ref}`]);
+    if (committed === null) return null;
+    fromCommits = committed.split("\0").filter(Boolean);
+  }
 
   return [...new Set([...fromCommits, ...uncommitted])];
 }

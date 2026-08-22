@@ -53,6 +53,14 @@ function git(cwd, args) {
   } catch (e) { return { ok: false, out: "", err: reason(e.stderr || e.message) }; }
 }
 
+/** What reeve will read of a tree's attributes files before it refuses instead.
+ * A real .gitattributes is a few hundred bytes; these are three and four orders
+ * of magnitude above that, so they bound a hostile tree without reaching a
+ * legitimate one. The TOTAL matters as much as the per-file bound: a tree can
+ * commit any number of these, and the daemon reads all of them synchronously. */
+const MAX_ATTRIBUTES_BYTES = 1 << 20;
+const MAX_ATTRIBUTES_TOTAL = 4 << 20;
+
 /** The conventional directory for one run's checkout. Keyed by run, not by PR:
  * two runs for the same pull request must never share a directory. */
 export const runPathFor = (root, pr, runId) => join(root, `run-${pr}-${runId}`);
@@ -230,10 +238,14 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
   //
   // Refused rather than reported, because a fixer working against unmaterialised
   // content produces a fix about a file it never saw. (Codex #7-[6].)
-  const filters = declaredFilters(path);
-  if (filters.length) {
+  const attrs = declaredFilters(path);
+  if (attrs.why) {
     rmSync(path, { recursive: true, force: true });
-    return { ok: false, path: null, why: `this tree declares checkout filter(s) reeve cannot supply (${filters.slice(0, 3).join(", ")}); ` +
+    return { ok: false, path: null, why: attrs.why };
+  }
+  if (attrs.filters.length) {
+    rmSync(path, { recursive: true, force: true });
+    return { ok: false, path: null, why: `this tree declares checkout filter(s) reeve cannot supply (${attrs.filters.slice(0, 3).join(", ")}); ` +
       `daemon git runs with no global configuration, so the content would be left unmaterialised — a worker would edit pointer files` };
   }
 
@@ -279,7 +291,32 @@ function declaredFilters(path) {
   const names = new Set();
   const listed = git(path, ["ls-files", "-z", "--", "*.gitattributes", ".gitattributes"]);
   const files = listed.ok ? listed.out.split("\0").filter(Boolean) : [];
+  let budget = MAX_ATTRIBUTES_TOTAL;
   for (const rel of files) {
+    // lstat before reading, and never on the strength of the listing alone.
+    // This tree is PULL-REQUEST content, and `.gitattributes` can be committed
+    // as a symlink -- mode 120000 -- which a clone materialises. Measured
+    // 2026-08-22 on git 2.50.1: one pointing at /dev/zero was listed by
+    // `ls-files` and killed the reading process outright (SIGKILL, exit 137),
+    // so a pull request could take the daemon down before a worker was ever
+    // launched. git itself refuses to follow these, warning "unable to access
+    // '.gitattributes': Too many levels of symbolic links" -- so a tree that
+    // relies on one is not getting the attributes it thinks it has either way.
+    //
+    // Nothing else writes this tree at this point: the clone is finished and
+    // the worker has not started, so there is no window between the stat and
+    // the read.
+    let st;
+    try { st = lstatSync(join(path, rel)); }
+    catch { return { filters: [], why: `this tree's ${rel} cannot be examined, and an attributes file reeve cannot read may declare a filter it cannot supply` }; }
+    if (!st.isFile())
+      return { filters: [], why: `this tree commits ${rel} as a ${st.isSymbolicLink() ? "symbolic link" : "special file"} rather than a file, which reeve will not read` };
+    if (st.size > MAX_ATTRIBUTES_BYTES)
+      return { filters: [], why: `this tree's ${rel} is ${st.size} bytes, past the ${MAX_ATTRIBUTES_BYTES} reeve will read of an attributes file` };
+    budget -= st.size;
+    if (budget < 0)
+      return { filters: [], why: `this tree's attributes files total more than the ${MAX_ATTRIBUTES_TOTAL} bytes reeve will read of them` };
+
     let text;
     try { text = readFileSync(join(path, rel), "utf8"); } catch { continue; }
     for (const line of text.split("\n")) {
@@ -288,7 +325,7 @@ function declaredFilters(path) {
       for (const m of t.matchAll(/(?:^|\s)filter=([^\s]+)/g)) names.add(m[1]);
     }
   }
-  return [...names];
+  return { filters: [...names], why: null };
 }
 
 /**

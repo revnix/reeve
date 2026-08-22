@@ -4,7 +4,7 @@
 import { prepareRunCheckout, releaseRunCheckout, fetchRunWork, publishRunWork, copyDeps, canCloneFiles, runPathFor, dependencyPathsFor } from "../src/checkout.mjs";
 import { verifyConfig } from "../src/gitguard.mjs";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -271,6 +271,73 @@ check(existsSync(join(r.path, "node_modules", "left-pad", "index.js")), "but the
   check(plain.ok, "control: a tree that declares no filter is unaffected", JSON.stringify(plain.why));
   if (plain.ok) releaseRunCheckout(plain.path, { workFetched: true });
   rmSync(lfsish, { recursive: true, force: true });
+}
+
+// ── an attributes file reeve will not read ───────────────────────────────────
+//
+// The tree is PULL-REQUEST content, and `.gitattributes` can be committed as a
+// symlink — mode 120000, which a clone materialises. The reader followed it.
+// Measured 2026-08-22 on git 2.50.1: one pointing at /dev/zero was listed by
+// `ls-files` and killed the reading process outright (SIGKILL, exit 137), so a
+// pull request could take the daemon down before a worker was ever launched.
+//
+// The fixture points somewhere harmless instead, at a file that DOES declare a
+// filter: if reeve still read through the link it would name that filter, so
+// the refusal naming the link rather than the filter is the evidence that it
+// did not.
+{
+  const outside = join(root, "outside-attrs");
+  writeFileSync(outside, "* filter=absolutely-not-supplied\n");
+
+  const linked = join(root, "linked-clone");
+  execFileSync("git", ["clone", "-q", origin, linked]);
+  const gS = (...a) => execFileSync("git", ["-C", linked, ...a], { encoding: "utf8" }).trim();
+  gS("checkout", "-q", "-b", "linked-attrs", "origin/main");
+  symlinkSync(outside, join(linked, ".gitattributes"));
+  gS("add", "-A"); gS("-c", "user.email=o@o", "-c", "user.name=o", "commit", "-qm", "attributes, as a link");
+  check(/^120000 /.test(gS("ls-files", "-s", ".gitattributes")),
+    "control: git committed the attributes file as a symlink, and a clone materialises it", gS("ls-files", "-s", ".gitattributes"));
+  gS("push", "-q", "origin", "linked-attrs");
+  const linkedHead = gS("rev-parse", "HEAD");
+
+  const rl = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 79, runId: "r79", branch: "linked-attrs", head: linkedHead });
+  check(!rl.ok && /symbolic link/.test(rl.why ?? ""),
+    "an attributes file committed as a symlink is refused unread", JSON.stringify(rl.why));
+  check(!/absolutely-not-supplied/.test(rl.why ?? ""),
+    "and reeve never read through it — the filter beyond the link is not named", JSON.stringify(rl.why));
+  check(!existsSync(runPathFor(runs, 79, "r79")), "and the half-built checkout is removed", "");
+
+  // The same reader, unbounded, on an attributes file larger than any real one.
+  const big = join(root, "big-clone");
+  execFileSync("git", ["clone", "-q", origin, big]);
+  const gB = (...a) => execFileSync("git", ["-C", big, ...a], { encoding: "utf8" }).trim();
+  gB("checkout", "-q", "-b", "big-attrs", "origin/main");
+  writeFileSync(join(big, ".gitattributes"), "#".repeat(2 << 20) + "\n");
+  gB("add", "-A"); gB("-c", "user.email=o@o", "-c", "user.name=o", "commit", "-qm", "a very large attributes file");
+  gB("push", "-q", "origin", "big-attrs");
+  const bigHead = gB("rev-parse", "HEAD");
+
+  const rb = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 80, runId: "r80", branch: "big-attrs", head: bigHead });
+  check(!rb.ok && /bytes/.test(rb.why ?? ""),
+    "an attributes file past the size reeve will read is refused", JSON.stringify(rb.why));
+
+  // The control that says the bound is a bound and not a ban: an ordinary
+  // attributes file, declaring an attribute that is not a filter, still prepares.
+  const ok = join(root, "ok-clone");
+  execFileSync("git", ["clone", "-q", origin, ok]);
+  const gO = (...a) => execFileSync("git", ["-C", ok, ...a], { encoding: "utf8" }).trim();
+  gO("checkout", "-q", "-b", "ok-attrs", "origin/main");
+  writeFileSync(join(ok, ".gitattributes"), "*.md text eol=lf\n");
+  gO("add", "-A"); gO("-c", "user.email=o@o", "-c", "user.name=o", "commit", "-qm", "ordinary attributes");
+  gO("push", "-q", "origin", "ok-attrs");
+  const okHead = gO("rev-parse", "HEAD");
+
+  const ro = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 81, runId: "r81", branch: "ok-attrs", head: okHead });
+  check(ro.ok, "control: an ordinary attributes file is read and the checkout prepares", JSON.stringify(ro.why));
+  if (ro.ok) releaseRunCheckout(ro.path, { workFetched: true });
+  rmSync(linked, { recursive: true, force: true });
+  rmSync(big, { recursive: true, force: true });
+  rmSync(ok, { recursive: true, force: true });
 }
 
 // ── the branch check is atomic with the push ─────────────────────────────────

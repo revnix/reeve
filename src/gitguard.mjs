@@ -88,7 +88,14 @@ export const GIT_ISOLATED_ENV = Object.freeze({
 export function gitEnv(extra = {}) {
   const env = { ...process.env };
   for (const k of Object.keys(env)) {
-    if (k === "GIT_CONFIG_COUNT" || k === "GIT_CONFIG_PARAMETERS"
+    // `GIT_CONFIG` is here as insurance, not as a measured hole. Its own
+    // documentation says it applies to `git config` and "has no effect on other
+    // Git commands", and measured on git 2.50.1 an injected smudge driver did
+    // NOT run through it, for a clone or a checkout. A reviewer reported
+    // otherwise on 2.43. Rather than depend on a promise about every version and
+    // vendor of git this daemon might meet, it is dropped: it costs nothing and
+    // reeve has no use for it. (Codex #7-[4], not reproduced here.)
+    if (k === "GIT_CONFIG" || k === "GIT_CONFIG_COUNT" || k === "GIT_CONFIG_PARAMETERS"
         || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(k)) delete env[k];
   }
   return { ...env, ...GIT_ISOLATED_ENV, ...extra };

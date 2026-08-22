@@ -38,7 +38,7 @@
 // relative and resolves inside the tree, so the copy resolves within the run
 // checkout.
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { GIT_NEUTRALISE, REFUSING_HOOK, recordConfig, reason, gitEnv } from "./gitguard.mjs";
 import { writeFileSync, chmodSync } from "node:fs";
@@ -192,7 +192,12 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
   // A single-ref fetch brings only what that revision reaches. It also removes
   // the earlier `--branch` problem entirely: nothing asks the source for a local
   // head that a pull request's branch does not have.
-  const init = git(repoRoot, ["init", "-q", "--", path]);
+  // HEAD is put on a name that CANNOT be the target branch. `git init` leaves it
+  // on the host's `init.defaultBranch`, and git refuses to fetch into a branch
+  // that is checked out — so a pull request whose branch happened to carry that
+  // name (`main` on most hosts) could not be prepared at all. Found by the
+  // control beside the filter test, not by the case it was written for.
+  const init = git(repoRoot, ["init", "-q", "-b", `${branch}.reeve-init`, "--", path]);
   if (!init.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not create the checkout: ${init.err}` }; }
   // By the pinned REVISION where there is one, so the fetch cannot race a branch
   // that moves between the decision and the preparation.
@@ -212,6 +217,24 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
     if (!at.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not stand on ${head.slice(0, 10)}: ${at.err}` }; }
     const now = git(path, ["rev-parse", "HEAD"]);
     if (!now.ok || now.out !== head) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `checkout is at ${now.out || "?"}, not the pinned ${head.slice(0, 10)}` }; }
+  }
+
+  // A checkout filter the tree DECLARES but this environment cannot supply.
+  //
+  // Daemon git runs with no global or system configuration, which is what stops
+  // a founder's filter driver executing on pull-request content — and it also
+  // means Git LFS's driver, which `git lfs install` registers globally, is not
+  // there. Git treats an undefined filter as PASS-THROUGH rather than an error,
+  // so the checkout succeeds holding pointer files, and the worker then edits
+  // and tests the wrong tree while everything reports success.
+  //
+  // Refused rather than reported, because a fixer working against unmaterialised
+  // content produces a fix about a file it never saw. (Codex #7-[6].)
+  const filters = declaredFilters(path);
+  if (filters.length) {
+    rmSync(path, { recursive: true, force: true });
+    return { ok: false, path: null, why: `this tree declares checkout filter(s) reeve cannot supply (${filters.slice(0, 3).join(", ")}); ` +
+      `daemon git runs with no global configuration, so the content would be left unmaterialised — a worker would edit pointer files` };
   }
 
   const h = hardenClone(path);
@@ -244,6 +267,28 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
   }
 
   return { ok: true, path, why: null, deps };
+}
+
+/**
+ * Filter drivers this checkout's own .gitattributes files ask for.
+ *
+ * Read from the checked-out tree, and only the names: a driver reeve does not
+ * provide cannot be run, and the point is to notice that rather than to run it.
+ */
+function declaredFilters(path) {
+  const names = new Set();
+  const listed = git(path, ["ls-files", "-z", "--", "*.gitattributes", ".gitattributes"]);
+  const files = listed.ok ? listed.out.split("\0").filter(Boolean) : [];
+  for (const rel of files) {
+    let text;
+    try { text = readFileSync(join(path, rel), "utf8"); } catch { continue; }
+    for (const line of text.split("\n")) {
+      const t = line.trim();
+      if (!t || t.startsWith("#")) continue;
+      for (const m of t.matchAll(/(?:^|\s)filter=([^\s]+)/g)) names.add(m[1]);
+    }
+  }
+  return [...names];
 }
 
 /**
@@ -324,6 +369,24 @@ export function publishRunWork({ repoRoot, path, branch, expectedRemote = null }
   // logged for a worker that committed nothing at all.
   if (expectedRemote && fetched.head === expectedRemote)
     return { ok: false, why: "the worker committed nothing: the branch is exactly where it was" };
+  // The ls-remote above is a look, not a lock: the branch can be deleted or moved
+  // between it and the push, and an ordinary push would then RECREATE a deleted
+  // branch or land on a head nobody checked. The remote is asked to verify the
+  // expectation itself, atomically. (Codex #7-[7].)
+  //
+  // A lease is not a licence to rewrite. `--force-with-lease` would happily
+  // replace a matching remote with an unrelated history, which is exactly what
+  // "never force" exists to prevent — so the push is refused first unless the
+  // work DESCENDS from what is being replaced. The lease then adds atomicity to
+  // a push that was already a fast-forward.
+  if (expectedRemote) {
+    const ff = git(repoRoot, ["merge-base", "--is-ancestor", expectedRemote, fetched.ref]);
+    if (!ff.ok) return { ok: false, why: `the worker's branch does not descend from ${expectedRemote.slice(0, 10)}; reeve does not rewrite published history` };
+    const leased = git(repoRoot, ["push", `--force-with-lease=refs/heads/${branch}:${expectedRemote}`,
+                                  "origin", `${fetched.ref}:refs/heads/${branch}`]);
+    if (!leased.ok) return { ok: false, why: `push refused: ${leased.err}` };
+    return { ok: true, why: null, head: fetched.head };
+  }
   // Never force: a worker's fix is not worth another party's commit.
   const pushed = git(repoRoot, ["push", "origin", `${fetched.ref}:refs/heads/${branch}`]);
   if (!pushed.ok) return { ok: false, why: `push refused: ${pushed.err}` };

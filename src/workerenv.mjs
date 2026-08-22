@@ -7,30 +7,45 @@
 // `git push` prefix and needs no helper. This module removes every credential
 // VARIABLE and every git entry point that could re-introduce one.
 //
-// What it does not do, stated plainly because the first version claimed
-// otherwise: it does not make the founder's credentials unreachable. HOME
-// stays real (the CLI reads ~/.claude and ~/.claude.json for subscription
-// authentication, and a per-run home would leave every worker unauthenticated),
-// so the keychain, ~/.config/gh, and ~/.ssh are on disk in front of a process
-// running as the founder. Measured under exactly this environment:
-// `git -c credential.helper=osxkeychain credential fill` and `gh auth token`
-// both returned the founder's token. Closing that needs the OS sandbox to deny
-// those reads, or a separate worker user; until one of them is proven, the
-// daemon reads CONTAINMENT below and refuses to dispatch a worker at all.
-import { writeFileSync, mkdirSync, chmodSync, renameSync } from "node:fs";
+// HOME is the boundary, and it is the thing that was wrong before.
+//
+// The first version gave every worker the founder's real HOME, because the CLI
+// reads `~/.claude` to know it is logged in and a scratch home left workers
+// unauthenticated. That handed the worker the founder's KEYCHAIN, which the OS
+// sandbox cannot deny at all: the runtime's Seatbelt profile hard-allows
+// securityd, and `git -c credential.helper=osxkeychain credential fill`
+// returned the founder's GitHub token from inside the sandbox.
+//
+// Measured 2026-08-22 (docs/measured/2026-08-22-scratch-home-closes-the-keychain.md):
+// the keychain is reached THROUGH HOME. With a scratch home the search list
+// collapses to `/Library/Keychains/System.keychain`, and the founder's GitHub
+// AND Claude items both answer errSecItemNotFound. The one thing that breaks is
+// the CLI's own authentication, and `CLAUDE_CODE_OAUTH_TOKEN` (from
+// `claude setup-token`) replaces it: one real worker under a scratch home with
+// that token authenticated (`is_error:false`) and could reach neither item.
+//
+// So a worker gets a home of reeve's making, and the founder's credentials are
+// unreachable by CONSTRUCTION rather than by deny rule. The deny list stays as
+// the second layer, and the canary proves the property per CLI build rather
+// than trusting this comment.
+import { writeFileSync, mkdirSync, chmodSync, renameSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 
 /**
  * What this environment can and cannot promise, read by the daemon before any
- * dispatch. `credentialRead` flips to "closed" only when a measured mechanism
- * (the OS sandbox canary denying keychain and gh-config reads, or a dedicated
- * worker user) proves it; a comment cannot flip it.
+ * dispatch. `credentialRead` says what mechanism closes the reach, and only a
+ * measured one may set it: the canary probes the keychain, the gh keyring and
+ * git's credential helper from inside a real worker, and reads the FILES that
+ * worker left rather than anything it said. A comment cannot flip it.
  */
 export const CONTAINMENT = Object.freeze({
-  credentialRead: "open",
-  why: "the worker runs as the founder with a real HOME; the keychain, ~/.config/gh and ~/.ssh are readable, " +
-       "and `git -c credential.helper=...` or `gh auth token` returns the founder's token",
+  credentialRead: "closed-by-home-and-path",
+  why: "workers run with a scratch HOME, so the founder's login keychain is not in their SEARCH LIST — which " +
+       "on its own closes nothing: measured 2026-08-22, the keychain is still readable BY PATH from a scratch " +
+       "home, as the same OS user, because it is unlocked with no timeout. ~/Library/Keychains is therefore " +
+       "denied by path as well, and the canary probes both shapes. Authentication comes from " +
+       "CLAUDE_CODE_OAUTH_TOKEN instead of ~/.claude. Proven per CLI build by the canary, not by this string.",
 });
 
 // The worker's node is the daemon's own: `node` on the system PATH is v22 here
@@ -112,15 +127,24 @@ export function writeGitConfig(dir, identity = WORKER_GIT_IDENTITY) {
  * `env` and it is used verbatim: nothing from this process is merged in. The
  * base variables are RESERVED: `extra` may add names, never replace these.
  */
-export function workerEnv({ gitConfigPath, tmpDir, bgWaitMs, maxRetries = 1, extra = {}, extraPath = [] }) {
+export function workerEnv({ gitConfigPath, tmpDir, bgWaitMs, maxRetries = 1, extra = {}, extraPath = [], home = null, oauthToken = null }) {
   if (!gitConfigPath) throw new Error("workerEnv: gitConfigPath is required; a worker must not find the founder's git config");
+  // A worker's HOME is reeve's to give. Refusing the founder's own home here is
+  // the whole containment property: with it, the keychain is one command away.
+  if (!home) throw new Error("workerEnv: home is required; a worker with the founder's HOME can read their keychain");
+  if (home === homedir()) throw new Error("workerEnv: home must not be the founder's own home directory");
+  mkdirSync(home, { recursive: true });
+  // Without a token a scratch home leaves the CLI unauthenticated ("Not logged
+  // in"), so a missing one is a refusal rather than a worker that cannot work.
+  if (!oauthToken) throw new Error("workerEnv: oauthToken is required; a worker with a scratch HOME has no ~/.claude to authenticate from");
   mkdirSync(tmpDir, { recursive: true });
   // The shims live beside reeve's own git config, never under the per-run
   // TMPDIR: the PATH must be the same for every run under one contract.
   const shims = writeShims(dirname(gitConfigPath));
   const env = {
     PATH: [shims, NODE_BIN, ...extraPath, ...SYSTEM_PATH].join(":"),
-    HOME: homedir(),
+    HOME: home,
+    CLAUDE_CODE_OAUTH_TOKEN: oauthToken,
     TMPDIR: tmpDir,
     LANG: process.env.LANG ?? "en_US.UTF-8",
     TERM: "dumb",
@@ -144,4 +168,45 @@ export function workerEnv({ gitConfigPath, tmpDir, bgWaitMs, maxRetries = 1, ext
     env[k] = String(v);
   }
   return env;
+}
+
+/**
+ * Where a repository's workers live. Stable per repository rather than per run,
+ * because the CLI keeps its sessions under HOME and `--resume` must be able to
+ * find one. Deliberately NOT under reeve's state tree: that tree is deny-read,
+ * and a worker must be able to read its own home.
+ */
+export function workerHomeFor(root, nwo) {
+  // NESTED, not flattened. `nwo.replace("/", "-")` maps `foo-bar/baz` and
+  // `foo/bar-baz` to the same directory, and this home holds the worker's own
+  // session state and is not denied to it -- so two repositories sharing a
+  // worktree root would share one, and either could read or disturb the other's.
+  // The same collision was found in the canary's state path; it is the same
+  // mistake, so it gets the same shape. (Codex #5-[8].)
+  const [owner, ...rest] = String(nwo).split("/");
+  return join(root, ".reeve-worker-home", owner, rest.join("/") || "_");
+}
+
+/**
+ * The worker's authentication, from a file only the founder can read.
+ *
+ * A scratch HOME has no `~/.claude`, so this token is what lets a worker run at
+ * all. It lives inside the deny-read state tree, so a worker cannot read the
+ * file even though it holds the value in its own environment (which no other
+ * sandboxed process can read: measured 2026-08-22).
+ */
+export function readOauthToken(path = join(homedir(), ".reeve", "claude-token")) {
+  let raw;
+  try { raw = readFileSync(path, "utf8"); }
+  catch (e) { return { ok: false, why: `${path} could not be read (${e.code ?? e.message}); create one with \`claude setup-token\`` }; }
+  const token = raw.trim();
+  if (!token) return { ok: false, why: `${path} is empty` };
+  // Loose on purpose: the prefix is what today's tokens carry, and refusing an
+  // unknown-but-plausible shape would strand a worker on a format change.
+  if (token.includes("\n") || token.length < 20) return { ok: false, why: `${path} does not look like a token` };
+  try {
+    const mode = statSync(path).mode & 0o077;
+    if (mode) return { ok: false, why: `${path} is readable by others (mode ${(statSync(path).mode & 0o777).toString(8)}); chmod 600 it` };
+  } catch { /* the read already succeeded; a stat failure is not a refusal */ }
+  return { ok: true, token, why: null };
 }

@@ -39,7 +39,11 @@ export const REVIEWER_KIND = ["blocking", "advisory"];
 // becomes, and it blocks.
 export const SEVERITY = ["critical", "major", "minor", "nit", "unknown"];
 export const MERGE_METHOD = ["squash", "merge", "rebase"];
-export const WORKER_ISOLATION = ["none", "dedicated-user"];
+export const WORKER_ISOLATION = ["none", "scratch-home", "dedicated-user"];
+// "scratch-home": workers get a HOME of reeve's making and a standalone clone,
+// so the founder's login keychain is not in their search list (measured
+// 2026-08-22) and they share no ref store or config with the founder's checkout.
+// "dedicated-user" is stronger still (its own OS account) and is not built.
 
 /**
  * field: [required, validator, description]
@@ -218,6 +222,12 @@ export const FIELDS = {
   // separate OS user (its own empty keychain) and per-run standalone clones;
   // ONLY then does a passing canary plus an empty keychain close dispatch.
   "worker.isolation":                    [false, oneOf(WORKER_ISOLATION)],
+  // The dependency trees to copy into a run checkout, RELATIVE to the checkout.
+  // A worker has no network and no home cache, so a project whose dependencies
+  // this cannot infer from its languages has no other way to be given them --
+  // and an override the loader REJECTS is not an override at all. (Codex #5-[9].)
+  "worker.dependencyPaths":              [false, isArr(v => (typeof v === "string" && v.length && !v.startsWith("/") && !v.split("/").includes("..")
+                                                    ? null : "must be a relative path inside the checkout"))],
   // The only network a worker's shell may reach, and only for research: the OS
   // sandbox denies every domain for every other action. A bare host name, no
   // scheme, no path: the runtime matches domains, and "https://x" matches nothing.

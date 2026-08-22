@@ -62,8 +62,20 @@ const base = { cliVersion: "2.1.237", sandbox, permissionsDeny: [], canaryPaths:
   check(r.credentialRead === "closed" && /passed/.test(r.why), "passing canary + empty keychain: closed", r.why);
 }
 {
+  // CHANGED 2026-08-22, deliberately. The host's keychain no longer gates: a
+  // worker runs with a scratch HOME and has no login keychain in its search
+  // list, so what the founder's keychain holds says nothing about what a worker
+  // can reach. The CANARY measures the reach directly, and it is the gate.
   const r = await measureContainment({ ...base, canary: pass, keychain: dirty });
-  check(r.credentialRead === "open" && /gh keyring/.test(r.why), "a GitHub item in the keychain keeps it open whatever the canary said", r.why);
+  check(r.credentialRead === "closed", "the founder's keychain contents no longer gate dispatch: the canary measures the worker's reach instead", r.why);
+  check(r.keychain?.items?.length === 1, "and the probe is still reported, so the doctor can say what the host holds", JSON.stringify(r.keychain?.items));
+}
+{
+  // The safety property that REPLACES it: a canary showing the keychain IS
+  // reachable keeps containment open, whatever the host probe said.
+  const reachable = { ok: false, id: "kc", why: "read the founder's GitHub credential from the keychain", evidence: {} };
+  const r = await measureContainment({ ...base, canary: reachable, keychain: clean });
+  check(r.credentialRead === "open" && /keychain/.test(r.why), "a canary that reached the keychain keeps containment OPEN even with a clean host probe", r.why);
 }
 {
   const r = await measureContainment({ ...base, isolated: false, canary: pass, keychain: clean });
@@ -75,7 +87,7 @@ const base = { cliVersion: "2.1.237", sandbox, permissionsDeny: [], canaryPaths:
 }
 {
   const r = await measureContainment({ ...base, canary: pass, keychain: { measured: false, items: [], why: "security exited 1" } });
-  check(r.credentialRead === "open" && /keychain unmeasured/.test(r.why), "an unmeasured keychain is open, not empty", r.why);
+  check(r.credentialRead === "closed", "an unmeasurable host keychain no longer blocks either: the canary is what decides", r.why);
 }
 {
   const r = await measureContainment({ ...base, canary: pass, keychain: clean, platform: "linux" });
@@ -119,7 +131,7 @@ const base = { cliVersion: "2.1.237", sandbox, permissionsDeny: [], canaryPaths:
   const cache = new Map();
   const r1 = await measureContainment({ ...base, canary: pass, keychain: kc, cache });
   const r2 = await measureContainment({ ...base, canary: pass, keychain: kc, cache });
-  check(r1.credentialRead === "closed" && r2.credentialRead === "open", "the keychain is re-probed on every ask", `${r1.credentialRead} -> ${r2.credentialRead}`);
+  check(r1.keychain?.items?.length === 0 && r2.keychain?.items?.length === 1, "the keychain is re-probed on every ask, so the report is never stale", `${asks} asks`);
 }
 
 // ── the cache key follows the canary's own normalisation ─────────────────────
@@ -159,15 +171,18 @@ const base = { cliVersion: "2.1.237", sandbox, permissionsDeny: [], canaryPaths:
   check((await revalidateContainment(closed, { bin: "/x@2", binaryIdentity: idOf, keychain: clean })).ok === false, "a changed binary identity refuses");
   const r = await revalidateContainment(closed, { bin: "/x@2", binaryIdentity: idOf, keychain: clean });
   check(/CLI binary changed/.test(r.why), "and says the binary changed", r.why);
+  // CHANGED 2026-08-22: a credential appearing in the FOUNDER's keychain no
+  // longer refuses, because a worker has no login keychain in its search list
+  // and cannot reach it either way. The canary measures the worker's reach.
   const rd = await revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: dirty });
-  check(rd.ok === false && /credential appeared/.test(rd.why), "a credential that appeared refuses", rd.why);
-  check((await revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: { measured: false, items: [], why: "no security" } })).ok === false, "an unmeasurable keychain refuses");
+  check(rd.ok === true, "the host keychain no longer decides a spawn: the worker cannot reach it", rd.why);
+  check((await revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: { measured: false, items: [], why: "no security" } })).ok === true, "and an unmeasurable one does not refuse either, for the same reason");
   check((await revalidateContainment({ credentialRead: "open" }, { bin: "/x@1", binaryIdentity: idOf, keychain: clean })).ok === false, "an open verdict is never revalidated as ok");
   // A verdict without a recorded binaryId cannot check the binary, but still checks the keychain.
   check((await revalidateContainment({ credentialRead: "closed" }, { bin: "/x@1", binaryIdentity: idOf, keychain: clean })).ok === true, "a verdict without a binaryId still passes on a clean keychain");
   // An ASYNC keychain injection is the same contract the initial measurement
   // supports; reading a pending Promise refused every eligible worker.
-  check((await revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: async () => clean })).ok === true, "an async keychain probe is awaited, not read as a Promise");
+  check((await revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: async () => clean })).ok === true, "an async keychain injection is still accepted without being read as a Promise");
 }
 
 rmSync(root, { recursive: true, force: true });

@@ -52,13 +52,19 @@ const db = open(join(dir, "c.db"));
     // Deterministic: the real capacity() backs off on the host's load average, so
     // a busy machine would fail these assertions for a reason that is not the code.
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
-    profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir }, authority: { policy: "propose_and_merge" },
+    // Separate directories, as a real deployment must have them: the worker
+    // policy denies reads of the clone, so a checkout inside it is refused.
+    profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-wc-clone-")) }, authority: { policy: "propose_and_merge" },
                rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 }, ci: { provider: "github-actions", requiredChecks: [] },
                watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 } },
     openPrs: () => [42], evaluate: () => evaluation,
     publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    // Injected, never read from disk: the real reader looks at
+    // ~/.reeve/claude-token, so a default passes on a machine that happens to
+    // have one and fails on CI.
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
     resolveCause: () => ({ ok: true, job: "CI Gate", step: "Test", runId: 11, cause: [{ where: "src/x.ts:1", message: "boom" }] }),
-    worktreeFor: () => mkdtempSync(join(dir, "wt-")),
+    prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dir, "wt-")), why: null, deps: { ok: true, cow: false } }),
   });
   var seenEnv = null, seenArgs = null;
   const ctx = { ...ctxFor(db, join(dir, "log.txt")),

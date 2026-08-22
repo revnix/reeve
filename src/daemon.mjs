@@ -19,10 +19,11 @@ import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
-import { sandboxFor, writeSandbox, reviewDiff, validateSettings, quarantineOsDenies } from "./sandbox.mjs";
-import { acquireWorktree, releaseWorktree, pushWorktree, verifyConfig, GIT_NEUTRALISE } from "./worktree.mjs";
+import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf } from "./sandbox.mjs";
+import { verifyConfig, GIT_NEUTRALISE } from "./gitguard.mjs";
+import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
-import { workerEnv, writeGitConfig } from "./workerenv.mjs";
+import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
 import { canaryIdFor, netListener } from "./canary.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
@@ -35,7 +36,7 @@ import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
+import { appendFileSync, mkdirSync, fstatSync, statSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
@@ -120,6 +121,69 @@ function attemptsFor(db, nwo, pr, fp, logPath) {
  * from anything the worker says about itself: the whole point of this gate is
  * that the actor does not get to be the only witness.
  */
+/**
+ * The paths a worker changed but never COMMITTED.
+ *
+ * Publishing moves commits, not working trees: reeve fetches the checkout's
+ * branch into its own repository and pushes from there. So an uncommitted edit
+ * passes the diff gate, is counted in "published N file(s)", and is then deleted
+ * with the checkout, having never left the machine. (Codex #5-[2].)
+ */
+function uncommittedFiles(worktree) {
+  try {
+    const out = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "status", "--porcelain"], { encoding: "utf8" }).trim();
+    return out ? out.split("\n").map(l => l.slice(3).trim().split(" -> ").pop()).filter(Boolean) : [];
+  } catch { return null; }
+}
+
+/**
+ * Does the work about to be published carry a secret reeve itself handed over?
+ *
+ * A worker holds a working OAuth token in its environment, because it needs one
+ * to run, and it is granted language runtimes that can read that environment. The
+ * diff gate judges FILENAMES, so a token written into an ordinary source file
+ * passes it, and reeve — not the worker — then pushes it. Denying the network
+ * does not close that route: the daemon is the one that publishes. (Codex #5-[3].)
+ *
+ * This is a literal match, and it is honest about being one: a worker that
+ * encodes the value walks around it. It costs nothing, it closes the accidental
+ * case and the obvious deliberate one, and the residual is stated in the docs
+ * rather than papered over. The value is never logged.
+ */
+function diffCarriesSecret(worktree, since, secrets) {
+  const present = secrets.filter(x => typeof x?.value === "string" && x.value.length >= 16);
+  if (!present.length) return null;
+  // The PATCH and the COMMIT METADATA, because a push carries both. `git diff`
+  // emits the file patch only, so a token placed in a commit message travelled
+  // straight into public history past a check that had just declared the change
+  // clean. Author name and email go with it, for the same reason. (Codex #5-[7].)
+  let text;
+  try {
+    // `--no-ext-diff` is not optional here. GIT_NEUTRALISE sets `diff.external=`
+    // to disable an external differ, and git takes the empty string literally:
+    // "cannot run : No such file or directory / fatal: external diff died". A
+    // content diff is the only command in reeve that reaches that code path, so
+    // nothing had exercised it — and the failure is silent in the direction that
+    // matters least and loudest in the one that matters most: this check would
+    // have refused EVERY publish as unreadable.
+    const args = [["diff", "--no-ext-diff", "--no-color", `${since}..HEAD`],
+                  ["log", `${since}..HEAD`, "--format=%B%n%an%n%ae%n%cn%n%ce"]];
+    text = args.map(a => execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...a],
+                                      { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })).join("\n");
+  } catch { return { label: "unreadable", why: "reeve could not read the change to check it for its own credentials" }; }
+  for (const sx of present) if (text.includes(sx.value)) return { label: sx.label, why: `the change carries ${sx.label}` };
+  return null;
+}
+
+/** Where a named branch points inside a checkout, or null if it cannot be read. */
+function branchHead(worktree, branch) {
+  if (!branch) return null;
+  try {
+    return execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`],
+                        { encoding: "utf8" }).trim() || null;
+  } catch { return null; }
+}
+
 function changedFiles(worktree, since = null) {
   const run = args => {
     try { return execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args], { encoding: "utf8" }).trim(); }
@@ -176,7 +240,12 @@ export function stateRootsFor(stateDir, logPath, worktree, dbPath = null) {
   return [...new Set(cands)].filter(p => !(worktree && under(p, worktree)));
 }
 
-async function measuredContainment(ctx, profile, nwo, logPath) {
+/**
+ * The containment verdict the daemon acts on: cheap gates first, then the paid
+ * sandbox canary. Exported so `reeve canary` can run exactly this, rather than a
+ * reconstruction of it that could drift from what dispatch actually does.
+ */
+export async function measuredContainment(ctx, profile, nwo, logPath) {
   const cache = (ctx.containmentCache ??= new Map());
   try {
     const root = profile.identity?.worktreeRoot;
@@ -184,7 +253,13 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     // Cheap gates FIRST: on a host where the verdict is already open, preparing a
     // canary would create a per-invocation tmp tree every tick that nothing then
     // cleans up, because the canary itself never runs. (Codex #4e-[9].)
-    const isolated = profile.worker?.isolation === "dedicated-user" && (ctx.isolationReady ?? isolationTopologyReady)();
+    // Only an arrangement reeve has actually BUILT can close containment. A
+    // profile that declares "dedicated-user" is declaring something that does
+    // not exist yet, and saying so is better than quietly treating it as the
+    // weaker thing that does.
+    const mode = profile.worker?.isolation ?? "none";
+    const isolated = mode === "scratch-home" && (ctx.isolationReady ?? isolationTopologyReady)();
+    if (mode === "dedicated-user") log(logPath, `  containment: worker.isolation is "dedicated-user", which is not built; use "scratch-home"`);
     const cheapKc = typeof ctx.keychain === "function" ? await ctx.keychain() : ctx.keychain ?? null;
     const cheap = cheapContainmentReasons({ platform: ctx.platform ?? process.platform, isolated, keychain: cheapKc });
     if (cheap.reasons.length) {
@@ -215,8 +290,14 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     // grants read: putting it under ~/.reeve (deny-read) left the sandboxed git
     // unable to read its own configured global config, so the worker could not
     // even commit. (Codex #4-[8].)
+    // A home of reeve's making, outside the deny-read state tree: with the
+    // founder's home a worker reads their keychain, which no setting can deny.
+    const workerHome = workerHomeFor(root, nwo);
+    const token = (ctx.oauthToken ?? readOauthToken)();
+    if (!token?.ok) return { credentialRead: "open", why: `no worker authentication token: ${token?.why ?? "unreadable"}` };
     const env = workerEnv({ gitConfigPath: writeGitConfig(join(canaryPaths.tmpDir, "git")), tmpDir: canaryPaths.tmpDir,
-                            bgWaitMs: 5 * 60_000, extraPath: [dirname(claudeBin)] });
+                            bgWaitMs: 5 * 60_000, extraPath: [dirname(claudeBin)],
+                            home: workerHome, oauthToken: token.token });
     const version = ctx.cliVersion ?? cliVersion(claudeBin, env);
     // The block every worker gets; the canary's id covers it, so a block that
     // changes (a new deny, a new domain) is measured again before it is trusted.
@@ -233,22 +314,25 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     // dependency, no timing window, and a hit at any point in the run is a leak.
     // (Codex #4d-[12], #4c-[13].) Injectable for tests.
     const netProbe = ctx.netProbe ?? netListener();
-    const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox, binaryId, worktree: canaryPaths.dir }))?.ok === true;
+    // Computed exactly as measureContainment computes it. A cache key that
+    // drifts from the id is how every tick came to pay for a five-minute canary.
+    const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox, binaryId, worktree: canaryPaths.dir,
+                                           permissionsDeny: policy.settings.permissions.deny, allowedTools: policy.allowedTools }))?.ok === true;
     if (!before) log(logPath, `containment: running the sandbox canary under ${version}`);
     let c;
     try {
       c = await measureContainment({
-      cliVersion: version, sandbox: policy.settings.sandbox, permissionsDeny: policy.settings.permissions.deny, binaryId,
+      cliVersion: version, sandbox: policy.settings.sandbox, permissionsDeny: policy.settings.permissions.deny,
+      allowedTools: policy.allowedTools, binaryId,
       canaryPaths, bin: claudeBin, env, stateDir: canaryStateDir, nwo, cache, netProbe, stateRoots,
       // process.platform in production; injectable so a test on one OS can
       // exercise the verdict for another (the fail-closed matrix is per-OS).
       platform: ctx.platform ?? undefined,
-      // The profile LABEL is necessary but not sufficient: the dedicated-user
-      // dispatch topology (a separate OS user, a per-run standalone clone) is
-      // PR-3, and production dispatch still uses a linked worktree as this user.
-      // So the label closes containment only when the topology is actually
-      // verified ready — false until PR-3, injectable for the wiring test.
-      // (Codex #4c-[9].)
+      // The profile LABEL is necessary but not sufficient: it closes containment
+      // only when the topology it names is actually in place. The scratch-home
+      // arrangement (a home of reeve's making, a per-run standalone clone, a
+      // token instead of ~/.claude) is built, so this reads true; it stays a
+      // seam because the next topology will not be. (Codex #4c-[9].)
       isolated,
       canary: ctx.canary ?? null, keychain: cheap.keychain,
       });
@@ -256,6 +340,13 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
       // The listener is torn down whatever happened, so a canary run never
       // leaves a socket bound.
       if (!ctx.netProbe) netProbe.close?.();
+      // And so is the per-invocation tree, unless the canary itself is the one
+      // holding it. sandboxCanary is the only code that removes these paths, and
+      // it never runs on a cache hit -- so every tick under a cached pass left
+      // another directory behind, each with a git config and the shims in it. A
+      // FAILED canary keeps its own directory for evidence, which is why this
+      // removes the tree only when the canary did not run. (Codex #5-[6].)
+      if (c?.canary?.skipped || c?.canary?.cached) rmSync(canaryRoot, { recursive: true, force: true });
     }
     if (!before) log(logPath, `containment: canary ${c.canary?.id ?? "?"} ${c.canary?.ok ? "passed" : `FAILED: ${c.canary?.why}`}; keychain: ${c.keychain?.measured ? (c.keychain.items.length ? c.keychain.why : "no GitHub credential") : `unmeasured (${c.keychain?.why})`}`);
     return c;
@@ -605,13 +696,19 @@ export async function tick(ctx) {
       const spec = promptFor(decision, promptCtx);
       if (!spec) continue;
 
-      const wt = resolveWorktree(ctx, profile, e);
-      if (!wt.path) {
-        escalations.set(`#${e.pr}: cannot dispatch — ${wt.why}`, 1);
-        log(logPath, `  #${e.pr}: NOT dispatching — ${wt.why}`);
+      // The checkout is prepared AFTER the run exists, because it is keyed by the
+      // run: two runs for one pull request must never share a directory, and the
+      // lease should be held while the (slow) preparation happens rather than
+      // leaving a window another daemon could race into. A preparation that
+      // fails is handled as one, below: refunded, backed off, nothing published.
+      const checkoutRoot = profile.identity?.worktreeRoot ?? null;
+      const repoCheckout = profile.identity?.checkout ?? null;
+      if (!checkoutRoot || !repoCheckout) {
+        const why = !checkoutRoot ? "no identity.worktreeRoot in the profile" : "no identity.checkout in the profile — a checkout is made FROM a clone";
+        escalations.set(`#${e.pr}: cannot dispatch — ${why}`, 1);
+        log(logPath, `  #${e.pr}: NOT dispatching — ${why}`);
         continue;
       }
-      const worktree = wt.path;
 
       // A durable run is the ONLY way a worker may start. The exclusive right to
       // act on this PR is taken FIRST, so a restarted daemon cannot re-dispatch
@@ -629,7 +726,7 @@ export async function tick(ctx) {
         continue;
       }
 
-      log(logPath, `  #${e.pr}: dispatching ${decision.action} in ${worktree} (run ${run.runId}, attempt ${run.attempt})`);
+      log(logPath, `  #${e.pr}: dispatching ${decision.action} (run ${run.runId}, attempt ${run.attempt})`);
       started++;
       // The heartbeat's answer is read, not discarded. `heartbeat` already
       // reports a lost lease; the interval used to swallow it, so a worker kept
@@ -655,10 +752,10 @@ export async function tick(ctx) {
       const stateDir = dirname(logPathOf(ctx));
       const runDir = join(stateDir, "runs", nwo.replace("/", "-"), String(e.pr), run.runId);
       const tmpDir = join(runDir, "tmp");
-      const dStateRoots = stateRootsFor(stateDir, logPathOf(ctx), worktree, ctx.dbPath ?? null);
-      const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane, tmpDir, stateRoots: dStateRoots });
-
-      let r, prepFailed = false;
+      // Declared out here, not inside the try: the publish path below reads it,
+      // and a const in the try block is a ReferenceError at that point -- the
+      // exact shape that once threw on every FIX_CI with every unit test green.
+      let r, prepFailed = false, worktree = null, workerToken = null;
       try {
         // Everything from here runs inside the cleanup scope: the run is
         // already leased and its heartbeat already ticking, so a failure in
@@ -672,13 +769,46 @@ export async function tick(ctx) {
         // run so a restart can read the report the worker left. The run dir is
         // keyed by repository, PR, and run id: the log dir is shared by every
         // repo's daemon, and two repos can share a PR number.
+        // A standalone clone, not a linked worktree: its own ref store and its own
+        // configuration, so a worker cannot move the founder's branches or plant
+        // git config the daemon would execute. Dependencies come from the
+        // founder's tree copy-on-write, because the network is denied and a fixer
+        // that cannot run the tests cannot check its own fix.
+        // Which trees to copy comes from the PROFILE's languages, not from a
+        // hard-coded node_modules: a python unit needs its .venv, and a language
+        // whose dependencies live under the home directory has nothing in the
+        // tree to copy at all. The worker has no network and a scratch home, so
+        // that last case cannot resolve anything and is SAID rather than left to
+        // be discovered as a mystery test failure. (Codex #5-[5].)
+        const wantDeps = dependencyPathsFor(profile);
+        const prepared = (ctx.prepareCheckout ?? prepareRunCheckout)({
+          repoRoot: repoCheckout, root: checkoutRoot, pr: e.pr, runId: run.runId,
+          branch: e.headRef, head: e.head, depsFrom: wantDeps.paths,
+        });
+        if (!prepared.ok) throw new Error(`could not prepare the checkout: ${prepared.why}`);
+        worktree = prepared.path;
+        log(logPath, `  #${e.pr}: checkout ready at ${worktree}` +
+                     `${prepared.deps?.copied?.length ? ` (deps: ${prepared.deps.copied.join(", ")}${prepared.deps.cow ? ", copy-on-write" : ""})` : ""}`);
+        if (wantDeps.unsupported.length)
+          log(logPath, `  #${e.pr}: no dependency tree to copy for ${wantDeps.unsupported.join(", ")} — those checks may not resolve`);
+
+        // The policy is built AFTER the checkout, because it is written in terms
+        // of that directory: the write scope, the quarantine denies and the
+        // overlap check all resolve against it.
+        const dStateRoots = stateRootsFor(stateDir, logPathOf(ctx), worktree, ctx.dbPath ?? null);
+        const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane, tmpDir, stateRoots: dStateRoots });
         const budgetMs = (profile.watch?.workerBudgetMinutes ?? 20) * 60_000;
         const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
         // In the run's tmp (sandbox-readable), never under the deny-read ~/.reeve:
         // a global config the sandboxed git cannot read stops it committing.
+        const dToken = (ctx.oauthToken ?? readOauthToken)();
+        if (!dToken?.ok) throw new Error(`no worker authentication token: ${dToken?.why ?? "unreadable"}`);
+        workerToken = dToken.token;
         const env = workerEnv({ gitConfigPath: writeGitConfig(join(tmpDir, "git")),
                                 tmpDir, bgWaitMs: budgetMs,
-                                extraPath: [dirname(claudeBin)] });
+                                extraPath: [dirname(claudeBin)],
+                                home: workerHomeFor(profile.identity?.worktreeRoot ?? dirname(worktree), nwo),
+                                oauthToken: dToken.token });
         const outPath = join(runDir, "worker.out"), errPath = join(runDir, "worker.err");
         // Validated BEFORE it is written or hashed. Measured: under -p the CLI
         // drops an invalid settings file whole and silently, deny rules
@@ -694,17 +824,27 @@ export async function tick(ctx) {
         // code, and the failure would read as a broken sandbox rather than the
         // configuration error it is. (Codex #4g-[4].)
         if (sandbox.stateHomeContainsWorktree?.length)
-          throw new Error(`reeve's state (${sandbox.stateHomeContainsWorktree.join(", ")}) contains the worktree ${worktree}, so the policy would deny the worker its own checkout — move REEVE_HOME or identity.worktreeRoot apart`);
+          throw new Error(`a denied path (${sandbox.stateHomeContainsWorktree.join(", ")}) contains the checkout ${worktree}, so the policy would deny the worker its own code — move identity.worktreeRoot apart from REEVE_HOME and from identity.checkout`);
         const qDenies = quarantineOsDenies(worktree, profile.risk?.quarantinePaths ?? []).paths;
         const notifyCred = typeof profile.notify?.credentialFile === "string" && isAbsolute(profile.notify.credentialFile) ? [profile.notify.credentialFile] : [];
-        const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots, quarantineDenies: qDenies, extraDenies: notifyCred });
+        const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots, quarantineDenies: qDenies,
+                                                                                  extraDenies: notifyCred, sourceCheckout: sourceCheckoutOf(profile) });
         if (!sv.ok) throw new Error(`settings invalid: ${sv.errors.join("; ")}`);
         // The settings file is immutable per run, in the run's own directory:
         // a path keyed by PR alone was shared by every daemon on the host, and
         // one could overwrite it between this run's hash and its spawn.
         const settingsPath = writeSandbox(runDir, sandbox);
         const maxTurns = profile.watch?.maxTurns ?? 40;
-        const tools = spec.tools ?? sandbox.allowedTools;
+        // A prompt spec may name its own tools, and those strings cannot know the
+        // worktree; they are scoped here, at the one place that knows both.
+        const tools = scopeGrant(spec.tools ?? sandbox.allowedTools, worktree);
+        // The grant travels beside the settings file, not inside it, so the
+        // settings validator never sees it -- and it is where the file tools are
+        // granted. A bare `Read` there is a grant to read the whole disk: the
+        // file tools are not covered by the OS sandbox. A prompt spec may
+        // override the grant, which is exactly the path that needs checking.
+        const tv = (ctx.toolValidator ?? validateToolGrant)(tools, { worktree });
+        if (!tv.ok) throw new Error(`tool grant invalid: ${tv.errors.join("; ")}`);
         const argv = workerArgs({ prompt: spec.prompt, allowedTools: tools, settings: settingsPath, maxTurns });
         // The complete argv is kept beside the hash: a hash proves what ran, the
         // file lets a later attempt run the same thing.
@@ -823,14 +963,24 @@ export async function tick(ctx) {
       }
       log(logPath, `  #${e.pr}: ${decision.action} -> ${r.outcome} (${r.why}) in ${Math.round(r.ms / 1000)}s${r.cost != null ? `, ${r.cost.toFixed(3)}` : ""}`);
 
+      // Nothing was prepared, so there is no checkout to read, judge or publish.
+      // Preparation happens inside the try-block above, so a failure there leaves
+      // this path null while everything below it still runs -- and the
+      // configuration check reads a null path as "no recorded configuration",
+      // which is a refusal. That reported the most ordinary failure there is (no
+      // disk, no token, a clone that would not clone) as the worker having
+      // tampered with git config, against a worker that never started.
+      if (!worktree) continue;
+
       // What the worker PRODUCED, judged after it has stopped talking. The
       // permission layer stops it reaching a forbidden path; this answers the
       // different question of whether the change is inside the work it was given.
       // A model that argued its way to a plausible edit outside its territory
       // still does not get it published.
-      // A worker that did not finish still leaves its work behind, and the next
-      // attempt cannot use a dirty checkout -- verifyWorktree refuses it, correctly,
-      // and the pull request is then stuck forever with no path out.
+      // A worker that did not finish still leaves its work behind. Each run gets
+      // its own checkout now, so a half-finished one no longer blocks the next
+      // attempt -- but it still holds work nobody else has a copy of, which is
+      // why the release below preserves it rather than deleting it.
       //
       // Measured: a worker repaired the planted bug and then hit its turn limit
       // before committing. The fix was correct, cost real money, and would have
@@ -864,20 +1014,31 @@ export async function tick(ctx) {
       // (Codex #4f-[6].)
       const cfg = (ctx.verifyConfig ?? verifyConfig)(worktree);
       if (!cfg.ok) {
-        log(logPath, `  #${e.pr}: NOT reading or publishing this worktree — ${cfg.why}`);
-        escalations.set(`#${e.pr}: the worker changed its checkout's git configuration; the worktree is preserved for inspection`, 1);
-        escalations.set("guardian:worktree:config-tampered", 1);
+        log(logPath, `  #${e.pr}: NOT reading or publishing this checkout — ${cfg.why}`);
+        escalations.set(`#${e.pr}: the worker changed its checkout's git configuration; the checkout is preserved at ${worktree} for inspection`, 1);
+        escalations.set("guardian:checkout:config-tampered", 1);
         continue;
       }
 
       if (r.outcome !== OUTCOMES.OK) {
         const left = changedFiles(worktree, e.head);
-        if (left?.length) {
-          const rel = releaseWorktree({ path: worktree, pr: e.pr });
-          log(logPath, `  #${e.pr}: the worker left ${left.length} changed file(s) unfinished — ${rel.quarantined ? `preserved at ${rel.path}` : "released"}`);
-          escalations.set(`#${e.pr}: an unfinished candidate fix was preserved rather than published — ${left.slice(0, 3).join(", ")}`, 1);
+        // `changedFiles` reads HEAD, and a worker that committed on the pull
+        // request's branch and then checked out something else leaves HEAD back
+        // at the pinned commit with the work still on the BRANCH. Publishing
+        // fetches that branch, so it is the branch that decides whether anything
+        // would be lost -- reading HEAD alone deleted the only copy of a
+        // candidate fix. (Codex #5-[11].)
+        const branchAt = branchHead(worktree, e.headRef);
+        const branchMoved = branchAt === null || branchAt !== e.head;
+        if (left?.length || branchMoved) {
+          const rel = releaseRunCheckout(worktree, { workFetched: false });
+          const why = left?.length ? `left ${left.length} changed file(s) unfinished`
+            : branchAt === null ? `left ${e.headRef} unreadable`
+            : `committed on ${e.headRef} without finishing`;
+          log(logPath, `  #${e.pr}: the worker ${why} — ${rel.quarantined ? `preserved at ${rel.path}` : "released"}`);
+          escalations.set(`#${e.pr}: an unfinished candidate fix was preserved rather than published — ${left?.length ? left.slice(0, 3).join(", ") : `commits on ${e.headRef}`}`, 1);
         } else {
-          releaseWorktree({ path: worktree, pr: e.pr });
+          releaseRunCheckout(worktree, { workFetched: true });
         }
       }
 
@@ -886,6 +1047,23 @@ export async function tick(ctx) {
       if (decision.action === "FIX_CI" && fp) noteFixAttempt(db, nwo, e.pr, fp, statedBlocker(r.report));
 
       if (r.outcome === OUTCOMES.OK) {
+        // Everything accepted must be COMMITTED before anything is published or
+        // released. reeve publishes by fetching the checkout's BRANCH, so an
+        // uncommitted edit is invisible to the push and would then be deleted
+        // with the checkout while the log said it was published. The work is
+        // kept and a human is told, because a candidate fix nobody has a copy of
+        // is not spare disk space. (Codex #5-[2].)
+        const stillDirty = uncommittedFiles(worktree);
+        if (stillDirty === null || stillDirty.length) {
+          const why = stillDirty === null
+            ? "reeve could not read the checkout's status, so it cannot say the work was committed"
+            : `the worker finished with ${stillDirty.length} uncommitted change(s), which a push cannot carry`;
+          const rel = releaseRunCheckout(worktree, { workFetched: false });
+          log(logPath, `  #${e.pr}: NOT published — ${why}${rel.quarantined ? `; preserved at ${rel.path}` : ""}`);
+          escalations.set(`#${e.pr}: a finished fix was NOT published — ${why}` +
+                          `${stillDirty?.length ? ` (${stillDirty.slice(0, 3).join(", ")})` : ""}`, 1);
+          continue;
+        }
         const changed = changedFiles(worktree, e.head);
         const gate = reviewDiff({ files: changed, profile, lane, action: decision.action });
         if (!gate.ok) {
@@ -901,10 +1079,21 @@ export async function tick(ctx) {
             ? `#${e.pr}: needs a human — ${blocker}`
             : `#${e.pr}: a fix was produced but refused publication — ${gate.why}`, 1);
         } else {
+          // Before reeve puts its name on it: the worker had a working token in
+          // its environment and every runtime needed to read it. A filename gate
+          // cannot see that, and reeve is the party that pushes.
+          const leak = diffCarriesSecret(worktree, e.head, [{ label: "reeve's worker authentication token", value: workerToken }]);
+          if (leak) {
+            const rel = releaseRunCheckout(worktree, { workFetched: false });
+            log(logPath, `  #${e.pr}: NOT published — ${leak.why}${rel.quarantined ? `; preserved at ${rel.path}` : ""}`);
+            escalations.set(`#${e.pr}: a fix was refused publication because ${leak.why}; rotate the token with \`claude setup-token\``, 1);
+            escalations.set("guardian:worker:credential-in-diff", 1);
+            continue;
+          }
           // reeve publishes, not the worker: the actor and the only claim that
           // the action was allowed must not be the same party.
-          const pushed = pushWorktree({ path: worktree, branch: e.headRef, expectedRemote: e.head,
-                                         repoRoot: profile.identity?.checkout ?? null });
+          const pushed = (ctx.publishWork ?? publishRunWork)({ repoRoot: repoCheckout, path: worktree,
+                                                               branch: e.headRef, expectedRemote: e.head });
           if (!pushed.ok) {
             log(logPath, `  #${e.pr}: NOT published — ${pushed.why}`);
             escalations.set(`#${e.pr}: a fix was produced but could not be published — ${pushed.why}`, 1);
@@ -917,8 +1106,10 @@ export async function tick(ctx) {
             // Only ever release what pushed cleanly. Anything else quarantines,
             // because a directory holding work nobody has a copy of is not spare
             // disk space.
-            const rel = releaseWorktree({ path: worktree, pr: e.pr });
-            if (!rel.ok) log(logPath, `  #${e.pr}: worktree quarantined — ${rel.why}`);
+            // Only what published cleanly is deleted; the release refuses to
+            // remove a checkout whose commits reeve never took out of it.
+            const rel = releaseRunCheckout(worktree, { workFetched: true });
+            if (!rel.ok) log(logPath, `  #${e.pr}: checkout kept — ${rel.why}`);
           }
         }
       }
@@ -1119,39 +1310,6 @@ export function announceable(db, escalations, { covered = null, waiting = null, 
     cleared.push(why);
   }
   return { fresh, cleared };
-}
-
-/**
- * Where a worker for this escalation should run.
- *
- * Returns `{path: null, why}` rather than a default, because the previous
- * default was `process.cwd()` -- which under launchd is the daemon's
- * WorkingDirectory, so a worker sent to fix a pull request in one repository
- * would have run inside another. A wrong directory is not a smaller version of
- * the right one, and refusing is the only safe answer.
- */
-export function resolveWorktree(ctx, profile, e) {
-  // An explicit override still wins: that is how a test, or a human working a PR
-  // by hand, hands a specific directory to a worker.
-  const override = ctx.worktreeFor?.(e) ?? null;
-  if (override) {
-    if (!isAbsolute(override)) return { path: null, why: `worktree path is relative (${override})` };
-    if (!existsSync(override)) return { path: null, why: `worktree does not exist: ${override}` };
-    return { path: override, why: null };
-  }
-
-  const root = profile.identity?.worktreeRoot ?? null;
-  const checkout = profile.identity?.checkout ?? null;
-  if (!root) return { path: null, why: "no identity.worktreeRoot in the profile" };
-  if (!isAbsolute(root)) return { path: null, why: `identity.worktreeRoot is relative (${root}); it must be absolute` };
-  if (!checkout) return { path: null, why: "no identity.checkout in the profile — a worktree is created FROM a clone" };
-  if (!existsSync(checkout)) return { path: null, why: `identity.checkout does not exist: ${checkout}` };
-
-  // A dedicated, verified checkout of THIS pull request's branch at the revision
-  // reeve pinned. Refusing is the whole point: a worktree holding somebody's
-  // unsaved work is not a worktree a worker may reset.
-  const w = acquireWorktree({ repoRoot: checkout, root, pr: e.pr, branch: e.headRef, head: e.head });
-  return w.ok ? { path: w.path, why: null, reused: w.reused } : { path: null, why: w.why };
 }
 
 /** The long-running loop. Ticks until halted or stopped. */

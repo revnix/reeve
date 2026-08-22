@@ -182,8 +182,8 @@ expectOk("a lane declaring sensitiveOk true",
   const isoDefault = d.worker?.isolation === "none";
   console.log(`${isoDefault ? "PASS" : "FAIL"}  worker.isolation defaults to "none"`);
   if (!isoDefault) fail++;
-  const isoOk = validate(withDefaults((() => { const q = clone(base); q.worker = { isolation: "dedicated-user" }; return q; })())).ok;
-  console.log(`${isoOk ? "PASS" : "FAIL"}  worker.isolation accepts "dedicated-user"`);
+  const isoOk = validate(withDefaults((() => { const q = clone(base); q.worker = { isolation: "scratch-home" }; return q; })())).ok;
+  console.log(`${isoOk ? "PASS" : "FAIL"}  worker.isolation accepts the implemented mode`);
   if (!isoOk) fail++;
 }
 
@@ -246,6 +246,18 @@ expectRefusal("a worker output cap that is not positive",
 
 expectOk("all five switches set explicitly",
   (() => { const p = clone(base); p.builder = { capabilities: { observe: true, draftSpec: false, implementLocal: false, publishPr: false, mergeBuilderPr: false } }; return p; })());
+
+// ── the dependency override must be declarable ───────────────────────────────
+//
+// It is the only way to give a network-isolated worker a dependency tree the
+// unit's language does not imply — and an override the loader REJECTS is not an
+// override at all: the profile fails to load and nothing dispatches.
+expectOk("a profile that declares worker.dependencyPaths",
+  (() => { const p = clone(base); p.worker = { dependencyPaths: ["node_modules", "api/.venv"] }; return p; })());
+expectRefusal("an absolute dependency path: it is copied INTO the checkout",
+  (() => { const p = clone(base); p.worker = { dependencyPaths: ["/etc"] }; return p; })(), /relative/);
+expectRefusal("a dependency path that climbs out of the checkout",
+  (() => { const p = clone(base); p.worker = { dependencyPaths: ["../../secrets"] }; return p; })(), /relative/);
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

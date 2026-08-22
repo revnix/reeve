@@ -304,6 +304,21 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       observed pass first, not a guessed regex. Also standing: all three reviewers
       are `kind: advisory`, so the blocking roster is EMPTY and clause B5's
       "absence read as success" is the live configuration, not a hypothetical.
+- [ ] **S2 (hub core) plan written 2026-08-22:**
+      `docs/superpowers/plans/2026-08-22-s2-hub-core.md` — 24 tasks, split into
+      THREE PRs because S2 is ~20 files against a 10-file budget: PR-A hub store
+      (32-table STRICT schema, forward-only migrations, three locks, hub-aware
+      backup, destructive restore drill, the prose-versus-DDL cross-check),
+      PR-B the pure phase machine and the fenced outbox, PR-C the provider
+      scheduler — last, because it is the only one that changes the running
+      guardian. Founder decisions, do not re-litigate: the guardian fails **OPEN**
+      when hub.db is unreadable (the scheduler restrains the BUILDER; it must not
+      become a new way to silence the watchman); `ci.flakePatterns` is **REMOVED**
+      and the live nextly profile stripped in the same change
+      (`docs/measured/2026-08-22-flakepatterns-has-no-readers.md` — zero readers,
+      and the validator refuses unknown keys including empty arrays, so removing
+      it alone would kill every daemon start); `repo_gate_state` ships with a pure
+      derivation behind an injected fetcher, the live client staying in S8.
 
 - [ ] **Guardian: the review shadow week RESET on 2026-08-22.** `#1134` diverged
       — `resolved differs: live 13, derived 18` (55 comparisons, 52 agreements;

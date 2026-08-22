@@ -20,7 +20,7 @@
 // open. A probe that cannot run is open. Closed is a conclusion, never a default.
 import { spawnSync } from "node:child_process";
 import { realpathSync, statSync } from "node:fs";
-import { sandboxCanary, canaryIdFor, readCanaryState, writeCanaryState } from "./canary.mjs";
+import { sandboxCanary, canaryIdFor, policyHashOf, readCanaryState, writeCanaryState } from "./canary.mjs";
 
 /**
  * Is the dedicated-user dispatch topology actually in place? A separate OS user
@@ -137,7 +137,7 @@ export async function measureContainment({
     cn = await run({ cliVersion, sandbox, permissionsDeny, binaryId, ...canaryPaths, bin, env, ...(netProbe ? { netProbe } : {}) });
     cn = { ...cn, at: now() };
     cache.set(id, cn);
-    if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, bin, binaryId, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }
+    if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, bin, binaryId, policyHash: policyHashOf(sandbox), stateRoots: sandbox?.filesystem?.denyRead ?? null, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }
   }
   // A skipped canary adds no reason of its own (the cheaper reasons already stand);
   // a run-or-injected canary that failed does.

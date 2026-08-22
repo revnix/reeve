@@ -18,13 +18,85 @@
 // administrative files behind pointing at nothing.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, renameSync, writeFileSync, rmSync, chmodSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, writeFileSync, readFileSync, rmSync, chmodSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, basename, dirname } from "node:path";
+
+/**
+ * Git configuration that makes git RUN something. A worker holds an unrestricted
+ * `git` grant inside its worktree, and several config keys are documented as
+ * invoking a program: `core.fsmonitor` (a pathname is run as a hook),
+ * `core.hooksPath`, the pagers and editors, `diff.external`, `core.sshCommand`,
+ * the pack hooks, and credential helpers. Every one of those would execute as
+ * the DAEMON user the moment reeve ran `git status` in that worktree, outside
+ * the sandbox. Command-line `-c` beats repository config, so every daemon git
+ * command in worker-controlled directories is prefixed with these.
+ * (Codex #4f-[6].)
+ *
+ * `-c` cannot blanket-clear `filter.<name>.clean`, whose driver name comes from
+ * the repository's own .gitattributes, so the fingerprint check below is what
+ * actually closes this: the daemon refuses to run git at all in a worktree whose
+ * configuration the worker changed.
+ */
+const NEUTRALISE = [
+  "-c", "core.fsmonitor=",
+  "-c", "core.hooksPath=/dev/null",
+  "-c", "core.pager=cat",
+  "-c", "core.editor=true",
+  "-c", "sequence.editor=true",
+  "-c", "core.sshCommand=",
+  "-c", "core.askPass=",
+  "-c", "diff.external=",
+  "-c", "uploadpack.packObjectsHook=",
+  "-c", "credential.helper=",
+  "-c", "protocol.ext.allow=never",
+];
 
 function git(cwd, args) {
   try {
-    return { ok: true, out: execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() };
+    return { ok: true, out: execFileSync("git", ["-C", cwd, ...NEUTRALISE, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() };
   } catch (e) { return { ok: false, out: "", err: reason(String(e.stderr || e.message)) }; }
+}
+
+/** The exported prefix, so every other daemon git call can use the same one. */
+export const GIT_NEUTRALISE = NEUTRALISE;
+
+/**
+ * A fingerprint of everything the repository's configuration says, shared and
+ * worktree-scoped. Taken when reeve creates the worktree and checked before the
+ * daemon runs any other git command in it: a worker that changed the config does
+ * not get that config executed, whatever key it used.
+ */
+export function configFingerprint(path) {
+  const parts = [];
+  for (const scope of ["--local", "--worktree"]) {
+    const r = git(path, ["config", scope, "--list"]);
+    // A repo without worktree config answers with an error; that is a fact about
+    // the repo, not a failure, and it is folded in verbatim so a LATER worktree
+    // config counts as a change.
+    parts.push(`${scope}:${r.ok ? r.out : "<none>"}`);
+  }
+  return createHash("sha256").update(parts.join("\n")).digest("hex");
+}
+
+const fingerprintPath = path => `${path}.cfg`;
+
+/** Record the fingerprint beside the worktree (outside it, where the sandbox denies writes). */
+export function recordConfig(path) {
+  try { writeFileSync(fingerprintPath(path), configFingerprint(path)); return true; } catch { return false; }
+}
+
+/**
+ * Has the repository configuration changed since reeve created the worktree?
+ * An unreadable record is a refusal, not a pass: without the baseline there is
+ * no way to say the config is the one reeve wrote.
+ */
+export function verifyConfig(path) {
+  let recorded = null;
+  try { recorded = readFileSync(fingerprintPath(path), "utf8").trim(); } catch { return { ok: false, why: "no recorded git configuration to compare against" }; }
+  const now = configFingerprint(path);
+  if (now !== recorded) return { ok: false, why: "the worker changed the repository's git configuration, which git would execute" };
+  return { ok: true, why: null };
 }
 
 /**
@@ -114,6 +186,9 @@ function hardenOrThrow(repoRoot, path) {
   if (!readPu.ok || readPu.out !== "reeve://refused-the-worker-does-not-publish") throw new Error("pushurl did not read back");
   if (!readHp.ok || readHp.out !== hooks || !existsSync(join(hooks, "pre-push"))) throw new Error("hooksPath or hook did not read back");
   if ((statSync(join(hooks, "pre-push")).mode & 0o111) === 0) throw new Error("the hook is not executable");
+  // The configuration reeve just wrote is the baseline every later daemon git
+  // command in this worktree is checked against.
+  if (!recordConfig(path)) throw new Error("the worktree's git configuration could not be recorded");
   return { ok: true, why: null };
 }
 

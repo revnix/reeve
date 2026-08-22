@@ -25,11 +25,21 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
   check(c.level === "UNKNOWN" && /no canary has been recorded/.test(c.lines[0]), "no recorded canary: UNKNOWN, and it says dispatch is refused meanwhile", c.lines.join(" | "));
 }
 {
-  writeCanaryState(root, "o/r", { id: "abc123", cliVersion: "2.1.237", bin: "/bin/claude", binaryId: "/bin/claude@1", ok: true, why: null, at: 1_000_000 });
-  const c = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 + 5 * 60_000, identity: () => "/bin/claude@1" });
-  check(c.level === "OK" && /abc123 passed 5 min ago under 2\.1\.237/.test(c.lines[0]), "a passing canary under the SAME binary is OK with id, age and CLI", c.lines.join(" | "));
-  const swapped = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@2" });
+  const rec = { id: "abc123", cliVersion: "2.1.237", bin: "/bin/claude", binaryId: "/bin/claude@1", policyHash: "pol1", ok: true, why: null, at: 1_000_000 };
+  writeCanaryState(root, "o/r", rec);
+  const c = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 + 5 * 60_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol1" });
+  check(c.level === "OK" && /abc123 passed 5 min ago under 2\.1\.237/.test(c.lines[0]), "a passing canary under the SAME binary and policy is OK with id, age and CLI", c.lines.join(" | "));
+  const swapped = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@2", currentPolicyHash: "pol1" });
   check(swapped.level === "DEGRADED" && /DIFFERENT build/.test(swapped.lines[0]), "a passing canary under a REPLACED binary is DEGRADED, not OK", swapped.lines.join(" | "));
+  // The binary can be unchanged while the policy the daemon generates has moved.
+  const repol = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol2" });
+  check(repol.level === "DEGRADED" && /DIFFERENT sandbox policy/.test(repol.lines[0]), "an unchanged binary under a CHANGED policy is DEGRADED, not OK", repol.lines.join(" | "));
+  // Unreconstructible policy: the comparison is left unmade rather than assumed.
+  const unk = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: null });
+  check(unk.level === "OK", "a policy that cannot be recomputed does not manufacture a failure", unk.level);
+  writeCanaryState(root, "o/r", { ...rec, policyHash: undefined });
+  const nopol = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1" });
+  check(nopol.level === "UNKNOWN" && /names no sandbox policy/.test(nopol.lines[0]), "a record with no policy to compare is UNKNOWN, never OK", nopol.lines.join(" | "));
   writeCanaryState(root, "o/r", { id: "old", cliVersion: "2.1.237", ok: true, at: 1_000_000 });
   const hist = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 });
   check(hist.level === "UNKNOWN" && /names no CLI binary/.test(hist.lines[0]), "a record with no binary to compare is UNKNOWN, never OK", hist.lines.join(" | "));

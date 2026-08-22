@@ -15,7 +15,7 @@ import { init } from "../src/init.mjs";
 import { writeDash } from "../src/dash.mjs";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, renameSync, readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 
@@ -294,7 +294,10 @@ switch (cmd) {
     if (!existsSync(dbPath)) { console.error(`reeve run: no state database at ${dbPath}`); process.exit(1); }
     const ctx = {
       nwo, profile, db: open(dbPath),
-      logPath: opt("log") ?? join(HOME, "reeve.log"),
+      // The database's own path: the worker must not be able to read the event
+      // store, whatever --db points at.
+      dbPath,
+      logPath: resolve(opt("log") ?? join(HOME, "reeve.log")),
       haltMarker: opt("halt") ?? join(HOME, "HALT"),
       // Execution is opt-in. A loop that acts before its decisions have been
       // watched is how an unattended run becomes an incident.

@@ -20,7 +20,7 @@ import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff, validateSettings, quarantineOsDenies } from "./sandbox.mjs";
-import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
+import { acquireWorktree, releaseWorktree, pushWorktree, verifyConfig, GIT_NEUTRALISE } from "./worktree.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
@@ -36,7 +36,7 @@ import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -122,7 +122,7 @@ function attemptsFor(db, nwo, pr, fp, logPath) {
  */
 function changedFiles(worktree, since = null) {
   const run = args => {
-    try { return execFileSync("git", ["-C", worktree, ...args], { encoding: "utf8" }).trim(); }
+    try { return execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args], { encoding: "utf8" }).trim(); }
     catch { return null; }
   };
 
@@ -162,9 +162,16 @@ function changedFiles(worktree, since = null) {
  * reason, and `~/.reeve` is denied by `credentialPaths()` regardless.
  * (Codex #4e-[5].)
  */
-export function stateRootsFor(stateDir, logPath, worktree) {
+export /** The daemon's log path, always absolute: everything else is derived from it. */
+function logPathOf(ctx) { return ctx.logPath ? resolve(ctx.logPath) : "/tmp/x"; }
+
+export function stateRootsFor(stateDir, logPath, worktree, dbPath = null) {
   const under = (p, child) => child === p || child.startsWith(p.endsWith("/") ? p : p + "/");
-  const cands = [logPath, join(stateDir, "runs"), join(stateDir, "canary"), join(stateDir, "backups"), process.env.REEVE_HOME]
+  // The database the daemon was pointed at, with its WAL and shared-memory
+  // files: `--db` can name a path outside every other protected tree, and it
+  // holds the event history, prompts and operational state. (Codex #4f-[7].)
+  const dbFiles = dbPath ? [dbPath, `${dbPath}-wal`, `${dbPath}-shm`] : [];
+  const cands = [logPath, ...dbFiles, join(stateDir, "runs"), join(stateDir, "canary"), join(stateDir, "backups"), process.env.REEVE_HOME]
     .filter(p => p && isAbsolute(p));
   return [...new Set(cands)].filter(p => !(worktree && under(p, worktree)));
 }
@@ -185,7 +192,7 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
                canary: { ok: false, id: null, why: "not run: containment is already open for a cheaper reason", skipped: true },
                keychain: cheap.keychain, platform: ctx.platform ?? process.platform, isolated, at: Date.now() };
     }
-    const stateDir = dirname(ctx.logPath ?? "/tmp/x");
+    const stateDir = dirname(logPathOf(ctx));
     // The canary result is read back by `reeve doctor`, which looks under a
     // fixed home, so it is written there too — never under a --log directory
     // that doctor would not know to read. (Codex #4-[4].)
@@ -215,7 +222,7 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     // changes (a new deny, a new domain) is measured again before it is trusted.
     // The reeve-owned trees are denied to workers too; the canary proves the
     // block that includes them. (Codex #4d-[15], #4e-[5].)
-    const stateRoots = stateRootsFor(stateDir, ctx.logPath ?? null, canaryPaths.dir);
+    const stateRoots = stateRootsFor(stateDir, logPathOf(ctx), canaryPaths.dir, ctx.dbPath ?? null);
     const policy = sandboxFor({ profile, action: "FIX_CI", worktree: canaryPaths.dir, tmpDir: canaryPaths.tmpDir, stateRoots });
     // The resolved binary's identity is part of the canary id, so a swapped
     // executable that prints the same --version is re-measured. (Codex #4-[3].)
@@ -359,7 +366,15 @@ function unknownSince(db, pr) {
 // path with no test at all -- because driving it otherwise needs GitHub and a
 // live `claude`. A ReferenceError sat in it undetected for exactly that reason.
 export async function tick(ctx) {
-  const { nwo, profile, db, logPath, execute = false, shadow = true } = ctx;
+  const { nwo, profile, db, execute = false, shadow = true } = ctx;
+  // Absolute, once, before ANYTHING derives from it. A relative `--log` made
+  // every state path relative — the run dir, the worker's tmp, its git config and
+  // the `--settings` argument — and those are consumed after the worker's cwd has
+  // become the WORKTREE, so the file it was handed was not the file that was
+  // validated; the state denies silently vanished as well, because they are
+  // filtered to absolute paths. (Codex #4f-[1].)
+  const logPath = ctx.logPath ? resolve(ctx.logPath) : ctx.logPath;
+  if (logPath !== ctx.logPath) ctx = { ...ctx, logPath };
   const decisions = [];
   const escalations = new Map();
 
@@ -637,10 +652,10 @@ export async function tick(ctx) {
       // shared by every repo's daemon, and two repos can share a PR number.
       // Known before the policy is built, because the run's own tmp is the one
       // write grant the OS sandbox carries beyond the worktree.
-      const stateDir = dirname(ctx.logPath ?? "/tmp/x");
+      const stateDir = dirname(logPathOf(ctx));
       const runDir = join(stateDir, "runs", nwo.replace("/", "-"), String(e.pr), run.runId);
       const tmpDir = join(runDir, "tmp");
-      const dStateRoots = stateRootsFor(stateDir, ctx.logPath ?? null, worktree);
+      const dStateRoots = stateRootsFor(stateDir, logPathOf(ctx), worktree, ctx.dbPath ?? null);
       const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane, tmpDir, stateRoots: dStateRoots });
 
       let r, prepFailed = false;
@@ -676,7 +691,8 @@ export async function tick(ctx) {
         if (sandbox.unrepresentableQuarantine?.length)
           throw new Error(`quarantined path(s) cannot be enforced by the OS sandbox: ${sandbox.unrepresentableQuarantine.join(", ")}`);
         const qDenies = quarantineOsDenies(worktree, profile.risk?.quarantinePaths ?? []).paths;
-        const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots, quarantineDenies: qDenies });
+        const notifyCred = typeof profile.notify?.credentialFile === "string" && isAbsolute(profile.notify.credentialFile) ? [profile.notify.credentialFile] : [];
+        const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots, quarantineDenies: qDenies, extraDenies: notifyCred });
         if (!sv.ok) throw new Error(`settings invalid: ${sv.errors.join("; ")}`);
         // The settings file is immutable per run, in the run's own directory:
         // a path keyed by PR alone was shared by every daemon on the host, and
@@ -832,6 +848,19 @@ export async function tick(ctx) {
         Object.values(u2.commands ?? {}).map(c => c?.cmd).filter(Boolean));
       const couldNotVerify = refused.some(w =>
         checkCmds.some(c => w.includes(c.split(/\s+/)[0])) && /test|lint|check|build/i.test(w));
+
+      // Before ANY git command runs in a directory the worker just held: a
+      // changed repository configuration is one git would EXECUTE, as the daemon
+      // user, outside the sandbox (core.fsmonitor and friends). Nothing is read
+      // from it and nothing is published; the worktree is kept for a human.
+      // (Codex #4f-[6].)
+      const cfg = (ctx.verifyConfig ?? verifyConfig)(worktree);
+      if (!cfg.ok) {
+        log(logPath, `  #${e.pr}: NOT reading or publishing this worktree — ${cfg.why}`);
+        escalations.set(`#${e.pr}: the worker changed its checkout's git configuration; the worktree is preserved for inspection`, 1);
+        escalations.set("guardian:worktree:config-tampered", 1);
+        continue;
+      }
 
       if (r.outcome !== OUTCOMES.OK) {
         const left = changedFiles(worktree, e.head);

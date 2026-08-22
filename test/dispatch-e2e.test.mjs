@@ -235,6 +235,37 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(dirC, { recursive: true, force: true });
 }
 
+// --- the database and a relative log are protected state, not blind spots -----
+{
+  // [7] --db can point anywhere; the store holds the event history and prompts.
+  const withDb = stateRootsFor("/s", "/s/reeve.log", "/wt", "/elsewhere/state.db");
+  check(withDb.includes("/elsewhere/state.db") && withDb.includes("/elsewhere/state.db-wal") && withDb.includes("/elsewhere/state.db-shm"),
+    "the selected database and its WAL/shm files are protected state", JSON.stringify(withDb));
+  // [1] a relative --log used to drop EVERY state deny, because they are filtered
+  // to absolute paths, and hand the worker relative run paths besides.
+  const rel = stateRootsFor("/s", "reeve.log", "/wt", null);
+  check(!rel.some(p => !p.startsWith("/")), "no relative path survives into the deny list", JSON.stringify(rel));
+}
+
+// --- a worker that changed its checkout's git config is not read from ---------
+//
+// core.fsmonitor names a program git RUNS, and the daemon's `git status` is
+// unsandboxed. Nothing is read and nothing is published from such a worktree.
+{
+  const dirG = mkdtempSync(join(tmpdir(), "reeve-e2e-cfgtamper-"));
+  const ctxG = { ...baseCtx(), db: open(join(dirG, "g.db")), logPath: join(dirG, "log.txt"), worktreeFor: () => mkdtempSync(join(dirG, "wt-")),
+                 verifyConfig: () => ({ ok: false, why: "planted: the worker changed the repository's git configuration" }) };
+  let pushedG = 0;
+  ctxG.spawnWorker = async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" });
+  const rG = await tick(ctxG);
+  const logG = readFileSync(join(dirG, "log.txt"), "utf8");
+  check(/NOT reading or publishing this worktree/.test(logG), "the tick refuses to read or publish that worktree", logG.split("\n").filter(l => /#42/.test(l)).slice(-2).join(" | ").slice(0, 200));
+  check(!/published/.test(logG) && pushedG === 0, "nothing is published", "");
+  check([...rG.escalations.keys()].includes("guardian:worktree:config-tampered"), "and it escalates under an identity key", [...rG.escalations.keys()].join(" | "));
+  ctxG.db.close();
+  rmSync(dirG, { recursive: true, force: true });
+}
+
 // --- an already-open verdict prepares nothing (no canary litter per tick) -----
 //
 // With the default worker.isolation: none the canary can never run, so building

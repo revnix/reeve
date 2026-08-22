@@ -41,6 +41,17 @@ export function canaryIdFor({ cliVersion, sandbox, binaryId = null }) {
   return createHash("sha256").update(`${cliVersion}\n${binaryId ?? "?"}\n${canonical(norm)}`).digest("hex").slice(0, 16);
 }
 
+/**
+ * The hash of a sandbox block alone, with the per-run paths normalised out — the
+ * policy half of a canary id. Recorded with every canary result so `reeve doctor`
+ * can recompute today's policy from the profile and say whether the record still
+ * describes it. (Codex #4f-[5].)
+ */
+export function policyHashOf(sandbox) {
+  const norm = { ...sandbox, filesystem: { ...(sandbox?.filesystem ?? {}), allowWrite: ["<tmp>"], allowRead: ["<tmp>"] } };
+  return createHash("sha256").update(canonical(norm)).digest("hex").slice(0, 16);
+}
+
 /** `~/x` as the runtime expands it: against the real home, never the worker's cwd. */
 const expandHome = p => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
 
@@ -149,6 +160,19 @@ function parseResults(path) {
 const nonEmpty = p => { try { return statSync(p).size > 0; } catch { return false; } };
 
 /**
+ * Does this tool result say the call was REFUSED BY POLICY, rather than merely
+ * failing? A malformed call (a bad offset, missing content) also sets
+ * `is_error`, and accepting that as proof of a denial would certify a boundary
+ * the probe never reached. Only the CLI's own refusal wording counts; anything
+ * else leaves the probe unproven. Wording measured 2026-08-22: "File is in a
+ * directory that is denied by your permission settings.", "Permission to use
+ * Bash with command ... has been denied.", "... may only list files in the
+ * allowed working directories". (Codex #4f-[3].)
+ */
+const REFUSAL = /(permission[s]? (to|settings|denied)|has been denied|denied by your permission|is not permitted|not allowed|allowed working director|outside the (allowed|working) director|was blocked)/i;
+export const isPolicyRefusal = text => REFUSAL.test(String(text ?? ""));
+
+/**
  * Run the canary under `sandbox` and judge the files it left.
  *
  * `dir` is the canary's working directory (fresh, under the project's
@@ -200,7 +224,9 @@ export async function sandboxCanary({
   // credential read was NOT denied.
   writeFileSync(decoyPath, `${CANARY_SENTINEL}\nreeve canary decoy: not a secret\n`);
   if (netProbe?.ready) { try { await netProbe.ready; } catch { /* selfReachable will report it */ } }
-  writeFileSync(join(dir, "canary.sh"), canaryScript({ tmpDir, outsideDir, decoyPath, netUrl: netProbe?.url ?? null }));
+  const scriptText = canaryScript({ tmpDir, outsideDir, decoyPath, netUrl: netProbe?.url ?? null });
+  writeFileSync(join(dir, "canary.sh"), scriptText);
+  const scriptHash = createHash("sha256").update(scriptText).digest("hex");
 
   const settings = {
     // Scoped, not exact: the sandbox's Bash matcher requires `:*` to admit
@@ -208,7 +234,9 @@ export async function sandboxCanary({
     // runs, so every real canary would fail and dispatch would stay blocked.
     // Read and Write are granted so the canary can exercise the Read-tool deny,
     // a boundary the OS sandbox does not cover.
-    permissions: { allow: ["Bash(sh ./canary.sh:*)", "Read", "Write"], deny: [...permissionsDeny], additionalDirectories: [] },
+    // Write is granted for the probes, and DENIED on the probe script itself: the
+    // canary's own instrument must not be rewritable by the thing it measures.
+    permissions: { allow: ["Bash(sh ./canary.sh:*)", "Read", "Write"], deny: [...permissionsDeny, "Write(./canary.sh)", "Edit(./canary.sh)"], additionalDirectories: [] },
     sandbox: { ...sandbox, filesystem: { ...(sandbox.filesystem ?? {}), allowWrite: [tmpDir], allowRead: [tmpDir] } },
   };
   const sv = validate(settings, { tmpDir });
@@ -256,6 +284,13 @@ export async function sandboxCanary({
     : readEv.denied ? "denied" : "not-denied";
 
   const problems = [];
+  // The instrument must be the one the daemon wrote. A rewritten script could
+  // record clean exit codes for probes it never ran — leaving no leak files and
+  // never touching the listener — while the tool calls still look denied.
+  // (Codex #4f-[4].) The deny rule above is the barrier; this is the evidence.
+  const scriptNow = (() => { try { return createHash("sha256").update(readFileSync(join(dir, "canary.sh"))).digest("hex"); } catch { return null; } })();
+  evidence.scriptIntact = scriptNow === scriptHash;
+  if (!evidence.scriptIntact) problems.push("the canary's probe script changed during the run, so nothing it recorded can be trusted");
   if (decoyGone) problems.push("the decoy vanished during the probe; the read-denial result is unproven");
   if (!results || ["inside", "tmp", "outside", "curl", "decoy", "symlink"].some(k => !(k in results)))
     problems.push(`the canary script did not run to completion (worker: ${r?.outcome ?? "?"}: ${r?.why ?? "?"})`);
@@ -333,7 +368,9 @@ export function parseReadProbe(outPath, decoyPath, cwd = dirname(decoyPath)) {
       if (b?.type === "tool_result" && ids.has(b.tool_use_id)) {
         const text = typeof b.content === "string" ? b.content : JSON.stringify(b.content ?? "");
         if (text.includes(CANARY_SENTINEL)) out.leaked = true;
-        else if (b.is_error === true || /(permission|denied|not permitted|no access|blocked)/i.test(text)) out.denied = true;
+        // A POLICY refusal only: `is_error` alone can be a malformed call, which
+        // would certify a boundary the probe never exercised.
+        else if (isPolicyRefusal(text)) out.denied = true;
       }
     }
   }
@@ -364,7 +401,7 @@ export function parseWriteProbe(outPath, targetPath, cwd = dirname(targetPath)) 
       }
       if (b?.type === "tool_result" && ids.has(b.tool_use_id)) {
         const text = typeof b.content === "string" ? b.content : JSON.stringify(b.content ?? "");
-        if (b.is_error === true || /(permission|denied|not permitted|no access|blocked|outside)/i.test(text)) out.denied = true;
+        if (isPolicyRefusal(text)) out.denied = true;
       }
     }
   }

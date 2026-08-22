@@ -215,6 +215,10 @@ const denyWriteVerbs = glob =>
  * the only boundary keeping it inside its own checkout.
  */
 export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = null, stateRoots = [] }) {
+  // The publishing credential the profile names by absolute path: outside every
+  // hard-coded credential directory, so it must be denied explicitly or a worker
+  // could copy the token into a source file. (Codex #4f-[8].)
+  const notifyCred = typeof profile?.notify?.credentialFile === "string" && profile.notify.credentialFile.startsWith("/") ? [profile.notify.credentialFile] : [];
   const risk = profile?.risk ?? {};
   const units = profile?.units ?? [];
 
@@ -299,11 +303,14 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
   // denied to it here as well; measured to hold for an absolute path and for a
   // symlink inside the worktree that points at one.
   deny.push(...credentialReadDenies());
-  // The daemon's run-state root (its log dir, where worker.out/err, prompts and
-  // other runs' artifacts live) is denied too: with a --log outside ~/.reeve it
-  // is not otherwise covered, and a worker could copy another run's output into
-  // its worktree for reeve to publish. (Codex #4d-[15].)
-  for (const r of stateRoots) deny.push(`Read(${r}/**)`);
+  // reeve's own state is denied too: with a --log or --db outside ~/.reeve it is
+  // not otherwise covered, and a worker could copy another run's output, the
+  // event store, or the log into its worktree for reeve to publish.
+  // (Codex #4d-[15].) BOTH forms per entry, because a state root may be a FILE
+  // (the log, the database): `Read(<file>/**)` matches descendants of it, which
+  // a file does not have, so the file itself would stay readable. (Codex #4f-[2].)
+  for (const r of stateRoots) { deny.push(`Read(${r})`); deny.push(`Read(${r}/**)`); }
+  for (const c of notifyCred) deny.push(`Read(${c})`);
 
   return {
     allowedTools: tools.join(","),
@@ -333,7 +340,7 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
           allowWrite: tmpDir ? [tmpDir] : [],
           denyWrite: [],
           allowRead: tmpDir ? [tmpDir] : [],
-          denyRead: [...credentialPaths(), ...stateRoots, ...quarantine.paths],
+          denyRead: [...credentialPaths(), ...notifyCred, ...stateRoots, ...quarantine.paths],
         },
         network: {
           allowedDomains: NETWORK_DOMAINS(profile, action),
@@ -366,7 +373,7 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
  * do). `tmpDir` is required: the only write grant beyond cwd is the run's own
  * tmp, and the validator cannot judge a grant without knowing what it should be.
  */
-export function validateSettings(settings, { tmpDir = null, stateRoots = [], quarantineDenies = [] } = {}) {
+export function validateSettings(settings, { tmpDir = null, stateRoots = [], quarantineDenies = [], extraDenies = [] } = {}) {
   const errors = [];
   if (!tmpDir) return { ok: false, errors: ["validator needs the run's tmpDir to judge the write grant"] };
   if (!settings || typeof settings !== "object" || Array.isArray(settings)) return { ok: false, errors: ["settings absent"] };
@@ -384,7 +391,7 @@ export function validateSettings(settings, { tmpDir = null, stateRoots = [], qua
     if (!strs(p.allow)) errors.push("permissions.allow must be an array of strings");
     if (!strs(p.deny)) errors.push("permissions.deny must be an array of strings");
     if (!Array.isArray(p.additionalDirectories) || p.additionalDirectories.length) errors.push("permissions.additionalDirectories must be empty");
-    if (strs(p.deny)) for (const d of [...credentialReadDenies(), ...stateRoots.map(r => `Read(${r}/**)`)]) if (!p.deny.includes(d)) errors.push(`permissions.deny is missing ${d}`);
+    if (strs(p.deny)) for (const d of [...credentialReadDenies(), ...extraDenies.map(c => `Read(${c})`), ...stateRoots.flatMap(r => [`Read(${r})`, `Read(${r}/**)`])]) if (!p.deny.includes(d)) errors.push(`permissions.deny is missing ${d}`);
   }
 
   const sb = settings.sandbox;
@@ -403,7 +410,7 @@ export function validateSettings(settings, { tmpDir = null, stateRoots = [], qua
       for (const k of ["allowWrite", "denyWrite", "allowRead", "denyRead"]) if (!strs(fs[k])) errors.push(`sandbox.filesystem.${k} must be an array of strings`);
       if (strs(fs.allowWrite) && (fs.allowWrite.length !== 1 || fs.allowWrite[0] !== tmpDir)) errors.push(`sandbox.filesystem.allowWrite must be exactly the run's tmp (${tmpDir})`);
       if (strs(fs.allowRead) && (fs.allowRead.length !== 1 || fs.allowRead[0] !== tmpDir)) errors.push(`sandbox.filesystem.allowRead must be exactly the run's tmp (${tmpDir})`);
-      if (strs(fs.denyRead)) for (const c of [...credentialPaths(), ...stateRoots, ...quarantineDenies]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
+      if (strs(fs.denyRead)) for (const c of [...credentialPaths(), ...extraDenies, ...stateRoots, ...quarantineDenies]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
     }
     const net = sb.network;
     if (!isObj(net)) errors.push("sandbox.network must be an object");

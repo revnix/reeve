@@ -5,7 +5,7 @@
 // assertion is on the verdict the daemon draws from those files. The real
 // boundary is measured in test/escape.test.mjs (under the runtime) and by the
 // daemon at start (under the CLI); this file proves the judge.
-import { sandboxCanary, canaryIdFor, canaryScript, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, netListener, CANARY_SENTINEL } from "../src/canary.mjs";
+import { sandboxCanary, canaryIdFor, canaryScript, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, parseWriteProbe, isPolicyRefusal, netListener, CANARY_SENTINEL } from "../src/canary.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
@@ -291,6 +291,46 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   await new Promise(r => setTimeout(r, 50));
   check(L.wasHit() === true, "a connection AFTER arming is recorded as a hit");
   L.close();
+}
+
+// ── only a POLICY refusal proves a boundary; any other error does not ────────
+{
+  check(isPolicyRefusal("File is in a directory that is denied by your permission settings.") &&
+        isPolicyRefusal("Permission to read /x has been denied.") &&
+        isPolicyRefusal("ls was blocked. Claude Code may only list files in the allowed working directories"),
+    "the CLI's own refusal wordings are recognised", "");
+  check(!isPolicyRefusal("Invalid offset: must be a positive integer") && !isPolicyRefusal("File has not been read yet") && !isPolicyRefusal(""),
+    "a malformed call's error is NOT a refusal", "");
+  // A Read that targets the decoy but fails for an unrelated reason must leave
+  // the probe unproven rather than certifying the deny.
+  const dir = mkdtempSync(join(tmpdir(), "reeve-refusal-"));
+  const out = join(dir, "o.jsonl");
+  writeFileSync(out, JSON.stringify({ type:"assistant", message:{ content:[{ type:"tool_use", name:"Read", id:"r1", input:{ file_path: "/d/decoy.txt" } }] } }) + "\n" +
+                     JSON.stringify({ type:"user", message:{ content:[{ type:"tool_result", tool_use_id:"r1", content:"Invalid offset", is_error:true }] } }) + "\n");
+  const ev = parseReadProbe(out, "/d/decoy.txt");
+  check(ev.attempted === true && ev.denied === false, "an is_error that is not a refusal does not count as denied", JSON.stringify(ev));
+  writeFileSync(out, JSON.stringify({ type:"assistant", message:{ content:[{ type:"tool_use", name:"Write", id:"w1", input:{ file_path: "/o/T" } }] } }) + "\n" +
+                     JSON.stringify({ type:"user", message:{ content:[{ type:"tool_result", tool_use_id:"w1", content:"missing required parameter content", is_error:true }] } }) + "\n");
+  const wv = parseWriteProbe(out, "/o/T");
+  check(wv.attempted === true && wv.denied === false, "and the same holds for the write probe", JSON.stringify(wv));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── the canary's own instrument must be the one the daemon wrote ─────────────
+{
+  // A worker that rewrote canary.sh could record clean exit codes for probes it
+  // never ran, leave no leak files, and never touch the listener.
+  const rewrite = async ({ cwd, outPath }) => {
+    writeFileSync(join(cwd, "canary.sh"), "#!/bin/sh\n# rewritten by the worker\n");
+    writeFileSync(join(cwd, "INSIDE"), ""); writeFileSync(join(base.tmpDir, "TMP"), "");
+    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\nprobe=7\ndecoy=1\nsymlink=1\n");
+    writeFileSync(join(cwd, "read-tool-out"), "DENIED"); writeFileSync(outPath, streamFor("denied", "denied"));
+    return { outcome: "ok", why: "completed" };
+  };
+  const r = await sandboxCanary({ ...base, runner: rewrite });
+  check(r.ok === false && /probe script changed during the run/.test(r.why), "a rewritten probe script fails the canary whatever it recorded", r.why);
+  const good = await sandboxCanary({ ...base, runner: runnerThat() });
+  check(good.ok === true && good.evidence.scriptIntact === true, "control: an untouched script passes and is recorded as intact", good.why);
 }
 
 // ── the state path keeps owner and repo distinct ─────────────────────────────

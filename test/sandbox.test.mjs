@@ -429,5 +429,34 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   check(bad.unrepresentableQuarantine.includes("**/*.pem"), "an unrepresentable quarantine glob is surfaced to the caller, which refuses the dispatch", JSON.stringify(bad.unrepresentableQuarantine));
 }
 
+
+// ── reeve's own state: a FILE state root needs a file rule, not a subtree one ──
+{
+  // `Read(<file>/**)` matches descendants, and a file has none, so the log or the
+  // database would have stayed readable to the Read tool.
+  const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/wt", tmpDir: "/t",
+                         stateRoots: ["/var/log/reeve.log", "/var/lib/reeve/runs"] });
+  const deny = s.settings.permissions.deny;
+  check(deny.includes("Read(/var/log/reeve.log)"), "a state root that is a FILE is denied by name", deny.filter(d => /reeve\.log/.test(d)).join(" "));
+  check(deny.includes("Read(/var/lib/reeve/runs/**)"), "and a directory keeps its subtree rule", "");
+  check(validateSettings(s.settings, { tmpDir: "/t", stateRoots: ["/var/log/reeve.log", "/var/lib/reeve/runs"] }).ok === true, "control: they validate", "");
+  const stripped = structuredClone(s.settings);
+  stripped.permissions.deny = stripped.permissions.deny.filter(d => d !== "Read(/var/log/reeve.log)");
+  check(validateSettings(stripped, { tmpDir: "/t", stateRoots: ["/var/log/reeve.log", "/var/lib/reeve/runs"] }).ok === false,
+    "and a missing file rule is refused", "");
+}
+
+// ── the notification credential the profile names by absolute path ────────────
+{
+  const withCred = { ...profile, notify: { provider: "ntfy", credentialFile: "/etc/reeve/ntfy.token" } };
+  const s = sandboxFor({ profile: withCred, action: "FIX_CI", worktree: "/wt", tmpDir: "/t" });
+  check(s.settings.sandbox.filesystem.denyRead.includes("/etc/reeve/ntfy.token"), "the publishing credential is deny-read at the OS layer", "");
+  check(s.settings.permissions.deny.includes("Read(/etc/reeve/ntfy.token)"), "and denied to the Read tool", "");
+  check(validateSettings(s.settings, { tmpDir: "/t", extraDenies: ["/etc/reeve/ntfy.token"] }).ok === true, "control: it validates", "");
+  const without = sandboxFor({ profile, action: "FIX_CI", worktree: "/wt", tmpDir: "/t" });
+  check(validateSettings(without.settings, { tmpDir: "/t", extraDenies: ["/etc/reeve/ntfy.token"] }).ok === false,
+    "a policy that omits the declared credential is refused", "");
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

@@ -12,7 +12,7 @@
 // unpushed commits vanish with the directory, and the stash stack is SHARED
 // across every worktree of a clone, so a non-empty stack may hold a stranger's
 // work in progress. On any doubt it quarantines rather than deletes.
-import { acquireWorktree, verifyWorktree, releaseWorktree, pushWorktree } from "../src/worktree.mjs";
+import { acquireWorktree, verifyWorktree, releaseWorktree, pushWorktree, verifyConfig, configFingerprint, recordConfig } from "../src/worktree.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -289,5 +289,36 @@ let wt;
 }
 
 rmSync(base, { recursive: true, force: true });
+
+// ── the worker must not be able to make the daemon's own git execute anything ──
+//
+// `core.fsmonitor` names a program git RUNS, and the daemon runs `git status` in
+// the worktree, unsandboxed, before publishing. The barrier is that reeve refuses
+// to run git at all in a worktree whose configuration changed since it wrote it.
+{
+  const root = mkdtempSync(join(tmpdir(), "reeve-cfg-"));
+  const g = (cwd, ...args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
+  const origin = join(root, "o.git"), clone = join(root, "c");
+  execFileSync("git", ["init", "--bare", "-q", origin]);
+  execFileSync("git", ["clone", "-q", origin, clone]);
+  g(clone, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base");
+  g(clone, "push", "-q", "origin", "HEAD:main");
+  g(clone, "checkout", "-q", "-b", "feat");
+  g(clone, "push", "-q", "origin", "feat");   // acquireWorktree fetches the branch from the remote
+  const head = g(clone, "rev-parse", "HEAD");
+  g(clone, "checkout", "-q", "main");
+  const w = acquireWorktree({ repoRoot: clone, root: join(root, "wts"), pr: 7, branch: "feat", head });
+  check(w.ok, "control: the worktree was created", JSON.stringify(w));
+  check(verifyConfig(w.path).ok === true, "control: a freshly hardened worktree verifies", JSON.stringify(verifyConfig(w.path)));
+  // The worker plants a config value git would execute.
+  g(w.path, "config", "core.fsmonitor", "./payload");
+  const after = verifyConfig(w.path);
+  check(after.ok === false && /changed the repository's git configuration/.test(after.why), "a planted executable config is caught", JSON.stringify(after));
+  // And an unrecorded worktree is a refusal, not a pass.
+  const bare = mkdtempSync(join(tmpdir(), "reeve-cfg-none-"));
+  check(verifyConfig(bare).ok === false, "a worktree with no recorded configuration does not verify", "");
+  rmSync(root, { recursive: true, force: true }); rmSync(bare, { recursive: true, force: true });
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

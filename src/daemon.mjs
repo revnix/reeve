@@ -27,7 +27,7 @@ import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./work
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
 import { canaryIdFor, netListener } from "./canary.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
-import { buildAlert, notify } from "./notify.mjs";
+import { buildAlert, notify, printable } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256 } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { snapshot, snapshotAll } from "./backup.mjs";
@@ -432,7 +432,11 @@ export async function measuredContainment(ctx, profile, nwo, logPath) {
 }
 
 export function log(logPath, line) {
-  const stamped = `${new Date().toISOString()} ${line}`;
+  // `printable`, because a line can carry a pathname a pull request chose, and a
+  // newline in one forges a log entry while an ANSI sequence rewrites what a
+  // human reading the log sees. One boundary rather than one escape per call
+  // site: the next thing that logs a worker-supplied string is covered too.
+  const stamped = `${new Date().toISOString()} ${printable(line)}`;
   if (!logPath) { console.log(stamped); return; }
   let appended = false;
   try {

@@ -111,10 +111,16 @@ export function gitEnv(extra = {}) {
  *
  * The founder's configuration is kept, because that is where the remote's URL,
  * its rewrites and its credential helper live and reeve is acting as the
- * founder when it fetches and pushes. `GIT_CONFIG_GLOBAL` and
- * `GIT_CONFIG_SYSTEM` are DELETED rather than left alone: a daemon launched
- * with them already pointing at /dev/null would otherwise reproduce exactly the
- * breakage this exists to avoid, silently.
+ * founder when it fetches and pushes.
+ *
+ * `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` are dropped only when they hold
+ * REEVE'S OWN isolation value, so a daemon launched with them already at
+ * /dev/null cannot reproduce the breakage this exists to avoid, silently. Any
+ * other value is a founder naming where their configuration lives — a company
+ * file supplying the rewrite or the credential helper — and deleting it puts
+ * git back on a `~/.gitconfig` that may carry neither. Measured 2026-08-23:
+ * `ls-remote` resolves through an explicit `GIT_CONFIG_GLOBAL` and fails the
+ * moment it is dropped. (Codex #10-[3].)
  *
  * What the founder's repository does not have is a terminal. A missing
  * credential must fail and be reported, not wait for an answer nobody is there
@@ -122,8 +128,8 @@ export function gitEnv(extra = {}) {
  */
 export function founderGitEnv(extra = {}) {
   const env = withoutInjectedConfig();
-  delete env.GIT_CONFIG_GLOBAL;
-  delete env.GIT_CONFIG_SYSTEM;
+  for (const k of ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"])
+    if (env[k] === GIT_ISOLATED_ENV[k]) delete env[k];
   return { ...env, GIT_NO_REPLACE_OBJECTS: "1", GIT_TERMINAL_PROMPT: "0", ...extra };
 }
 

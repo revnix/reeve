@@ -21,7 +21,7 @@ import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTC
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE } from "./gitguard.mjs";
-import { prepareRunCheckout, publishRunWork, releaseRunCheckout } from "./checkout.mjs";
+import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
@@ -36,7 +36,7 @@ import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, fstatSync, statSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, fstatSync, statSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
@@ -121,6 +121,47 @@ function attemptsFor(db, nwo, pr, fp, logPath) {
  * from anything the worker says about itself: the whole point of this gate is
  * that the actor does not get to be the only witness.
  */
+/**
+ * The paths a worker changed but never COMMITTED.
+ *
+ * Publishing moves commits, not working trees: reeve fetches the checkout's
+ * branch into its own repository and pushes from there. So an uncommitted edit
+ * passes the diff gate, is counted in "published N file(s)", and is then deleted
+ * with the checkout, having never left the machine. (Codex #5-[2].)
+ */
+function uncommittedFiles(worktree) {
+  try {
+    const out = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "status", "--porcelain"], { encoding: "utf8" }).trim();
+    return out ? out.split("\n").map(l => l.slice(3).trim().split(" -> ").pop()).filter(Boolean) : [];
+  } catch { return null; }
+}
+
+/**
+ * Does the work about to be published carry a secret reeve itself handed over?
+ *
+ * A worker holds a working OAuth token in its environment, because it needs one
+ * to run, and it is granted language runtimes that can read that environment. The
+ * diff gate judges FILENAMES, so a token written into an ordinary source file
+ * passes it, and reeve — not the worker — then pushes it. Denying the network
+ * does not close that route: the daemon is the one that publishes. (Codex #5-[3].)
+ *
+ * This is a literal match, and it is honest about being one: a worker that
+ * encodes the value walks around it. It costs nothing, it closes the accidental
+ * case and the obvious deliberate one, and the residual is stated in the docs
+ * rather than papered over. The value is never logged.
+ */
+function diffCarriesSecret(worktree, since, secrets) {
+  const present = secrets.filter(x => typeof x?.value === "string" && x.value.length >= 16);
+  if (!present.length) return null;
+  let diff;
+  try {
+    diff = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "diff", "--no-color", `${since}..HEAD`],
+                        { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  } catch { return { label: "unreadable", why: "reeve could not read the diff to check it for its own credentials" }; }
+  for (const sx of present) if (diff.includes(sx.value)) return { label: sx.label, why: `the diff contains ${sx.label}` };
+  return null;
+}
+
 function changedFiles(worktree, since = null) {
   const run = args => {
     try { return execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args], { encoding: "utf8" }).trim(); }
@@ -277,6 +318,13 @@ export async function measuredContainment(ctx, profile, nwo, logPath) {
       // The listener is torn down whatever happened, so a canary run never
       // leaves a socket bound.
       if (!ctx.netProbe) netProbe.close?.();
+      // And so is the per-invocation tree, unless the canary itself is the one
+      // holding it. sandboxCanary is the only code that removes these paths, and
+      // it never runs on a cache hit -- so every tick under a cached pass left
+      // another directory behind, each with a git config and the shims in it. A
+      // FAILED canary keeps its own directory for evidence, which is why this
+      // removes the tree only when the canary did not run. (Codex #5-[6].)
+      if (c?.canary?.skipped || c?.canary?.cached) rmSync(canaryRoot, { recursive: true, force: true });
     }
     if (!before) log(logPath, `containment: canary ${c.canary?.id ?? "?"} ${c.canary?.ok ? "passed" : `FAILED: ${c.canary?.why}`}; keychain: ${c.keychain?.measured ? (c.keychain.items.length ? c.keychain.why : "no GitHub credential") : `unmeasured (${c.keychain?.why})`}`);
     return c;
@@ -682,7 +730,10 @@ export async function tick(ctx) {
       const stateDir = dirname(logPathOf(ctx));
       const runDir = join(stateDir, "runs", nwo.replace("/", "-"), String(e.pr), run.runId);
       const tmpDir = join(runDir, "tmp");
-      let r, prepFailed = false, worktree = null;
+      // Declared out here, not inside the try: the publish path below reads it,
+      // and a const in the try block is a ReferenceError at that point -- the
+      // exact shape that once threw on every FIX_CI with every unit test green.
+      let r, prepFailed = false, worktree = null, workerToken = null;
       try {
         // Everything from here runs inside the cleanup scope: the run is
         // already leased and its heartbeat already ticking, so a failure in
@@ -701,13 +752,23 @@ export async function tick(ctx) {
         // git config the daemon would execute. Dependencies come from the
         // founder's tree copy-on-write, because the network is denied and a fixer
         // that cannot run the tests cannot check its own fix.
+        // Which trees to copy comes from the PROFILE's languages, not from a
+        // hard-coded node_modules: a python unit needs its .venv, and a language
+        // whose dependencies live under the home directory has nothing in the
+        // tree to copy at all. The worker has no network and a scratch home, so
+        // that last case cannot resolve anything and is SAID rather than left to
+        // be discovered as a mystery test failure. (Codex #5-[5].)
+        const wantDeps = dependencyPathsFor(profile);
         const prepared = (ctx.prepareCheckout ?? prepareRunCheckout)({
           repoRoot: repoCheckout, root: checkoutRoot, pr: e.pr, runId: run.runId,
-          branch: e.headRef, head: e.head, depsFrom: join(repoCheckout, "node_modules"),
+          branch: e.headRef, head: e.head, depsFrom: wantDeps.paths,
         });
         if (!prepared.ok) throw new Error(`could not prepare the checkout: ${prepared.why}`);
         worktree = prepared.path;
-        log(logPath, `  #${e.pr}: checkout ready at ${worktree}${prepared.deps?.cow ? " (dependencies shared copy-on-write)" : ""}`);
+        log(logPath, `  #${e.pr}: checkout ready at ${worktree}` +
+                     `${prepared.deps?.copied?.length ? ` (deps: ${prepared.deps.copied.join(", ")}${prepared.deps.cow ? ", copy-on-write" : ""})` : ""}`);
+        if (wantDeps.unsupported.length)
+          log(logPath, `  #${e.pr}: no dependency tree to copy for ${wantDeps.unsupported.join(", ")} — those checks may not resolve`);
 
         // The policy is built AFTER the checkout, because it is written in terms
         // of that directory: the write scope, the quarantine denies and the
@@ -720,6 +781,7 @@ export async function tick(ctx) {
         // a global config the sandboxed git cannot read stops it committing.
         const dToken = (ctx.oauthToken ?? readOauthToken)();
         if (!dToken?.ok) throw new Error(`no worker authentication token: ${dToken?.why ?? "unreadable"}`);
+        workerToken = dToken.token;
         const env = workerEnv({ gitConfigPath: writeGitConfig(join(tmpDir, "git")),
                                 tmpDir, bgWaitMs: budgetMs,
                                 extraPath: [dirname(claudeBin)],
@@ -952,6 +1014,23 @@ export async function tick(ctx) {
       if (decision.action === "FIX_CI" && fp) noteFixAttempt(db, nwo, e.pr, fp, statedBlocker(r.report));
 
       if (r.outcome === OUTCOMES.OK) {
+        // Everything accepted must be COMMITTED before anything is published or
+        // released. reeve publishes by fetching the checkout's BRANCH, so an
+        // uncommitted edit is invisible to the push and would then be deleted
+        // with the checkout while the log said it was published. The work is
+        // kept and a human is told, because a candidate fix nobody has a copy of
+        // is not spare disk space. (Codex #5-[2].)
+        const stillDirty = uncommittedFiles(worktree);
+        if (stillDirty === null || stillDirty.length) {
+          const why = stillDirty === null
+            ? "reeve could not read the checkout's status, so it cannot say the work was committed"
+            : `the worker finished with ${stillDirty.length} uncommitted change(s), which a push cannot carry`;
+          const rel = releaseRunCheckout(worktree, { workFetched: false });
+          log(logPath, `  #${e.pr}: NOT published — ${why}${rel.quarantined ? `; preserved at ${rel.path}` : ""}`);
+          escalations.set(`#${e.pr}: a finished fix was NOT published — ${why}` +
+                          `${stillDirty?.length ? ` (${stillDirty.slice(0, 3).join(", ")})` : ""}`, 1);
+          continue;
+        }
         const changed = changedFiles(worktree, e.head);
         const gate = reviewDiff({ files: changed, profile, lane, action: decision.action });
         if (!gate.ok) {
@@ -967,6 +1046,17 @@ export async function tick(ctx) {
             ? `#${e.pr}: needs a human — ${blocker}`
             : `#${e.pr}: a fix was produced but refused publication — ${gate.why}`, 1);
         } else {
+          // Before reeve puts its name on it: the worker had a working token in
+          // its environment and every runtime needed to read it. A filename gate
+          // cannot see that, and reeve is the party that pushes.
+          const leak = diffCarriesSecret(worktree, e.head, [{ label: "reeve's worker authentication token", value: workerToken }]);
+          if (leak) {
+            const rel = releaseRunCheckout(worktree, { workFetched: false });
+            log(logPath, `  #${e.pr}: NOT published — ${leak.why}${rel.quarantined ? `; preserved at ${rel.path}` : ""}`);
+            escalations.set(`#${e.pr}: a fix was refused publication because ${leak.why}; rotate the token with \`claude setup-token\``, 1);
+            escalations.set("guardian:worker:credential-in-diff", 1);
+            continue;
+          }
           // reeve publishes, not the worker: the actor and the only claim that
           // the action was allowed must not be the same party.
           const pushed = (ctx.publishWork ?? publishRunWork)({ repoRoot: repoCheckout, path: worktree,

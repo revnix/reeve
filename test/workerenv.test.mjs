@@ -102,7 +102,7 @@ const env = workerEnv({ home: WORKER_HOME, oauthToken: FAKE_TOKEN, gitConfigPath
   // What this module claims, and why it may. The keychain is reached through
   // HOME (measured 2026-08-22), so a scratch home takes it out of reach; the
   // string is a summary, and the CANARY is what proves it per CLI build.
-  check(CONTAINMENT.credentialRead === "closed-by-home" && /scratch HOME/.test(CONTAINMENT.why),
+  check(CONTAINMENT.credentialRead === "closed-by-home-and-path" && /scratch HOME/.test(CONTAINMENT.why),
     "the module declares the credential read closed BY THE HOME, with the reason", JSON.stringify(CONTAINMENT));
   // The two refusals that make the claim true rather than decorative.
   let threwHome = false, threwToken = false;

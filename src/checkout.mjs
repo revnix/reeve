@@ -39,7 +39,7 @@
 // checkout.
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { GIT_NEUTRALISE, REFUSING_HOOK, recordConfig, reason } from "./gitguard.mjs";
 import { writeFileSync, chmodSync } from "node:fs";
 
@@ -56,6 +56,41 @@ function git(cwd, args) {
 /** The conventional directory for one run's checkout. Keyed by run, not by PR:
  * two runs for the same pull request must never share a directory. */
 export const runPathFor = (root, pr, runId) => join(root, `run-${pr}-${runId}`);
+
+/**
+ * The dependency trees a fresh clone lacks, per language.
+ *
+ * IN-TREE paths only. A worker has no network and a scratch HOME, so a language
+ * whose dependencies live under the home directory (Go's module cache, cargo's
+ * registry, a pip cache) has nothing here to copy and its checks cannot resolve
+ * anything. That is a real limit and it is REPORTED rather than hidden: naming
+ * only node_modules and saying nothing left a fixer unable to run the tests it
+ * was dispatched to fix, with no line anywhere saying why. (Codex #5-[5].)
+ */
+const DEPENDENCY_PATHS = {
+  typescript: ["node_modules"],
+  javascript: ["node_modules"],
+  python: [".venv"],
+};
+const HOME_CACHED = { go: "~/go/pkg/mod", rust: "~/.cargo" };
+
+/**
+ * What to copy into a run checkout for this profile, and what cannot be copied.
+ *
+ * `worker.dependencyPaths` overrides the table entirely, for a project whose
+ * dependencies live somewhere this does not know about.
+ */
+export function dependencyPathsFor(profile) {
+  const declared = profile?.worker?.dependencyPaths;
+  if (Array.isArray(declared)) return { paths: declared.filter(p => typeof p === "string" && p.length), unsupported: [] };
+  const paths = new Set(), unsupported = new Set();
+  for (const u of profile?.units ?? []) {
+    const lang = String(u.language ?? "").toLowerCase();
+    for (const d of DEPENDENCY_PATHS[lang] ?? []) paths.add(u.root && u.root !== "." ? join(u.root, d) : d);
+    if (!DEPENDENCY_PATHS[lang] && HOME_CACHED[lang]) unsupported.add(`${lang} (${HOME_CACHED[lang]})`);
+  }
+  return { paths: [...paths], unsupported: [...unsupported] };
+}
 
 /**
  * Can this filesystem clone files copy-on-write?
@@ -113,11 +148,31 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
 
   // Fetch first, so the clone can see a head the local checkout has not yet
   // heard of. A clone of a stale checkout is the wrong code, silently.
-  const fetched = git(repoRoot, ["fetch", "-q", "origin", branch]);
+  //
+  // With an EXPLICIT refspec, because the remote-tracking ref is what the clone
+  // below reads and a bare `git fetch origin <branch>` only updates it when the
+  // remote carries the conventional refspec. Naming it makes the guarantee this
+  // depends on the one git is actually given.
+  const fetched = git(repoRoot, ["fetch", "-q", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
   if (!fetched.ok) return { ok: false, path: null, why: `could not fetch ${branch}: ${fetched.err}` };
 
-  const cloned = git(repoRoot, ["clone", "--no-hardlinks", "-q", "--branch", branch, repoRoot, path]);
+  // NOT `--branch <branch>`. A pull request's branch lives in the founder's clone
+  // as `origin/<branch>` and not as a local `refs/heads/<branch>` unless a human
+  // happened to check it out, and `git clone --branch` asks the source for a
+  // local head -- so every ordinary dispatch failed here with "Remote branch not
+  // found in upstream origin". Every fixture had created the branch locally
+  // first, which is why nothing caught it. (Codex #5-[1].)
+  const cloned = git(repoRoot, ["clone", "--no-hardlinks", "-q", repoRoot, path]);
   if (!cloned.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not clone: ${cloned.err}` }; }
+
+  // The remote-tracking ref by its full name, into a local branch of the same
+  // name. `git clone` copies the source's `refs/heads/*` into the clone's
+  // remote-tracking refs, so the PR branch is not among them and has to be
+  // asked for by the name the source really holds it under.
+  const branched = git(path, ["fetch", "--no-tags", "-q", repoRoot, `+refs/remotes/origin/${branch}:refs/heads/${branch}`]);
+  if (!branched.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not bring ${branch} into the checkout: ${branched.err}` }; }
+  const onBranch = git(path, ["checkout", "-q", branch]);
+  if (!onBranch.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not check out ${branch}: ${onBranch.err}` }; }
 
   // The clone followed the local branch, which may lag the revision reeve
   // pinned; move it onto that revision explicitly and check it landed.
@@ -131,10 +186,22 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
   const h = hardenClone(path);
   if (!h.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: h.why }; }
 
-  let deps = { ok: true, cow: false, skipped: true, why: "no dependency source given" };
-  if (depsFrom) {
-    deps = copyDeps(depsFrom, join(path, "node_modules"), { cow });
-    if (!deps.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: deps.why }; }
+  // `depsFrom` is a list of paths RELATIVE to the founder's checkout, copied to
+  // the same place in the run's. A tree that is not there is not an error: a
+  // project simply may not have one.
+  let deps = { ok: true, cow: false, skipped: true, copied: [], why: "no dependency source given" };
+  if (depsFrom?.length) {
+    const copied = [];
+    let anyCow = false;
+    for (const rel of depsFrom) {
+      const from = join(repoRoot, rel), to = join(path, rel);
+      if (!existsSync(from)) continue;
+      mkdirSync(dirname(to), { recursive: true });
+      const one = copyDeps(from, to, { cow });
+      if (!one.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: one.why }; }
+      if (!one.skipped) { copied.push(rel); anyCow = anyCow || one.cow; }
+    }
+    deps = { ok: true, cow: anyCow, skipped: copied.length === 0, copied, why: null };
   }
 
   return { ok: true, path, why: null, deps };
@@ -207,6 +274,11 @@ export function publishRunWork({ repoRoot, path, branch, expectedRemote = null }
   }
   const fetched = fetchRunWork({ repoRoot, path, branch });
   if (!fetched.ok) return { ok: false, why: fetched.why };
+  // A push of a ref that already equals the remote head succeeds and moves
+  // nothing. Reporting that as a publish is how "published 3 file(s)" gets
+  // logged for a worker that committed nothing at all.
+  if (expectedRemote && fetched.head === expectedRemote)
+    return { ok: false, why: "the worker committed nothing: the branch is exactly where it was" };
   // Never force: a worker's fix is not worth another party's commit.
   const pushed = git(repoRoot, ["push", "origin", `${fetched.ref}:refs/heads/${branch}`]);
   if (!pushed.ok) return { ok: false, why: `push refused: ${pushed.err}` };

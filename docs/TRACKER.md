@@ -328,10 +328,25 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
         on the first live dispatch.** Never seen because reeve has never dispatched
         and every fixture uses a local path as its origin.
         (`docs/measured/2026-08-22-the-isolation-broke-the-founders-own-remote.md`)
+      · **A NEWLINE in a filename walked past EVERY deny rule** — the most serious
+        of the set, found while testing Codex's log-forgery finding. `**` compiles
+        to `.*`, and without the `s` flag `.` cannot span a newline, so no `**`
+        glob could match such a path. Measured: `reviewDiff` returned **ok** for
+        `secrets/x⏎…` and for `.github/workflows/ci⏎x.yml` — a secret published,
+        and a worker editing the workflow that grades its own work. Invisible
+        until this PR because git's quoted output broke the glob by accident.
+        (`docs/measured/2026-08-23-a-newline-in-a-filename-walked-past-every-deny-rule.md`)
+      Codex rounds 1–3 on #10, all taken and all reproduced first:
+      · local-path fetch must KEEP the isolation (`protocol.file.allow=never`
+        would refuse every valid fix); `founderGit` is origin-facing calls only.
+      · an UNREADABLE range was reported as an empty diff; and the walk read under
+        `execFileSync`'s 1 MiB default, which 1,600 files crosses on their own.
+      · `GIT_CONFIG_GLOBAL` naming a company file must be KEPT, not deleted.
+      · worker-supplied text is escaped at the two boundaries facing a human.
       STILL OPEN: **`reeve doctor` runs no git at all**, so nothing checks that
       reeve's founder-side git can reach origin. That is the instrument that would
-      have caught the last one, and it is deliberately NOT in this PR.
-      REMAINING: the PR's Codex rounds, and the founder's merge grant.
+      have caught the founder-config one, and it is deliberately NOT in this PR.
+      REMAINING: the PR's remaining Codex rounds, and the founder's merge grant.
 
 - [ ] **Guardian: the review shadow week RESET on 2026-08-22.** `#1134` diverged
       — `resolved differs: live 13, derived 18` (55 comparisons, 52 agreements;

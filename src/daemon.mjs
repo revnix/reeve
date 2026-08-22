@@ -14,7 +14,7 @@
 //     it WOULD do. Shipping a loop that acts before its decisions have been
 //     watched is how an unattended run becomes an incident.
 
-import { evaluatePr, publishVerdict, readThreads } from "./pr.mjs";
+import { evaluatePr, publishVerdict } from "./pr.mjs";
 import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
@@ -519,12 +519,14 @@ export async function tick(ctx) {
       // Whether this tick's ingest changed anything, which decides below whether
       // the live read taken back in evaluate() still describes the same moment
       // as the projection.
-      let ingestWrote = false;
+      // The live side of the shadow comparison, taken from the SAME read that
+      // feeds the ingest below. Null when this tick did not observe.
+      let snapshot = null;
       if (moved) {
         try {
           const seen = (ctx.observe ?? observe)(nwo, pr);
+          snapshot = seen.threads ?? null;
           const w = ingest(db, nwo, pr, seen.observations, { at: now() });
-          ingestWrote = !!(w.inserted || w.generations);
           if (w.inserted || w.generations) {
             log(logPath, `  #${pr}: ingest +${w.inserted} new, +${w.generations} edit(s)` +
                          `${seen.incomplete ? " — INCOMPLETE read" : ""}`);
@@ -572,14 +574,20 @@ export async function tick(ctx) {
         // very count that PR's divergence reported.
         // (docs/measured/2026-08-22-the-shadow-compared-two-moments.md)
         //
-        // So the live read is retaken only when the ingest wrote something. A
-        // quiet pull request costs no extra call, and an unreadable retake makes
-        // the tick INCOMPARABLE rather than a disagreement, which is what a tick
-        // that learned nothing is.
-        const liveNow = ingestWrote ? (ctx.readThreads ?? readThreads)(nwo, pr) : e.threads;
-        if (ingestWrote && liveNow?.readable === false)
-          log(logPath, `  #${pr}: shadow not compared — the live re-read failed: ${liveNow.why}`);
-        const cmp = compare(liveNow, st);
+        // The live side is the observation that FED the projection, not a second
+        // read taken after it: a second read is a second moment, and re-reading
+        // only narrows the window rather than closing it. There is no extra API
+        // call either — `observe` already paginates the whole thread set, so the
+        // counts come from a read reeve was making anyway.
+        //
+        // A tick that did not observe has no snapshot, and comparing the older
+        // projection against anything would be comparing two moments again. That
+        // is INCOMPARABLE: a tick where nothing was learned, counted as neither
+        // agreement nor disagreement. It costs volume on quiet pull requests,
+        // and buys an instrument whose every remaining comparison is sound.
+        const cmp = snapshot
+          ? compare(snapshot, st)
+          : { comparable: false, agree: false, why: "no observation this tick to compare the projection against" };
         recordShadow(db, nwo, pr, cmp, now());
         if (cmp.comparable && !cmp.agree) {
           log(logPath, `  #${pr}: SHADOW DIVERGENCE — ${cmp.why}`);

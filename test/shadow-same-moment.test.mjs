@@ -47,10 +47,13 @@ const evaluation = threads => ({
 
 // The moment the live read in evaluate() saw: 10 threads, 3 resolved.
 const BEFORE = { readable: true, total: 10, unresolved: 7, seen: 10 };
-// The moment everything after the ingest describes: two more threads, and two
-// more resolved. This is an ordinary few seconds on an actively reviewed PR.
-const AFTER = { readable: true, total: 12, unresolved: 7, seen: 12 };
+// The moment the OBSERVATION saw, which is the one the projection is built from.
+// Two more threads and two more resolved: an ordinary few seconds on an actively
+// reviewed pull request.
+const OBSERVED = { readable: true, total: 12, unresolved: 7, seen: 12 };
 const PROJECTION = { readable: true, total: 12, open: 7, resolved: 5, unspilledCritical: 0, rounds: 1 };
+const THREAD_OBS = { source: "codexbot", kind: "review_thread", external_id: "t11",
+                     payload: { thread_id: "t11", is_resolved: false, body: "x" }, event_at: 1 };
 
 const ctxFor = (dir, extra = {}) => ({
   nwo: NWO, profile, db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
@@ -58,20 +61,19 @@ const ctxFor = (dir, extra = {}) => ({
   openPrs: () => [7],
   evaluate: () => evaluation(BEFORE),
   publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
-  // The ingest wrote: two threads appeared between the live read and now.
-  observe: () => ({ observations: [], incomplete: false }),
+  // One read, reporting both the observations AND the counts it saw. The daemon
+  // must compare against these, not against evaluate's older reading and not
+  // against a second call taken afterwards.
+  observe: () => ({ observations: [THREAD_OBS], incomplete: false, threads: OBSERVED }),
   derivePr: () => ({}),
   reviewState: () => PROJECTION,
-  // The live state as it is AFTER the ingest, which is the moment the projection
-  // describes. The daemon should ask for this rather than reuse the older one.
-  readThreads: () => AFTER,
   ...extra,
 });
 
 // ── the fix: a moved pull request is not a disagreement ──────────────────────
 {
   const dir = mkdtempSync(join(tmpdir(), "reeve-shadow-moment-"));
-  const ctx = ctxFor(dir, { observe: () => ({ observations: [{ source: "codexbot", kind: "review_thread", external_id: "t11", payload: { thread_id: "t11", is_resolved: false, body: "x" }, event_at: 1 }], incomplete: false }) });
+  const ctx = ctxFor(dir);
   await tick(ctx);
   const d = divergences(ctx.db, NWO);
   check(d.length === 0,
@@ -91,10 +93,8 @@ const ctxFor = (dir, extra = {}) => ({
 {
   const dir = mkdtempSync(join(tmpdir(), "reeve-shadow-real-"));
   const ctx = ctxFor(dir, {
-    observe: () => ({ observations: [{ source: "codexbot", kind: "review_thread", external_id: "t11", payload: { thread_id: "t11", is_resolved: false, body: "x" }, event_at: 1 }], incomplete: false }),
-    // The live state and the projection genuinely disagree at the same moment:
-    // the derivation has lost a thread.
-    readThreads: () => ({ readable: true, total: 12, unresolved: 7, seen: 12 }),
+    // The observation and the projection genuinely disagree at ONE moment: the
+    // derivation has lost a thread the same read saw.
     reviewState: () => ({ readable: true, total: 11, open: 7, resolved: 4, unspilledCritical: 0, rounds: 1 }),
   });
   await tick(ctx);
@@ -105,35 +105,37 @@ const ctxFor = (dir, extra = {}) => ({
   rmSync(dir, { recursive: true, force: true });
 }
 
-// ── a quiet pull request costs no extra call ─────────────────────────────────
+// ── no observation this tick means nothing to compare against ────────────────
+//
+// Not "compare the older reading anyway". Without a snapshot from this tick, the
+// projection would be held against a reading from a different moment, which is
+// the whole defect. A tick that learned nothing counts as nothing.
 {
   const dir = mkdtempSync(join(tmpdir(), "reeve-shadow-quiet-"));
-  let reread = 0;
-  const ctx = ctxFor(dir, {
-    observe: () => ({ observations: [], incomplete: false }),      // nothing to write
-    readThreads: () => { reread++; return AFTER; },
-    reviewState: () => ({ readable: true, total: 10, open: 7, resolved: 3, unspilledCritical: 0, rounds: 1 }),
-  });
+  const ctx = ctxFor(dir, { observe: () => { throw new Error("must not observe when the PR has not moved"); } });
+  ctx.lastIngest = new Map([[7, "2026-08-22T10:00:00Z"]]);   // matches the evaluation's updatedAt
   await tick(ctx);
-  check(reread === 0, "an ingest that wrote nothing does not pay for a second live read", String(reread));
-  const row = ctx.db.prepare("SELECT comparisons, agreements FROM review_shadow WHERE nwo=? AND pr=?").get(NWO, 7);
-  check(row?.comparisons === 1 && row?.agreements === 1,
-    "and the reading it already had is compared, and agrees", JSON.stringify(row));
+  const row = ctx.db.prepare("SELECT comparisons, agreements, incomparable FROM review_shadow WHERE nwo=? AND pr=?").get(NWO, 7);
+  check(row?.incomparable === 1 && row?.comparisons === 0,
+    "a tick with no observation is INCOMPARABLE, not an agreement and not a divergence", JSON.stringify(row));
+  check(divergences(ctx.db, NWO).length === 0, "and raises no divergence", "");
   ctx.db.close();
   rmSync(dir, { recursive: true, force: true });
 }
 
-// ── an unreadable re-read is INCOMPARABLE, never a disagreement ──────────────
+// ── an incomplete observation is INCOMPARABLE too ────────────────────────────
 {
   const dir = mkdtempSync(join(tmpdir(), "reeve-shadow-unread-"));
   const ctx = ctxFor(dir, {
-    observe: () => ({ observations: [{ source: "codexbot", kind: "review_thread", external_id: "t11", payload: { thread_id: "t11", is_resolved: false, body: "x" }, event_at: 1 }], incomplete: false }),
-    readThreads: () => ({ readable: false, why: "graphql timed out" }),
+    // The thread pages did not all come back, so the counts describe part of a
+    // pull request. compare() refuses an unreadable side on its own terms.
+    observe: () => ({ observations: [THREAD_OBS], incomplete: true,
+                      threads: { readable: false, total: 12, unresolved: null, seen: 4 } }),
   });
   await tick(ctx);
   const row = ctx.db.prepare("SELECT comparisons, agreements, incomparable FROM review_shadow WHERE nwo=? AND pr=?").get(NWO, 7);
   check(row?.incomparable === 1 && row?.comparisons === 0,
-    "a live re-read that failed teaches nothing, and is counted as nothing", JSON.stringify(row));
+    "an observation that did not see the whole pull request teaches nothing", JSON.stringify(row));
   check(divergences(ctx.db, NWO).length === 0, "and is not a divergence", "");
   ctx.db.close();
   rmSync(dir, { recursive: true, force: true });

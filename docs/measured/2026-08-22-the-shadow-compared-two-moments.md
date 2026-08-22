@@ -54,11 +54,21 @@ it exists to answer. Its own header warns about the other half of this:
 
 ## The fix
 
-The live read is retaken **after** the ingest, and only when the ingest wrote
-something — a quiet pull request costs no extra call, and an active one pays one
-GraphQL query to get a comparison that means something. A retake that fails makes
-the tick INCOMPARABLE, which the shadow already handles correctly: a tick where
-nothing was learned counts as neither agreement nor disagreement.
+The live side of the comparison is **the observation that fed the projection**,
+not a second read taken after it.
+
+The first attempt at this retook the live read after the ingest. Codex pointed
+out that this only narrows the window rather than closing it: a thread that
+changes between `observe()` returning and the retake completing produces exactly
+the same false divergence. That is right, and the better answer costs less —
+`observe()` already paginates the whole thread set, so the counts come from a
+read reeve was making anyway, and there is no second moment to disagree with.
+
+A tick that did not observe has no snapshot. Comparing the older projection
+against anything would be comparing two moments again, so such a tick is
+INCOMPARABLE: neither agreement nor disagreement, which the shadow already
+handles as "a tick where nothing was learned". It costs volume on quiet pull
+requests and buys an instrument whose every remaining comparison is sound.
 
 ## What this does NOT establish
 

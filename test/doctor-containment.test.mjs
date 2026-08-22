@@ -1,0 +1,111 @@
+// R-14 and R-15 report the two facts the daemon's dispatch refusal rests on,
+// from the same sources: the persisted canary result and the keychain probe.
+// Absent is UNKNOWN, never OK; a held credential is BROKEN with the fix named.
+import { checkCanary, checkKeychain, runDoctor } from "../src/doctor.mjs";
+import { sandboxFor } from "../src/sandbox.mjs";
+import { policyHashOf } from "../src/canary.mjs";
+import { writeCanaryState } from "../src/canary.mjs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+let fail = 0;
+const check = (ok, name, detail) => {
+  console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+  if (!ok) { if (detail) console.log("        " + detail); fail++; }
+};
+
+const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
+
+// ── R-14 ─────────────────────────────────────────────────────────────────────
+{
+  const c = checkCanary("o/r", { stateDir: null });
+  check(c.id === "R-14" && c.level === "UNKNOWN", "no state dir: UNKNOWN", JSON.stringify(c));
+}
+{
+  const c = checkCanary("o/r", { stateDir: root });
+  check(c.level === "UNKNOWN" && /no canary has been recorded/.test(c.lines[0]), "no recorded canary: UNKNOWN, and it says dispatch is refused meanwhile", c.lines.join(" | "));
+}
+{
+  const rec = { id: "abc123", cliVersion: "2.1.237", bin: "/bin/claude", binaryId: "/bin/claude@1", policyHash: "pol1", ok: true, why: null, at: 1_000_000 };
+  writeCanaryState(root, "o/r", rec);
+  const c = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 + 5 * 60_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol1" });
+  check(c.level === "OK" && /abc123 passed 5 min ago under 2\.1\.237/.test(c.lines[0]), "a passing canary under the SAME binary and policy is OK with id, age and CLI", c.lines.join(" | "));
+  const swapped = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@2", currentPolicyHash: "pol1" });
+  check(swapped.level === "DEGRADED" && /DIFFERENT build/.test(swapped.lines[0]), "a passing canary under a REPLACED binary is DEGRADED, not OK", swapped.lines.join(" | "));
+  // The binary can be unchanged while the policy the daemon generates has moved.
+  const repol = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol2" });
+  check(repol.level === "DEGRADED" && /DIFFERENT sandbox policy/.test(repol.lines[0]), "an unchanged binary under a CHANGED policy is DEGRADED, not OK", repol.lines.join(" | "));
+  // Unreconstructible policy: the comparison is left unmade rather than assumed.
+  const unk = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: null });
+  check(unk.level === "OK", "a policy that cannot be recomputed does not manufacture a failure", unk.level);
+  writeCanaryState(root, "o/r", { ...rec, policyHash: undefined });
+  const nopol = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1" });
+  check(nopol.level === "UNKNOWN" && /names no sandbox policy/.test(nopol.lines[0]), "a record with no policy to compare is UNKNOWN, never OK", nopol.lines.join(" | "));
+  writeCanaryState(root, "o/r", { id: "old", cliVersion: "2.1.237", ok: true, at: 1_000_000 });
+  const hist = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 });
+  check(hist.level === "UNKNOWN" && /names no CLI binary/.test(hist.lines[0]), "a record with no binary to compare is UNKNOWN, never OK", hist.lines.join(" | "));
+}
+{
+  writeCanaryState(root, "o/r", { id: "abc123", cliVersion: "2.1.237", ok: false, why: "wrote outside the worktree", at: 1_000_000 });
+  const c = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 + 30_000 });
+  check(c.level === "BROKEN" && /FAILED under a minute ago/.test(c.lines[0]) && /wrote outside/.test(c.lines[0]), "a failed canary is BROKEN with its reason", c.lines.join(" | "));
+}
+{
+  const c = checkCanary("o/r", { stateDir: root, read: () => ({ ok: "yes", id: "x" }) });
+  check(c.level === "BROKEN", "a state whose ok is not exactly true is not a pass", JSON.stringify(c));
+}
+
+// ── R-15 ─────────────────────────────────────────────────────────────────────
+{
+  const c = checkKeychain({ probe: () => ({ measured: true, items: [], why: null }), isolation: "dedicated-user", topologyReady: () => true });
+  check(c.id === "R-15" && c.level === "OK", "an empty keychain, a declared isolated worker, AND a ready topology is OK", JSON.stringify(c));
+}
+{
+  const c = checkKeychain({ probe: () => ({ measured: true, items: [], why: null }), isolation: "dedicated-user", topologyReady: () => false });
+  check(c.level === "DEGRADED", "the isolation LABEL without a ready topology (production today) is DEGRADED, not OK", JSON.stringify(c.level));
+}
+{
+  const c = checkKeychain({ probe: () => ({ measured: true, items: [], why: null }), isolation: "none" });
+  check(c.level === "DEGRADED" && /shared account cannot be certified/.test(c.lines.join(" ")), "an empty keychain WITHOUT an isolated worker is DEGRADED, not OK", c.lines.join(" | "));
+}
+{
+  const c = checkKeychain({ probe: () => ({ measured: true, items: ["generic password gh:github.com (gh keyring)"], why: "holds" }) });
+  check(c.level === "DEGRADED" && /gh keyring/.test(c.lines[0]) && /--insecure-storage/.test(c.lines.join(" ")) && /dedicated user/.test(c.lines.join(" ")),
+    "a held credential is DEGRADED (dispatch gated, not broken) and both closures are named", c.lines.join(" | "));
+  check(/observation and review are unaffected/.test(c.lines.join(" ")), "and it says the guardian's other work is unaffected", c.lines.join(" | "));
+}
+{
+  const c = checkKeychain({ probe: () => ({ measured: false, items: [], why: "security exited 1" }) });
+  check(c.level === "UNKNOWN" && /unmeasured/.test(c.lines[0]), "an unmeasured probe is UNKNOWN, never OK", c.lines.join(" | "));
+}
+
+// ── in the driver ────────────────────────────────────────────────────────────
+{
+  const r = runDoctor({ nwo: "o/r", profile: {}, stateDir: root, keychainIo: { probe: () => ({ measured: true, items: [], why: null }) },
+                        baselineIo: { fixturePath: join(root, "none.json") } });
+  const ids = r.checks.map(c => c.id);
+  check(ids.includes("R-14") && ids.includes("R-15"), "both checks run in the driver", ids.join(","));
+  check(r.verdict === "BROKEN" && r.checks.find(c => c.id === "R-14").level === "BROKEN", "and a failed canary makes the verdict BROKEN", r.verdict);
+}
+
+// ── the recomputed policy must follow the PROFILE, not the record ────────────
+//
+// The record supplies only the state roots the daemon knew (a --log or --db this
+// command cannot see); everything else is generated from the profile as it is
+// now, or a changed quarantine path would leave the hash equal to the old one
+// and doctor would keep reporting OK while the daemon re-measures.
+{
+  const roots = ["/s/reeve.log", "/s/runs"];
+  const base = { units: [], risk: {} };
+  const withQ = { units: [], risk: { quarantinePaths: ["secrets/**"] } };
+  const hash = prof => policyHashOf(sandboxFor({ profile: prof, action: "FIX_CI", worktree: "/wt/canary", tmpDir: "<tmp>", stateRoots: roots }).settings.sandbox, "/wt/canary");
+  check(hash(base) !== hash(withQ), "adding a quarantine path changes the recomputed policy hash", `${hash(base)} vs ${hash(withQ)}`);
+  const withCred = { units: [], notify: { credentialFile: "/etc/reeve/tok" } };
+  check(hash(base) !== hash(withCred), "and so does declaring a notification credential", `${hash(base)} vs ${hash(withCred)}`);
+  check(hash(base) === hash({ units: [], risk: {} }), "control: an unchanged profile hashes the same", "");
+}
+
+rmSync(root, { recursive: true, force: true });
+console.log(fail ? `\nfailed=${fail}` : "\nall green");
+process.exit(fail ? 1 : 0);

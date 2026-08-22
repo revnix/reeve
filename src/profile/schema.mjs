@@ -39,6 +39,7 @@ export const REVIEWER_KIND = ["blocking", "advisory"];
 // becomes, and it blocks.
 export const SEVERITY = ["critical", "major", "minor", "nit", "unknown"];
 export const MERGE_METHOD = ["squash", "merge", "rebase"];
+export const WORKER_ISOLATION = ["none", "dedicated-user"];
 
 /**
  * field: [required, validator, description]
@@ -210,6 +211,17 @@ export const FIELDS = {
   "builder.founder.login":               [false, isStr],
   // Cap on a worker's durable stdout/stderr files. Read by both daemons.
   "worker.maxOutputBytes":               [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
+  // How a dispatched worker is isolated from the founder's account. "none"
+  // (default) means a shared account and a linked worktree: a worker could read
+  // a keychain credential the probe does not know about, or plant a hook in the
+  // checkout's shared git dir. "dedicated-user" asserts the founder has set up a
+  // separate OS user (its own empty keychain) and per-run standalone clones;
+  // ONLY then does a passing canary plus an empty keychain close dispatch.
+  "worker.isolation":                    [false, oneOf(WORKER_ISOLATION)],
+  // The only network a worker's shell may reach, and only for research: the OS
+  // sandbox denies every domain for every other action. A bare host name, no
+  // scheme, no path: the runtime matches domains, and "https://x" matches nothing.
+  "builder.network.research.allowedDomains": [false, isArr(v => (typeof v === "string" && /^[A-Za-z0-9*.-]+$/.test(v) ? null : "must be a bare domain name (wildcards as *.example.com)"))],
 
   // Read by the daemon and the watcher. Declared here because the validator
   // refused a profile using them and `reeve doctor` exited before doing anything:
@@ -313,7 +325,7 @@ export function validate(profile) {
 
   // A container that is not a plain object (an array, a string) would take
   // the defaults as named properties and validate, then serialize to nothing.
-  for (const c of ["builder", "builder.capabilities", "builder.founder", "worker"]) {
+  for (const c of ["builder", "builder.capabilities", "builder.founder", "builder.network", "builder.network.research", "worker"]) {
     const v = get(profile, c);
     if (v !== undefined && v !== null && (typeof v !== "object" || Array.isArray(v))) errors.push(`${c} must be an object`);
   }
@@ -399,6 +411,7 @@ const UNIVERSAL_DEFAULTS = {
   "builder.capabilities.publishPr": false,
   "builder.capabilities.mergeBuilderPr": false,
   "worker.maxOutputBytes": 64 * 1024 * 1024,
+  "worker.isolation": "none",
 };
 
 export function withDefaults(profile) {

@@ -12,7 +12,7 @@
 // unpushed commits vanish with the directory, and the stash stack is SHARED
 // across every worktree of a clone, so a non-empty stack may hold a stranger's
 // work in progress. On any doubt it quarantines rather than deletes.
-import { acquireWorktree, verifyWorktree, releaseWorktree, pushWorktree } from "../src/worktree.mjs";
+import { acquireWorktree, verifyWorktree, releaseWorktree, pushWorktree, verifyConfig, configEntries, recordConfig } from "../src/worktree.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -289,5 +289,68 @@ let wt;
 }
 
 rmSync(base, { recursive: true, force: true });
+
+// ── the worker must not be able to make the daemon's own git execute anything ──
+//
+// `core.fsmonitor` names a program git RUNS, and the daemon runs `git status` in
+// the worktree, unsandboxed, before publishing. The barrier is that reeve refuses
+// to run git at all in a worktree whose configuration changed since it wrote it.
+{
+  const root = mkdtempSync(join(tmpdir(), "reeve-cfg-"));
+  const g = (cwd, ...args) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
+  const origin = join(root, "o.git"), clone = join(root, "c");
+  execFileSync("git", ["init", "--bare", "-q", origin]);
+  execFileSync("git", ["clone", "-q", origin, clone]);
+  g(clone, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base");
+  g(clone, "push", "-q", "origin", "HEAD:main");
+  g(clone, "checkout", "-q", "-b", "feat");
+  g(clone, "push", "-q", "origin", "feat");   // acquireWorktree fetches the branch from the remote
+  const head = g(clone, "rev-parse", "HEAD");
+  g(clone, "checkout", "-q", "main");
+  const w = acquireWorktree({ repoRoot: clone, root: join(root, "wts"), pr: 7, branch: "feat", head });
+  check(w.ok, "control: the worktree was created", JSON.stringify(w));
+  check(verifyConfig(w.path).ok === true, "control: a freshly hardened worktree verifies", JSON.stringify(verifyConfig(w.path)));
+  // The worker plants a config value git would execute.
+  g(w.path, "config", "core.fsmonitor", "./payload");
+  const after = verifyConfig(w.path);
+  check(after.ok === false && /core\.fsmonitor/.test(after.why) && /reeve does not own/.test(after.why),
+    "a planted executable config is caught, and named", JSON.stringify(after));
+  // acquire must refuse BEFORE running git in it: verifying a worktree runs
+  // `git status`, which a worker-added .gitattributes + filter.<name>.clean turns
+  // into code execution as the daemon user. The directory is moved aside without
+  // any git command, so the next tick builds a clean one.
+  const reacquire = acquireWorktree({ repoRoot: clone, root: join(root, "wts"), pr: 7, branch: "feat", head });
+  check(reacquire.ok === false && /reeve does not own/.test(reacquire.why) && /moved to/.test(reacquire.why),
+    "and re-acquiring that worktree refuses without running git in it", JSON.stringify(reacquire));
+  check(!existsSync(w.path), "the tampered directory is moved aside, so the next acquire starts clean", "");
+  // A worker that CHANGES an existing key must not cost the clone its real value:
+  // blanket --unset-all on remote.origin.url would delete the legitimate origin
+  // and leave the main checkout unable to fetch or push.
+  {
+    const w3 = acquireWorktree({ repoRoot: clone, root: join(root, "wts"), pr: 9, branch: "feat", head });
+    check(w3.ok, "control: a worktree for the url case", JSON.stringify(w3));
+    const realUrl = g(clone, "config", "--local", "--get", "remote.origin.url");
+    check(realUrl === origin, "control: the clone's origin is the real one", realUrl);
+    g(w3.path, "config", "remote.origin.url", "https://example.invalid/evil.git");
+    const re = acquireWorktree({ repoRoot: clone, root: join(root, "wts"), pr: 9, branch: "feat", head });
+    check(re.ok === false && /remote\.origin\.url/.test(re.why), "the changed key is caught", JSON.stringify(re.why));
+    // `git config --get` exits 1 when the key is gone, and a DELETED origin is
+    // exactly the failure under test, so this read must not throw.
+    const readUrl = () => { try { return g(clone, "config", "--local", "--get", "remote.origin.url"); } catch { return "(deleted)"; } };
+    const restored = readUrl();
+    check(restored === origin, "and the clone's ORIGINAL origin is restored, not deleted", restored);
+  }
+
+  // reeve's OWN keys moving is a daemon upgrade re-hardening, not tampering.
+  const w2 = acquireWorktree({ repoRoot: clone, root: join(root, "wts"), pr: 7, branch: "feat", head });
+  check(w2.ok, "control: a fresh worktree is created after the quarantine", JSON.stringify(w2));
+  g(w2.path, "config", "--worktree", "--unset", "core.hooksPath");
+  check(verifyConfig(w2.path).ok === true, "a change to a key reeve owns is not treated as tampering", JSON.stringify(verifyConfig(w2.path)));
+  // And an unrecorded worktree is a refusal, not a pass.
+  const bare = mkdtempSync(join(tmpdir(), "reeve-cfg-none-"));
+  check(verifyConfig(bare).ok === false, "a worktree with no recorded configuration does not verify", "");
+  rmSync(root, { recursive: true, force: true }); rmSync(bare, { recursive: true, force: true });
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

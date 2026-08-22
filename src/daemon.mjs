@@ -19,10 +19,12 @@ import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
-import { sandboxFor, writeSandbox, reviewDiff } from "./sandbox.mjs";
-import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
+import { sandboxFor, writeSandbox, reviewDiff, validateSettings, quarantineOsDenies } from "./sandbox.mjs";
+import { acquireWorktree, releaseWorktree, pushWorktree, verifyConfig, GIT_NEUTRALISE } from "./worktree.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
-import { workerEnv, writeGitConfig, CONTAINMENT } from "./workerenv.mjs";
+import { workerEnv, writeGitConfig } from "./workerenv.mjs";
+import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
+import { canaryIdFor, netListener } from "./canary.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256 } from "./db/ops.mjs";
@@ -34,7 +36,7 @@ import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -54,10 +56,6 @@ const CLI_VERSION = new Map();
 // and stand as one escalation until a preparation succeeds. The map lives on
 // the daemon's context: one per daemon, not one per module.
 const PREP_BACKOFF_BASE_MS = 60_000, PREP_BACKOFF_CAP_MS = 3_600_000;
-function binaryIdentity(bin) {
-  try { const real = realpathSync(bin); const st = statSync(real); return `${real}@${st.mtimeMs}`; }
-  catch { return bin; }
-}
 // The worker's PATH is pinned and does not contain the CLI's install dir (it
 // lives under ~/.local/bin here), and spawn resolves a bare command through the
 // CHILD's PATH. So the binary is resolved once on the daemon's PATH and passed
@@ -124,7 +122,7 @@ function attemptsFor(db, nwo, pr, fp, logPath) {
  */
 function changedFiles(worktree, since = null) {
   const run = args => {
-    try { return execFileSync("git", ["-C", worktree, ...args], { encoding: "utf8" }).trim(); }
+    try { return execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args], { encoding: "utf8" }).trim(); }
     catch { return null; }
   };
 
@@ -144,6 +142,126 @@ function changedFiles(worktree, since = null) {
   const fromCommits = committed ? committed.split("\n").filter(Boolean) : [];
 
   return [...new Set([...fromCommits, ...uncommitted])];
+}
+
+/**
+ * The measured containment verdict for this daemon: the CLI it would dispatch,
+ * the environment it would hand a worker, and the sandbox block every worker
+ * runs under, put to the canary once per (CLI build, block) and to the
+ * keychain probe every time. A preparation that fails (no CLI, no worktree
+ * root) is an OPEN verdict with the reason, never a thrown tick.
+ */
+/**
+ * The reeve-owned trees a worker must not read, as SPECIFIC paths.
+ *
+ * Never `dirname(logPath)`: with `--log ~/reeve.log` that is the home directory,
+ * and denying it also denies the worktree the fixer was dispatched to read — the
+ * boundary would break the work instead of containing it. So: the log file, the
+ * run artifacts, the canary records, the backups, and the configured state root.
+ * Any candidate that is an ANCESTOR of the worktree is dropped for the same
+ * reason, and `~/.reeve` is denied by `credentialPaths()` regardless.
+ * (Codex #4e-[5].)
+ */
+export /** The daemon's log path, always absolute: everything else is derived from it. */
+function logPathOf(ctx) { return ctx.logPath ? resolve(ctx.logPath) : "/tmp/x"; }
+
+export function stateRootsFor(stateDir, logPath, worktree, dbPath = null) {
+  const under = (p, child) => child === p || child.startsWith(p.endsWith("/") ? p : p + "/");
+  // The database the daemon was pointed at, with its WAL and shared-memory
+  // files: `--db` can name a path outside every other protected tree, and it
+  // holds the event history, prompts and operational state. (Codex #4f-[7].)
+  const dbFiles = dbPath ? [dbPath, `${dbPath}-wal`, `${dbPath}-shm`] : [];
+  const cands = [logPath, ...dbFiles, join(stateDir, "runs"), join(stateDir, "canary"), join(stateDir, "backups"), process.env.REEVE_HOME]
+    .filter(p => p && isAbsolute(p));
+  return [...new Set(cands)].filter(p => !(worktree && under(p, worktree)));
+}
+
+async function measuredContainment(ctx, profile, nwo, logPath) {
+  const cache = (ctx.containmentCache ??= new Map());
+  try {
+    const root = profile.identity?.worktreeRoot;
+    if (!root || !isAbsolute(root)) return { credentialRead: "open", why: "no absolute identity.worktreeRoot to run the canary under" };
+    // Cheap gates FIRST: on a host where the verdict is already open, preparing a
+    // canary would create a per-invocation tmp tree every tick that nothing then
+    // cleans up, because the canary itself never runs. (Codex #4e-[9].)
+    const isolated = profile.worker?.isolation === "dedicated-user" && (ctx.isolationReady ?? isolationTopologyReady)();
+    const cheapKc = typeof ctx.keychain === "function" ? await ctx.keychain() : ctx.keychain ?? null;
+    const cheap = cheapContainmentReasons({ platform: ctx.platform ?? process.platform, isolated, keychain: cheapKc });
+    if (cheap.reasons.length) {
+      return { credentialRead: "open", why: cheap.reasons.join("; "),
+               canary: { ok: false, id: null, why: "not run: containment is already open for a cheaper reason", skipped: true },
+               keychain: cheap.keychain, platform: ctx.platform ?? process.platform, isolated, at: Date.now() };
+    }
+    const stateDir = dirname(logPathOf(ctx));
+    // The canary result is read back by `reeve doctor`, which looks under a
+    // fixed home, so it is written there too — never under a --log directory
+    // that doctor would not know to read. (Codex #4-[4].)
+    const canaryStateDir = ctx.canaryStateDir ?? stateDir;
+    // Per repository AND per invocation for ALL of the canary's working
+    // directories, not just the decoy: two daemons (same repo, or repos sharing
+    // a worktree root) each rm/recreate these during a run up to 5 min long, and
+    // the cross-run deletion keeps containment open forever. (Codex #4d-[16].)
+    const inv = `${nwo.replace("/", "-")}-${process.pid}-${Date.now()}`;
+    const canaryRoot = join(root, ".reeve-canary", inv);
+    const canaryPaths = {
+      dir: join(canaryRoot, "run"), outsideDir: join(canaryRoot, "outside"), tmpDir: join(canaryRoot, "tmp"),
+      // Under the CONFIGURED state root (deny-read, so it is measurable), per
+      // repository AND per invocation: two daemons sharing one decoy could delete
+      // each other's and read the ENOENT as a denial. (Codex #4-[1], #4b-[11].)
+      decoyPath: join(process.env.REEVE_HOME ?? join(homedir(), ".reeve"), "canary", nwo.replace("/", "-"), `decoy-${process.pid}-${Date.now()}.txt`),
+    };
+    const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
+    // The credential-less git config lives in the run's tmp, which the sandbox
+    // grants read: putting it under ~/.reeve (deny-read) left the sandboxed git
+    // unable to read its own configured global config, so the worker could not
+    // even commit. (Codex #4-[8].)
+    const env = workerEnv({ gitConfigPath: writeGitConfig(join(canaryPaths.tmpDir, "git")), tmpDir: canaryPaths.tmpDir,
+                            bgWaitMs: 5 * 60_000, extraPath: [dirname(claudeBin)] });
+    const version = ctx.cliVersion ?? cliVersion(claudeBin, env);
+    // The block every worker gets; the canary's id covers it, so a block that
+    // changes (a new deny, a new domain) is measured again before it is trusted.
+    // The reeve-owned trees are denied to workers too; the canary proves the
+    // block that includes them. (Codex #4d-[15], #4e-[5].)
+    const stateRoots = stateRootsFor(stateDir, logPathOf(ctx), canaryPaths.dir, ctx.dbPath ?? null);
+    const policy = sandboxFor({ profile, action: "FIX_CI", worktree: canaryPaths.dir, tmpDir: canaryPaths.tmpDir, stateRoots });
+    // The resolved binary's identity is part of the canary id, so a swapped
+    // executable that prints the same --version is re-measured. (Codex #4-[3].)
+    const binaryId = binaryIdentity(claudeBin);
+    // The network positive control is a daemon-local listener the sandboxed curl
+    // tries to reach. The daemon knows the listener is reachable (it self-pings),
+    // so a sandboxed curl that cannot reach it proves a DENIAL — no external
+    // dependency, no timing window, and a hit at any point in the run is a leak.
+    // (Codex #4d-[12], #4c-[13].) Injectable for tests.
+    const netProbe = ctx.netProbe ?? netListener();
+    const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox, binaryId, worktree: canaryPaths.dir }))?.ok === true;
+    if (!before) log(logPath, `containment: running the sandbox canary under ${version}`);
+    let c;
+    try {
+      c = await measureContainment({
+      cliVersion: version, sandbox: policy.settings.sandbox, permissionsDeny: policy.settings.permissions.deny, binaryId,
+      canaryPaths, bin: claudeBin, env, stateDir: canaryStateDir, nwo, cache, netProbe, stateRoots,
+      // process.platform in production; injectable so a test on one OS can
+      // exercise the verdict for another (the fail-closed matrix is per-OS).
+      platform: ctx.platform ?? undefined,
+      // The profile LABEL is necessary but not sufficient: the dedicated-user
+      // dispatch topology (a separate OS user, a per-run standalone clone) is
+      // PR-3, and production dispatch still uses a linked worktree as this user.
+      // So the label closes containment only when the topology is actually
+      // verified ready — false until PR-3, injectable for the wiring test.
+      // (Codex #4c-[9].)
+      isolated,
+      canary: ctx.canary ?? null, keychain: cheap.keychain,
+      });
+    } finally {
+      // The listener is torn down whatever happened, so a canary run never
+      // leaves a socket bound.
+      if (!ctx.netProbe) netProbe.close?.();
+    }
+    if (!before) log(logPath, `containment: canary ${c.canary?.id ?? "?"} ${c.canary?.ok ? "passed" : `FAILED: ${c.canary?.why}`}; keychain: ${c.keychain?.measured ? (c.keychain.items.length ? c.keychain.why : "no GitHub credential") : `unmeasured (${c.keychain?.why})`}`);
+    return c;
+  } catch (err) {
+    return { credentialRead: "open", why: `containment could not be measured: ${err.message}` };
+  }
 }
 
 export function log(logPath, line) {
@@ -248,7 +366,15 @@ function unknownSince(db, pr) {
 // path with no test at all -- because driving it otherwise needs GitHub and a
 // live `claude`. A ReferenceError sat in it undetected for exactly that reason.
 export async function tick(ctx) {
-  const { nwo, profile, db, logPath, execute = false, shadow = true } = ctx;
+  const { nwo, profile, db, execute = false, shadow = true } = ctx;
+  // Absolute, once, before ANYTHING derives from it. A relative `--log` made
+  // every state path relative — the run dir, the worker's tmp, its git config and
+  // the `--settings` argument — and those are consumed after the worker's cwd has
+  // become the WORKTREE, so the file it was handed was not the file that was
+  // validated; the state denies silently vanished as well, because they are
+  // filtered to absolute paths. (Codex #4f-[1].)
+  const logPath = ctx.logPath ? resolve(ctx.logPath) : ctx.logPath;
+  if (logPath !== ctx.logPath) ctx = { ...ctx, logPath };
   const decisions = [];
   const escalations = new Map();
 
@@ -400,22 +526,25 @@ export async function tick(ctx) {
   }
 
   // A worker that can read the founder's credentials is not dispatched, whatever
-  // --execute says. workerenv.mjs declares what its environment can promise;
-  // until a measured mechanism closes the credential read (the OS sandbox
-  // canary or a dedicated worker user), the honest capability is none, and the
-  // founder is told once, by identity. The declaration is injectable for tests
-  // only; the default is the module's own, which refuses.
-  const containment = ctx.containment ?? CONTAINMENT;
-  if (execute && containment.credentialRead !== "closed") {
-    const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action));
-    if (wanted.length) {
-      log(logPath, `execute: NOT dispatching ${wanted.length} worker task(s) — worker containment is open: ${containment.why}`);
-      escalations.set("guardian:containment:open", 1);
-    }
+  // --execute says. Containment is MEASURED, on this host, under this CLI and
+  // this sandbox block (containment.mjs): the sandbox canary must have passed
+  // and the login keychain must hold no GitHub credential. Anything unmeasured
+  // is open, and the founder is told once, by identity. The verdict is
+  // injectable for tests only; the default measures, and measures only when a
+  // worker task actually wants dispatching, so a quiet tick runs no canary.
+  const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action));
+  let containment = ctx.containment ?? null;
+  if (execute && wanted.length && !containment) containment = await measuredContainment(ctx, profile, nwo, logPath);
+  if (execute && wanted.length && containment.credentialRead !== "closed") {
+    log(logPath, `execute: NOT dispatching ${wanted.length} worker task(s) — worker containment is open: ${containment.why}`);
+    escalations.set("guardian:containment:open", 1);
   }
 
-  if (execute && containment.credentialRead === "closed") {
-    const cap = capacity({ maxWorkers: profile.watch?.maxWorkers ?? 5, running: ctx.running ?? 0 });
+  if (execute && wanted.length && containment.credentialRead === "closed") {
+    // Injectable: the real reading is the machine's load average, which is right
+    // for production and wrong for a test — a busy host makes canStart 0 and the
+    // suite reports "no worker dispatched" about the laptop rather than the code.
+    const cap = (ctx.capacity ?? capacity)({ maxWorkers: profile.watch?.maxWorkers ?? 5, running: ctx.running ?? 0 });
     log(logPath, `execute: capacity allows ${cap.canStart} worker(s) (load ${cap.load1?.toFixed?.(2) ?? "?"}, ${cap.perfCores} perf cores)`);
     let started = 0;
 
@@ -519,7 +648,15 @@ export async function tick(ctx) {
       // still letting the worker run the project's own commands -- which it must,
       // or it cannot tell whether its fix worked.
       const lane = (profile.lanes ?? []).find(l => l.id === decision.lane) ?? null;
-      const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane });
+      // The run dir is keyed by repository, PR, and run id: the log dir is
+      // shared by every repo's daemon, and two repos can share a PR number.
+      // Known before the policy is built, because the run's own tmp is the one
+      // write grant the OS sandbox carries beyond the worktree.
+      const stateDir = dirname(logPathOf(ctx));
+      const runDir = join(stateDir, "runs", nwo.replace("/", "-"), String(e.pr), run.runId);
+      const tmpDir = join(runDir, "tmp");
+      const dStateRoots = stateRootsFor(stateDir, logPathOf(ctx), worktree, ctx.dbPath ?? null);
+      const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane, tmpDir, stateRoots: dStateRoots });
 
       let r, prepFailed = false;
       try {
@@ -535,14 +672,33 @@ export async function tick(ctx) {
         // run so a restart can read the report the worker left. The run dir is
         // keyed by repository, PR, and run id: the log dir is shared by every
         // repo's daemon, and two repos can share a PR number.
-        const stateDir = dirname(ctx.logPath ?? "/tmp/x");
-        const runDir = join(stateDir, "runs", nwo.replace("/", "-"), String(e.pr), run.runId);
         const budgetMs = (profile.watch?.workerBudgetMinutes ?? 20) * 60_000;
         const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
-        const env = workerEnv({ gitConfigPath: writeGitConfig(join(stateDir, "git")),
-                                tmpDir: join(runDir, "tmp"), bgWaitMs: budgetMs,
+        // In the run's tmp (sandbox-readable), never under the deny-read ~/.reeve:
+        // a global config the sandboxed git cannot read stops it committing.
+        const env = workerEnv({ gitConfigPath: writeGitConfig(join(tmpDir, "git")),
+                                tmpDir, bgWaitMs: budgetMs,
                                 extraPath: [dirname(claudeBin)] });
         const outPath = join(runDir, "worker.out"), errPath = join(runDir, "worker.err");
+        // Validated BEFORE it is written or hashed. Measured: under -p the CLI
+        // drops an invalid settings file whole and silently, deny rules
+        // included, so a worker launched on one would run with no boundary at
+        // all and a contract row claiming otherwise. A failure here is a
+        // preparation failure: refunded, backed off, escalated, never launched.
+        // A quarantined path the OS layer cannot express is a hole, not a
+        // detail: the worker holds `cat`, so a tool-only deny would not stop it.
+        // (Codex #4e-[8].)
+        if (sandbox.unrepresentableQuarantine?.length)
+          throw new Error(`quarantined path(s) cannot be enforced by the OS sandbox: ${sandbox.unrepresentableQuarantine.join(", ")}`);
+        // A denied path that CONTAINS the worktree would deny the worker its own
+        // code, and the failure would read as a broken sandbox rather than the
+        // configuration error it is. (Codex #4g-[4].)
+        if (sandbox.stateHomeContainsWorktree?.length)
+          throw new Error(`reeve's state (${sandbox.stateHomeContainsWorktree.join(", ")}) contains the worktree ${worktree}, so the policy would deny the worker its own checkout — move REEVE_HOME or identity.worktreeRoot apart`);
+        const qDenies = quarantineOsDenies(worktree, profile.risk?.quarantinePaths ?? []).paths;
+        const notifyCred = typeof profile.notify?.credentialFile === "string" && isAbsolute(profile.notify.credentialFile) ? [profile.notify.credentialFile] : [];
+        const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots, quarantineDenies: qDenies, extraDenies: notifyCred });
+        if (!sv.ok) throw new Error(`settings invalid: ${sv.errors.join("; ")}`);
         // The settings file is immutable per run, in the run's own directory:
         // a path keyed by PR alone was shared by every daemon on the host, and
         // one could overwrite it between this run's hash and its spawn.
@@ -565,6 +721,24 @@ export async function tick(ctx) {
           envHash: sha256(JSON.stringify(Object.keys(env).sort().map(k => [k, env[k]]))),
         });
 
+        // TOCTOU: the containment verdict was measured once for this tick, but
+        // the CLI binary and the keychain can change between then and NOW — after
+        // preparation (which includes a git fetch), immediately before the spawn.
+        // Re-check both cheap facts here, at the last moment, so a swap or a new
+        // credential during preparation reopens the gate. (Codex #4c-[11],[12],
+        // #4d-[13].)
+        const reval = await revalidateContainment(containment, {
+          bin: claudeBin, binaryIdentity, keychain: ctx.keychain ?? null, platform: ctx.platform ?? undefined,
+        });
+        if (!reval.ok) {
+          log(logPath, `  #${e.pr}: NOT dispatching — ${reval.why}`);
+          escalations.set("guardian:containment:changed", 1);
+          // The attempt is NOT refunded here: this is an UNBOUND outcome, and the
+          // finally block below refunds every pre-execution outcome once. Doing
+          // it in both places took a cause from two attempts to zero and handed
+          // back retries the cap had already spent. (Codex #4h-[3].)
+          r = { outcome: OUTCOMES.UNBOUND, why: `containment changed before spawn: ${reval.why}`, ms: 0, cost: null, sessionId: null };
+        } else {
         r = await (ctx.spawnWorker ?? runWorker)({
           bin: claudeBin,
           args: argv,
@@ -580,6 +754,7 @@ export async function tick(ctx) {
           // touch anything, so a crash leaves something probeable.
           onSpawn: ({ pid, lstart }) => { bindRun(db, { runId: run.runId, pid, boot: lstart }); noteWorkerBinding(db, { runId: run.runId, pid, lstart }); },
         });
+        }
       } catch (err) {
         // A worker that could not be prepared or launched is a failed attempt
         // with its reason, never a thrown tick: the run below is closed, the
@@ -681,6 +856,19 @@ export async function tick(ctx) {
         Object.values(u2.commands ?? {}).map(c => c?.cmd).filter(Boolean));
       const couldNotVerify = refused.some(w =>
         checkCmds.some(c => w.includes(c.split(/\s+/)[0])) && /test|lint|check|build/i.test(w));
+
+      // Before ANY git command runs in a directory the worker just held: a
+      // changed repository configuration is one git would EXECUTE, as the daemon
+      // user, outside the sandbox (core.fsmonitor and friends). Nothing is read
+      // from it and nothing is published; the worktree is kept for a human.
+      // (Codex #4f-[6].)
+      const cfg = (ctx.verifyConfig ?? verifyConfig)(worktree);
+      if (!cfg.ok) {
+        log(logPath, `  #${e.pr}: NOT reading or publishing this worktree — ${cfg.why}`);
+        escalations.set(`#${e.pr}: the worker changed its checkout's git configuration; the worktree is preserved for inspection`, 1);
+        escalations.set("guardian:worktree:config-tampered", 1);
+        continue;
+      }
 
       if (r.outcome !== OUTCOMES.OK) {
         const left = changedFiles(worktree, e.head);

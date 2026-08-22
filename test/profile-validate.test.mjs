@@ -176,7 +176,20 @@ expectOk("a lane declaring sensitiveOk true",
   const ok = d.worker?.maxOutputBytes === 67108864;
   console.log(`${ok ? "PASS" : "FAIL"}  worker.maxOutputBytes defaults to 64 MiB`);
   if (!ok) fail++;
+
+  // Dispatch stays refused unless the founder declares an isolated worker, so
+  // the default must be the un-isolated one; a dedicated-user value validates.
+  const isoDefault = d.worker?.isolation === "none";
+  console.log(`${isoDefault ? "PASS" : "FAIL"}  worker.isolation defaults to "none"`);
+  if (!isoDefault) fail++;
+  const isoOk = validate(withDefaults((() => { const q = clone(base); q.worker = { isolation: "dedicated-user" }; return q; })())).ok;
+  console.log(`${isoOk ? "PASS" : "FAIL"}  worker.isolation accepts "dedicated-user"`);
+  if (!isoOk) fail++;
 }
+
+expectRefusal("an unknown worker.isolation value",
+  (() => { const p = clone(base); p.worker = { isolation: "sandboxed" }; return p; })(),
+  /worker\.isolation must be one of/);
 
 expectRefusal("a capability switch that is not a boolean",
   (() => { const p = clone(base); p.builder = { capabilities: { mergeBuilderPr: "yes" } }; return p; })(),

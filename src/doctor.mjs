@@ -11,6 +11,9 @@
 // A check that cannot answer reports UNKNOWN and degrades; it never passes.
 
 import { checkBaseline } from "./baseline.mjs";
+import { sandboxFor } from "./sandbox.mjs";
+import { readCanaryState, policyHashOf } from "./canary.mjs";
+import { probeKeychain, isolationTopologyReady, binaryIdentity } from "./containment.mjs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
@@ -379,9 +382,104 @@ function checkDetectors(db, profile) {
   return { id: "R-08", level: OK, title: "detectors", lines };
 }
 
+// ── R-14 / R-15: worker containment ───────────────────────────────────────
+//
+// Both answer "may this host dispatch a worker under --execute": the daemon
+// refuses until the sandbox canary has passed under the CLI it would launch
+// AND the login keychain holds no GitHub credential. The doctor reports the
+// same two facts from the same sources, so that a refusal in the log can be
+// read here without the daemon.
+
+/** The last sandbox canary this daemon recorded, if any. */
+export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now = () => Date.now(), identity = binaryIdentity, currentPolicyHash = null } = {}) {
+  const id = "R-14", title = "worker sandbox canary";
+  if (!stateDir) return { id, level: UNKNOWN, title, lines: ["no state directory to read the canary from"] };
+  const st = read(stateDir, nwo);
+  if (!st) return { id, level: UNKNOWN, title, lines: [`no canary has been recorded for ${nwo}`,
+    "the daemon runs one before its first dispatch under --execute; until then every dispatch is refused"] };
+  const age = typeof st.at === "number" ? Math.floor((now() - st.at) / 60_000) : null;
+  const when = age === null ? "at an unknown time" : age < 1 ? "under a minute ago" : `${age} min ago`;
+  if (st.ok !== true) return { id, level: BROKEN, title, lines: [`the last canary FAILED ${when} under ${st.cliVersion ?? "?"}: ${st.why ?? "no reason recorded"}`,
+    "the daemon refuses every dispatch under --execute until a canary passes; it re-runs one on the next tick that wants a worker"] };
+  // A pass is a pass FOR THE BINARY IT RAN UNDER. The daemon keys containment by
+  // the current binary identity, so a replaced executable makes this record
+  // historical and the daemon will re-measure; reporting OK from `st.ok` alone
+  // would claim a health the daemon does not currently grant. A record that
+  // cannot be compared is UNKNOWN, never OK. (Codex #4e-[2].)
+  if (!st.bin || !st.binaryId) return { id, level: UNKNOWN, title, lines: [
+    `canary ${st.id ?? "?"} passed ${when} under ${st.cliVersion ?? "?"}, but the record names no CLI binary`,
+    "so it cannot be checked against the executable in use now; the daemon re-measures before it dispatches"] };
+  const live = identity(st.bin);
+  if (live !== st.binaryId) return { id, level: DEGRADED, title, lines: [
+    `the last canary passed ${when} under a DIFFERENT build of ${st.bin}`,
+    `recorded ${st.binaryId}, now ${live} — the daemon re-measures before dispatching under the new one`] };
+  // The binary can be unchanged while the POLICY the daemon would generate today
+  // has moved (a new deny, a new state root, a changed profile). The daemon keys
+  // containment by both, so a record describing an older policy is historical.
+  if (!st.policyHash) return { id, level: UNKNOWN, title, lines: [
+    `canary ${st.id ?? "?"} passed ${when}, but the record names no sandbox policy`,
+    "so it cannot be checked against the policy in force now; the daemon re-measures before it dispatches"] };
+  if (currentPolicyHash && currentPolicyHash !== st.policyHash) return { id, level: DEGRADED, title, lines: [
+    `the last canary passed ${when} under a DIFFERENT sandbox policy (${st.policyHash}, now ${currentPolicyHash})`,
+    "the daemon re-measures before dispatching under the policy in force now"] };
+  return { id, level: OK, title, lines: [`canary ${st.id ?? "?"} passed ${when} under ${st.cliVersion ?? "?"}, and the CLI binary is unchanged`,
+    "network, outside writes and credential-file reads denied; inside and tmp writes allowed"] };
+}
+
+/** GitHub credentials in the login keychain, and the isolation prerequisite.
+ * An empty two-item probe is necessary but NOT sufficient: dispatch also needs
+ * `worker.isolation: dedicated-user`, so doctor must not read OK while the
+ * daemon necessarily refuses. (Codex #4b-[10].) */
+export function checkKeychain({ probe = probeKeychain, isolation = "none", topologyReady = isolationTopologyReady } = {}) {
+  const id = "R-15", title = "worker credential reach";
+  // The LABEL is necessary but not sufficient: the dedicated-user topology must
+  // actually be in place (PR-3). Until then an isolated-labelled profile is
+  // still DEGRADED, because the daemon necessarily refuses. (Codex #4d-[14].)
+  const isolated = isolation === "dedicated-user" && topologyReady();
+  const kc = probe();
+  if (!kc.measured) return { id, level: UNKNOWN, title, lines: [`unmeasured: ${kc.why}`, "an unmeasured keychain keeps dispatch refused"] };
+  if (kc.items.length) return { id, level: DEGRADED, title, lines: [
+    `the login keychain holds a GitHub credential a sandboxed worker could read: ${kc.items.join("; ")}`,
+    "the OS sandbox cannot deny the keychain (securityd is hard-allowed by the runtime's profile), so write-capable",
+    "worker dispatch under --execute stays REFUSED until this is closed; observation and review are unaffected",
+    "-> run workers as a dedicated user (closes this AND the shared-ref hole), or log gh in with --insecure-storage",
+    "   and delete the git osxkeychain internet-password item for github.com (closes the keychain only)",
+  ] };
+  // The probe found neither of the two conventional items, but that cannot
+  // certify a shared account, so an un-isolated profile is still DEGRADED.
+  if (!isolated) return { id, level: DEGRADED, title, lines: [
+    "no GitHub credential under the two conventional keychain items, but a shared account cannot be certified",
+    "(another client can store a token under a different service name), and a linked worktree shares the git dir",
+    "dispatch under --execute stays REFUSED until worker.isolation is 'dedicated-user'; observation is unaffected",
+    "-> run workers as a dedicated OS user with its own empty keychain and its own clone, then set worker.isolation",
+  ] };
+  return { id, level: OK, title, lines: ["no GitHub credential in the login keychain, and an isolated worker is declared; file credentials are deny-read by the sandbox"] };
+}
+
+/**
+ * The policy hash the daemon would generate for this profile TODAY, when it can
+ * be reconstructed. The canary's own state roots are taken from the record (the
+ * daemon may run with a --log or --db this command knows nothing about), so a
+ * record without them leaves the comparison unmade rather than wrong.
+ */
+function currentPolicy(profile, { read = readCanaryState, stateDir = null, nwo = null } = {}) {
+  try {
+    const st = stateDir && nwo ? read(stateDir, nwo) : null;
+    // The state roots are the only inputs this command cannot reconstruct (the
+    // daemon may run with a --log or --db it knows nothing about), so they are
+    // taken from the record and fed BACK IN — everything else, including the
+    // quarantine paths and the notification credential, is generated from the
+    // profile as it is now. Overwriting the whole denyRead with the record would
+    // have hidden exactly those profile changes. (Codex #4g-[3].)
+    if (!Array.isArray(st?.stateRoots) || !st?.canaryDir) return null;
+    const block = sandboxFor({ profile, action: "FIX_CI", worktree: st.canaryDir, tmpDir: "<tmp>", stateRoots: st.stateRoots }).settings.sandbox;
+    return policyHashOf(block, st.canaryDir);
+  } catch { return null; }
+}
+
 // ── driver ────────────────────────────────────────────────────────────────
 
-export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {} }) {
+export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {}, stateDir = null, canaryIo = {}, keychainIo = {} }) {
   const checks = [
     checkMergeAuthority(nwo),
     pluginCacheRoot ? checkArtifactDrift(pluginCacheRoot, repoPluginDir) : null,
@@ -393,6 +491,8 @@ export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null
     profile.reviewers?.length ? checkDetectors(db, profile) : null,
     appCheck,
     checkBaseline(nwo, profile, baselineIo),
+    checkCanary(nwo, { stateDir, currentPolicyHash: currentPolicy(profile, { ...canaryIo, stateDir, nwo }), ...canaryIo }),
+    checkKeychain({ isolation: profile.worker?.isolation, ...keychainIo }),
   ].filter(Boolean);
 
   const broken = checks.filter(c => c.level === BROKEN);

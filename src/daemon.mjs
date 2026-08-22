@@ -861,6 +861,15 @@ export async function tick(ctx) {
       }
       log(logPath, `  #${e.pr}: ${decision.action} -> ${r.outcome} (${r.why}) in ${Math.round(r.ms / 1000)}s${r.cost != null ? `, ${r.cost.toFixed(3)}` : ""}`);
 
+      // Nothing was prepared, so there is no checkout to read, judge or publish.
+      // Preparation happens inside the try-block above, so a failure there leaves
+      // this path null while everything below it still runs -- and the
+      // configuration check reads a null path as "no recorded configuration",
+      // which is a refusal. That reported the most ordinary failure there is (no
+      // disk, no token, a clone that would not clone) as the worker having
+      // tampered with git config, against a worker that never started.
+      if (!worktree) continue;
+
       // What the worker PRODUCED, judged after it has stopped talking. The
       // permission layer stops it reaching a forbidden path; this answers the
       // different question of whether the change is inside the work it was given.

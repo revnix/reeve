@@ -138,6 +138,15 @@ export function observe(nwo, pr, io = {}) {
   }
   // Only a read that saw everything it was told exists is complete.
   if (total !== null && seen < total) incomplete = true;
+  // The thread counts FROM THIS READ, so the shadow can compare the projection
+  // against the same snapshot that fed it rather than against a second call
+  // taken moments later. Any second read is a second moment, and a pull request
+  // that moved between them reads as the derivation disagreeing — which is a
+  // different claim entirely, and the one the whole instrument exists to make.
+  // (Codex #6-[1].)
+  const threadsSeen = out.filter(o => o.kind === "review_thread");
+  const threads = { readable: total !== null && seen >= total, total,
+                    unresolved: threadsSeen.filter(o => !o.payload?.is_resolved).length, seen };
 
   // Reactions on the PR issue: Codex's push-triggered clean pass, and its "eyes"
   // review-in-progress marker.
@@ -151,7 +160,7 @@ export function observe(nwo, pr, io = {}) {
                payload: { login: x.user?.login ?? null, content: x.content } });
   }
 
-  return { ok: !incomplete || out.length > 0, observations: out, incomplete };
+  return { ok: !incomplete || out.length > 0, observations: out, incomplete, threads };
 }
 
 /** The content hash an edit changes and a re-poll does not. */

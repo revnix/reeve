@@ -92,6 +92,11 @@ touch ${JSON.stringify(join(outsideDir, "OUTSIDE"))}; rec outside $?
 curl -sS -m 5 https://example.com -o ./curl-body 2>/dev/null; rec curl $?
 ${netUrl ? `curl -sS -m 5 ${JSON.stringify(netUrl)} -o ./probe-body 2>/dev/null; rec probe $?` : ""}
 cp ${JSON.stringify(decoyPath)} ./decoy-copy 2>/dev/null; rec decoy $?
+# The KEYCHAIN, which no sandbox setting can deny: absolute paths on purpose,
+# because the refusing shims on the worker's PATH are a layer, not a boundary.
+/usr/bin/security find-internet-password -s github.com >/dev/null 2>&1; rec kc_github $?
+/usr/bin/security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; rec kc_claude $?
+printf 'protocol=https\nhost=github.com\n\n' | git -c credential.helper=osxkeychain credential fill 2>/dev/null | grep -q '^password='; rec kc_helper $?
 ${fileDecoyPath ? `cp ${JSON.stringify(fileDecoyPath)} ./filedecoy-copy 2>/dev/null; rec filedecoy $?` : ""}
 ${fileControlPath ? `cp ${JSON.stringify(fileControlPath)} ./filecontrol-copy 2>/dev/null; rec filecontrol $?` : ""}
 ln -sf ${JSON.stringify(decoyPath)} ./decoy-link 2>/dev/null; cp ./decoy-link ./decoy-copy2 2>/dev/null; rec symlink $?
@@ -170,7 +175,10 @@ function parseResults(path) {
   if (!existsSync(path)) return null;
   const out = {};
   for (const line of readFileSync(path, "utf8").split("\n")) {
-    const m = /^([a-z]+)=(-?\d+)$/.exec(line.trim());
+    // `[a-z_]`, not `[a-z]`: the keychain probes are named kc_github and friends,
+    // and a name-only regex silently dropped them — which read as "the probes did
+    // not run" and would have failed every real canary.
+    const m = /^([a-z_]+)=(-?\d+)$/.exec(line.trim());
     if (m) out[m[1]] = Number(m[2]);
   }
   return out;
@@ -338,6 +346,17 @@ export async function sandboxCanary({
       if (results.filecontrol !== 0) problems.push("control: a file that is NOT denied was unreadable, so the exact-file result proves nothing");
     }
     if (existsSync(join(dir, "decoy-copy2")) || results.symlink === 0 || decoyContains(join(dir, "decoy-copy2"))) problems.push("read a deny-read file through a symlink");
+    // The keychain is the boundary the OS sandbox cannot enforce, so it is the
+    // one the canary must prove: with a scratch HOME the founder's login
+    // keychain is not in the worker's search list and every probe fails. A
+    // SUCCESS here means a worker can read the founder's credentials.
+    if (!("kc_github" in results) || !("kc_claude" in results) || !("kc_helper" in results))
+      problems.push("the keychain probes did not run, so credential reach is unproven");
+    else {
+      if (results.kc_github === 0) problems.push("read the founder's GitHub credential from the keychain");
+      if (results.kc_claude === 0) problems.push("read the founder's Claude credentials from the keychain");
+      if (results.kc_helper === 0) problems.push("git's keychain helper returned a credential");
+    }
   }
   // The Write TOOL outside the canary's directory: the file must not exist, and
   // the stream must show the attempt being refused.

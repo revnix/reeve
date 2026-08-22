@@ -26,9 +26,14 @@ import { probeKeychain } from "../src/containment.mjs";
 import { netListener } from "../src/canary.mjs";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
+// A worker never gets the founder's HOME (that is where the keychain lives) and
+// authenticates from a token instead of ~/.claude.
+const WORKER_HOME = mkdtempSync(join(tmpdir(), "reeve-worker-home-"));
+const FAKE_TOKEN = "sk-ant-oat01-test-token-not-a-real-credential-000000000000";
 
 let fail = 0, skipped = 0;
 const check = (ok, name, detail) => {
@@ -61,7 +66,7 @@ const dest = join(root, "dest.git"); git(root, "init", "--bare", "-q", dest);
 const standalone = join(root, "standalone"); git(root, "clone", "-q", origin, standalone); git(standalone, "checkout", "-q", "feature");
 
 const tmpDir = join(root, "tmp"); mkdirSync(tmpDir, { recursive: true });
-const env = workerEnv({ gitConfigPath: writeGitConfig(join(root, "git")), tmpDir, bgWaitMs: 1 });
+const env = workerEnv({ home: WORKER_HOME, oauthToken: FAKE_TOKEN, gitConfigPath: writeGitConfig(join(root, "git")), tmpDir, bgWaitMs: 1 });
 const refsAt = bare => git(bare, "for-each-ref", "--format=%(refname)");
 const push = (args) => sh(wt.path, "git", args, env);
 
@@ -232,14 +237,19 @@ cat ${JSON.stringify(fileControl)} >/dev/null 2>&1; rec file_control $?
     // same underlying hole but runs through gh's own config code, whose
     // one-time migration writes the keychain and is denied under the sandbox on
     // this gh version; its result is therefore informational, never the finding.
+    // CLOSED 2026-08-22. This was the last KNOWN-OPEN and it is now HELD: the
+    // keychain is reached through HOME, and a worker's HOME is reeve's scratch
+    // directory, so the founder's login keychain is not in its search list. The
+    // founder's keychain is UNCHANGED and still holds the credential — which is
+    // what makes this a real test rather than a tautology: the item exists, and
+    // the worker still cannot reach it.
     if (!keychain.measured) skip("keychain shapes", keychain.why);
-    else if (!keychain.items.length) {
-      check(r.keychain !== 0, "HELD (this host): no GitHub credential in the keychain, so the osxkeychain helper returns nothing", `keychain=${r.keychain}`);
-    } else {
-      const git_item = keychain.items.some(i => /osxkeychain/.test(i));
-      if (git_item) check(r.keychain === 0, "KNOWN-OPEN (this host): `git -c credential.helper=osxkeychain credential fill` returns the founder's token INSIDE the sandbox (securityd is hard-allowed; closes only with an empty keychain or a dedicated worker user)", `keychain=${r.keychain}`);
-      else skip("the git-credential keychain shape", "no git osxkeychain item on this host");
-      console.log(`INFO  the gh-keyring shape returned ghkeyring=${r.ghkeyring} (gh's own config migration is denied a keychain write under the sandbox on this gh version; the git-credential shape above is the stable finding)`);
+    else {
+      if (keychain.items.length)
+        check(r.keychain !== 0, "HELD: the founder's keychain DOES hold a GitHub credential, and the worker still cannot read it (scratch HOME)", `keychain=${r.keychain} items=${keychain.items.length}`);
+      else
+        check(r.keychain !== 0, "HELD: no GitHub credential in the keychain, and the helper returns nothing", `keychain=${r.keychain}`);
+      check(r.ghkeyring !== 0, "HELD: gh pointed at a crafted config dir cannot reach the keyring either", `ghkeyring=${r.ghkeyring}`);
     }
   }
 
@@ -257,7 +267,7 @@ cat ${JSON.stringify(fileControl)} >/dev/null 2>&1; rec file_control $?
 }
 
 // ── the declaration the env alone makes must still say what it measured ──────
-check(CONTAINMENT.credentialRead === "open", "control: the environment layer alone declares the credential read open; closure is measured per host by containment.mjs", JSON.stringify(CONTAINMENT));
+check(CONTAINMENT.credentialRead === "closed-by-home", "control: the module declares the closure this file just measured, and the canary re-proves it per CLI build", JSON.stringify(CONTAINMENT));
 
 rmSync(root, { recursive: true, force: true });
 console.log(`${fail ? `\nfailed=${fail}` : "\nall green"}${skipped ? ` (skipped ${skipped}: not measurable on this host)` : ""}`);

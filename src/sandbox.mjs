@@ -96,6 +96,8 @@ const SELF_GOVERNING = [".github/**", ".git/**"];
  *   ~/.aws ~/.azure ~/.config/gcloud ~/.kube ~/.docker ~/.gnupg
  *                      cloud, cluster, registry and signing credentials
  */
+const expandTilde = p => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
+
 export const CREDENTIAL_PATHS = [
   "~/.reeve", "~/.claude", "~/.claude.json", "~/.config/gh", "~/.ssh", "~/.gitconfig",
   // Git's `store` helper writes plaintext tokens to ~/.git-credentials OR, under
@@ -106,7 +108,8 @@ export const CREDENTIAL_PATHS = [
   "~/.config/gcloud", "~/.kube", "~/.docker", "~/.gnupg",
 ];
 // The same list as Read-tool rules: a file is named, a directory gets `/**`.
-const CREDENTIAL_FILES = new Set(["~/.claude.json", "~/.gitconfig", "~/.git-credentials", "~/.netrc", "~/.npmrc"]);
+const CREDENTIAL_FILE_NAMES = ["~/.claude.json", "~/.gitconfig", "~/.git-credentials", "~/.netrc", "~/.npmrc"];
+const isCredentialFile = p => CREDENTIAL_FILE_NAMES.map(expandTilde).includes(p);
 
 /**
  * The credential paths, plus the CONFIGURED reeve state root when it is not the
@@ -120,10 +123,14 @@ export function credentialPaths() {
   const root = process.env.REEVE_HOME;
   const extra = (root && root.startsWith("/") && root.replace(/\/+$/, "") !== join(homedir(), ".reeve"))
     ? [root.replace(/\/+$/, "")] : [];
-  return [...CREDENTIAL_PATHS, ...extra];
+  // ABSOLUTE, always. Measured 2026-08-22: the sandbox expands `~` against the
+  // PROCESS's home, and a worker's home is now reeve's scratch directory — so a
+  // `~/.ssh` rule would expand to `<scratch>/.ssh` and protect nothing at all.
+  // The credentials being protected live in the DAEMON's home, so that is the
+  // home these resolve against.
+  return [...CREDENTIAL_PATHS.map(expandTilde), ...extra];
 }
-const expandTilde = p => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
-const credentialReadDenies = () => credentialPaths().map(p => (CREDENTIAL_FILES.has(p) ? `Read(${p})` : `Read(${p}/**)`));
+const credentialReadDenies = () => credentialPaths().map(p => (isCredentialFile(p) ? `Read(${p})` : `Read(${p}/**)`));
 
 /**
  * Actions whose Bash may reach the network at all, and where the domains come

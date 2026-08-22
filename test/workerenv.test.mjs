@@ -9,6 +9,11 @@ import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from "no
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 
+// A worker never gets the founder's HOME (that is where the keychain lives) and
+// authenticates from a token instead of ~/.claude.
+const WORKER_HOME = mkdtempSync(join(tmpdir(), "reeve-worker-home-"));
+const FAKE_TOKEN = "sk-ant-oat01-test-token-not-a-real-credential-000000000000";
+
 let fail = 0;
 const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
@@ -25,7 +30,7 @@ const planted = { GH_TOKEN: "x", GITHUB_TOKEN: "x", SSH_AUTH_SOCK: "/tmp/agent",
 for (const [k, v] of Object.entries(planted)) process.env[k] = v;
 
 const gitConfigPath = writeGitConfig(dir);
-const env = workerEnv({ gitConfigPath, tmpDir: join(dir, "tmp"), bgWaitMs: 1200000 });
+const env = workerEnv({ home: WORKER_HOME, oauthToken: FAKE_TOKEN, gitConfigPath, tmpDir: join(dir, "tmp"), bgWaitMs: 1200000 });
 
 {
   const leaked = Object.keys(planted).filter(k => k in env);
@@ -34,7 +39,10 @@ const env = workerEnv({ gitConfigPath, tmpDir: join(dir, "tmp"), bgWaitMs: 12000
     "control: the credentials were actually planted in this process", "");
 }
 {
-  check(env.HOME === homedir(), "HOME is the real home: the CLI reads ~/.claude for subscription auth", env.HOME);
+  // The property this module now exists for: a worker's HOME is reeve's, never
+  // the founder's, because the keychain is reached through HOME and the OS
+  // sandbox cannot deny it. Measured 2026-08-22.
+  check(env.HOME === WORKER_HOME && env.HOME !== homedir(), "HOME is a scratch home, NOT the founder's: that is what puts the keychain out of reach", env.HOME);
   const { dirname: dn } = await import("node:path");
   check(typeof env.PATH === "string" && env.PATH.split(":")[1] === dn(process.execPath),
     "PATH carries the running daemon's own node bin, right after the shims", env.PATH);
@@ -51,26 +59,26 @@ const env = workerEnv({ gitConfigPath, tmpDir: join(dir, "tmp"), bgWaitMs: 12000
   check(!/url\s*=/.test(cfg) && !/insteadOf/.test(cfg), "and carries no URL rewrite", cfg);
 }
 {
-  const e2 = workerEnv({ gitConfigPath, tmpDir: dir, bgWaitMs: 1, extra: { FOO: "bar" } });
+  const e2 = workerEnv({ home: WORKER_HOME, oauthToken: FAKE_TOKEN, gitConfigPath, tmpDir: dir, bgWaitMs: 1, extra: { FOO: "bar" } });
   check(e2.FOO === "bar", "a phase may add named variables", "");
-  const e3 = workerEnv({ gitConfigPath, tmpDir: dir, bgWaitMs: 1, extra: { GH_TOKEN: "sneak" } });
+  const e3 = workerEnv({ home: WORKER_HOME, oauthToken: FAKE_TOKEN, gitConfigPath, tmpDir: dir, bgWaitMs: 1, extra: { GH_TOKEN: "sneak" } });
   check(!("GH_TOKEN" in e3), "but a stripped name cannot be smuggled back through extra", JSON.stringify(e3.GH_TOKEN));
   // The strip rules are only reachable through `extra` (the base never copies
   // process.env), so each rule shape is exercised here, not just an exact name.
-  const e4 = workerEnv({ gitConfigPath, tmpDir: dir, bgWaitMs: 1,
+  const e4 = workerEnv({ home: WORKER_HOME, oauthToken: FAKE_TOKEN, gitConfigPath, tmpDir: dir, bgWaitMs: 1,
                          extra: { AWS_ACCESS_KEY_ID: "p", ALL_PROXY: "s", no_proxy: "s2", GIT_CREDENTIAL_X: "g", NODE_OPTIONS: "--require evil" } });
   check(!("AWS_ACCESS_KEY_ID" in e4) && !("ALL_PROXY" in e4) && !("no_proxy" in e4) && !("GIT_CREDENTIAL_X" in e4) && !("NODE_OPTIONS" in e4),
     "prefix, suffix, and the node preload variable are stripped through extra too", JSON.stringify(Object.keys(e4)));
-  const e4b = workerEnv({ gitConfigPath, tmpDir: dir, bgWaitMs: 1, extra: { GITHUB_ENTERPRISE_TOKEN: "t" } });
+  const e4b = workerEnv({ home: WORKER_HOME, oauthToken: FAKE_TOKEN, gitConfigPath, tmpDir: dir, bgWaitMs: 1, extra: { GITHUB_ENTERPRISE_TOKEN: "t" } });
   check(!("GITHUB_ENTERPRISE_TOKEN" in e4b), "gh's second enterprise-token alias is stripped too", JSON.stringify(Object.keys(e4b)));
   // The base is RESERVED: a phase cannot point git back at the founder's
   // config, swap HOME or PATH, or loosen the retry bound through `extra`.
-  const e5 = workerEnv({ gitConfigPath, tmpDir: dir, bgWaitMs: 1,
+  const e5 = workerEnv({ home: WORKER_HOME, oauthToken: FAKE_TOKEN, gitConfigPath, tmpDir: dir, bgWaitMs: 1,
                          extra: { GIT_CONFIG_GLOBAL: "/Users/x/.gitconfig", GIT_CONFIG_NOSYSTEM: "0", PATH: "/evil", HOME: "/tmp/h", CLAUDE_CODE_MAX_RETRIES: "99" } });
-  check(e5.GIT_CONFIG_GLOBAL === gitConfigPath && e5.GIT_CONFIG_NOSYSTEM === "1" && e5.PATH === env.PATH && e5.HOME === homedir() && e5.CLAUDE_CODE_MAX_RETRIES === "1",
-    "base variables are reserved and cannot be overridden through extra", JSON.stringify({ g: e5.GIT_CONFIG_GLOBAL, p: e5.PATH }));
+  check(e5.GIT_CONFIG_GLOBAL === gitConfigPath && e5.GIT_CONFIG_NOSYSTEM === "1" && e5.PATH === env.PATH && e5.HOME === WORKER_HOME && e5.CLAUDE_CODE_MAX_RETRIES === "1",
+    "base variables are reserved and cannot be overridden through extra (HOME included: a phase must not point a worker back at the founder's keychain)", JSON.stringify({ g: e5.GIT_CONFIG_GLOBAL, p: e5.PATH, h: e5.HOME }));
   // Git's other config and credential entry points are stripped by name.
-  const e6 = workerEnv({ gitConfigPath, tmpDir: dir, bgWaitMs: 1,
+  const e6 = workerEnv({ home: WORKER_HOME, oauthToken: FAKE_TOKEN, gitConfigPath, tmpDir: dir, bgWaitMs: 1,
                          extra: { GIT_CONFIG_PARAMETERS: "'credential.helper=osxkeychain'", GIT_CONFIG_SYSTEM: "/x", GIT_EXEC_PATH: "/x", GIT_DIR: "/x", GIT_WORK_TREE: "/x", GIT_SSH: "/x", XDG_CONFIG_HOME: "/x" } });
   check(["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_SYSTEM", "GIT_EXEC_PATH", "GIT_DIR", "GIT_WORK_TREE", "GIT_SSH", "XDG_CONFIG_HOME"].every(k => !(k in e6)),
     "every git config, credential, and location override is stripped", JSON.stringify(Object.keys(e6)));
@@ -86,16 +94,22 @@ const env = workerEnv({ gitConfigPath, tmpDir: join(dir, "tmp"), bgWaitMs: 12000
   let code = 0, err = "";
   try { execFileSync("gh", ["auth", "token"], { env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }); } catch (e) { code = e.status; err = String(e.stderr); }
   check(code !== 0 && /refused/.test(err), "a bare `gh` under the worker env is the shim, and it refuses", `code=${code} ${err.slice(0, 80)}`);
-  const e7 = workerEnv({ gitConfigPath, tmpDir: dir, bgWaitMs: 1, extraPath: ["/opt/tools/bin"] });
+  const e7 = workerEnv({ home: WORKER_HOME, oauthToken: FAKE_TOKEN, gitConfigPath, tmpDir: dir, bgWaitMs: 1, extraPath: ["/opt/tools/bin"] });
   check(e7.PATH.split(":").includes("/opt/tools/bin") && e7.PATH.split(":").indexOf("/opt/tools/bin") > e7.PATH.split(":").findIndex(p => /v24\.17\.0/.test(p)),
     "a caller may append tool directories, after the pinned node bin", e7.PATH);
 }
 {
-  // What this module does NOT claim. The founder's credential stores are
-  // reachable through the real HOME until the OS sandbox or a worker user
-  // closes them; the module says so in code, and the daemon reads it.
-  check(CONTAINMENT.credentialRead === "open" && typeof CONTAINMENT.why === "string",
-    "the module declares the credential read OPEN, with the reason", JSON.stringify(CONTAINMENT));
+  // What this module claims, and why it may. The keychain is reached through
+  // HOME (measured 2026-08-22), so a scratch home takes it out of reach; the
+  // string is a summary, and the CANARY is what proves it per CLI build.
+  check(CONTAINMENT.credentialRead === "closed-by-home" && /scratch HOME/.test(CONTAINMENT.why),
+    "the module declares the credential read closed BY THE HOME, with the reason", JSON.stringify(CONTAINMENT));
+  // The two refusals that make the claim true rather than decorative.
+  let threwHome = false, threwToken = false;
+  try { workerEnv({ home: homedir(), oauthToken: FAKE_TOKEN, gitConfigPath, tmpDir: dir, bgWaitMs: 1 }); } catch { threwHome = true; }
+  try { workerEnv({ home: WORKER_HOME, gitConfigPath, tmpDir: dir, bgWaitMs: 1 }); } catch { threwToken = true; }
+  check(threwHome, "the founder's own home is REFUSED as a worker home");
+  check(threwToken, "and a worker without a token is refused rather than left unauthenticated");
 }
 
 

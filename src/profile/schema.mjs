@@ -222,6 +222,12 @@ export const FIELDS = {
   // separate OS user (its own empty keychain) and per-run standalone clones;
   // ONLY then does a passing canary plus an empty keychain close dispatch.
   "worker.isolation":                    [false, oneOf(WORKER_ISOLATION)],
+  // The dependency trees to copy into a run checkout, RELATIVE to the checkout.
+  // A worker has no network and no home cache, so a project whose dependencies
+  // this cannot infer from its languages has no other way to be given them --
+  // and an override the loader REJECTS is not an override at all. (Codex #5-[9].)
+  "worker.dependencyPaths":              [false, isArr(v => (typeof v === "string" && v.length && !v.startsWith("/") && !v.split("/").includes("..")
+                                                    ? null : "must be a relative path inside the checkout"))],
   // The only network a worker's shell may reach, and only for research: the OS
   // sandbox denies every domain for every other action. A bare host name, no
   // scheme, no path: the runtime matches domains, and "https://x" matches nothing.

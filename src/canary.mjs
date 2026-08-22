@@ -35,10 +35,18 @@ const canonical = v => {
  * paths normalised out. The write grant is the run's own tmp, which differs on
  * every run and says nothing about what the sandbox denies.
  */
-export function canaryIdFor({ cliVersion, sandbox, binaryId = null, worktree = null, permissionsDeny = null, allowedTools = null }) {
+export function canaryIdFor({ cliVersion, sandbox, binaryId = null, worktree = null, permissionsDeny = null, allowedTools = null,
+                              script = null }) {
   if (!cliVersion || !sandbox) throw new Error("canaryIdFor: cliVersion and the sandbox block are required");
+  // The SCRIPT is part of the identity too, because it is the instrument. A
+  // record made before a probe existed describes a weaker measurement than the
+  // one being asked for now, and reusing it is how the by-path keychain reach
+  // stayed unmeasured while a passing record said containment was closed.
+  // Per-invocation paths inside it (the decoy, the tmp dir) normalise out, or
+  // every tick would pay for another five-minute canary.
+  const instrument = script ? createHash("sha256").update(canonical(normaliseRules(String(script).split("\n"), worktree))).digest("hex").slice(0, 12) : "?";
   return createHash("sha256").update(
-    `${cliVersion}\n${binaryId ?? "?"}\n${canonical(normalisePolicy(sandbox, worktree))}\n${canonical(normaliseRules(permissionsDeny, worktree))}\n${canonical(normaliseRules(allowedTools, worktree))}`,
+    `${cliVersion}\n${binaryId ?? "?"}\n${canonical(normalisePolicy(sandbox, worktree))}\n${canonical(normaliseRules(permissionsDeny, worktree))}\n${canonical(normaliseRules(allowedTools, worktree))}\n${instrument}`,
   ).digest("hex").slice(0, 16);
 }
 
@@ -132,6 +140,12 @@ cp ${JSON.stringify(decoyPath)} ./decoy-copy 2>/dev/null; rec decoy $?
 printf 'protocol=https\nhost=github.com\n\n' | git -c credential.helper=osxkeychain credential fill 2>/dev/null | grep -q '^password='; rec kc_helper $?
 /usr/bin/security find-internet-password -s github.com ${JSON.stringify(loginKeychain)} >/dev/null 2>&1; rec kc_path_github $?
 /usr/bin/security find-generic-password -s "Claude Code-credentials" ${JSON.stringify(loginKeychain)} >/dev/null 2>&1; rec kc_path_claude $?
+# The probe that DECIDES, because the two above cannot: find-*-password answers
+# 44 both when access is denied and when the item simply is not there, so on a
+# host without those exact records they would report a closure that does not
+# exist. show-keychain-info asks about the KEYCHAIN rather than an item, and
+# distinguishes them: measured 2026-08-22, 0 when reachable and 161 when denied.
+/usr/bin/security show-keychain-info ${JSON.stringify(loginKeychain)} >/dev/null 2>&1; rec kc_path_open $?
 ${fileDecoyPath ? `cp ${JSON.stringify(fileDecoyPath)} ./filedecoy-copy 2>/dev/null; rec filedecoy $?` : ""}
 ${fileControlPath ? `cp ${JSON.stringify(fileControlPath)} ./filecontrol-copy 2>/dev/null; rec filecontrol $?` : ""}
 ln -sf ${JSON.stringify(decoyPath)} ./decoy-link 2>/dev/null; cp ./decoy-link ./decoy-copy2 2>/dev/null; rec symlink $?
@@ -293,7 +307,6 @@ export async function sandboxCanary({
   // external endpoint, no timing window.
   netProbe = null,
 }) {
-  const id = canaryIdFor({ cliVersion, sandbox, binaryId, worktree: dir, permissionsDeny, allowedTools });
   const outsideToolPath = join(outsideDir, "TOOL-OUTSIDE");
   // Production denies whole DIRECTORIES (~/.ssh) and individual FILES (the log,
   // the database, ~/.gitconfig, notify.credentialFile). The subtree decoy proves
@@ -302,6 +315,17 @@ export async function sandboxCanary({
   // denies while regressing exact-file matching cannot pass. (Codex #4g-[6].)
   const fileDecoyPath = join(outsideDir, "FILE-DECOY.txt");
   const fileControlPath = join(outsideDir, "FILE-CONTROL.txt");
+  // The listener's URL is not known until it is ready, and the script embeds it.
+  // Awaited HERE rather than lower down, because the script is built next: with
+  // the await after it, `netUrl` was null, the network control never made it
+  // into the script, and the canary failed on its own missing probe. Caught by a
+  // live run within a minute of the change.
+  if (netProbe?.ready) { try { await netProbe.ready; } catch { /* selfReachable will report it */ } }
+  // Built BEFORE the id, because the script is the instrument and its identity
+  // belongs in the id: a record made before a probe existed describes a weaker
+  // measurement than the one being asked for now.
+  const scriptText = canaryScript({ tmpDir, outsideDir, decoyPath, netUrl: netProbe?.url ?? null, fileDecoyPath, fileControlPath });
+  const id = canaryIdFor({ cliVersion, sandbox, binaryId, worktree: dir, permissionsDeny, allowedTools, script: scriptText });
   const evidence = { id, cliVersion, dir, outcome: null, why: null, results: null, readTool: null, writeTool: null, network: null };
   const fail = why => ({ ok: false, id, why, evidence });
 
@@ -327,8 +351,6 @@ export async function sandboxCanary({
   writeFileSync(decoyPath, `${CANARY_SENTINEL}\nreeve canary decoy: not a secret\n`);
   writeFileSync(fileDecoyPath, `${CANARY_SENTINEL}\nreeve canary file decoy: not a secret\n`);
   writeFileSync(fileControlPath, "reeve canary control: readable on purpose\n");
-  if (netProbe?.ready) { try { await netProbe.ready; } catch { /* selfReachable will report it */ } }
-  const scriptText = canaryScript({ tmpDir, outsideDir, decoyPath, netUrl: netProbe?.url ?? null, fileDecoyPath, fileControlPath });
   writeFileSync(join(dir, "canary.sh"), scriptText);
   const scriptHash = createHash("sha256").update(scriptText).digest("hex");
 
@@ -431,9 +453,14 @@ export async function sandboxCanary({
     // three above measure; naming the keychain file walks around that entirely,
     // and did, until the path joined the deny list. Absent probes are a refusal:
     // a canary that did not run them proves nothing about the reach they cover.
-    if (!("kc_path_github" in results) || !("kc_path_claude" in results))
+    if (!("kc_path_open" in results) || !("kc_path_github" in results) || !("kc_path_claude" in results))
       problems.push("the keychain was not probed by path, so the reach a scratch HOME does NOT close is unproven");
     else {
+      // The deciding probe. The two item probes below corroborate it and cannot
+      // replace it: they answer 44 for a denied keychain AND for a keychain that
+      // simply does not hold that record, so on a host without those exact items
+      // they would certify a closure that was never measured. (Codex #5-[10].)
+      if (results.kc_path_open === 0) problems.push("the founder's login keychain is REACHABLE by path");
       if (results.kc_path_github === 0) problems.push("read the founder's GitHub credential from the login keychain BY PATH");
       if (results.kc_path_claude === 0) problems.push("read the founder's Claude credentials from the login keychain BY PATH");
     }

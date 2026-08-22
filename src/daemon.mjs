@@ -153,13 +153,35 @@ function uncommittedFiles(worktree) {
 function diffCarriesSecret(worktree, since, secrets) {
   const present = secrets.filter(x => typeof x?.value === "string" && x.value.length >= 16);
   if (!present.length) return null;
-  let diff;
+  // The PATCH and the COMMIT METADATA, because a push carries both. `git diff`
+  // emits the file patch only, so a token placed in a commit message travelled
+  // straight into public history past a check that had just declared the change
+  // clean. Author name and email go with it, for the same reason. (Codex #5-[7].)
+  let text;
   try {
-    diff = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "diff", "--no-color", `${since}..HEAD`],
-                        { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
-  } catch { return { label: "unreadable", why: "reeve could not read the diff to check it for its own credentials" }; }
-  for (const sx of present) if (diff.includes(sx.value)) return { label: sx.label, why: `the diff contains ${sx.label}` };
+    // `--no-ext-diff` is not optional here. GIT_NEUTRALISE sets `diff.external=`
+    // to disable an external differ, and git takes the empty string literally:
+    // "cannot run : No such file or directory / fatal: external diff died". A
+    // content diff is the only command in reeve that reaches that code path, so
+    // nothing had exercised it — and the failure is silent in the direction that
+    // matters least and loudest in the one that matters most: this check would
+    // have refused EVERY publish as unreadable.
+    const args = [["diff", "--no-ext-diff", "--no-color", `${since}..HEAD`],
+                  ["log", `${since}..HEAD`, "--format=%B%n%an%n%ae%n%cn%n%ce"]];
+    text = args.map(a => execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...a],
+                                      { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })).join("\n");
+  } catch { return { label: "unreadable", why: "reeve could not read the change to check it for its own credentials" }; }
+  for (const sx of present) if (text.includes(sx.value)) return { label: sx.label, why: `the change carries ${sx.label}` };
   return null;
+}
+
+/** Where a named branch points inside a checkout, or null if it cannot be read. */
+function branchHead(worktree, branch) {
+  if (!branch) return null;
+  try {
+    return execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`],
+                        { encoding: "utf8" }).trim() || null;
+  } catch { return null; }
 }
 
 function changedFiles(worktree, since = null) {
@@ -1000,10 +1022,21 @@ export async function tick(ctx) {
 
       if (r.outcome !== OUTCOMES.OK) {
         const left = changedFiles(worktree, e.head);
-        if (left?.length) {
+        // `changedFiles` reads HEAD, and a worker that committed on the pull
+        // request's branch and then checked out something else leaves HEAD back
+        // at the pinned commit with the work still on the BRANCH. Publishing
+        // fetches that branch, so it is the branch that decides whether anything
+        // would be lost -- reading HEAD alone deleted the only copy of a
+        // candidate fix. (Codex #5-[11].)
+        const branchAt = branchHead(worktree, e.headRef);
+        const branchMoved = branchAt === null || branchAt !== e.head;
+        if (left?.length || branchMoved) {
           const rel = releaseRunCheckout(worktree, { workFetched: false });
-          log(logPath, `  #${e.pr}: the worker left ${left.length} changed file(s) unfinished — ${rel.quarantined ? `preserved at ${rel.path}` : "released"}`);
-          escalations.set(`#${e.pr}: an unfinished candidate fix was preserved rather than published — ${left.slice(0, 3).join(", ")}`, 1);
+          const why = left?.length ? `left ${left.length} changed file(s) unfinished`
+            : branchAt === null ? `left ${e.headRef} unreadable`
+            : `committed on ${e.headRef} without finishing`;
+          log(logPath, `  #${e.pr}: the worker ${why} — ${rel.quarantined ? `preserved at ${rel.path}` : "released"}`);
+          escalations.set(`#${e.pr}: an unfinished candidate fix was preserved rather than published — ${left?.length ? left.slice(0, 3).join(", ") : `commits on ${e.headRef}`}`, 1);
         } else {
           releaseRunCheckout(worktree, { workFetched: true });
         }

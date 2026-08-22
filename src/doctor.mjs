@@ -465,9 +465,15 @@ export function checkKeychain({ probe = probeKeychain, isolation = "none", topol
 function currentPolicy(profile, { read = readCanaryState, stateDir = null, nwo = null } = {}) {
   try {
     const st = stateDir && nwo ? read(stateDir, nwo) : null;
-    if (!st?.stateRoots || !st?.evidence?.dir) return null;
-    const block = sandboxFor({ profile, action: "FIX_CI", worktree: st.evidence.dir, tmpDir: "<tmp>" }).settings.sandbox;
-    return policyHashOf({ ...block, filesystem: { ...block.filesystem, denyRead: st.stateRoots } });
+    // The state roots are the only inputs this command cannot reconstruct (the
+    // daemon may run with a --log or --db it knows nothing about), so they are
+    // taken from the record and fed BACK IN — everything else, including the
+    // quarantine paths and the notification credential, is generated from the
+    // profile as it is now. Overwriting the whole denyRead with the record would
+    // have hidden exactly those profile changes. (Codex #4g-[3].)
+    if (!Array.isArray(st?.stateRoots) || !st?.canaryDir) return null;
+    const block = sandboxFor({ profile, action: "FIX_CI", worktree: st.canaryDir, tmpDir: "<tmp>", stateRoots: st.stateRoots }).settings.sandbox;
+    return policyHashOf(block, st.canaryDir);
   } catch { return null; }
 }
 

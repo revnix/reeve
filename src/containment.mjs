@@ -103,7 +103,7 @@ export function cheapContainmentReasons({ platform = process.platform, isolated 
 }
 
 export async function measureContainment({
-  cliVersion, sandbox, permissionsDeny, canaryPaths, bin, env, binaryId = null,
+  cliVersion, sandbox, permissionsDeny, canaryPaths, bin, env, binaryId = null, stateRoots = null,
   stateDir, nwo, platform = process.platform, isolated = false, netProbe = null,
   canary = null, keychain = null, cache = new Map(), now = () => Date.now(),
 }) {
@@ -137,7 +137,7 @@ export async function measureContainment({
     cn = await run({ cliVersion, sandbox, permissionsDeny, binaryId, ...canaryPaths, bin, env, ...(netProbe ? { netProbe } : {}) });
     cn = { ...cn, at: now() };
     cache.set(id, cn);
-    if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, bin, binaryId, policyHash: policyHashOf(sandbox), stateRoots: sandbox?.filesystem?.denyRead ?? null, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }
+    if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, bin, binaryId, policyHash: policyHashOf(sandbox, canaryPaths?.dir ?? null), stateRoots, canaryDir: canaryPaths?.dir ?? null, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }
   }
   // A skipped canary adds no reason of its own (the cheaper reasons already stand);
   // a run-or-injected canary that failed does.

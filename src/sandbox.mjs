@@ -122,6 +122,7 @@ export function credentialPaths() {
     ? [root.replace(/\/+$/, "")] : [];
   return [...CREDENTIAL_PATHS, ...extra];
 }
+const expandTilde = p => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
 const credentialReadDenies = () => credentialPaths().map(p => (CREDENTIAL_FILES.has(p) ? `Read(${p})` : `Read(${p}/**)`));
 
 /**
@@ -357,6 +358,14 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
     // Non-empty means a quarantine glob could not be enforced at the OS layer;
     // the caller must refuse the dispatch rather than run with a hole.
     unrepresentableQuarantine: quarantine.unrepresentable,
+    // A denied path that CONTAINS the worktree denies the worker its own code
+    // (and the canary its own script), so containment could never close and the
+    // reason would look like a sandbox failure. A layout such as
+    // REEVE_HOME=/srv/reeve with worktreeRoot=/srv/reeve/worktrees is a
+    // configuration error, and it is named as one. (Codex #4g-[4].)
+    stateHomeContainsWorktree: worktree
+      ? [...credentialPaths().map(expandTilde), ...stateRoots].filter(d => d.startsWith("/") && (worktree === d || worktree.startsWith(d.endsWith("/") ? d : d + "/")))
+      : [],
   };
 }
 

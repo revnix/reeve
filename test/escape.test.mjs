@@ -111,7 +111,7 @@ if (process.platform !== "darwin") {
     const p = join(root, `srt-${extraWrite.length ? "wide" : "cwd"}-${cwd.split("/").pop()}.json`);
     writeFileSync(p, JSON.stringify({
       network: { allowedDomains: policy.network.allowedDomains, deniedDomains: [], allowUnixSockets: [], allowLocalBinding: false },
-      filesystem: { allowWrite: [cwd, tmpDir, ...extraWrite], denyWrite: [], allowRead: [tmpDir], denyRead: policy.filesystem.denyRead },
+      filesystem: { allowWrite: [cwd, tmpDir, ...extraWrite], denyWrite: [], allowRead: [tmpDir], denyRead: [...policy.filesystem.denyRead, fileDecoy] },
     }));
     return p;
   };
@@ -120,6 +120,11 @@ if (process.platform !== "darwin") {
   const decoy = join(homedir(), ".reeve", "canary", `escape-decoy-${process.pid}.txt`);
   mkdirSync(dirname(decoy), { recursive: true }); writeFileSync(decoy, "decoy\n");
   const outside = join(root, "outside"); mkdirSync(outside, { recursive: true });
+  // Production denies whole directories AND individual files (the log, the
+  // database, ~/.gitconfig, notify.credentialFile). This pair proves the second
+  // kind holds, with its own control beside it.
+  const fileDecoy = join(outside, "FILE-DECOY.txt"), fileControl = join(outside, "FILE-CONTROL.txt");
+  writeFileSync(fileDecoy, "secret\n"); writeFileSync(fileControl, "readable\n");
   // Two git configs to prove Codex #4-[8]: one under the deny-read tree (where
   // the daemon USED to put it), one in the run's readable tmp (where it puts it
   // now). Both are created OUTSIDE the sandbox; the sandboxed git can reach only
@@ -162,6 +167,8 @@ GIT_CONFIG_GLOBAL=${JSON.stringify(deniedCfg)} git config --global --list >/dev/
 GIT_CONFIG_GLOBAL=${JSON.stringify(join(tmpDir, "gitconfig"))} git config --global --list >/dev/null 2>/dev/null; rec ok_cfg $?
 curl -sS -m 4 ${JSON.stringify(netUrl)} -o ./netbody 2>/dev/null; rec netprobe $?
 cat ${JSON.stringify(xdgDecoy)} >/dev/null 2>&1; rec xdg_git $?
+cat ${JSON.stringify(fileDecoy)} >/dev/null 2>&1; rec file_decoy $?
+cat ${JSON.stringify(fileControl)} >/dev/null 2>&1; rec file_control $?
 `;
   const runProbe = (cwd, settings) => {
     for (const f of ["probe-results.txt", "INSIDE", "curl-body", "decoy-copy", "decoy-copy2", "decoy-link"]) rmSync(join(cwd, f), { force: true });
@@ -206,6 +213,9 @@ cat ${JSON.stringify(xdgDecoy)} >/dev/null 2>&1; rec xdg_git $?
     check(r.denied_cfg !== 0, "MEASURED (Codex #4-[8]): a git config under the deny-read tree is unreadable to sandboxed git — why the daemon writes it in the run's tmp", `denied_cfg=${r.denied_cfg}`);
     check(r.ok_cfg === 0, "and a git config in the run's tmp (allow-read) IS readable — the daemon's fix", `ok_cfg=${r.ok_cfg}`);
     check(r.xdg_git !== 0, "HELD: git's XDG credential store (~/.config/git) is unreadable to a sandboxed shell", `xdg_git=${r.xdg_git}`);
+    check(r.file_decoy !== 0 && r.file_control === 0,
+      "HELD: an EXACT-FILE deny holds while its neighbour in the same directory stays readable (the shape the log, the database and the notify credential rely on)",
+      `decoy=${r.file_decoy} control=${r.file_control}`);
     check(r.netprobe !== 0 && listener.wasHit() === false && listener.selfReachable() === true,
       "HELD: the sandboxed curl cannot reach the daemon's local control listener, though the daemon itself can (the network positive control)", `netprobe=${r.netprobe} hit=${listener.wasHit()}`);
     check(r.noverify !== 0 && !refsAt(dest).includes("escape-noverify"), "HELD: `git push --no-verify <url>` cannot land: the destination is outside the write scope", `noverify=${r.noverify}`);

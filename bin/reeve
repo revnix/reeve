@@ -290,7 +290,10 @@ switch (cmd) {
     // Keyed by owner AND repo. An existing store at the old short-name path is
     // moved rather than abandoned: opening a fresh empty database instead is how
     // real history stops being read without anything appearing to fail.
-    const dbPath = opt("db") ?? stateFor(nwo);
+    // Absolute before it is opened OR protected: `stateRootsFor` drops every
+    // non-absolute candidate, so a relative --db opened fine and was denied to
+    // nobody. (Codex #4g-[2].)
+    const dbPath = resolve(opt("db") ?? stateFor(nwo));
     if (!existsSync(dbPath)) { console.error(`reeve run: no state database at ${dbPath}`); process.exit(1); }
     const ctx = {
       nwo, profile, db: open(dbPath),

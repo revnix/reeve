@@ -35,10 +35,28 @@ const canonical = v => {
  * paths normalised out. The write grant is the run's own tmp, which differs on
  * every run and says nothing about what the sandbox denies.
  */
-export function canaryIdFor({ cliVersion, sandbox, binaryId = null }) {
+export function canaryIdFor({ cliVersion, sandbox, binaryId = null, worktree = null }) {
   if (!cliVersion || !sandbox) throw new Error("canaryIdFor: cliVersion and the sandbox block are required");
-  const norm = { ...sandbox, filesystem: { ...(sandbox.filesystem ?? {}), allowWrite: ["<tmp>"], allowRead: ["<tmp>"] } };
-  return createHash("sha256").update(`${cliVersion}\n${binaryId ?? "?"}\n${canonical(norm)}`).digest("hex").slice(0, 16);
+  return createHash("sha256").update(`${cliVersion}\n${binaryId ?? "?"}\n${canonical(normalisePolicy(sandbox, worktree))}`).digest("hex").slice(0, 16);
+}
+
+/**
+ * A sandbox block with every PER-INVOCATION path replaced by a placeholder: the
+ * tmp grants, and any deny rooted at the canary's own directory. Quarantine
+ * denies are resolved against the worktree, and the canary's worktree is unique
+ * per invocation, so without this the id changed on every tick for any profile
+ * with `risk.quarantinePaths` — the cache could never hit and every wanted task
+ * paid another five-minute model canary. The configured glob still shows through,
+ * because only the PREFIX is replaced. (Codex #4g-[5].)
+ */
+function normalisePolicy(sandbox, worktree = null) {
+  const fs = sandbox?.filesystem ?? {};
+  const rebase = p => (worktree && typeof p === "string" && (p === worktree || p.startsWith(worktree + "/"))
+    ? `<worktree>${p.slice(worktree.length)}` : p);
+  return {
+    ...sandbox,
+    filesystem: { ...fs, allowWrite: ["<tmp>"], allowRead: ["<tmp>"], denyRead: (fs.denyRead ?? []).map(rebase) },
+  };
 }
 
 /**
@@ -47,9 +65,8 @@ export function canaryIdFor({ cliVersion, sandbox, binaryId = null }) {
  * can recompute today's policy from the profile and say whether the record still
  * describes it. (Codex #4f-[5].)
  */
-export function policyHashOf(sandbox) {
-  const norm = { ...sandbox, filesystem: { ...(sandbox?.filesystem ?? {}), allowWrite: ["<tmp>"], allowRead: ["<tmp>"] } };
-  return createHash("sha256").update(canonical(norm)).digest("hex").slice(0, 16);
+export function policyHashOf(sandbox, worktree = null) {
+  return createHash("sha256").update(canonical(normalisePolicy(sandbox, worktree))).digest("hex").slice(0, 16);
 }
 
 /** `~/x` as the runtime expands it: against the real home, never the worker's cwd. */
@@ -64,7 +81,7 @@ export const CANARY_SENTINEL = "REEVE-CANARY-SENTINEL-DO-NOT-LEAK";
  * daemon can stat afterwards; exit codes are recorded as well but are not
  * what decides.
  */
-export function canaryScript({ tmpDir, outsideDir, decoyPath, netUrl = null }) {
+export function canaryScript({ tmpDir, outsideDir, decoyPath, netUrl = null, fileDecoyPath = null, fileControlPath = null }) {
   return `#!/bin/sh
 # reeve sandbox canary: leaves files for the daemon to read; records exit codes beside them
 out="./canary-results.txt"; : > "$out" || exit 97
@@ -75,6 +92,8 @@ touch ${JSON.stringify(join(outsideDir, "OUTSIDE"))}; rec outside $?
 curl -sS -m 5 https://example.com -o ./curl-body 2>/dev/null; rec curl $?
 ${netUrl ? `curl -sS -m 5 ${JSON.stringify(netUrl)} -o ./probe-body 2>/dev/null; rec probe $?` : ""}
 cp ${JSON.stringify(decoyPath)} ./decoy-copy 2>/dev/null; rec decoy $?
+${fileDecoyPath ? `cp ${JSON.stringify(fileDecoyPath)} ./filedecoy-copy 2>/dev/null; rec filedecoy $?` : ""}
+${fileControlPath ? `cp ${JSON.stringify(fileControlPath)} ./filecontrol-copy 2>/dev/null; rec filecontrol $?` : ""}
 ln -sf ${JSON.stringify(decoyPath)} ./decoy-link 2>/dev/null; cp ./decoy-link ./decoy-copy2 2>/dev/null; rec symlink $?
 echo done
 `;
@@ -198,8 +217,15 @@ export async function sandboxCanary({
   // external endpoint, no timing window.
   netProbe = null,
 }) {
-  const id = canaryIdFor({ cliVersion, sandbox, binaryId });
+  const id = canaryIdFor({ cliVersion, sandbox, binaryId, worktree: dir });
   const outsideToolPath = join(outsideDir, "TOOL-OUTSIDE");
+  // Production denies whole DIRECTORIES (~/.ssh) and individual FILES (the log,
+  // the database, ~/.gitconfig, notify.credentialFile). The subtree decoy proves
+  // only the first. This pair proves the second: two files in the same directory,
+  // one denied by exact path and one not, so a build that enforced directory
+  // denies while regressing exact-file matching cannot pass. (Codex #4g-[6].)
+  const fileDecoyPath = join(outsideDir, "FILE-DECOY.txt");
+  const fileControlPath = join(outsideDir, "FILE-CONTROL.txt");
   const evidence = { id, cliVersion, dir, outcome: null, why: null, results: null, readTool: null, writeTool: null, network: null };
   const fail = why => ({ ok: false, id, why, evidence });
 
@@ -223,8 +249,10 @@ export async function sandboxCanary({
   // worker-written file (the Bash cp, or the Read-tool probe) is hard proof a
   // credential read was NOT denied.
   writeFileSync(decoyPath, `${CANARY_SENTINEL}\nreeve canary decoy: not a secret\n`);
+  writeFileSync(fileDecoyPath, `${CANARY_SENTINEL}\nreeve canary file decoy: not a secret\n`);
+  writeFileSync(fileControlPath, "reeve canary control: readable on purpose\n");
   if (netProbe?.ready) { try { await netProbe.ready; } catch { /* selfReachable will report it */ } }
-  const scriptText = canaryScript({ tmpDir, outsideDir, decoyPath, netUrl: netProbe?.url ?? null });
+  const scriptText = canaryScript({ tmpDir, outsideDir, decoyPath, netUrl: netProbe?.url ?? null, fileDecoyPath, fileControlPath });
   writeFileSync(join(dir, "canary.sh"), scriptText);
   const scriptHash = createHash("sha256").update(scriptText).digest("hex");
 
@@ -237,7 +265,9 @@ export async function sandboxCanary({
     // Write is granted for the probes, and DENIED on the probe script itself: the
     // canary's own instrument must not be rewritable by the thing it measures.
     permissions: { allow: ["Bash(sh ./canary.sh:*)", "Read", "Write"], deny: [...permissionsDeny, "Write(./canary.sh)", "Edit(./canary.sh)"], additionalDirectories: [] },
-    sandbox: { ...sandbox, filesystem: { ...(sandbox.filesystem ?? {}), allowWrite: [tmpDir], allowRead: [tmpDir] } },
+    sandbox: { ...sandbox, filesystem: { ...(sandbox.filesystem ?? {}), allowWrite: [tmpDir], allowRead: [tmpDir],
+      // The exact-file deny under test. Its neighbour is deliberately NOT denied.
+      denyRead: [...(sandbox.filesystem?.denyRead ?? []), fileDecoyPath] } },
   };
   const sv = validate(settings, { tmpDir });
   if (!sv.ok) return fail(`canary settings invalid: ${sv.errors.join("; ")}`);
@@ -301,6 +331,12 @@ export async function sandboxCanary({
     // An external curl that SUCCEEDS is a definite egress leak.
     if (results.curl === 0 || nonEmpty(join(dir, "curl-body"))) problems.push("network was reachable (external egress)");
     if (existsSync(join(dir, "decoy-copy")) || results.decoy === 0 || decoyContains(join(dir, "decoy-copy"))) problems.push("read a file under a deny-read path");
+    // The exact-file deny, with its own positive control beside it.
+    if (!("filedecoy" in results) || !("filecontrol" in results)) problems.push("the exact-file deny was not probed");
+    else {
+      if (existsSync(join(dir, "filedecoy-copy")) || results.filedecoy === 0 || decoyContains(join(dir, "filedecoy-copy"))) problems.push("read a file denied by its exact path");
+      if (results.filecontrol !== 0) problems.push("control: a file that is NOT denied was unreadable, so the exact-file result proves nothing");
+    }
     if (existsSync(join(dir, "decoy-copy2")) || results.symlink === 0 || decoyContains(join(dir, "decoy-copy2"))) problems.push("read a deny-read file through a symlink");
   }
   // The Write TOOL outside the canary's directory: the file must not exist, and
@@ -332,6 +368,7 @@ export async function sandboxCanary({
   rmSync(outsideDir, { recursive: true, force: true });
   rmSync(tmpDir, { recursive: true, force: true });
   rmSync(decoyPath, { force: true });
+  rmSync(fileDecoyPath, { force: true }); rmSync(fileControlPath, { force: true });
   return ok ? { ok: true, id, why: null, evidence } : { ok: false, id, why: problems.join("; "), evidence };
 }
 

@@ -458,5 +458,22 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
     "a policy that omits the declared credential is refused", "");
 }
 
+
+// ── a state home that CONTAINS the worktree is a configuration error ─────────
+{
+  // REEVE_HOME=/srv/reeve with worktrees under it would deny the worker its own
+  // code (credentialPaths adds the state root back independently of stateRootsFor),
+  // and containment could never close — for a reason that looks like a broken
+  // sandbox. It is named as the layout error it is.
+  const saved = process.env.REEVE_HOME;
+  process.env.REEVE_HOME = "/srv/reeve";
+  try {
+    const bad = sandboxFor({ profile, action: "FIX_CI", worktree: "/srv/reeve/worktrees/pr-1", tmpDir: "/srv/reeve/tmp" });
+    check(bad.stateHomeContainsWorktree.includes("/srv/reeve"), "an overlapping state home is reported", JSON.stringify(bad.stateHomeContainsWorktree));
+    const ok = sandboxFor({ profile, action: "FIX_CI", worktree: "/Users/x/code/wt", tmpDir: "/t" });
+    check(ok.stateHomeContainsWorktree.length === 0, "and a normal layout reports nothing", JSON.stringify(ok.stateHomeContainsWorktree));
+  } finally { if (saved === undefined) delete process.env.REEVE_HOME; else process.env.REEVE_HOME = saved; }
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

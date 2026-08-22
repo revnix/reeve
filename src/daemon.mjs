@@ -239,7 +239,7 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     try {
       c = await measureContainment({
       cliVersion: version, sandbox: policy.settings.sandbox, permissionsDeny: policy.settings.permissions.deny, binaryId,
-      canaryPaths, bin: claudeBin, env, stateDir: canaryStateDir, nwo, cache, netProbe,
+      canaryPaths, bin: claudeBin, env, stateDir: canaryStateDir, nwo, cache, netProbe, stateRoots,
       // process.platform in production; injectable so a test on one OS can
       // exercise the verdict for another (the fail-closed matrix is per-OS).
       platform: ctx.platform ?? undefined,
@@ -690,6 +690,11 @@ export async function tick(ctx) {
         // (Codex #4e-[8].)
         if (sandbox.unrepresentableQuarantine?.length)
           throw new Error(`quarantined path(s) cannot be enforced by the OS sandbox: ${sandbox.unrepresentableQuarantine.join(", ")}`);
+        // A denied path that CONTAINS the worktree would deny the worker its own
+        // code, and the failure would read as a broken sandbox rather than the
+        // configuration error it is. (Codex #4g-[4].)
+        if (sandbox.stateHomeContainsWorktree?.length)
+          throw new Error(`reeve's state (${sandbox.stateHomeContainsWorktree.join(", ")}) contains the worktree ${worktree}, so the policy would deny the worker its own checkout — move REEVE_HOME or identity.worktreeRoot apart`);
         const qDenies = quarantineOsDenies(worktree, profile.risk?.quarantinePaths ?? []).paths;
         const notifyCred = typeof profile.notify?.credentialFile === "string" && isAbsolute(profile.notify.credentialFile) ? [profile.notify.credentialFile] : [];
         const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots, quarantineDenies: qDenies, extraDenies: notifyCred });

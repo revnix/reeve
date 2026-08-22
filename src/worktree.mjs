@@ -62,28 +62,44 @@ function git(cwd, args) {
 export const GIT_NEUTRALISE = NEUTRALISE;
 
 /**
- * A fingerprint of everything the repository's configuration says, shared and
- * worktree-scoped. Taken when reeve creates the worktree and checked before the
- * daemon runs any other git command in it: a worker that changed the config does
- * not get that config executed, whatever key it used.
+ * The repository's configuration as entries, shared and worktree-scoped. Taken
+ * when reeve creates or re-hardens the worktree, and compared before the daemon
+ * runs any other git command in it.
+ *
+ * Entries, not a hash, because WHICH key changed decides what it means: reeve
+ * sets three of them itself and a daemon upgrade legitimately re-writes them,
+ * while a key reeve does not own appearing in a worker's checkout is the thing
+ * this exists to catch.
  */
-export function configFingerprint(path) {
-  const parts = [];
+export function configEntries(path) {
+  const out = {};
   for (const scope of ["--local", "--worktree"]) {
     const r = git(path, ["config", scope, "--list"]);
-    // A repo without worktree config answers with an error; that is a fact about
-    // the repo, not a failure, and it is folded in verbatim so a LATER worktree
-    // config counts as a change.
-    parts.push(`${scope}:${r.ok ? r.out : "<none>"}`);
+    out[scope] = r.ok ? r.out.split("\n").filter(Boolean).sort() : [];
   }
-  return createHash("sha256").update(parts.join("\n")).digest("hex");
+  return out;
 }
+
+/** The keys reeve writes itself; git lowercases key names in `--list`. */
+const REEVE_OWNED = new Set(["extensions.worktreeconfig", "remote.origin.pushurl", "core.hookspath"]);
+
+const keyOf = line => line.slice(0, line.indexOf("=")).toLowerCase();
 
 const fingerprintPath = path => `${path}.cfg`;
 
-/** Record the fingerprint beside the worktree (outside it, where the sandbox denies writes). */
+/**
+ * Move a directory aside without running git in it. The normal release path
+ * asks git about stashes and unpushed work; that is exactly what must not happen
+ * when the repository's configuration is the thing under suspicion.
+ */
+export function quarantineByRename(path) {
+  const dest = `${path}.quarantined-${Date.now()}`;
+  try { renameSync(path, dest); return dest; } catch { return null; }
+}
+
+/** Record the configuration beside the worktree (outside it, where the sandbox denies writes). */
 export function recordConfig(path) {
-  try { writeFileSync(fingerprintPath(path), configFingerprint(path)); return true; } catch { return false; }
+  try { writeFileSync(fingerprintPath(path), JSON.stringify(configEntries(path))); return true; } catch { return false; }
 }
 
 /**
@@ -93,10 +109,21 @@ export function recordConfig(path) {
  */
 export function verifyConfig(path) {
   let recorded = null;
-  try { recorded = readFileSync(fingerprintPath(path), "utf8").trim(); } catch { return { ok: false, why: "no recorded git configuration to compare against" }; }
-  const now = configFingerprint(path);
-  if (now !== recorded) return { ok: false, why: "the worker changed the repository's git configuration, which git would execute" };
-  return { ok: true, why: null };
+  try { recorded = JSON.parse(readFileSync(fingerprintPath(path), "utf8")); } catch { return { ok: false, keys: [], why: "no recorded git configuration to compare against" }; }
+  const now = configEntries(path);
+  const foreign = new Set();
+  for (const scope of ["--local", "--worktree"]) {
+    const before = new Set(recorded[scope] ?? []), after = new Set(now[scope] ?? []);
+    for (const line of [...before].filter(l => !after.has(l)).concat([...after].filter(l => !before.has(l)))) {
+      const k = keyOf(line);
+      // reeve's own keys move when a daemon re-hardens a worktree it made
+      // earlier; hardening re-writes them and records the result. Anything else
+      // appearing or changing came from the worker.
+      if (!REEVE_OWNED.has(k)) foreign.add(k);
+    }
+  }
+  if (foreign.size) return { ok: false, keys: [...foreign], why: `the worker changed repository git configuration reeve does not own (${[...foreign].slice(0, 3).join(", ")}), which git would execute` };
+  return { ok: true, keys: [], why: null };
 }
 
 /**
@@ -236,6 +263,26 @@ export function acquireWorktree({ repoRoot, root, pr, branch, head = null }) {
   const path = pathFor(root, pr);
 
   if (existsSync(path)) {
+    // BEFORE any other git command in a directory a worker has held: verifying
+    // the worktree runs `git status`, and a worker-added `.gitattributes` plus a
+    // `filter.<name>.clean` entry makes that run a program as the daemon user —
+    // a shape the `-c` neutralisers cannot reach, because the driver name comes
+    // from the repository itself. `git config --list` reads no worktree file, so
+    // the fingerprint check is safe to run first. A directory with no record
+    // cannot be vouched for either. (Codex #4g-[1].)
+    const cfg = verifyConfig(path);
+    if (!cfg.ok) {
+      const parked = quarantineByRename(path);
+      // The shared config is the CLONE's, so a worker's key is still live for the
+      // main checkout: strip the keys git would execute, then drop the stale
+      // worktree registration or no future worktree can be made for this branch
+      // at all. Both `git config --unset-all` and `git worktree prune` leave the
+      // index alone, so neither can trigger the very hooks being removed.
+      for (const k of cfg.keys ?? []) git(repoRoot, ["config", "--local", "--unset-all", k]);
+      if (parked) git(repoRoot, ["worktree", "prune"]);
+      return { ok: false, path, reused: true,
+               why: `${cfg.why}; no git command was run in it, it was ${parked ? `moved to ${parked}` : "left in place"}, and the offending configuration was removed from the clone` };
+    }
     const v = verifyWorktree({ path, branch, head });
     return v.ok
       ? (h => h.ok ? { ok: true, path, reused: true, why: null } : { ok: false, path, reused: true, why: h.why })(harden(repoRoot, path))

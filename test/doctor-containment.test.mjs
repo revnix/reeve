@@ -2,6 +2,8 @@
 // from the same sources: the persisted canary result and the keychain probe.
 // Absent is UNKNOWN, never OK; a held credential is BROKEN with the fix named.
 import { checkCanary, checkKeychain, runDoctor } from "../src/doctor.mjs";
+import { sandboxFor } from "../src/sandbox.mjs";
+import { policyHashOf } from "../src/canary.mjs";
 import { writeCanaryState } from "../src/canary.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -85,6 +87,23 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
   const ids = r.checks.map(c => c.id);
   check(ids.includes("R-14") && ids.includes("R-15"), "both checks run in the driver", ids.join(","));
   check(r.verdict === "BROKEN" && r.checks.find(c => c.id === "R-14").level === "BROKEN", "and a failed canary makes the verdict BROKEN", r.verdict);
+}
+
+// ── the recomputed policy must follow the PROFILE, not the record ────────────
+//
+// The record supplies only the state roots the daemon knew (a --log or --db this
+// command cannot see); everything else is generated from the profile as it is
+// now, or a changed quarantine path would leave the hash equal to the old one
+// and doctor would keep reporting OK while the daemon re-measures.
+{
+  const roots = ["/s/reeve.log", "/s/runs"];
+  const base = { units: [], risk: {} };
+  const withQ = { units: [], risk: { quarantinePaths: ["secrets/**"] } };
+  const hash = prof => policyHashOf(sandboxFor({ profile: prof, action: "FIX_CI", worktree: "/wt/canary", tmpDir: "<tmp>", stateRoots: roots }).settings.sandbox, "/wt/canary");
+  check(hash(base) !== hash(withQ), "adding a quarantine path changes the recomputed policy hash", `${hash(base)} vs ${hash(withQ)}`);
+  const withCred = { units: [], notify: { credentialFile: "/etc/reeve/tok" } };
+  check(hash(base) !== hash(withCred), "and so does declaring a notification credential", `${hash(base)} vs ${hash(withCred)}`);
+  check(hash(base) === hash({ units: [], risk: {} }), "control: an unchanged profile hashes the same", "");
 }
 
 rmSync(root, { recursive: true, force: true });

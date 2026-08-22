@@ -12,7 +12,7 @@
 // unpushed commits vanish with the directory, and the stash stack is SHARED
 // across every worktree of a clone, so a non-empty stack may hold a stranger's
 // work in progress. On any doubt it quarantines rather than deletes.
-import { acquireWorktree, verifyWorktree, releaseWorktree, pushWorktree, verifyConfig, configFingerprint, recordConfig } from "../src/worktree.mjs";
+import { acquireWorktree, verifyWorktree, releaseWorktree, pushWorktree, verifyConfig, configEntries, recordConfig } from "../src/worktree.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -313,7 +313,21 @@ rmSync(base, { recursive: true, force: true });
   // The worker plants a config value git would execute.
   g(w.path, "config", "core.fsmonitor", "./payload");
   const after = verifyConfig(w.path);
-  check(after.ok === false && /changed the repository's git configuration/.test(after.why), "a planted executable config is caught", JSON.stringify(after));
+  check(after.ok === false && /core\.fsmonitor/.test(after.why) && /reeve does not own/.test(after.why),
+    "a planted executable config is caught, and named", JSON.stringify(after));
+  // acquire must refuse BEFORE running git in it: verifying a worktree runs
+  // `git status`, which a worker-added .gitattributes + filter.<name>.clean turns
+  // into code execution as the daemon user. The directory is moved aside without
+  // any git command, so the next tick builds a clean one.
+  const reacquire = acquireWorktree({ repoRoot: clone, root: join(root, "wts"), pr: 7, branch: "feat", head });
+  check(reacquire.ok === false && /reeve does not own/.test(reacquire.why) && /moved to/.test(reacquire.why),
+    "and re-acquiring that worktree refuses without running git in it", JSON.stringify(reacquire));
+  check(!existsSync(w.path), "the tampered directory is moved aside, so the next acquire starts clean", "");
+  // reeve's OWN keys moving is a daemon upgrade re-hardening, not tampering.
+  const w2 = acquireWorktree({ repoRoot: clone, root: join(root, "wts"), pr: 7, branch: "feat", head });
+  check(w2.ok, "control: a fresh worktree is created after the quarantine", JSON.stringify(w2));
+  g(w2.path, "config", "--worktree", "--unset", "core.hooksPath");
+  check(verifyConfig(w2.path).ok === true, "a change to a key reeve owns is not treated as tampering", JSON.stringify(verifyConfig(w2.path)));
   // And an unrecorded worktree is a refusal, not a pass.
   const bare = mkdtempSync(join(tmpdir(), "reeve-cfg-none-"));
   check(verifyConfig(bare).ok === false, "a worktree with no recorded configuration does not verify", "");

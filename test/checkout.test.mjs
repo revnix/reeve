@@ -273,6 +273,69 @@ check(existsSync(join(r.path, "node_modules", "left-pad", "index.js")), "but the
   rmSync(lfsish, { recursive: true, force: true });
 }
 
+// ── the founder's repository keeps the founder's configuration ───────────────
+//
+// The isolation exists because a worker's checkout holds pull-request content.
+// Applied to the founder's own repository it removes the things reeve needs
+// there: measured 2026-08-22 against revnix/reeve, `ls-remote origin` succeeded
+// ordinarily and failed under the isolation with "could not read Username for
+// 'https://github.com'", because the credential helper is global.
+//
+// A credential cannot be put in a fixture, so this reproduces the same
+// mechanism with the other global key that decides how git reaches a remote: a
+// `url.<base>.insteadOf` rewrite, which is what SSH rewrites and corporate
+// proxies use. Origin is a URL that resolves ONLY through it.
+{
+  const home = join(root, "founder-home");
+  const remote = join(root, "rewritten.git");
+  const repo = join(root, "rewritten-founder");
+  mkdirSync(home, { recursive: true });
+  execFileSync("git", ["init", "--bare", "-q", remote]);
+  execFileSync("git", ["init", "-q", "-b", "main", repo]);
+  writeFileSync(join(home, ".gitconfig"), `[url "${remote}"]\n\tinsteadOf = reeve-fixture://origin\n`);
+  writeFileSync(join(repo, "app.js"), "console.log(1)\n");
+  g(repo, "add", "-A"); g(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  g(repo, "remote", "add", "origin", "reeve-fixture://origin");
+
+  const wasHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    // The fixture's own precondition: the rewrite is real, and nothing else can
+    // resolve this URL. Without it the case below would pass for the wrong reason.
+    execFileSync("git", ["-C", repo, "push", "-q", "origin", "HEAD:refs/heads/rewritten"], { encoding: "utf8", env: { ...process.env, HOME: home } });
+    let unresolvable = "";
+    try { execFileSync("git", ["-C", repo, "ls-remote", "origin"], { encoding: "utf8", env: { ...process.env, HOME: home, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" }, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (e) { unresolvable = String(e.stderr || e.message); }
+    check(/reeve-fixture/.test(unresolvable),
+      "control: without the founder's global config the origin cannot be resolved at all", JSON.stringify(unresolvable.slice(0, 120)));
+
+    const rewrittenHead = g(repo, "rev-parse", "HEAD");
+    const rw = prepareRunCheckout({ repoRoot: repo, root: runs, pr: 82, runId: "r82", branch: "rewritten", head: rewrittenHead });
+    check(rw.ok, "a checkout prepares though origin resolves only through the founder's global config", JSON.stringify(rw.why));
+
+    if (rw.ok) releaseRunCheckout(rw.path, { workFetched: true });
+
+    // Publication is exercised SEPARATELY, on a checkout built by hand, so that
+    // it cannot be skipped by the case above failing: a stub that breaks only
+    // the push must still turn this red rather than leave it unrun.
+    const worker = join(root, "rewritten-worker");
+    // Cloned, then put on the branch by REVISION: `rewritten` exists on the
+    // remote and not as a local head in the founder's checkout, and
+    // `clone --branch` asks the source for a local head.
+    execFileSync("git", ["clone", "-q", repo, worker]);
+    g(worker, "checkout", "-q", "-B", "rewritten", rewrittenHead);
+    writeFileSync(join(worker, "app.js"), "console.log(2)\n");
+    g(worker, "add", "-A"); g(worker, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "the worker's fix");
+    const pub = publishRunWork({ repoRoot: repo, path: worker, branch: "rewritten", expectedRemote: rewrittenHead });
+    check(pub.ok, "and the work publishes through it", JSON.stringify(pub.why));
+    const onRemote = (() => { try { return g(remote, "rev-parse", "refs/heads/rewritten"); } catch { return "(unreadable)"; } })();
+    check(onRemote === g(worker, "rev-parse", "HEAD"), "the remote carries what the worker committed", onRemote);
+    rmSync(worker, { recursive: true, force: true });
+  } finally {
+    if (wasHome === undefined) delete process.env.HOME; else process.env.HOME = wasHome;
+  }
+}
+
 // ── an attributes file reeve will not read ───────────────────────────────────
 //
 // The tree is PULL-REQUEST content, and `.gitattributes` can be committed as a

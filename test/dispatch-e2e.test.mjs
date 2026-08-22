@@ -199,6 +199,10 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   const dirC = mkdtempSync(join(tmpdir(), "reeve-e2e-closed-"));
   let canaryRuns = 0;
   const ctxC = { ...baseCtx(), db: open(join(dirC, "c.db")), logPath: join(dirC, "log.txt"), worktreeFor: () => mkdtempSync(join(dirC, "wt-")),
+                 // Forced so the case runs the same on every CI OS: it tests the
+                 // canary+keychain wiring, not the per-OS platform gate (that is
+                 // its own case below).
+                 platform: "darwin",
                  canary: async () => { canaryRuns++; return { ok: true, id: "good", why: null, evidence: {} }; },
                  keychain: { measured: true, items: [], why: null } };
   delete ctxC.containment;
@@ -214,6 +218,28 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   check(canaryRuns === 1, "a second tick reuses the passing canary", String(canaryRuns));
   ctxC.db.close();
   rmSync(dirC, { recursive: true, force: true });
+}
+
+// --- an unmeasured platform stays open even with both probes green -----------
+//
+// The fail-closed matrix is per-OS: a sandbox measured on macOS says nothing
+// about Linux or Windows, so a host reeve has not measured is refused whatever
+// the canary and keychain say. This is the guard that makes "measured" mean the
+// platform too, not just the two probes.
+{
+  const dirP = mkdtempSync(join(tmpdir(), "reeve-e2e-platform-"));
+  const ctxP = { ...baseCtx(), db: open(join(dirP, "p.db")), logPath: join(dirP, "log.txt"), worktreeFor: () => mkdtempSync(join(dirP, "wt-")),
+                 platform: "win32",
+                 canary: async () => ({ ok: true, id: "good", why: null, evidence: {} }),
+                 keychain: { measured: true, items: [], why: null } };
+  delete ctxP.containment;
+  let launchedP = 0;
+  ctxP.spawnWorker = async () => { launchedP++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  const rP = await tick(ctxP);
+  check(launchedP === 0 && [...rP.escalations.keys()].includes("guardian:containment:open"), "an unmeasured platform refuses dispatch though both probes are green", String(launchedP));
+  check(/unmeasured on win32/.test(readFileSync(join(dirP, "log.txt"), "utf8")), "and the log names the platform", "");
+  ctxP.db.close();
+  rmSync(dirP, { recursive: true, force: true });
 }
 
 // --- a heartbeat that cannot be written revokes too ---------------------------

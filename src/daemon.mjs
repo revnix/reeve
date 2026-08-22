@@ -179,6 +179,9 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     const c = await measureContainment({
       cliVersion: version, sandbox: policy.settings.sandbox, permissionsDeny: policy.settings.permissions.deny,
       canaryPaths, bin: claudeBin, env, stateDir, nwo, cache,
+      // process.platform in production; injectable so a test on one OS can
+      // exercise the verdict for another (the fail-closed matrix is per-OS).
+      platform: ctx.platform ?? undefined,
       canary: ctx.canary ?? null, keychain: ctx.keychain ?? null,
     });
     if (!before) log(logPath, `containment: canary ${c.canary?.id ?? "?"} ${c.canary?.ok ? "passed" : `FAILED: ${c.canary?.why}`}; keychain: ${c.keychain?.measured ? (c.keychain.items.length ? c.keychain.why : "no GitHub credential") : `unmeasured (${c.keychain?.why})`}`);

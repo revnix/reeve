@@ -164,11 +164,36 @@ export function compose(proposal, questions, answers = {}) {
   }
   // A reviewer without a refusal pattern cannot tell a rate limit from approval,
   // and the schema refuses it, so detection's bare list is completed here.
+  //
+  // Refusal is one shape per REASON, not one per reviewer. Each bot spells quota,
+  // transient error and rate limit differently, so a single-string pattern is
+  // one-shape-short by construction rather than by oversight: it matches the one
+  // shape that happened to be on screen when it was written, and every other
+  // refusal falls through to null -- which derive.mjs reads as chatter, making a
+  // bot that crashed indistinguishable from a bot that never spoke. Those want
+  // opposite responses. Measured 2026-08-22 on two bots at once; the bodies are
+  // fixtures under test/fixtures/reviewer-bodies-2026-08-22/.
   const KNOWN_REFUSALS = {
-    "chatgpt-codex-connector": { refusal: "You have reached your Codex usage limits",
-                                 trigger: "@codex review", clean: "Didn't find any major issues" },
-    coderabbitai: { refusal: "Review rate limited", trigger: "@coderabbitai review",
-                    clean: "Actionable comments posted: 0" },
+    "chatgpt-codex-connector": {
+      refusal: "You have reached your Codex usage limits|Codex Review: Something went wrong",
+      trigger: "@codex review",
+      clean: "Didn't find any major issues",
+      // Without this, every Codex clean pass degrades to unbound_clean and never
+      // counts as coverage. The commit line is the entire structural tell that
+      // separates a pass from a refusal -- a refusal never names a reviewed
+      // commit -- so a seed that omits it throws away the one discriminator that
+      // does not depend on prose staying still.
+      commitPattern: "Reviewed commit:\\**\\s*`?([0-9a-f]{7,40})`?",
+    },
+    coderabbitai: {
+      // The second alternative is CodeRabbit's own machine marker, not its
+      // visible wording. Its two rate-limit bodies word themselves differently
+      // ("Review limit reached" and "Review rate limited") and only the marker
+      // is stable across both.
+      refusal: "Review rate limited|rate limited by coderabbit\\.ai",
+      trigger: "@coderabbitai review",
+      clean: "Actionable comments posted: 0",
+    },
   };
   p.reviewers = (p.reviewers ?? []).map(r => ({ ...r, kind: r.kind ?? "advisory", ...(KNOWN_REFUSALS[r.login] ?? {}) }))
     .filter(r => r.refusal);   // an unknown reviewer with no refusal pattern is dropped, not guessed at

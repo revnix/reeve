@@ -288,6 +288,23 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
         `credentialRead: closed`, and **doctor R-14 is OK for the first time**.
       REMAINING: the PR itself, its Codex rounds, and the founder's merge grant.
 
+- [ ] **Reviewer refusal patterns were one shape short (2026-08-22).** THREE
+      defects in the seeded roster, measured on `nextlyhq/nextly` #1137 with the
+      real bodies as fixtures (`docs/measured/2026-08-22-refusal-is-one-shape-per-reason.md`):
+      Codex's `Something went wrong` and CodeRabbit's `Review limit reached` both
+      classified as `null` — which `derive.mjs` reads as chatter, making a bot
+      that CRASHED indistinguishable from one that never spoke; and `commitPattern`
+      appeared ZERO times in `src/init.mjs`, so a fresh profile gives Codex no way
+      to bind a clean pass and every one degrades to `unbound_clean`. Fixed in
+      `fix/refusal-is-one-shape-per-reason`. **The live `nextlyhq/nextly.json` is
+      NOT yet updated** — `init.mjs` only seeds new profiles, so the running
+      daemon keeps the narrow patterns until the founder applies them.
+      STILL OPEN, deliberately: `greptile-apps` has no `clean` pattern at all, and
+      no greptile body exists on #1135-#1137 to write one against — it needs one
+      observed pass first, not a guessed regex. Also standing: all three reviewers
+      are `kind: advisory`, so the blocking roster is EMPTY and clause B5's
+      "absence read as success" is the live configuration, not a hypothetical.
+
 - [ ] **Guardian: the review shadow week RESET on 2026-08-22.** `#1134` diverged
       — `resolved differs: live 13, derived 18` (55 comparisons, 52 agreements;
       every other PR 161/161 that day). The 5-clean-day run for PR-5 restarts

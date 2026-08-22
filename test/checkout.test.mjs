@@ -309,6 +309,16 @@ check(existsSync(join(r.path, "node_modules", "left-pad", "index.js")), "but the
     check(/reeve-fixture/.test(unresolvable),
       "control: without the founder's global config the origin cannot be resolved at all", JSON.stringify(unresolvable.slice(0, 120)));
 
+    // An EXPLICIT GIT_CONFIG_GLOBAL is the founder naming where their
+    // configuration lives -- a company file supplying the rewrite or the
+    // credential helper -- and dropping it puts git back on a ~/.gitconfig that
+    // carries neither. Only reeve's OWN isolation value is discarded.
+    const company = join(root, "company.gitconfig");
+    writeFileSync(company, `[url "${remote}"]\n\tinsteadOf = reeve-company://origin\n`);
+    const bare = join(root, "bare-home");
+    mkdirSync(bare, { recursive: true });
+    writeFileSync(join(bare, ".gitconfig"), "# no rewrite here\n");
+
     const rewrittenHead = g(repo, "rev-parse", "HEAD");
     const rw = prepareRunCheckout({ repoRoot: repo, root: runs, pr: 82, runId: "r82", branch: "rewritten", head: rewrittenHead });
     check(rw.ok, "a checkout prepares though origin resolves only through the founder's global config", JSON.stringify(rw.why));
@@ -331,6 +341,32 @@ check(existsSync(join(r.path, "node_modules", "left-pad", "index.js")), "but the
     const onRemote = (() => { try { return g(remote, "rev-parse", "refs/heads/rewritten"); } catch { return "(unreadable)"; } })();
     check(onRemote === g(worker, "rev-parse", "HEAD"), "the remote carries what the worker committed", onRemote);
     rmSync(worker, { recursive: true, force: true });
+
+    // 1. reeve's own isolation value, inherited: discarded, so the founder's
+    //    ~/.gitconfig is read and the rewrite still resolves.
+    const wasIso = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+    const iso = prepareRunCheckout({ repoRoot: repo, root: runs, pr: 83, runId: "r83", branch: "rewritten", head: rewrittenHead });
+    check(iso.ok, "an inherited GIT_CONFIG_GLOBAL=/dev/null is discarded, not honoured", JSON.stringify(iso.why));
+    if (iso.ok) releaseRunCheckout(iso.path, { workFetched: true });
+
+    // 2. an explicit founder-chosen file: KEPT, and it is the only thing that
+    //    can resolve this origin -- the home config in scope carries no rewrite.
+    process.env.GIT_CONFIG_GLOBAL = company;
+    process.env.HOME = bare;
+    g(repo, "remote", "set-url", "origin", "reeve-company://origin");
+    let unresolvableC = "";
+    try { execFileSync("git", ["-C", repo, "ls-remote", "origin"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+                                                                     env: { ...process.env, HOME: bare, GIT_CONFIG_GLOBAL: "/dev/null" } }); }
+    catch (e) { unresolvableC = String(e.stderr || e.message); }
+    check(/reeve-company/.test(unresolvableC),
+      "control: without that file the company origin cannot be resolved either", JSON.stringify(unresolvableC.slice(0, 110)));
+
+    const explicit = prepareRunCheckout({ repoRoot: repo, root: runs, pr: 84, runId: "r84", branch: "rewritten", head: rewrittenHead });
+    check(explicit.ok, "an explicit GIT_CONFIG_GLOBAL is KEPT, so the founder's chosen config still applies", JSON.stringify(explicit.why));
+    if (explicit.ok) releaseRunCheckout(explicit.path, { workFetched: true });
+    if (wasIso === undefined) delete process.env.GIT_CONFIG_GLOBAL; else process.env.GIT_CONFIG_GLOBAL = wasIso;
+    process.env.HOME = home;
   } finally {
     if (wasHome === undefined) delete process.env.HOME; else process.env.HOME = wasHome;
   }

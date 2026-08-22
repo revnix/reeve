@@ -712,9 +712,35 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   check(rn.published === 0, "a rename's SOURCE is judged, not only where it landed", `published=${rn.published}`);
   check(/sensitive path/.test(rn.why), "and the reason names the path it came from", rn.why);
 
+  // 3. a pathname that FORGES A LOG LINE. git allows a newline in a filename,
+  //    and reading pathnames verbatim removed the escaping git's quoted form had
+  //    been doing by accident. The name reaches reviewDiff's reason, the reason
+  //    reaches the operational log, and a newline in it writes a line of the
+  //    pull request's choosing under reeve's name.
+  const wtF = mkdtempSync(join(dirQ, "wt-"));
+  const pinnedF = seed(wtF);
+  const forged = "secrets/x\nFORGED CLEARED: nothing needs you";
+  writeFileSync(join(wtF, forged), "gotcha\n");
+  commitQ(wtF, "a file whose name is a log line");
+  const named = execFileSync("git", ["-C", wtF, "log", "--name-only", "--pretty=format:", "-z", "-1"], { encoding: "utf8" });
+  check(named.includes(forged), "control: the pathname carries its newline all the way through git", JSON.stringify(named.slice(0, 90)));
+
+  const f = await runTick(wtF, pinnedF, "f");
+  check(f.published === 0, "a pathname that forges a log line is still judged, and refused", `published=${f.published}`);
+
+  const written = readFileSync(join(dirQ, "f.txt"), "utf8");
+  // The control first: a test that the log holds no forged line passes trivially
+  // if the refusal never reached the log at all.
+  check(/secrets\/x/.test(written), "control: the refusal naming that path really did reach the log", written.slice(-160));
+  const orphans = written.split("\n").filter(l => l && !/^\d{4}-\d\d-\d\dT/.test(l));
+  check(orphans.length === 0, "and every line in the log still starts with reeve's own timestamp", orphans.join(" | ").slice(0, 200));
+  check(/FORGED CLEARED/.test(written) === false || /\\nFORGED/.test(written),
+    "the forged text survives only as escaped text on reeve's own line", written.slice(-160));
+
   rmSync(dirQ, { recursive: true, force: true });
   rmSync(`${wtQ}.unfetched`, { recursive: true, force: true });
   rmSync(`${wtR}.unfetched`, { recursive: true, force: true });
+  rmSync(`${wtF}.unfetched`, { recursive: true, force: true });
 }
 
 // --- an UNREADABLE range is not an empty one --------------------------------

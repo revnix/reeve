@@ -687,9 +687,15 @@ export function writeSandbox(dir, sandbox) {
  * contains no `**` by construction, so it can be escaped and have its single `*`
  * expanded independently.
  */
+// `s`, so `.` matches a NEWLINE. git allows one in a pathname, and without the
+// flag `**` compiles to `.*` which stops dead at it: measured 2026-08-23,
+// `secrets/**` did not match `secrets/x\nanything` and `reviewDiff` returned ok
+// for it, so a worker could put a sensitive or self-governing path beyond every
+// deny rule by choosing a filename with a newline in it. `*` compiles to a
+// NEGATED class and was never affected, which is why only the `**` forms leaked.
 const toRe = glob => new RegExp("^" + glob.split("**")
   .map(seg => seg.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*"))
-  .join(".*") + "$");
+  .join(".*") + "$", "s");
 
 const matchesAny = (file, globs) => (globs ?? []).some(g => toRe(g).test(file));
 

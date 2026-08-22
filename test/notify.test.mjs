@@ -12,13 +12,40 @@ import { readFileSync } from "node:fs";
 // The payload is redacted because escalation text can carry a CI log slice, and a
 // log slice can carry a token. A notification is the one place output leaves this
 // machine.
-import { buildAlert, redact, notify } from "../src/notify.mjs";
+import { buildAlert, redact, notify, printable } from "../src/notify.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
+
+// --- a pathname a pull request chose ------------------------------------------
+//
+// git allows a NEWLINE and terminal control sequences in a pathname, and reeve
+// now reads pathnames verbatim rather than in git's quoted form -- which had
+// been escaping them by accident. Those names are interpolated into the reason a
+// change was refused, and that reason is logged and pushed to a phone. A branch
+// could therefore commit a file whose NAME forges a log entry.
+{
+  const CONTROL = /[\u0000-\u001F\u007F-\u009F]/;
+  const forged = "secrets/x\n2026-08-22T00:00:00Z CLEARED: nothing needs you";
+  const wiper = "docs/a\u001b[2Kb.md";
+
+  check(CONTROL.test(forged), "control: the raw pathname really does carry a newline", JSON.stringify(forged));
+  check(!CONTROL.test(printable(forged)), "a forged log line in a pathname is neutralised", JSON.stringify(printable(forged)));
+  check(printable(forged).includes("\\n"), "  and the newline is still VISIBLE, not deleted", printable(forged));
+  check(!CONTROL.test(printable(wiper)) && printable(wiper).includes("\\x1b"),
+    "an ANSI sequence is neutralised and shown as what it is", printable(wiper));
+
+  // Control: ordinary text is untouched, or this is just mangling.
+  const plain = "sensitive path(s) changed and need a human: src/db/ops.mjs";
+  check(printable(plain) === plain, "control: ordinary escalation text passes through unchanged", printable(plain));
+
+  // And the phone gets the escaped form, not the raw one.
+  const alert = buildAlert({ nwo: "o/r", escalations: [{ why: `sensitive path(s) changed: ${forged}`, count: 1 }] });
+  check(!CONTROL.test(alert.message), "the pushed alert carries no raw control characters", JSON.stringify(alert.message));
+}
 
 // --- redaction ----------------------------------------------------------------
 {

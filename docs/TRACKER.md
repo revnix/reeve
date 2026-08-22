@@ -164,9 +164,53 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       `CONTAINMENT.credentialRead === "open"` (escalation
       `guardian:containment:open`). PR-2 closes it or the founder picks a
       dedicated worker user.
-- [ ] **PR-2 (S1 sandbox)** — the two CLI measurements (sandbox under `-p`,
-      invalid settings under `-p`), `sandbox.*` settings + validation,
-      per-start canary, doctor R-13/R-14/R-15, escape test.
+- [ ] **PR-2 (S1 sandbox) — IN REVIEW, branch `feat/s1-sandbox`.** Both CLI
+      measurements are recorded (`docs/measured/2026-08-22-claude-print-mode.md`):
+      the `sandbox.*` block APPLIES under `-p` (network, outside writes,
+      `denyRead` incl. through symlinks, and `Read(...)` denies all hold), and
+      an INVALID settings file is dropped WHOLE and silently, deny rules
+      included. Shipped:
+      · **`sandbox.*` in every worker's settings** (`src/sandbox.mjs`):
+        enabled, failIfUnavailable, allowUnsandboxedCommands=false,
+        autoAllowBashIfSandboxed=false, no excluded commands; write scope =
+        worktree + the run's own tmp; network denied except research; the
+        credential paths are `denyRead` at the OS layer AND `Read(...)`-denied
+        for the Read tool the OS sandbox doesn't cover.
+      · **`validateSettings` before spawn** — a closed key-allowlist with exact
+        values; a refusal is a preparation failure (refund + backoff), never a
+        launch, because an invalid file would be silently ignored.
+      · **The sandbox canary** (`src/canary.mjs`): one throwaway worker per
+        (CLI build, block) runs a fixed script; the DAEMON reads the files it
+        left (writes outside, network, decoy reads — each with a positive
+        control), never the worker's word. Cached while it passes; a failure is
+        re-measured.
+      · **Measured containment** (`src/containment.mjs`): the static
+        `CONTAINMENT` constant is SUPERSEDED. Dispatch under `--execute` is
+        gated on `measureContainment` = canary pass **AND** an empty login
+        keychain of GitHub items **AND** a measured platform. Anything
+        unmeasured is open. Keychain probe is metadata-only (no `-w`/`-g`).
+      · **Doctor R-14 (canary) / R-15 (keychain)** — R-14 UNKNOWN with no
+        record, BROKEN on a failed canary, OK on a pass; R-15 DEGRADED (not
+        broken) while the keychain holds a credential: dispatch is gated,
+        observation/review unaffected.
+      · **Escape test** (`test/escape.test.mjs`) rewritten to measure every
+        shape twice — environment-only and UNDER THE SANDBOX (via the runtime's
+        own profile, `@anthropic-ai/sandbox-runtime` as a dev dep, no model).
+        The sandbox CLOSES the env-only holes (`--no-verify`,
+        `-c core.hooksPath=` pushes cannot land: destination is outside the
+        write scope; network denied). **Two KNOWN-OPEN remain under the sandbox
+        in a LINKED worktree:** (1) the shared ref store lets a worker move the
+        checkout's own branches; (2) `git -c credential.helper=osxkeychain
+        credential fill` returns the founder's token (securityd is hard-allowed
+        by the runtime's profile; no setting closes it).
+      Suite 57/57. **Not flipped:** dispatch stays refused on the founder's own
+      machine (R-15 finds the git osxkeychain item). **Founder decision for the
+      closure — the two options are NOT equivalent:**
+      · **a dedicated worker user** closes BOTH the keychain (its own empty
+        keychain) AND the shared-ref hole (its own clone); or
+      · **an empty keychain on the founder's account** closes the keychain only;
+        the shared-ref hole stays live until workers move to per-run standalone
+        clones (a small follow-up, deferred, documented as KNOWN-OPEN).
 
 ### Founder actions pending
 

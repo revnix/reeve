@@ -341,6 +341,45 @@ safety rule ships with its call-site assertion in the same commit.**
 - **`CHECK_ACCOUNTING` is guarded by a fingerprint**, so changing what counts as
   a check fails the suite until the version moves with it.
 
+### 6.7 The worker contract landed (PR-1 #3; PR-2 in review)
+
+The builder's first two PRs are the WORKER CONTRACT — what every dispatched
+`claude` worker runs under, shared by both daemons. What it enforces, measured:
+
+- **Environment built, never inherited** (`workerenv.mjs`): no token, no ssh
+  agent, credential-less git (`credential.helper=` empty, `GIT_CONFIG_NOSYSTEM`,
+  no `SSH_AUTH_SOCK`), the App's bot identity in `GIT_AUTHOR_*`/`GIT_COMMITTER_*`,
+  a reserved base plus strip lists. `gh`/`ssh`/`security` on the worker PATH are
+  refusing shims.
+- **The OS sandbox in every settings file** (`sandbox.mjs`, PR-2): Seatbelt on
+  macOS, no unsandboxed fallback, network denied except research; write scope is
+  the worktree + the run's tmp; credential paths are `denyRead` at the OS layer
+  and `Read(...)`-denied for the Read tool. Settings are **validated before
+  spawn** — an invalid file is dropped whole and silently by `-p`, so a supplied
+  path proves nothing.
+- **Publishing is reeve's, never the worker's**: the worktree carries a bogus
+  pushurl and a pre-push hook, and — the load-bearing layer — the OS sandbox
+  denies the network and every write outside the worktree, so `--no-verify` and
+  `-c core.hooksPath=` (which defeat the hook) still cannot land a push.
+- **Containment is MEASURED, per host** (`containment.mjs`, PR-2): dispatch
+  under `--execute` is refused unless a **sandbox canary** passed under the CLI
+  it would launch AND the login keychain holds no GitHub credential AND the
+  platform was measured. Anything unmeasured is open. Doctor R-14/R-15 report
+  both from the same sources.
+
+**What remains open, said plainly** (`test/escape.test.mjs` asserts each as
+KNOWN-OPEN so a green suite cannot hide it):
+
+- **The keychain.** The runtime's Seatbelt profile hard-allows securityd, so a
+  worker can read the founder's GitHub token via the osxkeychain git helper. No
+  setting closes it; a dedicated worker user or an empty keychain does. This is
+  why dispatch is refused on the founder's own machine today.
+- **The shared ref store.** A worker in a LINKED worktree can move the
+  checkout's own branches. A dedicated worker user closes this (its own clone);
+  per-run standalone clones would close it for the same-user case (deferred).
+- **Other platforms.** Only macOS is measured. Windows/Ubuntu workers are
+  refused until their sandbox is measured (fail-closed matrix in the spec).
+
 ---
 
 ## 7. The 500-PR study — measured, and what it says

@@ -283,9 +283,9 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   ctxG.spawnWorker = async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" });
   const rG = await tick(ctxG);
   const logG = readFileSync(join(dirG, "log.txt"), "utf8");
-  check(/NOT reading or publishing this worktree/.test(logG), "the tick refuses to read or publish that worktree", logG.split("\n").filter(l => /#42/.test(l)).slice(-2).join(" | ").slice(0, 200));
+  check(/NOT reading or publishing this checkout/.test(logG), "the tick refuses to read or publish that checkout", logG.split("\n").filter(l => /#42/.test(l)).slice(-2).join(" | ").slice(0, 200));
   check(!/published/.test(logG) && pushedG === 0, "nothing is published", "");
-  check([...rG.escalations.keys()].includes("guardian:worktree:config-tampered"), "and it escalates under an identity key", [...rG.escalations.keys()].join(" | "));
+  check([...rG.escalations.keys()].includes("guardian:checkout:config-tampered"), "and it escalates under an identity key", [...rG.escalations.keys()].join(" | "));
   ctxG.db.close();
   rmSync(dirG, { recursive: true, force: true });
 }

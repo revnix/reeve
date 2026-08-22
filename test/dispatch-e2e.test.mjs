@@ -134,24 +134,31 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 }
 
 
-// --- the default refuses to dispatch while the credential read is open ------
+// --- containment is MEASURED, and an open verdict refuses dispatch ----------
 //
-// workerenv.mjs declares CONTAINMENT.credentialRead = "open" until a measured
-// mechanism closes it. A daemon started with --execute must not launch a worker
-// that can read the founder's token; it says so, once, as an identity.
+// The verdict comes from containment.mjs: the sandbox canary must pass and the
+// login keychain must hold no GitHub credential. The measurement's two inputs
+// are injected here (ctx.canary, ctx.keychain); the wiring from verdict to
+// dispatch is what this case proves. A daemon started with --execute must not
+// launch a worker that can read the founder's token; it says so, once, as an
+// identity.
 {
   const dir4 = mkdtempSync(join(tmpdir(), "reeve-e2e-contain-"));
-  const ctx4 = { ...baseCtx(), db: open(join(dir4, "c.db")), logPath: join(dir4, "log.txt"), worktreeFor: () => mkdtempSync(join(dir4, "wt-")) };
-  delete ctx4.containment;          // the real module's declaration applies
+  const ctx4 = { ...baseCtx(), db: open(join(dir4, "c.db")), logPath: join(dir4, "log.txt"), worktreeFor: () => mkdtempSync(join(dir4, "wt-")),
+                 canary: async () => ({ ok: false, id: "planted", why: "planted: wrote outside the worktree", evidence: {} }),
+                 keychain: { measured: true, items: [], why: null } };
+  delete ctx4.containment;          // measured, not declared
   let launched = 0;
   ctx4.spawnWorker = async () => { launched++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
   const r4 = await tick(ctx4);
-  check(launched === 0, "no worker launches under the real containment declaration", String(launched));
+  check(launched === 0, "no worker launches while the measured containment is open (canary failed)", String(launched));
   const keys = [...(r4.escalations?.keys() ?? [])];
   check(keys.includes("guardian:containment:open"), "and the refusal is a standing escalation with an identity key", keys.join(" | "));
   check(!/open \d|\d+ worker/.test(keys.join(" ")), "the key carries no counts", keys.join(" | "));
   const log4 = readFileSync(join(dir4, "log.txt"), "utf8");
-  check(/NOT dispatching/.test(log4) && /credential/.test(log4), "the log names the reason", log4.split("\n").filter(l => /dispatch/.test(l)).join(" | ").slice(0, 300));
+  check(/NOT dispatching/.test(log4) && /canary planted failed: planted: wrote outside/.test(log4), "the log names the measured reason", log4.split("\n").filter(l => /dispatch/.test(l)).join(" | ").slice(0, 300));
+  check(existsSync(join(dir4, "canary", "o-r.json")) && JSON.parse(readFileSync(join(dir4, "canary", "o-r.json"), "utf8")).ok === false,
+    "and the canary's result is persisted for the doctor", "");
   // Every action promptFor can dispatch is a worker task, SPILL included; the
   // refusal must count them from one shared list, not a hand-copied subset.
   const { WORKER_ACTIONS, UNBUILT_ACTIONS } = await import("../src/prompts.mjs");
@@ -164,6 +171,49 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   check(/WORKER_ACTIONS\.includes\(d\.decision\.action\)/.test(dsrc), "and the containment refusal filters by that list", "");
   ctx4.db.close();
   rmSync(dir4, { recursive: true, force: true });
+}
+
+// --- a GitHub credential in the keychain keeps it open whatever the canary said
+{
+  const dirK = mkdtempSync(join(tmpdir(), "reeve-e2e-keychain-"));
+  const ctxK = { ...baseCtx(), db: open(join(dirK, "k.db")), logPath: join(dirK, "log.txt"), worktreeFor: () => mkdtempSync(join(dirK, "wt-")),
+                 canary: async () => ({ ok: true, id: "good", why: null, evidence: {} }),
+                 keychain: { measured: true, items: ["generic password gh:github.com (gh keyring)"], why: "the login keychain holds: generic password gh:github.com (gh keyring)" } };
+  delete ctxK.containment;
+  let launchedK = 0;
+  ctxK.spawnWorker = async () => { launchedK++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  const rK = await tick(ctxK);
+  check(launchedK === 0 && [...rK.escalations.keys()].includes("guardian:containment:open"), "a passing canary does not close what the keychain holds open", String(launchedK));
+  check(/gh keyring/.test(readFileSync(join(dirK, "log.txt"), "utf8")), "and the log names the keychain item", "");
+  ctxK.db.close();
+  rmSync(dirK, { recursive: true, force: true });
+}
+
+// --- measured closed: the canary passed, the keychain is empty, a worker runs
+//
+// The positive control for the two refusals above, and the proof that the
+// measurement is wired to dispatch rather than beside it. The canary runs
+// ONCE per (CLI, block): a second tick under the same daemon context does not
+// run it again.
+{
+  const dirC = mkdtempSync(join(tmpdir(), "reeve-e2e-closed-"));
+  let canaryRuns = 0;
+  const ctxC = { ...baseCtx(), db: open(join(dirC, "c.db")), logPath: join(dirC, "log.txt"), worktreeFor: () => mkdtempSync(join(dirC, "wt-")),
+                 canary: async () => { canaryRuns++; return { ok: true, id: "good", why: null, evidence: {} }; },
+                 keychain: { measured: true, items: [], why: null } };
+  delete ctxC.containment;
+  let launchedC = 0;
+  ctxC.spawnWorker = async () => { launchedC++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  const rC = await tick(ctxC);
+  check(launchedC === 1, "measured closed: a worker is dispatched", String(launchedC));
+  check(![...rC.escalations.keys()].includes("guardian:containment:open"), "and no containment escalation stands", [...rC.escalations.keys()].join(" | "));
+  check(canaryRuns === 1, "the canary ran exactly once", String(canaryRuns));
+  const stateC = JSON.parse(readFileSync(join(dirC, "canary", "o-r.json"), "utf8"));
+  check(stateC.ok === true && stateC.id === "good", "the passing result is persisted", JSON.stringify(stateC));
+  await tick(ctxC);
+  check(canaryRuns === 1, "a second tick reuses the passing canary", String(canaryRuns));
+  ctxC.db.close();
+  rmSync(dirC, { recursive: true, force: true });
 }
 
 // --- a heartbeat that cannot be written revokes too ---------------------------

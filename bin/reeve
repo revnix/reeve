@@ -130,6 +130,8 @@ switch (cmd) {
       nwo, profile, db, appCheck,
       pluginCacheRoot: opt("plugin-cache"),
       repoPluginDir: opt("plugin-repo"),
+      // Where the daemon records its canary: the same HOME the daemon logs to.
+      stateDir: HOME,
     });
     if (flag("json")) console.log(JSON.stringify(result, null, 2));
     else console.log(render(result, nwo));

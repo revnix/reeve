@@ -22,7 +22,9 @@ import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff, validateSettings } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
-import { workerEnv, writeGitConfig, CONTAINMENT } from "./workerenv.mjs";
+import { workerEnv, writeGitConfig } from "./workerenv.mjs";
+import { measureContainment } from "./containment.mjs";
+import { canaryIdFor } from "./canary.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256 } from "./db/ops.mjs";
@@ -144,6 +146,46 @@ function changedFiles(worktree, since = null) {
   const fromCommits = committed ? committed.split("\n").filter(Boolean) : [];
 
   return [...new Set([...fromCommits, ...uncommitted])];
+}
+
+/**
+ * The measured containment verdict for this daemon: the CLI it would dispatch,
+ * the environment it would hand a worker, and the sandbox block every worker
+ * runs under, put to the canary once per (CLI build, block) and to the
+ * keychain probe every time. A preparation that fails (no CLI, no worktree
+ * root) is an OPEN verdict with the reason, never a thrown tick.
+ */
+async function measuredContainment(ctx, profile, nwo, logPath) {
+  const cache = (ctx.containmentCache ??= new Map());
+  try {
+    const root = profile.identity?.worktreeRoot;
+    if (!root || !isAbsolute(root)) return { credentialRead: "open", why: "no absolute identity.worktreeRoot to run the canary under" };
+    const stateDir = dirname(ctx.logPath ?? "/tmp/x");
+    const canaryPaths = {
+      dir: join(root, ".reeve-canary", "run"), outsideDir: join(root, ".reeve-canary", "outside"), tmpDir: join(root, ".reeve-canary", "tmp"),
+      // Under the deny-read path itself, not under the state dir: the two are
+      // the same in production and the canary refuses a decoy anywhere else.
+      decoyPath: join(homedir(), ".reeve", "canary", "decoy.txt"),
+    };
+    const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
+    const env = workerEnv({ gitConfigPath: writeGitConfig(join(stateDir, "git")), tmpDir: canaryPaths.tmpDir,
+                            bgWaitMs: 5 * 60_000, extraPath: [dirname(claudeBin)] });
+    const version = ctx.cliVersion ?? cliVersion(claudeBin, env);
+    // The block every worker gets; the canary's id covers it, so a block that
+    // changes (a new deny, a new domain) is measured again before it is trusted.
+    const policy = sandboxFor({ profile, action: "FIX_CI", worktree: canaryPaths.dir, tmpDir: canaryPaths.tmpDir });
+    const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox }))?.ok === true;
+    if (!before) log(logPath, `containment: running the sandbox canary under ${version}`);
+    const c = await measureContainment({
+      cliVersion: version, sandbox: policy.settings.sandbox, permissionsDeny: policy.settings.permissions.deny,
+      canaryPaths, bin: claudeBin, env, stateDir, nwo, cache,
+      canary: ctx.canary ?? null, keychain: ctx.keychain ?? null,
+    });
+    if (!before) log(logPath, `containment: canary ${c.canary?.id ?? "?"} ${c.canary?.ok ? "passed" : `FAILED: ${c.canary?.why}`}; keychain: ${c.keychain?.measured ? (c.keychain.items.length ? c.keychain.why : "no GitHub credential") : `unmeasured (${c.keychain?.why})`}`);
+    return c;
+  } catch (err) {
+    return { credentialRead: "open", why: `containment could not be measured: ${err.message}` };
+  }
 }
 
 export function log(logPath, line) {
@@ -400,21 +442,21 @@ export async function tick(ctx) {
   }
 
   // A worker that can read the founder's credentials is not dispatched, whatever
-  // --execute says. workerenv.mjs declares what its environment can promise;
-  // until a measured mechanism closes the credential read (the OS sandbox
-  // canary or a dedicated worker user), the honest capability is none, and the
-  // founder is told once, by identity. The declaration is injectable for tests
-  // only; the default is the module's own, which refuses.
-  const containment = ctx.containment ?? CONTAINMENT;
-  if (execute && containment.credentialRead !== "closed") {
-    const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action));
-    if (wanted.length) {
-      log(logPath, `execute: NOT dispatching ${wanted.length} worker task(s) — worker containment is open: ${containment.why}`);
-      escalations.set("guardian:containment:open", 1);
-    }
+  // --execute says. Containment is MEASURED, on this host, under this CLI and
+  // this sandbox block (containment.mjs): the sandbox canary must have passed
+  // and the login keychain must hold no GitHub credential. Anything unmeasured
+  // is open, and the founder is told once, by identity. The verdict is
+  // injectable for tests only; the default measures, and measures only when a
+  // worker task actually wants dispatching, so a quiet tick runs no canary.
+  const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action));
+  let containment = ctx.containment ?? null;
+  if (execute && wanted.length && !containment) containment = await measuredContainment(ctx, profile, nwo, logPath);
+  if (execute && wanted.length && containment.credentialRead !== "closed") {
+    log(logPath, `execute: NOT dispatching ${wanted.length} worker task(s) — worker containment is open: ${containment.why}`);
+    escalations.set("guardian:containment:open", 1);
   }
 
-  if (execute && containment.credentialRead === "closed") {
+  if (execute && wanted.length && containment.credentialRead === "closed") {
     const cap = capacity({ maxWorkers: profile.watch?.maxWorkers ?? 5, running: ctx.running ?? 0 });
     log(logPath, `execute: capacity allows ${cap.canStart} worker(s) (load ${cap.load1?.toFixed?.(2) ?? "?"}, ${cap.perfCores} perf cores)`);
     let started = 0;

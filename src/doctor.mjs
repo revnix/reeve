@@ -11,6 +11,8 @@
 // A check that cannot answer reports UNKNOWN and degrades; it never passes.
 
 import { checkBaseline } from "./baseline.mjs";
+import { readCanaryState } from "./canary.mjs";
+import { probeKeychain } from "./containment.mjs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
@@ -379,9 +381,45 @@ function checkDetectors(db, profile) {
   return { id: "R-08", level: OK, title: "detectors", lines };
 }
 
+// ── R-14 / R-15: worker containment ───────────────────────────────────────
+//
+// Both answer "may this host dispatch a worker under --execute": the daemon
+// refuses until the sandbox canary has passed under the CLI it would launch
+// AND the login keychain holds no GitHub credential. The doctor reports the
+// same two facts from the same sources, so that a refusal in the log can be
+// read here without the daemon.
+
+/** The last sandbox canary this daemon recorded, if any. */
+export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now = () => Date.now() } = {}) {
+  const id = "R-14", title = "worker sandbox canary";
+  if (!stateDir) return { id, level: UNKNOWN, title, lines: ["no state directory to read the canary from"] };
+  const st = read(stateDir, nwo);
+  if (!st) return { id, level: UNKNOWN, title, lines: [`no canary has been recorded for ${nwo}`,
+    "the daemon runs one before its first dispatch under --execute; until then every dispatch is refused"] };
+  const age = typeof st.at === "number" ? Math.floor((now() - st.at) / 60_000) : null;
+  const when = age === null ? "at an unknown time" : age < 1 ? "under a minute ago" : `${age} min ago`;
+  if (st.ok !== true) return { id, level: BROKEN, title, lines: [`the last canary FAILED ${when} under ${st.cliVersion ?? "?"}: ${st.why ?? "no reason recorded"}`,
+    "the daemon refuses every dispatch under --execute until a canary passes; it re-runs one on the next tick that wants a worker"] };
+  return { id, level: OK, title, lines: [`canary ${st.id ?? "?"} passed ${when} under ${st.cliVersion ?? "?"}`,
+    "network, outside writes and credential-file reads denied; inside and tmp writes allowed"] };
+}
+
+/** GitHub credentials in the login keychain, by metadata only. */
+export function checkKeychain({ probe = probeKeychain } = {}) {
+  const id = "R-15", title = "worker credential reach";
+  const kc = probe();
+  if (!kc.measured) return { id, level: UNKNOWN, title, lines: [`unmeasured: ${kc.why}`, "an unmeasured keychain keeps dispatch refused"] };
+  if (kc.items.length) return { id, level: BROKEN, title, lines: [
+    `the login keychain holds a GitHub credential a sandboxed worker can read: ${kc.items.join("; ")}`,
+    "the OS sandbox cannot deny the keychain (securityd is hard-allowed by the runtime's profile)",
+    "-> run workers as a dedicated user, or log gh in with --insecure-storage and delete the git osxkeychain item for github.com",
+  ] };
+  return { id, level: OK, title, lines: ["no GitHub credential in the login keychain; file credentials are deny-read by the sandbox"] };
+}
+
 // ── driver ────────────────────────────────────────────────────────────────
 
-export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {} }) {
+export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {}, stateDir = null, canaryIo = {}, keychainIo = {} }) {
   const checks = [
     checkMergeAuthority(nwo),
     pluginCacheRoot ? checkArtifactDrift(pluginCacheRoot, repoPluginDir) : null,
@@ -393,6 +431,8 @@ export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null
     profile.reviewers?.length ? checkDetectors(db, profile) : null,
     appCheck,
     checkBaseline(nwo, profile, baselineIo),
+    checkCanary(nwo, { stateDir, ...canaryIo }),
+    checkKeychain(keychainIo),
   ].filter(Boolean);
 
   const broken = checks.filter(c => c.level === BROKEN);

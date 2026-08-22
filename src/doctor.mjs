@@ -498,8 +498,13 @@ function currentPolicy(profile, { read = readCanaryState, stateDir = null, nwo =
     // profile as it is now. Overwriting the whole denyRead with the record would
     // have hidden exactly those profile changes. (Codex #4g-[3].)
     if (!Array.isArray(st?.stateRoots) || !st?.canaryDir) return null;
-    const block = sandboxFor({ profile, action: "FIX_CI", worktree: st.canaryDir, tmpDir: "<tmp>", stateRoots: st.stateRoots }).settings.sandbox;
-    return policyHashOf(block, st.canaryDir);
+    const policy = sandboxFor({ profile, action: "FIX_CI", worktree: st.canaryDir, tmpDir: "<tmp>", stateRoots: st.stateRoots });
+    // The permission rules and the tool grant are half the boundary: the file
+    // tools are governed by them alone. A hash over the sandbox block only would
+    // call a policy whose rules match nothing identical to one whose rules work,
+    // and keep reporting OK from a record taken before the difference.
+    return policyHashOf(policy.settings.sandbox, st.canaryDir,
+                        { permissionsDeny: policy.settings.permissions.deny, allowedTools: policy.allowedTools });
   } catch { return null; }
 }
 

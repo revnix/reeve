@@ -15,7 +15,7 @@
 // a write to the run's own tmp), so an absent file means "denied", not
 // "the script never ran".
 import { runWorker, workerArgs } from "./supervisor.mjs";
-import { validateSettings } from "./sandbox.mjs";
+import { validateSettings, ruleFor } from "./sandbox.mjs";
 import { createHash } from "node:crypto";
 import { createServer, connect } from "node:net";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -35,9 +35,33 @@ const canonical = v => {
  * paths normalised out. The write grant is the run's own tmp, which differs on
  * every run and says nothing about what the sandbox denies.
  */
-export function canaryIdFor({ cliVersion, sandbox, binaryId = null, worktree = null }) {
+export function canaryIdFor({ cliVersion, sandbox, binaryId = null, worktree = null, permissionsDeny = null, allowedTools = null }) {
   if (!cliVersion || !sandbox) throw new Error("canaryIdFor: cliVersion and the sandbox block are required");
-  return createHash("sha256").update(`${cliVersion}\n${binaryId ?? "?"}\n${canonical(normalisePolicy(sandbox, worktree))}`).digest("hex").slice(0, 16);
+  return createHash("sha256").update(
+    `${cliVersion}\n${binaryId ?? "?"}\n${canonical(normalisePolicy(sandbox, worktree))}\n${canonical(normaliseRules(permissionsDeny, worktree))}\n${canonical(normaliseRules(allowedTools, worktree))}`,
+  ).digest("hex").slice(0, 16);
+}
+
+/**
+ * The permission rules, with per-invocation paths replaced the same way the
+ * sandbox block's are.
+ *
+ * These belong in the id because they are a SEPARATE boundary, not a description
+ * of the sandbox one: the file tools are governed by permissions alone, since
+ * the CLI's own process runs outside the Seatbelt profile it applies to the
+ * shells it spawns. A canary that ignored them would call a policy with a
+ * working permission layer identical to one whose rules matched nothing, and
+ * reuse the pass. That is not hypothetical — it is exactly the pair of policies
+ * this repository had on 2026-08-22, and their ids were equal.
+ *
+ * A rule names the same path in the permission spelling (a second leading
+ * slash), so both are rebased.
+ */
+function normaliseRules(rules, worktree = null) {
+  const list = typeof rules === "string" ? rules.split(",") : Array.isArray(rules) ? rules : [];
+  if (!worktree) return [...list].sort();
+  const rebase = t => t.split(`/${worktree}`).join("/<worktree>").split(worktree).join("<worktree>");
+  return list.map(rebase).sort();
 }
 
 /**
@@ -65,8 +89,10 @@ function normalisePolicy(sandbox, worktree = null) {
  * can recompute today's policy from the profile and say whether the record still
  * describes it. (Codex #4f-[5].)
  */
-export function policyHashOf(sandbox, worktree = null) {
-  return createHash("sha256").update(canonical(normalisePolicy(sandbox, worktree))).digest("hex").slice(0, 16);
+export function policyHashOf(sandbox, worktree = null, { permissionsDeny = null, allowedTools = null } = {}) {
+  return createHash("sha256").update(
+    `${canonical(normalisePolicy(sandbox, worktree))}\n${canonical(normaliseRules(permissionsDeny, worktree))}\n${canonical(normaliseRules(allowedTools, worktree))}`,
+  ).digest("hex").slice(0, 16);
 }
 
 /** `~/x` as the runtime expands it: against the real home, never the worker's cwd. */
@@ -212,8 +238,37 @@ export const isPolicyRefusal = text => REFUSAL.test(String(text ?? ""));
  * the worker said afterwards, and a missing results file is a failure
  * whatever the worker said.
  */
+/**
+ * The canary's own tool grant, and it is deliberately WIDER than production's.
+ *
+ * A production worker gets the file tools scoped to its checkout, so a read of
+ * the decoy is refused because nothing grants it -- which would make the canary
+ * pass while saying nothing about the deny list behind it. A defence in depth
+ * that hides whether the layer under it works is not evidence.
+ *
+ * So the canary grants EXACTLY what it is trying to read and write: the decoy by
+ * name, and the outside directory. The only thing left that can refuse them is
+ * the deny list, which is the thing under test. Measured 2026-08-22: a deny in
+ * the right form refuses even a bare grant, and in the wrong form refuses
+ * nothing (docs/measured/2026-08-22-the-read-deny-list-was-inert.md).
+ */
+function canaryGrant(dir, decoyPath) {
+  const rule = ruleFor;   // the generator's own spelling, never a second copy of it
+  return ["Bash(sh ./canary.sh:*)",
+          // Production's shape: the file tools scoped to the checkout.
+          ...["Read", "Write"].flatMap(t => [`${t}(${rule(dir)})`, `${t}(${rule(dir)}/**)`]),
+          // And the adversary the deny list must beat: the decoy, granted BY NAME.
+          // Nothing but the deny can refuse this read, which is the point.
+          //
+          // The write probe is deliberately NOT granted its target. Its boundary
+          // IS the scope above -- there is no deny list entry for "everywhere
+          // else", and there should not be one: an enumeration would protect the
+          // paths it named and invite the belief that they were the boundary.
+          `Read(${rule(decoyPath)})`];
+}
+
 export async function sandboxCanary({
-  cliVersion, sandbox, permissionsDeny = [], binaryId = null,
+  cliVersion, sandbox, permissionsDeny = [], allowedTools = null, binaryId = null,
   dir, outsideDir, tmpDir, decoyPath,
   bin, env,
   runner = runWorker, budgetMs = 5 * 60_000, maxOutputBytes = 8 * 1024 * 1024,
@@ -225,7 +280,7 @@ export async function sandboxCanary({
   // external endpoint, no timing window.
   netProbe = null,
 }) {
-  const id = canaryIdFor({ cliVersion, sandbox, binaryId, worktree: dir });
+  const id = canaryIdFor({ cliVersion, sandbox, binaryId, worktree: dir, permissionsDeny, allowedTools });
   const outsideToolPath = join(outsideDir, "TOOL-OUTSIDE");
   // Production denies whole DIRECTORIES (~/.ssh) and individual FILES (the log,
   // the database, ~/.gitconfig, notify.credentialFile). The subtree decoy proves
@@ -272,7 +327,7 @@ export async function sandboxCanary({
     // a boundary the OS sandbox does not cover.
     // Write is granted for the probes, and DENIED on the probe script itself: the
     // canary's own instrument must not be rewritable by the thing it measures.
-    permissions: { allow: ["Bash(sh ./canary.sh:*)", "Read", "Write"], deny: [...permissionsDeny, "Write(./canary.sh)", "Edit(./canary.sh)"], additionalDirectories: [] },
+    permissions: { allow: [...canaryGrant(dir, decoyPath)], deny: [...permissionsDeny, "Write(./canary.sh)", "Edit(./canary.sh)"], additionalDirectories: [] },
     sandbox: { ...sandbox, filesystem: { ...(sandbox.filesystem ?? {}), allowWrite: [tmpDir], allowRead: [tmpDir],
       // The exact-file deny under test. Its neighbour is deliberately NOT denied.
       denyRead: [...(sandbox.filesystem?.denyRead ?? []), fileDecoyPath] } },
@@ -290,7 +345,9 @@ export async function sandboxCanary({
   let r;
   try {
     r = await runner({
-      bin, args: workerArgs({ prompt: canaryPromptFor(decoyPath, outsideToolPath), allowedTools: "Bash(sh ./canary.sh:*),Read,Write", settings: settingsPath, maxTurns: 8 }),
+      bin, args: workerArgs({ prompt: canaryPromptFor(decoyPath, outsideToolPath),
+                              allowedTools: canaryGrant(dir, decoyPath).join(","),
+                              settings: settingsPath, maxTurns: 8 }),
       cwd: dir, env, outPath: join(dir, "canary.out"), errPath: join(dir, "canary.err"),
       maxOutputBytes, budgetMs, isHalted: () => false,
     });

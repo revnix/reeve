@@ -5,7 +5,7 @@
 // assertion is on the verdict the daemon draws from those files. The real
 // boundary is measured in test/escape.test.mjs (under the runtime) and by the
 // daemon at start (under the CLI); this file proves the judge.
-import { sandboxCanary, canaryIdFor, canaryScript, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, parseWriteProbe, isPolicyRefusal, netListener, CANARY_SENTINEL } from "../src/canary.mjs";
+import { sandboxCanary, canaryIdFor, policyHashOf, canaryScript, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, parseWriteProbe, isPolicyRefusal, netListener, CANARY_SENTINEL } from "../src/canary.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
@@ -107,7 +107,8 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
 {
   const r = await sandboxCanary({ ...base, runner: runnerThat() });
   check(r.ok === true && r.why === null, "every denial held and both controls succeeded: ok", r.why);
-  check(r.id === canaryIdFor({ cliVersion: base.cliVersion, sandbox: base.sandbox }), "the verdict carries the boundary's id");
+  check(r.id === canaryIdFor({ cliVersion: base.cliVersion, sandbox: base.sandbox, worktree: base.dir, permissionsDeny: base.permissionsDeny, allowedTools: base.allowedTools ?? null }),
+    "the verdict carries the boundary's id");
   check(!existsSync(base.dir) && !existsSync(base.outsideDir) && !existsSync(base.decoyPath), "a passing canary cleans up after itself");
 }
 {
@@ -285,13 +286,46 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   check(r.ok === false && /network control probe did not run/.test(r.why), "a canary script that skipped the probe curl fails", r.why);
 }
 
+// ── the PERMISSION layer is part of the id ───────────────────────────────────
+//
+// The file tools are governed by permissions alone: the CLI's own process runs
+// outside the Seatbelt profile it applies to the shells it spawns. An id over
+// the sandbox block alone therefore calls a policy whose rules match nothing
+// identical to one whose rules work -- which is not hypothetical. On 2026-08-22
+// this repository held both, one afternoon apart, and their ids were equal, so a
+// pass recorded under the broken one would have been reused under the fixed one
+// and, worse, the other way round.
+{
+  const deny = ["Read(//Users/x/.ssh/**)"];
+  const broken = ["Read(/Users/x/.ssh/**)"];            // one slash: matches nothing
+  const a = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, permissionsDeny: deny });
+  const b = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, permissionsDeny: broken });
+  check(a !== b, "a deny rule that stopped matching is a different boundary, and a different id", `${a} ${b}`);
+
+  const g1 = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, allowedTools: "Read(//wt),Read(//wt/**)" });
+  const g2 = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, allowedTools: "Read" });
+  check(g1 !== g2, "and so is a file tool granted bare instead of scoped", `${g1} ${g2}`);
+
+  // Per-invocation paths must still normalise out, or the id changes every tick
+  // and every wanted task pays for another five-minute model canary.
+  const p1 = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, worktree: "/wt/inv-a", allowedTools: "Read(//wt/inv-a/**)" });
+  const p2 = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, worktree: "/wt/inv-b", allowedTools: "Read(//wt/inv-b/**)" });
+  check(p1 === p2, "while the same grant under a different per-invocation directory is the SAME id", `${p1} ${p2}`);
+
+  // The doctor's half of the same question.
+  const h1 = policyHashOf(block.sandbox, null, { permissionsDeny: deny });
+  const h2 = policyHashOf(block.sandbox, null, { permissionsDeny: broken });
+  check(h1 !== h2, "the recorded policy hash moves with the rules too, so R-14 cannot report OK across the change", `${h1} ${h2}`);
+}
+
 // ── the binary identity is part of the id ────────────────────────────────────
 {
   const a = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, binaryId: "/x@1" });
   const b = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, binaryId: "/x@2" });
   check(a !== b, "a swapped binary (same version) is a different id", `${a} ${b}`);
   const r = await sandboxCanary({ ...base, binaryId: "/x@1", runner: runnerThat() });
-  check(r.id === canaryIdFor({ cliVersion: base.cliVersion, sandbox: base.sandbox, binaryId: "/x@1" }), "and the canary carries the binary-aware id");
+  check(r.id === canaryIdFor({ cliVersion: base.cliVersion, sandbox: base.sandbox, binaryId: "/x@1", worktree: base.dir, permissionsDeny: base.permissionsDeny, allowedTools: base.allowedTools ?? null }),
+    "and the canary carries the binary-aware id");
 }
 
 // ── the decoy must survive the probe ─────────────────────────────────────────

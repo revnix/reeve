@@ -15,7 +15,7 @@
 // a write to the run's own tmp), so an absent file means "denied", not
 // "the script never ran".
 import { runWorker, workerArgs } from "./supervisor.mjs";
-import { validateSettings, ruleFor } from "./sandbox.mjs";
+import { validateSettings, ruleFor, scopedFileTools } from "./sandbox.mjs";
 import { createHash } from "node:crypto";
 import { createServer, connect } from "node:net";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -253,10 +253,14 @@ export const isPolicyRefusal = text => REFUSAL.test(String(text ?? ""));
  * nothing (docs/measured/2026-08-22-the-read-deny-list-was-inert.md).
  */
 function canaryGrant(dir, decoyPath) {
-  const rule = ruleFor;   // the generator's own spelling, never a second copy of it
   return ["Bash(sh ./canary.sh:*)",
-          // Production's shape: the file tools scoped to the checkout.
-          ...["Read", "Write"].flatMap(t => [`${t}(${rule(dir)})`, `${t}(${rule(dir)}/**)`]),
+          // Production's shape, from production's own builder: it resolves the
+          // path before writing it into a rule, and a hand-rolled copy here
+          // would drift from it exactly where drift is invisible. macOS puts
+          // temporary directories behind /var -> /private/var, and the CLI
+          // checks the resolved path, so an unresolved scope matches nothing and
+          // the canary would fail its own write control for the wrong reason.
+          ...scopedFileTools(["Read", "Write"], dir),
           // And the adversary the deny list must beat: the decoy, granted BY NAME.
           // Nothing but the deny can refuse this read, which is the point.
           //
@@ -264,7 +268,7 @@ function canaryGrant(dir, decoyPath) {
           // IS the scope above -- there is no deny list entry for "everywhere
           // else", and there should not be one: an enumeration would protect the
           // paths it named and invite the belief that they were the boundary.
-          `Read(${rule(decoyPath)})`];
+          `Read(${ruleFor(decoyPath)})`];
 }
 
 export async function sandboxCanary({

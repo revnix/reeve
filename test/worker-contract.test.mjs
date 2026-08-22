@@ -59,6 +59,10 @@ const db = open(join(dir, "c.db"));
                watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 } },
     openPrs: () => [42], evaluate: () => evaluation,
     publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    // Injected, never read from disk: the real reader looks at
+    // ~/.reeve/claude-token, so a default passes on a machine that happens to
+    // have one and fails on CI.
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
     resolveCause: () => ({ ok: true, job: "CI Gate", step: "Test", runId: 11, cause: [{ where: "src/x.ts:1", message: "boom" }] }),
     prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dir, "wt-")), why: null, deps: { ok: true, cow: false } }),
   });

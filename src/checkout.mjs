@@ -40,14 +40,38 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { GIT_NEUTRALISE, REFUSING_HOOK, recordConfig, reason, gitEnv } from "./gitguard.mjs";
+import { GIT_NEUTRALISE, GIT_NEUTRALISE_FOUNDER, REFUSING_HOOK, recordConfig, reason, gitEnv, founderGitEnv } from "./gitguard.mjs";
 import { writeFileSync, chmodSync } from "node:fs";
 
 /** Every daemon git command in a worker-controlled directory carries the neutralisers. */
 function git(cwd, args) {
+  return run(cwd, GIT_NEUTRALISE, args, gitEnv());
+}
+
+/**
+ * A daemon git command whose repository is the FOUNDER's, not a worker's.
+ *
+ * The isolation exists because a worker's checkout holds pull-request content
+ * and its configuration is therefore hostile input. The founder's own
+ * repository is not that, and applying the isolation to it removed the very
+ * things reeve needs there: measured 2026-08-22, `ls-remote origin` on this
+ * repository succeeded ordinarily and failed under the isolation with "could
+ * not read Username for 'https://github.com'", because the credential helper
+ * lives in the founder's global configuration. Every fetch, ls-remote and push
+ * reeve makes on the founder's behalf went through it. A global
+ * `url.<base>.insteadOf` rewrite breaks the same way. (Codex #7-[10].)
+ *
+ * What stays is everything that stops git RUNNING a program; what goes is
+ * everything that decides how git reaches a remote.
+ */
+function founderGit(cwd, args) {
+  return run(cwd, GIT_NEUTRALISE_FOUNDER, args, founderGitEnv());
+}
+
+function run(cwd, neutralise, args, env) {
   try {
-    return { ok: true, out: execFileSync("git", ["-C", cwd, ...GIT_NEUTRALISE, ...args],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: gitEnv() }).trim() };
+    return { ok: true, out: execFileSync("git", ["-C", cwd, ...neutralise, ...args],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env }).trim() };
   // `reason` picks git's own fatal line rather than the last thing it printed,
   // which is usually progress narration and sends the reader somewhere else.
   } catch (e) { return { ok: false, out: "", err: reason(e.stderr || e.message) }; }
@@ -185,7 +209,7 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
   // below reads and a bare `git fetch origin <branch>` only updates it when the
   // remote carries the conventional refspec. Naming it makes the guarantee this
   // depends on the one git is actually given.
-  const fetched = git(repoRoot, ["fetch", "-q", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+  const fetched = founderGit(repoRoot, ["fetch", "-q", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
   if (!fetched.ok) return { ok: false, path: null, why: `could not fetch ${branch}: ${fetched.err}` };
 
   // An EMPTY repository plus one fetched ref, not a clone.
@@ -205,6 +229,9 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
   // that is checked out — so a pull request whose branch happened to carry that
   // name (`main` on most hosts) could not be prepared at all. Found by the
   // control beside the filter test, not by the case it was written for.
+  // `git`, not `founderGit`, though its cwd is the founder's checkout: the
+  // repository this CREATES is the worker's, and the founder's global
+  // `init.templateDir` would otherwise install its hooks into it.
   const init = git(repoRoot, ["init", "-q", "-b", `${branch}.reeve-init`, "--", path]);
   if (!init.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not create the checkout: ${init.err}` }; }
   // By the pinned REVISION where there is one, so the fetch cannot race a branch
@@ -369,9 +396,9 @@ function hardenClone(path) {
  */
 export function fetchRunWork({ repoRoot, path, branch, into = null }) {
   const ref = into ?? `refs/reeve/run/${branch}`;
-  const f = git(repoRoot, ["fetch", "--no-tags", "-q", path, `+${branch}:${ref}`]);
+  const f = founderGit(repoRoot, ["fetch", "--no-tags", "-q", path, `+${branch}:${ref}`]);
   if (!f.ok) return { ok: false, ref: null, why: `could not fetch the worker's branch: ${f.err}` };
-  const at = git(repoRoot, ["rev-parse", ref]);
+  const at = founderGit(repoRoot, ["rev-parse", ref]);
   if (!at.ok) return { ok: false, ref: null, why: `fetched but ${ref} does not resolve` };
   return { ok: true, ref, head: at.out, why: null };
 }
@@ -387,7 +414,7 @@ export function fetchRunWork({ repoRoot, path, branch, into = null }) {
  */
 export function publishRunWork({ repoRoot, path, branch, expectedRemote = null }) {
   if (expectedRemote) {
-    const ls = git(repoRoot, ["ls-remote", "origin", `refs/heads/${branch}`]);
+    const ls = founderGit(repoRoot, ["ls-remote", "origin", `refs/heads/${branch}`]);
     if (!ls.ok) return { ok: false, why: `could not read the remote head: ${ls.err}` };
     const now = ls.out.split(/\s+/)[0] ?? "";
     // An EMPTY result is not "unchanged": `git ls-remote` exits 0 and prints
@@ -417,15 +444,15 @@ export function publishRunWork({ repoRoot, path, branch, expectedRemote = null }
   // work DESCENDS from what is being replaced. The lease then adds atomicity to
   // a push that was already a fast-forward.
   if (expectedRemote) {
-    const ff = git(repoRoot, ["merge-base", "--is-ancestor", expectedRemote, fetched.ref]);
+    const ff = founderGit(repoRoot, ["merge-base", "--is-ancestor", expectedRemote, fetched.ref]);
     if (!ff.ok) return { ok: false, why: `the worker's branch does not descend from ${expectedRemote.slice(0, 10)}; reeve does not rewrite published history` };
-    const leased = git(repoRoot, ["push", `--force-with-lease=refs/heads/${branch}:${expectedRemote}`,
-                                  "origin", `${fetched.ref}:refs/heads/${branch}`]);
+    const leased = founderGit(repoRoot, ["push", `--force-with-lease=refs/heads/${branch}:${expectedRemote}`,
+                                       "origin", `${fetched.ref}:refs/heads/${branch}`]);
     if (!leased.ok) return { ok: false, why: `push refused: ${leased.err}` };
     return { ok: true, why: null, head: fetched.head };
   }
   // Never force: a worker's fix is not worth another party's commit.
-  const pushed = git(repoRoot, ["push", "origin", `${fetched.ref}:refs/heads/${branch}`]);
+  const pushed = founderGit(repoRoot, ["push", "origin", `${fetched.ref}:refs/heads/${branch}`]);
   if (!pushed.ok) return { ok: false, why: `push refused: ${pushed.err}` };
   return { ok: true, why: null, head: fetched.head };
 }

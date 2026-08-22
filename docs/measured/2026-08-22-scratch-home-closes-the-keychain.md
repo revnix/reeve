@@ -1,4 +1,28 @@
-# Measured: a scratch HOME closes the keychain, and a token replaces it
+# Measured: a scratch HOME closes the keychain SEARCH LIST, and a token replaces `~/.claude`
+
+> **CORRECTED 2026-08-22, same day.** The original title and finding said a
+> scratch HOME closed the keychain. It does not. It empties the keychain SEARCH
+> LIST, which is a smaller claim, and the difference is a credential:
+>
+> ```
+> # scratch HOME, no path denied
+> security find-internet-password -s github.com                                   -> 44
+> security find-internet-password -s github.com ~/Library/Keychains/login.keychain-db -> 0   ← FOUND
+> ```
+>
+> The keychain file does not move, is not locked (`no-timeout`), and the worker
+> runs as the same OS user, so naming it works. Every probe in the table below
+> asks the search list, so none of them could see this — including the canary's,
+> which certified containment on that basis.
+>
+> Found by Codex on PR #5, verified by measurement, and closed by denying
+> `~/Library/Keychains` in the worker's policy: the same probe returns 44 under
+> the deny and 0 without it, and the canary now runs both shapes
+> (`kc_path_github=44`, `kc_path_claude=44` in canary `163837cb9d095182`).
+>
+> What survives below is true and still load-bearing — the search list IS emptied,
+> and `~/.claude` IS replaced by a token. It is simply not sufficient on its own.
+
 
 Date: 2026-08-22. Host: macOS (Darwin 25.6), founder's account, CLI 2.1.237.
 
@@ -16,10 +40,12 @@ user (refused — "I'm not going to make another user"), or removing the GitHub
 credential from the keychain (leaves the CLAUDE credentials readable, and
 "the keychain is clean" can only be probed for the item shapes reeve knows).
 
-## The finding
+## The finding (as originally written, and too strong)
 
-**The keychain is reached through `HOME`.** The search list lives in the home
-directory, so a process with a scratch home has no login keychain to ask.
+**The keychain SEARCH LIST is reached through `HOME`.** The list lives in the
+home directory, so a process with a scratch home has no login keychain in its
+search path. Every row below probes that list. None of them names the keychain
+file, which is the reach that was still open.
 
 | probe | real `HOME` | scratch `HOME` |
 |---|---|---|
@@ -59,7 +85,9 @@ home and no token the CLI refuses before executing anything.
 ## What this changes
 
 - The founder's keychain is **untouched**, and both credentials in it — GitHub
-  and Claude — are unreachable from a worker.
+  and Claude — are out of the worker's SEARCH LIST. Reaching them by path stayed
+  open until `~/Library/Keychains` joined the deny list; see the correction at
+  the top.
 - `~/.gitconfig`, `~/.ssh`, `~/.aws`, `~/.npmrc` and the rest become unreachable
   **by construction** rather than by deny rule; the deny list becomes a second
   layer instead of the only one.

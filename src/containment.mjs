@@ -142,7 +142,9 @@ export async function measureContainment({
   const cheapReasons = reasons.length > 0;
   if (canary && typeof canary !== "function") cn = canary;
   else if (cheapReasons) cn = { ok: false, id, why: "not run: containment is already open for a cheaper reason", skipped: true };
-  else if (id && cache.get(id)?.ok) cn = cache.get(id);
+  // Marked, so the caller can tell a cached pass from one this call produced:
+  // only a real run creates (and cleans up) the per-invocation tree.
+  else if (id && cache.get(id)?.ok) cn = { ...cache.get(id), cached: true };
   else if (!id) cn = { ok: false, id: null, why: "no CLI version or sandbox block to run a canary under" };
   else {
     const run = typeof canary === "function" ? canary : sandboxCanary;

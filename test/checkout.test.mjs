@@ -1,7 +1,7 @@
 // A worker's checkout must share NOTHING with the founder's: not the ref store,
 // not the configuration, and not their uncommitted work. These assertions are
 // what makes the standalone clone a boundary rather than a convention.
-import { prepareRunCheckout, releaseRunCheckout, fetchRunWork, copyDeps, canCloneFiles, runPathFor } from "../src/checkout.mjs";
+import { prepareRunCheckout, releaseRunCheckout, fetchRunWork, copyDeps, canCloneFiles, runPathFor, dependencyPathsFor } from "../src/checkout.mjs";
 import { verifyConfig } from "../src/gitguard.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -40,7 +40,7 @@ mkdirSync(join(founder, "node_modules", "left-pad"), { recursive: true });
 writeFileSync(join(founder, "node_modules", "left-pad", "index.js"), "module.exports = 1\n");
 
 // ── the checkout is standalone, current, and carries nothing of the founder's ─
-const r = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 42, runId: "run1", branch: "feature", head, depsFrom: join(founder, "node_modules") });
+const r = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 42, runId: "run1", branch: "feature", head, depsFrom: ["node_modules"] });
 check(r.ok, "control: a run checkout is prepared", JSON.stringify(r.why));
 check(r.path === runPathFor(runs, 42, "run1"), "at a path keyed by run, not by pull request", r.path);
 check(existsSync(join(r.path, ".git")) && !existsSync(join(r.path, ".git", "..", "..", "founder")), "with its own .git", "");
@@ -86,6 +86,71 @@ check(existsSync(join(r.path, "node_modules", "left-pad", "index.js")), "but the
   check(c.cow === cow, "and the cheap path is taken exactly when the filesystem supports it", `cow=${c.cow} supported=${cow}`);
   const missing = copyDeps(join(root, "no-such-dir"), join(root, "nm2"));
   check(missing.ok && missing.skipped === true, "a project with no dependencies is not an error", JSON.stringify(missing));
+}
+
+// ── which dependency trees get copied comes from the profile ─────────────────
+//
+// node_modules was hard-coded. A python unit needs its .venv, and a language
+// whose dependencies live under the home directory has nothing in the tree to
+// copy at all — with no network and a scratch HOME that worker cannot resolve
+// anything, so the gap is REPORTED rather than discovered as a mystery failure.
+{
+  check(JSON.stringify(dependencyPathsFor({ units: [{ root: ".", language: "typescript" }] }).paths) === '["node_modules"]',
+    "a node unit asks for node_modules", "");
+  check(JSON.stringify(dependencyPathsFor({ units: [{ root: "api", language: "python" }] }).paths) === '["api/.venv"]',
+    "a python unit asks for its own .venv, under the unit's root", "");
+  const go = dependencyPathsFor({ units: [{ root: ".", language: "go" }] });
+  check(go.paths.length === 0 && go.unsupported.length === 1 && /go/.test(go.unsupported[0]),
+    "a language cached under the home directory has nothing to copy, and SAYS so", JSON.stringify(go));
+  check(JSON.stringify(dependencyPathsFor({ worker: { dependencyPaths: ["vendor"] }, units: [{ root: ".", language: "go" }] }).paths) === '["vendor"]',
+    "and the profile can name its own, which overrides the table", "");
+
+  // Two trees at once, each landing where it belongs in the run checkout.
+  mkdirSync(join(founder, "api", ".venv", "lib"), { recursive: true });
+  writeFileSync(join(founder, "api", ".venv", "lib", "mod.py"), "x = 1\n");
+  const multi = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 77, runId: "r77", branch: "feature", head,
+                                     depsFrom: ["node_modules", "api/.venv", "no/such/tree"] });
+  check(multi.ok, "control: a checkout wanting several trees is prepared", JSON.stringify(multi.why));
+  if (multi.ok) {
+    check(existsSync(join(multi.path, "node_modules", "left-pad", "index.js")), "the node tree landed", "");
+    check(existsSync(join(multi.path, "api", ".venv", "lib", "mod.py")), "the python tree landed under its unit's root", "");
+    check(JSON.stringify(multi.deps.copied) === '["node_modules","api/.venv"]',
+      "and a tree that does not exist is not an error, it is simply not copied", JSON.stringify(multi.deps));
+    releaseRunCheckout(multi.path, { workFetched: true });
+  }
+}
+
+// ── the ordinary case: a PR branch the founder has never checked out ─────────// ── the ordinary case: a PR branch the founder has never checked out ─────────
+//
+// A pull request's branch exists in the founder's clone as `origin/<branch>` and
+// NOT as a local `refs/heads/<branch>`, unless a human happened to check it out.
+// Every fixture above created the branch locally first, so none of them could
+// exhibit what a real dispatch does. (Codex #5-[1].)
+{
+  const g2 = (cwd, ...a) => execFileSync("git", ["-C", cwd, ...a], { encoding: "utf8" }).trim();
+  // A second contributor pushes a branch straight to the origin; the founder's
+  // clone learns about it only as a remote-tracking ref.
+  const other = join(root, "other");
+  execFileSync("git", ["clone", "-q", origin, other]);
+  g2(other, "checkout", "-q", "-b", "someone-elses-pr", "origin/main");
+  writeFileSync(join(other, "theirs.txt"), "their work\n");
+  g2(other, "add", "-A"); g2(other, "-c", "user.email=o@o", "-c", "user.name=o", "commit", "-q", "-m", "their fix");
+  g2(other, "push", "-q", "origin", "someone-elses-pr");
+  const theirHead = g2(other, "rev-parse", "HEAD");
+
+  const localHeads = g2(founder, "for-each-ref", "--format=%(refname)", "refs/heads");
+  check(!localHeads.includes("someone-elses-pr"),
+    "control: the founder's clone has no local branch for it, which is the normal case", localHeads.replace(/\n/g, " "));
+
+  const r = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 99, runId: "r99", branch: "someone-elses-pr", head: theirHead });
+  check(r.ok, "a checkout is still prepared for a branch that exists only on the remote", JSON.stringify(r.why));
+  if (r.ok) {
+    check(g(r.path, "rev-parse", "HEAD") === theirHead, "at the revision reeve pinned", g(r.path, "rev-parse", "HEAD"));
+    check(g(r.path, "rev-parse", "--abbrev-ref", "HEAD") === "someone-elses-pr", "on the pull request's branch, by name",
+      g(r.path, "rev-parse", "--abbrev-ref", "HEAD"));
+    check(existsSync(join(r.path, "theirs.txt")), "with their work in it", "");
+    releaseRunCheckout(r.path, { workFetched: true });
+  }
 }
 
 // ── a run checkout is never silently reused ──────────────────────────────────

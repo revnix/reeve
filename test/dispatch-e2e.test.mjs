@@ -11,6 +11,7 @@ import { tick, stateRootsFor } from "../src/daemon.mjs";
 import { open, liveRunFor, countFixAttempts, recordFixAttempt } from "../src/db/ops.mjs";
 import { causeKey } from "../src/ci-rootcause.mjs";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -333,6 +334,38 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
     String(countFixAttempts(ctxF.db, "o/r", 42, causeKey("o/r", CAUSE))));
   ctxF.db.close();
   rmSync(dirF, { recursive: true, force: true });
+}
+
+// --- a finished worker that never committed keeps its work ------------------
+//
+// reeve publishes by fetching the checkout's BRANCH, so an uncommitted edit
+// cannot travel with the push. changedFiles counts it anyway (deliberately: a
+// worker that stops part-way has still done something), so the diff gate passed,
+// the log said "published N file(s)", and the release then DELETED the only copy.
+{
+  const dirU = mkdtempSync(join(tmpdir(), "reeve-e2e-uncommitted-"));
+  const wtU = mkdtempSync(join(dirU, "wt-"));
+  // A checkout with an edit the worker never committed.
+  execFileSync("git", ["-C", wtU, "init", "-q"]);
+  writeFileSync(join(wtU, "fix.js"), "the fix nobody committed\n");
+  let publishedU = 0;
+  const ctxU = { ...baseCtx(), db: open(join(dirU, "u.db")), logPath: join(dirU, "log.txt"),
+                 prepareCheckout: () => ({ ok: true, path: wtU, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedU++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }) };
+  const rU = await tick(ctxU);
+  const logU = readFileSync(join(dirU, "log.txt"), "utf8");
+  const escU = [...rU.escalations.keys()].join(" | ");
+
+  check(publishedU === 0, "a checkout with uncommitted work is NOT published", `published=${publishedU}`);
+  check(!/published \d+ file/.test(logU), "and the log does not say it was", logU.split("\n").filter(l => /publish/.test(l)).join(" | ").slice(0, 200));
+  check(/uncommitted/.test(escU), "the escalation says what is wrong with it", escU);
+  check(existsSync(join(`${wtU}.unfetched`, "fix.js")) || existsSync(join(wtU, "fix.js")),
+    "and the work still exists somewhere on disk", `${wtU}`);
+  ctxU.db.close();
+  rmSync(dirU, { recursive: true, force: true });
+  rmSync(`${wtU}.unfetched`, { recursive: true, force: true });
 }
 
 // --- an already-open verdict prepares nothing (no canary litter per tick) -----

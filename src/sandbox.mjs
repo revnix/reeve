@@ -149,6 +149,14 @@ export function scopedFileTools(tools, dir) {
 }
 
 export const CREDENTIAL_PATHS = [
+  // The founder's keychains, BY PATH. A scratch HOME removes the login keychain
+  // from the search LIST, which is not the same as putting it out of reach:
+  // measured 2026-08-22, `security find-internet-password -s github.com
+  // ~/Library/Keychains/login.keychain-db` returns the credential under a
+  // scratch home, because the process runs as the same OS user and the keychain
+  // is unlocked with no timeout. Naming the path closes it — measured, with the
+  // same probe returning 44 under this deny and 0 without it.
+  "~/Library/Keychains",
   "~/.reeve", "~/.claude", "~/.claude.json", "~/.config/gh", "~/.ssh", "~/.gitconfig",
   // Git's `store` helper writes plaintext tokens to ~/.git-credentials OR, under
   // the XDG layout, ~/.config/git/credentials. Stripping XDG_CONFIG_HOME from the

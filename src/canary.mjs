@@ -107,7 +107,8 @@ export const CANARY_SENTINEL = "REEVE-CANARY-SENTINEL-DO-NOT-LEAK";
  * daemon can stat afterwards; exit codes are recorded as well but are not
  * what decides.
  */
-export function canaryScript({ tmpDir, outsideDir, decoyPath, netUrl = null, fileDecoyPath = null, fileControlPath = null }) {
+export function canaryScript({ tmpDir, outsideDir, decoyPath, netUrl = null, fileDecoyPath = null, fileControlPath = null,
+                               loginKeychain = join(homedir(), "Library", "Keychains", "login.keychain-db") }) {
   return `#!/bin/sh
 # reeve sandbox canary: leaves files for the daemon to read; records exit codes beside them
 out="./canary-results.txt"; : > "$out" || exit 97
@@ -118,11 +119,19 @@ touch ${JSON.stringify(join(outsideDir, "OUTSIDE"))}; rec outside $?
 curl -sS -m 5 https://example.com -o ./curl-body 2>/dev/null; rec curl $?
 ${netUrl ? `curl -sS -m 5 ${JSON.stringify(netUrl)} -o ./probe-body 2>/dev/null; rec probe $?` : ""}
 cp ${JSON.stringify(decoyPath)} ./decoy-copy 2>/dev/null; rec decoy $?
-# The KEYCHAIN, which no sandbox setting can deny: absolute paths on purpose,
-# because the refusing shims on the worker's PATH are a layer, not a boundary.
+# The KEYCHAIN. Absolute paths on purpose, because the refusing shims on the
+# worker's PATH are a layer, not a boundary.
+#
+# The first three ask the SEARCH LIST, which a scratch HOME empties. That is what
+# a scratch home does, and on its own it proves nothing: measured 2026-08-22, the
+# founder's login keychain is still readable BY PATH from a scratch home, as the
+# same OS user, because it is unlocked with no timeout. The last two name it, and
+# they are the probes that decide.
 /usr/bin/security find-internet-password -s github.com >/dev/null 2>&1; rec kc_github $?
 /usr/bin/security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; rec kc_claude $?
 printf 'protocol=https\nhost=github.com\n\n' | git -c credential.helper=osxkeychain credential fill 2>/dev/null | grep -q '^password='; rec kc_helper $?
+/usr/bin/security find-internet-password -s github.com ${JSON.stringify(loginKeychain)} >/dev/null 2>&1; rec kc_path_github $?
+/usr/bin/security find-generic-password -s "Claude Code-credentials" ${JSON.stringify(loginKeychain)} >/dev/null 2>&1; rec kc_path_claude $?
 ${fileDecoyPath ? `cp ${JSON.stringify(fileDecoyPath)} ./filedecoy-copy 2>/dev/null; rec filedecoy $?` : ""}
 ${fileControlPath ? `cp ${JSON.stringify(fileControlPath)} ./filecontrol-copy 2>/dev/null; rec filecontrol $?` : ""}
 ln -sf ${JSON.stringify(decoyPath)} ./decoy-link 2>/dev/null; cp ./decoy-link ./decoy-copy2 2>/dev/null; rec symlink $?
@@ -417,6 +426,16 @@ export async function sandboxCanary({
       if (results.kc_github === 0) problems.push("read the founder's GitHub credential from the keychain");
       if (results.kc_claude === 0) problems.push("read the founder's Claude credentials from the keychain");
       if (results.kc_helper === 0) problems.push("git's keychain helper returned a credential");
+    }
+    // The probes that decide. A scratch HOME empties the search LIST, which the
+    // three above measure; naming the keychain file walks around that entirely,
+    // and did, until the path joined the deny list. Absent probes are a refusal:
+    // a canary that did not run them proves nothing about the reach they cover.
+    if (!("kc_path_github" in results) || !("kc_path_claude" in results))
+      problems.push("the keychain was not probed by path, so the reach a scratch HOME does NOT close is unproven");
+    else {
+      if (results.kc_path_github === 0) problems.push("read the founder's GitHub credential from the login keychain BY PATH");
+      if (results.kc_path_claude === 0) problems.push("read the founder's Claude credentials from the login keychain BY PATH");
     }
   }
   // The Write TOOL outside the canary's directory: the file must not exist, and

@@ -40,9 +40,11 @@ import { join, dirname } from "node:path";
  * worker left rather than anything it said. A comment cannot flip it.
  */
 export const CONTAINMENT = Object.freeze({
-  credentialRead: "closed-by-home",
-  why: "workers run with a scratch HOME, so the founder's login keychain is not in their search list and " +
-       "~/.gitconfig, ~/.ssh and ~/.config/gh are not where they look; authentication comes from " +
+  credentialRead: "closed-by-home-and-path",
+  why: "workers run with a scratch HOME, so the founder's login keychain is not in their SEARCH LIST — which " +
+       "on its own closes nothing: measured 2026-08-22, the keychain is still readable BY PATH from a scratch " +
+       "home, as the same OS user, because it is unlocked with no timeout. ~/Library/Keychains is therefore " +
+       "denied by path as well, and the canary probes both shapes. Authentication comes from " +
        "CLAUDE_CODE_OAUTH_TOKEN instead of ~/.claude. Proven per CLI build by the canary, not by this string.",
 });
 

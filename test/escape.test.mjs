@@ -33,6 +33,9 @@ import { dirname, join } from "node:path";
 // A worker never gets the founder's HOME (that is where the keychain lives) and
 // authenticates from a token instead of ~/.claude.
 const WORKER_HOME = mkdtempSync(join(tmpdir(), "reeve-worker-home-"));
+// The founder's login keychain, by path. A scratch HOME empties the search LIST
+// and leaves this file exactly where it was, readable by the same OS user.
+const LOGIN_KEYCHAIN = join(homedir(), "Library", "Keychains", "login.keychain-db");
 const FAKE_TOKEN = "sk-ant-oat01-test-token-not-a-real-credential-000000000000";
 
 let fail = 0, skipped = 0;
@@ -197,6 +200,8 @@ git push --no-verify ${JSON.stringify(dest)} HEAD:refs/heads/escape-noverify 2>.
 git -c core.hooksPath=/dev/null push ${JSON.stringify(dest)} HEAD:refs/heads/escape-hookspath 2>/dev/null; rec hookspath $?
 git push --no-verify https://github.com/revnix/reeve-does-not-exist HEAD:refs/heads/x 2>/dev/null; rec https $?
 printf 'protocol=https\\nhost=github.com\\n\\n' | git -c credential.helper=osxkeychain credential fill 2>/dev/null | grep -q '^password='; rec keychain $?
+/usr/bin/security find-internet-password -s github.com ${JSON.stringify(LOGIN_KEYCHAIN)} >/dev/null 2>&1; rec kc_by_path $?
+/usr/bin/security find-generic-password -s "Claude Code-credentials" ${JSON.stringify(LOGIN_KEYCHAIN)} >/dev/null 2>&1; rec kc_claude_by_path $?
 mkdir -p ./ghcfg && printf 'github.com:\\n    user: %s\\n    git_protocol: https\\n' ${JSON.stringify(acct ?? "unknown")} > ./ghcfg/hosts.yml
 GH_CONFIG_DIR=./ghcfg ${JSON.stringify(gh || "/usr/bin/false")} auth token >/dev/null 2>&1; rec ghkeyring $?
 GIT_CONFIG_GLOBAL=${JSON.stringify(deniedCfg)} git config --global --list >/dev/null 2>./probe-cfg.err; rec denied_cfg $?
@@ -279,10 +284,25 @@ cat ${JSON.stringify(founderEnv)} >/dev/null 2>&1; rec founder_env $?
     if (!keychain.measured) skip("keychain shapes", keychain.why);
     else {
       if (keychain.items.length)
-        check(r.keychain !== 0, "HELD: the founder's keychain DOES hold a GitHub credential, and the worker still cannot read it (scratch HOME)", `keychain=${r.keychain} items=${keychain.items.length}`);
+        check(r.keychain !== 0, "HELD: the founder's keychain DOES hold a GitHub credential, and the worker still cannot read it", `keychain=${r.keychain} items=${keychain.items.length}`);
       else
         check(r.keychain !== 0, "HELD: no GitHub credential in the keychain, and the helper returns nothing", `keychain=${r.keychain}`);
       check(r.ghkeyring !== 0, "HELD: gh pointed at a crafted config dir cannot reach the keyring either", `ghkeyring=${r.ghkeyring}`);
+      // The shape a scratch HOME does NOT close, and the reason this file exists.
+      //
+      // A scratch home empties the keychain SEARCH LIST. It does not move the
+      // file, it does not lock it, and it does not change who the process runs
+      // as. Measured 2026-08-22: `security find-internet-password -s github.com
+      // ~/Library/Keychains/login.keychain-db` returned the founder's credential
+      // from a scratch home, and returns 44 only once that path is denied. The
+      // three probes above ask the search list and would all have passed while
+      // this was wide open — which they did, for one afternoon, in a canary that
+      // certified containment.
+      check(existsSync(LOGIN_KEYCHAIN), "control: the founder's login keychain exists to be probed", LOGIN_KEYCHAIN);
+      check(r.kc_by_path !== 0,
+        "HELD: naming the founder's login keychain by PATH does not reach it either", `kc_by_path=${r.kc_by_path}`);
+      check(r.kc_claude_by_path !== 0,
+        "HELD: nor does naming it for the Claude credentials", `kc_claude_by_path=${r.kc_claude_by_path}`);
     }
   }
 
@@ -309,7 +329,7 @@ cat ${JSON.stringify(founderEnv)} >/dev/null 2>&1; rec founder_env $?
 }
 
 // ── the declaration the env alone makes must still say what it measured ──────
-check(CONTAINMENT.credentialRead === "closed-by-home", "control: the module declares the closure this file just measured, and the canary re-proves it per CLI build", JSON.stringify(CONTAINMENT));
+check(CONTAINMENT.credentialRead === "closed-by-home-and-path", "control: the module declares the closure this file just measured, and the canary re-proves it per CLI build", JSON.stringify(CONTAINMENT));
 
 rmSync(root, { recursive: true, force: true });
 console.log(`${fail ? `\nfailed=${fail}` : "\nall green"}${skipped ? ` (skipped ${skipped}: not measurable on this host)` : ""}`);

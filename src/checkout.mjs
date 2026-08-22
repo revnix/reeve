@@ -22,10 +22,21 @@
 //
 // The clone deliberately carries only COMMITTED content: a `cp` of the founder's
 // checkout would hand the worker their uncommitted work and every ignored file
-// (a `.env` among them). Dependencies are the one thing a fresh clone lacks and
-// a fixer cannot live without — the network is denied, so it cannot install them
-// — and they are supplied by a copy-on-write clone of the directory the founder
-// already has, which costs almost nothing because unmodified blocks are shared.
+// (a `.env` among them). That keeps those files OUT of the worker's checkout,
+// which is not the same as keeping them out of its reach: measured 2026-08-22,
+// the sandbox denies writes outside the checkout but not reads, so a worker
+// could read them where they still live. The founder's clone is therefore
+// deny-read in the worker's policy too (sandbox.mjs, sourceCheckoutOf), and the
+// claim rests on both facts rather than on this one.
+//
+// Dependencies are the one thing a fresh clone lacks and a fixer cannot live
+// without — the network is denied, so it cannot install them — and they are
+// supplied by a copy-on-write clone of the directory the founder already has,
+// which costs almost nothing because unmodified blocks are shared. The DAEMON
+// copies them before the worker starts, so denying the source costs the worker
+// nothing: measured on nextlyhq/nextly, every symlink in its node_modules is
+// relative and resolves inside the tree, so the copy resolves within the run
+// checkout.
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";

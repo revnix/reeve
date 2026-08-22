@@ -19,7 +19,7 @@ import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
-import { sandboxFor, writeSandbox, reviewDiff, validateSettings, quarantineOsDenies } from "./sandbox.mjs";
+import { sandboxFor, writeSandbox, reviewDiff, validateSettings, quarantineOsDenies, sourceCheckoutOf } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE } from "./gitguard.mjs";
 import { prepareRunCheckout, publishRunWork, releaseRunCheckout } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
@@ -732,10 +732,11 @@ export async function tick(ctx) {
         // code, and the failure would read as a broken sandbox rather than the
         // configuration error it is. (Codex #4g-[4].)
         if (sandbox.stateHomeContainsWorktree?.length)
-          throw new Error(`reeve's state (${sandbox.stateHomeContainsWorktree.join(", ")}) contains the worktree ${worktree}, so the policy would deny the worker its own checkout — move REEVE_HOME or identity.worktreeRoot apart`);
+          throw new Error(`a denied path (${sandbox.stateHomeContainsWorktree.join(", ")}) contains the checkout ${worktree}, so the policy would deny the worker its own code — move identity.worktreeRoot apart from REEVE_HOME and from identity.checkout`);
         const qDenies = quarantineOsDenies(worktree, profile.risk?.quarantinePaths ?? []).paths;
         const notifyCred = typeof profile.notify?.credentialFile === "string" && isAbsolute(profile.notify.credentialFile) ? [profile.notify.credentialFile] : [];
-        const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots, quarantineDenies: qDenies, extraDenies: notifyCred });
+        const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots, quarantineDenies: qDenies,
+                                                                                  extraDenies: notifyCred, sourceCheckout: sourceCheckoutOf(profile) });
         if (!sv.ok) throw new Error(`settings invalid: ${sv.errors.join("; ")}`);
         // The settings file is immutable per run, in the run's own directory:
         // a path keyed by PR alone was shared by every daemon on the host, and

@@ -63,6 +63,13 @@ function git(cwd, args) {
  *
  * What stays is everything that stops git RUNNING a program; what goes is
  * everything that decides how git reaches a remote.
+ *
+ * Used for the ORIGIN-FACING commands only, not for every command in the
+ * founder's checkout. A local-path fetch, a rev-parse and a merge-base need
+ * nothing from the founder's configuration and can only be broken by it: a
+ * founder who has hardened git with `protocol.file.allow=never` would have the
+ * worker-to-founder fetch refused, and with it every valid fix. The isolation is
+ * dropped exactly where reeve must reach the remote, and nowhere else.
  */
 function founderGit(cwd, args) {
   return run(cwd, GIT_NEUTRALISE_FOUNDER, args, founderGitEnv());
@@ -396,9 +403,16 @@ function hardenClone(path) {
  */
 export function fetchRunWork({ repoRoot, path, branch, into = null }) {
   const ref = into ?? `refs/reeve/run/${branch}`;
-  const f = founderGit(repoRoot, ["fetch", "--no-tags", "-q", path, `+${branch}:${ref}`]);
+  // `git`, not `founderGit`, though the repository is the founder's: the SOURCE
+  // is a local path, so this needs neither their credentials nor their URL
+  // rewrites — and a founder who has hardened git with `protocol.file.allow=never`
+  // would otherwise have every valid fix refused before it could be pushed.
+  // Measured 2026-08-22 on git 2.50.1: with that key in the global config the
+  // same fetch fails `fatal: transport 'file' not allowed`, and succeeds under
+  // the isolation. (Codex #10-[1].)
+  const f = git(repoRoot, ["fetch", "--no-tags", "-q", path, `+${branch}:${ref}`]);
   if (!f.ok) return { ok: false, ref: null, why: `could not fetch the worker's branch: ${f.err}` };
-  const at = founderGit(repoRoot, ["rev-parse", ref]);
+  const at = git(repoRoot, ["rev-parse", ref]);
   if (!at.ok) return { ok: false, ref: null, why: `fetched but ${ref} does not resolve` };
   return { ok: true, ref, head: at.out, why: null };
 }
@@ -444,7 +458,7 @@ export function publishRunWork({ repoRoot, path, branch, expectedRemote = null }
   // work DESCENDS from what is being replaced. The lease then adds atomicity to
   // a push that was already a fast-forward.
   if (expectedRemote) {
-    const ff = founderGit(repoRoot, ["merge-base", "--is-ancestor", expectedRemote, fetched.ref]);
+    const ff = git(repoRoot, ["merge-base", "--is-ancestor", expectedRemote, fetched.ref]);
     if (!ff.ok) return { ok: false, why: `the worker's branch does not descend from ${expectedRemote.slice(0, 10)}; reeve does not rewrite published history` };
     const leased = founderGit(repoRoot, ["push", `--force-with-lease=refs/heads/${branch}:${expectedRemote}`,
                                        "origin", `${fetched.ref}:refs/heads/${branch}`]);

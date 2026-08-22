@@ -79,6 +79,31 @@ instrument, and is not in this change.
   cannot reproduce this silently, and set `GIT_TERMINAL_PROMPT=0` so a missing
   credential fails rather than waits.
 
+The founder-side environment is used for the **origin-facing commands only** —
+the opening fetch, the `ls-remote` that takes the lease, and both pushes — not
+for every command in the founder's checkout. That correction came from Codex on
+#10, and it reproduces:
+
+```
+$ printf '[protocol "file"]\n\tallow = never\n' > $HOME/.gitconfig
+$ git -C founder fetch --no-tags -q /path/to/worker '+branch:refs/x'
+fatal: transport 'file' not allowed
+$ <the same, under the worker isolation>
+(succeeds)
+```
+
+A founder who hardens git that way — the documented response to the submodule
+local-clone class of vulnerability — would have had the worker-to-founder fetch
+refused, and with it every valid fix, before anything could be pushed. That
+fetch reads a local path: it needs neither the founder's credentials nor their
+rewrites, and can only be broken by their configuration. The same is true of the
+`rev-parse` and the `merge-base` beside it.
+
+So the isolation is dropped exactly where reeve must reach the remote, and
+nowhere else. Two fixtures hold the rule from both sides: one where origin
+resolves ONLY through the founder's global config, and one where the founder's
+global config would refuse the local fetch. Neither classification passes both.
+
 `git init -- <path>` keeps the worker isolation even though its working
 directory is the founder's checkout: the repository it creates is the worker's,
 and the founder's `init.templateDir` would otherwise install hooks into it.

@@ -9,7 +9,7 @@ import { open } from "../src/db/ops.mjs";
 import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor } from "../src/paths.mjs";
 import { snapshot, restore, latestSnapshot, exportEvents } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
-import { run, tick } from "../src/daemon.mjs";
+import { run, tick, measuredContainment } from "../src/daemon.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
 import { writeDash } from "../src/dash.mjs";
@@ -281,6 +281,42 @@ switch (cmd) {
     process.exit(0);
   }
 
+  // Measure the worker boundary on demand, without arming anything.
+  //
+  // The canary is the evidence dispatch rests on, and until now the only way to
+  // produce it was to turn --execute on and wait for a tick that wanted a
+  // worker. That is the wrong order: the measurement is what should decide
+  // whether to arm, so it has to be available before.
+  //
+  // It measures the SCRATCH-HOME arrangement whatever the profile currently
+  // declares, because that is the question being asked -- "would a worker be
+  // contained here?" -- and the profile's isolation setting only governs whether
+  // the daemon may act on the answer. The sandbox policy is generated from the
+  // profile as it stands, so the record is the one `reeve doctor` R-14 reads and
+  // the one the daemon's own cache will match.
+  case "canary": {
+    const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
+    if (!nwo) { console.error("reeve canary: no repo. Pass owner/repo or run inside a git checkout."); process.exit(1); }
+    const profile = loadProfile(nwo);
+    if (!profile) { console.error(`reeve canary: no profile for ${nwo}.\n-> reeve init`); process.exit(1); }
+    const logPath = resolve(opt("log") ?? join(HOME, "reeve.log"));
+    const declared = profile.worker?.isolation ?? "none";
+    console.log(`reeve canary  ${nwo}\n`);
+    console.log("running a throwaway worker under the policy this profile generates.");
+    console.log("this is a real model call and takes minutes. nothing is dispatched and nothing is published.\n");
+    const asked = { ...profile, worker: { ...(profile.worker ?? {}), isolation: "scratch-home" } };
+    const v = await measuredContainment({ dbPath: resolve(opt("db") ?? stateFor(nwo)), logPath, canaryStateDir: HOME }, asked, nwo, logPath);
+    const c = v.canary ?? {};
+    console.log(`\ncredentialRead : ${v.credentialRead}`);
+    console.log(`canary         : ${c.skipped ? "NOT RUN" : c.ok ? "PASSED" : "FAILED"}${c.id ? ` (${c.id})` : ""}`);
+    if (c.why) console.log(`                 ${c.why}`);
+    if (v.why && v.credentialRead !== "closed") console.log(`why            : ${v.why}`);
+    if (declared !== "scratch-home")
+      console.log(`\nthe profile declares worker.isolation: '${declared}', so the daemon still refuses to dispatch.\n-> set it to 'scratch-home' to act on this measurement`);
+    console.log(`\nrecorded for \`reeve doctor\` R-14 under ${HOME}`);
+    process.exit(v.credentialRead === "closed" ? 0 : 1);
+  }
+
   case "run":
   case "tick": {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
@@ -334,6 +370,9 @@ switch (cmd) {
   init                  detect this repo, preview a profile, then --write it
       --set k=v             answer a question detection could not settle
       --write               apply  (exit 0 no-op · 2 changed · 1 needs an answer)
+
+  canary [owner/repo]   measure the worker sandbox for real, without arming anything
+                        (a throwaway worker, minutes, a real model call; 0 closed · 1 open)
 
   status [owner/repo]   what is happening now  (--health measures clean-merge, --json)
   why <pr>              why reeve decided what it decided, newest first

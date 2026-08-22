@@ -14,6 +14,7 @@ import { checkBaseline } from "./baseline.mjs";
 import { sandboxFor } from "./sandbox.mjs";
 import { readCanaryState, policyHashOf } from "./canary.mjs";
 import { probeKeychain, isolationTopologyReady, binaryIdentity } from "./containment.mjs";
+import { readOauthToken } from "./workerenv.mjs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
@@ -384,11 +385,11 @@ function checkDetectors(db, profile) {
 
 // ── R-14 / R-15: worker containment ───────────────────────────────────────
 //
-// Both answer "may this host dispatch a worker under --execute": the daemon
-// refuses until the sandbox canary has passed under the CLI it would launch
-// AND the login keychain holds no GitHub credential. The doctor reports the
-// same two facts from the same sources, so that a refusal in the log can be
-// read here without the daemon.
+// Both answer "may this host dispatch a worker under --execute". The daemon
+// refuses until the sandbox canary has passed under the CLI it would launch and
+// the policy it would apply, and until the profile declares the isolation reeve
+// has actually built. The doctor reads the same facts from the same sources, so
+// a refusal in the log can be understood here without the daemon.
 
 /** The last sandbox canary this daemon recorded, if any. */
 export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now = () => Date.now(), identity = binaryIdentity, currentPolicyHash = null } = {}) {
@@ -426,34 +427,59 @@ export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now 
     "network, outside writes and credential-file reads denied; inside and tmp writes allowed"] };
 }
 
-/** GitHub credentials in the login keychain, and the isolation prerequisite.
- * An empty two-item probe is necessary but NOT sufficient: dispatch also needs
- * `worker.isolation: dedicated-user`, so doctor must not read OK while the
- * daemon necessarily refuses. (Codex #4b-[10].) */
-export function checkKeychain({ probe = probeKeychain, isolation = "none", topologyReady = isolationTopologyReady } = {}) {
+/**
+ * Can a worker reach the founder's credentials?
+ *
+ * The keychain used to BE this check, and used to gate dispatch: a worker ran
+ * with the founder's HOME, so it could ask securityd directly, and the OS
+ * sandbox cannot deny that (securityd is hard-allowed by the runtime's own
+ * profile). "The login keychain holds nothing reeve recognises" was the only
+ * proxy available, and it was a weak one -- the probe knows two item shapes and
+ * any client can store a token under a third.
+ *
+ * Workers now run with a scratch HOME. The keychain search list lives in the
+ * home directory, so a worker has no login keychain to ask, and the canary
+ * (R-14) measures that reach directly, per CLI build and per policy. Evidence
+ * about the worker beats a proxy about the host.
+ *
+ * So the keychain is REPORTED here, not gated on, and the gate is the one thing
+ * that still decides: whether the profile declares the isolation reeve built,
+ * and whether the worker has a credential of its own to run with.
+ */
+export function checkKeychain({ probe = probeKeychain, isolation = "none", topologyReady = isolationTopologyReady,
+                                token = readOauthToken } = {}) {
   const id = "R-15", title = "worker credential reach";
-  // The LABEL is necessary but not sufficient: the dedicated-user topology must
-  // actually be in place (PR-3). Until then an isolated-labelled profile is
-  // still DEGRADED, because the daemon necessarily refuses. (Codex #4d-[14].)
-  const isolated = isolation === "dedicated-user" && topologyReady();
+  // Only the arrangement reeve has actually built counts. "dedicated-user" is
+  // stronger, unbuilt, and refused by name rather than silently downgraded.
+  const isolated = isolation === "scratch-home" && topologyReady();
   const kc = probe();
-  if (!kc.measured) return { id, level: UNKNOWN, title, lines: [`unmeasured: ${kc.why}`, "an unmeasured keychain keeps dispatch refused"] };
-  if (kc.items.length) return { id, level: DEGRADED, title, lines: [
-    `the login keychain holds a GitHub credential a sandboxed worker could read: ${kc.items.join("; ")}`,
-    "the OS sandbox cannot deny the keychain (securityd is hard-allowed by the runtime's profile), so write-capable",
-    "worker dispatch under --execute stays REFUSED until this is closed; observation and review are unaffected",
-    "-> run workers as a dedicated user (closes this AND the shared-ref hole), or log gh in with --insecure-storage",
-    "   and delete the git osxkeychain internet-password item for github.com (closes the keychain only)",
-  ] };
-  // The probe found neither of the two conventional items, but that cannot
-  // certify a shared account, so an un-isolated profile is still DEGRADED.
+  const held = !kc.measured ? `the login keychain is unmeasured (${kc.why})`
+    : kc.items.length ? `the login keychain holds a GitHub credential: ${kc.items.join("; ")}`
+    : "no GitHub credential under the two conventional keychain items";
+
   if (!isolated) return { id, level: DEGRADED, title, lines: [
-    "no GitHub credential under the two conventional keychain items, but a shared account cannot be certified",
-    "(another client can store a token under a different service name), and a linked worktree shares the git dir",
-    "dispatch under --execute stays REFUSED until worker.isolation is 'dedicated-user'; observation is unaffected",
-    "-> run workers as a dedicated OS user with its own empty keychain and its own clone, then set worker.isolation",
+    `${held}, and the OS sandbox cannot deny the keychain (securityd is hard-allowed by the runtime's profile)`,
+    `worker.isolation is '${isolation ?? "none"}', so a worker would run with the founder's HOME and could ask for it`,
+    "dispatch under --execute stays REFUSED until that changes; observation and review are unaffected",
+    "-> set worker.isolation: 'scratch-home' in the profile, and the canary (R-14) then measures the reach per CLI build",
   ] };
-  return { id, level: OK, title, lines: ["no GitHub credential in the login keychain, and an isolated worker is declared; file credentials are deny-read by the sandbox"] };
+
+  // A scratch HOME also takes ~/.claude away, so the worker authenticates from a
+  // token instead. Without one every dispatch fails while preparing the worker
+  // and backs off -- a refusal that reads like a broken daemon rather than a
+  // missing file, which is exactly the state this command exists to name.
+  const tk = token();
+  if (!tk.ok) return { id, level: DEGRADED, title, lines: [
+    `${held} — and a worker cannot read it: its HOME is reeve's own scratch directory`,
+    `but it has no credential of its own to run with: ${tk.why}`,
+    "every dispatch under --execute would fail while preparing the worker; observation and review are unaffected",
+    "-> run `claude setup-token` and write the token to ~/.reeve/claude-token, mode 600",
+  ] };
+
+  return { id, level: OK, title, lines: [
+    `${held} — and a worker cannot read it: its HOME is reeve's own scratch directory, so no login keychain is in its search list`,
+    "it authenticates from a token of its own instead, and R-14 re-measures that reach per CLI build and policy",
+  ] };
 }
 
 /**
@@ -472,8 +498,13 @@ function currentPolicy(profile, { read = readCanaryState, stateDir = null, nwo =
     // profile as it is now. Overwriting the whole denyRead with the record would
     // have hidden exactly those profile changes. (Codex #4g-[3].)
     if (!Array.isArray(st?.stateRoots) || !st?.canaryDir) return null;
-    const block = sandboxFor({ profile, action: "FIX_CI", worktree: st.canaryDir, tmpDir: "<tmp>", stateRoots: st.stateRoots }).settings.sandbox;
-    return policyHashOf(block, st.canaryDir);
+    const policy = sandboxFor({ profile, action: "FIX_CI", worktree: st.canaryDir, tmpDir: "<tmp>", stateRoots: st.stateRoots });
+    // The permission rules and the tool grant are half the boundary: the file
+    // tools are governed by them alone. A hash over the sandbox block only would
+    // call a policy whose rules match nothing identical to one whose rules work,
+    // and keep reporting OK from a record taken before the difference.
+    return policyHashOf(policy.settings.sandbox, st.canaryDir,
+                        { permissionsDeny: policy.settings.permissions.deny, allowedTools: policy.allowedTools });
   } catch { return null; }
 }
 

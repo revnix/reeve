@@ -15,7 +15,7 @@
 // a write to the run's own tmp), so an absent file means "denied", not
 // "the script never ran".
 import { runWorker, workerArgs } from "./supervisor.mjs";
-import { validateSettings } from "./sandbox.mjs";
+import { validateSettings, ruleFor, scopedFileTools } from "./sandbox.mjs";
 import { createHash } from "node:crypto";
 import { createServer, connect } from "node:net";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -35,9 +35,41 @@ const canonical = v => {
  * paths normalised out. The write grant is the run's own tmp, which differs on
  * every run and says nothing about what the sandbox denies.
  */
-export function canaryIdFor({ cliVersion, sandbox, binaryId = null, worktree = null }) {
+export function canaryIdFor({ cliVersion, sandbox, binaryId = null, worktree = null, permissionsDeny = null, allowedTools = null,
+                              script = null }) {
   if (!cliVersion || !sandbox) throw new Error("canaryIdFor: cliVersion and the sandbox block are required");
-  return createHash("sha256").update(`${cliVersion}\n${binaryId ?? "?"}\n${canonical(normalisePolicy(sandbox, worktree))}`).digest("hex").slice(0, 16);
+  // The SCRIPT is part of the identity too, because it is the instrument. A
+  // record made before a probe existed describes a weaker measurement than the
+  // one being asked for now, and reusing it is how the by-path keychain reach
+  // stayed unmeasured while a passing record said containment was closed.
+  // Per-invocation paths inside it (the decoy, the tmp dir) normalise out, or
+  // every tick would pay for another five-minute canary.
+  const instrument = script ? createHash("sha256").update(canonical(normaliseRules(String(script).split("\n"), worktree))).digest("hex").slice(0, 12) : "?";
+  return createHash("sha256").update(
+    `${cliVersion}\n${binaryId ?? "?"}\n${canonical(normalisePolicy(sandbox, worktree))}\n${canonical(normaliseRules(permissionsDeny, worktree))}\n${canonical(normaliseRules(allowedTools, worktree))}\n${instrument}`,
+  ).digest("hex").slice(0, 16);
+}
+
+/**
+ * The permission rules, with per-invocation paths replaced the same way the
+ * sandbox block's are.
+ *
+ * These belong in the id because they are a SEPARATE boundary, not a description
+ * of the sandbox one: the file tools are governed by permissions alone, since
+ * the CLI's own process runs outside the Seatbelt profile it applies to the
+ * shells it spawns. A canary that ignored them would call a policy with a
+ * working permission layer identical to one whose rules matched nothing, and
+ * reuse the pass. That is not hypothetical — it is exactly the pair of policies
+ * this repository had on 2026-08-22, and their ids were equal.
+ *
+ * A rule names the same path in the permission spelling (a second leading
+ * slash), so both are rebased.
+ */
+function normaliseRules(rules, worktree = null) {
+  const list = typeof rules === "string" ? rules.split(",") : Array.isArray(rules) ? rules : [];
+  if (!worktree) return [...list].sort();
+  const rebase = t => t.split(`/${worktree}`).join("/<worktree>").split(worktree).join("<worktree>");
+  return list.map(rebase).sort();
 }
 
 /**
@@ -65,8 +97,10 @@ function normalisePolicy(sandbox, worktree = null) {
  * can recompute today's policy from the profile and say whether the record still
  * describes it. (Codex #4f-[5].)
  */
-export function policyHashOf(sandbox, worktree = null) {
-  return createHash("sha256").update(canonical(normalisePolicy(sandbox, worktree))).digest("hex").slice(0, 16);
+export function policyHashOf(sandbox, worktree = null, { permissionsDeny = null, allowedTools = null } = {}) {
+  return createHash("sha256").update(
+    `${canonical(normalisePolicy(sandbox, worktree))}\n${canonical(normaliseRules(permissionsDeny, worktree))}\n${canonical(normaliseRules(allowedTools, worktree))}`,
+  ).digest("hex").slice(0, 16);
 }
 
 /** `~/x` as the runtime expands it: against the real home, never the worker's cwd. */
@@ -81,7 +115,8 @@ export const CANARY_SENTINEL = "REEVE-CANARY-SENTINEL-DO-NOT-LEAK";
  * daemon can stat afterwards; exit codes are recorded as well but are not
  * what decides.
  */
-export function canaryScript({ tmpDir, outsideDir, decoyPath, netUrl = null, fileDecoyPath = null, fileControlPath = null }) {
+export function canaryScript({ tmpDir, outsideDir, decoyPath, netUrl = null, fileDecoyPath = null, fileControlPath = null,
+                               loginKeychain = join(homedir(), "Library", "Keychains", "login.keychain-db") }) {
   return `#!/bin/sh
 # reeve sandbox canary: leaves files for the daemon to read; records exit codes beside them
 out="./canary-results.txt"; : > "$out" || exit 97
@@ -92,6 +127,25 @@ touch ${JSON.stringify(join(outsideDir, "OUTSIDE"))}; rec outside $?
 curl -sS -m 5 https://example.com -o ./curl-body 2>/dev/null; rec curl $?
 ${netUrl ? `curl -sS -m 5 ${JSON.stringify(netUrl)} -o ./probe-body 2>/dev/null; rec probe $?` : ""}
 cp ${JSON.stringify(decoyPath)} ./decoy-copy 2>/dev/null; rec decoy $?
+# The KEYCHAIN. Absolute paths on purpose, because the refusing shims on the
+# worker's PATH are a layer, not a boundary.
+#
+# The first three ask the SEARCH LIST, which a scratch HOME empties. That is what
+# a scratch home does, and on its own it proves nothing: measured 2026-08-22, the
+# founder's login keychain is still readable BY PATH from a scratch home, as the
+# same OS user, because it is unlocked with no timeout. The last two name it, and
+# they are the probes that decide.
+/usr/bin/security find-internet-password -s github.com >/dev/null 2>&1; rec kc_github $?
+/usr/bin/security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; rec kc_claude $?
+printf 'protocol=https\nhost=github.com\n\n' | git -c credential.helper=osxkeychain credential fill 2>/dev/null | grep -q '^password='; rec kc_helper $?
+/usr/bin/security find-internet-password -s github.com ${JSON.stringify(loginKeychain)} >/dev/null 2>&1; rec kc_path_github $?
+/usr/bin/security find-generic-password -s "Claude Code-credentials" ${JSON.stringify(loginKeychain)} >/dev/null 2>&1; rec kc_path_claude $?
+# The probe that DECIDES, because the two above cannot: find-*-password answers
+# 44 both when access is denied and when the item simply is not there, so on a
+# host without those exact records they would report a closure that does not
+# exist. show-keychain-info asks about the KEYCHAIN rather than an item, and
+# distinguishes them: measured 2026-08-22, 0 when reachable and 161 when denied.
+/usr/bin/security show-keychain-info ${JSON.stringify(loginKeychain)} >/dev/null 2>&1; rec kc_path_open $?
 ${fileDecoyPath ? `cp ${JSON.stringify(fileDecoyPath)} ./filedecoy-copy 2>/dev/null; rec filedecoy $?` : ""}
 ${fileControlPath ? `cp ${JSON.stringify(fileControlPath)} ./filecontrol-copy 2>/dev/null; rec filecontrol $?` : ""}
 ln -sf ${JSON.stringify(decoyPath)} ./decoy-link 2>/dev/null; cp ./decoy-link ./decoy-copy2 2>/dev/null; rec symlink $?
@@ -170,7 +224,10 @@ function parseResults(path) {
   if (!existsSync(path)) return null;
   const out = {};
   for (const line of readFileSync(path, "utf8").split("\n")) {
-    const m = /^([a-z]+)=(-?\d+)$/.exec(line.trim());
+    // `[a-z_]`, not `[a-z]`: the keychain probes are named kc_github and friends,
+    // and a name-only regex silently dropped them — which read as "the probes did
+    // not run" and would have failed every real canary.
+    const m = /^([a-z_]+)=(-?\d+)$/.exec(line.trim());
     if (m) out[m[1]] = Number(m[2]);
   }
   return out;
@@ -204,8 +261,41 @@ export const isPolicyRefusal = text => REFUSAL.test(String(text ?? ""));
  * the worker said afterwards, and a missing results file is a failure
  * whatever the worker said.
  */
+/**
+ * The canary's own tool grant, and it is deliberately WIDER than production's.
+ *
+ * A production worker gets the file tools scoped to its checkout, so a read of
+ * the decoy is refused because nothing grants it -- which would make the canary
+ * pass while saying nothing about the deny list behind it. A defence in depth
+ * that hides whether the layer under it works is not evidence.
+ *
+ * So the canary grants EXACTLY what it is trying to read and write: the decoy by
+ * name, and the outside directory. The only thing left that can refuse them is
+ * the deny list, which is the thing under test. Measured 2026-08-22: a deny in
+ * the right form refuses even a bare grant, and in the wrong form refuses
+ * nothing (docs/measured/2026-08-22-the-read-deny-list-was-inert.md).
+ */
+function canaryGrant(dir, decoyPath) {
+  return ["Bash(sh ./canary.sh:*)",
+          // Production's shape, from production's own builder: it resolves the
+          // path before writing it into a rule, and a hand-rolled copy here
+          // would drift from it exactly where drift is invisible. macOS puts
+          // temporary directories behind /var -> /private/var, and the CLI
+          // checks the resolved path, so an unresolved scope matches nothing and
+          // the canary would fail its own write control for the wrong reason.
+          ...scopedFileTools(["Read", "Write"], dir),
+          // And the adversary the deny list must beat: the decoy, granted BY NAME.
+          // Nothing but the deny can refuse this read, which is the point.
+          //
+          // The write probe is deliberately NOT granted its target. Its boundary
+          // IS the scope above -- there is no deny list entry for "everywhere
+          // else", and there should not be one: an enumeration would protect the
+          // paths it named and invite the belief that they were the boundary.
+          `Read(${ruleFor(decoyPath)})`];
+}
+
 export async function sandboxCanary({
-  cliVersion, sandbox, permissionsDeny = [], binaryId = null,
+  cliVersion, sandbox, permissionsDeny = [], allowedTools = null, binaryId = null,
   dir, outsideDir, tmpDir, decoyPath,
   bin, env,
   runner = runWorker, budgetMs = 5 * 60_000, maxOutputBytes = 8 * 1024 * 1024,
@@ -217,7 +307,6 @@ export async function sandboxCanary({
   // external endpoint, no timing window.
   netProbe = null,
 }) {
-  const id = canaryIdFor({ cliVersion, sandbox, binaryId, worktree: dir });
   const outsideToolPath = join(outsideDir, "TOOL-OUTSIDE");
   // Production denies whole DIRECTORIES (~/.ssh) and individual FILES (the log,
   // the database, ~/.gitconfig, notify.credentialFile). The subtree decoy proves
@@ -226,6 +315,17 @@ export async function sandboxCanary({
   // denies while regressing exact-file matching cannot pass. (Codex #4g-[6].)
   const fileDecoyPath = join(outsideDir, "FILE-DECOY.txt");
   const fileControlPath = join(outsideDir, "FILE-CONTROL.txt");
+  // The listener's URL is not known until it is ready, and the script embeds it.
+  // Awaited HERE rather than lower down, because the script is built next: with
+  // the await after it, `netUrl` was null, the network control never made it
+  // into the script, and the canary failed on its own missing probe. Caught by a
+  // live run within a minute of the change.
+  if (netProbe?.ready) { try { await netProbe.ready; } catch { /* selfReachable will report it */ } }
+  // Built BEFORE the id, because the script is the instrument and its identity
+  // belongs in the id: a record made before a probe existed describes a weaker
+  // measurement than the one being asked for now.
+  const scriptText = canaryScript({ tmpDir, outsideDir, decoyPath, netUrl: netProbe?.url ?? null, fileDecoyPath, fileControlPath });
+  const id = canaryIdFor({ cliVersion, sandbox, binaryId, worktree: dir, permissionsDeny, allowedTools, script: scriptText });
   const evidence = { id, cliVersion, dir, outcome: null, why: null, results: null, readTool: null, writeTool: null, network: null };
   const fail = why => ({ ok: false, id, why, evidence });
 
@@ -251,8 +351,6 @@ export async function sandboxCanary({
   writeFileSync(decoyPath, `${CANARY_SENTINEL}\nreeve canary decoy: not a secret\n`);
   writeFileSync(fileDecoyPath, `${CANARY_SENTINEL}\nreeve canary file decoy: not a secret\n`);
   writeFileSync(fileControlPath, "reeve canary control: readable on purpose\n");
-  if (netProbe?.ready) { try { await netProbe.ready; } catch { /* selfReachable will report it */ } }
-  const scriptText = canaryScript({ tmpDir, outsideDir, decoyPath, netUrl: netProbe?.url ?? null, fileDecoyPath, fileControlPath });
   writeFileSync(join(dir, "canary.sh"), scriptText);
   const scriptHash = createHash("sha256").update(scriptText).digest("hex");
 
@@ -264,7 +362,7 @@ export async function sandboxCanary({
     // a boundary the OS sandbox does not cover.
     // Write is granted for the probes, and DENIED on the probe script itself: the
     // canary's own instrument must not be rewritable by the thing it measures.
-    permissions: { allow: ["Bash(sh ./canary.sh:*)", "Read", "Write"], deny: [...permissionsDeny, "Write(./canary.sh)", "Edit(./canary.sh)"], additionalDirectories: [] },
+    permissions: { allow: [...canaryGrant(dir, decoyPath)], deny: [...permissionsDeny, "Write(./canary.sh)", "Edit(./canary.sh)"], additionalDirectories: [] },
     sandbox: { ...sandbox, filesystem: { ...(sandbox.filesystem ?? {}), allowWrite: [tmpDir], allowRead: [tmpDir],
       // The exact-file deny under test. Its neighbour is deliberately NOT denied.
       denyRead: [...(sandbox.filesystem?.denyRead ?? []), fileDecoyPath] } },
@@ -282,7 +380,9 @@ export async function sandboxCanary({
   let r;
   try {
     r = await runner({
-      bin, args: workerArgs({ prompt: canaryPromptFor(decoyPath, outsideToolPath), allowedTools: "Bash(sh ./canary.sh:*),Read,Write", settings: settingsPath, maxTurns: 8 }),
+      bin, args: workerArgs({ prompt: canaryPromptFor(decoyPath, outsideToolPath),
+                              allowedTools: canaryGrant(dir, decoyPath).join(","),
+                              settings: settingsPath, maxTurns: 8 }),
       cwd: dir, env, outPath: join(dir, "canary.out"), errPath: join(dir, "canary.err"),
       maxOutputBytes, budgetMs, isHalted: () => false,
     });
@@ -338,6 +438,32 @@ export async function sandboxCanary({
       if (results.filecontrol !== 0) problems.push("control: a file that is NOT denied was unreadable, so the exact-file result proves nothing");
     }
     if (existsSync(join(dir, "decoy-copy2")) || results.symlink === 0 || decoyContains(join(dir, "decoy-copy2"))) problems.push("read a deny-read file through a symlink");
+    // The keychain is the boundary the OS sandbox cannot enforce, so it is the
+    // one the canary must prove: with a scratch HOME the founder's login
+    // keychain is not in the worker's search list and every probe fails. A
+    // SUCCESS here means a worker can read the founder's credentials.
+    if (!("kc_github" in results) || !("kc_claude" in results) || !("kc_helper" in results))
+      problems.push("the keychain probes did not run, so credential reach is unproven");
+    else {
+      if (results.kc_github === 0) problems.push("read the founder's GitHub credential from the keychain");
+      if (results.kc_claude === 0) problems.push("read the founder's Claude credentials from the keychain");
+      if (results.kc_helper === 0) problems.push("git's keychain helper returned a credential");
+    }
+    // The probes that decide. A scratch HOME empties the search LIST, which the
+    // three above measure; naming the keychain file walks around that entirely,
+    // and did, until the path joined the deny list. Absent probes are a refusal:
+    // a canary that did not run them proves nothing about the reach they cover.
+    if (!("kc_path_open" in results) || !("kc_path_github" in results) || !("kc_path_claude" in results))
+      problems.push("the keychain was not probed by path, so the reach a scratch HOME does NOT close is unproven");
+    else {
+      // The deciding probe. The two item probes below corroborate it and cannot
+      // replace it: they answer 44 for a denied keychain AND for a keychain that
+      // simply does not hold that record, so on a host without those exact items
+      // they would certify a closure that was never measured. (Codex #5-[10].)
+      if (results.kc_path_open === 0) problems.push("the founder's login keychain is REACHABLE by path");
+      if (results.kc_path_github === 0) problems.push("read the founder's GitHub credential from the login keychain BY PATH");
+      if (results.kc_path_claude === 0) problems.push("read the founder's Claude credentials from the login keychain BY PATH");
+    }
   }
   // The Write TOOL outside the canary's directory: the file must not exist, and
   // the stream must show the attempt being refused.

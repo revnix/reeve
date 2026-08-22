@@ -201,13 +201,92 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       clone). Building that topology is **PR-3**; do not set the flag before it
       lands, and expect the first acquire after it to quarantine any worktree
       with no recorded config baseline (self-healing, once).
-- [ ] **PR-3 (S1 close-out): the dedicated-user dispatch topology.** The only
-      thing that closes containment: a separate OS user for workers (its own
-      empty keychain) and a per-run STANDALONE clone (its own git dir, which
-      also closes the shared-ref and shared-config holes). Ships with a real
-      `isolationTopologyReady()` (euid differs from the checkout owner; the
-      worktree is a standalone clone), replacing today's hard-false. Only after
-      it lands may `worker.isolation: dedicated-user` be set.
+- [x] ~~**PR-3: the dedicated-user dispatch topology.**~~ SUPERSEDED 2026-08-22
+      by the founder's ruling ("I'm not going to make another user"). The
+      closure it existed for was found elsewhere: the keychain is reached
+      THROUGH `HOME`, so a scratch home closes it without a second OS account.
+      `worker.isolation: dedicated-user` stays in the schema and is refused by
+      name rather than silently downgraded to the weaker thing that is built.
+
+- [ ] **PR-3 (S1 close-out): standalone checkouts + the scratch-HOME closure.**
+      IN FLIGHT on `feat/s1-standalone-clones`. Landed so far:
+      · **standalone clone per run** instead of a linked worktree — its own ref
+        store and config, so the shared-ref and shared-config holes close by
+        construction (measured: clone 2.4s/251MB; deps copy-on-write 15s/**31MB**
+        real vs 1.2GB apparent). The founder's uncommitted work and ignored files
+        never reach a worker; the work leaves by fetch into reeve's own
+        repository, so the worker still never publishes.
+      · **the keychain closure**: measured that the keychain is reached THROUGH
+        HOME, so workers get a scratch HOME and authenticate from
+        `CLAUDE_CODE_OAUTH_TOKEN` (`~/.reeve/claude-token`, 0600, inside the
+        deny-read tree). `workerEnv` REFUSES the founder's home and a missing
+        token. The founder's keychain is UNTOUCHED and still holds their GitHub
+        credential — and a worker cannot read it, which the escape test asserts
+        explicitly rather than tautologically.
+      · **the gate moved from a proxy to a measurement**: containment no longer
+        requires the host keychain to look empty (a probe of two known item
+        shapes). The CANARY measures the worker's actual reach — three keychain
+        probes whose success fails it — and that is what decides. `worker.isolation`
+        gains `scratch-home` (the built arrangement); `dedicated-user` is stronger,
+        unbuilt, and refused with that reason rather than silently downgraded.
+      · a dependency gap nobody had noticed: there was NO install step in the
+        dispatch path, so with the network denied a fixer could never run the
+        project's tests — it could not check its own fix.
+      Two bugs this introduced, both caught before shipping: every `~/...` deny
+      expanded against the WORKER's home (a scratch home would have silently
+      disabled the whole file deny list — the escape test caught it), and the
+      canary's results parser matched `[a-z]+`, dropping `kc_github` and friends,
+      which would have failed every real canary.
+      · **the dead worktree lifecycle removed** (`0be4703`). acquire / verify /
+        release / push and the daemon's `resolveWorktree` had no caller, but
+        their tests still passed, which reads as coverage of the path dispatch
+        takes. What survives is about git rather than worktrees, so the module is
+        `src/gitguard.mjs` now. `verifyConfig` also stopped exempting the keys
+        reeve writes itself: that allowance existed for re-hardening a reused
+        worktree, and a run checkout is never re-hardened, so it could only ever
+        have let a worker overwrite the two keys set to stop it publishing.
+      · **a preparation failure is no longer reported as tampering** (`0fbcc82`).
+        Preparation moved inside the dispatch try-block, so a failure left the
+        checkout path null; the config check read that as "no recorded
+        configuration" and accused a worker that never started, on the most
+        ordinary failure there is. Found by writing the test the removal needed.
+      · **R-15 says what actually gates dispatch** (`756008e`). It still
+        described the keychain as refusing dispatch and advised deleting the
+        credential or making a dedicated user. It now reports the keychain and
+        gates on the isolation declared AND on the worker having a token of its
+        own — without which every dispatch fails while preparing and backs off.
+      · **the founder's clone is deny-read** (`24f7eed`). The run checkout
+        carries only committed content, so their uncommitted work and ignored
+        files are not IN it — which is not the same as out of reach. MEASURED:
+        a sandboxed worker read an uncommitted file and a `.env` straight out of
+        the founder's checkout, because the sandbox denies writes outside the
+        checkout, not reads
+        (`docs/measured/2026-08-22-the-founders-checkout-was-readable.md`).
+        `identity.checkout` now joins the denied reads and the validator requires
+        it. Three fixtures had checkout == worktreeRoot and the overlap guard
+        duly refused them.
+      · **`reeve canary`** (`ca861da`): measure the boundary on demand without
+        arming anything. The measurement is what should decide whether to arm, so
+        it must be available before --execute, not only after.
+      · **the first live canary ever run, and it FAILED** (`69a8c8f` + `d49a807`).
+        Every shell probe held; the Read TOOL returned a decoy the `cp` beside it
+        could not. The file tools are governed by permissions ALONE — the CLI's
+        own process runs outside the Seatbelt profile it applies to the shells it
+        spawns — and an absolute path in a permission rule takes effect only with
+        TWO leading slashes. This branch shipped one, so every absolute Read deny
+        matched nothing: `~/.ssh`, `~/.gitconfig`, `~/.claude`, `~/.config/gh`,
+        `~/.aws`, reeve's own `~/.reeve` with the App key and the event store.
+        `main` is NOT exposed (tilde form + the founder's HOME). Fixed, plus:
+        the file tools are scoped to the checkout instead of granted bare, and
+        `validateToolGrant` refuses a bare grant before spawn.
+      · **the canary id did not cover the permission layer.** The re-run passed
+        under the SAME id as the failure, so a pass either side of the fix would
+        have been reused across it and R-14 would have reported OK through the
+        change. `canaryIdFor` and `policyHashOf` now cover `permissions.deny` and
+        the tool grant.
+      · **`reeve canary` PASSED live** (`942565ecf154b3ed`, 2026-08-22):
+        `credentialRead: closed`, and **doctor R-14 is OK for the first time**.
+      REMAINING: the PR itself, its Codex rounds, and the founder's merge grant.
 
 - [ ] **Guardian: the review shadow week RESET on 2026-08-22.** `#1134` diverged
       — `resolved differs: live 13, derived 18` (55 comparisons, 52 agreements;
@@ -226,7 +305,7 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
 
 ### Known constraints the design must answer (from measurements so far)
 
-- Codex refused **79%** of review requests this week (doctor R-05, 21 Aug) —
+- Codex refused **57%** of review requests (doctor R-05, 22 Aug; 79% on 21 Aug) —
   the gate's "Codex GO" arm will often be absent; the rule table already refuses
   to treat silence as approval.
 - The App reaches **one repo** (nextlyhq/nextly). Spec-PR host and builder-PR
@@ -242,6 +321,10 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
 
 | Date | Defect | Fix |
 |---|---|---|
+| 2026-08-22 | **PR-3 Codex round 1, 6 findings, 5 genuine P1.** The one that matters most: **a scratch HOME does not close the keychain** — it empties the keychain SEARCH LIST. Measured: `security find-internet-password -s github.com <login.keychain-db>` returns **0 (FOUND)** from a scratch home, because the file does not move, is unlocked with no timeout, and the worker runs as the same OS user. Every probe reeve had asked the search list, so nothing could see it — **including the canary, which had certified containment on that basis and PASSED**. Also: `git clone --branch <b>` asks the source for a LOCAL head and a PR branch exists only as `origin/<b>`, so **every ordinary dispatch would have failed at the first step** (every fixture created the branch locally first); a finished worker that never committed had its work **deleted** while the log said it was published, because a push carries commits and `changedFiles` counts uncommitted paths; the worker's OAuth token can be written into an ordinary source file that the filename-only diff gate passes and reeve then pushes; dependencies were hard-coded to `node_modules` while every worker got an empty scratch HOME, so python/go/rust checks could not resolve anything; and (P2) the per-invocation canary tree was built before the cache lookup, leaking a directory per tick under a cached pass | `~/Library/Keychains` denied by path (measured with a positive control: 44 under the deny, 0 without) and the canary probes BOTH shapes and refuses to pass if the by-path probes are absent; plain clone plus an explicit remote-tracking refspec; dispatch refuses to publish or release a checkout with uncommitted work, and `publishRunWork` refuses when the fetched head equals the remote head; the diff is scanned for reeve's own token before publishing (a literal match, and the code says so); dependency trees come from the profile's languages with `worker.dependencyPaths` overriding and the unsupported case LOGGED; cached/skipped canary results marked and the tree removed unless the canary holds it for evidence |
+| 2026-08-22 | The FIRST live canary failed, and was right to. The file tools (Read/Edit/Write/Grep/Glob) are governed by `permissions.*` alone — the CLI's own process runs outside the Seatbelt profile it applies to the shells it spawns — and a permission rule takes an absolute path only with TWO leading slashes. This branch shipped one slash, so every absolute Read deny matched nothing: `~/.ssh`, `~/.gitconfig`, `~/.claude`, `~/.config/gh`, `~/.aws`, `~/.reeve` (App key, event store, every run's output), the state roots and the founder's checkout. In one run `cp <decoy> .` was refused while `Read(<decoy>)` returned it. Nothing else could have caught it: the escape test drives the OS sandbox through `srt`, which is the layer that held, and there is no CLI in it. `--allowedTools` also granted the file tools BARE, which grants them wherever the deny list does not name. And the canary id covered only the sandbox block, so the re-run passed under the SAME id as the failure — a pass either side of the fix would have been reused across it | `ruleFor` emits the `//` form for permission rules while the OS layer keeps the plain one; `validateSettings` refuses a single-slash absolute rule; the file tools are scoped to the checkout in BOTH forms (creating a file is checked against the directory) with the path resolved first (`/var` → `/private/var`); `validateToolGrant` before spawn and `scopeGrant` for a prompt's own tool list; `canaryIdFor`/`policyHashOf` cover `permissions.deny` and the grant; the canary now takes production's scope AND grants the decoy by name, so only the deny can refuse it |
+| 2026-08-22 | A sandboxed worker could READ the founder's checkout — uncommitted work and ignored files, a `.env` among them. The standalone clone keeps them out of the worker's checkout, which is not the same as out of reach: the sandbox denies writes outside the checkout, not reads | `identity.checkout` joins the denied reads and the validator requires it; three fixtures that set checkout == worktreeRoot were separated, the overlap guard having correctly refused them |
+| 2026-08-22 | A failed checkout preparation was reported as the worker tampering with git config. Preparation moved inside the dispatch try-block, so a failure left the path null and the config check read that as "no recorded configuration" — accusing a worker that never started, on the most ordinary failure there is | `if (!worktree) continue` before the config check; the case lives in dispatch-e2e with a precondition asserting dispatch was reached |
 | 2026-08-22 | PR-2 Codex round 8, 3 genuine (2×P1), all follow-ups on round 7's own fixes: the id normalisation was applied inside `sandboxCanary` but the CACHE key in `measureContainment` was still computed without the worktree, so the cache still never hit and every tick still paid a five-minute canary; the tamper cleanup ran `--unset-all` on a key the worker CHANGED rather than added, so tampering with `remote.origin.url` would have deleted the clone's real origin and left the main checkout unable to fetch or push; and the spawn-time refusal refunded the fix attempt while the pre-execution handler refunded it again, taking a cause from two spent attempts to zero and handing back retries the cap had spent | `worktree` threaded into the cache key; `restoreConfig` puts recorded values back (removing only keys the worker ADDED); the refund left solely to the `finally` handler |
 | 2026-08-22 | flake-dispatch and worker-contract asserted dispatch while `capacity()` reads the HOST load average — the same fragility fixed in dispatch-e2e last round, in two tests I had not covered; they passed only because the machine was quiet, and failed as soon as my own test runs loaded it | the `ctx.capacity` seam injected in both; all three dispatch tests proven green under 14 CPU burners |
 | 2026-08-22 | PR-2 Codex round 7, 6 genuine (4×P1), each a follow-up on round 6's own fixes. Reproduced by the reviewer: a worktree PRESERVED for tampering was re-acquired on the next tick, and `verifyWorktree`'s `git status` ran BEFORE any config check — a worker-added `.gitattributes` plus `filter.<name>.clean` (a shape `-c` cannot reach) executes as the daemon user. Also: a relative `--db` was opened fine but protected by nothing; the doctor overwrote today's generated `denyRead` with the RECORDED one, so a changed `risk.quarantinePaths` or `notify.credentialFile` left the hash equal and R-14 kept saying OK; `credentialPaths()` re-adds a non-default `REEVE_HOME`, so a layout with worktrees inside it denies the worker its own checkout and containment can never close; quarantine denies are rooted at the canary's per-invocation dir, so the canary id changed every tick and the cache never hit (a 5-minute model call per tick); and the canary only ever exercised DIRECTORY denies while production also relies on exact-FILE denies (the log, the database, ~/.gitconfig, the notify credential) | config verified BEFORE any git command on re-acquire, quarantine by rename with the offending keys stripped from the clone and `worktree prune` (my own test caught that renaming alone strands the branch forever); the check is key-aware, so reeve's own keys moving is a re-harden and anything else is tampering; `resolve()` on `--db`; the record keeps only the non-reconstructable state roots and doctor regenerates the rest from the profile; an overlapping state/worktree layout is named and refused; `normalisePolicy` rebases worktree-derived denies; and an exact-file decoy WITH a readable neighbour as its control, measured to hold under the real Seatbelt sandbox |

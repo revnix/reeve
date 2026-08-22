@@ -19,16 +19,24 @@
 // proof under the runtime, and both read files, never a worker's word.
 //
 // Never print what a credential probe returns: presence is the only thing read.
-import { acquireWorktree } from "../src/worktree.mjs";
+import { REFUSING_HOOK } from "../src/gitguard.mjs";
 import { workerEnv, writeGitConfig, CONTAINMENT } from "../src/workerenv.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { probeKeychain } from "../src/containment.mjs";
 import { netListener } from "../src/canary.mjs";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+
+// A worker never gets the founder's HOME (that is where the keychain lives) and
+// authenticates from a token instead of ~/.claude.
+const WORKER_HOME = mkdtempSync(join(tmpdir(), "reeve-worker-home-"));
+// The founder's login keychain, by path. A scratch HOME empties the search LIST
+// and leaves this file exactly where it was, readable by the same OS user.
+const LOGIN_KEYCHAIN = join(homedir(), "Library", "Keychains", "login.keychain-db");
+const FAKE_TOKEN = "sk-ant-oat01-test-token-not-a-real-credential-000000000000";
 
 let fail = 0, skipped = 0;
 const check = (ok, name, detail) => {
@@ -53,15 +61,38 @@ git(clone, "push", "-q", "origin", "HEAD:main");
 git(clone, "checkout", "-q", "-b", "feature"); git(clone, "push", "-q", "origin", "feature");
 const head = git(clone, "rev-parse", "HEAD");
 git(clone, "checkout", "-q", "main");   // the clone keeps main; the worker's worktree takes the branch
-const wt = acquireWorktree({ repoRoot: clone, root: join(root, "wts"), pr: 1, branch: "feature", head });
-check(wt.ok, "control: a worker worktree exists", JSON.stringify(wt));
+// The LINKED worktree below is built here rather than by production code: reeve
+// no longer makes them, and the point of keeping the shape is to compare it with
+// the standalone clone that replaced it. Both hardening layers it used to carry
+// are reproduced, because two assertions measure what they stop.
+const makeLinkedWorktree = () => {
+  const path = join(root, "wts", "pr-1");
+  mkdirSync(dirname(path), { recursive: true });
+  git(clone, "worktree", "add", "--force", "-B", "feature", path, "origin/feature");
+  git(clone, "config", "extensions.worktreeConfig", "true");
+  git(path, "config", "--worktree", "remote.origin.pushurl", "reeve://refused-the-worker-does-not-publish");
+  const hooks = `${path}.hooks`;
+  mkdirSync(hooks, { recursive: true });
+  writeFileSync(join(hooks, "pre-push"), REFUSING_HOOK, { mode: 0o755 });
+  chmodSync(join(hooks, "pre-push"), 0o755);
+  git(path, "config", "--worktree", "core.hooksPath", hooks);
+  return { ok: existsSync(join(path, ".git")) && existsSync(join(hooks, "pre-push")), path };
+};
+const wt = makeLinkedWorktree();
+check(wt.ok, "control: a worker worktree exists, with both layers reeve used to give it", JSON.stringify(wt));
 writeFileSync(join(wt.path, "change.txt"), "from the worker\n");
 git(wt.path, "add", "-A"); git(wt.path, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-q", "-m", "worker change");
+// The founder's uncommitted work and an ignored secret, in the checkout a run
+// clone is made FROM. The clone carries neither, by construction -- but the
+// original files are still on this disk, and the probe below is what says
+// whether a worker can walk to them.
+const founderWip = join(clone, "WIP.txt"); writeFileSync(founderWip, "the founder unfinished work\n");
+const founderEnv = join(clone, ".env"); writeFileSync(founderEnv, "SECRET=hunter2\n");
 const dest = join(root, "dest.git"); git(root, "init", "--bare", "-q", dest);
 const standalone = join(root, "standalone"); git(root, "clone", "-q", origin, standalone); git(standalone, "checkout", "-q", "feature");
 
 const tmpDir = join(root, "tmp"); mkdirSync(tmpDir, { recursive: true });
-const env = workerEnv({ gitConfigPath: writeGitConfig(join(root, "git")), tmpDir, bgWaitMs: 1 });
+const env = workerEnv({ home: WORKER_HOME, oauthToken: FAKE_TOKEN, gitConfigPath: writeGitConfig(join(root, "git")), tmpDir, bgWaitMs: 1 });
 const refsAt = bare => git(bare, "for-each-ref", "--format=%(refname)");
 const push = (args) => sh(wt.path, "git", args, env);
 
@@ -106,12 +137,20 @@ if (process.platform !== "darwin") {
   // The block every worker gets, turned into the runtime's own settings
   // shape. The CLI adds cwd to the write scope implicitly; srt adds nothing,
   // so cwd (and, where noted, what the CLI was measured to add) is listed.
-  const policy = sandboxFor({ profile: { units: [] }, action: "FIX_CI", worktree: wt.path, tmpDir }).settings.sandbox;
-  const settingsFor = (cwd, extraWrite = []) => {
+  // Two policies, from the real generator. The LINKED one is built from a
+  // profile that names no clone, because that is the arrangement it documents:
+  // reeve had no source-checkout deny then, and adding one here would make the
+  // shared-ref shape look closed for a reason that did not exist. The STANDALONE
+  // one names the clone, so its denyRead is generated rather than hand-written
+  // -- the assertions below then measure the generator AND the OS together.
+  const policyFor = (profile, worktree) => sandboxFor({ profile, action: "FIX_CI", worktree, tmpDir }).settings.sandbox;
+  const policy = policyFor({ units: [] }, wt.path);
+  const policyStandalone = policyFor({ units: [], identity: { checkout: clone } }, standalone);
+  const settingsFor = (cwd, extraWrite = [], pol = policy) => {
     const p = join(root, `srt-${extraWrite.length ? "wide" : "cwd"}-${cwd.split("/").pop()}.json`);
     writeFileSync(p, JSON.stringify({
-      network: { allowedDomains: policy.network.allowedDomains, deniedDomains: [], allowUnixSockets: [], allowLocalBinding: false },
-      filesystem: { allowWrite: [cwd, tmpDir, ...extraWrite], denyWrite: [], allowRead: [tmpDir], denyRead: [...policy.filesystem.denyRead, fileDecoy] },
+      network: { allowedDomains: pol.network.allowedDomains, deniedDomains: [], allowUnixSockets: [], allowLocalBinding: false },
+      filesystem: { allowWrite: [cwd, tmpDir, ...extraWrite], denyWrite: [], allowRead: [tmpDir], denyRead: [...pol.filesystem.denyRead, fileDecoy] },
     }));
     return p;
   };
@@ -161,6 +200,8 @@ git push --no-verify ${JSON.stringify(dest)} HEAD:refs/heads/escape-noverify 2>.
 git -c core.hooksPath=/dev/null push ${JSON.stringify(dest)} HEAD:refs/heads/escape-hookspath 2>/dev/null; rec hookspath $?
 git push --no-verify https://github.com/revnix/reeve-does-not-exist HEAD:refs/heads/x 2>/dev/null; rec https $?
 printf 'protocol=https\\nhost=github.com\\n\\n' | git -c credential.helper=osxkeychain credential fill 2>/dev/null | grep -q '^password='; rec keychain $?
+/usr/bin/security find-internet-password -s github.com ${JSON.stringify(LOGIN_KEYCHAIN)} >/dev/null 2>&1; rec kc_by_path $?
+/usr/bin/security find-generic-password -s "Claude Code-credentials" ${JSON.stringify(LOGIN_KEYCHAIN)} >/dev/null 2>&1; rec kc_claude_by_path $?
 mkdir -p ./ghcfg && printf 'github.com:\\n    user: %s\\n    git_protocol: https\\n' ${JSON.stringify(acct ?? "unknown")} > ./ghcfg/hosts.yml
 GH_CONFIG_DIR=./ghcfg ${JSON.stringify(gh || "/usr/bin/false")} auth token >/dev/null 2>&1; rec ghkeyring $?
 GIT_CONFIG_GLOBAL=${JSON.stringify(deniedCfg)} git config --global --list >/dev/null 2>./probe-cfg.err; rec denied_cfg $?
@@ -169,6 +210,8 @@ curl -sS -m 4 ${JSON.stringify(netUrl)} -o ./netbody 2>/dev/null; rec netprobe $
 cat ${JSON.stringify(xdgDecoy)} >/dev/null 2>&1; rec xdg_git $?
 cat ${JSON.stringify(fileDecoy)} >/dev/null 2>&1; rec file_decoy $?
 cat ${JSON.stringify(fileControl)} >/dev/null 2>&1; rec file_control $?
+cat ${JSON.stringify(founderWip)} >/dev/null 2>&1; rec founder_wip $?
+cat ${JSON.stringify(founderEnv)} >/dev/null 2>&1; rec founder_env $?
 `;
   const runProbe = (cwd, settings) => {
     for (const f of ["probe-results.txt", "INSIDE", "curl-body", "decoy-copy", "decoy-copy2", "decoy-link"]) rmSync(join(cwd, f), { force: true });
@@ -232,32 +275,61 @@ cat ${JSON.stringify(fileControl)} >/dev/null 2>&1; rec file_control $?
     // same underlying hole but runs through gh's own config code, whose
     // one-time migration writes the keychain and is denied under the sandbox on
     // this gh version; its result is therefore informational, never the finding.
+    // CLOSED 2026-08-22. This was the last KNOWN-OPEN and it is now HELD: the
+    // keychain is reached through HOME, and a worker's HOME is reeve's scratch
+    // directory, so the founder's login keychain is not in its search list. The
+    // founder's keychain is UNCHANGED and still holds the credential — which is
+    // what makes this a real test rather than a tautology: the item exists, and
+    // the worker still cannot reach it.
     if (!keychain.measured) skip("keychain shapes", keychain.why);
-    else if (!keychain.items.length) {
-      check(r.keychain !== 0, "HELD (this host): no GitHub credential in the keychain, so the osxkeychain helper returns nothing", `keychain=${r.keychain}`);
-    } else {
-      const git_item = keychain.items.some(i => /osxkeychain/.test(i));
-      if (git_item) check(r.keychain === 0, "KNOWN-OPEN (this host): `git -c credential.helper=osxkeychain credential fill` returns the founder's token INSIDE the sandbox (securityd is hard-allowed; closes only with an empty keychain or a dedicated worker user)", `keychain=${r.keychain}`);
-      else skip("the git-credential keychain shape", "no git osxkeychain item on this host");
-      console.log(`INFO  the gh-keyring shape returned ghkeyring=${r.ghkeyring} (gh's own config migration is denied a keychain write under the sandbox on this gh version; the git-credential shape above is the stable finding)`);
+    else {
+      if (keychain.items.length)
+        check(r.keychain !== 0, "HELD: the founder's keychain DOES hold a GitHub credential, and the worker still cannot read it", `keychain=${r.keychain} items=${keychain.items.length}`);
+      else
+        check(r.keychain !== 0, "HELD: no GitHub credential in the keychain, and the helper returns nothing", `keychain=${r.keychain}`);
+      check(r.ghkeyring !== 0, "HELD: gh pointed at a crafted config dir cannot reach the keyring either", `ghkeyring=${r.ghkeyring}`);
+      // The shape a scratch HOME does NOT close, and the reason this file exists.
+      //
+      // A scratch home empties the keychain SEARCH LIST. It does not move the
+      // file, it does not lock it, and it does not change who the process runs
+      // as. Measured 2026-08-22: `security find-internet-password -s github.com
+      // ~/Library/Keychains/login.keychain-db` returned the founder's credential
+      // from a scratch home, and returns 44 only once that path is denied. The
+      // three probes above ask the search list and would all have passed while
+      // this was wide open — which they did, for one afternoon, in a canary that
+      // certified containment.
+      check(existsSync(LOGIN_KEYCHAIN), "control: the founder's login keychain exists to be probed", LOGIN_KEYCHAIN);
+      check(r.kc_by_path !== 0,
+        "HELD: naming the founder's login keychain by PATH does not reach it either", `kc_by_path=${r.kc_by_path}`);
+      check(r.kc_claude_by_path !== 0,
+        "HELD: nor does naming it for the Claude credentials", `kc_claude_by_path=${r.kc_claude_by_path}`);
     }
   }
 
   // ── a standalone clone: the topology PR-2b moves workers to ──────────────
   {
-    const { results: r } = runProbe(standalone, settingsFor(standalone));
+    const { results: r } = runProbe(standalone, settingsFor(standalone, [], policyStandalone));
+    check(policyStandalone.filesystem.denyRead.includes(clone),
+      "control: the generated policy denies the clone the checkout was made from", JSON.stringify(policyStandalone.filesystem.denyRead.slice(-3)));
     check(r.inside === 0 && r.commit === 0, "control: in a standalone clone the worker can write and commit", JSON.stringify(r));
     check(r.updateref === 0 && git(clone, "rev-parse", "refs/heads/main") === head,
       "HELD (by topology): moving refs in a standalone clone moves nothing in the founder's checkout", `updateref=${r.updateref}`);
     check(r.noverify !== 0 && !refsAt(dest).includes("escape-noverify") && r.outside !== 0 && r.curl !== 0 && r.decoy !== 0,
       "HELD: and every other denial holds the same there", JSON.stringify(r));
+    // The clone carries only committed content, so the founder's uncommitted work
+    // and ignored files are not IN the worker's checkout. That is a different
+    // claim from being out of its reach: the originals are still on this disk,
+    // and the sandbox denies WRITES outside the checkout, not reads.
+    check(r.founder_wip !== 0 && r.founder_env !== 0,
+      "HELD: the founder's uncommitted work and ignored secrets in their own checkout are unreadable",
+      `wip=${r.founder_wip} env=${r.founder_env}`);
   }
 
   rmSync(decoy, { force: true }); rmSync(deniedCfg, { force: true }); rmSync(xdgDecoy, { force: true }); listener.close();
 }
 
 // ── the declaration the env alone makes must still say what it measured ──────
-check(CONTAINMENT.credentialRead === "open", "control: the environment layer alone declares the credential read open; closure is measured per host by containment.mjs", JSON.stringify(CONTAINMENT));
+check(CONTAINMENT.credentialRead === "closed-by-home-and-path", "control: the module declares the closure this file just measured, and the canary re-proves it per CLI build", JSON.stringify(CONTAINMENT));
 
 rmSync(root, { recursive: true, force: true });
 console.log(`${fail ? `\nfailed=${fail}` : "\nall green"}${skipped ? ` (skipped ${skipped}: not measurable on this host)` : ""}`);

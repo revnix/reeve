@@ -11,10 +11,15 @@ import { tick, stateRootsFor } from "../src/daemon.mjs";
 import { open, liveRunFor, countFixAttempts, recordFixAttempt } from "../src/db/ops.mjs";
 import { causeKey } from "../src/ci-rootcause.mjs";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const dir = mkdtempSync(join(tmpdir(), "reeve-e2e-"));
+// The clone and the worktree root are separate directories, as a real
+// deployment must have them: the worker policy denies reads of the clone, so a
+// checkout INSIDE it would be denied its own code and the dispatch refuses.
+const clone = mkdtempSync(join(tmpdir(), "reeve-e2e-clone-"));
 const dbPath = join(dir, "e.db");
 const logPath = join(dir, "log.txt");
 let fail = 0;
@@ -28,7 +33,7 @@ const CAUSE = { ok: true, job: "CI Gate", step: "Test",
                 cause: [{ where: "src/x.ts:1", message: "boom" }] };
 
 const profile = {
-  identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir },
+  identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: clone },
   authority: { policy: "propose_and_merge" },
   rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
   ci: { provider: "github-actions", requiredChecks: [] },
@@ -69,7 +74,11 @@ const baseCtx = () => ({
   // rootCause reaches the network; the tick resolves it before deciding, so it
   // is stubbed at the same seam the daemon uses.
   resolveCause: () => CAUSE,
-  worktreeFor: () => dir,
+  // Injected, never read from disk. The real reader looks at
+  // ~/.reeve/claude-token, so a default makes these tests pass on a machine that
+  // happens to have one and fail on CI, which is exactly what it did.
+  oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+  prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
 });
 
 const ctx = baseCtx();
@@ -119,7 +128,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   // Its own worktree dir: the daemon quarantines (moves) a worktree after a
   // failed run, and a block that lent the shared dir would strand every later one.
   const ctx3 = { ...baseCtx(), db: open(join(dir3, "l.db")), logPath: join(dir3, "log.txt"), heartbeatMs: 100,
-                 worktreeFor: () => mkdtempSync(join(dir3, "wt-")) };
+                 prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dir3, "wt-")), why: null, deps: { ok: true, cow: false } }) };
   let sawRevoked = null;
   ctx3.spawnWorker = async (args) => {
     ctx3.db.prepare("UPDATE run SET status='abandoned' WHERE status IN ('leased','running')").run();
@@ -150,11 +159,11 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // identity.
 {
   const dir4 = mkdtempSync(join(tmpdir(), "reeve-e2e-contain-"));
-  const ctx4 = { ...baseCtx(), db: open(join(dir4, "c.db")), logPath: join(dir4, "log.txt"), worktreeFor: () => mkdtempSync(join(dir4, "wt-")),
+  const ctx4 = { ...baseCtx(), db: open(join(dir4, "c.db")), logPath: join(dir4, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dir4, "wt-")), why: null, deps: { ok: true, cow: false } }),
                  // No cheaper reason, so the canary is the gate that runs and fails:
                  // measured platform, an isolated (verified) worker, an empty keychain.
                  platform: "darwin",
-                 profile: { ...profile, worker: { isolation: "dedicated-user" } },
+                 profile: { ...profile, worker: { isolation: "scratch-home" } },
                  isolationReady: () => true,
                  canary: async () => ({ ok: false, id: "planted", why: "planted: wrote outside the worktree", evidence: {} }),
                  keychain: { measured: true, items: [], why: null } };
@@ -187,17 +196,41 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // --- a GitHub credential in the keychain keeps it open whatever the canary said
 {
   const dirK = mkdtempSync(join(tmpdir(), "reeve-e2e-keychain-"));
-  const ctxK = { ...baseCtx(), db: open(join(dirK, "k.db")), logPath: join(dirK, "log.txt"), worktreeFor: () => mkdtempSync(join(dirK, "wt-")),
+  const ctxK = { ...baseCtx(), db: open(join(dirK, "k.db")), logPath: join(dirK, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dirK, "wt-")), why: null, deps: { ok: true, cow: false } }),
+                 // The ONLY variable under test is the host keychain, so the
+                 // isolation is declared and the canary passes.
+                 platform: "darwin", profile: { ...profile, worker: { isolation: "scratch-home" } },
                  canary: async () => ({ ok: true, id: "good", why: null, evidence: {} }),
                  keychain: { measured: true, items: ["generic password gh:github.com (gh keyring)"], why: "the login keychain holds: generic password gh:github.com (gh keyring)" } };
   delete ctxK.containment;
   let launchedK = 0;
   ctxK.spawnWorker = async () => { launchedK++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
   const rK = await tick(ctxK);
-  check(launchedK === 0 && [...rK.escalations.keys()].includes("guardian:containment:open"), "a passing canary does not close what the keychain holds open", String(launchedK));
-  check(/gh keyring/.test(readFileSync(join(dirK, "log.txt"), "utf8")), "and the log names the keychain item", "");
+  // CHANGED 2026-08-22: the host's keychain no longer gates, because a worker
+  // has no login keychain in its search list. What gates is the canary, which
+  // measures that reach — so this case now proves the REPLACEMENT property.
+  check(launchedK === 1, "the founder's keychain contents no longer block dispatch on their own", String(launchedK));
   ctxK.db.close();
   rmSync(dirK, { recursive: true, force: true });
+}
+{
+  // ... and a canary that DID reach the keychain still refuses, which is the
+  // property that actually protects the credential.
+  const dirKC = mkdtempSync(join(tmpdir(), "reeve-e2e-kcreach-"));
+  const ctxKC = { ...baseCtx(), db: open(join(dirKC, "k.db")), logPath: join(dirKC, "log.txt"),
+                  prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dirKC, "wt-")), why: null, deps: { ok: true, cow: false } }),
+                  platform: "darwin", profile: { ...profile, worker: { isolation: "scratch-home" } },
+                  canary: async () => ({ ok: false, id: "kc", why: "read the founder's GitHub credential from the keychain", evidence: {} }),
+                  keychain: { measured: true, items: [], why: null } };
+  delete ctxKC.containment;
+  let launchedKC = 0;
+  ctxKC.spawnWorker = async () => { launchedKC++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  const rKC = await tick(ctxKC);
+  check(launchedKC === 0 && [...rKC.escalations.keys()].includes("guardian:containment:open"),
+    "a canary that reached the keychain refuses every dispatch", String(launchedKC));
+  check(/keychain/.test(readFileSync(join(dirKC, "log.txt"), "utf8")), "and the log names it", "");
+  ctxKC.db.close();
+  rmSync(dirKC, { recursive: true, force: true });
 }
 
 // --- measured closed: the canary passed, the keychain is empty, a worker runs
@@ -209,14 +242,14 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 {
   const dirC = mkdtempSync(join(tmpdir(), "reeve-e2e-closed-"));
   let canaryRuns = 0;
-  const ctxC = { ...baseCtx(), db: open(join(dirC, "c.db")), logPath: join(dirC, "log.txt"), worktreeFor: () => mkdtempSync(join(dirC, "wt-")),
+  const ctxC = { ...baseCtx(), db: open(join(dirC, "c.db")), logPath: join(dirC, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dirC, "wt-")), why: null, deps: { ok: true, cow: false } }),
                  // Forced so the case runs the same on every CI OS: it tests the
                  // canary+keychain wiring, not the per-OS platform gate (that is
                  // its own case below).
                  platform: "darwin",
                  // A declared isolated worker AND a verified-ready topology are
                  // required to close dispatch; this is the positive control.
-                 profile: { ...profile, worker: { isolation: "dedicated-user" } },
+                 profile: { ...profile, worker: { isolation: "scratch-home" } },
                  isolationReady: () => true,
                  canary: async () => { canaryRuns++; return { ok: true, id: "good", why: null, evidence: {} }; },
                  keychain: { measured: true, items: [], why: null } };
@@ -253,17 +286,185 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // unsandboxed. Nothing is read and nothing is published from such a worktree.
 {
   const dirG = mkdtempSync(join(tmpdir(), "reeve-e2e-cfgtamper-"));
-  const ctxG = { ...baseCtx(), db: open(join(dirG, "g.db")), logPath: join(dirG, "log.txt"), worktreeFor: () => mkdtempSync(join(dirG, "wt-")),
+  const ctxG = { ...baseCtx(), db: open(join(dirG, "g.db")), logPath: join(dirG, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dirG, "wt-")), why: null, deps: { ok: true, cow: false } }),
                  verifyConfig: () => ({ ok: false, why: "planted: the worker changed the repository's git configuration" }) };
   let pushedG = 0;
   ctxG.spawnWorker = async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" });
   const rG = await tick(ctxG);
   const logG = readFileSync(join(dirG, "log.txt"), "utf8");
-  check(/NOT reading or publishing this worktree/.test(logG), "the tick refuses to read or publish that worktree", logG.split("\n").filter(l => /#42/.test(l)).slice(-2).join(" | ").slice(0, 200));
+  check(/NOT reading or publishing this checkout/.test(logG), "the tick refuses to read or publish that checkout", logG.split("\n").filter(l => /#42/.test(l)).slice(-2).join(" | ").slice(0, 200));
   check(!/published/.test(logG) && pushedG === 0, "nothing is published", "");
-  check([...rG.escalations.keys()].includes("guardian:worktree:config-tampered"), "and it escalates under an identity key", [...rG.escalations.keys()].join(" | "));
+  check([...rG.escalations.keys()].includes("guardian:checkout:config-tampered"), "and it escalates under an identity key", [...rG.escalations.keys()].join(" | "));
   ctxG.db.close();
   rmSync(dirG, { recursive: true, force: true });
+}
+
+// --- a checkout that could not be built is reeve's failure, not the worker's --
+//
+// Preparation happens INSIDE the dispatch try-block, so a failure there leaves
+// the path null while everything below it still runs. The configuration check
+// reads a null path as "no recorded configuration", which is a refusal -- and it
+// was reported as the worker having tampered with git config. That accuses a
+// worker that never started, on the most ordinary failure there is (no disk, no
+// token, a clone that would not clone), and it fires the tamper channel every
+// time it happens.
+{
+  const dirF = mkdtempSync(join(tmpdir(), "reeve-e2e-prepfail-"));
+  const ctxF = { ...baseCtx(), db: open(join(dirF, "f.db")), logPath: join(dirF, "log.txt"),
+                 prepareCheckout: () => ({ ok: false, path: null, why: "no space left on device" }) };
+  let spawnedF = 0;
+  ctxF.spawnWorker = async () => { spawnedF++; return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; };
+  const rF = await tick(ctxF);
+  const escF = [...rF.escalations.keys()].join(" | ");
+  const logF = readFileSync(join(dirF, "log.txt"), "utf8");
+
+  // The precondition: dispatch was REACHED. Without this the case would pass by
+  // never getting that far, which is how a refund test proved nothing before.
+  const runF = ctxF.db.prepare("SELECT status, task_id FROM run ORDER BY started_at DESC LIMIT 1").get();
+  check(runF?.task_id === "pr:42", "control: dispatch was reached and a run was created", JSON.stringify(runF));
+  check(spawnedF === 0, "control: no worker was launched without a checkout", `spawned=${spawnedF}`);
+  check(/could not be prepared/i.test(escF), "it is reported as a preparation failure", escF);
+  check(!/tamper/i.test(escF) && !/git configuration/i.test(escF),
+    "and NOT as the worker changing the checkout's git configuration", escF);
+  check(!/NOT reading or publishing/.test(logF),
+    "the log does not claim there was a checkout to read",
+    logF.split("\n").filter(l => /NOT reading/.test(l)).join(" | "));
+  check(countFixAttempts(ctxF.db, "o/r", 42, causeKey("o/r", CAUSE)) === 0,
+    "and the fixer's attempt is refunded, because nothing ran",
+    String(countFixAttempts(ctxF.db, "o/r", 42, causeKey("o/r", CAUSE))));
+  ctxF.db.close();
+  rmSync(dirF, { recursive: true, force: true });
+}
+
+// --- a finished worker that never committed keeps its work ------------------
+//
+// reeve publishes by fetching the checkout's BRANCH, so an uncommitted edit
+// cannot travel with the push. changedFiles counts it anyway (deliberately: a
+// worker that stops part-way has still done something), so the diff gate passed,
+// the log said "published N file(s)", and the release then DELETED the only copy.
+{
+  const dirU = mkdtempSync(join(tmpdir(), "reeve-e2e-uncommitted-"));
+  const wtU = mkdtempSync(join(dirU, "wt-"));
+  // A checkout with an edit the worker never committed.
+  execFileSync("git", ["-C", wtU, "init", "-q"]);
+  writeFileSync(join(wtU, "fix.js"), "the fix nobody committed\n");
+  let publishedU = 0;
+  const ctxU = { ...baseCtx(), db: open(join(dirU, "u.db")), logPath: join(dirU, "log.txt"),
+                 prepareCheckout: () => ({ ok: true, path: wtU, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedU++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }) };
+  const rU = await tick(ctxU);
+  const logU = readFileSync(join(dirU, "log.txt"), "utf8");
+  const escU = [...rU.escalations.keys()].join(" | ");
+
+  check(publishedU === 0, "a checkout with uncommitted work is NOT published", `published=${publishedU}`);
+  check(!/published \d+ file/.test(logU), "and the log does not say it was", logU.split("\n").filter(l => /publish/.test(l)).join(" | ").slice(0, 200));
+  check(/uncommitted/.test(escU), "the escalation says what is wrong with it", escU);
+  check(existsSync(join(`${wtU}.unfetched`, "fix.js")) || existsSync(join(wtU, "fix.js")),
+    "and the work still exists somewhere on disk", `${wtU}`);
+  ctxU.db.close();
+  rmSync(dirU, { recursive: true, force: true });
+  rmSync(`${wtU}.unfetched`, { recursive: true, force: true });
+}
+
+// --- a token in the COMMIT MESSAGE travels with the push too -----------------
+//
+// The first version of this check ran `git diff`, which emits the file patch and
+// not commit metadata — so a worker that put the credential in its commit
+// message had it pushed into public history by a check that had just declared
+// the change clean.
+{
+  const dirT = mkdtempSync(join(tmpdir(), "reeve-e2e-msgtoken-"));
+  const wtT = mkdtempSync(join(dirT, "wt-"));
+  const TOKEN = "sk-ant-oat01-test-token-not-a-real-credential";
+  const gT = (...a) => execFileSync("git", ["-C", wtT, ...a], { encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", wtT, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtT, "a.txt"), "base\n");
+  gT("add", "-A"); gT("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  const baseSha = gT("rev-parse", "HEAD");
+  // An innocuous source change, and the credential in the message.
+  writeFileSync(join(wtT, "a.txt"), "fixed\n");
+  gT("add", "-A"); gT("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", `fix: it works\n\ndebug ${TOKEN}`);
+
+  let publishedT = 0;
+  const evalT = { ...evaluation, head: baseSha, headRef: "f" };
+  const ctxT = { ...baseCtx(), db: open(join(dirT, "t.db")), logPath: join(dirT, "log.txt"),
+                 evaluate: () => evalT,
+                 prepareCheckout: () => ({ ok: true, path: wtT, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedT++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }) };
+  const rT = await tick(ctxT);
+  const escT = [...rT.escalations.keys()].join(" | ");
+  check(publishedT === 0, "a commit MESSAGE carrying reeve's token is not published", `published=${publishedT}`);
+  // NAMED, not merely refused. The first version of this passed because the
+  // check could not read the diff at all and refused everything, which is a
+  // different fact wearing the same result.
+  check(/carries reeve's worker authentication token/.test(escT),
+    "and the reason names the credential, rather than a check that could not run", escT);
+  check(!escT.includes(TOKEN), "without ever printing the credential", "the escalation contained it");
+  ctxT.db.close();
+  rmSync(dirT, { recursive: true, force: true });
+  rmSync(`${wtT}.unfetched`, { recursive: true, force: true });
+
+  // THE CONTROL. A check that refuses everything also refuses the leak, and
+  // looks identical from the outside. This is the assertion that would have
+  // caught it: an ordinary change, no credential anywhere, must publish.
+  const dirC = mkdtempSync(join(tmpdir(), "reeve-e2e-cleanpub-"));
+  const wtC = mkdtempSync(join(dirC, "wt-"));
+  const gC = (...a) => execFileSync("git", ["-C", wtC, ...a], { encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", wtC, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtC, "a.txt"), "base\n");
+  gC("add", "-A"); gC("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  const baseC = gC("rev-parse", "HEAD");
+  writeFileSync(join(wtC, "a.txt"), "an ordinary fix\n");
+  gC("add", "-A"); gC("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "fix: nothing secret here");
+  let publishedC = 0;
+  const ctxC = { ...baseCtx(), db: open(join(dirC, "c.db")), logPath: join(dirC, "log.txt"),
+                 evaluate: () => ({ ...evaluation, head: baseC, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtC, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedC++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }) };
+  await tick(ctxC);
+  check(publishedC === 1, "control: a change carrying no credential still publishes", `published=${publishedC}`);
+  ctxC.db.close();
+  rmSync(dirC, { recursive: true, force: true });
+}
+
+// --- an unfinished worker's commit lives on the BRANCH, not at HEAD ----------
+//
+// A worker that commits on the PR branch and then checks out the pinned commit
+// leaves HEAD exactly where it started. changedFiles compares HEAD, saw nothing,
+// and the release deleted the standalone clone — the only copy of the commit.
+{
+  const dirB = mkdtempSync(join(tmpdir(), "reeve-e2e-branchwork-"));
+  const wtB = mkdtempSync(join(dirB, "wt-"));
+  const gB = (...a) => execFileSync("git", ["-C", wtB, ...a], { encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", wtB, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtB, "a.txt"), "base\n");
+  gB("add", "-A"); gB("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  const pinned = gB("rev-parse", "HEAD");
+  writeFileSync(join(wtB, "a.txt"), "a candidate fix\n");
+  gB("add", "-A"); gB("-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "the worker's commit");
+  const workSha = gB("rev-parse", "HEAD");
+  gB("checkout", "-q", pinned);            // detached, exactly where it started
+  check(gB("rev-parse", "HEAD") === pinned, "control: HEAD is back at the pinned commit", "");
+  check(gB("rev-parse", "refs/heads/f") === workSha, "control: and the work is on the branch", "");
+
+  const evalB = { ...evaluation, head: pinned, headRef: "f" };
+  const ctxB = { ...baseCtx(), db: open(join(dirB, "b.db")), logPath: join(dirB, "log.txt"),
+                 evaluate: () => evalB,
+                 prepareCheckout: () => ({ ok: true, path: wtB, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 spawnWorker: async () => ({ outcome: "failed", why: "turn limit", ms: 1, cost: 0, sessionId: "s" }) };
+  await tick(ctxB);
+  check(!existsSync(wtB), "control: the checkout was released from its original path", "");
+  check(existsSync(join(`${wtB}.unfetched`, ".git")), "an unfinished worker's commit is PRESERVED, not deleted with the clone", `${wtB}.unfetched`);
+  ctxB.db.close();
+  rmSync(dirB, { recursive: true, force: true });
+  rmSync(`${wtB}.unfetched`, { recursive: true, force: true });
 }
 
 // --- an already-open verdict prepares nothing (no canary litter per tick) -----
@@ -274,7 +475,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 {
   const dirN = mkdtempSync(join(tmpdir(), "reeve-e2e-nolitter-"));
   const wtRoot = mkdtempSync(join(tmpdir(), "reeve-e2e-wtroot-"));
-  const ctxN = { ...baseCtx(), db: open(join(dirN, "n.db")), logPath: join(dirN, "log.txt"), worktreeFor: () => mkdtempSync(join(dirN, "wt-")),
+  const ctxN = { ...baseCtx(), db: open(join(dirN, "n.db")), logPath: join(dirN, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dirN, "wt-")), why: null, deps: { ok: true, cow: false } }),
                  platform: "darwin",
                  profile: { ...profile, identity: { ...profile.identity, worktreeRoot: wtRoot } },
                  keychain: { measured: true, items: [], why: null } };   // isolation stays "none" -> already open
@@ -295,16 +496,19 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // runs a linked worktree as this user) must not dispatch. (Codex #4c-[9].)
 {
   const dirL = mkdtempSync(join(tmpdir(), "reeve-e2e-label-"));
-  const ctxL = { ...baseCtx(), db: open(join(dirL, "l.db")), logPath: join(dirL, "log.txt"), worktreeFor: () => mkdtempSync(join(dirL, "wt-")),
-                 platform: "darwin", profile: { ...profile, worker: { isolation: "dedicated-user" } },
+  const ctxL = { ...baseCtx(), db: open(join(dirL, "l.db")), logPath: join(dirL, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dirL, "wt-")), why: null, deps: { ok: true, cow: false } }),
+                 platform: "darwin", profile: { ...profile, worker: { isolation: "scratch-home" } },
                  canary: async () => ({ ok: true, id: "good", why: null, evidence: {} }),
-                 keychain: { measured: true, items: [], why: null } };   // NOTE: no isolationReady -> topology not built
+                 keychain: { measured: true, items: [], why: null } };
   delete ctxL.containment;
   let launchedL = 0;
   ctxL.spawnWorker = async () => { launchedL++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
   const rL = await tick(ctxL);
-  check(launchedL === 0 && [...rL.escalations.keys()].includes("guardian:containment:open"), "the isolation label alone, without a verified topology, does not dispatch", String(launchedL));
-  check(/no isolated worker/.test(readFileSync(join(dirL, "log.txt"), "utf8")), "and the log says the isolation is not satisfied", "");
+  // CHANGED 2026-08-22: the topology the label names is now implemented (a
+  // scratch HOME workerEnv refuses to override, and a standalone clone), so the
+  // label plus a passing canary dispatches. A profile that declares NOTHING
+  // still refuses — that case is below.
+  check(launchedL === 1, "a declared isolation with a passing canary dispatches", String(launchedL));
   ctxL.db.close();
   rmSync(dirL, { recursive: true, force: true });
 }
@@ -317,7 +521,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 {
   const dirR = mkdtempSync(join(tmpdir(), "reeve-e2e-refund-"));
   const fpR = causeKey("o/r", CAUSE);
-  const ctxR = { ...baseCtx(), db: open(join(dirR, "r.db")), logPath: join(dirR, "log.txt"), worktreeFor: () => mkdtempSync(join(dirR, "wt-")),
+  const ctxR = { ...baseCtx(), db: open(join(dirR, "r.db")), logPath: join(dirR, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dirR, "wt-")), why: null, deps: { ok: true, cow: false } }),
                  // A closed verdict whose binary identity no longer matches: the
                  // spawn is refused after the run row and the attempt exist.
                  containment: { credentialRead: "closed", why: "test", binaryId: "/some/other/claude@999" },
@@ -340,7 +544,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // --- a CLI binary swapped after the verdict is refused at the spawn -----------
 {
   const dirB = mkdtempSync(join(tmpdir(), "reeve-e2e-binswap-"));
-  const ctxB = { ...baseCtx(), db: open(join(dirB, "b.db")), logPath: join(dirB, "log.txt"), worktreeFor: () => mkdtempSync(join(dirB, "wt-")),
+  const ctxB = { ...baseCtx(), db: open(join(dirB, "b.db")), logPath: join(dirB, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dirB, "wt-")), why: null, deps: { ok: true, cow: false } }),
                  // A closed verdict whose binary identity differs from the one the
                  // spawn resolves (/bin/sh) -> the per-spawn re-check refuses.
                  containment: { credentialRead: "closed", why: "test", binaryId: "/some/other/claude@999" } };
@@ -356,14 +560,17 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // --- a credential that appears after the verdict is caught at the spawn --------
 {
   const dirK2 = mkdtempSync(join(tmpdir(), "reeve-e2e-credappear-"));
-  const ctxK2 = { ...baseCtx(), db: open(join(dirK2, "k.db")), logPath: join(dirK2, "log.txt"), worktreeFor: () => mkdtempSync(join(dirK2, "wt-")),
+  const ctxK2 = { ...baseCtx(), db: open(join(dirK2, "k.db")), logPath: join(dirK2, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dirK2, "wt-")), why: null, deps: { ok: true, cow: false } }),
                   // Verdict was closed, but the keychain now holds an item.
                   keychain: { measured: true, items: ["generic password gh:github.com (gh keyring)"], why: "appeared" } };
   let launchedK2 = 0;
   ctxK2.spawnWorker = async () => { launchedK2++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
   const rK2 = await tick(ctxK2);
-  check(launchedK2 === 0 && [...rK2.escalations.keys()].includes("guardian:containment:changed"), "a credential that appeared after the verdict refuses the spawn", String(launchedK2));
-  check(/credential appeared/.test(readFileSync(join(dirK2, "log.txt"), "utf8")), "and the log says a credential appeared", "");
+  // CHANGED 2026-08-22: a credential appearing in the founder's keychain no
+  // longer refuses a spawn, because the worker has no login keychain in its
+  // search list. The binary-swap case above is what per-spawn revalidation
+  // still guards, and the canary guards the reach.
+  check(launchedK2 === 1, "a credential appearing in the host keychain no longer refuses the spawn", String(launchedK2));
   ctxK2.db.close();
   rmSync(dirK2, { recursive: true, force: true });
 }
@@ -390,7 +597,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // platform too, not just the two probes.
 {
   const dirP = mkdtempSync(join(tmpdir(), "reeve-e2e-platform-"));
-  const ctxP = { ...baseCtx(), db: open(join(dirP, "p.db")), logPath: join(dirP, "log.txt"), worktreeFor: () => mkdtempSync(join(dirP, "wt-")),
+  const ctxP = { ...baseCtx(), db: open(join(dirP, "p.db")), logPath: join(dirP, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dirP, "wt-")), why: null, deps: { ok: true, cow: false } }),
                  platform: "win32",
                  canary: async () => ({ ok: true, id: "good", why: null, evidence: {} }),
                  keychain: { measured: true, items: [], why: null } };
@@ -411,7 +618,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 {
   const dir5 = mkdtempSync(join(tmpdir(), "reeve-e2e-hbfail-"));
   const ctx5 = { ...baseCtx(), db: open(join(dir5, "h.db")), logPath: join(dir5, "log.txt"), heartbeatMs: 100,
-                 worktreeFor: () => mkdtempSync(join(dir5, "wt-")),
+                 prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dir5, "wt-")), why: null, deps: { ok: true, cow: false } }),
                  heartbeat: () => { throw new Error("database is locked"); } };
   let sawRevoked = null;
   ctx5.spawnWorker = async (args) => {
@@ -434,7 +641,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // resolve is a preparation failure: no launch, the run closed, the attempt refunded.
 {
   const dir6 = mkdtempSync(join(tmpdir(), "reeve-e2e-cli-"));
-  const ctx6 = { ...baseCtx(), db: open(join(dir6, "v.db")), logPath: join(dir6, "log.txt"), worktreeFor: () => mkdtempSync(join(dir6, "wt-")),
+  const ctx6 = { ...baseCtx(), db: open(join(dir6, "v.db")), logPath: join(dir6, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dir6, "wt-")), why: null, deps: { ok: true, cow: false } }),
                  claudeBin: "/nonexistent/claude" };
   delete ctx6.cliVersion;
   let launched = 0;
@@ -458,7 +665,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // in the log.
 {
   const dirS = mkdtempSync(join(tmpdir(), "reeve-e2e-settings-"));
-  const ctxS = { ...baseCtx(), db: open(join(dirS, "s.db")), logPath: join(dirS, "log.txt"), worktreeFor: () => mkdtempSync(join(dirS, "wt-")),
+  const ctxS = { ...baseCtx(), db: open(join(dirS, "s.db")), logPath: join(dirS, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dirS, "wt-")), why: null, deps: { ok: true, cow: false } }),
                  settingsValidator: () => ({ ok: false, errors: ["planted: sandbox.enabled must be true"] }) };
   let launchedS = 0;
   ctxS.spawnWorker = async () => { launchedS++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
@@ -481,7 +688,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // positive control for every stubbed case above and below.
 {
   const dirV = mkdtempSync(join(tmpdir(), "reeve-e2e-validator-"));
-  const ctxV = { ...baseCtx(), db: open(join(dirV, "v.db")), logPath: join(dirV, "log.txt"), worktreeFor: () => mkdtempSync(join(dirV, "wt-")) };
+  const ctxV = { ...baseCtx(), db: open(join(dirV, "v.db")), logPath: join(dirV, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dirV, "wt-")), why: null, deps: { ok: true, cow: false } }) };
   let launchedV = 0, settingsSeen = null;
   ctxV.spawnWorker = async (args) => { launchedV++; const i = args.args.indexOf("--settings"); settingsSeen = i >= 0 ? JSON.parse(readFileSync(args.args[i + 1], "utf8")) : null; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
   await tick(ctxV);
@@ -498,7 +705,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 {
   const dir7 = mkdtempSync(join(tmpdir(), "reeve-e2e-cancel-"));
   const ctx7 = { ...baseCtx(), db: open(join(dir7, "c.db")), logPath: join(dir7, "log.txt"), heartbeatMs: 100,
-                 worktreeFor: () => mkdtempSync(join(dir7, "wt-")), heartbeat: () => ({ alive: false, reason: "cancelled" }) };
+                 prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dir7, "wt-")), why: null, deps: { ok: true, cow: false } }), heartbeat: () => ({ alive: false, reason: "cancelled" }) };
   ctx7.spawnWorker = async (args) => { await new Promise(r => setTimeout(r, 400)); const why = args.isRevoked?.(); return { outcome: why === "cancelled" ? "cancelled" : "ok", why: `lease revoked: ${why}`, ms: 400, cost: 0, sessionId: "s7" }; };
   await tick(ctx7);
   const run7 = ctx7.db.prepare("SELECT status FROM run ORDER BY started_at DESC LIMIT 1").get();
@@ -513,7 +720,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // --- an OK worker whose lease lapsed while it ran is not accepted -----------
 {
   const dir8 = mkdtempSync(join(tmpdir(), "reeve-e2e-lapsed-"));
-  const ctx8 = { ...baseCtx(), db: open(join(dir8, "x.db")), logPath: join(dir8, "log.txt"), worktreeFor: () => mkdtempSync(join(dir8, "wt-")) };
+  const ctx8 = { ...baseCtx(), db: open(join(dir8, "x.db")), logPath: join(dir8, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dir8, "wt-")), why: null, deps: { ok: true, cow: false } }) };
   ctx8.spawnWorker = async () => {
     // The lease expires under the worker between heartbeats; the worker still
     // reports success.
@@ -533,7 +740,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // --- a persistent preparation failure backs off and is escalated once --------
 {
   const dir9 = mkdtempSync(join(tmpdir(), "reeve-e2e-prep-"));
-  const ctx9 = { ...baseCtx(), db: open(join(dir9, "p.db")), logPath: join(dir9, "log.txt"), worktreeFor: () => mkdtempSync(join(dir9, "wt-")),
+  const ctx9 = { ...baseCtx(), db: open(join(dir9, "p.db")), logPath: join(dir9, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dir9, "wt-")), why: null, deps: { ok: true, cow: false } }),
                  claudeBin: "/nonexistent/claude" };
   delete ctx9.cliVersion;
   const r9a = await tick(ctx9);
@@ -549,7 +756,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // --- an UNBOUND worker refunds the attempt like any pre-execution failure ---
 {
   const dir10 = mkdtempSync(join(tmpdir(), "reeve-e2e-unbound-"));
-  const ctx10 = { ...baseCtx(), db: open(join(dir10, "u.db")), logPath: join(dir10, "log.txt"), worktreeFor: () => mkdtempSync(join(dir10, "wt-")) };
+  const ctx10 = { ...baseCtx(), db: open(join(dir10, "u.db")), logPath: join(dir10, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dir10, "wt-")), why: null, deps: { ok: true, cow: false } }) };
   ctx10.spawnWorker = async () => ({ outcome: "unbound", why: "run binding failed: x", ms: 1, cost: null, sessionId: null });
   await tick(ctx10);
   const spent = ctx10.db.prepare("SELECT COALESCE(SUM(attempts),0) n FROM fix_attempt").get().n;
@@ -567,7 +774,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // --- a cancel before the binding is a cancellation, not a preparation failure
 {
   const dir11 = mkdtempSync(join(tmpdir(), "reeve-e2e-prebind-"));
-  const ctx11 = { ...baseCtx(), db: open(join(dir11, "b.db")), logPath: join(dir11, "log.txt"), worktreeFor: () => mkdtempSync(join(dir11, "wt-")) };
+  const ctx11 = { ...baseCtx(), db: open(join(dir11, "b.db")), logPath: join(dir11, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dir11, "wt-")), why: null, deps: { ok: true, cow: false } }) };
   ctx11.db.prepare("INSERT OR REPLACE INTO node (id, kind, title, status, created_at, updated_at) VALUES ('pr:42','pr','t','open',unixepoch(),unixepoch())").run();
   ctx11.db.prepare("INSERT OR REPLACE INTO task_exec (task_id, cancel_requested) VALUES ('pr:42', 1)").run();
   ctx11.spawnWorker = async (args) => {
@@ -596,7 +803,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // --- a cancel after the binding is seen by the 2-second poll, not the next heartbeat
 {
   const dir12 = mkdtempSync(join(tmpdir(), "reeve-e2e-postbind-"));
-  const ctx12 = { ...baseCtx(), db: open(join(dir12, "c.db")), logPath: join(dir12, "log.txt"), worktreeFor: () => mkdtempSync(join(dir12, "wt-")), heartbeatMs: 3_600_000 };
+  const ctx12 = { ...baseCtx(), db: open(join(dir12, "c.db")), logPath: join(dir12, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dir12, "wt-")), why: null, deps: { ok: true, cow: false } }), heartbeatMs: 3_600_000 };
   let seen = null;
   ctx12.spawnWorker = async (args) => {
     args.onSpawn({ pid: 4322, lstart: "x" });
@@ -614,7 +821,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 // --- a recorder failure cannot turn an unbound launch into a spent failure --
 {
   const dir13 = mkdtempSync(join(tmpdir(), "reeve-e2e-unbound-rec-"));
-  const ctx13 = { ...baseCtx(), db: open(join(dir13, "r.db")), logPath: join(dir13, "log.txt"), worktreeFor: () => mkdtempSync(join(dir13, "wt-")),
+  const ctx13 = { ...baseCtx(), db: open(join(dir13, "r.db")), logPath: join(dir13, "log.txt"), prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(dir13, "wt-")), why: null, deps: { ok: true, cow: false } }),
                   noteWorkerResult: () => { throw new Error("disk full"); } };
   ctx13.spawnWorker = async () => ({ outcome: "unbound", why: "run binding failed: x", ms: 1, cost: null, sessionId: null });
   const r13 = await tick(ctx13);

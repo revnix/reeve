@@ -15,6 +15,30 @@ builder spec), `docs/measured/*` (the facts).
 
 ---
 
+## −1. What changed AFTER this document was written
+
+Appended 2026-08-22, later the same day. The body below is otherwise unedited.
+
+- `main` is **`aad542c`**, not `9bd0c61`. PR **#9** (`fix/refusal-is-one-shape-per-reason`,
+  another session's) merged: reviewer refusal shapes and Codex's `commitPattern`.
+  Its own tracker entry notes the LIVE `nextlyhq/nextly.json` is not updated by
+  it — `init.mjs` only seeds new profiles — so the running daemon keeps the
+  narrow patterns until the founder applies them.
+- The **running daemon is still on `9bd0c61`**, one merge behind. Restarting it
+  would pick up #9's code but not change the live profile, which is the half that
+  matters. Left alone deliberately: that is another session's lane.
+- The three findings this document lists as remaining are **done**, in PR **#10**
+  (`fix/per-commit-paths-and-attr-symlinks`), together with three more found
+  while testing them. All six are in `docs/TRACKER.md` and under `docs/measured/`.
+  The one that matters most was not in the brief: **the worker git isolation was
+  applied to the founder's own repository, so `ls-remote origin` and `push` could
+  not authenticate.** Every publication would have failed on the first live
+  dispatch, and `reeve doctor` runs no git at all so nothing would have said why.
+- Still true, unchanged: reeve has never dispatched a worker, `worker.isolation`
+  is `none`, and the `--execute` decision is the founder's.
+
+---
+
 ## 0. The one-paragraph truth
 
 reeve watches `nextlyhq/nextly` and publishes verdicts. It has **never dispatched

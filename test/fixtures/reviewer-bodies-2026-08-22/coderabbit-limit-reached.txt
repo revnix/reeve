@@ -1,0 +1,100 @@
+<!-- This is an auto-generated comment: summarize by coderabbit.ai -->
+<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->
+
+> [!WARNING]
+> ## Review limit reached
+> 
+> `@mobeenabdullah`, you've reached your PR review limit, so we couldn't start this review.
+> 
+> **Next review available in:** **7 minutes**
+> 
+> **Limit details:** You’ve used the included review currently available.
+> 
+> You've used all free OSS reviews for now. Wait for the free limit to reset to keep reviewing this public repository.
+> 
+> <details>
+> <summary>How can I continue?</summary>
+> 
+> Wait for the limit to reset, then comment `@coderabbitai review` or push new commits to the PR.
+> 
+> An organization admin can change what happens after included review limits in Billing.
+> 
+> </details>
+> 
+> 
+> <details>
+> <summary>How do review limits work?</summary>
+> 
+> CodeRabbit enforces per-developer PR review limits within each organization.
+> 
+> For paid Pro and Pro+ reviews, CodeRabbit uses a developer's included PR review attempts over the past 7 days to set the current hourly allowance. At typical activity levels, the full plan allowance applies. Higher sustained activity can lower the allowance until earlier attempts leave the 7-day window.
+> 
+> Please refer [docs](https://docs.coderabbit.ai/management/plans#rate-limits) for additional details.
+> 
+> </details>
+> 
+> <details>
+> <summary>Review details</summary>
+> 
+> <details>
+> <summary>⚙️ Run configuration</summary>
+> 
+> **Configuration used**: Path: .coderabbit.yaml
+> 
+> **Review profile**: CHILL
+> 
+> **Plan**: Pro Plus
+> 
+> **Run ID**: `8314e076-9491-4a81-9a87-f6b106a5ea10`
+> 
+> </details>
+> 
+> <details>
+> <summary>📥 Commits</summary>
+> 
+> Reviewing files that changed from the base of the PR and between f3caf104d6f6d2ecbd56f46bb5fee3160f4cc0ef and 00f2867b31e42c0793e56d63e42aae7ecd7a82e2.
+> 
+> </details>
+> 
+> <details>
+> <summary>⛔ Files ignored due to path filters (1)</summary>
+> 
+> * `.changeset/site-token-stable-identity.md` is excluded by `!.changeset/**`
+> 
+> </details>
+> 
+> <details>
+> <summary>📒 Files selected for processing (5)</summary>
+> 
+> * `packages/blocks-engine/src/index.ts`
+> * `packages/blocks-engine/src/style/dtcg.test.ts`
+> * `packages/blocks-engine/src/style/dtcg.ts`
+> * `packages/blocks-engine/src/style/site-tokens.test.ts`
+> * `packages/blocks-engine/src/style/site-tokens.ts`
+> 
+> </details>
+> 
+> </details>
+
+<!-- end of auto-generated comment: rate limited by coderabbit.ai -->
+
+<!-- tips_start -->
+
+---
+
+Thanks for using [CodeRabbit](https://coderabbit.ai?utm_source=oss&utm_medium=github&utm_campaign=nextlyhq/nextly&utm_content=1137)! It's free for OSS, and your support helps us grow. If you like it, consider giving us a shout-out.
+
+<details>
+<summary>❤️ Share</summary>
+
+- [X](https://twitter.com/intent/tweet?text=I%20just%20used%20%40coderabbitai%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20the%20proprietary%20code.%20Check%20it%20out%3A&url=https%3A//coderabbit.ai)
+- [Mastodon](https://mastodon.social/share?text=I%20just%20used%20%40coderabbitai%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20the%20proprietary%20code.%20Check%20it%20out%3A%20https%3A%2F%2Fcoderabbit.ai)
+- [Reddit](https://www.reddit.com/submit?title=Great%20tool%20for%20code%20review%20-%20CodeRabbit&text=I%20just%20used%20CodeRabbit%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20proprietary%20code.%20Check%20it%20out%3A%20https%3A//coderabbit.ai)
+- [LinkedIn](https://www.linkedin.com/sharing/share-offsite/?url=https%3A%2F%2Fcoderabbit.ai&mini=true&title=Great%20tool%20for%20code%20review%20-%20CodeRabbit&summary=I%20just%20used%20CodeRabbit%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21%20It%27s%20free%20for%20OSS%20and%20offers%20a%20free%20trial%20for%20proprietary%20code)
+
+</details>
+
+
+<sub>Comment `@coderabbitai help` to get the list of available commands.</sub>
+
+<!-- tips_end -->

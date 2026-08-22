@@ -290,6 +290,43 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(dirG, { recursive: true, force: true });
 }
 
+// --- a checkout that could not be built is reeve's failure, not the worker's --
+//
+// Preparation happens INSIDE the dispatch try-block, so a failure there leaves
+// the path null while everything below it still runs. The configuration check
+// reads a null path as "no recorded configuration", which is a refusal -- and it
+// was reported as the worker having tampered with git config. That accuses a
+// worker that never started, on the most ordinary failure there is (no disk, no
+// token, a clone that would not clone), and it fires the tamper channel every
+// time it happens.
+{
+  const dirF = mkdtempSync(join(tmpdir(), "reeve-e2e-prepfail-"));
+  const ctxF = { ...baseCtx(), db: open(join(dirF, "f.db")), logPath: join(dirF, "log.txt"),
+                 prepareCheckout: () => ({ ok: false, path: null, why: "no space left on device" }) };
+  let spawnedF = 0;
+  ctxF.spawnWorker = async () => { spawnedF++; return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; };
+  const rF = await tick(ctxF);
+  const escF = [...rF.escalations.keys()].join(" | ");
+  const logF = readFileSync(join(dirF, "log.txt"), "utf8");
+
+  // The precondition: dispatch was REACHED. Without this the case would pass by
+  // never getting that far, which is how a refund test proved nothing before.
+  const runF = ctxF.db.prepare("SELECT status, task_id FROM run ORDER BY started_at DESC LIMIT 1").get();
+  check(runF?.task_id === "pr:42", "control: dispatch was reached and a run was created", JSON.stringify(runF));
+  check(spawnedF === 0, "control: no worker was launched without a checkout", `spawned=${spawnedF}`);
+  check(/could not be prepared/i.test(escF), "it is reported as a preparation failure", escF);
+  check(!/tamper/i.test(escF) && !/git configuration/i.test(escF),
+    "and NOT as the worker changing the checkout's git configuration", escF);
+  check(!/NOT reading or publishing/.test(logF),
+    "the log does not claim there was a checkout to read",
+    logF.split("\n").filter(l => /NOT reading/.test(l)).join(" | "));
+  check(countFixAttempts(ctxF.db, "o/r", 42, causeKey("o/r", CAUSE)) === 0,
+    "and the fixer's attempt is refunded, because nothing ran",
+    String(countFixAttempts(ctxF.db, "o/r", 42, causeKey("o/r", CAUSE))));
+  ctxF.db.close();
+  rmSync(dirF, { recursive: true, force: true });
+}
+
 // --- an already-open verdict prepares nothing (no canary litter per tick) -----
 //
 // With the default worker.isolation: none the canary can never run, so building

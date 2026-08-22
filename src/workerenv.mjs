@@ -34,9 +34,10 @@ import { join, dirname } from "node:path";
 
 /**
  * What this environment can and cannot promise, read by the daemon before any
- * dispatch. `credentialRead` flips to "closed" only when a measured mechanism
- * (the OS sandbox canary denying keychain and gh-config reads, or a dedicated
- * worker user) proves it; a comment cannot flip it.
+ * dispatch. `credentialRead` says what mechanism closes the reach, and only a
+ * measured one may set it: the canary probes the keychain, the gh keyring and
+ * git's credential helper from inside a real worker, and reads the FILES that
+ * worker left rather than anything it said. A comment cannot flip it.
  */
 export const CONTAINMENT = Object.freeze({
   credentialRead: "closed-by-home",

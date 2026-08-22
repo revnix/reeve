@@ -116,15 +116,14 @@ export async function measureContainment({
   stateDir, nwo, platform = process.platform, isolated = false, netProbe = null,
   canary = null, keychain = null, cache = new Map(), now = () => Date.now(),
 }) {
-  // The keychain probe and the shared-account/linked-worktree topology are why
-  // a canary pass is NECESSARY but not SUFFICIENT. The probe reads only the two
-  // conventional GitHub items; another client can store a token elsewhere in the
-  // SAME account, and a linked worktree shares the founder's git dir (refs AND
-  // config), so a closed worker could still plant a hook the daemon later runs.
-  // Both are answered by the same thing: an ISOLATED worker (its own OS user
-  // with an empty keychain, its own clone), declared in the profile once the
-  // founder has set it up. Until then a found credential still hard-fails, but an
-  // empty probe never CLOSES on its own.
+  // The keychain is probed for the RECORD, not as a gate. It was a gate while a
+  // worker ran with the founder's HOME and could ask securityd directly, and it
+  // was a poor one: the probe reads two conventional GitHub items, and another
+  // client can store a token under a third in the same account. A worker's HOME
+  // is now reeve's own scratch directory, so no login keychain is in its search
+  // list, and its own clone shares no ref store or config with the founder's
+  // checkout. What is left to establish is that the OS sandbox holds under the
+  // CLI in use -- which the canary measures directly, per build and per policy.
   const probed = typeof keychain === "function" ? await keychain() : keychain;
   const cheap = cheapContainmentReasons({ platform, isolated, keychain: probed });
   const reasons = [...cheap.reasons];

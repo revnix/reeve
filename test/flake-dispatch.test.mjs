@@ -86,6 +86,10 @@ const scenario = async ({ failing, probe }) => {
     evaluate: () => evalFor(failing),
     publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
     spawnWorker: async args => { spawned.push(args); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; },
+    // Injected, never read from disk: the real reader looks at
+    // ~/.reeve/claude-token, so a default passes on a machine that happens to
+    // have one and fails on CI.
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
     resolveCause: (nwo, f) => CAUSES[f.name],
     flakeProbe: probe,
     prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),

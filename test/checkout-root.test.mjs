@@ -99,6 +99,10 @@ const ctxFor = (dir, identity, extra = {}) => ({
   evaluate: () => evaluation,
   publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
   spawnWorker: async (args) => { spawned.push(args); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s1" }; },
+  // Injected, never read from disk. The real reader looks at
+  // ~/.reeve/claude-token, so a default makes these tests pass on a machine that
+  // happens to have one and fail on CI, which is exactly what it did.
+  oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
   resolveCause: () => CAUSE,
   ...extra,
 });

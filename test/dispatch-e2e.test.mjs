@@ -73,6 +73,10 @@ const baseCtx = () => ({
   // rootCause reaches the network; the tick resolves it before deciding, so it
   // is stubbed at the same seam the daemon uses.
   resolveCause: () => CAUSE,
+  // Injected, never read from disk. The real reader looks at
+  // ~/.reeve/claude-token, so a default makes these tests pass on a machine that
+  // happens to have one and fail on CI, which is exactly what it did.
+  oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
   prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
 });
 

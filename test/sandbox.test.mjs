@@ -340,6 +340,44 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
                          action: "FIX_CI", worktree: "/tmp/wt", tmpDir: TMP });
   check(f.settings.sandbox.network.allowedDomains.length === 0, "and no other action does", JSON.stringify(f.settings.sandbox.network.allowedDomains));
 }
+
+// ── the clone a worker's checkout was made FROM ───────────────────────────────
+//
+// The run checkout carries only COMMITTED content, so the founder's uncommitted
+// work and their ignored files are not IN it. Measured 2026-08-22, that is not
+// the same as being out of reach: the sandbox denies WRITES outside the
+// checkout, not reads, and a worker could `cat` them where they still live
+// (test/escape.test.mjs measures this against the real Seatbelt profile).
+{
+  const withClone = { ...profile, identity: { ...profile.identity, checkout: "/srv/founder/repo" } };
+  const s = sandboxFor({ profile: withClone, action: "FIX_CI", worktree: "/srv/worktrees/run-1-a", tmpDir: TMP });
+  check(s.settings.sandbox.filesystem.denyRead.includes("/srv/founder/repo"),
+    "identity.checkout is deny-read at the OS layer", JSON.stringify(s.settings.sandbox.filesystem.denyRead.slice(-3)));
+  check(s.settings.permissions.deny.includes("Read(/srv/founder/repo)") && s.settings.permissions.deny.includes("Read(/srv/founder/repo/**)"),
+    "and denied to the Read tool in BOTH forms, so the directory entry is not left readable",
+    s.settings.permissions.deny.filter(d => d.includes("founder")).join(" "));
+  check(validateSettings(s.settings, { tmpDir: TMP, sourceCheckout: ["/srv/founder/repo"] }).ok === true,
+    "control: the generated settings validate against that expectation", "");
+  const stripped = structuredClone(s.settings);
+  stripped.sandbox.filesystem.denyRead = stripped.sandbox.filesystem.denyRead.filter(x => x !== "/srv/founder/repo");
+  check(validateSettings(stripped, { tmpDir: TMP, sourceCheckout: ["/srv/founder/repo"] }).ok === false,
+    "and a policy missing it cannot reach a worker", "");
+
+  // A clone that CONTAINS the checkout would deny the worker its own code. That
+  // is a configuration error, and it is named rather than silently dropped --
+  // dropping it would leave the founder's clone readable with nothing said.
+  const nested = sandboxFor({ profile: { ...profile, identity: { ...profile.identity, checkout: "/srv/founder/repo" } },
+                              action: "FIX_CI", worktree: "/srv/founder/repo/wt/run-1-a", tmpDir: TMP });
+  check(nested.stateHomeContainsWorktree.includes("/srv/founder/repo"),
+    "a worktree root inside the clone is reported as the overlap it is, so dispatch refuses",
+    JSON.stringify(nested.stateHomeContainsWorktree));
+
+  const none = sandboxFor({ profile: { ...profile, identity: { ...profile.identity, checkout: "relative/path" } },
+                            action: "FIX_CI", worktree: "/tmp/wt", tmpDir: TMP });
+  check(!none.settings.sandbox.filesystem.denyRead.some(d => d.includes("relative")),
+    "a relative identity.checkout contributes no deny — a relative path in a policy protects nothing",
+    JSON.stringify(none.settings.sandbox.filesystem.denyRead.slice(-2)));
+}
 {
   const good = () => structuredClone(sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: TMP }).settings);
   const errs = s => validateSettings(s, { tmpDir: TMP }).errors.join(" | ");

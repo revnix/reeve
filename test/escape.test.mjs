@@ -79,6 +79,12 @@ const wt = makeLinkedWorktree();
 check(wt.ok, "control: a worker worktree exists, with both layers reeve used to give it", JSON.stringify(wt));
 writeFileSync(join(wt.path, "change.txt"), "from the worker\n");
 git(wt.path, "add", "-A"); git(wt.path, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-q", "-m", "worker change");
+// The founder's uncommitted work and an ignored secret, in the checkout a run
+// clone is made FROM. The clone carries neither, by construction -- but the
+// original files are still on this disk, and the probe below is what says
+// whether a worker can walk to them.
+const founderWip = join(clone, "WIP.txt"); writeFileSync(founderWip, "the founder unfinished work\n");
+const founderEnv = join(clone, ".env"); writeFileSync(founderEnv, "SECRET=hunter2\n");
 const dest = join(root, "dest.git"); git(root, "init", "--bare", "-q", dest);
 const standalone = join(root, "standalone"); git(root, "clone", "-q", origin, standalone); git(standalone, "checkout", "-q", "feature");
 
@@ -128,12 +134,20 @@ if (process.platform !== "darwin") {
   // The block every worker gets, turned into the runtime's own settings
   // shape. The CLI adds cwd to the write scope implicitly; srt adds nothing,
   // so cwd (and, where noted, what the CLI was measured to add) is listed.
-  const policy = sandboxFor({ profile: { units: [] }, action: "FIX_CI", worktree: wt.path, tmpDir }).settings.sandbox;
-  const settingsFor = (cwd, extraWrite = []) => {
+  // Two policies, from the real generator. The LINKED one is built from a
+  // profile that names no clone, because that is the arrangement it documents:
+  // reeve had no source-checkout deny then, and adding one here would make the
+  // shared-ref shape look closed for a reason that did not exist. The STANDALONE
+  // one names the clone, so its denyRead is generated rather than hand-written
+  // -- the assertions below then measure the generator AND the OS together.
+  const policyFor = (profile, worktree) => sandboxFor({ profile, action: "FIX_CI", worktree, tmpDir }).settings.sandbox;
+  const policy = policyFor({ units: [] }, wt.path);
+  const policyStandalone = policyFor({ units: [], identity: { checkout: clone } }, standalone);
+  const settingsFor = (cwd, extraWrite = [], pol = policy) => {
     const p = join(root, `srt-${extraWrite.length ? "wide" : "cwd"}-${cwd.split("/").pop()}.json`);
     writeFileSync(p, JSON.stringify({
-      network: { allowedDomains: policy.network.allowedDomains, deniedDomains: [], allowUnixSockets: [], allowLocalBinding: false },
-      filesystem: { allowWrite: [cwd, tmpDir, ...extraWrite], denyWrite: [], allowRead: [tmpDir], denyRead: [...policy.filesystem.denyRead, fileDecoy] },
+      network: { allowedDomains: pol.network.allowedDomains, deniedDomains: [], allowUnixSockets: [], allowLocalBinding: false },
+      filesystem: { allowWrite: [cwd, tmpDir, ...extraWrite], denyWrite: [], allowRead: [tmpDir], denyRead: [...pol.filesystem.denyRead, fileDecoy] },
     }));
     return p;
   };
@@ -191,6 +205,8 @@ curl -sS -m 4 ${JSON.stringify(netUrl)} -o ./netbody 2>/dev/null; rec netprobe $
 cat ${JSON.stringify(xdgDecoy)} >/dev/null 2>&1; rec xdg_git $?
 cat ${JSON.stringify(fileDecoy)} >/dev/null 2>&1; rec file_decoy $?
 cat ${JSON.stringify(fileControl)} >/dev/null 2>&1; rec file_control $?
+cat ${JSON.stringify(founderWip)} >/dev/null 2>&1; rec founder_wip $?
+cat ${JSON.stringify(founderEnv)} >/dev/null 2>&1; rec founder_env $?
 `;
   const runProbe = (cwd, settings) => {
     for (const f of ["probe-results.txt", "INSIDE", "curl-body", "decoy-copy", "decoy-copy2", "decoy-link"]) rmSync(join(cwd, f), { force: true });
@@ -272,12 +288,21 @@ cat ${JSON.stringify(fileControl)} >/dev/null 2>&1; rec file_control $?
 
   // ── a standalone clone: the topology PR-2b moves workers to ──────────────
   {
-    const { results: r } = runProbe(standalone, settingsFor(standalone));
+    const { results: r } = runProbe(standalone, settingsFor(standalone, [], policyStandalone));
+    check(policyStandalone.filesystem.denyRead.includes(clone),
+      "control: the generated policy denies the clone the checkout was made from", JSON.stringify(policyStandalone.filesystem.denyRead.slice(-3)));
     check(r.inside === 0 && r.commit === 0, "control: in a standalone clone the worker can write and commit", JSON.stringify(r));
     check(r.updateref === 0 && git(clone, "rev-parse", "refs/heads/main") === head,
       "HELD (by topology): moving refs in a standalone clone moves nothing in the founder's checkout", `updateref=${r.updateref}`);
     check(r.noverify !== 0 && !refsAt(dest).includes("escape-noverify") && r.outside !== 0 && r.curl !== 0 && r.decoy !== 0,
       "HELD: and every other denial holds the same there", JSON.stringify(r));
+    // The clone carries only committed content, so the founder's uncommitted work
+    // and ignored files are not IN the worker's checkout. That is a different
+    // claim from being out of its reach: the originals are still on this disk,
+    // and the sandbox denies WRITES outside the checkout, not reads.
+    check(r.founder_wip !== 0 && r.founder_env !== 0,
+      "HELD: the founder's uncommitted work and ignored secrets in their own checkout are unreadable",
+      `wip=${r.founder_wip} env=${r.founder_env}`);
   }
 
   rmSync(decoy, { force: true }); rmSync(deniedCfg, { force: true }); rmSync(xdgDecoy, { force: true }); listener.close();

@@ -52,7 +52,9 @@ const db = open(join(dir, "c.db"));
     // Deterministic: the real capacity() backs off on the host's load average, so
     // a busy machine would fail these assertions for a reason that is not the code.
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
-    profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: dir }, authority: { policy: "propose_and_merge" },
+    // Separate directories, as a real deployment must have them: the worker
+    // policy denies reads of the clone, so a checkout inside it is refused.
+    profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-wc-clone-")) }, authority: { policy: "propose_and_merge" },
                rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 }, ci: { provider: "github-actions", requiredChecks: [] },
                watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 } },
     openPrs: () => [42], evaluate: () => evaluation,

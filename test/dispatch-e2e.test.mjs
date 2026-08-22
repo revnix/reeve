@@ -15,6 +15,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const dir = mkdtempSync(join(tmpdir(), "reeve-e2e-"));
+// The clone and the worktree root are separate directories, as a real
+// deployment must have them: the worker policy denies reads of the clone, so a
+// checkout INSIDE it would be denied its own code and the dispatch refuses.
+const clone = mkdtempSync(join(tmpdir(), "reeve-e2e-clone-"));
 const dbPath = join(dir, "e.db");
 const logPath = join(dir, "log.txt");
 let fail = 0;
@@ -28,7 +32,7 @@ const CAUSE = { ok: true, job: "CI Gate", step: "Test",
                 cause: [{ where: "src/x.ts:1", message: "boom" }] };
 
 const profile = {
-  identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: dir },
+  identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: clone },
   authority: { policy: "propose_and_merge" },
   rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
   ci: { provider: "github-actions", requiredChecks: [] },

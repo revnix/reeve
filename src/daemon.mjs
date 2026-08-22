@@ -27,7 +27,7 @@ import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./work
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
 import { canaryIdFor, netListener } from "./canary.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
-import { buildAlert, notify } from "./notify.mjs";
+import { buildAlert, notify, printable } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256 } from "./db/ops.mjs";
 import { writeDash } from "./dash.mjs";
 import { snapshot, snapshotAll } from "./backup.mjs";
@@ -216,25 +216,70 @@ function branchHead(worktree, branch) {
 }
 
 function changedFiles(worktree, since = null, ref = "HEAD") {
+  // The same 64 MiB the secret scanner reads under. `execFileSync` buffers 1 MiB
+  // by default and throws ENOBUFS past it, which a per-commit path walk reaches
+  // sooner than it looks: measured 2026-08-22, one commit of 1,800 files under
+  // long directory names produced 1,123,200 bytes of pathnames on its own.
   const run = args => {
-    try { return execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args], { encoding: "utf8", env: gitEnv() }).trim(); }
+    try { return execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args],
+                              { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: gitEnv() }); }
     catch { return null; }
   };
 
   // Uncommitted work, for a worker that stopped part-way.
-  const dirty = run(["status", "--porcelain"]);
+  //
+  // NUL-separated, because git's default output QUOTES any path holding a
+  // non-ASCII byte or a newline: `secrets/kéy.txt` arrives as
+  // `"secrets/k\303\251y.txt"`, and that leading quote means the risk globs
+  // stop matching. Measured 2026-08-22 — reviewDiff returned ok for the quoted
+  // form of a path it refused in raw form, so a sensitive file published itself
+  // by being named in a language with accents.
+  const dirty = run(["status", "--porcelain", "-z"]);
   if (dirty === null) return null;   // could not ask, which reviewDiff refuses on its own terms
-  // Porcelain v1: two status columns, a space, then the path. A rename carries
-  // "old -> new"; the new name is the one that matters.
-  const uncommitted = dirty ? dirty.split("\n").map(l => l.slice(3).trim().split(" -> ").pop()).filter(Boolean) : [];
+  // Porcelain -z: two status columns, a space, then the path, verbatim.
+  const uncommitted = [];
+  const records = dirty.split("\0");
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    if (!record) continue;
+    const path = record.slice(3);
+    if (path) uncommitted.push(path);
+    // A rename or copy carries its SOURCE as the NEXT record, with no status
+    // columns of its own. Both paths are judged: a worker that renames a
+    // sensitive file to a harmless name has still touched the sensitive one,
+    // and the "old -> new" parser this replaces kept only the destination.
+    if (/[RC]/.test(record.slice(0, 2))) { const source = records[++i]; if (source) uncommitted.push(source); }
+  }
 
   // And COMMITTED work, which is what a worker that finished produces. The prompt
   // tells it to commit; committing leaves a clean tree; and reading only the tree
   // therefore reported a complete, correct, committed fix as "nothing was changed"
   // and refused to publish it. The instrument could not represent the success case
   // it was written to check.
-  const committed = since ? (run(["diff", "--no-ext-diff", "--name-only", `${since}..${ref}`]) ?? "") : "";
-  const fromCommits = committed ? committed.split("\n").filter(Boolean) : [];
+  //
+  // EVERY commit's paths, not the range's endpoints. `--name-only` over a range
+  // names what the DIFF contains, so a worker that touched a sensitive or
+  // out-of-territory path in one commit and restored it in a later one showed
+  // nothing at the endpoints — while the push still carries that commit and its
+  // objects, and the diff gate had approved it. `--name-only` with `-m` over the
+  // whole range names the paths of each commit in it. (Codex #7-[8].)
+  //
+  // `--no-renames` because rename detection is ON by default and collapses a
+  // rename to its DESTINATION alone: measured 2026-08-22, moving
+  // `secrets/key.txt` to `public.txt` reported `public.txt` and nothing else,
+  // so the gate never saw the sensitive path the commit carried away.
+  //
+  // A failed read is `null` here exactly as it is for the status above, and is
+  // returned as such. `?? ""` read an UNREADABLE range as an EMPTY one, so a
+  // large completed fix was refused with "the worker produced an empty diff —
+  // nothing was changed": a reason that is not true, and one that sends whoever
+  // reads it to look at the worker instead of at the read. (Codex #10-[2].)
+  let fromCommits = [];
+  if (since) {
+    const committed = run(["log", "--no-ext-diff", "--name-only", "--no-renames", "--pretty=format:", "-m", "-z", `${since}..${ref}`]);
+    if (committed === null) return null;
+    fromCommits = committed.split("\0").filter(Boolean);
+  }
 
   return [...new Set([...fromCommits, ...uncommitted])];
 }
@@ -387,7 +432,11 @@ export async function measuredContainment(ctx, profile, nwo, logPath) {
 }
 
 export function log(logPath, line) {
-  const stamped = `${new Date().toISOString()} ${line}`;
+  // `printable`, because a line can carry a pathname a pull request chose, and a
+  // newline in one forges a log entry while an ANSI sequence rewrites what a
+  // human reading the log sees. One boundary rather than one escape per call
+  // site: the next thing that logs a worker-supplied string is covered too.
+  const stamped = `${new Date().toISOString()} ${printable(line)}`;
   if (!logPath) { console.log(stamped); return; }
   let appended = false;
   try {

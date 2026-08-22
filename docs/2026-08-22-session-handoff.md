@@ -1,4 +1,11 @@
-# Session handoff — 2026-08-22
+# Session handoff — 2026-08-22 (SUPERSEDED)
+
+> **SUPERSEDED by `docs/2026-08-22-session-handoff-2.md`.** This was written
+> before PRs #5, #6 and #7 merged. Its central keychain claim is WRONG: a scratch
+> HOME closes the keychain SEARCH LIST, not the keychain — the file stays
+> readable by path until `~/Library/Keychains` is denied, which is what actually
+> closed it. Several "remaining work" items here are done. Read the newer one.
+
 
 Written at the end of a long session so the next one starts with the same facts
 rather than re-deriving them. Everything here is either **measured** (with the

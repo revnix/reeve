@@ -4,7 +4,7 @@
 import { prepareRunCheckout, releaseRunCheckout, fetchRunWork, publishRunWork, copyDeps, canCloneFiles, runPathFor, dependencyPathsFor } from "../src/checkout.mjs";
 import { verifyConfig } from "../src/gitguard.mjs";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -271,6 +271,213 @@ check(existsSync(join(r.path, "node_modules", "left-pad", "index.js")), "but the
   check(plain.ok, "control: a tree that declares no filter is unaffected", JSON.stringify(plain.why));
   if (plain.ok) releaseRunCheckout(plain.path, { workFetched: true });
   rmSync(lfsish, { recursive: true, force: true });
+}
+
+// ── the founder's repository keeps the founder's configuration ───────────────
+//
+// The isolation exists because a worker's checkout holds pull-request content.
+// Applied to the founder's own repository it removes the things reeve needs
+// there: measured 2026-08-22 against revnix/reeve, `ls-remote origin` succeeded
+// ordinarily and failed under the isolation with "could not read Username for
+// 'https://github.com'", because the credential helper is global.
+//
+// A credential cannot be put in a fixture, so this reproduces the same
+// mechanism with the other global key that decides how git reaches a remote: a
+// `url.<base>.insteadOf` rewrite, which is what SSH rewrites and corporate
+// proxies use. Origin is a URL that resolves ONLY through it.
+{
+  const home = join(root, "founder-home");
+  const remote = join(root, "rewritten.git");
+  const repo = join(root, "rewritten-founder");
+  mkdirSync(home, { recursive: true });
+  execFileSync("git", ["init", "--bare", "-q", remote]);
+  execFileSync("git", ["init", "-q", "-b", "main", repo]);
+  writeFileSync(join(home, ".gitconfig"), `[url "${remote}"]\n\tinsteadOf = reeve-fixture://origin\n`);
+  writeFileSync(join(repo, "app.js"), "console.log(1)\n");
+  g(repo, "add", "-A"); g(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  g(repo, "remote", "add", "origin", "reeve-fixture://origin");
+
+  const wasHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    // The fixture's own precondition: the rewrite is real, and nothing else can
+    // resolve this URL. Without it the case below would pass for the wrong reason.
+    execFileSync("git", ["-C", repo, "push", "-q", "origin", "HEAD:refs/heads/rewritten"], { encoding: "utf8", env: { ...process.env, HOME: home } });
+    let unresolvable = "";
+    try { execFileSync("git", ["-C", repo, "ls-remote", "origin"], { encoding: "utf8", env: { ...process.env, HOME: home, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" }, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (e) { unresolvable = String(e.stderr || e.message); }
+    check(/reeve-fixture/.test(unresolvable),
+      "control: without the founder's global config the origin cannot be resolved at all", JSON.stringify(unresolvable.slice(0, 120)));
+
+    // An EXPLICIT GIT_CONFIG_GLOBAL is the founder naming where their
+    // configuration lives -- a company file supplying the rewrite or the
+    // credential helper -- and dropping it puts git back on a ~/.gitconfig that
+    // carries neither. Only reeve's OWN isolation value is discarded.
+    const company = join(root, "company.gitconfig");
+    writeFileSync(company, `[url "${remote}"]\n\tinsteadOf = reeve-company://origin\n`);
+    const bare = join(root, "bare-home");
+    mkdirSync(bare, { recursive: true });
+    writeFileSync(join(bare, ".gitconfig"), "# no rewrite here\n");
+
+    const rewrittenHead = g(repo, "rev-parse", "HEAD");
+    const rw = prepareRunCheckout({ repoRoot: repo, root: runs, pr: 82, runId: "r82", branch: "rewritten", head: rewrittenHead });
+    check(rw.ok, "a checkout prepares though origin resolves only through the founder's global config", JSON.stringify(rw.why));
+
+    if (rw.ok) releaseRunCheckout(rw.path, { workFetched: true });
+
+    // Publication is exercised SEPARATELY, on a checkout built by hand, so that
+    // it cannot be skipped by the case above failing: a stub that breaks only
+    // the push must still turn this red rather than leave it unrun.
+    const worker = join(root, "rewritten-worker");
+    // Cloned, then put on the branch by REVISION: `rewritten` exists on the
+    // remote and not as a local head in the founder's checkout, and
+    // `clone --branch` asks the source for a local head.
+    execFileSync("git", ["clone", "-q", repo, worker]);
+    g(worker, "checkout", "-q", "-B", "rewritten", rewrittenHead);
+    writeFileSync(join(worker, "app.js"), "console.log(2)\n");
+    g(worker, "add", "-A"); g(worker, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "the worker's fix");
+    const pub = publishRunWork({ repoRoot: repo, path: worker, branch: "rewritten", expectedRemote: rewrittenHead });
+    check(pub.ok, "and the work publishes through it", JSON.stringify(pub.why));
+    const onRemote = (() => { try { return g(remote, "rev-parse", "refs/heads/rewritten"); } catch { return "(unreadable)"; } })();
+    check(onRemote === g(worker, "rev-parse", "HEAD"), "the remote carries what the worker committed", onRemote);
+    rmSync(worker, { recursive: true, force: true });
+
+    // 1. reeve's own isolation value, inherited: discarded, so the founder's
+    //    ~/.gitconfig is read and the rewrite still resolves.
+    const wasIso = process.env.GIT_CONFIG_GLOBAL;
+    process.env.GIT_CONFIG_GLOBAL = "/dev/null";
+    const iso = prepareRunCheckout({ repoRoot: repo, root: runs, pr: 83, runId: "r83", branch: "rewritten", head: rewrittenHead });
+    check(iso.ok, "an inherited GIT_CONFIG_GLOBAL=/dev/null is discarded, not honoured", JSON.stringify(iso.why));
+    if (iso.ok) releaseRunCheckout(iso.path, { workFetched: true });
+
+    // 2. an explicit founder-chosen file: KEPT, and it is the only thing that
+    //    can resolve this origin -- the home config in scope carries no rewrite.
+    process.env.GIT_CONFIG_GLOBAL = company;
+    process.env.HOME = bare;
+    g(repo, "remote", "set-url", "origin", "reeve-company://origin");
+    let unresolvableC = "";
+    try { execFileSync("git", ["-C", repo, "ls-remote", "origin"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+                                                                     env: { ...process.env, HOME: bare, GIT_CONFIG_GLOBAL: "/dev/null" } }); }
+    catch (e) { unresolvableC = String(e.stderr || e.message); }
+    check(/reeve-company/.test(unresolvableC),
+      "control: without that file the company origin cannot be resolved either", JSON.stringify(unresolvableC.slice(0, 110)));
+
+    const explicit = prepareRunCheckout({ repoRoot: repo, root: runs, pr: 84, runId: "r84", branch: "rewritten", head: rewrittenHead });
+    check(explicit.ok, "an explicit GIT_CONFIG_GLOBAL is KEPT, so the founder's chosen config still applies", JSON.stringify(explicit.why));
+    if (explicit.ok) releaseRunCheckout(explicit.path, { workFetched: true });
+    if (wasIso === undefined) delete process.env.GIT_CONFIG_GLOBAL; else process.env.GIT_CONFIG_GLOBAL = wasIso;
+    process.env.HOME = home;
+  } finally {
+    if (wasHome === undefined) delete process.env.HOME; else process.env.HOME = wasHome;
+  }
+}
+
+// ── and it keeps its isolation everywhere the founder's config is not needed ─
+//
+// The other half of the same rule. The worker-to-founder fetch reads a LOCAL
+// path: it needs no credential and no rewrite, and a founder who has hardened
+// git with `protocol.file.allow=never` would otherwise have it refused —
+// measured 2026-08-22 on git 2.50.1, `fatal: transport 'file' not allowed` —
+// and with it every valid fix, before anything could be pushed.
+{
+  const home = join(root, "hardened-home");
+  const repo = join(root, "hardened-founder");
+  const worker = join(root, "hardened-worker");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, ".gitconfig"), '[protocol "file"]\n\tallow = never\n');
+  execFileSync("git", ["init", "-q", "-b", "main", repo]);
+  writeFileSync(join(repo, "app.js"), "console.log(1)\n");
+  g(repo, "add", "-A"); g(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  execFileSync("git", ["clone", "-q", repo, worker]);
+  g(worker, "checkout", "-q", "-B", "hardened");
+  writeFileSync(join(worker, "app.js"), "console.log(2)\n");
+  g(worker, "add", "-A"); g(worker, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "the worker's fix");
+
+  const wasHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    // The fixture's own precondition: the hardening is real and it does bite.
+    let refused = "";
+    try { execFileSync("git", ["-C", repo, "fetch", "--no-tags", "-q", worker, "+hardened:refs/control/one"],
+                       { encoding: "utf8", env: { ...process.env, HOME: home }, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (e) { refused = String(e.stderr || e.message); }
+    check(/transport 'file' not allowed/.test(refused),
+      "control: the founder's hardening refuses a plain fetch from the worker's checkout", JSON.stringify(refused.slice(0, 100)));
+
+    const got = fetchRunWork({ repoRoot: repo, path: worker, branch: "hardened" });
+    check(got.ok, "reeve's fetch of the worker's branch survives it", JSON.stringify(got.why));
+    check(got.head === g(worker, "rev-parse", "HEAD"), "and lands on what the worker committed", `${got.head}`);
+  } finally {
+    if (wasHome === undefined) delete process.env.HOME; else process.env.HOME = wasHome;
+  }
+  rmSync(worker, { recursive: true, force: true });
+}
+
+// ── an attributes file reeve will not read ───────────────────────────────────
+//
+// The tree is PULL-REQUEST content, and `.gitattributes` can be committed as a
+// symlink — mode 120000, which a clone materialises. The reader followed it.
+// Measured 2026-08-22 on git 2.50.1: one pointing at /dev/zero was listed by
+// `ls-files` and killed the reading process outright (SIGKILL, exit 137), so a
+// pull request could take the daemon down before a worker was ever launched.
+//
+// The fixture points somewhere harmless instead, at a file that DOES declare a
+// filter: if reeve still read through the link it would name that filter, so
+// the refusal naming the link rather than the filter is the evidence that it
+// did not.
+{
+  const outside = join(root, "outside-attrs");
+  writeFileSync(outside, "* filter=absolutely-not-supplied\n");
+
+  const linked = join(root, "linked-clone");
+  execFileSync("git", ["clone", "-q", origin, linked]);
+  const gS = (...a) => execFileSync("git", ["-C", linked, ...a], { encoding: "utf8" }).trim();
+  gS("checkout", "-q", "-b", "linked-attrs", "origin/main");
+  symlinkSync(outside, join(linked, ".gitattributes"));
+  gS("add", "-A"); gS("-c", "user.email=o@o", "-c", "user.name=o", "commit", "-qm", "attributes, as a link");
+  check(/^120000 /.test(gS("ls-files", "-s", ".gitattributes")),
+    "control: git committed the attributes file as a symlink, and a clone materialises it", gS("ls-files", "-s", ".gitattributes"));
+  gS("push", "-q", "origin", "linked-attrs");
+  const linkedHead = gS("rev-parse", "HEAD");
+
+  const rl = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 79, runId: "r79", branch: "linked-attrs", head: linkedHead });
+  check(!rl.ok && /symbolic link/.test(rl.why ?? ""),
+    "an attributes file committed as a symlink is refused unread", JSON.stringify(rl.why));
+  check(!/absolutely-not-supplied/.test(rl.why ?? ""),
+    "and reeve never read through it — the filter beyond the link is not named", JSON.stringify(rl.why));
+  check(!existsSync(runPathFor(runs, 79, "r79")), "and the half-built checkout is removed", "");
+
+  // The same reader, unbounded, on an attributes file larger than any real one.
+  const big = join(root, "big-clone");
+  execFileSync("git", ["clone", "-q", origin, big]);
+  const gB = (...a) => execFileSync("git", ["-C", big, ...a], { encoding: "utf8" }).trim();
+  gB("checkout", "-q", "-b", "big-attrs", "origin/main");
+  writeFileSync(join(big, ".gitattributes"), "#".repeat(2 << 20) + "\n");
+  gB("add", "-A"); gB("-c", "user.email=o@o", "-c", "user.name=o", "commit", "-qm", "a very large attributes file");
+  gB("push", "-q", "origin", "big-attrs");
+  const bigHead = gB("rev-parse", "HEAD");
+
+  const rb = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 80, runId: "r80", branch: "big-attrs", head: bigHead });
+  check(!rb.ok && /bytes/.test(rb.why ?? ""),
+    "an attributes file past the size reeve will read is refused", JSON.stringify(rb.why));
+
+  // The control that says the bound is a bound and not a ban: an ordinary
+  // attributes file, declaring an attribute that is not a filter, still prepares.
+  const ok = join(root, "ok-clone");
+  execFileSync("git", ["clone", "-q", origin, ok]);
+  const gO = (...a) => execFileSync("git", ["-C", ok, ...a], { encoding: "utf8" }).trim();
+  gO("checkout", "-q", "-b", "ok-attrs", "origin/main");
+  writeFileSync(join(ok, ".gitattributes"), "*.md text eol=lf\n");
+  gO("add", "-A"); gO("-c", "user.email=o@o", "-c", "user.name=o", "commit", "-qm", "ordinary attributes");
+  gO("push", "-q", "origin", "ok-attrs");
+  const okHead = gO("rev-parse", "HEAD");
+
+  const ro = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 81, runId: "r81", branch: "ok-attrs", head: okHead });
+  check(ro.ok, "control: an ordinary attributes file is read and the checkout prepares", JSON.stringify(ro.why));
+  if (ro.ok) releaseRunCheckout(ro.path, { workFetched: true });
+  rmSync(linked, { recursive: true, force: true });
+  rmSync(big, { recursive: true, force: true });
+  rmSync(ok, { recursive: true, force: true });
 }
 
 // ── the branch check is atomic with the push ─────────────────────────────────

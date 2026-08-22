@@ -35,7 +35,7 @@ import { writeFileSync, readFileSync } from "node:fs";
  * actually closes this: the daemon refuses to run git at all in a checkout whose
  * configuration the worker changed.
  */
-const NEUTRALISE = [
+const NEUTRALISE_ANYWHERE = [
   // A replacement ref rewrites what git SHOWS without touching what a push
   // carries: a worker can `git replace <pinned-head> <fake>` so every diff the
   // daemon takes reports an innocuous change, while the branch it publishes
@@ -47,13 +47,37 @@ const NEUTRALISE = [
   "-c", "core.pager=cat",
   "-c", "core.editor=true",
   "-c", "sequence.editor=true",
-  "-c", "core.sshCommand=",
-  "-c", "core.askPass=",
   "-c", "diff.external=",
   "-c", "uploadpack.packObjectsHook=",
+];
+
+/**
+ * And these, which only a WORKER-CONTROLLED directory carries.
+ *
+ * Every key here decides how git REACHES A REMOTE. Applied to the founder's own
+ * repository they do not harden anything — there is no hostile content there —
+ * and they break the two operations reeve exists to perform. Measured
+ * 2026-08-22 against this repository, whose origin is https and whose
+ * credentials come from a global `credential.https://github.com.helper`:
+ *
+ *     $ git ls-remote origin refs/heads/main
+ *     aad542c…  refs/heads/main
+ *     $ <the same, under these and no global config>
+ *     fatal: could not read Username for 'https://github.com'
+ *
+ * So every fetch, every ls-remote and every push reeve would make on the
+ * founder's behalf failed to authenticate. A global `url.<base>.insteadOf`
+ * rewrite — SSH rewrites, corporate proxies — is the same shape of breakage
+ * from the other direction. (Codex #7-[10].)
+ */
+const NEUTRALISE_WORKER_ONLY = [
+  "-c", "core.sshCommand=",
+  "-c", "core.askPass=",
   "-c", "credential.helper=",
   "-c", "protocol.ext.allow=never",
 ];
+
+const NEUTRALISE = [...NEUTRALISE_ANYWHERE, ...NEUTRALISE_WORKER_ONLY];
 
 /**
  * The environment every daemon git command in a worker-controlled directory runs
@@ -75,8 +99,44 @@ export const GIT_ISOLATED_ENV = Object.freeze({
 });
 
 /**
- * The env for a daemon git call: the real environment with the isolation above
- * layered on, and git's CONFIGURATION-INJECTION variables removed.
+ * The env for a daemon git call in a WORKER-CONTROLLED directory: the real
+ * environment with the isolation above layered on.
+ */
+export function gitEnv(extra = {}) {
+  return { ...withoutInjectedConfig(), ...GIT_ISOLATED_ENV, ...extra };
+}
+
+/**
+ * The env for a daemon git call in the FOUNDER's own repository.
+ *
+ * The founder's configuration is kept, because that is where the remote's URL,
+ * its rewrites and its credential helper live and reeve is acting as the
+ * founder when it fetches and pushes.
+ *
+ * `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` are dropped only when they hold
+ * REEVE'S OWN isolation value, so a daemon launched with them already at
+ * /dev/null cannot reproduce the breakage this exists to avoid, silently. Any
+ * other value is a founder naming where their configuration lives — a company
+ * file supplying the rewrite or the credential helper — and deleting it puts
+ * git back on a `~/.gitconfig` that may carry neither. Measured 2026-08-23:
+ * `ls-remote` resolves through an explicit `GIT_CONFIG_GLOBAL` and fails the
+ * moment it is dropped. (Codex #10-[3].)
+ *
+ * What the founder's repository does not have is a terminal. A missing
+ * credential must fail and be reported, not wait for an answer nobody is there
+ * to give.
+ */
+export function founderGitEnv(extra = {}) {
+  const env = withoutInjectedConfig();
+  for (const k of ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"])
+    if (env[k] === GIT_ISOLATED_ENV[k]) delete env[k];
+  return { ...env, GIT_NO_REPLACE_OBJECTS: "1", GIT_TERMINAL_PROMPT: "0", ...extra };
+}
+
+/**
+ * The daemon's environment with git's CONFIGURATION-INJECTION variables removed.
+ * Both callers strip these, because they are how a config key reaches git
+ * without a config FILE.
  *
  * `GIT_CONFIG_COUNT` with its `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` pairs, and
  * `GIT_CONFIG_PARAMETERS`, are applied by git INDEPENDENTLY of the global and
@@ -85,7 +145,7 @@ export const GIT_ISOLATED_ENV = Object.freeze({
  * request's `.gitattributes` can then name it. Inheriting them is the same hole
  * the file isolation exists to shut. (Codex #7-[1].)
  */
-export function gitEnv(extra = {}) {
+function withoutInjectedConfig() {
   const env = { ...process.env };
   for (const k of Object.keys(env)) {
     // `GIT_CONFIG` is here as insurance, not as a measured hole. Its own
@@ -98,7 +158,7 @@ export function gitEnv(extra = {}) {
     if (k === "GIT_CONFIG" || k === "GIT_CONFIG_COUNT" || k === "GIT_CONFIG_PARAMETERS"
         || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(k)) delete env[k];
   }
-  return { ...env, ...GIT_ISOLATED_ENV, ...extra };
+  return env;
 }
 
 function git(cwd, args) {
@@ -124,6 +184,11 @@ export function reason(stderr) {
 
 /** The exported prefix, so every other daemon git call can use the same one. */
 export const GIT_NEUTRALISE = NEUTRALISE;
+
+/** The same, for a command whose repository is the FOUNDER's: everything that
+ * stops git running a program, and nothing that decides how it reaches a
+ * remote. */
+export const GIT_NEUTRALISE_FOUNDER = NEUTRALISE_ANYWHERE;
 
 /** The pre-push hook every worker checkout carries. It refuses unconditionally. */
 export const REFUSING_HOOK = "#!/bin/sh\necho 'this checkout does not publish; reeve publishes after the diff gate' >&2\nexit 1\n";

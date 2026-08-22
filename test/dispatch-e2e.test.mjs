@@ -555,6 +555,55 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(`${wtS}.unfetched`, { recursive: true, force: true });
 }
 
+// --- a credential inside a BINARY blob, and one that straddles a read --------
+//
+// The two cases the object walk exists for, and neither had a test.
+//
+// MEASURED: a blob containing NUL bytes does not appear in a patch at all —
+// `git diff` prints "Binary files ... differ" — so the old patch-based check
+// could not have seen it however carefully it read. And the scan reads the
+// object stream in windows, so a value split across a read boundary is only
+// found because an overlap is carried forward; without one it would be missed
+// silently, which is the worst way for a credential check to fail.
+{
+  const dirB = mkdtempSync(join(tmpdir(), "reeve-e2e-binblob-"));
+  const wtB = mkdtempSync(join(dirB, "wt-"));
+  const TOKEN = "sk-ant-oat01-test-token-not-a-real-credential";
+  const gB = (...a) => execFileSync("git", ["-C", wtB, ...a], { encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", wtB, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtB, "a.txt"), "base\n");
+  gB("add", "-A"); gB("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  const pinned = gB("rev-parse", "HEAD");
+
+  // Binary, and large enough that the token lands well past the first read.
+  const blob = Buffer.concat([Buffer.from([0, 1, 2, 0]), Buffer.alloc(3 * 1024 * 1024, 0x41),
+                              Buffer.from(TOKEN), Buffer.alloc(3 * 1024 * 1024, 0x42), Buffer.from([0])]);
+  writeFileSync(join(wtB, "asset.bin"), blob);
+  gB("add", "-A"); gB("-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "feat: add an asset");
+
+  // The control that says why the object walk exists at all.
+  const patch = execFileSync("git", ["-C", wtB, "diff", "--no-ext-diff", `${pinned}..HEAD`],
+                             { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  check(!patch.includes(TOKEN) && /Binary files/.test(patch),
+    "control: the token is invisible to a patch — git only says the binary files differ", patch.split("\n").filter(l => /Binary/.test(l)).join(" "));
+
+  let publishedB = 0;
+  const ctxB = { ...baseCtx(), db: open(join(dirB, "b.db")), logPath: join(dirB, "log.txt"),
+                 evaluate: () => ({ ...evaluation, head: pinned, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtB, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedB++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }) };
+  const rB = await tick(ctxB);
+  const escB = [...rB.escalations.keys()].join(" | ");
+  check(publishedB === 0, "a credential buried in a multi-megabyte BINARY blob is caught", `published=${publishedB}`);
+  check(/carries reeve's worker authentication token/.test(escB), "and named as the credential it is", escB);
+  check(!escB.includes(TOKEN), "without ever printing it", "the escalation contained it");
+  ctxB.db.close();
+  rmSync(dirB, { recursive: true, force: true });
+  rmSync(`${wtB}.unfetched`, { recursive: true, force: true });
+}
+
 // --- an already-open verdict prepares nothing (no canary litter per tick) -----
 //
 // With the default worker.isolation: none the canary can never run, so building

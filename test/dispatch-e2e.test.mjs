@@ -467,6 +467,143 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(`${wtB}.unfetched`, { recursive: true, force: true });
 }
 
+// --- the gates judge the ref that gets PUSHED, not HEAD ----------------------
+//
+// publishRunWork pushes `e.headRef`. A worker can commit anything on that
+// branch, then check out an auxiliary branch carrying an allowed change: every
+// gate read HEAD, passed, and the push carried content none of them looked at.
+// Both commits descend from the pinned head, so nothing else noticed.
+{
+  const dirA = mkdtempSync(join(tmpdir(), "reeve-e2e-auxbranch-"));
+  const wtA = mkdtempSync(join(dirA, "wt-"));
+  const gA = (...a) => execFileSync("git", ["-C", wtA, ...a], { encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", wtA, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtA, "a.txt"), "base\n");
+  gA("add", "-A"); gA("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  const pinned = gA("rev-parse", "HEAD");
+  // On the PR branch: the change reeve must judge.
+  writeFileSync(join(wtA, "forbidden.txt"), "the content no gate looked at\n");
+  gA("add", "-A"); gA("-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "on the branch that gets pushed");
+  // Then an auxiliary branch from the SAME pinned head, with an allowed change.
+  gA("checkout", "-q", "-b", "aux", pinned);
+  writeFileSync(join(wtA, "innocuous.txt"), "nothing to see\n");
+  gA("add", "-A"); gA("-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "what the gates would see");
+  check(gA("rev-parse", "--abbrev-ref", "HEAD") === "aux", "control: the worker left HEAD on the auxiliary branch", "");
+
+  // The credential check reads the same range the gate does, so planting the
+  // token on the PR branch makes the answer unambiguous: refused means the
+  // branch was read, published means only the auxiliary HEAD was.
+  const TOKEN_A = "sk-ant-oat01-test-token-not-a-real-credential";
+  gA("checkout", "-q", "f");
+  writeFileSync(join(wtA, "forbidden.txt"), `the content no gate looked at\n${TOKEN_A}\n`);
+  gA("add", "-A"); gA("-c", "user.email=w@w", "-c", "user.name=w", "commit", "--amend", "-qm", "on the branch that gets pushed");
+  gA("checkout", "-q", "aux");
+  check(gA("rev-parse", "--abbrev-ref", "HEAD") === "aux", "control: HEAD is still the auxiliary branch", "");
+
+  let publishedA = 0;
+  const ctxA = { ...baseCtx(), db: open(join(dirA, "a.db")), logPath: join(dirA, "log.txt"),
+                 evaluate: () => ({ ...evaluation, head: pinned, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtA, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedA++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }) };
+  const rA = await tick(ctxA);
+  const escA = [...rA.escalations.keys()].join(" | ");
+  check(publishedA === 0, "the branch that will be PUSHED is what the gates read, not the auxiliary HEAD", `published=${publishedA}`);
+  check(/carries reeve's worker authentication token/.test(escA),
+    "so content only reachable from that branch is judged", escA);
+  ctxA.db.close();
+  rmSync(dirA, { recursive: true, force: true });
+  rmSync(`${wtA}.unfetched`, { recursive: true, force: true });
+}
+
+// --- a secret committed then deleted still travels with the push ------------
+//
+// `git diff <since>..<ref>` is the NET patch. A worker that committed the token
+// and removed it in a later commit left a clean net diff, and the push carried
+// the intermediate commit and its blob.
+{
+  const dirS = mkdtempSync(join(tmpdir(), "reeve-e2e-deletedsecret-"));
+  const wtS = mkdtempSync(join(dirS, "wt-"));
+  const TOKEN = "sk-ant-oat01-test-token-not-a-real-credential";
+  const gS = (...a) => execFileSync("git", ["-C", wtS, ...a], { encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", wtS, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtS, "a.txt"), "base\n");
+  gS("add", "-A"); gS("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  const pinned = gS("rev-parse", "HEAD");
+  writeFileSync(join(wtS, "leak.txt"), `${TOKEN}\n`);
+  gS("add", "-A"); gS("-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "oops");
+  rmSync(join(wtS, "leak.txt"));
+  writeFileSync(join(wtS, "a.txt"), "an ordinary fix\n");
+  gS("add", "-A"); gS("-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "fix: tidy up");
+  const net = execFileSync("git", ["-C", wtS, "diff", "--no-ext-diff", `${pinned}..HEAD`], { encoding: "utf8" });
+  check(!net.includes(TOKEN), "control: the NET patch is clean — this is why the old check passed", "");
+
+  let publishedS = 0;
+  const ctxS = { ...baseCtx(), db: open(join(dirS, "s.db")), logPath: join(dirS, "log.txt"),
+                 evaluate: () => ({ ...evaluation, head: pinned, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtS, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedS++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }) };
+  const rS = await tick(ctxS);
+  const escS = [...rS.escalations.keys()].join(" | ");
+  check(publishedS === 0, "a secret in an intermediate commit is caught, though the net patch is clean", `published=${publishedS}`);
+  check(/carries reeve's worker authentication token/.test(escS), "and named as the credential it is", escS);
+  ctxS.db.close();
+  rmSync(dirS, { recursive: true, force: true });
+  rmSync(`${wtS}.unfetched`, { recursive: true, force: true });
+}
+
+// --- a credential inside a BINARY blob, and one that straddles a read --------
+//
+// The two cases the object walk exists for, and neither had a test.
+//
+// MEASURED: a blob containing NUL bytes does not appear in a patch at all —
+// `git diff` prints "Binary files ... differ" — so the old patch-based check
+// could not have seen it however carefully it read. And the scan reads the
+// object stream in windows, so a value split across a read boundary is only
+// found because an overlap is carried forward; without one it would be missed
+// silently, which is the worst way for a credential check to fail.
+{
+  const dirB = mkdtempSync(join(tmpdir(), "reeve-e2e-binblob-"));
+  const wtB = mkdtempSync(join(dirB, "wt-"));
+  const TOKEN = "sk-ant-oat01-test-token-not-a-real-credential";
+  const gB = (...a) => execFileSync("git", ["-C", wtB, ...a], { encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", wtB, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtB, "a.txt"), "base\n");
+  gB("add", "-A"); gB("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  const pinned = gB("rev-parse", "HEAD");
+
+  // Binary, and large enough that the token lands well past the first read.
+  const blob = Buffer.concat([Buffer.from([0, 1, 2, 0]), Buffer.alloc(3 * 1024 * 1024, 0x41),
+                              Buffer.from(TOKEN), Buffer.alloc(3 * 1024 * 1024, 0x42), Buffer.from([0])]);
+  writeFileSync(join(wtB, "asset.bin"), blob);
+  gB("add", "-A"); gB("-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "feat: add an asset");
+
+  // The control that says why the object walk exists at all.
+  const patch = execFileSync("git", ["-C", wtB, "diff", "--no-ext-diff", `${pinned}..HEAD`],
+                             { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  check(!patch.includes(TOKEN) && /Binary files/.test(patch),
+    "control: the token is invisible to a patch — git only says the binary files differ", patch.split("\n").filter(l => /Binary/.test(l)).join(" "));
+
+  let publishedB = 0;
+  const ctxB = { ...baseCtx(), db: open(join(dirB, "b.db")), logPath: join(dirB, "log.txt"),
+                 evaluate: () => ({ ...evaluation, head: pinned, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtB, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedB++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }) };
+  const rB = await tick(ctxB);
+  const escB = [...rB.escalations.keys()].join(" | ");
+  check(publishedB === 0, "a credential buried in a multi-megabyte BINARY blob is caught", `published=${publishedB}`);
+  check(/carries reeve's worker authentication token/.test(escB), "and named as the credential it is", escB);
+  check(!escB.includes(TOKEN), "without ever printing it", "the escalation contained it");
+  ctxB.db.close();
+  rmSync(dirB, { recursive: true, force: true });
+  rmSync(`${wtB}.unfetched`, { recursive: true, force: true });
+}
+
 // --- an already-open verdict prepares nothing (no canary litter per tick) -----
 //
 // With the default worker.isolation: none the canary can never run, so building

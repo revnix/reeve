@@ -113,12 +113,37 @@ const ctxFor = (dir, extra = {}) => ({
 {
   const dir = mkdtempSync(join(tmpdir(), "reeve-shadow-quiet-"));
   const ctx = ctxFor(dir, { observe: () => { throw new Error("must not observe when the PR has not moved"); } });
-  ctx.lastIngest = new Map([[7, "2026-08-22T10:00:00Z"]]);   // matches the evaluation's updatedAt
+  // Matches the evaluation's updatedAt, and ingested just now, so neither the
+  // change signal nor the staleness window asks for another observation.
+  ctx.lastIngest = new Map([[7, { updatedAt: "2026-08-22T10:00:00Z", at: Date.now() }]]);
   await tick(ctx);
   const row = ctx.db.prepare("SELECT comparisons, agreements, incomparable FROM review_shadow WHERE nwo=? AND pr=?").get(NWO, 7);
   check(row?.incomparable === 1 && row?.comparisons === 0,
     "a tick with no observation is INCOMPARABLE, not an agreement and not a divergence", JSON.stringify(row));
   check(divergences(ctx.db, NWO).length === 0, "and raises no divergence", "");
+  ctx.db.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── `updatedAt` is not a complete change signal ──────────────────────────────
+//
+// MEASURED 2026-08-22 on revnix/reeve #4: resolving a review thread, and
+// unresolving one, leave `pull_request.updated_at` byte-identical. So a pull
+// request whose only activity is threads being resolved looks unchanged, the
+// ingest is skipped forever, and the projection keeps counts that stopped being
+// true — the fail-OPEN direction for PR-5, and a shadow that never compares.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-shadow-stale-"));
+  let observed = 0;
+  const ctx = ctxFor(dir, { observe: () => { observed++; return { observations: [THREAD_OBS], incomplete: false, threads: OBSERVED }; } });
+  // The pull request has not moved by GitHub's reckoning — and reeve last looked
+  // an hour ago, which is well past the window the fold itself calls stale.
+  ctx.lastIngest = new Map([[7, { updatedAt: "2026-08-22T10:00:00Z", at: Date.now() - 3600_000 }]]);
+  await tick(ctx);
+  check(observed === 1, "an unchanged pull request is re-observed once its projection goes stale", `observed=${observed}`);
+  const row = ctx.db.prepare("SELECT comparisons, agreements FROM review_shadow WHERE nwo=? AND pr=?").get(NWO, 7);
+  check(row?.comparisons === 1 && row?.agreements === 1,
+    "so the shadow keeps learning from it instead of stalling", JSON.stringify(row));
   ctx.db.close();
   rmSync(dir, { recursive: true, force: true });
 }

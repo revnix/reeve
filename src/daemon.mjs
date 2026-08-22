@@ -515,7 +515,23 @@ export async function tick(ctx) {
     // change reeve has not seen yet still triggers a read.
     if (ctx.reviewIngest !== false && e.ok) {
       noteHead(db, nwo, pr, e.head);
-      const moved = !ctx.lastIngest?.get?.(pr) || ctx.lastIngest.get(pr) !== e.updatedAt;
+      // `updatedAt` is NOT a complete change signal for review state. MEASURED
+      // 2026-08-22 on revnix/reeve #4: resolving a thread, and unresolving one,
+      // leave `pull_request.updated_at` byte-identical. So on a pull request
+      // whose only activity is threads being resolved or reopened -- which is
+      // most of a review's life -- this guard skips the ingest forever and the
+      // projection keeps counts that stopped being true.
+      //
+      // That is the fail-OPEN direction for PR-5: the verdict would read fewer
+      // unresolved threads than exist. It also starves the shadow, because a
+      // tick that does not observe has no snapshot to compare.
+      //
+      // So the projection is refreshed when the pull request moved OR when what
+      // reeve holds is older than the window the fold itself calls stale. A
+      // quiet pull request costs one observation per window, not one per tick.
+      const staleAfter = (profile?.watch?.staleSeconds ?? 900) * 1000;
+      const last = ctx.lastIngest?.get?.(pr) ?? null;
+      const moved = !last || last.updatedAt !== e.updatedAt || (now() * 1000) - last.at >= staleAfter;
       // Whether this tick's ingest changed anything, which decides below whether
       // the live read taken back in evaluate() still describes the same moment
       // as the projection.
@@ -533,7 +549,7 @@ export async function tick(ctx) {
           }
           // Only a COMPLETE read updates the watermark. Skipping a PR on the
           // strength of a partial read is how a gap becomes permanent.
-          if (!seen.incomplete) (ctx.lastIngest ??= new Map()).set(pr, e.updatedAt);
+          if (!seen.incomplete) (ctx.lastIngest ??= new Map()).set(pr, { updatedAt: e.updatedAt, at: now() * 1000 });
           // And whether it was whole is carried to the fold. Positively named and
           // fail-closed: a pull request reeve has never wholly observed is NOT
           // complete, so it answers UNKNOWN rather than confidently from a

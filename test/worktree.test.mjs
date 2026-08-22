@@ -323,6 +323,24 @@ rmSync(base, { recursive: true, force: true });
   check(reacquire.ok === false && /reeve does not own/.test(reacquire.why) && /moved to/.test(reacquire.why),
     "and re-acquiring that worktree refuses without running git in it", JSON.stringify(reacquire));
   check(!existsSync(w.path), "the tampered directory is moved aside, so the next acquire starts clean", "");
+  // A worker that CHANGES an existing key must not cost the clone its real value:
+  // blanket --unset-all on remote.origin.url would delete the legitimate origin
+  // and leave the main checkout unable to fetch or push.
+  {
+    const w3 = acquireWorktree({ repoRoot: clone, root: join(root, "wts"), pr: 9, branch: "feat", head });
+    check(w3.ok, "control: a worktree for the url case", JSON.stringify(w3));
+    const realUrl = g(clone, "config", "--local", "--get", "remote.origin.url");
+    check(realUrl === origin, "control: the clone's origin is the real one", realUrl);
+    g(w3.path, "config", "remote.origin.url", "https://example.invalid/evil.git");
+    const re = acquireWorktree({ repoRoot: clone, root: join(root, "wts"), pr: 9, branch: "feat", head });
+    check(re.ok === false && /remote\.origin\.url/.test(re.why), "the changed key is caught", JSON.stringify(re.why));
+    // `git config --get` exits 1 when the key is gone, and a DELETED origin is
+    // exactly the failure under test, so this read must not throw.
+    const readUrl = () => { try { return g(clone, "config", "--local", "--get", "remote.origin.url"); } catch { return "(deleted)"; } };
+    const restored = readUrl();
+    check(restored === origin, "and the clone's ORIGINAL origin is restored, not deleted", restored);
+  }
+
   // reeve's OWN keys moving is a daemon upgrade re-hardening, not tampering.
   const w2 = acquireWorktree({ repoRoot: clone, root: join(root, "wts"), pr: 7, branch: "feat", head });
   check(w2.ok, "control: a fresh worktree is created after the quarantine", JSON.stringify(w2));

@@ -233,7 +233,7 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     // dependency, no timing window, and a hit at any point in the run is a leak.
     // (Codex #4d-[12], #4c-[13].) Injectable for tests.
     const netProbe = ctx.netProbe ?? netListener();
-    const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox, binaryId }))?.ok === true;
+    const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox, binaryId, worktree: canaryPaths.dir }))?.ok === true;
     if (!before) log(logPath, `containment: running the sandbox canary under ${version}`);
     let c;
     try {
@@ -733,8 +733,11 @@ export async function tick(ctx) {
         if (!reval.ok) {
           log(logPath, `  #${e.pr}: NOT dispatching — ${reval.why}`);
           escalations.set("guardian:containment:changed", 1);
+          // The attempt is NOT refunded here: this is an UNBOUND outcome, and the
+          // finally block below refunds every pre-execution outcome once. Doing
+          // it in both places took a cause from two attempts to zero and handed
+          // back retries the cap had already spent. (Codex #4h-[3].)
           r = { outcome: OUTCOMES.UNBOUND, why: `containment changed before spawn: ${reval.why}`, ms: 0, cost: null, sessionId: null };
-          if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
         } else {
         r = await (ctx.spawnWorker ?? runWorker)({
           bin: claudeBin,

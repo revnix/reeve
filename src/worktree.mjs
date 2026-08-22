@@ -88,6 +88,32 @@ const keyOf = line => line.slice(0, line.indexOf("=")).toLowerCase();
 const fingerprintPath = path => `${path}.cfg`;
 
 /**
+ * Put the named keys back to the values reeve recorded for this clone.
+ *
+ * A blanket `--unset-all` was wrong for a key the worker CHANGED rather than
+ * added: tampering with `remote.origin.url` would have deleted the real origin
+ * and left the main checkout unable to fetch or push. A key that was absent from
+ * the baseline is removed; a key that was present is restored to its recorded
+ * values, in order. (Codex #4h-[2].)
+ */
+export function restoreConfig(repoRoot, worktreePath, keys) {
+  let recorded = null;
+  try { recorded = JSON.parse(readFileSync(fingerprintPath(worktreePath), "utf8")); } catch { recorded = null; }
+  const baseline = new Map();
+  for (const line of recorded?.["--local"] ?? []) {
+    const i = line.indexOf("=");
+    if (i < 0) continue;
+    const k = line.slice(0, i).toLowerCase();
+    if (!baseline.has(k)) baseline.set(k, []);
+    baseline.get(k).push(line.slice(i + 1));
+  }
+  for (const k of keys) {
+    git(repoRoot, ["config", "--local", "--unset-all", k]);
+    for (const v of baseline.get(k) ?? []) git(repoRoot, ["config", "--local", "--add", k, v]);
+  }
+}
+
+/**
  * Move a directory aside without running git in it. The normal release path
  * asks git about stashes and unpushed work; that is exactly what must not happen
  * when the repository's configuration is the thing under suspicion.
@@ -274,11 +300,11 @@ export function acquireWorktree({ repoRoot, root, pr, branch, head = null }) {
     if (!cfg.ok) {
       const parked = quarantineByRename(path);
       // The shared config is the CLONE's, so a worker's key is still live for the
-      // main checkout: strip the keys git would execute, then drop the stale
-      // worktree registration or no future worktree can be made for this branch
-      // at all. Both `git config --unset-all` and `git worktree prune` leave the
-      // index alone, so neither can trigger the very hooks being removed.
-      for (const k of cfg.keys ?? []) git(repoRoot, ["config", "--local", "--unset-all", k]);
+      // main checkout: put the affected keys back to what reeve recorded, then
+      // drop the stale worktree registration or no future worktree can be made
+      // for this branch at all. Both `git config` and `git worktree prune` leave
+      // the index alone, so neither can trigger the very hooks being removed.
+      restoreConfig(repoRoot, path, cfg.keys ?? []);
       if (parked) git(repoRoot, ["worktree", "prune"]);
       return { ok: false, path, reused: true,
                why: `${cfg.why}; no git command was run in it, it was ${parked ? `moved to ${parked}` : "left in place"}, and the offending configuration was removed from the clone` };

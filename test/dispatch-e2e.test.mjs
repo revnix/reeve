@@ -8,7 +8,7 @@
 // integration the audit named as missing: daemon -> durable run -> worker ->
 // finish, and the refusal to re-dispatch work already in flight.
 import { tick, stateRootsFor } from "../src/daemon.mjs";
-import { open, liveRunFor, countFixAttempts } from "../src/db/ops.mjs";
+import { open, liveRunFor, countFixAttempts, recordFixAttempt } from "../src/db/ops.mjs";
 import { causeKey } from "../src/ci-rootcause.mjs";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -307,6 +307,34 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   check(/no isolated worker/.test(readFileSync(join(dirL, "log.txt"), "utf8")), "and the log says the isolation is not satisfied", "");
   ctxL.db.close();
   rmSync(dirL, { recursive: true, force: true });
+}
+
+// --- a rejected spawn refunds its attempt exactly ONCE -----------------------
+//
+// The spawn-time refusal and the pre-execution handler both refund, so doing it
+// in both places took a cause from two spent attempts down to zero and handed
+// back retries the cap had already spent.
+{
+  const dirR = mkdtempSync(join(tmpdir(), "reeve-e2e-refund-"));
+  const fpR = causeKey("o/r", CAUSE);
+  const ctxR = { ...baseCtx(), db: open(join(dirR, "r.db")), logPath: join(dirR, "log.txt"), worktreeFor: () => mkdtempSync(join(dirR, "wt-")),
+                 // A closed verdict whose binary identity no longer matches: the
+                 // spawn is refused after the run row and the attempt exist.
+                 containment: { credentialRead: "closed", why: "test", binaryId: "/some/other/claude@999" },
+                 // The cap must allow a SECOND dispatch, or the pre-seeded attempt
+                 // exhausts it and the tick escalates without ever reaching the
+                 // spawn — the fixture would then pass whatever the refund does.
+                 profile: { ...profile, rounds: { ...profile.rounds, maxFixAttemptsPerFinding: 3 } } };
+  // One genuine attempt already spent on this cause.
+  recordFixAttempt(ctxR.db, "o/r", 42, fpR);
+  const before = countFixAttempts(ctxR.db, "o/r", 42, fpR);
+  check(before === 1, "control: one attempt is on the ledger before the tick", String(before));
+  ctxR.spawnWorker = async () => ({ outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" });
+  await tick(ctxR);
+  const after = countFixAttempts(ctxR.db, "o/r", 42, fpR);
+  check(after === before, "a refused spawn refunds only its OWN attempt, leaving the earlier one spent", `${before} -> ${after}`);
+  ctxR.db.close();
+  rmSync(dirR, { recursive: true, force: true });
 }
 
 // --- a CLI binary swapped after the verdict is refused at the spawn -----------

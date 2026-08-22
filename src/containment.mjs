@@ -126,7 +126,11 @@ export async function measureContainment({
   // it: the answer is settled. (Codex #4b-[12].) An injected canary RESULT is
   // still honoured for evidence; only the expensive RUN is skipped.
   let cn = null;
-  const id = cliVersion && sandbox ? canaryIdFor({ cliVersion, sandbox, binaryId }) : null;
+  // The canary's own id normalises denies rooted at its per-invocation directory;
+  // the CACHE key must be computed the same way or it changes every tick and the
+  // cache can never hit, so every wanted task pays another five-minute model
+  // canary. (Codex #4h-[1].)
+  const id = cliVersion && sandbox ? canaryIdFor({ cliVersion, sandbox, binaryId, worktree: canaryPaths?.dir ?? null }) : null;
   const cheapReasons = reasons.length > 0;
   if (canary && typeof canary !== "function") cn = canary;
   else if (cheapReasons) cn = { ok: false, id, why: "not run: containment is already open for a cheaper reason", skipped: true };

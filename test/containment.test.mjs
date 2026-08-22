@@ -122,6 +122,22 @@ const base = { cliVersion: "2.1.237", sandbox, permissionsDeny: [], canaryPaths:
   check(r1.credentialRead === "closed" && r2.credentialRead === "open", "the keychain is re-probed on every ask", `${r1.credentialRead} -> ${r2.credentialRead}`);
 }
 
+// ── the cache key follows the canary's own normalisation ─────────────────────
+//
+// The canary normalises denies rooted at its per-invocation directory. If the
+// CACHE key is computed without that, it changes every tick, never hits, and
+// every wanted task pays another five-minute model canary.
+{
+  let runs = 0;
+  const cache = new Map();
+  const quarantined = dir => ({ ...sandbox, filesystem: { ...sandbox.filesystem, denyRead: ["~/.reeve", dir + "/secrets"] } });
+  const fn = async () => { runs++; return { ok: true, id: "computed", why: null, evidence: {} }; };
+  for (const dir of ["/wt/inv-a/run", "/wt/inv-b/run"]) {
+    await measureContainment({ ...base, sandbox: quarantined(dir), canaryPaths: { dir }, canary: fn, keychain: clean, cache });
+  }
+  check(runs === 1, "two invocations with the same policy share one cache entry", `runs=${runs}`);
+}
+
 // ── the paid canary is skipped when a cheaper reason already opens it ─────────
 {
   let ran = 0;

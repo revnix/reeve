@@ -515,18 +515,47 @@ export async function tick(ctx) {
     // change reeve has not seen yet still triggers a read.
     if (ctx.reviewIngest !== false && e.ok) {
       noteHead(db, nwo, pr, e.head);
-      const moved = !ctx.lastIngest?.get?.(pr) || ctx.lastIngest.get(pr) !== e.updatedAt;
+      // `updatedAt` is NOT a complete change signal for review state. MEASURED
+      // 2026-08-22 on revnix/reeve #4: resolving a thread, and unresolving one,
+      // leave `pull_request.updated_at` byte-identical. So on a pull request
+      // whose only activity is threads being resolved or reopened -- which is
+      // most of a review's life -- this guard skips the ingest forever and the
+      // projection keeps counts that stopped being true.
+      //
+      // That is the fail-OPEN direction for PR-5: the verdict would read fewer
+      // unresolved threads than exist. It also starves the shadow, because a
+      // tick that does not observe has no snapshot to compare.
+      //
+      // So the projection is refreshed when the pull request moved OR when what
+      // reeve holds is older than the window the fold itself calls stale. A
+      // quiet pull request costs one observation per window, not one per tick.
+      const staleAfter = (profile?.watch?.staleSeconds ?? 900) * 1000;
+      const last = ctx.lastIngest?.get?.(pr) ?? null;
+      const moved = !last || last.updatedAt !== e.updatedAt || (now() * 1000) - last.at >= staleAfter;
+      // Whether this tick's ingest changed anything, which decides below whether
+      // the live read taken back in evaluate() still describes the same moment
+      // as the projection.
+      // The live side of the shadow comparison, taken from the SAME read that
+      // feeds the ingest below. Null when this tick did not observe.
+      let snapshot = null;
       if (moved) {
         try {
           const seen = (ctx.observe ?? observe)(nwo, pr);
-          const w = ingest(db, nwo, pr, seen.observations, { at: now() });
+          const w = (ctx.ingest ?? ingest)(db, nwo, pr, seen.observations, { at: now() });
+          // AFTER the ingest, not before it. An ingest that throws leaves the
+          // projection built from the PREVIOUS inbox, so an observation that
+          // never reached the database is not a reading of the same moment —
+          // and comparing them would record a storage failure as the derivation
+          // disagreeing, which is the exact confusion this whole change removes.
+          // (Codex #6-[2].)
+          snapshot = seen.threads ?? null;
           if (w.inserted || w.generations) {
             log(logPath, `  #${pr}: ingest +${w.inserted} new, +${w.generations} edit(s)` +
                          `${seen.incomplete ? " — INCOMPLETE read" : ""}`);
           }
           // Only a COMPLETE read updates the watermark. Skipping a PR on the
           // strength of a partial read is how a gap becomes permanent.
-          if (!seen.incomplete) (ctx.lastIngest ??= new Map()).set(pr, e.updatedAt);
+          if (!seen.incomplete) (ctx.lastIngest ??= new Map()).set(pr, { updatedAt: e.updatedAt, at: now() * 1000 });
           // And whether it was whole is carried to the fold. Positively named and
           // fail-closed: a pull request reeve has never wholly observed is NOT
           // complete, so it answers UNKNOWN rather than confidently from a
@@ -554,7 +583,33 @@ export async function tick(ctx) {
         // The shadow comparison. e.threads is the LIVE read the verdict already
         // trusts, so this asks the only question that matters before PR-5 swaps
         // them over: does the derived view say the same thing?
-        const cmp = compare(e.threads, st);
+        //
+        // Both readings must describe the SAME MOMENT. They did not: the live
+        // read happens inside evaluate(), the ingest above runs after it, and
+        // the projection is built from what that ingest just wrote — so a pull
+        // request that moved in between was recorded as the derivation
+        // disagreeing, which is a different claim entirely.
+        //
+        // Measured 2026-08-22: every one of the week's four recorded
+        // divergences AGREED exactly when the pair was taken together, and the
+        // probe's own ingest was still inserting five threads on #1128 — the
+        // very count that PR's divergence reported.
+        // (docs/measured/2026-08-22-the-shadow-compared-two-moments.md)
+        //
+        // The live side is the observation that FED the projection, not a second
+        // read taken after it: a second read is a second moment, and re-reading
+        // only narrows the window rather than closing it. There is no extra API
+        // call either — `observe` already paginates the whole thread set, so the
+        // counts come from a read reeve was making anyway.
+        //
+        // A tick that did not observe has no snapshot, and comparing the older
+        // projection against anything would be comparing two moments again. That
+        // is INCOMPARABLE: a tick where nothing was learned, counted as neither
+        // agreement nor disagreement. It costs volume on quiet pull requests,
+        // and buys an instrument whose every remaining comparison is sound.
+        const cmp = snapshot
+          ? compare(snapshot, st)
+          : { comparable: false, agree: false, why: "no observation this tick to compare the projection against" };
         recordShadow(db, nwo, pr, cmp, now());
         if (cmp.comparable && !cmp.agree) {
           log(logPath, `  #${pr}: SHADOW DIVERGENCE — ${cmp.why}`);

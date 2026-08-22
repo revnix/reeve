@@ -46,8 +46,9 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
 }
 {
   const c = checkKeychain({ probe: () => ({ measured: true, items: ["generic password gh:github.com (gh keyring)"], why: "holds" }) });
-  check(c.level === "BROKEN" && /gh keyring/.test(c.lines[0]) && /--insecure-storage/.test(c.lines.join(" ")) && /dedicated user/.test(c.lines.join(" ")),
-    "a held credential is BROKEN and both closures are named", c.lines.join(" | "));
+  check(c.level === "DEGRADED" && /gh keyring/.test(c.lines[0]) && /--insecure-storage/.test(c.lines.join(" ")) && /dedicated user/.test(c.lines.join(" ")),
+    "a held credential is DEGRADED (dispatch gated, not broken) and both closures are named", c.lines.join(" | "));
+  check(/observation and review are unaffected/.test(c.lines.join(" ")), "and it says the guardian's other work is unaffected", c.lines.join(" | "));
 }
 {
   const c = checkKeychain({ probe: () => ({ measured: false, items: [], why: "security exited 1" }) });

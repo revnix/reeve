@@ -409,10 +409,12 @@ export function checkKeychain({ probe = probeKeychain } = {}) {
   const id = "R-15", title = "worker credential reach";
   const kc = probe();
   if (!kc.measured) return { id, level: UNKNOWN, title, lines: [`unmeasured: ${kc.why}`, "an unmeasured keychain keeps dispatch refused"] };
-  if (kc.items.length) return { id, level: BROKEN, title, lines: [
-    `the login keychain holds a GitHub credential a sandboxed worker can read: ${kc.items.join("; ")}`,
-    "the OS sandbox cannot deny the keychain (securityd is hard-allowed by the runtime's profile)",
-    "-> run workers as a dedicated user, or log gh in with --insecure-storage and delete the git osxkeychain item for github.com",
+  if (kc.items.length) return { id, level: DEGRADED, title, lines: [
+    `the login keychain holds a GitHub credential a sandboxed worker could read: ${kc.items.join("; ")}`,
+    "the OS sandbox cannot deny the keychain (securityd is hard-allowed by the runtime's profile), so write-capable",
+    "worker dispatch under --execute stays REFUSED until this is closed; observation and review are unaffected",
+    "-> run workers as a dedicated user (closes this AND the shared-ref hole), or log gh in with --insecure-storage",
+    "   and delete the git osxkeychain internet-password item for github.com (closes the keychain only)",
   ] };
   return { id, level: OK, title, lines: ["no GitHub credential in the login keychain; file credentials are deny-read by the sandbox"] };
 }

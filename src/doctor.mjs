@@ -12,7 +12,7 @@
 
 import { checkBaseline } from "./baseline.mjs";
 import { readCanaryState } from "./canary.mjs";
-import { probeKeychain } from "./containment.mjs";
+import { probeKeychain, isolationTopologyReady } from "./containment.mjs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
@@ -408,9 +408,12 @@ export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now 
  * An empty two-item probe is necessary but NOT sufficient: dispatch also needs
  * `worker.isolation: dedicated-user`, so doctor must not read OK while the
  * daemon necessarily refuses. (Codex #4b-[10].) */
-export function checkKeychain({ probe = probeKeychain, isolation = "none" } = {}) {
+export function checkKeychain({ probe = probeKeychain, isolation = "none", topologyReady = isolationTopologyReady } = {}) {
   const id = "R-15", title = "worker credential reach";
-  const isolated = isolation === "dedicated-user";
+  // The LABEL is necessary but not sufficient: the dedicated-user topology must
+  // actually be in place (PR-3). Until then an isolated-labelled profile is
+  // still DEGRADED, because the daemon necessarily refuses. (Codex #4d-[14].)
+  const isolated = isolation === "dedicated-user" && topologyReady();
   const kc = probe();
   if (!kc.measured) return { id, level: UNKNOWN, title, lines: [`unmeasured: ${kc.why}`, "an unmeasured keychain keeps dispatch refused"] };
   if (kc.items.length) return { id, level: DEGRADED, title, lines: [

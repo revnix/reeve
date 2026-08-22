@@ -5,10 +5,11 @@
 // assertion is on the verdict the daemon draws from those files. The real
 // boundary is measured in test/escape.test.mjs (under the runtime) and by the
 // daemon at start (under the CLI); this file proves the judge.
-import { sandboxCanary, canaryIdFor, canaryScript, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, CANARY_SENTINEL } from "../src/canary.mjs";
+import { sandboxCanary, canaryIdFor, canaryScript, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, netListener, CANARY_SENTINEL } from "../src/canary.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
+import { connect } from "node:net";
 import { join } from "node:path";
 
 let fail = 0;
@@ -27,8 +28,9 @@ const base = {
   // path is never written to in these tests except by the canary itself.
   decoyPath: join(homedir(), ".reeve", "canary", "test-decoy-" + process.pid + ".txt"),
   bin: "/bin/sh", env: { PATH: "/usr/bin:/bin" },
-  // The host-reachability control is injected so tests never touch the network.
-  netReachable: () => true,
+  // The network control is a daemon-local listener; injected so tests never
+  // touch the network. selfReachable true, not hit = network denied.
+  netProbe: { url: "http://127.0.0.1:59999/canary", selfReachable: () => true, wasHit: () => false },
 };
 
 // A runner that behaves like a sandboxed script under the given boundary.
@@ -56,6 +58,7 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     if (curl) writeFileSync(join(cwd, "curl-body"), "<html>"); rec.push(`curl=${curl ? 0 : 56}`);
     if (decoy) writeFileSync(join(cwd, "decoy-copy"), "x"); rec.push(`decoy=${decoy ? 0 : 1}`);
     if (symlink) writeFileSync(join(cwd, "decoy-copy2"), "x"); rec.push(`symlink=${symlink ? 0 : 1}`);
+    rec.push("probe=7");   // the sandboxed curl to the daemon's listener fails (network denied)
     if (results) writeFileSync(join(cwd, "canary-results.txt"), rec.join("\n") + "\n");
     if (outPath) writeFileSync(outPath, streamFor(readTool));
     if (readTool === "denied") writeFileSync(join(cwd, "read-tool-out"), "DENIED");
@@ -188,18 +191,35 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   check(r.ok === false && /did not attempt the Read-tool probe/.test(r.why), "no attempted Read in the stream is a failure, not a pass", r.why);
 }
 
-// ── the network positive control ─────────────────────────────────────────────
+// ── the network positive control (a daemon-local listener) ───────────────────
 {
-  const r = await sandboxCanary({ ...base, netReachable: () => false, runner: runnerThat() });
-  check(r.ok === false && /network denial unproven/.test(r.why) && /offline/.test(r.why), "a failed curl while the host is offline is inconclusive, not a pass", r.why);
+  const r = await sandboxCanary({ ...base, netProbe: { url: base.netProbe.url, selfReachable: () => true, wasHit: () => true }, runner: runnerThat() });
+  check(r.ok === false && /reached the daemon's control listener/.test(r.why), "a sandboxed curl that reaches the daemon's listener is a leak", r.why);
 }
 {
-  const r = await sandboxCanary({ ...base, netReachable: () => null, runner: runnerThat() });
-  check(r.ok === false && /network denial unproven/.test(r.why) && /unknown/.test(r.why), "and unknown reachability is inconclusive too", r.why);
+  const r = await sandboxCanary({ ...base, netProbe: { url: base.netProbe.url, selfReachable: () => false, wasHit: () => false }, runner: runnerThat() });
+  check(r.ok === false && /could not reach its own control listener/.test(r.why), "a listener the daemon cannot itself reach makes denial unprovable", r.why);
 }
 {
-  const r = await sandboxCanary({ ...base, netReachable: () => { throw new Error("boom"); }, runner: runnerThat() });
-  check(r.ok === false && /network denial unproven/.test(r.why), "a throwing reachability control is unknown, never a pass", r.why);
+  const r = await sandboxCanary({ ...base, netProbe: { url: base.netProbe.url, selfReachable: async () => true, wasHit: () => false }, runner: runnerThat() });
+  check(r.ok === true, "an async selfReachable is awaited", r.why);
+}
+{
+  const r = await sandboxCanary({ ...base, netProbe: null, runner: runnerThat() });
+  check(r.ok === false && /no network control/.test(r.why), "no network control at all is unproven, never a pass", r.why);
+}
+{
+  // The script must actually run the probe curl: a results file without `probe`
+  // means the control never executed.
+  const noProbe = async ({ cwd, outPath }) => {
+    writeFileSync(join(cwd, "INSIDE"), ""); writeFileSync(join(base.tmpDir, "TMP"), "");
+    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\ndecoy=1\nsymlink=1\n");
+    writeFileSync(join(cwd, "read-tool-out"), "DENIED");
+    writeFileSync(outPath, streamFor("denied"));
+    return { outcome: "ok", why: "completed" };
+  };
+  const r = await sandboxCanary({ ...base, runner: noProbe });
+  check(r.ok === false && /network control probe did not run/.test(r.why), "a canary script that skipped the probe curl fails", r.why);
 }
 
 // ── the binary identity is part of the id ────────────────────────────────────
@@ -232,6 +252,19 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   const ev = parseReadProbe(out, "/Users/x/.reeve/canary/decoy-1.txt");
   check(ev.attempted === false, "an empty Read path does not count as attempting the decoy read", JSON.stringify(ev));
   rmSync(dir, { recursive: true, force: true });
+}
+
+// ── the real listener: self-reachable, and detects a hit ─────────────────────
+{
+  const L = netListener();
+  await L.ready;
+  const reachable = await L.selfReachable();
+  check(reachable === true && typeof L.url === "string" && /127\.0\.0\.1/.test(L.url), "the daemon can reach its own listener before any hit", `${reachable} ${L.url}`);
+  check(L.wasHit() === false, "and it reports no hit until something connects");
+  await new Promise((res) => { const c = connect(new URL(L.url).port, "127.0.0.1"); c.on("error", () => res()); c.on("connect", () => { c.end(); res(); }); });
+  await new Promise(r => setTimeout(r, 50));
+  check(L.wasHit() === true, "a connection is recorded as a hit");
+  L.close();
 }
 
 // ── the state path keeps owner and repo distinct ─────────────────────────────

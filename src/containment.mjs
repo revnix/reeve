@@ -22,6 +22,17 @@ import { spawnSync } from "node:child_process";
 import { sandboxCanary, canaryIdFor, readCanaryState, writeCanaryState } from "./canary.mjs";
 
 /**
+ * Is the dedicated-user dispatch topology actually in place? A separate OS user
+ * (its own empty keychain) and a per-run standalone clone (its own git dir) are
+ * PR-3; until they exist, production dispatch still runs a linked worktree as
+ * this user, so the profile LABEL worker.isolation="dedicated-user" must not
+ * close containment or read OK in the doctor. Hard-false until PR-3 replaces it
+ * with a real check (euid differs from the checkout owner; the worktree is a
+ * standalone clone). (Codex #4c-[9], #4d-[14].)
+ */
+export function isolationTopologyReady() { return false; }
+
+/**
  * Keychain items that hand a worker the founder's GitHub credential.
  * Metadata only: `security find-*` without `-g`/`-w` prints the item's
  * attributes and never the secret. Exit 0 means the item exists.
@@ -64,7 +75,7 @@ export function probeKeychain({ platform = process.platform, exec = spawnSync } 
  */
 export async function measureContainment({
   cliVersion, sandbox, permissionsDeny, canaryPaths, bin, env, binaryId = null,
-  stateDir, nwo, platform = process.platform, isolated = false, netReachable = null,
+  stateDir, nwo, platform = process.platform, isolated = false, netProbe = null,
   canary = null, keychain = null, cache = new Map(), now = () => Date.now(),
 }) {
   const reasons = [];
@@ -98,7 +109,7 @@ export async function measureContainment({
   else if (!id) cn = { ok: false, id: null, why: "no CLI version or sandbox block to run a canary under" };
   else {
     const run = typeof canary === "function" ? canary : sandboxCanary;
-    cn = await run({ cliVersion, sandbox, permissionsDeny, binaryId, ...canaryPaths, bin, env, ...(netReachable ? { netReachable } : {}) });
+    cn = await run({ cliVersion, sandbox, permissionsDeny, binaryId, ...canaryPaths, bin, env, ...(netProbe ? { netProbe } : {}) });
     cn = { ...cn, at: now() };
     cache.set(id, cn);
     if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }

@@ -180,7 +180,7 @@ const denyWriteVerbs = glob =>
  * with its worktree as the working directory, and adding anything to that widens
  * the only boundary keeping it inside its own checkout.
  */
-export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = null }) {
+export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = null, stateRoots = [] }) {
   const risk = profile?.risk ?? {};
   const units = profile?.units ?? [];
 
@@ -263,6 +263,11 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
   // denied to it here as well; measured to hold for an absolute path and for a
   // symlink inside the worktree that points at one.
   deny.push(...credentialReadDenies());
+  // The daemon's run-state root (its log dir, where worker.out/err, prompts and
+  // other runs' artifacts live) is denied too: with a --log outside ~/.reeve it
+  // is not otherwise covered, and a worker could copy another run's output into
+  // its worktree for reeve to publish. (Codex #4d-[15].)
+  for (const r of stateRoots) deny.push(`Read(${r}/**)`);
 
   return {
     allowedTools: tools.join(","),
@@ -292,7 +297,7 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
           allowWrite: tmpDir ? [tmpDir] : [],
           denyWrite: [],
           allowRead: tmpDir ? [tmpDir] : [],
-          denyRead: credentialPaths(),
+          denyRead: [...credentialPaths(), ...stateRoots],
         },
         network: {
           allowedDomains: NETWORK_DOMAINS(profile, action),
@@ -322,7 +327,7 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
  * do). `tmpDir` is required: the only write grant beyond cwd is the run's own
  * tmp, and the validator cannot judge a grant without knowing what it should be.
  */
-export function validateSettings(settings, { tmpDir = null } = {}) {
+export function validateSettings(settings, { tmpDir = null, stateRoots = [] } = {}) {
   const errors = [];
   if (!tmpDir) return { ok: false, errors: ["validator needs the run's tmpDir to judge the write grant"] };
   if (!settings || typeof settings !== "object" || Array.isArray(settings)) return { ok: false, errors: ["settings absent"] };
@@ -340,7 +345,7 @@ export function validateSettings(settings, { tmpDir = null } = {}) {
     if (!strs(p.allow)) errors.push("permissions.allow must be an array of strings");
     if (!strs(p.deny)) errors.push("permissions.deny must be an array of strings");
     if (!Array.isArray(p.additionalDirectories) || p.additionalDirectories.length) errors.push("permissions.additionalDirectories must be empty");
-    if (strs(p.deny)) for (const d of credentialReadDenies()) if (!p.deny.includes(d)) errors.push(`permissions.deny is missing ${d}`);
+    if (strs(p.deny)) for (const d of [...credentialReadDenies(), ...stateRoots.map(r => `Read(${r}/**)`)]) if (!p.deny.includes(d)) errors.push(`permissions.deny is missing ${d}`);
   }
 
   const sb = settings.sandbox;
@@ -359,7 +364,7 @@ export function validateSettings(settings, { tmpDir = null } = {}) {
       for (const k of ["allowWrite", "denyWrite", "allowRead", "denyRead"]) if (!strs(fs[k])) errors.push(`sandbox.filesystem.${k} must be an array of strings`);
       if (strs(fs.allowWrite) && (fs.allowWrite.length !== 1 || fs.allowWrite[0] !== tmpDir)) errors.push(`sandbox.filesystem.allowWrite must be exactly the run's tmp (${tmpDir})`);
       if (strs(fs.allowRead) && (fs.allowRead.length !== 1 || fs.allowRead[0] !== tmpDir)) errors.push(`sandbox.filesystem.allowRead must be exactly the run's tmp (${tmpDir})`);
-      if (strs(fs.denyRead)) for (const c of credentialPaths()) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
+      if (strs(fs.denyRead)) for (const c of [...credentialPaths(), ...stateRoots]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
     }
     const net = sb.network;
     if (!isObj(net)) errors.push("sandbox.network must be an object");

@@ -17,10 +17,10 @@
 import { runWorker, workerArgs } from "./supervisor.mjs";
 import { validateSettings } from "./sandbox.mjs";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { createServer, connect } from "node:net";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 const canonical = v => {
   if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
@@ -53,7 +53,7 @@ export const CANARY_SENTINEL = "REEVE-CANARY-SENTINEL-DO-NOT-LEAK";
  * daemon can stat afterwards; exit codes are recorded as well but are not
  * what decides.
  */
-export function canaryScript({ tmpDir, outsideDir, decoyPath }) {
+export function canaryScript({ tmpDir, outsideDir, decoyPath, netUrl = null }) {
   return `#!/bin/sh
 # reeve sandbox canary: leaves files for the daemon to read; records exit codes beside them
 out="./canary-results.txt"; : > "$out" || exit 97
@@ -62,10 +62,45 @@ touch ./INSIDE; rec inside $?
 touch ${JSON.stringify(join(tmpDir, "TMP"))}; rec tmp $?
 touch ${JSON.stringify(join(outsideDir, "OUTSIDE"))}; rec outside $?
 curl -sS -m 5 https://example.com -o ./curl-body 2>/dev/null; rec curl $?
+${netUrl ? `curl -sS -m 5 ${JSON.stringify(netUrl)} -o ./probe-body 2>/dev/null; rec probe $?` : ""}
 cp ${JSON.stringify(decoyPath)} ./decoy-copy 2>/dev/null; rec decoy $?
 ln -sf ${JSON.stringify(decoyPath)} ./decoy-link 2>/dev/null; cp ./decoy-link ./decoy-copy2 2>/dev/null; rec symlink $?
 echo done
 `;
+}
+
+/**
+ * A daemon-local TCP listener that is the POSITIVE control for the network
+ * probe. The daemon knows it is reachable (it can self-connect), so a sandboxed
+ * curl that FAILS to reach it proves a DENIAL rather than an outage, and one
+ * that DOES reach it (`wasHit`) proves the network sandbox is ineffective. This
+ * removes the external dependency and the timing window of a reachability check:
+ * the listener is up for the whole run, so a hit at any point is a leak.
+ * (Codex #4d-[12], #4c-[13], #4b-[6].) Measured 2026-08-22: the sandbox blocks
+ * loopback, so an effective sandbox never reaches it.
+ */
+export function netListener() {
+  let hit = false;
+  const server = createServer(sock => { hit = true; sock.on("error", () => {}); try { sock.end("reeve-canary\n"); } catch { /* ignore */ } });
+  server.on("error", () => { /* a listener that cannot bind makes selfReachable false */ });
+  // `ready` resolves once the port is bound; `url` reads the address live, so a
+  // caller that awaits `ready` always sees the real port rather than the null
+  // captured before listen() completes.
+  const ready = new Promise(res => { server.once("listening", () => res()); server.once("error", () => res()); });
+  server.listen(0, "127.0.0.1");
+  const addr = () => server.address();
+  const selfReachable = () => new Promise(res => {
+    const a = addr(); if (!a || typeof a !== "object") return res(false);
+    const c = connect(a.port, "127.0.0.1");
+    const done = ok => { try { c.destroy(); } catch { /* ignore */ } res(ok); };
+    c.setTimeout(2000); c.on("connect", () => done(true)); c.on("error", () => done(false)); c.on("timeout", () => done(false));
+  });
+  return {
+    ready,
+    get url() { const a = addr(); return a && typeof a === "object" ? `http://127.0.0.1:${a.port}/canary` : null; },
+    wasHit: () => hit, selfReachable,
+    close: () => { try { server.close(); } catch { /* ignore */ } },
+  };
 }
 
 // The Bash script exercises the OS sandbox (`cp` is a subprocess). The Read TOOL
@@ -111,15 +146,15 @@ export async function sandboxCanary({
   bin, env,
   runner = runWorker, budgetMs = 5 * 60_000, maxOutputBytes = 8 * 1024 * 1024,
   validate = validateSettings, keepOnFailure = true,
-  // The positive control for the network probe: a sandboxed curl that fails
-  // proves a DENIAL only if the host could otherwise reach the endpoint. Returns
-  // true (reachable), false (offline), or null (unknown). Default: an
-  // unsandboxed curl from the daemon itself. Without a reachable host the
-  // network result is inconclusive, never a pass.
-  netReachable = defaultNetReachable,
+  // The network positive control: a daemon-local listener (netListener above)
+  // the sandboxed curl tries to reach. `{ url, selfReachable, wasHit }`. The
+  // daemon confirms the listener is reachable (selfReachable) so a sandboxed
+  // curl that could NOT reach it proves a denial, and a hit proves a leak. No
+  // external endpoint, no timing window.
+  netProbe = null,
 }) {
   const id = canaryIdFor({ cliVersion, sandbox, binaryId });
-  const evidence = { id, cliVersion, dir, outcome: null, why: null, results: null, readTool: null, hostReachable: null };
+  const evidence = { id, cliVersion, dir, outcome: null, why: null, results: null, readTool: null, network: null };
   const fail = why => ({ ok: false, id, why, evidence });
 
   // The instrument must be able to represent the failure: a decoy that is not
@@ -142,7 +177,8 @@ export async function sandboxCanary({
   // worker-written file (the Bash cp, or the Read-tool probe) is hard proof a
   // credential read was NOT denied.
   writeFileSync(decoyPath, `${CANARY_SENTINEL}\nreeve canary decoy: not a secret\n`);
-  writeFileSync(join(dir, "canary.sh"), canaryScript({ tmpDir, outsideDir, decoyPath }));
+  if (netProbe?.ready) { try { await netProbe.ready; } catch { /* selfReachable will report it */ } }
+  writeFileSync(join(dir, "canary.sh"), canaryScript({ tmpDir, outsideDir, decoyPath, netUrl: netProbe?.url ?? null }));
 
   const settings = {
     // Scoped, not exact: the sandbox's Bash matcher requires `:*` to admit
@@ -158,11 +194,10 @@ export async function sandboxCanary({
   const settingsPath = join(dir, "canary-settings.json");
   writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
 
-  // The network control BRACKETS the sandboxed request: sampled immediately
-  // before and after the run, and trusted only when reachable in BOTH samples,
-  // so a failed sandboxed curl cannot be certified as a denial across a
-  // connectivity dip that recovered before a single later sample. (Codex #4b-[9].)
-  const netBefore = (() => { try { return netReachable(); } catch { return null; } })();
+  // The daemon's local listener must be reachable from the daemon BEFORE the
+  // run, or a sandboxed curl that fails to reach it proves nothing. Confirmed
+  // again after the run, so a hit at any point counts.
+  const selfBefore = netProbe ? await Promise.resolve(netProbe.selfReachable?.() ?? null) : null;
 
   let r;
   try {
@@ -174,7 +209,9 @@ export async function sandboxCanary({
   } catch (err) {
     r = { outcome: "failed", why: `the canary runner threw: ${err.message}` };
   }
-  const netAfter = (() => { try { return netReachable(); } catch { return null; } })();
+  const selfAfter = netProbe ? await Promise.resolve(netProbe.selfReachable?.() ?? null) : null;
+  const wasHit = netProbe ? !!netProbe.wasHit?.() : false;
+  evidence.network = netProbe ? { url: netProbe.url, selfBefore, selfAfter, wasHit } : null;
   evidence.outcome = r?.outcome ?? null;
   evidence.why = r?.why ?? null;
 
@@ -189,15 +226,12 @@ export async function sandboxCanary({
   // wrote: a model can write "DENIED" without ever calling Read. The stream must
   // show a Read tool_use targeting the decoy AND a denied result. The written
   // file and its sentinel are a second, corroborating check. (Codex #4b-[8].)
-  const readEv = parseReadProbe(join(dir, "canary.out"), decoyPath);
+  const readEv = parseReadProbe(join(dir, "canary.out"), decoyPath, dir);
   const readOut = existsSync(join(dir, "read-tool-out")) ? readFileSync(join(dir, "read-tool-out"), "utf8") : null;
   const fileLeaked = readOut !== null && readOut.includes(CANARY_SENTINEL);
   evidence.readTool = (readEv.leaked || fileLeaked) ? "LEAKED"
     : !readEv.attempted ? "not-attempted"
     : readEv.denied ? "denied" : "not-denied";
-  // The network positive control: reachable before AND after the run.
-  const reachable = netBefore === true && netAfter === true ? true : (netBefore === false || netAfter === false ? false : null);
-  evidence.hostReachable = { before: netBefore, after: netAfter, verdict: reachable };
 
   const problems = [];
   if (decoyGone) problems.push("the decoy vanished during the probe; the read-denial result is unproven");
@@ -207,11 +241,19 @@ export async function sandboxCanary({
     if (!existsSync(join(dir, "INSIDE")) || results.inside !== 0) problems.push("control: the worker could not write inside its own directory");
     if (!existsSync(join(tmpDir, "TMP")) || results.tmp !== 0) problems.push("the run's tmp was not writable");
     if (existsSync(join(outsideDir, "OUTSIDE")) || results.outside === 0) problems.push("wrote outside the worktree");
-    // Network: a failed curl is only a DENIAL if the host could otherwise reach it.
-    if (results.curl === 0 || nonEmpty(join(dir, "curl-body"))) problems.push("network was reachable");
-    else if (reachable !== true) problems.push(`network denial unproven: the host itself was not reachable (control: ${reachable === false ? "offline" : "unknown"})`);
+    // An external curl that SUCCEEDS is a definite egress leak.
+    if (results.curl === 0 || nonEmpty(join(dir, "curl-body"))) problems.push("network was reachable (external egress)");
     if (existsSync(join(dir, "decoy-copy")) || results.decoy === 0 || decoyContains(join(dir, "decoy-copy"))) problems.push("read a file under a deny-read path");
     if (existsSync(join(dir, "decoy-copy2")) || results.symlink === 0 || decoyContains(join(dir, "decoy-copy2"))) problems.push("read a deny-read file through a symlink");
+  }
+  // The network POSITIVE control: the daemon's own listener. A hit is a leak; a
+  // listener the daemon itself could not reach makes the denial unprovable.
+  if (netProbe) {
+    if (wasHit) problems.push("network was reachable (the sandboxed curl reached the daemon's control listener)");
+    else if (selfBefore !== true || selfAfter !== true) problems.push(`network denial unproven: the daemon could not reach its own control listener (before=${selfBefore}, after=${selfAfter})`);
+    if (results && !("probe" in results)) problems.push("the network control probe did not run in the canary script");
+  } else {
+    problems.push("no network control was provided, so network denial is unproven");
   }
   // The Read-tool boundary (separate from the OS sandbox), judged from the
   // worker's event stream: it must have ATTEMPTED the read and been DENIED.
@@ -234,8 +276,7 @@ export async function sandboxCanary({
  * a permission denial; leaked is a result carrying the decoy's sentinel. This is
  * evidence from the tool stream, not a file the model chose to write.
  */
-const base = p => basename(p);
-export function parseReadProbe(outPath, decoyPath) {
+export function parseReadProbe(outPath, decoyPath, cwd = dirname(decoyPath)) {
   const out = { attempted: false, denied: false, leaked: false };
   if (!existsSync(outPath)) return out;
   const ids = new Set();   // tool_use ids of Read calls that targeted the decoy
@@ -250,9 +291,13 @@ export function parseReadProbe(outPath, decoyPath) {
         // partial path must never match, or a malformed Read (`input:{}`) whose
         // validation error is a denial would be counted as a denied decoy read
         // while the Read boundary was never exercised. (Codex #4c-[10].)
-        const p = String(b.input?.file_path ?? b.input?.path ?? "");
-        const hit = p.length > 0 && (p === decoyPath || p === `./${base(decoyPath)}` || p.endsWith(`/${base(decoyPath)}`));
-        if (hit) { out.attempted = true; ids.add(b.id); }
+        // EXACT, normalised match: a same-basename path that does not resolve
+        // to the decoy could be a nonexistent file whose is_error result would
+        // read as a denial without the real decoy ever being targeted.
+        // (Codex #4d-[11].)
+        const raw = String(b.input?.file_path ?? b.input?.path ?? "");
+        const p = raw.length ? (isAbsolute(raw) ? raw : resolve(cwd, raw)) : "";
+        if (p && p === decoyPath) { out.attempted = true; ids.add(b.id); }
       }
       if (b?.type === "tool_result" && ids.has(b.tool_use_id)) {
         const text = typeof b.content === "string" ? b.content : JSON.stringify(b.content ?? "");
@@ -267,15 +312,6 @@ export function parseReadProbe(outPath, decoyPath) {
 /** True when a worker-written file exists and contains the decoy's sentinel. */
 function decoyContains(path) { try { return readFileSync(path, "utf8").includes(CANARY_SENTINEL); } catch { return false; } }
 
-/** Unsandboxed reachability of the canary's network endpoint, from the daemon.
- * true reachable, false offline, null unknown (curl missing, etc.). */
-function defaultNetReachable() {
-  try {
-    const r = spawnSync("curl", ["-sS", "-m", "5", "-o", "/dev/null", "https://example.com"], { stdio: ["ignore", "ignore", "ignore"], timeout: 8000 });
-    if (r.error) return null;
-    return r.status === 0 ? true : false;
-  } catch { return null; }
-}
 
 /** Where a daemon records its last canary result, for `reeve doctor`. Owner and
  * repository are separate path components, because `nwo.replace("/","-")` is not

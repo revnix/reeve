@@ -41,8 +41,12 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
 
 // ── R-15 ─────────────────────────────────────────────────────────────────────
 {
-  const c = checkKeychain({ probe: () => ({ measured: true, items: [], why: null }), isolation: "dedicated-user" });
-  check(c.id === "R-15" && c.level === "OK", "an empty keychain AND a declared isolated worker is OK", JSON.stringify(c));
+  const c = checkKeychain({ probe: () => ({ measured: true, items: [], why: null }), isolation: "dedicated-user", topologyReady: () => true });
+  check(c.id === "R-15" && c.level === "OK", "an empty keychain, a declared isolated worker, AND a ready topology is OK", JSON.stringify(c));
+}
+{
+  const c = checkKeychain({ probe: () => ({ measured: true, items: [], why: null }), isolation: "dedicated-user", topologyReady: () => false });
+  check(c.level === "DEGRADED", "the isolation LABEL without a ready topology (production today) is DEGRADED, not OK", JSON.stringify(c.level));
 }
 {
   const c = checkKeychain({ probe: () => ({ measured: true, items: [], why: null }), isolation: "none" });

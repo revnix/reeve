@@ -23,8 +23,8 @@ import { sandboxFor, writeSandbox, reviewDiff, validateSettings } from "./sandbo
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig } from "./workerenv.mjs";
-import { measureContainment, revalidateContainment, probeKeychain } from "./containment.mjs";
-import { canaryIdFor } from "./canary.mjs";
+import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady } from "./containment.mjs";
+import { canaryIdFor, netListener } from "./canary.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256 } from "./db/ops.mjs";
@@ -34,7 +34,7 @@ import { selfAudit } from "./selfaudit.mjs";
 import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
@@ -155,15 +155,6 @@ function changedFiles(worktree, since = null) {
  * keychain probe every time. A preparation that fails (no CLI, no worktree
  * root) is an OPEN verdict with the reason, never a thrown tick.
  */
-// The dedicated-user dispatch topology (a separate OS user, a per-run
-// standalone clone) is PR-3. Until it exists, a profile that DECLARES
-// worker.isolation="dedicated-user" must not close containment: production
-// dispatch still calls acquireWorktree (a linked worktree) and runWorker as
-// this user, the exact shared-account/shared-git-dir holes the gate prevents.
-// Returns false so the label is inert; PR-3 replaces this with a real check
-// (euid differs from the checkout owner, worktree is a standalone clone).
-function isolationTopologyReady() { return false; }
-
 async function measuredContainment(ctx, profile, nwo, logPath) {
   const cache = (ctx.containmentCache ??= new Map());
   try {
@@ -174,8 +165,14 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     // fixed home, so it is written there too — never under a --log directory
     // that doctor would not know to read. (Codex #4-[4].)
     const canaryStateDir = ctx.canaryStateDir ?? stateDir;
+    // Per repository AND per invocation for ALL of the canary's working
+    // directories, not just the decoy: two daemons (same repo, or repos sharing
+    // a worktree root) each rm/recreate these during a run up to 5 min long, and
+    // the cross-run deletion keeps containment open forever. (Codex #4d-[16].)
+    const inv = `${nwo.replace("/", "-")}-${process.pid}-${Date.now()}`;
+    const canaryRoot = join(root, ".reeve-canary", inv);
     const canaryPaths = {
-      dir: join(root, ".reeve-canary", "run"), outsideDir: join(root, ".reeve-canary", "outside"), tmpDir: join(root, ".reeve-canary", "tmp"),
+      dir: join(canaryRoot, "run"), outsideDir: join(canaryRoot, "outside"), tmpDir: join(canaryRoot, "tmp"),
       // Under the CONFIGURED state root (deny-read, so it is measurable), per
       // repository AND per invocation: two daemons sharing one decoy could delete
       // each other's and read the ENOENT as a denial. (Codex #4-[1], #4b-[11].)
@@ -191,23 +188,26 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     const version = ctx.cliVersion ?? cliVersion(claudeBin, env);
     // The block every worker gets; the canary's id covers it, so a block that
     // changes (a new deny, a new domain) is measured again before it is trusted.
-    const policy = sandboxFor({ profile, action: "FIX_CI", worktree: canaryPaths.dir, tmpDir: canaryPaths.tmpDir });
+    // The run-state root (the daemon's log dir) is denied to workers too; the
+    // canary proves the block that includes it. (Codex #4d-[15].)
+    const stateRoots = [...new Set([stateDir, process.env.REEVE_HOME].filter(p => p && isAbsolute(p)))];
+    const policy = sandboxFor({ profile, action: "FIX_CI", worktree: canaryPaths.dir, tmpDir: canaryPaths.tmpDir, stateRoots });
     // The resolved binary's identity is part of the canary id, so a swapped
     // executable that prints the same --version is re-measured. (Codex #4-[3].)
     const binaryId = binaryIdentity(claudeBin);
-    // The network positive control runs under the WORKER's environment (proxy
-    // variables stripped), so it tests the same direct route the sandboxed curl
-    // uses. A control on the daemon's ambient proxy could certify a failure the
-    // proxy caused, not the sandbox. (Codex #4c-[13].)
-    const netReachable = ctx.netReachable ?? (() => {
-      try { const rr = spawnSync("curl", ["-sS", "-m", "5", "-o", "/dev/null", "https://example.com"], { env, stdio: ["ignore", "ignore", "ignore"], timeout: 8000 }); return rr.error ? null : rr.status === 0; }
-      catch { return null; }
-    });
+    // The network positive control is a daemon-local listener the sandboxed curl
+    // tries to reach. The daemon knows the listener is reachable (it self-pings),
+    // so a sandboxed curl that cannot reach it proves a DENIAL — no external
+    // dependency, no timing window, and a hit at any point in the run is a leak.
+    // (Codex #4d-[12], #4c-[13].) Injectable for tests.
+    const netProbe = ctx.netProbe ?? netListener();
     const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox, binaryId }))?.ok === true;
     if (!before) log(logPath, `containment: running the sandbox canary under ${version}`);
-    const c = await measureContainment({
+    let c;
+    try {
+      c = await measureContainment({
       cliVersion: version, sandbox: policy.settings.sandbox, permissionsDeny: policy.settings.permissions.deny, binaryId,
-      canaryPaths, bin: claudeBin, env, stateDir: canaryStateDir, nwo, cache, netReachable,
+      canaryPaths, bin: claudeBin, env, stateDir: canaryStateDir, nwo, cache, netProbe,
       // process.platform in production; injectable so a test on one OS can
       // exercise the verdict for another (the fail-closed matrix is per-OS).
       platform: ctx.platform ?? undefined,
@@ -219,7 +219,12 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
       // (Codex #4c-[9].)
       isolated: profile.worker?.isolation === "dedicated-user" && (ctx.isolationReady ?? isolationTopologyReady)(),
       canary: ctx.canary ?? null, keychain: ctx.keychain ?? null,
-    });
+      });
+    } finally {
+      // The listener is torn down whatever happened, so a canary run never
+      // leaves a socket bound.
+      if (!ctx.netProbe) netProbe.close?.();
+    }
     if (!before) log(logPath, `containment: canary ${c.canary?.id ?? "?"} ${c.canary?.ok ? "passed" : `FAILED: ${c.canary?.why}`}; keychain: ${c.keychain?.measured ? (c.keychain.items.length ? c.keychain.why : "no GitHub credential") : `unmeasured (${c.keychain?.why})`}`);
     return c;
   } catch (err) {
@@ -517,23 +522,6 @@ export async function tick(ctx) {
       if (started >= cap.canStart) { log(logPath, `  capacity reached; ${decisions.length - started} decision(s) deferred to the next tick`); break; }
       if (halted(ctx.haltMarker)) { log(logPath, "HALTED before dispatch"); break; }
 
-      // TOCTOU: the containment verdict was measured once for this tick, but the
-      // CLI binary and the keychain can change between then and this spawn, and
-      // the verdict is reused for every worker in the tick. Re-check both cheap
-      // facts immediately before each worker task; a change reopens the gate for
-      // this spawn rather than after the tick. (Codex #4c-[11], #4c-[12].)
-      if (WORKER_ACTIONS.includes(decision.action)) {
-        const reval = revalidateContainment(containment, {
-          bin: resolveClaude(ctx.claudeBin ?? "claude"), binaryIdentity,
-          keychain: ctx.keychain ?? null, platform: ctx.platform ?? undefined,
-        });
-        if (!reval.ok) {
-          log(logPath, `  #${e.pr}: NOT dispatching — ${reval.why}`);
-          escalations.set("guardian:containment:changed", 1);
-          continue;
-        }
-      }
-
       // Only some decisions are worker tasks. WAIT, PARK, MERGE and ESCALATE are
       // not: two of them are for a human and one is the gate's own job.
       let promptCtx = { profile, nwo, pr: e.pr, head: e.head, branch: e.headRef };
@@ -624,7 +612,8 @@ export async function tick(ctx) {
       const stateDir = dirname(ctx.logPath ?? "/tmp/x");
       const runDir = join(stateDir, "runs", nwo.replace("/", "-"), String(e.pr), run.runId);
       const tmpDir = join(runDir, "tmp");
-      const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane, tmpDir });
+      const dStateRoots = [...new Set([stateDir, process.env.REEVE_HOME].filter(p => p && isAbsolute(p)))];
+      const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane, tmpDir, stateRoots: dStateRoots });
 
       let r, prepFailed = false;
       try {
@@ -653,7 +642,7 @@ export async function tick(ctx) {
         // included, so a worker launched on one would run with no boundary at
         // all and a contract row claiming otherwise. A failure here is a
         // preparation failure: refunded, backed off, escalated, never launched.
-        const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir });
+        const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots });
         if (!sv.ok) throw new Error(`settings invalid: ${sv.errors.join("; ")}`);
         // The settings file is immutable per run, in the run's own directory:
         // a path keyed by PR alone was shared by every daemon on the host, and
@@ -677,6 +666,21 @@ export async function tick(ctx) {
           envHash: sha256(JSON.stringify(Object.keys(env).sort().map(k => [k, env[k]]))),
         });
 
+        // TOCTOU: the containment verdict was measured once for this tick, but
+        // the CLI binary and the keychain can change between then and NOW — after
+        // preparation (which includes a git fetch), immediately before the spawn.
+        // Re-check both cheap facts here, at the last moment, so a swap or a new
+        // credential during preparation reopens the gate. (Codex #4c-[11],[12],
+        // #4d-[13].)
+        const reval = revalidateContainment(containment, {
+          bin: claudeBin, binaryIdentity, keychain: ctx.keychain ?? null, platform: ctx.platform ?? undefined,
+        });
+        if (!reval.ok) {
+          log(logPath, `  #${e.pr}: NOT dispatching — ${reval.why}`);
+          escalations.set("guardian:containment:changed", 1);
+          r = { outcome: OUTCOMES.UNBOUND, why: `containment changed before spawn: ${reval.why}`, ms: 0, cost: null, sessionId: null };
+          if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+        } else {
         r = await (ctx.spawnWorker ?? runWorker)({
           bin: claudeBin,
           args: argv,
@@ -692,6 +696,7 @@ export async function tick(ctx) {
           // touch anything, so a crash leaves something probeable.
           onSpawn: ({ pid, lstart }) => { bindRun(db, { runId: run.runId, pid, boot: lstart }); noteWorkerBinding(db, { runId: run.runId, pid, lstart }); },
         });
+        }
       } catch (err) {
         // A worker that could not be prepared or launched is a failed attempt
         // with its reason, never a thrown tick: the run below is closed, the

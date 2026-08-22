@@ -106,7 +106,9 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
 3. **The gate** (REVISED by founder 2026-08-21, supersedes the 30-min table) —
    a very detailed, plain-language spec PR in a PRIVATE repo. **Codex clean
    pass is a MANDATORY SERIAL WITNESS**: findings → revise → re-request, loop
-   until clean (cap 5 → escalate). Once Codex cleans at the current head, a
+   until clean (**cap 10** → escalate; founder 2026-08-22, was 5 — reeve #4
+   needed 8 rounds and a cap of 5 would have escalated it with real defects
+   open). Once Codex cleans at the current head, a
    **15-minute** founder window opens (GitHub clock):
    founder approves → proceed immediately · requests changes → revise ·
    silent 15 min → **proceed** (their good-to-go).

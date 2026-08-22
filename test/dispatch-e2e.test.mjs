@@ -203,6 +203,9 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
                  // canary+keychain wiring, not the per-OS platform gate (that is
                  // its own case below).
                  platform: "darwin",
+                 // A declared isolated worker is now required to close dispatch;
+                 // this case is the positive control for that whole path.
+                 profile: { ...profile, worker: { isolation: "dedicated-user" } },
                  canary: async () => { canaryRuns++; return { ok: true, id: "good", why: null, evidence: {} }; },
                  keychain: { measured: true, items: [], why: null } };
   delete ctxC.containment;

@@ -203,14 +203,18 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
         checkout's own branches; (2) `git -c credential.helper=osxkeychain
         credential fill` returns the founder's token (securityd is hard-allowed
         by the runtime's profile; no setting closes it).
-      Suite 57/57. **Not flipped:** dispatch stays refused on the founder's own
-      machine (R-15 finds the git osxkeychain item). **Founder decision for the
-      closure — the two options are NOT equivalent:**
-      · **a dedicated worker user** closes BOTH the keychain (its own empty
-        keychain) AND the shared-ref hole (its own clone); or
-      · **an empty keychain on the founder's account** closes the keychain only;
-        the shared-ref hole stays live until workers move to per-run standalone
-        clones (a small follow-up, deferred, documented as KNOWN-OPEN).
+      Suite 57/57. **Codex round 1 (10 findings, 7 P1) all worked** — see the
+      defect log below. The verdict is now strictly harder to reach: dispatch
+      requires canary + platform + keychain-clean **AND** a declared isolated
+      worker (`worker.isolation: dedicated-user`), because the keychain probe is
+      necessary-not-sufficient (a token can hide under another service name) and
+      a linked worktree shares the checkout's git dir. **The ONE closure is a
+      dedicated worker OS user** (own empty keychain + own clone); clearing the
+      founder's keychain is no longer treated as sufficient. **Not flipped:**
+      `worker.isolation` defaults to `none`, so dispatch is refused; the
+      dedicated-user DISPATCH TOPOLOGY (per-run standalone clones owned by the
+      worker user) is **PR-3** — do not set the flag to `dedicated-user` before
+      PR-3 lands it.
 
 ### Founder actions pending
 
@@ -238,5 +242,6 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
 
 | Date | Defect | Fix |
 |---|---|---|
+| 2026-08-22 | PR-2 Codex round 1, 7×P1: canary prompt ran `sh ./canary.sh .` but the grant was exact `Bash(sh ./canary.sh)` → every real canary refused, `--execute` permanently blocked; worker `GIT_CONFIG_GLOBAL` under deny-read `~/.reeve` → sandboxed git can't read its own config → no commits; canary exercised only Bash `cp`, never the Read-tool deny; any nonzero curl read as network-denied (also true offline); two daemons shared one decoy (ENOENT read as denial); keychain probe of two items can't certify a shared account; a linked-worktree worker can plant a hook the daemon's push runs unsandboxed. 3×P2: canary id ignored the binary identity; doctor read the canary from a different dir than the daemon wrote it; measured-closed test only passed on macOS | grant `:*`; git config → run tmp; Read-tool probe with a sentinel; network positive control; per-run decoy + existence check; `worker.isolation` gate (dedicated-user only); `pushWorktree -c core.hooksPath=/dev/null`; binaryId in the canary id; `canaryStateDir` shared by daemon+doctor; test pins the platform |
 | 2026-08-21 | Watcher reported "unclassified verdict: gap" for a PR green everywhere but refused by GitHub's approving-review requirement (live on #1129) — a routine needs-a-human state read as a broken classifier | `a5344dd` + `ESCALATIONS.PROTECTION_UNMET` |
 | 2026-08-21 | `shadow`'s case label captured `status`/`statusline`/`dash` — all three printed the shadow report since PR-4 landed; no test covered CLI routing | `c80f0a3` + `test/cli-routing.test.mjs` |

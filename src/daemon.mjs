@@ -161,27 +161,43 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     const root = profile.identity?.worktreeRoot;
     if (!root || !isAbsolute(root)) return { credentialRead: "open", why: "no absolute identity.worktreeRoot to run the canary under" };
     const stateDir = dirname(ctx.logPath ?? "/tmp/x");
+    // The canary result is read back by `reeve doctor`, which looks under a
+    // fixed home, so it is written there too — never under a --log directory
+    // that doctor would not know to read. (Codex #4-[4].)
+    const canaryStateDir = ctx.canaryStateDir ?? stateDir;
     const canaryPaths = {
       dir: join(root, ".reeve-canary", "run"), outsideDir: join(root, ".reeve-canary", "outside"), tmpDir: join(root, ".reeve-canary", "tmp"),
-      // Under the deny-read path itself, not under the state dir: the two are
-      // the same in production and the canary refuses a decoy anywhere else.
-      decoyPath: join(homedir(), ".reeve", "canary", "decoy.txt"),
+      // Under the deny-read path itself (so it is measurable), per repository AND
+      // per invocation: two daemons sharing one decoy could delete each other's
+      // and read the resulting ENOENT as a denial. (Codex #4-[1].)
+      decoyPath: join(homedir(), ".reeve", "canary", nwo.replace("/", "-"), `decoy-${process.pid}-${Date.now()}.txt`),
     };
     const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
-    const env = workerEnv({ gitConfigPath: writeGitConfig(join(stateDir, "git")), tmpDir: canaryPaths.tmpDir,
+    // The credential-less git config lives in the run's tmp, which the sandbox
+    // grants read: putting it under ~/.reeve (deny-read) left the sandboxed git
+    // unable to read its own configured global config, so the worker could not
+    // even commit. (Codex #4-[8].)
+    const env = workerEnv({ gitConfigPath: writeGitConfig(join(canaryPaths.tmpDir, "git")), tmpDir: canaryPaths.tmpDir,
                             bgWaitMs: 5 * 60_000, extraPath: [dirname(claudeBin)] });
     const version = ctx.cliVersion ?? cliVersion(claudeBin, env);
     // The block every worker gets; the canary's id covers it, so a block that
     // changes (a new deny, a new domain) is measured again before it is trusted.
     const policy = sandboxFor({ profile, action: "FIX_CI", worktree: canaryPaths.dir, tmpDir: canaryPaths.tmpDir });
-    const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox }))?.ok === true;
+    // The resolved binary's identity is part of the canary id, so a swapped
+    // executable that prints the same --version is re-measured. (Codex #4-[3].)
+    const binaryId = binaryIdentity(claudeBin);
+    const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox, binaryId }))?.ok === true;
     if (!before) log(logPath, `containment: running the sandbox canary under ${version}`);
     const c = await measureContainment({
-      cliVersion: version, sandbox: policy.settings.sandbox, permissionsDeny: policy.settings.permissions.deny,
-      canaryPaths, bin: claudeBin, env, stateDir, nwo, cache,
+      cliVersion: version, sandbox: policy.settings.sandbox, permissionsDeny: policy.settings.permissions.deny, binaryId,
+      canaryPaths, bin: claudeBin, env, stateDir: canaryStateDir, nwo, cache,
       // process.platform in production; injectable so a test on one OS can
       // exercise the verdict for another (the fail-closed matrix is per-OS).
       platform: ctx.platform ?? undefined,
+      // The worker runs as a dedicated OS user in its own clone: declared in the
+      // profile, and only true once the founder has actually set that up. Until
+      // then a passing canary and an empty keychain still do not close dispatch.
+      isolated: profile.worker?.isolation === "dedicated-user",
       canary: ctx.canary ?? null, keychain: ctx.keychain ?? null,
     });
     if (!before) log(logPath, `containment: canary ${c.canary?.id ?? "?"} ${c.canary?.ok ? "passed" : `FAILED: ${c.canary?.why}`}; keychain: ${c.keychain?.measured ? (c.keychain.items.length ? c.keychain.why : "no GitHub credential") : `unmeasured (${c.keychain?.why})`}`);
@@ -589,7 +605,9 @@ export async function tick(ctx) {
         // repo's daemon, and two repos can share a PR number.
         const budgetMs = (profile.watch?.workerBudgetMinutes ?? 20) * 60_000;
         const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
-        const env = workerEnv({ gitConfigPath: writeGitConfig(join(stateDir, "git")),
+        // In the run's tmp (sandbox-readable), never under the deny-read ~/.reeve:
+        // a global config the sandboxed git cannot read stops it committing.
+        const env = workerEnv({ gitConfigPath: writeGitConfig(join(tmpDir, "git")),
                                 tmpDir, bgWaitMs: budgetMs,
                                 extraPath: [dirname(claudeBin)] });
         const outPath = join(runDir, "worker.out"), errPath = join(runDir, "worker.err");

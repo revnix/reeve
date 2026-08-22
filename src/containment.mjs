@@ -63,26 +63,36 @@ export function probeKeychain({ platform = process.platform, exec = spawnSync } 
  * refuse dispatch until a restart.
  */
 export async function measureContainment({
-  cliVersion, sandbox, permissionsDeny, canaryPaths, bin, env,
-  stateDir, nwo, platform = process.platform,
+  cliVersion, sandbox, permissionsDeny, canaryPaths, bin, env, binaryId = null,
+  stateDir, nwo, platform = process.platform, isolated = false,
   canary = null, keychain = null, cache = new Map(), now = () => Date.now(),
 }) {
   const reasons = [];
 
   if (platform !== "darwin") reasons.push(`the OS sandbox is unmeasured on ${platform}; only macOS has been measured`);
 
+  // The keychain probe and the shared-account/linked-worktree topology are why
+  // a canary pass is NECESSARY but not SUFFICIENT. The probe reads only the two
+  // conventional GitHub items; another client can store a token elsewhere in the
+  // SAME account, and a linked worktree shares the founder's git dir (refs AND
+  // config), so a closed worker could still plant a hook the daemon later runs.
+  // Both are answered by the same thing: an ISOLATED worker (its own OS user
+  // with an empty keychain, its own clone), declared in the profile once the
+  // founder has set it up. Until then a found credential still hard-fails, but an
+  // empty probe never CLOSES on its own.
   const kc = typeof keychain === "function" ? await keychain() : keychain ?? probeKeychain({ platform });
   if (!kc.measured) reasons.push(`keychain unmeasured: ${kc.why}`);
   else if (kc.items.length) reasons.push(kc.why);
+  if (!isolated) reasons.push("no isolated worker environment declared (worker.isolation): a shared account cannot be certified free of credentials and a linked worktree shares the checkout's git dir");
 
   let cn = null;
-  const id = cliVersion && sandbox ? canaryIdFor({ cliVersion, sandbox }) : null;
+  const id = cliVersion && sandbox ? canaryIdFor({ cliVersion, sandbox, binaryId }) : null;
   if (canary && typeof canary !== "function") cn = canary;
   else if (id && cache.get(id)?.ok) cn = cache.get(id);
   else if (!id) cn = { ok: false, id: null, why: "no CLI version or sandbox block to run a canary under" };
   else {
     const run = typeof canary === "function" ? canary : sandboxCanary;
-    cn = await run({ cliVersion, sandbox, permissionsDeny, ...canaryPaths, bin, env });
+    cn = await run({ cliVersion, sandbox, permissionsDeny, binaryId, ...canaryPaths, bin, env });
     cn = { ...cn, at: now() };
     cache.set(id, cn);
     if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }
@@ -91,8 +101,8 @@ export async function measureContainment({
 
   return {
     credentialRead: reasons.length ? "open" : "closed",
-    why: reasons.length ? reasons.join("; ") : `canary ${cn.id} passed and the keychain holds no GitHub credential`,
-    canary: cn, keychain: kc, platform, at: now(),
+    why: reasons.length ? reasons.join("; ") : `canary ${cn.id} passed, an isolated worker is declared, and the keychain holds no GitHub credential`,
+    canary: cn, keychain: kc, platform, isolated, at: now(),
   };
 }
 

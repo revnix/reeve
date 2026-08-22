@@ -5,7 +5,7 @@
 // assertion is on the verdict the daemon draws from those files. The real
 // boundary is measured in test/escape.test.mjs (under the runtime) and by the
 // daemon at start (under the CLI); this file proves the judge.
-import { sandboxCanary, canaryIdFor, canaryScript, writeCanaryState, readCanaryState } from "../src/canary.mjs";
+import { sandboxCanary, canaryIdFor, canaryScript, writeCanaryState, readCanaryState, CANARY_SENTINEL } from "../src/canary.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
@@ -27,10 +27,12 @@ const base = {
   // path is never written to in these tests except by the canary itself.
   decoyPath: join(homedir(), ".reeve", "canary", "test-decoy-" + process.pid + ".txt"),
   bin: "/bin/sh", env: { PATH: "/usr/bin:/bin" },
+  // The host-reachability control is injected so tests never touch the network.
+  netReachable: () => true,
 };
 
 // A runner that behaves like a sandboxed script under the given boundary.
-const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, decoy = false, symlink = false, results = true, outcome = "ok" } = {}) =>
+const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, decoy = false, symlink = false, results = true, outcome = "ok", readTool = "denied" } = {}) =>
   async ({ cwd, args }) => {
     const rec = [];
     if (inside) writeFileSync(join(cwd, "INSIDE"), ""); rec.push(`inside=${inside ? 0 : 1}`);
@@ -40,6 +42,9 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     if (decoy) writeFileSync(join(cwd, "decoy-copy"), "x"); rec.push(`decoy=${decoy ? 0 : 1}`);
     if (symlink) writeFileSync(join(cwd, "decoy-copy2"), "x"); rec.push(`symlink=${symlink ? 0 : 1}`);
     if (results) writeFileSync(join(cwd, "canary-results.txt"), rec.join("\n") + "\n");
+    // The Read-tool probe: a working boundary yields DENIED; a leak writes the sentinel; "absent" writes nothing.
+    if (readTool === "denied") writeFileSync(join(cwd, "read-tool-out"), "DENIED");
+    else if (readTool === "leak") writeFileSync(join(cwd, "read-tool-out"), CANARY_SENTINEL + "\nreeve canary decoy: not a secret\n");
     return { outcome, why: outcome === "ok" ? "completed" : "planted", ms: 1, cost: 0, sessionId: "c", args };
   };
 
@@ -138,6 +143,51 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   let ran = false;
   const r = await sandboxCanary({ ...bad, runner: async (a) => { ran = true; return runnerThat()(a); } });
   check(r.ok === false && /settings invalid/.test(r.why) && !ran, "a block the validator refuses never launches a canary", r.why);
+}
+
+// ── the Read-tool boundary (separate from the OS sandbox) ────────────────────
+{
+  const r = await sandboxCanary({ ...base, runner: runnerThat({ readTool: "leak" }) });
+  check(r.ok === false && /Read tool returned a file/.test(r.why), "the Read tool returning the decoy's sentinel fails it", r.why);
+}
+{
+  const r = await sandboxCanary({ ...base, runner: runnerThat({ readTool: "absent" }) });
+  check(r.ok === false && /Read-tool probe left no result/.test(r.why), "no Read-tool result is a failure, not a pass", r.why);
+}
+
+// ── the network positive control ─────────────────────────────────────────────
+{
+  const r = await sandboxCanary({ ...base, netReachable: () => false, runner: runnerThat() });
+  check(r.ok === false && /network denial unproven/.test(r.why) && /offline/.test(r.why), "a failed curl while the host is offline is inconclusive, not a pass", r.why);
+}
+{
+  const r = await sandboxCanary({ ...base, netReachable: () => null, runner: runnerThat() });
+  check(r.ok === false && /network denial unproven/.test(r.why) && /unknown/.test(r.why), "and unknown reachability is inconclusive too", r.why);
+}
+{
+  const r = await sandboxCanary({ ...base, netReachable: () => { throw new Error("boom"); }, runner: runnerThat() });
+  check(r.ok === false && /network denial unproven/.test(r.why), "a throwing reachability control is unknown, never a pass", r.why);
+}
+
+// ── the binary identity is part of the id ────────────────────────────────────
+{
+  const a = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, binaryId: "/x@1" });
+  const b = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, binaryId: "/x@2" });
+  check(a !== b, "a swapped binary (same version) is a different id", `${a} ${b}`);
+  const r = await sandboxCanary({ ...base, binaryId: "/x@1", runner: runnerThat() });
+  check(r.id === canaryIdFor({ cliVersion: base.cliVersion, sandbox: base.sandbox, binaryId: "/x@1" }), "and the canary carries the binary-aware id");
+}
+
+// ── the decoy must survive the probe ─────────────────────────────────────────
+{
+  const r = await sandboxCanary({ ...base, runner: async ({ cwd }) => {
+    writeFileSync(join(cwd, "INSIDE"), ""); writeFileSync(join(base.tmpDir, "TMP"), "");
+    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\ndecoy=1\nsymlink=1\n");
+    writeFileSync(join(cwd, "read-tool-out"), "DENIED");
+    rmSync(base.decoyPath, { force: true });   // a concurrent daemon deleted the shared decoy
+    return { outcome: "ok", why: "completed" };
+  } });
+  check(r.ok === false && /decoy vanished/.test(r.why), "a decoy deleted during the probe makes the read-denial unproven", r.why);
 }
 
 // ── state for the doctor ──────────────────────────────────────────────────────

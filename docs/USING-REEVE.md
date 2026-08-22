@@ -143,15 +143,20 @@ still live, the worker is terminated rather than trusted.
 you, with your real home directory (the `claude` CLI needs it to authenticate).
 The OS sandbox denies credential *files*, but it cannot deny the macOS
 *keychain* — the runtime's own profile hard-allows the security service — so a
-worker that asks `git`'s osxkeychain helper still gets your GitHub token. That is
-measured, not theoretical (`test/escape.test.mjs` records it as known-open).
-**So before any worker is dispatched under `--execute`, reeve MEASURES this host:
-a sandbox canary must pass under the running CLI AND your login keychain must
-hold no GitHub credential.** Until both hold, dispatch is refused and reeve says
-so once as `guardian:containment:open`; `reeve doctor` shows R-14 (the canary)
-and R-15 (the keychain) so you can see why. To close it, run workers as a
-dedicated user with their own empty keychain (the clean option), or remove the
-GitHub item from your keychain. Capability 2 stays off by code, not by memory.
+worker that asks `git`'s osxkeychain helper still gets your GitHub token; and a
+worker in a linked worktree shares your checkout's git dir, so it can move a
+branch or plant a hook. That is measured, not theoretical
+(`test/escape.test.mjs` records each as known-open). **So before any worker is
+dispatched under `--execute`, reeve MEASURES this host: a sandbox canary must
+pass under the running CLI, your login keychain must hold no GitHub credential,
+and the profile must declare an isolated worker (`worker.isolation:
+dedicated-user`).** The keychain probe is a guard, not a guarantee — another app
+can store a token elsewhere in your account — so the only real closure is a
+**dedicated worker OS user** with its own empty keychain and its own clone of the
+repo. Until that is in place, dispatch is refused and reeve says so once as
+`guardian:containment:open`; `reeve doctor` shows R-14 (the canary) and R-15
+(the keychain) so you can see why. Capability 2 stays off by code, not by
+memory.
 
 These are enforced by the tool layer, not by asking the model nicely. That
 distinction was measured: told not to write a file but given a plain shell, the

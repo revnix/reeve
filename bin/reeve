@@ -303,6 +303,9 @@ switch (cmd) {
       shadow: !flag("enforce"),
       intervalMs: Number(opt("interval") ?? 90) * 1000,
       dashPath: opt("dash") ?? dashPathFor(HOME, nwo),
+      // The sandbox canary's result is written here and read by `reeve doctor`
+      // from the same place, independent of any --log directory.
+      canaryStateDir: HOME,
     };
     // Honour the FLAG as well as the command. The help has always documented
     // `run --tick` as "one pass and exit" while only the separate `tick` command

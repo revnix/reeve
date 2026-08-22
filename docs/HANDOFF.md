@@ -372,11 +372,18 @@ KNOWN-OPEN so a green suite cannot hide it):
 
 - **The keychain.** The runtime's Seatbelt profile hard-allows securityd, so a
   worker can read the founder's GitHub token via the osxkeychain git helper. No
-  setting closes it; a dedicated worker user or an empty keychain does. This is
-  why dispatch is refused on the founder's own machine today.
-- **The shared ref store.** A worker in a LINKED worktree can move the
-  checkout's own branches. A dedicated worker user closes this (its own clone);
-  per-run standalone clones would close it for the same-user case (deferred).
+  setting closes it, and the metadata probe only knows two conventional item
+  shapes — a token can hide under a third — so an *empty* probe is necessary but
+  not sufficient. The only real closure is a dedicated worker OS user with its
+  own empty keychain.
+- **The shared ref store AND config.** A worker in a LINKED worktree can move the
+  checkout's own branches, or plant a hook in the shared git config that the
+  daemon's later push would run unsandboxed. A dedicated worker user with its own
+  clone closes both.
+- **Both are gated by one declaration.** Dispatch requires
+  `worker.isolation: dedicated-user` in the profile (default `none`), which the
+  founder sets only once the dedicated-user + per-run standalone-clone dispatch
+  is built (**PR-3**). Until then dispatch is refused regardless of the probes.
 - **Other platforms.** Only macOS is measured. Windows/Ubuntu workers are
   refused until their sandbox is measured (fail-closed matrix in the spec).
 

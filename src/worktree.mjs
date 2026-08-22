@@ -276,7 +276,13 @@ export function pushWorktree({ path, branch, expectedRemote = null, repoRoot = n
 
   // The worktree's branch by name, read from the main checkout's ref store, which
   // both share. Never force: a worker's fix is not worth another party's commit.
-  const pushed = git(from, ["push", "origin", `${branch}:${branch}`]);
+  //
+  // `core.hooksPath=/dev/null` on THIS command, so no hook runs during reeve's
+  // own publish. A worker in a linked worktree can write `core.hooksPath` into
+  // the shared git config; without this, that worker-controlled hook would run
+  // here, unsandboxed, as the daemon user. Defense in depth beneath the dispatch
+  // gate, which already refuses a worker that is not in its own isolated clone.
+  const pushed = git(from, ["-c", "core.hooksPath=/dev/null", "push", "origin", `${branch}:${branch}`]);
   if (!pushed.ok) return { ok: false, why: `push refused: ${pushed.err}` };
   return { ok: true, why: null };
 }

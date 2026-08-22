@@ -56,7 +56,7 @@ const pass = { ok: true, id: "id1", why: null, evidence: {} };
 const flunk = { ok: false, id: "id1", why: "wrote outside the worktree", evidence: {} };
 const clean = { measured: true, items: [], why: null };
 const dirty = { measured: true, items: ["generic password gh:github.com (gh keyring)"], why: "the login keychain holds: generic password gh:github.com (gh keyring)" };
-const base = { cliVersion: "2.1.237", sandbox, permissionsDeny: [], canaryPaths: {}, bin: "/bin/sh", env: {}, stateDir: root, nwo: "o/r", platform: "darwin" };
+const base = { cliVersion: "2.1.237", sandbox, permissionsDeny: [], canaryPaths: {}, bin: "/bin/sh", env: {}, stateDir: root, nwo: "o/r", platform: "darwin", isolated: true };
 {
   const r = await measureContainment({ ...base, canary: pass, keychain: clean });
   check(r.credentialRead === "closed" && /passed/.test(r.why), "passing canary + empty keychain: closed", r.why);
@@ -64,6 +64,10 @@ const base = { cliVersion: "2.1.237", sandbox, permissionsDeny: [], canaryPaths:
 {
   const r = await measureContainment({ ...base, canary: pass, keychain: dirty });
   check(r.credentialRead === "open" && /gh keyring/.test(r.why), "a GitHub item in the keychain keeps it open whatever the canary said", r.why);
+}
+{
+  const r = await measureContainment({ ...base, isolated: false, canary: pass, keychain: clean });
+  check(r.credentialRead === "open" && /no isolated worker/.test(r.why), "without a declared isolated worker, a passing canary and an empty keychain do NOT close it", r.why);
 }
 {
   const r = await measureContainment({ ...base, canary: flunk, keychain: clean });

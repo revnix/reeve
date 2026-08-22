@@ -177,7 +177,12 @@ export function stateRootsFor(stateDir, logPath, worktree, dbPath = null) {
   return [...new Set(cands)].filter(p => !(worktree && under(p, worktree)));
 }
 
-async function measuredContainment(ctx, profile, nwo, logPath) {
+/**
+ * The containment verdict the daemon acts on: cheap gates first, then the paid
+ * sandbox canary. Exported so `reeve canary` can run exactly this, rather than a
+ * reconstruction of it that could drift from what dispatch actually does.
+ */
+export async function measuredContainment(ctx, profile, nwo, logPath) {
   const cache = (ctx.containmentCache ??= new Map());
   try {
     const root = profile.identity?.worktreeRoot;
@@ -256,12 +261,11 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
       // process.platform in production; injectable so a test on one OS can
       // exercise the verdict for another (the fail-closed matrix is per-OS).
       platform: ctx.platform ?? undefined,
-      // The profile LABEL is necessary but not sufficient: the dedicated-user
-      // dispatch topology (a separate OS user, a per-run standalone clone) is
-      // PR-3, and production dispatch still uses a linked worktree as this user.
-      // So the label closes containment only when the topology is actually
-      // verified ready — false until PR-3, injectable for the wiring test.
-      // (Codex #4c-[9].)
+      // The profile LABEL is necessary but not sufficient: it closes containment
+      // only when the topology it names is actually in place. The scratch-home
+      // arrangement (a home of reeve's making, a per-run standalone clone, a
+      // token instead of ~/.claude) is built, so this reads true; it stays a
+      // seam because the next topology will not be. (Codex #4c-[9].)
       isolated,
       canary: ctx.canary ?? null, keychain: cheap.keychain,
       });

@@ -1,0 +1,195 @@
+// checkout — a worker's own copy of the repository, sharing nothing.
+//
+// Until now a worker was given a LINKED worktree: its own working directory, but
+// the clone's `.git` underneath it. That is one directory away from the founder's
+// checkout and it shares two things that turned out to matter:
+//
+//   · the ref store — a worker could move any branch of the clone, including
+//     main, with no network and no credential;
+//   · the configuration — a worker could write `core.fsmonitor` or a
+//     `filter.<name>.clean` entry, and the daemon's own `git status` would then
+//     run that program, unsandboxed, as the daemon user.
+//
+// Both were closed by detection (a config fingerprint, refusing to run git in a
+// checkout whose config moved). This closes them by CONSTRUCTION: a standalone
+// clone has its own refs and its own config, so there is nothing shared to move
+// or to poison. Detection stays as the second layer.
+//
+// Measured on nextlyhq/nextly, 2026-08-22, APFS:
+//
+//   git clone --no-hardlinks   2.4s   251 MB   own .git, committed content only
+//   cp -Rc node_modules       15.2s    31 MB   copy-on-write, 1.2 GB apparent
+//
+// The clone deliberately carries only COMMITTED content: a `cp` of the founder's
+// checkout would hand the worker their uncommitted work and every ignored file
+// (a `.env` among them). Dependencies are the one thing a fresh clone lacks and
+// a fixer cannot live without — the network is denied, so it cannot install them
+// — and they are supplied by a copy-on-write clone of the directory the founder
+// already has, which costs almost nothing because unmodified blocks are shared.
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { GIT_NEUTRALISE, REFUSING_HOOK, recordConfig } from "./worktree.mjs";
+import { writeFileSync, chmodSync } from "node:fs";
+
+/** Every daemon git command in a worker-controlled directory carries the neutralisers. */
+function git(cwd, args) {
+  try {
+    return { ok: true, out: execFileSync("git", ["-C", cwd, ...GIT_NEUTRALISE, ...args],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() };
+  } catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim().split("\n").at(-1) }; }
+}
+
+/** The conventional directory for one run's checkout. Keyed by run, not by PR:
+ * two runs for the same pull request must never share a directory. */
+export const runPathFor = (root, pr, runId) => join(root, `run-${pr}-${runId}`);
+
+/**
+ * Can this filesystem clone files copy-on-write?
+ *
+ * `cp -c` fails on anything but APFS (and cross-volume), which is a fact about
+ * the host, not an error: the caller falls back to a plain copy and pays the
+ * space. Measured once per process against the directory that will actually be
+ * copied, because the answer is per-volume.
+ */
+export function canCloneFiles(nearPath) {
+  const probe = join(nearPath, `.reeve-cow-probe-${process.pid}`);
+  const copy = `${probe}.copy`;
+  try {
+    writeFileSync(probe, "probe\n");
+    execFileSync("cp", ["-c", probe, copy], { stdio: ["ignore", "ignore", "pipe"] });
+    return true;
+  } catch { return false; }
+  finally { rmSync(probe, { force: true }); rmSync(copy, { force: true }); }
+}
+
+/**
+ * Copy a dependency tree into the run's checkout, sharing blocks where the
+ * filesystem allows it. Returns `{ ok, why, cow }`; `cow` says whether the cheap
+ * path was taken, so the caller can report honestly rather than assume.
+ */
+export function copyDeps(from, to, { cow = null } = {}) {
+  if (!existsSync(from)) return { ok: true, why: "nothing to copy", cow: false, skipped: true };
+  const useCow = cow ?? canCloneFiles(from.replace(/\/[^/]+$/, "") || "/tmp");
+  const args = useCow ? ["-Rc", from, to] : ["-R", from, to];
+  try {
+    execFileSync("cp", args, { stdio: ["ignore", "ignore", "pipe"] });
+    return { ok: true, why: null, cow: useCow };
+  } catch (e) {
+    // A failed copy-on-write copy is retried as a plain one: the host may be
+    // APFS while this particular pair of paths crosses volumes.
+    if (!useCow) return { ok: false, why: `could not copy dependencies: ${String(e.stderr || e.message).trim()}`, cow: false };
+    try { execFileSync("cp", ["-R", from, to], { stdio: ["ignore", "ignore", "pipe"] }); return { ok: true, why: null, cow: false }; }
+    catch (e2) { return { ok: false, why: `could not copy dependencies: ${String(e2.stderr || e2.message).trim()}`, cow: false }; }
+  }
+}
+
+/**
+ * A standalone checkout for one run.
+ *
+ * `head` is the revision reeve pinned when it decided. The clone is made from
+ * the founder's local checkout (fast, and no credential is needed) but it is
+ * VERIFIED against that revision: a local clone can only be as current as the
+ * last fetch, and a worker sent to fix a pull request must stand on the commit
+ * the decision was made about, not on whatever the checkout happened to hold.
+ */
+export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = null, depsFrom = null, cow = null }) {
+  const path = runPathFor(root, pr, runId);
+  if (existsSync(path)) return { ok: false, path, why: `a checkout already exists at ${path}` };
+  mkdirSync(root, { recursive: true });
+
+  // Fetch first, so the clone can see a head the local checkout has not yet
+  // heard of. A clone of a stale checkout is the wrong code, silently.
+  const fetched = git(repoRoot, ["fetch", "-q", "origin", branch]);
+  if (!fetched.ok) return { ok: false, path: null, why: `could not fetch ${branch}: ${fetched.err}` };
+
+  const cloned = git(repoRoot, ["clone", "--no-hardlinks", "-q", "--branch", branch, repoRoot, path]);
+  if (!cloned.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not clone: ${cloned.err}` }; }
+
+  // The clone followed the local branch, which may lag the revision reeve
+  // pinned; move it onto that revision explicitly and check it landed.
+  if (head) {
+    const at = git(path, ["reset", "--hard", "-q", head]);
+    if (!at.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not stand on ${head.slice(0, 10)}: ${at.err}` }; }
+    const now = git(path, ["rev-parse", "HEAD"]);
+    if (!now.ok || now.out !== head) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `checkout is at ${now.out || "?"}, not the pinned ${head.slice(0, 10)}` }; }
+  }
+
+  const h = hardenClone(path);
+  if (!h.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: h.why }; }
+
+  let deps = { ok: true, cow: false, skipped: true, why: "no dependency source given" };
+  if (depsFrom) {
+    deps = copyDeps(depsFrom, join(path, "node_modules"), { cow });
+    if (!deps.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: deps.why }; }
+  }
+
+  return { ok: true, path, why: null, deps };
+}
+
+/**
+ * The same two physical layers a linked worktree carried, applied to a clone:
+ * a push URL git cannot resolve, and a hook that refuses every push. They are
+ * belt and braces here rather than the boundary — the clone shares nothing, and
+ * the OS sandbox denies the network — but a layer that costs nothing to keep is
+ * kept.
+ */
+function hardenClone(path) {
+  const pu = git(path, ["config", "--local", "remote.origin.pushurl", "reeve://refused-the-worker-does-not-publish"]);
+  if (!pu.ok) return { ok: false, why: `pushurl: ${pu.err}` };
+  const hooks = `${path}.hooks`;
+  try {
+    mkdirSync(hooks, { recursive: true });
+    writeFileSync(join(hooks, "pre-push"), REFUSING_HOOK);
+    chmodSync(join(hooks, "pre-push"), 0o755);
+  } catch (e) { return { ok: false, why: `could not write the refusing hook: ${e.message}` }; }
+  const hp = git(path, ["config", "--local", "core.hooksPath", hooks]);
+  if (!hp.ok) return { ok: false, why: `hooksPath: ${hp.err}` };
+
+  // Read back rather than trust the writes, and only then record the baseline
+  // the config check compares against.
+  const readPu = git(path, ["config", "--local", "remote.origin.pushurl"]);
+  const readHp = git(path, ["config", "--local", "core.hooksPath"]);
+  if (!readPu.ok || readPu.out !== "reeve://refused-the-worker-does-not-publish") return { ok: false, why: "pushurl did not read back" };
+  if (!readHp.ok || readHp.out !== hooks || !existsSync(join(hooks, "pre-push"))) return { ok: false, why: "hooksPath or hook did not read back" };
+  if ((statSync(join(hooks, "pre-push")).mode & 0o111) === 0) return { ok: false, why: "the hook is not executable" };
+  if (!recordConfig(path)) return { ok: false, why: "the checkout's git configuration could not be recorded" };
+  return { ok: true, why: null };
+}
+
+/**
+ * Take the worker's commits OUT of its checkout without running git inside it.
+ *
+ * The clone is disposable, so nothing there is worth preserving — but the work
+ * is, and it only exists in the clone. reeve FETCHES it into its own checkout
+ * (a fetch reads the other repository's objects; it runs no hook and no filter
+ * of theirs) and publishes from there, exactly as before: the worker is never
+ * the party that publishes.
+ */
+export function fetchRunWork({ repoRoot, path, branch, into = null }) {
+  const ref = into ?? `refs/reeve/run/${branch}`;
+  const f = git(repoRoot, ["fetch", "--no-tags", "-q", path, `+${branch}:${ref}`]);
+  if (!f.ok) return { ok: false, ref: null, why: `could not fetch the worker's branch: ${f.err}` };
+  const at = git(repoRoot, ["rev-parse", ref]);
+  if (!at.ok) return { ok: false, ref: null, why: `fetched but ${ref} does not resolve` };
+  return { ok: true, ref, head: at.out, why: null };
+}
+
+/**
+ * Remove a run's checkout. A standalone clone holds nothing reeve has not
+ * already fetched, so this is a deletion rather than the worktree reaper's
+ * careful quarantine — but it refuses when the caller has not confirmed the
+ * work was taken out, so a deletion can never be the thing that loses it.
+ */
+export function releaseRunCheckout(path, { workFetched = false, quarantineRoot = null } = {}) {
+  if (!existsSync(path)) return { ok: true, why: "already gone", quarantined: false };
+  if (!workFetched) {
+    const q = quarantineRoot ?? `${path}.unfetched`;
+    try { execFileSync("mv", [path, q]); return { ok: true, why: "kept: the worker's commits were never fetched", quarantined: true, path: q }; }
+    catch (e) { return { ok: false, why: `could not preserve the checkout: ${e.message}`, quarantined: false }; }
+  }
+  rmSync(path, { recursive: true, force: true });
+  rmSync(`${path}.hooks`, { recursive: true, force: true });
+  rmSync(`${path}.cfg`, { force: true });
+  return { ok: true, why: null, quarantined: false };
+}

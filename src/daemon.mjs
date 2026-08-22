@@ -22,7 +22,7 @@ import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff, validateSettings, quarantineOsDenies } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree, verifyConfig, GIT_NEUTRALISE } from "./worktree.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
-import { workerEnv, writeGitConfig } from "./workerenv.mjs";
+import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
 import { canaryIdFor, netListener } from "./canary.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
@@ -215,8 +215,14 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     // grants read: putting it under ~/.reeve (deny-read) left the sandboxed git
     // unable to read its own configured global config, so the worker could not
     // even commit. (Codex #4-[8].)
+    // A home of reeve's making, outside the deny-read state tree: with the
+    // founder's home a worker reads their keychain, which no setting can deny.
+    const workerHome = workerHomeFor(root, nwo);
+    const token = (ctx.oauthToken ?? readOauthToken)();
+    if (!token?.ok) return { credentialRead: "open", why: `no worker authentication token: ${token?.why ?? "unreadable"}` };
     const env = workerEnv({ gitConfigPath: writeGitConfig(join(canaryPaths.tmpDir, "git")), tmpDir: canaryPaths.tmpDir,
-                            bgWaitMs: 5 * 60_000, extraPath: [dirname(claudeBin)] });
+                            bgWaitMs: 5 * 60_000, extraPath: [dirname(claudeBin)],
+                            home: workerHome, oauthToken: token.token });
     const version = ctx.cliVersion ?? cliVersion(claudeBin, env);
     // The block every worker gets; the canary's id covers it, so a block that
     // changes (a new deny, a new domain) is measured again before it is trusted.
@@ -676,9 +682,13 @@ export async function tick(ctx) {
         const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
         // In the run's tmp (sandbox-readable), never under the deny-read ~/.reeve:
         // a global config the sandboxed git cannot read stops it committing.
+        const dToken = (ctx.oauthToken ?? readOauthToken)();
+        if (!dToken?.ok) throw new Error(`no worker authentication token: ${dToken?.why ?? "unreadable"}`);
         const env = workerEnv({ gitConfigPath: writeGitConfig(join(tmpDir, "git")),
                                 tmpDir, bgWaitMs: budgetMs,
-                                extraPath: [dirname(claudeBin)] });
+                                extraPath: [dirname(claudeBin)],
+                                home: workerHomeFor(profile.identity?.worktreeRoot ?? dirname(worktree), nwo),
+                                oauthToken: dToken.token });
         const outPath = join(runDir, "worker.out"), errPath = join(runDir, "worker.err");
         // Validated BEFORE it is written or hashed. Measured: under -p the CLI
         // drops an invalid settings file whole and silently, deny rules

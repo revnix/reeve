@@ -320,13 +320,16 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   check(sb?.network?.allowLocalBinding === false && sb.network.allowAllUnixSockets === false && sb.network.allowUnixSockets.length === 0 && sb.network.allowMachLookup.length === 0,
     "no local binding, no unix sockets, no extra mach services", JSON.stringify(sb?.network));
   const fs = sb?.filesystem ?? {};
-  check(CREDENTIAL_PATHS.every(c => fs.denyRead?.includes(c)) && fs.denyRead.includes("~/.reeve") && fs.denyRead.includes("~/.ssh") && fs.denyRead.includes("~/.config/gh"),
-    "credential paths are deny-read at the OS layer", JSON.stringify(fs.denyRead));
+  // ABSOLUTE, not `~/...`: the sandbox expands a tilde against the PROCESS's
+  // home, and a worker's home is reeve's scratch directory — so `~/.ssh` would
+  // expand to `<scratch>/.ssh` and protect nothing. Measured 2026-08-22.
+  check(credentialPaths().every(c => fs.denyRead?.includes(c)), "credential paths are deny-read at the OS layer", JSON.stringify(fs.denyRead?.slice(0, 3)));
+  check(fs.denyRead.every(p => !p.startsWith("~")), "and every one of them is an absolute path, never a tilde", JSON.stringify(fs.denyRead.filter(p => p.startsWith("~"))));
   check(JSON.stringify(fs.allowWrite) === JSON.stringify([TMP]) && JSON.stringify(fs.allowRead) === JSON.stringify([TMP]),
     "the run's own tmp is the only write grant beyond cwd, carved back out of the deny-read", JSON.stringify([fs.allowWrite, fs.allowRead]));
   const deny = s.settings.permissions.deny;
-  check(CREDENTIAL_PATHS.every(c => deny.includes(`Read(${c}/**)`) || deny.includes(`Read(${c})`)),
-    "and the Read tool, which the OS sandbox does not cover, is denied the same paths", deny.filter(d => d.startsWith("Read(")).join(" "));
+  check(credentialPaths().every(c => deny.includes(`Read(${c}/**)`) || deny.includes(`Read(${c})`)),
+    "and the Read tool, which the OS sandbox does not cover, is denied the same paths", deny.filter(d => d.startsWith("Read(")).slice(0, 2).join(" "));
   const v = validateSettings(s.settings, { tmpDir: TMP });
   check(v.ok === true, "control: generated settings validate", JSON.stringify(v.errors));
   const r = sandboxFor({ profile: { ...profile, builder: { network: { research: { allowedDomains: ["docs.example.com"] } } } },
@@ -358,11 +361,11 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   check(!validateSettings(b, { tmpDir: TMP }).ok && /allowLocalBinding/.test(errs(b)), "local binding is refused", errs(b));
   b = good(); b.sandbox.filesystem.allowWrite = [TMP, "/Users/x"];
   check(!validateSettings(b, { tmpDir: TMP }).ok && /allowWrite/.test(errs(b)), "a write grant outside the run's tmp is refused", errs(b));
-  b = good(); b.sandbox.filesystem.denyRead = b.sandbox.filesystem.denyRead.filter(x => x !== "~/.ssh");
+  b = good(); b.sandbox.filesystem.denyRead = b.sandbox.filesystem.denyRead.filter(x => !x.endsWith("/.ssh"));
   check(!validateSettings(b, { tmpDir: TMP }).ok && /denyRead/.test(errs(b)), "a missing credential deny is refused", errs(b));
   b = good(); b.permissions.additionalDirectories = ["/Users/x"];
   check(!validateSettings(b, { tmpDir: TMP }).ok && /additionalDirectories/.test(errs(b)), "an additional directory widens the boundary and is refused", errs(b));
-  b = good(); b.permissions.deny = b.permissions.deny.filter(d => !d.startsWith("Read(~/.reeve"));
+  b = good(); b.permissions.deny = b.permissions.deny.filter(d => !/\/\.reeve/.test(d));
   check(!validateSettings(b, { tmpDir: TMP }).ok && /Read\(/.test(errs(b)), "a missing Read deny is refused", errs(b));
   b = good(); delete b.sandbox;
   check(!validateSettings(b, { tmpDir: TMP }).ok && /sandbox/.test(errs(b)), "a settings object without the block is refused", errs(b));
@@ -400,8 +403,8 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   // the XDG path; stripping XDG_CONFIG_HOME only restores the default location.
   const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: "/tmp/run/tmp" });
   const dr = s.settings.sandbox.filesystem.denyRead;
-  check(dr.includes("~/.git-credentials") && dr.includes("~/.config/git"), "both git credential-store locations are deny-read", JSON.stringify(dr.filter(x => /git/.test(x))));
-  check(s.settings.permissions.deny.includes("Read(~/.config/git/**)"), "and the Read tool is denied the XDG one too", "");
+  check(dr.some(p => p.endsWith("/.git-credentials")) && dr.some(p => p.endsWith("/.config/git")), "both git credential-store locations are deny-read", JSON.stringify(dr.filter(x => /git/.test(x))));
+  check(s.settings.permissions.deny.some(d => /\/\.config\/git\/\*\*\)$/.test(d)), "and the Read tool is denied the XDG one too", "");
 }
 
 // ── quarantined paths reach the OS layer, or the dispatch is refused ─────────

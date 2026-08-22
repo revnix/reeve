@@ -19,7 +19,7 @@ import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
-import { sandboxFor, writeSandbox, reviewDiff, validateSettings, quarantineOsDenies, sourceCheckoutOf } from "./sandbox.mjs";
+import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE } from "./gitguard.mjs";
 import { prepareRunCheckout, publishRunWork, releaseRunCheckout } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
@@ -251,12 +251,16 @@ export async function measuredContainment(ctx, profile, nwo, logPath) {
     // dependency, no timing window, and a hit at any point in the run is a leak.
     // (Codex #4d-[12], #4c-[13].) Injectable for tests.
     const netProbe = ctx.netProbe ?? netListener();
-    const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox, binaryId, worktree: canaryPaths.dir }))?.ok === true;
+    // Computed exactly as measureContainment computes it. A cache key that
+    // drifts from the id is how every tick came to pay for a five-minute canary.
+    const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox, binaryId, worktree: canaryPaths.dir,
+                                           permissionsDeny: policy.settings.permissions.deny, allowedTools: policy.allowedTools }))?.ok === true;
     if (!before) log(logPath, `containment: running the sandbox canary under ${version}`);
     let c;
     try {
       c = await measureContainment({
-      cliVersion: version, sandbox: policy.settings.sandbox, permissionsDeny: policy.settings.permissions.deny, binaryId,
+      cliVersion: version, sandbox: policy.settings.sandbox, permissionsDeny: policy.settings.permissions.deny,
+      allowedTools: policy.allowedTools, binaryId,
       canaryPaths, bin: claudeBin, env, stateDir: canaryStateDir, nwo, cache, netProbe, stateRoots,
       // process.platform in production; injectable so a test on one OS can
       // exercise the verdict for another (the fail-closed matrix is per-OS).
@@ -747,7 +751,16 @@ export async function tick(ctx) {
         // one could overwrite it between this run's hash and its spawn.
         const settingsPath = writeSandbox(runDir, sandbox);
         const maxTurns = profile.watch?.maxTurns ?? 40;
-        const tools = spec.tools ?? sandbox.allowedTools;
+        // A prompt spec may name its own tools, and those strings cannot know the
+        // worktree; they are scoped here, at the one place that knows both.
+        const tools = scopeGrant(spec.tools ?? sandbox.allowedTools, worktree);
+        // The grant travels beside the settings file, not inside it, so the
+        // settings validator never sees it -- and it is where the file tools are
+        // granted. A bare `Read` there is a grant to read the whole disk: the
+        // file tools are not covered by the OS sandbox. A prompt spec may
+        // override the grant, which is exactly the path that needs checking.
+        const tv = (ctx.toolValidator ?? validateToolGrant)(tools, { worktree });
+        if (!tv.ok) throw new Error(`tool grant invalid: ${tv.errors.join("; ")}`);
         const argv = workerArgs({ prompt: spec.prompt, allowedTools: tools, settings: settingsPath, maxTurns });
         // The complete argv is kept beside the hash: a hash proves what ran, the
         // file lets a later attempt run the same thing.

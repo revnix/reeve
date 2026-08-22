@@ -99,3 +99,28 @@ Both forms of the grant are needed: `//<dir>/**` matches descendants, and a writ
 of a new file is checked against the directory, so `//<dir>` must be granted too.
 That is the same shape as the earlier finding that `Read(<file>/**)` leaves the
 file itself readable.
+
+## A second finding, from the fix
+
+The canary re-run passed — with **the same id as the failed run**,
+`e31c4bea2493664a`. `canaryIdFor` and `policyHashOf` covered only the `sandbox`
+block, so the two policies either side of this fix were, to reeve, the same
+boundary. A pass recorded under one would have been reused under the other, in
+both directions, and `reeve doctor` R-14 would have reported OK across the
+change.
+
+That is not a detail of this defect. The permission rules are a **separate
+boundary**, not a description of the sandbox one, and they are the only thing
+governing the file tools. Both now cover `permissions.deny` and the tool grant,
+with per-invocation paths normalised out the same way the sandbox block's are —
+the id must not change every tick, or every wanted task pays for another
+five-minute canary.
+
+After the fix the id moved to `942565ecf154b3ed` and the canary **passed**:
+
+```
+credentialRead : closed
+canary         : PASSED (942565ecf154b3ed)
+```
+
+R-14 read OK for the first time since it was written.

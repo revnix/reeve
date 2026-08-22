@@ -26,8 +26,10 @@
 // And a sixth, unprompted: denied twice, the model reached for a THIRD tool that
 // was not in the allowlist at all. Any tool that can run a command is a write
 // primitive, so this must be a closed allowlist, never a denylist.
-import { sandboxFor, reviewDiff, validateSettings, credentialPaths, quarantineOsDenies, CREDENTIAL_PATHS } from "../src/sandbox.mjs";
-import { readFileSync } from "node:fs";
+import { sandboxFor, reviewDiff, validateSettings, validateToolGrant, scopeGrant, credentialPaths, quarantineOsDenies, CREDENTIAL_PATHS } from "../src/sandbox.mjs";
+import { readFileSync, mkdtempSync, rmSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -328,7 +330,7 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   check(JSON.stringify(fs.allowWrite) === JSON.stringify([TMP]) && JSON.stringify(fs.allowRead) === JSON.stringify([TMP]),
     "the run's own tmp is the only write grant beyond cwd, carved back out of the deny-read", JSON.stringify([fs.allowWrite, fs.allowRead]));
   const deny = s.settings.permissions.deny;
-  check(credentialPaths().every(c => deny.includes(`Read(${c}/**)`) || deny.includes(`Read(${c})`)),
+  check(credentialPaths().every(c => deny.includes(`Read(/${c}/**)`) || deny.includes(`Read(/${c})`)),
     "and the Read tool, which the OS sandbox does not cover, is denied the same paths", deny.filter(d => d.startsWith("Read(")).slice(0, 2).join(" "));
   const v = validateSettings(s.settings, { tmpDir: TMP });
   check(v.ok === true, "control: generated settings validate", JSON.stringify(v.errors));
@@ -339,6 +341,56 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   const f = sandboxFor({ profile: { ...profile, builder: { network: { research: { allowedDomains: ["docs.example.com"] } } } },
                          action: "FIX_CI", worktree: "/tmp/wt", tmpDir: TMP });
   check(f.settings.sandbox.network.allowedDomains.length === 0, "and no other action does", JSON.stringify(f.settings.sandbox.network.allowedDomains));
+}
+
+// ── the two layers spell the same path differently ───────────────────────────
+//
+// MEASURED 2026-08-22 against the real CLI, after the first live canary failed:
+// a permission rule takes an absolute path only with TWO leading slashes. One
+// slash matches nothing, and says nothing while it does so. The OS layer wants
+// the plain path. Getting either wrong is silent, which is why the shape itself
+// is asserted here and refused by the validator.
+// (docs/measured/2026-08-22-the-read-deny-list-was-inert.md)
+{
+  const wt = realpathSync(mkdtempSync(join(tmpdir(), "reeve-form-")));
+  const s = sandboxFor({ profile: { ...profile, identity: { ...profile.identity, checkout: "/srv/clone" } },
+                         action: "FIX_CI", worktree: wt, tmpDir: TMP, stateRoots: ["/var/log/reeve.log"] });
+  const rules = s.settings.permissions.deny.filter(d => /^[A-Za-z]+\(\//.test(d));
+  check(rules.length > 0, "control: there are absolute rules to judge", String(rules.length));
+  check(rules.every(d => /^[A-Za-z]+\(\/\//.test(d)),
+    "every absolute permission rule carries the second leading slash",
+    rules.filter(d => !/^[A-Za-z]+\(\/\//.test(d)).join(" "));
+  check(s.settings.sandbox.filesystem.denyRead.every(p2 => !p2.startsWith("//")),
+    "and the OS layer keeps the plain form, which is the one IT reads",
+    s.settings.sandbox.filesystem.denyRead.filter(p2 => p2.startsWith("//")).join(" "));
+
+  const bad = structuredClone(s.settings);
+  bad.permissions.deny = bad.permissions.deny.map(d => d.replace(/^([A-Za-z]+)\(\/\//, "$1(/"));
+  const v = validateSettings(bad, { tmpDir: TMP });
+  check(v.ok === false && /one leading slash/.test(v.errors.join(" | ")),
+    "a policy that regressed to one slash cannot reach a worker", v.errors.slice(0, 1).join(""));
+
+  // The file tools are governed by permissions ALONE -- the CLI's own process is
+  // not inside the Seatbelt profile it applies to the shells it spawns -- so a
+  // bare grant is a grant to the whole disk.
+  const grant = s.allowedTools.split(",");
+  for (const t of ["Read", "Edit", "Write", "Grep", "Glob"])
+    check(!grant.includes(t), `${t} is never granted bare`, grant.filter(x => x === t).join(""));
+  check(grant.includes(`Read(/${wt})`) && grant.includes(`Read(/${wt}/**)`),
+    "each file tool is scoped to the checkout in BOTH forms, because creating a file is checked against the directory",
+    grant.filter(x => x.startsWith("Read(")).join(" "));
+  check(validateToolGrant(s.allowedTools, { worktree: wt }).ok === true, "control: the generated grant validates", "");
+  check(validateToolGrant("Read,Write,Bash(git:*)", { worktree: wt }).ok === false,
+    "a bare file-tool grant is refused before spawn", "");
+  check(validateToolGrant(`Read(/${wt}),Read(//elsewhere/**)`, { worktree: wt }).ok === false,
+    "and so is one scoped to somewhere that is not the worker's checkout", "");
+
+  // A prompt spec may name its own tools and cannot know the worktree.
+  const spilled = scopeGrant("Read,Grep,Bash(gh issue:*)", wt);
+  check(validateToolGrant(spilled, { worktree: wt }).ok === true, "a prompt's own tool list is scoped rather than refused", spilled);
+  check(spilled.includes("Bash(gh issue:*)"), "and everything that is not a file tool is left exactly as written", spilled);
+  check(scopeGrant(s.allowedTools, wt) === s.allowedTools, "scoping an already-scoped grant changes nothing", "");
+  rmSync(wt, { recursive: true, force: true });
 }
 
 // ── the clone a worker's checkout was made FROM ───────────────────────────────
@@ -353,7 +405,7 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   const s = sandboxFor({ profile: withClone, action: "FIX_CI", worktree: "/srv/worktrees/run-1-a", tmpDir: TMP });
   check(s.settings.sandbox.filesystem.denyRead.includes("/srv/founder/repo"),
     "identity.checkout is deny-read at the OS layer", JSON.stringify(s.settings.sandbox.filesystem.denyRead.slice(-3)));
-  check(s.settings.permissions.deny.includes("Read(/srv/founder/repo)") && s.settings.permissions.deny.includes("Read(/srv/founder/repo/**)"),
+  check(s.settings.permissions.deny.includes("Read(//srv/founder/repo)") && s.settings.permissions.deny.includes("Read(//srv/founder/repo/**)"),
     "and denied to the Read tool in BOTH forms, so the directory entry is not left readable",
     s.settings.permissions.deny.filter(d => d.includes("founder")).join(" "));
   check(validateSettings(s.settings, { tmpDir: TMP, sourceCheckout: ["/srv/founder/repo"] }).ok === true,
@@ -425,7 +477,7 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
     check(credentialPaths().includes("/var/lib/reeve-state"), "credentialPaths includes a non-default REEVE_HOME", credentialPaths().join(","));
     const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: "/tmp/run/tmp" });
     check(s.settings.sandbox.filesystem.denyRead.includes("/var/lib/reeve-state"), "and the OS denyRead denies that root", JSON.stringify(s.settings.sandbox.filesystem.denyRead.slice(-3)));
-    check(s.settings.permissions.deny.includes("Read(/var/lib/reeve-state/**)"), "and the Read tool is denied it too", "");
+    check(s.settings.permissions.deny.includes("Read(//var/lib/reeve-state/**)"), "and the Read tool is denied it too", "");
     check(validateSettings(s.settings, { tmpDir: "/tmp/run/tmp" }).ok === true, "and the generated settings still validate", "");
   } finally { if (saved === undefined) delete process.env.REEVE_HOME; else process.env.REEVE_HOME = saved; }
   // Default REEVE_HOME (or unset) adds nothing beyond ~/.reeve.
@@ -478,11 +530,11 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/wt", tmpDir: "/t",
                          stateRoots: ["/var/log/reeve.log", "/var/lib/reeve/runs"] });
   const deny = s.settings.permissions.deny;
-  check(deny.includes("Read(/var/log/reeve.log)"), "a state root that is a FILE is denied by name", deny.filter(d => /reeve\.log/.test(d)).join(" "));
-  check(deny.includes("Read(/var/lib/reeve/runs/**)"), "and a directory keeps its subtree rule", "");
+  check(deny.includes("Read(//var/log/reeve.log)"), "a state root that is a FILE is denied by name", deny.filter(d => /reeve\.log/.test(d)).join(" "));
+  check(deny.includes("Read(//var/lib/reeve/runs/**)"), "and a directory keeps its subtree rule", "");
   check(validateSettings(s.settings, { tmpDir: "/t", stateRoots: ["/var/log/reeve.log", "/var/lib/reeve/runs"] }).ok === true, "control: they validate", "");
   const stripped = structuredClone(s.settings);
-  stripped.permissions.deny = stripped.permissions.deny.filter(d => d !== "Read(/var/log/reeve.log)");
+  stripped.permissions.deny = stripped.permissions.deny.filter(d => d !== "Read(//var/log/reeve.log)");
   check(validateSettings(stripped, { tmpDir: "/t", stateRoots: ["/var/log/reeve.log", "/var/lib/reeve/runs"] }).ok === false,
     "and a missing file rule is refused", "");
 }
@@ -492,7 +544,7 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   const withCred = { ...profile, notify: { provider: "ntfy", credentialFile: "/etc/reeve/ntfy.token" } };
   const s = sandboxFor({ profile: withCred, action: "FIX_CI", worktree: "/wt", tmpDir: "/t" });
   check(s.settings.sandbox.filesystem.denyRead.includes("/etc/reeve/ntfy.token"), "the publishing credential is deny-read at the OS layer", "");
-  check(s.settings.permissions.deny.includes("Read(/etc/reeve/ntfy.token)"), "and denied to the Read tool", "");
+  check(s.settings.permissions.deny.includes("Read(//etc/reeve/ntfy.token)"), "and denied to the Read tool", "");
   check(validateSettings(s.settings, { tmpDir: "/t", extraDenies: ["/etc/reeve/ntfy.token"] }).ok === true, "control: it validates", "");
   const without = sandboxFor({ profile, action: "FIX_CI", worktree: "/wt", tmpDir: "/t" });
   check(validateSettings(without.settings, { tmpDir: "/t", extraDenies: ["/etc/reeve/ntfy.token"] }).ok === false,

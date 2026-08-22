@@ -26,7 +26,7 @@
 // was never offered. Any tool that can run a command is a write primitive, so the
 // grant is a CLOSED ALLOWLIST and the denies are belt-and-braces on top of it.
 
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -98,6 +98,52 @@ const SELF_GOVERNING = [".github/**", ".git/**"];
  */
 const expandTilde = p => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
 
+/**
+ * An absolute path as a PERMISSION RULE writes it: with a second leading slash.
+ *
+ * The two layers of this policy want two different spellings of the same path,
+ * and getting it wrong is silent both ways. Measured 2026-08-22 with a real
+ * worker (docs/measured/2026-08-22-the-read-deny-list-was-inert.md):
+ *
+ *   sandbox.filesystem.denyRead    /Users/x/.ssh      the OS layer, plain
+ *   permissions.deny  Read(...)   //Users/x/.ssh      the CLI layer, TWO slashes
+ *
+ * A rule written `Read(/Users/x/.ssh/**)` matches nothing at all. This branch
+ * shipped that form for one afternoon, which left every credential deny inert:
+ * the first live canary read a decoy the shell beside it could not.
+ *
+ * A tilde is not an option here either. It expands against the PROCESS's home,
+ * and a worker's home is reeve's scratch directory, so `~/.ssh` would protect a
+ * directory that does not exist. Project-relative rules are resolved against the
+ * checkout and are written plainly.
+ */
+export const ruleFor = p => (p.startsWith("/") ? `/${p}` : p);
+
+/** The tools that touch files, and so are governed by permissions alone. */
+const FILE_TOOLS = new Set(["Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit"]);
+
+/**
+ * The file tools, granted only inside one directory.
+ *
+ * BOTH forms per tool. `<dir>/**` matches descendants, and creating a new file
+ * is checked against the DIRECTORY, so a grant of only the subtree refused the
+ * worker's own `./made.txt` -- the same shape as `Read(<file>/**)` leaving the
+ * file itself readable. Measured with a real worker: with both forms a worker
+ * writes at the checkout root, writes in subdirectories and edits, while reads
+ * and writes outside are refused.
+ *
+ * The path is resolved before it is written into a rule. macOS puts temporary
+ * directories behind /var -> /private/var, and the CLI checks the resolved path,
+ * so an unresolved scope silently matches nothing and the worker cannot write in
+ * its own checkout.
+ */
+export function scopedFileTools(tools, dir) {
+  if (!dir || !dir.startsWith("/")) return tools;
+  let real = dir;
+  try { real = realpathSync(dir); } catch { /* not created yet: the given path is the best available */ }
+  return tools.flatMap(t => [`${t}(${ruleFor(real)})`, `${t}(${ruleFor(real)}/**)`]);
+}
+
 export const CREDENTIAL_PATHS = [
   "~/.reeve", "~/.claude", "~/.claude.json", "~/.config/gh", "~/.ssh", "~/.gitconfig",
   // Git's `store` helper writes plaintext tokens to ~/.git-credentials OR, under
@@ -130,7 +176,7 @@ export function credentialPaths() {
   // home these resolve against.
   return [...CREDENTIAL_PATHS.map(expandTilde), ...extra];
 }
-const credentialReadDenies = () => credentialPaths().map(p => (isCredentialFile(p) ? `Read(${p})` : `Read(${p}/**)`));
+const credentialReadDenies = () => credentialPaths().map(p => (isCredentialFile(p) ? `Read(${ruleFor(p)})` : `Read(${ruleFor(p)}/**)`));
 
 /**
  * The clone a worker's checkout was made FROM.
@@ -289,11 +335,27 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
   const selfInterpreter = `Bash(${process.execPath}:*)`;
   const runnerTools = [...[...runners].map(r => `Bash(${r}:*)`), selfInterpreter];
 
-  // A closed set. Nothing reaches the network, nothing spawns a shell, and Bash
-  // appears only with a scope attached.
-  const tools = action === "FIX_CI" || action === "FIX_FINDINGS"
-    ? ["Read", "Edit", "Write", "Grep", "Glob", ...gitTools, ...runnerTools, ...new Set(projectCmds)]
-    : ["Read", "Grep", "Glob", ...gitTools];
+  // A closed set. Nothing reaches the network, nothing spawns a shell, and every
+  // tool appears with a scope attached.
+  //
+  // The file tools are scoped to the CHECKOUT, which is not decoration. They are
+  // not covered by the OS sandbox at all -- the CLI's own process runs outside
+  // the Seatbelt profile it applies to the shells it spawns -- so `Read` granted
+  // bare is a grant to read the whole disk, and the deny list is the only thing
+  // standing in front of it. Measured 2026-08-22: a worker with a bare `Read`
+  // grant read a file the `cp` beside it was refused, in the same run
+  // (docs/measured/2026-08-22-the-read-deny-list-was-inert.md).
+  //
+  // A scope makes the checkout itself the boundary rather than an enumeration of
+  // forbidden paths, which is the same reason a worker gets its own clone rather
+  // than a list of branches it must not move. The deny list stays as the second
+  // layer, and it holds even against a bare grant once the rule form is right.
+  const fileTools = action === "FIX_CI" || action === "FIX_FINDINGS"
+    ? ["Read", "Edit", "Write", "Grep", "Glob"]
+    : ["Read", "Grep", "Glob"];
+  const tools = [...scopedFileTools(fileTools, worktree),
+                 ...gitTools,
+                 ...(action === "FIX_CI" || action === "FIX_FINDINGS" ? [...runnerTools, ...new Set(projectCmds)] : [])];
 
   const deny = [
     // Bash is NOT denied as a class here, and that is a measured decision rather
@@ -335,11 +397,11 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
   // (Codex #4d-[15].) BOTH forms per entry, because a state root may be a FILE
   // (the log, the database): `Read(<file>/**)` matches descendants of it, which
   // a file does not have, so the file itself would stay readable. (Codex #4f-[2].)
-  for (const r of stateRoots) { deny.push(`Read(${r})`); deny.push(`Read(${r}/**)`); }
-  for (const c of notifyCred) deny.push(`Read(${c})`);
+  for (const r of stateRoots) { deny.push(`Read(${ruleFor(r)})`); deny.push(`Read(${ruleFor(r)}/**)`); }
+  for (const c of notifyCred) deny.push(`Read(${ruleFor(c)})`);
   // Both forms, for the same reason the state roots take both: `Read(<p>/**)`
   // matches descendants, so the directory entry itself would stay readable.
-  for (const c of sourceCheckout) { deny.push(`Read(${c})`); deny.push(`Read(${c}/**)`); }
+  for (const c of sourceCheckout) { deny.push(`Read(${ruleFor(c)})`); deny.push(`Read(${ruleFor(c)}/**)`); }
 
   return {
     allowedTools: tools.join(","),
@@ -410,6 +472,51 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
  * do). `tmpDir` is required: the only write grant beyond cwd is the run's own
  * tmp, and the validator cannot judge a grant without knowing what it should be.
  */
+/**
+ * Validate the TOOL GRANT before spawn.
+ *
+ * `--allowedTools` travels beside the settings file, not inside it, so
+ * validateSettings never sees it -- and it is where the file tools are granted.
+ * A bare `Read` there is a grant to read the whole disk: the file tools are not
+ * covered by the OS sandbox, so nothing else is standing in front of them.
+ *
+ * Every file tool must therefore carry a scope, and that scope must be the
+ * checkout the worker was given. A grant scoped to somewhere else is worse than
+ * a bare one, because it looks careful.
+ */
+/**
+ * Scope the file tools in a grant to one directory, leaving everything else be.
+ *
+ * A prompt spec may name its own tools (SPILL asks for `Read,Grep`), and those
+ * strings cannot know the worktree. Rather than refuse them at spawn, they are
+ * scoped here, at the one place that knows both. An entry that already carries a
+ * scope is left exactly as written -- validateToolGrant then judges whether that
+ * scope is the right one, which is a different question from whether one exists.
+ */
+export function scopeGrant(allowedTools, worktree) {
+  const list = String(allowedTools ?? "").split(",").map(t => t.trim()).filter(Boolean);
+  return list.flatMap(t => (FILE_TOOLS.has(t) ? scopedFileTools([t], worktree) : [t])).join(",");
+}
+
+export function validateToolGrant(allowedTools, { worktree = null } = {}) {
+  const errors = [];
+  const list = String(allowedTools ?? "").split(",").map(t => t.trim()).filter(Boolean);
+  if (!list.length) return { ok: false, errors: ["the tool grant is empty; a worker with no tools cannot fix anything"] };
+  if (!worktree) return { ok: false, errors: ["the validator needs the worktree to judge the file-tool scope"] };
+  let real = worktree;
+  try { real = realpathSync(worktree); } catch { /* judged against the path as given */ }
+  const allowed = new Set([ruleFor(real), `${ruleFor(real)}/**`]);
+  for (const t of list) {
+    const m = /^([A-Za-z]+)(?:\((.*)\))?$/.exec(t);
+    if (!m) { errors.push(`unreadable tool grant: ${t}`); continue; }
+    const [, name, scope] = m;
+    if (!FILE_TOOLS.has(name)) continue;
+    if (scope === undefined) { errors.push(`${name} is granted without a scope, which grants it the whole filesystem`); continue; }
+    if (!allowed.has(scope)) errors.push(`${name} is scoped to ${scope}, which is not the worker's checkout`);
+  }
+  return { ok: errors.length === 0, errors };
+}
+
 export function validateSettings(settings, { tmpDir = null, stateRoots = [], quarantineDenies = [], extraDenies = [], sourceCheckout = [] } = {}) {
   const errors = [];
   if (!tmpDir) return { ok: false, errors: ["validator needs the run's tmpDir to judge the write grant"] };
@@ -428,8 +535,15 @@ export function validateSettings(settings, { tmpDir = null, stateRoots = [], qua
     if (!strs(p.allow)) errors.push("permissions.allow must be an array of strings");
     if (!strs(p.deny)) errors.push("permissions.deny must be an array of strings");
     if (!Array.isArray(p.additionalDirectories) || p.additionalDirectories.length) errors.push("permissions.additionalDirectories must be empty");
-    if (strs(p.deny)) for (const d of [...credentialReadDenies(), ...extraDenies.map(c => `Read(${c})`),
-                                      ...[...stateRoots, ...sourceCheckout].flatMap(r => [`Read(${r})`, `Read(${r}/**)`])]) if (!p.deny.includes(d)) errors.push(`permissions.deny is missing ${d}`);
+    if (strs(p.deny)) for (const d of [...credentialReadDenies(), ...extraDenies.map(c => `Read(${ruleFor(c)})`),
+                                      ...[...stateRoots, ...sourceCheckout].flatMap(r => [`Read(${ruleFor(r)})`, `Read(${ruleFor(r)}/**)`])]) if (!p.deny.includes(d)) errors.push(`permissions.deny is missing ${d}`);
+    // A rule naming an absolute path with ONE leading slash matches nothing, and
+    // says nothing while it does so. Refusing the shape is the only way a
+    // regression to it cannot reach a worker. (Measured 2026-08-22.)
+    if (strs(p.deny)) for (const d of p.deny) {
+      const m = /^[A-Za-z]+\((\/[^/].*)\)$/.exec(d);
+      if (m) errors.push(`permissions.deny has an absolute rule with one leading slash, which matches nothing: ${d}`);
+    }
   }
 
   const sb = settings.sandbox;

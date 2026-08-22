@@ -209,6 +209,13 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       worktree is a standalone clone), replacing today's hard-false. Only after
       it lands may `worker.isolation: dedicated-user` be set.
 
+- [ ] **Guardian: the review shadow week RESET on 2026-08-22.** `#1134` diverged
+      — `resolved differs: live 13, derived 18` (55 comparisons, 52 agreements;
+      every other PR 161/161 that day). The 5-clean-day run for PR-5 restarts
+      from the next clean day, and the divergence itself needs investigating: it
+      is a real disagreement between reeve's derived review state and GitHub's
+      live one, not a flake.
+
 ### Founder actions pending
 
 - [x] Add `nextly-ops` to App installation 155196718 — DONE by founder

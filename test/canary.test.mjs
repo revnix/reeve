@@ -257,13 +257,12 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
 // ── the real listener: self-reachable, and detects a hit ─────────────────────
 {
   const L = netListener();
-  await L.ready;
-  const reachable = await L.selfReachable();
-  check(reachable === true && typeof L.url === "string" && /127\.0\.0\.1/.test(L.url), "the daemon can reach its own listener before any hit", `${reachable} ${L.url}`);
-  check(L.wasHit() === false, "and it reports no hit until something connects");
+  await L.ready;   // bound, and the daemon's one-time self-check has run and been discounted
+  check(L.selfReachable() === true && typeof L.url === "string" && /127\.0\.0\.1/.test(L.url), "the daemon reached its own listener at startup", `${L.selfReachable()} ${L.url}`);
+  check(L.wasHit() === false, "the self-check is NOT counted as a hit — no worker has connected yet");
   await new Promise((res) => { const c = connect(new URL(L.url).port, "127.0.0.1"); c.on("error", () => res()); c.on("connect", () => { c.end(); res(); }); });
   await new Promise(r => setTimeout(r, 50));
-  check(L.wasHit() === true, "a connection is recorded as a hit");
+  check(L.wasHit() === true, "a connection AFTER arming is recorded as a hit");
   L.close();
 }
 

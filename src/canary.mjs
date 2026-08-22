@@ -80,25 +80,45 @@ echo done
  * loopback, so an effective sandbox never reaches it.
  */
 export function netListener() {
-  let hit = false;
-  const server = createServer(sock => { hit = true; sock.on("error", () => {}); try { sock.end("reeve-canary\n"); } catch { /* ignore */ } });
-  server.on("error", () => { /* a listener that cannot bind makes selfReachable false */ });
-  // `ready` resolves once the port is bound; `url` reads the address live, so a
-  // caller that awaits `ready` always sees the real port rather than the null
-  // captured before listen() completes.
-  const ready = new Promise(res => { server.once("listening", () => res()); server.once("error", () => res()); });
-  server.listen(0, "127.0.0.1");
-  const addr = () => server.address();
-  const selfReachable = () => new Promise(res => {
-    const a = addr(); if (!a || typeof a !== "object") return res(false);
-    const c = connect(a.port, "127.0.0.1");
-    const done = ok => { try { c.destroy(); } catch { /* ignore */ } res(ok); };
-    c.setTimeout(2000); c.on("connect", () => done(true)); c.on("error", () => done(false)); c.on("timeout", () => done(false));
+  let hit = false, selfOk = false, armed = false;
+  // Before `armed`, a connection is the daemon's OWN one-time self-check and is
+  // NOT counted; after arming, any connection is the sandboxed worker reaching
+  // in, which is a leak. Arming happens only once the self-check's connection
+  // has been recorded, so the self-ping can never masquerade as a worker hit
+  // (which would make the canary certify a false leak on every run).
+  const server = createServer(sock => {
+    sock.on("error", () => {});
+    if (armed) hit = true; else selfOk = true;
+    try { sock.end("reeve-canary\n"); } catch { /* ignore */ }
   });
+  server.on("error", () => { /* a listener that cannot bind leaves selfOk false */ });
+  const addr = () => server.address();
+  // `ready` resolves once the port is bound AND the self-check has run, so a
+  // caller that awaits it sees the real port and a clean hit counter.
+  const ready = new Promise(res => {
+    server.once("error", () => { armed = true; res(); });
+    server.once("listening", () => {
+      const a = addr();
+      if (!a || typeof a !== "object") { armed = true; return res(); }
+      const c = connect(a.port, "127.0.0.1");
+      c.setTimeout(2000);
+      const arm = () => { armed = true; try { c.destroy(); } catch { /* ignore */ } res(); };
+      c.on("error", arm); c.on("timeout", arm);
+      c.on("connect", async () => {
+        const t0 = Date.now();
+        while (!selfOk && Date.now() - t0 < 2000) await new Promise(r => setTimeout(r, 5));
+        arm();
+      });
+    });
+  });
+  server.listen(0, "127.0.0.1");
   return {
     ready,
     get url() { const a = addr(); return a && typeof a === "object" ? `http://127.0.0.1:${a.port}/canary` : null; },
-    wasHit: () => hit, selfReachable,
+    // The listener bound AND the daemon's self-check reached it: a real, reachable
+    // target, so a sandboxed curl that does NOT reach it proves a denial.
+    selfReachable: () => selfOk && !!server.listening,
+    wasHit: () => hit,
     close: () => { try { server.close(); } catch { /* ignore */ } },
   };
 }

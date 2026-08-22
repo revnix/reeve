@@ -19,14 +19,14 @@
 // proof under the runtime, and both read files, never a worker's word.
 //
 // Never print what a credential probe returns: presence is the only thing read.
-import { acquireWorktree } from "../src/worktree.mjs";
+import { REFUSING_HOOK } from "../src/gitguard.mjs";
 import { workerEnv, writeGitConfig, CONTAINMENT } from "../src/workerenv.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { probeKeychain } from "../src/containment.mjs";
 import { netListener } from "../src/canary.mjs";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -58,8 +58,25 @@ git(clone, "push", "-q", "origin", "HEAD:main");
 git(clone, "checkout", "-q", "-b", "feature"); git(clone, "push", "-q", "origin", "feature");
 const head = git(clone, "rev-parse", "HEAD");
 git(clone, "checkout", "-q", "main");   // the clone keeps main; the worker's worktree takes the branch
-const wt = acquireWorktree({ repoRoot: clone, root: join(root, "wts"), pr: 1, branch: "feature", head });
-check(wt.ok, "control: a worker worktree exists", JSON.stringify(wt));
+// The LINKED worktree below is built here rather than by production code: reeve
+// no longer makes them, and the point of keeping the shape is to compare it with
+// the standalone clone that replaced it. Both hardening layers it used to carry
+// are reproduced, because two assertions measure what they stop.
+const makeLinkedWorktree = () => {
+  const path = join(root, "wts", "pr-1");
+  mkdirSync(dirname(path), { recursive: true });
+  git(clone, "worktree", "add", "--force", "-B", "feature", path, "origin/feature");
+  git(clone, "config", "extensions.worktreeConfig", "true");
+  git(path, "config", "--worktree", "remote.origin.pushurl", "reeve://refused-the-worker-does-not-publish");
+  const hooks = `${path}.hooks`;
+  mkdirSync(hooks, { recursive: true });
+  writeFileSync(join(hooks, "pre-push"), REFUSING_HOOK, { mode: 0o755 });
+  chmodSync(join(hooks, "pre-push"), 0o755);
+  git(path, "config", "--worktree", "core.hooksPath", hooks);
+  return { ok: existsSync(join(path, ".git")) && existsSync(join(hooks, "pre-push")), path };
+};
+const wt = makeLinkedWorktree();
+check(wt.ok, "control: a worker worktree exists, with both layers reeve used to give it", JSON.stringify(wt));
 writeFileSync(join(wt.path, "change.txt"), "from the worker\n");
 git(wt.path, "add", "-A"); git(wt.path, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-q", "-m", "worker change");
 const dest = join(root, "dest.git"); git(root, "init", "--bare", "-q", dest);

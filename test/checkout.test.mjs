@@ -2,7 +2,7 @@
 // not the configuration, and not their uncommitted work. These assertions are
 // what makes the standalone clone a boundary rather than a convention.
 import { prepareRunCheckout, releaseRunCheckout, fetchRunWork, copyDeps, canCloneFiles, runPathFor } from "../src/checkout.mjs";
-import { verifyConfig } from "../src/worktree.mjs";
+import { verifyConfig } from "../src/gitguard.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";

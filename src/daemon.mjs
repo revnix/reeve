@@ -20,7 +20,7 @@ import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff, validateSettings, quarantineOsDenies } from "./sandbox.mjs";
-import { acquireWorktree, releaseWorktree, pushWorktree, verifyConfig, GIT_NEUTRALISE } from "./worktree.mjs";
+import { verifyConfig, GIT_NEUTRALISE } from "./gitguard.mjs";
 import { prepareRunCheckout, publishRunWork, releaseRunCheckout } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./workerenv.mjs";
@@ -36,7 +36,7 @@ import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
+import { appendFileSync, mkdirSync, fstatSync, statSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
@@ -866,9 +866,10 @@ export async function tick(ctx) {
       // different question of whether the change is inside the work it was given.
       // A model that argued its way to a plausible edit outside its territory
       // still does not get it published.
-      // A worker that did not finish still leaves its work behind, and the next
-      // attempt cannot use a dirty checkout -- verifyWorktree refuses it, correctly,
-      // and the pull request is then stuck forever with no path out.
+      // A worker that did not finish still leaves its work behind. Each run gets
+      // its own checkout now, so a half-finished one no longer blocks the next
+      // attempt -- but it still holds work nobody else has a copy of, which is
+      // why the release below preserves it rather than deleting it.
       //
       // Measured: a worker repaired the planted bug and then hit its turn limit
       // before committing. The fix was correct, cost real money, and would have
@@ -902,9 +903,9 @@ export async function tick(ctx) {
       // (Codex #4f-[6].)
       const cfg = (ctx.verifyConfig ?? verifyConfig)(worktree);
       if (!cfg.ok) {
-        log(logPath, `  #${e.pr}: NOT reading or publishing this worktree — ${cfg.why}`);
-        escalations.set(`#${e.pr}: the worker changed its checkout's git configuration; the worktree is preserved for inspection`, 1);
-        escalations.set("guardian:worktree:config-tampered", 1);
+        log(logPath, `  #${e.pr}: NOT reading or publishing this checkout — ${cfg.why}`);
+        escalations.set(`#${e.pr}: the worker changed its checkout's git configuration; the checkout is preserved at ${worktree} for inspection`, 1);
+        escalations.set("guardian:checkout:config-tampered", 1);
         continue;
       }
 
@@ -1159,39 +1160,6 @@ export function announceable(db, escalations, { covered = null, waiting = null, 
     cleared.push(why);
   }
   return { fresh, cleared };
-}
-
-/**
- * Where a worker for this escalation should run.
- *
- * Returns `{path: null, why}` rather than a default, because the previous
- * default was `process.cwd()` -- which under launchd is the daemon's
- * WorkingDirectory, so a worker sent to fix a pull request in one repository
- * would have run inside another. A wrong directory is not a smaller version of
- * the right one, and refusing is the only safe answer.
- */
-export function resolveWorktree(ctx, profile, e) {
-  // An explicit override still wins: that is how a test, or a human working a PR
-  // by hand, hands a specific directory to a worker.
-  const override = ctx.worktreeFor?.(e) ?? null;
-  if (override) {
-    if (!isAbsolute(override)) return { path: null, why: `worktree path is relative (${override})` };
-    if (!existsSync(override)) return { path: null, why: `worktree does not exist: ${override}` };
-    return { path: override, why: null };
-  }
-
-  const root = profile.identity?.worktreeRoot ?? null;
-  const checkout = profile.identity?.checkout ?? null;
-  if (!root) return { path: null, why: "no identity.worktreeRoot in the profile" };
-  if (!isAbsolute(root)) return { path: null, why: `identity.worktreeRoot is relative (${root}); it must be absolute` };
-  if (!checkout) return { path: null, why: "no identity.checkout in the profile — a worktree is created FROM a clone" };
-  if (!existsSync(checkout)) return { path: null, why: `identity.checkout does not exist: ${checkout}` };
-
-  // A dedicated, verified checkout of THIS pull request's branch at the revision
-  // reeve pinned. Refusing is the whole point: a worktree holding somebody's
-  // unsaved work is not a worktree a worker may reset.
-  const w = acquireWorktree({ repoRoot: checkout, root, pr: e.pr, branch: e.headRef, head: e.head });
-  return w.ok ? { path: w.path, why: null, reused: w.reused } : { path: null, why: w.why };
 }
 
 /** The long-running loop. Ticks until halted or stopped. */

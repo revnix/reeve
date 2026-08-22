@@ -29,7 +29,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { GIT_NEUTRALISE, REFUSING_HOOK, recordConfig } from "./worktree.mjs";
+import { GIT_NEUTRALISE, REFUSING_HOOK, recordConfig, reason } from "./gitguard.mjs";
 import { writeFileSync, chmodSync } from "node:fs";
 
 /** Every daemon git command in a worker-controlled directory carries the neutralisers. */
@@ -37,7 +37,9 @@ function git(cwd, args) {
   try {
     return { ok: true, out: execFileSync("git", ["-C", cwd, ...GIT_NEUTRALISE, ...args],
       { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() };
-  } catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim().split("\n").at(-1) }; }
+  // `reason` picks git's own fatal line rather than the last thing it printed,
+  // which is usually progress narration and sends the reader somewhere else.
+  } catch (e) { return { ok: false, out: "", err: reason(e.stderr || e.message) }; }
 }
 
 /** The conventional directory for one run's checkout. Keyed by run, not by PR:

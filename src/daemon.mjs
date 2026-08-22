@@ -35,7 +35,7 @@ import { selfAudit } from "./selfaudit.mjs";
 import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -150,7 +150,7 @@ function uncommittedFiles(worktree) {
  * case and the obvious deliberate one, and the residual is stated in the docs
  * rather than papered over. The value is never logged.
  */
-function diffCarriesSecret(worktree, since, ref, secrets) {
+async function diffCarriesSecret(worktree, since, ref, secrets) {
   const present = secrets.filter(x => typeof x?.value === "string" && x.value.length >= 16);
   if (!present.length) return null;
   // EVERY newly reachable object, not the net patch.
@@ -160,23 +160,50 @@ function diffCarriesSecret(worktree, since, ref, secrets) {
   // and published the secret blob anyway. Binary blobs never appear in patch
   // text at all. So the check walks the objects the push would add: every blob,
   // and every commit's message and identities. (Codex #5-[13], #5-[7].)
-  let text;
+  //
+  // STREAMED, not buffered. `cat-file --batch` over a range containing large
+  // assets exceeded the child-output limit, and the catch path then refused a
+  // perfectly good publication as unreadable — a check that fails closed on
+  // size is a check that stops the work for the wrong reason. It scans as the
+  // bytes arrive, keeping only an overlap between chunks so a value split
+  // across a boundary is still found. (Codex #7-[3].)
+  const hit = t => present.find(sx => t.includes(sx.value)) ?? null;
+  const longest = Math.max(...present.map(sx => sx.value.length));
+  // Enough of the previous chunk is carried forward that a value split across a
+  // read boundary is still whole in the next scan.
+  const overlap = Math.max(0, longest - 1);
+  let objs;
   try {
-    const run = (args, opts = {}) => execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args],
-                                                  { encoding: "utf8", maxBuffer: 256 * 1024 * 1024, env: gitEnv(), ...opts });
-    // Commit messages and identities across the whole range.
-    text = run(["log", `${since}..${ref}`, "--format=%B%n%an%n%ae%n%cn%n%ce"]);
-    // Then the objects themselves. `rev-list --objects` names every blob and
-    // tree the range adds; `cat-file --batch` streams their contents, binary
-    // included, which is what a patch cannot show.
-    const objs = run(["rev-list", "--objects", "--no-walk=unsorted", `${since}..${ref}`])
+    const run = args => execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args],
+                                     { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: gitEnv() });
+    const meta = hit(run(["log", `${since}..${ref}`, "--format=%B%n%an%n%ae%n%cn%n%ce"]));
+    if (meta) return { label: meta.label, why: `the change carries ${meta.label}` };
+    objs = run(["rev-list", "--objects", "--no-walk=unsorted", `${since}..${ref}`])
       .split("\n").map(l => l.split(" ")[0]).filter(Boolean);
-    if (objs.length) {
-      text += "\n" + run(["cat-file", "--batch"], { input: objs.join("\n") + "\n" });
-    }
   } catch { return { label: "unreadable", why: "reeve could not read the change to check it for its own credentials" }; }
-  for (const sx of present) if (text.includes(sx.value)) return { label: sx.label, why: `the change carries ${sx.label}` };
-  return null;
+  if (!objs.length) return null;
+
+  // Truly streamed: the bytes are scanned as they arrive and never held whole.
+  // A window keeps an overlap of one value's length so a match straddling a
+  // chunk boundary is still seen, and the child is killed the moment one is.
+  // Latin-1 rather than UTF-8, because the objects are arbitrary bytes and a
+  // decoder that replaces invalid sequences could destroy what is being sought.
+  return await new Promise(resolve => {
+    const child = spawn("git", ["-C", worktree, ...GIT_NEUTRALISE, "cat-file", "--batch"], { env: gitEnv() });
+    let tail = "", done = false;
+    const finish = v => { if (done) return; done = true; try { child.kill("SIGKILL"); } catch { /* already gone */ } resolve(v); };
+    child.on("error", () => finish({ label: "unreadable", why: "reeve could not read the change's objects to check them for its own credentials" }));
+    child.stdout.on("data", buf => {
+      const chunk = tail + buf.toString("latin1");
+      const found = hit(chunk);
+      if (found) return finish({ label: found.label, why: `the change carries ${found.label}` });
+      tail = chunk.slice(-overlap);
+    });
+    child.on("close", code => finish(done ? null : (code === 0 ? null
+      : { label: "unreadable", why: "reeve could not read the change's objects to check them for its own credentials" })));
+    child.stdin.on("error", () => { /* a killed child closes the pipe; the close handler answers */ });
+    child.stdin.end(objs.join("\n") + "\n");
+  });
 }
 
 /** Where a named branch points inside a checkout, or null if it cannot be read. */
@@ -1158,7 +1185,7 @@ export async function tick(ctx) {
           // Before reeve puts its name on it: the worker had a working token in
           // its environment and every runtime needed to read it. A filename gate
           // cannot see that, and reeve is the party that pushes.
-          const leak = diffCarriesSecret(worktree, e.head, publishRef, [{ label: "reeve's worker authentication token", value: workerToken }]);
+          const leak = await diffCarriesSecret(worktree, e.head, publishRef, [{ label: "reeve's worker authentication token", value: workerToken }]);
           if (leak) {
             const rel = releaseRunCheckout(worktree, { workFetched: false });
             log(logPath, `  #${e.pr}: NOT published — ${leak.why}${rel.quarantined ? `; preserved at ${rel.path}` : ""}`);

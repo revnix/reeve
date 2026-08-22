@@ -452,10 +452,21 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
   // Both forms, for the same reason the state roots take both: `Read(<p>/**)`
   // matches descendants, so the directory entry itself would stay readable.
   for (const c of sourceCheckout) { deny.push(`Read(${ruleFor(c)})`); deny.push(`Read(${ruleFor(c)}/**)`); }
-  // The Read tool is already scoped to this checkout, so a sibling is outside its
-  // grant; the deny is the second layer, and it is the OS list below that closes
-  // the shell.
-  for (const c of siblingRoots) { deny.push(`Read(${ruleFor(c)})`); deny.push(`Read(${ruleFor(c)}/**)`); }
+  // The shared worktree root is DELIBERATELY not denied here, only in the OS list
+  // below.
+  //
+  // The worker's own checkout is a CHILD of that root, and a deny beats an allow
+  // — the same precedence this module relies on everywhere else. Denying the
+  // parent at the permission layer therefore refused every Read of the worker's
+  // own files, for every worker. MEASURED 2026-08-22 against the real CLI: with
+  // the parent denied, `Read ./own-file.txt` in the checkout is refused; without
+  // it, it succeeds.
+  //
+  // Nothing is lost. The file tools are scoped to this checkout, so a sibling is
+  // outside the grant and refused for want of one; the OS list is what closes the
+  // shell. The canary now reads a file inside the checkout with the Read TOOL,
+  // because its own probes only ever read OUTSIDE and could not represent this.
+  // (Codex #7-[2].)
 
   return {
     allowedTools: tools.join(","),
@@ -596,13 +607,24 @@ export function validateSettings(settings, { tmpDir = null, stateRoots = [], qua
     if (!strs(p.deny)) errors.push("permissions.deny must be an array of strings");
     if (!Array.isArray(p.additionalDirectories) || p.additionalDirectories.length) errors.push("permissions.additionalDirectories must be empty");
     if (strs(p.deny)) for (const d of [...credentialReadDenies(), ...extraDenies.map(c => `Read(${ruleFor(c)})`),
-                                      ...[...stateRoots, ...sourceCheckout, ...siblingRoots].flatMap(r => [`Read(${ruleFor(r)})`, `Read(${ruleFor(r)}/**)`])]) if (!p.deny.includes(d)) errors.push(`permissions.deny is missing ${d}`);
+                                      // NOT siblingRoots: the worker's own checkout is a child of that
+                                      // root, and a deny beats an allow — requiring it here would demand
+                                      // the very rule that refuses a worker its own files.
+                                      ...[...stateRoots, ...sourceCheckout].flatMap(r => [`Read(${ruleFor(r)})`, `Read(${ruleFor(r)}/**)`])]) if (!p.deny.includes(d)) errors.push(`permissions.deny is missing ${d}`);
     // A rule naming an absolute path with ONE leading slash matches nothing, and
     // says nothing while it does so. Refusing the shape is the only way a
     // regression to it cannot reach a worker. (Measured 2026-08-22.)
     if (strs(p.deny)) for (const d of p.deny) {
       const m = /^[A-Za-z]+\((\/[^/].*)\)$/.exec(d);
       if (m) errors.push(`permissions.deny has an absolute rule with one leading slash, which matches nothing: ${d}`);
+    }
+    // A permission deny that CONTAINS the worker's checkout refuses the worker
+    // its own files, because a deny beats an allow and the file tools are
+    // scoped to a child of it. Measured, and it would break every dispatch.
+    if (strs(p.deny) && worktree) for (const d of p.deny) {
+      const m = /^[A-Za-z]+\(\/(\/[^)]*?)(?:\/\*\*)?\)$/.exec(d);
+      if (m && under(worktree, m[1]) && worktree !== m[1])
+        errors.push(`permissions.deny has ${d}, which contains the worker's own checkout and would refuse it every read`);
     }
   }
 

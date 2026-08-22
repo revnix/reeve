@@ -174,6 +174,56 @@ const mk = (pr, runId) => prepareRunCheckout({ repoRoot: founder, root: runs, pr
   check(gitEnv().GIT_CONFIG_GLOBAL === "/dev/null" && typeof gitEnv().PATH === "string",
     "and the isolation is layered onto the real environment, not a replacement for it", "");
 
+  // Pointing the config FILES at /dev/null closes nothing on its own: git also
+  // takes configuration from the environment, independently of those files. A
+  // daemon launched with a driver injected that way would still run it for any
+  // pull request whose .gitattributes names it.
+  {
+    const injected = { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "filter.evil.smudge", GIT_CONFIG_VALUE_0: "/bin/false",
+                       GIT_CONFIG_PARAMETERS: "'filter.evil.smudge=/bin/false'", KEEP_ME: "yes" };
+    const before = { ...process.env };
+    Object.assign(process.env, injected);
+    const e = gitEnv();
+    for (const k of ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_PARAMETERS"])
+      check(!(k in e), `${k} is stripped, not inherited`, JSON.stringify(e[k]));
+    check(e.KEEP_ME === "yes", "control: the rest of the environment is untouched", JSON.stringify(e.KEEP_ME));
+    for (const k of Object.keys(injected)) delete process.env[k];
+    Object.assign(process.env, before);
+  }
+
+  // And measured, because the stripping is only worth what git does with it.
+  {
+    const home2 = mkdtempSync(join(tmpdir(), "reeve-injected-"));
+    const marker2 = join(home2, "INJECTED-RAN");
+    const driver2 = join(home2, "injected.sh");
+    writeFileSync(driver2, `#!/bin/sh\ntouch ${JSON.stringify(marker2)}\ncat\n`, { mode: 0o755 });
+    chmodSync(driver2, 0o755);
+    const src2 = mkdtempSync(join(tmpdir(), "reeve-injectedsrc-"));
+    execFileSync("git", ["-C", src2, "init", "-q"]);
+    writeFileSync(join(src2, ".gitattributes"), "*.txt filter=evil\n");
+    writeFileSync(join(src2, "a.txt"), "content\n");
+    execFileSync("git", ["-C", src2, "add", "-A"]);
+    execFileSync("git", ["-C", src2, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "x"]);
+    const inj = { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "filter.evil.smudge", GIT_CONFIG_VALUE_0: driver2 };
+    const d2 = join(src2, "..", `inj-dest-${process.pid}`);
+
+    // The control: config FILES at /dev/null, driver injected through the
+    // environment. This is the hole, and it must be open before the fix closes it.
+    execFileSync("git", ["clone", "-q", src2, `${d2}-control`],
+                 { env: { ...process.env, ...inj, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" } });
+    check(existsSync(marker2), "control: a driver injected through the environment runs even with both config files at /dev/null", marker2);
+    rmSync(marker2, { force: true });
+
+    const saved = { ...process.env };
+    Object.assign(process.env, inj);
+    execFileSync("git", ["clone", "-q", src2, d2], { env: gitEnv() });
+    for (const k of Object.keys(inj)) delete process.env[k];
+    Object.assign(process.env, saved);
+    check(!existsSync(marker2), "and gitEnv() closes it", marker2);
+    rmSync(home2, { recursive: true, force: true }); rmSync(src2, { recursive: true, force: true });
+    rmSync(d2, { recursive: true, force: true }); rmSync(`${d2}-control`, { recursive: true, force: true });
+  }
+
   // Measured rather than asserted: a global driver, a .gitattributes that names
   // it, and a checkout that must NOT run it.
   const home = mkdtempSync(join(tmpdir(), "reeve-fakehome-"));

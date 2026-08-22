@@ -422,8 +422,20 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   check(fs2.denyRead.includes(ROOT), "the shared worktree root is deny-read, so every sibling is closed at once", JSON.stringify(fs2.denyRead.slice(-4)));
   check(JSON.stringify(fs2.allowRead) === JSON.stringify([TMP, MINE]),
     "and this run's OWN checkout is carved back out, or the worker cannot read its code", JSON.stringify(fs2.allowRead));
-  check(s.settings.permissions.deny.includes(`Read(/${ROOT}/**)`),
-    "the Read tool is denied the root too", s.settings.permissions.deny.filter(d => d.includes("worktrees")).join(" "));
+  // NOT at the permission layer. The worker's own checkout is a CHILD of that
+  // root and a deny beats an allow, so denying the parent there refused every
+  // Read of the worker's own files — measured against the real CLI, and it would
+  // have broken every dispatch. The file tools are scoped to this checkout, so a
+  // sibling is refused for want of a grant, and the OS list closes the shell.
+  check(!s.settings.permissions.deny.some(d => d === `Read(/${ROOT})` || d === `Read(/${ROOT}/**)`),
+    "and the root is NOT denied at the permission layer, where it would refuse the worker its own files",
+    s.settings.permissions.deny.filter(d => d.includes("worktrees")).join(" "));
+  check(s.allowedTools.split(",").includes(`Read(/${MINE})`),
+    "control: the file tools are scoped to this checkout, which is what refuses a sibling", "");
+  const selfDenying = structuredClone(s.settings);
+  selfDenying.permissions.deny.push(`Read(/${ROOT}/**)`);
+  check(validateSettings(selfDenying, { tmpDir: TMP, sourceCheckout: ["/srv/clone"], siblingRoots: [ROOT], worktree: MINE }).ok === false,
+    "and a policy that adds it back cannot reach a worker", "");
   // Denying the ROOT rather than listing siblings is the only shape that
   // survives a new run appearing after the policy was written.
   const siblings = fs2.denyRead.filter(d => d.startsWith(ROOT + "/run-") && d !== MINE && !d.startsWith(MINE + "/"));

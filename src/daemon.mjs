@@ -19,8 +19,8 @@ import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
-import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf } from "./sandbox.mjs";
-import { verifyConfig, GIT_NEUTRALISE } from "./gitguard.mjs";
+import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf } from "./sandbox.mjs";
+import { verifyConfig, GIT_NEUTRALISE, gitEnv } from "./gitguard.mjs";
 import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./workerenv.mjs";
@@ -131,7 +131,7 @@ function attemptsFor(db, nwo, pr, fp, logPath) {
  */
 function uncommittedFiles(worktree) {
   try {
-    const out = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "status", "--porcelain"], { encoding: "utf8" }).trim();
+    const out = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "status", "--porcelain"], { encoding: "utf8", env: gitEnv() }).trim();
     return out ? out.split("\n").map(l => l.slice(3).trim().split(" -> ").pop()).filter(Boolean) : [];
   } catch { return null; }
 }
@@ -150,26 +150,30 @@ function uncommittedFiles(worktree) {
  * case and the obvious deliberate one, and the residual is stated in the docs
  * rather than papered over. The value is never logged.
  */
-function diffCarriesSecret(worktree, since, secrets) {
+function diffCarriesSecret(worktree, since, ref, secrets) {
   const present = secrets.filter(x => typeof x?.value === "string" && x.value.length >= 16);
   if (!present.length) return null;
-  // The PATCH and the COMMIT METADATA, because a push carries both. `git diff`
-  // emits the file patch only, so a token placed in a commit message travelled
-  // straight into public history past a check that had just declared the change
-  // clean. Author name and email go with it, for the same reason. (Codex #5-[7].)
+  // EVERY newly reachable object, not the net patch.
+  //
+  // A push carries commits, so it carries every intermediate one. A worker that
+  // committed the token and deleted it in a later commit left a clean net diff
+  // and published the secret blob anyway. Binary blobs never appear in patch
+  // text at all. So the check walks the objects the push would add: every blob,
+  // and every commit's message and identities. (Codex #5-[13], #5-[7].)
   let text;
   try {
-    // `--no-ext-diff` is not optional here. GIT_NEUTRALISE sets `diff.external=`
-    // to disable an external differ, and git takes the empty string literally:
-    // "cannot run : No such file or directory / fatal: external diff died". A
-    // content diff is the only command in reeve that reaches that code path, so
-    // nothing had exercised it — and the failure is silent in the direction that
-    // matters least and loudest in the one that matters most: this check would
-    // have refused EVERY publish as unreadable.
-    const args = [["diff", "--no-ext-diff", "--no-color", `${since}..HEAD`],
-                  ["log", `${since}..HEAD`, "--format=%B%n%an%n%ae%n%cn%n%ce"]];
-    text = args.map(a => execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...a],
-                                      { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })).join("\n");
+    const run = (args, opts = {}) => execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args],
+                                                  { encoding: "utf8", maxBuffer: 256 * 1024 * 1024, env: gitEnv(), ...opts });
+    // Commit messages and identities across the whole range.
+    text = run(["log", `${since}..${ref}`, "--format=%B%n%an%n%ae%n%cn%n%ce"]);
+    // Then the objects themselves. `rev-list --objects` names every blob and
+    // tree the range adds; `cat-file --batch` streams their contents, binary
+    // included, which is what a patch cannot show.
+    const objs = run(["rev-list", "--objects", "--no-walk=unsorted", `${since}..${ref}`])
+      .split("\n").map(l => l.split(" ")[0]).filter(Boolean);
+    if (objs.length) {
+      text += "\n" + run(["cat-file", "--batch"], { input: objs.join("\n") + "\n" });
+    }
   } catch { return { label: "unreadable", why: "reeve could not read the change to check it for its own credentials" }; }
   for (const sx of present) if (text.includes(sx.value)) return { label: sx.label, why: `the change carries ${sx.label}` };
   return null;
@@ -180,13 +184,13 @@ function branchHead(worktree, branch) {
   if (!branch) return null;
   try {
     return execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}`],
-                        { encoding: "utf8" }).trim() || null;
+                        { encoding: "utf8", env: gitEnv() }).trim() || null;
   } catch { return null; }
 }
 
-function changedFiles(worktree, since = null) {
+function changedFiles(worktree, since = null, ref = "HEAD") {
   const run = args => {
-    try { return execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args], { encoding: "utf8" }).trim(); }
+    try { return execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args], { encoding: "utf8", env: gitEnv() }).trim(); }
     catch { return null; }
   };
 
@@ -202,7 +206,7 @@ function changedFiles(worktree, since = null) {
   // therefore reported a complete, correct, committed fix as "nothing was changed"
   // and refused to publish it. The instrument could not represent the success case
   // it was written to check.
-  const committed = since ? (run(["diff", "--name-only", `${since}..HEAD`]) ?? "") : "";
+  const committed = since ? (run(["diff", "--no-ext-diff", "--name-only", `${since}..${ref}`]) ?? "") : "";
   const fromCommits = committed ? committed.split("\n").filter(Boolean) : [];
 
   return [...new Set([...fromCommits, ...uncommitted])];
@@ -883,7 +887,9 @@ export async function tick(ctx) {
         const qDenies = quarantineOsDenies(worktree, profile.risk?.quarantinePaths ?? []).paths;
         const notifyCred = typeof profile.notify?.credentialFile === "string" && isAbsolute(profile.notify.credentialFile) ? [profile.notify.credentialFile] : [];
         const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots, quarantineDenies: qDenies,
-                                                                                  extraDenies: notifyCred, sourceCheckout: sourceCheckoutOf(profile) });
+                                                                                  extraDenies: notifyCred, sourceCheckout: sourceCheckoutOf(profile),
+                                                                                  siblingRoots: siblingRootsOf(profile).filter(r => worktree !== r && !r.startsWith(worktree + "/")),
+                                                                                  worktree });
         if (!sv.ok) throw new Error(`settings invalid: ${sv.errors.join("; ")}`);
         // The settings file is immutable per run, in the run's own directory:
         // a path keyed by PR alone was shared by every daemon on the host, and
@@ -1119,7 +1125,22 @@ export async function tick(ctx) {
                           `${stillDirty?.length ? ` (${stillDirty.slice(0, 3).join(", ")})` : ""}`, 1);
           continue;
         }
-        const changed = changedFiles(worktree, e.head);
+        // Against the ref that will actually be PUSHED, not against HEAD.
+        //
+        // publishRunWork pushes `e.headRef`. A worker can commit anything on that
+        // branch, then check out an auxiliary branch carrying an allowed change:
+        // every gate reads HEAD, passes, and the push carries the content none of
+        // them looked at. Both commits can descend from the pinned head, so
+        // nothing else notices. (Codex #5-[12].)
+        const publishRef = `refs/heads/${e.headRef}`;
+        const atRef = branchHead(worktree, e.headRef);
+        if (!atRef) {
+          const rel = releaseRunCheckout(worktree, { workFetched: false });
+          log(logPath, `  #${e.pr}: NOT published — ${e.headRef} cannot be read in the checkout${rel.quarantined ? `; preserved at ${rel.path}` : ""}`);
+          escalations.set(`#${e.pr}: a finished fix was NOT published — reeve could not read ${e.headRef} in the worker's checkout`, 1);
+          continue;
+        }
+        const changed = changedFiles(worktree, e.head, publishRef);
         const gate = reviewDiff({ files: changed, profile, lane, action: decision.action });
         if (!gate.ok) {
           log(logPath, `  #${e.pr}: NOT published — ${gate.why}`);
@@ -1137,7 +1158,7 @@ export async function tick(ctx) {
           // Before reeve puts its name on it: the worker had a working token in
           // its environment and every runtime needed to read it. A filename gate
           // cannot see that, and reeve is the party that pushes.
-          const leak = diffCarriesSecret(worktree, e.head, [{ label: "reeve's worker authentication token", value: workerToken }]);
+          const leak = diffCarriesSecret(worktree, e.head, publishRef, [{ label: "reeve's worker authentication token", value: workerToken }]);
           if (leak) {
             const rel = releaseRunCheckout(worktree, { workFetched: false });
             log(logPath, `  #${e.pr}: NOT published — ${leak.why}${rel.quarantined ? `; preserved at ${rel.path}` : ""}`);

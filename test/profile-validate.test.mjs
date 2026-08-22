@@ -182,8 +182,8 @@ expectOk("a lane declaring sensitiveOk true",
   const isoDefault = d.worker?.isolation === "none";
   console.log(`${isoDefault ? "PASS" : "FAIL"}  worker.isolation defaults to "none"`);
   if (!isoDefault) fail++;
-  const isoOk = validate(withDefaults((() => { const q = clone(base); q.worker = { isolation: "dedicated-user" }; return q; })())).ok;
-  console.log(`${isoOk ? "PASS" : "FAIL"}  worker.isolation accepts "dedicated-user"`);
+  const isoOk = validate(withDefaults((() => { const q = clone(base); q.worker = { isolation: "scratch-home" }; return q; })())).ok;
+  console.log(`${isoOk ? "PASS" : "FAIL"}  worker.isolation accepts the implemented mode`);
   if (!isoOk) fail++;
 }
 

@@ -23,15 +23,18 @@ import { realpathSync, statSync } from "node:fs";
 import { sandboxCanary, canaryIdFor, policyHashOf, readCanaryState, writeCanaryState } from "./canary.mjs";
 
 /**
- * Is the dedicated-user dispatch topology actually in place? A separate OS user
- * (its own empty keychain) and a per-run standalone clone (its own git dir) are
- * PR-3; until they exist, production dispatch still runs a linked worktree as
- * this user, so the profile LABEL worker.isolation="dedicated-user" must not
- * close containment or read OK in the doctor. Hard-false until PR-3 replaces it
- * with a real check (euid differs from the checkout owner; the worktree is a
- * standalone clone). (Codex #4c-[9], #4d-[14].)
+ * Is the isolation the profile declares actually implemented?
+ *
+ * It was hard-false while the code still handed workers a linked worktree and
+ * the founder's HOME, so the profile LABEL could not close anything. Both are
+ * now enforced in code and cannot be opted out of per dispatch: `workerEnv`
+ * REFUSES the founder's home and refuses a missing token, and dispatch prepares
+ * a standalone clone rather than a linked worktree. Neither is a promise this
+ * function makes on their behalf — the canary re-measures the consequence (no
+ * network, no writes outside, no credential reads, and no keychain reach) for
+ * every CLI build and policy before a single worker is dispatched.
  */
-export function isolationTopologyReady() { return false; }
+export function isolationTopologyReady() { return true; }
 
 /**
  * The identity of an executable: its real path and modification time. A CLI
@@ -95,10 +98,16 @@ export function probeKeychain({ platform = process.platform, exec = spawnSync } 
 export function cheapContainmentReasons({ platform = process.platform, isolated = false, keychain = null } = {}) {
   const reasons = [];
   if (platform !== "darwin") reasons.push(`the OS sandbox is unmeasured on ${platform}; only macOS has been measured`);
+  if (!isolated) reasons.push("no isolated worker environment declared (worker.isolation)");
+  // The keychain is PROBED here for the record, and it is deliberately no longer
+  // a gate. It used to be one because a worker ran with the founder's HOME and
+  // could ask the keychain directly, so "the keychain holds nothing we
+  // recognise" was the only available proxy — a weak one, since the probe knows
+  // two item shapes and any client can invent a third. Workers now run with a
+  // scratch HOME and have no login keychain in their search list at all, and the
+  // CANARY measures that reach directly. Evidence about the worker beats a proxy
+  // about the host, so the canary decides and this is reported, not enforced.
   const kc = keychain ?? probeKeychain({ platform });
-  if (!kc.measured) reasons.push(`keychain unmeasured: ${kc.why}`);
-  else if (kc.items.length) reasons.push(kc.why);
-  if (!isolated) reasons.push("no isolated worker environment declared (worker.isolation): a shared account cannot be certified free of credentials and a linked worktree shares the checkout's git dir");
   return { reasons, keychain: kc };
 }
 
@@ -167,12 +176,13 @@ export async function revalidateContainment(verdict, { bin, binaryIdentity, keyc
   const nowId = binaryIdentity(bin);
   if (verdict.binaryId && nowId !== verdict.binaryId)
     return { ok: false, why: `the CLI binary changed since containment was measured (${verdict.binaryId} -> ${nowId}); re-measuring before dispatch` };
-  // Awaited: the same injection contract as the initial measurement, where an
-  // async probe is legitimate. Reading a pending Promise's `.measured` gave
-  // undefined and refused every otherwise-eligible worker. (Codex #4e-[4].)
-  const kc = typeof keychain === "function" ? await keychain() : keychain ?? probeKeychain({ platform });
-  if (!kc || !kc.measured) return { ok: false, why: `keychain became unmeasurable since the verdict: ${kc?.why ?? "no result"}` };
-  if (kc.items.length) return { ok: false, why: `a GitHub credential appeared since the verdict: ${kc.why}` };
+  // The keychain is deliberately NOT re-checked here any more. It was, when a
+  // worker ran with the founder's HOME and could ask the keychain directly, so a
+  // credential appearing mid-tick genuinely changed what a worker could reach.
+  // A worker now has no login keychain in its search list at all, so the host's
+  // keychain contents no longer describe its reach; the canary measures that,
+  // and the binary identity above is what can still go stale between the verdict
+  // and this spawn.
   return { ok: true, why: null };
 }
 

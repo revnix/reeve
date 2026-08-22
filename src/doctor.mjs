@@ -435,7 +435,9 @@ export function checkKeychain({ probe = probeKeychain, isolation = "none", topol
   // The LABEL is necessary but not sufficient: the dedicated-user topology must
   // actually be in place (PR-3). Until then an isolated-labelled profile is
   // still DEGRADED, because the daemon necessarily refuses. (Codex #4d-[14].)
-  const isolated = isolation === "dedicated-user" && topologyReady();
+  // Only the arrangement reeve has built counts; "dedicated-user" is stronger
+  // and unbuilt, so declaring it must not read as OK.
+  const isolated = isolation === "scratch-home" && topologyReady();
   const kc = probe();
   if (!kc.measured) return { id, level: UNKNOWN, title, lines: [`unmeasured: ${kc.why}`, "an unmeasured keychain keeps dispatch refused"] };
   if (kc.items.length) return { id, level: DEGRADED, title, lines: [

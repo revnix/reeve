@@ -39,7 +39,11 @@ export const REVIEWER_KIND = ["blocking", "advisory"];
 // becomes, and it blocks.
 export const SEVERITY = ["critical", "major", "minor", "nit", "unknown"];
 export const MERGE_METHOD = ["squash", "merge", "rebase"];
-export const WORKER_ISOLATION = ["none", "dedicated-user"];
+export const WORKER_ISOLATION = ["none", "scratch-home", "dedicated-user"];
+// "scratch-home": workers get a HOME of reeve's making and a standalone clone,
+// so the founder's login keychain is not in their search list (measured
+// 2026-08-22) and they share no ref store or config with the founder's checkout.
+// "dedicated-user" is stronger still (its own OS account) and is not built.
 
 /**
  * field: [required, validator, description]

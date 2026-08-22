@@ -176,6 +176,31 @@ export function fetchRunWork({ repoRoot, path, branch, into = null }) {
 }
 
 /**
+ * Publish the worker's work, from REEVE's checkout, never the worker's.
+ *
+ * The commits exist only in the run's clone, so they are fetched into reeve's
+ * own repository first (a fetch reads the other repository's objects and runs
+ * none of its hooks or filters) and pushed from there. The separation the
+ * linked worktree gave by sharing a ref store is kept by moving the objects
+ * explicitly: the worker still holds no credential and still cannot push.
+ */
+export function publishRunWork({ repoRoot, path, branch, expectedRemote = null }) {
+  if (expectedRemote) {
+    const ls = git(repoRoot, ["ls-remote", "origin", `refs/heads/${branch}`]);
+    if (!ls.ok) return { ok: false, why: `could not read the remote head: ${ls.err}` };
+    const now = ls.out.split(/\s+/)[0] ?? "";
+    if (now && now !== expectedRemote)
+      return { ok: false, why: `the remote moved while the worker ran: expected ${expectedRemote.slice(0, 10)}, found ${now.slice(0, 10)}` };
+  }
+  const fetched = fetchRunWork({ repoRoot, path, branch });
+  if (!fetched.ok) return { ok: false, why: fetched.why };
+  // Never force: a worker's fix is not worth another party's commit.
+  const pushed = git(repoRoot, ["push", "origin", `${fetched.ref}:refs/heads/${branch}`]);
+  if (!pushed.ok) return { ok: false, why: `push refused: ${pushed.err}` };
+  return { ok: true, why: null, head: fetched.head };
+}
+
+/**
  * Remove a run's checkout. A standalone clone holds nothing reeve has not
  * already fetched, so this is a deletion rather than the worktree reaper's
  * careful quarantine — but it refuses when the caller has not confirmed the

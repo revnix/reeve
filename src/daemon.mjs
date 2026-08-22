@@ -21,6 +21,7 @@ import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTC
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff, validateSettings, quarantineOsDenies } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree, verifyConfig, GIT_NEUTRALISE } from "./worktree.mjs";
+import { prepareRunCheckout, publishRunWork, releaseRunCheckout } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
@@ -184,7 +185,13 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     // Cheap gates FIRST: on a host where the verdict is already open, preparing a
     // canary would create a per-invocation tmp tree every tick that nothing then
     // cleans up, because the canary itself never runs. (Codex #4e-[9].)
-    const isolated = profile.worker?.isolation === "dedicated-user" && (ctx.isolationReady ?? isolationTopologyReady)();
+    // Only an arrangement reeve has actually BUILT can close containment. A
+    // profile that declares "dedicated-user" is declaring something that does
+    // not exist yet, and saying so is better than quietly treating it as the
+    // weaker thing that does.
+    const mode = profile.worker?.isolation ?? "none";
+    const isolated = mode === "scratch-home" && (ctx.isolationReady ?? isolationTopologyReady)();
+    if (mode === "dedicated-user") log(logPath, `  containment: worker.isolation is "dedicated-user", which is not built; use "scratch-home"`);
     const cheapKc = typeof ctx.keychain === "function" ? await ctx.keychain() : ctx.keychain ?? null;
     const cheap = cheapContainmentReasons({ platform: ctx.platform ?? process.platform, isolated, keychain: cheapKc });
     if (cheap.reasons.length) {
@@ -611,13 +618,19 @@ export async function tick(ctx) {
       const spec = promptFor(decision, promptCtx);
       if (!spec) continue;
 
-      const wt = resolveWorktree(ctx, profile, e);
-      if (!wt.path) {
-        escalations.set(`#${e.pr}: cannot dispatch — ${wt.why}`, 1);
-        log(logPath, `  #${e.pr}: NOT dispatching — ${wt.why}`);
+      // The checkout is prepared AFTER the run exists, because it is keyed by the
+      // run: two runs for one pull request must never share a directory, and the
+      // lease should be held while the (slow) preparation happens rather than
+      // leaving a window another daemon could race into. A preparation that
+      // fails is handled as one, below: refunded, backed off, nothing published.
+      const checkoutRoot = profile.identity?.worktreeRoot ?? null;
+      const repoCheckout = profile.identity?.checkout ?? null;
+      if (!checkoutRoot || !repoCheckout) {
+        const why = !checkoutRoot ? "no identity.worktreeRoot in the profile" : "no identity.checkout in the profile — a checkout is made FROM a clone";
+        escalations.set(`#${e.pr}: cannot dispatch — ${why}`, 1);
+        log(logPath, `  #${e.pr}: NOT dispatching — ${why}`);
         continue;
       }
-      const worktree = wt.path;
 
       // A durable run is the ONLY way a worker may start. The exclusive right to
       // act on this PR is taken FIRST, so a restarted daemon cannot re-dispatch
@@ -635,7 +648,7 @@ export async function tick(ctx) {
         continue;
       }
 
-      log(logPath, `  #${e.pr}: dispatching ${decision.action} in ${worktree} (run ${run.runId}, attempt ${run.attempt})`);
+      log(logPath, `  #${e.pr}: dispatching ${decision.action} (run ${run.runId}, attempt ${run.attempt})`);
       started++;
       // The heartbeat's answer is read, not discarded. `heartbeat` already
       // reports a lost lease; the interval used to swallow it, so a worker kept
@@ -661,10 +674,7 @@ export async function tick(ctx) {
       const stateDir = dirname(logPathOf(ctx));
       const runDir = join(stateDir, "runs", nwo.replace("/", "-"), String(e.pr), run.runId);
       const tmpDir = join(runDir, "tmp");
-      const dStateRoots = stateRootsFor(stateDir, logPathOf(ctx), worktree, ctx.dbPath ?? null);
-      const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane, tmpDir, stateRoots: dStateRoots });
-
-      let r, prepFailed = false;
+      let r, prepFailed = false, worktree = null;
       try {
         // Everything from here runs inside the cleanup scope: the run is
         // already leased and its heartbeat already ticking, so a failure in
@@ -678,6 +688,24 @@ export async function tick(ctx) {
         // run so a restart can read the report the worker left. The run dir is
         // keyed by repository, PR, and run id: the log dir is shared by every
         // repo's daemon, and two repos can share a PR number.
+        // A standalone clone, not a linked worktree: its own ref store and its own
+        // configuration, so a worker cannot move the founder's branches or plant
+        // git config the daemon would execute. Dependencies come from the
+        // founder's tree copy-on-write, because the network is denied and a fixer
+        // that cannot run the tests cannot check its own fix.
+        const prepared = (ctx.prepareCheckout ?? prepareRunCheckout)({
+          repoRoot: repoCheckout, root: checkoutRoot, pr: e.pr, runId: run.runId,
+          branch: e.headRef, head: e.head, depsFrom: join(repoCheckout, "node_modules"),
+        });
+        if (!prepared.ok) throw new Error(`could not prepare the checkout: ${prepared.why}`);
+        worktree = prepared.path;
+        log(logPath, `  #${e.pr}: checkout ready at ${worktree}${prepared.deps?.cow ? " (dependencies shared copy-on-write)" : ""}`);
+
+        // The policy is built AFTER the checkout, because it is written in terms
+        // of that directory: the write scope, the quarantine denies and the
+        // overlap check all resolve against it.
+        const dStateRoots = stateRootsFor(stateDir, logPathOf(ctx), worktree, ctx.dbPath ?? null);
+        const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane, tmpDir, stateRoots: dStateRoots });
         const budgetMs = (profile.watch?.workerBudgetMinutes ?? 20) * 60_000;
         const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
         // In the run's tmp (sandbox-readable), never under the deny-read ~/.reeve:
@@ -883,11 +911,11 @@ export async function tick(ctx) {
       if (r.outcome !== OUTCOMES.OK) {
         const left = changedFiles(worktree, e.head);
         if (left?.length) {
-          const rel = releaseWorktree({ path: worktree, pr: e.pr });
+          const rel = releaseRunCheckout(worktree, { workFetched: false });
           log(logPath, `  #${e.pr}: the worker left ${left.length} changed file(s) unfinished — ${rel.quarantined ? `preserved at ${rel.path}` : "released"}`);
           escalations.set(`#${e.pr}: an unfinished candidate fix was preserved rather than published — ${left.slice(0, 3).join(", ")}`, 1);
         } else {
-          releaseWorktree({ path: worktree, pr: e.pr });
+          releaseRunCheckout(worktree, { workFetched: true });
         }
       }
 
@@ -913,8 +941,8 @@ export async function tick(ctx) {
         } else {
           // reeve publishes, not the worker: the actor and the only claim that
           // the action was allowed must not be the same party.
-          const pushed = pushWorktree({ path: worktree, branch: e.headRef, expectedRemote: e.head,
-                                         repoRoot: profile.identity?.checkout ?? null });
+          const pushed = (ctx.publishWork ?? publishRunWork)({ repoRoot: repoCheckout, path: worktree,
+                                                               branch: e.headRef, expectedRemote: e.head });
           if (!pushed.ok) {
             log(logPath, `  #${e.pr}: NOT published — ${pushed.why}`);
             escalations.set(`#${e.pr}: a fix was produced but could not be published — ${pushed.why}`, 1);
@@ -927,8 +955,10 @@ export async function tick(ctx) {
             // Only ever release what pushed cleanly. Anything else quarantines,
             // because a directory holding work nobody has a copy of is not spare
             // disk space.
-            const rel = releaseWorktree({ path: worktree, pr: e.pr });
-            if (!rel.ok) log(logPath, `  #${e.pr}: worktree quarantined — ${rel.why}`);
+            // Only what published cleanly is deleted; the release refuses to
+            // remove a checkout whose commits reeve never took out of it.
+            const rel = releaseRunCheckout(worktree, { workFetched: true });
+            if (!rel.ok) log(logPath, `  #${e.pr}: checkout kept — ${rel.why}`);
           }
         }
       }

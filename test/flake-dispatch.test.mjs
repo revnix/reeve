@@ -74,7 +74,7 @@ const scenario = async ({ failing, probe }) => {
     // a busy machine would fail these assertions for a reason that is not the code.
     capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
-      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir },
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: dir },
       authority: { policy: "propose_and_merge" },
       rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
       ci: { provider: "github-actions", requiredChecks: [] },
@@ -86,7 +86,7 @@ const scenario = async ({ failing, probe }) => {
     spawnWorker: async args => { spawned.push(args); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; },
     resolveCause: (nwo, f) => CAUSES[f.name],
     flakeProbe: probe,
-    worktreeFor: () => dir,
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
   };
   const r = await tick(ctx);
   const out = { r, spawned, db: ctx.db,

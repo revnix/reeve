@@ -148,6 +148,27 @@ const ctxFor = (dir, extra = {}) => ({
   rmSync(dir, { recursive: true, force: true });
 }
 
+// ── an ingest that FAILED leaves nothing to compare against ──────────────────
+//
+// The observation succeeded, so its counts describe this moment — but the
+// projection is still built from the PREVIOUS inbox, because the write never
+// landed. Comparing them would record a storage failure as the derivation
+// disagreeing, which is the confusion this whole change exists to remove.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-shadow-ingestfail-"));
+  const ctx = ctxFor(dir, {
+    observe: () => ({ observations: [THREAD_OBS], incomplete: false, threads: OBSERVED }),
+    ingest: () => { throw new Error("disk full"); },
+  });
+  await tick(ctx);
+  const row = ctx.db.prepare("SELECT comparisons, agreements, incomparable FROM review_shadow WHERE nwo=? AND pr=?").get(NWO, 7);
+  check(row?.incomparable === 1 && row?.comparisons === 0,
+    "an observation that never reached the database is not a reading of the same moment", JSON.stringify(row));
+  check(divergences(ctx.db, NWO).length === 0, "and a storage failure is not a divergence", "");
+  ctx.db.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // ── an incomplete observation is INCOMPARABLE too ────────────────────────────
 {
   const dir = mkdtempSync(join(tmpdir(), "reeve-shadow-unread-"));

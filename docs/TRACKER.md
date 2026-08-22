@@ -305,6 +305,34 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       are `kind: advisory`, so the blocking roster is EMPTY and clause B5's
       "absence read as success" is the live configuration, not a hypothetical.
 
+- [ ] **The publication gate read the wrong paths, and the founder's own remote
+      was unreachable (2026-08-22).** The three findings Codex left open on #7,
+      plus three found while testing them. In `fix/per-commit-paths-and-attr-symlinks`.
+      · **`changedFiles` compared a range's ENDPOINTS**, so a path weakened in one
+        commit and restored in a later one was never judged while the push still
+        carried it. Now a per-commit walk, `-m` so a merge contributes its paths.
+      · **git QUOTES a path holding a non-ASCII byte or a newline**, and the
+        leading quote stops every risk glob matching — measured, `reviewDiff`
+        returned **ok** for the quoted form of a path it refused raw. NUL-separated
+        now; `core.quotePath=false` would have fixed only half of it.
+      · **Rename detection collapsed a rename to its destination**, so moving
+        `secrets/key.txt` to `public.txt` named only `public.txt`. `--no-renames`.
+        (`docs/measured/2026-08-22-the-gate-read-the-wrong-paths.md`)
+      · **A symlinked `.gitattributes` KILLED the reader** — measured, SIGKILL,
+        exit 137 against `/dev/zero`, from pull-request content, before any worker
+        launched. lstat first, refuse non-regular files, bound per-file and total.
+        (`docs/measured/2026-08-22-a-symlinked-attributes-file-killed-the-reader.md`)
+      · **The worker git isolation was applied to the FOUNDER's repository**, so
+        `ls-remote origin` failed with "could not read Username" — origin is https
+        and the credential helper is global. **Every publication would have failed
+        on the first live dispatch.** Never seen because reeve has never dispatched
+        and every fixture uses a local path as its origin.
+        (`docs/measured/2026-08-22-the-isolation-broke-the-founders-own-remote.md`)
+      STILL OPEN: **`reeve doctor` runs no git at all**, so nothing checks that
+      reeve's founder-side git can reach origin. That is the instrument that would
+      have caught the last one, and it is deliberately NOT in this PR.
+      REMAINING: the PR's Codex rounds, and the founder's merge grant.
+
 - [ ] **Guardian: the review shadow week RESET on 2026-08-22.** `#1134` diverged
       — `resolved differs: live 13, derived 18` (55 comparisons, 52 agreements;
       every other PR 161/161 that day). The 5-clean-day run for PR-5 restarts

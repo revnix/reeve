@@ -240,6 +240,104 @@ check(existsSync(join(r.path, "node_modules", "left-pad", "index.js")), "but the
   }
 }
 
+// ── a tree whose checkout filters cannot run is refused ──────────────────────
+//
+// Daemon git runs with no global or system configuration — that is what stops a
+// founder's filter driver executing on pull-request content. It also means Git
+// LFS's driver, which `git lfs install` registers globally, is absent. Git
+// treats an undefined filter as PASS-THROUGH rather than an error, so the
+// checkout would succeed holding pointer files and the worker would edit and
+// test a tree that is not the code.
+{
+  const lfsish = join(root, "lfs-clone");
+  execFileSync("git", ["clone", "-q", origin, lfsish]);
+  const gL = (...a) => execFileSync("git", ["-C", lfsish, ...a], { encoding: "utf8" }).trim();
+  gL("checkout", "-q", "-b", "filtered", "origin/main");
+  writeFileSync(join(lfsish, ".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n");
+  writeFileSync(join(lfsish, "asset.bin"), "pointer\n");
+  gL("add", "-A"); gL("-c", "user.email=o@o", "-c", "user.name=o", "commit", "-qm", "an LFS-tracked asset");
+  gL("push", "-q", "origin", "filtered");
+  const filteredHead = gL("rev-parse", "HEAD");
+
+  const r = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 77, runId: "r77", branch: "filtered", head: filteredHead });
+  check(!r.ok && /filter/.test(r.why ?? ""),
+    "a tree declaring a checkout filter reeve cannot supply is REFUSED, not silently passed through", JSON.stringify(r.why));
+  check(/lfs/.test(r.why ?? ""), "and the refusal names the filter", JSON.stringify(r.why));
+  check(!existsSync(runPathFor(runs, 77, "r77")), "and the half-built checkout is removed", "");
+
+  // The control: an ordinary tree, no filter declared, still prepares.
+  const plain = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 78, runId: "r78", branch: "main",
+                                     head: g(founder, "rev-parse", "refs/remotes/origin/main") });
+  check(plain.ok, "control: a tree that declares no filter is unaffected", JSON.stringify(plain.why));
+  if (plain.ok) releaseRunCheckout(plain.path, { workFetched: true });
+  rmSync(lfsish, { recursive: true, force: true });
+}
+
+// ── the branch check is atomic with the push ─────────────────────────────────
+//
+// `ls-remote` is a look, not a lock. A branch deleted or moved between it and
+// the push would be recreated, or landed on, by an ordinary push. The remote
+// verifies the expectation itself now — and the push is refused first unless the
+// work DESCENDS from what it replaces, because a lease is not a licence to
+// rewrite somebody's history.
+{
+  // Its own branch: an earlier case deletes `feature` from the origin, and a
+  // fixture that depends on the order of the ones before it is a fixture that
+  // breaks for reasons that are not the code.
+  g(founder, "checkout", "-q", "-B", "leased", "main");
+  writeFileSync(join(founder, "leased-base.txt"), "base\n");
+  g(founder, "add", "-A"); g(founder, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "leased base");
+  g(founder, "push", "-q", "origin", "leased");
+  g(founder, "checkout", "-q", "main");
+  const r = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 91, runId: "r91", branch: "leased",
+                                 head: g(founder, "rev-parse", "refs/remotes/origin/leased") });
+  check(r.ok, "control: a checkout to publish from", JSON.stringify(r.why));
+  if (r.ok) {
+    writeFileSync(join(r.path, "leased.txt"), "a fix\n");
+    g(r.path, "add", "-A"); g(r.path, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "the fix");
+    const was = g(founder, "ls-remote", "origin", "refs/heads/leased").split(/\s+/)[0];
+
+    // Someone else lands a commit AFTER reeve looked. The lease must catch it.
+    const other = join(root, "racer");
+    execFileSync("git", ["clone", "-q", "-b", "leased", origin, other]);
+    writeFileSync(join(other, "theirs.txt"), "landed first\n");
+    execFileSync("git", ["-C", other, "add", "-A"]);
+    execFileSync("git", ["-C", other, "-c", "user.email=o@o", "-c", "user.name=o", "commit", "-qm", "theirs"]);
+    execFileSync("git", ["-C", other, "push", "-q", "origin", "leased"]);
+    const theirs = execFileSync("git", ["-C", other, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+    const pub = publishRunWork({ repoRoot: founder, path: r.path, branch: "leased", expectedRemote: was });
+    check(!pub.ok, "a remote that moved after the look refuses the push", JSON.stringify(pub.why));
+    check(g(founder, "ls-remote", "origin", "refs/heads/leased").split(/\s+/)[0] === theirs,
+      "and the other party's commit is still what the branch points at", "");
+    releaseRunCheckout(r.path, { workFetched: false });
+    rmSync(`${r.path}.unfetched`, { recursive: true, force: true });
+    rmSync(other, { recursive: true, force: true });
+  }
+}
+
+// ── reeve does not rewrite published history, lease or no lease ──────────────
+{
+  const head2 = g(founder, "rev-parse", "refs/remotes/origin/leased");
+  const r = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 92, runId: "r92", branch: "leased", head: head2 });
+  check(r.ok, "control: a checkout for the rewrite case", JSON.stringify(r.why));
+  if (r.ok) {
+    // A worker that rebased or amended: its branch no longer descends from the
+    // revision reeve pinned. A plain push refuses this; a lease would NOT.
+    g(r.path, "reset", "--hard", "-q", g(r.path, "rev-list", "--max-parents=0", "HEAD"));
+    writeFileSync(join(r.path, "rewritten.txt"), "an unrelated history\n");
+    g(r.path, "add", "-A"); g(r.path, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "rewritten");
+    const before = g(founder, "ls-remote", "origin", "refs/heads/leased").split(/\s+/)[0];
+    const pub = publishRunWork({ repoRoot: founder, path: r.path, branch: "leased", expectedRemote: before });
+    check(!pub.ok && /does not descend|rewrite/.test(pub.why ?? ""),
+      "a branch that does not descend from the pinned head is refused, though the lease would have allowed it", JSON.stringify(pub.why));
+    check(g(founder, "ls-remote", "origin", "refs/heads/leased").split(/\s+/)[0] === before,
+      "and the remote is untouched", "");
+    releaseRunCheckout(r.path, { workFetched: false });
+    rmSync(`${r.path}.unfetched`, { recursive: true, force: true });
+  }
+}
+
 // ── a run checkout is never silently reused ──────────────────────────────────
 {
   const again = prepareRunCheckout({ repoRoot: founder, root: runs, pr: 42, runId: "run1", branch: "feature", head });

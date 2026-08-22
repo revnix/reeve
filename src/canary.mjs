@@ -435,9 +435,17 @@ export async function sandboxCanary({
   // show a Read tool_use targeting the decoy AND a denied result. The written
   // file and its sentinel are a second, corroborating check. (Codex #4b-[8].)
   const readEv = parseReadProbe(join(dir, "canary.out"), decoyPath, dir);
-  // The positive control: the same tool, on the worker's OWN file, must WORK.
-  const insideEv = parseReadProbe(join(dir, "canary.out"), join(dir, "inside-control.txt"), dir);
-  evidence.readInside = !insideEv.attempted ? "not-attempted" : insideEv.denied ? "DENIED" : "allowed";
+  // The positive control: the same tool, on the worker's OWN file, must return
+  // THE CONTENT. A call with no matching result, or one that failed for a reason
+  // that is not a policy refusal — a path resolution error, a worker killed on
+  // its last step — would otherwise read as "allowed" while nothing was proven.
+  // The control exists because the other probes measure refusals; a control that
+  // can itself pass on absence is no better than they are. (Codex #7-[5].)
+  const insideEv = parseReadProbe(join(dir, "canary.out"), join(dir, "inside-control.txt"), dir, CANARY_INSIDE_CONTROL);
+  evidence.readInside = insideEv.leaked ? "allowed"
+    : insideEv.denied ? "DENIED"
+    : !insideEv.attempted ? "not-attempted"
+    : "no-content";
   const readOut = existsSync(join(dir, "read-tool-out")) ? readFileSync(join(dir, "read-tool-out"), "utf8") : null;
   const fileLeaked = readOut !== null && readOut.includes(CANARY_SENTINEL);
   evidence.readTool = (readEv.leaked || fileLeaked) ? "LEAKED"
@@ -522,6 +530,8 @@ export async function sandboxCanary({
     problems.push("control: the Read tool could not read the worker's OWN file, so every refusal here proves nothing");
   else if (evidence.readInside === "not-attempted")
     problems.push("control: the canary never read its own file, so the Read tool's grant is unproven");
+  else if (evidence.readInside === "no-content")
+    problems.push("control: the Read of the worker's own file returned no contents, so the Read tool's grant is unproven");
   if (evidence.readTool === "LEAKED") problems.push("the Read tool returned a file under a deny-read path");
   else if (evidence.readTool === "not-attempted") problems.push("the canary did not attempt the Read-tool probe (no denied Read of the decoy in the event stream), so the Read-tool deny is unproven");
   else if (evidence.readTool === "not-denied") problems.push("the Read tool was called on the decoy without a denial in the event stream");
@@ -542,7 +552,7 @@ export async function sandboxCanary({
  * a permission denial; leaked is a result carrying the decoy's sentinel. This is
  * evidence from the tool stream, not a file the model chose to write.
  */
-export function parseReadProbe(outPath, decoyPath, cwd = dirname(decoyPath)) {
+export function parseReadProbe(outPath, decoyPath, cwd = dirname(decoyPath), marker = CANARY_SENTINEL) {
   const out = { attempted: false, denied: false, leaked: false };
   if (!existsSync(outPath)) return out;
   const ids = new Set();   // tool_use ids of Read calls that targeted the decoy
@@ -567,7 +577,7 @@ export function parseReadProbe(outPath, decoyPath, cwd = dirname(decoyPath)) {
       }
       if (b?.type === "tool_result" && ids.has(b.tool_use_id)) {
         const text = typeof b.content === "string" ? b.content : JSON.stringify(b.content ?? "");
-        if (text.includes(CANARY_SENTINEL)) out.leaked = true;
+        if (marker && text.includes(marker)) out.leaked = true;
         // A POLICY refusal only: `is_error` alone can be a malformed call, which
         // would certify a boundary the probe never exercised.
         else if (isPolicyRefusal(text)) out.denied = true;

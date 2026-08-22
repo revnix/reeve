@@ -5,7 +5,7 @@
 // assertion is on the verdict the daemon draws from those files. The real
 // boundary is measured in test/escape.test.mjs (under the runtime) and by the
 // daemon at start (under the CLI); this file proves the judge.
-import { sandboxCanary, canaryIdFor, policyHashOf, canaryScript, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, parseWriteProbe, isPolicyRefusal, netListener, CANARY_SENTINEL } from "../src/canary.mjs";
+import { sandboxCanary, canaryIdFor, policyHashOf, canaryScript, CANARY_INSIDE_CONTROL, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, parseWriteProbe, isPolicyRefusal, netListener, CANARY_SENTINEL } from "../src/canary.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
@@ -62,7 +62,11 @@ const streamFor = (readTool, writeTool = "denied", readInside = "allowed") => {
   if (readInside !== "absent") {
     lines.push(JSON.stringify(use("Read", "r2", join(base.dir, "inside-control.txt"))));
     if (readInside === "denied") lines.push(JSON.stringify(resultOf("r2", "Permission to read the file was denied.")));
-    else lines.push(JSON.stringify(resultOf("r2", "reeve canary inside-control", false)));
+    // A call with NO result at all, which a worker killed on its last step leaves.
+    else if (readInside === "no-result") { /* the tool_use above stands alone */ }
+    // A failure that is not a policy refusal: the call happened, nothing came back.
+    else if (readInside === "broken") lines.push(JSON.stringify(resultOf("r2", "<tool_use_error>ENOENT: no such file</tool_use_error>", true)));
+    else lines.push(JSON.stringify(resultOf("r2", CANARY_INSIDE_CONTROL, false)));
   }
   return lines.length ? lines.join("\n") + "\n" : "";
 };
@@ -375,6 +379,14 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   const absent = await sandboxCanary({ ...base, runner: runnerThat({ readInside: "absent" }) });
   check(absent.ok === false && /never read its own file/.test(absent.why ?? ""),
     "and a canary that never tried proves nothing rather than passing", absent.why);
+  // A control that passes on ABSENCE is no better than the refusals it exists to
+  // qualify: the read must return the CONTENT, not merely have been called.
+  const noResult = await sandboxCanary({ ...base, runner: runnerThat({ readInside: "no-result" }) });
+  check(noResult.ok === false && /returned no contents/.test(noResult.why ?? ""),
+    "a Read that was called and never answered does not count as allowed", noResult.why);
+  const broken = await sandboxCanary({ ...base, runner: runnerThat({ readInside: "broken" }) });
+  check(broken.ok === false && /returned no contents/.test(broken.why ?? ""),
+    "and neither does one that failed for a reason that is not a refusal", broken.why);
 }
 
 // ── the SCRIPT is part of the boundary's identity ────────────────────────────

@@ -138,7 +138,11 @@ const FILE_TOOLS = new Set(["Read", "Edit", "Write", "Grep", "Glob", "NotebookEd
  * its own checkout.
  */
 export function scopedFileTools(tools, dir) {
-  if (!dir || !dir.startsWith("/")) return tools;
+  // No absolute directory to scope to, so no file tools. Returning them BARE
+  // would be a silent grant of the whole filesystem from a caller that forgot an
+  // argument -- the failure mode this function exists to remove. A worker with
+  // no file tools cannot work, and says so loudly.
+  if (!dir || !dir.startsWith("/")) return [];
   let real = dir;
   try { real = realpathSync(dir); } catch { /* not created yet: the given path is the best available */ }
   return tools.flatMap(t => [`${t}(${ruleFor(real)})`, `${t}(${ruleFor(real)}/**)`]);

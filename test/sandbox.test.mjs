@@ -390,6 +390,12 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   check(validateToolGrant(spilled, { worktree: wt }).ok === true, "a prompt's own tool list is scoped rather than refused", spilled);
   check(spilled.includes("Bash(gh issue:*)"), "and everything that is not a file tool is left exactly as written", spilled);
   check(scopeGrant(s.allowedTools, wt) === s.allowedTools, "scoping an already-scoped grant changes nothing", "");
+
+  // A caller with no directory to scope to gets NO file tools, never bare ones:
+  // a forgotten argument must not become a grant of the whole filesystem.
+  const nowhere = sandboxFor({ profile, action: "FIX_CI", worktree: null, tmpDir: TMP });
+  check(!nowhere.allowedTools.split(",").some(t => /^(Read|Edit|Write|Grep|Glob)\b/.test(t)),
+    "a policy built with no checkout grants no file tools at all", nowhere.allowedTools);
   rmSync(wt, { recursive: true, force: true });
 }
 

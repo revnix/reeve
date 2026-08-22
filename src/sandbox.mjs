@@ -79,9 +79,9 @@ const SELF_GOVERNING = [".github/**", ".git/**"];
  * deny holds under -p, through symlinks, for Bash and for the Read tool. It
  * does NOT reach the keychain -- securityd reads an item on the process's
  * behalf and the runtime's profile hard-allows that service -- so this list
- * closes FILE credentials only; the keychain is measured separately at daemon
- * start (canary.mjs) and a host that holds a GitHub credential there stays
- * refused.
+ * closes FILE credentials only. The keychain is closed by a different mechanism
+ * entirely: a worker's HOME is reeve's own scratch directory, so no login
+ * keychain is in its search list, and the canary measures that per CLI build.
  *
  *   ~/.reeve           the App's private key, every store, every other run's output
  *   ~/.claude          the founder's sessions, settings and account state; the

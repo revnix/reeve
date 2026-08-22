@@ -57,32 +57,70 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
 }
 
 // ── R-15 ─────────────────────────────────────────────────────────────────────
+//
+// The keychain stopped being the gate when workers gained a scratch HOME: the
+// search list lives in the home directory, so a worker has no login keychain to
+// ask, whatever the founder's holds. R-15 therefore REPORTS the keychain and
+// gates on the two things that still decide -- the isolation the profile
+// declares, and whether the worker has a credential of its own to run with.
+//
+// `token` is injected in every case. The real reader looks at
+// ~/.reeve/claude-token, so a default would make these assertions pass or fail
+// on whether this particular machine happens to have one.
+const HAS_TOKEN = () => ({ ok: true, token: "sk-ant-oat01-test", why: null });
+const EMPTY_KC = () => ({ measured: true, items: [], why: null });
+const HELD_KC = () => ({ measured: true, items: ["generic password gh:github.com (gh keyring)"], why: "holds" });
 {
-  const c = checkKeychain({ probe: () => ({ measured: true, items: [], why: null }), isolation: "scratch-home", topologyReady: () => true });
-  check(c.id === "R-15" && c.level === "OK", "an empty keychain, a declared isolated worker, AND a ready topology is OK", JSON.stringify(c));
+  const c = checkKeychain({ probe: EMPTY_KC, isolation: "scratch-home", topologyReady: () => true, token: HAS_TOKEN });
+  check(c.id === "R-15" && c.level === "OK", "a declared scratch HOME, a ready topology and a worker token is OK", JSON.stringify(c));
+  check(/cannot read it/.test(c.lines.join(" ")) && /scratch directory/.test(c.lines.join(" ")),
+    "and it says WHY the worker cannot reach the keychain, rather than that the keychain is empty", c.lines.join(" | "));
 }
 {
-  const c = checkKeychain({ probe: () => ({ measured: true, items: [], why: null }), isolation: "scratch-home", topologyReady: () => false });
-  check(c.level === "DEGRADED", "the isolation LABEL without a ready topology (production today) is DEGRADED, not OK", JSON.stringify(c.level));
+  // The behaviour that changed. A credential in the founder's keychain no longer
+  // refuses dispatch, because the worker cannot reach it -- and saying otherwise
+  // sent a reader off to delete a credential that was never the problem.
+  const c = checkKeychain({ probe: HELD_KC, isolation: "scratch-home", topologyReady: () => true, token: HAS_TOKEN });
+  check(c.level === "OK", "a keychain that HOLDS a GitHub credential is still OK, because a worker cannot reach it", JSON.stringify(c));
+  check(/gh keyring/.test(c.lines[0]), "and what it holds is reported rather than hidden", c.lines.join(" | "));
+  check(!/REFUSED/.test(c.lines.join(" ")) && !/--insecure-storage/.test(c.lines.join(" ")),
+    "and it no longer claims dispatch is refused, nor tells anyone to delete it", c.lines.join(" | "));
 }
 {
-  const c = checkKeychain({ probe: () => ({ measured: true, items: [], why: null }), isolation: "none" });
-  check(c.level === "DEGRADED" && /shared account cannot be certified/.test(c.lines.join(" ")), "an empty keychain WITHOUT an isolated worker is DEGRADED, not OK", c.lines.join(" | "));
-}
-{
-  const c = checkKeychain({ probe: () => ({ measured: true, items: ["generic password gh:github.com (gh keyring)"], why: "holds" }) });
-  check(c.level === "DEGRADED" && /gh keyring/.test(c.lines[0]) && /--insecure-storage/.test(c.lines.join(" ")) && /dedicated user/.test(c.lines.join(" ")),
-    "a held credential is DEGRADED (dispatch gated, not broken) and both closures are named", c.lines.join(" | "));
+  const c = checkKeychain({ probe: EMPTY_KC, isolation: "none", token: HAS_TOKEN });
+  check(c.level === "DEGRADED" && /worker\.isolation is 'none'/.test(c.lines.join(" ")) && /scratch-home/.test(c.lines.join(" ")),
+    "no declared isolation is DEGRADED, and names the setting that closes it", c.lines.join(" | "));
   check(/observation and review are unaffected/.test(c.lines.join(" ")), "and it says the guardian's other work is unaffected", c.lines.join(" | "));
 }
 {
-  const c = checkKeychain({ probe: () => ({ measured: false, items: [], why: "security exited 1" }) });
-  check(c.level === "UNKNOWN" && /unmeasured/.test(c.lines[0]), "an unmeasured probe is UNKNOWN, never OK", c.lines.join(" | "));
+  const c = checkKeychain({ probe: EMPTY_KC, isolation: "scratch-home", topologyReady: () => false, token: HAS_TOKEN });
+  check(c.level === "DEGRADED", "the isolation LABEL without a ready topology is DEGRADED, not OK", JSON.stringify(c.level));
+}
+{
+  // dedicated-user is stronger AND unbuilt. Reading it as OK would grant a
+  // health nothing implements; the daemon refuses it by name for the same reason.
+  const c = checkKeychain({ probe: EMPTY_KC, isolation: "dedicated-user", topologyReady: () => true, token: HAS_TOKEN });
+  check(c.level === "DEGRADED", "an isolation reeve has not built does not read as OK", JSON.stringify(c.level));
+}
+{
+  // A scratch HOME takes ~/.claude away too, so the token is not optional: with
+  // none, every dispatch fails while preparing the worker and backs off.
+  const c = checkKeychain({ probe: EMPTY_KC, isolation: "scratch-home", topologyReady: () => true,
+                            token: () => ({ ok: false, why: "/Users/x/.reeve/claude-token could not be read (ENOENT); create one with `claude setup-token`" }) });
+  check(c.level === "DEGRADED" && /setup-token/.test(c.lines.join(" ")),
+    "an isolated worker with no credential of its own is DEGRADED, and says how to make one", c.lines.join(" | "));
+  check(!/keychain holds/.test(c.lines.join(" ")), "and does not blame the keychain for it", c.lines.join(" | "));
+}
+{
+  const c = checkKeychain({ probe: () => ({ measured: false, items: [], why: "security exited 1" }),
+                            isolation: "scratch-home", topologyReady: () => true, token: HAS_TOKEN });
+  check(c.level === "OK" && /unmeasured/.test(c.lines[0]),
+    "an unmeasured keychain is reported and no longer gates, because the reach is closed either way", c.lines.join(" | "));
 }
 
 // ── in the driver ────────────────────────────────────────────────────────────
 {
-  const r = runDoctor({ nwo: "o/r", profile: {}, stateDir: root, keychainIo: { probe: () => ({ measured: true, items: [], why: null }) },
+  const r = runDoctor({ nwo: "o/r", profile: {}, stateDir: root, keychainIo: { probe: EMPTY_KC, token: HAS_TOKEN },
                         baselineIo: { fixturePath: join(root, "none.json") } });
   const ids = r.checks.map(c => c.id);
   check(ids.includes("R-14") && ids.includes("R-15"), "both checks run in the driver", ids.join(","));

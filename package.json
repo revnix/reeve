@@ -4,9 +4,16 @@
   "private": true,
   "type": "module",
   "description": "Agent-ops control plane: durable state, leases, verdicts, and a straight answer about what is true",
-  "bin": { "reeve": "./bin/reeve" },
-  "engines": { "node": ">=24" },
+  "bin": {
+    "reeve": "./bin/reeve"
+  },
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "test": "for f in test/*.test.mjs; do node \"$f\" || exit 1; done"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sandbox-runtime": "0.0.73"
   }
 }

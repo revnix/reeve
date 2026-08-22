@@ -57,6 +57,18 @@ const run = (...args) => {
   check(sh.code === 3, "control: shadow still exits 3 with no clean days", `exit=${sh.code}`);
 }
 
+// `canary` sits immediately above the run/tick labels, which is the position
+// that captured three commands the last time. It must reach its OWN body: with
+// no profile it says so as itself, and it must NOT fall through into `run` and
+// start the daemon. The refusal happens before any measurement, so this costs
+// no model call.
+{
+  const c = run("canary", "o/r");
+  check(/reeve canary: no profile/.test(c.out), "canary reaches its own body, not run's", c.out.slice(0, 160));
+  check(!/reeve run:/.test(c.out) && !/daemon starting/.test(c.out), "and does not fall through into the daemon", c.out.slice(0, 160));
+  check(c.code === 1, "and exits 1 rather than running", `exit=${c.code}`);
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

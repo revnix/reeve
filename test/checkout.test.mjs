@@ -336,6 +336,47 @@ check(existsSync(join(r.path, "node_modules", "left-pad", "index.js")), "but the
   }
 }
 
+// ── and it keeps its isolation everywhere the founder's config is not needed ─
+//
+// The other half of the same rule. The worker-to-founder fetch reads a LOCAL
+// path: it needs no credential and no rewrite, and a founder who has hardened
+// git with `protocol.file.allow=never` would otherwise have it refused —
+// measured 2026-08-22 on git 2.50.1, `fatal: transport 'file' not allowed` —
+// and with it every valid fix, before anything could be pushed.
+{
+  const home = join(root, "hardened-home");
+  const repo = join(root, "hardened-founder");
+  const worker = join(root, "hardened-worker");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, ".gitconfig"), '[protocol "file"]\n\tallow = never\n');
+  execFileSync("git", ["init", "-q", "-b", "main", repo]);
+  writeFileSync(join(repo, "app.js"), "console.log(1)\n");
+  g(repo, "add", "-A"); g(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  execFileSync("git", ["clone", "-q", repo, worker]);
+  g(worker, "checkout", "-q", "-B", "hardened");
+  writeFileSync(join(worker, "app.js"), "console.log(2)\n");
+  g(worker, "add", "-A"); g(worker, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "the worker's fix");
+
+  const wasHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    // The fixture's own precondition: the hardening is real and it does bite.
+    let refused = "";
+    try { execFileSync("git", ["-C", repo, "fetch", "--no-tags", "-q", worker, "+hardened:refs/control/one"],
+                       { encoding: "utf8", env: { ...process.env, HOME: home }, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (e) { refused = String(e.stderr || e.message); }
+    check(/transport 'file' not allowed/.test(refused),
+      "control: the founder's hardening refuses a plain fetch from the worker's checkout", JSON.stringify(refused.slice(0, 100)));
+
+    const got = fetchRunWork({ repoRoot: repo, path: worker, branch: "hardened" });
+    check(got.ok, "reeve's fetch of the worker's branch survives it", JSON.stringify(got.why));
+    check(got.head === g(worker, "rev-parse", "HEAD"), "and lands on what the worker committed", `${got.head}`);
+  } finally {
+    if (wasHome === undefined) delete process.env.HOME; else process.env.HOME = wasHome;
+  }
+  rmSync(worker, { recursive: true, force: true });
+}
+
 // ── an attributes file reeve will not read ───────────────────────────────────
 //
 // The tree is PULL-REQUEST content, and `.gitattributes` can be committed as a

@@ -19,11 +19,11 @@ import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
-import { sandboxFor, writeSandbox, reviewDiff, validateSettings } from "./sandbox.mjs";
+import { sandboxFor, writeSandbox, reviewDiff, validateSettings, quarantineOsDenies } from "./sandbox.mjs";
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig } from "./workerenv.mjs";
-import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady } from "./containment.mjs";
+import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
 import { canaryIdFor, netListener } from "./canary.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
@@ -56,10 +56,6 @@ const CLI_VERSION = new Map();
 // and stand as one escalation until a preparation succeeds. The map lives on
 // the daemon's context: one per daemon, not one per module.
 const PREP_BACKOFF_BASE_MS = 60_000, PREP_BACKOFF_CAP_MS = 3_600_000;
-function binaryIdentity(bin) {
-  try { const real = realpathSync(bin); const st = statSync(real); return `${real}@${st.mtimeMs}`; }
-  catch { return bin; }
-}
 // The worker's PATH is pinned and does not contain the CLI's install dir (it
 // lives under ~/.local/bin here), and spawn resolves a bare command through the
 // CHILD's PATH. So the binary is resolved once on the daemon's PATH and passed
@@ -155,11 +151,40 @@ function changedFiles(worktree, since = null) {
  * keychain probe every time. A preparation that fails (no CLI, no worktree
  * root) is an OPEN verdict with the reason, never a thrown tick.
  */
+/**
+ * The reeve-owned trees a worker must not read, as SPECIFIC paths.
+ *
+ * Never `dirname(logPath)`: with `--log ~/reeve.log` that is the home directory,
+ * and denying it also denies the worktree the fixer was dispatched to read — the
+ * boundary would break the work instead of containing it. So: the log file, the
+ * run artifacts, the canary records, the backups, and the configured state root.
+ * Any candidate that is an ANCESTOR of the worktree is dropped for the same
+ * reason, and `~/.reeve` is denied by `credentialPaths()` regardless.
+ * (Codex #4e-[5].)
+ */
+export function stateRootsFor(stateDir, logPath, worktree) {
+  const under = (p, child) => child === p || child.startsWith(p.endsWith("/") ? p : p + "/");
+  const cands = [logPath, join(stateDir, "runs"), join(stateDir, "canary"), join(stateDir, "backups"), process.env.REEVE_HOME]
+    .filter(p => p && isAbsolute(p));
+  return [...new Set(cands)].filter(p => !(worktree && under(p, worktree)));
+}
+
 async function measuredContainment(ctx, profile, nwo, logPath) {
   const cache = (ctx.containmentCache ??= new Map());
   try {
     const root = profile.identity?.worktreeRoot;
     if (!root || !isAbsolute(root)) return { credentialRead: "open", why: "no absolute identity.worktreeRoot to run the canary under" };
+    // Cheap gates FIRST: on a host where the verdict is already open, preparing a
+    // canary would create a per-invocation tmp tree every tick that nothing then
+    // cleans up, because the canary itself never runs. (Codex #4e-[9].)
+    const isolated = profile.worker?.isolation === "dedicated-user" && (ctx.isolationReady ?? isolationTopologyReady)();
+    const cheapKc = typeof ctx.keychain === "function" ? await ctx.keychain() : ctx.keychain ?? null;
+    const cheap = cheapContainmentReasons({ platform: ctx.platform ?? process.platform, isolated, keychain: cheapKc });
+    if (cheap.reasons.length) {
+      return { credentialRead: "open", why: cheap.reasons.join("; "),
+               canary: { ok: false, id: null, why: "not run: containment is already open for a cheaper reason", skipped: true },
+               keychain: cheap.keychain, platform: ctx.platform ?? process.platform, isolated, at: Date.now() };
+    }
     const stateDir = dirname(ctx.logPath ?? "/tmp/x");
     // The canary result is read back by `reeve doctor`, which looks under a
     // fixed home, so it is written there too — never under a --log directory
@@ -188,9 +213,9 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     const version = ctx.cliVersion ?? cliVersion(claudeBin, env);
     // The block every worker gets; the canary's id covers it, so a block that
     // changes (a new deny, a new domain) is measured again before it is trusted.
-    // The run-state root (the daemon's log dir) is denied to workers too; the
-    // canary proves the block that includes it. (Codex #4d-[15].)
-    const stateRoots = [...new Set([stateDir, process.env.REEVE_HOME].filter(p => p && isAbsolute(p)))];
+    // The reeve-owned trees are denied to workers too; the canary proves the
+    // block that includes them. (Codex #4d-[15], #4e-[5].)
+    const stateRoots = stateRootsFor(stateDir, ctx.logPath ?? null, canaryPaths.dir);
     const policy = sandboxFor({ profile, action: "FIX_CI", worktree: canaryPaths.dir, tmpDir: canaryPaths.tmpDir, stateRoots });
     // The resolved binary's identity is part of the canary id, so a swapped
     // executable that prints the same --version is re-measured. (Codex #4-[3].)
@@ -217,8 +242,8 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
       // So the label closes containment only when the topology is actually
       // verified ready — false until PR-3, injectable for the wiring test.
       // (Codex #4c-[9].)
-      isolated: profile.worker?.isolation === "dedicated-user" && (ctx.isolationReady ?? isolationTopologyReady)(),
-      canary: ctx.canary ?? null, keychain: ctx.keychain ?? null,
+      isolated,
+      canary: ctx.canary ?? null, keychain: cheap.keychain,
       });
     } finally {
       // The listener is torn down whatever happened, so a canary run never
@@ -501,7 +526,10 @@ export async function tick(ctx) {
   }
 
   if (execute && wanted.length && containment.credentialRead === "closed") {
-    const cap = capacity({ maxWorkers: profile.watch?.maxWorkers ?? 5, running: ctx.running ?? 0 });
+    // Injectable: the real reading is the machine's load average, which is right
+    // for production and wrong for a test — a busy host makes canStart 0 and the
+    // suite reports "no worker dispatched" about the laptop rather than the code.
+    const cap = (ctx.capacity ?? capacity)({ maxWorkers: profile.watch?.maxWorkers ?? 5, running: ctx.running ?? 0 });
     log(logPath, `execute: capacity allows ${cap.canStart} worker(s) (load ${cap.load1?.toFixed?.(2) ?? "?"}, ${cap.perfCores} perf cores)`);
     let started = 0;
 
@@ -612,7 +640,7 @@ export async function tick(ctx) {
       const stateDir = dirname(ctx.logPath ?? "/tmp/x");
       const runDir = join(stateDir, "runs", nwo.replace("/", "-"), String(e.pr), run.runId);
       const tmpDir = join(runDir, "tmp");
-      const dStateRoots = [...new Set([stateDir, process.env.REEVE_HOME].filter(p => p && isAbsolute(p)))];
+      const dStateRoots = stateRootsFor(stateDir, ctx.logPath ?? null, worktree);
       const sandbox = sandboxFor({ profile, action: decision.action, worktree, lane, tmpDir, stateRoots: dStateRoots });
 
       let r, prepFailed = false;
@@ -642,7 +670,13 @@ export async function tick(ctx) {
         // included, so a worker launched on one would run with no boundary at
         // all and a contract row claiming otherwise. A failure here is a
         // preparation failure: refunded, backed off, escalated, never launched.
-        const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots });
+        // A quarantined path the OS layer cannot express is a hole, not a
+        // detail: the worker holds `cat`, so a tool-only deny would not stop it.
+        // (Codex #4e-[8].)
+        if (sandbox.unrepresentableQuarantine?.length)
+          throw new Error(`quarantined path(s) cannot be enforced by the OS sandbox: ${sandbox.unrepresentableQuarantine.join(", ")}`);
+        const qDenies = quarantineOsDenies(worktree, profile.risk?.quarantinePaths ?? []).paths;
+        const sv = (ctx.settingsValidator ?? validateSettings)(sandbox.settings, { tmpDir, stateRoots: dStateRoots, quarantineDenies: qDenies });
         if (!sv.ok) throw new Error(`settings invalid: ${sv.errors.join("; ")}`);
         // The settings file is immutable per run, in the run's own directory:
         // a path keyed by PR alone was shared by every daemon on the host, and
@@ -672,7 +706,7 @@ export async function tick(ctx) {
         // Re-check both cheap facts here, at the last moment, so a swap or a new
         // credential during preparation reopens the gate. (Codex #4c-[11],[12],
         // #4d-[13].)
-        const reval = revalidateContainment(containment, {
+        const reval = await revalidateContainment(containment, {
           bin: claudeBin, binaryIdentity, keychain: ctx.keychain ?? null, platform: ctx.platform ?? undefined,
         });
         if (!reval.ok) {

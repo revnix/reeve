@@ -7,7 +7,7 @@
 // This drives a whole tick with the collaborators stubbed, which is the
 // integration the audit named as missing: daemon -> durable run -> worker ->
 // finish, and the refusal to re-dispatch work already in flight.
-import { tick } from "../src/daemon.mjs";
+import { tick, stateRootsFor } from "../src/daemon.mjs";
 import { open, liveRunFor, countFixAttempts } from "../src/db/ops.mjs";
 import { causeKey } from "../src/ci-rootcause.mjs";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
@@ -50,6 +50,9 @@ let spawned = [];
 const baseCtx = () => ({
   nwo: "o/r", profile, db: open(dbPath), logPath,
   execute: true, shadow: true, running: 0,
+  // Deterministic: the real capacity() backs off on the host's load average, so
+  // a busy machine would fail these assertions for a reason that is not the code.
+  capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
   // The tests below exercise dispatch, so they declare what the real module
   // cannot yet: a closed credential read. The default refuses; see the last case.
   containment: { credentialRead: "closed", why: "test" },
@@ -232,6 +235,29 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(dirC, { recursive: true, force: true });
 }
 
+// --- an already-open verdict prepares nothing (no canary litter per tick) -----
+//
+// With the default worker.isolation: none the canary can never run, so building
+// its per-invocation tmp tree would litter the worktree root on every tick with
+// directories nothing ever cleans up. (Codex #4e-[9].)
+{
+  const dirN = mkdtempSync(join(tmpdir(), "reeve-e2e-nolitter-"));
+  const wtRoot = mkdtempSync(join(tmpdir(), "reeve-e2e-wtroot-"));
+  const ctxN = { ...baseCtx(), db: open(join(dirN, "n.db")), logPath: join(dirN, "log.txt"), worktreeFor: () => mkdtempSync(join(dirN, "wt-")),
+                 platform: "darwin",
+                 profile: { ...profile, identity: { ...profile.identity, worktreeRoot: wtRoot } },
+                 keychain: { measured: true, items: [], why: null } };   // isolation stays "none" -> already open
+  delete ctxN.containment;
+  let launchedN = 0, canaryRunsN = 0;
+  ctxN.canary = async () => { canaryRunsN++; return { ok: true, id: "x", why: null, evidence: {} }; };
+  ctxN.spawnWorker = async () => { launchedN++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  await tick(ctxN);
+  check(launchedN === 0 && canaryRunsN === 0, "an already-open verdict runs no canary at all", `launched=${launchedN} canary=${canaryRunsN}`);
+  check(!existsSync(join(wtRoot, ".reeve-canary")), "and leaves no canary working directories behind", readdirSync(wtRoot).join(","));
+  ctxN.db.close();
+  rmSync(dirN, { recursive: true, force: true }); rmSync(wtRoot, { recursive: true, force: true });
+}
+
 // --- the isolation LABEL alone does not close: the topology must be verified ---
 //
 // worker.isolation=dedicated-user with an un-built topology (the daemon still
@@ -281,6 +307,20 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   check(/credential appeared/.test(readFileSync(join(dirK2, "log.txt"), "utf8")), "and the log says a credential appeared", "");
   ctxK2.db.close();
   rmSync(dirK2, { recursive: true, force: true });
+}
+
+// --- the denied state roots are SPECIFIC, never an ancestor of the worktree --
+//
+// With `--log ~/reeve.log`, dirname(logPath) is the home directory: denying it
+// would deny the very checkout the fixer was dispatched to read. The boundary
+// must contain the worker, not break the work. (Codex #4e-[5].)
+{
+  const roots = stateRootsFor("/Users/x", "/Users/x/reeve.log", "/Users/x/code/repo/wt");
+  check(!roots.includes("/Users/x"), "the log's PARENT directory is never denied wholesale", JSON.stringify(roots));
+  check(roots.includes("/Users/x/reeve.log") && roots.includes("/Users/x/runs") && roots.includes("/Users/x/canary") && roots.includes("/Users/x/backups"),
+    "the log file and reeve's own subtrees are denied by name", JSON.stringify(roots));
+  const anc = stateRootsFor("/Users/x/code", "/Users/x/code/reeve.log", "/Users/x/code/runs/wt");
+  check(!anc.includes("/Users/x/code/runs"), "a root that is an ancestor of the worktree is dropped rather than breaking the fixer", JSON.stringify(anc));
 }
 
 // --- an unmeasured platform stays open even with both probes green -----------

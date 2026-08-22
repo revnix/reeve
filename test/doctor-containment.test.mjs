@@ -25,9 +25,14 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
   check(c.level === "UNKNOWN" && /no canary has been recorded/.test(c.lines[0]), "no recorded canary: UNKNOWN, and it says dispatch is refused meanwhile", c.lines.join(" | "));
 }
 {
-  writeCanaryState(root, "o/r", { id: "abc123", cliVersion: "2.1.237", ok: true, why: null, at: 1_000_000 });
-  const c = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 + 5 * 60_000 });
-  check(c.level === "OK" && /abc123 passed 5 min ago under 2\.1\.237/.test(c.lines[0]), "a passing canary is OK with id, age and CLI", c.lines.join(" | "));
+  writeCanaryState(root, "o/r", { id: "abc123", cliVersion: "2.1.237", bin: "/bin/claude", binaryId: "/bin/claude@1", ok: true, why: null, at: 1_000_000 });
+  const c = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 + 5 * 60_000, identity: () => "/bin/claude@1" });
+  check(c.level === "OK" && /abc123 passed 5 min ago under 2\.1\.237/.test(c.lines[0]), "a passing canary under the SAME binary is OK with id, age and CLI", c.lines.join(" | "));
+  const swapped = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@2" });
+  check(swapped.level === "DEGRADED" && /DIFFERENT build/.test(swapped.lines[0]), "a passing canary under a REPLACED binary is DEGRADED, not OK", swapped.lines.join(" | "));
+  writeCanaryState(root, "o/r", { id: "old", cliVersion: "2.1.237", ok: true, at: 1_000_000 });
+  const hist = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 });
+  check(hist.level === "UNKNOWN" && /names no CLI binary/.test(hist.lines[0]), "a record with no binary to compare is UNKNOWN, never OK", hist.lines.join(" | "));
 }
 {
   writeCanaryState(root, "o/r", { id: "abc123", cliVersion: "2.1.237", ok: false, why: "wrote outside the worktree", at: 1_000_000 });

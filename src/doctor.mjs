@@ -12,7 +12,7 @@
 
 import { checkBaseline } from "./baseline.mjs";
 import { readCanaryState } from "./canary.mjs";
-import { probeKeychain, isolationTopologyReady } from "./containment.mjs";
+import { probeKeychain, isolationTopologyReady, binaryIdentity } from "./containment.mjs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
@@ -390,7 +390,7 @@ function checkDetectors(db, profile) {
 // read here without the daemon.
 
 /** The last sandbox canary this daemon recorded, if any. */
-export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now = () => Date.now() } = {}) {
+export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now = () => Date.now(), identity = binaryIdentity } = {}) {
   const id = "R-14", title = "worker sandbox canary";
   if (!stateDir) return { id, level: UNKNOWN, title, lines: ["no state directory to read the canary from"] };
   const st = read(stateDir, nwo);
@@ -400,7 +400,19 @@ export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now 
   const when = age === null ? "at an unknown time" : age < 1 ? "under a minute ago" : `${age} min ago`;
   if (st.ok !== true) return { id, level: BROKEN, title, lines: [`the last canary FAILED ${when} under ${st.cliVersion ?? "?"}: ${st.why ?? "no reason recorded"}`,
     "the daemon refuses every dispatch under --execute until a canary passes; it re-runs one on the next tick that wants a worker"] };
-  return { id, level: OK, title, lines: [`canary ${st.id ?? "?"} passed ${when} under ${st.cliVersion ?? "?"}`,
+  // A pass is a pass FOR THE BINARY IT RAN UNDER. The daemon keys containment by
+  // the current binary identity, so a replaced executable makes this record
+  // historical and the daemon will re-measure; reporting OK from `st.ok` alone
+  // would claim a health the daemon does not currently grant. A record that
+  // cannot be compared is UNKNOWN, never OK. (Codex #4e-[2].)
+  if (!st.bin || !st.binaryId) return { id, level: UNKNOWN, title, lines: [
+    `canary ${st.id ?? "?"} passed ${when} under ${st.cliVersion ?? "?"}, but the record names no CLI binary`,
+    "so it cannot be checked against the executable in use now; the daemon re-measures before it dispatches"] };
+  const live = identity(st.bin);
+  if (live !== st.binaryId) return { id, level: DEGRADED, title, lines: [
+    `the last canary passed ${when} under a DIFFERENT build of ${st.bin}`,
+    `recorded ${st.binaryId}, now ${live} — the daemon re-measures before dispatching under the new one`] };
+  return { id, level: OK, title, lines: [`canary ${st.id ?? "?"} passed ${when} under ${st.cliVersion ?? "?"}, and the CLI binary is unchanged`,
     "network, outside writes and credential-file reads denied; inside and tmp writes allowed"] };
 }
 

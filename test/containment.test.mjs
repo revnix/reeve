@@ -139,15 +139,19 @@ const base = { cliVersion: "2.1.237", sandbox, permissionsDeny: [], canaryPaths:
   const bid = b => "/x@" + b;
   const idOf = bin => bin;   // a fake binaryIdentity: identity is the path itself
   const closed = { credentialRead: "closed", binaryId: "/x@1" };
-  check(revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: clean }).ok === true, "same binary + clean keychain revalidates ok");
-  check(revalidateContainment(closed, { bin: "/x@2", binaryIdentity: idOf, keychain: clean }).ok === false, "a changed binary identity refuses");
-  const r = revalidateContainment(closed, { bin: "/x@2", binaryIdentity: idOf, keychain: clean });
+  check((await revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: clean })).ok === true, "same binary + clean keychain revalidates ok");
+  check((await revalidateContainment(closed, { bin: "/x@2", binaryIdentity: idOf, keychain: clean })).ok === false, "a changed binary identity refuses");
+  const r = await revalidateContainment(closed, { bin: "/x@2", binaryIdentity: idOf, keychain: clean });
   check(/CLI binary changed/.test(r.why), "and says the binary changed", r.why);
-  check(revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: dirty }).ok === false && /credential appeared/.test(revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: dirty }).why), "a credential that appeared refuses");
-  check(revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: { measured: false, items: [], why: "no security" } }).ok === false, "an unmeasurable keychain refuses");
-  check(revalidateContainment({ credentialRead: "open" }, { bin: "/x@1", binaryIdentity: idOf, keychain: clean }).ok === false, "an open verdict is never revalidated as ok");
+  const rd = await revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: dirty });
+  check(rd.ok === false && /credential appeared/.test(rd.why), "a credential that appeared refuses", rd.why);
+  check((await revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: { measured: false, items: [], why: "no security" } })).ok === false, "an unmeasurable keychain refuses");
+  check((await revalidateContainment({ credentialRead: "open" }, { bin: "/x@1", binaryIdentity: idOf, keychain: clean })).ok === false, "an open verdict is never revalidated as ok");
   // A verdict without a recorded binaryId cannot check the binary, but still checks the keychain.
-  check(revalidateContainment({ credentialRead: "closed" }, { bin: "/x@1", binaryIdentity: idOf, keychain: clean }).ok === true, "a verdict without a binaryId still passes on a clean keychain");
+  check((await revalidateContainment({ credentialRead: "closed" }, { bin: "/x@1", binaryIdentity: idOf, keychain: clean })).ok === true, "a verdict without a binaryId still passes on a clean keychain");
+  // An ASYNC keychain injection is the same contract the initial measurement
+  // supports; reading a pending Promise refused every eligible worker.
+  check((await revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: async () => clean })).ok === true, "an async keychain probe is awaited, not read as a Promise");
 }
 
 rmSync(root, { recursive: true, force: true });

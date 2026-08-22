@@ -98,8 +98,12 @@ const SELF_GOVERNING = [".github/**", ".git/**"];
  */
 export const CREDENTIAL_PATHS = [
   "~/.reeve", "~/.claude", "~/.claude.json", "~/.config/gh", "~/.ssh", "~/.gitconfig",
-  "~/.git-credentials", "~/.netrc", "~/.npmrc", "~/.aws", "~/.azure", "~/.config/gcloud",
-  "~/.kube", "~/.docker", "~/.gnupg",
+  // Git's `store` helper writes plaintext tokens to ~/.git-credentials OR, under
+  // the XDG layout, ~/.config/git/credentials. Stripping XDG_CONFIG_HOME from the
+  // worker env only restores ~/.config as the default, so the XDG location must
+  // be denied by path like every other credential file. (Codex #4e-[3].)
+  "~/.git-credentials", "~/.config/git", "~/.netrc", "~/.npmrc", "~/.aws", "~/.azure",
+  "~/.config/gcloud", "~/.kube", "~/.docker", "~/.gnupg",
 ];
 // The same list as Read-tool rules: a file is named, a directory gets `/**`.
 const CREDENTIAL_FILES = new Set(["~/.claude.json", "~/.gitconfig", "~/.git-credentials", "~/.netrc", "~/.npmrc"]);
@@ -126,6 +130,36 @@ const credentialReadDenies = () => credentialPaths().map(p => (CREDENTIAL_FILES.
  * dependencies are installed before it is dispatched) and a spec writer needs
  * no web. Research reads the profile's list and nothing else.
  */
+/**
+ * Quarantined paths as ABSOLUTE OS deny-read entries.
+ *
+ * `risk.quarantinePaths` are repo-relative globs, and until now they were denied
+ * only to the file TOOLS. A fixer is granted `cat` and a language runtime, so a
+ * shell read walked straight past them: the worker could copy a production dump
+ * into a source file and the diff gate, which judges destination filenames, would
+ * pass it. (Codex #4e-[8].)
+ *
+ * The OS layer takes concrete paths, so each glob is reduced to the segments
+ * before its first wildcard and resolved against the worktree. That is
+ * deliberately STRICTER than the glob (`data/*.sql` denies all of `data/`),
+ * because over-denying a quarantined tree is the safe error. A glob whose FIRST
+ * segment is a wildcard has no concrete prefix short of the worktree itself and
+ * is reported as unrepresentable: the caller refuses the dispatch rather than
+ * pretending the path is covered.
+ */
+export function quarantineOsDenies(worktree, globs = []) {
+  const paths = [], unrepresentable = [];
+  for (const g of globs) {
+    const clean = String(g).replace(/^\.\//, "");
+    const segs = clean.split("/");
+    const cut = segs.findIndex(seg => seg.includes("*") || seg.includes("?") || seg.includes("["));
+    const prefix = (cut === -1 ? segs : segs.slice(0, cut)).filter(Boolean);
+    if (!prefix.length) { unrepresentable.push(g); continue; }
+    paths.push(worktree ? join(worktree, ...prefix) : prefix.join("/"));
+  }
+  return { paths: [...new Set(paths)], unrepresentable };
+}
+
 const NETWORK_DOMAINS = (profile, action) =>
   action === "BUILD_RESEARCH" ? [...(profile?.builder?.network?.research?.allowedDomains ?? [])] : [];
 
@@ -259,6 +293,8 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
     ...SELF_GOVERNING.flatMap(denyWriteVerbs),
   ];
 
+  const quarantine = quarantineOsDenies(worktree, risk.quarantinePaths ?? []);
+
   // The Read tool is not under the OS sandbox, so the credential paths are
   // denied to it here as well; measured to hold for an absolute path and for a
   // symlink inside the worktree that points at one.
@@ -297,7 +333,7 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
           allowWrite: tmpDir ? [tmpDir] : [],
           denyWrite: [],
           allowRead: tmpDir ? [tmpDir] : [],
-          denyRead: [...credentialPaths(), ...stateRoots],
+          denyRead: [...credentialPaths(), ...stateRoots, ...quarantine.paths],
         },
         network: {
           allowedDomains: NETWORK_DOMAINS(profile, action),
@@ -311,6 +347,9 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
     },
     worktree,
     lane: lane?.id ?? null,
+    // Non-empty means a quarantine glob could not be enforced at the OS layer;
+    // the caller must refuse the dispatch rather than run with a hole.
+    unrepresentableQuarantine: quarantine.unrepresentable,
   };
 }
 
@@ -327,7 +366,7 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
  * do). `tmpDir` is required: the only write grant beyond cwd is the run's own
  * tmp, and the validator cannot judge a grant without knowing what it should be.
  */
-export function validateSettings(settings, { tmpDir = null, stateRoots = [] } = {}) {
+export function validateSettings(settings, { tmpDir = null, stateRoots = [], quarantineDenies = [] } = {}) {
   const errors = [];
   if (!tmpDir) return { ok: false, errors: ["validator needs the run's tmpDir to judge the write grant"] };
   if (!settings || typeof settings !== "object" || Array.isArray(settings)) return { ok: false, errors: ["settings absent"] };
@@ -364,7 +403,7 @@ export function validateSettings(settings, { tmpDir = null, stateRoots = [] } = 
       for (const k of ["allowWrite", "denyWrite", "allowRead", "denyRead"]) if (!strs(fs[k])) errors.push(`sandbox.filesystem.${k} must be an array of strings`);
       if (strs(fs.allowWrite) && (fs.allowWrite.length !== 1 || fs.allowWrite[0] !== tmpDir)) errors.push(`sandbox.filesystem.allowWrite must be exactly the run's tmp (${tmpDir})`);
       if (strs(fs.allowRead) && (fs.allowRead.length !== 1 || fs.allowRead[0] !== tmpDir)) errors.push(`sandbox.filesystem.allowRead must be exactly the run's tmp (${tmpDir})`);
-      if (strs(fs.denyRead)) for (const c of [...credentialPaths(), ...stateRoots]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
+      if (strs(fs.denyRead)) for (const c of [...credentialPaths(), ...stateRoots, ...quarantineDenies]) if (!fs.denyRead.includes(c)) errors.push(`sandbox.filesystem.denyRead is missing ${c}`);
     }
     const net = sb.network;
     if (!isObj(net)) errors.push("sandbox.network must be an object");

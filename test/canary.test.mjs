@@ -7,7 +7,7 @@
 // daemon at start (under the CLI); this file proves the judge.
 import { sandboxCanary, canaryIdFor, canaryScript, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, netListener, CANARY_SENTINEL } from "../src/canary.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { connect } from "node:net";
 import { join } from "node:path";
@@ -38,18 +38,27 @@ const base = {
 // so the fake runner writes a representative stream-json plus the corroborating
 // file. readTool: "denied" (attempted + denied), "leak" (result carries the
 // sentinel), "absent" (never attempted), "not-denied" (attempted, no denial).
-const streamFor = (readTool) => {
+// The Write-tool probe is judged from the stream too: writeTool "denied"
+// (attempted + refused), "leak" (the file appears), "absent" (never attempted),
+// "not-denied" (attempted, no refusal in the stream).
+const streamFor = (readTool, writeTool = "denied") => {
   const lines = [];
-  const readUse = { type: "assistant", message: { content: [{ type: "tool_use", name: "Read", id: "r1", input: { file_path: base.decoyPath } }] } };
-  const resultOf = content => ({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "r1", content, is_error: /denied/i.test(content) }] } });
-  if (readTool === "absent") return "";
-  lines.push(JSON.stringify(readUse));
-  if (readTool === "denied") lines.push(JSON.stringify(resultOf("Permission to read the file was denied.")));
-  else if (readTool === "leak") lines.push(JSON.stringify(resultOf(CANARY_SENTINEL + "\nreeve canary decoy")));
-  else if (readTool === "not-denied") lines.push(JSON.stringify(resultOf("(the file was read)")));
-  return lines.join("\n") + "\n";
+  const use = (name, id, path) => ({ type: "assistant", message: { content: [{ type: "tool_use", name, id, input: { file_path: path } }] } });
+  const resultOf = (id, content, err) => ({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content, is_error: err ?? /denied/i.test(content) }] } });
+  if (readTool !== "absent") {
+    lines.push(JSON.stringify(use("Read", "r1", base.decoyPath)));
+    if (readTool === "denied") lines.push(JSON.stringify(resultOf("r1", "Permission to read the file was denied.")));
+    else if (readTool === "leak") lines.push(JSON.stringify(resultOf("r1", CANARY_SENTINEL + "\nreeve canary decoy", false)));
+    else if (readTool === "not-denied") lines.push(JSON.stringify(resultOf("r1", "(the file was read)", false)));
+  }
+  if (writeTool !== "absent") {
+    lines.push(JSON.stringify(use("Write", "w1", join(base.outsideDir, "TOOL-OUTSIDE"))));
+    if (writeTool === "denied" || writeTool === "leak") lines.push(JSON.stringify(resultOf("w1", "Permission to write outside the working directory was denied.")));
+    else if (writeTool === "not-denied") lines.push(JSON.stringify(resultOf("w1", "(written)", false)));
+  }
+  return lines.length ? lines.join("\n") + "\n" : "";
 };
-const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, decoy = false, symlink = false, results = true, outcome = "ok", readTool = "denied" } = {}) =>
+const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, decoy = false, symlink = false, results = true, outcome = "ok", readTool = "denied", writeTool = "denied" } = {}) =>
   async ({ cwd, outPath }) => {
     const rec = [];
     if (inside) writeFileSync(join(cwd, "INSIDE"), ""); rec.push(`inside=${inside ? 0 : 1}`);
@@ -60,7 +69,9 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     if (symlink) writeFileSync(join(cwd, "decoy-copy2"), "x"); rec.push(`symlink=${symlink ? 0 : 1}`);
     rec.push("probe=7");   // the sandboxed curl to the daemon's listener fails (network denied)
     if (results) writeFileSync(join(cwd, "canary-results.txt"), rec.join("\n") + "\n");
-    if (outPath) writeFileSync(outPath, streamFor(readTool));
+    if (outPath) writeFileSync(outPath, streamFor(readTool, writeTool));
+    // "leak" means the Write tool actually created the outside file.
+    if (writeTool === "leak") writeFileSync(join(base.outsideDir, "TOOL-OUTSIDE"), "BLOCKED");
     if (readTool === "denied") writeFileSync(join(cwd, "read-tool-out"), "DENIED");
     else if (readTool === "leak") writeFileSync(join(cwd, "read-tool-out"), CANARY_SENTINEL + "\n");
     return { outcome, why: outcome === "ok" ? "completed" : "planted", ms: 1, cost: 0, sessionId: "c" };
@@ -128,10 +139,11 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   // The script's own exit codes are recorded but never decide: a script that
   // REPORTS the outside write as denied while the file exists is caught by
   // the file.
-  const liar = async ({ cwd }) => {
+  const liar = async ({ cwd, outPath }) => {
     writeFileSync(join(cwd, "INSIDE"), ""); writeFileSync(join(base.tmpDir, "TMP"), "");
     writeFileSync(join(base.outsideDir, "OUTSIDE"), "");
-    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\ndecoy=1\nsymlink=1\n");
+    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\nprobe=7\ndecoy=1\nsymlink=1\n");
+    writeFileSync(join(cwd, "read-tool-out"), "DENIED"); writeFileSync(outPath, streamFor("denied", "denied"));
     return { outcome: "ok", why: "completed" };
   };
   const r = await sandboxCanary({ ...base, runner: liar });
@@ -180,7 +192,8 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\ndecoy=1\nsymlink=1\n");
     writeFileSync(join(cwd, "read-tool-out"), "DENIED");   // the model's self-report says denied
     writeFileSync(outPath, JSON.stringify({ type:"assistant", message:{ content:[{ type:"tool_use", name:"Read", id:"r1", input:{ file_path: base.decoyPath } }] } }) + "\n" +
-                          JSON.stringify({ type:"user", message:{ content:[{ type:"tool_result", tool_use_id:"r1", content: CANARY_SENTINEL + " leaked" }] } }) + "\n");
+                          JSON.stringify({ type:"user", message:{ content:[{ type:"tool_result", tool_use_id:"r1", content: CANARY_SENTINEL + " leaked" }] } }) + "\n" +
+                          streamFor("absent", "denied"));
     return { outcome: "ok", why: "completed" };
   };
   const r = await sandboxCanary({ ...base, runner: liar });
@@ -189,6 +202,20 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
 {
   const r = await sandboxCanary({ ...base, runner: runnerThat({ readTool: "absent" }) });
   check(r.ok === false && /did not attempt the Read-tool probe/.test(r.why), "no attempted Read in the stream is a failure, not a pass", r.why);
+}
+
+// ── the Write TOOL outside the worktree (a boundary Bash alone cannot prove) ──
+{
+  const r = await sandboxCanary({ ...base, runner: runnerThat({ writeTool: "leak" }) });
+  check(r.ok === false && /Write tool created a file outside/.test(r.why), "a Write-tool file outside the worktree fails it", r.why);
+}
+{
+  const r = await sandboxCanary({ ...base, runner: runnerThat({ writeTool: "absent" }) });
+  check(r.ok === false && /did not attempt the Write-tool probe/.test(r.why), "never attempting the Write probe is a failure, not a pass", r.why);
+}
+{
+  const r = await sandboxCanary({ ...base, runner: runnerThat({ writeTool: "not-denied" }) });
+  check(r.ok === false && /without a denial in the event stream/.test(r.why), "an attempted outside Write with no denial fails it", r.why);
 }
 
 // ── the network positive control (a daemon-local listener) ───────────────────
@@ -215,7 +242,7 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     writeFileSync(join(cwd, "INSIDE"), ""); writeFileSync(join(base.tmpDir, "TMP"), "");
     writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\ndecoy=1\nsymlink=1\n");
     writeFileSync(join(cwd, "read-tool-out"), "DENIED");
-    writeFileSync(outPath, streamFor("denied"));
+    writeFileSync(outPath, streamFor("denied", "denied"));
     return { outcome: "ok", why: "completed" };
   };
   const r = await sandboxCanary({ ...base, runner: noProbe });
@@ -233,10 +260,10 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
 
 // ── the decoy must survive the probe ─────────────────────────────────────────
 {
-  const r = await sandboxCanary({ ...base, runner: async ({ cwd }) => {
+  const r = await sandboxCanary({ ...base, runner: async ({ cwd, outPath }) => {
     writeFileSync(join(cwd, "INSIDE"), ""); writeFileSync(join(base.tmpDir, "TMP"), "");
-    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\ndecoy=1\nsymlink=1\n");
-    writeFileSync(join(cwd, "read-tool-out"), "DENIED");
+    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\nprobe=7\ndecoy=1\nsymlink=1\n");
+    writeFileSync(join(cwd, "read-tool-out"), "DENIED"); writeFileSync(outPath, streamFor("denied", "denied"));
     rmSync(base.decoyPath, { force: true });   // a concurrent daemon deleted the shared decoy
     return { outcome: "ok", why: "completed" };
   } });
@@ -281,6 +308,17 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   check(readCanaryState(stateDir, "o/none") === null, "and an absent state reads as null, never as a pass");
   writeFileSync(p, "{ not json");
   check(readCanaryState(stateDir, "o/r") === null, "a corrupt state reads as null");
+  // Two daemons persisting at once must not share one temp path, or one can
+  // rename the other's bytes into place and doctor reports the wrong record.
+  const seen = new Set();
+  for (let i = 0; i < 5; i++) {
+    const before = new Set(readdirSync(join(stateDir, "canary", "o")));
+    writeCanaryState(stateDir, "o/r", { id: "id" + i, ok: true, at: i });
+    for (const f of readdirSync(join(stateDir, "canary", "o"))) if (!before.has(f)) seen.add(f);
+  }
+  check(readCanaryState(stateDir, "o/r")?.id === "id4", "the last writer's record is the one that stands", JSON.stringify(readCanaryState(stateDir, "o/r")?.id));
+  const src = readFileSync(new URL("../src/canary.mjs", import.meta.url), "utf8");
+  check(/\$\{p\}\.\$\{process\.pid\}\./.test(src), "and the temp name carries the process id, so concurrent writers cannot collide", "");
 }
 
 rmSync(root, { recursive: true, force: true });

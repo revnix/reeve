@@ -26,7 +26,7 @@
 // And a sixth, unprompted: denied twice, the model reached for a THIRD tool that
 // was not in the allowlist at all. Any tool that can run a command is a write
 // primitive, so this must be a closed allowlist, never a denylist.
-import { sandboxFor, reviewDiff, validateSettings, credentialPaths, CREDENTIAL_PATHS } from "../src/sandbox.mjs";
+import { sandboxFor, reviewDiff, validateSettings, credentialPaths, quarantineOsDenies, CREDENTIAL_PATHS } from "../src/sandbox.mjs";
 import { readFileSync } from "node:fs";
 
 let fail = 0;
@@ -391,6 +391,42 @@ const TMP = "/Users/x/.reeve/runs/o-r/1/run1/tmp";
   const before = process.env.REEVE_HOME; delete process.env.REEVE_HOME;
   try { check(credentialPaths().length === CREDENTIAL_PATHS.length, "an unset REEVE_HOME adds no extra deny", ""); }
   finally { if (before !== undefined) process.env.REEVE_HOME = before; }
+}
+
+
+// ── credential files the worker must not read, by path ───────────────────────
+{
+  // Git's `store` helper writes plaintext tokens to EITHER ~/.git-credentials or
+  // the XDG path; stripping XDG_CONFIG_HOME only restores the default location.
+  const s = sandboxFor({ profile, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: "/tmp/run/tmp" });
+  const dr = s.settings.sandbox.filesystem.denyRead;
+  check(dr.includes("~/.git-credentials") && dr.includes("~/.config/git"), "both git credential-store locations are deny-read", JSON.stringify(dr.filter(x => /git/.test(x))));
+  check(s.settings.permissions.deny.includes("Read(~/.config/git/**)"), "and the Read tool is denied the XDG one too", "");
+}
+
+// ── quarantined paths reach the OS layer, or the dispatch is refused ─────────
+//
+// A fixer is granted `cat` and a language runtime, so a tool-only deny is not a
+// boundary: it could read a production dump through the shell and copy it into a
+// source file, which the diff gate (which judges destination names) would pass.
+{
+  const q = quarantineOsDenies("/wt", ["secrets/**", "data/*.sql", "prod/dump.sql"]);
+  check(JSON.stringify(q.paths) === JSON.stringify(["/wt/secrets", "/wt/data", "/wt/prod/dump.sql"]),
+    "each glob is reduced to its concrete prefix and resolved against the worktree", JSON.stringify(q.paths));
+  check(q.unrepresentable.length === 0, "and nothing is left unrepresentable", JSON.stringify(q.unrepresentable));
+  const lead = quarantineOsDenies("/wt", ["**/*.pem"]);
+  check(lead.paths.length === 0 && lead.unrepresentable.includes("**/*.pem"),
+    "a leading wildcard has no prefix short of the worktree, so it is reported unrepresentable rather than silently dropped", JSON.stringify(lead));
+  const qp = { ...profile, risk: { ...(profile.risk ?? {}), quarantinePaths: ["secrets/**"] } };
+  const s = sandboxFor({ profile: qp, action: "FIX_CI", worktree: "/wt", tmpDir: "/wt-tmp" });
+  check(s.settings.sandbox.filesystem.denyRead.includes("/wt/secrets"), "sandboxFor denies the quarantined tree at the OS layer", "");
+  check(s.unrepresentableQuarantine.length === 0, "and reports nothing unrepresentable", "");
+  check(validateSettings(s.settings, { tmpDir: "/wt-tmp", quarantineDenies: ["/wt/secrets"] }).ok === true, "control: those settings validate", "");
+  const without = structuredClone(s.settings);
+  without.sandbox.filesystem.denyRead = without.sandbox.filesystem.denyRead.filter(x => x !== "/wt/secrets");
+  check(validateSettings(without, { tmpDir: "/wt-tmp", quarantineDenies: ["/wt/secrets"] }).ok === false, "and a missing quarantine deny is refused", "");
+  const bad = sandboxFor({ profile: { ...profile, risk: { quarantinePaths: ["**/*.pem"] } }, action: "FIX_CI", worktree: "/wt", tmpDir: "/wt-tmp" });
+  check(bad.unrepresentableQuarantine.includes("**/*.pem"), "an unrepresentable quarantine glob is surfaced to the caller, which refuses the dispatch", JSON.stringify(bad.unrepresentableQuarantine));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

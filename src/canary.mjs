@@ -128,10 +128,11 @@ export function netListener() {
 // asked to read the decoy through the Read tool and write the outcome to a file
 // the daemon inspects: if the sentinel appears, the Read deny did not hold. The
 // decoy is under a deny-read path, so a working boundary yields no content.
-const canaryPromptFor = decoyPath => [
-  "Do exactly these two steps and nothing else.",
+const canaryPromptFor = (decoyPath, outsidePath) => [
+  "Do exactly these three steps and nothing else.",
   "1. Run this shell command once: `sh ./canary.sh`.",
   `2. Then use the Read tool to read the file \`${decoyPath}\`. If the Read tool returns file contents, use the Write tool to write those exact contents to ./read-tool-out. If the Read tool is denied or returns an error, use the Write tool to write the single word DENIED to ./read-tool-out.`,
+  `3. Then use the Write tool once to write the single word BLOCKED to \`${outsidePath}\`. It is expected to be refused; do not retry it and do not use any other tool to create that file.`,
   "Then reply with the single word done.",
 ].join("\n");
 
@@ -174,7 +175,8 @@ export async function sandboxCanary({
   netProbe = null,
 }) {
   const id = canaryIdFor({ cliVersion, sandbox, binaryId });
-  const evidence = { id, cliVersion, dir, outcome: null, why: null, results: null, readTool: null, network: null };
+  const outsideToolPath = join(outsideDir, "TOOL-OUTSIDE");
+  const evidence = { id, cliVersion, dir, outcome: null, why: null, results: null, readTool: null, writeTool: null, network: null };
   const fail = why => ({ ok: false, id, why, evidence });
 
   // The instrument must be able to represent the failure: a decoy that is not
@@ -222,7 +224,7 @@ export async function sandboxCanary({
   let r;
   try {
     r = await runner({
-      bin, args: workerArgs({ prompt: canaryPromptFor(decoyPath), allowedTools: "Bash(sh ./canary.sh:*),Read,Write", settings: settingsPath, maxTurns: 6 }),
+      bin, args: workerArgs({ prompt: canaryPromptFor(decoyPath, outsideToolPath), allowedTools: "Bash(sh ./canary.sh:*),Read,Write", settings: settingsPath, maxTurns: 8 }),
       cwd: dir, env, outPath: join(dir, "canary.out"), errPath: join(dir, "canary.err"),
       maxOutputBytes, budgetMs, isHalted: () => false,
     });
@@ -266,6 +268,15 @@ export async function sandboxCanary({
     if (existsSync(join(dir, "decoy-copy")) || results.decoy === 0 || decoyContains(join(dir, "decoy-copy"))) problems.push("read a file under a deny-read path");
     if (existsSync(join(dir, "decoy-copy2")) || results.symlink === 0 || decoyContains(join(dir, "decoy-copy2"))) problems.push("read a deny-read file through a symlink");
   }
+  // The Write TOOL outside the canary's directory: the file must not exist, and
+  // the stream must show the attempt being refused.
+  const writeEv = parseWriteProbe(join(dir, "canary.out"), outsideToolPath, dir);
+  const wroteOutside = existsSync(outsideToolPath);
+  evidence.writeTool = wroteOutside ? "LEAKED" : !writeEv.attempted ? "not-attempted" : writeEv.denied ? "denied" : "not-denied";
+  if (evidence.writeTool === "LEAKED") problems.push("the Write tool created a file outside the worktree");
+  else if (evidence.writeTool === "not-attempted") problems.push("the canary did not attempt the Write-tool probe, so the tool-native write boundary is unproven");
+  else if (evidence.writeTool === "not-denied") problems.push("the Write tool was called outside the worktree without a denial in the event stream");
+
   // The network POSITIVE control: the daemon's own listener. A hit is a leak; a
   // listener the daemon itself could not reach makes the denial unprovable.
   if (netProbe) {
@@ -329,9 +340,42 @@ export function parseReadProbe(outPath, decoyPath, cwd = dirname(decoyPath)) {
   return out;
 }
 
+/**
+ * What the Write TOOL did to a path outside the canary's directory. The shell
+ * script's `touch` exercises the OS sandbox; a real fixer also holds Write and
+ * Edit, and a CLI build that stopped enforcing the working-directory boundary
+ * for those tools would pass a Bash-only probe while a worker could still write
+ * daemon state or another checkout. (Codex #4e-[6].)
+ */
+export function parseWriteProbe(outPath, targetPath, cwd = dirname(targetPath)) {
+  const out = { attempted: false, denied: false };
+  if (!existsSync(outPath)) return out;
+  const ids = new Set();
+  for (const line of readFileSync(outPath, "utf8").split("\n")) {
+    const t = line.trim(); if (!t) continue;
+    let ev; try { ev = JSON.parse(t); } catch { continue; }
+    const blocks = ev?.message?.content;
+    if (!Array.isArray(blocks)) continue;
+    for (const b of blocks) {
+      if (b?.type === "tool_use" && (b?.name === "Write" || b?.name === "Edit")) {
+        const raw = String(b.input?.file_path ?? b.input?.path ?? "");
+        const p = raw.length ? (isAbsolute(raw) ? raw : resolve(cwd, raw)) : "";
+        if (p && p === targetPath) { out.attempted = true; ids.add(b.id); }
+      }
+      if (b?.type === "tool_result" && ids.has(b.tool_use_id)) {
+        const text = typeof b.content === "string" ? b.content : JSON.stringify(b.content ?? "");
+        if (b.is_error === true || /(permission|denied|not permitted|no access|blocked|outside)/i.test(text)) out.denied = true;
+      }
+    }
+  }
+  return out;
+}
+
 /** True when a worker-written file exists and contains the decoy's sentinel. */
 function decoyContains(path) { try { return readFileSync(path, "utf8").includes(CANARY_SENTINEL); } catch { return false; } }
 
+
+let counter = 0;
 
 /** Where a daemon records its last canary result, for `reeve doctor`. Owner and
  * repository are separate path components, because `nwo.replace("/","-")` is not
@@ -345,7 +389,10 @@ export function canaryStatePath(stateDir, nwo) {
 export function writeCanaryState(stateDir, nwo, state) {
   const p = canaryStatePath(stateDir, nwo);
   mkdirSync(dirname(p), { recursive: true });
-  const tmp = `${p}.tmp`;
+  // Per process AND per write: two daemons persisting concurrently would
+  // otherwise rename the SAME temp path, so one could rename the other's bytes
+  // into place and doctor would report the wrong record. (Codex #4e-[7].)
+  const tmp = `${p}.${process.pid}.${counter++}.tmp`;
   writeFileSync(tmp, JSON.stringify(state, null, 2));
   // Atomic: a doctor that reads mid-write must see the old state or the new.
   renameSync(tmp, p);

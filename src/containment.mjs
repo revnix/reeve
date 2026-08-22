@@ -19,6 +19,7 @@
 // Anything unmeasured is open. A platform whose sandbox was never measured is
 // open. A probe that cannot run is open. Closed is a conclusion, never a default.
 import { spawnSync } from "node:child_process";
+import { realpathSync, statSync } from "node:fs";
 import { sandboxCanary, canaryIdFor, readCanaryState, writeCanaryState } from "./canary.mjs";
 
 /**
@@ -31,6 +32,16 @@ import { sandboxCanary, canaryIdFor, readCanaryState, writeCanaryState } from ".
  * standalone clone). (Codex #4c-[9], #4d-[14].)
  */
 export function isolationTopologyReady() { return false; }
+
+/**
+ * The identity of an executable: its real path and modification time. A CLI
+ * replaced in place keeps its path but not its mtime, so a canary that passed
+ * under the old bytes is not credited to the new ones.
+ */
+export function binaryIdentity(bin) {
+  try { const real = realpathSync(bin); const st = statSync(real); return `${real}@${st.mtimeMs}`; }
+  catch { return bin; }
+}
 
 /**
  * Keychain items that hand a worker the founder's GitHub credential.
@@ -73,15 +84,29 @@ export function probeKeychain({ platform = process.platform, exec = spawnSync } 
  * re-measured every time it is asked for, so a transient failure does not
  * refuse dispatch until a restart.
  */
+/**
+ * The reasons containment is open that cost nothing to establish: the platform,
+ * the keychain, and whether an isolated worker is actually in place. A caller
+ * checks these BEFORE preparing a canary (directories, a git config, an env),
+ * because on a host where the verdict is already open that preparation is pure
+ * litter — a new tmp tree every tick that nothing ever cleans up.
+ * (Codex #4e-[9].)
+ */
+export function cheapContainmentReasons({ platform = process.platform, isolated = false, keychain = null } = {}) {
+  const reasons = [];
+  if (platform !== "darwin") reasons.push(`the OS sandbox is unmeasured on ${platform}; only macOS has been measured`);
+  const kc = keychain ?? probeKeychain({ platform });
+  if (!kc.measured) reasons.push(`keychain unmeasured: ${kc.why}`);
+  else if (kc.items.length) reasons.push(kc.why);
+  if (!isolated) reasons.push("no isolated worker environment declared (worker.isolation): a shared account cannot be certified free of credentials and a linked worktree shares the checkout's git dir");
+  return { reasons, keychain: kc };
+}
+
 export async function measureContainment({
   cliVersion, sandbox, permissionsDeny, canaryPaths, bin, env, binaryId = null,
   stateDir, nwo, platform = process.platform, isolated = false, netProbe = null,
   canary = null, keychain = null, cache = new Map(), now = () => Date.now(),
 }) {
-  const reasons = [];
-
-  if (platform !== "darwin") reasons.push(`the OS sandbox is unmeasured on ${platform}; only macOS has been measured`);
-
   // The keychain probe and the shared-account/linked-worktree topology are why
   // a canary pass is NECESSARY but not SUFFICIENT. The probe reads only the two
   // conventional GitHub items; another client can store a token elsewhere in the
@@ -91,10 +116,10 @@ export async function measureContainment({
   // with an empty keychain, its own clone), declared in the profile once the
   // founder has set it up. Until then a found credential still hard-fails, but an
   // empty probe never CLOSES on its own.
-  const kc = typeof keychain === "function" ? await keychain() : keychain ?? probeKeychain({ platform });
-  if (!kc.measured) reasons.push(`keychain unmeasured: ${kc.why}`);
-  else if (kc.items.length) reasons.push(kc.why);
-  if (!isolated) reasons.push("no isolated worker environment declared (worker.isolation): a shared account cannot be certified free of credentials and a linked worktree shares the checkout's git dir");
+  const probed = typeof keychain === "function" ? await keychain() : keychain;
+  const cheap = cheapContainmentReasons({ platform, isolated, keychain: probed });
+  const reasons = [...cheap.reasons];
+  const kc = cheap.keychain;
 
   // The canary is a paid, minutes-long model call. When a cheaper prerequisite
   // (platform, keychain, isolation) already makes the verdict open, do not run
@@ -112,7 +137,7 @@ export async function measureContainment({
     cn = await run({ cliVersion, sandbox, permissionsDeny, binaryId, ...canaryPaths, bin, env, ...(netProbe ? { netProbe } : {}) });
     cn = { ...cn, at: now() };
     cache.set(id, cn);
-    if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }
+    if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, bin, binaryId, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }
   }
   // A skipped canary adds no reason of its own (the cheaper reasons already stand);
   // a run-or-injected canary that failed does.
@@ -133,13 +158,16 @@ export async function measureContainment({
  * next worker, not after the tick. (Codex #4c-[11], #4c-[12].) Cheap: no model
  * call, just a stat and two metadata reads.
  */
-export function revalidateContainment(verdict, { bin, binaryIdentity, keychain = null, platform = process.platform } = {}) {
+export async function revalidateContainment(verdict, { bin, binaryIdentity, keychain = null, platform = process.platform } = {}) {
   if (!verdict || verdict.credentialRead !== "closed") return { ok: false, why: "containment was not closed" };
   const nowId = binaryIdentity(bin);
   if (verdict.binaryId && nowId !== verdict.binaryId)
     return { ok: false, why: `the CLI binary changed since containment was measured (${verdict.binaryId} -> ${nowId}); re-measuring before dispatch` };
-  const kc = typeof keychain === "function" ? keychain() : keychain ?? probeKeychain({ platform });
-  if (!kc.measured) return { ok: false, why: `keychain became unmeasurable since the verdict: ${kc.why}` };
+  // Awaited: the same injection contract as the initial measurement, where an
+  // async probe is legitimate. Reading a pending Promise's `.measured` gave
+  // undefined and refused every otherwise-eligible worker. (Codex #4e-[4].)
+  const kc = typeof keychain === "function" ? await keychain() : keychain ?? probeKeychain({ platform });
+  if (!kc || !kc.measured) return { ok: false, why: `keychain became unmeasurable since the verdict: ${kc?.why ?? "no result"}` };
   if (kc.items.length) return { ok: false, why: `a GitHub credential appeared since the verdict: ${kc.why}` };
   return { ok: true, why: null };
 }

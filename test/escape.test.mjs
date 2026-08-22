@@ -124,6 +124,10 @@ if (process.platform !== "darwin") {
   // the daemon USED to put it), one in the run's readable tmp (where it puts it
   // now). Both are created OUTSIDE the sandbox; the sandboxed git can reach only
   // the second.
+  // Git's `store` helper writes tokens here under the XDG layout; the deny must
+  // cover it, so a decoy of our own goes there and is removed afterwards.
+  const xdgDecoy = join(homedir(), ".config", "git", `reeve-escape-probe-${process.pid}`);
+  mkdirSync(dirname(xdgDecoy), { recursive: true }); writeFileSync(xdgDecoy, "decoy\n");
   const deniedCfg = join(homedir(), ".reeve", "canary", `escape-cfg-${process.pid}`);
   writeFileSync(deniedCfg, "[user]\n\temail = x@x\n");
   writeFileSync(join(tmpDir, "gitconfig"), "[user]\n\temail = x@x\n");
@@ -157,6 +161,7 @@ GH_CONFIG_DIR=./ghcfg ${JSON.stringify(gh || "/usr/bin/false")} auth token >/dev
 GIT_CONFIG_GLOBAL=${JSON.stringify(deniedCfg)} git config --global --list >/dev/null 2>./probe-cfg.err; rec denied_cfg $?
 GIT_CONFIG_GLOBAL=${JSON.stringify(join(tmpDir, "gitconfig"))} git config --global --list >/dev/null 2>/dev/null; rec ok_cfg $?
 curl -sS -m 4 ${JSON.stringify(netUrl)} -o ./netbody 2>/dev/null; rec netprobe $?
+cat ${JSON.stringify(xdgDecoy)} >/dev/null 2>&1; rec xdg_git $?
 `;
   const runProbe = (cwd, settings) => {
     for (const f of ["probe-results.txt", "INSIDE", "curl-body", "decoy-copy", "decoy-copy2", "decoy-link"]) rmSync(join(cwd, f), { force: true });
@@ -200,7 +205,8 @@ curl -sS -m 4 ${JSON.stringify(netUrl)} -o ./netbody 2>/dev/null; rec netprobe $
     check(r.symlink !== 0 && !existsSync(join(wt.path, "decoy-copy2")), "HELD: nor through a symlink inside the worktree", `symlink=${r.symlink}`);
     check(r.denied_cfg !== 0, "MEASURED (Codex #4-[8]): a git config under the deny-read tree is unreadable to sandboxed git — why the daemon writes it in the run's tmp", `denied_cfg=${r.denied_cfg}`);
     check(r.ok_cfg === 0, "and a git config in the run's tmp (allow-read) IS readable — the daemon's fix", `ok_cfg=${r.ok_cfg}`);
-    check(r.netprobe !== 0 && listener.wasHit() === false && (await listener.selfReachable()) === true,
+    check(r.xdg_git !== 0, "HELD: git's XDG credential store (~/.config/git) is unreadable to a sandboxed shell", `xdg_git=${r.xdg_git}`);
+    check(r.netprobe !== 0 && listener.wasHit() === false && listener.selfReachable() === true,
       "HELD: the sandboxed curl cannot reach the daemon's local control listener, though the daemon itself can (the network positive control)", `netprobe=${r.netprobe} hit=${listener.wasHit()}`);
     check(r.noverify !== 0 && !refsAt(dest).includes("escape-noverify"), "HELD: `git push --no-verify <url>` cannot land: the destination is outside the write scope", `noverify=${r.noverify}`);
     check(r.hookspath !== 0 && !refsAt(dest).includes("escape-hookspath"), "HELD: `-c core.hooksPath=/dev/null` cannot land either, for the same reason", `hookspath=${r.hookspath}`);
@@ -237,7 +243,7 @@ curl -sS -m 4 ${JSON.stringify(netUrl)} -o ./netbody 2>/dev/null; rec netprobe $
       "HELD: and every other denial holds the same there", JSON.stringify(r));
   }
 
-  rmSync(decoy, { force: true }); rmSync(deniedCfg, { force: true }); listener.close();
+  rmSync(decoy, { force: true }); rmSync(deniedCfg, { force: true }); rmSync(xdgDecoy, { force: true }); listener.close();
 }
 
 // ── the declaration the env alone makes must still say what it measured ──────

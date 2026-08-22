@@ -84,6 +84,44 @@ The commit carries a secret out of the directory that protects it, and the gate
 is shown a harmless name. `--no-renames` reports the pair as a delete and an add,
 which is the fail-closed reading: more paths judged, never fewer.
 
+## 4. And an UNREADABLE range was reported as an empty one
+
+Added 2026-08-23, from Codex on #10.
+
+The reader returns `null` when git could not be asked. The status read returns
+that straight out, and `reviewDiff` has a distinct refusal for it — "could not
+read what the worker changed". The commit walk did not: `?? ""` turned an
+unreadable range into an empty path list, and the refusal became "the worker
+produced an empty diff — nothing was changed".
+
+That reason is not true, and it points whoever reads it at the worker rather
+than at the read.
+
+It is reachable two ways. A revision the checkout does not hold:
+
+```
+$ git log --name-only 0000000000000000000000000000000000000001..HEAD
+fatal: Invalid revision range 0000000000000000000000000000000000000001..HEAD
+```
+
+and output past `execFileSync`'s buffer, which defaults to 1 MiB and throws
+`ENOBUFS` beyond it:
+
+```
+$ node -e '<execFileSync of 1.5 MB, default options>'
+THREW code=ENOBUFS
+```
+
+A per-commit path walk reaches that sooner than it looks. One commit of 1,600
+files under three 240-byte directory components produced **1,177,600 bytes** of
+pathnames on its own, in 0.28s of fixture time.
+
+So both halves: the walk reads under the same 64 MiB the secret scanner uses,
+and a failed read is returned as `null` rather than as nothing-changed. Stubbing
+each back out separately turns exactly one assertion red — the first gives the
+"empty diff" reason on an unreadable range, the second refuses a wide change as
+unreadable.
+
 ## What this does not establish
 
 Nothing here was measured against a live worker; reeve has still never dispatched

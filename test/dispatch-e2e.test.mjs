@@ -717,6 +717,80 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(`${wtR}.unfetched`, { recursive: true, force: true });
 }
 
+// --- an UNREADABLE range is not an empty one --------------------------------
+//
+// `run` returns null when git could not be asked, and `?? ""` turned that into
+// an empty path list — so a completed fix that could not be READ was refused
+// with "the worker produced an empty diff, nothing was changed". That reason is
+// not true, and it sends whoever reads it to look at the worker rather than at
+// the read. Two ways the read fails: a revision the checkout does not have, and
+// output past execFileSync's buffer.
+{
+  const dirU = mkdtempSync(join(tmpdir(), "reeve-e2e-unreadable-"));
+  const runTickU = async (wt, since, tag) => {
+    let published = 0;
+    const c = { ...baseCtx(), db: open(join(dirU, `${tag}.db`)), logPath: join(dirU, `${tag}.txt`),
+                evaluate: () => ({ ...evaluation, head: since, headRef: "f" }),
+                prepareCheckout: () => ({ ok: true, path: wt, why: null, deps: { ok: true, cow: false } }),
+                verifyConfig: () => ({ ok: true, why: null }),
+                publishWork: () => { published++; return { ok: true, why: null }; },
+                spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }) };
+    const r = await tick(c);
+    c.db.close();
+    return { published, why: [...r.escalations.keys()].join(" | ") };
+  };
+
+  // 1. a pinned revision the checkout does not hold, so `git log` refuses it
+  const wtU = mkdtempSync(join(dirU, "wt-"));
+  execFileSync("git", ["-C", wtU, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtU, "app.js"), "console.log(1)\n");
+  execFileSync("git", ["-C", wtU, "add", "-A"]);
+  execFileSync("git", ["-C", wtU, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "base"]);
+  const absent = "0".repeat(39) + "1";
+  let bad = "";
+  try { execFileSync("git", ["-C", wtU, "log", "--name-only", `${absent}..HEAD`], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }); }
+  catch (e) { bad = String(e.stderr || e.message); }
+  check(/bad revision|unknown revision|invalid revision|not a valid/i.test(bad),
+    "control: git refuses the range, so the walk cannot be read at all", JSON.stringify(bad.slice(0, 90)));
+
+  const u = await runTickU(wtU, absent, "u");
+  check(u.published === 0, "a range that cannot be read is refused", `published=${u.published}`);
+  check(/could not read/.test(u.why) && !/empty diff/.test(u.why),
+    "and it is reported as unreadable, NOT as an empty diff", u.why);
+
+  // 2. more pathnames than execFileSync's 1 MiB default will carry. ONE deep
+  //    directory holding many files, rather than many deep directories: the
+  //    pathname is repeated per file either way, and this builds in a fraction
+  //    of a second where the other shape cost a minute.
+  const wtB = mkdtempSync(join(dirU, "wt-"));
+  execFileSync("git", ["-C", wtB, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtB, "app.js"), "console.log(1)\n");
+  execFileSync("git", ["-C", wtB, "add", "-A"]);
+  execFileSync("git", ["-C", wtB, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "base"]);
+  const pinnedB = execFileSync("git", ["-C", wtB, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const pad = "x".repeat(240);
+  const wide = join(wtB, `a${pad}`, `b${pad}`, `c${pad}`);
+  mkdirSync(wide, { recursive: true });
+  for (let i = 0; i < 1600; i++) writeFileSync(join(wide, `f${String(i).padStart(4, "0")}.txt`), "x\n");
+  // The path the gate must still see, buried in the pile.
+  mkdirSync(join(wtB, ".github", "workflows"), { recursive: true });
+  writeFileSync(join(wtB, ".github", "workflows", "ci.yml"), "name: CI\n");
+  execFileSync("git", ["-C", wtB, "add", "-A"]);
+  execFileSync("git", ["-C", wtB, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "a very wide change"]);
+  const walked = execFileSync("git", ["-C", wtB, "log", "--name-only", "--no-renames", "--pretty=format:", "-m", "-z", `${pinnedB}..HEAD`],
+                              { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).length;
+  check(walked > 1024 * 1024,
+    "control: the walk is past the 1 MiB execFileSync carries by default", `${walked} bytes`);
+
+  const b = await runTickU(wtB, pinnedB, "b");
+  check(b.published === 0, "a change wider than the default buffer is still judged", `published=${b.published}`);
+  check(/\.github/.test(b.why), "and the gate saw the path buried in it", b.why.slice(0, 160));
+
+  rmSync(dirU, { recursive: true, force: true });
+  rmSync(`${wtU}.unfetched`, { recursive: true, force: true });
+  rmSync(`${wtB}.unfetched`, { recursive: true, force: true });
+}
+
 // --- an already-open verdict prepares nothing (no canary litter per tick) -----
 //
 // With the default worker.isolation: none the canary can never run, so building

@@ -40,18 +40,57 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { GIT_NEUTRALISE, REFUSING_HOOK, recordConfig, reason, gitEnv } from "./gitguard.mjs";
+import { GIT_NEUTRALISE, GIT_NEUTRALISE_FOUNDER, REFUSING_HOOK, recordConfig, reason, gitEnv, founderGitEnv } from "./gitguard.mjs";
 import { writeFileSync, chmodSync } from "node:fs";
 
 /** Every daemon git command in a worker-controlled directory carries the neutralisers. */
 function git(cwd, args) {
+  return run(cwd, GIT_NEUTRALISE, args, gitEnv());
+}
+
+/**
+ * A daemon git command whose repository is the FOUNDER's, not a worker's.
+ *
+ * The isolation exists because a worker's checkout holds pull-request content
+ * and its configuration is therefore hostile input. The founder's own
+ * repository is not that, and applying the isolation to it removed the very
+ * things reeve needs there: measured 2026-08-22, `ls-remote origin` on this
+ * repository succeeded ordinarily and failed under the isolation with "could
+ * not read Username for 'https://github.com'", because the credential helper
+ * lives in the founder's global configuration. Every fetch, ls-remote and push
+ * reeve makes on the founder's behalf went through it. A global
+ * `url.<base>.insteadOf` rewrite breaks the same way. (Codex #7-[10].)
+ *
+ * What stays is everything that stops git RUNNING a program; what goes is
+ * everything that decides how git reaches a remote.
+ *
+ * Used for the ORIGIN-FACING commands only, not for every command in the
+ * founder's checkout. A local-path fetch, a rev-parse and a merge-base need
+ * nothing from the founder's configuration and can only be broken by it: a
+ * founder who has hardened git with `protocol.file.allow=never` would have the
+ * worker-to-founder fetch refused, and with it every valid fix. The isolation is
+ * dropped exactly where reeve must reach the remote, and nowhere else.
+ */
+function founderGit(cwd, args) {
+  return run(cwd, GIT_NEUTRALISE_FOUNDER, args, founderGitEnv());
+}
+
+function run(cwd, neutralise, args, env) {
   try {
-    return { ok: true, out: execFileSync("git", ["-C", cwd, ...GIT_NEUTRALISE, ...args],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: gitEnv() }).trim() };
+    return { ok: true, out: execFileSync("git", ["-C", cwd, ...neutralise, ...args],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env }).trim() };
   // `reason` picks git's own fatal line rather than the last thing it printed,
   // which is usually progress narration and sends the reader somewhere else.
   } catch (e) { return { ok: false, out: "", err: reason(e.stderr || e.message) }; }
 }
+
+/** What reeve will read of a tree's attributes files before it refuses instead.
+ * A real .gitattributes is a few hundred bytes; these are three and four orders
+ * of magnitude above that, so they bound a hostile tree without reaching a
+ * legitimate one. The TOTAL matters as much as the per-file bound: a tree can
+ * commit any number of these, and the daemon reads all of them synchronously. */
+const MAX_ATTRIBUTES_BYTES = 1 << 20;
+const MAX_ATTRIBUTES_TOTAL = 4 << 20;
 
 /** The conventional directory for one run's checkout. Keyed by run, not by PR:
  * two runs for the same pull request must never share a directory. */
@@ -177,7 +216,7 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
   // below reads and a bare `git fetch origin <branch>` only updates it when the
   // remote carries the conventional refspec. Naming it makes the guarantee this
   // depends on the one git is actually given.
-  const fetched = git(repoRoot, ["fetch", "-q", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+  const fetched = founderGit(repoRoot, ["fetch", "-q", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
   if (!fetched.ok) return { ok: false, path: null, why: `could not fetch ${branch}: ${fetched.err}` };
 
   // An EMPTY repository plus one fetched ref, not a clone.
@@ -197,6 +236,9 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
   // that is checked out — so a pull request whose branch happened to carry that
   // name (`main` on most hosts) could not be prepared at all. Found by the
   // control beside the filter test, not by the case it was written for.
+  // `git`, not `founderGit`, though its cwd is the founder's checkout: the
+  // repository this CREATES is the worker's, and the founder's global
+  // `init.templateDir` would otherwise install its hooks into it.
   const init = git(repoRoot, ["init", "-q", "-b", `${branch}.reeve-init`, "--", path]);
   if (!init.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not create the checkout: ${init.err}` }; }
   // By the pinned REVISION where there is one, so the fetch cannot race a branch
@@ -230,10 +272,14 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
   //
   // Refused rather than reported, because a fixer working against unmaterialised
   // content produces a fix about a file it never saw. (Codex #7-[6].)
-  const filters = declaredFilters(path);
-  if (filters.length) {
+  const attrs = declaredFilters(path);
+  if (attrs.why) {
     rmSync(path, { recursive: true, force: true });
-    return { ok: false, path: null, why: `this tree declares checkout filter(s) reeve cannot supply (${filters.slice(0, 3).join(", ")}); ` +
+    return { ok: false, path: null, why: attrs.why };
+  }
+  if (attrs.filters.length) {
+    rmSync(path, { recursive: true, force: true });
+    return { ok: false, path: null, why: `this tree declares checkout filter(s) reeve cannot supply (${attrs.filters.slice(0, 3).join(", ")}); ` +
       `daemon git runs with no global configuration, so the content would be left unmaterialised — a worker would edit pointer files` };
   }
 
@@ -279,7 +325,32 @@ function declaredFilters(path) {
   const names = new Set();
   const listed = git(path, ["ls-files", "-z", "--", "*.gitattributes", ".gitattributes"]);
   const files = listed.ok ? listed.out.split("\0").filter(Boolean) : [];
+  let budget = MAX_ATTRIBUTES_TOTAL;
   for (const rel of files) {
+    // lstat before reading, and never on the strength of the listing alone.
+    // This tree is PULL-REQUEST content, and `.gitattributes` can be committed
+    // as a symlink -- mode 120000 -- which a clone materialises. Measured
+    // 2026-08-22 on git 2.50.1: one pointing at /dev/zero was listed by
+    // `ls-files` and killed the reading process outright (SIGKILL, exit 137),
+    // so a pull request could take the daemon down before a worker was ever
+    // launched. git itself refuses to follow these, warning "unable to access
+    // '.gitattributes': Too many levels of symbolic links" -- so a tree that
+    // relies on one is not getting the attributes it thinks it has either way.
+    //
+    // Nothing else writes this tree at this point: the clone is finished and
+    // the worker has not started, so there is no window between the stat and
+    // the read.
+    let st;
+    try { st = lstatSync(join(path, rel)); }
+    catch { return { filters: [], why: `this tree's ${rel} cannot be examined, and an attributes file reeve cannot read may declare a filter it cannot supply` }; }
+    if (!st.isFile())
+      return { filters: [], why: `this tree commits ${rel} as a ${st.isSymbolicLink() ? "symbolic link" : "special file"} rather than a file, which reeve will not read` };
+    if (st.size > MAX_ATTRIBUTES_BYTES)
+      return { filters: [], why: `this tree's ${rel} is ${st.size} bytes, past the ${MAX_ATTRIBUTES_BYTES} reeve will read of an attributes file` };
+    budget -= st.size;
+    if (budget < 0)
+      return { filters: [], why: `this tree's attributes files total more than the ${MAX_ATTRIBUTES_TOTAL} bytes reeve will read of them` };
+
     let text;
     try { text = readFileSync(join(path, rel), "utf8"); } catch { continue; }
     for (const line of text.split("\n")) {
@@ -288,7 +359,7 @@ function declaredFilters(path) {
       for (const m of t.matchAll(/(?:^|\s)filter=([^\s]+)/g)) names.add(m[1]);
     }
   }
-  return [...names];
+  return { filters: [...names], why: null };
 }
 
 /**
@@ -332,6 +403,13 @@ function hardenClone(path) {
  */
 export function fetchRunWork({ repoRoot, path, branch, into = null }) {
   const ref = into ?? `refs/reeve/run/${branch}`;
+  // `git`, not `founderGit`, though the repository is the founder's: the SOURCE
+  // is a local path, so this needs neither their credentials nor their URL
+  // rewrites — and a founder who has hardened git with `protocol.file.allow=never`
+  // would otherwise have every valid fix refused before it could be pushed.
+  // Measured 2026-08-22 on git 2.50.1: with that key in the global config the
+  // same fetch fails `fatal: transport 'file' not allowed`, and succeeds under
+  // the isolation. (Codex #10-[1].)
   const f = git(repoRoot, ["fetch", "--no-tags", "-q", path, `+${branch}:${ref}`]);
   if (!f.ok) return { ok: false, ref: null, why: `could not fetch the worker's branch: ${f.err}` };
   const at = git(repoRoot, ["rev-parse", ref]);
@@ -350,7 +428,7 @@ export function fetchRunWork({ repoRoot, path, branch, into = null }) {
  */
 export function publishRunWork({ repoRoot, path, branch, expectedRemote = null }) {
   if (expectedRemote) {
-    const ls = git(repoRoot, ["ls-remote", "origin", `refs/heads/${branch}`]);
+    const ls = founderGit(repoRoot, ["ls-remote", "origin", `refs/heads/${branch}`]);
     if (!ls.ok) return { ok: false, why: `could not read the remote head: ${ls.err}` };
     const now = ls.out.split(/\s+/)[0] ?? "";
     // An EMPTY result is not "unchanged": `git ls-remote` exits 0 and prints
@@ -382,13 +460,13 @@ export function publishRunWork({ repoRoot, path, branch, expectedRemote = null }
   if (expectedRemote) {
     const ff = git(repoRoot, ["merge-base", "--is-ancestor", expectedRemote, fetched.ref]);
     if (!ff.ok) return { ok: false, why: `the worker's branch does not descend from ${expectedRemote.slice(0, 10)}; reeve does not rewrite published history` };
-    const leased = git(repoRoot, ["push", `--force-with-lease=refs/heads/${branch}:${expectedRemote}`,
-                                  "origin", `${fetched.ref}:refs/heads/${branch}`]);
+    const leased = founderGit(repoRoot, ["push", `--force-with-lease=refs/heads/${branch}:${expectedRemote}`,
+                                       "origin", `${fetched.ref}:refs/heads/${branch}`]);
     if (!leased.ok) return { ok: false, why: `push refused: ${leased.err}` };
     return { ok: true, why: null, head: fetched.head };
   }
   // Never force: a worker's fix is not worth another party's commit.
-  const pushed = git(repoRoot, ["push", "origin", `${fetched.ref}:refs/heads/${branch}`]);
+  const pushed = founderGit(repoRoot, ["push", "origin", `${fetched.ref}:refs/heads/${branch}`]);
   if (!pushed.ok) return { ok: false, why: `push refused: ${pushed.err}` };
   return { ok: true, why: null, head: fetched.head };
 }

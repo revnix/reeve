@@ -172,6 +172,31 @@ const lane = { id: "schema", territory: ["packages/nextly/**"] };
   check(!r.ok, "editing the gate that judges the work refuses", JSON.stringify(r));
 }
 {
+  // A NEWLINE in a pathname walked past every deny rule. `**` compiles to `.*`,
+  // and without the `s` flag `.` stops dead at a newline -- so the glob simply
+  // did not match, and a path git is perfectly happy to carry was neither
+  // quarantined, nor self-governing, nor sensitive, nor outside any territory.
+  // `*` compiles to a NEGATED class and was never affected, which is why only
+  // the `**` forms leaked. Reeve reads pathnames verbatim now, so this is the
+  // shape that reaches the gate.
+  const hidden = ".github/workflows/ci\nx.yml";
+  const r = reviewDiff({ files: [hidden], profile, lane });
+  // The REASON, not just the refusal: with the matcher blind to a newline this
+  // path is still refused, but as "outside the territory" — so an assertion that
+  // only checked `!ok` would pass while every deny rule was being walked past.
+  check(!r.ok && /judges it/i.test(r.why ?? ""),
+    "a newline in a pathname does not walk it past the self-governing rule", JSON.stringify(r.why));
+
+  const q = reviewDiff({ files: ["vendor-dumps/dump\nx.sql"], profile, lane });
+  check(!q.ok && /quarantin/i.test(q.why ?? ""), "the same for a quarantined path", JSON.stringify(q.why));
+
+  // Control: the ordinary form of each still behaves as before, so this is a
+  // matcher that learned a character rather than one that started refusing.
+  const ok = reviewDiff({ files: ["packages/nextly/src/a\nb.ts"], profile, lane });
+  check(ok.ok, "control: a newline INSIDE the lane's territory is allowed, not refused", JSON.stringify(ok.why));
+}
+
+{
   const r = reviewDiff({ files: [], profile, lane });
   check(!r.ok && /no change|empty/i.test(r.why ?? ""),
     "an empty diff refuses rather than pushing nothing as success", JSON.stringify(r));

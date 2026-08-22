@@ -35,6 +35,27 @@ const SECRETS = [
 
 const LIMIT = 700;
 
+/**
+ * Text a pull request wrote, made safe to put in front of a human.
+ *
+ * A pathname may hold a NEWLINE or a terminal control sequence -- git allows it,
+ * and reeve now reads pathnames verbatim rather than in git's quoted form, which
+ * had been escaping them by accident. Those names are interpolated into the
+ * reason a change was refused, and that reason is written to the operational log
+ * and pushed to a phone. So a branch could commit a file whose NAME holds a
+ * newline followed by a plausible timestamp and "CLEARED: nothing needs you",
+ * forging a log entry -- or carry an ANSI sequence that rewrites what a human
+ * sees when they tail the log. The raw name is what the risk globs match on;
+ * this is only for display. (Codex #10-[4].)
+ *
+ * C0, DEL and C1 are all neutralised: a JS string holding U+0080-U+009F encodes
+ * to bytes a terminal may still read as an escape introducer.
+ */
+const NAMED = { "\n": "\\n", "\r": "\\r", "\t": "\\t", "\0": "\\0" };
+export const printable = text =>
+  String(text ?? "").replace(/[\u0000-\u001F\u007F-\u009F]/g,
+    c => NAMED[c] ?? `\\x${c.codePointAt(0).toString(16).padStart(2, "0")}`);
+
 /** Strip anything secret, and cap the length. A phone is not a log viewer. */
 export function redact(text) {
   let s = String(text ?? "");
@@ -50,7 +71,7 @@ export function redact(text) {
 export function buildAlert({ nwo, escalations }) {
   const list = (escalations ?? []).filter(e => e && e.why);
   if (!list.length) return null;
-  const lines = list.map(e => redact(e.count > 1 ? `${e.why} (${e.count} PRs)` : e.why));
+  const lines = list.map(e => redact(printable(e.count > 1 ? `${e.why} (${e.count} PRs)` : e.why)));
   return {
     title: `reeve · ${nwo}`,
     message: lines.join("\n"),

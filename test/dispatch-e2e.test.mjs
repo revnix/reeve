@@ -10,7 +10,7 @@
 import { tick, stateRootsFor } from "../src/daemon.mjs";
 import { open, liveRunFor, countFixAttempts, recordFixAttempt } from "../src/db/ops.mjs";
 import { causeKey } from "../src/ci-rootcause.mjs";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -601,6 +601,219 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   check(!escB.includes(TOKEN), "without ever printing it", "the escalation contained it");
   ctxB.db.close();
   rmSync(dirB, { recursive: true, force: true });
+  rmSync(`${wtB}.unfetched`, { recursive: true, force: true });
+}
+
+// --- a path touched and RESTORED still reaches the gate ----------------------
+//
+// `git diff --name-only <since>..<ref>` names what the DIFF contains, not what
+// each commit touched. A worker that edited a forbidden path in one commit and
+// put it back in a later one showed NOTHING at the endpoints — while the push
+// still carried that commit and its objects, and the diff gate had approved it.
+{
+  const dirP = mkdtempSync(join(tmpdir(), "reeve-e2e-restored-"));
+  const wtP = mkdtempSync(join(dirP, "wt-"));
+  const gP = (...a) => execFileSync("git", ["-C", wtP, ...a], { encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", wtP, "init", "-q", "-b", "f"]);
+  mkdirSync(join(wtP, ".github", "workflows"), { recursive: true });
+  writeFileSync(join(wtP, ".github", "workflows", "ci.yml"), "name: CI\n");
+  writeFileSync(join(wtP, "app.js"), "console.log(1)\n");
+  gP("add", "-A"); gP("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  const pinned = gP("rev-parse", "HEAD");
+
+  // The gate that judges the work is SELF_GOVERNING on .github/** — a worker
+  // editing the thing that grades it is the case reviewDiff exists for.
+  writeFileSync(join(wtP, ".github", "workflows", "ci.yml"), "name: CI\n# quietly weakened\n");
+  gP("add", "-A"); gP("-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "touch the gate");
+  writeFileSync(join(wtP, ".github", "workflows", "ci.yml"), "name: CI\n");   // put it back
+  gP("add", "-A"); gP("-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "restore it");
+  writeFileSync(join(wtP, "app.js"), "console.log(2)\n");
+  gP("add", "-A"); gP("-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "fix: the allowed change");
+
+  // The control that says why the per-commit walk exists at all.
+  const endpoints = execFileSync("git", ["-C", wtP, "diff", "--no-ext-diff", "--name-only", `${pinned}..HEAD`], { encoding: "utf8" }).trim();
+  check(!/\.github/.test(endpoints) && /app\.js/.test(endpoints),
+    "control: the endpoint diff shows only the allowed change — the gate saw nothing wrong", JSON.stringify(endpoints));
+
+  let publishedP = 0;
+  const ctxP = { ...baseCtx(), db: open(join(dirP, "p.db")), logPath: join(dirP, "log.txt"),
+                 evaluate: () => ({ ...evaluation, head: pinned, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtP, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedP++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }) };
+  const rP = await tick(ctxP);
+  const escP = [...rP.escalations.keys()].join(" | ");
+  check(publishedP === 0, "a path touched and restored mid-range is still judged, and refused", `published=${publishedP}`);
+  check(/\.github/.test(escP) || /refused publication/.test(escP), "and the reason names it", escP);
+  ctxP.db.close();
+  rmSync(dirP, { recursive: true, force: true });
+  rmSync(`${wtP}.unfetched`, { recursive: true, force: true });
+}
+
+// --- a path git would QUOTE is still judged ----------------------------------
+//
+// git's default output quotes any path holding a non-ASCII byte or a newline:
+// `secrets/kéy.txt` arrives as `"secrets/k\303\251y.txt"`. The leading quote
+// means the risk globs stop matching, so a sensitive path published itself by
+// being named in a language with accents. A rename had the same shape of hole
+// from the other side: the "old -> new" parser kept only the destination, so
+// renaming a secret to a harmless name showed the harmless name alone.
+{
+  const dirQ = mkdtempSync(join(tmpdir(), "reeve-e2e-quoted-"));
+  const riskProfile = { ...profile, risk: { sensitivePaths: ["secrets/**"] } };
+  const commitQ = (wt, msg) => {
+    execFileSync("git", ["-C", wt, "add", "-A"], { encoding: "utf8" });
+    execFileSync("git", ["-C", wt, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", msg], { encoding: "utf8" });
+  };
+  const seed = wt => {
+    execFileSync("git", ["-C", wt, "init", "-q", "-b", "f"]);
+    mkdirSync(join(wt, "secrets"), { recursive: true });
+    writeFileSync(join(wt, "secrets", "key.txt"), "shhh\n");
+    writeFileSync(join(wt, "app.js"), "console.log(1)\n");
+    commitQ(wt, "base");
+    return execFileSync("git", ["-C", wt, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  };
+  const runTick = async (wt, pinned, tag) => {
+    let published = 0;
+    const c = { ...baseCtx(), profile: riskProfile, db: open(join(dirQ, `${tag}.db`)), logPath: join(dirQ, `${tag}.txt`),
+                evaluate: () => ({ ...evaluation, head: pinned, headRef: "f" }),
+                prepareCheckout: () => ({ ok: true, path: wt, why: null, deps: { ok: true, cow: false } }),
+                verifyConfig: () => ({ ok: true, why: null }),
+                publishWork: () => { published++; return { ok: true, why: null }; },
+                spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }) };
+    const r = await tick(c);
+    c.db.close();
+    return { published, why: [...r.escalations.keys()].join(" | ") };
+  };
+
+  // 1. a committed sensitive path whose name git quotes
+  const wtQ = mkdtempSync(join(dirQ, "wt-"));
+  const pinnedQ = seed(wtQ);
+  writeFileSync(join(wtQ, "secrets", "kéy.txt"), "stolen\n");
+  commitQ(wtQ, "add a secret with an accent in its name");
+  const quoted = execFileSync("git", ["-C", wtQ, "log", "--name-only", "--pretty=format:", "-1"], { encoding: "utf8" }).trim();
+  check(quoted.startsWith('"'),
+    "control: git quotes the path, so a line-split reader never sees secrets/", JSON.stringify(quoted));
+  const q = await runTick(wtQ, pinnedQ, "q");
+  check(q.published === 0, "a sensitive path git would quote is still judged, and refused", `published=${q.published}`);
+  check(/sensitive path/.test(q.why), "and the reason names it as sensitive", q.why);
+
+  // 2. a COMMITTED rename that moves a sensitive file to a harmless name. Rename
+  //    detection is on by default, and it collapses the pair to the destination.
+  const wtR = mkdtempSync(join(dirQ, "wt-"));
+  const pinnedR = seed(wtR);
+  execFileSync("git", ["-C", wtR, "mv", join("secrets", "key.txt"), "public.txt"], { encoding: "utf8" });
+  commitQ(wtR, "move it somewhere harmless");
+  const detected = execFileSync("git", ["-C", wtR, "log", "--name-only", "--pretty=format:", "-1"], { encoding: "utf8" }).trim();
+  check(detected === "public.txt",
+    "control: rename detection reports the destination alone, so secrets/ vanishes", JSON.stringify(detected));
+  const rn = await runTick(wtR, pinnedR, "r");
+  check(rn.published === 0, "a rename's SOURCE is judged, not only where it landed", `published=${rn.published}`);
+  check(/sensitive path/.test(rn.why), "and the reason names the path it came from", rn.why);
+
+  // 3. a pathname that FORGES A LOG LINE. git allows a newline in a filename,
+  //    and reading pathnames verbatim removed the escaping git's quoted form had
+  //    been doing by accident. The name reaches reviewDiff's reason, the reason
+  //    reaches the operational log, and a newline in it writes a line of the
+  //    pull request's choosing under reeve's name.
+  const wtF = mkdtempSync(join(dirQ, "wt-"));
+  const pinnedF = seed(wtF);
+  const forged = "secrets/x\nFORGED CLEARED: nothing needs you";
+  writeFileSync(join(wtF, forged), "gotcha\n");
+  commitQ(wtF, "a file whose name is a log line");
+  const named = execFileSync("git", ["-C", wtF, "log", "--name-only", "--pretty=format:", "-z", "-1"], { encoding: "utf8" });
+  check(named.includes(forged), "control: the pathname carries its newline all the way through git", JSON.stringify(named.slice(0, 90)));
+
+  const f = await runTick(wtF, pinnedF, "f");
+  check(f.published === 0, "a pathname that forges a log line is still judged, and refused", `published=${f.published}`);
+
+  const written = readFileSync(join(dirQ, "f.txt"), "utf8");
+  // The control first: a test that the log holds no forged line passes trivially
+  // if the refusal never reached the log at all.
+  check(/secrets\/x/.test(written), "control: the refusal naming that path really did reach the log", written.slice(-160));
+  const orphans = written.split("\n").filter(l => l && !/^\d{4}-\d\d-\d\dT/.test(l));
+  check(orphans.length === 0, "and every line in the log still starts with reeve's own timestamp", orphans.join(" | ").slice(0, 200));
+  check(/FORGED CLEARED/.test(written) === false || /\\nFORGED/.test(written),
+    "the forged text survives only as escaped text on reeve's own line", written.slice(-160));
+
+  rmSync(dirQ, { recursive: true, force: true });
+  rmSync(`${wtQ}.unfetched`, { recursive: true, force: true });
+  rmSync(`${wtR}.unfetched`, { recursive: true, force: true });
+  rmSync(`${wtF}.unfetched`, { recursive: true, force: true });
+}
+
+// --- an UNREADABLE range is not an empty one --------------------------------
+//
+// `run` returns null when git could not be asked, and `?? ""` turned that into
+// an empty path list — so a completed fix that could not be READ was refused
+// with "the worker produced an empty diff, nothing was changed". That reason is
+// not true, and it sends whoever reads it to look at the worker rather than at
+// the read. Two ways the read fails: a revision the checkout does not have, and
+// output past execFileSync's buffer.
+{
+  const dirU = mkdtempSync(join(tmpdir(), "reeve-e2e-unreadable-"));
+  const runTickU = async (wt, since, tag) => {
+    let published = 0;
+    const c = { ...baseCtx(), db: open(join(dirU, `${tag}.db`)), logPath: join(dirU, `${tag}.txt`),
+                evaluate: () => ({ ...evaluation, head: since, headRef: "f" }),
+                prepareCheckout: () => ({ ok: true, path: wt, why: null, deps: { ok: true, cow: false } }),
+                verifyConfig: () => ({ ok: true, why: null }),
+                publishWork: () => { published++; return { ok: true, why: null }; },
+                spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }) };
+    const r = await tick(c);
+    c.db.close();
+    return { published, why: [...r.escalations.keys()].join(" | ") };
+  };
+
+  // 1. a pinned revision the checkout does not hold, so `git log` refuses it
+  const wtU = mkdtempSync(join(dirU, "wt-"));
+  execFileSync("git", ["-C", wtU, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtU, "app.js"), "console.log(1)\n");
+  execFileSync("git", ["-C", wtU, "add", "-A"]);
+  execFileSync("git", ["-C", wtU, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "base"]);
+  const absent = "0".repeat(39) + "1";
+  let bad = "";
+  try { execFileSync("git", ["-C", wtU, "log", "--name-only", `${absent}..HEAD`], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }); }
+  catch (e) { bad = String(e.stderr || e.message); }
+  check(/bad revision|unknown revision|invalid revision|not a valid/i.test(bad),
+    "control: git refuses the range, so the walk cannot be read at all", JSON.stringify(bad.slice(0, 90)));
+
+  const u = await runTickU(wtU, absent, "u");
+  check(u.published === 0, "a range that cannot be read is refused", `published=${u.published}`);
+  check(/could not read/.test(u.why) && !/empty diff/.test(u.why),
+    "and it is reported as unreadable, NOT as an empty diff", u.why);
+
+  // 2. more pathnames than execFileSync's 1 MiB default will carry. ONE deep
+  //    directory holding many files, rather than many deep directories: the
+  //    pathname is repeated per file either way, and this builds in a fraction
+  //    of a second where the other shape cost a minute.
+  const wtB = mkdtempSync(join(dirU, "wt-"));
+  execFileSync("git", ["-C", wtB, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtB, "app.js"), "console.log(1)\n");
+  execFileSync("git", ["-C", wtB, "add", "-A"]);
+  execFileSync("git", ["-C", wtB, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "base"]);
+  const pinnedB = execFileSync("git", ["-C", wtB, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const pad = "x".repeat(240);
+  const wide = join(wtB, `a${pad}`, `b${pad}`, `c${pad}`);
+  mkdirSync(wide, { recursive: true });
+  for (let i = 0; i < 1600; i++) writeFileSync(join(wide, `f${String(i).padStart(4, "0")}.txt`), "x\n");
+  // The path the gate must still see, buried in the pile.
+  mkdirSync(join(wtB, ".github", "workflows"), { recursive: true });
+  writeFileSync(join(wtB, ".github", "workflows", "ci.yml"), "name: CI\n");
+  execFileSync("git", ["-C", wtB, "add", "-A"]);
+  execFileSync("git", ["-C", wtB, "-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "a very wide change"]);
+  const walked = execFileSync("git", ["-C", wtB, "log", "--name-only", "--no-renames", "--pretty=format:", "-m", "-z", `${pinnedB}..HEAD`],
+                              { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).length;
+  check(walked > 1024 * 1024,
+    "control: the walk is past the 1 MiB execFileSync carries by default", `${walked} bytes`);
+
+  const b = await runTickU(wtB, pinnedB, "b");
+  check(b.published === 0, "a change wider than the default buffer is still judged", `published=${b.published}`);
+  check(/\.github/.test(b.why), "and the gate saw the path buried in it", b.why.slice(0, 160));
+
+  rmSync(dirU, { recursive: true, force: true });
+  rmSync(`${wtU}.unfetched`, { recursive: true, force: true });
   rmSync(`${wtB}.unfetched`, { recursive: true, force: true });
 }
 

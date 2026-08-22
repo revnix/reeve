@@ -36,6 +36,12 @@ import { writeFileSync, readFileSync } from "node:fs";
  * configuration the worker changed.
  */
 const NEUTRALISE = [
+  // A replacement ref rewrites what git SHOWS without touching what a push
+  // carries: a worker can `git replace <pinned-head> <fake>` so every diff the
+  // daemon takes reports an innocuous change, while the branch it publishes
+  // holds the real commits. The configuration fingerprint cannot see this — a
+  // replacement is a ref, not a config key. (Codex #5-[16].)
+  "--no-replace-objects",
   "-c", "core.fsmonitor=",
   "-c", "core.hooksPath=/dev/null",
   "-c", "core.pager=cat",
@@ -49,9 +55,56 @@ const NEUTRALISE = [
   "-c", "protocol.ext.allow=never",
 ];
 
+/**
+ * The environment every daemon git command in a worker-controlled directory runs
+ * under: no global config, no system config.
+ *
+ * `-c` can only override keys it NAMES, and a filter driver's name comes from
+ * the repository's own `.gitattributes`. So a `filter.<anything>.smudge` in the
+ * founder's global config is invoked by a checkout of PR-controlled content,
+ * unsandboxed, as the daemon, BEFORE the worker starts — and the configuration
+ * fingerprint cannot protect an operation that already happened. Taking the
+ * files out of git's reach removes the whole class rather than a list of names.
+ * (Codex #5-[19].)
+ */
+export const GIT_ISOLATED_ENV = Object.freeze({
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+  GIT_ATTR_NOSYSTEM: "1",
+  GIT_NO_REPLACE_OBJECTS: "1",
+});
+
+/**
+ * The env for a daemon git call: the real environment with the isolation above
+ * layered on, and git's CONFIGURATION-INJECTION variables removed.
+ *
+ * `GIT_CONFIG_COUNT` with its `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` pairs, and
+ * `GIT_CONFIG_PARAMETERS`, are applied by git INDEPENDENTLY of the global and
+ * system files — so pointing those files at /dev/null closes nothing if the
+ * daemon was launched with a filter driver injected that way, and a pull
+ * request's `.gitattributes` can then name it. Inheriting them is the same hole
+ * the file isolation exists to shut. (Codex #7-[1].)
+ */
+export function gitEnv(extra = {}) {
+  const env = { ...process.env };
+  for (const k of Object.keys(env)) {
+    // `GIT_CONFIG` is here as insurance, not as a measured hole. Its own
+    // documentation says it applies to `git config` and "has no effect on other
+    // Git commands", and measured on git 2.50.1 an injected smudge driver did
+    // NOT run through it, for a clone or a checkout. A reviewer reported
+    // otherwise on 2.43. Rather than depend on a promise about every version and
+    // vendor of git this daemon might meet, it is dropped: it costs nothing and
+    // reeve has no use for it. (Codex #7-[4], not reproduced here.)
+    if (k === "GIT_CONFIG" || k === "GIT_CONFIG_COUNT" || k === "GIT_CONFIG_PARAMETERS"
+        || /^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(k)) delete env[k];
+  }
+  return { ...env, ...GIT_ISOLATED_ENV, ...extra };
+}
+
 function git(cwd, args) {
   try {
-    return { ok: true, out: execFileSync("git", ["-C", cwd, ...NEUTRALISE, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() };
+    return { ok: true, out: execFileSync("git", ["-C", cwd, ...NEUTRALISE, ...args],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: gitEnv() }).trim() };
   } catch { return { ok: false, out: "" }; }
 }
 

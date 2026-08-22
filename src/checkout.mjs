@@ -38,16 +38,16 @@
 // relative and resolves inside the tree, so the copy resolves within the run
 // checkout.
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { GIT_NEUTRALISE, REFUSING_HOOK, recordConfig, reason } from "./gitguard.mjs";
+import { GIT_NEUTRALISE, REFUSING_HOOK, recordConfig, reason, gitEnv } from "./gitguard.mjs";
 import { writeFileSync, chmodSync } from "node:fs";
 
 /** Every daemon git command in a worker-controlled directory carries the neutralisers. */
 function git(cwd, args) {
   try {
     return { ok: true, out: execFileSync("git", ["-C", cwd, ...GIT_NEUTRALISE, ...args],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() };
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: gitEnv() }).trim() };
   // `reason` picks git's own fatal line rather than the last thing it printed,
   // which is usually progress narration and sends the reader somewhere else.
   } catch (e) { return { ok: false, out: "", err: reason(e.stderr || e.message) }; }
@@ -133,6 +133,30 @@ export function copyDeps(from, to, { cow = null } = {}) {
 }
 
 /**
+ * Would copying into `rel` write outside the checkout?
+ *
+ * Checked component by component, because it is the PARENTS that matter: a link
+ * at `api` sends everything under it elsewhere, whatever `api/.venv` is. A
+ * component that does not exist yet is fine -- it will be a real directory,
+ * created here. Returns a reason, or null when the destination is safe.
+ */
+function escapesCheckout(root, rel) {
+  const realRoot = (() => { try { return realpathSync(root); } catch { return root; } })();
+  const parts = rel.split("/").filter(p => p && p !== ".");
+  if (parts.includes("..")) return `dependency path ${rel} climbs out of the checkout`;
+  let at = realRoot;
+  for (const part of parts) {
+    at = join(at, part);
+    let st;
+    try { st = lstatSync(at); } catch { return null; }        // not there yet: this call creates it
+    if (st.isSymbolicLink()) return `dependency path ${rel} passes through a symlink (${part}), which would write outside the checkout`;
+    const real = (() => { try { return realpathSync(at); } catch { return at; } })();
+    if (real !== realRoot && !real.startsWith(realRoot + "/")) return `dependency path ${rel} resolves outside the checkout`;
+  }
+  return null;
+}
+
+/**
  * A standalone checkout for one run.
  *
  * `head` is the revision reeve pinned when it decided. The clone is made from
@@ -156,23 +180,35 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
   const fetched = git(repoRoot, ["fetch", "-q", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
   if (!fetched.ok) return { ok: false, path: null, why: `could not fetch ${branch}: ${fetched.err}` };
 
-  // NOT `--branch <branch>`. A pull request's branch lives in the founder's clone
-  // as `origin/<branch>` and not as a local `refs/heads/<branch>` unless a human
-  // happened to check it out, and `git clone --branch` asks the source for a
-  // local head -- so every ordinary dispatch failed here with "Remote branch not
-  // found in upstream origin". Every fixture had created the branch locally
-  // first, which is why nothing caught it. (Codex #5-[1].)
-  const cloned = git(repoRoot, ["clone", "--no-hardlinks", "-q", repoRoot, path]);
-  if (!cloned.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not clone: ${cloned.err}` }; }
-
-  // The remote-tracking ref by its full name, into a local branch of the same
-  // name. `git clone` copies the source's `refs/heads/*` into the clone's
-  // remote-tracking refs, so the PR branch is not among them and has to be
-  // asked for by the name the source really holds it under.
-  const branched = git(path, ["fetch", "--no-tags", "-q", repoRoot, `+refs/remotes/origin/${branch}:refs/heads/${branch}`]);
-  if (!branched.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not bring ${branch} into the checkout: ${branched.err}` }; }
+  // An EMPTY repository plus one fetched ref, not a clone.
+  //
+  // `git clone` copies every one of the source's branches and tags and the
+  // objects behind them, so a local `private` branch in the founder's checkout
+  // arrives as `origin/private` in the worker's — readable with the worker's own
+  // unrestricted git grant, and copyable into an allowed path for reeve to
+  // publish. Denying the founder's checkout by path does nothing about a copy of
+  // its object database sitting inside the worker's own. (Codex #5-[17].)
+  //
+  // A single-ref fetch brings only what that revision reaches. It also removes
+  // the earlier `--branch` problem entirely: nothing asks the source for a local
+  // head that a pull request's branch does not have.
+  // HEAD is put on a name that CANNOT be the target branch. `git init` leaves it
+  // on the host's `init.defaultBranch`, and git refuses to fetch into a branch
+  // that is checked out — so a pull request whose branch happened to carry that
+  // name (`main` on most hosts) could not be prepared at all. Found by the
+  // control beside the filter test, not by the case it was written for.
+  const init = git(repoRoot, ["init", "-q", "-b", `${branch}.reeve-init`, "--", path]);
+  if (!init.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not create the checkout: ${init.err}` }; }
+  // By the pinned REVISION where there is one, so the fetch cannot race a branch
+  // that moves between the decision and the preparation.
+  const want = head ?? `refs/remotes/origin/${branch}`;
+  const fetchedRef = git(path, ["fetch", "--no-tags", "-q", "--no-write-fetch-head", repoRoot, `+${want}:refs/heads/${branch}`]);
+  if (!fetchedRef.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not fetch ${branch} into the checkout: ${fetchedRef.err}` }; }
   const onBranch = git(path, ["checkout", "-q", branch]);
   if (!onBranch.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not check out ${branch}: ${onBranch.err}` }; }
+  // origin is set so the checkout is a normal repository to work in; the push
+  // URL below is what stops it publishing.
+  git(path, ["remote", "add", "origin", repoRoot]);
 
   // The clone followed the local branch, which may lag the revision reeve
   // pinned; move it onto that revision explicitly and check it landed.
@@ -181,6 +217,24 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
     if (!at.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not stand on ${head.slice(0, 10)}: ${at.err}` }; }
     const now = git(path, ["rev-parse", "HEAD"]);
     if (!now.ok || now.out !== head) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `checkout is at ${now.out || "?"}, not the pinned ${head.slice(0, 10)}` }; }
+  }
+
+  // A checkout filter the tree DECLARES but this environment cannot supply.
+  //
+  // Daemon git runs with no global or system configuration, which is what stops
+  // a founder's filter driver executing on pull-request content — and it also
+  // means Git LFS's driver, which `git lfs install` registers globally, is not
+  // there. Git treats an undefined filter as PASS-THROUGH rather than an error,
+  // so the checkout succeeds holding pointer files, and the worker then edits
+  // and tests the wrong tree while everything reports success.
+  //
+  // Refused rather than reported, because a fixer working against unmaterialised
+  // content produces a fix about a file it never saw. (Codex #7-[6].)
+  const filters = declaredFilters(path);
+  if (filters.length) {
+    rmSync(path, { recursive: true, force: true });
+    return { ok: false, path: null, why: `this tree declares checkout filter(s) reeve cannot supply (${filters.slice(0, 3).join(", ")}); ` +
+      `daemon git runs with no global configuration, so the content would be left unmaterialised — a worker would edit pointer files` };
   }
 
   const h = hardenClone(path);
@@ -196,6 +250,14 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
     for (const rel of depsFrom) {
       const from = join(repoRoot, rel), to = join(path, rel);
       if (!existsSync(from)) continue;
+      // The destination is inside PR-CONTROLLED content. A pull request can
+      // commit a symlink where a unit root belongs, and both `mkdirSync` and
+      // `cp -R` follow it -- so the copy lands wherever the link points, written
+      // by the DAEMON, outside the checkout entirely. Every component is checked,
+      // and the resolved destination must still be under the run's own path.
+      // (Codex #5-[18].)
+      const esc = escapesCheckout(path, rel);
+      if (esc) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: esc }; }
       mkdirSync(dirname(to), { recursive: true });
       const one = copyDeps(from, to, { cow });
       if (!one.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: one.why }; }
@@ -205,6 +267,28 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
   }
 
   return { ok: true, path, why: null, deps };
+}
+
+/**
+ * Filter drivers this checkout's own .gitattributes files ask for.
+ *
+ * Read from the checked-out tree, and only the names: a driver reeve does not
+ * provide cannot be run, and the point is to notice that rather than to run it.
+ */
+function declaredFilters(path) {
+  const names = new Set();
+  const listed = git(path, ["ls-files", "-z", "--", "*.gitattributes", ".gitattributes"]);
+  const files = listed.ok ? listed.out.split("\0").filter(Boolean) : [];
+  for (const rel of files) {
+    let text;
+    try { text = readFileSync(join(path, rel), "utf8"); } catch { continue; }
+    for (const line of text.split("\n")) {
+      const t = line.trim();
+      if (!t || t.startsWith("#")) continue;
+      for (const m of t.matchAll(/(?:^|\s)filter=([^\s]+)/g)) names.add(m[1]);
+    }
+  }
+  return [...names];
 }
 
 /**
@@ -269,7 +353,13 @@ export function publishRunWork({ repoRoot, path, branch, expectedRemote = null }
     const ls = git(repoRoot, ["ls-remote", "origin", `refs/heads/${branch}`]);
     if (!ls.ok) return { ok: false, why: `could not read the remote head: ${ls.err}` };
     const now = ls.out.split(/\s+/)[0] ?? "";
-    if (now && now !== expectedRemote)
+    // An EMPTY result is not "unchanged": `git ls-remote` exits 0 and prints
+    // nothing when the ref is gone, so a branch the contributor deleted while
+    // the worker ran read as a match, and the push RECREATED it. Only
+    // `--exit-code` makes an unmatched ref nonzero, and reading the output is
+    // clearer than relying on that. (Codex #5-[15].)
+    if (!now) return { ok: false, why: `${branch} no longer exists on the remote; publishing would recreate a branch someone deleted` };
+    if (now !== expectedRemote)
       return { ok: false, why: `the remote moved while the worker ran: expected ${expectedRemote.slice(0, 10)}, found ${now.slice(0, 10)}` };
   }
   const fetched = fetchRunWork({ repoRoot, path, branch });
@@ -279,6 +369,24 @@ export function publishRunWork({ repoRoot, path, branch, expectedRemote = null }
   // logged for a worker that committed nothing at all.
   if (expectedRemote && fetched.head === expectedRemote)
     return { ok: false, why: "the worker committed nothing: the branch is exactly where it was" };
+  // The ls-remote above is a look, not a lock: the branch can be deleted or moved
+  // between it and the push, and an ordinary push would then RECREATE a deleted
+  // branch or land on a head nobody checked. The remote is asked to verify the
+  // expectation itself, atomically. (Codex #7-[7].)
+  //
+  // A lease is not a licence to rewrite. `--force-with-lease` would happily
+  // replace a matching remote with an unrelated history, which is exactly what
+  // "never force" exists to prevent — so the push is refused first unless the
+  // work DESCENDS from what is being replaced. The lease then adds atomicity to
+  // a push that was already a fast-forward.
+  if (expectedRemote) {
+    const ff = git(repoRoot, ["merge-base", "--is-ancestor", expectedRemote, fetched.ref]);
+    if (!ff.ok) return { ok: false, why: `the worker's branch does not descend from ${expectedRemote.slice(0, 10)}; reeve does not rewrite published history` };
+    const leased = git(repoRoot, ["push", `--force-with-lease=refs/heads/${branch}:${expectedRemote}`,
+                                  "origin", `${fetched.ref}:refs/heads/${branch}`]);
+    if (!leased.ok) return { ok: false, why: `push refused: ${leased.err}` };
+    return { ok: true, why: null, head: fetched.head };
+  }
   // Never force: a worker's fix is not worth another party's commit.
   const pushed = git(repoRoot, ["push", "origin", `${fetched.ref}:refs/heads/${branch}`]);
   if (!pushed.ok) return { ok: false, why: `push refused: ${pushed.err}` };

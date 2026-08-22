@@ -209,6 +209,40 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       worktree is a standalone clone), replacing today's hard-false. Only after
       it lands may `worker.isolation: dedicated-user` be set.
 
+- [ ] **PR-3 (S1 close-out): standalone checkouts + the scratch-HOME closure.**
+      IN FLIGHT on `feat/s1-standalone-clones`. Landed so far:
+      · **standalone clone per run** instead of a linked worktree — its own ref
+        store and config, so the shared-ref and shared-config holes close by
+        construction (measured: clone 2.4s/251MB; deps copy-on-write 15s/**31MB**
+        real vs 1.2GB apparent). The founder's uncommitted work and ignored files
+        never reach a worker; the work leaves by fetch into reeve's own
+        repository, so the worker still never publishes.
+      · **the keychain closure**: measured that the keychain is reached THROUGH
+        HOME, so workers get a scratch HOME and authenticate from
+        `CLAUDE_CODE_OAUTH_TOKEN` (`~/.reeve/claude-token`, 0600, inside the
+        deny-read tree). `workerEnv` REFUSES the founder's home and a missing
+        token. The founder's keychain is UNTOUCHED and still holds their GitHub
+        credential — and a worker cannot read it, which the escape test asserts
+        explicitly rather than tautologically.
+      · **the gate moved from a proxy to a measurement**: containment no longer
+        requires the host keychain to look empty (a probe of two known item
+        shapes). The CANARY measures the worker's actual reach — three keychain
+        probes whose success fails it — and that is what decides. `worker.isolation`
+        gains `scratch-home` (the built arrangement); `dedicated-user` is stronger,
+        unbuilt, and refused with that reason rather than silently downgraded.
+      · a dependency gap nobody had noticed: there was NO install step in the
+        dispatch path, so with the network denied a fixer could never run the
+        project's tests — it could not check its own fix.
+      Two bugs this introduced, both caught before shipping: every `~/...` deny
+      expanded against the WORKER's home (a scratch home would have silently
+      disabled the whole file deny list — the escape test caught it), and the
+      canary's results parser matched `[a-z]+`, dropping `kc_github` and friends,
+      which would have failed every real canary.
+      REMAINING: `worktree.mjs`'s acquire/release/push are now unused by dispatch
+      (tests still cover them, which is false confidence — remove or re-point);
+      doctor wording; the PR itself; and a live canary pass as evidence before
+      recommending the flag.
+
 ### Founder actions pending
 
 - [x] Add `nextly-ops` to App installation 155196718 — DONE by founder

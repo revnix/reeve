@@ -64,7 +64,7 @@ export function probeKeychain({ platform = process.platform, exec = spawnSync } 
  */
 export async function measureContainment({
   cliVersion, sandbox, permissionsDeny, canaryPaths, bin, env, binaryId = null,
-  stateDir, nwo, platform = process.platform, isolated = false,
+  stateDir, nwo, platform = process.platform, isolated = false, netReachable = null,
   canary = null, keychain = null, cache = new Map(), now = () => Date.now(),
 }) {
   const reasons = [];
@@ -98,7 +98,7 @@ export async function measureContainment({
   else if (!id) cn = { ok: false, id: null, why: "no CLI version or sandbox block to run a canary under" };
   else {
     const run = typeof canary === "function" ? canary : sandboxCanary;
-    cn = await run({ cliVersion, sandbox, permissionsDeny, binaryId, ...canaryPaths, bin, env });
+    cn = await run({ cliVersion, sandbox, permissionsDeny, binaryId, ...canaryPaths, bin, env, ...(netReachable ? { netReachable } : {}) });
     cn = { ...cn, at: now() };
     cache.set(id, cn);
     if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }
@@ -110,8 +110,27 @@ export async function measureContainment({
   return {
     credentialRead: reasons.length ? "open" : "closed",
     why: reasons.length ? reasons.join("; ") : `canary ${cn.id} passed, an isolated worker is declared, and the keychain holds no GitHub credential`,
-    canary: cn, keychain: kc, platform, isolated, at: now(),
+    canary: cn, keychain: kc, platform, isolated, binaryId, at: now(),
   };
+}
+
+/**
+ * Re-check, immediately before a spawn, the two facts a per-tick verdict cannot
+ * keep fresh: the CLI binary identity and the keychain. The canary is bound to a
+ * binary identity (its id), so a swapped executable must not run under an old
+ * pass; and a credential added after the probe must reopen the gate before the
+ * next worker, not after the tick. (Codex #4c-[11], #4c-[12].) Cheap: no model
+ * call, just a stat and two metadata reads.
+ */
+export function revalidateContainment(verdict, { bin, binaryIdentity, keychain = null, platform = process.platform } = {}) {
+  if (!verdict || verdict.credentialRead !== "closed") return { ok: false, why: "containment was not closed" };
+  const nowId = binaryIdentity(bin);
+  if (verdict.binaryId && nowId !== verdict.binaryId)
+    return { ok: false, why: `the CLI binary changed since containment was measured (${verdict.binaryId} -> ${nowId}); re-measuring before dispatch` };
+  const kc = typeof keychain === "function" ? keychain() : keychain ?? probeKeychain({ platform });
+  if (!kc.measured) return { ok: false, why: `keychain became unmeasurable since the verdict: ${kc.why}` };
+  if (kc.items.length) return { ok: false, why: `a GitHub credential appeared since the verdict: ${kc.why}` };
+  return { ok: true, why: null };
 }
 
 export { readCanaryState };

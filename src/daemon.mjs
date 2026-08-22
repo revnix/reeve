@@ -23,7 +23,7 @@ import { sandboxFor, writeSandbox, reviewDiff, validateSettings } from "./sandbo
 import { acquireWorktree, releaseWorktree, pushWorktree } from "./worktree.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig } from "./workerenv.mjs";
-import { measureContainment } from "./containment.mjs";
+import { measureContainment, revalidateContainment, probeKeychain } from "./containment.mjs";
 import { canaryIdFor } from "./canary.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify } from "./notify.mjs";
@@ -34,7 +34,7 @@ import { selfAudit } from "./selfaudit.mjs";
 import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, existsSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { homedir } from "node:os";
@@ -155,6 +155,15 @@ function changedFiles(worktree, since = null) {
  * keychain probe every time. A preparation that fails (no CLI, no worktree
  * root) is an OPEN verdict with the reason, never a thrown tick.
  */
+// The dedicated-user dispatch topology (a separate OS user, a per-run
+// standalone clone) is PR-3. Until it exists, a profile that DECLARES
+// worker.isolation="dedicated-user" must not close containment: production
+// dispatch still calls acquireWorktree (a linked worktree) and runWorker as
+// this user, the exact shared-account/shared-git-dir holes the gate prevents.
+// Returns false so the label is inert; PR-3 replaces this with a real check
+// (euid differs from the checkout owner, worktree is a standalone clone).
+function isolationTopologyReady() { return false; }
+
 async function measuredContainment(ctx, profile, nwo, logPath) {
   const cache = (ctx.containmentCache ??= new Map());
   try {
@@ -186,18 +195,29 @@ async function measuredContainment(ctx, profile, nwo, logPath) {
     // The resolved binary's identity is part of the canary id, so a swapped
     // executable that prints the same --version is re-measured. (Codex #4-[3].)
     const binaryId = binaryIdentity(claudeBin);
+    // The network positive control runs under the WORKER's environment (proxy
+    // variables stripped), so it tests the same direct route the sandboxed curl
+    // uses. A control on the daemon's ambient proxy could certify a failure the
+    // proxy caused, not the sandbox. (Codex #4c-[13].)
+    const netReachable = ctx.netReachable ?? (() => {
+      try { const rr = spawnSync("curl", ["-sS", "-m", "5", "-o", "/dev/null", "https://example.com"], { env, stdio: ["ignore", "ignore", "ignore"], timeout: 8000 }); return rr.error ? null : rr.status === 0; }
+      catch { return null; }
+    });
     const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox, binaryId }))?.ok === true;
     if (!before) log(logPath, `containment: running the sandbox canary under ${version}`);
     const c = await measureContainment({
       cliVersion: version, sandbox: policy.settings.sandbox, permissionsDeny: policy.settings.permissions.deny, binaryId,
-      canaryPaths, bin: claudeBin, env, stateDir: canaryStateDir, nwo, cache,
+      canaryPaths, bin: claudeBin, env, stateDir: canaryStateDir, nwo, cache, netReachable,
       // process.platform in production; injectable so a test on one OS can
       // exercise the verdict for another (the fail-closed matrix is per-OS).
       platform: ctx.platform ?? undefined,
-      // The worker runs as a dedicated OS user in its own clone: declared in the
-      // profile, and only true once the founder has actually set that up. Until
-      // then a passing canary and an empty keychain still do not close dispatch.
-      isolated: profile.worker?.isolation === "dedicated-user",
+      // The profile LABEL is necessary but not sufficient: the dedicated-user
+      // dispatch topology (a separate OS user, a per-run standalone clone) is
+      // PR-3, and production dispatch still uses a linked worktree as this user.
+      // So the label closes containment only when the topology is actually
+      // verified ready — false until PR-3, injectable for the wiring test.
+      // (Codex #4c-[9].)
+      isolated: profile.worker?.isolation === "dedicated-user" && (ctx.isolationReady ?? isolationTopologyReady)(),
       canary: ctx.canary ?? null, keychain: ctx.keychain ?? null,
     });
     if (!before) log(logPath, `containment: canary ${c.canary?.id ?? "?"} ${c.canary?.ok ? "passed" : `FAILED: ${c.canary?.why}`}; keychain: ${c.keychain?.measured ? (c.keychain.items.length ? c.keychain.why : "no GitHub credential") : `unmeasured (${c.keychain?.why})`}`);
@@ -496,6 +516,23 @@ export async function tick(ctx) {
       }
       if (started >= cap.canStart) { log(logPath, `  capacity reached; ${decisions.length - started} decision(s) deferred to the next tick`); break; }
       if (halted(ctx.haltMarker)) { log(logPath, "HALTED before dispatch"); break; }
+
+      // TOCTOU: the containment verdict was measured once for this tick, but the
+      // CLI binary and the keychain can change between then and this spawn, and
+      // the verdict is reused for every worker in the tick. Re-check both cheap
+      // facts immediately before each worker task; a change reopens the gate for
+      // this spawn rather than after the tick. (Codex #4c-[11], #4c-[12].)
+      if (WORKER_ACTIONS.includes(decision.action)) {
+        const reval = revalidateContainment(containment, {
+          bin: resolveClaude(ctx.claudeBin ?? "claude"), binaryIdentity,
+          keychain: ctx.keychain ?? null, platform: ctx.platform ?? undefined,
+        });
+        if (!reval.ok) {
+          log(logPath, `  #${e.pr}: NOT dispatching — ${reval.why}`);
+          escalations.set("guardian:containment:changed", 1);
+          continue;
+        }
+      }
 
       // Only some decisions are worker tasks. WAIT, PARK, MERGE and ESCALATE are
       // not: two of them are for a human and one is the gate's own job.

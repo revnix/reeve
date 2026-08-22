@@ -1,7 +1,7 @@
 // Closed is a conclusion. Every input that is missing, unmeasured or failed
 // leaves the credential read OPEN, and only a passing canary together with an
 // empty keychain (of GitHub items) closes it.
-import { probeKeychain, measureContainment, GITHUB_KEYCHAIN_ITEMS } from "../src/containment.mjs";
+import { probeKeychain, measureContainment, revalidateContainment, GITHUB_KEYCHAIN_ITEMS } from "../src/containment.mjs";
 import { readCanaryState } from "../src/canary.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -132,6 +132,22 @@ const base = { cliVersion: "2.1.237", sandbox, permissionsDeny: [], canaryPaths:
   // With every cheap prerequisite met, the canary runs.
   const r2 = await measureContainment({ ...base, isolated: true, canary: fn, keychain: clean });
   check(r2.credentialRead === "closed" && ran === 1, "and it runs once every cheaper gate is clear", `ran=${ran}`);
+}
+
+// ── revalidateContainment: the cheap facts, re-checked before a spawn ─────────
+{
+  const bid = b => "/x@" + b;
+  const idOf = bin => bin;   // a fake binaryIdentity: identity is the path itself
+  const closed = { credentialRead: "closed", binaryId: "/x@1" };
+  check(revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: clean }).ok === true, "same binary + clean keychain revalidates ok");
+  check(revalidateContainment(closed, { bin: "/x@2", binaryIdentity: idOf, keychain: clean }).ok === false, "a changed binary identity refuses");
+  const r = revalidateContainment(closed, { bin: "/x@2", binaryIdentity: idOf, keychain: clean });
+  check(/CLI binary changed/.test(r.why), "and says the binary changed", r.why);
+  check(revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: dirty }).ok === false && /credential appeared/.test(revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: dirty }).why), "a credential that appeared refuses");
+  check(revalidateContainment(closed, { bin: "/x@1", binaryIdentity: idOf, keychain: { measured: false, items: [], why: "no security" } }).ok === false, "an unmeasurable keychain refuses");
+  check(revalidateContainment({ credentialRead: "open" }, { bin: "/x@1", binaryIdentity: idOf, keychain: clean }).ok === false, "an open verdict is never revalidated as ok");
+  // A verdict without a recorded binaryId cannot check the binary, but still checks the keychain.
+  check(revalidateContainment({ credentialRead: "closed" }, { bin: "/x@1", binaryIdentity: idOf, keychain: clean }).ok === true, "a verdict without a binaryId still passes on a clean keychain");
 }
 
 rmSync(root, { recursive: true, force: true });

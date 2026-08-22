@@ -48,7 +48,7 @@ const db = open(join(dir, "c.db"));
   // Each context gets its own worktree dir: the daemon quarantines (moves) a
   // worktree after a failed run, and a shared one strands every later tick.
   var ctxFor = (db_, logPath) => ({
-    nwo: "o/r", db: db_, logPath, execute: true, shadow: true, running: 0, containment: { credentialRead: "closed", why: "test" }, claudeBin: "/bin/sh", cliVersion: "2.1.237",
+    nwo: "o/r", db: db_, logPath, execute: true, shadow: true, running: 0, containment: { credentialRead: "closed", why: "test" }, keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "2.1.237",
     profile: { identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir }, authority: { policy: "propose_and_merge" },
                rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 }, ci: { provider: "github-actions", requiredChecks: [] },
                watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 } },

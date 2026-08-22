@@ -5,7 +5,7 @@
 // assertion is on the verdict the daemon draws from those files. The real
 // boundary is measured in test/escape.test.mjs (under the runtime) and by the
 // daemon at start (under the CLI); this file proves the judge.
-import { sandboxCanary, canaryIdFor, canaryScript, writeCanaryState, readCanaryState, canaryStatePath, CANARY_SENTINEL } from "../src/canary.mjs";
+import { sandboxCanary, canaryIdFor, canaryScript, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, CANARY_SENTINEL } from "../src/canary.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
@@ -221,6 +221,17 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     return { outcome: "ok", why: "completed" };
   } });
   check(r.ok === false && /decoy vanished/.test(r.why), "a decoy deleted during the probe makes the read-denial unproven", r.why);
+}
+
+// ── a malformed Read (empty path) is not a denied decoy read ─────────────────
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-readprobe-"));
+  const out = join(dir, "o.jsonl");
+  writeFileSync(out, JSON.stringify({ type:"assistant", message:{ content:[{ type:"tool_use", name:"Read", id:"r1", input:{} }] } }) + "\n" +
+                     JSON.stringify({ type:"user", message:{ content:[{ type:"tool_result", tool_use_id:"r1", content:"input validation error", is_error:true }] } }) + "\n");
+  const ev = parseReadProbe(out, "/Users/x/.reeve/canary/decoy-1.txt");
+  check(ev.attempted === false, "an empty Read path does not count as attempting the decoy read", JSON.stringify(ev));
+  rmSync(dir, { recursive: true, force: true });
 }
 
 // ── the state path keeps owner and repo distinct ─────────────────────────────

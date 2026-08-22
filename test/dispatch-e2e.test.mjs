@@ -53,6 +53,9 @@ const baseCtx = () => ({
   // The tests below exercise dispatch, so they declare what the real module
   // cannot yet: a closed credential read. The default refuses; see the last case.
   containment: { credentialRead: "closed", why: "test" },
+  // The per-spawn revalidation re-probes the keychain; injected clean here so
+  // the default-closed cases dispatch. Cases that test an open verdict override.
+  keychain: { measured: true, items: [], why: null },
   // The worker is stubbed, so no CLI is resolved or launched: the seam is
   // given an absolute path and a version, which is what a real dispatch records.
   claudeBin: "/bin/sh", cliVersion: "test",
@@ -146,9 +149,10 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   const dir4 = mkdtempSync(join(tmpdir(), "reeve-e2e-contain-"));
   const ctx4 = { ...baseCtx(), db: open(join(dir4, "c.db")), logPath: join(dir4, "log.txt"), worktreeFor: () => mkdtempSync(join(dir4, "wt-")),
                  // No cheaper reason, so the canary is the gate that runs and fails:
-                 // measured platform, an isolated worker declared, an empty keychain.
+                 // measured platform, an isolated (verified) worker, an empty keychain.
                  platform: "darwin",
                  profile: { ...profile, worker: { isolation: "dedicated-user" } },
+                 isolationReady: () => true,
                  canary: async () => ({ ok: false, id: "planted", why: "planted: wrote outside the worktree", evidence: {} }),
                  keychain: { measured: true, items: [], why: null } };
   delete ctx4.containment;          // measured, not declared
@@ -207,9 +211,10 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
                  // canary+keychain wiring, not the per-OS platform gate (that is
                  // its own case below).
                  platform: "darwin",
-                 // A declared isolated worker is now required to close dispatch;
-                 // this case is the positive control for that whole path.
+                 // A declared isolated worker AND a verified-ready topology are
+                 // required to close dispatch; this is the positive control.
                  profile: { ...profile, worker: { isolation: "dedicated-user" } },
+                 isolationReady: () => true,
                  canary: async () => { canaryRuns++; return { ok: true, id: "good", why: null, evidence: {} }; },
                  keychain: { measured: true, items: [], why: null } };
   delete ctxC.containment;
@@ -225,6 +230,57 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   check(canaryRuns === 1, "a second tick reuses the passing canary", String(canaryRuns));
   ctxC.db.close();
   rmSync(dirC, { recursive: true, force: true });
+}
+
+// --- the isolation LABEL alone does not close: the topology must be verified ---
+//
+// worker.isolation=dedicated-user with an un-built topology (the daemon still
+// runs a linked worktree as this user) must not dispatch. (Codex #4c-[9].)
+{
+  const dirL = mkdtempSync(join(tmpdir(), "reeve-e2e-label-"));
+  const ctxL = { ...baseCtx(), db: open(join(dirL, "l.db")), logPath: join(dirL, "log.txt"), worktreeFor: () => mkdtempSync(join(dirL, "wt-")),
+                 platform: "darwin", profile: { ...profile, worker: { isolation: "dedicated-user" } },
+                 canary: async () => ({ ok: true, id: "good", why: null, evidence: {} }),
+                 keychain: { measured: true, items: [], why: null } };   // NOTE: no isolationReady -> topology not built
+  delete ctxL.containment;
+  let launchedL = 0;
+  ctxL.spawnWorker = async () => { launchedL++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  const rL = await tick(ctxL);
+  check(launchedL === 0 && [...rL.escalations.keys()].includes("guardian:containment:open"), "the isolation label alone, without a verified topology, does not dispatch", String(launchedL));
+  check(/no isolated worker/.test(readFileSync(join(dirL, "log.txt"), "utf8")), "and the log says the isolation is not satisfied", "");
+  ctxL.db.close();
+  rmSync(dirL, { recursive: true, force: true });
+}
+
+// --- a CLI binary swapped after the verdict is refused at the spawn -----------
+{
+  const dirB = mkdtempSync(join(tmpdir(), "reeve-e2e-binswap-"));
+  const ctxB = { ...baseCtx(), db: open(join(dirB, "b.db")), logPath: join(dirB, "log.txt"), worktreeFor: () => mkdtempSync(join(dirB, "wt-")),
+                 // A closed verdict whose binary identity differs from the one the
+                 // spawn resolves (/bin/sh) -> the per-spawn re-check refuses.
+                 containment: { credentialRead: "closed", why: "test", binaryId: "/some/other/claude@999" } };
+  let launchedB = 0;
+  ctxB.spawnWorker = async () => { launchedB++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  const rB = await tick(ctxB);
+  check(launchedB === 0 && [...rB.escalations.keys()].includes("guardian:containment:changed"), "a CLI binary that changed since the verdict refuses the spawn", String(launchedB));
+  check(/CLI binary changed/.test(readFileSync(join(dirB, "log.txt"), "utf8")), "and the log names the binary change", "");
+  ctxB.db.close();
+  rmSync(dirB, { recursive: true, force: true });
+}
+
+// --- a credential that appears after the verdict is caught at the spawn --------
+{
+  const dirK2 = mkdtempSync(join(tmpdir(), "reeve-e2e-credappear-"));
+  const ctxK2 = { ...baseCtx(), db: open(join(dirK2, "k.db")), logPath: join(dirK2, "log.txt"), worktreeFor: () => mkdtempSync(join(dirK2, "wt-")),
+                  // Verdict was closed, but the keychain now holds an item.
+                  keychain: { measured: true, items: ["generic password gh:github.com (gh keyring)"], why: "appeared" } };
+  let launchedK2 = 0;
+  ctxK2.spawnWorker = async () => { launchedK2++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  const rK2 = await tick(ctxK2);
+  check(launchedK2 === 0 && [...rK2.escalations.keys()].includes("guardian:containment:changed"), "a credential that appeared after the verdict refuses the spawn", String(launchedK2));
+  check(/credential appeared/.test(readFileSync(join(dirK2, "log.txt"), "utf8")), "and the log says a credential appeared", "");
+  ctxK2.db.close();
+  rmSync(dirK2, { recursive: true, force: true });
 }
 
 // --- an unmeasured platform stays open even with both probes green -----------

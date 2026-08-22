@@ -1,0 +1,10 @@
+<!-- This is an auto-generated reply by CodeRabbit -->
+<!-- CodeRabbit review command invocation: a5455c16-1ab6-4daf-a01d-f9f730ce880e -->
+<details>
+<summary>⚠️ Action not completed</summary>
+
+Review rate limited.
+
+> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits. This command is applicable only when automatic reviews are paused.
+
+</details>

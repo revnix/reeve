@@ -177,7 +177,14 @@ export function workerEnv({ gitConfigPath, tmpDir, bgWaitMs, maxRetries = 1, ext
  * and a worker must be able to read its own home.
  */
 export function workerHomeFor(root, nwo) {
-  return join(root, ".reeve-worker-home", nwo.replace("/", "-"));
+  // NESTED, not flattened. `nwo.replace("/", "-")` maps `foo-bar/baz` and
+  // `foo/bar-baz` to the same directory, and this home holds the worker's own
+  // session state and is not denied to it -- so two repositories sharing a
+  // worktree root would share one, and either could read or disturb the other's.
+  // The same collision was found in the canary's state path; it is the same
+  // mistake, so it gets the same shape. (Codex #5-[8].)
+  const [owner, ...rest] = String(nwo).split("/");
+  return join(root, ".reeve-worker-home", owner, rest.join("/") || "_");
 }
 
 /**

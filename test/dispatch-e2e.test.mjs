@@ -368,6 +368,105 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(`${wtU}.unfetched`, { recursive: true, force: true });
 }
 
+// --- a token in the COMMIT MESSAGE travels with the push too -----------------
+//
+// The first version of this check ran `git diff`, which emits the file patch and
+// not commit metadata — so a worker that put the credential in its commit
+// message had it pushed into public history by a check that had just declared
+// the change clean.
+{
+  const dirT = mkdtempSync(join(tmpdir(), "reeve-e2e-msgtoken-"));
+  const wtT = mkdtempSync(join(dirT, "wt-"));
+  const TOKEN = "sk-ant-oat01-test-token-not-a-real-credential";
+  const gT = (...a) => execFileSync("git", ["-C", wtT, ...a], { encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", wtT, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtT, "a.txt"), "base\n");
+  gT("add", "-A"); gT("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  const baseSha = gT("rev-parse", "HEAD");
+  // An innocuous source change, and the credential in the message.
+  writeFileSync(join(wtT, "a.txt"), "fixed\n");
+  gT("add", "-A"); gT("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", `fix: it works\n\ndebug ${TOKEN}`);
+
+  let publishedT = 0;
+  const evalT = { ...evaluation, head: baseSha, headRef: "f" };
+  const ctxT = { ...baseCtx(), db: open(join(dirT, "t.db")), logPath: join(dirT, "log.txt"),
+                 evaluate: () => evalT,
+                 prepareCheckout: () => ({ ok: true, path: wtT, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedT++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }) };
+  const rT = await tick(ctxT);
+  const escT = [...rT.escalations.keys()].join(" | ");
+  check(publishedT === 0, "a commit MESSAGE carrying reeve's token is not published", `published=${publishedT}`);
+  // NAMED, not merely refused. The first version of this passed because the
+  // check could not read the diff at all and refused everything, which is a
+  // different fact wearing the same result.
+  check(/carries reeve's worker authentication token/.test(escT),
+    "and the reason names the credential, rather than a check that could not run", escT);
+  check(!escT.includes(TOKEN), "without ever printing the credential", "the escalation contained it");
+  ctxT.db.close();
+  rmSync(dirT, { recursive: true, force: true });
+  rmSync(`${wtT}.unfetched`, { recursive: true, force: true });
+
+  // THE CONTROL. A check that refuses everything also refuses the leak, and
+  // looks identical from the outside. This is the assertion that would have
+  // caught it: an ordinary change, no credential anywhere, must publish.
+  const dirC = mkdtempSync(join(tmpdir(), "reeve-e2e-cleanpub-"));
+  const wtC = mkdtempSync(join(dirC, "wt-"));
+  const gC = (...a) => execFileSync("git", ["-C", wtC, ...a], { encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", wtC, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtC, "a.txt"), "base\n");
+  gC("add", "-A"); gC("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  const baseC = gC("rev-parse", "HEAD");
+  writeFileSync(join(wtC, "a.txt"), "an ordinary fix\n");
+  gC("add", "-A"); gC("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "fix: nothing secret here");
+  let publishedC = 0;
+  const ctxC = { ...baseCtx(), db: open(join(dirC, "c.db")), logPath: join(dirC, "log.txt"),
+                 evaluate: () => ({ ...evaluation, head: baseC, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtC, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedC++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }) };
+  await tick(ctxC);
+  check(publishedC === 1, "control: a change carrying no credential still publishes", `published=${publishedC}`);
+  ctxC.db.close();
+  rmSync(dirC, { recursive: true, force: true });
+}
+
+// --- an unfinished worker's commit lives on the BRANCH, not at HEAD ----------
+//
+// A worker that commits on the PR branch and then checks out the pinned commit
+// leaves HEAD exactly where it started. changedFiles compares HEAD, saw nothing,
+// and the release deleted the standalone clone — the only copy of the commit.
+{
+  const dirB = mkdtempSync(join(tmpdir(), "reeve-e2e-branchwork-"));
+  const wtB = mkdtempSync(join(dirB, "wt-"));
+  const gB = (...a) => execFileSync("git", ["-C", wtB, ...a], { encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", wtB, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtB, "a.txt"), "base\n");
+  gB("add", "-A"); gB("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "base");
+  const pinned = gB("rev-parse", "HEAD");
+  writeFileSync(join(wtB, "a.txt"), "a candidate fix\n");
+  gB("add", "-A"); gB("-c", "user.email=w@w", "-c", "user.name=w", "commit", "-qm", "the worker's commit");
+  const workSha = gB("rev-parse", "HEAD");
+  gB("checkout", "-q", pinned);            // detached, exactly where it started
+  check(gB("rev-parse", "HEAD") === pinned, "control: HEAD is back at the pinned commit", "");
+  check(gB("rev-parse", "refs/heads/f") === workSha, "control: and the work is on the branch", "");
+
+  const evalB = { ...evaluation, head: pinned, headRef: "f" };
+  const ctxB = { ...baseCtx(), db: open(join(dirB, "b.db")), logPath: join(dirB, "log.txt"),
+                 evaluate: () => evalB,
+                 prepareCheckout: () => ({ ok: true, path: wtB, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 spawnWorker: async () => ({ outcome: "failed", why: "turn limit", ms: 1, cost: 0, sessionId: "s" }) };
+  await tick(ctxB);
+  check(!existsSync(wtB), "control: the checkout was released from its original path", "");
+  check(existsSync(join(`${wtB}.unfetched`, ".git")), "an unfinished worker's commit is PRESERVED, not deleted with the clone", `${wtB}.unfetched`);
+  ctxB.db.close();
+  rmSync(dirB, { recursive: true, force: true });
+  rmSync(`${wtB}.unfetched`, { recursive: true, force: true });
+}
+
 // --- an already-open verdict prepares nothing (no canary litter per tick) -----
 //
 // With the default worker.isolation: none the canary can never run, so building

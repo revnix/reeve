@@ -4,7 +4,7 @@
 // patterns to succeed. The environment is now built from an allowlist, and the
 // test asserts the ABSENCE of each ambient credential with a positive control
 // (it plants them first), because an absence search that cannot see is not one.
-import { workerEnv, writeGitConfig, CONTAINMENT } from "../src/workerenv.mjs";
+import { workerEnv, writeGitConfig, workerHomeFor, CONTAINMENT } from "../src/workerenv.mjs";
 import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
@@ -139,5 +139,19 @@ const env = workerEnv({ home: WORKER_HOME, oauthToken: FAKE_TOKEN, gitConfigPath
 
 for (const k of Object.keys(planted)) delete process.env[k];
 rmSync(dir, { recursive: true, force: true });
+// ── a worker's home must be its OWN, across repositories ─────────────────────
+//
+// `nwo.replace("/", "-")` maps `foo-bar/baz` and `foo/bar-baz` to one directory.
+// This home holds the worker's session state and is not denied to it, so two
+// repositories sharing a worktree root would share one. The same collision was
+// found in the canary's state path; this is the same mistake in a second place.
+{
+  const a = workerHomeFor("/root", "foo-bar/baz");
+  const b = workerHomeFor("/root", "foo/bar-baz");
+  check(a !== b, "two repositories whose flattened names collide get different homes", `${a} ${b}`);
+  check(workerHomeFor("/root", "o/r").startsWith("/root/"), "and a home still lives under the given root", workerHomeFor("/root", "o/r"));
+  check(workerHomeFor("/root", "o/r") === workerHomeFor("/root", "o/r"), "the same repository always gets the same one", "");
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

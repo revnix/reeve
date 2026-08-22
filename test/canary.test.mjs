@@ -58,7 +58,14 @@ const streamFor = (readTool, writeTool = "denied") => {
   }
   return lines.length ? lines.join("\n") + "\n" : "";
 };
-const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, decoy = false, symlink = false, results = true, outcome = "ok", readTool = "denied", writeTool = "denied", fileDecoy = false, fileControl = true, keychainReach = false, keychainByPath = null } = {}) =>
+// The script sandboxCanary would build for this fixture. The instrument is part
+// of the boundary's identity, so recomputing the id has to include it.
+const scriptOf = b => canaryScript({ tmpDir: b.tmpDir, outsideDir: b.outsideDir, decoyPath: b.decoyPath,
+                                     netUrl: b.netProbe?.url ?? null,
+                                     fileDecoyPath: join(b.outsideDir, "FILE-DECOY.txt"),
+                                     fileControlPath: join(b.outsideDir, "FILE-CONTROL.txt") });
+
+const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, decoy = false, symlink = false, results = true, outcome = "ok", readTool = "denied", writeTool = "denied", fileDecoy = false, fileControl = true, keychainReach = false, keychainByPath = null, keychainOpen = null } = {}) =>
   async ({ cwd, outPath }) => {
     const rec = [];
     if (inside) writeFileSync(join(cwd, "INSIDE"), ""); rec.push(`inside=${inside ? 0 : 1}`);
@@ -67,7 +74,13 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     if (curl) writeFileSync(join(cwd, "curl-body"), "<html>"); rec.push(`curl=${curl ? 0 : 56}`);
     if (decoy) writeFileSync(join(cwd, "decoy-copy"), "x"); rec.push(`decoy=${decoy ? 0 : 1}`);
     if (symlink) writeFileSync(join(cwd, "decoy-copy2"), "x"); rec.push(`symlink=${symlink ? 0 : 1}`);
-    rec.push("probe=7");   // the sandboxed curl to the daemon's listener fails (network denied)
+    // Read from the SCRIPT, not asserted independently of it. A runner that
+    // fabricates its results regardless of the instrument makes the instrument
+    // untestable: the network control could vanish from the script entirely and
+    // every case here would still report it running. The real worker's results
+    // come from executing this file, so the stub reads it too.
+    const script = existsSync(join(cwd, "canary.sh")) ? readFileSync(join(cwd, "canary.sh"), "utf8") : "";
+    if (/-o \.\/probe-body/.test(script)) rec.push("probe=7");   // the sandboxed curl to the daemon's listener fails (network denied)
     // The exact-file deny pair: the decoy is refused, its neighbour is readable.
     rec.push(`filedecoy=${fileDecoy ? 0 : 1}`); rec.push(`filecontrol=${fileControl ? 0 : 1}`);
     // The keychain: with a scratch HOME every probe fails (44 / no password).
@@ -77,10 +90,16 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     const byPath = keychainByPath === null ? keychainReach : keychainByPath;
     rec.push(`kc_path_github=${byPath ? 0 : 44}`);
     rec.push(`kc_path_claude=${byPath ? 0 : 44}`);
+    // The deciding probe, separate on purpose: find-*-password answers 44 for a
+    // DENIED keychain and for one that simply lacks the item, so `keychainOpen`
+    // models the host where the items are absent while the keychain is wide open.
+    const open = keychainOpen === null ? byPath : keychainOpen;
+    rec.push(`kc_path_open=${open ? 0 : 161}`);
     if (fileDecoy) writeFileSync(join(base.outsideDir, "..", "filedecoy-copy"), "x");
     // "no-path-probes" writes everything EXCEPT the by-path keychain probes, which
     // is what an older canary script would leave behind after a daemon upgrade.
-    const lines = results === "no-path-probes" ? rec.filter(l => !l.startsWith("kc_path_")) : rec;
+    const lines = results === "no-path-probes" ? rec.filter(l => !l.startsWith("kc_path_"))
+      : results === "no-open-probe" ? rec.filter(l => !l.startsWith("kc_path_open")) : rec;
     if (results) writeFileSync(join(cwd, "canary-results.txt"), lines.join("\n") + "\n");
     if (outPath) writeFileSync(outPath, streamFor(readTool, writeTool));
     // "leak" means the Write tool actually created the outside file.
@@ -115,7 +134,8 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
 {
   const r = await sandboxCanary({ ...base, runner: runnerThat() });
   check(r.ok === true && r.why === null, "every denial held and both controls succeeded: ok", r.why);
-  check(r.id === canaryIdFor({ cliVersion: base.cliVersion, sandbox: base.sandbox, worktree: base.dir, permissionsDeny: base.permissionsDeny, allowedTools: base.allowedTools ?? null }),
+  check(r.id === canaryIdFor({ cliVersion: base.cliVersion, sandbox: base.sandbox, worktree: base.dir, permissionsDeny: base.permissionsDeny,
+                              allowedTools: base.allowedTools ?? null, script: scriptOf(base) }),
     "the verdict carries the boundary's id");
   check(!existsSync(base.dir) && !existsSync(base.outsideDir) && !existsSync(base.decoyPath), "a passing canary cleans up after itself");
 }
@@ -156,7 +176,7 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   const liar = async ({ cwd, outPath }) => {
     writeFileSync(join(cwd, "INSIDE"), ""); writeFileSync(join(base.tmpDir, "TMP"), "");
     writeFileSync(join(base.outsideDir, "OUTSIDE"), "");
-    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\nprobe=7\ndecoy=1\nsymlink=1\nfiledecoy=1\nfilecontrol=0\nkc_github=44\nkc_claude=44\nkc_helper=1\nkc_path_github=44\nkc_path_claude=44\n");
+    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\nprobe=7\ndecoy=1\nsymlink=1\nfiledecoy=1\nfilecontrol=0\nkc_github=44\nkc_claude=44\nkc_helper=1\nkc_path_github=44\nkc_path_claude=44\nkc_path_open=161\n");
     writeFileSync(join(cwd, "read-tool-out"), "DENIED"); writeFileSync(outPath, streamFor("denied", "denied"));
     return { outcome: "ok", why: "completed" };
   };
@@ -203,7 +223,7 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   // stream shows a Read that returned the sentinel is a LEAK, not a pass.
   const liar = async ({ cwd, outPath }) => {
     writeFileSync(join(cwd, "INSIDE"), ""); writeFileSync(join(base.tmpDir, "TMP"), "");
-    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\ndecoy=1\nsymlink=1\nfiledecoy=1\nfilecontrol=0\nkc_github=44\nkc_claude=44\nkc_helper=1\nkc_path_github=44\nkc_path_claude=44\n");
+    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\ndecoy=1\nsymlink=1\nfiledecoy=1\nfilecontrol=0\nkc_github=44\nkc_claude=44\nkc_helper=1\nkc_path_github=44\nkc_path_claude=44\nkc_path_open=161\n");
     writeFileSync(join(cwd, "read-tool-out"), "DENIED");   // the model's self-report says denied
     writeFileSync(outPath, JSON.stringify({ type:"assistant", message:{ content:[{ type:"tool_use", name:"Read", id:"r1", input:{ file_path: base.decoyPath } }] } }) + "\n" +
                           JSON.stringify({ type:"user", message:{ content:[{ type:"tool_result", tool_use_id:"r1", content: CANARY_SENTINEL + " leaked" }] } }) + "\n" +
@@ -285,7 +305,7 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   // means the control never executed.
   const noProbe = async ({ cwd, outPath }) => {
     writeFileSync(join(cwd, "INSIDE"), ""); writeFileSync(join(base.tmpDir, "TMP"), "");
-    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\ndecoy=1\nsymlink=1\nfiledecoy=1\nfilecontrol=0\nkc_github=44\nkc_claude=44\nkc_helper=1\nkc_path_github=44\nkc_path_claude=44\n");
+    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\ndecoy=1\nsymlink=1\nfiledecoy=1\nfilecontrol=0\nkc_github=44\nkc_claude=44\nkc_helper=1\nkc_path_github=44\nkc_path_claude=44\nkc_path_open=161\n");
     writeFileSync(join(cwd, "read-tool-out"), "DENIED");
     writeFileSync(outPath, streamFor("denied", "denied"));
     return { outcome: "ok", why: "completed" };
@@ -312,6 +332,61 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   const noProbe = await sandboxCanary({ ...base, runner: runnerThat({ results: "no-path-probes" }) });
   check(noProbe.ok === false && /not probed by path/.test(noProbe.why ?? ""),
     "and a canary that skipped those probes proves nothing rather than passing", noProbe.why);
+}
+
+// ── the listener's URL is not known until it is READY ────────────────────────
+//
+// Every fixture here hands over a netProbe whose `url` is already set, so the
+// ORDER in which sandboxCanary awaits `ready` is invisible to them. The real
+// `netListener()` binds a port and self-checks first, and its url only means
+// anything after `ready` resolves. Building the script before that await left
+// netUrl null, dropped the network control out of the script entirely, and the
+// canary then failed on its own missing probe — found by a live run, not here.
+{
+  let url = null;
+  const late = {
+    get url() { return url; },
+    ready: new Promise(res => setTimeout(() => { url = "http://127.0.0.1:59998/canary"; res(); }, 5)),
+    selfReachable: () => true, wasHit: () => false,
+  };
+  const r = await sandboxCanary({ ...base, netProbe: late, runner: runnerThat() });
+  check(r.ok, "a listener whose url arrives with `ready` still gets its probe into the script", r.why);
+}
+
+// ── the SCRIPT is part of the boundary's identity ────────────────────────────
+//
+// The script is the instrument. A record made before a probe existed describes a
+// weaker measurement than the one being asked for now, and reusing it is exactly
+// how the by-path keychain reach stayed unmeasured while a passing record said
+// containment was closed.
+{
+  const a = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, script: "probe A\n" });
+  const b = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, script: "probe A\nprobe B\n" });
+  check(a !== b, "adding a probe to the canary script is a different id", `${a} ${b}`);
+  const p1 = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, worktree: "/wt/inv-a", script: "cp /wt/inv-a/x .\n" });
+  const p2 = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, worktree: "/wt/inv-b", script: "cp /wt/inv-b/x .\n" });
+  check(p1 === p2, "while the same script under a different per-invocation directory is the SAME id", `${p1} ${p2}`);
+}
+
+// ── a probe that cannot tell DENIAL from ABSENCE decides nothing ─────────────
+//
+// `security find-internet-password -s github.com <keychain>` answers 44 when
+// access is denied AND when the keychain simply holds no such record. On a host
+// without those exact items, both item probes report "not found" while the
+// keychain is wide open — a canary passing on a closure it never measured.
+//
+// Measured 2026-08-22: `security show-keychain-info <keychain>` asks about the
+// KEYCHAIN rather than an item, and answers 0 when reachable, 161 when denied.
+// That is the probe that decides; the item probes corroborate it.
+{
+  const r = await sandboxCanary({ ...base, runner: runnerThat({ keychainByPath: false, keychainOpen: true }) });
+  check(r.ok === false && /REACHABLE by path/.test(r.why ?? ""),
+    "a keychain that is reachable but holds neither item does NOT pass", r.why);
+}
+{
+  const r = await sandboxCanary({ ...base, runner: runnerThat({ results: "no-open-probe" }) });
+  check(r.ok === false && /not probed by path/.test(r.why ?? ""),
+    "and a canary missing the deciding probe proves nothing rather than passing", r.why);
 }
 
 // ── the PERMISSION layer is part of the id ───────────────────────────────────
@@ -352,7 +427,8 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   const b = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, binaryId: "/x@2" });
   check(a !== b, "a swapped binary (same version) is a different id", `${a} ${b}`);
   const r = await sandboxCanary({ ...base, binaryId: "/x@1", runner: runnerThat() });
-  check(r.id === canaryIdFor({ cliVersion: base.cliVersion, sandbox: base.sandbox, binaryId: "/x@1", worktree: base.dir, permissionsDeny: base.permissionsDeny, allowedTools: base.allowedTools ?? null }),
+  check(r.id === canaryIdFor({ cliVersion: base.cliVersion, sandbox: base.sandbox, binaryId: "/x@1", worktree: base.dir, permissionsDeny: base.permissionsDeny,
+                              allowedTools: base.allowedTools ?? null, script: scriptOf(base) }),
     "and the canary carries the binary-aware id");
 }
 
@@ -360,7 +436,7 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
 {
   const r = await sandboxCanary({ ...base, runner: async ({ cwd, outPath }) => {
     writeFileSync(join(cwd, "INSIDE"), ""); writeFileSync(join(base.tmpDir, "TMP"), "");
-    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\nprobe=7\ndecoy=1\nsymlink=1\nfiledecoy=1\nfilecontrol=0\nkc_github=44\nkc_claude=44\nkc_helper=1\nkc_path_github=44\nkc_path_claude=44\n");
+    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\nprobe=7\ndecoy=1\nsymlink=1\nfiledecoy=1\nfilecontrol=0\nkc_github=44\nkc_claude=44\nkc_helper=1\nkc_path_github=44\nkc_path_claude=44\nkc_path_open=161\n");
     writeFileSync(join(cwd, "read-tool-out"), "DENIED"); writeFileSync(outPath, streamFor("denied", "denied"));
     rmSync(base.decoyPath, { force: true });   // a concurrent daemon deleted the shared decoy
     return { outcome: "ok", why: "completed" };
@@ -421,7 +497,7 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   const rewrite = async ({ cwd, outPath }) => {
     writeFileSync(join(cwd, "canary.sh"), "#!/bin/sh\n# rewritten by the worker\n");
     writeFileSync(join(cwd, "INSIDE"), ""); writeFileSync(join(base.tmpDir, "TMP"), "");
-    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\nprobe=7\ndecoy=1\nsymlink=1\nfiledecoy=1\nfilecontrol=0\nkc_github=44\nkc_claude=44\nkc_helper=1\nkc_path_github=44\nkc_path_claude=44\n");
+    writeFileSync(join(cwd, "canary-results.txt"), "inside=0\ntmp=0\noutside=1\ncurl=56\nprobe=7\ndecoy=1\nsymlink=1\nfiledecoy=1\nfilecontrol=0\nkc_github=44\nkc_claude=44\nkc_helper=1\nkc_path_github=44\nkc_path_claude=44\nkc_path_open=161\n");
     writeFileSync(join(cwd, "read-tool-out"), "DENIED"); writeFileSync(outPath, streamFor("denied", "denied"));
     return { outcome: "ok", why: "completed" };
   };

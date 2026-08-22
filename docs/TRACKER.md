@@ -164,9 +164,57 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       `CONTAINMENT.credentialRead === "open"` (escalation
       `guardian:containment:open`). PR-2 closes it or the founder picks a
       dedicated worker user.
-- [ ] **PR-2 (S1 sandbox)** — the two CLI measurements (sandbox under `-p`,
-      invalid settings under `-p`), `sandbox.*` settings + validation,
-      per-start canary, doctor R-13/R-14/R-15, escape test.
+- [ ] **PR-2 (S1 sandbox) — IN REVIEW, branch `feat/s1-sandbox`.** Both CLI
+      measurements are recorded (`docs/measured/2026-08-22-claude-print-mode.md`):
+      the `sandbox.*` block APPLIES under `-p` (network, outside writes,
+      `denyRead` incl. through symlinks, and `Read(...)` denies all hold), and
+      an INVALID settings file is dropped WHOLE and silently, deny rules
+      included. Shipped:
+      · **`sandbox.*` in every worker's settings** (`src/sandbox.mjs`):
+        enabled, failIfUnavailable, allowUnsandboxedCommands=false,
+        autoAllowBashIfSandboxed=false, no excluded commands; write scope =
+        worktree + the run's own tmp; network denied except research; the
+        credential paths are `denyRead` at the OS layer AND `Read(...)`-denied
+        for the Read tool the OS sandbox doesn't cover.
+      · **`validateSettings` before spawn** — a closed key-allowlist with exact
+        values; a refusal is a preparation failure (refund + backoff), never a
+        launch, because an invalid file would be silently ignored.
+      · **The sandbox canary** (`src/canary.mjs`): one throwaway worker per
+        (CLI build, block) runs a fixed script; the DAEMON reads the files it
+        left (writes outside, network, decoy reads — each with a positive
+        control), never the worker's word. Cached while it passes; a failure is
+        re-measured.
+      · **Measured containment** (`src/containment.mjs`): the static
+        `CONTAINMENT` constant is SUPERSEDED. Dispatch under `--execute` is
+        gated on `measureContainment` = canary pass **AND** an empty login
+        keychain of GitHub items **AND** a measured platform. Anything
+        unmeasured is open. Keychain probe is metadata-only (no `-w`/`-g`).
+      · **Doctor R-14 (canary) / R-15 (keychain)** — R-14 UNKNOWN with no
+        record, BROKEN on a failed canary, OK on a pass; R-15 DEGRADED (not
+        broken) while the keychain holds a credential: dispatch is gated,
+        observation/review unaffected.
+      · **Escape test** (`test/escape.test.mjs`) rewritten to measure every
+        shape twice — environment-only and UNDER THE SANDBOX (via the runtime's
+        own profile, `@anthropic-ai/sandbox-runtime` as a dev dep, no model).
+        The sandbox CLOSES the env-only holes (`--no-verify`,
+        `-c core.hooksPath=` pushes cannot land: destination is outside the
+        write scope; network denied). **Two KNOWN-OPEN remain under the sandbox
+        in a LINKED worktree:** (1) the shared ref store lets a worker move the
+        checkout's own branches; (2) `git -c credential.helper=osxkeychain
+        credential fill` returns the founder's token (securityd is hard-allowed
+        by the runtime's profile; no setting closes it).
+      Suite 57/57. **Codex round 1 (10 findings, 7 P1) all worked** — see the
+      defect log below. The verdict is now strictly harder to reach: dispatch
+      requires canary + platform + keychain-clean **AND** a declared isolated
+      worker (`worker.isolation: dedicated-user`), because the keychain probe is
+      necessary-not-sufficient (a token can hide under another service name) and
+      a linked worktree shares the checkout's git dir. **The ONE closure is a
+      dedicated worker OS user** (own empty keychain + own clone); clearing the
+      founder's keychain is no longer treated as sufficient. **Not flipped:**
+      `worker.isolation` defaults to `none`, so dispatch is refused; the
+      dedicated-user DISPATCH TOPOLOGY (per-run standalone clones owned by the
+      worker user) is **PR-3** — do not set the flag to `dedicated-user` before
+      PR-3 lands it.
 
 ### Founder actions pending
 
@@ -194,5 +242,15 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
 
 | Date | Defect | Fix |
 |---|---|---|
+| 2026-08-22 | PR-2 Codex round 8, 3 genuine (2×P1), all follow-ups on round 7's own fixes: the id normalisation was applied inside `sandboxCanary` but the CACHE key in `measureContainment` was still computed without the worktree, so the cache still never hit and every tick still paid a five-minute canary; the tamper cleanup ran `--unset-all` on a key the worker CHANGED rather than added, so tampering with `remote.origin.url` would have deleted the clone's real origin and left the main checkout unable to fetch or push; and the spawn-time refusal refunded the fix attempt while the pre-execution handler refunded it again, taking a cause from two spent attempts to zero and handing back retries the cap had spent | `worktree` threaded into the cache key; `restoreConfig` puts recorded values back (removing only keys the worker ADDED); the refund left solely to the `finally` handler |
+| 2026-08-22 | flake-dispatch and worker-contract asserted dispatch while `capacity()` reads the HOST load average — the same fragility fixed in dispatch-e2e last round, in two tests I had not covered; they passed only because the machine was quiet, and failed as soon as my own test runs loaded it | the `ctx.capacity` seam injected in both; all three dispatch tests proven green under 14 CPU burners |
+| 2026-08-22 | PR-2 Codex round 7, 6 genuine (4×P1), each a follow-up on round 6's own fixes. Reproduced by the reviewer: a worktree PRESERVED for tampering was re-acquired on the next tick, and `verifyWorktree`'s `git status` ran BEFORE any config check — a worker-added `.gitattributes` plus `filter.<name>.clean` (a shape `-c` cannot reach) executes as the daemon user. Also: a relative `--db` was opened fine but protected by nothing; the doctor overwrote today's generated `denyRead` with the RECORDED one, so a changed `risk.quarantinePaths` or `notify.credentialFile` left the hash equal and R-14 kept saying OK; `credentialPaths()` re-adds a non-default `REEVE_HOME`, so a layout with worktrees inside it denies the worker its own checkout and containment can never close; quarantine denies are rooted at the canary's per-invocation dir, so the canary id changed every tick and the cache never hit (a 5-minute model call per tick); and the canary only ever exercised DIRECTORY denies while production also relies on exact-FILE denies (the log, the database, ~/.gitconfig, the notify credential) | config verified BEFORE any git command on re-acquire, quarantine by rename with the offending keys stripped from the clone and `worktree prune` (my own test caught that renaming alone strands the branch forever); the check is key-aware, so reeve's own keys moving is a re-harden and anything else is tampering; `resolve()` on `--db`; the record keeps only the non-reconstructable state roots and doctor regenerates the rest from the profile; an overlapping state/worktree layout is named and refused; `normalisePolicy` rebases worktree-derived denies; and an exact-file decoy WITH a readable neighbour as its control, measured to hold under the real Seatbelt sandbox |
+| 2026-08-22 | PR-2 Codex round 6, 8 genuine (6×P1). The worst: a worker's `git config core.fsmonitor ./payload` would have been EXECUTED by the daemon's own unsandboxed `git status` before the push, as the daemon user — the hooksPath fix covered only the push. Also: a relative `--log` silently dropped every state deny (they are filtered to absolute) and handed the worker relative run/settings paths consumed after its cwd became the worktree; `Read(<file>/**)` denies descendants, so the log and database files stayed readable to the Read tool; the `--db` store and the `notify.credentialFile` were in no deny list at all; the canary accepted ANY `is_error` as a denial, so a malformed call could certify a boundary it never reached; the canary worker could rewrite `canary.sh` before running it; and R-14 compared only the stored binary, not the policy the daemon would generate now | neutralising `-c` flags on every daemon git call plus a config FINGERPRINT taken at harden and verified before any read/publish (refuses and preserves the worktree); `resolve()` on logPath at the single derivation point; file-and-subtree Read rules per state root; `--db` (+WAL/shm) and the notify credential threaded into the denies and required by the validator; a policy-refusal predicate (`isPolicyRefusal`) replacing bare `is_error`; `Write(./canary.sh)` denied plus a post-run script hash; `policyHashOf` recorded and compared, UNKNOWN when it cannot be reconstructed |
+| 2026-08-22 | PR-2 Codex round 5, 8 genuine (3×P1): git's XDG credential store (`~/.config/git/credentials`) was not denied — stripping `XDG_CONFIG_HOME` only restores the default location; `risk.quarantinePaths` were denied to the file TOOLS only, so a fixer holding `cat` could read a production dump and copy it into a source file the diff gate would pass; the canary probed outside-writes only through the shell, never the Write TOOL a real fixer holds; R-14 reported OK from a historical record even after the CLI was replaced; `revalidateContainment` read an async keychain injection as a pending Promise and refused every eligible worker; `dirname(logPath)` as a denied state root can be `$HOME`, which would deny the worktree itself; concurrent canary-state writes shared one `.tmp` path; and the cheap-gate skip still built a per-invocation canary tmp tree every tick that nothing cleaned up | `~/.config/git` denied; `quarantineOsDenies` (unrepresentable globs REFUSE the dispatch); `parseWriteProbe`; R-14 verifies the recorded binary identity, UNKNOWN when it cannot; awaited keychain; `stateRootsFor` names specific subtrees and never an ancestor of the worktree; per-process temp names; cheap gates run before any preparation |
+| 2026-08-22 | dispatch-e2e asserted "a worker was dispatched" while `capacity()` reads the HOST's load average, so a busy machine failed the suite for a reason that was not the code (found while chasing an apparent hang: the e2e also makes real `gh` calls per tick, so it is slow rather than hung) | a `ctx.capacity` seam; the e2e injects a deterministic capacity, proven by running it green under 12 CPU burners |
+| 2026-08-22 | PR-2 Codex round 4, 6 genuine (4×P1): the network control still bracketed the whole 5-min model run and depended on external reachability → replaced with a daemon-LOCAL listener the sandboxed curl must not reach (positive control, no external dep, no timing window; measured: the sandbox blocks loopback, and the escape test proves it against the real Seatbelt); the Read-path match still accepted any same-basename path → require a normalised EXACT match to the decoy; the per-spawn revalidation ran before `resolveWorktree`'s git fetch → moved to the last moment before `spawnWorker`; R-15 still read the isolation LABEL → now reads `isolationTopologyReady()` (false until PR-3); the run-state root (`dirname(logPath)`) was undenied under a non-default `--log` → threaded `stateRoots` into the worker settings + validator; the canary's working dirs were fixed per repo → per-invocation. (Round-4 findings 1-10 were stale re-reports, verified fixed.) | `netListener` positive control; exact `parseReadProbe`; revalidate-at-spawn; `isolationTopologyReady` in doctor; `stateRoots`; per-invocation canary dirs |
+| 2026-08-22 | PR-2 Codex round 3, 5 genuine P1: the `worker.isolation` LABEL was trusted, but dispatch still runs a linked worktree as this user (the dedicated-user topology is PR-3) → the label closes only when a `isolationTopologyReady()` seam says so, which hard-returns false until PR-3; `parseReadProbe` matched an empty path (`decoyPath.endsWith("")`) → require a nonempty exact/basename match; the per-tick verdict was reused for every spawn → `revalidateContainment` re-checks the CLI binary identity AND the keychain immediately before each spawn (`guardian:containment:changed`); the network control ran on the daemon's ambient proxy while the sandboxed curl runs proxy-stripped → run the control under the worker env. (Round-3 findings 1-8 were stale re-reports, verified fixed.) | `isolationTopologyReady`; exact `parseReadProbe`; `revalidateContainment` per spawn; worker-env `netReachable` |
+| 2026-08-22 | PR-2 Codex round 2, 6 genuine (4×P1): the Read-tool probe trusted a worker-written file (a model can write `DENIED` without calling Read) → judge it from the event stream (Read tool_use on the decoy + a denied result); the network control was sampled once, 5 min after the sandboxed curl → bracket it before AND after; `CREDENTIAL_PATHS` hard-coded `~/.reeve` while `REEVE_HOME` can move the state root → deny the configured root; the paid canary ran even when a cheaper reason already opened containment → short-circuit; doctor R-15 read OK on an empty keychain though the daemon refuses without `worker.isolation` → R-15 DEGRADED until isolated; `nwo.replace("/","-")` collides (`foo-bar/baz` vs `foo/bar-baz`) → nested `owner/repo.json`. (Round-2 findings 1-7 were stale re-reports of round 1, verified fixed + CI-green.) | `parseReadProbe`; bracketed `netReachable`; `credentialPaths()`; canary short-circuit; `checkKeychain` isolation; injective `canaryStatePath` |
+| 2026-08-22 | PR-2 Codex round 1, 7×P1: canary prompt ran `sh ./canary.sh .` but the grant was exact `Bash(sh ./canary.sh)` → every real canary refused, `--execute` permanently blocked; worker `GIT_CONFIG_GLOBAL` under deny-read `~/.reeve` → sandboxed git can't read its own config → no commits; canary exercised only Bash `cp`, never the Read-tool deny; any nonzero curl read as network-denied (also true offline); two daemons shared one decoy (ENOENT read as denial); keychain probe of two items can't certify a shared account; a linked-worktree worker can plant a hook the daemon's push runs unsandboxed. 3×P2: canary id ignored the binary identity; doctor read the canary from a different dir than the daemon wrote it; measured-closed test only passed on macOS | grant `:*`; git config → run tmp; Read-tool probe with a sentinel; network positive control; per-run decoy + existence check; `worker.isolation` gate (dedicated-user only); `pushWorktree -c core.hooksPath=/dev/null`; binaryId in the canary id; `canaryStateDir` shared by daemon+doctor; test pins the platform |
 | 2026-08-21 | Watcher reported "unclassified verdict: gap" for a PR green everywhere but refused by GitHub's approving-review requirement (live on #1129) — a routine needs-a-human state read as a broken classifier | `a5344dd` + `ESCALATIONS.PROTECTION_UNMET` |
 | 2026-08-21 | `shadow`'s case label captured `status`/`statusline`/`dash` — all three printed the shadow report since PR-4 landed; no test covered CLI routing | `c80f0a3` + `test/cli-routing.test.mjs` |

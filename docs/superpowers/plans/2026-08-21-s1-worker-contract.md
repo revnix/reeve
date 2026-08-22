@@ -1315,7 +1315,7 @@ git push origin main
 
 # PR-2: S1 sandbox
 
-### Task 11: Measure the two unknowns about print mode
+### Task 11: Measure the two unknowns about print mode  (DONE, PR-2)
 
 **Files:**
 - Create: `docs/measured/2026-08-22-claude-print-mode.md`
@@ -1356,7 +1356,7 @@ Record: the process exit code, whether any validation error was printed, and whe
 
 ---
 
-### Task 12: The OS-sandbox settings block and pre-spawn validation
+### Task 12: The OS-sandbox settings block and pre-spawn validation  (DONE, PR-2)
 
 **Files:**
 - Modify: `src/sandbox.mjs` (`sandboxFor` return, new `validateSettings`), `src/daemon.mjs` (call `validateSettings` before `writeSandbox`)
@@ -1444,7 +1444,7 @@ In the daemon, before `writeSandbox`: `const sv = (ctx.settingsValidator ?? vali
 
 ---
 
-### Task 13: The sandbox canary, once per contract per daemon start
+### Task 13: The sandbox canary, once per contract per daemon start  (DONE, PR-2)
 
 **Files:**
 - Create: `src/canary.mjs`
@@ -1460,7 +1460,7 @@ In the daemon, before `writeSandbox`: `const sv = (ctx.settingsValidator ?? vali
 
 ---
 
-### Task 14: Doctor R-13 baseline drift, R-14 subscription-auth probe, R-15 canary
+### Task 14: Doctor R-13 baseline drift, R-14 subscription-auth probe, R-15 canary  (DONE, PR-2)
 
 **Files:**
 - Modify: `src/doctor.mjs` (three new checks appended to the check list)
@@ -1473,7 +1473,7 @@ In the daemon, before `writeSandbox`: `const sv = (ctx.settingsValidator ?? vali
 
 ---
 
-### Task 15: The real non-publishing escape test
+### Task 15: The real non-publishing escape test  (DONE, PR-2)
 
 **Files:**
 - Create: `test/escape.test.mjs`
@@ -1487,7 +1487,7 @@ In the daemon, before `writeSandbox`: `const sv = (ctx.settingsValidator ?? vali
 
 ---
 
-### Task 16: PR-2 close-out
+### Task 16: PR-2 close-out  (docs DONE; merge + daemon restart pending review)
 
 - [ ] Update `docs/TRACKER.md` (PR-2 landed, S1 complete, S2 next), `docs/HANDOFF.md` §6 (one paragraph: the worker contract landed, what it enforces, what remains unmeasured on other platforms), `docs/USING-REEVE.md` §5 table. Restart the daemon; confirm a clean tick and a passing R-14/R-15 in `reeve doctor nextlyhq/nextly --as-app`. Commit `docs: worker contract complete (S1)`.
 

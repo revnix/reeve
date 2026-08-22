@@ -7,10 +7,10 @@
 // This drives a whole tick with the collaborators stubbed, which is the
 // integration the audit named as missing: daemon -> durable run -> worker ->
 // finish, and the refusal to re-dispatch work already in flight.
-import { tick } from "../src/daemon.mjs";
-import { open, liveRunFor, countFixAttempts } from "../src/db/ops.mjs";
+import { tick, stateRootsFor } from "../src/daemon.mjs";
+import { open, liveRunFor, countFixAttempts, recordFixAttempt } from "../src/db/ops.mjs";
 import { causeKey } from "../src/ci-rootcause.mjs";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -50,9 +50,15 @@ let spawned = [];
 const baseCtx = () => ({
   nwo: "o/r", profile, db: open(dbPath), logPath,
   execute: true, shadow: true, running: 0,
+  // Deterministic: the real capacity() backs off on the host's load average, so
+  // a busy machine would fail these assertions for a reason that is not the code.
+  capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
   // The tests below exercise dispatch, so they declare what the real module
   // cannot yet: a closed credential read. The default refuses; see the last case.
   containment: { credentialRead: "closed", why: "test" },
+  // The per-spawn revalidation re-probes the keychain; injected clean here so
+  // the default-closed cases dispatch. Cases that test an open verdict override.
+  keychain: { measured: true, items: [], why: null },
   // The worker is stubbed, so no CLI is resolved or launched: the seam is
   // given an absolute path and a version, which is what a real dispatch records.
   claudeBin: "/bin/sh", cliVersion: "test",
@@ -134,24 +140,36 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 }
 
 
-// --- the default refuses to dispatch while the credential read is open ------
+// --- containment is MEASURED, and an open verdict refuses dispatch ----------
 //
-// workerenv.mjs declares CONTAINMENT.credentialRead = "open" until a measured
-// mechanism closes it. A daemon started with --execute must not launch a worker
-// that can read the founder's token; it says so, once, as an identity.
+// The verdict comes from containment.mjs: the sandbox canary must pass and the
+// login keychain must hold no GitHub credential. The measurement's two inputs
+// are injected here (ctx.canary, ctx.keychain); the wiring from verdict to
+// dispatch is what this case proves. A daemon started with --execute must not
+// launch a worker that can read the founder's token; it says so, once, as an
+// identity.
 {
   const dir4 = mkdtempSync(join(tmpdir(), "reeve-e2e-contain-"));
-  const ctx4 = { ...baseCtx(), db: open(join(dir4, "c.db")), logPath: join(dir4, "log.txt"), worktreeFor: () => mkdtempSync(join(dir4, "wt-")) };
-  delete ctx4.containment;          // the real module's declaration applies
+  const ctx4 = { ...baseCtx(), db: open(join(dir4, "c.db")), logPath: join(dir4, "log.txt"), worktreeFor: () => mkdtempSync(join(dir4, "wt-")),
+                 // No cheaper reason, so the canary is the gate that runs and fails:
+                 // measured platform, an isolated (verified) worker, an empty keychain.
+                 platform: "darwin",
+                 profile: { ...profile, worker: { isolation: "dedicated-user" } },
+                 isolationReady: () => true,
+                 canary: async () => ({ ok: false, id: "planted", why: "planted: wrote outside the worktree", evidence: {} }),
+                 keychain: { measured: true, items: [], why: null } };
+  delete ctx4.containment;          // measured, not declared
   let launched = 0;
   ctx4.spawnWorker = async () => { launched++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
   const r4 = await tick(ctx4);
-  check(launched === 0, "no worker launches under the real containment declaration", String(launched));
+  check(launched === 0, "no worker launches while the measured containment is open (canary failed)", String(launched));
   const keys = [...(r4.escalations?.keys() ?? [])];
   check(keys.includes("guardian:containment:open"), "and the refusal is a standing escalation with an identity key", keys.join(" | "));
   check(!/open \d|\d+ worker/.test(keys.join(" ")), "the key carries no counts", keys.join(" | "));
   const log4 = readFileSync(join(dir4, "log.txt"), "utf8");
-  check(/NOT dispatching/.test(log4) && /credential/.test(log4), "the log names the reason", log4.split("\n").filter(l => /dispatch/.test(l)).join(" | ").slice(0, 300));
+  check(/NOT dispatching/.test(log4) && /canary planted failed: planted: wrote outside/.test(log4), "the log names the measured reason", log4.split("\n").filter(l => /dispatch/.test(l)).join(" | ").slice(0, 300));
+  check(existsSync(join(dir4, "canary", "o", "r.json")) && JSON.parse(readFileSync(join(dir4, "canary", "o", "r.json"), "utf8")).ok === false,
+    "and the canary's result is persisted for the doctor", "");
   // Every action promptFor can dispatch is a worker task, SPILL included; the
   // refusal must count them from one shared list, not a hand-copied subset.
   const { WORKER_ACTIONS, UNBUILT_ACTIONS } = await import("../src/prompts.mjs");
@@ -164,6 +182,226 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   check(/WORKER_ACTIONS\.includes\(d\.decision\.action\)/.test(dsrc), "and the containment refusal filters by that list", "");
   ctx4.db.close();
   rmSync(dir4, { recursive: true, force: true });
+}
+
+// --- a GitHub credential in the keychain keeps it open whatever the canary said
+{
+  const dirK = mkdtempSync(join(tmpdir(), "reeve-e2e-keychain-"));
+  const ctxK = { ...baseCtx(), db: open(join(dirK, "k.db")), logPath: join(dirK, "log.txt"), worktreeFor: () => mkdtempSync(join(dirK, "wt-")),
+                 canary: async () => ({ ok: true, id: "good", why: null, evidence: {} }),
+                 keychain: { measured: true, items: ["generic password gh:github.com (gh keyring)"], why: "the login keychain holds: generic password gh:github.com (gh keyring)" } };
+  delete ctxK.containment;
+  let launchedK = 0;
+  ctxK.spawnWorker = async () => { launchedK++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  const rK = await tick(ctxK);
+  check(launchedK === 0 && [...rK.escalations.keys()].includes("guardian:containment:open"), "a passing canary does not close what the keychain holds open", String(launchedK));
+  check(/gh keyring/.test(readFileSync(join(dirK, "log.txt"), "utf8")), "and the log names the keychain item", "");
+  ctxK.db.close();
+  rmSync(dirK, { recursive: true, force: true });
+}
+
+// --- measured closed: the canary passed, the keychain is empty, a worker runs
+//
+// The positive control for the two refusals above, and the proof that the
+// measurement is wired to dispatch rather than beside it. The canary runs
+// ONCE per (CLI, block): a second tick under the same daemon context does not
+// run it again.
+{
+  const dirC = mkdtempSync(join(tmpdir(), "reeve-e2e-closed-"));
+  let canaryRuns = 0;
+  const ctxC = { ...baseCtx(), db: open(join(dirC, "c.db")), logPath: join(dirC, "log.txt"), worktreeFor: () => mkdtempSync(join(dirC, "wt-")),
+                 // Forced so the case runs the same on every CI OS: it tests the
+                 // canary+keychain wiring, not the per-OS platform gate (that is
+                 // its own case below).
+                 platform: "darwin",
+                 // A declared isolated worker AND a verified-ready topology are
+                 // required to close dispatch; this is the positive control.
+                 profile: { ...profile, worker: { isolation: "dedicated-user" } },
+                 isolationReady: () => true,
+                 canary: async () => { canaryRuns++; return { ok: true, id: "good", why: null, evidence: {} }; },
+                 keychain: { measured: true, items: [], why: null } };
+  delete ctxC.containment;
+  let launchedC = 0;
+  ctxC.spawnWorker = async () => { launchedC++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  const rC = await tick(ctxC);
+  check(launchedC === 1, "measured closed: a worker is dispatched", String(launchedC));
+  check(![...rC.escalations.keys()].includes("guardian:containment:open"), "and no containment escalation stands", [...rC.escalations.keys()].join(" | "));
+  check(canaryRuns === 1, "the canary ran exactly once", String(canaryRuns));
+  const stateC = JSON.parse(readFileSync(join(dirC, "canary", "o", "r.json"), "utf8"));
+  check(stateC.ok === true && stateC.id === "good", "the passing result is persisted", JSON.stringify(stateC));
+  await tick(ctxC);
+  check(canaryRuns === 1, "a second tick reuses the passing canary", String(canaryRuns));
+  ctxC.db.close();
+  rmSync(dirC, { recursive: true, force: true });
+}
+
+// --- the database and a relative log are protected state, not blind spots -----
+{
+  // [7] --db can point anywhere; the store holds the event history and prompts.
+  const withDb = stateRootsFor("/s", "/s/reeve.log", "/wt", "/elsewhere/state.db");
+  check(withDb.includes("/elsewhere/state.db") && withDb.includes("/elsewhere/state.db-wal") && withDb.includes("/elsewhere/state.db-shm"),
+    "the selected database and its WAL/shm files are protected state", JSON.stringify(withDb));
+  // [1] a relative --log used to drop EVERY state deny, because they are filtered
+  // to absolute paths, and hand the worker relative run paths besides.
+  const rel = stateRootsFor("/s", "reeve.log", "/wt", null);
+  check(!rel.some(p => !p.startsWith("/")), "no relative path survives into the deny list", JSON.stringify(rel));
+}
+
+// --- a worker that changed its checkout's git config is not read from ---------
+//
+// core.fsmonitor names a program git RUNS, and the daemon's `git status` is
+// unsandboxed. Nothing is read and nothing is published from such a worktree.
+{
+  const dirG = mkdtempSync(join(tmpdir(), "reeve-e2e-cfgtamper-"));
+  const ctxG = { ...baseCtx(), db: open(join(dirG, "g.db")), logPath: join(dirG, "log.txt"), worktreeFor: () => mkdtempSync(join(dirG, "wt-")),
+                 verifyConfig: () => ({ ok: false, why: "planted: the worker changed the repository's git configuration" }) };
+  let pushedG = 0;
+  ctxG.spawnWorker = async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" });
+  const rG = await tick(ctxG);
+  const logG = readFileSync(join(dirG, "log.txt"), "utf8");
+  check(/NOT reading or publishing this worktree/.test(logG), "the tick refuses to read or publish that worktree", logG.split("\n").filter(l => /#42/.test(l)).slice(-2).join(" | ").slice(0, 200));
+  check(!/published/.test(logG) && pushedG === 0, "nothing is published", "");
+  check([...rG.escalations.keys()].includes("guardian:worktree:config-tampered"), "and it escalates under an identity key", [...rG.escalations.keys()].join(" | "));
+  ctxG.db.close();
+  rmSync(dirG, { recursive: true, force: true });
+}
+
+// --- an already-open verdict prepares nothing (no canary litter per tick) -----
+//
+// With the default worker.isolation: none the canary can never run, so building
+// its per-invocation tmp tree would litter the worktree root on every tick with
+// directories nothing ever cleans up. (Codex #4e-[9].)
+{
+  const dirN = mkdtempSync(join(tmpdir(), "reeve-e2e-nolitter-"));
+  const wtRoot = mkdtempSync(join(tmpdir(), "reeve-e2e-wtroot-"));
+  const ctxN = { ...baseCtx(), db: open(join(dirN, "n.db")), logPath: join(dirN, "log.txt"), worktreeFor: () => mkdtempSync(join(dirN, "wt-")),
+                 platform: "darwin",
+                 profile: { ...profile, identity: { ...profile.identity, worktreeRoot: wtRoot } },
+                 keychain: { measured: true, items: [], why: null } };   // isolation stays "none" -> already open
+  delete ctxN.containment;
+  let launchedN = 0, canaryRunsN = 0;
+  ctxN.canary = async () => { canaryRunsN++; return { ok: true, id: "x", why: null, evidence: {} }; };
+  ctxN.spawnWorker = async () => { launchedN++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  await tick(ctxN);
+  check(launchedN === 0 && canaryRunsN === 0, "an already-open verdict runs no canary at all", `launched=${launchedN} canary=${canaryRunsN}`);
+  check(!existsSync(join(wtRoot, ".reeve-canary")), "and leaves no canary working directories behind", readdirSync(wtRoot).join(","));
+  ctxN.db.close();
+  rmSync(dirN, { recursive: true, force: true }); rmSync(wtRoot, { recursive: true, force: true });
+}
+
+// --- the isolation LABEL alone does not close: the topology must be verified ---
+//
+// worker.isolation=dedicated-user with an un-built topology (the daemon still
+// runs a linked worktree as this user) must not dispatch. (Codex #4c-[9].)
+{
+  const dirL = mkdtempSync(join(tmpdir(), "reeve-e2e-label-"));
+  const ctxL = { ...baseCtx(), db: open(join(dirL, "l.db")), logPath: join(dirL, "log.txt"), worktreeFor: () => mkdtempSync(join(dirL, "wt-")),
+                 platform: "darwin", profile: { ...profile, worker: { isolation: "dedicated-user" } },
+                 canary: async () => ({ ok: true, id: "good", why: null, evidence: {} }),
+                 keychain: { measured: true, items: [], why: null } };   // NOTE: no isolationReady -> topology not built
+  delete ctxL.containment;
+  let launchedL = 0;
+  ctxL.spawnWorker = async () => { launchedL++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  const rL = await tick(ctxL);
+  check(launchedL === 0 && [...rL.escalations.keys()].includes("guardian:containment:open"), "the isolation label alone, without a verified topology, does not dispatch", String(launchedL));
+  check(/no isolated worker/.test(readFileSync(join(dirL, "log.txt"), "utf8")), "and the log says the isolation is not satisfied", "");
+  ctxL.db.close();
+  rmSync(dirL, { recursive: true, force: true });
+}
+
+// --- a rejected spawn refunds its attempt exactly ONCE -----------------------
+//
+// The spawn-time refusal and the pre-execution handler both refund, so doing it
+// in both places took a cause from two spent attempts down to zero and handed
+// back retries the cap had already spent.
+{
+  const dirR = mkdtempSync(join(tmpdir(), "reeve-e2e-refund-"));
+  const fpR = causeKey("o/r", CAUSE);
+  const ctxR = { ...baseCtx(), db: open(join(dirR, "r.db")), logPath: join(dirR, "log.txt"), worktreeFor: () => mkdtempSync(join(dirR, "wt-")),
+                 // A closed verdict whose binary identity no longer matches: the
+                 // spawn is refused after the run row and the attempt exist.
+                 containment: { credentialRead: "closed", why: "test", binaryId: "/some/other/claude@999" },
+                 // The cap must allow a SECOND dispatch, or the pre-seeded attempt
+                 // exhausts it and the tick escalates without ever reaching the
+                 // spawn — the fixture would then pass whatever the refund does.
+                 profile: { ...profile, rounds: { ...profile.rounds, maxFixAttemptsPerFinding: 3 } } };
+  // One genuine attempt already spent on this cause.
+  recordFixAttempt(ctxR.db, "o/r", 42, fpR);
+  const before = countFixAttempts(ctxR.db, "o/r", 42, fpR);
+  check(before === 1, "control: one attempt is on the ledger before the tick", String(before));
+  ctxR.spawnWorker = async () => ({ outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" });
+  await tick(ctxR);
+  const after = countFixAttempts(ctxR.db, "o/r", 42, fpR);
+  check(after === before, "a refused spawn refunds only its OWN attempt, leaving the earlier one spent", `${before} -> ${after}`);
+  ctxR.db.close();
+  rmSync(dirR, { recursive: true, force: true });
+}
+
+// --- a CLI binary swapped after the verdict is refused at the spawn -----------
+{
+  const dirB = mkdtempSync(join(tmpdir(), "reeve-e2e-binswap-"));
+  const ctxB = { ...baseCtx(), db: open(join(dirB, "b.db")), logPath: join(dirB, "log.txt"), worktreeFor: () => mkdtempSync(join(dirB, "wt-")),
+                 // A closed verdict whose binary identity differs from the one the
+                 // spawn resolves (/bin/sh) -> the per-spawn re-check refuses.
+                 containment: { credentialRead: "closed", why: "test", binaryId: "/some/other/claude@999" } };
+  let launchedB = 0;
+  ctxB.spawnWorker = async () => { launchedB++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  const rB = await tick(ctxB);
+  check(launchedB === 0 && [...rB.escalations.keys()].includes("guardian:containment:changed"), "a CLI binary that changed since the verdict refuses the spawn", String(launchedB));
+  check(/CLI binary changed/.test(readFileSync(join(dirB, "log.txt"), "utf8")), "and the log names the binary change", "");
+  ctxB.db.close();
+  rmSync(dirB, { recursive: true, force: true });
+}
+
+// --- a credential that appears after the verdict is caught at the spawn --------
+{
+  const dirK2 = mkdtempSync(join(tmpdir(), "reeve-e2e-credappear-"));
+  const ctxK2 = { ...baseCtx(), db: open(join(dirK2, "k.db")), logPath: join(dirK2, "log.txt"), worktreeFor: () => mkdtempSync(join(dirK2, "wt-")),
+                  // Verdict was closed, but the keychain now holds an item.
+                  keychain: { measured: true, items: ["generic password gh:github.com (gh keyring)"], why: "appeared" } };
+  let launchedK2 = 0;
+  ctxK2.spawnWorker = async () => { launchedK2++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  const rK2 = await tick(ctxK2);
+  check(launchedK2 === 0 && [...rK2.escalations.keys()].includes("guardian:containment:changed"), "a credential that appeared after the verdict refuses the spawn", String(launchedK2));
+  check(/credential appeared/.test(readFileSync(join(dirK2, "log.txt"), "utf8")), "and the log says a credential appeared", "");
+  ctxK2.db.close();
+  rmSync(dirK2, { recursive: true, force: true });
+}
+
+// --- the denied state roots are SPECIFIC, never an ancestor of the worktree --
+//
+// With `--log ~/reeve.log`, dirname(logPath) is the home directory: denying it
+// would deny the very checkout the fixer was dispatched to read. The boundary
+// must contain the worker, not break the work. (Codex #4e-[5].)
+{
+  const roots = stateRootsFor("/Users/x", "/Users/x/reeve.log", "/Users/x/code/repo/wt");
+  check(!roots.includes("/Users/x"), "the log's PARENT directory is never denied wholesale", JSON.stringify(roots));
+  check(roots.includes("/Users/x/reeve.log") && roots.includes("/Users/x/runs") && roots.includes("/Users/x/canary") && roots.includes("/Users/x/backups"),
+    "the log file and reeve's own subtrees are denied by name", JSON.stringify(roots));
+  const anc = stateRootsFor("/Users/x/code", "/Users/x/code/reeve.log", "/Users/x/code/runs/wt");
+  check(!anc.includes("/Users/x/code/runs"), "a root that is an ancestor of the worktree is dropped rather than breaking the fixer", JSON.stringify(anc));
+}
+
+// --- an unmeasured platform stays open even with both probes green -----------
+//
+// The fail-closed matrix is per-OS: a sandbox measured on macOS says nothing
+// about Linux or Windows, so a host reeve has not measured is refused whatever
+// the canary and keychain say. This is the guard that makes "measured" mean the
+// platform too, not just the two probes.
+{
+  const dirP = mkdtempSync(join(tmpdir(), "reeve-e2e-platform-"));
+  const ctxP = { ...baseCtx(), db: open(join(dirP, "p.db")), logPath: join(dirP, "log.txt"), worktreeFor: () => mkdtempSync(join(dirP, "wt-")),
+                 platform: "win32",
+                 canary: async () => ({ ok: true, id: "good", why: null, evidence: {} }),
+                 keychain: { measured: true, items: [], why: null } };
+  delete ctxP.containment;
+  let launchedP = 0;
+  ctxP.spawnWorker = async () => { launchedP++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  const rP = await tick(ctxP);
+  check(launchedP === 0 && [...rP.escalations.keys()].includes("guardian:containment:open"), "an unmeasured platform refuses dispatch though both probes are green", String(launchedP));
+  check(/unmeasured on win32/.test(readFileSync(join(dirP, "log.txt"), "utf8")), "and the log names the platform", "");
+  ctxP.db.close();
+  rmSync(dirP, { recursive: true, force: true });
 }
 
 // --- a heartbeat that cannot be written revokes too ---------------------------
@@ -210,6 +448,51 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(dir6, { recursive: true, force: true });
 }
 
+
+// --- settings that fail validation never reach a worker ----------------------
+//
+// Measured: under -p the CLI drops an invalid settings file WHOLE and silently,
+// deny rules included. A worker launched on one would run with no boundary and
+// a contract row claiming otherwise. The validator runs before the file is
+// written; a refusal is a preparation failure: no launch, refund, the reason
+// in the log.
+{
+  const dirS = mkdtempSync(join(tmpdir(), "reeve-e2e-settings-"));
+  const ctxS = { ...baseCtx(), db: open(join(dirS, "s.db")), logPath: join(dirS, "log.txt"), worktreeFor: () => mkdtempSync(join(dirS, "wt-")),
+                 settingsValidator: () => ({ ok: false, errors: ["planted: sandbox.enabled must be true"] }) };
+  let launchedS = 0;
+  ctxS.spawnWorker = async () => { launchedS++; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  await tick(ctxS);
+  check(launchedS === 0, "no worker launches when the generated settings fail validation", String(launchedS));
+  const logS = readFileSync(join(dirS, "log.txt"), "utf8");
+  check(/settings invalid: planted/.test(logS), "the log carries the validator's reason", logS.split("\n").filter(l => /#42/.test(l)).slice(-2).join(" | ").slice(0, 300));
+  const prDirS = join(dirS, "runs", "o-r", "42");
+  const writtenS = existsSync(prDirS) ? readdirSync(prDirS).filter(d => existsSync(join(prDirS, d, "sandbox-settings.json"))) : [];
+  check(writtenS.length === 0, "and no settings file was written for the refused run", JSON.stringify(writtenS));
+  check((ctxS.db.prepare("SELECT COALESCE(SUM(attempts),0) n FROM fix_attempt").get().n) === 0, "the attempt is refunded", "");
+  ctxS.db.close();
+  rmSync(dirS, { recursive: true, force: true });
+}
+
+// --- and the real validator accepts what the real policy generates -----------
+//
+// A seam that is only ever stubbed proves the seam, not the pair. One dispatch
+// with the default validator, asserting that a worker WAS launched, is the
+// positive control for every stubbed case above and below.
+{
+  const dirV = mkdtempSync(join(tmpdir(), "reeve-e2e-validator-"));
+  const ctxV = { ...baseCtx(), db: open(join(dirV, "v.db")), logPath: join(dirV, "log.txt"), worktreeFor: () => mkdtempSync(join(dirV, "wt-")) };
+  let launchedV = 0, settingsSeen = null;
+  ctxV.spawnWorker = async (args) => { launchedV++; const i = args.args.indexOf("--settings"); settingsSeen = i >= 0 ? JSON.parse(readFileSync(args.args[i + 1], "utf8")) : null; return { outcome: "ok", why: "d", ms: 1, cost: 0, sessionId: "s" }; };
+  await tick(ctxV);
+  check(launchedV === 1, "control: the default validator accepts the generated settings and a worker launches", String(launchedV));
+  check(settingsSeen?.sandbox?.enabled === true && settingsSeen?.sandbox?.failIfUnavailable === true,
+    "and the file the worker received carries the sandbox block", JSON.stringify(settingsSeen?.sandbox)?.slice(0, 200));
+  check(Array.isArray(settingsSeen?.sandbox?.filesystem?.allowWrite) && settingsSeen.sandbox.filesystem.allowWrite.length === 1 && settingsSeen.sandbox.filesystem.allowWrite[0].endsWith("/tmp"),
+    "whose only write grant is the run's own tmp", JSON.stringify(settingsSeen?.sandbox?.filesystem?.allowWrite));
+  ctxV.db.close();
+  rmSync(dirV, { recursive: true, force: true });
+}
 
 // --- a cooperative cancel closes the run as abandoned, never as failed ------
 {

@@ -18,13 +18,138 @@
 // administrative files behind pointing at nothing.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, renameSync, writeFileSync, rmSync, chmodSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, writeFileSync, readFileSync, rmSync, chmodSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, basename, dirname } from "node:path";
+
+/**
+ * Git configuration that makes git RUN something. A worker holds an unrestricted
+ * `git` grant inside its worktree, and several config keys are documented as
+ * invoking a program: `core.fsmonitor` (a pathname is run as a hook),
+ * `core.hooksPath`, the pagers and editors, `diff.external`, `core.sshCommand`,
+ * the pack hooks, and credential helpers. Every one of those would execute as
+ * the DAEMON user the moment reeve ran `git status` in that worktree, outside
+ * the sandbox. Command-line `-c` beats repository config, so every daemon git
+ * command in worker-controlled directories is prefixed with these.
+ * (Codex #4f-[6].)
+ *
+ * `-c` cannot blanket-clear `filter.<name>.clean`, whose driver name comes from
+ * the repository's own .gitattributes, so the fingerprint check below is what
+ * actually closes this: the daemon refuses to run git at all in a worktree whose
+ * configuration the worker changed.
+ */
+const NEUTRALISE = [
+  "-c", "core.fsmonitor=",
+  "-c", "core.hooksPath=/dev/null",
+  "-c", "core.pager=cat",
+  "-c", "core.editor=true",
+  "-c", "sequence.editor=true",
+  "-c", "core.sshCommand=",
+  "-c", "core.askPass=",
+  "-c", "diff.external=",
+  "-c", "uploadpack.packObjectsHook=",
+  "-c", "credential.helper=",
+  "-c", "protocol.ext.allow=never",
+];
 
 function git(cwd, args) {
   try {
-    return { ok: true, out: execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() };
+    return { ok: true, out: execFileSync("git", ["-C", cwd, ...NEUTRALISE, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim() };
   } catch (e) { return { ok: false, out: "", err: reason(String(e.stderr || e.message)) }; }
+}
+
+/** The exported prefix, so every other daemon git call can use the same one. */
+export const GIT_NEUTRALISE = NEUTRALISE;
+
+/**
+ * The repository's configuration as entries, shared and worktree-scoped. Taken
+ * when reeve creates or re-hardens the worktree, and compared before the daemon
+ * runs any other git command in it.
+ *
+ * Entries, not a hash, because WHICH key changed decides what it means: reeve
+ * sets three of them itself and a daemon upgrade legitimately re-writes them,
+ * while a key reeve does not own appearing in a worker's checkout is the thing
+ * this exists to catch.
+ */
+export function configEntries(path) {
+  const out = {};
+  for (const scope of ["--local", "--worktree"]) {
+    const r = git(path, ["config", scope, "--list"]);
+    out[scope] = r.ok ? r.out.split("\n").filter(Boolean).sort() : [];
+  }
+  return out;
+}
+
+/** The keys reeve writes itself; git lowercases key names in `--list`. */
+const REEVE_OWNED = new Set(["extensions.worktreeconfig", "remote.origin.pushurl", "core.hookspath"]);
+
+const keyOf = line => line.slice(0, line.indexOf("=")).toLowerCase();
+
+const fingerprintPath = path => `${path}.cfg`;
+
+/**
+ * Put the named keys back to the values reeve recorded for this clone.
+ *
+ * A blanket `--unset-all` was wrong for a key the worker CHANGED rather than
+ * added: tampering with `remote.origin.url` would have deleted the real origin
+ * and left the main checkout unable to fetch or push. A key that was absent from
+ * the baseline is removed; a key that was present is restored to its recorded
+ * values, in order. (Codex #4h-[2].)
+ */
+export function restoreConfig(repoRoot, worktreePath, keys) {
+  let recorded = null;
+  try { recorded = JSON.parse(readFileSync(fingerprintPath(worktreePath), "utf8")); } catch { recorded = null; }
+  const baseline = new Map();
+  for (const line of recorded?.["--local"] ?? []) {
+    const i = line.indexOf("=");
+    if (i < 0) continue;
+    const k = line.slice(0, i).toLowerCase();
+    if (!baseline.has(k)) baseline.set(k, []);
+    baseline.get(k).push(line.slice(i + 1));
+  }
+  for (const k of keys) {
+    git(repoRoot, ["config", "--local", "--unset-all", k]);
+    for (const v of baseline.get(k) ?? []) git(repoRoot, ["config", "--local", "--add", k, v]);
+  }
+}
+
+/**
+ * Move a directory aside without running git in it. The normal release path
+ * asks git about stashes and unpushed work; that is exactly what must not happen
+ * when the repository's configuration is the thing under suspicion.
+ */
+export function quarantineByRename(path) {
+  const dest = `${path}.quarantined-${Date.now()}`;
+  try { renameSync(path, dest); return dest; } catch { return null; }
+}
+
+/** Record the configuration beside the worktree (outside it, where the sandbox denies writes). */
+export function recordConfig(path) {
+  try { writeFileSync(fingerprintPath(path), JSON.stringify(configEntries(path))); return true; } catch { return false; }
+}
+
+/**
+ * Has the repository configuration changed since reeve created the worktree?
+ * An unreadable record is a refusal, not a pass: without the baseline there is
+ * no way to say the config is the one reeve wrote.
+ */
+export function verifyConfig(path) {
+  let recorded = null;
+  try { recorded = JSON.parse(readFileSync(fingerprintPath(path), "utf8")); } catch { return { ok: false, keys: [], why: "no recorded git configuration to compare against" }; }
+  const now = configEntries(path);
+  const foreign = new Set();
+  for (const scope of ["--local", "--worktree"]) {
+    const before = new Set(recorded[scope] ?? []), after = new Set(now[scope] ?? []);
+    for (const line of [...before].filter(l => !after.has(l)).concat([...after].filter(l => !before.has(l)))) {
+      const k = keyOf(line);
+      // reeve's own keys move when a daemon re-hardens a worktree it made
+      // earlier; hardening re-writes them and records the result. Anything else
+      // appearing or changing came from the worker.
+      if (!REEVE_OWNED.has(k)) foreign.add(k);
+    }
+  }
+  if (foreign.size) return { ok: false, keys: [...foreign], why: `the worker changed repository git configuration reeve does not own (${[...foreign].slice(0, 3).join(", ")}), which git would execute` };
+  return { ok: true, keys: [], why: null };
 }
 
 /**
@@ -114,6 +239,9 @@ function hardenOrThrow(repoRoot, path) {
   if (!readPu.ok || readPu.out !== "reeve://refused-the-worker-does-not-publish") throw new Error("pushurl did not read back");
   if (!readHp.ok || readHp.out !== hooks || !existsSync(join(hooks, "pre-push"))) throw new Error("hooksPath or hook did not read back");
   if ((statSync(join(hooks, "pre-push")).mode & 0o111) === 0) throw new Error("the hook is not executable");
+  // The configuration reeve just wrote is the baseline every later daemon git
+  // command in this worktree is checked against.
+  if (!recordConfig(path)) throw new Error("the worktree's git configuration could not be recorded");
   return { ok: true, why: null };
 }
 
@@ -161,6 +289,26 @@ export function acquireWorktree({ repoRoot, root, pr, branch, head = null }) {
   const path = pathFor(root, pr);
 
   if (existsSync(path)) {
+    // BEFORE any other git command in a directory a worker has held: verifying
+    // the worktree runs `git status`, and a worker-added `.gitattributes` plus a
+    // `filter.<name>.clean` entry makes that run a program as the daemon user —
+    // a shape the `-c` neutralisers cannot reach, because the driver name comes
+    // from the repository itself. `git config --list` reads no worktree file, so
+    // the fingerprint check is safe to run first. A directory with no record
+    // cannot be vouched for either. (Codex #4g-[1].)
+    const cfg = verifyConfig(path);
+    if (!cfg.ok) {
+      const parked = quarantineByRename(path);
+      // The shared config is the CLONE's, so a worker's key is still live for the
+      // main checkout: put the affected keys back to what reeve recorded, then
+      // drop the stale worktree registration or no future worktree can be made
+      // for this branch at all. Both `git config` and `git worktree prune` leave
+      // the index alone, so neither can trigger the very hooks being removed.
+      restoreConfig(repoRoot, path, cfg.keys ?? []);
+      if (parked) git(repoRoot, ["worktree", "prune"]);
+      return { ok: false, path, reused: true,
+               why: `${cfg.why}; no git command was run in it, it was ${parked ? `moved to ${parked}` : "left in place"}, and the offending configuration was removed from the clone` };
+    }
     const v = verifyWorktree({ path, branch, head });
     return v.ok
       ? (h => h.ok ? { ok: true, path, reused: true, why: null } : { ok: false, path, reused: true, why: h.why })(harden(repoRoot, path))
@@ -276,7 +424,13 @@ export function pushWorktree({ path, branch, expectedRemote = null, repoRoot = n
 
   // The worktree's branch by name, read from the main checkout's ref store, which
   // both share. Never force: a worker's fix is not worth another party's commit.
-  const pushed = git(from, ["push", "origin", `${branch}:${branch}`]);
+  //
+  // `core.hooksPath=/dev/null` on THIS command, so no hook runs during reeve's
+  // own publish. A worker in a linked worktree can write `core.hooksPath` into
+  // the shared git config; without this, that worker-controlled hook would run
+  // here, unsandboxed, as the daemon user. Defense in depth beneath the dispatch
+  // gate, which already refuses a worker that is not in its own isolated clone.
+  const pushed = git(from, ["-c", "core.hooksPath=/dev/null", "push", "origin", `${branch}:${branch}`]);
   if (!pushed.ok) return { ok: false, why: `push refused: ${pushed.err}` };
   return { ok: true, why: null };
 }

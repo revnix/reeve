@@ -69,7 +69,10 @@ const scenario = async ({ failing, probe }) => {
   const spawned = [];
   const ctx = {
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
-    execute: true, shadow: true, running: 0, containment: { credentialRead: "closed", why: "test" }, claudeBin: "/bin/sh", cliVersion: "test",
+    execute: true, shadow: true, running: 0, containment: { credentialRead: "closed", why: "test" }, keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    // Deterministic: the real capacity() backs off on the host's load average, so
+    // a busy machine would fail these assertions for a reason that is not the code.
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
     profile: {
       identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir },
       authority: { policy: "propose_and_merge" },

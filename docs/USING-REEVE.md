@@ -119,31 +119,44 @@ Worth knowing, because it runs unattended.
 
 | It can | It cannot |
 |---|---|
-| Read, edit and write files in **its own copy** of the branch | Touch your working directory |
-| Run the project's own commands and language runtime (`pnpm test`, `node`, `git`) | Reach the network — `curl`, `wget`, `ssh` |
+| Read, edit and write files in **its own copy** of the branch, and the run's own temp dir | Write anywhere else — the OS sandbox denies it, not just a rule |
+| Run the project's own commands and language runtime (`pnpm test`, `node`, `git`) | Reach the network at all — the OS sandbox denies it (research phases get a named allowlist) |
 | `git add`, `git commit` locally | **Push or merge, ever.** reeve publishes, after checking the diff |
 | **Read** the workflow that is failing it | **Change** `.github/**` — the files that judge its work |
 | Read sensitive code to understand a failure | **Change** sensitive paths (auth, migrations, changesets, release scripts) |
-| — | Read quarantined data at all (production dumps, other clients' credentials) |
+| — | Read quarantined data, or any credential FILE (`~/.ssh`, `~/.config/gh`, `~/.aws`, …) — deny-read at the OS layer |
 
 A FIX_CI worker also runs with a **built environment**, not your shell's: no
 `GH_TOKEN`, no ssh agent, no cloud or proxy variables, a git that is told to read
-no system config and use no credential helper, and a `gh`/`ssh` that refuse. Its
-output streams to files under `~/.reeve/runs/<owner>-<repo>/<pr>/<run>/` so a
-crashed daemon can still read what the worker said, and every run records the
-exact CLI version, model, and settings it ran under (`worker_run`). If the
-daemon cannot prove the worker's lease is still live, the worker is terminated
-rather than trusted.
+no system config and use no credential helper, and a `gh`/`ssh` that refuse. It
+runs inside the **OS sandbox** (Seatbelt on macOS) with no unsandboxed fallback:
+the network is denied, writes are confined to its worktree and the run's temp
+dir, and every credential file is deny-read. The settings that ask for all this
+are **validated before the worker starts**, because a settings file that fails
+validation is silently ignored. Its output streams to files under
+`~/.reeve/runs/<owner>-<repo>/<pr>/<run>/` so a crashed daemon can still read what
+the worker said, and every run records the exact CLI version, model, and settings
+it ran under (`worker_run`). If the daemon cannot prove the worker's lease is
+still live, the worker is terminated rather than trusted.
 
-**What that does not yet guarantee, stated plainly.** The worker still runs as
-you, with your real home directory, so your keychain and `~/.config/gh` are on
-disk in front of it; a worker that asked `git` or `gh` the right way would get
-your token, and `git push --no-verify <url>` walks around the worktree's hook.
-That is measured, not theoretical (`test/escape.test.mjs` records each shape as
-known-open). **Until the OS sandbox stage proves those reads and writes are
-denied, the daemon refuses to dispatch any worker even with `--execute`**, and
-says so once as `guardian:containment:open`. Capability 2 stays off by code,
-not by memory.
+**What the sandbox does NOT cover, stated plainly.** The worker still runs as
+you, with your real home directory (the `claude` CLI needs it to authenticate).
+The OS sandbox denies credential *files*, but it cannot deny the macOS
+*keychain* — the runtime's own profile hard-allows the security service — so a
+worker that asks `git`'s osxkeychain helper still gets your GitHub token; and a
+worker in a linked worktree shares your checkout's git dir, so it can move a
+branch or plant a hook. That is measured, not theoretical
+(`test/escape.test.mjs` records each as known-open). **So before any worker is
+dispatched under `--execute`, reeve MEASURES this host: a sandbox canary must
+pass under the running CLI, your login keychain must hold no GitHub credential,
+and the profile must declare an isolated worker (`worker.isolation:
+dedicated-user`).** The keychain probe is a guard, not a guarantee — another app
+can store a token elsewhere in your account — so the only real closure is a
+**dedicated worker OS user** with its own empty keychain and its own clone of the
+repo. Until that is in place, dispatch is refused and reeve says so once as
+`guardian:containment:open`; `reeve doctor` shows R-14 (the canary) and R-15
+(the keychain) so you can see why. Capability 2 stays off by code, not by
+memory.
 
 These are enforced by the tool layer, not by asking the model nicely. That
 distinction was measured: told not to write a file but given a plain shell, the

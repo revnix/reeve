@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "sha256": "2d9bbe2af80a9b6bccacebbab8be9ade20c40998033b964279173be0ec185cd9",
+  "up_sha256": "6264e37e5557b6757fa2316748bf4d74ea9c491bc31e9df62a444392c0e08ceb",
+  "frozen_at": "2026-08-24",
+  "note": "migration 1; new schema goes in a new numbered migration"
+}

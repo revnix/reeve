@@ -63,11 +63,14 @@ ONLY (both mine), and the running process carrying `--execute`.
    10 rounds, do not merge. It is documents only.
 
 3. **Watch for the first real dispatch on nextly.** It has never dispatched there
-   (verified: zero worker_run rows in ~/.reeve/state/nextlyhq/nextly.db). Each red
-   PR gets ONE attempt and it is spent even when nothing publishes, so it is
-   one-shot data: capture the worker transcript, the worktree diff and the
-   escalation, not just a log tail. Expect it to fail to publish until task 1
-   lands.
+   (verified: zero worker_run rows in ~/.reeve/state/nextlyhq/nextly.db). Note a
+   red PR does not always spend an attempt: `watcher.mjs:120-136` escalates a
+   missing required check, an inherited-only failure, or a failure it cannot name
+   WITHOUT dispatching. Only a caused, named failure reaches `FIX_CI` and
+   `recordFixAttempt`. For those, the one attempt is spent even when nothing
+   publishes, so it is one-shot data: capture the worker transcript, the worktree
+   diff and the escalation, not just a log tail. Expect no publication until task
+   1 lands.
 
 ## A freeze is in force, and I promised it to another session
 
@@ -83,12 +86,14 @@ frozen. If it needs `daemon.mjs`, tell me and wait.
 
   - the fix quality was GOOD 3/3 — the experiment set out to find a confidently
     BAD fix and did not find one
-  - it published NOTHING 3/3, because `git add`/`git commit` fail with EPERM on
-    `.git/index.lock`. Controls: a Bash write elsewhere in the same worktree
-    SUCCEEDED, and an identical copy commits fine unsandboxed. reeve's own
-    settings do not cause it
-  - the dirty-checkout gate fired ONCE, on run 3. Runs 1 and 2 were
-    `failed (max_turns)` and never reached it
+  - it published NOTHING 3/3, but for two different reasons. Runs 1 and 2 were
+    `failed (max_turns)` and never reached the publication gate at all
+    (`daemon.mjs:1161-1181` routes an unfinished run before it). Only RUN 3
+    demonstrates the commit restriction: `git add`/`git commit` fail with EPERM on
+    `.git/index.lock`. Do not carry a 3/3 reproduction claim forward
+  - the controls for run 3: a Bash write elsewhere in the same worktree SUCCEEDED,
+    and an identical copy commits fine unsandboxed. reeve's own settings do not
+    cause it
   - `src/prompts.mjs:31` tells the worker "`pnpm test` is permitted" when pnpm
     may not be granted, and :33-34 forbids absolute paths while the only
     unconditional runtime grant IS an absolute path

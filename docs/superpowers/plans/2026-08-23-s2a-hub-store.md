@@ -2141,10 +2141,19 @@ Add to `bin/reeve`, beside the existing `case "run":`:
 
 ```js
   case "build": {
-    // HOME is the value bin/reeve already resolved (--home, REEVE_HOME, or the
-    // default). An earlier draft called `HOME`, which is not defined in
-    // this file, so every build run and build status threw before reaching the
-    // lease -- the two commands this task exists to add.
+    // HOME is the value bin/reeve already resolved. An earlier draft called
+    // `HOME`, which is not defined in this file, so every build run and build
+    // status threw before reaching the lease -- the two commands this task
+    // exists to add.
+    //
+    // That resolution is `process.env.REEVE_HOME ?? join(homedir(), ".reeve")`
+    // and NOTHING ELSE -- `bin/reeve:45`. There is no `--home` flag, and this
+    // comment claimed one. Unknown flags are IGNORED rather than refused, so
+    // `reeve build run --home /tmp/x` silently operates on the operator's real
+    // home; that is how the first run of Task 7's CLI test created a hub and a
+    // singleton lease in `~/.reeve`. Scope a test or an operator to a different
+    // home with the ENVIRONMENT VARIABLE. A real `--home`, and a refusal for
+    // unknown flags, belong to the CLI surface pass, not to this task.
     const sub = process.argv[3];
     if (sub !== "run" && sub !== "status")
       die(`usage: reeve build run [--takeover] | reeve build status`);

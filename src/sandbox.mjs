@@ -60,6 +60,13 @@ const GIT_WRITE = ["add", "commit", "checkout --", "restore"];
  * territory before reeve publishes it.
  */
 const NEVER = [
+  // `git add` and `git commit` join `git push` because reeve now does all three.
+  // Denied rather than merely unmentioned: without an explicit refusal the
+  // sandbox's write deny on `.git` surfaces as `Operation not permitted` on
+  // `.git/index.lock`, which reads as a broken machine rather than a boundary. A
+  // worker met exactly that on 2026-08-23 and spent thirteen of its thirty-six
+  // turns investigating the filesystem instead of finishing.
+  "Bash(git add:*)", "Bash(git commit:*)",
   "Bash(git push:*)", "Bash(git remote:*)", "Bash(gh pr merge:*)", "Bash(gh api:*)",
   "Bash(gh auth:*)", "Bash(curl:*)", "Bash(wget:*)", "Bash(ssh:*)", "Bash(nc:*)",
   "Bash(sudo:*)", "Bash(chmod:*)", "Bash(rm -rf:*)",

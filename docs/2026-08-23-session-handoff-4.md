@@ -151,35 +151,119 @@ Each plan is self-contained: header, global constraints, the S1 measured facts,
 founder decisions, a test-harness block, a file-structure table, its tasks, and
 its own self-review. B and C open with a **consumed-interfaces table**.
 
-**Run this after ANY edit.** It has caught defects five separate rounds, and each
-direction was added because something slipped past the previous set:
+**Run this after ANY edit.** It has caught defects in six separate rounds, and
+each direction was added because something slipped past the previous set. It
+runs from `~/Work/Products/reeve-wt` and needs all three worktrees present.
+
+The version that shipped in the previous handoff had **four wrong regexes** and
+died on `PHASES` (which is composed from `ACTIVE`/`HELD`/`DRAINING`/`TERMINAL`,
+not a literal array), on `pr_hold`'s two-line CHECK, and on `NON_REPLAYED_KINDS`.
+Direction 4 also scanned only plan B for emissions, which is how
+`lease.singleton.granted`/`.released` — emitted by **A's own `locks.mjs`** — went
+undeclared for nine rounds until review caught them. This version is the one that
+actually runs:
 
 ```python
-import io, re
-pa = io.open("<pa>/docs/superpowers/plans/2026-08-23-s2a-hub-store.md", encoding="utf-8").read()
-pb = io.open("<pb>/docs/superpowers/plans/2026-08-23-s2b-phase-machine.md", encoding="utf-8").read()
+#!/usr/bin/env python3
+"""Cross-document invariants for the reeve S2 plans. Run from ~/Work/Products/reeve-wt.
 
-# 1. 32 tables, and TABLE_OWNERS/PROSE_TABLES complete
+Every direction was added because something slipped past the previous set.
+Each one carries a positive control: a check that cannot fail is not a check.
+"""
+import io, re, sys
+pa = io.open("pa/docs/superpowers/plans/2026-08-23-s2a-hub-store.md", encoding="utf-8").read()
+pb = io.open("pb/docs/superpowers/plans/2026-08-23-s2b-phase-machine.md", encoding="utf-8").read()
+pc = io.open("pc/docs/superpowers/plans/2026-08-23-s2c-provider-scheduler.md", encoding="utf-8").read()
+bad = []
+def eq(n, a, b, brief=False):
+    ok = a == b
+    shown = (f"{len(a)} items" if brief and ok else a)
+    print(("  OK  " if ok else " FAIL ") + f"{n}: {shown}" + ("" if ok else f"  vs  {b}"))
+    if not ok: bad.append(n)
+
+# 1. 32 tables; TABLE_OWNERS and PROSE_TABLES complete
 t  = sorted(set(re.findall(r"CREATE TABLE IF NOT EXISTS ([a-z_]+) *\(", pa)))
-ow = re.findall(r"^\s{2}([a-z_]+):\s*\{", re.search(r"export const TABLE_OWNERS = \{(.*?)\n\};", pa, re.S).group(1), re.M)
-pt = re.findall(r'"([a-z_]+)"', re.search(r"export const PROSE_TABLES = \[(.*?)\];", pa, re.S).group(1))
+ow = sorted(re.findall(r"^\s{2}([a-z_]+):\s*\{", re.search(r"export const TABLE_OWNERS = \{(.*?)\n\};", pa, re.S).group(1), re.M))
+pt = sorted(set(re.findall(r'"([a-z_]+)"', re.search(r"export const PROSE_TABLES = \[(.*?)\];", pa, re.S).group(1))))
+eq("1a tables == 32", len(t), 32)
+eq("1b TABLE_OWNERS complete", ow, t, brief=True)
+eq("1c PROSE_TABLES complete", pt, t, brief=True)
 
 # 2. COMPARISON_SET <-> HANDLERS, both directions
 cs = re.findall(r'"([a-z_]+)"', re.search(r"export const COMPARISON_SET = \[(.*?)\];", pa, re.S).group(1))
 H  = re.search(r"const HANDLERS = \{(.*?)\n\};", pa, re.S).group(1)
 h  = sorted(set(re.findall(r'table:\s*"([a-z_]+)"', H)))
+eq("2a COMPARISON_SET == 19", len(cs), 19)
+eq("2b handlers subset of comparison", [x for x in h if x not in cs], [])
+eq("2c comparison all handled", [x for x in cs if x not in h], [])
 
-# 3. TABLE_OWNERS.replayed must agree with HANDLERS
-kinds   = set(re.findall(r'"([a-z_]+\.[a-z_]+)":', H))
-handled = {k.split(".")[0] for k in kinds}
+# 3. TABLE_OWNERS.replayed agrees with HANDLERS
+kinds  = set(re.findall(r'"([a-z_.]+)":\s*\{\s*table', H))
+owners = dict(re.findall(r"^\s{2}([a-z_]+):\s*\{([^}]*)\}",
+              re.search(r"export const TABLE_OWNERS = \{(.*?)\n\};", pa, re.S).group(1), re.M))
+eq("3 replayed == handler tables", sorted(k for k,v in owners.items() if "replayed: true" in v), sorted(set(h)), brief=True)
 
-# 4. every kind B emits is HANDLED or DECLARED unreplayed
-nr = set(re.findall(r'"([a-z_]+\.[a-z_]+)",', re.search(r"NON_REPLAYED_KINDS = Object\.freeze\(\[(.*?)\]\)", pa, re.S).group(1)))
-em = set(re.findall(r'hubEvent\(db,\s*\{\s*kind:\s*"([a-z_.]+)"', pb))
+# 4. every kind ANY plan emits is handled or declared unreplayed.
+#    Scans A and C too -- locks.mjs lives in A, and an A-only scan of B was the
+#    gap that let lease.singleton.granted/released go undeclared for nine rounds.
+#    Undotted kinds are test fixtures (e.g. `kind: "k"` proving canonical JSON);
+#    the plan's own scanner reads src/build/*.mjs and never sees them.
+nr = set(re.findall(r'"([a-z_.]+)"', re.search(r"NON_REPLAYED_KINDS = Object\.freeze\(\[(.*?)\]\);", pa, re.S).group(1)))
+RX = r'hubEvent\(\s*\w+\s*,\s*\{\s*kind:\s*"([a-z_.]+)"'
+em_all = set(re.findall(RX, pa)) | set(re.findall(RX, pb)) | set(re.findall(RX, pc))
+em = {k for k in em_all if "." in k}
+eq("4 every emitted kind declared", sorted(em - kinds - nr), [])
+print(f"        scanned {len(em)} dotted kinds; ignored fixtures {sorted(em_all - em) or 'none'}")
 
-# 5. task.phase CHECK in A == phases.mjs sets in B, 21 states
-# 6. every compensation in the closed set has a table row (14)
+# 5. task.phase CHECK in A == the phase sets composed in B, 21 states
+aph = sorted(set(re.findall(r"'([A-Z_]+)'", re.search(r"CHECK\s*\(\s*phase IN \((.*?)\)\s*\)", pa, re.S).group(1))))
+bph = []
+for g in ("ACTIVE","HELD","DRAINING","TERMINAL"):
+    bph += re.findall(r'"([A-Z_]+)"', re.search(r"export const %s\s*= Object\.freeze\(\[(.*?)\]\);" % g, pb, re.S).group(1))
+eq("5a phases == 21", len(aph), 21)
+eq("5b A CHECK == B PHASES", aph, sorted(set(bph)), brief=True)
+
+# 6. the compensation set is closed at 14 and every name has a table row
+comp = re.findall(r"'([a-z-]+)'", re.search(r"closed set `\[(.*?)\]`", pb, re.S).group(1))
+rows = re.findall(r"^\| `([a-z-]+)` \| ", pb, re.M)
+eq("6a compensations == 14", len(comp), 14)
+eq("6b each has a table row", sorted(c for c in comp if c not in rows), [])
+
 # 7. HOLD_ESCALATION keys are a subset of pr_hold's CHECK set
+he = re.findall(r"^\s{2}([a-z_]+):\s", re.search(r"const HOLD_ESCALATION = Object\.freeze\(\{(.*?)\n\}\);", pb, re.S).group(1), re.M)
+prh = re.search(r"CREATE TABLE IF NOT EXISTS pr_hold(.*?)\n\) STRICT;", pa, re.S).group(1)
+prset = set(re.findall(r"'([a-z_]+)'", re.search(r"reason\s+TEXT\s+NOT NULL CHECK \(reason IN\s*\n?\s*\((.*?)\)\),", prh, re.S).group(1)))
+eq("7 HOLD_ESCALATION subset of pr_hold", sorted(set(he) - prset), [])
+
+# 8. ENUMS holds a LEGAL value for every enumerated NOT NULL column in the set
+enums = dict(re.findall(r'"([a-z_]+\.[a-z_]+)":\s*"([^"]*)"', re.search(r"const ENUMS = \{(.*?)\n\};", pa, re.S).group(1)))
+wrong, scanned = [], 0
+for tb in cs:
+    m = re.search(r"CREATE TABLE IF NOT EXISTS %s \((.*?)\n\) (STRICT|WITHOUT)" % tb, pa, re.S)
+    if not m: continue
+    body = m.group(1)
+    for line in body.split("\n"):
+        cm = re.match(r"\s*([a-z_]+)\s+TEXT\s+NOT NULL(?!.*DEFAULT).*CHECK\s*\(", line)
+        if not cm: continue
+        im = re.search(r"IN\s*\((.*?)\)", body[body.index(line):body.index(line)+400], re.S)
+        if not im: continue
+        scanned += 1
+        legal, key = set(re.findall(r"'([^']+)'", im.group(1))), f"{tb}.{cm.group(1)}"
+        if enums.get(key) not in legal:
+            wrong.append(f"{key}={enums.get(key)!r} legal={sorted(legal)}")
+eq("8 ENUMS legal for every enumerated column", wrong, [])
+print(f"        scanned {scanned} enumerated NOT NULL columns")
+
+# CONTROLS -- each instrument must be able to report something.
+ctl = [("tables found", len(t) > 0), ("handlers found", len(kinds) > 0),
+       ("kinds found", len(em) > 0), ("phases found", len(aph) > 0),
+       ("pr_hold CHECK read", len(prset) > 0), ("enum columns read", scanned > 0)]
+for n, ok in ctl:
+    print(("  OK  " if ok else " FAIL ") + f"control: {n}")
+    if not ok: bad.append("control " + n)
+
+print("\n" + ("ALL INVARIANTS GREEN" if not bad else "FAILED: " + ", ".join(bad)))
+sys.exit(1 if bad else 0)
 ```
 
 Current values, all green: **32** tables, owners and prose complete,

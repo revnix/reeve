@@ -153,9 +153,15 @@ function repairMessage(report, decision) {
   return cause ? `${subject}\n\n${cause}` : subject;
 }
 
-function uncommittedFiles(worktree) {
+function uncommittedFiles(worktree, exclude = []) {
   try {
-    const out = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "status", "--porcelain"], { encoding: "utf8", env: gitEnv() }).trim();
+    // The daemon copies dependency trees in BEFORE the worker starts, and they are
+    // deliberately not staged. A repository that does not ignore its own
+    // `node_modules` would otherwise leave `?? node_modules/` behind and this gate
+    // would quarantine every valid repair -- the exclusion from staging turning
+    // into a refusal here.
+    const spec = exclude.length ? ["--", ".", ...exclude.map(e => `:(exclude)${e}`)] : [];
+    const out = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "status", "--porcelain", ...spec], { encoding: "utf8", env: gitEnv() }).trim();
     return out ? out.split("\n").map(l => l.slice(3).trim().split(" -> ").pop()).filter(Boolean) : [];
   } catch { return null; }
 }
@@ -1244,7 +1250,7 @@ export async function tick(ctx) {
         // with the checkout while the log said it was published. The work is
         // kept and a human is told, because a candidate fix nobody has a copy of
         // is not spare disk space. (Codex #5-[2].)
-        const stillDirty = uncommittedFiles(worktree);
+        const stillDirty = uncommittedFiles(worktree, dependencyPathsFor(profile).paths);
         if (stillDirty === null || stillDirty.length) {
           const why = stillDirty === null
             ? "reeve could not read the checkout's status, so it cannot say the work was committed"

@@ -180,7 +180,23 @@ Each task names any imports it needs **beyond** these.
   - **Every provider mutation calls `assertWritable` inside its own transaction** (`inTx: true`), exactly as `withWriterLease` does. Without it a guardian can take a held lease and launch a worker after `restoreHub` has acquired `maintenance_lock` and finished its holder scan — reopening the writer race the lock exists to close, from the one code path that is allowed to write the hub without holding a writer lease. `assertWritable` throws; `claimProvider` catches and returns `reason: 'maintenance'`, which the guardian treats exactly like `at-limit`: it does not dispatch, and it does not escalate, because a restore in progress is an operator action rather than a fault.
   - `releaseProvider(db, { id, owner, repoId, runRef, force })` — deletes the row. When BOTH an id and an identity are given it requires them to **match** — `WHERE id=? AND owner=? AND repo_id=? AND run_ref=?` — and falls back to the identity alone when no id is supplied. Preferring the id whenever present was unsafe even for the immediate cleanup: if the worker exits and a restore completes before the `finally` runs, the restore clears `provider_lease` and the next claim can inherit that integer key, so the cleanup deletes an unrelated LIVE lease and admits work past the limit. Requiring both keeps the fast path, makes a renumbered id inert rather than dangerous, and fixes every caller instead of the one that noticed. **The retry queue stores the identity, never the id**: a queued release survives a restore that clears `provider_lease` and renumbers it, and an id-keyed retry would then delete whatever inherited that primary key. **A release refused because a restore holds `maintenance_lock` must not be dropped**: `assertWritable` throws, and the caller retries on the next tick with the lease id recorded in memory; the caller keeps the id and retries next tick, and the production snippet must actually do that rather than `catch {}`. There is deliberately **no durable marker**: an earlier draft added `provider_lease.refused_release`, and it cannot be written in the one case it represents — `assertWritable` blocks that write while the lock is held. It is also unnecessary, because `restoreHub` clears every process-scoped row (`provider_lease` included) from the restored file, so a lease held across a restore does not survive it. An abandoned restore is covered by ordinary expiry.
   - `queuedGuardianRequests(db, { repoId }) -> Row[]` — every `queued` guardian request for one repository. It exists because the sweep below runs in `src/daemon.mjs`, and this plan's global rule is that raw SQL lives only under `src/db/` or `src/build/`: a `SELECT ... FROM provider_lease` embedded in the daemon is a second definition of the guest's SQL surface, and it drifts from this one the first time the allowlist or the schema changes.
-  - `heartbeatProvider(db, { id, now })`
+  - `bindProviderLease(db, { id, owner, repoId, runRef, pid, lstart })` and
+    `heartbeatProvider(db, { id, owner, repoId, runRef, now })` — **both match on
+    the identity as well as the id**, exactly as `releaseProvider` does, and for
+    the same reason stated one bullet above: a restore replaces the database,
+    clears `provider_lease` and renumbers it, so an integer key can come back
+    pointing at somebody else's request. The two failures are different and both
+    silent. If a restore lands between the claim and `onSpawn`, `bindProviderLease`
+    overwrites the NEW holder's pid and lstart with the spawned worker's, so the
+    reaper can never match either. If it lands while an old worker is still
+    running, that worker's heartbeat interval keeps renewing an unrelated reused
+    row and prevents its reaping for as long as the worker lives. A mutation
+    keyed on a reusable integer is not keyed on anything.
+    Covered by a restore-and-id-reuse case: claim, clear the table, admit a
+    different request that inherits the id, then assert the stale rebind and the
+    stale heartbeat both leave it untouched — with a control that the CURRENT
+    owner's rebind and heartbeat still work, so the match is a fence and not a
+    blanket refusal.
   - `reapProviderLeases(db, { isAlive, now }) -> { reaped: number }` — an **object**, like every other function here, not a bare count. Two assertions in the suite previously read it both ways (`n === 1` and `.reaped >= 1`), which no single return value can satisfy.
   - `bindProviderLease(db, { id, pid, lstart })` — re-binds a held row from the daemon to the spawned worker.
   - `cancelQueued(db, { owner, repoId, runRef })` — removes a `queued` request whose dispatch is no longer going to happen. **Called on every path out of the dispatch block that did not launch, AND swept at the top of each tick**: a queued request whose PR has since closed, whose head moved, or whose task simply is not in this tick's decisions never re-enters that block at all, so a per-path call alone leaves it queued forever — and a queued guardian request blocks the next builder admission by design. The sweep compares live queued rows against the run refs this tick actually decided on, and cancels the rest.
@@ -1142,6 +1158,15 @@ before dispatch`). **This task does not move or duplicate the halt check:**
       // claim taken before them is held and abandoned once per skipped PR, until
       // expiry -- starving the builder for reasons unrelated to quota. The only
       // thing between this block and the spawn must be the spawn.
+      // The tick-level `repoId` (declared once, near the top of `tick`) is what
+      // `abandonClaim` closes over. A per-PR `const repoId` used to be
+      // redeclared inside this block, which shadows the outer binding for the
+      // block's WHOLE lexical scope -- so the hoisted helper captured the inner
+      // one, and calling it from a refusal above that declaration threw from the
+      // temporal dead zone instead of cancelling the queued row. Hoisting the
+      // helper without removing the shadow moved the failure rather than fixing
+      // it.
+      //
       // HOISTED, and this is the third revision of this instruction: the rule
       // moved twice while the declaration stayed here. `abandonClaim` is a
       // `const` closing over this `let`, and the refusal `continue`s that must
@@ -1224,7 +1249,8 @@ before dispatch`). **This task does not move or duplicate the halt check:**
       // A tick never makes that call. If startup could not resolve it, ctx.repoId
       // is null and every provider claim below is refused -- fail closed, because
       // a lease that cannot be scoped to a repository is worse than no lease.
-      const repoId = ctx.repoId ?? null;
+      // (the tick-level `repoId` is used here; the per-PR redeclaration that
+      //  used to sit at this point is gone -- see the note at the hoist)
       if (ctx.hub && repoId == null) {
         // REFUSE, do not merely note it. Falling through spends model quota
         // under no lease at all -- the one thing the scheduler exists to make
@@ -1371,6 +1397,12 @@ exact value that implies:
   // `BASE` and `LEASE_SECONDS` are declared here too. The previous revision
   // named all three and declared none, so the block was a ReferenceError before
   // it asserted anything.
+  // Its OWN database and spawn identity. The ordinary-path fixture's `db` and
+  // `SPAWNED` are block-scoped to that block and invisible here, and the
+  // standard harness supplies neither -- so this threw while constructing `ctx`,
+  // before it could observe a single heartbeat.
+  const db = openHub(join(dir, "h1h.db"));
+  const SPAWNED = { pid: 31338, lstart: "Sat Aug 23 09:31:00 2026" };
   const BASE = 1_800_000_000, LEASE_SECONDS = 300;
   let beats = 0, heldAfter = null;
   const ctx = { ...fixtureCtx(dir), hub: db, lstart: LSTART, heartbeatMs: 5,
@@ -1496,12 +1528,35 @@ And on a rate-limit exit, before the `finally` releases:
         //                                      now: Math.floor(Date.now() / 1000),
         //                                      cooldownSeconds: profile.builder?.provider?.cooldownSeconds ?? 300 }); }
         //       catch { (ctx.pendingRateLimits ??= []).push({ /* as above */ }); }
+        //       sawRateLimit = true;                      // see the classification note
         //       revoked = "provider rate limit reached";   // the supervisor terminates
         //     },
         //
+        // AND THE CLASSIFICATION HAS TO SURVIVE THE KILL. Setting `revoked` is
+        // what terminates the worker, and it is also what destroys the reason:
+        // `src/supervisor.mjs:444-445` on `16769e7` gives `lateWhy` precedence
+        // over `classifyResult`, so the exit comes back `OUTCOMES.LEASE_LOST`
+        // and the 429 branch at `:220` is never reached. The daemon's
+        // RATE_LIMITED handling then does not run -- no escalation, no break out
+        // of the dispatch loop -- and the FIX_CI attempt is spent recording a
+        // lost lease for what was actually a provider refusal. Fast-failing the
+        // worker would have cost exactly the thing fast-failing it was for.
+        //
+        // So the daemon keeps the fact it already has. `sawRateLimit` is set in
+        // the same handler that recorded the cooldown, and the post-exit branch
+        // keys on it as well as on the outcome:
+        //
+        //     const rateLimited = r.outcome === OUTCOMES.RATE_LIMITED || sawRateLimit;
+        //
+        // Normalising in the daemon rather than in the supervisor is deliberate:
+        // this task changes no supervisor code, and `LEASE_LOST` is the honest
+        // classification of what the supervisor observed -- it was told the lease
+        // was revoked. Only the daemon knows why it revoked it.
+        //
         // The post-exit branch below then finds the cooldown already recorded and
         // does not write a second one; it stays because a 429 can also arrive as
-        // an exit status with no live event preceding it.
+        // an exit status with no live event preceding it, and `sawRateLimit` is
+        // false on that path.
         //
         // Rate limits are ALREADY normalised by the supervisor -- `--print` exits
         // with api_error_status 429 and the runner maps it to OUTCOMES.RATE_LIMITED
@@ -2230,7 +2285,6 @@ check(ordinary.state === "PASS" && touched === false,
 
 ```js
 import { VERDICT_CLAUSES, computeVerdict } from "../src/verdict.mjs";
-import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 // The INPUTS computeVerdict consumes -- not a clause list, which it does not

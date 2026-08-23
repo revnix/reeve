@@ -770,6 +770,44 @@ rmSync(root, { recursive: true, force: true });
     check(r.files.length === many.length, "and every path is accounted for", `${r.files.length} of ${many.length}`);
   }
 
+  {
+    // A copied dependency tree can hold TRACKED files -- a vendored directory
+    // under version control -- and a worker editing one is doing real work.
+    // Excluding the whole path dropped that edit from the commit and hid it from
+    // the uncommitted check, publishing the rest as a complete fix.
+    const w = mkWorktree("tracked-inside-a-copied-tree");
+    mkdirSync(join(w, "vendor"), { recursive: true });
+    writeFileSync(join(w, "vendor", "a.js"), "vendored, and tracked\n");
+    g(w, "add", "-A");
+    g(w, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "vendor it");
+    // The worker edits the tracked vendored file AND a companion; preparation
+    // separately left untracked content in the same tree.
+    writeFileSync(join(w, "vendor", "a.js"), "vendored, and repaired\n");
+    writeFileSync(join(w, "vendor", "copied-in.js"), "what preparation put here\n");
+    writeFileSync(join(w, "fix.js"), "the companion\n");
+
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              exclude: ["vendor"], declared: ["fix.js", "vendor/a.js"] });
+    check(r.ok && r.committed, "a repair that edits a tracked file inside a copied tree commits", JSON.stringify(r).slice(0, 200));
+    check(r.files.includes("vendor/a.js"), "and that edit is part of it, not silently dropped", r.files.join(", "));
+    check(r.files.includes("fix.js"), "control: so is the companion", r.files.join(", "));
+    check(!r.files.includes("vendor/copied-in.js"), "while the untracked content preparation left is still excluded", r.files.join(", "));
+  }
+
+  {
+    // Leading and trailing whitespace are legal in a git filename, and trimming
+    // the declared entry made it match nothing the staged list holds.
+    const w = mkWorktree("whitespace-filename");
+    // TRAILING space, which is what `.trim()` destroys. A space in the middle
+    // survives trimming and would have passed while the defect stood.
+    const odd = "trailing ";
+    writeFileSync(join(w, odd), "the fix\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: [odd] });
+    check(r.ok && r.committed, "a filename with trailing whitespace the worker declared is committed", JSON.stringify(r).slice(0, 200));
+    check(r.files.includes(odd), "and matched byte for byte", JSON.stringify(r.files));
+  }
+
   rmSync(cRoot, { recursive: true, force: true });
 }
 

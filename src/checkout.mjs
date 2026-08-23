@@ -552,12 +552,32 @@ export function commitRunWork({ repoRoot, path, branch, message, exclude = [], s
     return { ok: true, committed: false, files: [], why: `not committing: the checkout is on ${on.out || "a detached head"}, not ${branch}` };
 
   // Dependency trees are copied in by `prepareRunCheckout` BEFORE the worker
-  // starts, so they are not the worker's work. A repository that does not ignore
-  // its own `node_modules` or `.venv` would otherwise have the whole tree staged
-  // into the repair: published wholesale where the lane is broad, and refusing
-  // every valid repair where it is narrow.
-  const added = git(path, ["add", "--all", "--", ".", ...exclude.map(e => `:(exclude)${e}`)]);
+  // starts, so their CONTENT is not the worker's work. A repository that does not
+  // ignore its own `node_modules` or `.venv` would otherwise have the whole tree
+  // staged into the repair: published wholesale where the lane is broad, and
+  // refusing every valid repair where it is narrow.
+  //
+  // But a copied tree can hold TRACKED files -- a vendored directory under
+  // version control -- and a worker editing one of those is doing real work.
+  // Excluding the whole path dropped that edit from the commit AND hid it from
+  // the uncommitted check, publishing the rest as a complete fix. So the staging
+  // is in two steps: everything outside the copied trees, then tracked changes
+  // INSIDE them. What is never staged is untracked content under a copied tree,
+  // which is exactly what preparation put there.
+  const spec = exclude.map(e => `:(exclude)${e}`);
+  const added = git(path, ["add", "--all", "--", ".", ...spec]);
   if (!added.ok) return { ok: false, why: `could not stage the work: ${added.err}` };
+  if (exclude.length) {
+    // Only for trees that actually HOLD tracked files: `git add --update` fails
+    // outright when no pathspec matches, which is the ordinary case for a
+    // `node_modules` nothing has ever tracked.
+    const known = git(path, ["ls-files", "-z", "--", ...exclude]);
+    if (!known.ok) return { ok: false, why: `could not read the copied trees: ${known.err}` };
+    if (known.out) {
+      const tracked = git(path, ["add", "--update", "--", ...exclude]);
+      if (!tracked.ok) return { ok: false, why: `could not stage changes inside a copied dependency tree: ${tracked.err}` };
+    }
+  }
 
   // `-z`, because git QUOTES a path it considers unusual: `kéy.txt` comes back as
   // `"k\303\251y.txt"` from `--name-only`, which matches nothing the worker
@@ -577,9 +597,12 @@ export function commitRunWork({ repoRoot, path, branch, message, exclude = [], s
   // check that can tell those apart, because only the worker knows which of its
   // files were the fix.
   if (declared !== null) {
+    // Only a leading `./` or `/` comes off. NOT `.trim()`: leading and trailing
+    // whitespace are legal in a git filename, and `"a "` trimmed to `"a"` matches
+    // nothing the NUL-delimited staged list holds, quarantining a valid repair.
     const said = new Set(declared
       .filter(f => typeof f === "string")
-      .map(f => f.trim().replace(/^\.\//, "").replace(/^\/+/, "")));
+      .map(f => f.replace(/^\.\//, "").replace(/^\/+/, "")));
     const undeclared = files.filter(f => !said.has(f));
     if (undeclared.length) {
       // Nothing is staged when this fires: the index is reset so the checkout is

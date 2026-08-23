@@ -155,13 +155,20 @@ function repairMessage(report, decision) {
 
 function uncommittedFiles(worktree, exclude = []) {
   try {
-    // The daemon copies dependency trees in BEFORE the worker starts, and they are
-    // deliberately not staged. A repository that does not ignore its own
-    // `node_modules` would otherwise leave `?? node_modules/` behind and this gate
-    // would quarantine every valid repair -- the exclusion from staging turning
-    // into a refusal here.
-    const spec = exclude.length ? ["--", ".", ...exclude.map(e => `:(exclude)${e}`)] : [];
-    const out = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "status", "--porcelain", ...spec], { encoding: "utf8", env: gitEnv() }).trim();
+    // The daemon copies dependency trees in BEFORE the worker starts, and their
+    // untracked content is deliberately not staged. A repository that does not
+    // ignore its own `node_modules` would otherwise leave `?? node_modules/`
+    // behind and this gate would quarantine every valid repair -- the exclusion
+    // from staging turning into a refusal here.
+    //
+    // Read in the same two parts the staging uses, or this hides the half it does
+    // not exclude: everything outside the copied trees, then TRACKED changes
+    // inside them. A worker editing a vendored file under version control is
+    // doing real work, and a gate blind to it lets an incomplete fix publish.
+    const run = args => execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: gitEnv() }).trim();
+    const outside = run(["status", "--porcelain", ...(exclude.length ? ["--", ".", ...exclude.map(e => `:(exclude)${e}`)] : [])]);
+    const inside = exclude.length ? run(["status", "--porcelain", "--untracked-files=no", "--", ...exclude]) : "";
+    const out = [outside, inside].filter(Boolean).join("\n");
     return out ? out.split("\n").map(l => l.slice(3).trim().split(" -> ").pop()).filter(Boolean) : [];
   } catch { return null; }
 }

@@ -472,6 +472,90 @@ export function publishRunWork({ repoRoot, path, branch, expectedRemote = null }
 }
 
 /**
+ * The identity reeve commits under.
+ *
+ * A worker checkout runs with GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM at
+ * /dev/null, so git has no configured identity there and invents one from the
+ * username and the hostname -- measured 2026-08-23: `Mobeen <mobeen@192.168.1.18>`.
+ * That address is not routable, links to no account, and a ruleset requiring a
+ * verified committer refuses it. reeve pushes as the founder, so it commits as
+ * the founder, read from the founder's own repository where that configuration
+ * is deliberately still visible.
+ *
+ * Null when either half is missing, rather than half an identity: git would
+ * invent the other half and the commit would carry a plausible address nobody
+ * owns.
+ */
+export function founderIdentity(repoRoot) {
+  const read = key => {
+    const r = founderGit(repoRoot, ["config", "--get", key]);
+    return r.ok && r.out ? r.out : null;
+  };
+  const name = read("user.name");
+  const email = read("user.email");
+  return name && email ? { name, email } : null;
+}
+
+/**
+ * Stage and commit what the worker changed.
+ *
+ * The worker cannot do this itself. Its sandbox denies Bash writes to `.git`, so
+ * `git add` and `git commit` fail with EPERM on `.git/index.lock`: measured
+ * 2026-08-23 across seven attempts in one run, which then spent thirteen of its
+ * thirty-six turns correctly diagnosing an instruction it could not carry out.
+ * Nothing published, three runs of three, with a correct fix sitting in the
+ * working tree each time (docs/measured/2026-08-23-three-real-dispatches.md).
+ *
+ * Moving the commit here is the answer already applied to the PUSH, one step
+ * earlier in the same sequence: the party that decides what may ship is the party
+ * that writes it. The worker is now unable to touch git's state at all.
+ *
+ * Everything the worker left is staged, ignored files excepted, and nothing is
+ * judged here. The diff gate runs AFTER this, against the ref that gets pushed,
+ * so a stray file is refused by the gate that exists for exactly that -- rather
+ * than by a guess made here about which of a worker's files it meant to leave.
+ */
+export function commitRunWork({ repoRoot, path, branch, message }) {
+  if (!String(message ?? "").trim()) return { ok: false, why: "no commit message was given" };
+
+  // The commit has to land on the branch that gets published. A worker that
+  // checked out something else would otherwise have its work committed where
+  // nothing looks for it, while the push carried the pinned head.
+  //
+  // A mismatch is a SKIP, not a failure. Refusing outright here would return
+  // before the gates below, and one of them reads the pushed ref for reeve's own
+  // worker token: a worker that commits a credential on the branch and then
+  // checks out another would have been reported as "wrong branch" rather than as
+  // carrying a token. Not committing is enough -- the gates still judge the ref,
+  // and the uncommitted-work check still refuses anything that would be lost.
+  const on = git(path, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  if (!on.ok) return { ok: false, why: `could not read the checked-out branch: ${on.err}` };
+  if (on.out !== branch)
+    return { ok: true, committed: false, files: [], why: `not committing: the checkout is on ${on.out || "a detached head"}, not ${branch}` };
+
+  const added = git(path, ["add", "--all", "--"]);
+  if (!added.ok) return { ok: false, why: `could not stage the work: ${added.err}` };
+
+  const staged = git(path, ["diff", "--cached", "--name-only"]);
+  if (!staged.ok) return { ok: false, why: `could not read what was staged: ${staged.err}` };
+  const files = staged.out ? staged.out.split("\n").filter(Boolean) : [];
+  // A worker that committed its own work, or changed nothing, leaves nothing to
+  // stage. Not an error: the gates below judge whatever the branch now holds.
+  if (!files.length) return { ok: true, why: null, committed: false, files: [] };
+
+  const id = founderIdentity(repoRoot);
+  if (!id) return { ok: false, why: "the founder's git identity is not configured, so a commit would carry an address nobody owns" };
+
+  const done = git(path, ["-c", `user.name=${id.name}`, "-c", `user.email=${id.email}`,
+                          "commit", "--quiet", "-m", message]);
+  if (!done.ok) return { ok: false, why: `commit refused: ${done.err}` };
+
+  const head = git(path, ["rev-parse", "HEAD"]);
+  if (!head.ok) return { ok: false, why: `committed, but the new head could not be read: ${head.err}` };
+  return { ok: true, why: null, committed: true, files, head: head.out };
+}
+
+/**
  * Remove a run's checkout. A standalone clone holds nothing reeve has not
  * already fetched, so this is a deletion rather than the worktree reaper's
  * careful quarantine — but it refuses when the caller has not confirmed the

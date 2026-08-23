@@ -20,6 +20,13 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-e2e-"));
 // deployment must have them: the worker policy denies reads of the clone, so a
 // checkout INSIDE it would be denied its own code and the dispatch refuses.
 const clone = mkdtempSync(join(tmpdir(), "reeve-e2e-clone-"));
+// A real repository with a LOCAL identity. reeve reads user.name/user.email from
+// the founder's checkout to commit a worker's work, and a fixture that fell
+// through to the developer's global config would pass here and fail on a machine
+// that has none.
+execFileSync("git", ["-C", clone, "init", "-q"]);
+execFileSync("git", ["-C", clone, "config", "user.name", "Founder"]);
+execFileSync("git", ["-C", clone, "config", "user.email", "founder@example.invalid"]);
 const dbPath = join(dir, "e.db");
 const logPath = join(dir, "log.txt");
 let fail = 0;
@@ -358,7 +365,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   const logU = readFileSync(join(dirU, "log.txt"), "utf8");
   const escU = [...rU.escalations.keys()].join(" | ");
 
-  check(publishedU === 0, "a checkout with uncommitted work is NOT published", `published=${publishedU}`);
+  check(publishedU === 0, "a checkout with uncommitted work on ANOTHER branch is NOT published", `published=${publishedU}`);
   check(!/published \d+ file/.test(logU), "and the log does not say it was", logU.split("\n").filter(l => /publish/.test(l)).join(" | ").slice(0, 200));
   check(/uncommitted/.test(escU), "the escalation says what is wrong with it", escU);
   check(existsSync(join(`${wtU}.unfetched`, "fix.js")) || existsSync(join(wtU, "fix.js")),
@@ -366,6 +373,77 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   ctxU.db.close();
   rmSync(dirU, { recursive: true, force: true });
   rmSync(`${wtU}.unfetched`, { recursive: true, force: true });
+}
+
+// --- reeve COMMITS what the worker could not, and then publishes it ----------
+//
+// The worker's sandbox denies Bash writes to `.git`, so `git add` and
+// `git commit` fail with EPERM on `.git/index.lock`. Measured 2026-08-23: three
+// dispatches, three correct fixes, nothing published, because the fix only ever
+// existed in the working tree. reeve commits before the gates, and the gates then
+// judge the ref that results.
+{
+  const dirV = mkdtempSync(join(tmpdir(), "reeve-e2e-reeve-commits-"));
+  const wtV = mkdtempSync(join(dirV, "wt-"));
+  execFileSync("git", ["-C", wtV, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtV, "seed.js"), "seed\n");
+  execFileSync("git", ["-C", wtV, "add", "-A"]);
+  execFileSync("git", ["-C", wtV, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"]);
+  const pinnedV = execFileSync("git", ["-C", wtV, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  // What a worker leaves behind now: the fix, in the files, uncommitted. Plus a
+  // file git is told to ignore, which must not travel.
+  writeFileSync(join(wtV, ".gitignore"), "ignored.log\n");
+  writeFileSync(join(wtV, "fix.js"), "the fix the worker could not commit\n");
+  writeFileSync(join(wtV, "ignored.log"), "build noise\n");
+
+  let publishedV = 0, atPublish = null;
+  const ctxV = { ...baseCtx(), db: open(join(dirV, "v.db")), logPath: join(dirV, "log.txt"),
+                 evaluate: () => ({ ...evaluation, head: pinnedV, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtV, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 // Read at the moment reeve considers the work publishable: a
+                 // successful publish releases the checkout, so nothing can be
+                 // inspected after the tick returns.
+                 publishWork: ({ path }) => {
+                   publishedV++;
+                   const gv = (...a) => execFileSync("git", ["-C", path, ...a], { encoding: "utf8" }).trim();
+                   atPublish = { head: gv("rev-parse", "f"), dirty: gv("status", "--porcelain"),
+                                 shipped: gv("diff", "--name-only", `${pinnedV}..refs/heads/f`).split("\n").filter(Boolean),
+                                 who: gv("log", "-1", "--format=%an <%ae>"),
+                                 subject: gv("log", "-1", "--format=%s"), body: gv("log", "-1", "--format=%b") };
+                   return { ok: true, why: null };
+                 },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0,
+                                             sessionId: "s", report: { cause: "the day was read in local time", change: "use the UTC accessors" } }) };
+  const rV = await tick(ctxV);
+  const escV = [...rV.escalations.keys()].join(" | ");
+  check(atPublish !== null, "control: reeve reached the publish step at all", escV);
+  // Every assertion below is conditioned on having reached it. Without that, a
+  // run that never publishes leaves these undefined and `undefined !== pinned`
+  // reads as a pass -- the check would be green precisely when the fix is gone.
+  const at = atPublish ?? {};
+  const reached = atPublish !== null;
+  const shipped = at.shipped ?? [];
+
+  check(reached && at.head !== pinnedV, "reeve commits the work the worker left in the files", `${pinnedV.slice(0, 8)} -> ${String(at.head ?? "(never published)").slice(0, 8)}`);
+  check(reached && publishedV === 1, "and publishes it", `published=${publishedV} esc=${escV}`);
+  check(reached && at.dirty === "", "leaving the checkout clean, so nothing is silently dropped", String(at.dirty ?? "(never published)"));
+  check(reached && shipped.includes("fix.js"), "the fix travels", shipped.join(", ") || "(never published)");
+  check(reached && !shipped.includes("ignored.log"), "an ignored file does not", shipped.join(", ") || "(never published)");
+
+  // The commit must carry the FOUNDER's identity. With GIT_CONFIG_GLOBAL at
+  // /dev/null a worker checkout has none, and git invents one from the username
+  // and the hostname -- an address nobody owns, which a ruleset requiring a
+  // verified committer refuses.
+  check(reached && at.who === "Founder <founder@example.invalid>", "under the founder's identity, not one git invented", String(at.who ?? "(never published)"));
+
+  // And the message is reeve's, built from the worker's own two sentences.
+  check(reached && at.subject === "fix(ci): use the UTC accessors", "the subject is Conventional Commits, from the report's `change`", String(at.subject ?? "(never published)"));
+  check(reached && at.body === "the day was read in local time", "and the body is the report's `cause`", String(at.body ?? "(never published)"));
+  check(reached && String(at.subject ?? "x".repeat(99)).length <= 72, "control: the subject fits the 72-character limit", String((at.subject ?? "").length));
+
+  ctxV.db.close();
+  rmSync(dirV, { recursive: true, force: true });
 }
 
 // --- a token in the COMMIT MESSAGE travels with the push too -----------------

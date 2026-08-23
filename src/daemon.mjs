@@ -21,7 +21,7 @@ import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTC
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE, gitEnv } from "./gitguard.mjs";
-import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor } from "./checkout.mjs";
+import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor, commitRunWork } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
@@ -129,6 +129,30 @@ function attemptsFor(db, nwo, pr, fp, logPath) {
  * passes the diff gate, is counted in "published N file(s)", and is then deleted
  * with the checkout, having never left the machine. (Codex #5-[2].)
  */
+/**
+ * The commit message reeve writes for a worker's repair.
+ *
+ * Built from the worker's own report rather than from the failure text: `cause`
+ * and `change` are the two sentences it was asked for, and they are what someone
+ * reading `git log` a month later needs. The report is model output that has read
+ * untrusted CI logs, so it goes through `printable` like every other worker
+ * string that reaches a terminal.
+ */
+function repairMessage(report, decision) {
+  const clean = s => printable(String(s ?? "")).replace(/\s+/g, " ").trim();
+  const change = clean(report?.change);
+  const cause = clean(report?.cause);
+  const scope = decision?.action === "FIX_FINDINGS" ? "review" : "ci";
+  // Conventional Commits: a lowercase subject of at most 72 characters and no
+  // trailing period. Truncation falls back to a word boundary, because a subject
+  // cut mid-word reads as corruption rather than as brevity.
+  const said = (change || "repair the failing check").replace(/\.+$/, "");
+  const full = `fix(${scope}): ${said.charAt(0).toLowerCase()}${said.slice(1)}`;
+  const subject = full.length <= 72 ? full
+    : full.slice(0, 72).replace(/\s+\S*$/, "");
+  return cause ? `${subject}\n\n${cause}` : subject;
+}
+
 function uncommittedFiles(worktree) {
   try {
     const out = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "status", "--porcelain"], { encoding: "utf8", env: gitEnv() }).trim();
@@ -1185,6 +1209,31 @@ export async function tick(ctx) {
       if (decision.action === "FIX_CI" && fp) noteFixAttempt(db, nwo, e.pr, fp, statedBlocker(r.report));
 
       if (r.outcome === OUTCOMES.OK) {
+        // The worker cannot commit its own work. Its sandbox denies Bash writes
+        // to `.git`, so `git add` and `git commit` fail with EPERM on
+        // `.git/index.lock`: measured 2026-08-23, seven attempts in one run and
+        // thirteen of its thirty-six turns spent correctly diagnosing an
+        // instruction it could not carry out. Three dispatches produced three
+        // correct fixes and published none of them
+        // (docs/measured/2026-08-23-three-real-dispatches.md).
+        //
+        // reeve commits instead, and does it HERE -- before every gate below, so
+        // this decides nothing about what may ship. It only makes the work
+        // pushable; the gates then judge the ref that results, exactly as they
+        // judged the worker's own commits before.
+        const landed = (ctx.commitWork ?? commitRunWork)({
+          repoRoot: repoCheckout, path: worktree, branch: e.headRef,
+          message: repairMessage(r.report, decision),
+        });
+        if (!landed.ok) {
+          const rel = releaseRunCheckout(worktree, { workFetched: false });
+          log(logPath, `  #${e.pr}: NOT published — reeve could not commit the work: ${landed.why}${rel.quarantined ? `; preserved at ${rel.path}` : ""}`);
+          escalations.set(`#${e.pr}: a finished fix was NOT published — reeve could not commit it: ${landed.why}`, 1);
+          continue;
+        }
+        if (landed.committed) log(logPath, `  #${e.pr}: committed ${landed.files.length} file(s) the worker left in the checkout`);
+        else if (landed.why) log(logPath, `  #${e.pr}: ${landed.why}`);
+
         // Everything accepted must be COMMITTED before anything is published or
         // released. reeve publishes by fetching the checkout's BRANCH, so an
         // uncommitted edit is invisible to the push and would then be deleted

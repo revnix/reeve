@@ -38,8 +38,14 @@ for (const action of ["FIX_CI", "FIX_FINDINGS"]) {
   // Anything the sandbox refuses outright must not be INSTRUCTED. A line that
   // explains why something is refused is not an instruction to do it, so the
   // check looks for the imperative form rather than for the word.
-  const instructions = p.split("\n").filter(l => /^\s*(?:[0-9]+\.|[-*])?\s*(?:then\s+)?(?:push|run|execute|merge)\b/i.test(l.trim()));
-  for (const [verb, rule] of [["push", "Bash(git push"], ["merge", "gh pr merge"]]) {
+  const instructions = p.split("\n").filter(l => /^\s*(?:[0-9]+\.|[-*])?\s*(?:then\s+)?(?:push|run|execute|merge|commit|stage)\b/i.test(l.trim()));
+  // `commit` joined this list on 2026-08-23. The prompt said "Commit only the
+  // files your fix touches" while the sandbox denied every write to `.git`, so
+  // three dispatches produced correct fixes that could not be committed and were
+  // never published. It is the same defect as the `push` row above, one step
+  // earlier in the sequence, and this test did not have the verb for it.
+  for (const [verb, rule] of [["push", "Bash(git push"], ["merge", "gh pr merge"],
+                              ["commit", "Bash(git commit"], ["add", "Bash(git add"]]) {
     const told = instructions.some(l => new RegExp(`\\b${verb}\\b`, "i").test(l) && !/do not|never|cannot|not able/i.test(l));
     check(!(told && deny.includes(rule)),
       `${action}: never INSTRUCTED to ${verb}, which the sandbox denies`,

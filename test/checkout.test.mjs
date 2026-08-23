@@ -1,7 +1,7 @@
 // A worker's checkout must share NOTHING with the founder's: not the ref store,
 // not the configuration, and not their uncommitted work. These assertions are
 // what makes the standalone clone a boundary rather than a convention.
-import { prepareRunCheckout, releaseRunCheckout, fetchRunWork, publishRunWork, copyDeps, canCloneFiles, runPathFor, dependencyPathsFor } from "../src/checkout.mjs";
+import { prepareRunCheckout, releaseRunCheckout, fetchRunWork, publishRunWork, copyDeps, canCloneFiles, runPathFor, dependencyPathsFor, commitRunWork, founderIdentity } from "../src/checkout.mjs";
 import { verifyConfig } from "../src/gitguard.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
@@ -554,5 +554,96 @@ check(existsSync(join(r.path, "node_modules", "left-pad", "index.js")), "but the
 releaseRunCheckout(r.path, { workFetched: true });
 check(!existsSync(r.path), "a fetched checkout is removed", "");
 rmSync(root, { recursive: true, force: true });
+
+// ── reeve commits what the worker cannot ─────────────────────────────────────
+//
+// The worker's sandbox denies Bash writes to `.git`: `git add` and `git commit`
+// fail with EPERM on `.git/index.lock`. Measured 2026-08-23, seven attempts in a
+// single run, three dispatches that produced correct fixes and published none of
+// them. reeve does the committing now, before the gates that judge the result.
+{
+  const cRoot = mkdtempSync(join(tmpdir(), "reeve-commit-"));
+  // The founder's checkout, with a LOCAL identity so this test does not read the
+  // developer's global git configuration and pass for a reason CI would not have.
+  const cFounder = join(cRoot, "founder");
+  mkdirSync(cFounder);
+  g(cFounder, "init", "-q");
+  g(cFounder, "config", "user.name", "Founder");
+  g(cFounder, "config", "user.email", "founder@example.invalid");
+
+  const id = founderIdentity(cFounder);
+  check(id?.name === "Founder" && id?.email === "founder@example.invalid",
+    "the founder's identity is read from the founder's own repository", JSON.stringify(id));
+
+  // A worker checkout on the branch that gets published.
+  const mkWorktree = (name, branch = "f") => {
+    const w = join(cRoot, name);
+    mkdirSync(w);
+    g(w, "init", "-q", "-b", branch);
+    writeFileSync(join(w, "seed.js"), "seed\n");
+    g(w, "add", "-A");
+    g(w, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed");
+    return w;
+  };
+
+  {
+    const w = mkWorktree("clean-branch");
+    const before = g(w, "rev-parse", "HEAD");
+    writeFileSync(join(w, ".gitignore"), "noise.log\n");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    writeFileSync(join(w, "noise.log"), "build output\n");
+
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): repair the thing" });
+    check(r.ok && r.committed === true, "an uncommitted fix is committed", JSON.stringify(r).slice(0, 200));
+    check(g(w, "rev-parse", "f") !== before, "and the branch that gets pushed moves", `${before.slice(0,8)} -> ${g(w, "rev-parse", "f").slice(0,8)}`);
+    check(g(w, "status", "--porcelain") === "", "leaving nothing behind to be silently dropped", g(w, "status", "--porcelain"));
+    check(r.files.includes("fix.js") && !r.files.includes("noise.log"),
+      "an ignored file is not staged with it", r.files.join(", "));
+    check(g(w, "log", "-1", "--format=%an <%ae>") === "Founder <founder@example.invalid>",
+      "the commit carries the founder's identity, not one git invents from the hostname",
+      g(w, "log", "-1", "--format=%an <%ae>"));
+    check(g(w, "log", "-1", "--format=%s") === "fix(ci): repair the thing", "and the message reeve was given", g(w, "log", "-1", "--format=%s"));
+  }
+
+  {
+    // Nothing left behind is not an error: a worker that changed nothing, or one
+    // whose work is already committed, leaves the branch for the gates to judge.
+    const w = mkWorktree("nothing-to-do");
+    const before = g(w, "rev-parse", "HEAD");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): nothing" });
+    check(r.ok && r.committed === false, "a clean checkout produces no commit, and no error", JSON.stringify(r));
+    check(g(w, "rev-parse", "f") === before, "control: and the branch did not move", before.slice(0, 8));
+  }
+
+  {
+    // A checkout on another branch is SKIPPED rather than refused. Refusing here
+    // would return before the gate that reads the pushed ref for reeve's own
+    // worker token, and a worker that commits a credential on the branch then
+    // checks out elsewhere would be reported as "wrong branch" instead.
+    const w = mkWorktree("wrong-branch");
+    g(w, "checkout", "-q", "-b", "aux");
+    writeFileSync(join(w, "stray.js"), "not on the published branch\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x" });
+    check(r.ok === true && r.committed === false, "a checkout on another branch is skipped, not refused", JSON.stringify(r));
+    check(/not committing/.test(r.why ?? ""), "and says why, so the log is not silent about it", String(r.why));
+    check(g(w, "status", "--porcelain") !== "", "control: the work is still there for the uncommitted check to catch", g(w, "status", "--porcelain"));
+  }
+
+  {
+    // No identity is a REFUSAL. git would otherwise invent one from the username
+    // and the hostname -- `Mobeen <mobeen@192.168.1.18>`, measured 2026-08-23 --
+    // and the commit would carry an address nobody owns.
+    const w = mkWorktree("needs-identity");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    const before = g(w, "rev-parse", "HEAD");
+    const r = commitRunWork({ repoRoot: "/nonexistent-repo-root", path: w, branch: "f", message: "fix(ci): x" });
+    check(r.ok === false, "an unreadable founder identity refuses the commit", JSON.stringify(r));
+    check(/identity/.test(r.why ?? ""), "and names the identity as the reason", String(r.why));
+    check(g(w, "rev-parse", "f") === before, "control: nothing was committed under an invented address", before.slice(0, 8));
+  }
+
+  rmSync(cRoot, { recursive: true, force: true });
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

@@ -105,6 +105,10 @@ const PROFILES = {
                                   commands: { release: { cmd: "npm run release", state: "present" },
                                               test: { cmd: "npm test", state: "present" } } }],
                         risk: { forbiddenCommands: ["npm run release"] } },
+  // Every declared command refused. The project HAS verification commands; the
+  // worker may not run them, which is different from the project having none.
+  "all commands denied": { units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm",
+                                     commands: { release: { cmd: "npm publish", state: "present" } } }], risk: {} },
   // Nothing runnable at all: no units, and git plus every read-only utility
   // forbidden.
   "nothing runnable": { units: [],
@@ -173,6 +177,26 @@ for (const [name, prof] of Object.entries(PROFILES)) {
     const cmd = /^\s{2}\S+\s+(\S.*)$/.exec(line)?.[1];
     if (!cmd) continue;
     check(isGranted(cmd.trim()), `${name}: the verify section offers \`${cmd.trim()}\`, and it is granted`, `granted: ${granted.join(", ")}`);
+  }
+
+  // Rule 0 must describe MATCHING, not promise permission: a granted prefix can
+  // always have a more specific deny under it, and `git` is the standing example
+  // -- `Bash(git:*)` is granted while `git push` is denied.
+  check(!/is permitted/.test(rule0), `${name}: rule 0 does not promise that every form of the example is permitted`,
+        rule0.split("\n").filter(l => /permitted/.test(l)).join(" | ").slice(0, 160));
+
+  // A profile with nothing else granted still has the interpreter, by absolute
+  // path, and must be pointed at it rather than told it has nothing.
+  if (name === "nothing runnable") {
+    check(prompt.includes(process.execPath), "nothing runnable: the worker is pointed at the interpreter it does have", "");
+    check(!/no shell commands granted/.test(prompt), "and is not told it has none", "");
+  }
+
+  // Declared-but-refused must not be reported as never declared.
+  if (name === "all commands denied") {
+    check(/all refused by this sandbox/.test(prompt), "all commands denied: the prompt says the commands exist and are refused",
+          verify.slice(0, 160) || prompt.split("HOW TO VERIFY")[1]?.slice(0, 200) || "");
+    check(!/declares no verification commands/.test(prompt), "and does not claim the project declares none", "");
   }
 
   check(!/`undefined|`null/.test(rule0), `${name}: rule 0 never prints a placeholder as a command`,

@@ -10,6 +10,41 @@
 // protocol containing instructions that contradicted each other and a path to a
 // checkout 47 commits stale.
 
+import { projectRunners } from "./sandbox.mjs";
+
+/**
+ * The commands this prompt presents to a worker as runnable, in the order it
+ * names them. Every one is drawn from the profile the grant is built from, never
+ * written in by hand.
+ *
+ * Exported so a test can hold the prose against the real grant. Until 2026-08-23
+ * rule 0 promised `pnpm test` to every worker regardless of profile; a worker
+ * granted `npm` spent a turn discovering otherwise, and that was the sixth
+ * measured instance of the prompt claiming what the sandbox refuses.
+ */
+export function claimedCommands(profile) {
+  const example = exampleCommand(profile);
+  return [...(example ? [example] : []), ...namedRunners(profile)];
+}
+
+/** `git` first because it is granted for every action, then the language's own
+ * runners. Two is enough to make the point without listing the whole grant. */
+function namedRunners(profile) {
+  return ["git", ...[...projectRunners(profile)].slice(0, 2)];
+}
+
+/** The project's own verification command, as the grant sees it: the runner and
+ * its first argument, which is exactly the shape `sandboxFor` allows. */
+function exampleCommand(profile) {
+  for (const u of profile?.units ?? []) {
+    for (const c of Object.values(u.commands ?? {})) {
+      if (c?.state !== "present" || !c.cmd) continue;
+      return c.cmd.trim().split(/\s+/).slice(0, 2).join(" ");
+    }
+  }
+  return null;
+}
+
 /**
  * Invariants every worker gets, whatever its task.
  *
@@ -19,6 +54,9 @@
  */
 function invariants(profile) {
   const risk = profile.risk ?? {};
+  const named = namedRunners(profile);
+  const runnable = exampleCommand(profile) ?? named[0];
+  const nameList = named.map(r => `\`${r}\``).join(", ");
   const lines = [
     "RULES, in order of precedence:",
 
@@ -28,9 +66,10 @@ function invariants(profile) {
     // worker reads that as "I am not allowed to run tests" rather than "say it
     // differently". This is about the shape of the request, not about restraint.
     "0. Run ONE command per tool call. Do not chain with && or ; , do not pipe, and do",
-    "   not redirect. `pnpm test` is permitted; `pnpm test 2>&1 | tail -20` is refused",
-    "   by the sandbox as a different command. If output is long, read the file instead.",
-    "   Use plain command names — `node`, `git`, `pnpm` — never an absolute path to a",
+    `   not redirect. A command is matched from its START, so \`${runnable} …\` is`,
+    `   permitted while \`${runnable} … 2>&1 | tail -20\` is refused as a different command.`,
+    "   If output is long, read the file instead.",
+    `   Use plain command names — ${nameList} — never an absolute path to a`,
     "   binary and never `env` or `sh` as a wrapper. The permissions are written",
     "   against the names, so a path or a wrapper reads as something else entirely.",
     "   A `for` loop is a compound command too, and will be refused. To run the",

@@ -40,6 +40,15 @@ function namedRunners(profile) {
 /** The project's own verification command, as the grant sees it: the runner and
  * its first argument, which is exactly the shape `sandboxFor` allows. */
 function exampleCommand(profile) {
+  return runnableCommands(profile)[0] ?? null;
+}
+
+/** EVERY declared command that survives the deny rules, deduplicated and in
+ * declaration order. The fallback below has to name all of them: `sandboxFor`
+ * grants one per declared command, so describing only the first tells a worker
+ * that a command HOW TO VERIFY goes on to recommend is not available. */
+function runnableCommands(profile) {
+  const out = [];
   for (const u of profile?.units ?? []) {
     for (const c of Object.values(u.commands ?? {})) {
       if (c?.state !== "present" || !c.cmd) continue;
@@ -59,10 +68,10 @@ function exampleCommand(profile) {
       // `npm run` looking clean while the command the worker is actually told to
       // run below is refused.
       if (commandDenied(head, profile) || commandDenied(full, profile)) continue;
-      return head;
+      if (!out.includes(head)) out.push(head);
     }
   }
-  return null;
+  return out;
 }
 
 /**
@@ -77,6 +86,7 @@ function invariants(profile) {
   const named = namedRunners(profile);
   // Unconditional in `sandboxFor`, but a profile may forbid it by absolute path.
   const interpreter = commandDenied(process.execPath, profile) ? null : process.execPath;
+  const runnableList = runnableCommands(profile);
   const runnable = exampleCommand(profile) ?? named[0] ?? null;
   const nameList = named.map(r => `\`${r}\``).join(", ");
   const lines = [
@@ -119,19 +129,12 @@ function invariants(profile) {
       // schema accepts any non-empty string in `forbiddenCommands` -- including
       // this absolute path -- and deny beats allow. Advertising it then names a
       // command the sandbox refuses, which is the defect this file exists to stop.
-      ...(interpreter && runnable
-            ? [`   The shell commands granted here are \`${runnable} …\` and the interpreter`,
-               `   itself, at \`${interpreter}\`.`,
+      ...(runnableList.length || interpreter
+            ? [`   The shell commands granted here are ${[...runnableList.map(c => `\`${c} …\``),
+                                                          ...(interpreter ? [`the interpreter itself at \`${interpreter}\``] : [])]
+                                                          .join(", ")}.`,
                "   Use those exactly as written: the rule about plain names does not apply",
-               "   to them, because these grants are written against a path and a whole command."]
-        : interpreter
-            ? [`   The only shell command granted here is the interpreter itself, at`,
-               `   \`${interpreter}\`. Use that exact path: the rule about plain names does`,
-               "   not apply to it, because the grant is written against a path."]
-        : runnable
-            ? [`   The only shell command granted here is \`${runnable} …\`. Use it exactly as`,
-               "   written: the rule about plain names does not apply, because the grant is",
-               "   written against the whole command."]
+               "   to them, because these grants are written against whole commands and a path."]
             : ["   You have no shell commands granted at all: work from the files alone."]),
     ]),
     "   A `for` loop is a compound command too, and will be refused. To run the",

@@ -119,6 +119,13 @@ const PROFILES = {
   // forbidden. The interpreter grant survives, and the prompt must say so.
   "nothing runnable": { units: [],
                         risk: { forbiddenCommands: ["git", "ls", "cat", "head", "tail", "wc", "find", "which", "pwd"] } },
+  // TWO surviving declared commands, and no plain name at all. `sandboxFor` grants
+  // one per declared command, so naming only the first hides the second -- which
+  // HOW TO VERIFY then goes on to recommend.
+  "two declared commands": { units: [{ id: "root", root: ".", language: "cobol",
+                                       commands: { test: { cmd: "make test", state: "present" },
+                                                   lint: { cmd: "custom lint", state: "present" } } }],
+                             risk: { forbiddenCommands: ["git", "ls", "cat", "head", "tail", "wc", "find", "which", "pwd"] } },
   // The same, plus the interpreter forbidden by its absolute path. The schema
   // accepts any non-empty string here, and deny beats allow.
   "not even the interpreter": { units: [],
@@ -197,6 +204,10 @@ for (const [name, prof] of Object.entries(PROFILES)) {
 
   // A profile with nothing else granted still has the interpreter, by absolute
   // path, and must be pointed at it rather than told it has nothing.
+  if (name === "two declared commands") {
+    check(/make test/.test(rule0) && /custom lint/.test(rule0),
+      "two declared commands: rule 0 names both, not just the first", rule0.slice(-320));
+  }
   if (name === "only a declared command") {
     check(/make test/.test(rule0), "only a declared command: rule 0 names the command the declaration granted", rule0.slice(-300));
     check(!/only shell command/.test(prompt), "and does not call the interpreter the only one", "");

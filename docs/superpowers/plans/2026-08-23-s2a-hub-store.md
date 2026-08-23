@@ -457,7 +457,11 @@ Append to `test/hub-schema.test.mjs`, immediately before the `rmSync` line:
   const terr = (kind) => { try {
     db.prepare("INSERT INTO task_territory(task,kind,path) VALUES('bt:FILED',?,'packages/x')").run(kind);
     return true; } catch { return false; } };
-  check(terr("file") === false || terr("prefix"), "task_territory accepts the two v1 claim shapes");
+  // Both kinds, asserted separately. `a === false || b` is SATISFIED when the
+  // schema wrongly rejects 'file' (the left side becomes true), so the original
+  // passed on exactly the breakage it was written to catch.
+  check(terr("file"), "task_territory accepts an exact-file claim");
+  check(terr("prefix"), "and a recursive-prefix claim");
   check(!terr("glob"), "and refuses anything else, including glob");
 
   // At most one live run per task. The guardian's run table learned this the
@@ -1369,7 +1373,14 @@ CREATE TABLE IF NOT EXISTS provider_lease (
   requested_at INTEGER NOT NULL,
   started_at   INTEGER,
   heartbeat_at INTEGER,
-  expires_at   INTEGER NOT NULL
+  expires_at   INTEGER NOT NULL,
+  -- Set when a guardian is queued and every slot is held by builder leases
+  -- (section 10.4, builder.provider.preemptAtBoundary). It is a REQUEST, read by
+  -- the builder loop at a phase boundary and never acted on mid-phase, which is
+  -- why it is a flag here rather than a revocation. S2-C writes and reads it;
+  -- the column lives here because migration 1 owns the whole schema and a table
+  -- gaining a column later would need a numbered migration for no reason.
+  preempt_requested INTEGER NOT NULL DEFAULT 0 CHECK (preempt_requested IN (0,1))
 ) STRICT;
 CREATE INDEX IF NOT EXISTS provider_lease_live ON provider_lease(status, owner, requested_at);
 -- One LIVE request per run. A capacity-blocked guardian calls claimProvider again
@@ -1452,9 +1463,17 @@ import { hubEvent, migrationPlan } from "../src/build/hubdb.mjs";
   // hub_event must join the CALLER's transaction. If it opened its own, a
   // transition that rolled back would still leave its event behind, and the
   // replay would rebuild a fact that never happened.
-  try { hubTx(db, () => { hubEvent(db, { kind: "approval.recorded", task: "bt:1", payload: { a: 1 } }); throw new Error("x"); }); } catch {}
+  // A hubEvent that opened its OWN transaction throws on the nested BEGIN, and a
+  // bare catch swallows that -- leaving the row count at 0 for the wrong reason,
+  // so the assertion passes against the very implementation it targets.
+  let nested = null;
+  try { hubTx(db, () => { hubEvent(db, { kind: "approval.recorded", task: "bt:1", payload: { a: 1 } }); throw new Error("SENTINEL"); }); }
+  catch (e) { nested = e.message; }
+  check(nested === "SENTINEL",
+    "hubEvent joins the caller's transaction rather than opening its own",
+    `the body's own error should surface; got ${nested} -- a BEGIN error means hubEvent wrapped itself`);
   check(db.prepare("SELECT count(*) c FROM hub_event").get().c === 0,
-    "a hub_event written inside a transaction that rolls back leaves nothing");
+    "and a hub_event written in a transaction that rolls back leaves nothing");
   const seq = hubTx(db, () => hubEvent(db, { kind: "approval.recorded", task: "bt:1", payload: { b: 2 } }));
   check(typeof seq === "number" && seq > 0, "control: it returns its seq when the transaction commits", String(seq));
 
@@ -1676,10 +1695,12 @@ const ALWAYS = () => true;   // everything is alive
   writeFileSync(worker, `
 import { openHub } from "${join(process.cwd(), "src/build/hubdb.mjs")}";
 import { acquireSingleton } from "${join(process.cwd(), "src/build/locks.mjs")}";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 const db = openHub(process.argv[2]);          // open BEFORE the barrier, so the
 const go = process.argv[4];                   // race is over the write, not over
-while (!existsSync(go)) {}                    // process startup and file open
+writeFileSync(join(process.argv[5], process.argv[3]), "");   // ...startup and open
+while (!existsSync(go)) {}
 const r = acquireSingleton(db, { name: "builder", pid: Number(process.argv[3]),
   lstart: "L" + process.argv[3], command: "reeve build run", isAlive: () => true });
 console.log(r.ok ? "WON" : "lost");
@@ -1691,14 +1712,22 @@ console.log(r.ok ? "WON" : "lost");
   // one opens the database. The barrier file below is what makes it a race: every
   // child opens the store, then spins until `go` appears, so all twenty contend
   // for the same write at once.
-  const go = join(dir, "go");
+  const go = join(dir, "go"), ready = join(dir, "ready");
+  mkdirSync(ready, { recursive: true });
   const kids = Array.from({ length: 20 }, (_, i) =>
     new Promise((res) => {
-      const c = spawn(process.execPath, [worker, p, String(1000 + i), go], { encoding: "utf8" });
+      const c = spawn(process.execPath, [worker, p, String(1000 + i), go, ready], { encoding: "utf8" });
       let out = ""; c.stdout.on("data", d => out += d);
       c.on("exit", () => res(out.trim()));
     }));
-  await new Promise(r => setTimeout(r, 300));   // let every child reach the barrier
+  // Wait for every child to ANNOUNCE it is at the barrier rather than sleeping a
+  // fixed 300ms and hoping. On a loaded machine some children have not opened
+  // the database when the gun fires, so they arrive late, contend with nobody,
+  // and the race silently shrinks to however many made it in time.
+  for (let i = 0; i < 400 && readdirSync(ready).length < 20; i++)
+    await new Promise(r => setTimeout(r, 25));
+  check(readdirSync(ready).length === 20,
+    `control: all 20 children reached the barrier before the start (${readdirSync(ready).length}/20)`);
   writeFileSync(go, "");
   const results = await Promise.all(kids);
   const winners = results.filter(r => r === "WON").length;
@@ -1884,6 +1913,10 @@ Add to `bin/reeve`, beside the existing `case "run":`:
 
 ```js
   case "build": {
+    // HOME is the value bin/reeve already resolved (--home, REEVE_HOME, or the
+    // default). An earlier draft called `reeveHome()`, which is not defined in
+    // this file, so every build run and build status threw before reaching the
+    // lease -- the two commands this task exists to add.
     const sub = process.argv[3];
     if (sub !== "run" && sub !== "status")
       die(`usage: reeve build run [--takeover] | reeve build status`);
@@ -1956,8 +1989,9 @@ Add to `bin/reeve`, beside the existing `case "run":`:
         log("build run: lost the singleton lease; another process holds it. Stopping.");
         process.exit(1);
       }
-      refreshGateState(db, ...);        // the one tick S2 ships (Task 18)
-      await sleep(HEARTBEAT_SECONDS * 1000);
+      // refreshGateState lands with S2-B (its Task 18); until then the loop body
+      // is the heartbeat alone. `sleep` is not a global -- spelled out here.
+      await new Promise(r => setTimeout(r, HEARTBEAT_SECONDS * 1000));
     }
     break;
   }
@@ -2006,6 +2040,8 @@ Create `test/hub-backup-restore.test.mjs`:
 // zero backups and the repo it watched had fourteen. A store that nothing
 // reminds you about is exactly the one that is not backed up.
 import { everyStore, snapshotAll, latestSnapshot, validateSnapshot } from "../src/backup.mjs";
+import { open as openStore } from "../src/db/ops.mjs";      // builds the real guardian fixture
+import { readFileSync } from "node:fs";                      // reads the durable tail back
 import { openHub, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
 import { hubPathFor } from "../src/paths.mjs";
 import { DatabaseSync } from "node:sqlite";
@@ -2098,8 +2134,17 @@ openHub(hubPathFor(home)).close();
   // Calling validateSnapshot alone leaves the corrupt file in place and the
   // assertion below passes for the wrong reason -- it never exercised the
   // code that is supposed to remove it.
-  snapshotAll(home, root);
-  check(!existsSync(path), "and snapshotAll deletes it rather than leaving it as the newest candidate");
+  // snapshotAll only validates the snapshot IT takes this second, so a corrupt
+  // file planted at a future timestamp is never its candidate and is never
+  // deleted. What actually protects a restore is the read path: latestSnapshot
+  // must not hand back a file that fails validation. Assert that, and assert
+  // the sweep the command performs over existing candidates.
+  const before = latestSnapshot(root, "hub");
+  check(before !== path,
+    "latestSnapshot never returns a candidate that fails validation, whatever its timestamp",
+    `returned ${before}`);
+  check(validateSnapshot(path, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION }).ok === false,
+    "control: the planted file really is invalid, so the assertion above is not vacuous");
   check(latestSnapshot(root, "hub") !== path,
     "so latestSnapshot no longer offers a file that would fail at restore time", String(latestSnapshot(root, "hub")));
 }
@@ -2416,7 +2461,7 @@ import { hubTx } from "./hubdb.mjs";
  * one reason that is correct.
  */
 export const COMPARISON_SET = [
-  "task", "task_territory", "task_drain", "phase_event", "approval", "gate_request", "notice_receipt", "impl_pr", "attested_push",
+  "task", "task_territory", "task_drain", "phase_event", "phase_run", "approval", "gate_request", "notice_receipt", "impl_pr", "attested_push",
   "harness_acceptance", "gate_run", "pr_hold", "hold_reason", "project_authority",
   "outbox", "territory_lease", "merge_decision",
 ];
@@ -2431,6 +2476,13 @@ const HANDLERS = {
   // compares against nothing. The transition tx emits this beside
   // task.transitioned, carrying the exact row including its seq.
   "phase_event.appended":     { table: "phase_event", key: ["seq"] },
+  // phase_run's LIVE rows are process state, but its settled ones are history:
+  // the attempt counter is monotonic per (task, generation, phase, slice) and
+  // must never be reused (section 3.4). Losing settled rows on restore lets a
+  // resumed run collide with an earlier attempt's key, and the retry budget
+  // silently resets. Live rows are excluded at replay: a run whose process is
+  // gone is not resurrected.
+  "phase_run.settled":        { table: "phase_run", key: ["task","generation","phase","slice","attempt"] },
   "task.filed":               { table: "task", key: ["id"] },
   // A filing writes the task AND its territory children in one transaction, so a
   // replay that restores only the task row loses the claims -- and territory is
@@ -2583,13 +2635,32 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // unlocked hub and writes into it while the replay is still running. There
     // is no such window here: the live file keeps its maintenance lock right up
     // until the instant it is replaced, and rename is atomic.
-    try { rmSync(staging, { force: true }); } catch {}
+    // Remove the staging file AND its WAL sidecars. A restore killed after
+    // opening the staging database in WAL mode leaves -wal/-shm behind; the next
+    // attempt copies a fresh main file over the same path and the stale sidecar
+    // is replayed into it on open, which is a silent merge of two restores.
+    for (const ext of ["", "-wal", "-shm"]) { try { rmSync(staging + ext, { force: true }); } catch {} }
     copyFileSync(snapshotPath, staging);
     let replayed = 0;
     {
       const back = openHub(staging);
       try {
         acquireMaintenanceLock(back, { pid, lstart, isAlive });
+
+        // Snapshots are taken by the running daemon, so a normal one CONTAINS
+        // live-looking process rows: a singleton lease held by a pid that was
+        // alive when VACUUM INTO ran, provider leases mid-dispatch, worktree
+        // leases. Restoring them resurrects authority that belongs to processes
+        // which no longer exist -- the next `build run` is refused by a ghost,
+        // and the reaper cannot help because pid+lstart may since have been
+        // reused by something unrelated. They are excluded from the comparison
+        // set for the same reason; they must be cleared from the restored file
+        // as well, not merely ignored when comparing.
+        for (const t of ["singleton_lease","writer_lease","maintenance_lock","directory_lease","provider_lease"])
+          if (t !== "maintenance_lock") back.exec(`DELETE FROM ${t}`);
+        // maintenance_lock is deliberately last and deliberately not cleared:
+        // this restore holds it. It is released below.
+
         if (tail.length) replayed = replayHub(back, tail).applied;
         releaseMaintenanceLock(back, { pid, lstart });
       } finally { back.close(); }
@@ -2908,7 +2979,7 @@ git commit -m "feat(doctor): report hub snapshot, gate state and provider state"
 | `phase_event` | `transition.mjs` | `why`, dash age-in-state, fence minting | **yes** (outbox fences reference its seq) | 3.2 |
 | `hold_reason` | `transition.mjs` (hold on a held task) | `task resume`, `why` | yes | 3.1 |
 | `hub_event` | every authority-bearing tx | `replay.mjs`, restore drill | n/a (is the log) | 11.4 |
-| `phase_run` | `loop.mjs` at dispatch, `daemon` adopt-or-kill | `why`, adopt-or-kill, retry budget | no (process-scoped detail) | 4.5 |
+| `phase_run` | `loop.mjs` at dispatch, `daemon` adopt-or-kill | `why`, adopt-or-kill, retry budget | **yes** (settled rows carry the monotonic attempt counter) | 4.5 |
 | `gate_run` | `gates.mjs` (controller-run gates) | merge clause B2, `why` | yes | 8.3 |
 | `gate_request` | `gate.mjs` per round | revision cap, `why` | yes | 7.3 |
 | `approval` | `gate.mjs` from the inbox | merge clauses B4/U2, `why` | yes | 7.3 |
@@ -2979,9 +3050,12 @@ for (const t of declared) check(inDb.has(t), `${t} is declared in TABLE_OWNERS a
 const kinds = replayableKinds();
 const replayTables = new Set(kinds.map(k => k.split(".")[0]).map(s => s === "task" ? "task" : s));
 for (const [t, o] of Object.entries(TABLE_OWNERS)) {
-  if (!o.replayed) continue;
   const covered = kinds.some(k => k.startsWith(t + ".")) || (t === "task" && kinds.includes("task.transitioned"));
-  check(covered, `${t} is marked replayed and replay.mjs has a handler for it`, kinds.join(","));
+  if (o.replayed) check(covered, `${t} is marked replayed and replay.mjs has a handler for it`, kinds.join(","));
+  // The reverse direction the contract promises and the loop skipped: a handler
+  // for a table nobody marked replayed means the two lists disagree about what
+  // survives a restore, and the comparison set is built from one of them.
+  else check(!covered, `${t} is marked NOT replayed and has no handler`, kinds.join(","));
 }
 
 // A guard against the cheapest wrong fix: a TABLE_OWNERS filled with "TBD".
@@ -3021,9 +3095,23 @@ Transcribe the checklist table above into two exports. `PROSE_TABLES` is transcr
 // PROSE_TABLES is transcribed BY HAND from section 11.2's SQL block. It is
 // deliberately not derived from TABLE_OWNERS: two lists built from one source
 // agree with each other and prove nothing.
+// One entry per row of the checklist above, transcribed VERBATIM -- all 32.
+// "... one entry per row ..." was shorthand in an earlier draft, and an executor
+// following it literally produces a file with one entry, which the cross-check
+// then reports as 31 missing tables. Write them all out; the checklist is the
+// source and it is directly above.
 export const TABLE_OWNERS = {
-  task: { writer: "transition.mjs, intake.mjs", reader: "loop.mjs, dash, task why, merge.mjs", replayed: true, section: "11.2" },
-  // ... one entry per row of the checklist, verbatim ...
+  task:            { writer: "transition.mjs, intake.mjs", reader: "loop.mjs, dash, task why, merge.mjs", replayed: true,  section: "11.2" },
+  task_territory:  { writer: "intake.mjs (admission tx)",  reader: "territory.mjs overlap check",         replayed: true,  section: "10.1" },
+  task_drain:      { writer: "transition.mjs (CANCELLING)", reader: "loop.mjs drain check, task why",     replayed: true,  section: "3.5"  },
+  phase_event:     { writer: "transition.mjs",              reader: "why, dash age-in-state, fences",     replayed: true,  section: "3.2"  },
+  hold_reason:     { writer: "transition.mjs",              reader: "task resume, why",                   replayed: true,  section: "3.1"  },
+  hub_event:       { writer: "every authority-bearing tx",  reader: "replay.mjs, the restore drill",      replayed: false, section: "11.4" },
+  phase_run:       { writer: "loop.mjs at dispatch",        reader: "why, adopt-or-kill, retry budget",   replayed: true,  section: "4.5"  },
+  gate_run:        { writer: "gates.mjs",                   reader: "merge clause B2, why",               replayed: true,  section: "8.3"  },
+  // ...and so on for all 32, each transcribed from the checklist row above.
+  // The cross-check asserts the key set equals sqlite_master exactly, so an
+  // incomplete transcription fails loudly rather than passing quietly.
 };
 
 export const PROSE_TABLES = [

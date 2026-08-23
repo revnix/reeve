@@ -261,7 +261,7 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
     const c = checkRemoteReach(pub, io);
     check(io.askedFor.includes("https://github.com/o/one.git") && io.askedFor.includes("https://github.com/o/two.git"),
       "every configured push url gets its own credential question, not just the first", io.askedFor.join(" "));
-    check(c.lines.filter(l => /a credential is available/.test(l)).length === 2,
+    check(c.lines.filter(l => /a credential is obtained/.test(l)).length === 2,
       "  and each destination is reported on in its own right", c.lines.join(" | "));
   }
   {
@@ -327,6 +327,30 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
   check(real.level === "OK", "control: a configured, non-empty pushurl is unaffected", real.lines.join(" | "));
   const none = checkRemoteReach(pub, withConfig(null));
   check(none.level === "OK", "control: no pushurl configured at all is unaffected", none.lines.join(" | "));
+}
+
+// ── R-16: obtained is not validated ──────────────────────────────────────────
+//
+// `git credential fill` gets the fields from the helpers; it does not present
+// them to the server. An expired, revoked, wrong-account or read-only token
+// answers exactly as a working one does, so OK here cannot mean "publication
+// works" — and a reader will take it that way unless the line says otherwise.
+{
+  const io = {
+    run: (cwd, args) => {
+      if (args[0] === "remote") return { ok: true, out: "https://github.com/o/r.git" };
+      if (args[0] === "ls-remote") return { ok: true, out: "abcdef1234567890  refs/heads/main" };
+      return { ok: false, out: "", err: "" };
+    },
+    credential: () => ({ ok: true }),
+  };
+  const c = checkRemoteReach({ identity: { checkout: "/co", defaultBranch: "main" } }, io);
+  const all = c.lines.join(" | ");
+  check(c.level === "OK", "control: an obtainable credential is still OK", all);
+  check(/obtained/.test(all) && /not validated against the server/.test(all),
+    "the line says the credential was OBTAINED, not validated", all);
+  check(/not established/.test(all) && /without pushing/.test(all),
+    "  and the report states what remains unknown, beside the verdict rather than only in the docs", all);
 }
 
 // ── R-14 ─────────────────────────────────────────────────────────────────────

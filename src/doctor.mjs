@@ -680,7 +680,7 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
   // `ls-remote origin` above still exercises origin's full configuration, which
   // is what reeve's own fetch uses. The credential question below needs no
   // network and no proxy, so it is asked per destination as before.
-  const unverified = [];
+  const unverified = [], https = [];
   for (const url of pushUrls) {
     const shown = withoutUserinfo(url);
     // ssh and local transports authenticate through the transport itself, so the
@@ -691,8 +691,14 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
       lines.push(`${shown} carries its own authentication, so the reach above exercised it`);
       continue;
     }
+    https.push(url);
     const cred = credential(checkout, url);
-    if (cred.ok) { lines.push(`a credential is available for ${shown} (its value is never read into reeve)`); continue; }
+    // OBTAINED, not validated. `git credential fill` gets the fields from the
+    // helpers; it does not present them to the server, so an expired, revoked,
+    // wrong-account or read-only token answers exactly as a working one does.
+    // Said in the line rather than only in the docs, because a reader takes OK
+    // to mean publication works. (Codex #14-[11].)
+    if (cred.ok) { lines.push(`a credential is obtained for ${shown}, though not validated against the server (its value is never read into reeve)`); continue; }
     // A credential helper is not the only way http authenticates. `http.
     // <url>.extraHeader` carrying an Authorization header, and a cookie file,
     // are both used by `ls-remote` and by the real push while `credential fill`
@@ -709,6 +715,7 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
               "-> a push authenticates; reeve would fetch, judge and refuse at the last step"] };
   }
   if (separate) lines.push("the push destination(s) are not probed for reachability: a literal-url probe drops remote.origin.proxy and answers a different question");
+  if (https.length) lines.push(`-> not established: whether ${https.length > 1 ? "those credentials are" : "that credential is"} accepted, or authorised to write here — neither can be known without pushing`);
   if (unverified.length) return { id, level: DEGRADED, title,
     lines: [...lines, `-> publication to ${unverified.join(", ")} rests on configuration this check cannot exercise without pushing`] };
   return { id, level: OK, title, lines };

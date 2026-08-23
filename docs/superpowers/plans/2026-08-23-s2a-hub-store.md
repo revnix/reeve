@@ -2454,19 +2454,26 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo", de
       // A missing table is the one corruption that repairs itself into silence.
       const present = new Set(probe.prepare(
         "SELECT name FROM sqlite_master WHERE type='table'").all().map(r => r.name));
-      const missing = HUB_TABLES.filter(t => !present.has(t));
+      // The version FIRST, because it decides which tables are required. An
+      // older snapshot legitimately lacks tables a later migration added, and
+      // openHub migrates it forward after the copy -- so comparing against this
+      // binary's inventory would refuse every pre-migration snapshot, and refuse
+      // it as CORRUPT rather than as old, on the one path an operator reaches
+      // for when everything else has failed.
+      const version = probe.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+      if (expectVersion != null && version > expectVersion)
+        return { ok: false, why: `snapshot is schema version ${version}; this binary knows ${expectVersion}`, version, integrity };
+      const required = TABLES_AT[version] ?? HUB_TABLES;
+      const missing = required.filter(t => !present.has(t));
       if (missing.length)
-        return { ok: false, why: `snapshot is missing ${missing.length} table(s): ${missing.slice(0, 5).join(", ")}`,
-                 version: null, integrity };
+        return { ok: false, why: `snapshot at version ${version} is missing ${missing.length} table(s): ${missing.slice(0, 5).join(", ")}`,
+                 version, integrity };
       // schema_version alone is too weak a marker: a physically valid SQLite file
       // carrying only that table passes, is retained as a usable backup, and is
       // discovered to be empty at the moment it is restored. hub_event is the
       // table replay reads and the one migration 1 guarantees, so it is the
       // marker that actually means "this is a hub".
       probe.prepare("SELECT count(*) c FROM hub_event").get();
-      const version = probe.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
-      if (expectVersion != null && version > expectVersion)
-        return { ok: false, why: `snapshot is schema version ${version}; this binary knows ${expectVersion}`, version, integrity };
       return { ok: true, why: null, version, integrity };
     }
     // A repo store's marker is the append-only log the existing restore() probes.
@@ -2601,9 +2608,30 @@ than retyped, so it cannot drift from the DDL it describes.
 // doctor can run.
 const SCHEMA_PATH = new URL("./hub.sql", import.meta.url);
 
-export const HUB_TABLES = Object.freeze(
-  [...readFileSync(SCHEMA_PATH, "utf8")
-      .matchAll(/CREATE TABLE IF NOT EXISTS ([a-z_]+)\s*\(/g)].map(m => m[1]));
+export const HUB_TABLES = Object.freeze([
+  // `schema_version` is NOT in hub.sql and cannot be: `openHub` creates it
+  // directly, before any migration runs, because migration 1 needs somewhere to
+  // record itself. hub.sql declares 31 tables and the live database has 32, so a
+  // set derived from the file alone is one short -- which makes Task 11's
+  // equality cross-check fail on this plan's own implementation, and, worse,
+  // lets snapshot validation accept a snapshot missing the one table that says
+  // which migrations a store has had.
+  "schema_version",
+  ...[...readFileSync(SCHEMA_PATH, "utf8")
+        .matchAll(/CREATE TABLE IF NOT EXISTS ([a-z_]+)\s*\(/g)].map(m => m[1]),
+]);
+
+/**
+ * The tables a snapshot at a given schema version is required to carry.
+ *
+ * Migration 1 creates all of them. A LATER migration that adds a table adds its
+ * own entry here, and a snapshot taken before that migration is not missing
+ * anything -- `openHub` applies the forward migration after the copy, which is
+ * exactly what the restore and H-3 contracts promise. Validating every snapshot
+ * against the CURRENT binary's inventory would reject every older snapshot the
+ * moment migration 2 lands, and reject it as corrupt rather than as old.
+ */
+export const TABLES_AT = Object.freeze({ 1: HUB_TABLES });
 ```
 
 **Task 1's inline read becomes this constant**, in the same edit: leaving two
@@ -2658,7 +2686,12 @@ Task 8 needs only `HUB_SCHEMA_VERSION`.
 ```bash
 $N test/hub-backup-restore.test.mjs
 $N test/backup.test.mjs            # the existing suite must stay green
-git add src/backup.mjs test/hub-backup-restore.test.mjs
+# `src/build/hubdb.mjs` too: this task defines SCHEMA_PATH there and adds the
+# HUB_TABLES and TABLES_AT exports. Staging only backup.mjs commits a module that
+# imports them from a file that does not export them yet, so ESM instantiation
+# fails for every backup and CLI consumer -- and the suite passes locally against
+# the working tree, so only the push finds it.
+git add src/build/hubdb.mjs src/backup.mjs test/hub-backup-restore.test.mjs
 git commit -m "feat(backup): discover and validate the hub snapshot"
 ```
 
@@ -2889,10 +2922,30 @@ const writeRow = (table, kind) => Object.assign((db, task, over = {}) => {
   if ("task" in row && !("task" in over)) row.task = task;
   const cols = Object.keys(row);
   db.exec("BEGIN IMMEDIATE");
-  db.prepare(`INSERT INTO ${table}(${cols.join(",")}) VALUES(${cols.map(() => "?").join(",")})`)
+  const info = db.prepare(`INSERT INTO ${table}(${cols.join(",")}) VALUES(${cols.map(() => "?").join(",")})`)
     .run(...cols.map(c => row[c]));
+  // The row as WRITTEN, read back, not the object that was assembled.
+  // `minimalRow` deliberately skips the rowid alias because SQLite allocates it
+  // -- so the assembled object has no `id`, and the handlers key their upserts
+  // on exactly that column (`phase_event.seq`, `outbox.id`, `merge_decision.id`).
+  // An image with no key replays into a NEWLY allocated one, so an `outbox.fence`
+  // or a `task_drain.outbox_id` that pointed at the old id now points at nothing.
+  // The drill only passes today because it replays into tables that were empty
+  // at the snapshot and happen to re-allocate the same low ids; it proves
+  // nothing about a snapshot that already had rows, or one with gaps.
+  //
+  // Reading back is also what keeps the image from drifting from the row, which
+  // is the rule every other writer in this plan follows.
+  const written = (() => {
+    // WITHOUT ROWID tables have no rowid to select by -- and they need none:
+    // their whole primary key is supplied by minimalRow, so the assembled row is
+    // already complete.
+    try { return db.prepare(`SELECT * FROM ${table} WHERE rowid = ?`).get(info.lastInsertRowid) ?? row; }
+    catch { return row; }
+  })();
+  const image = Object.keys(written).sort();
   db.prepare(`INSERT INTO hub_event(at,kind,task,payload) VALUES(unixepoch(),?,?,?)`)
-    .run(kind, task, JSON.stringify(Object.fromEntries(cols.sort().map(c => [c, row[c]]))));
+    .run(kind, task, JSON.stringify(Object.fromEntries(image.map(c => [c, written[c]]))));
   db.exec("COMMIT");
 }, { kind });
 
@@ -3094,6 +3147,23 @@ And a block for the unreadable case, which is the one this route is named for:
   check(back.prepare("SELECT count(*) c FROM task WHERE id='bt:2'").get().c === 1,
     "and the supplied tail was replayed, so events after the snapshot survived");
   back.close();
+  // A FAILED recovery must leave the corrupt database exactly where it was.
+  // This is the assertion that would have caught the earlier ordering: with the
+  // rename at the top of the branch, `dbPath` is gone by the time replayHub
+  // throws, the finally clears staging, and the canonical path is left empty for
+  // the next writer to create a fresh hub at.
+  {
+    const bad = [{ seq: 100, at: 1, kind: "task.transitioned", task: "bt:3", payload: "{not json" }];
+    const before = readFileSync(p).length;
+    const failed = restoreHub(snap, p, { isAlive: () => false, pid: process.pid, lstart: "L", force: true, tail: bad });
+    check(!failed.ok, "fixture: a malformed tail fails the restore", JSON.stringify(failed));
+    check(existsSync(p) && readFileSync(p).length === before,
+      "a failed recovery leaves the database at the canonical path, byte for byte",
+      `${existsSync(p)} ${readFileSync(p).length} vs ${before}`);
+    check(!failed.quarantined,
+      "and reports no quarantine, because nothing was moved", String(failed.quarantined));
+  }
+
   // CONTROL: the sibling lock was RELEASED. A canonical `.restore-lock` left
   // held makes every later restore refuse, naming a pid that exited long ago --
   // and because the lock is not inside the hub, nothing else in this suite or
@@ -3266,10 +3336,35 @@ export function replayHub(db, events) {
       }
       const cols = Object.keys(row);
       const set = cols.filter(c => !h.key.includes(c)).map(c => `${c}=excluded.${c}`).join(",");
-      db.prepare(
-        `INSERT INTO ${h.table}(${cols.join(",")}) VALUES(${cols.map(() => "?").join(",")})
-         ON CONFLICT(${h.key.join(",")}) DO UPDATE SET ${set || h.key[0] + "=" + h.key[0]}`)
-        .run(...cols.map(c => row[c]));
+      // UPDATE when the row is already there; INSERT only when it is not.
+      //
+      // A row image may legitimately be PARTIAL. `sizing.overridden` carries
+      // `id` and `depth` and nothing else by design -- it is documented as a
+      // partial image, and replaying it must set `depth` and leave every other
+      // column as the last FULL image left it. An upsert cannot express that:
+      // SQLite evaluates the INSERT's NOT NULL constraints BEFORE it reaches
+      // ON CONFLICT, so a two-column image raises on `task.project`,
+      // `task.repo_id`, `task.phase` and the rest even when the row it would
+      // have updated is sitting right there -- and the whole restore aborts.
+      //
+      // Existence is checked by the handler's own key, which is the key the
+      // upsert would have conflicted on, so the two paths agree by construction.
+      const where = h.key.map(k => `${k}=?`).join(" AND ");
+      const keyVals = h.key.map(k => row[k]);
+      const exists = db.prepare(`SELECT 1 FROM ${h.table} WHERE ${where}`).get(...keyVals);
+      if (exists) {
+        // No columns beyond the key means the image says nothing to change --
+        // an UPDATE with an empty SET is a syntax error, not a no-op.
+        const assign = cols.filter(c => !h.key.includes(c));
+        if (assign.length)
+          db.prepare(`UPDATE ${h.table} SET ${assign.map(c => `${c}=?`).join(",")} WHERE ${where}`)
+            .run(...assign.map(c => row[c]), ...keyVals);
+      } else {
+        db.prepare(
+          `INSERT INTO ${h.table}(${cols.join(",")}) VALUES(${cols.map(() => "?").join(",")})
+           ON CONFLICT(${h.key.join(",")}) DO UPDATE SET ${set || h.key[0] + "=" + h.key[0]}`)
+          .run(...cols.map(c => row[c]));
+      }
       applied++;
     }
     // The log itself is history and is restored with the rest of the row set,
@@ -3383,12 +3478,20 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       const got = acquireMaintenanceLock(lockDb, { pid, lstart, isAlive });
       if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
       locked = true;
-      // QUARANTINE, never delete. The unreadable file is the only evidence of
+      // QUARANTINE, never delete: the unreadable file is the only evidence of
       // what went wrong, and a recovery that destroys it leaves nothing to
-      // diagnose afterwards. Moved aside BEFORE the staged copy is renamed into
-      // place, so the two never occupy the path at once.
+      // diagnose. But the NAME is chosen here and the move happens later, one
+      // step before the staged copy takes the path.
+      //
+      // Renaming now would vacate the canonical path for the whole of staging --
+      // the copy, the open, the migration and the replay. Any failure in that
+      // window (a malformed supplied tail makes `replayHub` throw, and the
+      // operator on this path is supplying one by hand) returns through the
+      // catch, the finally deletes staging, and NOTHING moves the quarantine
+      // back: `dbPath` is simply absent, and the next writer to start creates a
+      // fresh empty hub there. Losing a corrupt database to a failed recovery is
+      // bad; replacing it with an empty one that looks healthy is worse.
       quarantined = `${dbPath}.corrupt-${Math.floor(Date.now() / 1000)}`;
-      renameSync(dbPath, quarantined);
       // `live` stays null, which the tail read below already handles: with no
       // readable hub, `suppliedTail` is the ONLY source of post-snapshot events.
     } else {
@@ -3535,6 +3638,12 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         why: `could not remove ${dbPath}${ext} (${e.message}); refusing to replace the database, ` +
              `because a stale write-ahead log beside a restored file is replayed into it on the next open` }; }
     }
+    // The quarantine move, here rather than at the top: everything that can
+    // fail has now succeeded, and the two renames are adjacent so the canonical
+    // path is unoccupied for as short a time as a rename takes. An unreadable
+    // hub is not readable by anything, so nothing is served from it in the
+    // meantime.
+    if (quarantined) renameSync(dbPath, quarantined);
     renameSync(staging, dbPath);
     // `quarantined` is REPORTED, not merely done. When the live hub was
     // unreadable it was moved aside rather than deleted, and this result is the
@@ -3721,7 +3830,7 @@ git commit -m "feat(hub): restore refuses live writers; destructive drill"
 
 **Interfaces:**
 - Consumes: `everyStore`, `latestSnapshot`, `validateSnapshot` (Task 8); `COMPARISON_SET` (Task 9); `openHub` (Task 1).
-- Produces: `hubFindings(db, { root, now, snapshotFor, projects, offDevice }) -> Finding[]` where `projects` is the registry set `[{ name, nwo }]` where `Finding = { id, severity, classification, title, detail, action }` and `classification ∈ {'configuration','dependency-outage','stale-evidence','unsafe-authority'}`. Findings `H-1` snapshot age, `H-2` last integrity result, `H-3` restore compatibility, `H-4` `repo_gate_state` per registry project, `H-5` provider scheduler state and stale leases, `H-6` off-device copy missing.
+- Produces: `hubFindings(db, { root, now, snapshotFor, projects, offDevice }) -> Finding[]` where `projects` is the registry set `[{ name, nwo }]` where `Finding = { id, severity, classification, title, detail, action }` and `classification ∈ {'configuration','dependency-outage','stale-evidence','unsafe-authority'}`. Findings `H-1` snapshot age, `H-2` last integrity result, `H-3` restore compatibility, `H-4` `repo_gate_state` per registry project, `H-5` provider scheduler state and stale leases, `H-6` off-device copy missing. **`H-7` (the registry could not be read) is emitted by the CLI route, not by `hubFindings`** — `hubFindings` receives the project list as an input and therefore cannot distinguish a failed read from an empty registry, which is precisely the confusion H-7 exists to remove.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -4012,6 +4121,9 @@ Add the case, and add `bin/reeve` to the commit:
       process.exit(1);
     }
     const db = new DatabaseSync(p, { readOnly: true });
+    // Read ONCE, and its failure is carried rather than swallowed. H-7 below is
+    // what stops an unreadable registry from reading as an empty one.
+    const registry = registryProjects(HOME);
     let findings;
     try {
       findings = hubFindings(db, { root: opt("backups") ?? join(HOME, "backups"),
@@ -4023,7 +4135,7 @@ Add the case, and add `bin/reeve` to the commit:
                                    // makes the CLI report only what is already
                                    // present, so the exact absent-row case this task
                                    // calls unsafe is the one case it cannot see.
-                                   projects: registryProjects(HOME),   // defined below
+                                   projects: registry.projects,       // see registryProjects below
                                    snapshotFor: (nwo) => {
                                      const s = latestSnapshot(opt("backups") ?? join(HOME, "backups"), nwo);
                                      // DEEP, and the only deep call on this path. `builder doctor` is an
@@ -4042,6 +4154,17 @@ Add the case, and add `bin/reeve` to the commit:
     // stale snapshot, unmeasured provider limits, expired requests or no
     // off-device copy are all healthy -- which is the reading the `warn`
     // severity exists to prevent.
+    // H-7: the registry itself could not be read. Emitted HERE rather than
+    // inside hubFindings, because hubFindings takes the project list as an
+    // input and cannot tell an empty list from a failed read -- that
+    // indistinguishability is the defect. Severity `fail`, not `warn`: with no
+    // expected projects, every absent-row H-4 is suppressed, so this one finding
+    // is standing in for an unknown number of hidden ones.
+    if (registry.error)
+      findings.unshift({ id: "H-7", severity: "fail", classification: "configuration",
+        title: "the project registry could not be read",
+        detail: registry.error,
+        action: "fix or create ~/.reeve/projects.json; until then H-4 cannot report a missing gate-state row" });
     process.exit(findings.some(f => f.severity === "fail") ? 1
                : findings.some(f => f.severity === "warn") ? 3 : 0);
   }
@@ -4069,12 +4192,22 @@ registry, not from the table:
 // `builder doctor` deliberately does not use). So H-4 matches projects to
 // `repo_gate_state` rows by `nwo_snapshot`, which both sides have.
 const registryProjects = (home) => {
+  const path = join(home, "projects.json");
   try {
-    const reg = JSON.parse(readFileSync(join(home, "projects.json"), "utf8"));
-    return Object.entries(reg)
-      .filter(([, p]) => p && typeof p === "object")
-      .map(([name, p]) => ({ name, nwo: p.nwo ?? null }));
-  } catch { return []; }
+    const reg = JSON.parse(readFileSync(path, "utf8"));
+    return { projects: Object.entries(reg)
+               .filter(([, p]) => p && typeof p === "object")
+               .map(([name, p]) => ({ name, nwo: p.nwo ?? null })),
+             error: null };
+  } catch (e) {
+    // The read failure is ITSELF a finding, and the route below emits it.
+    // Returning a bare [] made an unreadable registry indistinguishable from a
+    // legitimately empty one -- and since H-4 reports projects that have NO
+    // gate-state row, an empty expected set suppresses every one of them. So a
+    // machine whose registry cannot be parsed reported a clean hub, which is the
+    // exact absence-read-as-success this doctor exists to refuse.
+    return { projects: [], error: `${path}: ${e.message}` };
+  }
 };
 ```
 
@@ -4363,10 +4496,17 @@ Create `test/hub-crosscheck.test.mjs`:
 //     code that reads it silently gets nothing and reads absence as success;
 //   - a table in the DDL that no writer fills and no reader consults -- the
 //     read-never-written shape the tracker has already flagged twice.
-import { openHub } from "../src/build/hubdb.mjs";
-import { replayableKinds } from "../src/build/replay.mjs";
+// ONE import per module, not two spellings of the same path -- and every binding
+// the file reaches for. The directory-based emitter scan below uses
+// `NON_REPLAYED_KINDS`, `readdirSync` and `fileURLToPath`, none of which the
+// standard harness supplies; without them Task 11 throws a ReferenceError before
+// it checks a single emitted kind, which reads as a broken suite rather than as
+// a missing import.
+import { openHub, HUB_TABLES } from "../src/build/hubdb.mjs";
+import { replayableKinds, NON_REPLAYED_KINDS } from "../src/build/replay.mjs";
 import { TABLE_OWNERS, PROSE_TABLES } from "../src/build/tables.mjs";
-import { HUB_TABLES } from "../src/build/hubdb.mjs";
+import { readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 /* ... standard harness ... */
 
 const db = openHub(join(mkdtempSync(join(tmpdir(), "reeve-xc-")), "x.db"));
@@ -4727,6 +4867,12 @@ $N test/hub-schema.test.mjs
 
 ```js
 // test/hub-schema.test.mjs
+// `createHash` and `migrationPlan` are imported HERE. The only other bindings in
+// this task are block-scoped dynamic imports inside the two `$N -e '...'`
+// fixture commands, which are separate processes -- so this file had neither,
+// and the mandatory suite threw before comparing either hash.
+import { createHash } from "node:crypto";
+import { migrationPlan } from "../src/build/hubdb.mjs";
 const frozen = JSON.parse(readFileSync("test/fixtures/hub-schema-v1.json", "utf8"));
 const sqlNow = createHash("sha256").update(readFileSync("src/build/hub.sql", "utf8")).digest("hex");
 // Also through the export, and the same value the fixture command recorded --

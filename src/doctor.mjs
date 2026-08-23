@@ -626,10 +626,11 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
             "-> reeve publishes by pushing to origin; a checkout without one can publish nothing"] };
   // EVERY push url. `git push origin` affects all configured `remote.origin.
   // pushurl` values, and `get-url --push` returns only the first — measured, two
-  // pushurls give one value without `--all` and both with it. Validating the
-  // first alone reports OK for a remote whose second destination cannot be
-  // reached. `--push --all` falls back to the fetch url when no pushurl is set,
-  // which is git's own behaviour.
+  // pushurls give one value without `--all` and both with it. Each destination
+  // gets its own CREDENTIAL question below, so reading only the first would
+  // report OK on the strength of a credential for somewhere else.
+  // `--push --all` falls back to the fetch url when no pushurl is set, which is
+  // git's own behaviour.
   const pushed = run(checkout, ["remote", "get-url", "--push", "--all", "origin"]);
   const pushUrls = (pushed.ok && pushed.out ? pushed.out.split("\n") : [fetchUrl.out]).map(u => u.trim()).filter(Boolean);
   const separate = pushUrls.length > 1 || pushUrls[0] !== fetchUrl.out;
@@ -643,18 +644,28 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
   // run on. Either way the configuration is wrong; only its consequence moves.
   // `-z`, because `--get-all` alone loses an empty value to the trim.
   const configured = run(checkout, ["config", "-z", "--get-all", "remote.origin.pushurl"]);
-  if (configured.ok && configured.out.split("\0").slice(0, -1).some(v => v === "")) return { id, level: BROKEN, title,
+  if (configured.ok && configured.out.split("\0").slice(0, -1).some(v => v.trim() === "")) return { id, level: BROKEN, title,
     lines: [`origin ${withoutUserinfo(fetchUrl.out)}`,
             "remote.origin.pushurl is configured with an EMPTY value",
             "git 2.50.1 ignores it and pushes to the remaining url; git 2.43 fails the push with `no path specified`",
             "-> whichever git is in front of it, the configuration does not say where to publish"] };
 
+  // Nothing left to publish to. `filter(Boolean)` above drops a value that was
+  // only whitespace, and if that took the last one the loop below would run zero
+  // times and the check would report OK having asked nothing — an absence read
+  // as success, from the one direction the empty-value guard does not cover.
+  if (!pushUrls.length) return { id, level: BROKEN, title,
+    lines: [`origin ${withoutUserinfo(fetchUrl.out)}`,
+            "origin resolves to no push destination at all",
+            "-> reeve publishes by pushing to origin; there is nowhere for that to go"] };
+
   const branch = profile.identity?.defaultBranch ?? "main";
   const lines = [`origin ${withoutUserinfo(fetchUrl.out)}`];
   if (separate) lines.push(`push url(s) ${pushUrls.map(withoutUserinfo).join(", ")}`);
 
-  // Reachability on the url each operation actually uses: `ls-remote origin`
-  // reads through the FETCH url, so a push url of its own needs its own look.
+  // Through `origin`, never through a literal url: this is the one probe that
+  // carries origin's whole configuration, which is what reeve's own fetch uses.
+  // Why the push destinations get no probe of their own is below.
   const reach = run(checkout, ["ls-remote", "origin", `refs/heads/${branch}`]);
   if (!reach.ok) return { id, level: BROKEN, title,
     lines: [...lines, `reeve's git cannot reach it: ${reach.err}`,

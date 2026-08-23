@@ -7,7 +7,8 @@
 // daemon at start (under the CLI); this file proves the judge.
 import { sandboxCanary, canaryIdFor, policyHashOf, canaryScript, CANARY_INSIDE_CONTROL, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, parseWriteProbe, isPolicyRefusal, netListener, CANARY_SENTINEL, instrumentHash } from "../src/canary.mjs";
 import { measureContainment } from "../src/containment.mjs";
-import { currentInstrument } from "../src/canary.mjs";
+import { currentInstrument, INSTRUMENT_SOURCES, INSTRUMENT_NOT_SOURCES } from "../src/canary.mjs";
+import { createHash } from "node:crypto";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
@@ -473,6 +474,35 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   const h1 = policyHashOf(block.sandbox, null, { permissionsDeny: deny });
   const h2 = policyHashOf(block.sandbox, null, { permissionsDeny: broken });
   check(h1 !== h2, "the recorded policy hash moves with the rules too, so R-14 cannot report OK across the change", `${h1} ${h2}`);
+}
+
+// ── the instrument is more than the script ───────────────────────────────────
+//
+// `canaryScript` is one part of it. `canaryPromptFor` decides what the worker is
+// told to attempt, `parseReadProbe` and `parseWriteProbe` decide what the event
+// stream is read to mean, and the assertions in `sandboxCanary` decide which
+// combination is a pass. A release strengthening any of those changes what a
+// pass MEANS while leaving the script untouched — and `binaryId` identifies the
+// Claude executable, not reeve's own code, so nothing else would notice.
+{
+  const scriptOnly = createHash("sha256").update(canaryScript({
+    tmpDir: "<tmp>", outsideDir: "<outside>", decoyPath: "<decoy>", netUrl: "<net>",
+    fileDecoyPath: "<file-decoy>", fileControlPath: "<file-control>",
+  })).digest("hex").slice(0, 12);
+  check(instrumentHash({ hasNet: true }) !== scriptOnly,
+    "the instrument hash is not the script's hash — it carries the code that judges too",
+    `${instrumentHash({ hasNet: true })} ${scriptOnly}`);
+
+  // The rot guard. A new local import of canary.mjs has to be classified as
+  // part of the instrument or explicitly not, rather than silently ignored.
+  const src = readFileSync(new URL("../src/canary.mjs", import.meta.url), "utf8");
+  const imported = [...src.matchAll(/from "(\.\/[^"]+)"/g)].map(m => m[1]).sort();
+  const classified = [...INSTRUMENT_SOURCES, ...INSTRUMENT_NOT_SOURCES].filter(f => f !== "./canary.mjs").sort();
+  check(JSON.stringify(imported) === JSON.stringify(classified),
+    "every module canary.mjs imports is classified as instrument or not-instrument",
+    `imports ${imported.join(",")} | classified ${classified.join(",")}`);
+  check(INSTRUMENT_SOURCES.includes("./canary.mjs"),
+    "  and this file counts itself, since the probes and the verdicts live here", INSTRUMENT_SOURCES.join(","));
 }
 
 // ── the recorded id IS the cache key ─────────────────────────────────────────

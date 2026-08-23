@@ -148,3 +148,43 @@ flag, all of them with it — and the stub turns two assertions red.
 Neither test was wrong about what it asserted. Both were unable to represent the
 defect they were written for, which a green run does not distinguish from
 covering it.
+
+## The instrument is more than the script
+
+Raised by Codex in the fourth round, and it is a hole in the guarantee this
+document claimed two sections ago.
+
+`instrumentHash` hashed `canaryScript`'s output. But the script is one part of
+the instrument:
+
+| what it decides | where it lives |
+|---|---|
+| what the worker is told to attempt | `canaryPromptFor` |
+| what the event stream is read to MEAN | `parseReadProbe`, `parseWriteProbe` |
+| which combination of evidence is a PASS | the assertions in `sandboxCanary` |
+| how the worker is launched at all | `workerArgs`, in supervisor.mjs |
+
+A release strengthening any of those changes what a pass means while leaving the
+script untouched — and `binaryId` identifies the Claude executable, not reeve's
+own code, so nothing else would have noticed. R-14 would have gone on reporting
+a prior pass as current.
+
+The hash now covers the SOURCE of the modules whose code decides what the canary
+does: `canary.mjs` (script, prompt, parsers, verdicts) and `supervisor.mjs`
+(launch). `sandbox.mjs` is deliberately excluded — what it contributes is the
+policy, and the policy is hashed into the id directly.
+
+Any edit to those files, comments included, changes the hash and costs one
+re-measurement. That is the fail-closed direction: a spurious re-measure costs a
+five-minute model call, a missed one costs a false "contained".
+
+## The list that could rot
+
+Naming the modules by hand is the kind of list that goes stale the first time
+someone adds an import. So a test asserts it against reality: every `./`-relative
+import in `canary.mjs` must appear in `INSTRUMENT_SOURCES` or in
+`INSTRUMENT_NOT_SOURCES`, and nothing else may.
+
+Adding a dependency now fails the suite until it is classified as part of the
+instrument or explicitly not. Removing `./supervisor.mjs` from the list turns it
+red, which is the check working.

@@ -197,11 +197,29 @@ configuration: `git config -z --get-all remote.origin.pushurl`, with `-z` becaus
 and the report names both gits so a reader is not misled about which behaviour
 their own git has.
 
-## What this does not establish
+## What this does not establish, said in the report rather than only here
 
-That a push would SUCCEED. It establishes that the credential a push needs can be
-obtained and the remote answers. Authorisation — whether that credential may
-write to that repository — is not measured, and cannot be without pushing.
+That a push would SUCCEED. `git credential fill` obtains the fields from the
+helpers; it does not present them to the server, so an expired, revoked,
+wrong-account or read-only token answers exactly as a working one does. Neither
+acceptance nor authorisation is measured, and neither can be without pushing.
+
+That belongs beside the verdict, not only in a document nobody reads at 3am, so
+R-16's own lines say it:
+
+```
+  R-16  publication reach
+        origin https://github.com/nextlyhq/nextly.git
+        reachable: main is at b5c9199141
+        a credential is obtained for https://github.com/nextlyhq/nextly.git, though not validated against the server (its value is never read into reeve)
+        -> not established: whether that credential is accepted, or authorised to write here — neither can be known without pushing
+```
+
+The verdict stays OK rather than becoming DEGRADED, which a reviewer suggested.
+DEGRADED would be permanent for every https remote — there is no path from
+"obtained" to "validated" that does not push — and a check that is always
+degraded is one its reader learns to skip. What it can say precisely is: the
+credential path resolves, and here is exactly what that does not prove.
 
 The regression test drives the check through injected seams rather than the
 network, including the case a reachability-only check gets wrong. Stubbing the

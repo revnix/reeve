@@ -21,6 +21,7 @@ import { createServer, connect } from "node:net";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const canonical = v => {
   if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
@@ -90,7 +91,44 @@ export function instrumentHash({ hasNet = false } = {}) {
     tmpDir: "<tmp>", outsideDir: "<outside>", decoyPath: "<decoy>",
     netUrl: hasNet ? "<net>" : null,
     fileDecoyPath: "<file-decoy>", fileControlPath: "<file-control>",
-  })).digest("hex").slice(0, 12);
+  }) + "\n" + instrumentSourceHash()).digest("hex").slice(0, 12);
+}
+
+/**
+ * The modules whose CODE decides what the canary does.
+ *
+ * The script is only part of the instrument. `canaryPromptFor` decides what the
+ * worker is told to attempt, `parseReadProbe` and `parseWriteProbe` decide what
+ * the event stream is read to mean, and the assertions in `sandboxCanary`
+ * decide which combination is a pass — all of them in this file. `workerArgs`
+ * in supervisor.mjs decides how the worker is launched at all. A release that
+ * strengthens any of those changes what a pass MEANS while leaving the script
+ * untouched, and `binaryId` identifies the Claude executable, not reeve's own
+ * code — so nothing else would have noticed. (Codex #14-[12].)
+ *
+ * sandbox.mjs is deliberately absent: what it contributes is the POLICY, and
+ * the policy is hashed into the id directly. A test asserts this list against
+ * the local imports this file actually has, so a new dependency has to be
+ * classified rather than forgotten.
+ */
+export const INSTRUMENT_SOURCES = ["./canary.mjs", "./supervisor.mjs"];
+export const INSTRUMENT_NOT_SOURCES = ["./sandbox.mjs"];
+
+let sourceHashCache = null;
+function instrumentSourceHash() {
+  if (sourceHashCache) return sourceHashCache;
+  const here = dirname(fileURLToPath(import.meta.url));
+  const h = createHash("sha256");
+  for (const rel of INSTRUMENT_SOURCES) {
+    h.update(rel);
+    // A source that cannot be read gets a marker rather than nothing: it cannot
+    // collide with that file's real bytes, so the effect is a re-measurement
+    // rather than a silent match, and it stays the same across processes so the
+    // re-measurement happens once instead of on every tick.
+    try { h.update(readFileSync(join(here, rel))); }
+    catch { h.update(`<unreadable:${rel}>`); }
+  }
+  return (sourceHashCache = h.digest("hex").slice(0, 12));
 }
 
 /**

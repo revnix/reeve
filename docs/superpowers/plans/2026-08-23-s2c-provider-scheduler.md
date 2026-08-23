@@ -160,12 +160,37 @@ Each task names any imports it needs **beyond** these.
   - **Every provider mutation calls `assertWritable` inside its own transaction** (`inTx: true`), exactly as `withWriterLease` does. Without it a guardian can take a held lease and launch a worker after `restoreHub` has acquired `maintenance_lock` and finished its holder scan — reopening the writer race the lock exists to close, from the one code path that is allowed to write the hub without holding a writer lease. `assertWritable` throws; `claimProvider` catches and returns `reason: 'maintenance'`, which the guardian treats exactly like `at-limit`: it does not dispatch, and it does not escalate, because a restore in progress is an operator action rather than a fault.
   - `releaseProvider(db, { id, force })` — deletes the row. **A release refused because a restore holds `maintenance_lock` must not be dropped**: `assertWritable` throws, and the caller retries on the next tick with the lease id recorded in memory; the caller keeps the id and retries next tick, and the production snippet must actually do that rather than `catch {}`. There is deliberately **no durable marker**: an earlier draft added `provider_lease.refused_release`, and it cannot be written in the one case it represents — `assertWritable` blocks that write while the lock is held. It is also unnecessary, because `restoreHub` clears every process-scoped row (`provider_lease` included) from the restored file, so a lease held across a restore does not survive it. An abandoned restore is covered by ordinary expiry.
   - `queuedGuardianRequests(db, { repoId }) -> Row[]` — every `queued` guardian request for one repository. It exists because the sweep below runs in `src/daemon.mjs`, and this plan's global rule is that raw SQL lives only under `src/db/` or `src/build/`: a `SELECT ... FROM provider_lease` embedded in the daemon is a second definition of the guest's SQL surface, and it drifts from this one the first time the allowlist or the schema changes.
-  - `heartbeatProvider(db, { id, now })`, `reapProviderLeases(db, { isAlive, now })`
+  - `heartbeatProvider(db, { id, now })`
+  - `reapProviderLeases(db, { isAlive, now }) -> { reaped: number }` — an **object**, like every other function here, not a bare count. Two assertions in the suite previously read it both ways (`n === 1` and `.reaped >= 1`), which no single return value can satisfy.
   - `bindProviderLease(db, { id, pid, lstart })` — re-binds a held row from the daemon to the spawned worker.
   - `cancelQueued(db, { owner, repoId, runRef })` — removes a `queued` request whose dispatch is no longer going to happen. **Called on every path out of the dispatch block that did not launch, AND swept at the top of each tick**: a queued request whose PR has since closed, whose head moved, or whose task simply is not in this tick's decisions never re-enters that block at all, so a per-path call alone leaves it queued forever — and a queued guardian request blocks the next builder admission by design. The sweep compares live queued rows against the run refs this tick actually decided on, and cancels the rest.
 
+Both of these run at the **top** of the tick, before the canary and before the
+per-PR loop, because both have consumers earlier than the spawn seam:
+
 ```js
-// top of the tick, AFTER repoId is resolved and AFTER decisions are computed.
+// Top of the tick, immediately after `decisions` is computed and before the
+// containment canary. Two bindings, in this order.
+
+// 1. repoId, hoisted. The queued sweep below and the containment canary both
+//    read it, and both run before the per-PR loop -- so a declaration inside
+//    that loop is a ReferenceError on the first tick that has any dispatch-worthy
+//    decision, which is every tick that matters.
+const repoId = ctx.repoId ?? null;
+
+// 2. Releases a previous tick could not complete. This must not sit in the
+//    spawn seam: a tick with no dispatch-worthy PR, a quota-refused canary, or
+//    every candidate exiting through an earlier refusal never reaches that
+//    point, so a lease refused once during a restore would stay held until
+//    expiry -- exactly the leak the retry was added to prevent.
+for (const id of (ctx.pendingReleases ?? []).splice(0)) {
+  try { (ctx.providerRelease ?? releaseProvider)(ctx.hub, { id }); }
+  catch { (ctx.pendingReleases ??= []).push(id); }    // still locked: keep it for next tick
+}
+```
+
+```js
+// Still at the top of the tick, AFTER repoId is bound and AFTER decisions are computed.
 //
 // Three things this must get right, each of which was wrong in an earlier draft:
 //
@@ -187,7 +212,13 @@ if (ctx.hub && repoId != null) {
   // cancelled at the top of every tick and re-requested moments later, and a
   // builder racing that gap takes the freed slot -- which defeats the queued-
   // guardian priority guarantee in exactly the window it exists for.
-  const live = new Set(wanted.map(e => `pr:${e.pr}`));       // dispatch-worthy only
+  // `d.e.pr`, not `d.pr`. `decisions` holds `{ e, decision, cause, fp }`
+  // (src/daemon.mjs:731) and `wanted` is a filter over it, so the wrapper
+  // survives -- `e.pr` on the wrapper is undefined, every run ref becomes
+  // `pr:undefined`, and the sweep then finds NO live request matching any real
+  // queued row and cancels all of them on the next tick. That reopens the
+  // builder-admission race the queue exists to close, and does it silently.
+  const live = new Set(wanted.map(d => `pr:${d.e.pr}`));     // dispatch-worthy only
   if (execute && wanted.length && !containment) live.add(`canary:${nwo}`);
 
   // FAIL OPEN. This sweep is a hub read on the guardian's path, and the founder
@@ -381,8 +412,8 @@ const LSTART = "Sat Aug 23 09:00:00 2026";
   db.exec(`UPDATE provider_lease SET expires_at = unixepoch() - 1 WHERE id = ${a.id}`);
   const blockedWhileAlive = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:2", pid: 2, lstart: "B", isAlive: ALIVE });
   check(!blockedWhileAlive.ok, "an expired lease whose holder is still ALIVE is not reaped: a busy process may miss a heartbeat");
-  const n = reapProviderLeases(db, { isAlive: DEAD });
-  check(n === 1, `a crashed worker's slot is freed (reaped ${n})`);
+  const { reaped } = reapProviderLeases(db, { isAlive: DEAD });
+  check(reaped === 1, `a crashed worker's slot is freed (reaped ${reaped})`);
   check(claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:2", pid: 2, lstart: "B", isAlive: DEAD }).ok,
     "and the next claim is admitted");
 }
@@ -461,6 +492,9 @@ git commit -m "feat(provider): transactional admission for the shared subscripti
 1. **The containment canary**, `measuredContainment(...)` at `src/daemon.mjs:763` (search that name). It is itself a model dispatch and runs **once per tick**, before the per-PR loop, so it takes its own claim and releases it on return:
 
 ```js
+   // Declared beside `containment`, ABOVE the canary block, because the per-PR
+   // loop below reads it. A `let` inside the block would not be in scope there.
+   let skipDispatch = false;
    if (execute && wanted.length && !containment) {
      let canaryLease = null;
      // A hub with no resolvable repository id is FAIL CLOSED here, exactly as it
@@ -470,9 +504,12 @@ git commit -m "feat(provider): transactional admission for the shared subscripti
      if (ctx.hub && repoId == null) {
        escalations.set("the repository numeric id is unknown; provider leases cannot be scoped", 1);
        log(logPath, "execute: NOT running the containment canary — the repository id is unknown");
-       return { decisions, escalations, halted: false };
-     }
-     if (ctx.hub) {
+       // Same shape as the quota refusal below: suppress the DISPATCH, finish
+       // the TICK. This one escalates, and an early return would leave that
+       // escalation sitting in the map unsent, because notification happens in
+       // the epilogue -- a fail-closed path that silences its own alarm.
+       skipDispatch = true;
+     } else if (ctx.hub) {
        let got;
        // FAIL OPEN on an unreadable hub, the same shape as the per-PR claim.
        // claimProvider is called on a handle that can throw; outside a catch,
@@ -491,12 +528,19 @@ git commit -m "feat(provider): transactional admission for the shared subscripti
        }
        if (!got.ok) {
          log(logPath, `execute: NOT running the containment canary — provider ${got.reason}`);
-         // A COMPLETE tick result. Every other exit from tick() returns
-         // { decisions, escalations, halted }, and `bin/reeve tick` reads
-         // r.halted at bin/reeve:356 -- so a bare `return` turns an ordinary
-         // quota refusal into `TypeError: cannot read properties of undefined`,
-         // and skips the tick's escalation persistence and cleanup besides.
-         return { decisions, escalations, halted: false };
+         // NO RETURN. An earlier revision returned a complete result object
+         // here, which fixed `reeve tick`'s r.halted crash and still left the
+         // real problem: `queued`, `cooldown` and `at-limit` are ORDINARY
+         // outcomes, and returning early skips the tick's whole epilogue --
+         // self-audit, escalation reconciliation and notification, supply
+         // derivation, and noteTick. A quota refusal would leave already-computed
+         // escalations unsent and the health bookkeeping unwritten, on the ticks
+         // most likely to need both.
+         //
+         // Suppress the dispatch, not the tick. The per-PR loop is guarded on
+         // this flag and the function falls through to its normal return at
+         // src/daemon.mjs:1396.
+         skipDispatch = true;
        }
        canaryLease = got.id;
      }
@@ -720,6 +764,10 @@ const escalatedWith = (result, why) =>
 In `src/daemon.mjs`, immediately after the halt check at line 712:
 
 ```js
+      // The canary could not claim, so nothing is dispatched this tick -- but
+      // the tick still finishes normally. `break`, not `return`: the epilogue
+      // after the loop is the point.
+      if (skipDispatch) break;
       if (halted(ctx.haltMarker)) { log(logPath, "HALTED before dispatch"); break; }
 
       // Claim shared model quota before spending any.
@@ -750,14 +798,14 @@ In `src/daemon.mjs`, immediately after the halt check at line 712:
       // one the inbox recorded when it observed this repository; read it from
       // the store and fail closed if absent, rather than inventing a profile key
       // this plan does not add to FIELDS.
-      // Drain releases that a previous tick could not complete. Appending to
-      // ctx.pendingReleases without ever draining it means a lease refused
-      // during a restore stays held until expiry, which is the leak the retry
-      // was added to avoid.
-      for (const id of (ctx.pendingReleases ?? []).splice(0)) {
-        try { (ctx.providerRelease ?? releaseProvider)(ctx.hub, { id }); }
-        catch { (ctx.pendingReleases ??= []).push(id); }    // still locked: keep it for next tick
-      }
+      // (The pending-release drain and the repoId binding are BOTH at the top
+      // of the tick now, above the queued-request sweep -- see the block that
+      // precedes it. Neither may live here: this is the per-PR spawn seam, and
+      // a tick with no dispatch-worthy PR, a quota-refused canary, or every
+      // candidate exiting through an earlier refusal never reaches this line.
+      // A release that failed once would then stay unretried and hold a slot
+      // until expiry, and `repoId` -- which the sweep and the canary both read
+      // earlier in the tick -- would be a ReferenceError.)
 
       // Resolved ONCE at daemon start and carried on ctx -- not queried here.
       //
@@ -927,13 +975,24 @@ And on a rate-limit exit, before the `finally` releases:
         try { this._hub.prepare("SELECT count(*) c FROM provider_state").get(); return this._hub; }
         catch { /* corrupt, locked, or closed: fall through and reopen */ }
       }
+      // Stat BEFORE and AFTER the open, and accept the handle only when the
+      // path did not move under it. Recording the POST-open stat alone
+      // reintroduces this getter's own bug one level up: a restore landing
+      // between `openHubAsGuest` and the stat leaves a handle on the OLD inode
+      // with the NEW inode recorded beside it, after which every later check
+      // matches, the probe succeeds, and the stale database is served forever.
+      //
+      // Bounded retries, then null. Null fails OPEN for the guardian, which is
+      // the founder decision: a scheduler it cannot read never stops dispatch.
       this._closeHub();
-      try {
-        const h = openHubAsGuest(hp);
-        // Re-stat AFTER opening, so the recorded inode is the one actually
-        // opened rather than whatever the path pointed at a moment earlier.
-        this._hub = h; this._hubIno = statSync(hp).ino;
-      } catch { this._closeHub(); }
+      for (let attempt = 0; attempt < 3; attempt++) {
+        let before, h, after;
+        try { before = statSync(hp).ino; } catch { break; }
+        try { h = openHubAsGuest(hp); } catch { break; }
+        try { after = statSync(hp).ino; } catch { try { h.close(); } catch {} break; }
+        if (before === after) { this._hub = h; this._hubIno = after; return this._hub; }
+        try { h.close(); } catch {}      // a restore landed mid-open; try again
+      }
       return this._hub;
     },
     // Closing matters: a replaced handle that is merely dropped keeps the old
@@ -1102,6 +1161,9 @@ for (const [sql, name] of [
   ["BEGIN DEFERRED", "a deferred transaction"],
   ["BEGIN", "a bare BEGIN, which is DEFERRED"],
   ["SELECT count(*) FROM provider_state; BEGIN EXCLUSIVE", "an exclusive BEGIN hidden behind a permitted statement"],
+  ["/* guest */ BEGIN EXCLUSIVE", "an exclusive BEGIN behind a block comment"],
+  ["-- guest\nBEGIN EXCLUSIVE", "an exclusive BEGIN behind a line comment"],
+  ["\t/*x*/BEGIN EXCLUSIVE", "an exclusive BEGIN behind leading whitespace and a comment"],
   ["SAVEPOINT sp", "a savepoint"],
 ]) {
   for (const via of ["prepare", "exec"]) {
@@ -1231,7 +1293,21 @@ export function openHubAsGuest(path) {
   // SAVEPOINT needs no clause here -- it arrives as its own action (32) and the
   // authorizer's `default: DENY` already refuses it.
   const gate = (sql) => {
-    for (const part of String(sql).split(";")) {
+    // Strip comments BEFORE looking for the keyword. Measured 2026-08-23: all
+    // three of `/* guest */ BEGIN EXCLUSIVE`, `-- guest\nBEGIN EXCLUSIVE` and
+    // `\t/*x*/BEGIN EXCLUSIVE` run to completion and fire SQLITE_TRANSACTION
+    // with arg1 "BEGIN", while a check anchored at the start of the trimmed
+    // text matches none of them -- so the guest takes the exclusive lock this
+    // gate exists to forbid, through a comment.
+    //
+    // The stripper is naive about comment markers inside string literals, and
+    // that is the SAFE direction: stripping can only make more text look like a
+    // BEGIN, so its mistakes are refusals, never admissions. The original text
+    // is what runs, comments and all.
+    const bare = String(sql)
+      .replace(/\/\*[\s\S]*?\*\//g, " ")     // block comments
+      .replace(/--[^\n]*/g, " ");             // line comments
+    for (const part of bare.split(";")) {
       if (!part.trim()) continue;
       if (/^\s*BEGIN\b/i.test(part) && !/^\s*BEGIN\s+IMMEDIATE\s*$/i.test(part))
         throw new Error(`only BEGIN IMMEDIATE is permitted on the guest hub connection: ${part.trim()}`);
@@ -1449,6 +1525,32 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 const dir = mkdtempSync(join(tmpdir(), "reeve-accept-"));
 const db = openHub(join(dir, "hub.db"));
+
+// This script is STANDALONE -- it is not a test file and imports no harness --
+// so the fixture is written out here. `fixtureCtx` lives in
+// test/worker-contract.test.mjs and is not exported; referencing it from here
+// is a ReferenceError before tick() runs, and the script then records no rows
+// while looking like it ran.
+//
+// `repoId` is required, not optional: without it the claim is refused
+// fail-closed (a lease that cannot be scoped to a repository is worse than no
+// lease), and the acceptance run would observe an empty provider_lease and
+// report the opposite of what it is meant to prove.
+const fixtureCtx = (d) => ({
+  nwo: "o/r", repoId: 1,
+  profile: { ci: {}, watch: {}, worker: { isolation: "none" } },
+  db: null, dbPath: join(d, "state.db"),
+  logPath: join(d, "reeve.log"), haltMarker: join(d, "HALT"),
+  execute: true, shadow: false, selfAudit: false,
+  log: () => {},
+  // One dispatch-worthy decision, injected rather than evaluated: evaluatePr
+  // shells out to GitHub (src/pr.mjs:132) and this script must make no network
+  // call. The shape is the one src/daemon.mjs:731 pushes.
+  evaluate: () => ({ ok: true, pr: 7, headRef: "mp/bt-1-s0",
+                     decision: { action: "FIX_CI", why: "red required check" },
+                     verdict: { state: "BLOCK", clauses: [] } }),
+});
+
 let during = null;
 const ctx = { ...fixtureCtx(dir), hub: db, lstart: "acceptance",
   spawnWorker: async () => {

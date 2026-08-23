@@ -56,6 +56,9 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
         return { ok: false, out: "", err: "unexpected" };
       },
       credential: (cwd, url) => { asked.push("credential"); askedFor.push(url); return cred; },
+      // Explicit, never the machine's own: a fixture that reads the founder's
+      // ~/.netrc is green here and something else on a host that has one.
+      netrc: () => reach.netrc ?? "",
     };
   };
   const pub = { identity: { checkout: "/co", defaultBranch: "main", visibility: "public" } };
@@ -147,6 +150,9 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
         return { ok: false, out: "", err: "unexpected" };
       },
       credential: (cwd, url) => { asked.push("credential"); askedFor.push(url); return cred; },
+      // Explicit, never the machine's own: a fixture that reads the founder's
+      // ~/.netrc is green here and something else on a host that has one.
+      netrc: () => reach.netrc ?? "",
     };
   };
   const pub = { identity: { checkout: "/co", defaultBranch: "main", visibility: "public" } };
@@ -258,6 +264,9 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
         return { ok: false, out: "", err: "unexpected" };
       },
       credential: (cwd, url) => { asked.push("credential"); askedFor.push(url); return cred; },
+      // Explicit, never the machine's own: a fixture that reads the founder's
+      // ~/.netrc is green here and something else on a host that has one.
+      netrc: () => reach.netrc ?? "",
     };
   };
   const pub = { identity: { checkout: "/co", defaultBranch: "main", visibility: "public" } };
@@ -295,6 +304,35 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
     check(io.asked.includes("--get-urlmatch"), "  resolved with git's own per-url matching", io.asked.join(","));
   }
   {
+    // netrc is not git configuration at all: git hands libcurl CURL_NETRC_
+    // OPTIONAL and curl reads the file. Measured 2026-08-23 on git 2.50.1
+    // against a local server issuing a 401 Basic challenge — no netrc, exit 128
+    // and no Authorization header; with a matching netrc, exit 0 and the header
+    // SENT; `credential fill` with that same netrc, exit 128 and no password.
+    const io = seams({ url: "https://enterprise.example/o/r.git",
+                       netrc: "machine enterprise.example\n  login u\n  password SECRET-NETRC-VALUE\n" },
+                     { ok: false, why: "no helper answered" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "DEGRADED" && /~\/\.netrc/.test(c.lines.join(" ")),
+      "a netrc entry for the host is DEGRADED, not BROKEN", c.lines.join(" | "));
+    check(!/SECRET-NETRC-VALUE/.test(c.lines.join(" ")),
+      "  and nothing from the netrc reaches the report", c.lines.join(" | "));
+  }
+  {
+    // `default` matches any host, which is the whole point of it.
+    const io = seams({ url: "https://enterprise.example/o/r.git", netrc: "default\n  login u\n  password p\n" },
+                     { ok: false, why: "no helper answered" });
+    check(checkRemoteReach(pub, io).level === "DEGRADED",
+      "a netrc `default` entry covers the host too", "");
+  }
+  {
+    // Control: a netrc naming a DIFFERENT host says nothing about this one.
+    const io = seams({ url: "https://enterprise.example/o/r.git", netrc: "machine elsewhere.example\n  login u\n  password p\n" },
+                     { ok: false, why: "no helper answered" });
+    check(checkRemoteReach(pub, io).level === "BROKEN",
+      "control: a netrc for another host does not excuse this one", "");
+  }
+  {
     // Control: no alternative configured, so a silent helper is still BROKEN.
     const io = seams({ url: "https://enterprise.example/o/r.git" }, { ok: false, why: "no helper answered" });
     const c = checkRemoteReach(pub, io);
@@ -323,6 +361,7 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
       return { ok: false, out: "", err: "unexpected" };
     },
     credential: () => cred,
+    netrc: () => "",
   });
   const pub = { identity: { checkout: "/co", defaultBranch: "main", visibility: "public" } };
 
@@ -352,6 +391,7 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
       return { ok: false, out: "", err: "" };
     },
     credential: () => { throw new Error("the credential must not be asked for: there is no destination"); },
+    netrc: () => "",
   };
   const n = checkRemoteReach(pub, nowhere);
   check(n.level === "BROKEN" && /no push destination/.test(n.lines.join(" ")),
@@ -378,6 +418,7 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
       return { ok: false, out: "", err: "" };
     },
     credential: () => ({ ok: true }),
+    netrc: () => "",
   };
   const c = checkRemoteReach({ identity: { checkout: "/co", defaultBranch: "main" } }, io);
   const all = c.lines.join(" | ");

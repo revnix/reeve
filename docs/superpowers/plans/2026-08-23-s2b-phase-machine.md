@@ -34,6 +34,8 @@ S2-A must be merged first. These are the exact names this plan builds on; if any
 | | `HUB_SCHEMA_VERSION` | integer, currently 1 |
 | `src/build/hub.sql` | all 32 tables | `task` (with `slice_cursor`, `resume_seq`, `held_from`, `blocked_reason`, `terminal_reason`), `task_territory`, `task_drain`, `phase_event`, `hold_reason`, `hub_event`, `outbox` (with `task_generation`, `fence`, `cancellable`, and `outbox_live_key`), `territory_lease`, `repo_gate_state` |
 | | `outbox.fence INTEGER NOT NULL REFERENCES phase_event(seq)` | **added to S2-A's migration 1 for this plan.** An effect can only name an authorising event that exists, so `applyTransition` must append its `phase_event` **before** it enqueues — which it does — and every fixture that enqueues must mint the events first, which is why `seed` creates a run of them |
+| | `impl_pr.head_sha TEXT NOT NULL` | **added to S2-A's migration 1 for this plan.** `write-pr-hold` reads the PR's current head from the projection inside its own transaction, and `pr_hold.head_sha` is `NOT NULL` — so a nullable column here would turn every hold into a constraint failure that rolls back the transition it was compensating for. This plan's `impl_pr` fixtures supply it; so do S2-A's |
+| | `impl_pr.merged_sha TEXT` | read by `hasOpenBuilderPr`. `impl_pr` is durable history keyed `(task, generation, slice)` and rows survive the merge, so "open" is `merged_sha IS NULL`, never mere existence |
 | `src/build/locks.mjs` | `assertWritable(db, {isAlive, at, inTx})` | throws while a live restore holds `maintenance_lock`; **every hub writer calls it** |
 | `src/build/replay.mjs` | `COMPARISON_SET`, `replayableKinds()` | this plan's new `hub_event` kinds must appear in `HANDLERS` |
 | `src/build/tables.mjs` | `TABLE_OWNERS` | every table this plan gives a writer to must have its row updated |
@@ -1596,6 +1598,50 @@ import { applyTransition } from "../src/build/transition.mjs";
     "a --force with no configured threshold is refused, not defaulted", JSON.stringify(noThreshold));
   db.close(); db2.close();
 }
+
+// ── FINALIZING -> DONE forgives voided effects ONE BY ONE ────────────────────
+// The forgiveness rule is per EFFECT: a voided row stops mattering when the
+// resume re-enqueued that same idempotency key and the replacement reached
+// `done`. Asking "is there ANY replacement" and dropping the whole voided group
+// on a single yes is how a task commits DONE -- terminal, no edges out -- with
+// its ledger write-back never performed.
+//
+// The fixture is the smallest one that can tell the two apart: TWO voided
+// completion effects, exactly ONE replaced. A group-level check sees one
+// replacement and forgives both; a correlated check forgives one and refuses.
+{
+  const db = openHub(join(dir, "t7.db"));
+  seed(db, { id: "bt:1", phase: "FINALIZING", generation: 1 });
+  // The completion check scopes itself to the FINALIZING entry for this
+  // generation and refuses outright without one, so the fixture supplies it.
+  db.prepare(`INSERT INTO phase_event(seq,task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+              VALUES(200,'bt:1',unixepoch(),'phase.advanced','SLICE_MERGED','FINALIZING',1,1,'{}')`).run();
+  const put = (key, status) => db.prepare(
+    `INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,status,args,created_at,updated_at)
+     VALUES(?,'gh.pr.comment','bt:1',1,200,?,'{}',unixepoch(),unixepoch())`).run(key, status);
+  put("bt:1:g1:ledger-writeback", "voided");
+  put("bt:1:g1:pr-close",         "voided");
+  put("bt:1:g1:pr-close",         "done");     // ONE replacement, for ONE of the two
+  const settle = () => applyTransition(db, { taskId: "bt:1", expectedPhase: "FINALIZING",
+    expectedGeneration: 1, evidence: { kind: "finalize.settled", outstanding: 0 }, op: "phase.advanced" });
+
+  const partial = settle();
+  check(partial.applied === false && /1 voided/.test(String(partial.refusal)),
+    "one replaced voided effect does not forgive the other, and the count reported is the UNREPLACED one",
+    JSON.stringify(partial));
+  check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "FINALIZING",
+    "and the task is still FINALIZING, because DONE cannot be revisited once entered");
+
+  // CONTROL: replace the second one too and the SAME call commits. Without it a
+  // completion check that refuses whenever any voided row exists -- the obvious
+  // over-fix -- satisfies both assertions above.
+  put("bt:1:g1:ledger-writeback", "done");
+  const complete = settle();
+  check(complete.applied === true && complete.to === "DONE",
+    "control: with EVERY voided effect replaced, the same transition commits",
+    JSON.stringify(complete));
+  db.close();
+}
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -1648,15 +1694,27 @@ import { enqueueEffect } from "./outbox.mjs";
 // plan's behaviour was unreachable. Both read inside the caller's transaction,
 // like every other input on that object; reading them before BEGIN IMMEDIATE
 // would decide the transition from a state the transaction does not hold.
-// "Open" means the PR EXISTS, not that it is unheld. Excluding held PRs made
-// `hasOpenPr` false exactly when the task was already BLOCKED or ESCALATED --
-// which is a legal source for `founder.cancel` and `founder.infeasible` -- so
-// `nextPhase` omitted `write-pr-hold`, the upsert never ran, and the open hold
-// kept its obsolete non-terminal reason on a task that had just been cancelled.
-// The upsert is what reuses the existing row; that is its whole job, and it
-// cannot do it for a PR this predicate has hidden.
+// "Open" means the PR exists and is NOT YET MERGED. Two corrections live in this
+// one line and they pull in opposite directions, so both are stated.
+//
+// Excluding HELD PRs made `hasOpenPr` false exactly when the task was already
+// BLOCKED or ESCALATED -- which is a legal source for `founder.cancel` and
+// `founder.infeasible` -- so `nextPhase` omitted `write-pr-hold`, the upsert
+// never ran, and the open hold kept its obsolete non-terminal reason on a task
+// that had just been cancelled. The upsert is what reuses the existing row; that
+// is its whole job, and it cannot do it for a PR this predicate has hidden. So
+// held PRs are IN.
+//
+// But dropping every condition went too far the other way. `impl_pr` is durable
+// history: rows persist after the PR is merged and record it via `merged_sha`,
+// and the PRIMARY KEY is (task, generation, slice), so an earlier generation's
+// merged PR keeps this predicate true forever. Terminal transitions then
+// scheduled holds, comments and close effects against a PR that merged weeks
+// ago; those effects fail, and a cancellation that cannot drain is a task that
+// cannot reach a terminal phase. So merged PRs are OUT, and `merged_sha IS NULL`
+// is the whole difference: held-but-unmerged still counts, merged does not.
 const hasOpenBuilderPr = (db, taskId) => db.prepare(
-  `SELECT count(*) c FROM impl_pr WHERE task = ?`).get(taskId).c > 0;
+  `SELECT count(*) c FROM impl_pr WHERE task = ? AND merged_sha IS NULL`).get(taskId).c > 0;
 
 const hasLivePin = (db, taskId) => db.prepare(
   `SELECT count(*) c FROM task_territory WHERE task = ? AND pinned = 1`).get(taskId).c > 0;
@@ -1941,22 +1999,38 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
            -- re-enqueued, let alone performed. A voided row is not a settled
            -- one; it is an effect that was deliberately abandoned and never
            -- replaced.
-           AND status IN ('pending','inflight','failed','dead_letter','refused','voided')
+           AND status IN ('pending','inflight','failed','dead_letter','refused')
          GROUP BY status`).all(taskId, expectedGeneration, finalizingSeq);
-      // A voided row is forgiven only when a SUCCESSFUL replacement for the same
-      // idempotency key exists at this generation -- that is the resume having
-      // re-enqueued and completed the work, which is the one case where the
-      // abandonment no longer matters.
-      const unreplaced = bad.filter(r => r.status !== 'voided' || db.prepare(
-        `SELECT count(*) c FROM outbox o
-          WHERE o.task_id = ? AND o.task_generation = ? AND o.status = 'done'
-            AND o.idempotency_key IN (SELECT idempotency_key FROM outbox
-                                       WHERE task_id = ? AND status = 'voided'
-                                         AND task_generation = ?)`)
-        .get(taskId, expectedGeneration, taskId, expectedGeneration).c === 0);
-      const bad2 = unreplaced;
-      if (bad2.length)
-        return refuseDurably(`finalization is not complete: ` + bad2.map(r => `${r.c} ${r.status}`).join(", ") +
+      // `voided` is counted SEPARATELY, and per row. It is the one status that
+      // can be forgiven -- a voided effect no longer matters if the resume
+      // re-enqueued it and that replacement reached `done` -- but forgiveness is
+      // per EFFECT, not per group, and the previous form could not express that.
+      //
+      // It grouped every voided row into a single aggregate and then ran ONE
+      // existence query beside it, asking "is there any voided key with a done
+      // replacement". So a FINALIZING task with five voided completion effects
+      // and one re-enqueued replacement dropped the whole group of five, and
+      // committed DONE -- terminal, no edges out -- with four effects that were
+      // deliberately abandoned and never performed. The ledger write-back, the
+      // completion comment and the PR close are exactly the effects in that set.
+      //
+      // A correlated NOT EXISTS asks the question once per row, which is where
+      // the answer differs.
+      const unreplacedVoided = db.prepare(
+        `SELECT count(*) c FROM outbox v
+          WHERE v.task_id = ? AND v.task_generation = ? AND v.fence >= ?
+            AND v.status = 'voided'
+            AND NOT EXISTS (SELECT 1 FROM outbox d
+                             WHERE d.task_id          = v.task_id
+                               AND d.task_generation  = v.task_generation
+                               AND d.idempotency_key  = v.idempotency_key
+                               AND d.status           = 'done')`)
+        .get(taskId, expectedGeneration, finalizingSeq).c;
+      // Same fence scope as the group above, so the two halves cannot disagree
+      // about which effects belong to this finalization.
+      if (unreplacedVoided) bad.push({ status: 'voided', c: unreplacedVoided });
+      if (bad.length)
+        return refuseDurably(`finalization is not complete: ` + bad.map(r => `${r.c} ${r.status}`).join(", ") +
                              `; DONE is terminal and cannot be revisited`);
     }
 
@@ -2280,6 +2354,20 @@ if (drained.changes) {
 import { openHub, hubTx } from "../src/build/hubdb.mjs";
 import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
          voidPending, KEY_KINDS } from "../src/build/outbox.mjs";
+
+// A fixed clock for every lease in this file, declared ABOVE the first block
+// that reads it. `leaseEffect` evaluates `not_before <= now` and the module has
+// no clock of its own, so a call that omits `now` either binds undefined and
+// leases nothing or forces an undeclared fallback -- and the not-before block
+// was the only place supplying one, so every OTHER positive lease assertion
+// failed against a literal implementation.
+//
+// Position is load-bearing, not tidiness. A top-level `const` is in the temporal
+// dead zone until its own line is evaluated, and this sat below fifteen blocks
+// that read it: the very first lease attempt threw
+// `ReferenceError: Cannot access 'NOW' before initialization` and NOTHING in
+// Task 16 ran. A declaration used by a whole file belongs at the top of it.
+const NOW = 1_800_000_000;
 
 
 // ── fence revalidation ───────────────────────────────────────────────────────
@@ -2645,13 +2733,6 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
   db.close();
 }
 
-// A fixed clock for every lease in this file. `leaseEffect` evaluates
-// `not_before <= now` and the module has no clock of its own, so a call that
-// omits `now` either binds undefined and leases nothing or forces an undeclared
-// fallback -- and the not-before block was the only place supplying one, so
-// every OTHER positive lease assertion failed against a literal implementation.
-const NOW = 1_800_000_000;
-
 // ── every outbox mutation appends its row image ──────────────────────────────
 // A DELTA per path, executable. The requirement was written into the interface
 // and asserted nowhere, so an implementation emitting none of these row images
@@ -2669,16 +2750,28 @@ const NOW = 1_800_000_000;
   // which in SQL compares equal to nothing at all, so both counts were 0 and the
   // `before + 1` assertion failed against a correct implementation. Anything
   // keyed on a value the callback produces has to read it after the callback.
-  const delta = (label, kind, fn, idOf = (out) => out.id) => {
-    const before = (id) => db.prepare(
+  const delta = (label, kind, fn, idOf = (out) => out.id, idHint = null) => {
+    const countFor = (id) => db.prepare(
       `SELECT count(*) c FROM hub_event WHERE kind=? AND json_extract(payload,'$.id') = ?`).get(kind, id).c;
+    // A DELTA per id, not an absolute count of one. Asserting the post-call
+    // per-row count is exactly 1 is wrong for every path that touches a row
+    // twice, and this block contains one: `leaseEffect` appends an
+    // `outbox.settled` for a row and `settleEffect` appends another for the SAME
+    // row, so the settle assertion observed 2 and went red against precisely the
+    // implementation this plan prescribes. Only the enqueue case cannot name its
+    // id before the call -- and there the pre-count is 0 by construction,
+    // because the row does not exist yet.
+    const idBefore = idHint === null ? null : idHint();
+    const perIdBefore = idBefore === null ? 0 : countFor(idBefore);
     // Snapshot the WHOLE-kind count too, so a mutation that emits an event for
     // the wrong row is still caught: the per-id count would stay flat and look
     // like a missing event rather than a misdirected one.
     const wholeBefore = db.prepare("SELECT count(*) c FROM hub_event WHERE kind=?").get(kind).c;
     const out = fn();
     const id = idOf(out);
-    check(before(id) === 1, `${label} appends exactly one ${kind} for its own row`, `id=${id}`);
+    const perIdAfter = countFor(id);
+    check(perIdAfter === perIdBefore + 1, `${label} appends exactly one ${kind} for its own row`,
+      `id=${id} ${perIdBefore} -> ${perIdAfter}`);
     check(db.prepare("SELECT count(*) c FROM hub_event WHERE kind=?").get(kind).c === wholeBefore + 1,
       `control: ${label} appends exactly one ${kind} in total, not one for another row`);
     return out;
@@ -2688,14 +2781,18 @@ const NOW = 1_800_000_000;
   const row = delta("enqueueEffect", "outbox.enqueued", () =>
     hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:IMPLEMENTING:comment:0",
       kind: "gh.pr.comment", taskId: "bt:1", generation: 1, fence: 1, args: {} })));
-  // lease -- the row becomes `inflight`, which replay must not lose
+  // lease -- the row becomes `inflight`, which replay must not lose. The id IS
+  // knowable in advance here: it is the row the enqueue above returned.
   const leased = delta("leaseEffect", "outbox.settled",
-    () => leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW }));
-  // settle
+    () => leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW }),
+    (out) => out.id, () => row.id);
+  // settle -- the SAME row, which by now already carries the lease's
+  // `outbox.settled`. Without the hint this asserts a post-call count of one
+  // against a row that correctly has two.
   delta("settleEffect", "outbox.settled",
     () => settleEffect(db, { id: leased.id, worker: leased.worker, leaseToken: leased.lease_token,
                              ok: true, result: {} }),
-    () => leased.id);
+    () => leased.id, () => leased.id);
 
   // fence: a row whose generation moved settles `fenced` inside leaseEffect
   const stale = hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:IMPLEMENTING:comment:1",
@@ -3553,14 +3650,38 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
   // never refreshed gate state -- the exact half-wiring the assertion exists to
   // catch. Bounded at the next `case`/`break` at the same nesting, which is where
   // this CLI's routes end.
-  const at = cli.indexOf('case "run"');
-  check(at !== -1, "fixture: the `build run` branch exists to scan", String(at));
+  // `case "build"`, not `case "run"`. The builder has no nested `case "run"`:
+  // S2-A adds a TOP-LEVEL `case "build"` and dispatches on `const sub =
+  // process.argv[3]` with `sub === "run"`. Searching for `case "run"` finds the
+  // pre-existing GUARDIAN route instead -- `bin/reeve:320` on `16769e7`, where
+  // `buildTick` must not appear -- so the assertion below inspected the wrong
+  // branch entirely and could never establish that `reeve build run` is wired.
+  const at = cli.indexOf('case "build"');
+  check(at !== -1, "fixture: the `build` route exists to scan", String(at));
+  // Two spaces, which is this CLI's actual top-level case indentation (`  case
+  // "doctor":`, `  case "backup":`, `  case "run":`). The six-space delimiter
+  // matched nothing, so `nxt` was -1 and the slice ran to end-of-file -- the
+  // unbounded scan the control below exists to rule out, reintroduced by the
+  // very line meant to bound it. Nested cases sit at four spaces or deeper and
+  // cannot match this pattern, so the slice ends at the next ROUTE.
   const branch = cli.slice(at, (() => {
-    const nxt = cli.indexOf("\n      case ", at + 1);
+    const nxt = cli.indexOf("\n  case ", at + 1);
     return nxt === -1 ? cli.length : nxt;
   })());
+  // CONTROL: it is the BUILDER's route that was scanned. `sub` is the builder
+  // subcommand dispatch and appears in no other case, so its presence is what
+  // distinguishes this branch from the guardian's `case "run"`.
+  check(/\bsub\b/.test(branch),
+    "control: the scanned branch is the builder's `build` route, not the guardian's `run` route",
+    branch.slice(0, 120));
+  // ROUTE-level, and the assertion says so rather than claiming more. The build
+  // route dispatches `run`, `status` and `pause` from one case body with no
+  // delimiter a text scan can trust, so "somewhere in the build route" is the
+  // honest granularity here. It still rules out the failure this exists to catch
+  // -- a correct loop.mjs that bin/reeve imports and never calls -- which is what
+  // no behavioural assertion in this file can see.
   check(/\bbuildTick\s*\(/.test(branch),
-    "and the `build run` branch CALLS it, so the tick runs in production and not only here");
+    "and the `build` route CALLS it, so the tick runs in production and not only here");
   // CONTROL: the slice really is bounded. If it reached end-of-file the two
   // lengths would match, and the assertion above would be the old one again.
   check(branch.length > 0 && branch.length < cli.length - at,
@@ -3746,7 +3867,7 @@ control for an otherwise-valid installation carrying one extra permission.
 
 **On the broken implementation** — `app_installed` defaulting to `'pass'` when `installation` is present but has no `permissions` key — the four not-knowing cases go red as a group, which is exactly the signal wanted: the failure is "unknown became a pass", not one edge case.
 
-The wiring assertions have a second broken implementation, and it is the one this task is most likely to ship: a complete, correct `src/build/loop.mjs` that `bin/reeve` never imports. Every behavioural assertion in this file passes — they all call `buildTick` directly — and two lines go red: `bin/reeve imports buildTick from build/loop.mjs` and `the build run route CALLS it`. Production `build run` would then have no `repo_gate_state` writer at all, which is the failure §9.1 exists to prevent, and no behavioural test can see it. The `control:` line below them is what stops the scan from degrading into a search for the word: an import with no call site matches a bare name search and is exactly the half-wiring being ruled out.
+The wiring assertions have a second broken implementation, and it is the one this task is most likely to ship: a complete, correct `src/build/loop.mjs` that `bin/reeve` never imports. Every behavioural assertion in this file passes — they all call `buildTick` directly — and two lines go red: `bin/reeve imports buildTick from build/loop.mjs` and `the build route CALLS it`. Production `build run` would then have no `repo_gate_state` writer at all, which is the failure §9.1 exists to prevent, and no behavioural test can see it. The `control:` line below them is what stops the scan from degrading into a search for the word: an import with no call site matches a bare name search and is exactly the half-wiring being ruled out.
 
 ```bash
 $N test/hub-gatestate.test.mjs
@@ -3806,8 +3927,20 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { openSync, writeSync, closeSync, mkdirSync } from "node:fs";
 
-// The generated worker performs the handshake. Inside each transaction, after
-// the projection write and before COMMIT:
+// This file's OWN fixed lease clock. `NOW` is a module-scoped constant, and the
+// one Task 16 declares belongs to `test/hub-outbox.test.mjs` -- a different
+// module, whose bindings are not visible here. The recovery drill below leases
+// an effect and read that name, so it threw `ReferenceError: NOW is not defined`
+// at its first line and never exercised recovery at all. Same value as Task 16's
+// deliberately: the two files assert the same not-before arithmetic, and two
+// clocks that drift would make one of them wrong for a reason nobody would look
+// for here.
+const NOW = 1_800_000_000;
+
+// The generated worker performs the handshake, and the template below CONTAINS
+// it rather than describing it. The seam is SQLite's authorizer, which fires
+// while `applyTransition` prepares its `INSERT INTO phase_event` -- inside
+// `hubTx`'s BEGIN IMMEDIATE and after the projection UPDATE:
 //
 //     writeSync(3, "x");                    // "I am inside a transaction"
 //     try { readSync(4, Buffer.alloc(1), 0, 1, null); } catch {}   // block until killed
@@ -3817,6 +3950,20 @@ import { openSync, writeSync, closeSync, mkdirSync } from "node:fs";
 // than by timing. `readSync` on a pipe with no writer throws EAGAIN on some
 // platforms, hence the catch; a child that falls through it simply continues and
 // the next iteration signals again.
+//
+// Two seams were rejected and it is worth saying why, because both look right.
+// `isAlive` is an injected collaborator, but `assertWritable` returns early when
+// no `maintenance_lock` row exists, and it runs BEFORE the projection write even
+// when it is called -- so a kill there proves only that BEGIN happened. Wrapping
+// the call in the worker's own `hubTx` is not available at all: nested
+// `BEGIN IMMEDIATE` throws in `node:sqlite` rather than nesting.
+//
+// This makes one demand of the implementation, and it is a reasonable one:
+// `applyTransition` prepares its statements INSIDE the transaction, as the code
+// in Task 15 does. An implementation that hoists them to module scope prepares
+// once, outside any transaction, and the authorizer fires there instead -- the
+// child then signals before it holds a lock, and the SQLITE_BUSY control below
+// catches exactly that.
 //
 // The child the crash drill spawns imports from the checkout, so the paths in
 // its generated source must be ABSOLUTE -- a relative specifier resolves from
@@ -3859,8 +4006,43 @@ mkdirSync(join(home, "state"), { recursive: true });
   writeFileSync(worker, `
 import { openHub } from "${SRC}/build/hubdb.mjs";
 import { applyTransition } from "${SRC}/build/transition.mjs";
+import { writeSync, readSync } from "node:fs";
+import { constants } from "node:sqlite";
 const db = openHub(process.argv[2]);
+// THE HANDSHAKE, WRITTEN. An earlier revision described it in a comment beside
+// this template and generated a worker that never signalled, so fd 3 never
+// carried a byte, the race always settled on the child's exit, and the drill
+// reported failure whatever the implementation did.
+//
+// The seam is the AUTHORIZER, because it is the only callback that fires at the
+// right instant without changing production code. SQLite calls it while
+// applyTransition prepares its INSERT INTO phase_event -- which happens inside
+// hubTx's BEGIN IMMEDIATE and AFTER the projection UPDATE has already run. That
+// is exactly the window the drill needs: a torn implementation has written the
+// phase and not yet the event. Signalling from isAlive would be too early (it
+// runs before the UPDATE) and wrapping the call in our own hubTx is impossible
+// (nested BEGIN IMMEDIATE throws in node:sqlite).
+//
+// The child announces itself on fd 3 and then BLOCKS on a read from fd 4, which
+// the parent never writes. It therefore cannot leave the transaction whatever
+// the scheduler does, and the kill lands inside it by construction rather than
+// by timing. readSync on a pipe with no writer throws EAGAIN on some platforms,
+// hence the catch; a child that falls through simply continues.
+let armed = false, signalled = false;
+db.setAuthorizer((op, arg1) => {
+  if (armed && !signalled && op === constants.SQLITE_INSERT && arg1 === "phase_event") {
+    signalled = true;
+    writeSync(3, "x");
+    try { readSync(4, Buffer.alloc(1), 0, 1, null); } catch {}
+  }
+  return constants.SQLITE_OK;
+});
 for (let i = 0; i < 500; i++) {
+  // Let a couple of hundred transitions COMMIT before arming, so the kill lands
+  // MID-RUN. Signalling on the first iteration would leave zero committed
+  // events and the parent's "the kill really did interrupt the run" control
+  // would fail against a perfectly correct implementation.
+  armed = i >= 250;
   applyTransition(db, { taskId: "bt:" + i, expectedPhase: "RESEARCH", expectedGeneration: 1,
     evidence: { kind: "phase.succeeded", phase: "RESEARCH" }, artifactSha: "s" + i, op: "phase.advanced" });
 }
@@ -3922,16 +4104,26 @@ for (let i = 0; i < 500; i++) {
   // arrives -- so the handshake cannot pass on a child that signals without
   // having opened anything.
   const caught = await Promise.race([insideTxSignal, exit]);
+  // `"inside"` is what `insideTxSignal` resolves to and `"exited"` is what the
+  // child's exit resolves to; those are the only two outcomes this race has. The
+  // previous revision asserted `caught === "locked"`, a value nothing here can
+  // ever produce, so the drill reported failure against every implementation --
+  // including a correct one -- and the message it printed blamed the timing.
+  check(caught === "inside",
+    "the child signalled from INSIDE an open write transaction",
+    caught === "exited"
+      ? "the worker finished before it signalled: lower the arming index or raise the loop count and re-run"
+      : `the race settled on ${caught}`);
+  // CONTROL, and it is what makes the signal mean anything at all: a child could
+  // write fd 3 from anywhere. SQLITE_BUSY on BEGIN IMMEDIATE from this process
+  // is INDEPENDENT evidence that the write lock really is held at this instant,
+  // so the handshake cannot pass on a child that signals without having opened
+  // anything.
   if (caught === "inside") {
     const locked = await insideTx();
     check(locked, "control: the write lock IS held when the child says it is inside a transaction",
       String(locked));
   }
-  check(caught === "locked",
-    "control: the child was observed INSIDE an open write transaction",
-    caught === "exited"
-      ? "the worker finished before the probe saw a lock: raise the loop count and re-run"
-      : "never saw the write lock held; the kill would have proved nothing");
   // (A second, duplicate `check(caught, ...)` used to sit here. It was vacuous:
   // every outcome of the race is a non-empty string, so it passed on "exited"
   // and "timeout" as readily as on "locked".)

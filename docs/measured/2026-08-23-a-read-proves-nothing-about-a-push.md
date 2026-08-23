@@ -303,6 +303,59 @@ So the list stays explicit rather than widening to "any `http.*` key at all":
 authentication would suppress a real refusal — trading the loud error for the
 quiet one.
 
+## A mirror remote refuses every push reeve makes
+
+Round eight, and the one finding in this stretch that is not about an
+authentication mechanism. `publishRunWork` always names an explicit refspec, and
+`remote.<name>.mirror` makes a push behave as `--mirror`, which git will not
+combine with one:
+
+```
+$ git config remote.origin.mirror true
+$ git push origin HEAD:refs/heads/main
+fatal: --mirror can't be combined with refspecs
+$ git config --unset remote.origin.mirror
+$ git push origin HEAD:refs/heads/main      # succeeds
+```
+
+Every publication fails, and no credential or reachability probe can see it —
+the remote is perfectly reachable and the credential is perfectly obtainable.
+BROKEN, with git's own message quoted so the reader is not left to guess.
+
+Read with `--type=bool`, for the reason `emptyAuth` taught: `mirror = false` is
+configuration saying the opposite, and presence is not the question.
+
+## Two more shapes the credential question can take
+
+**A helper that answers with a credential rather than a password.** With the
+`authtype` capability negotiated, a helper returns `authtype=Bearer` and
+`credential=...` and git forms the Authorization header from those — no
+`password=` line anywhere. Measured 2026-08-23: git 2.50.1 (Apple Git-155) does
+NOT support the capability, so this is forward insurance rather than a
+reproduced defect. Unknown input keys are tolerated silently on that build, but
+2.43 cannot be tested from here, so a call that FAILS is retried without the
+capability line. A git that rejects the key gets the plain question rather than a
+wrong BROKEN.
+
+**A quoted netrc machine name.** curl permits a double-quoted field, and
+measured against the same 401 Basic server, `machine "127.0.0.1"` authenticates
+exactly as the unquoted form does. Comparing raw whitespace tokens missed it.
+
+## And the instrument reaches outside the file that defines it
+
+`measuredContainment` assembles the probe's environment from workerenv.mjs:
+`workerEnv`, `writeGitConfig` and `workerHomeFor` choose the HOME, the PATH
+shims and the git configuration the canary runs under — which are the very
+mechanisms whose isolation it measures. Changing them changes what a pass means,
+from outside canary.mjs.
+
+The rot guard reads canary.mjs's imports, so it cannot see a caller's assembly.
+**That blind spot is real and is not closed.** Hashing daemon.mjs would
+re-measure on every unrelated edit to the daemon; parsing one function's body for
+imports is a guard that breaks quietly. The entry is declared by hand, asserted
+by name, and the comment says why a reader should check it when
+`measuredContainment` grows a dependency.
+
 ## What this does not establish, said in the report rather than only here
 
 That a push would SUCCEED. `git credential fill` obtains the fields from the

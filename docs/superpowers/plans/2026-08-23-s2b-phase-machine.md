@@ -160,7 +160,7 @@ Each task names any imports it needs **beyond** these.
     `Transition = { ok: true, to, generation, bumps, compensations: string[] }`,
     `Refusal = { ok: false, refusal: string }`.
   - `escalate` (optional) names the §11.7 identity this transition must raise, or is absent. `applyTransition` raises it in the same transaction. The identities are **bare**: no counts, durations, SHAs or paths in the key — those ride in the body. Three transitions carry one: `INFEASIBLE` raises `bt:<id>:infeasible` (a success state, but never a quiet one — it is the one builder escalation retired by the terminal state itself), the post-approval depth override raises `bt:<id>:depth:post-approval`, and a worker phase's exhausted retries raise `bt:<id>:phase:failed:<phase>`.
-  - `compensations` is a list drawn from the closed set `['void-pending','write-pr-hold','close-prs','release-territory','regrant-territory','clear-holds','annotate-resumed','record-hold-reason','record-drain','force-drain']`, so the transaction in Task 15 has nothing to decide.
+  - `compensations` is a list drawn from the closed set `['void-pending','write-pr-hold','close-prs','release-territory','regrant-territory','clear-holds','annotate-resumed','record-hold-reason','adopt-snapshot','release-ledger-claim','record-drain','force-drain']`, so the transaction in Task 15 has nothing to decide.
   - **The list is ORDERED, and `applyCompensation` runs it in that order.** `record-drain` is last because it snapshots the outbox rows that are in flight *at that moment*: run before `close-prs`, it captures only rows that were already inflight and misses the PR-close and comment effects the cancellation itself just enqueued, so `drainRemaining` reads zero and the task can reach CANCELLED with its own compensations still pending. Anything that enqueues must run before the thing that counts what is outstanding.
   - Every name in that set has a branch in `applyCompensation` (Task 15). A compensation the machine can emit and the transaction cannot apply either throws and rolls back the transition, or silently does nothing — and `regrant-territory` was emitted for a round with no branch to run it, which would have made every resume either fail or return without its lease.
 
@@ -480,6 +480,14 @@ export function nextPhase(state, evidence) {
       // close-prs it missed the close and comment effects the cancellation
       // itself had just created -- which is the whole set it exists to capture.
       compensations: ["void-pending","close-prs","release-territory",
+                      // A ledger claim that already LANDED is not undone by
+                      // draining: another actor must be able to take the node.
+                      // Section 3.5 requires the compensating `ledger.release`,
+                      // or the orphan sweep later finds a reeve-owned claim for
+                      // a CANCELLED task. `--if-owner` makes it inert when a
+                      // human already owns it, so it is safe whenever the claim
+                      // may have landed or is still in flight.
+                      ...(evidence.ledgerClaimLanded ? ["release-ledger-claim"] : []),
                       ...(hasOpenPr ? ["write-pr-hold"] : []), "record-drain"] });
   if (kind === "founder.infeasible") {
     // INFEASIBLE from IMPL_PR_OPEN or VERDICT_WAIT leaves an open builder PR
@@ -1076,6 +1084,7 @@ Write `applyCompensation` as a switch over the closed set `phases.mjs` produces,
 | `record-hold-reason` | inserts the `hold_reason` row for **this** hold — the first one, not only the stacked ones |
 | `record-drain` | inserts one `task_drain` row per outbox row for this task in `status IN ('pending','inflight')`. **Runs last**, so it captures the close and comment effects the compensations above just enqueued — those are `pending`, not `inflight`, so an inflight-only select would have missed exactly the rows ordering it last was meant to catch |
 | `adopt-snapshot` | writes the re-resolved registry snapshot columns (`profile_hash`, `registry_version`, `gate_definition_hash`, `default_branch`, `visibility`) onto the task, from values the caller resolved BEFORE the transaction. Only `regenerate` emits it |
+| `release-ledger-claim` | enqueues `ledger.release` (`release <id> --if-owner reeve:bt:<ulid>`) through the typed CLI in the dedicated clone. `--if-owner` makes it inert when a human already owns the node |
 | `force-drain` | sets `forced=1` and `last_known` on every unsettled `task_drain` row, and moves their outbox rows to `forced`, so a `--force` cancel records what was never confirmed instead of leaving the projection claiming it is still in flight |
 
 - [ ] **Step 4: Run and commit**
@@ -1339,16 +1348,24 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
   // BROKEN one that imports node:fs directly ignores it too. Instrument the
   // module boundary instead -- stub the filesystem the implementation would
   // have to reach for.
-  const fs = await import("node:fs");
-  const realStat = fs.lstatSync, realRead = fs.readFileSync;
+  // An ESM module namespace is READ-ONLY: assigning fs.lstatSync throws
+  // "Cannot assign to read only property", and it throws BEFORE the call under
+  // test, so the block fails for a reason unrelated to admitTask. Observe the
+  // syscalls instead of monkeypatching the module.
+  //
+  // admitTask also takes the RESOLVED claims, not raw strings: resolveClaims is
+  // where the symlink refusal lives, so passing filing.territory straight
+  // through lets an implementation satisfy the root and no-territory cases
+  // while never consulting the resolver at all.
+  const { createHook } = await import("node:async_hooks");
   let ioTouched = false;
-  fs.lstatSync = (...a) => { ioTouched = true; return realStat(...a); };
-  fs.readFileSync = (...a) => { ioTouched = true; return realRead(...a); };
+  const hook = createHook({ init(_id, type) { if (/FSREQ|STATWATCHER/i.test(type)) ioTouched = true; } }).enable();
+  const resolved = resolveClaims([normalizeClaim("packages/x")], snap.repoPath, { lstat: () => ({ isSymbolicLink: () => false }) });
   let r; try {
-    r = admitTask(db, snap, { id: "bt:1", project: "nextly", title: "t", territory: ["packages/x"] });
+    r = admitTask(db, snap, { id: "bt:1", project: "nextly", title: "t", claims: resolved.claims });
   } catch (e) { threw = e.message; }
-  finally { fs.lstatSync = realStat; fs.readFileSync = realRead; }
-  check(!ioTouched, "admitTask touched no filesystem call during its transaction");
+  finally { hook.disable(); }
+  check(!ioTouched, "admitTask issued no filesystem operation during its transaction");
   check(threw === null, "admitTask performs no I/O", String(threw));
   check(r.ok === true, "and admits the filing", JSON.stringify(r));
   const t = db.prepare("SELECT * FROM task WHERE id='bt:1'").get();

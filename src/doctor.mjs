@@ -21,6 +21,9 @@ import { createHash } from "node:crypto";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+// `hubFindings`'s healthy-snapshot path evaluates HUB_SCHEMA_VERSION; without
+// this import that branch throws a ReferenceError on a working installation.
+import { HUB_SCHEMA_VERSION } from "./build/hubdb.mjs";
 
 const BROKEN = "BROKEN";
 const DEGRADED = "DEGRADED";
@@ -925,4 +928,286 @@ export function render({ verdict, checks }, nwo) {
     }
   }
   return out.join("\n").replace(/\n{3,}/g, "\n\n");
+}
+
+/**
+ * The hub half of doctor. Reads only.
+ *
+ * Every finding is classified, because a flat list of sixteen problems is not
+ * something anyone acts on. The four classes are the four different responses:
+ * a configuration error is fixed, a dependency outage is waited out, stale
+ * evidence is refreshed, and unsafe authority is the one that must stop a merge.
+ *
+ * This function never writes repo_gate_state. The builder loop establishes that
+ * row; a reporter that could also write it would be agreeing with itself, and
+ * clause U4's whole value is that it reads something another actor established.
+ */
+export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), snapshotFor,
+                                  newestCandidate = () => null,
+                                  freshMinutes = 60, snapshotMaxHours = 24, offDevice = null,
+                                  projects = [] }) {
+  const out = [];
+  const snap = snapshotFor("hub");
+  if (!snap) {
+    out.push({ id: "H-1", severity: "fail", classification: "configuration",
+      title: "the hub has no snapshot", detail: `nothing under ${root}/hub`,
+      action: "reeve backup --hub" });
+  } else if (!snap.ok) {
+    out.push({ id: "H-1", severity: "fail", classification: "configuration",
+      title: "the newest hub snapshot does not validate", detail: String(snap.why), action: "reeve backup --hub" });
+  } else if (now - snap.at > snapshotMaxHours * 3600) {
+    out.push({ id: "H-1", severity: "warn", classification: "stale-evidence",
+      title: "the hub snapshot is stale",
+      detail: `${Math.round((now - snap.at) / 3600)}h old, taken ${new Date(snap.at * 1000).toISOString()}`,
+      action: "reeve backup --hub" });
+  } else {
+    out.push({ id: "H-1", severity: "pass", classification: "stale-evidence",
+      title: "hub snapshot is fresh", detail: `${Math.round((now - snap.at) / 60)}m old`, action: null });
+  }
+
+  // The NEWEST FILE, reported separately from the newest USABLE one. This was
+  // added to the interface and to the CLI call and then read by nothing, which
+  // is the worst of the three states: the argument arrived, the finding did not,
+  // and a repository-wide search for the name found only the call site.
+  //
+  // They differ exactly when the most recent backup is broken. `latestSnapshot`
+  // skips it and returns an older good file, so `snapshotFor` describes the
+  // fallback and H-1/H-2/H-3 all answer `pass` -- and the broken newest backup
+  // stays invisible for as long as the older recovery point remains fresh, which
+  // is precisely the window in which the next backup fails too.
+  const newest = newestCandidate("hub");
+  if (newest && (!snap || newest.path !== snap.path))
+    // `H-2:newest`, not a second bare `H-2`. The fallback's own H-2 is pushed
+    // below and PASSES, so a consumer indexing findings by id -- the exact
+    // failure this function already scopes H-4 and H-5 against -- keeps whichever
+    // came last and hides the broken newest backup. Scoped, like the others.
+    out.push({ id: "H-2:newest", severity: newest.ok ? "warn" : "fail", classification: "configuration",
+      title: "the newest hub snapshot is not the one a restore would use",
+      detail: newest.ok
+        ? `${newest.path} is newer than ${snap?.path ?? "(none)"} but was not selected`
+        : `${newest.path} does not validate: ${newest.why}`,
+      action: "reeve backup --hub, and investigate why the newest snapshot is unusable" });
+
+  // A project with NO row produces no finding at all unless it is asked for by
+  // name. That is absence read as success on the clause whose entire job is to
+  // refuse absence: on a fresh hub, or where one project has never refreshed,
+  // U4 is UNKNOWN and doctor must say so. The registry is the list of what
+  // SHOULD be there; the table is only what IS.
+  // ONE IDENTITY PER PROJECT. Every push below used a bare `H-4`, so with two
+  // projects a failing one and a healthy one both emit `H-4` -- and any consumer
+  // that indexes findings by id keeps whichever was appended last, which is
+  // whichever project the registry happened to list second. The id carries the
+  // repository, exactly as `#<pr>:` scopes the guardian's per-PR escalations.
+  // Keyed by `nwo_snapshot`, because that is the field the registry and the
+  // table share. Keying on `repo_id` compared a column against a registry field
+  // that does not exist -- `proj.repoId` was always null, `have.has(null)` always
+  // false, and EVERY project reported "no gate-state row" including ones whose
+  // row was present and healthy.
+  const have = new Map(db.prepare("SELECT * FROM repo_gate_state").all().map(r => [r.nwo_snapshot, r]));
+  for (const proj of projects) {
+    if (have.has(proj.nwo)) continue;
+    out.push({ id: `H-4:${proj.nwo}`, severity: "fail", classification: "unsafe-authority",
+      title: `${proj.nwo} has no gate-state row`,
+      detail: "the builder loop has never recorded one; clause U4 reads UNKNOWN, which is never PASS",
+      action: "start the builder and let one tick refresh it" });
+  }
+  for (const r of have.values()) {
+    const stale = now - r.verified_at > freshMinutes * 60;
+    const bound = r.ruleset_requires_check === 1 && r.bound_app_id != null && r.bound_app_id === r.expected_app_id;
+    const installed = r.app_installed === "pass";
+    if (stale) {
+      out.push({ id: `H-4:${r.nwo_snapshot}`, severity: "warn", classification: "stale-evidence",
+        title: `gate state for ${r.nwo_snapshot} is stale`,
+        detail: `verified ${Math.round((now - r.verified_at) / 60)}m ago; the bound is ${freshMinutes}m`,
+        action: "start the builder, or wait one tick" });
+    } else if (!bound || !installed || r.permission_diff != null || r.error != null) {
+      out.push({ id: `H-4:${r.nwo_snapshot}`, severity: "fail", classification: "unsafe-authority",
+        title: `${r.nwo_snapshot} does not enforce the bound check`,
+        // permission_diff and error are part of the answer, not colour: a row can
+        // name the right app and still record a missing permission, or that the
+        // read failed. Both are unsafe authority, and leaving them out of the
+        // predicate let a drifted installation report PASS.
+        detail: `requires=${r.ruleset_requires_check} bound_app=${r.bound_app_id} expected=${r.expected_app_id} ` +
+                `installed=${r.app_installed} permission_diff=${r.permission_diff ?? "none"} error=${r.error ?? "none"}`,
+        action: "merge stays dark until the ruleset requires ops/merge-policy from the expected app" });
+    } else {
+      out.push({ id: `H-4:${r.nwo_snapshot}`, severity: "pass", classification: "unsafe-authority",
+        title: `${r.nwo_snapshot} enforces the bound check`, detail: null, action: null });
+    }
+  }
+
+  // H-2/H-3: the snapshot's own integrity, and whether THIS binary could read it
+  // back. Declared in the interface, so they are emitted rather than folded into
+  // H-1: "a snapshot exists and is recent" is a different question from "it
+  // restores", and a stale-but-valid snapshot and a fresh-but-corrupt one need
+  // opposite responses.
+  if (snap?.ok) {
+    out.push({ id: "H-2", severity: "pass", classification: "stale-evidence",
+      title: "the newest hub snapshot passes integrity_check", detail: snap.integrity, action: null });
+    // Older is fine: validateSnapshot accepts any version at or below this
+    // binary, and openHub applies the forward migrations after the copy. Only a
+    // NEWER snapshot is unreadable. Requiring equality would tell an operator to
+    // hunt for an old binary in the one case restore already handles.
+    const ok = snap.version <= HUB_SCHEMA_VERSION;
+    out.push({ id: "H-3", severity: ok ? "pass" : "fail", classification: "configuration",
+      title: ok ? "the newest snapshot is restorable by this binary"
+                : "the newest snapshot is NOT restorable by this binary",
+      detail: `snapshot v${snap.version}, binary v${HUB_SCHEMA_VERSION}`,
+      action: ok ? null : "run the matching binary, or take a fresh snapshot" });
+  } else if (snap) {
+    out.push({ id: "H-2", severity: "fail", classification: "configuration",
+      title: "the newest hub snapshot does not read back", detail: String(snap.why), action: "reeve backup --hub" });
+    out.push({ id: "H-3", severity: "fail", classification: "configuration",
+      title: "restore compatibility is unknown: the snapshot does not open",
+      detail: String(snap.why), action: "reeve backup --hub" });
+  }
+
+  // H-6: the off-device copy is a REQUIREMENT of this design whose destination is
+  // still a founder decision (section 16.2). Reported missing rather than left
+  // silent -- an unreported gap in the backup story reads as no gap.
+  out.push(offDevice
+    ? { id: "H-6", severity: "pass", classification: "configuration",
+        title: "an off-device copy is configured", detail: offDevice, action: null }
+    : { id: "H-6", severity: "warn", classification: "configuration",
+        title: "no off-device copy is configured",
+        detail: "same-disk snapshots only; this machine is still a single point of failure",
+        action: "choose a destination (LAN machine, NAS or external disk; never cloud, never a git repository)" });
+
+  // A held lease whose holder is gone still occupies a slot until something reaps
+  // it, and a scheduler full of dead holders looks exactly like a busy one.
+  // 'held' AND 'queued'. A queued guardian request is scheduler authority in its
+  // own right -- admission blocks every builder while one is outstanding -- so a
+  // request whose daemon died before it was admitted starves builder dispatch
+  // indefinitely, while a held-only query reports nothing wrong.
+  // ONE H-5, worst-case. Lease freshness and provider-state measurement are two
+  // observations about one check, and pushing both produced a report saying the
+  // scheduler is stale AND healthy in the same breath -- with any consumer that
+  // indexes findings by id keeping whichever came last, which was the pass. A
+  // finding id is an identity; it gets one verdict.
+  const staleLeases = db.prepare(
+    `SELECT count(*) c FROM provider_lease WHERE status IN ('held','queued') AND expires_at < ?`).get(now).c;
+  const st = db.prepare("SELECT * FROM provider_state WHERE provider='claude'").get();
+
+  const notes = [];
+  if (staleLeases > 0)
+    notes.push({ classification: "stale-evidence",
+      why: `${staleLeases} held or queued provider request(s) expired; a dead holder starves every claim ` +
+           `behind it, and an expired QUEUED request blocks builder admission by itself`,
+      action: "the next tick reaps them; if it persists, the reaper is not running" });
+  if (!st)
+    notes.push({ classification: "configuration",
+      why: "the provider scheduler has no state row; limits fall back to the defaults 2/1",
+      action: "reeve build measure-provider (S3)" });
+  else if (st.measured_at == null)
+    notes.push({ classification: "stale-evidence",
+      why: `provider limits are the unmeasured defaults: limit=${st.concurrency_limit} reserved=${st.guardian_reserved}`,
+      action: "reeve build measure-provider (S3)" });
+  // An ACTIVE COOLDOWN is a note too. Measured limits and no expired leases read
+  // as healthy while `cooldown_until > now` means the scheduler is deliberately
+  // admitting nothing -- so doctor answered "fine" about a builder that was,
+  // correctly and invisibly, stopped. `dependency-outage`, not `configuration`:
+  // nothing here is misconfigured, the provider is refusing, and the fold below
+  // has to carry that classification or the finding degrades into a generic
+  // warning that suggests changing something.
+  if (st?.cooldown_until != null && st.cooldown_until > now)
+    notes.push({ classification: "dependency-outage",
+      why: `a provider cooldown is active until ${new Date(st.cooldown_until * 1000).toISOString()}` +
+           `${st.last_signature ? ` (${st.last_signature})` : ""}; no new provider work is admitted`,
+      action: "wait for the window, or investigate what exhausted it" });
+
+  if (notes.length === 0) {
+    out.push({ id: "H-5", severity: "pass", classification: "stale-evidence",
+      title: "the provider scheduler is healthy",
+      detail: `limit=${st.concurrency_limit} reserved=${st.guardian_reserved}, ` +
+              `measured ${new Date(st.measured_at * 1000).toISOString()}; no expired requests`, action: null });
+  } else {
+    // Every reason is still reported; only the SEVERITY is folded. Dropping the
+    // second reason would be this same defect in the other direction.
+    out.push({ id: "H-5", severity: "warn",
+      // WORST-CASE over every note, not a two-way test. An active provider
+      // cooldown is classified `dependency-outage` above and this fold then
+      // returned `stale-evidence` for it, so a provider refusing all new work
+      // was rendered as old data -- and `dependency-outage` is the one
+      // classification that tells an operator the fault is not theirs to fix.
+      // Ordered most-severe first; the first match wins.
+      classification: ["unsafe-authority", "dependency-outage", "configuration", "stale-evidence"]
+        .find(c => notes.some(n => n.classification === c)) ?? "stale-evidence",
+      title: "the provider scheduler needs attention",
+      detail: notes.map(n => n.why).join("; "),
+      action: notes.map(n => n.action).join("; ") });
+  }
+  return out;
+}
+
+/**
+ * `hubFindings`' human renderer -- the companion `render` has for the guardian.
+ *
+ * This function did not exist. Four call sites in `bin/reeve`'s `builder doctor`
+ * route named it, an import instruction listed it, and the plan described it as
+ * "`hubFindings`' human renderer, added in `src/doctor.mjs` beside the existing
+ * `render`" -- so every `reeve builder doctor` invocation would have thrown
+ * `ReferenceError: renderHub is not defined`, which is the exact failure the
+ * paragraph naming it claimed to prevent.
+ *
+ * Grouped by CLASSIFICATION rather than by severity, because that is what the
+ * classes are for: `hubFindings` documents them as "the four different
+ * responses" -- a configuration error is fixed, a dependency outage is waited
+ * out, stale evidence is refreshed, and unsafe authority must stop a merge. A
+ * renderer that sorted by severity would print a slug and throw that away,
+ * leaving an operator to work out for themselves which of sixteen problems they
+ * can actually do something about right now.
+ *
+ * Groups are ordered by what they demand of the reader: authority first because
+ * it blocks a merge, then the things you fix, then the things you wait for, then
+ * the things you refresh. Passes are kept -- "is it healthy" is a question this
+ * command has to answer, and a report that shows only faults cannot answer it --
+ * but they sort last inside their group.
+ */
+const HUB_CLASSES = [
+  ["unsafe-authority",  "UNSAFE AUTHORITY   this stops a merge"],
+  ["configuration",     "CONFIGURATION      fix these"],
+  ["dependency-outage", "DEPENDENCY         wait for these"],
+  ["stale-evidence",    "STALE EVIDENCE     refresh these"],
+];
+const HUB_SEVERITY_RANK = { fail: 0, warn: 1, pass: 2 };
+const HUB_MARK = { fail: "FAIL", warn: "warn", pass: "ok  " };
+
+export function renderHub(findings) {
+  const all = Array.isArray(findings) ? findings : [];
+  const n = (sev) => all.filter(f => f.severity === sev).length;
+  const verdict = n("fail") ? "broken" : n("warn") ? "degraded" : all.length ? "ok" : "nothing to report";
+  const out = [`reeve builder doctor${" ".repeat(30)}${verdict}`,
+               `  ${n("fail")} failing · ${n("warn")} warning · ${n("pass")} ok`];
+
+  const seen = new Set();
+  for (const [cls, heading] of HUB_CLASSES) {
+    const group = all.filter(f => f.classification === cls)
+      .sort((a, b) => (HUB_SEVERITY_RANK[a.severity] ?? 9) - (HUB_SEVERITY_RANK[b.severity] ?? 9)
+                   || String(a.id).localeCompare(String(b.id)));
+    for (const f of group) seen.add(f);
+    if (!group.length) continue;
+    out.push("", heading);
+    for (const f of group) {
+      out.push(`  ${HUB_MARK[f.severity] ?? "?   "}  ${f.id}  ${f.title}`);
+      if (f.detail) out.push(`          ${f.detail}`);
+      // The house style for "what to do next", the same arrow every other reeve
+      // command uses. An action is the only part of a finding that is not a
+      // description, so it does not get buried in the detail.
+      if (f.action) out.push(`          -> ${f.action}`);
+    }
+  }
+
+  // A finding whose classification is not one of the four is REPORTED, not
+  // dropped. Silently omitting it would make this renderer the one place a new
+  // class could be added and never seen -- and the reader would have no way to
+  // tell an empty report from a swallowed one.
+  const unclassified = all.filter(f => !seen.has(f));
+  if (unclassified.length) {
+    out.push("", `UNCLASSIFIED       these carry a classification renderHub does not know`);
+    for (const f of unclassified)
+      out.push(`  ${HUB_MARK[f.severity] ?? "?   "}  ${f.id}  ${f.title}` +
+               `  [classification: ${JSON.stringify(f.classification)}]`);
+  }
+  if (!all.length) out.push("", "  no findings: the hub reported nothing at all");
+  return out.join("\n");
 }

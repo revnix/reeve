@@ -25,7 +25,8 @@
 // known, accepted condition forever. doctor stays a command a human runs.
 
 import { latestSnapshot, everyStore, snapshotCandidates } from "./backup.mjs";
-import { statSync } from "node:fs";
+import { statSync, existsSync } from "node:fs";
+import { hubPathFor } from "./paths.mjs";
 import { DatabaseSync } from "node:sqlite";
 
 export const OK = "OK";
@@ -202,6 +203,35 @@ export function selfAudit(db, opts = {}) {
     checkLeases(db, { at }),
     checkNotify(db, { profile }),
   ].filter(Boolean);
+
+  const home = opts.home ?? null;
+  const hub = home ? hubPathFor(home) : null;
+  if (hub && existsSync(hub)) {
+    // CHEAP on the tick path. `selfAudit` runs on every guardian tick, once per
+    // repository daemon, against a SHARED hub -- so a full-page integrity_check
+    // here re-scans a growing database every 90 seconds per daemon, which is the
+    // cost this plan measured OUT of `latestSnapshot` two rounds ago
+    // (~1.1 ms/MB; docs/measured/2026-08-23-integrity-check-cost.md). Moving it
+    // off one caller and onto a busier one is not a fix.
+    //
+    // `quick_check` walks the b-trees without the full page sweep, and the `(1)`
+    // argument stops at the first fault -- the audit reports "the hub is broken",
+    // not a catalogue. The deep scan stays where it earns its cost: `snapshotAll`
+    // on what it just wrote, `restoreHub` before it replaces anything, and
+    // `builder doctor` when an operator asks.
+    let integrity = null;
+    try {
+      const d = new DatabaseSync(hub, { readOnly: true });
+      try { integrity = Object.values(d.prepare("PRAGMA quick_check(1)").get())[0]; }
+      finally { d.close(); }
+    } catch (e) { integrity = `unreadable: ${e.message}`; }
+    // A hub that cannot be OPENED is also a fault, and lands here rather than
+    // throwing out of selfAudit and taking the whole per-repo audit with it.
+    if (integrity !== "ok")
+      findings.push({ id: "hub.integrity", level: BROKEN,
+                      why: "reeve's hub database fails its integrity check",
+                      detail: `${hub}: ${integrity}` });
+  }
 
   const rank = { [BROKEN]: 0, [DEGRADED]: 1, [OK]: 2 };
   return findings.sort((a, b) => rank[a.level] - rank[b.level]);

@@ -4,7 +4,7 @@
 // Node >=24 is a hard floor: node:sqlite still emits an ExperimentalWarning on
 // 22.x and the state layer is the authority, so it must not run under a warning
 // it might one day become.
-import { runDoctor, render, checkAppIdentity } from "../src/doctor.mjs";
+import { runDoctor, render, checkAppIdentity, hubFindings, renderHub } from "../src/doctor.mjs";
 import { open } from "../src/db/ops.mjs";
 import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor, hubPathFor } from "../src/paths.mjs";
 import { snapshot, restore, latestSnapshot, exportEvents,
@@ -41,6 +41,40 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 // Every other command in this file is `console.error(...); process.exit(1)`.
 // One helper for the whole file, written once rather than invented per route.
 const die = (msg) => { console.error(msg); process.exit(1); };
+
+// The registry is projects.json under the reeve home. An unreadable or absent
+// one yields NO projects rather than throwing: doctor must still report the
+// findings it can compute, and "the registry could not be read" is itself a
+// finding rather than a crash.
+// The TOP-LEVEL object, not `reg.projects`. The design doc fixes the format at
+// §1.5: `~/.reeve/projects.json` is `{name: {repoPath, nwo, profilePath,
+// worktreeRoot, specRepo?, ledger?}}` -- there is no `projects` wrapper, so
+// reading one returned [] on every real file and the CLI passed no projects at
+// all, silently suppressing the absent-row H-4 failures this loader was added to
+// expose. A defaulted `?? {}` is what made it silent.
+//
+// `nwo`, and no `repoId`: the registry format carries no numeric repository id
+// (§1.5, and measured -- resolving one needs the App client, which
+// `builder doctor` deliberately does not use). So H-4 matches projects to
+// `repo_gate_state` rows by `nwo_snapshot`, which both sides have.
+const registryProjects = (home) => {
+  const path = join(home, "projects.json");
+  try {
+    const reg = JSON.parse(readFileSync(path, "utf8"));
+    return { projects: Object.entries(reg)
+               .filter(([, p]) => p && typeof p === "object")
+               .map(([name, p]) => ({ name, nwo: p.nwo ?? null })),
+             error: null };
+  } catch (e) {
+    // The read failure is ITSELF a finding, and the route below emits it.
+    // Returning a bare [] made an unreadable registry indistinguishable from a
+    // legitimately empty one -- and since H-4 reports projects that have NO
+    // gate-state row, an empty expected set suppresses every one of them. So a
+    // machine whose registry cannot be parsed reported a clean hub, which is the
+    // exact absence-read-as-success this doctor exists to refuse.
+    return { projects: [], error: `${path}: ${e.message}` };
+  }
+};
 
 // One home for every command. Four of them read REEVE_HOME and loadProfile did
 // not, so a scratch home redirected a project's state database but not the
@@ -452,6 +486,177 @@ switch (cmd) {
       console.log(`\nthe profile declares worker.isolation: '${declared}', so the daemon still refuses to dispatch.\n-> set it to 'scratch-home' to act on this measurement`);
     console.log(`\nrecorded for \`reeve doctor\` R-14 under ${HOME}`);
     process.exit(v.credentialRead === "closed" ? 0 : 1);
+  }
+
+  case "builder": {
+    if (process.argv[3] !== "doctor") die("usage: reeve builder doctor [--json]");
+    // READ-ONLY, like every doctor path: a reporter that can write what it
+    // reports can agree with itself.
+    const p = hubPathFor(HOME);
+    if (!existsSync(p)) {
+      const none = [{ id: "H-0", severity: "fail", classification: "configuration",
+                      title: "there is no hub database", detail: p,
+                      action: "reeve build run creates it" }];
+      console.log(flag("json") ? JSON.stringify(none, null, 2) : renderHub(none));
+      process.exit(1);
+    }
+    // The open and the version probe TOGETHER, in a try. A hub that exists but
+    // cannot be opened -- or cannot answer for its schema version -- is an
+    // ordinary diagnostic scenario, and it is the scenario `builder doctor`
+    // exists for. Throwing an uncaught SQLite error produces no finding and no
+    // JSON at all, so the one command an operator runs to find out what is wrong
+    // answers with a stack trace. `selfAudit` in this same task already treats
+    // this as a structured integrity fault; doctor has to agree with it.
+    let db;
+    try {
+      db = new DatabaseSync(p, { readOnly: true });
+      db.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get();
+    } catch (e) {
+      try { db?.close(); } catch {}
+      const broken = [{ id: "H-0", severity: "fail", classification: "configuration",
+        title: "the hub database cannot be read", detail: `${p}: ${e.message}`,
+        action: "reeve restore --hub, and pass --tail from a durable export-events --hub if you have one" }];
+      console.log(flag("json") ? JSON.stringify(broken, null, 2) : renderHub(broken));
+      process.exit(1);
+    }
+    // The forward-version refusal, here too. `build status`, `build run` and
+    // both restore paths refuse a store above this binary's version; doctor read
+    // one and answered anyway, running queries shaped for the older schema. Its
+    // answers are then confidently wrong in the direction that matters most --
+    // omitted authority checks and passes for things it cannot see -- which is
+    // worse from the command an operator runs precisely to find out whether
+    // anything is wrong.
+    {
+      const v = db.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+      if (v > HUB_SCHEMA_VERSION) {
+        const stale = [{ id: "H-0", severity: "fail", classification: "configuration",
+          title: "the hub is newer than this reeve", detail: `hub is at schema version ${v}; this reeve knows ${HUB_SCHEMA_VERSION}`,
+          action: "upgrade reeve; this binary cannot report on a schema it does not know" }];
+        console.log(flag("json") ? JSON.stringify(stale, null, 2) : renderHub(stale));
+        process.exit(1);
+      }
+    }
+    // Read ONCE, and its failure is carried rather than swallowed. H-7 below is
+    // what stops an unreadable registry from reading as an empty one.
+    const registry = registryProjects(HOME);
+    let findings;
+    try {
+      findings = hubFindings(db, { root: opt("backups") ?? join(HOME, "backups"),
+                                   now: Math.floor(Date.now() / 1000),
+                                   // The REGISTRY's projects, not the rows the table
+                                   // happens to hold. H-4 exists to report a project
+                                   // that has NEVER acquired a repo_gate_state row --
+                                   // unsafe authority, silently. Defaulting to []
+                                   // makes the CLI report only what is already
+                                   // present, so the exact absent-row case this task
+                                   // calls unsafe is the one case it cannot see.
+                                   projects: registry.projects,       // see registryProjects below
+                                   // The NEWEST on-disk candidate is reported
+                                   // separately from the one restore would pick.
+                                   // `latestSnapshot` skips a candidate that
+                                   // fails cheap validation and returns an older
+                                   // good file -- which is right for restore and
+                                   // wrong for doctor: H-1/H-2/H-3 then describe
+                                   // the fallback and report `pass`, so a broken
+                                   // newest backup is invisible for as long as
+                                   // the older recovery point stays fresh. That
+                                   // is the exact window in which the next backup
+                                   // fails too and nobody is told.
+                                   newestCandidate: (nwo) => {
+                                     // `slug` is module-private in src/backup.mjs
+                                     // and is NOT exported by Task 8. Evaluated
+                                     // before the try below, so an installation
+                                     // with no backup directory crashed rather
+                                     // than returning findings. `latestSnapshot`
+                                     // already owns this mapping, so the CLI asks
+                                     // it for the directory instead of
+                                     // reimplementing the slug rule -- two
+                                     // spellings of one convention is how they
+                                     // drift.
+                                     const dir = dirname(latestSnapshot(
+                                       opt("backups") ?? join(HOME, "backups"), nwo)
+                                       ?? join(opt("backups") ?? join(HOME, "backups"), "hub", "0.db"));
+                                     let f;
+                                     try { f = readdirSync(dir).filter(n => /^\d+\.db$/.test(n))
+                                             .sort((a, b) => Number(b.split(".")[0]) - Number(a.split(".")[0]))[0]; }
+                                     catch { return null; }
+                                     if (!f) return null;
+                                     const path = join(dir, f);
+                                     // The epoch in the FILENAME, not the mtime.
+                                     //
+                                     // `basename` MUST be added to bin/reeve's
+                                     // node:path import, which reads
+                                     // `{ join, dirname, resolve }` on
+                                     // `16769e7` (bin/reeve:18) and becomes
+                                     // `{ join, dirname, resolve, basename }`.
+                                     // Stated as an instruction rather than a
+                                     // parenthetical because an unimported
+                                     // `basename` has already shipped once in
+                                     // this programme: both call sites below
+                                     // throw ReferenceError at the first
+                                     // `builder doctor` invocation, which is
+                                     // the whole command.
+                                     // `snapshot()` writes `<epoch>.db`, and that
+                                     // is the authoritative creation time; a copy
+                                     // back from off-device storage carries a
+                                     // fresh mtime, so H-1 would call a days-old
+                                     // recovery point fresh for another 24 hours
+                                     // -- and the moment an operator most needs
+                                     // this answer is right after restoring from
+                                     // off-device.
+                                     return { path, at: Number(basename(path).split(".")[0]),
+                                              ...validateSnapshot(path, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true }) };
+                                   },
+                                   snapshotFor: (nwo) => {
+                                     // Same filename-epoch rule as
+                                     // `newestCandidate` below. Fixing one and
+                                     // not the other left H-1 reading a copy
+                                     // time for the snapshot a restore would
+                                     // actually use -- the one that matters most.
+                                     const s = latestSnapshot(opt("backups") ?? join(HOME, "backups"), nwo, { deep: true });
+                                     // DEEP, and the only deep call on this path. `builder doctor` is an
+                                     // operator command run on demand, not a loop, and H-2's whole claim
+                                     // is that the newest snapshot would restore. The cheap validation
+                                     // returns `integrity: null`, so labelling it "integrity_check
+                                     // passed" reports a green H-2 for a snapshot with page corruption
+                                     // outside the schema pages -- the one failure H-2 exists to find.
+                                     // The epoch from the FILENAME, like
+                                     // `newestCandidate`. The comment above
+                                     // claimed this rule and the line below
+                                     // still read `statSync(s).mtimeMs`, which
+                                     // is the copy time -- so H-1 called a
+                                     // days-old snapshot restored from
+                                     // off-device fresh for another 24 hours,
+                                     // at exactly the moment an operator most
+                                     // needs the true age.
+                                     return s ? { path: s, at: Number(basename(s).split(".")[0]),
+                                                  ...validateSnapshot(s, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true }) } : null;
+                                   } });
+    } finally { db.close(); }
+    // H-7 goes in BEFORE anything is printed. Unshifting after the render set the
+    // exit status correctly and told the operator nothing: neither the JSON nor
+    // the human output carried the registry error that explains the failure, and
+    // every suppressed H-4 stayed invisible. A finding that does not reach the
+    // output is not a finding.
+    if (registry.error)
+      findings.unshift({ id: "H-7", severity: "fail", classification: "configuration",
+        title: "the project registry could not be read",
+        detail: registry.error,
+        action: "fix or create ~/.reeve/projects.json; until then H-4 cannot report a missing gate-state row" });
+    console.log(flag("json") ? JSON.stringify(findings, null, 2) : renderHub(findings));
+    // The CLI's existing doctor convention, documented at `bin/reeve:364`:
+    // 0 ok, 1 broken, 3 degraded. Exiting 0 on warnings tells automation that a
+    // stale snapshot, unmeasured provider limits, expired requests or no
+    // off-device copy are all healthy -- which is the reading the `warn`
+    // severity exists to prevent.
+    // H-7 is emitted at the ROUTE rather than inside hubFindings, because
+    // hubFindings takes the project list as an input and cannot tell an empty
+    // list from a failed read -- that indistinguishability is the defect.
+    // Severity `fail`, not `warn`: with no expected projects every absent-row
+    // H-4 is suppressed, so this one finding stands in for an unknown number of
+    // hidden ones. It is unshifted above, before the render.
+    process.exit(findings.some(f => f.severity === "fail") ? 1
+               : findings.some(f => f.severity === "warn") ? 3 : 0);
   }
 
   case "build": {

@@ -1380,7 +1380,13 @@ CREATE TABLE IF NOT EXISTS provider_lease (
   -- why it is a flag here rather than a revocation. S2-C writes and reads it;
   -- the column lives here because migration 1 owns the whole schema and a table
   -- gaining a column later would need a numbered migration for no reason.
-  preempt_requested INTEGER NOT NULL DEFAULT 0 CHECK (preempt_requested IN (0,1))
+  preempt_requested INTEGER NOT NULL DEFAULT 0 CHECK (preempt_requested IN (0,1)),
+  -- Set when a release was refused because a restore held maintenance_lock. The
+  -- daemon can restart before its retry, and an in-memory id does not survive
+  -- that, so the reaper treats a row marked here as releasable once the lock
+  -- clears -- rather than holding the slot for a full lease window after every
+  -- restore. Written and cleared by S2-C's scheduler.
+  refused_release   INTEGER NOT NULL DEFAULT 0 CHECK (refused_release IN (0,1))
 ) STRICT;
 CREATE INDEX IF NOT EXISTS provider_lease_live ON provider_lease(status, owner, requested_at);
 -- One LIVE request per run. A capacity-blocked guardian calls claimProvider again

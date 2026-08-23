@@ -231,6 +231,16 @@ const repoId = ctx.repoId ?? null;
 // `(owner, repo_id, run_ref)` is the live-request unique key, so it is the
 // identity that survives. After a restore the row is simply gone and the
 // release is correctly inert.
+// PLACEMENT, and it is these two loops that move -- not a comment about them.
+// The previous revision put the instruction on the stale-sweep block below,
+// which genuinely does need `repoId` and `decisions`, and left the loops
+// themselves where they were. Both go at the TOP of `tick`, before the halt
+// check and the PR listing: `src/daemon.mjs:554` (halted), `:562` (the PR list
+// could not be read) and `:578` (halted mid-tick) on `16769e7` all return
+// before `decisions` exists, and a tick taking any of them ran no retries at
+// all -- so a GitHub outage unrelated to the builder kept a dead worker's slot
+// held until expiry. Neither loop needs `repoId` or `decisions`: every queued
+// entry already carries its own owner, repoId and runRef.
 for (const ref of (ctx.pendingReleases ?? []).splice(0)) {
   try { (ctx.providerRelease ?? releaseProvider)(ctx.hub, ref); }
   catch { (ctx.pendingReleases ??= []).push(ref); }    // still locked: keep it for next tick
@@ -246,14 +256,9 @@ for (const rl of (ctx.pendingRateLimits ?? []).splice(0)) {
 ```
 
 ```js
-// BEFORE the PR listing, the halt check, and every other path that can return
-// early. This drain retries releases a previous tick could not perform because a
-// restore held `maintenance_lock`, and each one is a slot a dead worker is still
-// holding. Placed after `decisions`, a tick that could not list PRs, was halted,
-// or returned during evaluation ran none of them -- so a GitHub outage unrelated
-// to the builder kept the builder starved until the leases expired. It needs
-// neither `repoId` nor `decisions`: every queued ref already carries its own
-// owner, repoId and runRef.
+// The stale-request sweep. Unlike the drains above, this one DOES belong after
+// `decisions`: it decides what is still live FROM the tick's own decisions, and
+// it needs `repoId` resolved.
 //
 // Three things this must get right, each of which was wrong in an earlier draft:
 //
@@ -269,6 +274,17 @@ for (const rl of (ctx.pendingRateLimits ?? []).splice(0)) {
 //   dispatch. A PR that is still open and evaluated but whose CI went green, or
 //   whose decision became WAIT or PASS, no longer wants one, and its queued row
 //   would otherwise block builder admission indefinitely.
+//
+//   and what counts as NOT-live, which is narrower than "absent from `wanted`".
+//   A PR whose evaluation FAILED transiently produces no decision at all
+//   (`if (!e.ok) ... continue`, `src/daemon.mjs:579` on `16769e7`), so a
+//   `wanted`-only live set drops it and the sweep cancels a request nobody
+//   withdrew. A builder takes the freed slot, and the guardian request becomes
+//   dispatchable again on the next successful read -- the queued-guardian
+//   priority guarantee inverted by a GitHub blip. So the live set is `wanted`
+//   PLUS every listed PR that could not be evaluated; a queued row is cancelled
+//   only after a SUCCESSFUL non-dispatch decision or a confirmed closure. The
+//   per-PR loop records the unevaluated ones as it goes, beside `waiting`.
 if (ctx.hub && repoId != null) {
   // The live set includes the CANARY's run ref while this tick still needs an
   // unmeasured containment check. Without it a queued `canary:<nwo>` is
@@ -1179,11 +1195,34 @@ than adding a second timer, so the two cannot drift:
         }
 ```
 
-Task 22's test asserts the wiring, not just the function: with a stubbed
-`ctx.heartbeatMs` short enough to fire during the fixture `spawnWorker`, the
-held row's `expires_at` must ADVANCE. On the broken implementation — the one
-that ships today, with `heartbeatProvider` defined and uncalled — every other
-assertion in the block passes and that single line goes red.
+Task 22's test asserts the wiring, not just the function — but **not by
+requiring a strictly larger `expires_at`**. Every timestamp here is integer Unix
+seconds, so a heartbeat firing in the same second as the claim rewrites the same
+value, and a "must ADVANCE" assertion fails against *correct* wiring most of the
+time. That was the previous revision: a flaky test wearing a strict one's
+clothes.
+
+The seam carries the clock instead, as every other time-dependent assertion in
+this plan does. `heartbeatProvider(db, { id, now })` already takes `now`, so the
+test injects `ctx.providerHeartbeat` with a `now` a minute ahead and asserts the
+exact value that implies:
+
+```js
+  let beats = 0;
+  const ctx = { ...fixtureCtx(dir), hub: db, lstart: LSTART, heartbeatMs: 5,
+    providerHeartbeat: (h, { id }) => { beats++; return heartbeatProvider(h, { id, now: BASE + 60 }); },
+    spawnWorker: async (opts) => { opts?.onSpawn?.(SPAWNED); await new Promise(r => setTimeout(r, 40)); /* ... */ } };
+  // ...
+  check(beats > 0, "the run heartbeat renews the provider lease while the worker runs", String(beats));
+  check(heldAfter.expires_at === BASE + 60 + LEASE_SECONDS,
+    "and the lease expires from the heartbeat's clock, not the claim's",
+    `${heldAfter.expires_at} vs ${BASE + 60 + LEASE_SECONDS}`);
+```
+
+Deterministic, and it still fails on the implementation that matters: with
+`heartbeatProvider` defined and uncalled — which is what ships today — `beats`
+is 0 and both lines go red. `beats > 0` alone would not be enough, because it
+passes for a heartbeat that is called and writes nothing.
 
 **The paths that must call it**, each identified by the `continue` it already
 takes in `src/daemon.mjs`: the `!run.ok` branch after `startRun`, the prompt-build
@@ -1746,35 +1785,83 @@ export function openHubAsGuest(path) {
   };
 
   const rawExec = db.exec.bind(db), rawPrepare = db.prepare.bind(db);
-  Object.defineProperty(db, "exec",    { value: (sql) => rawExec(gate(sql)) });
-  Object.defineProperty(db, "prepare", { value: (sql) => rawPrepare(gate(sql)) });
 
   // And remove every other route to the engine. `enableDefensive` blocks the
   // writable_schema class; the rest are deleted from this handle so a caller
   // cannot reach them at all.
+  // The method list that used to be shadowed here is gone with the shadowing:
+  // `setAuthorizer`, `applyChangeset`, `createSession`, `createTagStore`,
+  // `deserialize`, `enableLoadExtension`, `loadExtension`, `function`,
+  // `aggregate`, `open` and `serialize` are simply ABSENT from the facade, which
+  // is the property the list was trying to approximate. Enumerating them was
+  // always the weaker form: a method added by a future node release would not
+  // have been on it.
+  // A FACADE, not the handle with properties written over it. This is the
+  // correction to the previous design, and the previous design did not hold:
+  // `Object.defineProperty(db, "setAuthorizer", ...)` installs an OWN property
+  // that SHADOWS the prototype method. It does not remove it. Any caller can
+  // write
+  //
+  //     Object.getPrototypeOf(g).setAuthorizer.call(g, null)
+  //
+  // and take the authorizer straight off -- after which the retained `prepare`
+  // and `exec` reach the whole hub and every gate in this module is decorative.
+  // The same reach undoes `exec`, so `BEGIN EXCLUSIVE` is available too. The
+  // tests could not see it: they called `g[m]()`, which finds the shadow.
+  //
+  // So nothing is returned that HAS that prototype. The real handle stays in
+  // this closure. The caller gets an object created with a null prototype,
+  // carrying exactly the three operations the guardian needs, each already
+  // gated, and no chain leading anywhere else. `Object.freeze` stops the surface
+  // being extended back.
+  //
+  // `enableDefensive` still runs on the real handle, and the authorizer is
+  // still the primary boundary: the facade removes the route to REMOVING them.
   db.enableDefensive?.(true);
-  // setAuthorizer is in this list: leaving it exposed lets any caller install a
-  // permissive callback -- or pass null -- and then use the retained prepare and
-  // exec against the whole hub. A boundary a caller can remove is not one.
-  // `serialize` is in this list for a reason the review that asked for it did
-  // not give. Measured 2026-08-23: with an authorizer denying everything,
-  // `serialize()` THROWS `not authorized` -- SQLite does route it through the
-  // authorizer on this build, so it is not the hole it was reported to be. It
-  // is shadowed anyway because whether serialize consults the authorizer is
-  // SQLite's choice and not reeve's, and a boundary should not rest on an
-  // implementation detail of the thing it is guarding.
-  for (const m of ["setAuthorizer","applyChangeset","createSession","createTagStore","deserialize",
-                   "enableLoadExtension","loadExtension","function","aggregate","open","serialize"])
-    Object.defineProperty(db, m, { value: () => { throw new Error(`${m} is not permitted on the guest hub connection`); } });
-  return db;
+  return Object.freeze(Object.assign(Object.create(null), {
+    prepare: (sql) => rawPrepare(gate(sql)),
+    exec:    (sql) => rawExec(gate(sql)),
+    close:   () => db.close(),
+  }));
 }
 ``` Refuse `ATTACH`, `PRAGMA` writes, and multi-statement strings outright — a permissive parser is a hole, so the wrapper allows a **closed list of statement shapes** rather than trying to spot forbidden ones.
+
+The API assertions change with it, because `g[m]()` throwing was exactly what
+made the old design look sound:
+
+```js
+  // ABSENT, not shadowed. The previous assertions called `g[m]()` and found the
+  // throwing own-property, which is equally true of a handle whose prototype
+  // still carries the real method one `.call` away.
+  check(Object.getPrototypeOf(g) === null,
+    "the guest has no prototype, so there is no inherited method to reach through");
+  for (const m of ["setAuthorizer","applyChangeset","createSession","createTagStore","deserialize",
+                   "enableLoadExtension","loadExtension","function","aggregate","open","serialize"])
+    check(!(m in g), `${m} is absent from the guest surface, not merely shadowed on it`);
+  check(Object.isFrozen(g), "and the surface cannot be extended back");
+  check(typeof g.prepare === "function" && typeof g.exec === "function" && typeof g.close === "function",
+    "control: the three operations the guardian actually needs are present");
+
+  // CONTROL, and the one that proves the assertions above are about the FACADE:
+  // the same reach really does work on a raw handle, so `Object.getPrototypeOf`
+  // is a live escape route and not a theoretical one.
+  const raw = new DatabaseSync(":memory:");
+  check(typeof Object.getPrototypeOf(raw).setAuthorizer === "function",
+    "control: a raw DatabaseSync DOES expose setAuthorizer through its prototype, which is what the facade removes");
+  raw.close();
+```
 
 **On the broken implementation** — an allowlist checked by table name with a naive `sql.includes("provider_lease")` — the allowed list passes and `refused: enqueue an effect` goes red, because `INSERT INTO outbox ... VALUES('k','notify',...)` contains no table from the allowlist and yet a substring check that looks for *forbidden* names rather than matching *permitted shapes* lets it through. That inversion is the most likely wrong implementation here.
 
 ```bash
 $N test/guardian-hub-allowlist.test.mjs
-git add src/build/hubguest.mjs src/daemon.mjs test/guardian-hub-allowlist.test.mjs
+# `src/profile/schema.mjs` too: this task adds the three `builder.provider.*`
+# entries, their defaults and the container declaration. Left unstaged, the
+# committed daemon still rejects the keys this plan documents as unknown -- and
+# the suite passes against the working tree either way, so nothing before the
+# push notices.
+git add src/build/hubguest.mjs src/daemon.mjs src/profile/schema.mjs \
+        test/guardian-hub-allowlist.test.mjs
 git commit -m "feat(daemon): open the hub through a statement allowlist"
 ```
 
@@ -2043,28 +2130,33 @@ check(VERDICT_CLAUSES.includes("hold"),
   // does not today: add the author login and its `__typename`/app id to the
   // fields it already requests, and pass the classification through. Without
   // that read there is nothing for the second branch to test.
-  for (const [label, meta] of [
-    ["a builder branch",  { headRef: "mp/bt-1-s0", authorIsApp: false }],
-    ["an App author",     { headRef: "feature/ordinary", authorIsApp: true }],
-  ]) {
-    const v = evaluatePr({ ...evalFixture, hub, repoId: 1, pr: 7, ...meta });
-    check(v.verdict?.state === "BLOCK",
-      `${label} is classified as a builder PR, so an uncleared hold blocks it`,
-      JSON.stringify(v.verdict));
-    check(clause(v.verdict, "hold")?.state === "BLOCK",
-      `${label}: and it is the hold clause that blocks, not something else`,
-      JSON.stringify(clause(v.verdict, "hold")));
-  }
-  // CONTROL: an ordinary PR -- neither branch nor author -- is NOT classified,
-  // so the two above are not satisfied by an implementation that treats every
-  // PR as a builder PR and blocks the whole repository.
-  {
-    const v = evaluatePr({ ...evalFixture, hub, repoId: 1, pr: 7,
-                           headRef: "feature/ordinary", authorIsApp: false });
-    check(clause(v.verdict, "hold")?.state === "PASS",
-      "control: an ordinary PR is not a builder PR, and its hold clause passes untouched",
-      JSON.stringify(clause(v.verdict, "hold")));
-  }
+  // The classifier DIRECTLY, as a pure exported function. The previous revision
+  // spread a `...evalFixture` that was never defined anywhere -- and even with
+  // one, `evaluatePr` has no injected I/O seam and would have gone to GitHub for
+  // the metadata rather than reading the fixture's, so the block either threw a
+  // ReferenceError or tested the network. Driving the composition was the wrong
+  // shape for the claim anyway: what has to be right is WHICH PRs count as
+  // builder PRs, and that is a decision over two fields.
+  //
+  // `isBuilderPr({ headRef, authorIsApp })` is exported from `src/pr.mjs`, and
+  // `evaluatePr` calls it with the metadata it already reads plus the author it
+  // must now also read. The structural assertion below is what ties the two
+  // together; this table is what says the decision is right.
+  for (const [label, meta, want] of [
+    ["a builder branch",      { headRef: "mp/bt-1-s0",       authorIsApp: false }, true],
+    ["an App author",         { headRef: "feature/ordinary", authorIsApp: true  }, true],
+    ["both at once",          { headRef: "mp/bt-2-s0",       authorIsApp: true  }, true],
+    ["neither",               { headRef: "feature/ordinary", authorIsApp: false }, false],
+    // The control that keeps `mp/*` a SEGMENT prefix rather than a string one --
+    // the same defect `overlaps` had, and the reason it is written out here.
+    ["a lookalike branch",    { headRef: "mpx/not-ours",     authorIsApp: false }, false],
+  ]) check(isBuilderPr(meta) === want,
+      `${label}: isBuilderPr is ${want}`, JSON.stringify(meta));
+
+  // And the clause consumes the classification rather than re-deriving it, which
+  // is the half a pure-function test cannot see.
+  check(holdClause(hub, { repoId: 1, pr: 7, isBuilderPr: isBuilderPr({ headRef: "mp/bt-1-s0", authorIsApp: false }) }).state === "BLOCK",
+    "and a PR the classifier accepts reaches the hold clause as a builder PR");
 
   // CONTROLS, both directions. The first proves the extractor found a real call
   // rather than matching nothing and testing the empty string; the second proves

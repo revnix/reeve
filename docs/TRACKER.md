@@ -160,8 +160,12 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       Review history kept in `2026-08-23-s2-review-history.md`; #8 closed as
       superseded, its 54 resolved threads standing as the record. Founder
       decisions unchanged: guardian fails OPEN on an unreadable hub;
-      `ci.flakePatterns` removed (shipped in #9); `repo_gate_state` ships with a
-      pure derivation behind an injected fetcher.
+      `ci.flakePatterns` removal is PLANNED, in S2-A's Task 12 — it is still
+      declared at `src/profile/schema.mjs:183` after #9, and removing it from
+      `FIELDS` without stripping the live profile in the same change would make
+      every daemon start fail
+      (`docs/measured/2026-08-22-flakepatterns-has-no-readers.md`);
+      `repo_gate_state` ships with a pure derivation behind an injected fetcher.
       **The durable finding is about plan SIZE**: a plan needing four rounds and
       still finding sixteen defects at the fourth is one document doing three
       documents' work.

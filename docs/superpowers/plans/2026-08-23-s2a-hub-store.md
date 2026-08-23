@@ -249,6 +249,28 @@ Expected: `ERR_MODULE_NOT_FOUND` for `../src/build/hubdb.mjs`.
 
 - [ ] **Step 3: Add the path**
 
+**`bin/reeve` needs these bindings before either `build` subcommand can run.**
+It has no `die` helper, does not import `log`, and imports none of the hub or
+lock symbols; following the case below literally throws `ReferenceError` before
+it acquires or inspects anything. Add:
+
+```js
+import { openHub } from "../src/build/hubdb.mjs";
+import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
+import { readStart, isSameProcess } from "../src/supervisor.mjs";
+import { HEARTBEAT_SECONDS } from "../src/db/ops.mjs";
+import { hubPathFor } from "../src/paths.mjs";            // also used by export-events
+```
+
+and use the CLI's **existing** error-exit pattern rather than inventing a `die`:
+every other command in this file is `console.error(...); process.exit(1);`. One
+helper for the whole file is fine, but it has to be written somewhere, so it is
+written here:
+
+```js
+const die = (msg) => { console.error(msg); process.exit(1); };
+```
+
 Append to `src/paths.mjs`:
 
 ```js
@@ -2195,6 +2217,26 @@ openHub(hubPathFor(home)).close();
   // must not hand back a file that fails validation. Step 3 changes it to skip
   // candidates that do not validate instead of trusting the filename, which is
   // what these three assertions are about.
+  // An invalid snapshot must not cost a retention slot. Before this change
+  // `snapshot()` pruned on the way out, so each failed backup evicted the
+  // oldest GOOD one and then deleted itself -- a run of failures erasing every
+  // recovery point while each looked self-contained.
+  {
+    const hubDir = join(root, "hub");
+    const kept = () => readdirSync(hubDir).filter(f => /^\d+\.db$/.test(f)).length;
+    const goodBefore = kept();
+    // Force a failing validation by snapshotting a hub that is not one.
+    const notAHub = join(home, "state", "notahub.db");
+    openStore(notAHub).close();                      // a REPO store, so hub validation fails
+    const r = snapshotAll(home, root, { at: Math.floor(Date.now() / 1000) + 5, keep: 1,
+                                        open: () => new DatabaseSync(notAHub) });
+    check(r.some(x => x.nwo === "hub" && x.ok === false),
+      "a hub snapshot that fails validation is reported as failed", JSON.stringify(r));
+    check(kept() === goodBefore,
+      "and costs no retention slot: the good snapshots that existed before it are all still there",
+      `${goodBefore} -> ${kept()}`);
+  }
+
   const before = latestSnapshot(root, "hub");
   check(before !== path,
     "latestSnapshot never returns a candidate that fails validation, whatever its timestamp",
@@ -2339,7 +2381,13 @@ must stay green, and Step 4 runs it.
 Then, inside `snapshotAll`, validate what was just written and refuse to keep a bad one:
 
 ```js
-      const taken = snapshot(db, root, nwo, at, { keep });
+      // `keep: Infinity` because `snapshot()` prunes BEFORE it returns
+      // (`src/backup.mjs:47`), so a snapshot that later fails validation has
+      // already evicted the oldest good one. A run of invalid snapshots would
+      // then erase every usable recovery point, one per attempt, while each
+      // failure looked like it deleted only itself. Pruning happens below,
+      // after the candidate has proved it can be read back.
+      const taken = snapshot(db, root, nwo, at, { keep: Infinity });
       // A snapshot that cannot be read back is worse than no snapshot: it makes
       // `latestSnapshot` answer with a file that will fail at restore time.
       if (taken.ok && taken.path) {
@@ -2348,14 +2396,21 @@ Then, inside `snapshotAll`, validate what was just written and refuse to keep a 
           : validateSnapshot(taken.path, { kind: "repo" });
         if (!v.ok) {
           try { rmSync(taken.path, { force: true }); } catch {}
+          // NOT pruned. The retention window still holds every good snapshot it
+          // held before this attempt, which is the whole point of deferring it.
           results.push({ nwo, ok: false, why: `snapshot failed validation and was deleted: ${v.why}`, escalate: "builder:backup:failed" });
           continue;
         }
+        // Valid, so it has earned its slot: prune now, with the real `keep`.
+        prune(join(root, slug(nwo)), keep);
       }
       results.push({ nwo, ...taken });
 ```
 
-Add the import `HUB_SCHEMA_VERSION` from `./build/hubdb.mjs` and keep `existsSync` (already imported).
+`prune` is module-private today (`src/backup.mjs:53`) and `snapshotAll` is in
+the same module, so it needs no export — but `slug` is used with it, and both
+must stay in scope. Add the import `HUB_SCHEMA_VERSION` from
+`./build/hubdb.mjs` and keep `existsSync` (already imported).
 
 **The full import line `src/backup.mjs` must carry after Tasks 8 and 9.** It
 currently imports only `DatabaseSync`, `execFileSync` and
@@ -2900,7 +2955,7 @@ import { openHub } from "../src/build/hubdb.mjs";
 import { hubFindings } from "../src/doctor.mjs";
 // The self-audit block at the end of this task needs all of these. The standard
 // harness supplies only check, dir, join, tmpdir, mkdtempSync and rmSync.
-import { selfAudit } from "../src/selfaudit.mjs";
+import { selfAudit, BROKEN } from "../src/selfaudit.mjs";
 import { open as openStore } from "../src/db/ops.mjs";
 import { hubPathFor } from "../src/paths.mjs";
 import { DatabaseSync } from "node:sqlite";
@@ -3125,18 +3180,44 @@ as `opts.home`, so the block below destructures it rather than assuming a bare
 `import { DatabaseSync } from "node:sqlite";` to `src/selfaudit.mjs`; `existsSync`
 is already imported there.
 
+**`selfAudit` returns FAULTS ONLY, and its findings have a fixed shape.** Both
+matter, and an earlier revision of this block got both wrong. Measured on
+`e41cd28`: `selfaudit.mjs` contains **zero** `level: OK` returns — every check
+returns `{ id, level, why, detail }` or nothing, and `selfAudit` ends with
+`.filter(Boolean)`. `src/daemon.mjs:1334` then treats **every** returned item as
+a fault:
+
 ```js
-// src/selfaudit.mjs, inside selfAudit(), beside the per-repo integrity walk:
+log(logPath, `self: ${f.level} ${f.why}${f.detail ? ` — ${f.detail}` : ""}`);
+escalations.set(f.why, f.count ?? 1);
+```
+
+There is no `level === OK` filter. So a healthy-case finding would log
+`self: ok undefined` and call `escalations.set(undefined, 1)` on **every tick of
+every repository**, permanently — a healthy hub manufacturing an
+undefined-keyed escalation is worse than no check at all. And a `text` field is
+read by nobody: the identity has to be `why`, because that is the escalation key.
+
+```js
+// src/selfaudit.mjs, inside selfAudit(), beside the per-repo integrity walk.
+// BROKEN and the { id, level, why, detail } shape come from this module's own
+// contract (its constants are at :31-:33); `findings` is filtered for Boolean
+// below, so the healthy case pushes NOTHING.
 const home = opts.home ?? null;
 const hub = home ? hubPathFor(home) : null;
 if (hub && existsSync(hub)) {
-  const d = new DatabaseSync(hub, { readOnly: true });
+  let integrity = null;
   try {
-    const r = Object.values(d.prepare("PRAGMA integrity_check").get())[0];
-    findings.push(r === "ok"
-      ? { level: "ok",    text: "hub integrity_check: ok" }
-      : { level: "error", text: `hub integrity_check: ${r}` });
-  } finally { d.close(); }
+    const d = new DatabaseSync(hub, { readOnly: true });
+    try { integrity = Object.values(d.prepare("PRAGMA integrity_check").get())[0]; }
+    finally { d.close(); }
+  } catch (e) { integrity = `unreadable: ${e.message}`; }
+  // A hub that cannot be OPENED is also a fault, and lands here rather than
+  // throwing out of selfAudit and taking the whole per-repo audit with it.
+  if (integrity !== "ok")
+    findings.push({ id: "hub.integrity", level: BROKEN,
+                    why: "reeve's hub database fails its integrity check",
+                    detail: `${hub}: ${integrity}` });
 }
 ```
 
@@ -3154,9 +3235,17 @@ if (hub && existsSync(hub)) {
   const repoDb = openStore(join(machine, "state", "o", "r.db"));   // the audit's own store argument
   const audit = () => selfAudit(repoDb, { nwo: "o/r", home: machine, backupRoot: join(machine, "backups") });
 
-  check(audit().some(f => /hub integrity_check: ok/.test(f.text)),
-    "self-audit reports the hub's integrity alongside the per-repo stores",
-    JSON.stringify(audit().map(f => f.text)));
+  // A HEALTHY hub contributes NOTHING. Asserting an "ok" finding here is what
+  // put an undefined-keyed escalation on every tick: daemon.mjs escalates every
+  // item selfAudit returns, without filtering by level.
+  check(!audit().some(f => f.id === "hub.integrity"),
+    "a healthy hub adds no finding at all, because selfAudit returns faults only",
+    JSON.stringify(audit().map(f => `${f.level}:${f.id}`)));
+  // CONTROL: the audit is running and producing its ordinary findings, so the
+  // absence above is a healthy hub and not an audit that did nothing.
+  check(audit().every(f => f.id && f.why && f.level),
+    "control: every finding the audit does return carries the id/level/why contract",
+    JSON.stringify(audit()));
 
   // Corrupt a page the database ACTUALLY USES, derived from the file rather
   // than hardcoded. Offset 8192 is page 3, which is live only because openHub
@@ -3183,9 +3272,15 @@ if (hub && existsSync(hub)) {
   finally { probe.close(); }
   check(integrity !== "ok", "control: the fixture really is corrupt now", String(integrity));
 
-  check(audit().some(f => f.level === "error" && /hub integrity/.test(f.text)),
-    "and reports an ERROR when the hub is corrupt, so a silent audit is not a passing one",
-    JSON.stringify(audit().map(f => `${f.level}:${f.text}`)));
+  const bad = audit().find(f => f.id === "hub.integrity");
+  check(bad?.level === BROKEN,
+    "and reports the hub as BROKEN when it is corrupt, so a silent audit is not a passing one",
+    JSON.stringify(audit().map(f => `${f.level}:${f.id}`)));
+  // The escalation key is `why`, and daemon.mjs uses it verbatim. A finding
+  // whose why is undefined becomes escalations.set(undefined, 1).
+  check(typeof bad?.why === "string" && bad.why.length > 0,
+    "carrying a stable `why`, because that string IS the escalation key", JSON.stringify(bad));
+  check((bad?.detail ?? "").includes(p), "and a detail naming the file", String(bad?.detail));
   rmSync(machine, { recursive: true, force: true });
 }
 ```
@@ -3558,8 +3653,16 @@ Expected: no `FAILED` lines. 59 pre-existing files plus `hub-schema`, `hub-locks
 
 `docs/TRACKER.md` conflicts on every branch. One line, added last, so the conflict is trivial. Under Programme 2's "In flight":
 
+The entry says **in flight**, not `LANDED`, and it is unchecked. This commit
+precedes Step 4, which opens the PR, and Step 5 forbids merging without a
+founder grant — so a `[x] LANDED` written here claims the hub-store base is
+delivered while it is an unmerged review branch, which would incorrectly unblock
+the ordered S2-B work and mislead any recovery or status check that reads the
+tracker. Change it to `[x] ... LANDED <date>, merge <sha>` when the PR actually
+merges, which is how every landed entry above it is written.
+
 ```markdown
-- [x] **S2-A (hub store) LANDED** — `docs/superpowers/plans/2026-08-23-s2a-hub-store.md`,
+- [ ] **S2-A (hub store) — in flight, revnix/reeve #11** — `docs/superpowers/plans/2026-08-23-s2a-hub-store.md`,
       13 tasks: 32-table STRICT schema, forward-only migrations, the three locks,
       hub-aware backup, the destructive restore drill, and the prose-versus-DDL
       cross-check. `ci.flakePatterns` removed

@@ -220,13 +220,39 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hub-"));
   const p = join(dir, "future.db");
   openHub(p).close();
   const raw = new DatabaseSync(p);
-  raw.exec(`INSERT INTO schema_version(version, applied_at) VALUES(${HUB_SCHEMA_VERSION + 7}, unixepoch())`);
+  // CONTIGUOUS, not merely tall. Writing only `HUB_SCHEMA_VERSION + 7` leaves
+  // every version between it and this binary's missing, so `openHub`'s
+  // CONTIGUITY refusal fires first and this whole block passes against an
+  // implementation with no forward-version check at all. Measured while
+  // executing this task, not supposed: with BOTH version checks stubbed out the
+  // refusal read `records schema version 8 but is missing migration(s) 2, 3, 4,
+  // 5, 6, 7` and every assertion here stayed green.
+  for (let v = HUB_SCHEMA_VERSION + 1; v <= HUB_SCHEMA_VERSION + 7; v++)
+    raw.exec(`INSERT INTO schema_version(version, applied_at) VALUES(${v}, unixepoch())`);
   raw.close();
   let why = null;
   try { openHub(p); } catch (e) { why = e.message; }
   check(why !== null, "a store recorded above this binary's version refuses to open");
-  check(why?.includes(String(HUB_SCHEMA_VERSION + 7)) && why?.includes(String(HUB_SCHEMA_VERSION)),
+  // The PHRASES, not bare digits. `why.includes(String(1))` is satisfied by any
+  // "1" anywhere in the message -- and the message carries a tmpdir path, which
+  // on the machine this was measured on supplied one. That assertion was green
+  // by accident.
+  check(new RegExp(`schema version ${HUB_SCHEMA_VERSION + 7}\\b`).test(String(why)) &&
+        new RegExp(`this binary knows ${HUB_SCHEMA_VERSION}\\b`).test(String(why)),
     "and the refusal names both versions, so the operator knows which binary to run", String(why));
+  // WHICH refusal. Contiguity and forward-version are different failures and
+  // only one of them is this block's subject; without this line the assertions
+  // above are satisfied by a hole the fixture itself created.
+  check(!/missing migration/.test(String(why)),
+    "and it is refused for being NEWER than this binary, not for a hole in its history", String(why));
+  // And by the OPENING check, not the locked recheck. BOTH refuse a newer
+  // store, so removing the opening one alone leaves this block green -- while
+  // the operator is told `It was migrated by a newer reeve while this one was
+  // opening it`, describing a concurrent migration that never happened. Two
+  // guards need two assertions, or one of them is free to rot.
+  check(/Migrations are forward-only/.test(String(why)),
+    "and the message is the opening refusal, not the concurrent-migration one that would misdescribe it",
+    String(why));
 }
 
 // ── hubTx rolls back, so a failed transition leaves nothing behind ───────────
@@ -254,7 +280,11 @@ $N test/hub-schema.test.mjs
 
 Expected: `ERR_MODULE_NOT_FOUND` for `../src/build/hubdb.mjs`.
 
-**On the broken implementation this plan is guarding against** — an `openHub` that is `open()` from `ops.mjs` with a different filename — the module resolves and the suite still goes red on exactly two lines: `synchronous is FULL, not the guardian's NORMAL` reads `1`, and `a store recorded above this binary's version refuses to open` passes silently because there is no version check at all. Those two are the assertions that carry this task; the WAL and foreign-keys checks would pass either way and are controls, not evidence.
+**On the broken implementation this plan is guarding against** — an `openHub` that is `open()` from `ops.mjs` with a different filename — the module resolves and the suite goes red on `synchronous is FULL, not the guardian's NORMAL`, which reads `1`, and on the three forward-version assertions above. The WAL and foreign-keys checks would pass either way and are controls, not evidence.
+
+**Measured while executing this task, because the earlier version of this paragraph was wrong.** With the fixture writing only `HUB_SCHEMA_VERSION + 7`, stubbing out *both* version checks left the whole file green: `openHub` refused anyway, from the CONTIGUITY check, because versions 2..7 were missing. The block asserted a refusal, got one, and never touched the guard it names. Two changes make it real — a contiguous version history so contiguity has nothing to complain about, and assertions on WHICH refusal arrived. Verified afterwards with the four-check loop: both checks stubbed → two lines red; the opening check alone stubbed → one line red; restored → green.
+
+**The stub loop for this task**, so it is not left to invention: in `openHub`, change `PRAGMA synchronous = FULL` to `NORMAL`, and replace the `seen > HUB_SCHEMA_VERSION` block and the locked `applied > HUB_SCHEMA_VERSION` block with a comment. Run, confirm the lines above go red and nothing else does, restore, and confirm green.
 
 - [ ] **Step 3: Add the path**
 

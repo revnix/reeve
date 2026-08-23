@@ -7,6 +7,7 @@
 // daemon at start (under the CLI); this file proves the judge.
 import { sandboxCanary, canaryIdFor, policyHashOf, canaryScript, CANARY_INSIDE_CONTROL, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, parseWriteProbe, isPolicyRefusal, netListener, CANARY_SENTINEL, instrumentHash } from "../src/canary.mjs";
 import { measureContainment } from "../src/containment.mjs";
+import { currentInstrument } from "../src/canary.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
@@ -513,6 +514,11 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   const first = await ask(54321);
   check(first.canary?.ok === true && !first.canary.cached,
     "control: the first ask runs the canary for real", JSON.stringify({ ok: first.canary?.ok, why: first.canary?.why }));
+  // The other end of the invariant doctor's default rests on: what a run WITH a
+  // listener — which is every production run — records as its instrument.
+  check(instrumentHash({ hasNet: true }) === currentInstrument(),
+    "the instrument a listener-carrying run uses IS the one anything reading a record expects",
+    `${instrumentHash({ hasNet: true })} ${currentInstrument()}`);
 
   const second = await ask(61234);
   check(second.canary?.cached === true,

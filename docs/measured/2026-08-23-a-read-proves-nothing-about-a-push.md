@@ -111,6 +111,42 @@ anonymous read exactly as https does, so that branch reproduced the very false
 green the https branch exists to prevent. Git's credential subsystem covers both
 schemes; both take the credential path.
 
+## Two more, from the second round
+
+**A remote can have several push urls, and git pushes to all of them.**
+`get-url --push` returns only the first:
+
+```
+$ git config --add remote.origin.pushurl https://github.com/o/one.git
+$ git config --add remote.origin.pushurl https://github.com/o/two.git
+$ git remote get-url --push origin        -> https://github.com/o/one.git
+$ git remote get-url --push --all origin  -> https://github.com/o/one.git
+                                             https://github.com/o/two.git
+```
+
+Every one is reached and credential-checked now. `--push --all` returns the
+fetch url when no pushurl is set, so the ordinary single-remote case is
+unchanged.
+
+**A credential helper is not the only way http authenticates.**
+`http.<url>.extraHeader` carrying an Authorization header, and
+`http.<url>.cookieFile`, are used by `ls-remote` and by the real push while
+`git credential fill` knows nothing about them — so a silent helper is not proof
+that publication is broken. Resolved with git's own per-url matching:
+
+```
+$ git config --get-urlmatch http.extraHeader https://github.com/o/one.git
+Authorization: Bearer [value hidden]        # exit 0
+$ git config --get-urlmatch http.extraHeader https://elsewhere.example/x
+                                            # exit 1
+```
+
+When one of those is configured the verdict is DEGRADED with the mechanism
+named — not BROKEN, which would call a working checkout broken, and not OK,
+which would claim a verification that did not happen. Only the KEY is reported;
+the value is an Authorization header, and it gets the same treatment as the
+credential.
+
 ## What this does not establish
 
 That a push would SUCCEED. It establishes that the credential a push needs can be

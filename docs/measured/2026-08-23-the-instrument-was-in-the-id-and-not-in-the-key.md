@@ -114,3 +114,37 @@ UNKNOWN
 
 Which is the correct reading: that measurement was taken with a different
 instrument, and nothing about it can be matched to the one in use now.
+
+## And the comparison had to be against the right instrument
+
+Raised by Codex in the second round, and it is the sharper half of the previous
+section. `checkCanary` defaulted its expectation to `instrumentHash()` — the
+NO-network variant, because that is the parameter default.
+
+`measuredContainment` always builds a `netListener`, so every canary it records
+carries the network control and persists the hasNet instrument. The two never
+match. Every freshly recorded PASS would have been reported as a changed script:
+permanently DEGRADED, exit code 3, on a host whose canary had just passed.
+
+`currentInstrument()` is now the one place that says what the daemon would run
+today, and doctor defaults to it. If the daemon ever stops guaranteeing a
+listener, that is the line which has to change with it.
+
+## Two tests that could not see their own stub
+
+Both found by running the stub loop rather than by reading the tests.
+
+The first wrote its fixture record with `currentInstrument()` and compared it
+against doctor's default — which is `currentInstrument()`. Stubbing that function
+moved both sides together and the assertion stayed green. It writes
+`instrumentHash({ hasNet: true })` explicitly now: the value production
+persists, so a default that drifts from it is visible.
+
+The second is the `--all` fix. The fake `run` returned the whole list whether or
+not `--all` was in the arguments, so removing the flag from the code changed
+nothing the test could observe. The fake models git now — first url without the
+flag, all of them with it — and the stub turns two assertions red.
+
+Neither test was wrong about what it asserted. Both were unable to represent the
+defect they were written for, which a green run does not distinguish from
+covering it.

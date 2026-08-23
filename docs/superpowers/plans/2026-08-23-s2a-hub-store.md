@@ -2847,9 +2847,38 @@ export const COMPARISON_SET = [
   "outbox", "territory_lease", "merge_decision", "guardian_receipt",
 ];
 
+/**
+ * Kinds that are deliberately NOT replayed, declared rather than merely absent.
+ *
+ * An unknown kind is skipped silently, so "no handler" and "typo in the kind
+ * name" are the same observable outcome -- which is exactly how six fixture
+ * kinds came to be wrong in this plan's own drill. Declaring the intentional
+ * ones makes the difference checkable: Task 11 asserts every kind any plan emits
+ * is in HANDLERS or in this set, and nothing may be in neither.
+ */
+export const NON_REPLAYED_KINDS = Object.freeze([
+  // A refusal is a record that nothing happened. There is no projection row to
+  // restore, and re-applying it would append a second refusal for an attempt
+  // that was never re-made.
+  "transition.refused",
+  // `escalation` is re-derived: the next evaluation of the same condition raises
+  // it again, which is also the behaviour a founder wants after a restore --
+  // being re-told, rather than inheriting an announcement counter that says the
+  // notification already went out.
+  "escalation.raised",
+  // RESEARCH was skipped, not lost. The reason is durable in hub_event as
+  // history; there is no row it projects into.
+  "research.skipped",
+]);
+
 /** kind -> the table its payload is a row of. */
 const HANDLERS = {
   "task.transitioned":        { table: "task", key: ["id"] },
+  // A PARTIAL row image, and legitimately so: the upsert is by primary key, so
+  // replaying it sets `depth` and leaves every other column as the last full
+  // image left it. S2-B's depth override writes this on both the accepted-and-
+  // moved and the accepted-but-refused paths.
+  "sizing.overridden":        { table: "task", key: ["id"] },
   // The transition LOG, not just the projection. Without it every transition
   // after the snapshot vanishes from history: `task why` and dash's
   // age-in-state lose the record, and restored outbox rows keep fence values
@@ -3724,10 +3753,42 @@ git commit -m "feat(doctor): report hub snapshot, gate state and provider state"
 - Create: `src/build/tables.mjs`, `test/hub-crosscheck.test.mjs`
 
 **Interfaces:**
-- Consumes: `openHub` (Task 1), `replayableKinds` (Task 9).
+- Consumes: `openHub` (Task 1), `replayableKinds` and `NON_REPLAYED_KINDS` (Task 9).
 - Produces: `TABLE_OWNERS: Record<string, { writer: string, reader: string, replayed: boolean, section: string }>` — one entry per hub table. `PROSE_TABLES: string[]` — every table §11.2's prose names, transcribed by hand.
 
 **This is the task the S2 review requires.** §11.1: "the S2 review includes a prose-versus-DDL cross-check so that every table the prose names exists and every table the DDL names has a stated writer and reader." A checklist a reviewer ticks by hand is a checklist that is ticked by hand once; this makes it a test that runs on every push.
+
+**A fourth direction, added after S2-B was written against this plan.** The
+cross-check compared tables against handlers in both directions and never looked
+at the KINDS the other plans emit — so `transition.refused` and
+`escalation.raised`, both emitted by `applyTransition`, and `research.skipped`,
+emitted by its compensation table, reached S2-B with no handler and no
+declaration. Replay would have skipped all three in silence, indistinguishable
+from a misspelling.
+
+```js
+// test/hub-crosscheck.test.mjs
+// Every kind ANY plan emits must be handled or declared unreplayed. Scanned from
+// the sources rather than from a list, because a list is the thing that drifts.
+const emitted = new Set();
+for (const f of ["transition.mjs", "outbox.mjs", "registry.mjs", "gatestate.mjs", "intake.mjs", "chain.mjs", "gate.mjs"]) {
+  const p = fileURLToPath(new URL(`../src/build/${f}`, import.meta.url));
+  if (!existsSync(p)) continue;                    // not every module exists yet at S2-A
+  for (const m of readFileSync(p, "utf8").matchAll(/hubEvent\(\s*\w+\s*,\s*\{\s*kind:\s*"([a-z_.]+)"/g))
+    emitted.add(m[1]);
+}
+const known = new Set([...replayableKinds(), ...NON_REPLAYED_KINDS]);
+const undeclared = [...emitted].filter(k => !known.has(k));
+check(undeclared.length === 0,
+  "every hub_event kind any module emits is either replayed or declared unreplayed",
+  JSON.stringify(undeclared));
+// CONTROL: the scanner found kinds at all. An empty `emitted` set satisfies the
+// assertion above for every possible implementation.
+check(emitted.size > 0, "control: the emit scanner actually found kinds", String(emitted.size));
+// CONTROL, the other direction: nothing may be in both.
+const both = [...replayableKinds()].filter(k => NON_REPLAYED_KINDS.includes(k));
+check(both.length === 0, "control: no kind is both replayed and declared unreplayed", JSON.stringify(both));
+```
 
 **The reviewer's checklist** (each row must also be confirmed by eye against §11.2, because the test can only check that a claim was *made*, never that it is *true*):
 

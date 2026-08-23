@@ -2789,6 +2789,9 @@ import { acquireSingleton, withWriterLease } from "../src/build/locks.mjs";
     "phase_run", "gate_request", "gate_run", "approval", "notice_receipt",
     "impl_pr", "attested_push", "guardian_receipt", "harness_acceptance",
     "project_authority", "merge_decision",
+    // No foreign keys of its own (`why` is the primary key and nothing
+    // references it), so its position here is free.
+    "escalation",
   ];
   check(WRITE_ORDER.length === COMPARISON_SET.length
         && WRITE_ORDER.every(t => COMPARISON_SET.includes(t))
@@ -2894,7 +2897,7 @@ const writeRow = (table, kind) => Object.assign((db, task, over = {}) => {
 }, { kind });
 
 // The minimum legal row for a table, DERIVED from its own schema rather than
-// transcribed. Nineteen hand-copied column lists is nineteen chances to bake in
+// transcribed. Twenty hand-copied column lists is twenty chances to bake in
 // a typo that makes an INSERT throw or -- worse -- silently insert nothing, and
 // the drill is back to comparing [] with [].
 //
@@ -3014,6 +3017,9 @@ const POST_SNAPSHOT = {
   outbox:            writeRow("outbox", "outbox.enqueued"),
   territory_lease:   writeRow("territory_lease", "territory_lease.granted"),
   merge_decision:    writeRow("merge_decision", "merge_decision.recorded"),
+  // No `task` column, like guardian_receipt and project_authority -- writeRow
+  // already only sets one on tables that declare it.
+  escalation:        writeRow("escalation", "escalation.raised"),
 };
 
 function writeAuthority(db, project) {
@@ -3133,6 +3139,10 @@ export const COMPARISON_SET = [
   "task", "task_territory", "task_drain", "phase_event", "phase_run", "approval", "gate_request", "notice_receipt", "impl_pr", "attested_push",
   "harness_acceptance", "gate_run", "pr_hold", "hold_reason", "project_authority",
   "outbox", "territory_lease", "merge_decision", "guardian_receipt",
+  // `escalation` joined the set when `escalation.raised` became replayable: a
+  // table that replay writes and the drill does not compare is a projection
+  // nothing proves came back.
+  "escalation",
 ];
 
 /**
@@ -3149,11 +3159,6 @@ export const NON_REPLAYED_KINDS = Object.freeze([
   // restore, and re-applying it would append a second refusal for an attempt
   // that was never re-made.
   "transition.refused",
-  // `escalation` is re-derived: the next evaluation of the same condition raises
-  // it again, which is also the behaviour a founder wants after a restore --
-  // being re-told, rather than inheriting an announcement counter that says the
-  // notification already went out.
-  "escalation.raised",
   // RESEARCH was skipped, not lost. The reason is durable in hub_event as
   // history; there is no row it projects into.
   "research.skipped",
@@ -3171,6 +3176,19 @@ export const NON_REPLAYED_KINDS = Object.freeze([
 /** kind -> the table its payload is a row of. */
 const HANDLERS = {
   "task.transitioned":        { table: "task", key: ["id"] },
+  // REPLAYED, after review on PR #12 argued the re-derivation premise away. It
+  // held for the guardian's escalations, which every tick re-raises from live
+  // conditions. It does not hold for the ones `applyTransition` writes: they are
+  // raised BY a transition, once. INFEASIBLE is terminal, with no edges out and
+  // no later phase; BLOCKED and ESCALATED do not leave on their own either. So
+  // for exactly the escalations whose whole purpose is to tell the founder why
+  // work stopped, there is no next evaluation -- and this plan's own INFEASIBLE
+  // branch refuses a transition without a reason on the grounds that "a terminal
+  // state with no durable explanation cannot be explained afterwards". Declaring
+  // the carrier unreplayable contradicted that in the one case it was written
+  // for. Keyed on `why`, which is the table's primary key, so the upsert is
+  // idempotent across a re-replay.
+  "escalation.raised":        { table: "escalation", key: ["why"] },
   // A PARTIAL row image, and legitimately so: the upsert is by primary key, so
   // replaying it sets `depth` and leaves every other column as the last full
   // image left it. S2-B's depth override writes this on both the accepted-and-
@@ -4477,7 +4495,7 @@ export const TABLE_OWNERS = {
   inbox:           { writer: "ingest.mjs",                  reader: "gate.mjs, the post-GATE watcher",    replayed: false,  section: "7.6"  },
   outbox:          { writer: "transition.mjs; the executor", reader: "executor, recoverOutbox, drain",    replayed: true,  section: "3.2"  },
   merge_decision:  { writer: "merge.mjs at each phase",     reader: "task why, the false-merge metric",   replayed: true,  section: "9.3"  },
-  escalation:      { writer: "applyTransition, the loop",   reader: "notify.mjs, dash, task resolve",     replayed: false,  section: "11.7" },
+  escalation:      { writer: "applyTransition, the loop",   reader: "notify.mjs, dash, task resolve",     replayed: true,   section: "11.7" },
   intake_event:    { writer: "intake.mjs per candidate",    reader: "the starvation check, why",          replayed: false,  section: "2.4"  },
   schema_version:  { writer: "hubdb.mjs migrations only",   reader: "openHub, validateSnapshot",          replayed: false, section: "11.1" },
   // Five more are `replayed: false` because they are RE-DERIVED, not restored:

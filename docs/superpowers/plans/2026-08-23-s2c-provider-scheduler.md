@@ -170,7 +170,7 @@ Each task names any imports it needs **beyond** these.
   - `claimProvider(db, { owner, repoId, runRef, pid, lstart, priority = 0, budgetUsd = null, isAlive, now }) -> { ok: true, id } | { ok: false, reason: 'queued'|'cooldown'|'at-limit'|'maintenance', until }`
   - **Where the SQL lives.** The Global Constraints say no raw SQL outside `src/db/` and `src/build/`, and `src/provider.mjs` is neither — it sits at the top level because both daemons import it. Resolve it by keeping the statements in `src/build/providerdb.mjs` (the hub owns its own SQL, as `hubdb.mjs` does) and making `src/provider.mjs` the shared **policy** layer that imports them: the admission rule, the reservation arithmetic, the cooldown comparison. That also puts the boundary in the right place — the guardian imports a policy function, not a query builder, and the statement allowlist in Task 23 is checking a surface that has exactly one definition.
   - **Every provider mutation calls `assertWritable` inside its own transaction** (`inTx: true`), exactly as `withWriterLease` does. Without it a guardian can take a held lease and launch a worker after `restoreHub` has acquired `maintenance_lock` and finished its holder scan — reopening the writer race the lock exists to close, from the one code path that is allowed to write the hub without holding a writer lease. `assertWritable` throws; `claimProvider` catches and returns `reason: 'maintenance'`, which the guardian treats exactly like `at-limit`: it does not dispatch, and it does not escalate, because a restore in progress is an operator action rather than a fault.
-  - `releaseProvider(db, { id, force })` — deletes the row. **A release refused because a restore holds `maintenance_lock` must not be dropped**: `assertWritable` throws, and the caller retries on the next tick with the lease id recorded in memory; the caller keeps the id and retries next tick, and the production snippet must actually do that rather than `catch {}`. There is deliberately **no durable marker**: an earlier draft added `provider_lease.refused_release`, and it cannot be written in the one case it represents — `assertWritable` blocks that write while the lock is held. It is also unnecessary, because `restoreHub` clears every process-scoped row (`provider_lease` included) from the restored file, so a lease held across a restore does not survive it. An abandoned restore is covered by ordinary expiry.
+  - `releaseProvider(db, { id, owner, repoId, runRef, force })` — deletes the row, by `id` when one is given and otherwise by the `(owner, repo_id, run_ref)` identity. **The retry queue stores the identity, never the id**: a queued release survives a restore that clears `provider_lease` and renumbers it, and an id-keyed retry would then delete whatever inherited that primary key. **A release refused because a restore holds `maintenance_lock` must not be dropped**: `assertWritable` throws, and the caller retries on the next tick with the lease id recorded in memory; the caller keeps the id and retries next tick, and the production snippet must actually do that rather than `catch {}`. There is deliberately **no durable marker**: an earlier draft added `provider_lease.refused_release`, and it cannot be written in the one case it represents — `assertWritable` blocks that write while the lock is held. It is also unnecessary, because `restoreHub` clears every process-scoped row (`provider_lease` included) from the restored file, so a lease held across a restore does not survive it. An abandoned restore is covered by ordinary expiry.
   - `queuedGuardianRequests(db, { repoId }) -> Row[]` — every `queued` guardian request for one repository. It exists because the sweep below runs in `src/daemon.mjs`, and this plan's global rule is that raw SQL lives only under `src/db/` or `src/build/`: a `SELECT ... FROM provider_lease` embedded in the daemon is a second definition of the guest's SQL surface, and it drifts from this one the first time the allowlist or the schema changes.
   - `heartbeatProvider(db, { id, now })`
   - `reapProviderLeases(db, { isAlive, now }) -> { reaped: number }` — an **object**, like every other function here, not a bare count. Two assertions in the suite previously read it both ways (`n === 1` and `.reaped >= 1`), which no single return value can satisfy.
@@ -188,6 +188,32 @@ per-PR loop, because both have consumers earlier than the spawn seam:
 //    read it, and both run before the per-PR loop -- so a declaration inside
 //    that loop is a ReferenceError on the first tick that has any dispatch-worthy
 //    decision, which is every tick that matters.
+//
+//    RE-RESOLVED here when startup could not. A single attempt at boot means one
+//    transient outage -- an expired token, a 502 from the installations endpoint
+//    -- fails every provider claim closed for the entire life of a long-running
+//    daemon, so a five-second GitHub blip disables all guardian model dispatch
+//    until an operator happens to notice and restart the service.
+//
+//    Bounded, so a genuinely broken configuration does not become a per-tick API
+//    call: at most one attempt every `builder.provider.repoIdRetryMinutes`
+//    (default 10), through the same seam startup uses.
+if (ctx.repoId == null && ctx.resolveRepoId) {
+  const at = Math.floor(Date.now() / 1000);
+  const every = (profile.builder?.provider?.repoIdRetryMinutes ?? 10) * 60;
+  if (at - (ctx._repoIdTriedAt ?? 0) >= every) {
+    ctx._repoIdTriedAt = at;
+    try {
+      const got = await ctx.resolveRepoId(nwo);
+      if (got != null) {
+        ctx.repoId = got;
+        log(logPath, `provider: resolved the repository id (${got}) on a retry; claims resume`);
+      }
+    } catch (err) {
+      log(logPath, `provider: repository id still unresolved (${err.message}); claims stay refused`);
+    }
+  }
+}
 const repoId = ctx.repoId ?? null;
 
 // 2. Releases a previous tick could not complete. This must not sit in the
@@ -195,9 +221,19 @@ const repoId = ctx.repoId ?? null;
 //    every candidate exiting through an earlier refusal never reaches that
 //    point, so a lease refused once during a restore would stay held until
 //    expiry -- exactly the leak the retry was added to prevent.
-for (const id of (ctx.pendingReleases ?? []).splice(0)) {
-  try { (ctx.providerRelease ?? releaseProvider)(ctx.hub, { id }); }
-  catch { (ctx.pendingReleases ??= []).push(id); }    // still locked: keep it for next tick
+// By IDENTITY, not by row id. A release is queued precisely because a restore
+// held `maintenance_lock` -- and that restore then REPLACES the database and
+// clears `provider_lease`, so the integer primary key is free to be reused by
+// the next claim against the restored file. Retrying a stale `id` would delete
+// an unrelated live builder or guardian lease and silently admit excess work,
+// which is the opposite of what the retry exists to prevent.
+//
+// `(owner, repo_id, run_ref)` is the live-request unique key, so it is the
+// identity that survives. After a restore the row is simply gone and the
+// release is correctly inert.
+for (const ref of (ctx.pendingReleases ?? []).splice(0)) {
+  try { (ctx.providerRelease ?? releaseProvider)(ctx.hub, ref); }
+  catch { (ctx.pendingReleases ??= []).push(ref); }    // still locked: keep it for next tick
 }
 ```
 
@@ -265,7 +301,7 @@ if (ctx.hub && repoId != null) {
 /* ... standard harness, plus: ... */
 import { openHub } from "../src/build/hubdb.mjs";
 import { claimProvider, releaseProvider, noteRateLimit, reapProviderLeases,
-         cancelQueued, bindProviderLease } from "../src/provider.mjs";
+         cancelQueued, bindProviderLease, heartbeatProvider } from "../src/provider.mjs";
 import { acquireMaintenanceLock } from "../src/build/locks.mjs";
 import { spawn } from "node:child_process";
 import { mkdirSync, readdirSync } from "node:fs";
@@ -418,19 +454,38 @@ const LSTART = "Sat Aug 23 09:00:00 2026";
     // early return that a live-holder fixture would take.
     ["reapProviderLeases", () => reapProviderLeases(db, { isAlive: () => false })],
   ]) {
-    let refused = false;
-    try { const r = run(); refused = r?.ok === false && r.reason === "maintenance"; } catch { refused = true; }
-    check(refused, `${name} refuses while a live restore holds maintenance_lock`);
+    // The refusal must be the MAINTENANCE one. A bare `catch { refused = true }`
+    // counts every throw as success -- including the `ReferenceError` from a
+    // mutator that was never imported, which is exactly how `heartbeatProvider`
+    // sat in this list unimported and green. An unexpected error now fails the
+    // assertion and prints itself.
+    let refused = false, unexpected = null;
+    try {
+      const r = run();
+      refused = r?.ok === false && r.reason === "maintenance";
+      if (!refused) unexpected = `returned ${JSON.stringify(r)}`;
+    } catch (e) {
+      if (/restore|maintenance/i.test(e.message)) refused = true;
+      else unexpected = `${e.constructor.name}: ${e.message}`;
+    }
+    check(refused, `${name} refuses while a live restore holds maintenance_lock`, String(unexpected));
   }
   // Control: with the lock gone the same call succeeds -- otherwise "refuses
   // everything" satisfies all four above.
   db.exec("DELETE FROM maintenance_lock");
+  // Reap FIRST. `held` and the expired `dead` row occupy both configured slots,
+  // and a claim with `isAlive: ALIVE` cannot reap either -- so the control below
+  // would return `at-limit` against a perfectly correct implementation, and read
+  // as "the lock is still refusing". Order matters here, and it did not before.
+  //
+  // This doubles as the reaper's own control: its refusal under the lock could
+  // equally have been "there was nothing to reap", and this proves there was.
+  const { reaped } = reapProviderLeases(db, { isAlive: (pid) => pid !== 999 });
+  check(reaped >= 1,
+    "control: with the lock released the reaper really does delete the dead holder's lease",
+    String(reaped));
   check(claimProvider(db, { owner: "builder", repoId: 1, runRef: "r2", pid: 1, lstart: "A", isAlive: ALIVE }).ok,
-    "control: the same claim succeeds once the lock is released");
-  // A control for the reaper too, since its refusal above could equally have
-  // been "there was nothing to reap".
-  check(reapProviderLeases(db, { isAlive: (pid) => pid !== 999 }).reaped >= 1,
-    "control: with the lock released the reaper really does delete the dead holder's lease");
+    "control: and the slot the reaper freed is claimable, so the refusals above were the lock");
   db.close();
 }
 
@@ -615,8 +670,9 @@ git commit -m "feat(provider): transactional admission for the shared subscripti
        // the lease expires, blocking guardian and builder work alike -- and
        // silently, because the tick otherwise looks like it completed.
        if (canaryLease != null) {
-         try { (ctx.providerRelease ?? releaseProvider)(ctx.hub, { id: canaryLease }); }
-         catch { (ctx.pendingReleases ??= []).push(canaryLease); }
+         const ref = { owner: "guardian", repoId, runRef: `canary:${nwo}` };
+         try { (ctx.providerRelease ?? releaseProvider)(ctx.hub, { id: canaryLease, ...ref }); }
+         catch { (ctx.pendingReleases ??= []).push(ref); }   // identity, not id: see the drain
        }
      }
    }
@@ -660,6 +716,11 @@ import { OUTCOMES } from "../src/supervisor.mjs";
 // "the fixture from X" does not carry them, and an executor discovers that only
 // when the test throws ReferenceError.
 const logLines = [];
+// This file's own identity constant. The only other `const LSTART` in the plan
+// belongs to test/provider-scheduler.test.mjs, and a binding in another file is
+// not a binding here -- every healthy-hub fixture below uses it, so the first
+// block would stop at ReferenceError before reaching tick().
+const LSTART = "Sat Aug 23 09:00:00 2026";
 // `repoId` is part of the SHARED fixture, not something each block remembers.
 // The plan's own fail-closed check refuses a claim when ctx.repoId is null, so
 // a fixture without it makes the ordinary claim/release, exception-release,
@@ -906,8 +967,17 @@ In `src/daemon.mjs`, immediately after the halt check at line 712:
       //         console.error(`reeve run: could not resolve the numeric id for ${nwo}; ` +
       //                       `provider leases will be refused until it can be read`);
       //     }
-      //     // ...then inside the ctx literal:
+      //     // ...then inside the ctx literal, BOTH the value and the seam that
+      //     // produced it -- the tick retries through the same function when
+      //     // startup could not resolve it (see the top-of-tick block):
       //     repoId,
+      //     resolveRepoId: async (n) => {
+      //       const a = await authenticate(n).catch(() => ({ ok: false }));
+      //       if (!a.ok) return null;
+      //       const r = apiAsInstallation(a.token, [`repos/${n}`]);
+      //       if (!r.ok) return null;
+      //       try { return JSON.parse(r.out).id ?? null; } catch { return null; }
+      //     },
       //
       // **`statSync` joins the `node:fs` import too**, for the hub getter's
       // identity check below: `bin/reeve` currently imports
@@ -1000,8 +1070,9 @@ In `src/daemon.mjs`, immediately after the halt check at line 712:
       // Insert `abandonClaim(...)` before the `continue` on each of those paths.
       const abandonClaim = (why) => {
         if (lease != null) {
-          try { (ctx.providerRelease ?? releaseProvider)(ctx.hub, { id: lease }); }
-          catch { (ctx.pendingReleases ??= []).push(lease); }
+          const ref = { owner: "guardian", repoId, runRef: `pr:${e.pr}` };
+          try { (ctx.providerRelease ?? releaseProvider)(ctx.hub, { id: lease, ...ref }); }
+          catch { (ctx.pendingReleases ??= []).push(ref); }  // identity, not id: see the drain
           lease = null;
         }
         if (ctx.hub && repoId != null)
@@ -1021,13 +1092,22 @@ asserts it with a fixture whose `startRun` is stubbed to fail:
 // a previously QUEUED request that is refused before spawn is withdrawn
 {
   const db = openHub(join(dir, "h6.db"));
+  // `pr:42`, not `pr:7`. The fixture copied from test/worker-contract.test.mjs
+  // lists and evaluates PR **42** (`openPrs: () => [42]`, `evaluation.pr = 42`),
+  // so a row for pr:7 is not dispatch-worthy -- the new top-of-tick sweep cancels
+  // it as stale before the refusal path is ever reached, and the assertion
+  // passes without `abandonClaim` existing at all.
   db.exec(`INSERT INTO provider_lease(owner,repo_id,run_ref,pid,lstart,priority,status,requested_at,expires_at)
-           VALUES('guardian',1,'pr:7',1,'L1',0,'queued',unixepoch(),unixepoch()+120)`);
+           VALUES('guardian',1,'pr:42',1,'L1',0,'queued',unixepoch(),unixepoch()+120)`);
   const ctx = { ...fixtureCtx(dir), hub: db, repoId: 1, lstart: LSTART,
     startRun: () => ({ ok: false, why: "the run could not be recorded" }),
     spawnWorker: async () => { throw new Error("must not dispatch"); } };
+  // CONTROL: the row is there when the tick begins, so its absence afterwards is
+  // a withdrawal rather than a fixture that never seeded it.
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE run_ref='pr:42'").get().c === 1,
+    "fixture: the queued request exists before the tick");
   await tick(ctx);
-  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE run_ref='pr:7' AND status='queued'").get().c === 0,
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE run_ref='pr:42' AND status='queued'").get().c === 0,
     "a queued request whose dispatch is refused before spawn is withdrawn, not left blocking admission");
   // CONTROL: a request whose dispatch SUCCEEDS keeps nothing queued either, so
   // the assertion above is about withdrawal and not about the row never existing.
@@ -1047,8 +1127,12 @@ asserts it with a fixture whose `startRun` is stubbed to fail:
         // the next tick, and a restore clears provider_lease outright, so the
         // worst case is one tick of delay rather than a lost slot.
         if (lease != null) {
-          try { (ctx.providerRelease ?? releaseProvider)(ctx.hub, { id: lease }); }
-          catch { (ctx.pendingReleases ??= []).push(lease); }
+          // IDENTITY, not id -- the same reason as the drain at the top of the
+          // tick: a restore clears and renumbers provider_lease, so a queued
+          // integer key can come back pointing at somebody else's lease.
+          const ref = { owner: "guardian", repoId, runRef: `pr:${e.pr}` };
+          try { (ctx.providerRelease ?? releaseProvider)(ctx.hub, { id: lease, ...ref }); }
+          catch { (ctx.pendingReleases ??= []).push(ref); }
         }
       }
 ```
@@ -1693,8 +1777,17 @@ check(VERDICT_CLAUSES.includes("hold"),
   // so reading it here returns PASS and every BLOCK assertion below fails
   // against a correct implementation -- a fixture invalidated by a test that ran
   // before it. PR 11 is untouched by anything above.
-  hub.exec(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at)
-            VALUES('bt:1',1,11,'${"c".repeat(40)}','cancel',unixepoch())`);
+  // Through an OWNER connection. `hub` is the openHubAsGuest handle, whose
+  // authorizer denies every INSERT into pr_hold by design -- the guest may read
+  // that table and nothing more -- so seeding through it throws before
+  // computeVerdict is reached, and the block fails on its own fixture.
+  //
+  // The guest handle is kept for the production READ below, which is the thing
+  // under test: `holdClause` runs on the guardian's connection.
+  { const owner = openHub(p);
+    owner.exec(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at)
+                VALUES('bt:1',1,11,'${"c".repeat(40)}','cancel',unixepoch())`);
+    owner.close(); }
   check(holdClause(hub, { repoId: 1, pr: 7, isBuilderPr: true }).state === "PASS",
     "control: PR 7's hold really was cleared above, so this block needs its own",
     JSON.stringify(holdClause(hub, { repoId: 1, pr: 7, isBuilderPr: true })));
@@ -1807,12 +1900,38 @@ const fixtureCtx = (d) => ({
   logPath: join(d, "reeve.log"), haltMarker: join(d, "HALT"),
   execute: true, shadow: false, selfAudit: false,
   log: () => {},
-  // One dispatch-worthy decision, injected rather than evaluated: evaluatePr
-  // shells out to GitHub (src/pr.mjs:132) and this script must make no network
-  // call. The shape is the one src/daemon.mjs:732 pushes (on 16769e7).
-  evaluate: () => ({ ok: true, pr: 7, headRef: "mp/bt-1-s0",
-                     decision: { action: "FIX_CI", why: "red required check" },
-                     verdict: { state: "BLOCK", clauses: [] } }),
+  // BOTH network seams. `tick` calls `(ctx.openPrs ?? openPrs)` at
+  // src/daemon.mjs:557 BEFORE it evaluates anything, so injecting `evaluate`
+  // alone still reaches the real GitHub-backed listing: offline it exits without
+  // dispatching, and configured it inspects real repository state. An acceptance
+  // artefact that quietly consults production is worse than none.
+  openPrs: () => [7],
+
+  // And the evaluation has to produce a FIX_CI through the inputs `tick`
+  // actually reads. It IGNORES `evaluate`'s `decision` and recomputes with
+  // `nextAction(e, profile, ...)` (src/daemon.mjs:716), so a BLOCK verdict with
+  // no clauses falls through to the unclassified escalation -- no dispatch, no
+  // lease, `during` null, and the run records the opposite of what it exists to
+  // show. The clause set below is what nextAction reads to reach FIX_CI: a
+  // settled RED ci clause with a named failing check, and a mergeable/base pair
+  // that does not divert it first.
+  evaluate: () => ({
+    ok: true, pr: 7, headRef: "mp/bt-1-s0", baseRef: "main", state: "open",
+    head: "a".repeat(40), title: "t",
+    checks: { settled: true, verdict: "RED", failing: [{ name: "build" }], inherited: [], caused: [{ name: "build" }] },
+    verdict: { state: "BLOCK", summary: "failing: build", clauses: [
+      { id: "mergeable", state: "PASS", detail: "clean" },
+      { id: "base",      state: "PASS", detail: "green" },
+      { id: "ci",        state: "BLOCK", detail: "failing: build" },
+      { id: "review",    state: "PASS", detail: "n/a" },
+      { id: "threads",   state: "PASS", detail: "none" },
+      { id: "rounds",    state: "PASS", detail: "0" },
+      { id: "findings",  state: "PASS", detail: "none" },
+    ] },
+  }),
+  // The root-cause seam too: FIX_CI is refused when no cause can be resolved,
+  // and resolving one shells out to GitHub like everything else here.
+  resolveCause: () => ({ ok: true, cause: "compile error", files: ["src/x.mjs"] }),
 });
 
 let during = null;
@@ -1825,7 +1944,15 @@ await tick(ctx);
 const after = db.prepare("SELECT * FROM provider_lease").all();
 console.log("DURING dispatch:", JSON.stringify(during));
 console.log("AFTER  dispatch:", JSON.stringify(after));
-console.log("guardian held during:", during?.filter(r => r.status === "held" && r.owner === "guardian").length);
+// A guard, not just a log line: `during` stays null if the tick never reached
+// spawnWorker, and printing `undefined` into a measured document records a
+// non-observation as an observation.
+if (!during || !during.some(r => r.status === "held" && r.owner === "guardian")) {
+  console.error("ACCEPTANCE FAILED: no guardian lease was held during dispatch");
+  console.error("  during:", JSON.stringify(during));
+  process.exit(1);
+}
+console.log("guardian held during:", during.filter(r => r.status === "held" && r.owner === "guardian").length);
 console.log("rows remaining after:", after.length);
 EOF
 $N ./acceptance-tmp.mjs | tee /tmp/acceptance.txt

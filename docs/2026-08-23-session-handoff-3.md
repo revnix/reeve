@@ -235,46 +235,10 @@ rounds and is worth knowing before reading any of them:
 Every one of the three has reached zero open at least twice. Re-openings are new
 rounds against text a previous round's fixes added, not regressions.
 
-### The original section 8, for reference
-
-### #12 (S2-B) — 12 open
-
-| Thread | Finding |
-|---|---|
-| `PRRT_kwDOT-hWms6beCgr` | `CLAIMING` needs a durable claim-success witness; a generic `phase.succeeded` advances it |
-| `PRRT_kwDOT-hWms6beCgs` | `regenerate` from `IMPL_PR_OPEN`/`VERDICT_WAIT` must close or hold stale slice PRs |
-| `PRRT_kwDOT-hWms6beCgu` | §10.1's **submodule** path refusal is missing from the claim grammar |
-| `PRRT_kwDOT-hWms6beCgv` | the App permission `FULL` set is incomplete (only checks/contents/pull_requests) |
-| `PRRT_kwDOT-hWms6beCgx` | a bare `{kind:"phase.succeeded"}` with no `phase` still advances |
-| `PRRT_kwDOT-hWms6beCgz` | `task.depth` is never persisted by an accepted depth override |
-| `PRRT_kwDOT-hWms6beCg0` | a live `--pin-territory` must survive BLOCKED entry |
-| `PRRT_kwDOT-hWms6beCg1` | outbox writers (`leaseEffect`/`settleEffect`/`recoverEffects`/`voidPending`) must call `assertWritable` |
-| `PRRT_kwDOT-hWms6beCg2` | the close-out suite loop must return a failing exit status |
-| `PRRT_kwDOT-hWms6beCg4` | cancellation must terminate the live worker (§4.5) |
-| `PRRT_kwDOT-hWms6beCg7` | `DONE` must refuse when finalization effects **failed**, not only when pending |
-| `PRRT_kwDOT-hWms6beCg9` | `buildTick` is called by a test and defined by no task |
-
-### #13 (S2-C) — 13 open
-
-| Thread | Finding |
-|---|---|
-| `PRRT_kwDOT-hWms6beGsU` | move the lease claim to the final spawn seam, after every refusal path |
-| `PRRT_kwDOT-hWms6beGsV` | supply concrete claim/release wiring around the containment canary |
-| `PRRT_kwDOT-hWms6beGsX` | actually drain `ctx.pendingReleases` at the start of a tick |
-| `PRRT_kwDOT-hWms6beGsY` | restrict `maintenance_lock` guest writes to `DELETE` only |
-| `PRRT_kwDOT-hWms6beGsc` | prevent callers from replacing the SQLite authorizer |
-| `PRRT_kwDOT-hWms6beGsh` | handle `SQLITE_FUNCTION` for a closed list of SQL functions guest queries use |
-| `PRRT_kwDOT-hWms6beGsk` | read the repo id from a source that actually carries it |
-| `PRRT_kwDOT-hWms6beGsl` | scope queued reconciliation to the current repository |
-| `PRRT_kwDOT-hWms6beGsm` | define `repoId` before the top-of-tick sweep uses it |
-| `PRRT_kwDOT-hWms6beGsn` | add the promised `evaluatePr` routing assertion |
-| `PRRT_kwDOT-hWms6beGsp` | break the circular dependency between Tasks 22 and 23 |
-| `PRRT_kwDOT-hWms6beGsq` | import `DatabaseSync` and the authorizer constants |
-| `PRRT_kwDOT-hWms6beGss` | build `live` from dispatch-worthy requests only |
-
-**#11 has 0 open** and is awaiting its next round.
-
----
+Every thread listed in the first version of this section — twelve on #12 and
+thirteen on #13, each named by id — has been replied to and resolved. The list
+was removed rather than kept "for reference": a resolved thread id in a handoff
+is an instruction to go and chase something that no longer exists.
 
 ## 9. After the plans: what S2 actually needs next
 

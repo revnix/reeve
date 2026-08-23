@@ -106,13 +106,23 @@ export function instrumentHash({ hasNet = false } = {}) {
  * untouched, and `binaryId` identifies the Claude executable, not reeve's own
  * code — so nothing else would have noticed. (Codex #14-[12].)
  *
- * sandbox.mjs is deliberately absent: what it contributes is the POLICY, and
- * the policy is hashed into the id directly. A test asserts this list against
- * the local imports this file actually has, so a new dependency has to be
- * classified rather than forgotten.
+ * sandbox.mjs is here too, and excluding it was wrong. The reasoning was that
+ * what it contributes is the POLICY and the policy is hashed into the id
+ * directly -- true of the PRODUCTION policy, and false of the canary's own
+ * grant: `canaryGrant` builds `permissions.allow` from `scopedFileTools` and
+ * `ruleFor`, `carveOuts` builds the canary's `allowRead`, and `validateSettings`
+ * decides whether the result is accepted. None of those reach the id, which
+ * carries the production `permissionsDeny` and `allowedTools` it was handed. A
+ * change to any of them alters what the probe may attempt while leaving the
+ * hash still. (Codex #14-[14].)
+ *
+ * Nothing is excluded now. The mechanism stays because a future import might
+ * genuinely contribute nothing to the measurement -- and a test asserts both
+ * lists against the local imports this file actually has, so that decision has
+ * to be made rather than defaulted into.
  */
-export const INSTRUMENT_SOURCES = ["./canary.mjs", "./supervisor.mjs"];
-export const INSTRUMENT_NOT_SOURCES = ["./sandbox.mjs"];
+export const INSTRUMENT_SOURCES = ["./canary.mjs", "./supervisor.mjs", "./sandbox.mjs"];
+export const INSTRUMENT_NOT_SOURCES = [];
 
 let sourceHashCache = null;
 function instrumentSourceHash() {

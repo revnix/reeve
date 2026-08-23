@@ -188,3 +188,30 @@ import in `canary.mjs` must appear in `INSTRUMENT_SOURCES` or in
 Adding a dependency now fails the suite until it is classified as part of the
 instrument or explicitly not. Removing `./supervisor.mjs` from the list turns it
 red, which is the check working.
+
+## And sandbox.mjs, which I had excluded with a reason that was half true
+
+The exclusion said: what sandbox.mjs contributes is the POLICY, and the policy is
+hashed into the id directly.
+
+True of the PRODUCTION policy. False of the canary's own grant:
+
+| what it builds | from |
+|---|---|
+| the canary's `permissions.allow` | `canaryGrant` → `scopedFileTools`, `ruleFor` |
+| the canary's `allowRead` | `carveOuts` |
+| whether the generated settings are ACCEPTED | `validateSettings` |
+
+None of those reach the id, which carries the production `permissionsDeny` and
+`allowedTools` it was handed. A change to any of them alters what the probe may
+attempt while leaving the hash still — which is the same failure the hash exists
+to prevent, arriving through the one module I had argued was safe to leave out.
+
+It is included now, and `INSTRUMENT_NOT_SOURCES` is empty. The mechanism stays
+because a future import might genuinely contribute nothing, and the rot-guard
+test forces that to be a decision rather than a default.
+
+The cost is one extra re-measurement for a sandbox.mjs edit that does NOT change
+the generated policy — because an edit that does change it already moves the
+policy hash and forces one anyway. So the coverage is complete and the added
+expense is close to nil.

@@ -694,12 +694,20 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
   const unverified = [], https = [];
   for (const url of pushUrls) {
     const shown = withoutUserinfo(url);
-    // ssh and local transports authenticate through the transport itself, so the
-    // reach above already exercised them. http and https do not, on a PUBLIC
-    // repository -- git's credential subsystem covers both schemes, and a plain
-    // http remote answers an anonymous read exactly as https does.
+    // ssh and local transports authenticate through the transport itself -- but
+    // "the reach above exercised it" is only true when the reach WENT there.
+    // `ls-remote origin` uses the FETCH url, so an https fetch beside an ssh
+    // push url means the ssh transport was never touched: an anonymous public
+    // fetch plus an ssh push with no usable key reported healthy. That claim was
+    // written while the push destination still had a probe of its own, and
+    // survived the round that removed it. (Codex #14-[13].)
+    //
+    // http and https never authenticate on a read of a PUBLIC repository, so
+    // they take the credential path whether or not they are the fetch url --
+    // git's credential subsystem covers both schemes.
     if (!/^https?:\/\//.test(url)) {
-      lines.push(`${shown} carries its own authentication, so the reach above exercised it`);
+      if (url === fetchUrl.out) lines.push(`${shown} carries its own authentication, and the reach above went through it`);
+      else { unverified.push(shown); lines.push(`${shown} carries its own authentication, which the reach above did NOT exercise: it went to the fetch url`); }
       continue;
     }
     https.push(url);

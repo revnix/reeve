@@ -148,12 +148,23 @@ Each task names any imports it needs **beyond** these.
 
 **Files:**
 - Create: `src/build/providerdb.mjs` (every scheduler statement — the hub owns its own SQL, as `hubdb.mjs` does), `src/provider.mjs` (the shared policy layer that imports them)
-- Test: `test/provider-scheduler.test.mjs`, `test/provider-race.test.mjs`
+- Test: `test/provider-scheduler.test.mjs` — **one file**. An earlier revision
+  also named `test/provider-race.test.mjs`, but every step writes the race into
+  `provider-scheduler.test.mjs`, so `git add` would fail on an unmatched pathspec
+  after the tests had passed: the plan's last step broken by a path nothing
+  creates.
 
 `src/provider.mjs` holds **no SQL**. It holds the admission rule, the reservation arithmetic and the cooldown comparison, and calls `providerdb.mjs` for every read and write. That keeps "no raw SQL outside `src/db/` and `src/build/`" true, and means the guardian imports a policy function rather than a query builder.
 
 **Interfaces:**
-- Consumes: `openHub`, `hubTx`, `hubEvent` (PR-A).
+- Consumes: `openHub`, `hubTx` (PR-A). **Not `hubEvent`** — and this is not a
+  tidy-up. `provider_lease` and `provider_state` are process-scoped: `restoreHub`
+  clears them and they are not in `COMPARISON_SET`, so there is nothing for a
+  replay to restore and no event to write. More concretely, the guest
+  authorizer's write set is exactly `{provider_lease, provider_state}`, so an
+  `INSERT INTO hub_event` from a provider transaction is **denied** — every real
+  guardian claim and release would fail. A dependency list naming `hubEvent`
+  invites the one statement that breaks the whole feature.
 - Produces:
   - `claimProvider(db, { owner, repoId, runRef, pid, lstart, priority = 0, budgetUsd = null, isAlive, now }) -> { ok: true, id } | { ok: false, reason: 'queued'|'cooldown'|'at-limit'|'maintenance', until }`
   - **Where the SQL lives.** The Global Constraints say no raw SQL outside `src/db/` and `src/build/`, and `src/provider.mjs` is neither — it sits at the top level because both daemons import it. Resolve it by keeping the statements in `src/build/providerdb.mjs` (the hub owns its own SQL, as `hubdb.mjs` does) and making `src/provider.mjs` the shared **policy** layer that imports them: the admission rule, the reservation arithmetic, the cooldown comparison. That also puts the boundary in the right place — the guardian imports a policy function, not a query builder, and the statement allowlist in Task 23 is checking a surface that has exactly one definition.
@@ -296,8 +307,12 @@ const LSTART = "Sat Aug 23 09:00:00 2026";
   check(db.prepare("SELECT concurrency_limit c, guardian_reserved g FROM provider_state WHERE provider='claude'").get().c === 3,
     "control: the limit really is 3/0 before the claims below run");
   const a = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE });
-  const c = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:2", pid: 2, lstart: "B", isAlive: ALIVE });
-  const d = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:3", pid: 3, lstart: "C", isAlive: ALIVE });
+  // DISTINCT timestamps. requested_at is integer seconds, so three claims in
+  // the same tick ordinarily share one value and "the youngest builder" has no
+  // defined answer -- an implementation ordering by requested_at alone could
+  // legitimately flag bt:2, and the assertion below would fail or pass by luck.
+  const c = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:2", pid: 2, lstart: "B", isAlive: ALIVE, now: 1001 });
+  const d = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:3", pid: 3, lstart: "C", isAlive: ALIVE, now: 1002 });
   check(a.ok && c.ok && d.ok, "three builders fit under a limit of 3 with nothing reserved");
   const g = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:9", pid: 4, lstart: "D", isAlive: ALIVE });
   check(!g.ok && g.reason === "queued", "a guardian that cannot be admitted is QUEUED, not simply refused", JSON.stringify(g));
@@ -367,9 +382,22 @@ const LSTART = "Sat Aug 23 09:00:00 2026";
   // is taken -- a mutator that no-ops because it found nothing to change is
   // indistinguishable from one that refused, and would satisfy the assertion
   // below without ever calling assertWritable.
+  // Room for TWO builders first. The documented defaults are limit 2 with
+  // guardian_reserved 1, so exactly one builder lease fits and the second claim
+  // below is refused at the builder limit -- leaving no dead row, and the
+  // reaper's deleting path unreachable by the very test that claims to cover it.
+  db.exec(`INSERT INTO provider_state(provider,concurrency_limit,guardian_reserved)
+           VALUES('claude',2,0)
+           ON CONFLICT(provider) DO UPDATE SET concurrency_limit=2, guardian_reserved=0`);
   const held = claimProvider(db, { owner: "builder", repoId: 1, runRef: "seed", pid: 1, lstart: "A", isAlive: ALIVE });
   const dead = claimProvider(db, { owner: "builder", repoId: 1, runRef: "dead", pid: 999, lstart: "GONE", isAlive: ALIVE });
-  check(held.ok && dead.ok, "fixture: two live rows exist for the mutators to act on");
+  check(held.ok && dead.ok, "fixture: two live rows exist for the mutators to act on",
+    JSON.stringify({ held, dead }));
+  // And the dead one must be EXPIRED. Reaping requires expiry AND failed
+  // liveness -- the p4 control below asserts exactly that -- so `isAlive: () =>
+  // false` alone leaves the reaper's delete unreached and its refusal below
+  // would be "nothing to reap" wearing the costume of "the lock stopped me".
+  db.exec(`UPDATE provider_lease SET expires_at = unixepoch() - 1 WHERE id = ${dead.id}`);
 
   acquireMaintenanceLock(db, { pid: 4242, lstart: "L4242", isAlive: ALIVE });
   // ALL SEVEN mutators. The first version of this block covered four, and the
@@ -460,15 +488,36 @@ console.log(r.ok ? "HELD" : "no");
 `);
   const go = join(dir, "go"), ready = join(dir, "ready");
   mkdirSync(ready, { recursive: true });
+  // Capture stderr and the exit code, not just stdout. A child that throws
+  // prints nothing to stdout and exits non-zero; collecting only stdout turns
+  // that into the empty string, which the old filter counted as "not HELD" --
+  // indistinguishable from an orderly refusal.
   const kids = Array.from({ length: 20 }, (_, i) => new Promise((res) => {
     const c = spawn(process.execPath, [worker, p, String(i), go, ready], { encoding: "utf8" });
-    let out = ""; c.stdout.on("data", d => out += d);
-    c.on("exit", () => res(out.trim()));
+    let out = "", err = "";
+    c.stdout.on("data", d => out += d);
+    c.stderr.on("data", d => err += d);
+    c.on("exit", (code) => res({ out: out.trim(), err: err.trim(), code }));
   }));
   for (let i = 0; i < 400 && readdirSync(ready).length < 20; i++) await new Promise(r => setTimeout(r, 25));
   check(readdirSync(ready).length === 20, "control: all 20 children reached the barrier before the start");
   writeFileSync(go, "");
-  const held = (await Promise.all(kids)).filter(r => r === "HELD").length;
+  // Every contender must COMPLETE, with a recognised answer. Counting only
+  // "HELD" treats a crash -- a lock error, a constraint violation, a throw from
+  // a read-then-insert implementation -- as if it were a legitimate refusal, so
+  // a broken non-transactional admission where one child wins and nineteen die
+  // still reports "exactly one holder". The failure mode this test exists to
+  // catch is invisible to it.
+  const results = await Promise.all(kids);
+  const unrecognised = results.filter(r => r.out !== "HELD" && r.out !== "no");
+  check(unrecognised.length === 0,
+    "control: all 20 contenders completed with a recognised answer, so a crash cannot read as a refusal",
+    JSON.stringify(unrecognised.slice(0, 3)));
+  const crashed = results.filter(r => r.code !== 0);
+  check(crashed.length === 0,
+    "control: and none of them exited non-zero",
+    JSON.stringify(crashed.slice(0, 3).map(r => ({ code: r.code, err: String(r.err).slice(0, 120) }))));
+  const held = results.filter(r => r.out === "HELD").length;
   check(held === 1, `exactly one of 20 racing processes holds the last slot (got ${held})`);
 }
 ```
@@ -479,7 +528,7 @@ console.log(r.ok ? "HELD" : "no");
 
 ```bash
 $N test/provider-scheduler.test.mjs
-git add src/build/providerdb.mjs src/provider.mjs test/provider-scheduler.test.mjs test/provider-race.test.mjs
+git add src/build/providerdb.mjs src/provider.mjs test/provider-scheduler.test.mjs
 git commit -m "feat(provider): transactional admission for the shared subscription"
 ```
 
@@ -544,7 +593,20 @@ git commit -m "feat(provider): transactional admission for the shared subscripti
        }
        canaryLease = got.id;
      }
-     try { containment = await measuredContainment(ctx, profile, nwo, logPath); }
+     // GUARDED. Setting skipDispatch and then calling the canary anyway spends
+     // the model request the flag was raised to prevent -- a healthy hub
+     // answering `queued`/`at-limit`, or a healthy hub with no repository id,
+     // paid real quota under no lease. The flag suppresses the canary AND the
+     // per-PR loop; the tick still finishes through its normal epilogue.
+     //
+     // The INJECTED seam, not the lexical function: every other daemon
+     // collaborator is reached as `(ctx.x ?? x)`, and without it the canary
+     // test's `ctx.measuredContainment` override is inert -- CI would run the
+     // real, host-dependent containment path and the assertion would never see
+     // it fire.
+     if (!skipDispatch) try {
+       containment = await (ctx.measuredContainment ?? measuredContainment)(ctx, profile, nwo, logPath);
+     }
      finally {
        // The SAME retry the worker-dispatch cleanup uses. `catch {}` here drops
        // the lease id on the floor: a release refused because a restore holds
@@ -597,7 +659,14 @@ import { OUTCOMES } from "../src/supervisor.mjs";
 // "the fixture from X" does not carry them, and an executor discovers that only
 // when the test throws ReferenceError.
 const logLines = [];
+// `repoId` is part of the SHARED fixture, not something each block remembers.
+// The plan's own fail-closed check refuses a claim when ctx.repoId is null, so
+// a fixture without it makes the ordinary claim/release, exception-release,
+// quota-wait and rate-limit blocks all refuse before dispatch -- every one of
+// them passing or failing for a reason that has nothing to do with what it
+// tests. Only the dedicated missing-id block overrides it back to null.
 const fixtureCtx = (dir) => ({ /* ...as in test/worker-contract.test.mjs... */
+  repoId: 1,
   log: (_p, line) => logLines.push(String(line)) });
 const loggedAny  = (_ctx, re) => logLines.some(l => re.test(l));
 const throwingHub = () => ({ prepare: () => { throw new Error("hub unreadable"); },
@@ -861,6 +930,18 @@ In `src/daemon.mjs`, immediately after the halt check at line 712:
         log(logPath, `  #${e.pr}: NOT dispatching — cannot scope a provider lease without the repository id`);
         continue;
       }
+      // WHERE this block goes, exactly: immediately BEFORE `startRun`
+      // (`src/daemon.mjs:852`) and the `recordFixAttempt` beside it at `:856`.
+      //
+      // Both boundaries are load-bearing and they pull in opposite directions.
+      // It must be AFTER every earlier refusal (no root cause, demonstrated
+      // flake, prompt build, worktree acquisition) or a claimed lease leaks when
+      // one of them `continue`s. And it must be BEFORE the attempt is charged:
+      // `recordFixAttempt`'s own comment says the attempt is spent "past every
+      // refusal, before any work" -- and a provider refusal IS a refusal.
+      // Placed after it, a quota wait burns a FIX_CI attempt and marks the
+      // durable run failed, so a repository merely at its concurrency limit
+      // exhausts its retry budget without a worker ever running.
       if (ctx.hub) {
         try {
           const got = (ctx.providerClaim ?? claimProvider)(ctx.hub, {
@@ -879,7 +960,12 @@ In `src/daemon.mjs`, immediately after the halt check at line 712:
           if (!got.ok) {
             log(logPath, `  #${e.pr}: NOT dispatching — provider ${got.reason}` +
                          (got.until ? ` until ${new Date(got.until * 1000).toISOString()}` : ""));
-            continue;                       // no attempt spent: this is quota, not a failure
+            // Truly no attempt spent, now that this block sits above startRun.
+            // The queued row STAYS: this PR still wants a dispatch, so the
+            // top-of-tick sweep keeps it live and it is admitted when a slot
+            // frees. Cancelling here would surrender the queue position the
+            // request exists to hold.
+            continue;
           }
           lease = got.id;
         } catch (err) {
@@ -898,6 +984,57 @@ In `src/daemon.mjs`, immediately after the halt check at line 712:
       } else {
         escalations.set("the provider scheduler is unreadable; dispatching unscheduled", 1);
       }
+
+      // Every path from here to the spawn that does NOT launch must give the
+      // lease back AND withdraw any queued request for this run ref. The
+      // top-of-tick sweep only cancels requests whose PR stopped being
+      // dispatch-worthy; a PR that STAYS dispatch-worthy and is refused here on
+      // every tick -- a prompt that will not build, a worktree that cannot be
+      // acquired, a run that cannot be recorded -- stays in the live set forever
+      // and blocks builder admission indefinitely. That is precisely the case
+      // the sweep structurally cannot see, and `cancelQueued` was advertised as
+      // "called on every path out of the dispatch block that did not launch"
+      // while having exactly one caller: the sweep.
+      //
+      // Insert `abandonClaim(...)` before the `continue` on each of those paths.
+      const abandonClaim = (why) => {
+        if (lease != null) {
+          try { (ctx.providerRelease ?? releaseProvider)(ctx.hub, { id: lease }); }
+          catch { (ctx.pendingReleases ??= []).push(lease); }
+          lease = null;
+        }
+        if (ctx.hub && repoId != null)
+          try { cancelQueued(ctx.hub, { owner: "guardian", repoId, runRef: `pr:${e.pr}` }); } catch {}
+        log(logPath, `  #${e.pr}: provider claim withdrawn — ${why}`);
+      };
+```
+
+**The paths that must call it**, each identified by the `continue` it already
+takes in `src/daemon.mjs`: the `!run.ok` branch after `startRun`, the prompt-build
+refusal, the worktree-acquisition refusal, and the demonstrated-flake refusal if
+it is reached after the claim. The rule is mechanical — **if a `continue` sits
+below the claim block, it calls `abandonClaim` first** — and Task 22's test
+asserts it with a fixture whose `startRun` is stubbed to fail:
+
+```js
+// a previously QUEUED request that is refused before spawn is withdrawn
+{
+  const db = openHub(join(dir, "h6.db"));
+  db.exec(`INSERT INTO provider_lease(owner,repo_id,run_ref,pid,lstart,priority,status,requested_at,expires_at)
+           VALUES('guardian',1,'pr:7',1,'L1',0,'queued',unixepoch(),unixepoch()+120)`);
+  const ctx = { ...fixtureCtx(dir), hub: db, repoId: 1, lstart: LSTART,
+    startRun: () => ({ ok: false, why: "the run could not be recorded" }),
+    spawnWorker: async () => { throw new Error("must not dispatch"); } };
+  await tick(ctx);
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE run_ref='pr:7' AND status='queued'").get().c === 0,
+    "a queued request whose dispatch is refused before spawn is withdrawn, not left blocking admission");
+  // CONTROL: a request whose dispatch SUCCEEDS keeps nothing queued either, so
+  // the assertion above is about withdrawal and not about the row never existing.
+  check(db.prepare("SELECT count(*) c FROM provider_lease").get().c === 0,
+    "control: no provider rows survive the tick at all", 
+    JSON.stringify(db.prepare("SELECT * FROM provider_lease").all()));
+  db.close();
+}
 
       try {
         /* ... the existing dispatch ... */
@@ -1390,6 +1527,42 @@ git commit -m "feat(daemon): open the hub through a statement allowlist"
 
 ### Task 23b: The guardian's verdict actually reads `pr_hold`
 
+**`src/watcher.mjs` is in this task's file list, and that is not optional.**
+`nextAction` inspects exactly seven clause ids — `clause(v, "…")` for `base`,
+`ci`, `findings`, `mergeable`, `review`, `rounds`, `threads` — and anything it
+does not recognise falls through to `src/watcher.mjs:207`:
+
+```js
+return act(ACTIONS.ESCALATE, `unclassified verdict ${v.state}: ${v.summary}`, { gap: true });
+```
+
+So adding a BLOCK-valued `hold` clause without touching the watcher makes **every
+ordinary held builder PR** escalate every tick as an *implementation gap* —
+`gap: true` is the flag reserved for "reeve met a verdict it does not understand".
+The merge is correctly blocked and the reason reported is a lie, on a loop.
+
+The intended action is **PARK**: a hold is a deliberate, recorded decision with a
+founder exit (`reeve task resume`), not a repair the guardian can perform and not
+a gap in reeve. Insert it beside the other clause branches, before the
+unclassified fallback:
+
+```js
+  // A builder hold is not a defect and not a gap: the builder wrote this row on
+  // purpose and a founder clears it. PARK, so the PR is left alone rather than
+  // repaired, escalated, or reported as something reeve failed to classify.
+  const hold = clause(v, "hold");
+  if (hold?.state === "BLOCK") return act(ACTIONS.PARK, `held by the builder: ${hold.detail}`);
+  if (hold?.state === "UNKNOWN") return act(ACTIONS.ESCALATE, `builder hold state unknown: ${hold.detail}`);
+```
+
+UNKNOWN escalates rather than parking, because "the hold cannot be scoped" is a
+configuration fault the founder must fix, not a decision to respect.
+
+**The totality matrix in `test/watcher.test.mjs` iterates the seven clause ids
+too**, so it gains `hold` in the same change — otherwise the suite still claims
+totality over a set that is now one short, which is the shape that let this
+through.
+
 **A declared gap.** `evaluatePr` cannot be exercised end to end from a test
 today: it shells out to GitHub five times and takes no injectable seam. Task 23b
 therefore proves the clause (unit), proves the fold (`computeVerdict`, the real
@@ -1405,6 +1578,8 @@ hottest read path and does not belong in a PR about the provider scheduler.
 
 **Interfaces:**
 - Consumes: `openHubAsGuest` (Task 23).
+- Produces: `openHolds(db, { repoId, pr }) -> Row[]` in **`src/build/holds.mjs`** — the scoped `pr_hold` reader. It lives under `src/build/` because this plan's global rule is that raw SQL exists only under `src/db/` or `src/build/`: a `SELECT ... FROM pr_hold` embedded in `src/verdict.mjs` would be a third definition of the guest SQL surface, drifting from the allowlist the moment either changes.
+- **`holdClause` is fail-closed on a missing repository id.** `ctx.repoId` is permitted to be null (startup resolves it and a failure is not fatal), and a plain `WHERE repo_id = ? AND pr = ?` with a null id matches nothing and returns PASS — so a builder PR would go **green exactly when its hold cannot be scoped**, which is the one case that must never pass. A builder PR with `repoId == null` returns `UNKNOWN` with `detail: 'the repository id is unknown; a hold cannot be scoped'`. Ordinary PRs still short-circuit to PASS without opening the hub.
 - Produces: `holdClause(hub, { repoId, pr, isBuilderPr }) -> { id: 'hold', state: 'PASS'|'BLOCK'|'UNKNOWN', detail }`, and **`computeVerdict` gains one input, `i.hold`**, which it appends to its clause list through the same `add(...)` call every other clause uses. That is the whole routing change, and it has to be an input: `computeVerdict` builds its clauses from inputs and accepts no clause array, so a caller cannot inject one. Ordinary PRs are **not evaluated**: the clause returns `PASS` with `detail: 'not a builder PR'` and never opens the hub.
 
 **Why this task exists.** Task 23 proves the guest connection is *permitted* to `SELECT` on `pr_hold`. Permission is not wiring. Without a reader, §9.6's entire mechanism is inert: cancellation, escalation and blocking write `pr_hold` rows that nothing consults, the required `ops/merge-policy` check stays green at the head, and a held builder PR remains mergeable — which is the exact failure the hold was invented to prevent. A capability nobody calls is indistinguishable from one that was never added.
@@ -1512,7 +1687,17 @@ check(VERDICT_CLAUSES.includes("hold"),
   // not exist. The hold arrives as its own input, and Task 23b's additive
   // change is the `add("hold", ...)` that consumes it -- which is the routing
   // under test.
-  const blocking = holdClause(hub, { repoId: 1, pr: 7, isBuilderPr: true });
+  // A hold this block OWNS. PR 7's row was cleared by the earlier
+  // clear-on-resume assertion (`UPDATE pr_hold SET cleared_at=... WHERE pr=7`),
+  // so reading it here returns PASS and every BLOCK assertion below fails
+  // against a correct implementation -- a fixture invalidated by a test that ran
+  // before it. PR 11 is untouched by anything above.
+  hub.exec(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at)
+            VALUES('bt:1',1,11,'${"c".repeat(40)}','cancel',unixepoch())`);
+  check(holdClause(hub, { repoId: 1, pr: 7, isBuilderPr: true }).state === "PASS",
+    "control: PR 7's hold really was cleared above, so this block needs its own",
+    JSON.stringify(holdClause(hub, { repoId: 1, pr: 7, isBuilderPr: true })));
+  const blocking = holdClause(hub, { repoId: 1, pr: 11, isBuilderPr: true });
   check(blocking.state === "BLOCK", "fixture: the hold clause blocks", JSON.stringify(blocking));
 
   const withHold    = computeVerdict({ ...baseInputs, hold: blocking });
@@ -1535,19 +1720,35 @@ check(VERDICT_CLAUSES.includes("hold"),
     JSON.stringify(withoutHold.clauses.map(c => `${c.id}:${c.state}`)));
 }
 
-// (b) THE WIRING from evaluatePr into that fold, which no runnable assertion can
-//     reach while src/pr.mjs shells out. Checked structurally, with a control,
-//     and labelled as the weaker half it is.
+// (b) THE WIRING, at BOTH ends. Asserting only that `src/pr.mjs` contains a
+//     `holdClause(` and the word `hub` is satisfied by an implementation that
+//     adds `evaluatePr({ hub })` and calls the clause perfectly while the
+//     DAEMON's invocation still passes no hub -- so every builder PR evaluates
+//     the hold as UNKNOWN and stays unmergeable, with this whole mandatory
+//     suite green. The call SITE is the half that was unchecked.
 {
-  const prSrc = readFileSync(fileURLToPath(new URL("../src/pr.mjs", import.meta.url)), "utf8");
+  const read = (rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
+  const prSrc = read("../src/pr.mjs"), daemonSrc = read("../src/daemon.mjs");
+
   check(/holdClause\s*\(/.test(prSrc),
     "evaluatePr's module calls holdClause: membership in VERDICT_CLAUSES is not routing");
-  check(/hub/.test(prSrc),
-    "and it has a hub to call it with");
-  // CONTROL: the same search for a clause that does NOT exist must fail, or a
-  // regex that matches anything reports every clause as wired.
-  check(!/thisClauseDoesNotExist\s*\(/.test(prSrc),
-    "control: the same search finds nothing for a clause that was never added");
+
+  // The daemon's evaluatePr call must SUPPLY the hub and the builder
+  // classification. Matched on the call itself, not on the file containing the
+  // words somewhere.
+  const call = daemonSrc.match(/\(ctx\.evaluate \?\? evaluatePr\)\(\{[^}]*\}/s)?.[0] ?? "";
+  check(/\bhub\b/.test(call),
+    "and the DAEMON passes ctx.hub into it, or every builder PR reads UNKNOWN", call);
+  check(/isBuilderPr|builderPr|headRef/.test(call),
+    "and passes the builder classification the clause branches on", call);
+
+  // CONTROLS, both directions. The first proves the extractor found a real call
+  // rather than matching nothing and testing the empty string; the second proves
+  // the searches can fail at all.
+  check(call.length > 0 && /evaluatePr/.test(call),
+    "control: the daemon's evaluatePr call site was actually located", JSON.stringify(call.slice(0, 120)));
+  check(!/thisClauseDoesNotExist\s*\(/.test(prSrc) && !/thisFieldDoesNotExist/.test(call),
+    "control: the same searches find nothing for names that were never added");
 }
 ```
 
@@ -1575,6 +1776,7 @@ Write it as a real script, not a placeholder — a `tee` of a comment produces a
 # file's own location, so a script at /tmp/acceptance.mjs looks for /tmp/src/.
 cat > ./acceptance-tmp.mjs <<'EOF'
 import { openHub } from "./src/build/hubdb.mjs";
+import { open as openStore } from "./src/db/ops.mjs";
 import { tick } from "./src/daemon.mjs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1595,7 +1797,12 @@ const db = openHub(join(dir, "hub.db"));
 const fixtureCtx = (d) => ({
   nwo: "o/r", repoId: 1,
   profile: { ci: {}, watch: {}, worker: { isolation: "none" } },
-  db: null, dbPath: join(d, "state.db"),
+  // A REAL guardian store, not null. After an evaluation succeeds, `tick` hands
+  // ctx.db to reconcilePr, unknownSince and record -- so a null one throws
+  // before spawnWorker runs and the script observes no provider lease at all,
+  // recording the opposite of what it is meant to prove. The guardian store and
+  // the hub are two different databases and both are needed here.
+  db: openStore(join(d, "state.db")), dbPath: join(d, "state.db"),
   logPath: join(d, "reeve.log"), haltMarker: join(d, "HALT"),
   execute: true, shadow: false, selfAudit: false,
   log: () => {},

@@ -37,6 +37,7 @@ Their review history — all 54 findings and what each changed — is `2026-08-2
   ```
 
   The glob must not simply be `test/*.test.mjs`: that includes `escape.test.mjs`, which writes decoys into the shared `~/.reeve/canary/` tree the live daemon reads and probes the login keychain. Advertising a command that contradicts the warning beside it means the warning loses. **Measured 2026-08-22 on `9dbd3a0`: 59 test files exist; 58 were run and all 58 passed.** `test/escape.test.mjs` was NOT run, because it writes decoy files into the shared `~/.reeve/canary/` directory that the live daemon also reads; run it once on a quiet machine to complete the baseline. That run had `node_modules` absent, and a green file can hide a skip, so skips were counted rather than assumed: exactly two files carry one `SKIP` each (`policy-self-exclusion`, `supervisor-contract`). That 58-file pass is the base every task is measured against, and it is the same base for all three PRs — never a chained comparison against the previous task.
+- **"Append to `test/x.test.mjs`" always means "insert before that file's terminator."** Every test file in this repository ends with a cleanup line and `process.exit(fail ? 1 : 0)`. A block pasted after `process.exit` never runs, and the file still reports green -- the worst available outcome, because it is indistinguishable from a passing test. Each append step below names its terminator explicitly; where one does not, insert before the final `rmSync`/`console.log`/`process.exit` group.
 - **Conventional Commits**, lowercase, `type(scope): subject`, ≤72 characters. **No attribution trailer of any kind.** Never `--no-verify`.
 - Every change carries a what/why comment in the style of the file it lands in. Comments never reference tasks, plans, findings, or this document.
 - **No raw SQL outside `src/db/` and `src/build/`.** `hubdb.mjs` owns every hub statement the way `ops.mjs` owns every guardian statement.
@@ -1108,6 +1109,14 @@ git commit -m "feat(hub): pr holds, project authority and repo gate state"
              repo_path,profile_path,profile_hash,default_branch,visibility,registry_version,created_at,updated_at)
            VALUES('bt:1','p',1,'o/r','t','SPEC_DRAFT','founder','k','/p','/f','h','main','private',1,unixepoch(),unixepoch())`);
 
+  // outbox.fence is a FOREIGN KEY to phase_event(seq), so the authorising event
+  // has to exist before any effect can reference it. Seq 1 is minted here for
+  // the same reason the transition transaction writes phase_event before it
+  // enqueues: an effect whose authorisation cannot be checked should be
+  // impossible to store, not merely unusual.
+  db.exec(`INSERT INTO phase_event(seq,task,at,op,from_phase,to_phase,detail)
+           VALUES(1,'bt:1',unixepoch(),'seed',NULL,'SPEC_DRAFT','{}')`);
+
   // The builder never publishes a check run on any production repository; the
   // guardian is the sole publisher of ops/merge-policy there. That is not a
   // convention to remember at the call site -- there is no kind to enqueue.
@@ -1117,6 +1126,15 @@ git commit -m "feat(hub): pr holds, project authority and repo gate state"
   check(kind("git.push.branch") && kind("gh.pr.create") && kind("notify"), "the ordinary effect kinds are enqueueable");
   check(!kind("gh.check.publish"), "there is NO builder check-publish kind: the guardian is the sole publisher");
   check(!kind("gh.pr.forceMerge"), "control: an invented kind is refused, so the enumeration is closed and not open");
+
+  // The fence FK, asserted rather than merely declared. Without this line the
+  // REFERENCES clause is a claim the plan makes and no test checks, and a
+  // migration that quietly dropped it would go unnoticed.
+  const orphan = () => { try {
+    db.prepare(`INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,cancellable,args,created_at,updated_at)
+                VALUES('bt:1:orphan','notify','bt:1',1,9999,1,'{}',unixepoch(),unixepoch())`).run();
+    return true; } catch { return false; } };
+  check(!orphan(), "an effect whose fence names no phase_event is refused: authorisation must be checkable");
 
   // Key uniqueness is over LIVE rows only. A completed, voided, fenced or
   // failed row is history: a plain resume re-enqueues the same key and must be
@@ -1232,6 +1250,17 @@ CREATE INDEX IF NOT EXISTS inbox_incomplete ON inbox(repo_id, pr_number) WHERE c
 --    effect. Without it a stale attempt from generation 3 can act on a task
 --    that was redesigned into generation 4.
 --
+-- 3. `fence` is a FOREIGN KEY, not just an integer that happens to hold a seq.
+--    The executor's whole safety argument is that it can revalidate the
+--    authorisation behind an externally-visible effect; an unconstrained column
+--    lets a buggy writer or a partial replay enqueue a push or a merge whose
+--    authorising event does not exist, and revalidation then compares against
+--    nothing. `phase_event` is append-only and its seq is INTEGER PRIMARY KEY,
+--    so the parent is never deleted and no child-side index is needed: SQLite
+--    scans the child table only on a parent delete, and there is no such path.
+--    The transition transaction writes phase_event BEFORE it enqueues, so the
+--    parent is always present by the time the FK is checked.
+--
 -- There is no check-publish kind. On a production repository the guardian is
 -- the sole publisher of ops/merge-policy; the builder has nothing to enqueue.
 CREATE TABLE IF NOT EXISTS outbox (
@@ -1249,7 +1278,7 @@ CREATE TABLE IF NOT EXISTS outbox (
                  -- and no silence approval can ever be legitimate.
   task_id      TEXT REFERENCES task(id) ON DELETE CASCADE,
   task_generation INTEGER NOT NULL,
-  fence        INTEGER NOT NULL,                   -- the phase_event seq that enqueued it
+  fence        INTEGER NOT NULL REFERENCES phase_event(seq),   -- the event that enqueued it
   cancellable  INTEGER NOT NULL DEFAULT 1 CHECK (cancellable IN (0,1)),
   args         TEXT    NOT NULL,                   -- canonical JSON
   status       TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN
@@ -2065,7 +2094,7 @@ import { readFileSync } from "node:fs";                      // reads the durabl
 import { openHub, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
 import { hubPathFor } from "../src/paths.mjs";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -2145,9 +2174,15 @@ openHub(hubPathFor(home)).close();
   const newest = Math.floor(Date.now() / 1000) + 60;
   const path = join(corruptDir, `${newest}.db`);
   writeFileSync(path, "this is not a database");
-  check(latestSnapshot(root, "hub") === path,
-    "control: the corrupt file IS the newest candidate, so deleting it is observable",
-    `${latestSnapshot(root, "hub")}`);
+  // The control is a FILESYSTEM fact, deliberately, not a latestSnapshot() call.
+  // Asserting `latestSnapshot(...) === path` here would contradict the assertion
+  // below it in the same block with no code in between, so one of the two could
+  // never be green -- and the read path is the very thing Step 3 changes.
+  const candidates = readdirSync(corruptDir).filter(f => /^\d+\.db$/.test(f))
+    .sort((a, b) => Number(b.split(".")[0]) - Number(a.split(".")[0]));
+  check(candidates[0] === `${newest}.db`,
+    "control: the corrupt file IS the newest candidate on disk, so skipping it is observable",
+    JSON.stringify(candidates.slice(0, 3)));
   const v = validateSnapshot(path, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION });
   check(v.ok === false, "a file that is not a database does not validate");
   // The deletion is snapshotAll's job, so the test has to RUN snapshotAll.
@@ -2156,17 +2191,22 @@ openHub(hubPathFor(home)).close();
   // code that is supposed to remove it.
   // snapshotAll only validates the snapshot IT takes this second, so a corrupt
   // file planted at a future timestamp is never its candidate and is never
-  // deleted. What actually protects a restore is the read path: latestSnapshot
-  // must not hand back a file that fails validation. Assert that, and assert
-  // the sweep the command performs over existing candidates.
+  // deleted. What actually protects a restore is the READ path: latestSnapshot
+  // must not hand back a file that fails validation. Step 3 changes it to skip
+  // candidates that do not validate instead of trusting the filename, which is
+  // what these three assertions are about.
   const before = latestSnapshot(root, "hub");
   check(before !== path,
     "latestSnapshot never returns a candidate that fails validation, whatever its timestamp",
     `returned ${before}`);
   check(validateSnapshot(path, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION }).ok === false,
     "control: the planted file really is invalid, so the assertion above is not vacuous");
-  check(latestSnapshot(root, "hub") !== path,
-    "so latestSnapshot no longer offers a file that would fail at restore time", String(latestSnapshot(root, "hub")));
+  // and it falls THROUGH to a good one rather than giving up. Without this line
+  // a `latestSnapshot` "fixed" by returning null whenever anything is wrong
+  // passes the assertion above while making every restore impossible.
+  check(before !== null && validateSnapshot(before, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION }).ok === true,
+    "and it returns the newest snapshot that DOES validate, rather than null",
+    String(before));
 }
 
 rmSync(home, { recursive: true, force: true });
@@ -2261,6 +2301,41 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo" } =
 }
 ```
 
+Then replace `latestSnapshot`, so the read path stops trusting the filename:
+
+```js
+/**
+ * The newest snapshot that would actually restore.
+ *
+ * Sorting filenames by timestamp answers "which is newest", not "which is
+ * usable", and the two differ exactly when it matters: the file an operator
+ * reaches for at 2am is the one written by the run that was already failing.
+ * A candidate that does not validate is skipped, so `reeve restore` defaults to
+ * the newest GOOD snapshot rather than the newest file.
+ */
+export function latestSnapshot(root, nwo) {
+  const dir = join(root, slug(nwo));
+  let files;
+  try {
+    files = readdirSync(dir).filter(f => /^\d+\.db$/.test(f))
+      .sort((a, b) => Number(b.split(".")[0]) - Number(a.split(".")[0]));
+  } catch { return null; }
+  const opts = nwo === "hub" ? { kind: "hub", expectVersion: HUB_SCHEMA_VERSION } : { kind: "repo" };
+  for (const f of files) {
+    const p = join(dir, f);
+    if (validateSnapshot(p, opts).ok) return p;
+  }
+  return null;
+}
+```
+
+**Two call sites change meaning, and both change for the better.** `bin/reeve
+restore` now defaults `--from` to the newest snapshot that will actually restore
+(it already handles `null` at `bin/reeve:166`), and `selfaudit.mjs` now counts a
+store whose every snapshot is corrupt as un-backed-up -- which is what it is. Both
+already branch on `null`, so neither needs a change here; `test/backup.test.mjs`
+must stay green, and Step 4 runs it.
+
 Then, inside `snapshotAll`, validate what was just written and refuse to keep a bad one:
 
 ```js
@@ -2280,7 +2355,25 @@ Then, inside `snapshotAll`, validate what was just written and refuse to keep a 
       results.push({ nwo, ...taken });
 ```
 
-Add the imports `HUB_SCHEMA_VERSION` from `./build/hubdb.mjs` and keep `existsSync` (already imported).
+Add the import `HUB_SCHEMA_VERSION` from `./build/hubdb.mjs` and keep `existsSync` (already imported).
+
+**The full import line `src/backup.mjs` must carry after Tasks 8 and 9.** It
+currently imports only `DatabaseSync`, `execFileSync` and
+`{ mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync }`
+from `node:fs`, so every symbol `validateSnapshot`, `latestSnapshot` and
+`restoreHub` reach for below has to be added explicitly. Written out once here
+rather than left to be discovered one `ReferenceError` at a time:
+
+```js
+import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync,
+         writeFileSync, renameSync } from "node:fs";
+import { openHub, hubEvent, HUB_SCHEMA_VERSION } from "./build/hubdb.mjs";
+import { acquireMaintenanceLock, releaseMaintenanceLock, liveWriters } from "./build/locks.mjs";
+import { replayHub, COMPARISON_SET } from "./build/replay.mjs";
+```
+
+`DatabaseSync` and `join` are already imported. Task 9 adds the last three lines;
+Task 8 needs only `HUB_SCHEMA_VERSION`.
 
 - [ ] **Step 4: Run it, then commit**
 
@@ -2309,6 +2402,12 @@ git commit -m "feat(backup): discover and validate the hub snapshot"
 **The decision that makes replay possible without the phase machine.** `hub_event.payload` carries **the row that was written**, canonical, not a description of a change. Replay is therefore a primary-key upsert per kind, and it needs no knowledge of legal transitions — which is what lets it live in PR-A while `phases.mjs` arrives in PR-B. Every writer in PR-B and PR-C must honour it; Task 11's cross-check asserts each authority-bearing table has a replay handler.
 
 - [ ] **Step 1: Append the failing test**
+
+Insert this **before** `test/hub-backup-restore.test.mjs`'s closing
+`rmSync(home, ...)` / `console.log` / `process.exit(fail ? 1 : 0)` group, which
+Task 8 wrote. Pasted after `process.exit` it never executes, and the file goes
+green having tested nothing -- the one failure this whole plan is written to
+avoid. The imports below go at the top of the file with the others.
 
 ```js
 // ── restore refuses while anything is writing ────────────────────────────────
@@ -2379,7 +2478,7 @@ import { acquireSingleton, withWriterLease } from "../src/build/locks.mjs";
   const snapSeq = (() => { const q = new DatabaseSync(snap, { readOnly: true });
     try { return q.prepare("SELECT COALESCE(max(seq),0) s FROM hub_event").get().s; } finally { q.close(); } })();
   const events = db.prepare("SELECT seq,at,kind,task,payload FROM hub_event WHERE seq > ? ORDER BY seq").all(snapSeq);
-  writeFileSync(join(dir, "tail.json"), JSON.stringify(events));
+  writeFileSync(join(home, "tail.json"), JSON.stringify(events));
   db.close();
 
   // DESTROY
@@ -2387,7 +2486,7 @@ import { acquireSingleton, withWriterLease } from "../src/build/locks.mjs";
   for (const s of ["-wal", "-shm"]) rmSync(p + s, { force: true });
   check(!existsSync(p), "the live hub is really gone");
 
-  const durableTail = JSON.parse(readFileSync(join(dir, "tail.json"), "utf8"));
+  const durableTail = JSON.parse(readFileSync(join(home, "tail.json"), "utf8"));
   const r = restoreHub(snap, p, { isAlive: () => false, pid: process.pid, lstart: "me", tail: durableTail });
   check(r.ok === true, "the snapshot restores", JSON.stringify(r));
   // The COMMAND replays the tail. The test must not do it on the command's
@@ -2737,6 +2836,17 @@ Add to `bin/reeve`:
 - **`export-events --hub <file>`** writes `hub_event` as JSONL. This is not optional garnish: `restoreHub`'s `tail` argument is the ONLY way to recover post-snapshot history when the live database is destroyed or too corrupt to open, and without a route that produces such a file the argument is unreachable from the command line. The existing `backup --events` exports the per-repository `event` table and does not cover `hub_event`.
 - The `--hub` restore path prints, when no tail is available and the live file could not be read: `no post-snapshot events were recovered; if you have an export from before the loss, re-run with --tail <file>` — so an operator learns the option exists at the moment it matters rather than from the source.
 
+`bin/reeve` imports none of `DatabaseSync`, `hubPathFor` or `writeFileSync`
+today -- its `node:fs` line is `{ existsSync, mkdirSync, renameSync, readFileSync }`
+and its `paths.mjs` line names only the four per-repo helpers -- so add these
+three first or the case below throws a `ReferenceError` before it reads anything:
+
+```js
+import { DatabaseSync } from "node:sqlite";
+import { hubPathFor } from "../src/paths.mjs";          // add to the existing paths.mjs import
+import { writeFileSync } from "node:fs";                 // add to the existing node:fs import
+```
+
 ```js
   case "export-events": {
     if (!flag("hub")) die("usage: reeve export-events --hub <file>");
@@ -2788,6 +2898,13 @@ git commit -m "feat(hub): restore refuses live writers; destructive drill"
 // reads something the LOOP established.
 import { openHub } from "../src/build/hubdb.mjs";
 import { hubFindings } from "../src/doctor.mjs";
+// The self-audit block at the end of this task needs all of these. The standard
+// harness supplies only check, dir, join, tmpdir, mkdtempSync and rmSync.
+import { selfAudit } from "../src/selfaudit.mjs";
+import { open as openStore } from "../src/db/ops.mjs";
+import { hubPathFor } from "../src/paths.mjs";
+import { DatabaseSync } from "node:sqlite";
+import { mkdirSync, openSync, writeSync, closeSync } from "node:fs";
 /* ... standard harness ... */
 
 {
@@ -3002,10 +3119,17 @@ import { HUB_SCHEMA_VERSION } from "./build/hubdb.mjs";
 
 Wire `hubFindings` into `reeve builder doctor` and its `--json` output. Then extend `selfaudit.mjs` **concretely** — a sentence is not an implementation direction, and the control below is what makes the check mean something:
 
+`selfAudit`'s signature is `selfAudit(db, opts)` and it reads the machine root
+as `opts.home`, so the block below destructures it rather than assuming a bare
+`home` is in scope. Add `import { hubPathFor } from "./paths.mjs";` and
+`import { DatabaseSync } from "node:sqlite";` to `src/selfaudit.mjs`; `existsSync`
+is already imported there.
+
 ```js
-// src/selfaudit.mjs, beside the per-repo integrity walk:
-const hub = hubPathFor(home);
-if (existsSync(hub)) {
+// src/selfaudit.mjs, inside selfAudit(), beside the per-repo integrity walk:
+const home = opts.home ?? null;
+const hub = home ? hubPathFor(home) : null;
+if (hub && existsSync(hub)) {
   const d = new DatabaseSync(hub, { readOnly: true });
   try {
     const r = Object.values(d.prepare("PRAGMA integrity_check").get())[0];
@@ -3019,12 +3143,50 @@ if (existsSync(hub)) {
 ```js
 // in test/hub-doctor.test.mjs:
 {
-  const p = join(dir, "audit.db"); openHub(p).close();
-  check(selfAudit(dir).some(f => /hub integrity_check: ok/.test(f.text)),
-    "self-audit reports the hub's integrity alongside the per-repo stores");
-  const fd = openSync(p, "r+"); writeSync(fd, Buffer.alloc(4096, 0x41), 0, 4096, 8192); closeSync(fd);
-  check(selfAudit(dir).some(f => f.level === "error" && /hub integrity/.test(f.text)),
-    "and reports an ERROR when the hub is corrupt, so a silent audit is not a passing one");
+  // selfAudit(db, opts) -- a DATABASE first, and the machine root as opts.home.
+  // Passing a directory as the db argument makes every existing check call
+  // dir.prepare(...) and return unrelated store findings, so the assertions
+  // below would be scored against an audit that never looked at a hub.
+  const machine = mkdtempSync(join(tmpdir(), "reeve-audit-"));
+  mkdirSync(join(machine, "state"), { recursive: true });
+  const p = hubPathFor(machine); openHub(p).close();
+  mkdirSync(join(machine, "state", "o"), { recursive: true });
+  const repoDb = openStore(join(machine, "state", "o", "r.db"));   // the audit's own store argument
+  const audit = () => selfAudit(repoDb, { nwo: "o/r", home: machine, backupRoot: join(machine, "backups") });
+
+  check(audit().some(f => /hub integrity_check: ok/.test(f.text)),
+    "self-audit reports the hub's integrity alongside the per-repo stores",
+    JSON.stringify(audit().map(f => f.text)));
+
+  // Corrupt a page the database ACTUALLY USES, derived from the file rather
+  // than hardcoded. Offset 8192 is page 3, which is live only because openHub
+  // creates 32 tables and their indexes (67 pages, measured 2026-08-23); a
+  // fixture of two pages or fewer would take the write past the end of the
+  // file, integrity_check would still say `ok`, and the assertion below would
+  // pass having corrupted nothing. See
+  // docs/measured/2026-08-23-sqlite-page-corruption.md.
+  const geom = new DatabaseSync(p, { readOnly: true });
+  const pageSize  = geom.prepare("PRAGMA page_size").get().page_size;
+  const pageCount = geom.prepare("PRAGMA page_count").get().page_count;
+  geom.close();
+  const fd = openSync(p, "r+");
+  writeSync(fd, Buffer.alloc(pageSize, 0x41), 0, pageSize, (pageCount - 1) * pageSize);
+  closeSync(fd);
+
+  // CONTROL, and the durable half of this test: prove the file is really broken
+  // before asserting that the audit says so. Without it, a technique that stops
+  // corrupting anything turns the assertion below into a silent pass.
+  const probe = new DatabaseSync(p, { readOnly: true });
+  let integrity = null;
+  try { integrity = Object.values(probe.prepare("PRAGMA integrity_check").get())[0]; }
+  catch (e) { integrity = `threw: ${e.message}`; }
+  finally { probe.close(); }
+  check(integrity !== "ok", "control: the fixture really is corrupt now", String(integrity));
+
+  check(audit().some(f => f.level === "error" && /hub integrity/.test(f.text)),
+    "and reports an ERROR when the hub is corrupt, so a silent audit is not a passing one",
+    JSON.stringify(audit().map(f => `${f.level}:${f.text}`)));
+  rmSync(machine, { recursive: true, force: true });
 }
 ```
 
@@ -3235,7 +3397,8 @@ The reasoning for removing rather than wiring: the shipped `flakeAssessment` (`s
 
 - [ ] **Step 1: Append the failing test**
 
-Append to `test/profile-validate.test.mjs`:
+Append to `test/profile-validate.test.mjs`, **before** its closing
+`process.exit(fail ? 1 : 0)`:
 
 ```js
 // A key with zero readers is a false affordance: it looks like it configures
@@ -3345,7 +3508,7 @@ Commit body: name the measurement doc, and record that the live `nextlyhq/nextly
 
 - [ ] **Step 1: Freeze migration 1**
 
-A merged migration must never be edited: a store that already applied version 1 will never re-run it, so an edit changes what new machines get and leaves every existing machine behind, silently. Append to `test/hub-schema.test.mjs`:
+A merged migration must never be edited: a store that already applied version 1 will never re-run it, so an edit changes what new machines get and leaves every existing machine behind, silently. Append to `test/hub-schema.test.mjs`, **before** its closing `rmSync` / `process.exit(fail ? 1 : 0)` group:
 
 ```js
 // Migration 1 is frozen. New schema goes in a NEW numbered migration, never

@@ -168,10 +168,11 @@ cannot ship.
 | `threadDetails` wiring | a session the founder started | `feat/thread-details` (to be created) |
 | docs PR #15 | this session | `docs/first-dispatches` @ `reeve-wt/paths` |
 
-**A freeze is in force and was promised to the threadDetails session:**
-`src/daemon.mjs` and `docs/TRACKER.md` are not to be edited until their PR lands.
-A tracker entry is **owed** for: PR #14, the arming, the limits, the three
-dispatches, and Finding 1. Fold it in when the freeze lifts.
+**The daemon freeze was lifted on 23 Aug.** It was promised to a `threadDetails`
+session that never pushed a branch, and PR #19 needed `src/daemon.mjs` to fix the
+P0. `docs/TRACKER.md` is still untouched, and an entry is **owed** for: PR #14,
+the arming, the limits, the three dispatches, Finding 1 and its fix. Fold it in
+once those PRs land.
 
 ---
 

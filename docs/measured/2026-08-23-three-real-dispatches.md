@@ -38,11 +38,14 @@ repaired" guard exists for, and which had never met a real model.
 
 ## What happened
 
-| run | turns | outcome | cost | why nothing shipped |
+| run | turn limit | outcome | cost | why nothing shipped |
 |---|---|---|---|---|
 | 1 | 20 | `failed (max_turns)` | $0.758 | run did not finish |
 | 2 | 40 | `failed (max_turns)` | $0.994 | run did not finish |
 | 3 | 40 | `ok (completed)` | $0.910 | could not commit; refused with 2 uncommitted files |
+
+The column is the LIMIT the run was given, not what it used. Run 3 finished
+inside its 40 with 36 tool calls; runs 1 and 2 reached theirs.
 
 **The fix was correct in all three.** Byte-identical each time:
 
@@ -96,7 +99,7 @@ Run 3 attempted `git add` or `git commit` **seven times**. Six produced:
 fatal: Unable to create '…/run-1-mt5w2gbe-9y5i/.git/index.lock': Operation not permitted
 ```
 
-The worker then spent **thirteen consecutive turns** (turns 10–22 of 36)
+The worker then spent **thirteen consecutive tool calls** (10–22 of its 36)
 diagnosing it: `ls -la .git/index.lock`, `ls -ld .git; whoami; id`,
 `touch .git/testwrite`, `git rev-parse --git-dir --git-common-dir`, `ls -lO .git`,
 `xattr -l .git`, `ls -le .git`, `mount`. It was not flailing. It was correctly
@@ -212,9 +215,9 @@ a human to write, produces a worker with no `Bash(node:*)`. It is not left with
 
 What the fixture proved is that THIS fixture lacked pnpm, not that a bare name is
 ever the only route. The gap that remains is narrower than it first looked: the
-prompt tells the worker never to use an absolute path, so where the language is
-unrecognised AND no command is declared, the one grant left is the one it is
-instructed not to take. Found by walking into it: runs 1 and 2 used that fixture, which is why
+prompt tells the worker never to use an absolute path, so the interpreter is the
+only grant left when the language is unrecognised AND no `packageManager` is
+declared AND no command is declared. Any one of those three fills the gap. Found by walking into it: runs 1 and 2 used that fixture, which is why
 `node` was refused in them. Run 3 declared `typescript` and had `Bash(node:*)`.
 
 reeve's own detection never emits `javascript` (`profile/detect.mjs:55` maps any
@@ -248,8 +251,8 @@ one `worker_run` row survives. The claim cannot be re-verified and should not be
 carried forward.
 
 What is measurable, from run 3's surviving transcript: **36 tool calls, 18
-errors, 8 of them "This command requires approval"** — and 13 of those 36 turns
-spent on Finding 1's impossible instruction.
+errors, 8 of them "This command requires approval"** — and 13 of those 36 tool
+calls spent on Finding 1's impossible instruction.
 
 The earlier reading also mistook this for opacity in the refusal message. On the
 evidence that survives, the worker was not failing to adapt. It was diagnosing a

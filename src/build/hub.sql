@@ -1,0 +1,16 @@
+-- The hub store. One file for the whole builder.
+--
+-- Every table here obeys the same rules, and they are rules rather than style:
+--   STRICT                 -- a TEXT written into an INTEGER column is an error,
+--                             not a silent affinity conversion
+--   WITHOUT ROWID          -- for every composite identity, so the primary key
+--                             IS the storage and a duplicate cannot hide
+--   CHECK on every enum    -- the set of legal values lives with the data, not
+--                             only in the code that happens to write it
+--   NOT NULL on identity   -- a null in a key is a row that matches nothing
+--   *_at INTEGER           -- unixepoch() seconds, never a TEXT date
+--   numeric GitHub ids     -- repo_id/actor_id/app_id are immutable; the
+--                             human-readable name sits beside them as a snapshot
+--
+-- Pragmas are set in hubdb.mjs rather than here, because foreign_keys cannot be
+-- changed inside a transaction and this file runs inside one.

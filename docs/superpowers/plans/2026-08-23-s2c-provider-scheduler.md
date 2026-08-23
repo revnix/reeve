@@ -49,10 +49,18 @@ Every reference to `src/daemon.mjs` names the **anchor text to search for** firs
 - **Run the full suite before every commit**, skipping the one file the next sentence explains:
 
   ```bash
+  fail=0
   for f in test/*.test.mjs; do
     case "$f" in */escape.test.mjs) continue;; esac
-    $N "$f" >/dev/null || echo "FAILED $f"
+    $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
   done
+  # NONZERO on red. `|| echo` turns a failing node process into a SUCCESSFUL
+  # command, so this loop exited 0 with any number of red files -- and this is
+  # the mandatory pre-commit and close-out gate, so an executor checking the
+  # command status commits and publishes a broken implementation on a suite that
+  # just failed. The flag is set inside the loop because a pipeline's status is
+  # its last command's, and the last command here is `done`.
+  [ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
   ```
 
   `escape.test.mjs` writes decoys into the shared `~/.reeve/canary/` tree the live daemon reads. **Measured 2026-08-22 on `9dbd3a0`: 59 test files exist; 58 were run and all 58 passed.** `test/escape.test.mjs` was NOT run, because it writes decoy files into the shared `~/.reeve/canary/` directory that the live daemon also reads; run it once on a quiet machine to complete the baseline. That run had `node_modules` absent, and a green file can hide a skip, so skips were counted rather than assumed: exactly two files carry one `SKIP` each (`policy-self-exclusion`, `supervisor-contract`). That 58-file pass is the base every task is measured against, and it is the same base for all three PRs — never a chained comparison against the previous task.
@@ -256,6 +264,25 @@ for (const rl of (ctx.pendingRateLimits ?? []).splice(0)) {
 ```
 
 ```js
+// AND on the halt paths, which return before this sweep ever runs.
+// `src/daemon.mjs:554` (halted at startup) and `:578` (halted mid-tick) on
+// `16769e7` both return early, so a guardian request queued on the previous tick
+// survives a deliberate halt -- and expiry does not free it, because the daemon
+// process holding it is still alive and its identity still matches. The
+// scheduler then blocks builder admission on behalf of a guardian the operator
+// has explicitly stopped, which is the scheduler acting against its own purpose.
+//
+// So both halt returns cancel this repository's queued guardian requests first,
+// fail-open like every other hub touch on this path:
+//
+//     if (ctx.hub && repoId != null)
+//       try { for (const q of queuedGuardianRequests(ctx.hub, { repoId }))
+//               cancelQueued(ctx.hub, { owner: "guardian", repoId, runRef: q.run_ref }); }
+//       catch { /* an unreadable hub never blocks the halt */ }
+//
+// A halted guardian wants nothing dispatched, so every one of its requests is
+// stale by definition -- there is no live-set question to ask here.
+
 // The stale-request sweep. Unlike the drains above, this one DOES belong after
 // `decisions`: it decides what is still live FROM the tick's own decisions, and
 // it needs `repoId` resolved.
@@ -738,7 +765,20 @@ git commit -m "feat(provider): transactional admission for the shared subscripti
 - Test: `test/provider-guardian.test.mjs` (new)
 
 **Interfaces:**
-- Consumes: `claimProvider`, `releaseProvider`, `noteRateLimit` (Task 21); `hubPathFor`, `openHub` (PR-A).
+- Consumes: `claimProvider`, `releaseProvider`, `noteRateLimit`, **`queuedGuardianRequests`, `cancelQueued`, `bindProviderLease`, `heartbeatProvider`** (Task 21); `hubPathFor`, `openHub` (PR-A); **`isSameProcess`** from `src/supervisor.mjs`.
+  All eight are **production** imports in `src/daemon.mjs`, and the four in bold
+  were reached by this task's own snippets while the Consumes line named only the
+  first three — so the first healthy-hub sweep or claim is a ReferenceError
+  rather than a scheduled worker. Listing only what the test module happens to
+  import is how that gap survived: the test file's imports say nothing about what
+  the daemon can see.
+
+```js
+// src/daemon.mjs, joining the existing imports
+import { claimProvider, releaseProvider, noteRateLimit, queuedGuardianRequests,
+         cancelQueued, bindProviderLease, heartbeatProvider } from "./provider.mjs";
+import { isSameProcess } from "./supervisor.mjs";
+```
 - Produces: `ctx.hub` — an opened hub handle, or `null`. Defaults to opening `hubPathFor(reeveHome())` **if the file exists**, and to `null` otherwise. `ctx.providerClaim` / `ctx.providerRelease` override the seam in tests. `ctx.hub === null` is a normal, supported state.
 
 **Founder decision 2026-08-22: the guardian fails OPEN.** When the hub is missing, locked, or corrupt, the guardian dispatches exactly as it does today and escalates **`the provider scheduler is unreadable; dispatching unscheduled`** — the guardian's identity, because this escalation lands in the guardian's own store and a `builder:`-grammar subject there reaches nobody. The builder fails closed. The scheduler exists to restrain the builder, and must never become a new way to silence the watchman: a watchman that has stopped looking is indistinguishable from one reporting nothing wrong. This also keeps the existing guardian test files green untouched, which is what §14 asks of every new ctx key, and it matches the shipped `ctx.reviewIngest !== false` shape (search `ctx.reviewIngest !== false`; `src/daemon.mjs:597,1361,1368` on `16769e7`).
@@ -1030,6 +1070,18 @@ before dispatch`). **This task does not move or duplicate the halt check:**
       // claim taken before them is held and abandoned once per skipped PR, until
       // expiry -- starving the builder for reasons unrelated to quota. The only
       // thing between this block and the spawn must be the spawn.
+      // HOISTED, and this is the third revision of this instruction: the rule
+      // moved twice while the declaration stayed here. `abandonClaim` is a
+      // `const` closing over this `let`, and the refusal `continue`s that must
+      // call it -- no-root-cause, demonstrated-flake, prompt-build,
+      // worktree-acquisition -- all sit ABOVE this line. Inserting the calls as
+      // instructed therefore hit the temporal dead zone or could not name
+      // `lease` at all, so the withdrawal never happened and a previously queued
+      // request blocked builder admission indefinitely.
+      //
+      // Both bindings go immediately after the per-PR loop's opening, above the
+      // first refusal. `abandonClaim`'s body is unchanged; only its position and
+      // the position of `lease` move, so nothing below needs editing.
       let lease = null;
       // Resolved once per tick, not per PR. A missing numeric id is a
       // configuration error, not a reason to write a colliding lease row.
@@ -1187,6 +1239,8 @@ before dispatch`). **This task does not move or duplicate the halt check:**
       // already safe before a claim exists -- its release is guarded on
       // `lease != null` -- so the rule is uniform: **every `continue` below the
       // evaluation calls it**, whether or not a lease was taken.
+      // Declared with `lease`, at the top of the per-PR loop -- NOT here beside
+      // the claim, which is what put it below the refusals that call it.
       const abandonClaim = (why) => {
         if (lease != null) {
           const ref = { owner: "guardian", repoId, runRef: `pr:${e.pr}` };
@@ -1241,11 +1295,37 @@ exact value that implies:
   const ctx = { ...fixtureCtx(dir), hub: db, lstart: LSTART, heartbeatMs: 5,
     providerHeartbeat: (h, { id }) => { beats++; return heartbeatProvider(h, { id, now: BASE + 60 }); },
     spawnWorker: async (opts) => { opts?.onSpawn?.(SPAWNED); await new Promise(r => setTimeout(r, 40)); /* ... */ } };
-  // ...
+  // CAPTURED INSIDE spawnWorker, after the interval has fired. `tick` releases
+  // and DELETES the lease before it returns, so a query after `await tick(ctx)`
+  // inspects nothing -- the row it is meant to check is gone. The stub is the
+  // only place the lease is both held and heartbeaten.
+  //
+  // `BASE` and `LEASE_SECONDS` are declared here too. The previous revision
+  // named all three and declared none, so the block was a ReferenceError before
+  // it asserted anything.
+  const BASE = 1_800_000_000, LEASE_SECONDS = 300;
+  let beats = 0, heldAfter = null;
+  const ctx = { ...fixtureCtx(dir), hub: db, lstart: LSTART, heartbeatMs: 5,
+    providerClaim: (h, a) => claimProvider(h, { ...a, now: BASE }),
+    providerHeartbeat: (h, { id }) => { beats++; return heartbeatProvider(h, { id, now: BASE + 60 }); },
+    spawnWorker: async (opts) => {
+      opts?.onSpawn?.(SPAWNED);
+      // Long enough for at least one 5ms interval to fire, and the wait is on
+      // the OBSERVED beat rather than a fixed sleep -- a fixed one is either
+      // flaky on a loaded machine or slow on every other.
+      for (let i = 0; i < 400 && beats === 0; i++) await new Promise(r => setTimeout(r, 5));
+      heldAfter = db.prepare("SELECT * FROM provider_lease WHERE status='held'").get();
+      return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", model: "m" };
+    } };
+  await tick(ctx);
   check(beats > 0, "the run heartbeat renews the provider lease while the worker runs", String(beats));
-  check(heldAfter.expires_at === BASE + 60 + LEASE_SECONDS,
+  check(heldAfter?.expires_at === BASE + 60 + LEASE_SECONDS,
     "and the lease expires from the heartbeat's clock, not the claim's",
-    `${heldAfter.expires_at} vs ${BASE + 60 + LEASE_SECONDS}`);
+    `${heldAfter?.expires_at} vs ${BASE + 60 + LEASE_SECONDS}`);
+  // CONTROL: the claim's own clock is NOT what set it, or the assertion above is
+  // satisfied by a lease that was never renewed and happens to line up.
+  check(BASE + 60 + LEASE_SECONDS !== BASE + LEASE_SECONDS,
+    "control: the heartbeat clock and the claim clock give different expiries");
 ```
 
 Deterministic, and it still fails on the implementation that matters: with
@@ -1437,10 +1517,16 @@ lstart: readStart(process.pid),
 - [ ] **Step 4: Run the FULL guardian suite; this is the PR that could break it**
 
 ```bash
+fail=0
 for f in test/*.test.mjs; do
   case "$f" in */escape.test.mjs) continue;; esac   # writes into the live daemon's ~/.reeve/canary
-  $N "$f" >/dev/null || echo "FAILED $f"
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
 done
+# NONZERO on red. `|| echo` turns a failing node process into a SUCCESSFUL
+# command, so this loop exited 0 with any number of red files -- and it is a
+# mandatory pre-commit gate, so an executor checking the command status
+# commits on a suite that just failed.
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
 ```
 
 Expected: no `FAILED` lines. Any pre-existing guardian file that goes red here means the claim is not defaulting correctly, not that the file needs editing.
@@ -2146,11 +2232,21 @@ check(VERDICT_CLAUSES.includes("hold"),
   const call = daemonSrc.match(/\(ctx\.evaluate \?\? evaluatePr\)\(\{[^}]*\}/s)?.[0] ?? "";
   check(/\bhub\b/.test(call),
     "and the DAEMON passes ctx.hub into it, or every builder PR reads UNKNOWN", call);
-  check(/isBuilderPr|builderPr/.test(call),
-    "and passes the builder classification the clause branches on", call);
-  // `headRef` is NOT accepted as evidence of the classification any more. It is
-  // already in that call for unrelated reasons, so the old alternation passed
-  // against an implementation that had no classifier at all.
+  // The classification is derived INSIDE `evaluatePr`, so the daemon's call site
+  // cannot carry it -- the daemon has no `headRef` and no author metadata at
+  // that point; fetching them is what `evaluatePr` is for. Requiring the string
+  // there made this assertion unsatisfiable by a correct implementation and
+  // satisfiable only by adding a redundant parameter to appease a regex. Assert
+  // the composition where it actually happens:
+  const prSrcHold = readFileSync(srcFile("../src/pr.mjs"), "utf8");
+  check(/\bisBuilderPr\s*\(/.test(prSrcHold),
+    "evaluatePr derives the classification by calling isBuilderPr", "");
+  check(/holdClause\s*\([^)]*isBuilderPr/s.test(prSrcHold),
+    "and passes its RESULT into holdClause, rather than deriving it twice", "");
+  // CONTROL: the same searches find nothing for a name that was never added, so
+  // a regex that matches anything is not what made the two above pass.
+  check(!/\bthisClassifierDoesNotExist\s*\(/.test(prSrcHold),
+    "control: the scan can fail");
 
   // BEHAVIOURAL, both classifiers, because a text match over the call site
   // cannot tell which of the two branches exists. §9.2 classifies a builder PR
@@ -2398,10 +2494,16 @@ Then write `docs/measured/2026-08-23-guardian-claims-provider.md` around that ra
 - [ ] **Step 2: Full suite, and the S2 Verify clause re-checked end to end**
 
 ```bash
+fail=0
 for f in test/*.test.mjs; do
   case "$f" in */escape.test.mjs) continue;; esac   # mutates the live daemon's ~/.reeve/canary
-  $N "$f" >/dev/null || echo "FAILED $f"
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
 done
+# NONZERO on red. `|| echo` turns a failing node process into a SUCCESSFUL
+# command, so this loop exited 0 with any number of red files -- and it is a
+# mandatory pre-commit gate, so an executor checking the command status
+# commits on a suite that just failed.
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
 ```
 
 Then walk Task 20's Verify table again with PR-C's two rows now filled: *guardian FIX_CI claims and releases a provider lease* → Task 22; *guardian hub connection allowlist test* → Task 23. Every row must name a test file that exists and is green.

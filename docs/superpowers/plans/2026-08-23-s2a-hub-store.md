@@ -38,6 +38,7 @@ Their review history — all 54 findings and what each changed — is `2026-08-2
 
   The glob must not simply be `test/*.test.mjs`: that includes `escape.test.mjs`, which writes decoys into the shared `~/.reeve/canary/` tree the live daemon reads and probes the login keychain. Advertising a command that contradicts the warning beside it means the warning loses. **Measured 2026-08-22 on `9dbd3a0`: 59 test files exist; 58 were run and all 58 passed.** `test/escape.test.mjs` was NOT run, because it writes decoy files into the shared `~/.reeve/canary/` directory that the live daemon also reads; run it once on a quiet machine to complete the baseline. That run had `node_modules` absent, and a green file can hide a skip, so skips were counted rather than assumed: exactly two files carry one `SKIP` each (`policy-self-exclusion`, `supervisor-contract`). That 58-file pass is the base every task is measured against, and it is the same base for all three PRs — never a chained comparison against the previous task.
 - **"Append to `test/x.test.mjs`" always means "insert before that file's terminator."** Every test file in this repository ends with a cleanup line and `process.exit(fail ? 1 : 0)`. A block pasted after `process.exit` never runs, and the file still reports green -- the worst available outcome, because it is indistinguishable from a passing test. Each append step below names its terminator explicitly; where one does not, insert before the final `rmSync`/`console.log`/`process.exit` group.
+- **Line numbers are measured against `16769e7`** (the `main` this plan was last checked on) and every one is paired with a searchable string. If a number does not match, the file has moved under it — search the string, and do not assume the surrounding reasoning is stale. PR #14 shifted nine of them by one line on 2026-08-23, and one citation (`ctx.reviewIngest`) had been wrong by eighty lines since before that.
 - **Conventional Commits**, lowercase, `type(scope): subject`, ≤72 characters. **No attribution trailer of any kind.** Never `--no-verify`.
 - Every change carries a what/why comment in the style of the file it lands in. Comments never reference tasks, plans, findings, or this document.
 - **No raw SQL outside `src/db/` and `src/build/`.** `hubdb.mjs` owns every hub statement the way `ops.mjs` owns every guardian statement.
@@ -73,7 +74,7 @@ Do not re-derive any of these. Each is recorded under `docs/measured/`.
 Recorded so no executor re-litigates them.
 
 1. **S2 splits into three PRs**, in the order A → B → C, with the provider scheduler last because it is the only one that changes the running guardian.
-2. **The guardian fails OPEN when hub.db is unreadable at provider-claim time.** It dispatches exactly as it does today and escalates `builder:provider:hub-unreadable`. The builder fails closed. The scheduler restrains the builder; it must never become a new way to silence the guardian. This matches the `ctx.reviewIngest !== false` opt-out shape §14 asks new ctx keys to follow (`src/daemon.mjs:516,1263,1270`), so existing guardian tests stay green untouched.
+2. **The guardian fails OPEN when hub.db is unreadable at provider-claim time.** It dispatches exactly as it does today and escalates `builder:provider:hub-unreadable`. The builder fails closed. The scheduler restrains the builder; it must never become a new way to silence the guardian. This matches the `ctx.reviewIngest !== false` opt-out shape §14 asks new ctx keys to follow (search `ctx.reviewIngest !== false`; `src/daemon.mjs:597,1361,1368` on `16769e7`), so existing guardian tests stay green untouched.
 3. **`ci.flakePatterns` is REMOVED**, and the live `nextlyhq/nextly.json` is stripped in the same change. Measured, with a positive control, in `docs/measured/2026-08-22-flakepatterns-has-no-readers.md`. Removing it from `FIELDS` alone would make the live profile invalid and kill every daemon start.
 4. **`repo_gate_state` ships in S2 with a real writer**: the table, a pure `gateStateFrom()` derivation with unit tests over drifted/absent/stale inputs, and a `build run` tick that calls it through an injected `ctx.fetchGateState`. No live GitHub call in S2. S8 supplies the fetcher and clause U4, the reader.
 
@@ -2431,7 +2432,7 @@ Then, inside `snapshotAll`, validate what was just written and refuse to keep a 
 
 ```js
       // `keep: Infinity` because `snapshot()` prunes BEFORE it returns
-      // (`src/backup.mjs:47`), so a snapshot that later fails validation has
+      // (search `prune(dir, keep);` -- `src/backup.mjs:45` on `16769e7`), so a snapshot that later fails validation has
       // already evicted the oldest good one. A run of invalid snapshots would
       // then erase every usable recovery point, one per attempt, while each
       // failure looked like it deleted only itself. Pruning happens below,
@@ -3463,7 +3464,7 @@ is already imported there.
 matter, and an earlier revision of this block got both wrong. Measured on
 `e41cd28`: `selfaudit.mjs` contains **zero** `level: OK` returns — every check
 returns `{ id, level, why, detail }` or nothing, and `selfAudit` ends with
-`.filter(Boolean)`. `src/daemon.mjs:1334` then treats **every** returned item as
+`.filter(Boolean)`. `src/daemon.mjs:1335` on `16769e7` (search `ctx.selfAudit !== false`) then treats **every** returned item as
 a fault:
 
 ```js

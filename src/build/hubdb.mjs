@@ -19,6 +19,10 @@ import { canonical } from "../db/ops.mjs";
 // hand callers runnable `up` functions.
 import { createHash } from "node:crypto";
 
+// ONE module-level schema URL. Both `openHub`'s migration 1 and `HUB_TABLES`
+// read it; two spellings of the same path is how they drift.
+const SCHEMA_PATH = new URL("./hub.sql", import.meta.url);
+
 export const HUB_SCHEMA_VERSION = 1;
 
 /**
@@ -26,7 +30,7 @@ export const HUB_SCHEMA_VERSION = 1;
  * and records itself. Never edit a merged entry -- add the next number.
  */
 const MIGRATIONS = [
-  { version: 1, up: (db) => db.exec(readFileSync(new URL("./hub.sql", import.meta.url), "utf8")) },
+  { version: 1, up: (db) => db.exec(readFileSync(SCHEMA_PATH, "utf8")) },
 ];
 
 export function openHub(path) {
@@ -196,3 +200,41 @@ export function migrationPlan() {
     implHash: createHash("sha256").update(String(m.up)).digest("hex"),
   }));
 }
+
+/**
+ * The tables a snapshot at a given schema version is required to carry.
+ *
+ * Migration 1's inventory is derived from `hub.sql`, plus `schema_version` --
+ * which is NOT in that file and cannot be, because `openHub` creates it directly
+ * before any migration runs, migration 1 needing somewhere to record itself.
+ * hub.sql declares 31 tables and a live database has 32.
+ *
+ * **Every later migration adds its own entry**, built from the previous version
+ * plus whatever it creates. That is the whole maintenance burden, and it is
+ * mechanical.
+ */
+const V1 = Object.freeze([
+  "schema_version",
+  ...[...readFileSync(SCHEMA_PATH, "utf8")
+        .matchAll(/CREATE TABLE IF NOT EXISTS ([a-z_]+)\s*\(/g)].map(m => m[1]),
+]);
+export const TABLES_AT = Object.freeze({ 1: V1 });
+
+/**
+ * The CURRENT schema's tables: what snapshot validation compares a
+ * same-version snapshot against, and what Task 11 compares the live database to.
+ *
+ * Derived from `TABLES_AT`, NOT from `hub.sql`. hub.sql is frozen as migration 1
+ * by design and its freeze test enforces that, so a constant read straight from
+ * it can never discover a table migration 2 creates -- it would sit at the v1
+ * inventory forever, Task 11's live-set equality would fail the moment migration
+ * 2 landed, and the fallback validation would omit exactly the new
+ * authority-bearing table.
+ */
+export const HUB_TABLES = TABLES_AT[HUB_SCHEMA_VERSION];
+// LOUD, at module load. A migration added without its inventory would otherwise
+// make HUB_TABLES undefined, and every `HUB_TABLES.filter(...)` in the backup
+// path would throw somewhere far away from the omission that caused it.
+if (!HUB_TABLES)
+  throw new Error(`TABLES_AT has no inventory for schema version ${HUB_SCHEMA_VERSION}; ` +
+                  `every migration that adds a table adds its entry there`);

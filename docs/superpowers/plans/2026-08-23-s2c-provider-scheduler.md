@@ -161,7 +161,15 @@ Each task names any imports it needs **beyond** these.
   - `releaseProvider(db, { id, force })` — deletes the row. **A release refused because a restore holds `maintenance_lock` must not be dropped**: `assertWritable` throws, and the caller retries on the next tick with the lease id recorded in memory; the caller keeps the id and retries next tick, and the production snippet must actually do that rather than `catch {}`. There is deliberately **no durable marker**: an earlier draft added `provider_lease.refused_release`, and it cannot be written in the one case it represents — `assertWritable` blocks that write while the lock is held. It is also unnecessary, because `restoreHub` clears every process-scoped row (`provider_lease` included) from the restored file, so a lease held across a restore does not survive it. An abandoned restore is covered by ordinary expiry.
   - `heartbeatProvider(db, { id, now })`, `reapProviderLeases(db, { isAlive, now })`
   - `bindProviderLease(db, { id, pid, lstart })` — re-binds a held row from the daemon to the spawned worker.
-  - `cancelQueued(db, { owner, repoId, runRef })` — removes a `queued` request whose dispatch is no longer going to happen. A guardian that queues and then finds the PR closed, the head moved, or the tick abandoned must withdraw: a queued guardian request **blocks the next builder admission by design**, so an abandoned one starves the builder indefinitely and looks exactly like a busy guardian. Called on every path out of the dispatch block that did not launch.
+  - `cancelQueued(db, { owner, repoId, runRef })` — removes a `queued` request whose dispatch is no longer going to happen. **Called on every path out of the dispatch block that did not launch, AND swept at the top of each tick**: a queued request whose PR has since closed, whose head moved, or whose task simply is not in this tick's decisions never re-enters that block at all, so a per-path call alone leaves it queued forever — and a queued guardian request blocks the next builder admission by design. The sweep compares live queued rows against the run refs this tick actually decided on, and cancels the rest.
+
+```js
+// top of the tick, after evaluations are computed:
+const live = new Set(evaluations.map(e => `pr:${e.pr}`));
+for (const q of hub.prepare(
+  "SELECT id, run_ref FROM provider_lease WHERE owner='guardian' AND status='queued'").all())
+  if (!live.has(q.run_ref)) cancelQueued(hub, { owner: "guardian", repoId, runRef: q.run_ref });
+``` A guardian that queues and then finds the PR closed, the head moved, or the tick abandoned must withdraw: a queued guardian request **blocks the next builder admission by design**, so an abandoned one starves the builder indefinitely and looks exactly like a busy guardian. Called on every path out of the dispatch block that did not launch.
   - **The lease is bound to the WORKER, not the daemon.** `claimProvider` records the daemon's pid+lstart at request time because the worker does not exist yet; the dispatch path then re-binds the row to the spawned process (`pid`, `lstart` from the same fail-closed `onSpawn` that records the run) via `bindProviderLease(db, { id, pid, lstart })`. Without that, liveness is asked about a long-lived daemon that is always alive, so a worker that dies takes its slot with it until expiry, and `reapProviderLeases` — whose whole basis is pid+lstart death — can never fire.
   - **Preemption at a safe boundary** (§10.4, `builder.provider.preemptAtBoundary`, default true): when a guardian request is `queued` and every slot is held by builder leases, the builder marks the youngest builder lease `preempt_requested` rather than revoking it. **The column is `provider_lease.preempt_requested`, added by S2-A's migration 1** (`INTEGER NOT NULL DEFAULT 0 CHECK (preempt_requested IN (0,1))`), and it is listed in this plan's consumed-interfaces table: a flag with nowhere to live is a contract with no storage. The builder loop reads that flag **at phase boundaries only** and releases there; nothing is ever killed mid-phase. S2 ships the **column** (S2-A's migration 1) and the **write** (this plan, with a test asserting the flag is set when a guardian is queued and every slot is builder-held). It does **not** ship a reader: no task here modifies `src/doctor.mjs`, and claiming a doctor read that no task implements is exactly the read-never-written shape this programme keeps finding. The builder loop that acts on the flag at a phase boundary is S4's, and S2-A's H-5 finding is where a doctor read belongs when it arrives. Declared gap, not a silent one.
   - `noteRateLimit(db, { signature, now, cooldownSeconds })` — sets `cooldown_until`, `last_429_at`, `last_signature`.
@@ -176,7 +184,15 @@ Each task names any imports it needs **beyond** these.
 //
 // The asymmetry between the two owners is deliberate. The guardian is the
 // watchman; the builder is the thing being restrained.
-/* ... standard harness ... */
+/* ... standard harness, plus: ... */
+import { openHub } from "../src/build/hubdb.mjs";
+import { claimProvider, releaseProvider, noteRateLimit, reapProviderLeases,
+         cancelQueued, bindProviderLease } from "../src/provider.mjs";
+import { acquireMaintenanceLock } from "../src/build/locks.mjs";
+import { spawn } from "node:child_process";
+import { mkdirSync, readdirSync } from "node:fs";
+const SRC = new URL("../src", import.meta.url).pathname;
+
 const ALIVE = () => true, DEAD = () => false;
 // fixtureCtx is copied from test/worker-contract.test.mjs, whose context carries
 // no lstart -- and this plan makes claimProvider REFUSE with 'no-identity' when
@@ -308,7 +324,18 @@ const LSTART = "Sat Aug 23 09:00:00 2026";
   // every single-process assertion above passes against a read-then-write
   // implementation with no transaction at all.
   const p = join(dir, "race.db");
-  openHub(p).close();
+  {
+    // ONE free slot, explicitly. On the documented defaults (limit 2, reserved 1)
+    // the alternating owners can admit two guardians, or a builder plus a
+    // guardian, so "exactly one winner" is not a property of the code — it is a
+    // property of the numbers, and the assertion would be flaky rather than
+    // wrong. limit 1 / reserved 0 makes one winner the only correct outcome.
+    const seed = openHub(p);
+    seed.exec(`INSERT INTO provider_state(provider,concurrency_limit,guardian_reserved)
+               VALUES('claude',1,0)
+               ON CONFLICT(provider) DO UPDATE SET concurrency_limit=1, guardian_reserved=0`);
+    seed.close();
+  }
   const worker = join(dir, "provider-race-worker.mjs");
   writeFileSync(worker, `
 import { existsSync, writeFileSync } from "node:fs";
@@ -380,17 +407,39 @@ import { tick } from "../src/daemon.mjs";
 import { OUTCOMES } from "../src/supervisor.mjs";   // the normalised rate-limit outcome
 import { openHub } from "../src/build/hubdb.mjs";
 import { claimProvider } from "../src/provider.mjs";
-/* ... standard harness, plus the fixture ctx from test/worker-contract.test.mjs ... */
+/* ... standard harness, plus: ... */
+import { OUTCOMES } from "../src/supervisor.mjs";
+
+// The fixture ctx from test/worker-contract.test.mjs, and the three helpers this
+// file needs that neither the harness nor that file supplies. Named here because
+// "the fixture from X" does not carry them, and an executor discovers that only
+// when the test throws ReferenceError.
+const logLines = [];
+const fixtureCtx = (dir) => ({ /* ...as in test/worker-contract.test.mjs... */
+  log: (_p, line) => logLines.push(String(line)) });
+const loggedAny  = (_ctx, re) => logLines.some(l => re.test(l));
+const throwingHub = () => ({ prepare: () => { throw new Error("hub unreadable"); },
+                             exec:    () => { throw new Error("hub unreadable"); } });
+const escalatedWith = (ctx, why) =>
+  [...(ctx.escalations?.keys?.() ?? [])].some(k => k === why || k.includes(why));
 
 // ── the ordinary path: claim, dispatch, release ──────────────────────────────
 {
   const db = openHub(join(dir, "h.db"));
-  let dispatched = 0, heldDuringDispatch = -1, ownerDuringDispatch = null;
+  let dispatched = 0, heldDuringDispatch = -1, ownerDuringDispatch = null, boundPidDuringDispatch = null;
   const ctx = { ...fixtureCtx(dir), hub: db, lstart: LSTART,
-    spawnWorker: async () => {
+    spawnWorker: async (opts) => {
       dispatched++;
+      // Invoke onSpawn the way the real supervisor does, so the rebinding is
+      // exercised. A fixture that ignores its arguments passes while
+      // bindProviderLease is never called, and the lease stays bound to the
+      // long-lived daemon -- whose liveness is always true, so the reaper can
+      // never free the slot.
+      opts?.onSpawn?.({ pid: 31337, lstart: "Sat Aug 23 09:30:00 2026" });
       heldDuringDispatch = db.prepare("SELECT count(*) c FROM provider_lease WHERE status='held'").get().c;
-      ownerDuringDispatch = db.prepare("SELECT owner FROM provider_lease WHERE status='held'").get()?.owner ?? null;
+      const held = db.prepare("SELECT owner, pid, lstart FROM provider_lease WHERE status='held'").get();
+      ownerDuringDispatch = held?.owner ?? null;
+      boundPidDuringDispatch = held?.pid ?? null;
       return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", model: "m" };
     } };
   await tick(ctx);
@@ -405,6 +454,9 @@ import { claimProvider } from "../src/provider.mjs";
     JSON.stringify(db.prepare("SELECT * FROM provider_lease").all()));
   check(ownerDuringDispatch === "guardian",
     "and while it was held it recorded the guardian as owner", String(ownerDuringDispatch));
+  check(boundPidDuringDispatch === 31337,
+    "and was re-bound to the SPAWNED worker's pid, not the daemon's, so a dead worker frees its slot",
+    String(boundPidDuringDispatch));
   db.close();
 }
 
@@ -519,8 +571,15 @@ In `src/daemon.mjs`, immediately after the halt check at line 712:
         db.prepare("SELECT repo_id FROM inbox WHERE repo_id IS NOT NULL ORDER BY id DESC LIMIT 1").get()?.repo_id ?? null;
       const repoId = ctx.repoId ?? repoIdFor(ctx.db);
       if (ctx.hub && repoId == null) {
-        escalations.set("the repository numeric id is missing from the profile; provider leases cannot be scoped", 1);
-      } else if (ctx.hub) {
+        // REFUSE, do not merely note it. Falling through spends model quota
+        // under no lease at all -- the one thing the scheduler exists to make
+        // impossible -- and does it silently, because the escalation reads like
+        // the work was stopped.
+        escalations.set("the repository numeric id is unknown; provider leases cannot be scoped", 1);
+        log(logPath, `  #${e.pr}: NOT dispatching — cannot scope a provider lease without the repository id`);
+        continue;
+      }
+      if (ctx.hub) {
         try {
           const got = (ctx.providerClaim ?? claimProvider)(ctx.hub, {
             // repo_id is IN the live-request unique key, so a null makes every
@@ -528,8 +587,11 @@ In `src/daemon.mjs`, immediately after the halt check at line 712:
             // `evaluatePr` does not currently return it; resolve it once per tick
             // from the profile's numeric id and fail closed if it is absent,
             // rather than writing a row that collides by construction.
+            // isSameProcess(pid, storedStart) is the shipped predicate
+            // (src/supervisor.mjs:67). `pidAlive` was a name this plan invented
+            // and nothing exports it, so the claim argument would have thrown.
             owner: "guardian", repoId, runRef: `pr:${e.pr}`,
-            pid: process.pid, lstart: ctx.lstart, isAlive: pidAlive,
+            pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess,
           });
           if (!got.ok) {
             log(logPath, `  #${e.pr}: NOT dispatching — provider ${got.reason}` +
@@ -613,7 +675,12 @@ And on a rate-limit exit, before the `finally` releases:
       // on a machine where it exists, failing open in silence.
       try {
         if (!this._hub) throw new Error("not opened yet");
-        this._hub.prepare("SELECT 1").get();
+        // A permitted statement, and one that actually touches the file: the
+        // authorizer denies bare `SELECT 1` (no table, so no READ to allow), and
+        // a probe the guest rejects makes the getter reopen on every access. It
+        // must also READ, because a handle to a deleted inode answers a
+        // no-op successfully -- reading a real table is what detects the swap.
+        this._hub.prepare("SELECT count(*) c FROM provider_state").get();
         return this._hub;
       } catch {
         try { this._hub = openHubAsGuest(hp); } catch { this._hub = null; }
@@ -684,6 +751,7 @@ git commit -m "feat(daemon): claim provider quota before dispatch, fail open"
 // would notice.
 import { openHubAsGuest } from "../src/build/hubguest.mjs";
 import { openHub } from "../src/build/hubdb.mjs";
+import { claimProvider } from "../src/provider.mjs";   // the end-to-end guest assertion
 /* ... standard harness ... */
 
 const p = join(dir, "g.db");
@@ -695,9 +763,13 @@ const allowed = [
   // and section 10.4 requires the admission rule to be evaluated under
   // BEGIN IMMEDIATE. A table-only allowlist refuses the guardian its own
   // transaction, which is not a narrower surface -- it is a broken one.
+  // Ordered so each is legal where it runs: a standalone ROLLBACK after a COMMIT
+  // fails with "cannot rollback - no transaction is active", which would report
+  // an allowlist refusal that never happened.
   ["BEGIN IMMEDIATE", "begin a transaction"],
-  ["COMMIT", "commit"],
   ["ROLLBACK", "roll back"],
+  ["BEGIN IMMEDIATE", "begin again"],
+  ["COMMIT", "commit"],
   ["SELECT * FROM provider_lease", "read provider_lease"],
   ["SELECT * FROM provider_state", "read provider_state"],
   ["INSERT INTO provider_lease(owner,repo_id,run_ref,pid,lstart,priority,status,requested_at,expires_at) VALUES('guardian',1,'r',1,'x',0,'held',1,2)", "insert a provider lease"],
@@ -749,7 +821,20 @@ const refused = [
   ["SELECT (SELECT count(*) FROM approval) FROM provider_lease", "read a forbidden table in a subquery"],
   ["SELECT * FROM provider_lease UNION SELECT * FROM merge_decision", "union a forbidden table"],
   ["INSERT INTO provider_lease SELECT * FROM merge_decision", "insert FROM a forbidden table"],
+  // Multi-statement: an exec wrapper that validates only the FIRST statement
+  // lets everything after the semicolon through. The authorizer sees each
+  // accessed object regardless of how many statements the string carries.
+  ["SELECT * FROM provider_lease; SELECT * FROM task", "reach a forbidden table after a semicolon"],
+  ["BEGIN IMMEDIATE; DELETE FROM approval", "reach a forbidden table after a permitted statement"],
 ];
+// The non-statement APIs are the other half of the surface. Measured on node
+// v24.17.0, DatabaseSync exposes seventeen methods; gating prepare and exec
+// leaves the mutation-capable ones open.
+for (const m of ["applyChangeset", "deserialize", "loadExtension", "enableLoadExtension", "createSession"]) {
+  let refused = false;
+  try { g[m](); } catch { refused = true; }
+  check(refused, `refused: the non-statement API ${m}() is not reachable on the guest`);
+}
 for (const [sql, name] of refused) {
   let why = null; try { g.prepare(sql); } catch (e) { why = e.message; }
   check(why !== null, `refused via prepare: ${name}`);
@@ -795,7 +880,42 @@ for (const [sql, name] of refused) {
 
 - [ ] **Step 2–4: Run it red, implement, run green, commit**
 
-Implement `openHubAsGuest` by wrapping `DatabaseSync` and gating `prepare`/`exec`. **Extracting the verb and the first table is not enough**: the first table is only the first one named, so a join, a subquery, a UNION or an `INSERT ... SELECT` reaches a forbidden table through a permitted one. Match against a closed list of permitted statement shapes, and additionally refuse any statement whose text mentions a table identifier outside the allowlist **anywhere**, whatever its position. Refuse `ATTACH`, `PRAGMA` writes, and multi-statement strings outright — a permissive parser is a hole, so the wrapper allows a **closed list of statement shapes** rather than trying to spot forbidden ones.
+Implement `openHubAsGuest` with **SQLite's own authorizer**, not string parsing.
+
+Measured on node v24.17.0: `DatabaseSync` exposes `setAuthorizer`, and gating text was never going to hold. The same measurement shows the connection also exposes `aggregate, applyChangeset, createSession, createTagStore, deserialize, enableDefensive, enableLoadExtension, exec, function, loadExtension, location, open, prepare, serialize, setAuthorizer` — so a wrapper that gates `prepare` and `exec` leaves `applyChangeset` (arbitrary mutation), `deserialize` (replace the entire database), and `loadExtension` (arbitrary native code) untouched. Gating two methods on a seventeen-method object is not a boundary.
+
+```js
+export function openHubAsGuest(path) {
+  const db = new DatabaseSync(path, { timeout: 10000 });
+  const READ  = new Set(["provider_lease", "provider_state", "pr_hold", "maintenance_lock"]);
+  const WRITE = new Set(["provider_lease", "provider_state", "maintenance_lock"]);
+
+  // The authorizer runs inside SQLite, per accessed object, AFTER parsing. A
+  // join, a subquery, a UNION, an INSERT ... SELECT and a multi-statement string
+  // all decompose into the same per-table actions, so none of them can smuggle a
+  // table past it -- which is exactly what a text matcher cannot promise.
+  db.setAuthorizer((action, arg1) => {
+    switch (action) {
+      case SQLITE_READ:   return READ.has(arg1)  ? SQLITE_OK : SQLITE_DENY;
+      case SQLITE_INSERT:
+      case SQLITE_UPDATE:
+      case SQLITE_DELETE: return WRITE.has(arg1) ? SQLITE_OK : SQLITE_DENY;
+      case SQLITE_TRANSACTION: return SQLITE_OK;      // hubTx needs BEGIN/COMMIT/ROLLBACK
+      case SQLITE_SELECT:      return SQLITE_OK;      // per-table READs are still checked
+      default: return SQLITE_DENY;                    // ATTACH, PRAGMA, DDL, function creation
+    }
+  });
+
+  // And remove every other route to the engine. `enableDefensive` blocks the
+  // writable_schema class; the rest are deleted from this handle so a caller
+  // cannot reach them at all.
+  db.enableDefensive?.(true);
+  for (const m of ["applyChangeset","createSession","createTagStore","deserialize",
+                   "enableLoadExtension","loadExtension","function","aggregate","open"])
+    Object.defineProperty(db, m, { value: () => { throw new Error(`${m} is not permitted on the guest hub connection`); } });
+  return db;
+}
+``` Refuse `ATTACH`, `PRAGMA` writes, and multi-statement strings outright — a permissive parser is a hole, so the wrapper allows a **closed list of statement shapes** rather than trying to spot forbidden ones.
 
 **On the broken implementation** — an allowlist checked by table name with a naive `sql.includes("provider_lease")` — the allowed list passes and `refused: enqueue an effect` goes red, because `INSERT INTO outbox ... VALUES('k','notify',...)` contains no table from the allowlist and yet a substring check that looks for *forbidden* names rather than matching *permitted shapes* lets it through. That inversion is the most likely wrong implementation here.
 
@@ -907,7 +1027,9 @@ git commit -m "feat(verdict): builder prs block on an uncleared hub hold"
 Write it as a real script, not a placeholder — a `tee` of a comment produces an empty evidence file and observes nothing:
 
 ```bash
-cat > /tmp/acceptance.mjs <<'EOF'
+# Written INTO the repository, not /tmp: relative imports resolve from the
+# file's own location, so a script at /tmp/acceptance.mjs looks for /tmp/src/.
+cat > ./acceptance-tmp.mjs <<'EOF'
 import { openHub } from "./src/build/hubdb.mjs";
 import { tick } from "./src/daemon.mjs";
 import { mkdtempSync } from "node:fs";
@@ -928,7 +1050,8 @@ console.log("AFTER  dispatch:", JSON.stringify(after));
 console.log("guardian held during:", during?.filter(r => r.status === "held" && r.owner === "guardian").length);
 console.log("rows remaining after:", after.length);
 EOF
-$N /tmp/acceptance.mjs | tee /tmp/acceptance.txt
+$N ./acceptance-tmp.mjs | tee /tmp/acceptance.txt
+rm ./acceptance-tmp.mjs        # scratch, never committed
 ```
 
 Then write `docs/measured/2026-08-23-guardian-claims-provider.md` around that raw output and **`git add` and commit it** — a `tee` alone leaves the evidence untracked and it never reaches the PR. State plainly that it was observed under a fixture `spawnWorker`, not against a live model call: no task in S2 may dispatch a real worker.
@@ -938,7 +1061,10 @@ Then write `docs/measured/2026-08-23-guardian-claims-provider.md` around that ra
 - [ ] **Step 2: Full suite, and the S2 Verify clause re-checked end to end**
 
 ```bash
-for f in test/*.test.mjs; do $N "$f" >/dev/null || echo "FAILED $f"; done
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac   # mutates the live daemon's ~/.reeve/canary
+  $N "$f" >/dev/null || echo "FAILED $f"
+done
 ```
 
 Then walk Task 20's Verify table again with PR-C's two rows now filled: *guardian FIX_CI claims and releases a provider lease* → Task 22; *guardian hub connection allowlist test* → Task 23. Every row must name a test file that exists and is green.

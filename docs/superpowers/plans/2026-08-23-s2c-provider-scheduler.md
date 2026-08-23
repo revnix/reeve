@@ -428,6 +428,26 @@ const LSTART = "Sat Aug 23 09:00:00 2026";
   const c = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:2", pid: 2, lstart: "B", isAlive: ALIVE, now: 1001 });
   const d = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:3", pid: 3, lstart: "C", isAlive: ALIVE, now: 1002 });
   check(a.ok && c.ok && d.ok, "three builders fit under a limit of 3 with nothing reserved");
+  // BOTH ORDERINGS. Starting with the guardian proves only that a builder
+  // cannot take the reserved slot -- and an implementation that caps EVERY
+  // owner at `concurrency_limit - guardian_reserved` passes all of it: the
+  // guardian gets in, the builder is refused, the builder gets in after the
+  // release. In production that same implementation lets one builder holding
+  // the single unreserved slot block the guardian out of the reserved one,
+  // which is the reservation inverted. So the reverse is asserted too, under
+  // the default 2/1:
+  {
+    const rev = openHub(join(dir, "p1r.db"));
+    const b1 = claimProvider(rev, { owner: "builder", repoId: 1, runRef: "bt:9", pid: 1, lstart: "A", isAlive: ALIVE });
+    check(b1.ok, "fixture: a builder takes the one unreserved slot under 2/1", JSON.stringify(b1));
+    const gr = claimProvider(rev, { owner: "guardian", repoId: 1, runRef: "pr:9", pid: 2, lstart: "B", isAlive: ALIVE });
+    check(gr.ok, "and a guardian is admitted CONCURRENTLY into the reserved slot", JSON.stringify(gr));
+    // CONTROL: the limit is still a limit. A second builder does not fit.
+    const b2 = claimProvider(rev, { owner: "builder", repoId: 1, runRef: "bt:10", pid: 3, lstart: "C", isAlive: ALIVE });
+    check(!b2.ok, "control: a second builder is still refused, so the reservation is not just 'admit everything'",
+      JSON.stringify(b2));
+    rev.close();
+  }
   const g = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:9", pid: 4, lstart: "D", isAlive: ALIVE });
   check(!g.ok && g.reason === "queued", "a guardian that cannot be admitted is QUEUED, not simply refused", JSON.stringify(g));
   // A blocked guardian re-asks on every tick. That must not deepen the queue.
@@ -877,6 +897,58 @@ const escalatedWith = (result, why) =>
   db.close();
 }
 
+// ── the canary's lease, observed alive and then gone ─────────────────────────
+// Both halves, on a HEALTHY hub. The unreadable-hub and at-limit blocks below
+// exercise refusals; neither can observe a SUCCESSFUL claim, so an
+// implementation that claims and then drops `got.id` -- or omits the `finally`
+// release entirely -- passed the whole suite while leaving a held row bound to
+// the long-lived daemon, whose liveness is always true, consuming a shared slot
+// until expiry. That is the exact leak the canary claim was added to prevent.
+{
+  const db = openHub(join(dir, "h1c.db"));
+  let duringCanary = null;
+  const ctx = { ...fixtureCtx(dir), hub: db, repoId: 1, lstart: LSTART, containment: null,
+    measuredContainment: async () => {
+      duringCanary = db.prepare(
+        "SELECT owner, status, run_ref FROM provider_lease WHERE run_ref = ?").get(`canary:o/r`);
+      return { credentialRead: "closed", why: "test" };
+    },
+    spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", model: "m" }) };
+  await tick(ctx);
+  check(duringCanary?.status === "held" && duringCanary?.owner === "guardian",
+    "the canary holds a guardian lease WHILE measuredContainment runs", JSON.stringify(duringCanary));
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE run_ref = ?").get(`canary:o/r`).c === 0,
+    "and the row is gone once the tick returns, so the slot is genuinely free",
+    JSON.stringify(db.prepare("SELECT * FROM provider_lease").all()));
+  db.close();
+}
+
+// ── a hub with no resolvable repository id fails CLOSED ──────────────────────
+// The one fixture the plan's prose kept referring to and did not contain. Every
+// other healthy-hub block supplies `repoId: 1`, and so does the acceptance
+// script -- so an implementation that falls through and dispatches unscheduled
+// when startup could not resolve the id passed the mandatory suite while doing
+// the single thing the scheduler exists to make impossible: spending real quota
+// under no lease at all.
+{
+  const db = openHub(join(dir, "h1n.db"));
+  let canaryRan = 0, dispatched = 0;
+  const ctx = { ...fixtureCtx(dir), hub: db, repoId: null, lstart: LSTART, containment: null,
+    measuredContainment: async () => { canaryRan++; return { credentialRead: "closed", why: "test" }; },
+    spawnWorker: async () => { dispatched++; return { outcome: "ok" }; } };
+  const result = await tick(ctx);
+  check(canaryRan === 0, "no repository id: the containment canary does NOT run", String(canaryRan));
+  check(dispatched === 0, "and no worker is dispatched", String(dispatched));
+  check(escalatedWith(result, "the repository numeric id is unknown; provider leases cannot be scoped"),
+    "and the scoping escalation is raised, so the founder is told why work stopped");
+  check(result && result.halted === false,
+    "control: the tick still finishes normally -- it suppresses the DISPATCH, not the tick",
+    JSON.stringify(result && Object.keys(result)));
+  check(db.prepare("SELECT count(*) c FROM provider_lease").get().c === 0,
+    "control: and nothing was claimed, so the refusal left no row behind");
+  db.close();
+}
+
 // ── released even when the worker throws ─────────────────────────────────────
 {
   const db = openHub(join(dir, "h2.db"));
@@ -1291,10 +1363,6 @@ test injects `ctx.providerHeartbeat` with a `now` a minute ahead and asserts the
 exact value that implies:
 
 ```js
-  let beats = 0;
-  const ctx = { ...fixtureCtx(dir), hub: db, lstart: LSTART, heartbeatMs: 5,
-    providerHeartbeat: (h, { id }) => { beats++; return heartbeatProvider(h, { id, now: BASE + 60 }); },
-    spawnWorker: async (opts) => { opts?.onSpawn?.(SPAWNED); await new Promise(r => setTimeout(r, 40)); /* ... */ } };
   // CAPTURED INSIDE spawnWorker, after the interval has fired. `tick` releases
   // and DELETES the lease before it returns, so a query after `await tick(ctx)`
   // inspects nothing -- the row it is meant to check is gone. The stub is the
@@ -1403,6 +1471,38 @@ asserts it with a fixture whose `startRun` is stubbed to fail:
 And on a rate-limit exit, before the `finally` releases:
 
 ```js
+        // AND THE LIVE EVENT, which is the half this branch cannot reach. Measured
+        // on `16769e7`: the supervisor's `rate_limit` event only assigns
+        // `rateLimit = ev.info` and calls `onEvent(ev)` (`src/supervisor.mjs:386-387`);
+        // `OUTCOMES.RATE_LIMITED` is derived by `classifyResult` from
+        // `api_error_status === 429` (`:220`) AFTER the child closes, and the
+        // only early-termination paths are budget, halt and lease revocation. So
+        // a CLI that hits its window and waits it out keeps the guardian's serial
+        // tick blocked for as long as the window lasts -- hours -- and this
+        // post-exit branch runs far too late to help.
+        //
+        // This task changes no supervisor code, and does not need to: the daemon
+        // already passes `isRevoked` (`src/daemon.mjs:1029` on `16769e7`), which
+        // the supervisor honours with the same SIGTERM-then-SIGKILL path it uses
+        // for a budget overrun. So the daemon's `onEvent` handles the live event:
+        //
+        //     onEvent: (ev) => {
+        //       if (ev.kind !== "rate_limit") return;
+        //       // Recorded from the EVENT, not from the exit. Killing the child
+        //       // changes how it is classified afterwards, so the cooldown has
+        //       // to be taken from the thing that is actually true right now --
+        //       // otherwise fast-failing the worker also discards the reason.
+        //       try { noteRateLimit(ctx.hub, { signature: ev.info?.signature ?? "rate_limit_exceeded",
+        //                                      now: Math.floor(Date.now() / 1000),
+        //                                      cooldownSeconds: profile.builder?.provider?.cooldownSeconds ?? 300 }); }
+        //       catch { (ctx.pendingRateLimits ??= []).push({ /* as above */ }); }
+        //       revoked = "provider rate limit reached";   // the supervisor terminates
+        //     },
+        //
+        // The post-exit branch below then finds the cooldown already recorded and
+        // does not write a second one; it stays because a 429 can also arrive as
+        // an exit status with no live event preceding it.
+        //
         // Rate limits are ALREADY normalised by the supervisor -- `--print` exits
         // with api_error_status 429 and the runner maps it to OUTCOMES.RATE_LIMITED
         // (src/supervisor.mjs:220). Re-matching a regex against the reason text
@@ -2238,7 +2338,9 @@ check(VERDICT_CLAUSES.includes("hold"),
   // there made this assertion unsatisfiable by a correct implementation and
   // satisfiable only by adding a redundant parameter to appease a regex. Assert
   // the composition where it actually happens:
-  const prSrcHold = readFileSync(srcFile("../src/pr.mjs"), "utf8");
+  // `read`, defined just above -- the standard harness has no `srcFile`, and
+  // naming one throws before a single composition assertion runs.
+  const prSrcHold = read("../src/pr.mjs");
   check(/\bisBuilderPr\s*\(/.test(prSrcHold),
     "evaluatePr derives the classification by calling isBuilderPr", "");
   check(/holdClause\s*\([^)]*isBuilderPr/s.test(prSrcHold),

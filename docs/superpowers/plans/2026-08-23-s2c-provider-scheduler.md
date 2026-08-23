@@ -92,7 +92,7 @@ Do not re-derive any of these. Each is recorded under `docs/measured/`.
 Recorded so no executor re-litigates them.
 
 1. **S2 splits into three PRs**, in the order A → B → C, with the provider scheduler last because it is the only one that changes the running guardian.
-2. **The guardian fails OPEN when hub.db is unreadable at provider-claim time.** It dispatches exactly as it does today and escalates `builder:provider:hub-unreadable`. The builder fails closed. The scheduler restrains the builder; it must never become a new way to silence the guardian. This matches the `ctx.reviewIngest !== false` opt-out shape §14 asks new ctx keys to follow (search `ctx.reviewIngest !== false`; `src/daemon.mjs:597,1361,1368` on `16769e7`), so existing guardian tests stay green untouched.
+2. **The guardian fails OPEN when hub.db is unreadable at provider-claim time.** It dispatches exactly as it does today and escalates **`the provider scheduler is unreadable; dispatching unscheduled`** — the GUARDIAN's identity, not a `builder:` one. The escalation lands in the per-repo guardian store, whose announcer knows guardian subjects; a `builder:`-grammar subject there is announced by nobody, so this fail-open path would escalate silently. The code and the mandatory test already use this string, and the earlier `builder:provider:hub-unreadable` wording here contradicted both. The builder fails closed. The scheduler restrains the builder; it must never become a new way to silence the guardian. This matches the `ctx.reviewIngest !== false` opt-out shape §14 asks new ctx keys to follow (search `ctx.reviewIngest !== false`; `src/daemon.mjs:597,1361,1368` on `16769e7`), so existing guardian tests stay green untouched.
 3. **`ci.flakePatterns` is REMOVED**, and the live `nextlyhq/nextly.json` is stripped in the same change. Measured, with a positive control, in `docs/measured/2026-08-22-flakepatterns-has-no-readers.md`. Removing it from `FIELDS` alone would make the live profile invalid and kill every daemon start.
 4. **`repo_gate_state` ships in S2 with a real writer**: the table, a pure `gateStateFrom()` derivation with unit tests over drifted/absent/stale inputs, and a `build run` tick that calls it through an injected `ctx.fetchGateState`. No live GitHub call in S2. S8 supplies the fetcher and clause U4, the reader.
 
@@ -170,7 +170,7 @@ Each task names any imports it needs **beyond** these.
   - `claimProvider(db, { owner, repoId, runRef, pid, lstart, priority = 0, budgetUsd = null, isAlive, now }) -> { ok: true, id } | { ok: false, reason: 'queued'|'cooldown'|'at-limit'|'maintenance', until }`
   - **Where the SQL lives.** The Global Constraints say no raw SQL outside `src/db/` and `src/build/`, and `src/provider.mjs` is neither — it sits at the top level because both daemons import it. Resolve it by keeping the statements in `src/build/providerdb.mjs` (the hub owns its own SQL, as `hubdb.mjs` does) and making `src/provider.mjs` the shared **policy** layer that imports them: the admission rule, the reservation arithmetic, the cooldown comparison. That also puts the boundary in the right place — the guardian imports a policy function, not a query builder, and the statement allowlist in Task 23 is checking a surface that has exactly one definition.
   - **Every provider mutation calls `assertWritable` inside its own transaction** (`inTx: true`), exactly as `withWriterLease` does. Without it a guardian can take a held lease and launch a worker after `restoreHub` has acquired `maintenance_lock` and finished its holder scan — reopening the writer race the lock exists to close, from the one code path that is allowed to write the hub without holding a writer lease. `assertWritable` throws; `claimProvider` catches and returns `reason: 'maintenance'`, which the guardian treats exactly like `at-limit`: it does not dispatch, and it does not escalate, because a restore in progress is an operator action rather than a fault.
-  - `releaseProvider(db, { id, owner, repoId, runRef, force })` — deletes the row, by `id` when one is given and otherwise by the `(owner, repo_id, run_ref)` identity. **The retry queue stores the identity, never the id**: a queued release survives a restore that clears `provider_lease` and renumbers it, and an id-keyed retry would then delete whatever inherited that primary key. **A release refused because a restore holds `maintenance_lock` must not be dropped**: `assertWritable` throws, and the caller retries on the next tick with the lease id recorded in memory; the caller keeps the id and retries next tick, and the production snippet must actually do that rather than `catch {}`. There is deliberately **no durable marker**: an earlier draft added `provider_lease.refused_release`, and it cannot be written in the one case it represents — `assertWritable` blocks that write while the lock is held. It is also unnecessary, because `restoreHub` clears every process-scoped row (`provider_lease` included) from the restored file, so a lease held across a restore does not survive it. An abandoned restore is covered by ordinary expiry.
+  - `releaseProvider(db, { id, owner, repoId, runRef, force })` — deletes the row. When BOTH an id and an identity are given it requires them to **match** — `WHERE id=? AND owner=? AND repo_id=? AND run_ref=?` — and falls back to the identity alone when no id is supplied. Preferring the id whenever present was unsafe even for the immediate cleanup: if the worker exits and a restore completes before the `finally` runs, the restore clears `provider_lease` and the next claim can inherit that integer key, so the cleanup deletes an unrelated LIVE lease and admits work past the limit. Requiring both keeps the fast path, makes a renumbered id inert rather than dangerous, and fixes every caller instead of the one that noticed. **The retry queue stores the identity, never the id**: a queued release survives a restore that clears `provider_lease` and renumbers it, and an id-keyed retry would then delete whatever inherited that primary key. **A release refused because a restore holds `maintenance_lock` must not be dropped**: `assertWritable` throws, and the caller retries on the next tick with the lease id recorded in memory; the caller keeps the id and retries next tick, and the production snippet must actually do that rather than `catch {}`. There is deliberately **no durable marker**: an earlier draft added `provider_lease.refused_release`, and it cannot be written in the one case it represents — `assertWritable` blocks that write while the lock is held. It is also unnecessary, because `restoreHub` clears every process-scoped row (`provider_lease` included) from the restored file, so a lease held across a restore does not survive it. An abandoned restore is covered by ordinary expiry.
   - `queuedGuardianRequests(db, { repoId }) -> Row[]` — every `queued` guardian request for one repository. It exists because the sweep below runs in `src/daemon.mjs`, and this plan's global rule is that raw SQL lives only under `src/db/` or `src/build/`: a `SELECT ... FROM provider_lease` embedded in the daemon is a second definition of the guest's SQL surface, and it drifts from this one the first time the allowlist or the schema changes.
   - `heartbeatProvider(db, { id, now })`
   - `reapProviderLeases(db, { isAlive, now }) -> { reaped: number }` — an **object**, like every other function here, not a bare count. Two assertions in the suite previously read it both ways (`n === 1` and `.reaped >= 1`), which no single return value can satisfy.
@@ -235,10 +235,25 @@ for (const ref of (ctx.pendingReleases ?? []).splice(0)) {
   try { (ctx.providerRelease ?? releaseProvider)(ctx.hub, ref); }
   catch { (ctx.pendingReleases ??= []).push(ref); }    // still locked: keep it for next tick
 }
+// The rate-limit cooldowns a previous tick could not persist, for the same
+// reason and with the same retry. Each carries the `now` it was captured at, so
+// a cooldown recorded three ticks late still runs from the 429 rather than from
+// the moment the lock cleared.
+for (const rl of (ctx.pendingRateLimits ?? []).splice(0)) {
+  try { (ctx.noteRateLimit ?? noteRateLimit)(ctx.hub, rl); }
+  catch { (ctx.pendingRateLimits ??= []).push(rl); }
+}
 ```
 
 ```js
-// Still at the top of the tick, AFTER repoId is bound and AFTER decisions are computed.
+// BEFORE the PR listing, the halt check, and every other path that can return
+// early. This drain retries releases a previous tick could not perform because a
+// restore held `maintenance_lock`, and each one is a slot a dead worker is still
+// holding. Placed after `decisions`, a tick that could not list PRs, was halted,
+// or returned during evaluation ran none of them -- so a GitHub outage unrelated
+// to the builder kept the builder starved until the leases expired. It needs
+// neither `repoId` nor `decisions`: every queued ref already carries its own
+// owner, repoId and runRef.
 //
 // Three things this must get right, each of which was wrong in an earlier draft:
 //
@@ -696,7 +711,7 @@ git commit -m "feat(provider): transactional admission for the shared subscripti
 - Consumes: `claimProvider`, `releaseProvider`, `noteRateLimit` (Task 21); `hubPathFor`, `openHub` (PR-A).
 - Produces: `ctx.hub` — an opened hub handle, or `null`. Defaults to opening `hubPathFor(reeveHome())` **if the file exists**, and to `null` otherwise. `ctx.providerClaim` / `ctx.providerRelease` override the seam in tests. `ctx.hub === null` is a normal, supported state.
 
-**Founder decision 2026-08-22: the guardian fails OPEN.** When the hub is missing, locked, or corrupt, the guardian dispatches exactly as it does today and escalates `builder:provider:hub-unreadable`. The builder fails closed. The scheduler exists to restrain the builder, and must never become a new way to silence the watchman: a watchman that has stopped looking is indistinguishable from one reporting nothing wrong. This also keeps the existing guardian test files green untouched, which is what §14 asks of every new ctx key, and it matches the shipped `ctx.reviewIngest !== false` shape (search `ctx.reviewIngest !== false`; `src/daemon.mjs:597,1361,1368` on `16769e7`).
+**Founder decision 2026-08-22: the guardian fails OPEN.** When the hub is missing, locked, or corrupt, the guardian dispatches exactly as it does today and escalates **`the provider scheduler is unreadable; dispatching unscheduled`** — the guardian's identity, because this escalation lands in the guardian's own store and a `builder:`-grammar subject there reaches nobody. The builder fails closed. The scheduler exists to restrain the builder, and must never become a new way to silence the watchman: a watchman that has stopped looking is indistinguishable from one reporting nothing wrong. This also keeps the existing guardian test files green untouched, which is what §14 asks of every new ctx key, and it matches the shipped `ctx.reviewIngest !== false` shape (search `ctx.reviewIngest !== false`; `src/daemon.mjs:597,1361,1368` on `16769e7`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1140,6 +1155,36 @@ before dispatch`). **This task does not move or duplicate the halt check:**
       };
 ```
 
+**And the lease must be RENEWED while the worker runs.** Task 21 defines
+`heartbeatProvider` and, before this, no production path called it — the suite
+exercised it only as one more mutator that must be refused while
+`maintenance_lock` is held, which proves it is guarded and not that it runs. A
+normal worker outlives the lease window comfortably; once the row is expired, any
+transient failure of the `pid+lstart` probe lets the reaper class a running
+worker dead and admit replacement work past the provider limit. That is the exact
+over-admission this scheduler exists to prevent, reached through its own
+bookkeeping.
+
+The daemon already runs a per-run heartbeat interval (search `ctx.heartbeat ??
+heartbeat`; `src/daemon.mjs:873` on `16769e7`). Extend that same interval rather
+than adding a second timer, so the two cannot drift:
+
+```js
+        // Wrapped separately and swallowed on purpose. A hub made unwritable by
+        // a restore must not kill the guardian's RUN heartbeat -- that is the
+        // founder decision this whole plan rests on. A missed renewal costs a
+        // slot at worst; a thrown interval costs the run.
+        if (lease != null && ctx.hub) {
+          try { (ctx.providerHeartbeat ?? heartbeatProvider)(ctx.hub, { id: lease }); } catch {}
+        }
+```
+
+Task 22's test asserts the wiring, not just the function: with a stubbed
+`ctx.heartbeatMs` short enough to fire during the fixture `spawnWorker`, the
+held row's `expires_at` must ADVANCE. On the broken implementation — the one
+that ships today, with `heartbeatProvider` defined and uncalled — every other
+assertion in the block passes and that single line goes red.
+
 **The paths that must call it**, each identified by the `continue` it already
 takes in `src/daemon.mjs`: the `!run.ok` branch after `startRun`, the prompt-build
 refusal, the worktree-acquisition refusal, and the demonstrated-flake refusal if
@@ -1227,7 +1272,22 @@ And on a rate-limit exit, before the `finally` releases:
         // two, and only one of them is in this file.
         if (r.outcome === OUTCOMES.RATE_LIMITED) {
           try { noteRateLimit(ctx.hub, { signature: (r.why ?? "").slice(0, 200),
-                  cooldownSeconds: profile.builder?.provider?.cooldownSeconds ?? 300 }); } catch {}
+                  cooldownSeconds: profile.builder?.provider?.cooldownSeconds ?? 300 }); }
+          catch {
+            // QUEUED, not dropped. Every provider mutation throws while a restore
+            // holds `maintenance_lock`, and this one is the fast-fail itself:
+            // discarding it means that the moment the restore finishes, the
+            // scheduler admits another worker into the same exhausted rate
+            // window and pays for the 429 again. Same shape as `pendingReleases`.
+            //
+            // `now` is captured HERE, not at drain time: the cooldown runs from
+            // the 429, and stamping it a tick later silently extends the window
+            // by however long the restore took.
+            (ctx.pendingRateLimits ??= []).push({
+              signature: r.signature ?? "rate_limit_exceeded",
+              now: Math.floor(Date.now() / 1000),
+              cooldownSeconds: profile.builder?.provider?.cooldownSeconds ?? 300 });
+          }
         }
 ```
 
@@ -1340,7 +1400,47 @@ git commit -m "feat(daemon): claim provider quota before dispatch, fail open"
   - **23a — the module.** Create `src/build/hubguest.mjs` with the authorizer and the sealed method surface, plus `test/guardian-hub-allowlist.test.mjs`'s statement and API assertions, which build their own guest handle and need no `bin/reeve` change. **Do this before Task 22.**
   - **23b — the structural control.** After Task 22 has wired `bin/reeve`, add the assertion that no privileged `openHub(` remains in `bin/reeve` or `src/daemon.mjs`, with its positive control that a guest call is present.
 
+  - **23b needs its own commit, after Task 22.** The split as written left the
+    structural control with nowhere to land: 23a is committed before Task 22, so
+    Task 23's single commit has already happened by the time the assertion
+    exists, and Task 22's `git add` does not stage
+    `test/guardian-hub-allowlist.test.mjs`. Deferring 23a's commit instead is
+    worse — Task 22 would then commit an import of an untracked module. So the
+    order is: **23a implement and commit → Task 22 → 23b add the control and
+    commit it**, with 23b's own step:
+
+    ```bash
+    git add test/guardian-hub-allowlist.test.mjs
+    git commit -m "test(guardian): no privileged hub open remains in the daemon"
+    ```
+
   Stated as an explicit order rather than left for an executor to discover by deadlock.
+**The profile keys this plan advertises must be declared in `FIELDS`, in this
+task.** `src/profile/schema.mjs` is fail-closed on unknown keys — `unknown key:
+${p}` at `src/profile/schema.mjs:352` on `16769e7` — so an operator who sets any
+control this plan documents kills **every** `reeve run` at profile load rather
+than tuning the scheduler. That is the same failure mode measured for
+`ci.flakePatterns`, in the opposite direction.
+
+Sweeping the three plans for `builder.*` reads against the 8 declared keys found
+three undeclared, not the two that were reported. Two belong here:
+
+```js
+  "builder.provider.cooldownSeconds":     [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
+  "builder.provider.repoIdRetryMinutes":  [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
+  "builder.provider.preemptAtBoundary":   [false, isBool],
+```
+
+with matching entries in `DEFAULTS` (`300`, `10`, `true`) and
+**`"builder.provider"` added to the container list** at `src/profile/schema.mjs:338`
+— that list is separate from the derived container set, and without the entry a
+profile with `builder: { provider: "oops" }` takes the defaults as named
+properties and validates.
+
+The third, `builder.cancel.drainMinutes`, is read by S2-B's `applyTransition` and
+belongs to that plan; it is recorded in B's consumed-interfaces table so neither
+plan assumes the other declared it.
+
 - Produces: `openHubAsGuest(path) -> DatabaseSync` — a connection whose `prepare`/`exec` refuse any statement outside the allowlist: `INSERT`/`UPDATE`/`DELETE`/`SELECT` on `provider_lease` and `provider_state`, `SELECT` on `pr_hold`, `SELECT`/`DELETE` on `maintenance_lock`, and the three transaction-control statements `BEGIN IMMEDIATE`, `COMMIT`, `ROLLBACK`.
 
 **On §13's "exactly two touches".** §13 says the guardian *writes* the provider scheduler and *reads* `pr_hold`, and nothing else. `maintenance_lock` is a third table, so the wording and this allowlist have to be reconciled rather than quietly diverged. They are reconciled this way: the lock is not a third **surface**, it is the precondition on the two it already has. Every hub writer checks it before writing — that is the property S2-A established for the singleton, the writer lease and every provider mutation alike — and a guardian that could write `provider_lease` while a restore is replacing the file would reopen the race the lock exists to close. The `DELETE` is the ordinary reap of a lock whose holder is provably dead, identical to what every other writer does; it grants no new reach. The design's sentence describes surfaces the guardian acts *on*; this is the check it acts *under*. Worth a line in §13 when the design is next amended, so the two do not read as contradictory to someone checking. Everything else throws, naming the statement.
@@ -1699,7 +1799,27 @@ The merge is correctly blocked and the reason reported is a lie, on a loop.
 The intended action is **PARK**: a hold is a deliberate, recorded decision with a
 founder exit (`reeve task resume`), not a repair the guardian can perform and not
 a gap in reeve. Insert it beside the other clause branches, before the
-unclassified fallback:
+**FIRST, immediately after the `state !== "open"` park** (`src/daemon.mjs`'s
+consumer reads `nextAction` in `src/watcher.mjs`; search `PR is ${e.state}`) —
+**not** before the unclassified fallback, which is where an earlier revision of
+this plan put it. `nextAction` decides `ci` at `src/watcher.mjs:118-136` and the
+generic UNKNOWN sweep at `:146` on `16769e7`, both long before any fallback. Late
+placement therefore loses in two directions at once:
+
+- a held PR that ALSO has red CI returns `FIX_CI` from the ci branch and the
+  guardian dispatches a fixer for a task the builder deliberately parked — the
+  precise outcome `pr_hold` exists to prevent;
+- a `hold` clause in UNKNOWN is swallowed by the generic not-checkable
+  escalation, which reports it as an unscopeable clause rather than as the
+  configuration fault it is.
+
+A hold is not a defect to repair or a gap to report; it is a decision already
+taken, so it is read before anything that might act. `test/watcher.test.mjs`
+gains mixed-clause precedence cases for exactly these two — a hold BLOCK with a
+red ci clause, and a hold UNKNOWN alongside another UNKNOWN — because a matrix
+that varies one clause at a time cannot see a precedence bug at all.
+
+The clause, placed there rather than at the unclassified fallback:
 
 ```js
   // A builder hold is not a defect and not a gap: the builder wrote this row on
@@ -1904,8 +2024,47 @@ check(VERDICT_CLAUSES.includes("hold"),
   const call = daemonSrc.match(/\(ctx\.evaluate \?\? evaluatePr\)\(\{[^}]*\}/s)?.[0] ?? "";
   check(/\bhub\b/.test(call),
     "and the DAEMON passes ctx.hub into it, or every builder PR reads UNKNOWN", call);
-  check(/isBuilderPr|builderPr|headRef/.test(call),
+  check(/isBuilderPr|builderPr/.test(call),
     "and passes the builder classification the clause branches on", call);
+  // `headRef` is NOT accepted as evidence of the classification any more. It is
+  // already in that call for unrelated reasons, so the old alternation passed
+  // against an implementation that had no classifier at all.
+
+  // BEHAVIOURAL, both classifiers, because a text match over the call site
+  // cannot tell which of the two branches exists. §9.2 classifies a builder PR
+  // by head branch `mp/*` OR by the PR's author being the App, and an
+  // implementation that recognises only the branch passes every static check
+  // here while treating an App-authored PR on an ordinary branch as a normal
+  // one -- skipping `pr_hold` entirely, so a cancelled or blocked task's PR
+  // stays green and mergeable. That is the whole failure this clause exists to
+  // prevent, and it was the likelier half to be missed.
+  //
+  // This requires `evaluatePr`'s metadata read to INCLUDE the author, which it
+  // does not today: add the author login and its `__typename`/app id to the
+  // fields it already requests, and pass the classification through. Without
+  // that read there is nothing for the second branch to test.
+  for (const [label, meta] of [
+    ["a builder branch",  { headRef: "mp/bt-1-s0", authorIsApp: false }],
+    ["an App author",     { headRef: "feature/ordinary", authorIsApp: true }],
+  ]) {
+    const v = evaluatePr({ ...evalFixture, hub, repoId: 1, pr: 7, ...meta });
+    check(v.verdict?.state === "BLOCK",
+      `${label} is classified as a builder PR, so an uncleared hold blocks it`,
+      JSON.stringify(v.verdict));
+    check(clause(v.verdict, "hold")?.state === "BLOCK",
+      `${label}: and it is the hold clause that blocks, not something else`,
+      JSON.stringify(clause(v.verdict, "hold")));
+  }
+  // CONTROL: an ordinary PR -- neither branch nor author -- is NOT classified,
+  // so the two above are not satisfied by an implementation that treats every
+  // PR as a builder PR and blocks the whole repository.
+  {
+    const v = evaluatePr({ ...evalFixture, hub, repoId: 1, pr: 7,
+                           headRef: "feature/ordinary", authorIsApp: false });
+    check(clause(v.verdict, "hold")?.state === "PASS",
+      "control: an ordinary PR is not a builder PR, and its hold clause passes untouched",
+      JSON.stringify(clause(v.verdict, "hold")));
+  }
 
   // CONTROLS, both directions. The first proves the extractor found a real call
   // rather than matching nothing and testing the empty string; the second proves
@@ -2142,7 +2301,7 @@ model dispatch.
 
 The guardian **fails OPEN**: a missing, locked or corrupt hub means it
 dispatches exactly as it does today and escalates
-`builder:provider:hub-unreadable`. The builder fails closed. The scheduler
+`the provider scheduler is unreadable; dispatching unscheduled` (the guardian's identity, since the escalation lands in the guardian's own store). The builder fails closed. The scheduler
 exists to restrain the builder; it must not become a new way to stop CI being
 fixed on every watched repo. The cost is real and is stated rather than hidden:
 during a hub outage both daemons could dispatch and exhaust the subscription

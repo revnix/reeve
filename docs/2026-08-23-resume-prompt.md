@@ -13,15 +13,15 @@ order, and treat them as the source of truth over anything you infer:
   ~/Work/Products/reeve/docs/measured/                         <- the measured facts
 
 Ignore docs/2026-08-22-session-handoff.md (superseded banner) and treat
-docs/2026-08-22-session-handoff-2.md as history: it describes a reeve that had
-never dispatched a worker, and that stopped being true on 23 Aug.
+docs/2026-08-22-session-handoff-2.md as history.
 
 ## In one line
 
-reeve is ARMED. `--execute` is live, `worker.isolation` is `scratch-home`, and it
-will dispatch a real worker at the next red CI on nextlyhq/nextly. Three real
-workers have now run (in a sandboxed experiment): three CORRECT fixes, ZERO
-published, because the work is never committed.
+reeve is ARMED and CANNOT PUBLISH. `--execute` is live and it will dispatch at
+the next red CI on nextlyhq/nextly, but the worker cannot run `git add` or
+`git commit` — the sandbox that landed 22 Aug denies Bash writes to `.git`. Three
+dispatches, three correct fixes, zero published. That is a regression: reeve
+published three times on 21 Aug, on its OWN repo, before that sandbox existed.
 
 ## VERIFY the state before trusting any of it, and tell me what drifted
 
@@ -42,41 +42,58 @@ ONLY (both mine), and the running process carrying `--execute`.
 
 ## Your task, in priority order
 
-1. **PR #15** (`docs/first-dispatches`, worktree ~/Work/Products/reeve-wt/paths)
-   is open and awaiting Codex. Work its rounds: reply to AND resolve every
-   thread via GraphQL, cap 10 rounds, do not merge. It is documents only.
+1. **The P0: the worker cannot commit.** Read
+   `docs/measured/2026-08-23-three-real-dispatches.md` Finding 1 in full — it has
+   the evidence and both controls. Then bring me a decision, do not just start
+   coding: the two shapes are (a) grant the worker `.git` writes, or (b) have
+   reeve stage and commit on the worker's behalf after the diff gate, leaving the
+   worker unable to touch git at all. (b) is probably right — the diff gate
+   already decides what may ship, and a worker that cannot commit cannot rewrite
+   history either — but it changes the worker contract, so it is my call.
+   Whatever we choose needs a test that FAILS on today's code.
 
-2. **Watch for the first real dispatch.** reeve is armed and has never dispatched
-   on nextly. Each red PR gets ONE attempt (`maxFixAttemptsPerFinding: 1`) and it
-   is spent even when nothing publishes, so the first one is one-shot data:
-   capture the worker transcript (~/.reeve/runs/...), the worktree diff, and the
-   escalation, not just a log tail.
+   Read the section above Finding 3 before proposing anything. This is the SIXTH
+   time the prompt has claimed a capability the grant does not carry, and the
+   21 Aug set includes this exact defect one step later in the sequence. A fix
+   that only unblocks `.git` leaves the mechanism that produced all six. Tell me
+   what it would cost to generate the prompt from the grant instead.
 
-3. Then ask me what next. Do not start new reeve work without checking §"Other
-   sessions" below — the lanes are narrow right now.
+2. **PR #15** (`docs/first-dispatches`, worktree ~/Work/Products/reeve-wt/paths)
+   is open. Work its rounds: reply to AND resolve every thread via GraphQL, cap
+   10 rounds, do not merge. It is documents only.
+
+3. **Watch for the first real dispatch on nextly.** It has never dispatched there
+   (verified: zero worker_run rows in ~/.reeve/state/nextlyhq/nextly.db). Each red
+   PR gets ONE attempt and it is spent even when nothing publishes, so it is
+   one-shot data: capture the worker transcript, the worktree diff and the
+   escalation, not just a log tail. Expect it to fail to publish until task 1
+   lands.
 
 ## A freeze is in force, and I promised it to another session
 
 **Do not edit `src/daemon.mjs` or `docs/TRACKER.md`** until the threadDetails
 session's PR lands. A tracker entry is OWED for PR #14, the arming, the worker
-limits and the three dispatches — write it the moment the freeze lifts, not
-before, or you create the exact rebase conflict I warned them about.
+limits, the three dispatches and the P0 — write it the moment the freeze lifts,
+not before, or you create the exact rebase conflict I warned them about.
+
+Note task 1 may need `src/sandbox.mjs` and `src/prompts.mjs`, which are NOT
+frozen. If it needs `daemon.mjs`, tell me and wait.
 
 ## What is true about the worker, measured on 2026-08-23
 
-Read `docs/measured/2026-08-23-three-real-dispatches.md` in full. The short form:
-
   - the fix quality was GOOD 3/3 — the experiment set out to find a confidently
     BAD fix and did not find one
-  - it published NOTHING 3/3, because the work was never committed
-  - the worker creates a scratch file probing whether it can write, cannot `rm`
-    it, and that stray file blocks publication on its own
-  - refusals say only "This command requires approval", so it retries rather than
-    adapting: 28 of 40 turns in two runs. RAISING THE TURN LIMIT DOES NOT HELP —
-    it buys more retries of the same refusals
-  - none of this is known to reproduce on nextly. The fixture had no lockfile and
-    no node_modules, which is what sent the worker guessing. Only a real dispatch
-    settles it, which is why task 2 matters
+  - it published NOTHING 3/3, because `git add`/`git commit` fail with EPERM on
+    `.git/index.lock`. Controls: a Bash write elsewhere in the same worktree
+    SUCCEEDED, and an identical copy commits fine unsandboxed. reeve's own
+    settings do not cause it
+  - the dirty-checkout gate fired ONCE, on run 3. Runs 1 and 2 were
+    `failed (max_turns)` and never reached it
+  - `src/prompts.mjs:31` tells the worker "`pnpm test` is permitted" when pnpm
+    may not be granted, and :33-34 forbids absolute paths while the only
+    unconditional runtime grant IS an absolute path
+  - findings 2-4 are fixture-sensitive and may not reproduce on nextly. Finding 1
+    is in the contract and reproduces everywhere
 
 ## Decisions already made — do not re-open
 
@@ -84,37 +101,41 @@ Read `docs/measured/2026-08-23-three-real-dispatches.md` in full. The short form
     propose_and_merge + admin + a bypassable ruleset and chose it anyway. The
     GitHub rules get fixed at the end.
   - Limits stay 10 min / 20 turns / 1 worker.
-  - `maxFixAttemptsPerFinding` stays 1, and reeve stays armed, even though each
-    red PR spends its only attempt on a fix that will not publish. The proper
-    turn-on waits until the BUILDER is done; today's arming is evidence-gathering.
+  - `maxFixAttemptsPerFinding` stays 1. NOTE: I decided that before the P0 was
+    understood — I accepted a reeve that had not yet published, not one that
+    cannot. Ask me again once task 1 has a plan.
   - PRs #1 and #2 are closed. Do not reopen them.
   - No `git push --dry-run` probe in doctor. The one-off was run by hand: both
     repos returned PUSH AUTHORISED.
 
 ## House rules that earned their place
 
+  - **Do not inherit a factual claim from a handoff, including this one.** The
+    23 Aug session was told "reeve has never dispatched a worker", repeated it in
+    three documents and a PR body, and it was false. Re-verifying it is what
+    uncovered the P0.
   - Measure, do not assume. Every claim is either measured (say when, record it
     under docs/measured/) or marked intent.
   - **After writing a test, stub the fix back OUT and confirm it goes red.** In
     PR #14 three assertions passed with the code they tested deleted, twice. A
     test that a helper works is not a test that it is WIRED IN.
+  - Give every experiment run its OWN root. Runs 1 and 2 of the dispatch
+    experiment are unrecoverable because run 3 reused the path.
   - `git diff main..branch` is NOT what a PR proposes — that is tree difference.
-    Compute from `git merge-base` or you will report something false. I nearly
-    did.
+    Compute from `git merge-base` or you will report something false.
   - A profile edit is not in force until the daemon restarts (`loadProfile` runs
     once at startup). Verify the running process, not the file.
   - Removing a reading is not finished until every sentence that depended on it
-    has been re-read. PR #14 produced three stale comments describing behaviour
-    deleted in a later round of the same PR.
+    has been re-read.
   - Assert on every text patch; do not report an edit as applied without checking
     the anchor matched.
-  - Conventional Commits, never --no-verify. **No AI/Claude attribution
-    anywhere** — a hook blocks the word in PR bodies, including factual uses;
-    rewrite rather than argue.
+  - Conventional Commits, never --no-verify. **No AI attribution anywhere** — a
+    hook blocks the vendor's name in commits and PR bodies, including factual
+    uses; rewrite rather than argue.
   - Comment "@codex review" on every PR and every push. Reply to AND resolve each
     thread via GraphQL — replying alone does not clear it. Cap 10 rounds. Expect
-    real findings: #14 took 10 rounds and 22, and several were defects introduced
-    by my own fix for the previous round.
+    real findings: #14 took 10 rounds and 22, and PR #15 was documents only and
+    still took 6, four of which were my own false claims.
   - **Do not merge.** Every PR needs my explicit grant, and the last one is spent.
 
 ## Other sessions are alive — check before starting anything
@@ -129,18 +150,20 @@ Use ListAgents and SendMessage to check what peers are on before touching
 anything outside your lane, and tell them what you are on.
 
 Do NOT `git pull` or switch branches in ~/Work/Products/reeve — that is the
-running daemon's checkout AND REEVE IS NOW ARMED, so a restart there has real
+running daemon's checkout AND REEVE IS ARMED, so a restart there has real
 consequences. Restarting after a merge is fine and expected, after verifying the
 merge by CONTENT (squash merges break SHA ancestry: `git diff --name-only
 origin/main <your-pushed-head>` should be empty).
 
 ## What needs me, so you do not wait on it silently
 
+  - **The P0 fix shape** (task 1) — my call, not yours.
   - R-01: the ruleset lets admins bypass everything and requires no status check.
     Agreed to fix at the end; it is why every gate on nextly is decorative.
-  - The outbox question: guardian GitHub effects either wait for the builder's
-    outbox (S2/S4) or use the direct `gh` path reeve already uses in src/github/.
-    This blocks half of capability 3.
+  - Capability 3 routing. The outbox EXISTS (src/db/schema.sql:110-130,
+    src/db/ops.mjs:239-284) with zero callers and no drainer, so the options are
+    wire it now, wait for the builder's drainer at S2/S4, or use the direct `gh`
+    path reeve already uses from 16 call sites across src/.
   - ntfy read user (needs shell on 95.217.11.127).
   - Whether to raise the fix-attempt cap from 1.
 
@@ -152,14 +175,15 @@ verified that you have not run.
 
 ## Why the prompt is shaped this way
 
-- **It leads with the arming**, because that is the fact most likely to cause harm
-  if a new session does not know it. A restart of the daemon's checkout now has
-  consequences it did not have yesterday.
+- **It leads with the P0**, because reeve is armed against a repository it cannot
+  publish to, and every red PR there spends a paid attempt to prove it.
 - **It makes the `ps` check non-optional**, because the plist/process divergence
   already bit once and is invisible to anyone reading files.
+- **It tells the reader not to trust it**, first house rule. The document it
+  replaces was believed rather than checked, and that cost a P0 two days of
+  invisibility.
 - **It names the freeze and who it was promised to**, since the tracker entry is
   owed and writing it early is exactly the collision it exists to prevent.
-- **It states what the dispatch evidence does NOT establish**, so the next session
-  does not fix a synthetic fixture's problems and believe it fixed nextly's.
-- **It carries the traps rather than the conclusions**, because the conclusions
-  are in the handoff and the traps are what cost hours.
+- **It separates what reproduces everywhere from what is fixture-bound**, so the
+  next session does not fix a synthetic fixture's problems and believe it fixed
+  nextly's.

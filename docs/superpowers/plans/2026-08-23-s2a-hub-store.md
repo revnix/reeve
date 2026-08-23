@@ -255,8 +255,13 @@ It has no `die` helper, does not import `log`, and imports none of the hub or
 lock symbols; following the case below literally throws `ReferenceError` before
 it acquires or inspects anything. Add:
 
+`HUB_SCHEMA_VERSION` is in that list because **three** places in `bin/reeve`
+compare against it — `build status`'s version refusal, `builder doctor`'s
+snapshot validation, and `restore --hub` — and nothing else would bind it: the
+only other mention in this plan adds it to `src/doctor.mjs`.
+
 ```js
-import { openHub } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION, HUB_TABLES } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
 import { HEARTBEAT_SECONDS } from "../src/db/ops.mjs";
@@ -2181,7 +2186,15 @@ openHub(hubPathFor(home)).close();
   check(res.find(r => r.nwo === "nextlyhq/nextly")?.ok === true,
     "and snapshotAll keeps it rather than deleting it as unusable");
   check(v.version === HUB_SCHEMA_VERSION, "and reports the schema version it holds", String(v.version));
-  check(v.integrity === "ok", "and its integrity_check result", String(v.integrity));
+  // DEEP, because this line asserts an integrity result and the cheap path does
+  // not produce one -- it returns `integrity: null` by design, since skipping
+  // the full page scan is the entire point of the split. Asserting it from a
+  // cheap call fails against the correct implementation.
+  const deepV = validateSnapshot(snap, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true });
+  check(deepV.integrity === "ok", "and a DEEP validation reports its integrity_check result", String(deepV.integrity));
+  check(v.integrity === null,
+    "control: the cheap path deliberately reports no integrity at all, rather than a stale 'ok'",
+    String(v.integrity));
 }
 
 // ── a snapshot at the wrong version is not restorable ────────────────────────
@@ -2605,6 +2618,19 @@ import { acquireSingleton, withWriterLease } from "../src/build/locks.mjs";
   check(missingWriters.length === 0,
     "every compared table has a post-snapshot writer, so no comparison is [] vs []",
     JSON.stringify(missingWriters));
+  // And every kind those writers emit must be one replayHub RECOGNISES. Six did
+  // not -- `impl_pr.opened` against a handler for `impl_pr.bound`, and five more
+  // of the same shape -- so replay skipped the rows as unknown kinds, leaving
+  // those tables empty in the restored database and populated in the pre-drop
+  // export. The row-for-row comparison then failed against the exact
+  // implementation Step 3 prescribes, and the failure would have read as
+  // "replay is broken" rather than "the fixture invented an event name".
+  const unknownKinds = COMPARISON_SET
+    .map(t => POST_SNAPSHOT[t].kind).filter(Boolean)
+    .filter(k => !replayableKinds().includes(k));
+  check(unknownKinds.length === 0,
+    "and every kind they emit is one replayHub has a handler for",
+    JSON.stringify(unknownKinds));
   // COMPARISON_SET's ORDER is load-bearing here: `task` is first and
   // `phase_event` is fourth, both before `outbox` -- whose `task_id` and `fence`
   // are foreign keys to them. Iterating it in declaration order satisfies every
@@ -2687,7 +2713,11 @@ function writeHold(db, task, pr, reason) {
 // the thing under test rather than the fixture. `writeRow` is the shared shape;
 // the three hand-written functions above predate it and are kept because their
 // column lists document the authority-bearing tables in full.
-const writeRow = (table, kind) => (db, task, over = {}) => {
+// `.kind` is hung off the returned function so the coverage assertion above can
+// read what each writer emits without calling it. A kind visible only at call
+// time can be checked only by running the drill -- which is the moment a wrong
+// one stops looking like a fixture bug and starts looking like broken replay.
+const writeRow = (table, kind) => Object.assign((db, task, over = {}) => {
   const row = minimalRow(db, table, over);
   // Only tables that HAVE a task column get one: guardian_receipt and
   // project_authority do not, and setting it unconditionally would insert a
@@ -2700,7 +2730,7 @@ const writeRow = (table, kind) => (db, task, over = {}) => {
   db.prepare(`INSERT INTO hub_event(at,kind,task,payload) VALUES(unixepoch(),?,?,?)`)
     .run(kind, task, JSON.stringify(Object.fromEntries(cols.sort().map(c => [c, row[c]]))));
   db.exec("COMMIT");
-};
+}, { kind });
 
 // The minimum legal row for a table, DERIVED from its own schema rather than
 // transcribed. Nineteen hand-copied column lists is nineteen chances to bake in
@@ -2742,20 +2772,20 @@ const minimalRow = (db, table, over = {}) => {
 
 const POST_SNAPSHOT = {
   task:              (db, t) => writeRow("task", "task.transitioned")(db, t),
-  task_territory:    writeRow("task_territory", "task_territory.granted"),
+  task_territory:    writeRow("task_territory", "task_territory.claimed"),
   task_drain:        writeRow("task_drain", "task_drain.recorded"),
   phase_event:       writeRow("phase_event", "phase_event.appended"),
   phase_run:         writeRow("phase_run", "phase_run.settled"),
   approval:          (db, t) => writeApproval(db, t, "a".repeat(40)),
   gate_request:      writeRow("gate_request", "gate_request.minted"),
-  notice_receipt:    writeRow("notice_receipt", "notice_receipt.written"),
-  impl_pr:           writeRow("impl_pr", "impl_pr.opened"),
-  attested_push:     writeRow("attested_push", "attested_push.recorded"),
+  notice_receipt:    writeRow("notice_receipt", "notice_receipt.recorded"),
+  impl_pr:           writeRow("impl_pr", "impl_pr.bound"),
+  attested_push:     writeRow("attested_push", "attested_push.appended"),
   guardian_receipt:  writeRow("guardian_receipt", "guardian_receipt.imported"),
   harness_acceptance: writeRow("harness_acceptance", "harness_acceptance.recorded"),
-  gate_run:          writeRow("gate_run", "gate_run.settled"),
+  gate_run:          writeRow("gate_run", "gate_run.recorded"),
   pr_hold:           (db, t) => writeHold(db, t, 7, "cancel"),
-  hold_reason:       writeRow("hold_reason", "hold_reason.recorded"),
+  hold_reason:       writeRow("hold_reason", "hold_reason.appended"),
   project_authority: (db) => writeAuthority(db, "nextly"),
   outbox:            writeRow("outbox", "outbox.enqueued"),
   territory_lease:   writeRow("territory_lease", "territory_lease.granted"),
@@ -2959,6 +2989,23 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // established it is allowed to touch it at all. The exclusion has to come
       // before any write, including a well-intentioned one.
       live = new DatabaseSync(dbPath, { timeout: 10000 });
+      // A RAW open skips openHub's forward-version refusal, so this command must
+      // repeat it before it touches anything. Without it an older binary can
+      // restore beside a hub a newer binary already migrated: it collects event
+      // kinds it does not recognise, `replayHub` counts them as skipped, and the
+      // newer database is replaced by one built only through the old binary's
+      // migrations -- state lost, exit status 0.
+      //
+      // Before the lock and before staging: refusing after either has already
+      // interfered with a database this binary has just established it must not
+      // touch.
+      const liveVersion = live.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+      if (liveVersion > HUB_SCHEMA_VERSION) {
+        try { live.close(); } catch {}
+        return { ok: false, holders: [],
+                 why: `the live hub is at schema version ${liveVersion} and this reeve knows ` +
+                      `${HUB_SCHEMA_VERSION}; restoring would replace it with an older store. Upgrade reeve.` };
+      }
       const got = acquireMaintenanceLock(live, { pid, lstart, isAlive });
       if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
       locked = true;
@@ -3114,6 +3161,77 @@ import { writeFileSync } from "node:fs";                 // add to the existing 
     break;
   }
 ```
+
+- [ ] **Step 4b: The `restore --hub` route, as code**
+
+The recovery path this task advertises does not exist until `bin/reeve` has a
+case for it. `bin/reeve`'s existing `restore` requires an `owner/repo` and calls
+the per-repo `restore()`, so `reeve restore --hub` falls through to it and asks
+for a repository. Every test above calls `restoreHub` **directly**, so all of
+them pass while the command an operator would actually type does nothing:
+
+```js
+  case "restore": {
+    if (flag("hub")) {
+      const from = opt("from") ?? latestSnapshot(opt("to") ?? join(HOME, "backups"), "hub");
+      if (!from) die(`reeve restore --hub: no usable snapshot under ${opt("to") ?? join(HOME, "backups")}`);
+      // The durable tail, written by `reeve export-events --hub`. Optional: a
+      // restore with no tail is still correct, it just recovers less.
+      let tail = null;
+      const tailPath = opt("tail");
+      if (tailPath) {
+        if (!existsSync(tailPath)) die(`reeve restore --hub: no tail file at ${tailPath}`);
+        tail = readFileSync(tailPath, "utf8").split("\n").filter(Boolean).map(l => JSON.parse(l));
+      }
+      const r = restoreHub(from, hubPathFor(HOME), {
+        isAlive: isSameProcess, pid: process.pid, lstart: readStart(process.pid),
+        force: flag("force"), tail });
+      if (!r.ok) {
+        console.error(`refused: ${r.why}`);
+        for (const h of r.holders ?? []) console.error(`  held by ${h.what} pid ${h.pid} (${h.command})`);
+        process.exit(1);
+      }
+      console.log(`restored ${from} -> ${hubPathFor(HOME)} (replayed ${r.replayed} of ${r.tail} tail events)`);
+      process.exit(0);
+    }
+    // ...the existing per-repo restore, unchanged, below.
+```
+
+and a CLI test that goes through the command, with a tail produced by the
+command that writes one:
+
+```js
+// test/hub-backup-restore.test.mjs, before the terminator
+{
+  const home2 = mkdtempSync(join(tmpdir(), "reeve-cli-restore-"));
+  mkdirSync(join(home2, "state"), { recursive: true });
+  const hub = hubPathFor(home2);
+  openHub(hub).close();
+  const runCli = (args) => spawnSync(process.execPath, ["bin/reeve", ...args],
+    { encoding: "utf8", env: { ...process.env, REEVE_HOME: home2 } });
+
+  runCli(["backup", "--hub"]);
+  const tailFile = join(home2, "tail.jsonl");
+  const ex = runCli(["export-events", "--hub", tailFile]);
+  check(ex.status === 0 && existsSync(tailFile),
+    "`reeve export-events --hub` writes a tail file", `${ex.status} ${ex.stderr?.slice(0, 120)}`);
+
+  rmSync(hub, { force: true });
+  const r = runCli(["restore", "--hub", "--tail", tailFile]);
+  check(r.status === 0, "`reeve restore --hub` restores through the CLI, not just the function",
+    `${r.status} ${r.stderr?.slice(0, 200)}`);
+  check(existsSync(hub), "and the hub is back at its canonical path");
+  // CONTROL: without --hub the command still asks for a repository, so the new
+  // branch has not swallowed the existing per-repo route.
+  const repo = runCli(["restore"]);
+  check(repo.status !== 0 && /repo/i.test(repo.stderr ?? ""),
+    "control: `reeve restore` with no --hub still takes the per-repo path",
+    String(repo.stderr).slice(0, 160));
+  rmSync(home2, { recursive: true, force: true });
+}
+```
+
+`spawnSync` and `readStart` join the imports for this file.
 
 - [ ] **Step 5: Run it, then commit**
 
@@ -3406,6 +3524,14 @@ Add the case, and add `bin/reeve` to the commit:
     try {
       findings = hubFindings(db, { root: opt("backups") ?? join(HOME, "backups"),
                                    now: Math.floor(Date.now() / 1000),
+                                   // The REGISTRY's projects, not the rows the table
+                                   // happens to hold. H-4 exists to report a project
+                                   // that has NEVER acquired a repo_gate_state row --
+                                   // unsafe authority, silently. Defaulting to []
+                                   // makes the CLI report only what is already
+                                   // present, so the exact absent-row case this task
+                                   // calls unsafe is the one case it cannot see.
+                                   projects: registryProjects(HOME),
                                    snapshotFor: (nwo) => {
                                      const s = latestSnapshot(opt("backups") ?? join(HOME, "backups"), nwo);
                                      return s ? { path: s, at: statSync(s).mtimeMs / 1000,
@@ -3413,7 +3539,13 @@ Add the case, and add `bin/reeve` to the commit:
                                    } });
     } finally { db.close(); }
     console.log(flag("json") ? JSON.stringify(findings, null, 2) : renderHub(findings));
-    process.exit(findings.some(f => f.severity === "fail") ? 1 : 0);
+    // The CLI's existing doctor convention, documented at `bin/reeve:364`:
+    // 0 ok, 1 broken, 3 degraded. Exiting 0 on warnings tells automation that a
+    // stale snapshot, unmeasured provider limits, expired requests or no
+    // off-device copy are all healthy -- which is the reading the `warn`
+    // severity exists to prevent.
+    process.exit(findings.some(f => f.severity === "fail") ? 1
+               : findings.some(f => f.severity === "warn") ? 3 : 0);
   }
 ```
 
@@ -3426,8 +3558,13 @@ shape this programme keeps finding:
   const home = mkdtempSync(join(tmpdir(), "reeve-cli-"));
   mkdirSync(join(home, "state"), { recursive: true });
   openHub(hubPathFor(home)).close();
-  const run = (args) => spawnSync(process.execPath, ["bin/reeve", ...args, "--home", home],
-    { encoding: "utf8" });
+  // REEVE_HOME, not `--home`. `bin/reeve` derives its home from
+  // `process.env.REEVE_HOME ?? join(homedir(), ".reeve")` and has no --home
+  // option, so passing one is silently ignored and the child inspects the
+  // DEVELOPER'S real ~/.reeve -- host state deciding the result, and a
+  // no-hub H-0 answer loose enough to satisfy the assertions anyway.
+  const run = (args) => spawnSync(process.execPath, ["bin/reeve", ...args],
+    { encoding: "utf8", env: { ...process.env, REEVE_HOME: home } });
   const j = run(["builder", "doctor", "--json"]);
   check(j.status === 0 || j.status === 1,
     "`reeve builder doctor --json` runs rather than falling through to unknown-command",
@@ -3438,6 +3575,11 @@ shape this programme keeps finding:
   try { parsed = JSON.parse(j.stdout); } catch {}
   check(Array.isArray(parsed) && parsed.every(f => f.id && f.severity),
     "and --json emits the finding array", String(j.stdout).slice(0, 200));
+  // CONTROL: the child really is reading the temporary home, not the
+  // developer's. Without this the whole block can pass against ~/.reeve.
+  check((parsed ?? []).every(f => !/\/Users\/[^/]+\/\.reeve/.test(JSON.stringify(f))),
+    "control: the findings name the temporary home, so REEVE_HOME took effect",
+    String(j.stdout).slice(0, 200));
   // CONTROL: a command that really IS unknown must fail differently, or the
   // assertions above pass for any exit status at all.
   const bogus = run(["builder", "nonsense"]);
@@ -3733,17 +3875,25 @@ export const TABLE_OWNERS = {
   impl_pr:         { writer: "chain.mjs (pr-create settle)", reader: "receipt importer, merge.mjs",       replayed: true,  section: "8.5"  },
   attested_push:   { writer: "chain.mjs",                   reader: "merge clause B1",                    replayed: true,  section: "8.5"  },
   guardian_receipt:{ writer: "chain.mjs receipt importer",  reader: "clause B1 via attested_push",        replayed: true,  section: "8.5"  },
-  ownership_check: { writer: "the VERDICT_WAIT poller",     reader: "merge clause B6, pre-flight",        replayed: true,  section: "2.5"  },
+  ownership_check: { writer: "the VERDICT_WAIT poller",     reader: "merge clause B6, pre-flight",        replayed: false,  section: "2.5"  },
   harness_acceptance:{ writer: "task resume --accept-harness", reader: "merge clause B7",                 replayed: true,  section: "8.4"  },
   pr_hold:         { writer: "transition.mjs, chain.mjs",   reader: "the GUARDIAN's verdict (PR-C)",      replayed: true,  section: "9.6"  },
   project_authority:{ writer: "intake.mjs at registry read", reader: "admission, doctor",                 replayed: true,  section: "2.1"  },
-  repo_gate_state: { writer: "loop.mjs per tick (PR-B)",    reader: "merge clause U4",                    replayed: true,  section: "9.3"  },
-  inbox:           { writer: "ingest.mjs",                  reader: "gate.mjs, the post-GATE watcher",    replayed: true,  section: "7.6"  },
+  repo_gate_state: { writer: "loop.mjs per tick (PR-B)",    reader: "merge clause U4",                    replayed: false,  section: "9.3"  },
+  inbox:           { writer: "ingest.mjs",                  reader: "gate.mjs, the post-GATE watcher",    replayed: false,  section: "7.6"  },
   outbox:          { writer: "transition.mjs; the executor", reader: "executor, recoverOutbox, drain",    replayed: true,  section: "3.2"  },
   merge_decision:  { writer: "merge.mjs at each phase",     reader: "task why, the false-merge metric",   replayed: true,  section: "9.3"  },
-  escalation:      { writer: "applyTransition, the loop",   reader: "notify.mjs, dash, task resolve",     replayed: true,  section: "11.7" },
-  intake_event:    { writer: "intake.mjs per candidate",    reader: "the starvation check, why",          replayed: true,  section: "2.4"  },
+  escalation:      { writer: "applyTransition, the loop",   reader: "notify.mjs, dash, task resolve",     replayed: false,  section: "11.7" },
+  intake_event:    { writer: "intake.mjs per candidate",    reader: "the starvation check, why",          replayed: false,  section: "2.4"  },
   schema_version:  { writer: "hubdb.mjs migrations only",   reader: "openHub, validateSnapshot",          replayed: false, section: "11.1" },
+  // Five more are `replayed: false` because they are RE-DERIVED, not restored:
+  // ownership_check by the poller's next full sync, repo_gate_state by the next
+  // refreshGateState, inbox by the next ingest, escalation by the next
+  // evaluation of the same condition, intake_event by the next intake pass.
+  // They carried `replayed: true` with no handler in HANDLERS -- a table
+  // claiming to be restorable with nothing able to restore it, which is exactly
+  // what Task 11's direction-3 check exists to catch.
+  //
   // The five process-scoped tables. NOT replayed and NOT compared, for the same
   // reason restoreHub clears them: they record which PROCESS holds authority,
   // and every one of those processes is gone by the time a restore runs.

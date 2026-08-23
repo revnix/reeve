@@ -276,7 +276,7 @@ Current values, all green: **32** tables, owners and prose complete,
   lock with a **forward-version recheck inside it**; the three locks; hub-aware
   backup with cheap/deep validation; `restoreHub` (refuse live writers, stage +
   atomic rename, clear process-scoped rows, settle live `phase_run` rows
-  `killed`, replay the tail); the destructive drill over all 19 compared tables;
+  `killed`, replay the tail); the destructive drill over all 20 compared tables;
   the prose-versus-DDL cross-check with **four** directions; `NON_REPLAYED_KINDS`;
   `backup --hub`, `restore --hub`, `builder doctor` and `build status` CLI
   routes; retires `ci.flakePatterns`.

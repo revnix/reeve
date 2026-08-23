@@ -122,8 +122,23 @@ console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);
 ```
 
+`allOn` belongs to the shared block too. Three test files in this plan lease
+effects and only one of them defined it:
+
+```js
+// Every capability switch ON. leaseEffect settles a row `refused` when the
+// effect's switch is off (section 1.6), so a file that omits this gets null
+// from every lease and every assertion below it fails for the same unrelated
+// reason -- which reads as a broken outbox rather than a missing fixture.
+// The switch names are the outbox `kind` values.
+const allOn = Object.fromEntries(
+  ["git.push.branch","gh.pr.create","gh.pr.comment","gh.pr.close","gh.pr.body",
+   "gh.review.request","gh.pr.merge","notify","gate.clean_notice",
+   "ledger.claim","ledger.release"].map(k => [k, true]));
+```
+
 Where a task writes `/* ... standard harness, plus seed ... */`, it means the
-block above **and** this helper. Several task files use `seed(db, over)` and only
+block above, `allOn`, **and** this helper. Several task files use `seed(db, over)` and only
 one of them previously said where it came from:
 
 ```js
@@ -300,6 +315,28 @@ const EVIDENCE = [
 
 // ── the named edges from the Verify clause ───────────────────────────────────
 {
+  // regenerate emits adopt-snapshot, which writes the contract columns from
+  // evidence.snapshot. Without the snapshot it bumped the generation and then
+  // adopted undefined into every one of them.
+  const SNAP = { profileHash: "h", registryVersion: 3, gateDefinitionHash: "g",
+                 defaultBranch: "main", visibility: "private" };
+  const regenOk = nextPhase({ phase: "IMPL_PR_OPEN", generation: 2 },
+    { kind: "founder.regenerate", snapshot: SNAP });
+  check(regenOk.ok && regenOk.compensations.includes("adopt-snapshot"),
+    "a regenerate with a resolved snapshot adopts it", JSON.stringify(regenOk));
+  const regenBare = nextPhase({ phase: "IMPL_PR_OPEN", generation: 2 }, { kind: "founder.regenerate" });
+  check(!regenBare.ok && /resolved registry snapshot/.test(regenBare.refusal ?? ""),
+    "a regenerate with NO snapshot is refused before the generation bumps", JSON.stringify(regenBare));
+  // A PARTIAL snapshot is the dangerous one: the fields it does carry are
+  // correct, so it looks like it worked.
+  for (const drop of Object.keys(SNAP)) {
+    const partial = { ...SNAP }; delete partial[drop];
+    const r = nextPhase({ phase: "IMPL_PR_OPEN", generation: 2 },
+      { kind: "founder.regenerate", snapshot: partial });
+    check(!r.ok && (r.refusal ?? "").includes(drop),
+      `a regenerate missing ${drop} is refused, naming it`, JSON.stringify(r));
+  }
+
   const gate = nextPhase({ phase: "GATE", generation: 1 }, { kind: "gate.capReached" });
   check(gate.ok && gate.to === "ESCALATED", "GATE -> ESCALATED at the revision cap", JSON.stringify(gate));
 
@@ -360,6 +397,26 @@ const EVIDENCE = [
     check(!conflicted.ok && /bt:9/.test(conflicted.refusal ?? ""),
       `${held} + resume is refused when the territory now conflicts, naming the blocker`, JSON.stringify(conflicted));
 
+    // A LEDGER-sourced task needs an affirmative, fresh ownership witness. The
+    // guard used to be negative-only, so a caller that never ran the sync
+    // omitted `ownerNotReeve` and was read as "reeve owns it" -- restarting work
+    // on a claim nobody re-verified. Section 2.5 requires a full sync before
+    // every resume, so its absence is a refusal.
+    const unverified = nextPhase({ phase: held, generation: 3, heldFrom: "IMPLEMENTING", sourceKind: "ledger" },
+      { kind: "founder.resume", redesign: false });
+    check(!unverified.ok && /ledger sync/.test(unverified.refusal ?? ""),
+      `${held} + a ledger resume with no ownership witness is refused`, JSON.stringify(unverified));
+    const verified = nextPhase({ phase: held, generation: 3, heldFrom: "IMPLEMENTING", sourceKind: "ledger" },
+      { kind: "founder.resume", redesign: false, ownerIsReeve: true, ownershipSyncedAt: 1_800_000_000 });
+    check(verified.ok, `${held} + a ledger resume WITH a fresh witness proceeds`, JSON.stringify(verified));
+    // CONTROL, both directions: the founder-filed default is unaffected (the
+    // plain resume above passed), and an explicit contrary owner still refuses.
+    const humanOwned = nextPhase({ phase: held, generation: 3, heldFrom: "IMPLEMENTING", sourceKind: "ledger" },
+      { kind: "founder.resume", redesign: false, ownerIsReeve: true,
+        ownershipSyncedAt: 1_800_000_000, ownerNotReeve: "someone" });
+    check(!humanOwned.ok && /someone/.test(humanOwned.refusal ?? ""),
+      `${held} + a ledger resume is still refused when a human owns the node`, JSON.stringify(humanOwned));
+
     const redesign = nextPhase({ phase: held, generation: 3, heldFrom: "IMPLEMENTING", hasOpenPr: true }, { kind: "founder.resume", redesign: true });
     check(redesign.ok && redesign.to === "DESIGN" && redesign.generation === 4 && redesign.bumps === true,
       `${held} + --redesign lands in DESIGN and bumps the generation`, JSON.stringify(redesign));
@@ -375,6 +432,33 @@ const EVIDENCE = [
     check(/stack|already held/i.test(r.refusal ?? ""), "and says so, so the caller appends a hold_reason instead", String(r.refusal));
   }
 
+  // Every hold cause raises ITS OWN identity. A generic BLOCKED with no
+  // escalation is a task that stops and waits for a founder who was never told,
+  // and BLOCKED has no automatic exit.
+  for (const [reason, why] of [
+    ["ownership_lost",      "bt:<id>:intake:ownership-lost"],
+    ["harness_touched",     "bt:<id>:impl:harness-touched"],
+    ["over_budget",         "bt:<id>:impl:over-budget"],
+    ["depth_post_approval", "bt:<id>:depth:post-approval"],
+    ["reopen",              "bt:<id>:spec:reopened"],
+  ]) {
+    const h = nextPhase({ phase: "IMPLEMENTING", generation: 1 }, { kind: "hold", reason });
+    check(h.ok && h.escalate === why, `a ${reason} hold raises ${why}`, JSON.stringify(h));
+  }
+  // blocked_other carries the identity the CALLER determined -- the DDL gives
+  // pr_hold a `detail` column for exactly this -- and refuses without one.
+  const other = nextPhase({ phase: "IMPLEMENTING", generation: 1 },
+    { kind: "hold", reason: "blocked_other", escalation: "bt:<id>:lease:conflict" });
+  check(other.ok && other.escalate === "bt:<id>:lease:conflict",
+    "a blocked_other hold raises the identity its caller supplied", JSON.stringify(other));
+  const nameless = nextPhase({ phase: "IMPLEMENTING", generation: 1 }, { kind: "hold", reason: "blocked_other" });
+  check(!nameless.ok, "and a blocked_other hold with no identity is REFUSED, not held silently", JSON.stringify(nameless));
+  // CONTROL: the map is closed against pr_hold's CHECK set, so a reason outside
+  // it is a refusal rather than a hold with no name.
+  const bogus = nextPhase({ phase: "IMPLEMENTING", generation: 1 }, { kind: "hold", reason: "because" });
+  check(!bogus.ok && /unknown hold reason/.test(bogus.refusal ?? ""),
+    "control: a reason outside pr_hold's CHECK set is refused", JSON.stringify(bogus));
+
   // ESCALATED voids nothing; BLOCKED voids pending rows. Both release territory.
   const blocked = nextPhase({ phase: "IMPLEMENTING", generation: 1, hasOpenPr: true }, { kind: "hold", reason: "over_budget" });
   check(blocked.ok && blocked.to === "BLOCKED" && blocked.compensations.includes("void-pending"),
@@ -384,8 +468,8 @@ const EVIDENCE = [
     "ESCALATED voids NOTHING: the phase merely stopped, and its effects stand", JSON.stringify(esc));
   // A trivial filing skips RESEARCH, and the skip is recorded rather than merely
   // implied by a missing artifact.
-  const triv = nextPhase({ phase: "SIZING", generation: 1,
-    evidence: { kind: "phase.succeeded", phase: "SIZING", depth: "trivial" } });
+  const triv = nextPhase({ phase: "SIZING", generation: 1 },
+    { kind: "phase.succeeded", phase: "SIZING", depth: "trivial" });
   check(triv.ok && triv.to === "DESIGN", "a trivial filing goes straight from SIZING to DESIGN", JSON.stringify(triv));
   check(triv.compensations.includes("record-research-skip"),
     "and emits record-research-skip, so the absent research artifact has a durable reason",
@@ -474,12 +558,25 @@ const ADVANCE = {
 // does not change the phase is still an accepted override, and discarding it
 // would leave the promised redispatch with nothing new to dispatch under.
 const refuse = (refusal, extra = {}) => ({ ok: false, refusal, ...extra });
+// One identity per hold cause, section 11.7. The keys are exactly `pr_hold`'s
+// CHECK set minus the two that never arrive as a `hold` (`cancel` is CANCELLING,
+// `escalated` is the exhausted-retries edge), so the map is closed against the
+// schema rather than against memory. `<id>` is substituted by applyTransition.
+const HOLD_ESCALATION = Object.freeze({
+  ownership_lost:      "bt:<id>:intake:ownership-lost",
+  harness_touched:     "bt:<id>:impl:harness-touched",
+  over_budget:         "bt:<id>:impl:over-budget",
+  depth_post_approval: "bt:<id>:depth:post-approval",
+  reopen:              "bt:<id>:spec:reopened",
+  blocked_other:       null,          // supplied by the caller; see the hold branch
+});
+
 const go = (to, { generation, bumps = false, compensations = [], sliceCursor = null, escalate = null }) =>
   ({ ok: true, to, generation, bumps, sliceCursor, escalate, compensations: Object.freeze(compensations) });
 
 export function nextPhase(state, evidence) {
   const { phase, generation = 1, heldFrom = null, drainRemaining = 0,
-          hasOpenPr = false, pinnedTerritory = false } = state ?? {};
+          hasOpenPr = false, pinnedTerritory = false, sourceKind = "founder" } = state ?? {};
   const kind = evidence?.kind;
 
   if (!PHASES.includes(phase)) return refuse(`unknown phase ${JSON.stringify(phase)}`);
@@ -584,9 +681,29 @@ export function nextPhase(state, evidence) {
       // because ownership was lost is precisely the case where the second
       // matters: territory can be free while a human still owns the ledger node,
       // and resuming then puts reeve back to work on someone else's task.
-      if (evidence.ownerNotReeve)
-        return refuse(`the ledger still projects ${evidence.ownerNotReeve} as owner; ` +
-                      `resume is refused until reeve's claim is re-established`);
+      // AFFIRMATIVE, not negative-only. `if (evidence.ownerNotReeve)` refuses a
+      // caller that checked and found a human, and admits a caller that never
+      // checked at all -- and the second is the likelier bug, because omitting
+      // an optional field is what a forgetful caller does. Section 2.5 requires
+      // a FULL ledger sync before every `reeve task resume`, so the witness has
+      // to be present, positive and fresh, and its absence is a refusal.
+      //
+      // Scoped by source kind: founder-filed tasks have no ledger owner, and
+      // section 2.5 puts them out of scope explicitly rather than by omission.
+      if (sourceKind === "ledger") {
+        if (evidence.ownerNotReeve)
+          return refuse(`the ledger still projects ${evidence.ownerNotReeve} as owner; ` +
+                        `resume is refused until reeve's claim is re-established`);
+        if (evidence.ownerIsReeve !== true || evidence.ownershipSyncedAt == null)
+          return refuse("a ledger-sourced resume needs a full ledger sync showing reeve as owner; " +
+                        "pass ownerIsReeve and ownershipSyncedAt from that sync, or the resume is " +
+                        "restarting work on a claim nobody re-verified");
+      } else if (evidence.ownerNotReeve) {
+        // A founder-filed task carrying an owner is a caller error, not a
+        // silently ignored field.
+        return refuse(`a founder-filed task has no ledger owner; ` +
+                      `${evidence.ownerNotReeve} cannot be projected for it`);
+      }
       if (evidence.redesign)
         return go("DESIGN", { generation: generation + 1, bumps: true,
           compensations: ["clear-holds","annotate-resumed","regrant-territory", ...(hasOpenPr ? ["close-prs"] : [])] });
@@ -605,11 +722,34 @@ export function nextPhase(state, evidence) {
   // pinned lease here lets an overlapping filing take territory the founder
   // explicitly reserved, and `resume` then refuses naming a blocker the founder
   // created by pinning.
-  if (kind === "hold")
-    return go("BLOCKED", { generation,
+  if (kind === "hold") {
+    // Every hold cause has a founder-visible identity in section 11.7, and this
+    // branch raised none of them: a worker-reported block, an over-budget slice,
+    // a touched harness and a lost ledger claim all entered BLOCKED silently.
+    // BLOCKED has no automatic exit, so an unannounced hold is a task that stops
+    // and waits for a founder who was never told.
+    //
+    // The reasons are pr_hold's closed CHECK set (S2-A migration 1), so this map
+    // is closed too, and a reason outside it is a refusal rather than a hold
+    // with no name.
+    if (!HOLD_ESCALATION.hasOwnProperty(evidence.reason))
+      return refuse(`unknown hold reason ${JSON.stringify(evidence.reason)}; ` +
+                    `it must be one of ${Object.keys(HOLD_ESCALATION).join(", ")}`);
+    // `blocked_other` is the catch-all the DDL gives a `detail` column for
+    // ("for blocked_other, the escalation identity"). The caller that knows the
+    // cause supplies the identity; without one the hold is exactly the silent
+    // stop this whole branch is being fixed for.
+    const escalate = evidence.reason === "blocked_other"
+      ? (evidence.escalation ?? null)
+      : HOLD_ESCALATION[evidence.reason];
+    if (escalate === null)
+      return refuse("a blocked_other hold must carry the escalation identity for its cause; " +
+                    "a hold with no identity reaches no founder");
+    return go("BLOCKED", { generation, escalate,
       compensations: ["record-hold-reason","void-pending",
                       ...(pinnedTerritory ? [] : ["release-territory"]),
                       ...(hasOpenPr ? ["write-pr-hold"] : [])] });
+  }
 
   // A worker phase whose bounded retries are exhausted. ESCALATED voids
   // NOTHING -- the phase merely stopped and its effects stand -- but it does
@@ -730,6 +870,21 @@ export function nextPhase(state, evidence) {
     // contract nobody approved: the spec it was built from is about to be
     // re-rendered and re-gated. It has to be held and closed like every other
     // path that abandons work, or it stays mergeable against a superseded plan.
+    // `adopt-snapshot` writes the contract columns onto the task from
+    // evidence.snapshot. A bare {kind:"founder.regenerate"} bumped the
+    // generation and then either threw inside applyCompensation or adopted
+    // undefined into profile_hash, registry_version, gate_definition_hash,
+    // default_branch and visibility -- a task whose contract is null, at a
+    // generation that says it was deliberately re-resolved.
+    //
+    // Every field is required, and named, because a partial snapshot is the
+    // failure that looks like success: the columns it does carry are correct.
+    const SNAPSHOT_FIELDS = ["profileHash", "registryVersion", "gateDefinitionHash",
+                             "defaultBranch", "visibility"];
+    const missing = SNAPSHOT_FIELDS.filter(f => evidence.snapshot?.[f] == null);
+    if (missing.length)
+      return refuse(`regenerate needs a resolved registry snapshot; missing ${missing.join(", ")}. ` +
+                    `Resolve it before the transaction, as section 2.2 requires`);
     return go(PAST_GATE.includes(phase) ? "SPEC_DRAFT" : phase,
       { generation: generation + 1, bumps: true,
         compensations: ["adopt-snapshot","annotate-resumed",
@@ -852,6 +1007,7 @@ import { applyTransition } from "../src/build/transition.mjs";
     evidence: { kind: "phase.succeeded", phase: "RESEARCH" }, artifactSha: "sha-research", op: "phase.advanced" });
   check(r.applied === true && r.to === "DESIGN", "a legal transition advances the task", JSON.stringify(r));
   check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "DESIGN", "and the projection moved");
+  const eventsBefore = db.prepare("SELECT count(*) c FROM phase_event").get().c;
   const ev = db.prepare("SELECT * FROM phase_event WHERE task='bt:1' ORDER BY seq DESC LIMIT 1").get();
   check(ev.from_phase === "RESEARCH" && ev.to_phase === "DESIGN" && ev.from_generation === 2 && ev.to_generation === 2,
     "the phase_event records both phases and both generations", JSON.stringify(ev));
@@ -881,7 +1037,14 @@ import { applyTransition } from "../src/build/transition.mjs";
   check(threw === null, "a concurrent actor winning the race does not throw", String(threw));
   check(r?.applied === false && r.reason === "lost-race", "it is reported as a lost race", JSON.stringify(r));
   check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "DESIGN", "the projection is untouched");
-  check(db.prepare("SELECT count(*) c FROM phase_event").get().c === 0, "and no event is appended for work that did not happen");
+  // A DELTA, not an absolute count: `seed` mints a run of phase_event rows so
+  // that outbox fences have events to reference, and an assertion written as
+  // `=== 0` reads those and fails against a correct implementation. Measuring
+  // the change is also the right shape regardless of what the fixture seeds --
+  // the claim is "this call appended nothing", not "the table is empty".
+  check(db.prepare("SELECT count(*) c FROM phase_event").get().c === eventsBefore,
+    "and no event is appended for work that did not happen",
+    `${eventsBefore} -> ${db.prepare("SELECT count(*) c FROM phase_event").get().c}`);
   db.close();
 }
 
@@ -1015,8 +1178,15 @@ import { applyTransition } from "../src/build/transition.mjs";
 // error: the loop is allowed to race with itself and with a founder command,
 // and turning every race into a thrown exception makes the caller invent a
 // recovery for something that needs none.
+// Every binding this module reaches for. `isSameProcess` is evaluated as a
+// DEFAULT ARGUMENT, so an undeclared one throws on the very first ordinary call
+// -- before hubTx, before anything -- and `assertWritable` is called on the
+// first line inside the transaction.
 import { hubTx, hubEvent } from "./hubdb.mjs";
 import { nextPhase, HELD } from "./phases.mjs";
+import { assertWritable } from "./locks.mjs";
+import { isSameProcess } from "../supervisor.mjs";       // build/ is one level down
+import { enqueueEffect } from "./outbox.mjs";
 
 export function applyTransition(db, { taskId, expectedPhase, expectedGeneration, evidence,
                                       artifactSha = null, op, effects = [], slice = null,
@@ -1107,6 +1277,15 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
     // who ran the command a second after cancelling would otherwise force a
     // drain that had had no window at all.
     if (evidence?.kind === "founder.cancelForce") {
+      // FENCE FIRST. Every one of the refusals below happens BEFORE the
+      // generation-fenced CAS, and the rule this module keeps relearning is
+      // that any path returning early must fence itself: without it a stale
+      // caller whose task was already settled or force-cancelled by someone
+      // else gets "the drain has had 4m of its 30m window" instead of the
+      // required lost-race no-op -- a refusal that describes a task that no
+      // longer exists in that state, and that a retry loop will keep retrying.
+      if (task.phase !== expectedPhase || task.generation !== expectedGeneration)
+        return { applied: false, reason: "lost-race" };
       // The clock and the threshold are the CALLER's. This module has no clock
       // by design, and the hub does not store the profile, so
       // `builder.cancel.drainMinutes` can only arrive through the interface --
@@ -1138,10 +1317,23 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
       // to have SETTLED THROUGH ITS RECONCILER -- a ledger write-back that
       // reached `failed`, `dead_letter` or `refused` never happened, and DONE is
       // terminal with no edges out, so the task can never come back to do it.
+      // Scoped to THIS generation, and to rows enqueued since FINALIZING was
+      // entered. An unqualified query reads the task's whole history, so a
+      // `failed` row from an earlier phase -- one the task already recovered
+      // from through a fresh row -- blocks FINALIZING -> DONE forever, and DONE
+      // is terminal with no edges out. The task would be permanently
+      // unfinishable because of a failure that was already handled.
+      const finalizingAt = db.prepare(
+        `SELECT at FROM phase_event WHERE task=? AND to_phase='FINALIZING'
+           AND to_generation=? ORDER BY seq DESC LIMIT 1`).get(taskId, expectedGeneration)?.at;
+      if (finalizingAt == null)
+        return { applied: false, reason: "refused",
+                 refusal: "there is no FINALIZING entry for this generation to scope the completion check to" };
       const bad = db.prepare(
         `SELECT status, count(*) c FROM outbox
-         WHERE task_id=? AND status IN ('pending','inflight','failed','dead_letter','refused')
-         GROUP BY status`).all(taskId);
+         WHERE task_id=? AND task_generation=? AND created_at >= ?
+           AND status IN ('pending','inflight','failed','dead_letter','refused')
+         GROUP BY status`).all(taskId, expectedGeneration, finalizingAt);
       if (bad.length)
         return { applied: false, reason: "refused",
                  refusal: `finalization is not complete: ` + bad.map(r => `${r.c} ${r.status}`).join(", ") +
@@ -1181,14 +1373,22 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
     // `evidence` is passed through: record-hold-reason needs the reason and detail
     // the hold carried, and without them it can only write a row saying a hold
     // happened -- which is what `task resume` lists to the founder.
+    // Caller-supplied effects are enqueued BEFORE the compensations run, so
+    // that `record-drain` -- which is ordered last precisely because it
+    // snapshots what is outstanding -- actually sees them. Enqueueing them
+    // afterwards meant any cancellation effect passed through the documented
+    // `effects` parameter was absent from `task_drain`, so `drainRemaining`
+    // could reach zero and the task reach CANCELLED with that effect still
+    // pending. Each carries the fence: the seq of the event that decided it.
+    for (const e of effects) enqueueEffect(db, { ...e, taskId, generation: decision.generation, fence: seq });
+
     for (const c of decision.compensations)
       applyCompensation(db, { c, taskId, generation: decision.generation, seq, evidence, snapshot: evidence?.snapshot });
 
-    // Effects are enqueued, never performed. Each carries the fence: the seq of
-    // the event that decided it. The executor revalidates that fence inside its
-    // lease transaction, so an effect decided under a contract that has since
-    // been replaced settles 'fenced' with nothing done.
-    for (const e of effects) enqueueEffect(db, { ...e, taskId, generation: decision.generation, fence: seq });
+    // (Effects were enqueued above, before the compensations, so record-drain
+    // can count them. They are never performed here: the executor revalidates
+    // the fence inside its lease transaction, and an effect decided under a
+    // contract that has since been replaced settles 'fenced' with nothing done.)
 
     // resume_seq is bumped BEFORE the event is built, and travels IN it. Bumping
     // it afterwards means the replayed payload carries the old counter: the
@@ -1254,7 +1454,10 @@ Write `applyCompensation` as a switch over the closed set `phases.mjs` produces,
 
 ```bash
 $N test/hub-transition.test.mjs
-git add src/build/transition.mjs test/hub-transition.test.mjs
+# replay.mjs too: this task adds the handlers for the event kinds it introduces,
+# and leaving them uncommitted fails the event-kind cross-check -- or worse,
+# passes it and loses those projections at the next restore.
+git add src/build/transition.mjs src/build/replay.mjs test/hub-transition.test.mjs
 git commit -m "feat(hub): generation-fenced transition with compensations"
 ```
 
@@ -1313,6 +1516,10 @@ if (drained.changes) {
 //      different bytes and would otherwise push a second time for one round.
 //   3. Every row carries a fence, revalidated inside the lease transaction.
 /* ... standard harness, plus seed ... */
+import { openHub, hubTx } from "../src/build/hubdb.mjs";
+import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
+         voidPending, KEY_KINDS } from "../src/build/outbox.mjs";
+
 
 // ── fence revalidation ───────────────────────────────────────────────────────
 {
@@ -1435,10 +1642,28 @@ if (drained.changes) {
     }
   };
 
-  // (a) A round-keyed effect re-enqueued after it completed is SUPERSEDED, so it
-  //     is never handed out a second time.
-  for (const k of KINDS) {
-    const key = `bt:1:g1:IMPLEMENTING:${k}:0`;
+  // The two mechanisms are DIFFERENT, and a single loop expecting `superseded`
+  // for all ten contradicted this file's own control forty lines above, which
+  // requires a completed `gh.pr.comment` with the same key to be re-enqueued as
+  // `pending` for its reconciler. No implementation can satisfy both.
+  //
+  //   KEYED kinds (round- and sha-keyed): the key itself is proof the effect
+  //   happened, so a re-enqueue against a `done` row is SUPERSEDED at enqueue.
+  //   Everything else: the re-enqueue is ADMITTED and made inert by the
+  //   reconciler against external truth.
+  //
+  // Partitioned from the module's own KEY_KINDS rather than a list retyped
+  // here, so the test cannot disagree with the implementation about which is
+  // which.
+  const keyed = KINDS.filter(k => KEY_KINDS.includes(k));
+  const plain = KINDS.filter(k => !KEY_KINDS.includes(k));
+  check(keyed.length > 0 && plain.length > 0,
+    "control: the fixture covers both partitions, so neither branch below is vacuous",
+    `keyed=${JSON.stringify(keyed)} plain=${JSON.stringify(plain)}`);
+
+  // (a) KEYED: re-enqueue after completion is superseded, never handed out again.
+  for (const k of keyed) {
+    const key = `bt:1:g1:IMPLEMENTING:${k}:deadbeef`;      // sha-keyed form
     const first = hubTx(db, () => enqueueEffect(db, {
       idempotencyKey: key, kind: k, taskId: "bt:1", generation: 1, fence: 1, args: {} }));
     check(first.status === "pending", `${k}: the first enqueue is admitted`, String(first.status));
@@ -1446,9 +1671,35 @@ if (drained.changes) {
     const repeat = hubTx(db, () => enqueueEffect(db, {
       idempotencyKey: key, kind: k, taskId: "bt:1", generation: 1, fence: 1, args: {} }));
     check(repeat.status === "superseded",
-      `${k}: re-enqueueing a completed round key is superseded, not admitted`, String(repeat.status));
+      `${k}: re-enqueueing a completed keyed effect is superseded, not admitted`, String(repeat.status));
     drain();                              // must find nothing to hand out
   }
+
+  // (b) NON-KEYED: the re-enqueue is admitted, and the RECONCILER is what makes
+  //     it inert. `drain` performs whatever it is handed, so if the second
+  //     delivery reaches a worker it happens twice and `world` says so.
+  for (const k of plain) {
+    const key = `bt:1:g1:IMPLEMENTING:${k}:0`;
+    hubTx(db, () => enqueueEffect(db, {
+      idempotencyKey: key, kind: k, taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+    drain();                              // performs it once
+    const repeat = hubTx(db, () => enqueueEffect(db, {
+      idempotencyKey: key, kind: k, taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+    check(repeat.status === "pending",
+      `${k}: a non-keyed re-enqueue is ADMITTED, for its reconciler to settle`, String(repeat.status));
+    // Recovery, not dispatch: the reconciler may only OBSERVE external truth.
+    // It never appends to `world`, so if the outbox needs a second external
+    // action to make progress, this drill cannot supply one.
+    db.exec(`UPDATE outbox SET status='inflight', lease_expires_at = unixepoch() - 1
+             WHERE idempotency_key = '${key}' AND status = 'pending'`);
+    recoverEffects(db, { reconcile: (row) =>
+      world.includes(row.idempotency_key)
+        ? { settled: true, ok: true, result: { reconciled: true } }
+        : { settled: false } });
+    check(db.prepare("SELECT status FROM outbox WHERE idempotency_key=? ORDER BY id DESC LIMIT 1").get(key).status === "done",
+      `${k}: and is settled from external truth without performing it again`);
+  }
+
   const counts = {};
   for (const key of world) counts[key] = (counts[key] ?? 0) + 1;
   const repeated = Object.entries(counts).filter(([, n]) => n !== 1);
@@ -1511,7 +1762,7 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
 **Interfaces:**
 - Consumes: `hubTx`, `hubEvent`, **`assertWritable`** (S2-A), `applyTransition` (Tasks 1, 6, 15).
 - Produces:
-  - `resolveSnapshot(registry, project, claims, io) -> Snapshot` — takes the filing's normalised claims, because it is the only place with both the repository path and an I/O capability, and it returns them resolved. Without the parameter `resolveClaims` had no caller and the symlink refusal was unreachable from the filing path. where `io = { repoId, visibility, specRepoId, profileHash, defaultBranch, gateDefinitionHash }`, each a function. **Async, and it is where every network call lives.**
+  - `resolveSnapshot(registry, project, claims, io) -> Snapshot` — takes the filing's normalised claims, because it is the only place with both the repository path and an I/O capability, and it returns them resolved. Without the parameter `resolveClaims` had no caller and the symlink refusal was unreachable from the filing path. where `io = { repoId, visibility, specRepoId, profileHash, defaultBranch, gateDefinitionHash, lstat, lsTree }`, each a function. **Async, and it is where every network call lives.** `lstat` and `lsTree` are in that list because `resolveSnapshot` calls `resolveClaims`, which needs both — the symlink refusal and the gitlink (submodule) refusal are its entire purpose. An `io` carrying only the lookup functions makes the composition throw when snapshot resolution reaches the filesystem-aware stage, or silently skip both refusals; the tests call `resolveClaims` directly, so they exercise the half that works and not the seam that does not.
   - `admitTask(db, snapshot, filing) -> { ok, taskId, refusal }` — **synchronous, one `BEGIN IMMEDIATE`, and it performs no I/O of its own.** Inserts the task row at generation 1, its `task_territory` children, the `task.filed` event, and grants the territory lease **with the full intersection check**, refusing the whole filing and naming the blocker on a conflict. It calls **`assertWritable(db, { isAlive, inTx: true })` first, inside that transaction**: it writes four authority-bearing rows, so admitting a filing while a restore holds `maintenance_lock` races the snapshot replacement and can be lost by the replay that follows it. "Every hub writer calls it" is a rule with no exceptions, and admission was one.
   - `normalizeClaim(raw) -> { kind, path } | { refusal }` — **pure**, and grammar only: shape, normalisation, and the refused constructs (`*`, `**`, `!`, braces, character classes, absolute paths, `..`). It cannot and does not check symlinks.
   - `resolveClaims(claims, repoPath, io) -> { ok, claims } | { refusal }` — the **filesystem-aware** half, run by `resolveSnapshot` in the network-first phase (§2.2). It walks each normalised claim **and every ancestor** and refuses:
@@ -1791,8 +2042,19 @@ file exists it has nothing to import.
 // default that happens to look like a pass.
 /* ... standard harness ... */
 const EXPECTED = 42;
+// The COMPLETE section 1.8 contract, defined ONCE at file scope and shared by
+// the positive fixture and the per-permission negative loop below. When `FULL`
+// was widened to eight and `ok` was left at three, a correct gateStateFrom
+// returned `app_installed: "fail"` on the first assertion that claims to be a
+// pass: two fixtures for one contract, disagreeing.
+//
+// Administration is READ deliberately -- administration write is refused in
+// code, so requiring write would be wrong in the other direction.
+const FULL = { actions: "read", administration: "read", checks: "write",
+               contents: "write", issues: "write", metadata: "read",
+               pull_requests: "write", statuses: "write" };
 const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", integration_id: EXPECTED }] },
-             installation: { permissions: { checks: "write", contents: "write", pull_requests: "write" } } };
+             installation: { permissions: { ...FULL } } };
 
 {
   let r = gateStateFrom({ ...ok, expectedAppId: EXPECTED, repoId: 1, nwo: "o/r", now: 100 });
@@ -1838,13 +2100,9 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
   // One permission at a time. A fixture missing several at once is satisfied by
   // an implementation that checks only the first, which then passes an
   // installation with read-only contents or no pull_requests write.
-  // The COMPLETE contract from section 1.8, all eight. An incomplete FULL means
-  // the loop below never removes the five it omits, so an installation missing
-  // Actions read or Statuses write passes. Administration is READ: administration
-  // write is refused in code, so requiring write would be wrong the other way.
-  const FULL = { actions: "read", administration: "read", checks: "write",
-                 contents: "write", issues: "write", metadata: "read",
-                 pull_requests: "write", statuses: "write" };
+  // FULL is the file-scope constant the positive `ok` fixture is built from, so
+  // the two cannot drift: this loop removes one permission at a time from the
+  // SAME contract the pass case asserts.
   for (const missing of Object.keys(FULL)) {
     const perms = { ...FULL }; delete perms[missing];
     const p = gateStateFrom({ ruleset: ok.ruleset, installation: { permissions: perms },
@@ -2126,10 +2384,20 @@ for (let i = 0; i < 500; i++) {
     caught === "exited"
       ? "the worker finished before the probe saw a lock: raise the loop count and re-run"
       : "never saw the write lock held; the kill would have proved nothing");
-  check(caught, "control: the child was observed INSIDE an open write transaction",
-    "never saw the write lock held; the kill would have landed between transactions and proved nothing");
-  kid.kill("SIGKILL");
-  await once(kid, "exit");
+  // (A second, duplicate `check(caught, ...)` used to sit here. It was vacuous:
+  // every outcome of the race is a non-empty string, so it passed on "exited"
+  // and "timeout" as readily as on "locked".)
+
+  // Kill only if the child is STILL RUNNING, and reuse the one exit promise.
+  // `once(kid, "exit")` installs a fresh listener, and EventEmitter does not
+  // replay past events -- so when the race was won by `exit`, the child is
+  // already gone, the new listener never fires, and the whole suite HANGS
+  // rather than reporting red. A hanging test is worse than a failing one: CI
+  // reports a timeout with no assertion to read.
+  if (caught !== "exited") {
+    kid.kill("SIGKILL");
+    await exit;                       // already resolved if it has since exited
+  }
   probe.close();
 
   const back = openHub(p);

@@ -1247,6 +1247,11 @@ export async function tick(ctx) {
         // SAID it fixed this.
         const declined = !r.report ? "the worker returned no usable report"
           : r.report.fixed !== true ? "the worker did not report a fix"
+          // An absent or malformed `filesTouched` would reach `commitRunWork` as
+          // null and turn the declaration check OFF, so a scratch file would be
+          // committed with the fix. A field reeve cannot read is not permission
+          // to skip the guard it feeds.
+          : !Array.isArray(r.report.filesTouched) ? "the worker did not report which files it changed"
           : r.report.needsHuman ? `the worker reported it needs a human: ${printable(String(r.report.needsHuman)).slice(0, 160)}`
           : null;
         const landed = declined ? { ok: true, committed: false, files: [], why: `not committing: ${declined}` }
@@ -1261,7 +1266,7 @@ export async function tick(ctx) {
           // reproduction script inside the lane passes it. reeve commits what the
           // worker SAID it changed, and refuses when the checkout holds anything
           // it did not.
-          declared: Array.isArray(r.report?.filesTouched) ? r.report.filesTouched : null,
+          declared: r.report.filesTouched,
         });
         if (!landed.ok) {
           const rel = releaseRunCheckout(worktree, { workFetched: false });

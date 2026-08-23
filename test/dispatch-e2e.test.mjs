@@ -526,6 +526,10 @@ for (const [what, report] of [
   ["an undeclared scratch file", { fixed: true, cause: "c", change: "ch", filesTouched: ["fix.js"] }],
   ["no report at all", null],
   ["a report with no `fixed`", { cause: "c", change: "ch", filesTouched: ["fix.js", "repro.js"] }],
+  // An unusable `filesTouched` reached `commitRunWork` as null and turned the
+  // declaration check OFF, so the undeclared file went with the fix.
+  ["no filesTouched at all", { fixed: true, cause: "c", change: "ch" }],
+  ["a filesTouched that is not an array", { fixed: true, cause: "c", change: "ch", filesTouched: "fix.js" }],
 ]) {
   const dirU2 = mkdtempSync(join(tmpdir(), "reeve-e2e-undeclared-"));
   const wtU2 = mkdtempSync(join(dirU2, "wt-"));

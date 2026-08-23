@@ -77,8 +77,11 @@ function founderGit(cwd, args) {
 
 function run(cwd, neutralise, args, env) {
   try {
+    // 64 MiB, because the default 1 MiB is not enough for a repository-sized
+    // answer: `changedFiles` raised it after about 1,800 long paths overflowed
+    // it, and a helper that fails on SIZE turns a valid repair into a refusal.
     return { ok: true, out: execFileSync("git", ["-C", cwd, ...neutralise, ...args],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env }).trim() };
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024, env }).trim() };
   // `reason` picks git's own fatal line rather than the last thing it printed,
   // which is usually progress narration and sends the reader somewhere else.
   } catch (e) { return { ok: false, out: "", err: reason(e.stderr || e.message) }; }
@@ -556,9 +559,13 @@ export function commitRunWork({ repoRoot, path, branch, message, exclude = [], s
   const added = git(path, ["add", "--all", "--", ".", ...exclude.map(e => `:(exclude)${e}`)]);
   if (!added.ok) return { ok: false, why: `could not stage the work: ${added.err}` };
 
-  const staged = git(path, ["diff", "--cached", "--name-only"]);
+  // `-z`, because git QUOTES a path it considers unusual: `kéy.txt` comes back as
+  // `"k\303\251y.txt"` from `--name-only`, which matches nothing the worker
+  // reported and would quarantine a perfectly good repair. NUL-terminated output
+  // is the raw filename, and it is what `changedFiles` already reads.
+  const staged = git(path, ["diff", "--cached", "--name-only", "-z"]);
   if (!staged.ok) return { ok: false, why: `could not read what was staged: ${staged.err}` };
-  const files = staged.out ? staged.out.split("\n").filter(Boolean) : [];
+  const files = staged.out ? staged.out.split("\0").filter(Boolean) : [];
   // A worker that committed its own work, or changed nothing, leaves nothing to
   // stage. Not an error: the gates below judge whatever the branch now holds.
   if (!files.length) return { ok: true, why: null, committed: false, files: [] };

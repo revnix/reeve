@@ -12,7 +12,7 @@
 
 import { checkBaseline } from "./baseline.mjs";
 import { sandboxFor } from "./sandbox.mjs";
-import { readCanaryState, policyHashOf, instrumentHash } from "./canary.mjs";
+import { readCanaryState, policyHashOf, currentInstrument as instrumentInForce } from "./canary.mjs";
 import { probeKeychain, isolationTopologyReady, binaryIdentity } from "./containment.mjs";
 import { GIT_NEUTRALISE_FOUNDER, founderGitEnv } from "./gitguard.mjs";
 import { readOauthToken } from "./workerenv.mjs";
@@ -393,7 +393,7 @@ function checkDetectors(db, profile) {
 // a refusal in the log can be understood here without the daemon.
 
 /** The last sandbox canary this daemon recorded, if any. */
-export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now = () => Date.now(), identity = binaryIdentity, currentPolicyHash = null, currentInstrument = instrumentHash() } = {}) {
+export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now = () => Date.now(), identity = binaryIdentity, currentPolicyHash = null, currentInstrument = instrumentInForce() } = {}) {
   const id = "R-14", title = "worker sandbox canary";
   if (!stateDir) return { id, level: UNKNOWN, title, lines: ["no state directory to read the canary from"] };
   const st = read(stateDir, nwo);
@@ -581,6 +581,28 @@ export function founderCredential(cwd, url, { run = founderRun } = {}) {
 }
 
 /**
+ * HTTP authentication configured somewhere other than a credential helper.
+ *
+ * `http.<url>.extraHeader` carrying an Authorization header, and
+ * `http.<url>.cookieFile`, are both used by `ls-remote` and by the real push
+ * while `git credential fill` knows nothing about them. `--get-urlmatch` is
+ * git's own resolution for per-url http config: measured 2026-08-23, it exits 0
+ * for a url the section matches and 1 for one it does not.
+ *
+ * Only the KEY is returned. The value is an Authorization header or a path to a
+ * cookie jar, so it is never returned, printed or recorded — the same rule the
+ * credential itself gets.
+ */
+const HTTP_AUTH_KEYS = ["http.extraHeader", "http.cookieFile"];
+function httpAuthElsewhere(run, cwd, url) {
+  for (const key of HTTP_AUTH_KEYS) {
+    const r = run(cwd, ["config", "--get-urlmatch", key, url]);
+    if (r.ok && r.out) return key;
+  }
+  return null;
+}
+
+/**
  * A remote URL with its userinfo removed, for printing.
  *
  * `git remote get-url` EXPANDS `url.<base>.insteadOf`, so a rewrite pointing at
@@ -602,52 +624,65 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
   if (!fetchUrl.ok || !fetchUrl.out) return { id, level: BROKEN, title,
     lines: [`no origin in ${checkout}${fetchUrl.err ? `: ${fetchUrl.err}` : ""}`,
             "-> reeve publishes by pushing to origin; a checkout without one can publish nothing"] };
-  // The PUSH url, because that is the one `git push origin` uses and it can name
-  // a different transport: `remote.origin.pushurl` makes https-fetch plus
-  // ssh-push, and the reverse, both ordinary. Without `--push` this checked the
-  // wrong URL and the wrong credential. Falls back to the fetch URL when no
-  // pushurl is set, which is git's own behaviour.
-  const pushed = run(checkout, ["remote", "get-url", "--push", "origin"]);
-  const pushUrl = pushed.ok && pushed.out ? pushed.out : fetchUrl.out;
-  const separate = pushUrl !== fetchUrl.out;
+  // EVERY push url. `git push origin` affects all configured `remote.origin.
+  // pushurl` values, and `get-url --push` returns only the first — measured, two
+  // pushurls give one value without `--all` and both with it. Validating the
+  // first alone reports OK for a remote whose second destination cannot be
+  // reached. `--push --all` falls back to the fetch url when no pushurl is set,
+  // which is git's own behaviour.
+  const pushed = run(checkout, ["remote", "get-url", "--push", "--all", "origin"]);
+  const pushUrls = (pushed.ok && pushed.out ? pushed.out.split("\n") : [fetchUrl.out]).map(u => u.trim()).filter(Boolean);
+  const separate = pushUrls.length > 1 || pushUrls[0] !== fetchUrl.out;
 
   const branch = profile.identity?.defaultBranch ?? "main";
   const lines = [`origin ${withoutUserinfo(fetchUrl.out)}`];
-  if (separate) lines.push(`push url ${withoutUserinfo(pushUrl)}`);
+  if (separate) lines.push(`push url(s) ${pushUrls.map(withoutUserinfo).join(", ")}`);
 
   // Reachability on the url each operation actually uses: `ls-remote origin`
-  // reads through the FETCH url, so a separate push url needs its own look.
+  // reads through the FETCH url, so a push url of its own needs its own look.
   const reach = run(checkout, ["ls-remote", "origin", `refs/heads/${branch}`]);
   if (!reach.ok) return { id, level: BROKEN, title,
     lines: [...lines, `reeve's git cannot reach it: ${reach.err}`,
             "-> every publication would fail; the reads reeve makes through `gh` are unaffected, so nothing else reports this"] };
   lines.push(`reachable: ${branch} is at ${(reach.out.split(/\s+/)[0] ?? "").slice(0, 10) || "(no such ref)"}`);
-  if (separate) {
-    const reachPush = run(checkout, ["ls-remote", pushUrl, `refs/heads/${branch}`]);
-    if (!reachPush.ok) return { id, level: BROKEN, title,
-      lines: [...lines, `but the PUSH url cannot be reached: ${reachPush.err}`,
-              "-> reeve would fetch and judge normally, then fail at the push"] };
-    lines.push("the push url answers too");
-  }
 
-  // ssh and local transports authenticate through the transport itself, so the
-  // reach above already exercised them. http and https do not, on a PUBLIC
-  // repository -- git's credential subsystem covers both schemes, and a plain
-  // http remote answers an anonymous read exactly as https does.
-  if (!/^https?:\/\//.test(pushUrl)) {
-    lines.push("the push transport carries its own authentication, so the reach above exercised it");
-    return { id, level: OK, title, lines };
+  const unverified = [];
+  for (const url of pushUrls) {
+    const shown = withoutUserinfo(url);
+    if (url !== fetchUrl.out) {
+      const reachPush = run(checkout, ["ls-remote", url, `refs/heads/${branch}`]);
+      if (!reachPush.ok) return { id, level: BROKEN, title,
+        lines: [...lines, `but the push url ${shown} cannot be reached: ${reachPush.err}`,
+                "-> reeve would fetch and judge normally, then fail at the push"] };
+      lines.push(`the push url ${shown} answers too`);
+    }
+    // ssh and local transports authenticate through the transport itself, so the
+    // reach above already exercised them. http and https do not, on a PUBLIC
+    // repository -- git's credential subsystem covers both schemes, and a plain
+    // http remote answers an anonymous read exactly as https does.
+    if (!/^https?:\/\//.test(url)) {
+      lines.push(`${shown} carries its own authentication, so the reach above exercised it`);
+      continue;
+    }
+    const cred = credential(checkout, url);
+    if (cred.ok) { lines.push(`a credential is available for ${shown} (its value is never read into reeve)`); continue; }
+    // A credential helper is not the only way http authenticates. `http.
+    // <url>.extraHeader` carrying an Authorization header, and a cookie file,
+    // are both used by `ls-remote` and by the real push while `credential fill`
+    // knows nothing about them — so reporting BROKEN on the helper's silence
+    // alone calls a working checkout broken. What reeve can say is that it
+    // cannot verify this one, which is neither of the two confident answers.
+    const elsewhere = httpAuthElsewhere(run, checkout, url);
+    if (elsewhere) { unverified.push(shown); lines.push(`${shown} authenticates through ${elsewhere}, which this check cannot verify`); continue; }
+    return { id, level: BROKEN, title,
+      lines: [...lines,
+              `but no credential can be obtained for ${shown}: ${cred.why}`,
+              ...(profile.identity?.visibility === "public"
+                ? ["this repository is PUBLIC, so the read above succeeded anonymously and proves nothing about a push"] : []),
+              "-> a push authenticates; reeve would fetch, judge and refuse at the last step"] };
   }
-
-  const shown = withoutUserinfo(pushUrl);
-  const cred = credential(checkout, pushUrl);
-  if (!cred.ok) return { id, level: BROKEN, title,
-    lines: [...lines,
-            `but no credential can be obtained for ${shown}: ${cred.why}`,
-            ...(profile.identity?.visibility === "public"
-              ? ["this repository is PUBLIC, so the read above succeeded anonymously and proves nothing about a push"] : []),
-            "-> a push authenticates; reeve would fetch, judge and refuse at the last step"] };
-  lines.push(`a credential is available for ${shown} (its value is never read into reeve)`);
+  if (unverified.length) return { id, level: DEGRADED, title,
+    lines: [...lines, `-> publication to ${unverified.join(", ")} rests on configuration this check cannot exercise without pushing`] };
   return { id, level: OK, title, lines };
 }
 

@@ -70,6 +70,21 @@ export function canaryIdFor({ cliVersion, sandbox, binaryId = null, worktree = n
  * it points: with no listener the network positive control is absent, and a pass
  * measured without it is a weaker measurement.
  */
+/**
+ * The instrument the daemon would run TODAY.
+ *
+ * `measuredContainment` always builds a `netListener`, so every canary it
+ * records carries the network positive control and its instrument is the
+ * hasNet form. Anything reading a persisted record has to compare against
+ * THAT, not against the default: doctor defaulting to the no-network variant
+ * reported every freshly recorded pass as a different script, which is
+ * permanently DEGRADED and exit code 3 on a host whose canary had just passed.
+ *
+ * One function so the two cannot drift again. If the daemon ever stops
+ * guaranteeing a listener, this is the line that has to change with it.
+ */
+export const currentInstrument = () => instrumentHash({ hasNet: true });
+
 export function instrumentHash({ hasNet = false } = {}) {
   return createHash("sha256").update(canaryScript({
     tmpDir: "<tmp>", outsideDir: "<outside>", decoyPath: "<decoy>",

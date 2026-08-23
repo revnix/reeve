@@ -2,6 +2,7 @@
 // from the same sources: the persisted canary result and the keychain probe.
 // Absent is UNKNOWN, never OK; a held credential is BROKEN with the fix named.
 import { checkCanary, checkKeychain, checkRemoteReach, founderCredential, runDoctor } from "../src/doctor.mjs";
+import { instrumentHash } from "../src/canary.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { policyHashOf } from "../src/canary.mjs";
 import { writeCanaryState } from "../src/canary.mjs";
@@ -34,10 +35,23 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
       asked, askedFor,
       run: (cwd, args) => {
         asked.push(args[0] === "remote" && args.includes("--push") ? "remote --push" : args[0]);
-        if (args[0] === "remote") return { ok: true, out: (args.includes("--push") ? reach.pushUrl : reach.url) ?? reach.url ?? "https://github.com/o/r.git" };
+        if (args[0] === "remote") {
+          // git returns only the FIRST push url without `--all`. Modelling that
+          // is what lets a stub which drops the flag be seen at all.
+          const all = (args.includes("--push") ? reach.pushUrl : reach.url) ?? reach.url ?? "https://github.com/o/r.git";
+          return { ok: true, out: args.includes("--all") ? all : String(all).split("\n")[0] };
+        }
         if (args[0] === "ls-remote") {
           askedFor.push(args[1]);
+          const byUrl = reach.lsRemoteFor?.[args[1]];
+          if (byUrl) return byUrl;
           return (args[1] === "origin" ? reach.lsRemote : reach.lsRemotePush) ?? { ok: true, out: "abcdef1234567890  refs/heads/main" };
+        }
+        // `git config --get-urlmatch http.<key> <url>` — exits 1 when nothing matches.
+        if (args[0] === "config") {
+          asked.push(args[1]);
+          const hit = reach.httpAuth?.[args[2]];
+          return hit ? { ok: true, out: hit } : { ok: false, out: "", err: "" };
         }
         return { ok: false, out: "", err: "unexpected" };
       },
@@ -98,10 +112,23 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
       asked, askedFor,
       run: (cwd, args) => {
         asked.push(args[0] === "remote" && args.includes("--push") ? "remote --push" : args[0]);
-        if (args[0] === "remote") return { ok: true, out: (args.includes("--push") ? reach.pushUrl : reach.url) ?? reach.url ?? "https://github.com/o/r.git" };
+        if (args[0] === "remote") {
+          // git returns only the FIRST push url without `--all`. Modelling that
+          // is what lets a stub which drops the flag be seen at all.
+          const all = (args.includes("--push") ? reach.pushUrl : reach.url) ?? reach.url ?? "https://github.com/o/r.git";
+          return { ok: true, out: args.includes("--all") ? all : String(all).split("\n")[0] };
+        }
         if (args[0] === "ls-remote") {
           askedFor.push(args[1]);
+          const byUrl = reach.lsRemoteFor?.[args[1]];
+          if (byUrl) return byUrl;
           return (args[1] === "origin" ? reach.lsRemote : reach.lsRemotePush) ?? { ok: true, out: "abcdef1234567890  refs/heads/main" };
+        }
+        // `git config --get-urlmatch http.<key> <url>` — exits 1 when nothing matches.
+        if (args[0] === "config") {
+          asked.push(args[1]);
+          const hit = reach.httpAuth?.[args[2]];
+          return hit ? { ok: true, out: hit } : { ok: false, out: "", err: "" };
         }
         return { ok: false, out: "", err: "unexpected" };
       },
@@ -127,7 +154,7 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
     const io = seams({ url: "https://github.com/o/r.git", pushUrl: "https://github.com/o/p.git",
                        lsRemotePush: { ok: false, out: "", err: "fatal: repository not found" } }, { ok: true });
     const c = checkRemoteReach(pub, io);
-    check(c.level === "BROKEN" && /PUSH url cannot be reached/.test(c.lines.join(" ")),
+    check(c.level === "BROKEN" && /push url https:\/\/github\.com\/o\/p\.git cannot be reached/.test(c.lines.join(" ")),
       "a push url that does not answer is BROKEN even when the fetch url does", c.lines.join(" | "));
   }
   {
@@ -180,6 +207,78 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
   }
 }
 
+// ── R-16, round two ──────────────────────────────────────────────────────────
+{
+  const seams = (reach, cred) => {
+    const asked = [], askedFor = [];
+    return {
+      asked, askedFor,
+      run: (cwd, args) => {
+        asked.push(args[0] === "remote" && args.includes("--push") ? "remote --push" : args[0]);
+        if (args[0] === "remote") {
+          // git returns only the FIRST push url without `--all`. Modelling that
+          // is what lets a stub which drops the flag be seen at all.
+          const all = (args.includes("--push") ? reach.pushUrl : reach.url) ?? reach.url ?? "https://github.com/o/r.git";
+          return { ok: true, out: args.includes("--all") ? all : String(all).split("\n")[0] };
+        }
+        if (args[0] === "ls-remote") {
+          askedFor.push(args[1]);
+          const byUrl = reach.lsRemoteFor?.[args[1]];
+          if (byUrl) return byUrl;
+          return (args[1] === "origin" ? reach.lsRemote : reach.lsRemotePush) ?? { ok: true, out: "abcdef1234567890  refs/heads/main" };
+        }
+        if (args[0] === "config") {
+          asked.push(args[1]);
+          const hit = reach.httpAuth?.[args[2]];
+          return hit ? { ok: true, out: hit } : { ok: false, out: "", err: "" };
+        }
+        return { ok: false, out: "", err: "unexpected" };
+      },
+      credential: (cwd, url) => { asked.push("credential"); askedFor.push(url); return cred; },
+    };
+  };
+  const pub = { identity: { checkout: "/co", defaultBranch: "main", visibility: "public" } };
+
+  {
+    // `git push origin` affects EVERY configured pushurl, and `get-url --push`
+    // returns only the first — measured 2026-08-23, two pushurls give one value
+    // without `--all` and both with it. Checking the first alone reports OK for
+    // a remote whose second destination cannot be reached.
+    const io = seams({
+      url: "https://github.com/o/r.git",
+      pushUrl: "https://github.com/o/one.git\nhttps://github.com/o/two.git",
+      lsRemoteFor: { "https://github.com/o/two.git": { ok: false, out: "", err: "fatal: repository not found" } },
+    }, { ok: true });
+    const c = checkRemoteReach(pub, io);
+    check(io.askedFor.includes("https://github.com/o/one.git") && io.askedFor.includes("https://github.com/o/two.git"),
+      "every configured push url is probed, not just the first", io.askedFor.join(" "));
+    check(c.level === "BROKEN" && /two\.git cannot be reached/.test(c.lines.join(" ")),
+      "  and a later push destination that cannot be reached is BROKEN", c.lines.join(" | "));
+  }
+  {
+    // A credential helper is not the only way http authenticates.
+    // `http.<url>.extraHeader` is used by ls-remote and by the real push while
+    // `credential fill` knows nothing about it, so a silent helper is not proof
+    // that publication is broken.
+    const io = seams({ url: "https://enterprise.example/o/r.git",
+                       httpAuth: { "http.extraHeader": "Authorization: Bearer SECRET-HEADER-VALUE" } },
+                     { ok: false, why: "no helper answered" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "DEGRADED", "http auth configured outside a helper is DEGRADED, not BROKEN", c.lines.join(" | "));
+    check(/http\.extraHeader/.test(c.lines.join(" ")) && /cannot verify/.test(c.lines.join(" ")),
+      "  and it names the mechanism and says it is unverified", c.lines.join(" | "));
+    check(!/SECRET-HEADER-VALUE/.test(c.lines.join(" ")),
+      "  and the header's VALUE never reaches the report", c.lines.join(" | "));
+    check(io.asked.includes("--get-urlmatch"), "  resolved with git's own per-url matching", io.asked.join(","));
+  }
+  {
+    // Control: no alternative configured, so a silent helper is still BROKEN.
+    const io = seams({ url: "https://enterprise.example/o/r.git" }, { ok: false, why: "no helper answered" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "BROKEN", "control: a silent helper with nothing else configured is still BROKEN", c.lines.join(" | "));
+  }
+}
+
 // ── R-14 ─────────────────────────────────────────────────────────────────────
 {
   const c = checkCanary("o/r", { stateDir: null });
@@ -194,6 +293,19 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
   writeCanaryState(root, "o/r", rec);
   const c = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 + 5 * 60_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol1", currentInstrument: "inst1" });
   check(c.level === "OK" && /abc123 passed 5 min ago under 2\.1\.237/.test(c.lines[0]), "a passing canary under the SAME binary and policy is OK with id, age and CLI", c.lines.join(" | "));
+  // The DEFAULT expectation, with nothing injected. `measuredContainment` always
+  // builds a netListener, so a record it writes carries the hasNet instrument —
+  // and doctor defaulting to the other variant reported every freshly recorded
+  // pass as a changed script, which is permanently DEGRADED on a healthy host.
+  // `instrumentHash({ hasNet: true })` explicitly, NOT `currentInstrument()`:
+  // the record has to carry what production writes, so that a default which
+  // drifts from it is visible. Written with the same function doctor defaults
+  // to, both sides move together and the assertion proves nothing.
+  writeCanaryState(root, "o/r", { ...rec, instrument: instrumentHash({ hasNet: true }) });
+  const live = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol1" });
+  check(live.level === "OK",
+    "a record carrying the instrument production writes is OK against doctor's DEFAULT", live.lines.join(" | "));
+  writeCanaryState(root, "o/r", rec);
   const swapped = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@2", currentPolicyHash: "pol1", currentInstrument: "inst1" });
   check(swapped.level === "DEGRADED" && /DIFFERENT build/.test(swapped.lines[0]), "a passing canary under a REPLACED binary is DEGRADED, not OK", swapped.lines.join(" | "));
   // The binary can be unchanged while the policy the daemon generates has moved.

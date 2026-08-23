@@ -343,7 +343,12 @@ const LSTART = "Sat Aug 23 09:00:00 2026";
            ON CONFLICT(provider) DO UPDATE SET concurrency_limit=3, guardian_reserved=0`);
   check(db.prepare("SELECT concurrency_limit c, guardian_reserved g FROM provider_state WHERE provider='claude'").get().c === 3,
     "control: the limit really is 3/0 before the claims below run");
-  const a = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE });
+  // ALL THREE in the same synthetic epoch, bt:1 oldest. Leaving bt:1 on the wall
+  // clock made it the largest requested_at by nine orders of magnitude, so a
+  // CORRECT youngest-first implementation flagged bt:1 -- and bt:1's row is
+  // released below, taking the flag with it, leaving `flagged.length === 1` to
+  // fail against exactly the implementation it is written to accept.
+  const a = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE, now: 1000 });
   // DISTINCT timestamps. requested_at is integer seconds, so three claims in
   // the same tick ordinarily share one value and "the youngest builder" has no
   // defined answer -- an implementation ordering by requested_at alone could
@@ -592,7 +597,7 @@ git commit -m "feat(provider): transactional admission for the shared subscripti
 ### Task 22: The guardian claims a provider lease before dispatch, and fails OPEN
 
 **Files:**
-- Modify: `src/daemon.mjs` (at the dispatch site, at **two** places, because the tick spends model quota in two shapes. Measured on `e41cd28`:
+- Modify: `src/daemon.mjs` (at the dispatch site, at **two** places, because the tick spends model quota in two shapes. Re-derived on `16769e7`:
 
 1. **The containment canary**, `measuredContainment(...)` at `src/daemon.mjs:764` on `16769e7` (search that name). It is itself a model dispatch and runs **once per tick**, before the per-PR loop, so it takes its own claim and releases it on return:
 
@@ -682,9 +687,9 @@ git commit -m "feat(provider): transactional admission for the shared subscripti
    otherwise let an executor complete every visible step with the canary
    unclaimed: assert that a tick which runs the canary holds exactly one
    `provider_lease` row with `run_ref = canary:<nwo>` **during**
-   `measuredContainment`, and none after. An earlier draft of this plan said "before the containment canary" while anchoring at the halt check, which sits at line 792 — *after* it. The anchor was wrong, not the intent.
+   `measuredContainment`, and none after. An earlier draft of this plan said "before the containment canary" while anchoring at the halt check, which sits at `src/daemon.mjs:793` on `16769e7` — *after* it. The anchor was wrong, not the intent.
 
-2. **Each worker dispatch**, immediately before the spawn and **after every refusal path in the loop**. The halt check is too early: `cannot dispatch FIX_CI — no resolvable root cause` (800), `demonstrated flake` (810) and the other `continue`s all sit between it and the spawn, so a claim taken there is held and abandoned on each — leaking a slot per skipped PR until expiry, starving the builder for reasons unrelated to quota. Claim last: the only thing between the claim and the spawn should be the spawn, which is the same shape: a precondition consulted before dispatch, never after)
+2. **Each worker dispatch**, immediately before the spawn and **after every refusal path in the loop**. The halt check is too early: `cannot dispatch FIX_CI — no resolvable root cause` (801), `demonstrated flake` (810) and the other `continue`s all sit between it and the spawn, so a claim taken there is held and abandoned on each — leaking a slot per skipped PR until expiry, starving the builder for reasons unrelated to quota. Claim last: the only thing between the claim and the spawn should be the spawn, which is the same shape: a precondition consulted before dispatch, never after)
 - Test: `test/provider-guardian.test.mjs` (new)
 
 **Interfaces:**
@@ -743,7 +748,9 @@ const escalatedWith = (result, why) =>
 // ── the ordinary path: claim, dispatch, release ──────────────────────────────
 {
   const db = openHub(join(dir, "h.db"));
-  let dispatched = 0, heldDuringDispatch = -1, ownerDuringDispatch = null, boundPidDuringDispatch = null;
+  let dispatched = 0, heldDuringDispatch = -1, ownerDuringDispatch = null,
+      boundPidDuringDispatch = null, boundLstartDuringDispatch = null;
+  const SPAWNED = { pid: 31337, lstart: "Sat Aug 23 09:30:00 2026" };
   const ctx = { ...fixtureCtx(dir), hub: db, lstart: LSTART,
     spawnWorker: async (opts) => {
       dispatched++;
@@ -752,11 +759,12 @@ const escalatedWith = (result, why) =>
       // bindProviderLease is never called, and the lease stays bound to the
       // long-lived daemon -- whose liveness is always true, so the reaper can
       // never free the slot.
-      opts?.onSpawn?.({ pid: 31337, lstart: "Sat Aug 23 09:30:00 2026" });
+      opts?.onSpawn?.(SPAWNED);
       heldDuringDispatch = db.prepare("SELECT count(*) c FROM provider_lease WHERE status='held'").get().c;
       const held = db.prepare("SELECT owner, pid, lstart FROM provider_lease WHERE status='held'").get();
       ownerDuringDispatch = held?.owner ?? null;
       boundPidDuringDispatch = held?.pid ?? null;
+      boundLstartDuringDispatch = held?.lstart ?? null;
       return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", model: "m" };
     } };
   await tick(ctx);
@@ -771,9 +779,17 @@ const escalatedWith = (result, why) =>
     JSON.stringify(db.prepare("SELECT * FROM provider_lease").all()));
   check(ownerDuringDispatch === "guardian",
     "and while it was held it recorded the guardian as owner", String(ownerDuringDispatch));
-  check(boundPidDuringDispatch === 31337,
+  check(boundPidDuringDispatch === SPAWNED.pid,
     "and was re-bound to the SPAWNED worker's pid, not the daemon's, so a dead worker frees its slot",
     String(boundPidDuringDispatch));
+  // The PAIR, not the pid. Liveness everywhere in reeve is `(pid, lstart)`, so a
+  // bindProviderLease that writes the pid and leaves the DAEMON's lstart passes
+  // the line above and is wrong in the worst direction: the pair never matches,
+  // the reaper judges a running worker dead, frees its slot, and admits work
+  // beyond the concurrency limit the scheduler exists to enforce.
+  check(boundLstartDuringDispatch === SPAWNED.lstart,
+    "and to the worker's START TIME too, so the (pid, lstart) pair identifies the worker and not the daemon",
+    String(boundLstartDuringDispatch));
   db.close();
 }
 
@@ -830,7 +846,11 @@ const escalatedWith = (result, why) =>
   {
     let canaryRan = 0, dispatched = 0;
     const ctx = { ...fixtureCtx(dir), hub: throwingHub(), repoId: 1, containment: null,
-      measuredContainment: async () => { canaryRan++; return { ok: true }; },
+      // A PRODUCTION-SHAPED verdict. `{ ok: true }` is not one: the daemon
+      // enters the dispatch loop on `containment.credentialRead === "closed"`,
+      // so an `ok` stub leaves containment open and `dispatched === 1` below
+      // fails against the very implementation this block is written for.
+      measuredContainment: async () => { canaryRan++; return { credentialRead: "closed", why: "test" }; },
       spawnWorker: async () => { dispatched++; return { outcome: "ok" }; } };
     const result = await tick(ctx);
     check(canaryRan === 1, "an unreadable hub does not stop the containment canary either", String(canaryRan));
@@ -846,14 +866,28 @@ const escalatedWith = (result, why) =>
   // the tick properly: `bin/reeve tick` reads r.halted at bin/reeve:356.
   {
     const db = openHub(join(dir, "canary-refused.db"));
+    let refusedDispatch = 0;
     const ctx = { ...fixtureCtx(dir), hub: db, repoId: 1, containment: null,
       providerClaim: () => ({ ok: false, reason: "at-limit" }),
       measuredContainment: async () => { throw new Error("the canary must not run without a lease"); },
-      spawnWorker: async () => ({ outcome: "ok" }) };
+      spawnWorker: async () => { refusedDispatch++; return { outcome: "ok" }; } };
     const result = await tick(ctx);
     check(result && typeof result.halted === "boolean",
       "a canary refused for quota returns a complete tick result, not undefined",
       JSON.stringify(result));
+    // BOTH halves. The result assertion alone is satisfied by any tick that
+    // returns, including one that dispatched anyway -- and it is also satisfied
+    // by nothing at all if the tick THROWS, because the throw takes the whole
+    // file down and this line never runs to report which assertion failed.
+    check(refusedDispatch === 0,
+      "and dispatches nothing: the flag suppresses the work, not merely the canary",
+      String(refusedDispatch));
+    // CONTROL for the null dereference specifically. `containment` stays null
+    // when the canary is skipped, so a dispatch gate that reads it unguarded
+    // throws here rather than refusing -- and a thrown tick is indistinguishable
+    // from a suite that was never run.
+    check(db.prepare("SELECT count(*) c FROM provider_lease").get().c === 0,
+      "control: and holds no lease afterwards, so the refusal left nothing behind");
     db.close();
   }
 }
@@ -892,13 +926,38 @@ const escalatedWith = (result, why) =>
 
 - [ ] **Step 3: Implement at the dispatch site**
 
-In `src/daemon.mjs`, immediately after the halt check at line 712:
+First the two conditions that gate dispatch on containment — `src/daemon.mjs:765`
+and `:770` on `16769e7` (search `containment.credentialRead`). **Both dereference
+`containment`, and `containment` is now null whenever the canary was skipped**:
+every quota refusal and every unknown-repository-id tick. Left as they are, a
+refused tick throws `TypeError: Cannot read properties of null (reading
+'credentialRead')` on the line immediately after the guard — the exact failure
+`skipDispatch` was raised to avoid, moved four lines later. Derive the predicate
+once and consult it twice:
 
 ```js
-      // The canary could not claim, so nothing is dispatched this tick -- but
-      // the tick still finishes normally. `break`, not `return`: the epilogue
-      // after the loop is the point.
-      if (skipDispatch) break;
+  // `!skipDispatch` folded into ONE derivation rather than bolted onto each
+  // condition. Both of these read `containment.credentialRead`, and the canary
+  // that fills it is skipped on a refusal -- so gating them individually is two
+  // chances to forget, and a third reader added later inherits neither. This is
+  // also what makes the per-PR loop unreachable on a refusal, which is what the
+  // flag was for.
+  const mayDispatch = execute && wanted.length > 0 && !skipDispatch;
+  if (mayDispatch && containment.credentialRead !== "closed") {
+    log(logPath, `execute: NOT dispatching ${wanted.length} worker task(s) — worker containment is open: ${containment.why}`);
+    escalations.set("guardian:containment:open", 1);
+  }
+  if (mayDispatch && containment.credentialRead === "closed") {
+```
+
+Note what `mayDispatch` makes unnecessary: an earlier revision of this plan put
+an `if (skipDispatch) break;` inside the per-PR loop. That is dead code once the
+enclosing block never runs, and it sat *after* both dereferences, so it could
+never have prevented the throw. It also cited "the halt check at line 712", which
+is wrong — the halt check is `src/daemon.mjs:793` on `16769e7` (search `HALTED
+before dispatch`). **This task does not move or duplicate the halt check:**
+
+```js
       if (halted(ctx.haltMarker)) { log(logPath, "HALTED before dispatch"); break; }
 
       // Claim shared model quota before spending any.
@@ -915,8 +974,8 @@ In `src/daemon.mjs`, immediately after the halt check at line 712:
       // because a watchman that has stopped looking reports exactly what a
       // healthy one does.
       // THE CLAIM GOES HERE -- at the spawn seam, after every `continue`.
-      // Checked on e41cd28: between the halt check (792) and the spawn sit the
-      // no-root-cause branch (800), the demonstrated-flake branch (810), and the
+      // Re-derived on 16769e7: between the halt check (793) and the spawn sit the
+      // no-root-cause branch (801), the demonstrated-flake branch (810), and the
       // prompt/worktree preparation branches, each of which can `continue`. A
       // claim taken before them is held and abandoned once per skipped PR, until
       // expiry -- starving the builder for reasons unrelated to quota. The only
@@ -940,7 +999,7 @@ In `src/daemon.mjs`, immediately after the halt check at line 712:
 
       // Resolved ONCE at daemon start and carried on ctx -- not queried here.
       //
-      // Measured on e41cd28: the numeric repository id is stored NOWHERE reeve
+      // Re-measured on 16769e7: the numeric repository id is stored NOWHERE reeve
       // already has. `src/db/schema.sql` has no repo_id column on inbox or any
       // other table, and no live profile carries one. An earlier draft of this
       // plan queried `inbox.repo_id`, which does not exist and would throw.
@@ -1099,6 +1158,17 @@ asserts it with a fixture whose `startRun` is stubbed to fail:
   // passes without `abandonClaim` existing at all.
   db.exec(`INSERT INTO provider_lease(owner,repo_id,run_ref,pid,lstart,priority,status,requested_at,expires_at)
            VALUES('guardian',1,'pr:42',1,'L1',0,'queued',unixepoch(),unixepoch()+120)`);
+  // `ctx.startRun` is INERT unless production is changed to read the seam: the
+  // daemon calls the lexical `startRun` at `src/daemon.mjs:853` on `16769e7`
+  // (search `const run = startRun(db,`). Without the change the real run
+  // succeeds, `spawnWorker` throws into the daemon's preparation catch, the
+  // provider cleanup removes the row on THAT path, and both assertions below
+  // pass while the `!run.ok` branch and its `abandonClaim` call are never
+  // reached -- a test that is green whether or not the feature exists.
+  //
+  // So this task's `src/daemon.mjs` change includes making that call
+  // `(ctx.startRun ?? startRun)(db, { ... })`, the same shape every other
+  // collaborator in the tick already uses.
   const ctx = { ...fixtureCtx(dir), hub: db, repoId: 1, lstart: LSTART,
     startRun: () => ({ ok: false, why: "the run could not be recorded" }),
     spawnWorker: async () => { throw new Error("must not dispatch"); } };
@@ -1145,7 +1215,7 @@ And on a rate-limit exit, before the `finally` releases:
         // (src/supervisor.mjs:220). Re-matching a regex against the reason text
         // would be a second, weaker classifier for a question already answered,
         // and it would drift the first time the wording changed. The variable at
-        // this dispatch site is `r`, the same one the rate-limit branch already reads (search `OUTCOMES.RATE_LIMITED`; `src/daemon.mjs:1272` on `16769e7` on `e41cd28`).
+        // this dispatch site is `r`, the same one the rate-limit branch already reads (search `OUTCOMES.RATE_LIMITED`; `src/daemon.mjs:1272` on `16769e7`).
         // OUTCOMES is already imported in daemon.mjs (search `OUTCOMES.RATE_LIMITED`);
         // no new import is needed here.
         // The fast-fail of §10.4 is about not WAITING on the window: the attempt
@@ -1656,7 +1726,8 @@ function), and checks the one link between them structurally. Giving
 hottest read path and does not belong in a PR about the provider scheduler.
 
 **Files:**
-- Modify: `src/verdict.mjs` (one additive clause **and its entry in the clause list**), `src/daemon.mjs` (pass the guest handle into evaluation), `src/pr.mjs` (`evaluatePr` threads `ctx.hub` and the builder-PR classification through to the verdict)
+- Create: `src/build/holds.mjs` (the scoped `pr_hold` reader — see Produces below)
+- Modify: `src/verdict.mjs` (one additive clause **and its entry in the clause list**), `src/daemon.mjs` (pass the guest handle into evaluation), `src/pr.mjs` (`evaluatePr` threads `ctx.hub` and the builder-PR classification through to the verdict), **`src/watcher.mjs`** (route the new clause id, per the paragraph that opens this task), **`test/watcher.test.mjs`** (its totality matrix iterates the clause ids and fails on an unrouted one)
 
 **Routing, not just definition.** `holdClause` computing the right answer is worth nothing if the production verdict never calls it. `evaluatePr` is what builds the clause set the daemon publishes, so it must pass `ctx.hub` and the structural builder-PR classification (head branch `mp/*`, or author is the App — the same detection as §9.2) into the verdict, and the verdict must include the clause's result in its worst-wins fold. The test below asserts membership in `VERDICT_CLAUSES` for that reason; add a second assertion that a fixture `evaluatePr` over a builder PR with an uncleared hold returns a verdict of `BLOCK`, because membership alone does not prove the value reaches the fold.
 - Test: `test/guardian-pr-hold-clause.test.mjs` (new)
@@ -1851,7 +1922,15 @@ check(VERDICT_CLAUSES.includes("hold"),
 ```bash
 # src/pr.mjs is where evaluatePr threads the hub and the builder classification
 # into the verdict. Omitting it leaves holdClause defined and never called.
-git add src/verdict.mjs src/pr.mjs src/daemon.mjs test/guardian-pr-hold-clause.test.mjs
+# EVERY file this task touches. Three were missing: `src/build/holds.mjs` is
+# created by this task and would be left untracked, so the pushed commit imports
+# a module that is not in it; and `src/watcher.mjs` plus `test/watcher.test.mjs`
+# carry the clause routing this task's own opening paragraph calls not optional.
+# Task 24's suite passes against the WORKING TREE either way, so nothing
+# downstream catches an unstaged file -- only the push does, and by then the
+# branch is broken.
+git add src/verdict.mjs src/pr.mjs src/daemon.mjs src/build/holds.mjs \
+        src/watcher.mjs test/watcher.test.mjs test/guardian-pr-hold-clause.test.mjs
 git commit -m "feat(verdict): builder prs block on an uncleared hub hold"
 ```
 
@@ -1888,9 +1967,46 @@ const db = openHub(join(dir, "hub.db"));
 // fail-closed (a lease that cannot be scoped to a repository is worse than no
 // lease), and the acceptance run would observe an empty provider_lease and
 // report the opposite of what it is meant to prove.
+//
+// Every seam below is copied from `test/worker-contract.test.mjs`'s `ctxFor`,
+// which is the fixture that demonstrably reaches `spawnWorker`. Three of them
+// were missing and each one refuses the dispatch on its own, BEFORE any provider
+// claim -- so the script printed ACCEPTANCE FAILED for a reason that has nothing
+// to do with provider admission, which is the one thing it exists to observe:
+//
+//   * no `containment`  -> the production measurement runs and returns
+//     `credentialRead: "open"` for want of an absolute identity.worktreeRoot
+//     (`src/daemon.mjs:327-328` on `16769e7`), so the dispatch block is skipped.
+//   * no `identity`     -> `src/daemon.mjs:841` refuses with "no
+//     identity.worktreeRoot in the profile", before startRun and the claim.
+//   * a failing check with no `id` -> `resolveFailureCause` filters on `f?.id`
+//     (`src/ci-rootcause.mjs:259`), so `resolveCause` is never called, `cause`
+//     stays null, and FIX_CI exits at "no resolvable root cause".
 const fixtureCtx = (d) => ({
-  nwo: "o/r", repoId: 1,
-  profile: { ci: {}, watch: {}, worker: { isolation: "none" } },
+  nwo: "o/r", repoId: 1, running: 0,
+  // Known-closed, injected. The real measurement is host-dependent and would
+  // make this artefact report on the machine rather than on the code.
+  containment: { credentialRead: "closed", why: "acceptance fixture" },
+  keychain: { measured: true, items: [], why: null },
+  claudeBin: "/bin/sh", cliVersion: "2.1.237",
+  // Deterministic: the real capacity() backs off on the host load average.
+  capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+  // worktreeRoot and checkout must be SEPARATE directories, as a real
+  // deployment has them: the worker policy denies reads of the clone, so a
+  // checkout inside it is refused.
+  profile: { ci: {}, worker: { isolation: "none" },
+             identity: { key: "o/r", defaultBranch: "main",
+                         worktreeRoot: d, checkout: mkdtempSync(join(tmpdir(), "reeve-accept-clone-")) },
+             authority: { policy: "propose_and_merge" },
+             rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+             watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 } },
+  prepareCheckout: () => ({ ok: true, path: mkdtempSync(join(d, "wt-")), why: null,
+                            deps: { ok: true, cow: false } }),
+  publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+  // Injected, never read from disk: the real reader looks at
+  // ~/.reeve/claude-token, so a default passes on a machine that has one and
+  // fails everywhere else.
+  oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
   // A REAL guardian store, not null. After an evaluation succeeds, `tick` hands
   // ctx.db to reconcilePr, unknownSince and record -- so a null one throws
   // before spawnWorker runs and the script observes no provider lease at all,
@@ -1901,7 +2017,7 @@ const fixtureCtx = (d) => ({
   execute: true, shadow: false, selfAudit: false,
   log: () => {},
   // BOTH network seams. `tick` calls `(ctx.openPrs ?? openPrs)` at
-  // src/daemon.mjs:557 BEFORE it evaluates anything, so injecting `evaluate`
+  // src/daemon.mjs:558 BEFORE it evaluates anything, so injecting `evaluate`
   // alone still reaches the real GitHub-backed listing: offline it exits without
   // dispatching, and configured it inspects real repository state. An acceptance
   // artefact that quietly consults production is worse than none.
@@ -1918,7 +2034,11 @@ const fixtureCtx = (d) => ({
   evaluate: () => ({
     ok: true, pr: 7, headRef: "mp/bt-1-s0", baseRef: "main", state: "open",
     head: "a".repeat(40), title: "t",
-    checks: { settled: true, verdict: "RED", failing: [{ name: "build" }], inherited: [], caused: [{ name: "build" }] },
+    // `id` is REQUIRED on the failing check. resolveFailureCause keeps only
+    // rows with one (a commit status has no job behind it, so there is nothing
+    // to read), and with none it returns { cause: null } without ever calling
+    // the resolveCause seam below.
+    checks: { settled: true, verdict: "RED", failing: [{ name: "build", id: 1 }], inherited: [], caused: [{ name: "build" }] },
     verdict: { state: "BLOCK", summary: "failing: build", clauses: [
       { id: "mergeable", state: "PASS", detail: "clean" },
       { id: "base",      state: "PASS", detail: "green" },
@@ -1931,7 +2051,11 @@ const fixtureCtx = (d) => ({
   }),
   // The root-cause seam too: FIX_CI is refused when no cause can be resolved,
   // and resolving one shells out to GitHub like everything else here.
-  resolveCause: () => ({ ok: true, cause: "compile error", files: ["src/x.mjs"] }),
+  // The shape `rootCause` really returns, matching test/worker-contract.test.mjs.
+  // `resolveFailureCause` sorts on `job` and builds a fingerprint from the
+  // result, so an ad-hoc object is not interchangeable with it.
+  resolveCause: () => ({ ok: true, job: "CI Gate", step: "Test", runId: 11,
+                         cause: [{ where: "src/x.ts:1", message: "boom" }] }),
 });
 
 let during = null;
@@ -1952,11 +2076,29 @@ if (!during || !during.some(r => r.status === "held" && r.owner === "guardian"))
   console.error("  during:", JSON.stringify(during));
   process.exit(1);
 }
+// The OTHER half of the §14 clause: "claims a provider lease before launch AND
+// releases it on exit". Only acquisition was guarded, so a broken cleanup that
+// left the row behind still exited 0 and could be written up as passing
+// evidence -- with the nonzero row count printed directly above the claim that
+// the lease was released.
+if (after.length !== 0) {
+  console.error("ACCEPTANCE FAILED: provider_lease rows survived the tick");
+  console.error("  after:", JSON.stringify(after));
+  process.exit(1);
+}
 console.log("guardian held during:", during.filter(r => r.status === "held" && r.owner === "guardian").length);
 console.log("rows remaining after:", after.length);
 EOF
+# pipefail, or the pipeline reports TEE's exit status and a run that printed
+# ACCEPTANCE FAILED is indistinguishable from a passing one -- after which the
+# measured document gets written and committed as evidence of the opposite.
+set -o pipefail
 $N ./acceptance-tmp.mjs | tee /tmp/acceptance.txt
+status=$?
 rm ./acceptance-tmp.mjs        # scratch, never committed
+# Stop HERE on a failure. The next step writes docs/measured/ from this output;
+# reaching it with status != 0 records a non-observation as an observation.
+[ "$status" -eq 0 ] || { echo "acceptance failed ($status): do not write the measured document"; exit 1; }
 ```
 
 Then write `docs/measured/2026-08-23-guardian-claims-provider.md` around that raw output and **`git add` and commit it** — a `tee` alone leaves the evidence untracked and it never reaches the PR. State plainly that it was observed under a fixture `spawnWorker`, not against a live model call: no task in S2 may dispatch a real worker.

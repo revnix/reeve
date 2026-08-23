@@ -56,6 +56,7 @@ Every reference to `src/daemon.mjs` names the **anchor text to search for** firs
   ```
 
   `escape.test.mjs` writes decoys into the shared `~/.reeve/canary/` tree the live daemon reads. **Measured 2026-08-22 on `9dbd3a0`: 59 test files exist; 58 were run and all 58 passed.** `test/escape.test.mjs` was NOT run, because it writes decoy files into the shared `~/.reeve/canary/` directory that the live daemon also reads; run it once on a quiet machine to complete the baseline. That run had `node_modules` absent, and a green file can hide a skip, so skips were counted rather than assumed: exactly two files carry one `SKIP` each (`policy-self-exclusion`, `supervisor-contract`). That 58-file pass is the base every task is measured against, and it is the same base for all three PRs — never a chained comparison against the previous task.
+- **Line numbers are measured against `16769e7`** (the `main` this plan was last checked on) and each is paired with a searchable string. If a number does not match, the file moved under it — search the string; the reasoning around it is not thereby stale. PR #14 shifted nine citations by one line on 2026-08-23, and one (`ctx.reviewIngest`) had been wrong by eighty lines since before that, unnoticed by nine review rounds.
 - **Conventional Commits**, lowercase, `type(scope): subject`, ≤72 characters. **No attribution trailer of any kind.** Never `--no-verify`.
 - Every change carries a what/why comment in the style of the file it lands in. Comments never reference tasks, plans, findings, or this document.
 - **No raw SQL outside `src/db/` and `src/build/`.** `hubdb.mjs` owns every hub statement the way `ops.mjs` owns every guardian statement.
@@ -91,7 +92,7 @@ Do not re-derive any of these. Each is recorded under `docs/measured/`.
 Recorded so no executor re-litigates them.
 
 1. **S2 splits into three PRs**, in the order A → B → C, with the provider scheduler last because it is the only one that changes the running guardian.
-2. **The guardian fails OPEN when hub.db is unreadable at provider-claim time.** It dispatches exactly as it does today and escalates `builder:provider:hub-unreadable`. The builder fails closed. The scheduler restrains the builder; it must never become a new way to silence the guardian. This matches the `ctx.reviewIngest !== false` opt-out shape §14 asks new ctx keys to follow (search `ctx.reviewIngest !== false`; `src/daemon.mjs:596,1360,1367` on `e41cd28`), so existing guardian tests stay green untouched.
+2. **The guardian fails OPEN when hub.db is unreadable at provider-claim time.** It dispatches exactly as it does today and escalates `builder:provider:hub-unreadable`. The builder fails closed. The scheduler restrains the builder; it must never become a new way to silence the guardian. This matches the `ctx.reviewIngest !== false` opt-out shape §14 asks new ctx keys to follow (search `ctx.reviewIngest !== false`; `src/daemon.mjs:597,1361,1368` on `16769e7`), so existing guardian tests stay green untouched.
 3. **`ci.flakePatterns` is REMOVED**, and the live `nextlyhq/nextly.json` is stripped in the same change. Measured, with a positive control, in `docs/measured/2026-08-22-flakepatterns-has-no-readers.md`. Removing it from `FIELDS` alone would make the live profile invalid and kill every daemon start.
 4. **`repo_gate_state` ships in S2 with a real writer**: the table, a pure `gateStateFrom()` derivation with unit tests over drifted/absent/stale inputs, and a `build run` tick that calls it through an injected `ctx.fetchGateState`. No live GitHub call in S2. S8 supplies the fetcher and clause U4, the reader.
 
@@ -224,7 +225,7 @@ if (ctx.hub && repoId != null) {
   // builder racing that gap takes the freed slot -- which defeats the queued-
   // guardian priority guarantee in exactly the window it exists for.
   // `d.e.pr`, not `d.pr`. `decisions` holds `{ e, decision, cause, fp }`
-  // (src/daemon.mjs:731) and `wanted` is a filter over it, so the wrapper
+  // (src/daemon.mjs:732 on 16769e7) and `wanted` is a filter over it, so the wrapper
   // survives -- `e.pr` on the wrapper is undefined, every run ref becomes
   // `pr:undefined`, and the sweep then finds NO live request matching any real
   // queued row and cancels all of them on the next tick. That reopens the
@@ -538,7 +539,7 @@ git commit -m "feat(provider): transactional admission for the shared subscripti
 **Files:**
 - Modify: `src/daemon.mjs` (at the dispatch site, at **two** places, because the tick spends model quota in two shapes. Measured on `e41cd28`:
 
-1. **The containment canary**, `measuredContainment(...)` at `src/daemon.mjs:763` (search that name). It is itself a model dispatch and runs **once per tick**, before the per-PR loop, so it takes its own claim and releases it on return:
+1. **The containment canary**, `measuredContainment(...)` at `src/daemon.mjs:764` on `16769e7` (search that name). It is itself a model dispatch and runs **once per tick**, before the per-PR loop, so it takes its own claim and releases it on return:
 
 ```js
    // Declared beside `containment`, ABOVE the canary block, because the per-PR
@@ -588,7 +589,7 @@ git commit -m "feat(provider): transactional admission for the shared subscripti
          //
          // Suppress the dispatch, not the tick. The per-PR loop is guarded on
          // this flag and the function falls through to its normal return at
-         // src/daemon.mjs:1396.
+         // src/daemon.mjs:1397 (on 16769e7).
          skipDispatch = true;
        }
        canaryLease = got.id;
@@ -634,7 +635,7 @@ git commit -m "feat(provider): transactional admission for the shared subscripti
 - Consumes: `claimProvider`, `releaseProvider`, `noteRateLimit` (Task 21); `hubPathFor`, `openHub` (PR-A).
 - Produces: `ctx.hub` — an opened hub handle, or `null`. Defaults to opening `hubPathFor(reeveHome())` **if the file exists**, and to `null` otherwise. `ctx.providerClaim` / `ctx.providerRelease` override the seam in tests. `ctx.hub === null` is a normal, supported state.
 
-**Founder decision 2026-08-22: the guardian fails OPEN.** When the hub is missing, locked, or corrupt, the guardian dispatches exactly as it does today and escalates `builder:provider:hub-unreadable`. The builder fails closed. The scheduler exists to restrain the builder, and must never become a new way to silence the watchman: a watchman that has stopped looking is indistinguishable from one reporting nothing wrong. This also keeps the existing guardian test files green untouched, which is what §14 asks of every new ctx key, and it matches the shipped `ctx.reviewIngest !== false` shape (search `ctx.reviewIngest !== false`; `src/daemon.mjs:596,1360,1367` on `e41cd28`).
+**Founder decision 2026-08-22: the guardian fails OPEN.** When the hub is missing, locked, or corrupt, the guardian dispatches exactly as it does today and escalates `builder:provider:hub-unreadable`. The builder fails closed. The scheduler exists to restrain the builder, and must never become a new way to silence the watchman: a watchman that has stopped looking is indistinguishable from one reporting nothing wrong. This also keeps the existing guardian test files green untouched, which is what §14 asks of every new ctx key, and it matches the shipped `ctx.reviewIngest !== false` shape (search `ctx.reviewIngest !== false`; `src/daemon.mjs:597,1361,1368` on `16769e7`).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -671,7 +672,7 @@ const fixtureCtx = (dir) => ({ /* ...as in test/worker-contract.test.mjs... */
 const loggedAny  = (_ctx, re) => logLines.some(l => re.test(l));
 const throwingHub = () => ({ prepare: () => { throw new Error("hub unreadable"); },
                              exec:    () => { throw new Error("hub unreadable"); } });
-// tick() builds its escalations in a LOCAL Map (src/daemon.mjs:550) and returns
+// tick() builds its escalations in a LOCAL Map (src/daemon.mjs:551 on 16769e7) and returns
 // it as result.escalations (:554, :562, :578, :1396). It is never attached to
 // the ctx it was given, so a helper reading ctx.escalations answers false for
 // every case -- including the ones production gets right. Take the RESULT.
@@ -893,7 +894,7 @@ In `src/daemon.mjs`, immediately after the halt check at line 712:
       //     // ...where ctx is built, BEFORE `const ctx = {`:
       //     let repoId = null;
       //     {
-      //       // authenticate() can throw; doctor.mjs:265 already guards it the
+      //       // authenticate() can throw; doctor.mjs:267 already guards it the
       //       // same way. A failure here is not fatal to the daemon -- the
       //       // guardian still runs -- it only means provider claims refuse.
       //       const auth = await authenticate(nwo).catch(e => ({ ok: false, why: e.message }));
@@ -931,7 +932,7 @@ In `src/daemon.mjs`, immediately after the halt check at line 712:
         continue;
       }
       // WHERE this block goes, exactly: immediately BEFORE `startRun`
-      // (`src/daemon.mjs:852`) and the `recordFixAttempt` beside it at `:856`.
+      // (search `startRun(db, { nwo, pr: e.pr` -- `src/daemon.mjs:853` on `16769e7`) and the `recordFixAttempt` beside it at `:857`.
       //
       // Both boundaries are load-bearing and they pull in opposite directions.
       // It must be AFTER every earlier refusal (no root cause, demonstrated
@@ -1060,7 +1061,7 @@ And on a rate-limit exit, before the `finally` releases:
         // (src/supervisor.mjs:220). Re-matching a regex against the reason text
         // would be a second, weaker classifier for a question already answered,
         // and it would drift the first time the wording changed. The variable at
-        // this dispatch site is `r`, the same one the rate-limit branch already reads (search `OUTCOMES.RATE_LIMITED`; `src/daemon.mjs:1271` on `e41cd28`).
+        // this dispatch site is `r`, the same one the rate-limit branch already reads (search `OUTCOMES.RATE_LIMITED`; `src/daemon.mjs:1272` on `16769e7` on `e41cd28`).
         // OUTCOMES is already imported in daemon.mjs (search `OUTCOMES.RATE_LIMITED`);
         // no new import is needed here.
         // The fast-fail of §10.4 is about not WAITING on the window: the attempt
@@ -1808,7 +1809,7 @@ const fixtureCtx = (d) => ({
   log: () => {},
   // One dispatch-worthy decision, injected rather than evaluated: evaluatePr
   // shells out to GitHub (src/pr.mjs:132) and this script must make no network
-  // call. The shape is the one src/daemon.mjs:731 pushes.
+  // call. The shape is the one src/daemon.mjs:732 pushes (on 16769e7).
   evaluate: () => ({ ok: true, pr: 7, headRef: "mp/bt-1-s0",
                      decision: { action: "FIX_CI", why: "red required check" },
                      verdict: { state: "BLOCK", clauses: [] } }),

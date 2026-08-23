@@ -156,7 +156,7 @@ export async function measureContainment({
     cn = await run({ cliVersion, sandbox, permissionsDeny, allowedTools, binaryId, ...canaryPaths, bin, env, ...(netProbe ? { netProbe } : {}) });
     cn = { ...cn, at: now() };
     cache.set(id, cn);
-    if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, bin, binaryId, policyHash: policyHashOf(sandbox, canaryPaths?.dir ?? null, { permissionsDeny, allowedTools }), stateRoots, allowedTools, canaryDir: canaryPaths?.dir ?? null, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }
+    if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, bin, binaryId, instrument: instrumentHash({ hasNet: !!netProbe }), policyHash: policyHashOf(sandbox, canaryPaths?.dir ?? null, { permissionsDeny, allowedTools }), stateRoots, allowedTools, canaryDir: canaryPaths?.dir ?? null, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }
   }
   // A skipped canary adds no reason of its own (the cheaper reasons already stand);
   // a run-or-injected canary that failed does.

@@ -61,6 +61,56 @@ Live on 2026-08-23:
         a credential is available for github.com (its value is never read into reeve)
 ```
 
+## Four more ways it asked the wrong question
+
+From Codex on #14, all four reproduced before being taken.
+
+**The fetch url is not the push url.** `git push origin` uses
+`remote.origin.pushurl` when it is set, so https-fetch plus ssh-push — and the
+reverse — are both ordinary:
+
+```
+$ git remote get-url origin        -> https://github.com/o/fetchside.git
+$ git remote get-url --push origin -> https://github.com/o/PUSHSIDE.git
+```
+
+The check probed the fetch url, which is the wrong transport AND the wrong
+credential. It now reads both, asks the credential about the push url, and gives
+a separate push url its own `ls-remote` — `ls-remote origin` reads through the
+fetch url and says nothing about the other one.
+
+**`git remote get-url` EXPANDS `insteadOf`.** A rewrite pointing at a
+credential-bearing URL hands the credential straight back:
+
+```
+$ cat ~/.gitconfig
+[url "https://user:s3cr3t-token@example.com/"]
+	insteadOf = short:
+$ git remote get-url origin
+https://user:s3cr3t-token@example.com/o/r.git
+```
+
+That string was being printed in the report and in `--json`. Userinfo is removed
+before any url is reported, and the removal is visible (`[redacted]@host`) rather
+than silent. An scp-style `git@host:path` has no authority and is untouched.
+
+**`credential.useHttpPath` makes protocol-and-host the wrong question.** Measured
+against a helper that records what git asked it:
+
+| fill form | what git asked | result |
+|---|---|---|
+| `protocol=https, host=example.com` | protocol, host | a **host-wide** credential answers |
+| `url=https://example.com/two.git` | protocol, host, **path=two.git** | nothing answers |
+
+So the host-only form reports a credential is available while the real
+path-qualified push has none. `url=` is what is asked now, and it carries the
+port and any username as well.
+
+**`http://` was grouped with ssh and local.** A public http repository answers an
+anonymous read exactly as https does, so that branch reproduced the very false
+green the https branch exists to prevent. Git's credential subsystem covers both
+schemes; both take the credential path.
+
 ## What this does not establish
 
 That a push would SUCCEED. It establishes that the credential a push needs can be

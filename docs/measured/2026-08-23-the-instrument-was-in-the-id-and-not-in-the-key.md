@@ -88,3 +88,29 @@ Stubbing each half back out separately:
 | the cache key omits the instrument | "a run WITHOUT the network control does not reuse the pass measured with it" — it comes back `cached: true` |
 
 The second is the original defect, reproduced.
+
+## The persisted record needed the same treatment
+
+Raised by Codex on #14, and it is a consequence of this change rather than a
+pre-existing defect: after the upgrade, a canary record can carry the same binary
+identity and the same policy hash while its id was produced by the previous,
+weaker instrument. The daemon's in-memory cache is emptied by the restart that
+loads the new code, but `reeve doctor` reads the PERSISTED record, and
+`checkCanary` compared only `binaryId` and `policyHash`.
+
+So the instrument is written into the record and compared there too. A record
+whose instrument differs is DEGRADED; a record with no instrument at all cannot
+be compared and is UNKNOWN, never OK — the same treatment a record with no
+`binaryId` or no `policyHash` already got.
+
+Live immediately after the change, against the record written that morning:
+
+```
+UNKNOWN
+  R-14  worker sandbox canary
+        canary 7e14000fb54d28f5 passed 548 min ago, but the record names no instrument
+        so it cannot be checked against the canary script in use now; the daemon re-measures before it dispatches
+```
+
+Which is the correct reading: that measurement was taken with a different
+instrument, and nothing about it can be matched to the one in use now.

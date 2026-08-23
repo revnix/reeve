@@ -1,7 +1,7 @@
 // R-14 and R-15 report the two facts the daemon's dispatch refusal rests on,
 // from the same sources: the persisted canary result and the keychain probe.
 // Absent is UNKNOWN, never OK; a held credential is BROKEN with the fix named.
-import { checkCanary, checkKeychain, checkRemoteReach, runDoctor } from "../src/doctor.mjs";
+import { checkCanary, checkKeychain, checkRemoteReach, founderCredential, runDoctor } from "../src/doctor.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { policyHashOf } from "../src/canary.mjs";
 import { writeCanaryState } from "../src/canary.mjs";
@@ -29,16 +29,19 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
 // repository reeve watches.
 {
   const seams = (reach, cred) => {
-    const asked = [];
+    const asked = [], askedFor = [];
     return {
-      asked,
+      asked, askedFor,
       run: (cwd, args) => {
-        asked.push(args[0]);
-        if (args[0] === "remote") return { ok: true, out: reach.url ?? "https://github.com/o/r.git" };
-        if (args[0] === "ls-remote") return reach.lsRemote ?? { ok: true, out: "abcdef1234567890  refs/heads/main" };
+        asked.push(args[0] === "remote" && args.includes("--push") ? "remote --push" : args[0]);
+        if (args[0] === "remote") return { ok: true, out: (args.includes("--push") ? reach.pushUrl : reach.url) ?? reach.url ?? "https://github.com/o/r.git" };
+        if (args[0] === "ls-remote") {
+          askedFor.push(args[1]);
+          return (args[1] === "origin" ? reach.lsRemote : reach.lsRemotePush) ?? { ok: true, out: "abcdef1234567890  refs/heads/main" };
+        }
         return { ok: false, out: "", err: "unexpected" };
       },
-      credential: () => { asked.push("credential"); return cred; },
+      credential: (cwd, url) => { asked.push("credential"); askedFor.push(url); return cred; },
     };
   };
   const pub = { identity: { checkout: "/co", defaultBranch: "main", visibility: "public" } };
@@ -87,6 +90,96 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
   }
 }
 
+// ── R-16, the four ways it asked the wrong question ──────────────────────────
+{
+  const seams = (reach, cred) => {
+    const asked = [], askedFor = [];
+    return {
+      asked, askedFor,
+      run: (cwd, args) => {
+        asked.push(args[0] === "remote" && args.includes("--push") ? "remote --push" : args[0]);
+        if (args[0] === "remote") return { ok: true, out: (args.includes("--push") ? reach.pushUrl : reach.url) ?? reach.url ?? "https://github.com/o/r.git" };
+        if (args[0] === "ls-remote") {
+          askedFor.push(args[1]);
+          return (args[1] === "origin" ? reach.lsRemote : reach.lsRemotePush) ?? { ok: true, out: "abcdef1234567890  refs/heads/main" };
+        }
+        return { ok: false, out: "", err: "unexpected" };
+      },
+      credential: (cwd, url) => { asked.push("credential"); askedFor.push(url); return cred; },
+    };
+  };
+  const pub = { identity: { checkout: "/co", defaultBranch: "main", visibility: "public" } };
+
+  {
+    // `git push origin` uses remote.origin.pushurl when it is set, so the fetch
+    // url is the wrong transport AND the wrong credential to ask about.
+    // Measured 2026-08-23: get-url and get-url --push return different values.
+    const io = seams({ url: "https://github.com/o/fetchside.git", pushUrl: "https://github.com/o/PUSHSIDE.git" }, { ok: true });
+    const c = checkRemoteReach(pub, io);
+    check(io.asked.includes("remote --push"), "the PUSH url is what gets probed", io.asked.join(","));
+    check(io.askedFor.includes("https://github.com/o/PUSHSIDE.git"),
+      "  and the credential is asked for that url, not the fetch one", io.askedFor.join(" "));
+    check(c.lines.some(l => /PUSHSIDE/.test(l)), "  and the report names it", c.lines.join(" | "));
+  }
+  {
+    // A separate push url is reached in its own right: `ls-remote origin` reads
+    // through the FETCH url and says nothing about the other one.
+    const io = seams({ url: "https://github.com/o/r.git", pushUrl: "https://github.com/o/p.git",
+                       lsRemotePush: { ok: false, out: "", err: "fatal: repository not found" } }, { ok: true });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "BROKEN" && /PUSH url cannot be reached/.test(c.lines.join(" ")),
+      "a push url that does not answer is BROKEN even when the fetch url does", c.lines.join(" | "));
+  }
+  {
+    // `git remote get-url` EXPANDS insteadOf, so a rewrite to a credential-
+    // bearing URL hands the credential back and it was printed verbatim.
+    const io = seams({ url: "https://user:s3cr3t-token@example.com/o/r.git" }, { ok: true });
+    const c = checkRemoteReach(pub, io);
+    const all = c.lines.join(" | ");
+    check(!/s3cr3t-token/.test(all) && !/user:/.test(all),
+      "userinfo in an origin url never reaches the report", all);
+    check(/\[redacted\]@example\.com/.test(all), "  and its removal is visible rather than silent", all);
+  }
+  {
+    // credential.useHttpPath keeps separate credentials per repository on one
+    // host, so protocol+host is not the question a push asks. Measured 2026-08-23
+    // against a helper that records what git asked it: a host-only fill returns a
+    // HOST-WIDE credential where the path-qualified one has none.
+    const io = seams({ url: "https://example.com/o/two.git" }, { ok: true });
+    checkRemoteReach(pub, io);
+    check(io.askedFor.some(u => u === "https://example.com/o/two.git"),
+      "the whole url is what the check hands to the credential machinery", io.askedFor.join(" "));
+
+    // And what the credential machinery then ASKS git. The assertion above only
+    // covers the caller: with the seam injected, `founderCredential` never runs,
+    // so a version of it that threw the url away and asked by host would pass it.
+    let sent = null;
+    founderCredential("/co", "https://example.com/o/two.git",
+                      { run: (cwd, args, opts) => { sent = { args, input: opts?.input }; return { ok: true, out: "password=x\n" }; } });
+    check(sent?.args?.join(" ") === "credential fill", "  it runs `git credential fill`", JSON.stringify(sent?.args));
+    check(sent?.input === "url=https://example.com/o/two.git\n\n",
+      "  and asks it by url, not by protocol and host — the form that carries the path", JSON.stringify(sent?.input));
+  }
+  {
+    // http:// was grouped with ssh and local, so a public http repository
+    // reproduced the exact false green the https branch exists to prevent.
+    const io = seams({ url: "http://example.com/o/r.git" }, { ok: false, why: "no helper answered" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "BROKEN" && io.asked.includes("credential"),
+      "a plain http origin takes the credential path too", `${c.level} ${io.asked.join(",")}`);
+  }
+  {
+    // Control: no pushurl set, so git returns the fetch url for both and there
+    // is exactly one url to reach and one credential to ask for.
+    const io = seams({ url: "https://github.com/o/r.git", pushUrl: "https://github.com/o/r.git" }, { ok: true });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "OK", "control: one url for both is OK", c.lines.join(" | "));
+    check(io.askedFor.filter(u => u && u.startsWith("http")).length === 1,
+      "  and nothing is probed twice", io.askedFor.join(" "));
+    check(!c.lines.some(l => /push url/.test(l)), "  and no second url is reported", c.lines.join(" | "));
+  }
+}
+
 // ── R-14 ─────────────────────────────────────────────────────────────────────
 {
   const c = checkCanary("o/r", { stateDir: null });
@@ -97,21 +190,36 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
   check(c.level === "UNKNOWN" && /no canary has been recorded/.test(c.lines[0]), "no recorded canary: UNKNOWN, and it says dispatch is refused meanwhile", c.lines.join(" | "));
 }
 {
-  const rec = { id: "abc123", cliVersion: "2.1.237", bin: "/bin/claude", binaryId: "/bin/claude@1", policyHash: "pol1", ok: true, why: null, at: 1_000_000 };
+  const rec = { id: "abc123", cliVersion: "2.1.237", bin: "/bin/claude", binaryId: "/bin/claude@1", policyHash: "pol1", instrument: "inst1", ok: true, why: null, at: 1_000_000 };
   writeCanaryState(root, "o/r", rec);
-  const c = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 + 5 * 60_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol1" });
+  const c = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 + 5 * 60_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol1", currentInstrument: "inst1" });
   check(c.level === "OK" && /abc123 passed 5 min ago under 2\.1\.237/.test(c.lines[0]), "a passing canary under the SAME binary and policy is OK with id, age and CLI", c.lines.join(" | "));
-  const swapped = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@2", currentPolicyHash: "pol1" });
+  const swapped = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@2", currentPolicyHash: "pol1", currentInstrument: "inst1" });
   check(swapped.level === "DEGRADED" && /DIFFERENT build/.test(swapped.lines[0]), "a passing canary under a REPLACED binary is DEGRADED, not OK", swapped.lines.join(" | "));
   // The binary can be unchanged while the policy the daemon generates has moved.
-  const repol = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol2" });
+  const repol = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol2", currentInstrument: "inst1" });
   check(repol.level === "DEGRADED" && /DIFFERENT sandbox policy/.test(repol.lines[0]), "an unchanged binary under a CHANGED policy is DEGRADED, not OK", repol.lines.join(" | "));
   // Unreconstructible policy: the comparison is left unmade rather than assumed.
-  const unk = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: null });
+  const unk = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: null, currentInstrument: "inst1" });
   check(unk.level === "OK", "a policy that cannot be recomputed does not manufacture a failure", unk.level);
   writeCanaryState(root, "o/r", { ...rec, policyHash: undefined });
-  const nopol = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1" });
+  const nopol = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentInstrument: "inst1" });
   check(nopol.level === "UNKNOWN" && /names no sandbox policy/.test(nopol.lines[0]), "a record with no policy to compare is UNKNOWN, never OK", nopol.lines.join(" | "));
+  // The INSTRUMENT is the third thing a record can be historical about. A canary
+  // script strengthened with a new probe leaves the binary and the policy
+  // identical while describing a weaker measurement, and doctor reads the
+  // PERSISTED record — which the daemon's in-memory cache does not speak for.
+  writeCanaryState(root, "o/r", { ...rec, instrument: "inst0" });
+  const reinst = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol1", currentInstrument: "inst1" });
+  check(reinst.level === "DEGRADED" && /DIFFERENT canary script/.test(reinst.lines[0]),
+    "an unchanged binary and policy under a CHANGED canary script is DEGRADED, not OK", reinst.lines.join(" | "));
+  // And a record written before the instrument was persisted at all: it cannot
+  // be compared, so it is UNKNOWN rather than inherited as a pass.
+  writeCanaryState(root, "o/r", { ...rec, instrument: undefined });
+  const noinst = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol1", currentInstrument: "inst1" });
+  check(noinst.level === "UNKNOWN" && /names no instrument/.test(noinst.lines[0]),
+    "a record from before the instrument was recorded is UNKNOWN, never OK", noinst.lines.join(" | "));
+  writeCanaryState(root, "o/r", rec);
   writeCanaryState(root, "o/r", { id: "old", cliVersion: "2.1.237", ok: true, at: 1_000_000 });
   const hist = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 });
   check(hist.level === "UNKNOWN" && /names no CLI binary/.test(hist.lines[0]), "a record with no binary to compare is UNKNOWN, never OK", hist.lines.join(" | "));

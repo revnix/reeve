@@ -12,7 +12,7 @@
 
 import { checkBaseline } from "./baseline.mjs";
 import { sandboxFor } from "./sandbox.mjs";
-import { readCanaryState, policyHashOf } from "./canary.mjs";
+import { readCanaryState, policyHashOf, instrumentHash } from "./canary.mjs";
 import { probeKeychain, isolationTopologyReady, binaryIdentity } from "./containment.mjs";
 import { GIT_NEUTRALISE_FOUNDER, founderGitEnv } from "./gitguard.mjs";
 import { readOauthToken } from "./workerenv.mjs";
@@ -393,7 +393,7 @@ function checkDetectors(db, profile) {
 // a refusal in the log can be understood here without the daemon.
 
 /** The last sandbox canary this daemon recorded, if any. */
-export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now = () => Date.now(), identity = binaryIdentity, currentPolicyHash = null } = {}) {
+export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now = () => Date.now(), identity = binaryIdentity, currentPolicyHash = null, currentInstrument = instrumentHash() } = {}) {
   const id = "R-14", title = "worker sandbox canary";
   if (!stateDir) return { id, level: UNKNOWN, title, lines: ["no state directory to read the canary from"] };
   const st = read(stateDir, nwo);
@@ -424,6 +424,19 @@ export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now 
   if (currentPolicyHash && currentPolicyHash !== st.policyHash) return { id, level: DEGRADED, title, lines: [
     `the last canary passed ${when} under a DIFFERENT sandbox policy (${st.policyHash}, now ${currentPolicyHash})`,
     "the daemon re-measures before dispatching under the policy in force now"] };
+  // And the INSTRUMENT. A record can carry the same binary and the same policy
+  // and still describe a weaker measurement, because the canary script itself
+  // changed -- which is the whole reason the instrument is in the id. The
+  // daemon's in-memory cache notices on its next run, but doctor reads the
+  // PERSISTED record, and a record written before this comparison existed has no
+  // instrument to compare at all. Neither is OK: a measurement that cannot be
+  // matched to today's instrument is UNKNOWN.
+  if (!st.instrument) return { id, level: UNKNOWN, title, lines: [
+    `canary ${st.id ?? "?"} passed ${when}, but the record names no instrument`,
+    "so it cannot be checked against the canary script in use now; the daemon re-measures before it dispatches"] };
+  if (currentInstrument && currentInstrument !== st.instrument) return { id, level: DEGRADED, title, lines: [
+    `the last canary passed ${when} under a DIFFERENT canary script (${st.instrument}, now ${currentInstrument})`,
+    "an older instrument proves less than the one being asked for; the daemon re-measures before dispatching"] };
   return { id, level: OK, title, lines: [`canary ${st.id ?? "?"} passed ${when} under ${st.cliVersion ?? "?"}, and the CLI binary is unchanged`,
     "network, outside writes and credential-file reads denied; inside and tmp writes allowed"] };
 }
@@ -542,18 +555,42 @@ function founderRun(cwd, args, { input = null, timeout = 20_000 } = {}) {
 }
 
 /**
- * Whether a credential can be OBTAINED for this remote's host.
+ * Whether a credential can be OBTAINED for this remote.
+ *
+ * Asked with `url=`, the whole target, rather than protocol and host. With
+ * `credential.useHttpPath` set -- which is how a founder keeps separate
+ * credentials for repositories on one host -- a host-only question is not the
+ * question a push asks. Measured 2026-08-23 against a helper that records what
+ * git asked it:
+ *
+ *   protocol+host      -> git asks without a path, a HOST-WIDE credential answers
+ *   url=.../two.git    -> git asks with path=two.git, and nothing answers
+ *
+ * So the host-only form reports a credential is available while the real
+ * path-qualified push has none. `url=` also carries the port and any username.
  *
  * `git credential fill` prints the credential on stdout. Nothing is kept: this
  * returns a boolean and git's own error line, never the value, and the reply is
- * not logged, recorded or included in any evidence file.
+ * not logged, recorded, or included in any evidence file.
  */
-function founderCredential(cwd, host) {
-  const r = founderRun(cwd, ["credential", "fill"], { input: `protocol=https\nhost=${host}\n\n` });
+export function founderCredential(cwd, url, { run = founderRun } = {}) {
+  const r = run(cwd, ["credential", "fill"], { input: `url=${url}\n\n` });
   if (!r.ok) return { ok: false, why: r.err };
   return { ok: r.out.split("\n").some(l => l.startsWith("password=")),
-           why: "the helper returned no password for this host" };
+           why: "the credential helpers returned no password for it" };
 }
+
+/**
+ * A remote URL with its userinfo removed, for printing.
+ *
+ * `git remote get-url` EXPANDS `url.<base>.insteadOf`, so a rewrite pointing at
+ * a credential-bearing URL hands one straight back. Measured 2026-08-23: a
+ * rewrite to `https://user:s3cr3t-token@example.com/` made `get-url` return that
+ * URL verbatim, token included, and this check prints the URL in its report and
+ * its `--json`. Only the part before `@` in an authority is removed; an
+ * scp-style `git@host:path` has no authority and is left alone.
+ */
+const withoutUserinfo = url => String(url).replace(/^([a-zA-Z][a-zA-Z0-9+.\-]*:\/\/)[^/@]*@/, "$1[redacted]@");
 
 export function checkRemoteReach(profile, { run = founderRun, credential = founderCredential } = {}) {
   const id = "R-16", title = "publication reach";
@@ -561,36 +598,56 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
   if (!checkout) return { id, level: UNKNOWN, title,
     lines: ["the profile names no checkout, so there is nothing to publish from"] };
 
-  const url = run(checkout, ["remote", "get-url", "origin"]);
-  if (!url.ok || !url.out) return { id, level: BROKEN, title,
-    lines: [`no origin in ${checkout}${url.err ? `: ${url.err}` : ""}`,
+  const fetchUrl = run(checkout, ["remote", "get-url", "origin"]);
+  if (!fetchUrl.ok || !fetchUrl.out) return { id, level: BROKEN, title,
+    lines: [`no origin in ${checkout}${fetchUrl.err ? `: ${fetchUrl.err}` : ""}`,
             "-> reeve publishes by pushing to origin; a checkout without one can publish nothing"] };
+  // The PUSH url, because that is the one `git push origin` uses and it can name
+  // a different transport: `remote.origin.pushurl` makes https-fetch plus
+  // ssh-push, and the reverse, both ordinary. Without `--push` this checked the
+  // wrong URL and the wrong credential. Falls back to the fetch URL when no
+  // pushurl is set, which is git's own behaviour.
+  const pushed = run(checkout, ["remote", "get-url", "--push", "origin"]);
+  const pushUrl = pushed.ok && pushed.out ? pushed.out : fetchUrl.out;
+  const separate = pushUrl !== fetchUrl.out;
 
   const branch = profile.identity?.defaultBranch ?? "main";
+  const lines = [`origin ${withoutUserinfo(fetchUrl.out)}`];
+  if (separate) lines.push(`push url ${withoutUserinfo(pushUrl)}`);
+
+  // Reachability on the url each operation actually uses: `ls-remote origin`
+  // reads through the FETCH url, so a separate push url needs its own look.
   const reach = run(checkout, ["ls-remote", "origin", `refs/heads/${branch}`]);
-  const lines = [`origin ${url.out}`];
   if (!reach.ok) return { id, level: BROKEN, title,
     lines: [...lines, `reeve's git cannot reach it: ${reach.err}`,
             "-> every publication would fail; the reads reeve makes through `gh` are unaffected, so nothing else reports this"] };
   lines.push(`reachable: ${branch} is at ${(reach.out.split(/\s+/)[0] ?? "").slice(0, 10) || "(no such ref)"}`);
+  if (separate) {
+    const reachPush = run(checkout, ["ls-remote", pushUrl, `refs/heads/${branch}`]);
+    if (!reachPush.ok) return { id, level: BROKEN, title,
+      lines: [...lines, `but the PUSH url cannot be reached: ${reachPush.err}`,
+              "-> reeve would fetch and judge normally, then fail at the push"] };
+    lines.push("the push url answers too");
+  }
 
   // ssh and local transports authenticate through the transport itself, so the
-  // reach above already exercised it. https does not, on a PUBLIC repository.
-  const https = /^https:\/\//.test(url.out);
-  if (!https) {
-    lines.push("the transport carries its own authentication, so the reach above exercised it");
+  // reach above already exercised them. http and https do not, on a PUBLIC
+  // repository -- git's credential subsystem covers both schemes, and a plain
+  // http remote answers an anonymous read exactly as https does.
+  if (!/^https?:\/\//.test(pushUrl)) {
+    lines.push("the push transport carries its own authentication, so the reach above exercised it");
     return { id, level: OK, title, lines };
   }
 
-  const host = url.out.replace(/^https:\/\//, "").split("/")[0].split("@").pop();
-  const cred = credential(checkout, host);
+  const shown = withoutUserinfo(pushUrl);
+  const cred = credential(checkout, pushUrl);
   if (!cred.ok) return { id, level: BROKEN, title,
     lines: [...lines,
-            `but no credential can be obtained for ${host}: ${cred.why}`,
+            `but no credential can be obtained for ${shown}: ${cred.why}`,
             ...(profile.identity?.visibility === "public"
               ? ["this repository is PUBLIC, so the read above succeeded anonymously and proves nothing about a push"] : []),
             "-> a push authenticates; reeve would fetch, judge and refuse at the last step"] };
-  lines.push(`a credential is available for ${host} (its value is never read into reeve)`);
+  lines.push(`a credential is available for ${shown} (its value is never read into reeve)`);
   return { id, level: OK, title, lines };
 }
 

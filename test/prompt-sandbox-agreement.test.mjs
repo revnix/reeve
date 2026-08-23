@@ -116,9 +116,13 @@ const PROFILES = {
                                          commands: { test: { cmd: "make test", state: "present" } } }],
                                risk: { forbiddenCommands: ["git", "ls", "cat", "head", "tail", "wc", "find", "which", "pwd"] } },
   // Nothing runnable at all: no units, and git plus every read-only utility
-  // forbidden.
+  // forbidden. The interpreter grant survives, and the prompt must say so.
   "nothing runnable": { units: [],
                         risk: { forbiddenCommands: ["git", "ls", "cat", "head", "tail", "wc", "find", "which", "pwd"] } },
+  // The same, plus the interpreter forbidden by its absolute path. The schema
+  // accepts any non-empty string here, and deny beats allow.
+  "not even the interpreter": { units: [],
+                                risk: { forbiddenCommands: ["git", "ls", "cat", "head", "tail", "wc", "find", "which", "pwd", process.execPath] } },
   // The profile forbids one of its own language's runners.
   "a forbidden runner": { units: [{ id: "root", language: "typescript", packageManager: "npm",
                                     commands: { test: { cmd: "npm test", state: "present" } } }],
@@ -141,7 +145,7 @@ for (const [name, prof] of Object.entries(PROFILES)) {
 
   const claimed = claimedCommands(prof);
   // "nothing runnable" is the one profile where an empty list is correct.
-  if (name !== "nothing runnable")
+  if (!["nothing runnable", "not even the interpreter"].includes(name))
     check(claimed.length > 0, `control: ${name} claims at least one command`, JSON.stringify(claimed));
   else
     check(claimed.length === 0, `control: ${name} claims nothing, because nothing survives`, JSON.stringify(claimed));
@@ -171,7 +175,7 @@ for (const [name, prof] of Object.entries(PROFILES)) {
   const mentioned = [...rule0.matchAll(/`([^`]+)`/g)]
     .map(m => m[1].replace(/\s*…\s*$/, "").trim())
     .filter(c => !c.includes("2>&1") && !REFUSED_BY_DESIGN.includes(c));
-  if (name !== "nothing runnable")
+  if (!["nothing runnable", "not even the interpreter"].includes(name))
     check(mentioned.length > 0, `control: ${name} rule 0 names commands at all`, JSON.stringify(mentioned));
   // The verify section is the other place the prompt names commands, and a rule
   // above may forbid one BY NAME while this section prints it as the way to check
@@ -196,6 +200,15 @@ for (const [name, prof] of Object.entries(PROFILES)) {
   if (name === "only a declared command") {
     check(/make test/.test(rule0), "only a declared command: rule 0 names the command the declaration granted", rule0.slice(-300));
     check(!/only shell command/.test(prompt), "and does not call the interpreter the only one", "");
+  }
+  if (name === "not even the interpreter") {
+    // It may appear ONLY in a sentence that forbids it -- rule 6 echoes the
+    // profile's own list -- never in one that offers it. Same rule the forbidden
+    // commands already get above.
+    const offers = prompt.split("\n").filter(l => l.includes(process.execPath) && !/NEVER run|never|do not/i.test(l));
+    check(offers.length === 0, "not even the interpreter: the path is only ever mentioned as forbidden",
+          offers.join(" | ").slice(0, 160));
+    check(/no shell commands granted at all/.test(prompt), "and says so plainly", "");
   }
   if (name === "nothing runnable") {
     check(prompt.includes(process.execPath), "nothing runnable: the worker is pointed at the interpreter it does have", "");

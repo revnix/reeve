@@ -1368,7 +1368,13 @@ CREATE INDEX IF NOT EXISTS territory_lease_task ON territory_lease(task);
 CREATE TABLE IF NOT EXISTS provider_lease (
   id           INTEGER PRIMARY KEY,
   owner        TEXT    NOT NULL CHECK (owner IN ('guardian','builder')),
-  repo_id      INTEGER,
+  -- NOT NULL, because provider_one_live_request is UNIQUE over
+  -- (owner, repo_id, run_ref) and SQLite does not deduplicate rows whose key
+  -- contains a NULL. Nullable here means a caller that cannot resolve the
+  -- numeric id inserts a live request the index cannot see, and every tick
+  -- inserts another -- the exact duplication the index exists to prevent,
+  -- reappearing precisely when identity is unknown.
+  repo_id      INTEGER NOT NULL,
   run_ref      TEXT    NOT NULL,
   pid          INTEGER NOT NULL,
   lstart       TEXT    NOT NULL,
@@ -1587,7 +1593,9 @@ Create `test/hub-locks.test.mjs`:
 import { openHub } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton,
          withWriterLease, acquireMaintenanceLock, assertWritable } from "../src/build/locks.mjs";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+// mkdirSync and readdirSync are the race barrier's; without them the test throws
+// a ReferenceError before releasing the gun and the 20-way race never runs.
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readdirSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2600,7 +2608,17 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
   let live = null, locked = false;
   const staging = dbPath + ".restoring";
   try {
-    if (existsSync(dbPath)) {
+    // When dbPath is ABSENT -- the destructive drill's case, and a real total
+    // loss -- the holder scan is skipped and NO lock exists at the canonical
+    // path while the snapshot is copied and replayed into staging. A
+    // service-manager restart or a CLI write landing in that window creates a
+    // fresh hub at dbPath which the rename then silently destroys. So an absent
+    // hub gets a minimal one created first, purely to hold the lock.
+    if (!existsSync(dbPath)) {
+      live = openHub(dbPath);
+      acquireMaintenanceLock(live, { pid, lstart, isAlive });
+      locked = true;
+    } else {
       // RAW DatabaseSync, not openHub. openHub applies forward migrations, and
       // migrating a database is a write -- so opening that way would upgrade a
       // hub that a builder or a CLI is actively using, before this command has
@@ -2619,6 +2637,18 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       for (const r of live.prepare("SELECT * FROM provider_lease WHERE status='held'").all())
         if (isAlive(r.pid, r.lstart)) holders.push({ what: r.owner, pid: r.pid, lstart: r.lstart, command: r.run_ref });
 
+      // `force` overrides the operator-judgement half of this check, never the
+      // safety half. A live builder or CLI writer holds a descriptor to the file
+      // being replaced and carries on issuing external effects against a
+      // database that no longer exists; no flag makes that safe, and the whole
+      // point of the maintenance lock is that no writer is running here. So
+      // force is refused outright while anything is provably alive — it is for
+      // clearing holders whose processes are already gone.
+      if (holders.length && force)
+        return { ok: false, holders,
+          why: `force does not override a LIVE holder; it only clears dead ones. Still running:\n` +
+               holders.map(h => `  ${h.what.padEnd(8)} pid ${h.pid} (started ${h.lstart})  ${h.command}`).join("\n") +
+               `\n  stop them, then re-run.` };
       if (holders.length && !force) {
         return { ok: false, holders,
           why: `the hub has live writers; stop them first:\n` +
@@ -3337,14 +3367,13 @@ Expected: no `FAILED` lines. 59 pre-existing files plus `hub-schema`, `hub-locks
 `docs/TRACKER.md` conflicts on every branch. One line, added last, so the conflict is trivial. Under Programme 2's "In flight":
 
 ```markdown
-- [x] **Implementation plan for S2:** `docs/superpowers/plans/2026-08-22-s2-hub-core.md`
-      (3 PRs: hub store, phase machine, provider scheduler). Founder decisions
-      2026-08-22: guardian fails OPEN on an unreadable hub; `ci.flakePatterns`
-      REMOVED (`docs/measured/2026-08-22-flakepatterns-has-no-readers.md`);
-      `repo_gate_state` ships with a pure writer and an injected fetcher.
-- [ ] **PR-A (hub store)** — 32-table STRICT schema, forward-only migrations,
-      the three locks, hub-aware backup, destructive restore drill, the
-      prose-versus-DDL cross-check.
+- [x] **S2-A (hub store) LANDED** — `docs/superpowers/plans/2026-08-23-s2a-hub-store.md`,
+      13 tasks: 32-table STRICT schema, forward-only migrations, the three locks,
+      hub-aware backup, the destructive restore drill, and the prose-versus-DDL
+      cross-check. `ci.flakePatterns` removed
+      (`docs/measured/2026-08-22-flakepatterns-has-no-readers.md`).
+      Next: S2-B (`2026-08-23-s2b-phase-machine.md`, #12), then S2-C
+      (`2026-08-23-s2c-provider-scheduler.md`, #13), in that order.
 ```
 
 ```bash

@@ -19,6 +19,7 @@ import { readOauthToken } from "./workerenv.mjs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 const BROKEN = "BROKEN";
@@ -594,13 +595,77 @@ export function founderCredential(cwd, url, { run = founderRun } = {}) {
  * credential itself gets.
  */
 const HTTP_AUTH_KEYS = ["http.extraHeader", "http.cookieFile"];
-function httpAuthElsewhere(run, cwd, url) {
+
+/**
+ * The founder's netrc, if they have one. Read for one question only -- whether
+ * it has an entry for a host -- and no token from it is ever returned.
+ *
+ * `_netrc` as well as `.netrc`, because reeve has to run on Windows and that is
+ * the name curl looks for there.
+ */
+function readNetrcFile() {
+  for (const name of [".netrc", "_netrc"]) {
+    try { return readFileSync(join(homedir(), name), "utf8"); } catch { /* the next one, or none */ }
+  }
+  return "";
+}
+
+/**
+ * Does the netrc name this host?
+ *
+ * Tokens are whitespace-separated. `default` matches any host, which is the
+ * whole point of it. A `machine` token inside a `macdef` body could match
+ * spuriously -- that direction is harmless here, since the consequence is
+ * reporting a credential as UNVERIFIED rather than as absent.
+ */
+function netrcNames(text, host) {
+  const bare = String(host ?? "").split(":")[0];
+  if (!bare) return false;
+  const toks = String(text ?? "").split(/\s+/).filter(Boolean);
+  for (let i = 0; i < toks.length; i++) {
+    if (toks[i] === "default") return true;
+    if (toks[i] === "machine" && (toks[i + 1] === bare || toks[i + 1] === host)) return true;
+  }
+  return false;
+}
+
+/**
+ * HTTP authentication configured somewhere other than a credential helper.
+ *
+ * `http.<url>.extraHeader`, `http.<url>.cookieFile` and `~/.netrc` are all used
+ * by `ls-remote` and by the real push while `git credential fill` knows nothing
+ * about them. `--get-urlmatch` is git's own resolution for the first two:
+ * measured 2026-08-23, it exits 0 for a url the section matches and 1 for one it
+ * does not.
+ *
+ * netrc is not git configuration at all -- git hands libcurl `CURL_NETRC_
+ * OPTIONAL` and curl reads the file itself. Measured 2026-08-23 on git 2.50.1
+ * against a local server issuing a 401 Basic challenge:
+ *
+ *   no netrc              -> exit 128, no Authorization header sent
+ *   with a matching netrc -> exit 0, Authorization header SENT
+ *   credential fill       -> exit 128, no password
+ *
+ * Worth recording that it did NOT reproduce against GitHub over https, where
+ * git's own credential lookup fails first and the request is never made. So the
+ * exposure is real and narrower than the general case: it needs a server that
+ * answers with a challenge rather than one git pre-empts. (Codex #14-[15].)
+ *
+ * Only the KEY, or the name of the file, is returned. The values are an
+ * Authorization header, a cookie jar and a password file, and they get the same
+ * treatment as the credential itself.
+ */
+function httpAuthElsewhere(run, cwd, url, { netrc = readNetrcFile } = {}) {
   for (const key of HTTP_AUTH_KEYS) {
     const r = run(cwd, ["config", "--get-urlmatch", key, url]);
     if (r.ok && r.out) return key;
   }
+  if (netrcNames(netrc(), hostOf(url))) return "~/.netrc";
   return null;
 }
+
+/** The authority of an http(s) url, without any userinfo. */
+const hostOf = url => String(url).replace(/^https?:\/\//, "").split("/")[0].split("@").pop();
 
 /**
  * A remote URL with its userinfo removed, for printing.
@@ -614,7 +679,7 @@ function httpAuthElsewhere(run, cwd, url) {
  */
 const withoutUserinfo = url => String(url).replace(/^([a-zA-Z][a-zA-Z0-9+.\-]*:\/\/)[^/@]*@/, "$1[redacted]@");
 
-export function checkRemoteReach(profile, { run = founderRun, credential = founderCredential } = {}) {
+export function checkRemoteReach(profile, { run = founderRun, credential = founderCredential, netrc = readNetrcFile } = {}) {
   const id = "R-16", title = "publication reach";
   const checkout = profile?.identity?.checkout;
   if (!checkout) return { id, level: UNKNOWN, title,
@@ -724,7 +789,7 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
     // knows nothing about them — so reporting BROKEN on the helper's silence
     // alone calls a working checkout broken. What reeve can say is that it
     // cannot verify this one, which is neither of the two confident answers.
-    const elsewhere = httpAuthElsewhere(run, checkout, url);
+    const elsewhere = httpAuthElsewhere(run, checkout, url, { netrc });
     if (elsewhere) { unverified.push(shown); lines.push(`${shown} authenticates through ${elsewhere}, which this check cannot verify`); continue; }
     return { id, level: BROKEN, title,
       lines: [...lines,

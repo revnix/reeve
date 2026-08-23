@@ -218,6 +218,52 @@ when the code did more than it does now. Two were found by a reviewer and one by
 re-reading my own diff. What they have in common is that removing a reading is
 not finished until every sentence that depended on it is re-read.
 
+## netrc, which is not git configuration at all
+
+Round six. `http.<url>.extraHeader` and `http.<url>.cookieFile` are git config
+and resolve through `--get-urlmatch`. `~/.netrc` is neither: git hands libcurl
+`CURL_NETRC_OPTIONAL` and curl reads the file itself, so `git credential fill`
+never sees it.
+
+Measured 2026-08-23 on git 2.50.1, against a local server issuing a 401 Basic
+challenge (a bare repo served dumb-http, with the handler recording what
+Authorization header arrived):
+
+| HOME | `ls-remote` | Authorization sent |
+|---|---|---|
+| no netrc | exit 128 | no |
+| a matching netrc | **exit 0** | **yes** |
+| `credential fill`, same netrc | exit 128 | returned no password |
+
+So a netrc-backed checkout publishes fine while R-16 called it BROKEN.
+
+**It did NOT reproduce against GitHub over https.** There, git's own credential
+lookup fails first and the request is never made, so netrc never gets its turn:
+
+```
+$ HOME=<scratch, with a matching netrc> git ls-remote origin refs/heads/main
+fatal: could not read Username for 'https://github.com': terminal prompts disabled
+```
+
+The exposure is therefore real and narrower than the general claim: it needs a
+server that answers with a challenge rather than one git pre-empts. Worth
+recording, because the obvious reproduction attempt is the one that fails.
+
+A netrc entry for the host — or a `default` entry, which matches any host — is
+treated exactly like the other two: DEGRADED with the mechanism named, never
+BROKEN. Only the FILE NAME is reported; the file is a list of passwords.
+
+## A fixture that was green because of this machine
+
+The netrc seam defaults to reading the founder's own `~/.netrc`. There is none
+on this host, so every existing R-16 fixture passed without knowing the seam
+existed — and would have behaved differently on a machine that has one. Every
+fixture now injects its netrc explicitly, including the ones that want none.
+
+That is the same shape as the dispatch fixtures that read the real
+`~/.reeve/claude-token`: green here, red on a machine configured differently, for
+a reason that is not the code.
+
 ## What this does not establish, said in the report rather than only here
 
 That a push would SUCCEED. `git credential fill` obtains the fields from the

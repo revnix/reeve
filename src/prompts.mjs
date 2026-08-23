@@ -238,9 +238,10 @@ function landing(profile) {
     "  given. Being told to do something the sandbox refuses is how a finished fix",
     "  gets spent on diagnosing its own permissions and thrown away.",
     "",
-    "  Change only the files your fix needs, and leave nothing else behind.",
-    "  EVERYTHING left in the checkout is committed as your fix, so a scratch file",
-    "  you wrote while working becomes part of the change and the gate refuses it.",
+    "  List EVERY file you changed in `filesTouched`. reeve commits exactly those,",
+    "  and if the checkout holds any change you did not list it refuses to publish",
+    "  and calls a human — so a reproduction script or a debug dump you leave behind",
+    "  costs the whole repair unless you remove it or declare it.",
     ...(commandDenied("git", profile) ? [] : [
       "  `rm` is not granted; `git clean -f -- <path>` is, and it removes an untracked",
       "  file without touching anything you are not allowed to touch.",
@@ -248,6 +249,10 @@ function landing(profile) {
     "",
     "  You do not write the commit message. reeve writes it from the `cause` and",
     "  `change` sentences of your report, so make those two accurate and specific.",
+    "",
+    "  Nothing is published unless your report says `\"fixed\": true`. A missing or",
+    "  malformed report is treated as no fix at all, and the work is kept for a",
+    "  human rather than shipped.",
   ].join("\n");
 }
 

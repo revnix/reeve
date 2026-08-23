@@ -707,6 +707,33 @@ rmSync(root, { recursive: true, force: true });
     check(g(w, "rev-parse", "f") === before, "and no commit is made, so it never enters history", before.slice(0, 8));
   }
 
+  {
+    // The diff gate judges paths and territory, never intent, so a reproduction
+    // script inside the lane passes it. Only the worker knows which of its files
+    // were the repair, so the disagreement between what it reported and what it
+    // left is the check.
+    const w = mkWorktree("undeclared");
+    const before = g(w, "rev-parse", "HEAD");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    writeFileSync(join(w, "repro.js"), "console.log('reproducing')\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: ["fix.js"] });
+    check(r.ok === false, "a change the worker did not report refuses the commit", JSON.stringify(r));
+    check(/repro\.js/.test(r.why ?? ""), "and names the file", String(r.why));
+    check(g(w, "rev-parse", "f") === before, "control: nothing was committed", before.slice(0, 8));
+    check(g(w, "diff", "--cached", "--name-only") === "", "and the index is left clean for the human who gets this", g(w, "diff", "--cached", "--name-only"));
+  }
+
+  {
+    // Declared exactly: the ordinary case still commits.
+    const w = mkWorktree("declared-exactly");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    writeFileSync(join(w, "also.js"), "and this\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: ["./fix.js", "also.js"] });
+    check(r.ok && r.committed, "control: a fully declared change commits, leading ./ and all", JSON.stringify(r).slice(0, 160));
+  }
+
   rmSync(cRoot, { recursive: true, force: true });
 }
 

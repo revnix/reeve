@@ -921,7 +921,7 @@ export async function tick(ctx) {
       // Declared out here, not inside the try: the publish path below reads it,
       // and a const in the try block is a ReferenceError at that point -- the
       // exact shape that once threw on every FIX_CI with every unit test green.
-      let r, prepFailed = false, worktree = null, workerToken = null;
+      let r, prepFailed = false, worktree = null, workerToken = null, copiedDeps = [];
       try {
         // Everything from here runs inside the cleanup scope: the run is
         // already leased and its heartbeat already ticking, so a failure in
@@ -953,6 +953,11 @@ export async function tick(ctx) {
         });
         if (!prepared.ok) throw new Error(`could not prepare the checkout: ${prepared.why}`);
         worktree = prepared.path;
+        // What preparation ACTUALLY copied, not what the profile declared. A
+        // declared path that did not exist is skipped, and excluding it anyway
+        // would hide the worker's own creation of it from staging AND from the
+        // uncommitted check -- losing that part of the fix while the rest ships.
+        copiedDeps = prepared.deps?.copied ?? [];
         log(logPath, `  #${e.pr}: checkout ready at ${worktree}` +
                      `${prepared.deps?.copied?.length ? ` (deps: ${prepared.deps.copied.join(", ")}${prepared.deps.cow ? ", copy-on-write" : ""})` : ""}`);
         if (wantDeps.unsupported.length)
@@ -1234,8 +1239,15 @@ export async function tick(ctx) {
         // uncommitted-work gate below; committing first would turn a declared
         // non-fix into a publishable repair. The edits are left exactly where they
         // are, so that gate preserves them and names a human.
-        const declined = r.report?.fixed === false ? "the worker reported it did not fix this"
-          : r.report?.needsHuman ? `the worker reported it needs a human: ${printable(String(r.report.needsHuman)).slice(0, 160)}`
+        // Affirmative, not merely not-negative. `parseReport` returns null when the
+        // worker omits the fenced JSON or emits something malformed, and
+        // `classifyResult` still says OK -- so optional-chained checks for
+        // `fixed: false` both read false and reeve would commit an exploratory
+        // edit under a generic message. A publication needs the worker to have
+        // SAID it fixed this.
+        const declined = !r.report ? "the worker returned no usable report"
+          : r.report.fixed !== true ? "the worker did not report a fix"
+          : r.report.needsHuman ? `the worker reported it needs a human: ${printable(String(r.report.needsHuman)).slice(0, 160)}`
           : null;
         const landed = declined ? { ok: true, committed: false, files: [], why: `not committing: ${declined}` }
                                 : (ctx.commitWork ?? commitRunWork)({
@@ -1243,8 +1255,13 @@ export async function tick(ctx) {
           message: repairMessage(r.report, decision),
           // What reeve itself copied in before the worker started is not the
           // worker's work, and must not be staged as part of the repair.
-          exclude: dependencyPathsFor(profile).paths,
+          exclude: copiedDeps,
           secrets: [{ label: "reeve's worker authentication token", value: workerToken }],
+          // The diff gate judges paths and territory, never intent, so a
+          // reproduction script inside the lane passes it. reeve commits what the
+          // worker SAID it changed, and refuses when the checkout holds anything
+          // it did not.
+          declared: Array.isArray(r.report?.filesTouched) ? r.report.filesTouched : null,
         });
         if (!landed.ok) {
           const rel = releaseRunCheckout(worktree, { workFetched: false });
@@ -1261,7 +1278,7 @@ export async function tick(ctx) {
         // with the checkout while the log said it was published. The work is
         // kept and a human is told, because a candidate fix nobody has a copy of
         // is not spare disk space. (Codex #5-[2].)
-        const stillDirty = uncommittedFiles(worktree, dependencyPathsFor(profile).paths);
+        const stillDirty = uncommittedFiles(worktree, copiedDeps);
         if (stillDirty === null || stillDirty.length) {
           const why = stillDirty === null
             ? "reeve could not read the checkout's status, so it cannot say the work was committed"

@@ -44,7 +44,16 @@ S2-A must be merged first. These are the exact names this plan builds on; if any
 - **Node:** always `~/.nvm/versions/node/v24.17.0/bin/node`. Alias it `N` in every shell: `N=~/.nvm/versions/node/v24.17.0/bin/node`. `node` on PATH is v22 and `node:sqlite` emits an ExperimentalWarning there; CI asserts a floor of 24.
 - **Tests:** plain scripts, no framework. Use the `check(ok, name, detail)` helper shape every existing test file uses; `console.log("PASS  name")` / `"FAIL  name"`; end with `process.exit(fail ? 1 : 0)`. New files under `test/` are discovered by CI automatically.
 - **The four-check stub loop for every fix:** control green, stub verified applied, the RIGHT assertion red, restore verified. Never commit a test that has not been seen red against the broken code. Every task below names the stub explicitly.
-- **Run the full suite before every commit:** `for f in test/*.test.mjs; do $N "$f" >/dev/null || echo "FAILED $f"; done`. **Measured 2026-08-22 on `9dbd3a0`: 59 test files exist; 58 were run and all 58 passed.** `test/escape.test.mjs` was NOT run, because it writes decoy files into the shared `~/.reeve/canary/` directory that the live daemon also reads; run it once on a quiet machine to complete the baseline. That run had `node_modules` absent, and a green file can hide a skip, so skips were counted rather than assumed: exactly two files carry one `SKIP` each (`policy-self-exclusion`, `supervisor-contract`). That 58-file pass is the base every task is measured against, and it is the same base for all three PRs — never a chained comparison against the previous task.
+- **Run the full suite before every commit**, skipping the one file the next sentence explains:
+
+  ```bash
+  for f in test/*.test.mjs; do
+    case "$f" in */escape.test.mjs) continue;; esac
+    $N "$f" >/dev/null || echo "FAILED $f"
+  done
+  ```
+
+  `escape.test.mjs` writes decoys into the shared `~/.reeve/canary/` tree the live daemon reads. A command that contradicts the warning beside it means the warning loses. **Measured 2026-08-22 on `9dbd3a0`: 59 test files exist; 58 were run and all 58 passed.** `test/escape.test.mjs` was NOT run, because it writes decoy files into the shared `~/.reeve/canary/` directory that the live daemon also reads; run it once on a quiet machine to complete the baseline. That run had `node_modules` absent, and a green file can hide a skip, so skips were counted rather than assumed: exactly two files carry one `SKIP` each (`policy-self-exclusion`, `supervisor-contract`). That 58-file pass is the base every task is measured against, and it is the same base for all three PRs — never a chained comparison against the previous task.
 - **Conventional Commits**, lowercase, `type(scope): subject`, ≤72 characters. **No attribution trailer of any kind.** Never `--no-verify`.
 - Every change carries a what/why comment in the style of the file it lands in. Comments never reference tasks, plans, findings, or this document.
 - **No raw SQL outside `src/db/` and `src/build/`.** `hubdb.mjs` owns every hub statement the way `ops.mjs` owns every guardian statement.
@@ -87,6 +96,35 @@ Recorded so no executor re-litigates them.
 ---
 
 
+## The test harness every file in this plan opens with
+
+Where a task writes `/* ... standard harness ... */`, it means exactly this block. It is written once here rather than repeated in each task, but it is **not** optional shorthand: without it `check`, `dir` and the imports are undefined and the file fails before reaching its first assertion.
+
+```js
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+let fail = 0;
+const check = (ok, name, detail) => {
+  console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+  if (!ok) { if (detail) console.log("        " + detail); fail++; }
+};
+const dir = mkdtempSync(join(tmpdir(), "reeve-<slug>-"));
+```
+
+and closes with:
+
+```js
+rmSync(dir, { recursive: true, force: true });
+console.log(fail ? `\nfailed=${fail}` : "\nall green");
+process.exit(fail ? 1 : 0);
+```
+
+Each task names any imports it needs **beyond** these.
+
+## File structure
+
 | File | Responsibility after this plan |
 |---|---|
 | `bin/reeve` (PR-A, PR-B) | `build run|status|pause` routes; `build run` takes the singleton lease and refuses a second instance naming the holder. |
@@ -121,6 +159,7 @@ Recorded so no executor re-litigates them.
     `state = { phase, generation, heldFrom, sliceCursor, drainRemaining, hasOpenPr, pinnedTerritory }`,
     `Transition = { ok: true, to, generation, bumps, compensations: string[] }`,
     `Refusal = { ok: false, refusal: string }`.
+  - `escalate` (optional) names the §11.7 identity this transition must raise, or is absent. `applyTransition` raises it in the same transaction. The identities are **bare**: no counts, durations, SHAs or paths in the key — those ride in the body. Three transitions carry one: `INFEASIBLE` raises `bt:<id>:infeasible` (a success state, but never a quiet one — it is the one builder escalation retired by the terminal state itself), the post-approval depth override raises `bt:<id>:depth:post-approval`, and a worker phase's exhausted retries raise `bt:<id>:phase:failed:<phase>`.
   - `compensations` is a list drawn from the closed set `['void-pending','write-pr-hold','close-prs','release-territory','regrant-territory','clear-holds','annotate-resumed','record-hold-reason','record-drain','force-drain']`, so the transaction in Task 15 has nothing to decide.
   - **The list is ORDERED, and `applyCompensation` runs it in that order.** `record-drain` is last because it snapshots the outbox rows that are in flight *at that moment*: run before `close-prs`, it captures only rows that were already inflight and misses the PR-close and comment effects the cancellation itself just enqueued, so `drainRemaining` reads zero and the task can reach CANCELLED with its own compensations still pending. Anything that enqueues must run before the thing that counts what is outstanding.
   - Every name in that set has a branch in `applyCompensation` (Task 15). A compensation the machine can emit and the transaction cannot apply either throws and rolls back the transition, or silently does nothing — and `regrant-territory` was emitted for a round with no branch to run it, which would have made every resume either fail or return without its lease.
@@ -151,6 +190,7 @@ const EVIDENCE = [
   { kind: "depth.override" }, { kind: "slice.merged" }, { kind: "claim.lost" },
   { kind: "slice.next", moreSlices: true }, { kind: "slice.next", moreSlices: false },
   { kind: "finalize.settled", outstanding: 0 }, { kind: "finalize.settled", outstanding: 2 },
+  { kind: "founder.regenerate" },
   { kind: "hold", reason: "ownership_lost" },
   { kind: "founder.cancel" },
   { kind: "founder.cancelForce", drainEligible: true }, { kind: "founder.cancelForce", drainEligible: false },
@@ -405,13 +445,20 @@ export function nextPhase(state, evidence) {
     return go("CANCELLING", { generation,
       compensations: ["void-pending","record-drain","close-prs","release-territory", ...(hasOpenPr ? ["write-pr-hold"] : [])] });
   if (kind === "founder.infeasible") {
+    // INFEASIBLE from IMPL_PR_OPEN or VERDICT_WAIT leaves an open builder PR
+    // behind. Without a hold the guardian's verdict has nothing to read, the
+    // required check stays green at the head, and a PR belonging to a task that
+    // was declared infeasible remains mergeable until its close effect settles.
+    // The hold is the part that does not depend on an effect settling.
     // INFEASIBLE is a success state, but never a quiet one: its entry raises
     // bt:<id>:infeasible so the founder reads WHY work stopped. A terminal state
     // with no durable explanation cannot be explained afterwards -- there are no
     // edges out and no later phase to record it.
     if (!evidence.reason || !String(evidence.reason).trim())
       return refuse("infeasible requires a reason; a terminal state with no explanation cannot be explained later");
-    return go("INFEASIBLE", { generation, compensations: ["void-pending","close-prs","release-territory"] });
+    return go("INFEASIBLE", { generation, escalate: `bt:<id>:infeasible`,
+      compensations: ["void-pending","close-prs","release-territory",
+                      ...(hasOpenPr ? ["write-pr-hold"] : [])] });
   }
 
   // Held states: exactly one exit verb each, and a hold that arrives while
@@ -427,6 +474,11 @@ export function nextPhase(state, evidence) {
       // the task can work again -- otherwise two tasks edit the same paths
       // concurrently, which is the single thing territory exists to prevent.
       // The caller supplies the answer; the machine stays pure.
+      // The machine stays pure, so the caller supplies the answer -- but
+      // applyTransition RE-RUNS the intersection check inside its transaction
+      // before granting the lease (see `regrant-territory`). Trusting a value
+      // computed before BEGIN IMMEDIATE would let a filing that landed in
+      // between hold both claims.
       if (evidence.territoryConflict)
         return refuse(`territory now conflicts with ${evidence.territoryConflict}; ` +
                       `resume is refused until the founder settles who owns it`);
@@ -465,8 +517,12 @@ export function nextPhase(state, evidence) {
   if (phase === "GATE") {
     if (kind === "gate.approved")    return go("APPROVED", { generation });
     if (kind === "gate.revise")      return go("SPEC_DRAFT", { generation });
+    // A task at the revision cap necessarily has an open SPEC PR -- that is what
+    // the rounds were spent on -- so this edge holds it like every other path
+    // into a held state. Omitting it made GATE the one escalation that left its
+    // PR unheld.
     if (kind === "gate.capReached")  return go("ESCALATED", { generation,
-      compensations: [...(pinnedTerritory ? [] : ["release-territory"])] });
+      compensations: ["write-pr-hold", ...(pinnedTerritory ? [] : ["release-territory"])] });
     // depth.override from GATE is handled by the shared block below, so the two
     // cannot drift apart.
   }
@@ -485,8 +541,13 @@ export function nextPhase(state, evidence) {
     if (WORKER_PHASES.includes(phase) && ["SIZING","RESEARCH","DESIGN"].includes(phase))
       return refuse(`${phase} re-dispatches under the new depth as a new attempt; the phase does not change`);
     if (["SPEC_DRAFT","SPEC_PR_OPEN","GATE"].includes(phase)) return go("DESIGN", { generation });
-    return go("BLOCKED", { generation,
-      compensations: ["void-pending","release-territory", ...(hasOpenPr ? ["write-pr-hold"] : [])] });
+    // Post-approval: holds, and records WHY like every other hold. Without
+    // record-hold-reason this was the one BLOCKED entry with no reason, so
+    // `task resume` would list nothing and the founder would see a held task
+    // with no explanation.
+    return go("BLOCKED", { generation, escalate: `bt:<id>:depth:post-approval`,
+      compensations: ["record-hold-reason","void-pending","release-territory",
+                      ...(hasOpenPr ? ["write-pr-hold"] : [])] });
   }
 
   // SLICE_MERGED must exit, or a task that merged its first slice sits there
@@ -505,6 +566,19 @@ export function nextPhase(state, evidence) {
         : go("FINALIZING", { generation });
     if (kind === "slice.merged")
       return refuse("SLICE_MERGED is entered BY slice.merged; advancing needs slice.next");
+  }
+
+  // `reeve task regenerate` (§4.7): the founder deliberately adopts a changed
+  // contract. It bumps the generation, and re-enters at SPEC_DRAFT if the task
+  // is past GATE (the spec is re-rendered under the new contract and goes
+  // through the full gate again as a new head) or at the current phase
+  // otherwise. Absent from the machine entirely until now, so the CLI verb
+  // §11.6 lists had no transition to make.
+  if (kind === "founder.regenerate") {
+    if (TERMINAL.includes(phase)) return refuse(`${phase} is terminal; regenerate cannot re-open it`);
+    const PAST_GATE = ["APPROVED","IMPLEMENTING","IMPL_PR_OPEN","VERDICT_WAIT","SLICE_MERGED","FINALIZING"];
+    return go(PAST_GATE.includes(phase) ? "SPEC_DRAFT" : phase,
+      { generation: generation + 1, bumps: true, compensations: ["annotate-resumed"] });
   }
 
   if (kind === "phase.succeeded") {
@@ -719,8 +793,13 @@ import { hubTx, hubEvent } from "./hubdb.mjs";
 import { nextPhase, HELD } from "./phases.mjs";
 
 export function applyTransition(db, { taskId, expectedPhase, expectedGeneration, evidence,
-                                      artifactSha = null, op, effects = [], slice = null }) {
+                                      artifactSha = null, op, effects = [], slice = null,
+                                      isAlive = pidAlive }) {
   return hubTx(db, () => {
+    // Every hub writer checks the restore exclusion first, inside its own
+    // transaction. This is the busiest writer in the system; omitting it here
+    // would leave the largest hole in the lock S2-A added.
+    assertWritable(db, { isAlive, inTx: true });
     const task = db.prepare("SELECT * FROM task WHERE id=?").get(taskId);
     if (!task) return { applied: false, reason: "no-such-task" };
 
@@ -734,6 +813,14 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
     // A hold arriving on an already-held task appends a reason and updates the
     // open hold; it does NOT transition, because a transition would rewrite
     // held_from and lose where resume should send the task back to.
+    // A transition justified by a phase report must name the artifact that
+    // justified it: section 3.2 requires the sha in the event, and a null one
+    // records a transition whose evidence cannot be re-checked afterwards.
+    const WORKER_PHASES = ["SIZING","RESEARCH","DESIGN","SPEC_DRAFT","IMPLEMENTING"];
+    if (evidence?.kind === "phase.succeeded" && WORKER_PHASES.includes(expectedPhase) && !artifactSha)
+      return { applied: false, reason: "refused",
+               refusal: `${expectedPhase} succeeded with no artifact sha; a transition must record what justified it` };
+
     if (!decision.ok && HELD.includes(expectedPhase) && evidence?.kind === "hold") {
       // This branch returns before the CAS, so it must do the CAS's job itself.
       // Without it a stale caller -- one that read BLOCKED before another
@@ -746,8 +833,16 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
         .run(taskId, evidence.reason, evidence.detail ?? null);
       db.prepare("UPDATE pr_hold SET reason=?, detail=? WHERE task=? AND cleared_at IS NULL")
         .run(holdReasonFor(evidence.reason), evidence.detail ?? null, taskId);
+      // BOTH writes need row images. The hold_reason payload was hand-built (so
+      // it lacked the row's id, which replay keys on) and the pr_hold update had
+      // no event at all -- so a replay restored the stacked reason and left the
+      // open hold's reason at whatever the snapshot held.
       hubEvent(db, { kind: "hold_reason.appended", task: taskId,
-        payload: { task: taskId, reason: evidence.reason, at: nowOf(db) } });
+        payload: db.prepare(`SELECT id, task, reason, detail, at, cleared_at FROM hold_reason
+                             WHERE task=? ORDER BY id DESC LIMIT 1`).get(taskId) });
+      const held = db.prepare(`SELECT id, task, repo_id, pr, head_sha, reason, detail, created_at, cleared_at
+                               FROM pr_hold WHERE task=? AND cleared_at IS NULL`).all(taskId);
+      for (const h of held) hubEvent(db, { kind: "pr_hold.created", task: taskId, payload: h });
       return { applied: false, reason: "stacked" };
     }
     if (!decision.ok) {
@@ -767,6 +862,19 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
     }
 
     const TERMINAL_WITH_REASON = ["INFEASIBLE", "CANCELLED", "LOST"];
+    // Re-check the outstanding count from the DATABASE before committing a
+    // terminal transition. nextPhase is pure and can only use what it was told;
+    // between the caller counting and this transaction opening, a reconciler can
+    // have settled a row -- or an effect can have been enqueued. DONE has no
+    // edges out, so a wrong count here is unrecoverable.
+    if (decision.to === "DONE") {
+      const outstanding = db.prepare(
+        `SELECT count(*) c FROM outbox WHERE task_id=? AND status IN ('pending','inflight')`).get(taskId).c;
+      if (outstanding > 0)
+        return { applied: false, reason: "refused",
+                 refusal: `${outstanding} finalization effect(s) still unsettled at commit time` };
+    }
+
     const upd = db.prepare(
       `UPDATE task SET phase=?, generation=?, updated_at=unixepoch(),
                        held_from=?, blocked_reason=?, terminal_reason=?,
@@ -786,6 +894,16 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
        VALUES(?,unixepoch(),?,?,?,?,?,?,?,?) RETURNING seq`)
       .get(taskId, op, expectedPhase, decision.to, expectedGeneration, decision.generation,
            slice, artifactSha, JSON.stringify({ evidence: evidence?.kind ?? null }));
+
+    // The transition LOG needs its own row image, or replay restores the task
+    // projection and loses every transition after the snapshot -- and restored
+    // outbox rows keep fence values pointing at phase_event seqs that no longer
+    // exist, so fence revalidation compares against nothing. replay.mjs has a
+    // phase_event.appended handler; this is what feeds it.
+    hubEvent(db, { kind: "phase_event.appended", task: taskId,
+      payload: db.prepare(`SELECT seq, task, at, op, from_phase, to_phase, from_generation,
+                                  to_generation, slice, artifact_sha, detail
+                           FROM phase_event WHERE seq = ?`).get(seq) });
 
     for (const c of decision.compensations) applyCompensation(db, { c, taskId, generation: decision.generation, seq });
 
@@ -832,11 +950,11 @@ Write `applyCompensation` as a switch over the closed set `phases.mjs` produces,
 | `write-pr-hold` | one `pr_hold` row per open builder PR, reason from the closed set |
 | `close-prs` | enqueues `gh.pr.close` plus the explanatory comment |
 | `release-territory` | deletes the task's `territory_lease` rows |
-| `regrant-territory` | re-inserts them after the §10.2 intersection check; the caller has already established there is no conflict (the machine refuses otherwise), so this is the write, not the check |
+| `regrant-territory` | **re-runs the §10.2 intersection check inside this transaction**, and throws if it now conflicts, rolling the whole resume back. The machine's `territoryConflict` evidence is the caller's earlier read; this is the authoritative one, because only a check under `BEGIN IMMEDIATE` excludes a filing that landed in between |
 | `clear-holds` | sets `cleared_at` on every open `pr_hold` **and** `hold_reason` for the task |
 | `annotate-resumed` | enqueues the compensating "resumed" comment for any hold comment left behind |
 | `record-hold-reason` | inserts the `hold_reason` row for **this** hold — the first one, not only the stacked ones |
-| `record-drain` | inserts one `task_drain` row per `status='inflight'` outbox row. **Runs last**, so it counts the effects the compensations above just enqueued |
+| `record-drain` | inserts one `task_drain` row per outbox row for this task in `status IN ('pending','inflight')`. **Runs last**, so it captures the close and comment effects the compensations above just enqueued — those are `pending`, not `inflight`, so an inflight-only select would have missed exactly the rows ordering it last was meant to catch |
 | `force-drain` | sets `forced=1` and `last_known` on every unsettled `task_drain` row, and moves their outbox rows to `forced`, so a `--force` cancel records what was never confirmed instead of leaving the projection claiming it is still in flight |
 
 - [ ] **Step 4: Run and commit**
@@ -864,10 +982,16 @@ git commit -m "feat(hub): generation-fenced transition with compensations"
   - **Settling an effect settles its drain row.** In the same transaction, `settleEffect` (and `recoverEffects` through it) sets `task_drain.settled_at` for any row matching `(task_id, id)` and appends a `task_drain.settled` `hub_event`. Without this nothing ever clears the drain: `nextPhase` refuses `drain.settled` while any row has `settled_at IS NULL`, so every cancellation that caught an inflight effect would sit in CANCELLING until `builder.cancel.drainMinutes` expired and the founder ran `--force` — turning the ordinary path into the exceptional one, and recording rows as `forced` whose reconcilers had in fact completed.
 
 ```js
-// inside settleEffect's transaction, after the outbox row is updated:
-const drained = db.prepare(
+// inside settleEffect's transaction, after the outbox row is updated.
+// ONLY when the row reached a terminal status: a failed-but-retryable settle
+// returns it to `pending`, and marking its drain row settled would let the task
+// reach CANCELLED while the effect is still queued to run again.
+const TERMINAL_OUTBOX = ["done","failed","dead_letter","voided","fenced","refused","superseded","forced"];
+const nowStatus = db.prepare("SELECT status FROM outbox WHERE id=?").get(id).status;
+const drained = TERMINAL_OUTBOX.includes(nowStatus) ? db.prepare(
   `UPDATE task_drain SET settled_at = unixepoch()
-   WHERE task = (SELECT task_id FROM outbox WHERE id = ?) AND outbox_id = ? AND settled_at IS NULL`).run(id, id);
+   WHERE task = (SELECT task_id FROM outbox WHERE id = ?) AND outbox_id = ? AND settled_at IS NULL`).run(id, id)
+  : { changes: 0 };
 if (drained.changes) {
   const row = db.prepare(`SELECT task, outbox_id, recorded_at, settled_at, forced, last_known
                           FROM task_drain WHERE outbox_id=?`).get(id);
@@ -980,6 +1104,10 @@ if (drained.changes) {
                  "gh.review.request","gh.pr.merge","notify","ledger.claim","ledger.release"];
   let performed = 0;
   const external = new Set();     // stands in for external truth: what really happened out there
+  // The reconciler seam, in the shape recoverEffects takes: given a leased row,
+  // answer from external truth whether the effect already happened.
+  const reconcileAgainst = (world, row) =>
+    ({ settled: true, ok: true, alreadyDone: world.has(row.idempotency_key) });
   for (const k of KINDS) {
     const key = `bt:1:g1:IMPLEMENTING:${k}:0`;
     for (let i = 0; i < 2; i++) {                   // delivered twice
@@ -991,7 +1119,12 @@ if (drained.changes) {
       // enqueue deliberately ADMITS the repeat (uniqueness is over live rows
       // only), so a loop that leases and immediately performs would count two
       // external effects and report duplicate delivery as working when it is not.
-      if (external.has(key)) { settleEffect(db, { id: leased.id, ok: true, result: { reconciled: true } }); continue; }
+      // The RECONCILER decides, not the test. Passing the check to
+      // recoverEffects's reconcile seam is what exercises the production
+      // mechanism; a Set consulted in the loop proves only that the loop can
+      // count, and would pass against an outbox with no reconciler at all.
+      const verdict = reconcileAgainst(external, leased);      // { settled, ok, alreadyDone }
+      if (verdict.alreadyDone) { settleEffect(db, { id: leased.id, ok: true, result: { reconciled: true } }); continue; }
       external.add(key); performed++;
       settleEffect(db, { id: leased.id, ok: true, result: {} });
     }
@@ -1023,7 +1156,7 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
 **Interfaces:**
 - Consumes: `hubTx`, `hubEvent`, `applyTransition` (Tasks 1, 6, 15).
 - Produces:
-  - `resolveSnapshot(registry, project, io) -> Snapshot` where `io = { repoId, visibility, specRepoId, profileHash, defaultBranch, gateDefinitionHash }`, each a function. **Async, and it is where every network call lives.**
+  - `resolveSnapshot(registry, project, claims, io) -> Snapshot` — takes the filing's normalised claims, because it is the only place with both the repository path and an I/O capability, and it returns them resolved. Without the parameter `resolveClaims` had no caller and the symlink refusal was unreachable from the filing path. where `io = { repoId, visibility, specRepoId, profileHash, defaultBranch, gateDefinitionHash }`, each a function. **Async, and it is where every network call lives.**
   - `admitTask(db, snapshot, filing) -> { ok, taskId, refusal }` — **synchronous, one `BEGIN IMMEDIATE`, and it performs no I/O of its own.** Inserts the task row at generation 1, its `task_territory` children, the `task.filed` event, and grants the territory lease **with the full intersection check**, refusing the whole filing and naming the blocker on a conflict.
   - `normalizeClaim(raw) -> { kind, path } | { refusal }` — **pure**, and grammar only: shape, normalisation, and the refused constructs (`*`, `**`, `!`, braces, character classes, absolute paths, `..`). It cannot and does not check symlinks.
   - `resolveClaims(claims, repoPath, io) -> { ok, claims } | { refusal }` — the **filesystem-aware** half, run by `resolveSnapshot` in the network-first phase (§2.2) alongside every other I/O. It walks each normalised claim against `repoPath` with `io.lstat` and refuses any path that traverses a symlink, naming it.
@@ -1068,7 +1201,15 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
 // ── territory grammar: two shapes, and nothing else ──────────────────────────
 {
   check(normalizeClaim("packages/x").kind === "prefix", "a bare path is a recursive prefix claim");
-  check(normalizeClaim("packages/x/index.ts").kind === "file", "a path with a file extension is an exact file claim");
+  // Kind comes from the CLAIM SHAPE the founder typed, not from guessing at the
+  // path: `--territory-file` and a bare `--territory` are different flags, and
+  // an extension heuristic gets `packages/x.js` (a directory some projects
+  // really do have) and `packages/Makefile` (a file with no extension) both
+  // wrong -- silently, and in opposite directions.
+  check(normalizeClaim("packages/x/index.ts", { kind: "file" }).kind === "file",
+    "an explicit file claim is a file claim");
+  check(normalizeClaim("packages/x/index.ts").kind === "prefix",
+    "and the same string with no kind given is a prefix: the shape is declared, never inferred");
   check(normalizeClaim("./packages/x/").path === "packages/x", "leading ./ and trailing / are normalized away");
   for (const bad of ["packages/*", "packages/**", "!packages/x", "packages/{a,b}", "/abs/path", "../up", "packages/[ab]"])
     check(!!normalizeClaim(bad).refusal, `${bad} is refused`, JSON.stringify(normalizeClaim(bad)));
@@ -1187,8 +1328,12 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
     ["a fetch error",     { ruleset: null, installation: null, error: "403" }],
   ]) {
     const u = gateStateFrom({ ...input, expectedAppId: EXPECTED, repoId: 1, nwo: "o/r", now: 100 });
-    check(u.app_installed === "unknown" || u.ruleset_requires_check === 0,
-      `${label} never yields a pass`, JSON.stringify(u));
+    // BOTH, not either. The interface says any absent or unreadable input yields
+    // app_installed 'unknown' AND ruleset_requires_check 0; an `||` is satisfied
+    // by a row that claims the ruleset requires the check while the app state is
+    // unknown, which is a half-pass the clause would read as evidence.
+    check(u.app_installed === "unknown" && u.ruleset_requires_check === 0,
+      `${label} yields unknown AND not-required, never a half-pass`, JSON.stringify(u));
     check(typeof u.error === "string" && u.error.length > 0, `${label} records WHY it is unknown`, String(u.error));
   }
 
@@ -1203,6 +1348,16 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
 // ── the tick writes it; S2 makes no network call ─────────────────────────────
 {
   const db = openHub(join(dir, "g.db"));
+  // A fetcher that THROWS is the live case: a 403, a network drop, a rate limit.
+  // If refreshGateState lets it propagate, the row is never written, U4 finds
+  // nothing, and doctor reports the project as having never refreshed -- which
+  // is indistinguishable from a fresh hub and hides an outage. It must catch,
+  // record the error on the row, and leave the state unknown.
+  const threw = refreshGateState(db, { name: "nextly", repoId: 1, nwo: "o/r", expectedAppId: EXPECTED },
+    () => { throw new Error("403 from the rulesets API"); });
+  check(threw.app_installed === "unknown" && /403/.test(threw.error ?? ""),
+    "a fetcher that throws still writes an unknown row, carrying WHY", JSON.stringify(threw));
+
   const row = refreshGateState(db, { name: "nextly", repoId: 1, nwo: "o/r", expectedAppId: EXPECTED },
     () => null);                                   // the S2 default: reeve has not looked
   check(row.app_installed === "unknown", "with no fetcher wired, the row reads unknown rather than absent");
@@ -1212,6 +1367,16 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
   refreshGateState(db, { name: "nextly", repoId: 1, nwo: "o/r", expectedAppId: EXPECTED }, () => ok);
   check(db.prepare("SELECT count(*) c FROM repo_gate_state WHERE repo_id=1").get().c === 1,
     "control: a second refresh upserts rather than inserting a second row for the same repo");
+
+  // The block is labelled "the tick writes it", so it has to run the TICK.
+  // Calling refreshGateState directly proves the function works and says nothing
+  // about whether `build run` ever reaches it -- which is the wiring that would
+  // actually be missing.
+  db.exec("DELETE FROM repo_gate_state");
+  await buildTick({ hub: db, projects: [{ name: "nextly", repoId: 1, nwo: "o/r", expectedAppId: EXPECTED }],
+                    fetchGateState: () => ok, once: true });
+  check(db.prepare("SELECT count(*) c FROM repo_gate_state WHERE repo_id=1").get().c === 1,
+    "one pass of the builder tick writes the gate-state row");
   db.close();
 }
 ```
@@ -1311,7 +1476,17 @@ for (let i = 0; i < 500; i++) {
     }
     return false;
   };
+  // Watch for the child EXITING as well: 500 fast transactions can complete
+  // before the first probe, and then the loop spins to its limit and reports a
+  // missed window as a failure of the code rather than of the timing. A child
+  // that finished cleanly means the drill has to be re-run with more work, not
+  // that atomicity is broken.
+  let exited = false;
+  kid.on("exit", () => { exited = true; });
   const caught = await insideTx();
+  check(!exited || caught,
+    "control: the child had not already finished; if it had, raise the loop count and re-run",
+    "the kill window was missed because the worker completed first");
   check(caught, "control: the child was observed INSIDE an open write transaction",
     "never saw the write lock held; the kill would have landed between transactions and proved nothing");
   kid.kill("SIGKILL");

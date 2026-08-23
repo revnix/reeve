@@ -107,13 +107,18 @@ function invariants(profile) {
       "   binary and never `env` or `sh` as a wrapper. The permissions are written",
       "   against the names, so a path or a wrapper reads as something else entirely.",
     ] : [
-      // `sandboxFor` grants `Bash(<process.execPath>:*)` unconditionally, so a
-      // profile that forbids everything else has NOT been left with nothing --
-      // and telling it so would send it away from its only shell. The
-      // plain-names rule above cannot apply here, because this grant is a path.
-      `   The only shell command granted here is the interpreter itself, at`,
-      `   \`${process.execPath}\`. Use that exact path: the rule about plain names`,
-      "   does not apply to it, because the grant is written against the path.",
+      // `sandboxFor` grants `Bash(<process.execPath>:*)` unconditionally, and a
+      // declared command as `Bash(<runner> <first arg>:*)`, so a profile that
+      // forbids every plain NAME has still not been left with nothing -- and
+      // telling it so would send it away from the shell it does have. The
+      // plain-names rule above cannot apply here, because these grants are a path
+      // and a two-word head.
+      ...(runnable ? [`   The shell commands granted here are \`${runnable} …\` and the interpreter`,
+                      `   itself, at \`${process.execPath}\`.`]
+                   : [`   The only shell command granted here is the interpreter itself, at`,
+                      `   \`${process.execPath}\`.`]),
+      "   Use those exactly as written: the rule about plain names does not apply to",
+      "   them, because these grants are written against a path and a whole command.",
     ]),
     "   A `for` loop is a compound command too, and will be refused. To run the",
     "   suite, use the project's own command below rather than inventing a loop",

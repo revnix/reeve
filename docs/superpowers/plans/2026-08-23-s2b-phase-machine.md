@@ -184,6 +184,8 @@ import { PHASES, ACTIVE, HELD, DRAINING, TERMINAL, NON_TERMINAL, nextPhase } fro
 
 const EVIDENCE = [
   { kind: "phase.succeeded", phase: "RESEARCH", artifactSha: "a" },
+  { kind: "slice.merged" },                                   // no witness: must refuse
+  { kind: "slice.merged", mergedSha: "d".repeat(40), mergedAt: 1 },
   { kind: "phase.failed", retriesExhausted: true },
   { kind: "phase.failed", retriesExhausted: false },
   { kind: "gate.approved" }, { kind: "gate.revise" }, { kind: "gate.capReached" },
@@ -419,6 +421,10 @@ export function nextPhase(state, evidence) {
         ? refuse(`${drainRemaining} row(s) still draining; CANCELLED is not legitimate until every one reconciles`)
         : go("CANCELLED", { generation, compensations: ["release-territory"] });
     if (kind === "founder.cancelForce") {
+      // drainEligible is the caller's read; applyTransition re-derives it from
+      // the CANCELLING entry timestamp inside the transaction before committing,
+      // for the same reason FINALIZING re-counts its effects: this is a terminal
+      // transition and the machine cannot see a clock.
       // Section 3.5 permits --force only after builder.cancel.drainMinutes has
       // passed. Without that guard a founder can force a cancel one second in,
       // recording rows as `forced` whose reconcilers had not been tried even
@@ -482,6 +488,13 @@ export function nextPhase(state, evidence) {
       if (evidence.territoryConflict)
         return refuse(`territory now conflicts with ${evidence.territoryConflict}; ` +
                       `resume is refused until the founder settles who owns it`);
+      // Section 3.4 requires TWO preconditions on resume, not one. A task held
+      // because ownership was lost is precisely the case where the second
+      // matters: territory can be free while a human still owns the ledger node,
+      // and resuming then puts reeve back to work on someone else's task.
+      if (evidence.ownerNotReeve)
+        return refuse(`the ledger still projects ${evidence.ownerNotReeve} as owner; ` +
+                      `resume is refused until reeve's claim is re-established`);
       if (evidence.redesign)
         return go("DESIGN", { generation: generation + 1, bumps: true,
           compensations: ["clear-holds","annotate-resumed","regrant-territory", ...(hasOpenPr ? ["close-prs"] : [])] });
@@ -511,8 +524,12 @@ export function nextPhase(state, evidence) {
       compensations: [...(hasOpenPr ? ["write-pr-hold"] : []), ...(pinnedTerritory ? [] : ["release-territory"])] });
   }
 
+  // LOST voids like every other terminal path. A task that lost the claim race
+  // has pending effects enqueued during CLAIMING; leaving them pending means the
+  // executor performs them for a task that never owned the work -- the ledger
+  // claim being the one that matters, since another actor now holds it.
   if (phase === "CLAIMING" && kind === "claim.lost")
-    return go("LOST", { generation, compensations: ["release-territory"] });
+    return go("LOST", { generation, compensations: ["void-pending","release-territory"] });
 
   if (phase === "GATE") {
     if (kind === "gate.approved")    return go("APPROVED", { generation });
@@ -521,7 +538,11 @@ export function nextPhase(state, evidence) {
     // the rounds were spent on -- so this edge holds it like every other path
     // into a held state. Omitting it made GATE the one escalation that left its
     // PR unheld.
+    // The cap is a founder-held stop, and section 11.7 names the identity for it.
+    // Without the escalation the task simply goes quiet in ESCALATED: fail-closed
+    // must never mean fail-quiet.
     if (kind === "gate.capReached")  return go("ESCALATED", { generation,
+      escalate: `bt:<id>:gate:revision-loop`,
       compensations: ["write-pr-hold", ...(pinnedTerritory ? [] : ["release-territory"])] });
     // depth.override from GATE is handled by the shared block below, so the two
     // cannot drift apart.
@@ -577,8 +598,15 @@ export function nextPhase(state, evidence) {
   if (kind === "founder.regenerate") {
     if (TERMINAL.includes(phase)) return refuse(`${phase} is terminal; regenerate cannot re-open it`);
     const PAST_GATE = ["APPROVED","IMPLEMENTING","IMPL_PR_OPEN","VERDICT_WAIT","SLICE_MERGED","FINALIZING"];
+    // regenerate exists to ADOPT a changed contract, so the new snapshot has to
+    // be written; bumping the generation without it re-runs the phase under the
+    // contract the founder just replaced, which is the opposite of the command's
+    // purpose. applyTransition writes the resolved snapshot columns in the same
+    // transaction (`adopt-snapshot`) from the values the caller resolved before
+    // the transaction opened -- network first, transaction second, as at filing.
     return go(PAST_GATE.includes(phase) ? "SPEC_DRAFT" : phase,
-      { generation: generation + 1, bumps: true, compensations: ["annotate-resumed"] });
+      { generation: generation + 1, bumps: true,
+        compensations: ["adopt-snapshot","annotate-resumed"] });
   }
 
   if (kind === "phase.succeeded") {
@@ -592,7 +620,15 @@ export function nextPhase(state, evidence) {
     return to ? go(to, { generation }) : refuse(`${phase} has no successor on phase.succeeded`);
   }
 
-  if (phase === "VERDICT_WAIT" && kind === "slice.merged") return go("SLICE_MERGED", { generation });
+  // The witness must be the RECONCILER's, not any caller's say-so. section 8.6
+  // makes mergedAt the evidence, so the edge requires it: without the check this
+  // branch accepts a bare slice.merged and the refusal added to the
+  // phase.succeeded path above is trivially routed around.
+  if (phase === "VERDICT_WAIT" && kind === "slice.merged") {
+    if (!evidence.mergedSha || !evidence.mergedAt)
+      return refuse("slice.merged without the reconciler's mergedAt and merged sha is not a merge witness");
+    return go("SLICE_MERGED", { generation });
+  }
 
   // FINALIZING is reeve code, not a worker phase: no claude session runs. It
   // exits when the loop reports every effect settled, and not before.
@@ -675,8 +711,12 @@ import { applyTransition } from "../src/build/transition.mjs";
     "the phase_event records both phases and both generations", JSON.stringify(ev));
   check(ev.artifact_sha === "sha-research", "and the artifact sha that justified it", String(ev.artifact_sha));
   check(r.seq === ev.seq, "and its seq is returned as the fence for this transition's effects");
-  check(db.prepare("SELECT count(*) c FROM hub_event WHERE task='bt:1'").get().c === 1,
-    "one hub_event is appended in the same transaction");
+  // TWO row images now: task.transitioned and phase_event.appended. The
+  // assertion said one and the implementation emits both, so it contradicted the
+  // plan it appears in.
+  const kinds = db.prepare("SELECT kind FROM hub_event WHERE task='bt:1' ORDER BY seq").all().map(r => r.kind);
+  check(JSON.stringify(kinds) === '["task.transitioned","phase_event.appended"]',
+    "the transition appends BOTH row images in the same transaction", kinds.join(","));
   db.close();
 }
 
@@ -867,6 +907,19 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
     // between the caller counting and this transaction opening, a reconciler can
     // have settled a row -- or an effect can have been enqueued. DONE has no
     // edges out, so a wrong count here is unrecoverable.
+    // --force is time-gated, and the machine has no clock. Re-derive eligibility
+    // from the durable CANCELLING entry rather than trusting the flag: a founder
+    // who ran the command a second after cancelling would otherwise force a
+    // drain that had had no window at all.
+    if (evidence?.kind === "founder.cancelForce") {
+      const enteredAt = db.prepare(
+        `SELECT at FROM phase_event WHERE task=? AND to_phase='CANCELLING' ORDER BY seq DESC LIMIT 1`).get(taskId)?.at;
+      const mins = (nowOf(db) - (enteredAt ?? nowOf(db))) / 60;
+      if (mins < drainMinutes)
+        return { applied: false, reason: "refused",
+                 refusal: `the drain has had ${Math.floor(mins)}m of its ${drainMinutes}m window` };
+    }
+
     if (decision.to === "DONE") {
       const outstanding = db.prepare(
         `SELECT count(*) c FROM outbox WHERE task_id=? AND status IN ('pending','inflight')`).get(taskId).c;
@@ -905,7 +958,11 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
                                   to_generation, slice, artifact_sha, detail
                            FROM phase_event WHERE seq = ?`).get(seq) });
 
-    for (const c of decision.compensations) applyCompensation(db, { c, taskId, generation: decision.generation, seq });
+    // `evidence` is passed through: record-hold-reason needs the reason and detail
+    // the hold carried, and without them it can only write a row saying a hold
+    // happened -- which is what `task resume` lists to the founder.
+    for (const c of decision.compensations)
+      applyCompensation(db, { c, taskId, generation: decision.generation, seq, evidence, snapshot: evidence?.snapshot });
 
     // Effects are enqueued, never performed. Each carries the fence: the seq of
     // the event that decided it. The executor revalidates that fence inside its
@@ -955,6 +1012,7 @@ Write `applyCompensation` as a switch over the closed set `phases.mjs` produces,
 | `annotate-resumed` | enqueues the compensating "resumed" comment for any hold comment left behind |
 | `record-hold-reason` | inserts the `hold_reason` row for **this** hold — the first one, not only the stacked ones |
 | `record-drain` | inserts one `task_drain` row per outbox row for this task in `status IN ('pending','inflight')`. **Runs last**, so it captures the close and comment effects the compensations above just enqueued — those are `pending`, not `inflight`, so an inflight-only select would have missed exactly the rows ordering it last was meant to catch |
+| `adopt-snapshot` | writes the re-resolved registry snapshot columns (`profile_hash`, `registry_version`, `gate_definition_hash`, `default_branch`, `visibility`) onto the task, from values the caller resolved BEFORE the transaction. Only `regenerate` emits it |
 | `force-drain` | sets `forced=1` and `last_known` on every unsettled `task_drain` row, and moves their outbox rows to `forced`, so a `--force` cancel records what was never confirmed instead of leaving the projection claiming it is still in flight |
 
 - [ ] **Step 4: Run and commit**
@@ -979,6 +1037,7 @@ git commit -m "feat(hub): generation-fenced transition with compensations"
   - `enqueueEffect(db, { idempotencyKey, kind, taskId, generation, fence, cancellable = true, args, notBefore = 0 }) -> { id, status }` — **must be called inside the caller's transaction**. Returns `status: 'superseded'` with no row performed when the key is round- or sha-keyed and a `done` row already carries it.
   - `leaseEffect(db, { worker, leaseSeconds = 300, capabilities }) -> Row | null` — revalidates the fence **inside the lease transaction** and settles `fenced` (returning null and trying the next row) when the task has moved generation or the row was voided; settles `refused` when the effect's capability switch is off.
   - `settleEffect(db, { id, ok, result, error, retryable })`, `recoverEffects(db, { reconcile })`, `voidPending(db, taskId)`.
+  - `settleDrainFor(db, outboxId)` — the shared helper that clears a `task_drain` row when its outbox row reaches a terminal status and appends `task_drain.settled`. **Called by `settleEffect` AND by `leaseEffect`**, because `leaseEffect` settles `fenced` and `refused` itself without going through `settleEffect`. A hook installed in only one of the two leaves exactly the cancellations that were fenced at lease time stuck in CANCELLING.
   - **Settling an effect settles its drain row.** In the same transaction, `settleEffect` (and `recoverEffects` through it) sets `task_drain.settled_at` for any row matching `(task_id, id)` and appends a `task_drain.settled` `hub_event`. Without this nothing ever clears the drain: `nextPhase` refuses `drain.settled` while any row has `settled_at IS NULL`, so every cancellation that caught an inflight effect would sit in CANCELLING until `builder.cancel.drainMinutes` expired and the founder ran `--force` — turning the ordinary path into the exceptional one, and recording rows as `forced` whose reconcilers had in fact completed.
 
 ```js
@@ -986,6 +1045,10 @@ git commit -m "feat(hub): generation-fenced transition with compensations"
 // ONLY when the row reached a terminal status: a failed-but-retryable settle
 // returns it to `pending`, and marking its drain row settled would let the task
 // reach CANCELLED while the effect is still queued to run again.
+// leaseEffect settles rows as `fenced` or `refused` directly, without going
+// through settleEffect -- so the drain hook has to live in a helper BOTH call,
+// or a cancellation whose in-flight effect is fenced at lease time never clears
+// its drain row and the task waits out drainMinutes for nothing.
 const TERMINAL_OUTBOX = ["done","failed","dead_letter","voided","fenced","refused","superseded","forced"];
 const nowStatus = db.prepare("SELECT status FROM outbox WHERE id=?").get(id).status;
 const drained = TERMINAL_OUTBOX.includes(nowStatus) ? db.prepare(
@@ -1088,8 +1151,19 @@ if (drained.changes) {
 {
   const db = openHub(join(dir, "o4.db")); seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
   hubTx(db, () => enqueueEffect(db, { idempotencyKey: "k", kind: "git.push.branch", taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+  // Two switches, two surfaces: publishPr governs project-repo effects and
+  // draftSpec governs spec-repo ones (section 1.4). Testing one kind against one
+  // switch cannot tell a correct gate from one that consults the same switch for
+  // everything, which would leave the spec repo ungated the moment publishPr
+  // turned on.
   const off = { ...allOn, publishPr: false };
-  check(leaseEffect(db, { worker: "w", capabilities: off }) === null, "an effect whose switch is off is not leased");
+  check(leaseEffect(db, { worker: "w", capabilities: off }) === null, "a project-repo push is not leased with publishPr off");
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "spec", kind: "gh.pr.comment", taskId: "bt:1",
+    generation: 1, fence: 1, args: { repo: "spec" } }));
+  check(leaseEffect(db, { worker: "w", capabilities: { ...allOn, draftSpec: false } }) === null,
+    "a SPEC-repo comment is not leased with draftSpec off");
+  check(leaseEffect(db, { worker: "w", capabilities: off })?.kind === "gh.pr.comment",
+    "control: the same spec effect IS leased when only publishPr is off, so the two switches are distinct");
   const row = db.prepare("SELECT * FROM outbox WHERE idempotency_key='k'").get();
   check(row.status === "refused", "it settles 'refused'", row.status);
   check(row.attempts === 0, "and burns no attempt: a switch the founder set is configuration, not a fault", String(row.attempts));
@@ -1180,9 +1254,8 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
 {
   const db = openHub(join(dir, "r1.db"));
   const EXPLODE = new Proxy({}, { get: () => () => { throw new Error("admitTask made a network call"); } });
-  const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f", profileHash: "h",
-                 defaultBranch: "main", visibility: "private", specRepoId: 9,
-                 gateDefinitionHash: "g", registryVersion: 3 };
+  // Declared at file scope, not inside this block: later blocks reference it.
+  // (Hoisted in the harness; shown here for readability.)
   let threw = null;
   let r; try {
     r = admitTask(db, snap, { id: "bt:1", project: "nextly", title: "t", territory: ["packages/x"], io: EXPLODE });
@@ -1216,6 +1289,8 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
 
   // The symlink refusal lives in the filesystem-aware half, with an injected io
   // so the test needs no real symlink and admitTask still performs no I/O.
+  check(normalizeClaim("packages/café").path === "packages/caf\u00e9".normalize("NFC"),
+    "claims are normalised to NFC, so one composition cannot hide beside another");
   const io = { lstat: (p) => ({ isSymbolicLink: () => p.endsWith("/linked") }) };
   const viaLink = resolveClaims([{ kind: "prefix", path: "packages/linked" }], "/repo", io);
   check(!!viaLink.refusal && /linked/.test(viaLink.refusal),
@@ -1263,7 +1338,7 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
 
 - [ ] **Step 3: Implement, run, commit**
 
-`overlaps` compares normalized **path segments**, not strings: `a === b`, or one is the other plus a `/` boundary. `normalizeClaim` refuses `*`, `**`, `!`, `{}`, `[]`, absolute paths, `..`, and any path traversing a symlink at claim time; an empty or unparseable claim returns `{kind:"prefix", path:""}`, the repository root.
+`overlaps` compares normalized **path segments**, not strings: `a === b`, or one is the other plus a `/` boundary. Normalisation is **NFC**, as §10.1 requires and as git itself compares: on macOS a path typed in one composition and read back in another are different byte strings for the same file, so two claims can look disjoint and address the same tree. Case is preserved and compared exactly, also as git does. `normalizeClaim` refuses `*`, `**`, `!`, `{}`, `[]`, absolute paths, `..`, and any path traversing a symlink at claim time; an empty or unparseable claim returns `{kind:"prefix", path:""}`, the repository root.
 
 ```bash
 $N test/hub-registry.test.mjs
@@ -1353,8 +1428,15 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
   // nothing, and doctor reports the project as having never refreshed -- which
   // is indistinguishable from a fresh hub and hides an outage. It must catch,
   // record the error on the row, and leave the state unknown.
-  const threw = refreshGateState(db, { name: "nextly", repoId: 1, nwo: "o/r", expectedAppId: EXPECTED },
+  // Both failure shapes: a synchronous throw and a REJECTED promise. The live
+  // fetcher is async, so the rejected case is the one that will actually happen,
+  // and a try/catch around a call that returns a promise catches neither.
+  const threw = await refreshGateState(db, { name: "nextly", repoId: 1, nwo: "o/r", expectedAppId: EXPECTED },
     () => { throw new Error("403 from the rulesets API"); });
+  const rejected = await refreshGateState(db, { name: "nextly", repoId: 2, nwo: "o/other", expectedAppId: EXPECTED },
+    () => Promise.reject(new Error("ECONNRESET")));
+  check(rejected.app_installed === "unknown" && /ECONNRESET/.test(rejected.error ?? ""),
+    "a fetcher whose promise REJECTS also writes an unknown row carrying why", JSON.stringify(rejected));
   check(threw.app_installed === "unknown" && /403/.test(threw.error ?? ""),
     "a fetcher that throws still writes an unknown row, carrying WHY", JSON.stringify(threw));
 
@@ -1362,7 +1444,12 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
     () => null);                                   // the S2 default: reeve has not looked
   check(row.app_installed === "unknown", "with no fetcher wired, the row reads unknown rather than absent");
   check(db.prepare("SELECT count(*) c FROM repo_gate_state WHERE repo_id=1").get().c === 1, "and the row is written");
-  check(db.prepare("SELECT count(*) c FROM hub_event WHERE kind='repo_gate_state.refreshed'").get().c === 1,
+  // Count the events for THIS repo: the caught-error and rejected refreshes
+  // above already wrote rows, so an unqualified count of 1 is wrong by exactly
+  // the number of failure cases the block just exercised.
+  check(db.prepare(
+    `SELECT count(*) c FROM hub_event WHERE kind='repo_gate_state.refreshed'
+     AND json_extract(payload,'$.repo_id') = 1`).get().c >= 1,
     "with its hub_event, so the restore drill can replay it");
   refreshGateState(db, { name: "nextly", repoId: 1, nwo: "o/r", expectedAppId: EXPECTED }, () => ok);
   check(db.prepare("SELECT count(*) c FROM repo_gate_state WHERE repo_id=1").get().c === 1,

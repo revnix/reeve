@@ -66,33 +66,46 @@ ONLY (both mine), and the running process carrying `--execute`.
 
    Read the section above Finding 3 before proposing anything. This is the SIXTH
    time the prompt has claimed a capability the grant does not carry, and the
-   21 Aug set includes this exact defect one step later in the sequence. A fix
-   that only unblocks `.git` leaves the mechanism that produced all six. Tell me
-   what it would cost to generate the prompt from the grant instead.
+   21 Aug set includes this exact defect one step later in the sequence.
+
+   But do NOT propose generating the prompt from the DECLARED grant as the answer
+   to all six. It cannot touch Finding 1: `sandboxFor` grants `Bash(git:*)`,
+   carries no add/commit deny, and emits `filesystem.denyWrite: []`, so a
+   generator reading that would still advertise `git commit` and the P0 would
+   survive. Five of the six are drift between two things reeve writes; the sixth
+   comes from beneath them. Tell me what it would cost to represent or PROBE the
+   effective restrictions, which is the only version that reaches all six.
 
 2. **PR #15** (`docs/first-dispatches`, worktree ~/Work/Products/reeve-wt/paths)
    is open. Work its rounds: reply to AND resolve every thread via GraphQL, cap
    10 rounds, do not merge. It is documents only.
 
-3. **Watch for the first real dispatch on nextly.** It has never dispatched there
-   (verified: zero worker_run rows in ~/.reeve/state/nextlyhq/nextly.db). Note a
-   red PR does not always spend an attempt: `watcher.mjs:120-136` escalates a
-   missing required check, an inherited-only failure, or a failure it cannot name
-   WITHOUT dispatching. Only a caused, named failure reaches `FIX_CI` and
-   `recordFixAttempt`. For those, the one attempt is spent even when nothing
-   publishes, so it is one-shot data: capture the worker transcript, the worktree
-   diff and the escalation, not just a log tail. Expect no publication until task
-   1 lands.
+3. **Watch for the first real dispatch on nextly.** It has never dispatched there.
+   Mind which table you use for that: `worker_run` only landed on 22 Aug
+   (`0d31350`) with no backfill, so its emptiness says nothing about the 20-21 Aug
+   dispatch era. What does carry is that nextly's store has been recording since
+   2026-08-19 13:03 and holds ZERO `run` rows and ZERO `fix_attempt` rows, and
+   `fix_attempt` landed 20 Aug (`0eadfd5`), before those dispatches. The 20-21 Aug
+   runs were against `revnix/reeve`, whose store holds the `fix_attempt` row.
 
-## A freeze is in force, and I promised it to another session
+   A red PR does not always spend an attempt. `watcher.mjs:120-136` escalates a
+   missing required check, an inherited-only failure, or one it cannot name
+   WITHOUT dispatching, and `daemon.mjs:808-812` then declines a caused, named
+   failure whose checks are ALL demonstrated flakes — before `startRun`, so there
+   is no transcript, no worktree and no spent attempt to capture. Only a caused,
+   named, not-wholly-flaky failure past the containment and capacity gates reaches
+   `recordFixAttempt`. For those the attempt is spent even when nothing publishes,
+   so it is one-shot data: capture the worker transcript, the worktree diff and
+   the escalation, not just a log tail.
 
-**Do not edit `src/daemon.mjs` or `docs/TRACKER.md`** until the threadDetails
-session's PR lands. A tracker entry is OWED for PR #14, the arming, the worker
-limits, the three dispatches and the P0 — write it the moment the freeze lifts,
-not before, or you create the exact rebase conflict I warned them about.
+## The daemon freeze is LIFTED; the tracker entry is still owed
 
-Note task 1 may need `src/sandbox.mjs` and `src/prompts.mjs`, which are NOT
-frozen. If it needs `daemon.mjs`, tell me and wait.
+`src/daemon.mjs` was frozen for a `threadDetails` session that never pushed a
+branch. I lifted it on 23 Aug so the P0 could be fixed, and PR #19 edits it.
+
+`docs/TRACKER.md` is still untouched, and an entry is OWED for: PR #14, the
+arming, the worker limits, the three dispatches, the P0 and its fix. Write it
+once those PRs land, not before.
 
 ## What is true about the worker, measured on 2026-08-23
 

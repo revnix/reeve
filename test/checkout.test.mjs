@@ -734,6 +734,42 @@ rmSync(root, { recursive: true, force: true });
     check(r.ok && r.committed, "control: a fully declared change commits, leading ./ and all", JSON.stringify(r).slice(0, 160));
   }
 
+  {
+    // git QUOTES a path it considers unusual, so `--name-only` returns
+    // `"k\\303\\251y.txt"` where the worker reported `kéy.txt` -- and the
+    // declaration check would quarantine a perfectly good repair on the mismatch.
+    const w = mkWorktree("quoted-path");
+    writeFileSync(join(w, "kéy.txt"), "the fix\n");
+    const quoted = g(w, "add", "-A") || g(w, "diff", "--cached", "--name-only");
+    check(/\\303/.test(quoted), "control: git really does quote this path without -z", quoted);
+    g(w, "reset", "--quiet", "HEAD", "--");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: ["kéy.txt"] });
+    check(r.ok && r.committed, "a non-ASCII filename the worker declared is committed, not quarantined", JSON.stringify(r).slice(0, 200));
+    check(r.files.includes("kéy.txt"), "and it is reported as the raw name", r.files.join(", "));
+  }
+
+  {
+    // A repository-sized answer must not fail on SIZE. `changedFiles` already
+    // raises this buffer because about 1,800 long paths overflowed the 1 MiB
+    // default, and the declaration gate reads the staged list the same way -- so
+    // without the same ceiling a bulk repair is quarantined for its length.
+    const w = mkWorktree("bulk");
+    const deep = "d".repeat(60);
+    mkdirSync(join(w, deep, deep), { recursive: true });
+    const many = [];
+    for (let i = 0; i < 7000; i++) {
+      const rel = `${deep}/${deep}/file-${String(i).padStart(6, "0")}-${"n".repeat(60)}.js`;
+      writeFileSync(join(w, rel), "x");
+      many.push(rel);
+    }
+    const bytes = many.join("\0").length;
+    check(bytes > 1024 * 1024, "control: the staged list really does exceed the 1 MiB default", `${bytes} bytes`);
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): a bulk repair", declared: many });
+    check(r.ok && r.committed, "a staged list larger than the default buffer still commits", String(r.why ?? "").slice(0, 160));
+    check(r.files.length === many.length, "and every path is accounted for", `${r.files.length} of ${many.length}`);
+  }
+
   rmSync(cRoot, { recursive: true, force: true });
 }
 

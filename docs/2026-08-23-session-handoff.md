@@ -13,10 +13,13 @@ Durable companions: `docs/TRACKER.md` (done / in flight), `docs/HANDOFF.md`
 
 ## 0. The one-paragraph truth
 
-**reeve is armed, and it cannot publish.** `--execute` is live on the running
-daemon, `worker.isolation` is `scratch-home`, and the next ELIGIBLE red CI on
-`nextlyhq/nextly` will dispatch a real worker. Eligible is narrower than red: a
-missing required check, an inherited-only failure, one reeve cannot name, and a
+**reeve is DISARMED, because it could not publish.** `--execute` was removed from
+the plist on 23 Aug and the running process verified without it; `worker.isolation`
+remains `scratch-home`. It still watches, judges and escalates — it just does not
+dispatch, so no attempt is spent at all.
+
+When it is re-armed, eligible will be narrower than red: a missing required check,
+an inherited-only failure, one reeve cannot name, one already at cap, and a
 demonstrated flake (`daemon.mjs:808-812`) all escalate without dispatching, and
 containment and capacity can defer one earlier still.
 
@@ -35,15 +38,15 @@ that sandbox existed. Measured and controlled:
 
 | | before | now |
 |---|---|---|
-| `--execute` | off | **ON** — verified on the running process, not just the plist |
+| `--execute` | off | armed, then **DISARMED again** the same day once Finding 1 was understood — both verified on the running process, not just the plist |
 | `worker.isolation` | unset (dispatch refused) | `scratch-home` |
 | `watch` limits | none (defaults: 20min / 40 turns / 5 workers) | **10 min / 20 turns / 1 worker** |
 | PR #14 | open | merged (`16769e7`), 10 rounds, 22 findings |
 | PRs #1, #2 | open since 20 Aug | **closed** — both superseded/empty |
 | dispatch evidence | last measured 21 Aug, pre-sandbox | **3 runs under the new contract, $2.66**, recorded |
 
-`main` is `16769e7`. The daemon runs from `~/Work/Products/reeve` and was
-restarted onto it.
+`main` was `16769e7` at the time of writing and is now `bc17a06` (#17). The
+daemon runs from `~/Work/Products/reeve`.
 
 ---
 
@@ -79,7 +82,7 @@ on 22 August: the OS sandbox (`1a2fbea`) plus scratch-HOME standalone checkouts
 
 The experiment was built to find a **confidently bad fix**. It did not find one.
 
-| run | turns | outcome | cost |
+| run | turn limit | outcome | cost |
 |---|---|---|---|
 | 1 | 20 | `failed (max_turns)` | $0.758 |
 | 2 | 40 | `failed (max_turns)` | $0.994 |
@@ -108,11 +111,14 @@ runs, routed at `daemon.mjs:1161` (`outcome !== OK`) before the gate at
    runner was `pnpm` — and run 3's grant had `npm`.
    `prompts.mjs:33-34` also tells the worker never to use an absolute path,
    while `sandboxFor` grants `Bash(${process.execPath}:*)` unconditionally.
-3. **An unrecognised `units[].language` grants no named runtime.** `UNIT`
+3. **An unrecognised `units[].language` grants no runtime BY LANGUAGE.** `UNIT`
    validates only that it is a string; `sandbox.mjs` does `RUNTIMES[lang] ?? []`,
-   and there is no `javascript` key. The absolute `execPath` grant survives, but
-   finding 2's instruction forbids using it. Nothing live is affected (detection
-   only emits `typescript`).
+   and there is no `javascript` key. Three other routes survive: a declared
+   `packageManager` (`sandbox.mjs:361`), a declared command as
+   `Bash(<runner> <first arg>:*)` (`:348-355`), and the absolute `execPath`. Only
+   a unit with none of the three is left with the interpreter alone — which
+   finding 2's instruction then forbids using. Nothing live is affected
+   (detection only emits `typescript`).
 4. **The worker leaves litter, and does not reach for the tool that removes it.**
    A Bash-redirect scratch file; `rm` is not granted, and three attempts at it
    were refused. But `git clean -f --` was available the whole time (`Bash(git:*)`
@@ -164,9 +170,11 @@ cannot ship.
 
 | lane | owner | branch / worktree |
 |---|---|---|
-| S2-A/B/C plans (#11/#12/#13) | peer session | `reeve-wt/pa`, `pb`, `pc` |
-| `threadDetails` wiring | a session the founder started | `feat/thread-details` (to be created) |
+| S2-A/B/C plans (#11/#12/#13, #17) | **merged** | — |
+| `threadDetails` wiring | never started; no branch was ever pushed | — |
 | docs PR #15 | this session | `docs/first-dispatches` @ `reeve-wt/paths` |
+| prompt/grant PR #18 | this session | `fix/prompt-grant-agreement` @ `reeve-wt/prompt-grant` |
+| the P0 fix PR #19 | this session | `fix/reeve-commits` @ `reeve-wt/commits` |
 
 **The daemon freeze was lifted on 23 Aug.** It was promised to a `threadDetails`
 session that never pushed a branch, and PR #19 needed `src/daemon.mjs` to fix the
@@ -240,8 +248,9 @@ Also open: ntfy read user (needs shell on 95.217.11.127), second project
 
 ### Programme 2 — the BUILDER (~15%, 2 of 13 stages)
 
-S0 and S1 are done. S2 is in planning as three chained PRs (#11 → #12 → #13,
-each explicitly based on the previous one's merge commit). S3–S12 not started.
+S0 and S1 are done. **The three S2 plan PRs have merged** — #11 (`f8cb926`),
+#12 (`4eb2abf`), #13 (`2dc6e67`) and their follow-up #17 (`bc17a06`) — so S2 is
+planned but not built. S3–S12 not started.
 
 **S2 cannot be parallelised** — the plans say so themselves, with a reason: the
 tests open a hub, and rebasing across a changed `hub.sql` silently changes what
@@ -256,10 +265,11 @@ PR #14 took 10 rounds and 22 findings.
 
 ## 8. What needs the founder
 
-- **Finding 1, first.** reeve is armed and cannot publish. Either fix the
-  contract (grant the worker `.git` writes, or have reeve commit on the worker's
-  behalf after the diff gate), or disarm until it is fixed. Every red PR
-  meanwhile burns its one attempt for ~$1 and produces an escalation.
+- **Finding 1: decided and in flight.** The founder chose to have reeve stage
+  and commit after the diff gate, and disarmed reeve meanwhile — `--execute` is
+  off, verified on the running process. PR #19 implements it. Until that lands,
+  reeve watches, judges and escalates but does not dispatch, so no attempt is
+  spent at all.
   **Findings 1 and 2 are the fifth and sixth instance of the same shape** — the
   prompt claiming a capability the grant does not carry; `docs/HANDOFF.md`
   tabulated four more on 21 August, including this exact one a step later in the
@@ -294,14 +304,15 @@ armed.
 
 ## 10. Open risks
 
-- **reeve is armed and cannot publish.** Not "has not yet" — cannot, by the
-  contract, in any repository. Each ELIGIBLE red nextly PR — caused, named,
-  not a demonstrated flake, past the containment and capacity gates — spends its
-  one attempt for ~$1 and escalates. This supersedes the earlier framing that the founder
-  accepted; they accepted a slower reeve, not a broken one.
+- **reeve cannot publish, which is why it is disarmed.** Not "has not yet" —
+  cannot, by the contract, in any repository. That risk is currently held closed
+  by the disarm rather than by a fix; PR #19 is the fix. If anyone re-arms before
+  it lands, each ELIGIBLE red nextly PR — caused, named, not already at cap, not
+  a demonstrated flake, past the containment and capacity gates — spends its one
+  attempt for ~$1 and escalates.
 - **`docs/HANDOFF.md:442` overstates the current state.** Its "Proven — three
   complete dispatches … reeve published → green" was true on 21 August and is
-  not true now. Fix it when the freeze lifts.
+  not true now. Fix it when PR #19 lands.
 - **The first real dispatch on nextly under this contract has not happened.**
   Everything in §3 is from a synthetic fixture. Finding 1 will reproduce there;
   findings 2–4 may not.

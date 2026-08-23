@@ -121,7 +121,24 @@ export function instrumentHash({ hasNet = false } = {}) {
  * lists against the local imports this file actually has, so that decision has
  * to be made rather than defaulted into.
  */
-export const INSTRUMENT_SOURCES = ["./canary.mjs", "./supervisor.mjs", "./sandbox.mjs"];
+export const INSTRUMENT_LOCAL_SOURCES = ["./canary.mjs", "./supervisor.mjs", "./sandbox.mjs"];
+
+/**
+ * And the caller side. `measuredContainment` assembles the probe's environment
+ * from workerenv.mjs -- `workerEnv`, `writeGitConfig`, `workerHomeFor` choose
+ * the HOME, the PATH shims and the git configuration the canary runs under, and
+ * those are the very mechanisms whose isolation it measures. A release changing
+ * them changes what a pass means, from outside this file. (Codex #14-[19].)
+ *
+ * The rot guard below can see what canary.mjs imports; it cannot see what a
+ * caller assembles. That blind spot is real and is not closed here: hashing
+ * daemon.mjs would re-measure on every unrelated edit to the daemon, and
+ * parsing one function's body for imports is a guard that breaks quietly. This
+ * entry is declared by hand, and the comment is the reason a reader should
+ * check it when `measuredContainment` grows a dependency.
+ */
+export const INSTRUMENT_CALLER_SOURCES = ["./workerenv.mjs"];
+export const INSTRUMENT_SOURCES = [...INSTRUMENT_LOCAL_SOURCES, ...INSTRUMENT_CALLER_SOURCES];
 export const INSTRUMENT_NOT_SOURCES = [];
 
 let sourceHashCache = null;

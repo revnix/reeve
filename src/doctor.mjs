@@ -575,10 +575,24 @@ function founderRun(cwd, args, { input = null, timeout = 20_000 } = {}) {
  * not logged, recorded, or included in any evidence file.
  */
 export function founderCredential(cwd, url, { run = founderRun } = {}) {
-  const r = run(cwd, ["credential", "fill"], { input: `url=${url}\n\n` });
+  // `capability[]=authtype` is advertised, because a helper that negotiates it
+  // answers with `authtype=Bearer` and `credential=...` INSTEAD of a password,
+  // and git forms the Authorization header from those. A password-only test
+  // calls that a missing credential.
+  //
+  // Measured 2026-08-23 on git 2.50.1 (Apple Git-155): this build does not
+  // support the capability -- a helper returning those fields has them
+  // discarded -- so the case is not reproducible here and this is forward
+  // insurance rather than a fixed defect. Unknown input keys are tolerated
+  // silently on that build (exit 0, no warning), but 2.43 on Ubuntu LTS cannot
+  // be tested from here, so a call that FAILS is retried without the line. A
+  // git that rejects the key gets the plain question rather than a wrong BROKEN.
+  let r = run(cwd, ["credential", "fill"], { input: `capability[]=authtype\nurl=${url}\n\n` });
+  if (!r.ok) r = run(cwd, ["credential", "fill"], { input: `url=${url}\n\n` });
   if (!r.ok) return { ok: false, why: r.err };
-  return { ok: r.out.split("\n").some(l => l.startsWith("password=")),
-           why: "the credential helpers returned no password for it" };
+  // `credential=` is as much an answer as `password=`. Neither value is read.
+  return { ok: r.out.split("\n").some(l => l.startsWith("password=") || l.startsWith("credential=")),
+           why: "the credential helpers returned no password or credential for it" };
 }
 
 /**
@@ -653,7 +667,12 @@ function readNetrcFile() {
 function netrcNames(text, host) {
   const bare = String(host ?? "").split(":")[0];
   if (!bare) return false;
-  const toks = String(text ?? "").split(/\s+/).filter(Boolean);
+  // Quotes come off: curl permits a double-quoted field, and measured
+  // 2026-08-23 against a 401 Basic server, `machine "127.0.0.1"` authenticates
+  // exactly as the unquoted form does. Comparing the raw token missed it and
+  // reported a working checkout BROKEN.
+  const unquote = t => (t.startsWith('"') && t.endsWith('"') && t.length > 1 ? t.slice(1, -1) : t);
+  const toks = String(text ?? "").split(/\s+/).filter(Boolean).map(unquote);
   for (let i = 0; i < toks.length; i++) {
     if (toks[i] === "default") return true;
     if (toks[i] === "machine" && (toks[i + 1] === bare || toks[i + 1] === host)) return true;
@@ -758,6 +777,24 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
     lines: [`origin ${withoutUserinfo(fetchUrl.out)}`,
             "origin resolves to no push destination at all",
             "-> reeve publishes by pushing to origin; there is nowhere for that to go"] };
+
+  // A MIRROR remote refuses the only kind of push reeve makes. `publishRunWork`
+  // always names an explicit refspec, and `remote.<name>.mirror` makes a push
+  // behave as `--mirror`, which git will not combine with one. Measured
+  // 2026-08-23:
+  //
+  //   $ git config remote.origin.mirror true
+  //   $ git push origin HEAD:refs/heads/main
+  //   fatal: --mirror can't be combined with refspecs
+  //
+  // and the same push without the setting succeeds. So every publication fails,
+  // for a reason no credential or reachability probe can see. (Codex #14-[18].)
+  const mirror = run(checkout, ["config", "--type=bool", "--get", "remote.origin.mirror"]);
+  if (mirror.ok && mirror.out === "true") return { id, level: BROKEN, title,
+    lines: [`origin ${withoutUserinfo(fetchUrl.out)}`,
+            "remote.origin.mirror is set, so a push to origin behaves as --mirror",
+            "reeve publishes with an explicit refspec, and git refuses that combination outright",
+            "-> every publication would fail with `--mirror can't be combined with refspecs`"] };
 
   const branch = profile.identity?.defaultBranch ?? "main";
   const lines = [`origin ${withoutUserinfo(fetchUrl.out)}`];

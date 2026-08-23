@@ -219,8 +219,10 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
     founderCredential("/co", "https://example.com/o/two.git",
                       { run: (cwd, args, opts) => { sent = { args, input: opts?.input }; return { ok: true, out: "password=x\n" }; } });
     check(sent?.args?.join(" ") === "credential fill", "  it runs `git credential fill`", JSON.stringify(sent?.args));
-    check(sent?.input === "url=https://example.com/o/two.git\n\n",
+    check(/(^|\n)url=https:\/\/example\.com\/o\/two\.git\n/.test(sent?.input ?? "") && !/protocol=|host=/.test(sent?.input ?? ""),
       "  and asks it by url, not by protocol and host — the form that carries the path", JSON.stringify(sent?.input));
+    check(/capability\[\]=authtype/.test(sent?.input ?? ""),
+      "  advertising authtype, so a helper answering with a credential rather than a password is heard", JSON.stringify(sent?.input));
   }
   {
     // http:// was grouped with ssh and local, so a public http repository
@@ -371,6 +373,70 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
     const c = checkRemoteReach(pub, io);
     check(c.level === "DEGRADED" && /http\.sslCert/.test(c.lines.join(" ")),
       "a client certificate is DEGRADED, not BROKEN", c.lines.join(" | "));
+  }
+  {
+    // A capability-negotiating helper answers with `credential=` and no
+    // password at all, and git forms the Authorization header from it. Not
+    // reproducible on git 2.50.1, which does not support the capability — this
+    // is forward insurance, and the fallback below is what keeps it safe.
+    let calls = 0;
+    const io = { run: (cwd, args) => {
+        if (args[0] === "remote") return { ok: true, out: "https://enterprise.example/o/r.git" };
+        if (args[0] === "ls-remote") return { ok: true, out: "abcdef1234567890  refs/heads/main" };
+        return { ok: false, out: "", err: "" };
+      }, netrc: () => "",
+      credential: (cwd, url) => founderCredential(cwd, url, { run: (c, a, o) => {
+        calls++;
+        return { ok: true, out: "protocol=https\nhost=enterprise.example\nauthtype=Bearer\ncredential=NOT-A-REAL-TOKEN\n" };
+      } }) };
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "OK", "a helper answering with a credential rather than a password counts", c.lines.join(" | "));
+    check(!/NOT-A-REAL-TOKEN/.test(c.lines.join(" ")), "  and its value still never reaches the report", c.lines.join(" | "));
+    check(calls === 1, "  asked once, since the capability form was accepted", `${calls}`);
+  }
+  {
+    // ...and a git that REJECTS the capability line is asked again without it,
+    // rather than being read as having no credential. 2.43 cannot be tested
+    // from here, so the fallback is what makes advertising safe to ship.
+    let inputs = [];
+    const r = founderCredential("/co", "https://enterprise.example/o/r.git", { run: (c, a, o) => {
+      inputs.push(o?.input ?? "");
+      return inputs.length === 1
+        ? { ok: false, out: "", err: "fatal: unknown credential option" }
+        : { ok: true, out: "password=x\n" };
+    } });
+    check(r.ok, "a git that refuses the capability line is asked the plain question instead", JSON.stringify(r));
+    check(inputs.length === 2 && /capability/.test(inputs[0]) && !/capability/.test(inputs[1]),
+      "  the retry drops it, and only the retry", JSON.stringify(inputs));
+  }
+  {
+    // `remote.origin.mirror` makes a push behave as --mirror, and reeve always
+    // names an explicit refspec. Measured: `fatal: --mirror can't be combined
+    // with refspecs`, where the same push without the setting succeeds.
+    const io = { run: (cwd, args) => {
+        if (args[0] === "remote") return { ok: true, out: "https://github.com/o/r.git" };
+        if (args[0] === "ls-remote") return { ok: true, out: "abcdef1234567890  refs/heads/main" };
+        if (args[0] === "config" && args.includes("remote.origin.mirror")) return { ok: true, out: "true" };
+        return { ok: false, out: "", err: "" };
+      }, credential: () => ({ ok: true }), netrc: () => "" };
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "BROKEN" && /mirror/.test(c.lines.join(" ")) && /refspec/.test(c.lines.join(" ")),
+      "a mirror remote is BROKEN: every publication reeve makes would be refused", c.lines.join(" | "));
+
+    // Control: the same check with mirror unset, or set false, is unaffected.
+    const off = { ...io, run: (cwd, args) => args[0] === "config" && args.includes("remote.origin.mirror")
+      ? { ok: true, out: "false" } : io.run(cwd, args) };
+    check(checkRemoteReach(pub, off).level === "OK", "control: `mirror = false` is not a mirror", "");
+  }
+  {
+    // curl permits a double-quoted netrc field, and measured 2026-08-23 against
+    // a 401 Basic server `machine "127.0.0.1"` authenticates exactly as the
+    // unquoted form does. Comparing raw tokens missed it.
+    const io = seams({ url: "https://enterprise.example/o/r.git",
+                       netrc: 'machine "enterprise.example"\n  login u\n  password p\n' },
+                     { ok: false, why: "no helper answered" });
+    check(checkRemoteReach(pub, io).level === "DEGRADED",
+      "a QUOTED netrc machine name is matched, not missed", checkRemoteReach(pub, io).lines.join(" | "));
   }
   {
     // Control: no alternative configured, so a silent helper is still BROKEN.

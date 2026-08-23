@@ -7,7 +7,7 @@
 // daemon at start (under the CLI); this file proves the judge.
 import { sandboxCanary, canaryIdFor, policyHashOf, canaryScript, CANARY_INSIDE_CONTROL, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, parseWriteProbe, isPolicyRefusal, netListener, CANARY_SENTINEL, instrumentHash } from "../src/canary.mjs";
 import { measureContainment } from "../src/containment.mjs";
-import { currentInstrument, INSTRUMENT_SOURCES, INSTRUMENT_NOT_SOURCES } from "../src/canary.mjs";
+import { currentInstrument, INSTRUMENT_SOURCES, INSTRUMENT_LOCAL_SOURCES, INSTRUMENT_CALLER_SOURCES, INSTRUMENT_NOT_SOURCES } from "../src/canary.mjs";
 import { createHash } from "node:crypto";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
@@ -497,7 +497,9 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   // part of the instrument or explicitly not, rather than silently ignored.
   const src = readFileSync(new URL("../src/canary.mjs", import.meta.url), "utf8");
   const imported = [...src.matchAll(/from "(\.\/[^"]+)"/g)].map(m => m[1]).sort();
-  const classified = [...INSTRUMENT_SOURCES, ...INSTRUMENT_NOT_SOURCES].filter(f => f !== "./canary.mjs").sort();
+  // The LOCAL list: the guard reads this file's imports, so a caller-side source
+  // is not one of them and must not be expected here.
+  const classified = [...INSTRUMENT_LOCAL_SOURCES, ...INSTRUMENT_NOT_SOURCES].filter(f => f !== "./canary.mjs").sort();
   check(JSON.stringify(imported) === JSON.stringify(classified),
     "every module canary.mjs imports is classified as instrument or not-instrument",
     `imports ${imported.join(",")} | classified ${classified.join(",")}`);
@@ -510,6 +512,12 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   // `validateSettings` then accepts or refuses. None of that reaches the id.
   check(INSTRUMENT_SOURCES.includes("./sandbox.mjs"),
     "  and so does sandbox.mjs, which builds the grant the probe runs under", INSTRUMENT_SOURCES.join(","));
+  // The caller side: `measuredContainment` assembles the probe's environment
+  // from workerenv.mjs — the HOME, the PATH shims and the git configuration
+  // whose isolation the canary exists to measure. The guard above cannot see
+  // it, since it is not an import of this file, so it is asserted by name.
+  check(INSTRUMENT_CALLER_SOURCES.includes("./workerenv.mjs") && INSTRUMENT_SOURCES.includes("./workerenv.mjs"),
+    "  and workerenv.mjs, which builds the environment the probe measures the isolation of", INSTRUMENT_SOURCES.join(","));
 }
 
 // ── the recorded id IS the cache key ─────────────────────────────────────────

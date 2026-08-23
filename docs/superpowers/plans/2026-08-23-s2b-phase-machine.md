@@ -212,6 +212,12 @@ Each task names any imports it needs **beyond** these.
 ### Task 14: `phases.mjs` — pure, total, and the whole §3.1 matrix
 
 **Files:**
+- Modify: `src/profile/schema.mjs` — this task's `--force` branch documents
+  `builder.cancel.drainMinutes`, and the validator is fail-closed on unknown
+  keys, so the declaration lands in the same commit or setting the documented
+  control kills every `reeve run`. An instruction embedded in a code comment is
+  not a file list; it was in one, and this line is what makes it a step. Its
+  `git add` includes this path.
 - Create: `src/build/phases.mjs`
 - Test: `test/hub-phases.test.mjs`
 
@@ -449,8 +455,21 @@ const EVIDENCE = [
     check(!unverified.ok && /ledger sync/.test(unverified.refusal ?? ""),
       `${held} + a ledger resume with no ownership witness is refused`, JSON.stringify(unverified));
     const verified = nextPhase({ phase: held, generation: 3, heldFrom: "IMPLEMENTING", sourceKind: "ledger" },
-      { kind: "founder.resume", redesign: false, ownerIsReeve: true, ownershipSyncedAt: 1_800_000_000 });
+      { kind: "founder.resume", redesign: false, ownerIsReeve: true,
+        // A witness is fresh RELATIVE to something. The fixture used to assert a
+        // bare timestamp was "fresh" while supplying neither a current time nor a
+        // bound, so it could not have distinguished a sync from a second ago from
+        // one from a year ago.
+        ownershipSyncedAt: 1_800_000_000, now: 1_800_000_060, ownershipMaxAgeSeconds: 900 });
     check(verified.ok, `${held} + a ledger resume WITH a fresh witness proceeds`, JSON.stringify(verified));
+    // CONTROL: the same witness, past the bound, is refused. Without it the
+    // assertion above is satisfied by an implementation that ignores age
+    // entirely -- which is the implementation that shipped.
+    const stale = nextPhase({ phase: held, generation: 3, heldFrom: "IMPLEMENTING", sourceKind: "ledger" },
+      { kind: "founder.resume", redesign: false, ownerIsReeve: true,
+        ownershipSyncedAt: 1_800_000_000, now: 1_800_000_000 + 86_400, ownershipMaxAgeSeconds: 900 });
+    check(!stale.ok && /witness is/.test(stale.refusal ?? ""),
+      `${held} + a ledger resume on a STALE witness is refused`, JSON.stringify(stale));
     // CONTROL, both directions: the founder-filed default is unaffected (the
     // plain resume above passed), and an explicit contrary owner still refuses.
     const humanOwned = nextPhase({ phase: held, generation: 3, heldFrom: "IMPLEMENTING", sourceKind: "ledger" },
@@ -724,6 +743,16 @@ export function nextPhase(state, evidence) {
       // is outstanding, so anything that ENQUEUES must run before it. Ahead of
       // close-prs it missed the close and comment effects the cancellation
       // itself had just created -- which is the whole set it exists to capture.
+      //
+      // And void-pending FIRST, before any of them, which is what this order
+      // already gives -- but the rule has to be stated because it is not
+      // obvious: `void-pending` voids `cancellable=1 AND status='pending'`, and
+      // every effect the cancellation itself enqueues is created cancellable and
+      // pending. Run in the other order it would void its own new rows, they
+      // would be absent from `record-drain`'s snapshot, and CANCELLED would be
+      // reachable with the close and comment effects never performed. The
+      // caller's `effects` parameter is likewise enqueued AFTER the compensation
+      // loop, for the same reason and stated in the same place.
       compensations: ["void-pending","close-prs","release-territory",
                       // A ledger claim that already LANDED is not undone by
                       // draining: another actor must be able to take the node.
@@ -732,7 +761,17 @@ export function nextPhase(state, evidence) {
                       // a CANCELLED task. `--if-owner` makes it inert when a
                       // human already owns it, so it is safe whenever the claim
                       // may have landed or is still in flight.
-                      ...(evidence.ledgerClaimLanded ? ["release-ledger-claim"] : []),
+                      // From the task's own SOURCE, not from an optional field
+                      // the caller may simply have omitted. A cancel that leaves
+                      // out `ledgerClaimLanded` after `ledger.claim` settled
+                      // walked to CANCELLED with the node still owned by a
+                      // terminal task, and the orphan sweep then finds a
+                      // reeve-owned claim for a task that no longer exists.
+                      // `release-ledger-claim` enqueues `--if-owner`, which is
+                      // inert when reeve does not own it -- so emitting it for
+                      // every ledger-sourced cancellation is safe, and the
+                      // safe direction is the one to default to.
+                      ...(sourceKind === "ledger" ? ["release-ledger-claim"] : []),
                       // A live phase worker keeps consuming provider capacity and
                       // writing to its worktree after the cancel commits.
                       // Section 4.5 terminates through the lease; this schedules
@@ -815,6 +854,21 @@ export function nextPhase(state, evidence) {
           return refuse("a ledger-sourced resume needs a full ledger sync showing reeve as owner; " +
                         "pass ownerIsReeve and ownershipSyncedAt from that sync, or the resume is " +
                         "restarting work on a claim nobody re-verified");
+        // FRESH, not merely present. A non-null `ownershipSyncedAt` says a sync
+        // happened at some point, which stays true forever after the first one --
+        // so a task resumed on a witness from last week even though a human has
+        // taken the node since, which is the exact case the witness exists to
+        // rule out. The machine has no clock by design, so the bound and the
+        // current time arrive as evidence, the same way `drainMinutes` does for
+        // the force window. A missing bound REFUSES rather than defaulting: a
+        // default here is an invented freshness, and this guard exists precisely
+        // because "recent enough" cannot be guessed.
+        if (evidence.ownershipMaxAgeSeconds == null || evidence.now == null)
+          return refuse("a ledger-sourced resume needs the ownership freshness bound and the command time; " +
+                        "the machine has no clock and cannot invent one");
+        if (evidence.now - evidence.ownershipSyncedAt > evidence.ownershipMaxAgeSeconds)
+          return refuse(`the ownership witness is ${Math.floor((evidence.now - evidence.ownershipSyncedAt) / 60)}m old ` +
+                        `and the bound is ${Math.floor(evidence.ownershipMaxAgeSeconds / 60)}m; re-sync before resuming`);
       } else if (evidence.ownerNotReeve) {
         // A founder-filed task carrying an owner is a caller error, not a
         // silently ignored field.
@@ -964,6 +1018,18 @@ export function nextPhase(state, evidence) {
         // alone it keeps spending and keeps writing its artifact, and the
         // re-dispatch that follows either races it or never happens.
         compensations: hasLiveRun ? ["terminate-worker"] : [] });
+    // Pre-SIZING is neither of the cases above, and it is not post-approval
+    // either. FILED and CLAIMING matched no earlier list and fell through to the
+    // hold below, so an override arriving before the task had even been sized
+    // moved it to BLOCKED and raised `depth:post-approval` -- naming an approval
+    // that does not exist. Nothing is bound yet at those phases, so the override
+    // is simply recorded and the task carries on.
+    //
+    // The exhaustive matrix cannot catch this: it accepts either a transition or
+    // a refusal for every cell, so a WRONG transition reads as a legal one.
+    if (["FILED", "CLAIMING"].includes(phase))
+      return refuse(`${phase} has nothing sized yet; the depth is recorded and applies when SIZING starts`,
+                    { persistDepth: evidence.depth });
     // Post-approval: holds, and records WHY like every other hold. Without
     // record-hold-reason this was the one BLOCKED entry with no reason, so
     // `task resume` would list nothing and the founder would see a held task
@@ -1466,6 +1532,13 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
     // diverge, and they had: this one returned `refused` with no event at all, so
     // a malformed phase report left NO trace in the history `task why` renders --
     // which is indistinguishable from a report that was never sent.
+    // EVERY post-fence refusal in this function goes through here. Five did not
+    // -- the two force-window guards, the missing drain threshold, the missing
+    // FINALIZING entry, and the incomplete-finalization check -- and each of
+    // them is a refusal about the CURRENT state, which is exactly what `task why`
+    // is expected to render. A founder who ran `cancel --force` too early got no
+    // record of having done so. The rule is mechanical: if a return happens after
+    // the phase-and-generation fence and is not `lost-race`, it uses this exit.
     const refuseDurably = (refusal) => {
       hubEvent(db, { kind: "transition.refused", task: taskId,
         payload: { from: expectedPhase, evidence: evidence?.kind ?? null, refusal } });
@@ -1579,8 +1652,7 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
       // invented window, and the one thing this guard exists to prevent is a
       // force that had no window at all.
       if (drainMinutes == null)
-        return { applied: false, reason: "refused",
-                 refusal: "cancel --force needs builder.cancel.drainMinutes; the hub does not store the profile" };
+        return refuseDurably("cancel --force needs builder.cancel.drainMinutes; the hub does not store the profile");
       const at = now ?? db.prepare("SELECT unixepoch() n").get().n;
       const enteredAt = db.prepare(
         `SELECT at FROM phase_event WHERE task=? AND to_phase='CANCELLING' ORDER BY seq DESC LIMIT 1`).get(taskId)?.at;
@@ -1588,12 +1660,10 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
       // "zero minutes elapsed" happens to refuse, but for the wrong reason and
       // with a message that says the window is still running.
       if (enteredAt == null)
-        return { applied: false, reason: "refused",
-                 refusal: "there is no CANCELLING entry to measure the drain window from" };
+        return refuseDurably("there is no CANCELLING entry to measure the drain window from");
       const mins = (at - enteredAt) / 60;
       if (mins < drainMinutes)
-        return { applied: false, reason: "refused",
-                 refusal: `the drain has had ${Math.floor(mins)}m of its ${drainMinutes}m window` };
+        return refuseDurably(`the drain has had ${Math.floor(mins)}m of its ${drainMinutes}m window`);
     }
 
     if (decision.to === "DONE") {
@@ -1625,17 +1695,15 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
         `SELECT seq FROM phase_event WHERE task=? AND to_phase='FINALIZING'
            AND to_generation=? ORDER BY seq DESC LIMIT 1`).get(taskId, expectedGeneration)?.seq;
       if (finalizingSeq == null)
-        return { applied: false, reason: "refused",
-                 refusal: "there is no FINALIZING entry for this generation to scope the completion check to" };
+        return refuseDurably("there is no FINALIZING entry for this generation to scope the completion check to");
       const bad = db.prepare(
         `SELECT status, count(*) c FROM outbox
          WHERE task_id=? AND task_generation=? AND fence >= ?
            AND status IN ('pending','inflight','failed','dead_letter','refused')
          GROUP BY status`).all(taskId, expectedGeneration, finalizingSeq);
       if (bad.length)
-        return { applied: false, reason: "refused",
-                 refusal: `finalization is not complete: ` + bad.map(r => `${r.c} ${r.status}`).join(", ") +
-                          `; DONE is terminal and cannot be revisited` };
+        return refuseDurably(`finalization is not complete: ` + bad.map(r => `${r.c} ${r.status}`).join(", ") +
+                             `; DONE is terminal and cannot be revisited`);
     }
 
     const upd = db.prepare(
@@ -1662,7 +1730,16 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
       `INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,slice,artifact_sha,detail)
        VALUES(?,unixepoch(),?,?,?,?,?,?,?,?) RETURNING seq`)
       .get(taskId, op, expectedPhase, decision.to, expectedGeneration, decision.generation,
+           // The merge witness rides in `detail` for `slice.merged`. `nextPhase`
+           // refuses that evidence without `mergedSha`/`mergedAt`, and then the
+           // durable event serialised only the evidence KIND -- and this path
+           // requires no `artifactSha` -- so the record said the task reached
+           // SLICE_MERGED with nothing naming the merge that authorised it.
+           // `task why` could not show it and replay could not re-check it,
+           // which is the whole reason the fields are demanded.
            slice, artifactSha, JSON.stringify({
+             ...(evidence?.kind === "slice.merged"
+               ? { mergedSha: evidence.mergedSha, mergedAt: evidence.mergedAt } : {}),
              evidence: evidence?.kind ?? null,
              // The CLAIMING witness, durable. `nextPhase` refuses a claim.won
              // without these two precisely so the provenance exists -- and then
@@ -1818,6 +1895,35 @@ git commit -m "feat(hub): generation-fenced transition with compensations"
   - `enqueueEffect(db, { idempotencyKey, kind, taskId, generation, fence, cancellable = true, args, notBefore = 0 }) -> { id, status }` — **must be called inside the caller's transaction**. Returns `status: 'superseded'` with no row performed when the key is round- or sha-keyed and a `done` row already carries it.
   - `leaseEffect(db, { worker, leaseSeconds = 300, capabilities }) -> Row | null` — revalidates the fence **inside the lease transaction** and settles `fenced` (returning null and trying the next row) when the task has moved generation or the row was voided; settles `refused` when the effect's capability switch is off.
   - `settleEffect(db, { id, ok, result, error, retryable })`, `recoverEffects(db, { reconcile })`, `voidPending(db, taskId)`.
+  - **EVERY outbox mutation appends a row-image `hub_event`, in the same
+    transaction as the write.** `outbox` is in S2-A's `COMPARISON_SET` and has
+    four handlers there, and this plan emitted **none** of them — the same gap
+    `territory_lease` had. Without them a snapshot taken before an effect is
+    enqueued loses that effect entirely at replay, and one taken before a
+    settlement resurrects the row at its OLD status; for a `pending` row that
+    means the reconciler performs the external action a second time. The four
+    kinds S2-A already handles cover every path, keyed on `id`:
+
+    | path | kind |
+    |---|---|
+    | `enqueueEffect` admitting a row | `outbox.enqueued`, from the written row |
+    | `leaseEffect` taking a row | `outbox.settled` — the lease writes `inflight`, which replay must not lose |
+    | `leaseEffect` settling `fenced` | `outbox.fenced`, before it moves to the next row |
+    | `leaseEffect` settling `refused` | `outbox.settled` |
+    | `settleEffect`, `recoverEffects` | `outbox.settled`, any terminal status |
+    | `voidPending` | `outbox.voided`, one per row voided, never one for the batch |
+
+    `outbox.settled` carries whatever the status now is, so `refused`,
+    `superseded` and `forced` need no kinds of their own — the row image is the
+    record, and a kind per status would be four more names that can drift from
+    the CHECK set. A `superseded` enqueue that performs no row appends nothing,
+    because nothing changed.
+
+    **Each is asserted as a DELTA, per path**, in the same shape as the
+    gate-state assertion: capture the count for that `id`, perform the mutation,
+    require exactly one more. A cumulative floor (`>= 1`) stays green when a
+    later path appends nothing, which is how five of these could be missing while
+    one existed.
   - `settleDrainFor(db, outboxId)` — the shared helper that clears a `task_drain` row when its outbox row reaches a terminal status and appends `task_drain.settled`. **Called by `settleEffect` AND by `leaseEffect`**, because `leaseEffect` settles `fenced` and `refused` itself without going through `settleEffect`. A hook installed in only one of the two leaves exactly the cancellations that were fenced at lease time stuck in CANCELLING.
   - **Settling an effect settles its drain row.** In the same transaction, `settleEffect` (and `recoverEffects` through it) sets `task_drain.settled_at` for any row matching `(task_id, id)` and appends a `task_drain.settled` `hub_event`. Without this nothing ever clears the drain: `nextPhase` refuses `drain.settled` while any row has `settled_at IS NULL`, so every cancellation that caught an inflight effect would sit in CANCELLING until `builder.cancel.drainMinutes` expired and the founder ran `--force` — turning the ordinary path into the exceptional one, and recording rows as `forced` whose reconcilers had in fact completed.
 
@@ -2205,6 +2311,22 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
 **Interfaces:**
 - Consumes: `hubTx`, `hubEvent`, **`assertWritable`** (S2-A), `applyTransition` (Tasks 1, 6, 15).
 - Produces:
+  - **`resolveClaims` stops traversing at the first component that does not
+    exist, and that is not a refusal.** Territory describes work a task is
+    *going to do*, so claiming a file or directory that has yet to be created is
+    an ordinary filing — the commonest one for a task whose whole job is to add a
+    module. An implementation that literally `lstat`s every component as an
+    earlier revision prescribed throws `ENOENT` on the first missing one and
+    refuses the filing, reporting a normal claim as a broken path.
+    The rule: walk the ancestors that DO exist, refusing on a symlink or a
+    gitlink among them exactly as now; on the first `ENOENT`, stop — everything
+    below a path that does not exist cannot be a symlink, so there is nothing
+    left to check. The refusals keep their whole force over the existing prefix,
+    which is where the escape they guard against would have to live.
+    Tested with a claim whose leaf is missing, one whose middle ancestor is
+    missing, and a control in which a symlink sits *above* a missing leaf and is
+    still refused — without that control, "stop at ENOENT" degrades into "stop
+    checking".
   - `resolveSnapshot(registry, project, claims, io) -> Snapshot` — takes the filing's normalised claims, because it is the only place with both the repository path and an I/O capability, and it returns them resolved. Without the parameter `resolveClaims` had no caller and the symlink refusal was unreachable from the filing path. where `io = { repoId, visibility, specRepoId, profileHash, defaultBranch, gateDefinitionHash, founderUserId, lstat, lsTree }`, each a function. **Async, and it is where every network call lives.** `lstat` and `lsTree` are in that list because `resolveSnapshot` calls `resolveClaims`, which needs both — the symlink refusal and the gitlink (submodule) refusal are its entire purpose. An `io` carrying only the lookup functions makes the composition throw when snapshot resolution reaches the filesystem-aware stage, or silently skip both refusals; the tests call `resolveClaims` directly, so they exercise the half that works and not the seam that does not.
   - **The territory grant appends its event.** `admitTask` writes `territory_lease` rows and must append one `territory_lease.granted` `hub_event` each, with the row image — S2-A has the handler and the table is in `COMPARISON_SET`, so an ungranted event means a post-snapshot admission loses its lease at replay and the task runs with territory nothing records it holding.
   - **`filing.idempotencyKey` is carried into the transaction and enforced.** `task.idempotency_key` and its partial unique index `task_idem` already exist in S2-A's migration 1, and the command contract says a repeated `--idempotency-key` request returns the ORIGINAL task and performs nothing. Without the lookup a retried script — a shell loop, a re-run CI step — mints a second task for the same work, which then competes with the first for its own territory and is refused, so the retry looks like a conflict with a stranger. `admitTask` returns `{ ok: true, taskId, replayed: true }` when the key already exists, and inserts nothing.
@@ -2294,10 +2416,29 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   };
   const srcFile = (rel) => fileURLToPath(new URL(rel, import.meta.url));
 
-  const reach = walk(srcFile("../src/build/registry.mjs"));
+  // BOUNDED at the hub store. `registry.mjs` is required to import `hubdb.mjs`
+  // for `hubTx`/`hubEvent`, and `hubdb.mjs` owns the migrations -- it reads
+  // `hub.sql` through `node:fs` by design. An unbounded transitive walk therefore
+  // reports a violation for the intended architecture and this assertion is
+  // permanently red: an instrument that cannot return the answer it is asked for.
+  //
+  // The narrower claim is the one that matters and is still worth asserting:
+  // `registry.mjs` and everything it pulls in BEYOND the hub store performs no
+  // I/O, so `admitTask` cannot read the filesystem or the network on its own
+  // account. The boundary is named explicitly rather than discovered, so adding
+  // a third module to it is a deliberate act.
+  const HUB_STORE = new Set(["hubdb.mjs", "locks.mjs"].map(f => srcFile("../src/build/" + f)));
+  const reach = walk(srcFile("../src/build/registry.mjs"), new Set(HUB_STORE));
   check(reach.length === 0,
-    "admitTask's module cannot reach the filesystem or the network, transitively",
+    "admitTask's module cannot reach the filesystem or the network, outside the hub store it must import",
     reach.join("; "));
+  // CONTROL: the exclusion is doing real work, not hiding an empty graph. The
+  // walk must actually REACH hubdb.mjs -- if registry.mjs stopped importing it,
+  // this assertion would pass for a module that imports nothing at all.
+  const unbounded = walk(srcFile("../src/build/registry.mjs"));
+  check(unbounded.length > 0,
+    "control: the same walk WITHOUT the exclusion finds the hub store's own I/O, so the boundary is real",
+    JSON.stringify(unbounded));
 
   // CONTROL, and the half that carries the weight: run the same walk over a
   // module that demonstrably DOES perform I/O. Without it, a walker with a
@@ -2437,8 +2578,20 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   // cannot contain anything. Treating it as a prefix refuses concurrent filings
   // that do not actually conflict -- a false conflict is as costly here as a
   // missed one, because it blocks work with a message naming the wrong reason.
-  check(!overlaps({kind:"file",path:"packages/x"}, {kind:"prefix",path:"packages/x/y"}),
-    "an exact file claim does not contain a prefix beneath its own path");
+  // These DO conflict, and the earlier expectation had it backwards. One task
+  // claiming `packages/x` as an exact file and another claiming `packages/x/y`
+  // as a prefix cannot both complete: the first requires `x` to be a file, the
+  // second requires it to be a directory, and no filesystem offers both. Granting
+  // both leases hands out territory that is structurally impossible to occupy --
+  // and it contradicts §10.1's segment-prefix rule, which does not have a
+  // file-claim exception. The claim KIND limits which diffs a task may make; it
+  // cannot make incompatible paths safe to hold at once.
+  check(overlaps({kind:"file",path:"packages/x"}, {kind:"prefix",path:"packages/x/y"}),
+    "a file claim and a prefix BENEATH it conflict: x cannot be both a file and a directory");
+  // CONTROL, so this does not become "everything overlaps": a file claim and a
+  // prefix that is its SIBLING still do not.
+  check(!overlaps({kind:"file",path:"packages/x"}, {kind:"prefix",path:"packages/z"}),
+    "control: a file claim and an unrelated sibling prefix do not overlap");
   check(overlaps({kind:"file",path:"packages/x/y.ts"}, {kind:"file",path:"packages/x/y.ts"}),
     "control: two identical file claims still overlap");
   check(!overlaps({kind:"prefix",path:"packages/x"}, {kind:"prefix",path:"packages/xy"}),
@@ -2944,6 +3097,25 @@ git commit -m "feat(hub): pure repo gate state derivation behind a seam"
 **Files:**
 - Test: `test/hub-drills.test.mjs` (new); `src/build/hubdb.mjs` (the corruption refusal)
 
+**The refusal is a CHECK, not a caught exception.** SQLite opens a database with
+damage in an index or an unrelated table perfectly happily, and the probe query
+this drill uses (`SELECT count(*) FROM task`) can succeed against exactly that
+file — so a refusal built on "the open threw" hands the caller a corrupt hub and
+calls it healthy. `openHub` therefore runs **`PRAGMA quick_check(1)`** before it
+returns and refuses on any answer but `ok`, naming the newest usable snapshot.
+
+`quick_check(1)`, not `integrity_check`: `openHub` is on every command and every
+tick, and `2026-08-23-integrity-check-cost.md` measures the full check at
+~1.1 ms/MB — 52 ms on a 47 MB hub, per open. `quick_check` skips the index
+cross-references, which is the expensive half, and still refuses the page-level
+damage this drill produces; the deep check stays where it already is, on
+`snapshotAll`, `restoreHub` and `builder doctor`. Moving a full scan onto the
+hot path to fix this would be the same mistake as the earlier `latestSnapshot`
+repair, in the other direction.
+
+The drill's assertion changes shape with it: it must not rely on the probe query
+throwing. `openHub(p)` itself is the thing that refuses.
+
 **Interfaces:**
 - Consumes: everything above.
 - Produces: `openHub` gains an `integrity_check` on open failure that names the newest snapshot in its error. `recoverEffects(db, { reconcile })` from Task 16 is exercised end to end.
@@ -3165,9 +3337,14 @@ for (let i = 0; i < 500; i++) {
   finally { probe.close(); }
   check(integrity !== "ok", "control: the fixture really is corrupt now", String(integrity));
 
+  // `openHub(p)` ALONE, with no probe query after it. Leaning on the query meant
+  // the assertion passed only when the damage happened to be somewhere the query
+  // read -- and SQLite opens a file with a corrupt index or an untouched table
+  // without complaint, so the refusal has to come from openHub's own
+  // quick_check rather than from a lucky SELECT.
   let why = null;
-  try { const d = openHub(p); d.prepare("SELECT count(*) FROM task").get(); } catch (e) { why = e.message; }
-  check(why !== null, "a corrupt hub does not open silently");
+  try { openHub(p).close(); } catch (e) { why = e.message; }
+  check(why !== null, "a corrupt hub does not open silently: openHub itself refuses");
   // Name the actual newest snapshot, not the word "snapshot". The interface
   // promises the path an operator should restore, and `/snapshot/i` passes on a
   // generic "the snapshot is unreadable" that tells them nothing.

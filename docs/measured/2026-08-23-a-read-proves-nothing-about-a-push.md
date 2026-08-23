@@ -264,6 +264,45 @@ That is the same shape as the dispatch fixtures that read the real
 `~/.reeve/claude-token`: green here, red on a machine configured differently, for
 a reason that is not the code.
 
+## emptyAuth, and a boolean that is not a presence
+
+Round seven, and the third round in a row that added an authentication mechanism
+`git credential fill` cannot see. `http.<url>.emptyAuth` tells git to attempt
+authentication without seeking a username or password — Kerberos and
+GSS-Negotiate — so a push succeeds where the helper returns nothing.
+
+The trap is that it is a BOOLEAN. Measured 2026-08-23:
+
+```
+http.emptyAuth  https://enterprise.example/o/r.git -> [true]  exit=0
+http.emptyAuth  https://other.example/x.git        -> [false] exit=0
+http.emptyAuth  https://nowhere.example/x.git      -> []      exit=1
+```
+
+Reading it the way the other keys are read — presence, exit 0 — would take
+configuration that says the OPPOSITE as evidence for it, and suppress a refusal
+that is real. Boolean keys are asked with `--type=bool` and only `true` counts.
+
+`http.<url>.sslCert` was added at the same time, without a reviewer asking. A
+client certificate is an authentication mechanism exactly as a header or a cookie
+jar is, and this is the third round of one being found missing.
+
+## The list is incomplete by nature, and that is a decision
+
+git keeps adding ways to authenticate, so an enumeration of them will always be
+one behind. What matters is which way its incompleteness errs:
+
+| | consequence |
+|---|---|
+| a mechanism MISSING from the list | a working checkout is called BROKEN — loud, and a human can dismiss it |
+| a mechanism WRONGLY in the list | a broken checkout is called DEGRADED — quiet, and nobody looks |
+
+The first is recoverable and the second is the failure R-16 exists to prevent.
+So the list stays explicit rather than widening to "any `http.*` key at all":
+`http.postBuffer` says nothing about authentication, and treating it as
+authentication would suppress a real refusal — trading the loud error for the
+quiet one.
+
 ## What this does not establish, said in the report rather than only here
 
 That a push would SUCCEED. `git credential fill` obtains the fields from the

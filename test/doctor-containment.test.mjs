@@ -50,8 +50,11 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
         // `git config --get-urlmatch http.<key> <url>` — exits 1 when nothing matches.
         if (args[0] === "config") {
           asked.push(args[1]);
-          const hit = reach.httpAuth?.[args[2]];
-          return hit ? { ok: true, out: hit } : { ok: false, out: "", err: "" };
+          // The key follows `--get-urlmatch`, which is not a fixed index: a
+          // boolean key is asked with `--type=bool` in front of it.
+          const i = args.indexOf("--get-urlmatch");
+          const hit = i >= 0 ? reach.httpAuth?.[args[i + 1]] : undefined;
+          return hit === undefined ? { ok: false, out: "", err: "" } : { ok: true, out: hit };
         }
         return { ok: false, out: "", err: "unexpected" };
       },
@@ -144,8 +147,11 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
         // `git config --get-urlmatch http.<key> <url>` — exits 1 when nothing matches.
         if (args[0] === "config") {
           asked.push(args[1]);
-          const hit = reach.httpAuth?.[args[2]];
-          return hit ? { ok: true, out: hit } : { ok: false, out: "", err: "" };
+          // The key follows `--get-urlmatch`, which is not a fixed index: a
+          // boolean key is asked with `--type=bool` in front of it.
+          const i = args.indexOf("--get-urlmatch");
+          const hit = i >= 0 ? reach.httpAuth?.[args[i + 1]] : undefined;
+          return hit === undefined ? { ok: false, out: "", err: "" } : { ok: true, out: hit };
         }
         return { ok: false, out: "", err: "unexpected" };
       },
@@ -258,8 +264,11 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
         }
         if (args[0] === "config") {
           asked.push(args[1]);
-          const hit = reach.httpAuth?.[args[2]];
-          return hit ? { ok: true, out: hit } : { ok: false, out: "", err: "" };
+          // The key follows `--get-urlmatch`, which is not a fixed index: a
+          // boolean key is asked with `--type=bool` in front of it.
+          const i = args.indexOf("--get-urlmatch");
+          const hit = i >= 0 ? reach.httpAuth?.[args[i + 1]] : undefined;
+          return hit === undefined ? { ok: false, out: "", err: "" } : { ok: true, out: hit };
         }
         return { ok: false, out: "", err: "unexpected" };
       },
@@ -331,6 +340,37 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
                      { ok: false, why: "no helper answered" });
     check(checkRemoteReach(pub, io).level === "BROKEN",
       "control: a netrc for another host does not excuse this one", "");
+  }
+  {
+    // `http.emptyAuth` tells git to authenticate without seeking a username or
+    // password — Kerberos, GSS-Negotiate — so a push succeeds where `credential
+    // fill` returns nothing.
+    const io = seams({ url: "https://enterprise.example/o/r.git", httpAuth: { "http.emptyAuth": "true" } },
+                     { ok: false, why: "no helper answered" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "DEGRADED" && /http\.emptyAuth/.test(c.lines.join(" ")),
+      "an emptyAuth remote is DEGRADED, not BROKEN", c.lines.join(" | "));
+  }
+  {
+    // The trap in reading that key by PRESENCE. Measured 2026-08-23,
+    // `--get-urlmatch` returns `false` with EXIT 0 for a url configured
+    // `emptyAuth = false` — so configuration saying the OPPOSITE would have
+    // been taken as evidence for it, suppressing a refusal that is real.
+    const io = seams({ url: "https://enterprise.example/o/r.git", httpAuth: { "http.emptyAuth": "false" } },
+                     { ok: false, why: "no helper answered" });
+    check(checkRemoteReach(pub, io).level === "BROKEN",
+      "`emptyAuth = false` is configuration saying the opposite, and does not excuse anything",
+      checkRemoteReach(pub, io).lines.join(" | "));
+  }
+  {
+    // A client certificate is an authentication mechanism exactly as a header or
+    // a cookie jar is. Added without a reviewer asking, after three rounds of
+    // one being found missing.
+    const io = seams({ url: "https://enterprise.example/o/r.git", httpAuth: { "http.sslCert": "/path/to/client.pem" } },
+                     { ok: false, why: "no helper answered" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "DEGRADED" && /http\.sslCert/.test(c.lines.join(" ")),
+      "a client certificate is DEGRADED, not BROKEN", c.lines.join(" | "));
   }
   {
     // Control: no alternative configured, so a silent helper is still BROKEN.

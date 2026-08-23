@@ -274,6 +274,13 @@ missing named export at module instantiation, so importing it here makes *every*
 commit, and the incremental tests this plan runs per task cannot pass. Task 9
 adds it to this line when `restore --hub` needs it.
 
+**This whole block lands in TASK 7, not here.** It is written in Task 1 because
+that is where the reader meets `openHub`, but `src/build/locks.mjs` does not
+exist until Task 7 — and ESM resolves imports at instantiation, so adding it to
+`bin/reeve` any earlier makes *every* CLI test in Tasks 1 through 6 fail with
+`ERR_MODULE_NOT_FOUND` under this plan's run-the-whole-suite-before-every-commit
+rule. Task 1's `git add` does not include `bin/reeve`, and Task 7's does.
+
 ```js
 import { openHub, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
@@ -445,7 +452,11 @@ export function openHub(path) {
       // fast, clear message; this is the one that holds under a race.
       if (applied > HUB_SCHEMA_VERSION) {
         db.exec("ROLLBACK");
-        db.close();
+        // NO close here. The catch below closes and rethrows, and
+        // `DatabaseSync.close()` throws when the handle is already closed -- so
+        // closing twice replaces the message that names BOTH schema versions
+        // with `database is not open`, which tells an operator nothing about
+        // what actually happened. One owner for cleanup, and it is the catch.
         throw new Error(
           `hub store at ${path} was migrated to schema version ${applied} while this binary waited; ` +
           `this binary knows ${HUB_SCHEMA_VERSION}. Run the newer binary.`);
@@ -456,7 +467,11 @@ export function openHub(path) {
       db.exec("COMMIT");
     } catch (e) {
       try { db.exec("ROLLBACK"); } catch {}
-      db.close();
+      try { db.close(); } catch {}
+      // The version-race error is RETHROWN verbatim. Wrapping it as "migration N
+      // failed" is wrong twice: no migration was attempted, and the wrapper hides
+      // the two version numbers an operator needs to know which binary to run.
+      if (/was migrated to schema version/.test(e.message)) throw e;
       throw new Error(`hub migration ${m.version} failed, store unchanged: ${e.message}`);
     }
   }
@@ -2256,7 +2271,11 @@ Add to `bin/reeve`, beside the existing `case "run":`:
       // a restore that replaced the file. Authority is gone, so the loop stops
       // rather than ticking on without it (section 1.2).
       if (!heartbeatSingleton(db, { name: "builder", pid: process.pid, lstart })) {
-        log("build run: lost the singleton lease; another process holds it. Stopping.");
+        // `console.error`, like the shutdown path. `bin/reeve` has no `log`
+        // binding, so this threw before printing the diagnostic that is the entire
+        // reason the branch exists -- a lost lease reported as a ReferenceError
+        // about logging.
+        console.error("build run: lost the singleton lease; another process holds it. Stopping.");
         process.exit(1);
       }
       // refreshGateState lands with S2-B (its Task 18); until then the loop body
@@ -2643,7 +2662,7 @@ Then replace `latestSnapshot`, so the read path stops trusting the filename:
  * A candidate that does not validate is skipped, so `reeve restore` defaults to
  * the newest GOOD snapshot rather than the newest file.
  */
-export function latestSnapshot(root, nwo) {
+export function latestSnapshot(root, nwo, { deep = false } = {}) {
   const dir = join(root, slug(nwo));
   let files;
   try {
@@ -2661,6 +2680,12 @@ export function latestSnapshot(root, nwo) {
   //
   //   latestSnapshot(root, nwo, { deep: false })   // selfaudit, per tick
   //   latestSnapshot(root, nwo, { deep: true })    // restore --hub's default
+  //
+  // The parameter is REAL, not described: an earlier revision wrote this comment
+  // and left the signature at two arguments, so the restore route could not ask
+  // for depth even though the plan said it did. `deep` is forwarded straight to
+  // `validateSnapshot`, and a candidate that fails is skipped like any other --
+  // the walk continues to the next older file rather than stopping.
   //
   // With `deep`, a candidate that fails is skipped and the walk CONTINUES to the
   // next older one, which is what "the newest snapshot that would actually
@@ -2687,6 +2712,16 @@ store whose every snapshot is corrupt as un-backed-up -- which is what it is. Bo
 already branch on `null`, so neither needs a change here; `test/backup.test.mjs`
 must stay green, and Step 4 runs it.
 
+**`snapshot()` gains one field, `mine`.** It writes to a unique temporary path
+(`.<epoch>.<pid>.tmp` beside the target) and renames it into place, so two
+daemons snapshotting the same store in the same second produce one winner rather
+than one half-written file. The loser removes its own temporary and returns
+`{ ok: true, path, mine: false, why: "already taken this second" }`; the winner
+returns `mine: true`. Only a snapshot this process actually wrote is one this
+process may validate or delete — that is what `mine` is for, and without it
+`snapshotAll` deep-validated a file another process was still writing and could
+delete a snapshot that process then reported as successful.
+
 Then, inside `snapshotAll`, validate what was just written and refuse to keep a bad one:
 
 ```js
@@ -2696,10 +2731,30 @@ Then, inside `snapshotAll`, validate what was just written and refuse to keep a 
       // then erase every usable recovery point, one per attempt, while each
       // failure looked like it deleted only itself. Pruning happens below,
       // after the candidate has proved it can be read back.
+      // `snapshot()` writes to a UNIQUE temporary path and renames it into
+      // place. Without that, two repository daemons running `snapshotAll` for the
+      // same store in the same second collide: the second `snapshot()` finds the
+      // first process's target already present, returns it `ok` with
+      // `why: "already taken this second"`, and this block then deep-validates a
+      // file the OTHER process is still writing with VACUUM INTO. A probe that
+      // catches it incomplete or locked deletes a snapshot the first process
+      // owns -- and that process goes on to report success for a path that no
+      // longer exists.
+      //
+      // Write-temp-then-rename is the ordinary answer and it is the right one
+      // here: `VACUUM INTO <dir>/.<epoch>.<pid>.tmp` followed by `renameSync` to
+      // `<epoch>.db`. The rename is atomic within the directory, so a reader sees
+      // the file either absent or complete and never partial, and two writers
+      // racing produce one winner rather than one corrupt file. `snapshot()`
+      // therefore never returns an "already taken" path it did not itself write:
+      // if the rename target exists, the losing writer removes its own temp and
+      // returns `{ ok: true, path, why: "already taken this second" }` WITHOUT
+      // this block validating or deleting it -- `taken.mine` is false, and only
+      // a snapshot this process wrote is a snapshot this process may judge.
       const taken = snapshot(db, root, nwo, at, { keep: Infinity });
       // A snapshot that cannot be read back is worse than no snapshot: it makes
       // `latestSnapshot` answer with a file that will fail at restore time.
-      if (taken.ok && taken.path) {
+      if (taken.ok && taken.path && taken.mine) {
         // DEEP: this is a snapshot written one line ago, and "can it be read
         // back" is the entire question. Once per store per backup interval.
         const v = nwo === "hub"
@@ -3356,7 +3411,16 @@ And a block for the unreadable case, which is the one this route is named for:
   // version and the timestamps. A partial image is only legal for a row the
   // snapshot already carries -- which is exactly the distinction the applier's
   // existence check draws, and this fixture sat on the wrong side of it.
-  const tail = [{ seq: 99, at: 1, kind: "task.transitioned", task: "bt:2",
+  // `snapSeq + 1`, DERIVED. A literal 99 against a snapshot whose max seq is 1
+  // makes the continuity check report 2..98 missing and return {ok:false} before
+  // replay -- so the assertion on the next line fails against the very
+  // implementation this plan prescribes. The check and the fixture were written
+  // in the same round and never run against each other.
+  const snapMax = (() => {
+    const q = new DatabaseSync(snap, { readOnly: true });
+    try { return q.prepare("SELECT COALESCE(max(seq),0) s FROM hub_event").get().s; } finally { q.close(); }
+  })();
+  const tail = [{ seq: snapMax + 1, at: 1, kind: "task.transitioned", task: "bt:2",
                   payload: JSON.stringify({
                     id: "bt:2", project: "p", repo_id: 1, nwo_snapshot: "o/r", title: "t",
                     phase: "SIZING", generation: 1, source_kind: "founder", source_key: "k2",
@@ -3858,6 +3922,21 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // Contiguity is checkable without a manifest because the tail's own first
     // seq must follow the snapshot's max.
     if (suppliedTail) {
+      // The FOOTER first. Contiguity finds holes in the middle and cannot see a
+      // file that simply stops early -- the remaining run is gapless, so every
+      // check below passes on a tail missing its newest records. The manifest is
+      // written last by `export-events --hub`, so its absence IS the truncation
+      // signal, and its `count`/`sha256` catch the rarer case of a file that was
+      // truncated and then had a footer appended by something else.
+      const manifest = suppliedTail.manifest ?? null;
+      if (!manifest)
+        return { ok: false, holders: [],
+                 why: `the supplied tail has no manifest footer, so it cannot be distinguished from ` +
+                      `a partial copy that lost its newest events. Re-export it with export-events --hub.` };
+      if (manifest.count !== rawTail.length)
+        return { ok: false, holders: [],
+                 why: `the supplied tail claims ${manifest.count} events and carries ${rawTail.length}; ` +
+                      `it is truncated or was edited.` };
       const seqs = tail.map(e => e.seq);
       const dupes = seqs.filter((s, i) => i > 0 && s === seqs[i - 1]);
       const holes = [];
@@ -3891,7 +3970,27 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     {
       const back = openHub(staging);
       try {
-        acquireMaintenanceLock(back, { pid, lstart, isAlive });
+        // The SNAPSHOT's own maintenance_lock goes first, before this restore
+        // tries to take one. A snapshot is taken by a running daemon, so it can
+        // contain a lock row whose pid was alive at VACUUM INTO time --
+        // `acquireMaintenanceLock` then sees a live-looking foreign holder,
+        // returns { ok: false } and writes nothing. That result was ignored, and
+        // `maintenance_lock` is deliberately excluded from the clearing below on
+        // the grounds that "this restore holds it" -- which it does not. So the
+        // staged database was installed carrying a stranger's lock, the release
+        // names this restore's pid and cannot remove it, and every subsequent hub
+        // writer is refused by a holder that never existed on this machine.
+        //
+        // Clearing first makes the acquire meaningful, and the result is CHECKED:
+        // a lock that cannot be taken on a private staging file this function
+        // just created is not a race, it is a broken invariant, and continuing
+        // past it replays into a database nothing is protecting.
+        back.exec("DELETE FROM maintenance_lock");
+        const staged = acquireMaintenanceLock(back, { pid, lstart, isAlive });
+        if (!staged.ok)
+          return { ok: false, holders: [],
+                   why: `could not take the maintenance lock on the staging copy at ${staging}; ` +
+                        `refusing to replay into a database this restore does not hold` };
 
         // Snapshots are taken by the running daemon, so a normal one CONTAINS
         // live-looking process rows: a singleton lease held by a pid that was
@@ -3902,10 +4001,13 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // reused by something unrelated. They are excluded from the comparison
         // set for the same reason; they must be cleared from the restored file
         // as well, not merely ignored when comparing.
-        for (const t of ["singleton_lease","writer_lease","maintenance_lock","directory_lease","provider_lease"])
-          if (t !== "maintenance_lock") back.exec(`DELETE FROM ${t}`);
-        // maintenance_lock is deliberately last and deliberately not cleared:
-        // this restore holds it. It is released below.
+        for (const t of ["singleton_lease","writer_lease","directory_lease","provider_lease"])
+          back.exec(`DELETE FROM ${t}`);
+        // `maintenance_lock` is absent from that list because it was cleared and
+        // re-taken ABOVE, before the replay -- so the row present now is this
+        // restore's own, and it is released below. The previous version skipped
+        // it here while never having acquired it, which is how a stranger's lock
+        // reached the installed file.
 
         // phase_run is NOT a lease table and is not process-scoped as a whole:
         // its SETTLED rows are the attempt history the retry budget counts, so
@@ -4036,7 +4138,22 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
 Add to `bin/reeve`:
 
 - `restore --hub [--tail <file>]` routes to `restoreHub`, printing `why` verbatim and, on success, `replayed N of M post-snapshot events`.
-- **`export-events --hub <file>`** writes `hub_event` as JSONL. This is not optional garnish: `restoreHub`'s `tail` argument is the ONLY way to recover post-snapshot history when the live database is destroyed or too corrupt to open, and without a route that produces such a file the argument is unreachable from the command line. The existing `backup --events` exports the per-repository `event` table and does not cover `hub_event`.
+- **`export-events --hub <file>`** writes `hub_event` as JSONL, and ends with a
+  **footer line** — `{"_manifest":{"count":N,"first":F,"last":L,"sha256":"…"}}` —
+  where the digest is over the event lines only. Contiguity alone cannot detect a
+  truncated tail: a partially copied export that loses its LAST records is still
+  a gapless run, so `restoreHub`'s hole check passes and the restore reports
+  success while silently dropping the newest authority-bearing writes — which are
+  exactly the ones the operator is running this command to save. A footer turns
+  "the file ends here" into a claim that can be false, and `restoreHub` refuses a
+  tail whose footer is absent, whose `count` disagrees with the lines read, or
+  whose digest does not match. Writing the footer last is what makes it a
+  truncation detector: a file cut short loses the footer before it loses
+  anything else.
+
+  This is the same reasoning as the snapshot marker table — a store that says
+  what it should contain can be checked against itself, and one that does not
+  can only be trusted. This is not optional garnish: `restoreHub`'s `tail` argument is the ONLY way to recover post-snapshot history when the live database is destroyed or too corrupt to open, and without a route that produces such a file the argument is unreachable from the command line. The existing `backup --events` exports the per-repository `event` table and does not cover `hub_event`.
 - The `--hub` restore path prints, when no tail is available and the live file could not be read: `no post-snapshot events were recovered; if you have an export from before the loss, re-run with --tail <file>` — so an operator learns the option exists at the moment it matters rather than from the source.
 
 `bin/reeve` imports none of `DatabaseSync`, `hubPathFor` or `writeFileSync`
@@ -4123,7 +4240,13 @@ them pass while the command an operator would actually type does nothing:
 ```js
   case "restore": {
     if (flag("hub")) {
-      const from = opt("from") ?? latestSnapshot(opt("to") ?? join(HOME, "backups"), "hub");
+      // DEEP for the restore path. Cheap validation reads markers and the table
+      // set; a corrupt data page or a foreign-key violation passes all of it, so
+      // the newest candidate was selected here and then rejected by restoreHub's
+      // own deep check -- with no fallthrough to the next older snapshot, which
+      // is precisely the fallback this selection advertises. Paid once, on the
+      // file about to be installed.
+      const from = opt("from") ?? latestSnapshot(opt("to") ?? join(HOME, "backups"), "hub", { deep: true });
       if (!from) die(`reeve restore --hub: no usable snapshot under ${opt("to") ?? join(HOME, "backups")}`);
       // The durable tail, written by `reeve export-events --hub`. Optional: a
       // restore with no tail is still correct, it just recovers less.
@@ -4525,7 +4648,14 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
     // Every reason is still reported; only the SEVERITY is folded. Dropping the
     // second reason would be this same defect in the other direction.
     out.push({ id: "H-5", severity: "warn",
-      classification: notes.some(n => n.classification === "configuration") ? "configuration" : "stale-evidence",
+      // WORST-CASE over every note, not a two-way test. An active provider
+      // cooldown is classified `dependency-outage` above and this fold then
+      // returned `stale-evidence` for it, so a provider refusing all new work
+      // was rendered as old data -- and `dependency-outage` is the one
+      // classification that tells an operator the fault is not theirs to fix.
+      // Ordered most-severe first; the first match wins.
+      classification: ["unsafe-authority", "dependency-outage", "configuration", "stale-evidence"]
+        .find(c => notes.some(n => n.classification === c)) ?? "stale-evidence",
       title: "the provider scheduler needs attention",
       detail: notes.map(n => n.why).join("; "),
       action: notes.map(n => n.action).join("; ") });
@@ -4559,7 +4689,25 @@ Add the case, and add `bin/reeve` to the commit:
       console.log(flag("json") ? JSON.stringify(none, null, 2) : renderHub(none));
       process.exit(1);
     }
-    const db = new DatabaseSync(p, { readOnly: true });
+    // The open and the version probe TOGETHER, in a try. A hub that exists but
+    // cannot be opened -- or cannot answer for its schema version -- is an
+    // ordinary diagnostic scenario, and it is the scenario `builder doctor`
+    // exists for. Throwing an uncaught SQLite error produces no finding and no
+    // JSON at all, so the one command an operator runs to find out what is wrong
+    // answers with a stack trace. `selfAudit` in this same task already treats
+    // this as a structured integrity fault; doctor has to agree with it.
+    let db;
+    try {
+      db = new DatabaseSync(p, { readOnly: true });
+      db.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get();
+    } catch (e) {
+      try { db?.close(); } catch {}
+      const broken = [{ id: "H-0", severity: "fail", classification: "configuration",
+        title: "the hub database cannot be read", detail: `${p}: ${e.message}`,
+        action: "reeve restore --hub, and pass --tail from a durable export-events --hub if you have one" }];
+      console.log(flag("json") ? JSON.stringify(broken, null, 2) : renderHub(broken));
+      process.exit(1);
+    }
     // The forward-version refusal, here too. `build status`, `build run` and
     // both restore paths refuse a store above this binary's version; doctor read
     // one and answered anyway, running queries shaped for the older schema. Its
@@ -4638,7 +4786,12 @@ Add the case, and add `bin/reeve` to the commit:
                                               ...validateSnapshot(path, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true }) };
                                    },
                                    snapshotFor: (nwo) => {
-                                     const s = latestSnapshot(opt("backups") ?? join(HOME, "backups"), nwo);
+                                     // Same filename-epoch rule as
+                                     // `newestCandidate` below. Fixing one and
+                                     // not the other left H-1 reading a copy
+                                     // time for the snapshot a restore would
+                                     // actually use -- the one that matters most.
+                                     const s = latestSnapshot(opt("backups") ?? join(HOME, "backups"), nwo, { deep: true });
                                      // DEEP, and the only deep call on this path. `builder doctor` is an
                                      // operator command run on demand, not a loop, and H-2's whole claim
                                      // is that the newest snapshot would restore. The cheap validation

@@ -83,14 +83,30 @@ const PROFILES = {
                                        commands: { test: { cmd: "npm test", state: "present" } } }], risk: {} },
   // Nothing declared: the prompt still has to name only what exists.
   "no units": { units: [], risk: {} },
+  // Declared, granted from its own declaration, and DENIED by NEVER. Deny wins,
+  // so this must never be offered as the runnable example.
+  "a publishing command": { units: [{ id: "root", language: "typescript", packageManager: "npm",
+                                      commands: { release: { cmd: "npm publish --access public", state: "present" },
+                                                  test: { cmd: "npm test", state: "present" } } }], risk: {} },
+  // The profile forbids one of its own language's runners.
+  "a forbidden runner": { units: [{ id: "root", language: "typescript", packageManager: "npm",
+                                    commands: { test: { cmd: "npm test", state: "present" } } }],
+                          risk: { forbiddenCommands: ["npx"] } },
 };
 
 for (const [name, prof] of Object.entries(PROFILES)) {
-  const allow = sandboxFor({ profile: prof, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: "/tmp/t" })
-    .settings.permissions.allow;
+  const perms = sandboxFor({ profile: prof, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: "/tmp/t" })
+    .settings.permissions;
+  const { allow, deny } = perms;
   // The matcher compares from the START of the command, so a grant is a prefix.
-  const granted = allow.map(a => /^Bash\((.+):\*\)$/.exec(a)?.[1]).filter(Boolean);
-  const isGranted = cmd => granted.some(g => cmd === g || cmd.startsWith(g + " "));
+  // DENY beats allow, and reading only the allowlist is how a command could be
+  // both declared by the profile and refused by the sandbox: `npm publish` is
+  // granted from a unit's own declaration and denied by NEVER.
+  const prefixes = list => list.map(a => /^Bash\((.+):\*\)$/.exec(a)?.[1]).filter(Boolean);
+  const granted = prefixes(allow);
+  const refused = prefixes(deny);
+  const matches = (cmd, set) => set.some(g => cmd === g || cmd.startsWith(g + " "));
+  const isGranted = cmd => matches(cmd, granted) && !matches(cmd, refused);
 
   const claimed = claimedCommands(prof);
   check(claimed.length > 0, `control: ${name} claims at least one command`, JSON.stringify(claimed));

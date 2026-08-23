@@ -300,6 +300,26 @@ const RUNTIMES = {
   rust: ["cargo"],
 };
 
+/**
+ * Does the sandbox refuse this command whatever else it grants?
+ *
+ * Deny beats allow, so a declared project command can be in the allowlist and
+ * still be refused: a profile whose test command is `npm publish` gets
+ * `Bash(npm publish:*)` granted from its own declaration and denied by NEVER.
+ * The prompt must not offer one of those as an example, and a check that reads
+ * only `permissions.allow` cannot tell.
+ *
+ * Matching is by prefix, because that is how the permission matcher compares.
+ */
+export function commandDenied(cmd, profile) {
+  const rules = [...NEVER, ...(profile?.risk?.forbiddenCommands ?? []).map(c => `Bash(${c}:*)`)];
+  return rules.some(rule => {
+    const m = /^Bash\((.+):\*\)$/.exec(rule);
+    if (!m) return false;
+    return cmd === m[1] || cmd.startsWith(m[1] + " ");
+  });
+}
+
 /** Utilities that make a checkout readable. A fixer that cannot list a directory
  * is reduced to guessing at filenames. */
 const READ_ONLY_UTILITIES = ["ls", "cat", "head", "tail", "wc", "find", "which", "pwd"];
@@ -326,6 +346,8 @@ export function projectRunners(profile) {
     if (u.packageManager) runners.add(u.packageManager);
   }
   for (const r of READ_ONLY_UTILITIES) runners.add(r);
+  // A profile may forbid a command that is otherwise a runner, and deny wins.
+  for (const r of [...runners]) if (commandDenied(r, profile)) runners.delete(r);
   return runners;
 }
 

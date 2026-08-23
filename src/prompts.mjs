@@ -10,7 +10,7 @@
 // protocol containing instructions that contradicted each other and a path to a
 // checkout 47 commits stale.
 
-import { projectRunners } from "./sandbox.mjs";
+import { projectRunners, commandDenied } from "./sandbox.mjs";
 
 /**
  * The commands this prompt presents to a worker as runnable, in the order it
@@ -39,7 +39,12 @@ function exampleCommand(profile) {
   for (const u of profile?.units ?? []) {
     for (const c of Object.values(u.commands ?? {})) {
       if (c?.state !== "present" || !c.cmd) continue;
-      return c.cmd.trim().split(/\s+/).slice(0, 2).join(" ");
+      const head = c.cmd.trim().split(/\s+/).slice(0, 2).join(" ");
+      // Declared and granted is not the same as runnable: `npm publish` is in
+      // NEVER, and deny beats allow. Offering one of those as the example is the
+      // very contradiction this derivation exists to close.
+      if (commandDenied(head, profile)) continue;
+      return head;
     }
   }
   return null;

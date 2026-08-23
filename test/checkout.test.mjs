@@ -642,6 +642,71 @@ rmSync(root, { recursive: true, force: true });
     check(g(w, "rev-parse", "f") === before, "control: nothing was committed under an invented address", before.slice(0, 8));
   }
 
+  {
+    // A DETACHED head is a mismatch, not an unreadable repository.
+    // `symbolic-ref --quiet` exits nonzero when detached, which the first version
+    // read as a hard failure -- and a hard failure returns before the gate that
+    // scans the pushed ref for reeve's own token.
+    const w = mkWorktree("detached");
+    g(w, "checkout", "-q", "--detach", "HEAD");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x" });
+    check(r.ok === true && r.committed === false, "a detached head is skipped, not reported as a broken repository", JSON.stringify(r));
+    check(/detached head/.test(r.why ?? ""), "and is named as what it is", String(r.why));
+  }
+
+  {
+    // An inherited GIT_AUTHOR_* must not decide who a repair is attributed to.
+    // Git gives the environment precedence over `-c user.*`: measured,
+    // GIT_AUTHOR_NAME=Injected beside -c user.name=Founder produces Injected.
+    const w = mkWorktree("inherited-identity");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    const saved = { n: process.env.GIT_AUTHOR_NAME, e: process.env.GIT_AUTHOR_EMAIL,
+                    cn: process.env.GIT_COMMITTER_NAME, ce: process.env.GIT_COMMITTER_EMAIL };
+    process.env.GIT_AUTHOR_NAME = "Injected";
+    process.env.GIT_AUTHOR_EMAIL = "injected@evil.invalid";
+    process.env.GIT_COMMITTER_NAME = "Injected";
+    process.env.GIT_COMMITTER_EMAIL = "injected@evil.invalid";
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x" });
+    for (const [k, v] of [["GIT_AUTHOR_NAME", saved.n], ["GIT_AUTHOR_EMAIL", saved.e],
+                          ["GIT_COMMITTER_NAME", saved.cn], ["GIT_COMMITTER_EMAIL", saved.ce]])
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    check(r.ok && r.committed, "control: the commit was made with an identity in the environment", JSON.stringify(r).slice(0, 120));
+    check(g(w, "log", "-1", "--format=%an <%ae>") === "Founder <founder@example.invalid>",
+      "an inherited GIT_AUTHOR_* does not decide who a repair is attributed to", g(w, "log", "-1", "--format=%an <%ae>"));
+    check(g(w, "log", "-1", "--format=%cn <%ce>") === "Founder <founder@example.invalid>",
+      "and neither does an inherited GIT_COMMITTER_*", g(w, "log", "-1", "--format=%cn <%ce>"));
+  }
+
+  {
+    // What the DAEMON copied in before the worker started is not the worker's
+    // work. A repository that does not ignore its own dependency tree would
+    // otherwise have the whole thing staged into the repair.
+    const w = mkWorktree("deps-not-staged");
+    mkdirSync(join(w, "node_modules", "pkg"), { recursive: true });
+    writeFileSync(join(w, "node_modules", "pkg", "index.js"), "vendored\n");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x", exclude: ["node_modules"] });
+    check(r.ok && r.committed, "control: a repair beside an unignored dependency tree still commits", JSON.stringify(r).slice(0, 140));
+    check(r.files.includes("fix.js"), "the fix is staged", r.files.join(", "));
+    check(!r.files.some(f => f.startsWith("node_modules/")), "the dependency tree reeve copied in is not", r.files.join(", "));
+  }
+
+  {
+    // The message is built from model output that has read untrusted CI logs.
+    // The publication gate scans commit messages too, but only once the commit
+    // exists, and a secret in history is not undone by refusing the push.
+    const w = mkWorktree("secret-in-message");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    const before = g(w, "rev-parse", "HEAD");
+    const TOKEN = "sk-ant-oat01-test-token-not-a-real-credential";
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f",
+                              message: `fix(ci): repair it\n\nthe log said ${TOKEN}`,
+                              secrets: [{ label: "reeve's worker authentication token", value: TOKEN }] });
+    check(r.ok === false, "a commit message carrying reeve's own token is refused", JSON.stringify(r));
+    check(g(w, "rev-parse", "f") === before, "and no commit is made, so it never enters history", before.slice(0, 8));
+  }
+
   rmSync(cRoot, { recursive: true, force: true });
 }
 

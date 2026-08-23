@@ -124,6 +124,16 @@ function checkMergeAuthority(nwo) {
       }
       const hasChecks = (d.rules ?? []).some(x => x.type === "required_status_checks");
       if (!hasChecks) { level = BROKEN; lines.push(`ruleset ${d.name}: contains no required_status_checks rule at all`); }
+      // reeve commits a worker's repair itself, in a checkout whose global and
+      // system configuration are /dev/null, so it has no signing key and cannot
+      // acquire one without reaching back into the founder's environment -- which
+      // is the isolation this design exists to keep. Under this rule every repair
+      // is rejected at the push, AFTER a worker run has been paid for. Said here
+      // rather than discovered there.
+      if ((d.rules ?? []).some(x => x.type === "required_signatures")) {
+        level = BROKEN;
+        lines.push(`ruleset ${d.name}: requires signed commits, and reeve commits unsigned — every repair it makes will be refused at the push`);
+      }
     }
   }
 

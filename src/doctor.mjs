@@ -828,7 +828,7 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
   // `ls-remote origin` above still exercises origin's full configuration, which
   // is what reeve's own fetch uses. The credential question below needs no
   // network and no proxy, so it is asked per destination as before.
-  const unverified = [], https = [];
+  const unverified = [], unproven = [];
   for (const url of pushUrls) {
     const shown = withoutUserinfo(url);
     // ssh and local transports authenticate through the transport itself -- but
@@ -843,11 +843,15 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
     // they take the credential path whether or not they are the fetch url --
     // git's credential subsystem covers both schemes.
     if (!/^https?:\/\//.test(url)) {
-      if (url === fetchUrl.out) lines.push(`${shown} carries its own authentication, and the reach above went through it`);
+      // For READING. `ls-remote` speaks to git-upload-pack and a push speaks to
+      // git-receive-pack, so a read-only deploy key answers the first and
+      // refuses the second — the reach establishes the transport works, not
+      // that it may write. (Codex #14-[21].)
+      if (url === fetchUrl.out) { unproven.push(shown); lines.push(`${shown} carries its own authentication, and the reach above exercised it for READING`); }
       else { unverified.push(shown); lines.push(`${shown} carries its own authentication, which the reach above did NOT exercise: it went to the fetch url`); }
       continue;
     }
-    https.push(url);
+    unproven.push(shown);
     const cred = credential(checkout, url);
     // OBTAINED, not validated. `git credential fill` gets the fields from the
     // helpers; it does not present them to the server, so an expired, revoked,
@@ -871,7 +875,12 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
               "-> a push authenticates; reeve would fetch, judge and refuse at the last step"] };
   }
   if (separate) lines.push("the push destination(s) are not probed for reachability: a literal-url probe drops remote.origin.proxy and answers a different question");
-  if (https.length) lines.push(`-> not established: whether ${https.length > 1 ? "those credentials are" : "that credential is"} accepted, or authorised to write here — neither can be known without pushing`);
+  // One statement for every destination, whatever its transport. An https
+  // credential is obtained rather than validated; an ssh key answered the READ
+  // service. Neither says a push would be accepted, and both were previously
+  // claimed as though they did.
+  if (unproven.length) lines.push(`-> not established: whether a PUSH to ${unproven.join(", ")} would be accepted — ` +
+    "`ls-remote` speaks to git-upload-pack and a push to git-receive-pack, so a read-only key or token answers the read and refuses the write, and nothing here can tell them apart without pushing");
   if (unverified.length) return { id, level: DEGRADED, title,
     lines: [...lines, `-> publication to ${unverified.join(", ")} rests on configuration this check cannot exercise without pushing`] };
   return { id, level: OK, title, lines };

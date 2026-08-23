@@ -8,7 +8,7 @@
 //
 // A prompt that instructs an action the sandbox forbids is a contradiction the
 // worker cannot resolve, and it costs a whole dispatch to discover.
-import { promptFor } from "../src/prompts.mjs";
+import { promptFor, claimedCommands } from "../src/prompts.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 
 let fail = 0;
@@ -58,6 +58,72 @@ for (const action of ["FIX_CI", "FIX_FINDINGS"]) {
     for (const line of p.split("\n").filter(l => l.includes(c)))
       check(/never|do not|forbidden|irreversible/i.test(line),
         `${action}: "${c}" is only ever mentioned as forbidden`, line.trim());
+}
+
+// ---------------------------------------------------------------------------
+// Every command the prompt NAMES as runnable must actually be granted.
+//
+// The fixture above declares pnpm, which is why this went unmeasured until a
+// real dispatch found it: rule 0 hardcoded "`pnpm test` is permitted", and the
+// only profile ever tested against it also said pnpm, so prose and grant agreed
+// by coincidence. A worker on an npm project was told pnpm was permitted, tried
+// it, and was refused. That was the sixth measured instance of this shape.
+//
+// So the profiles below vary the one field that coincidence depended on.
+const PROFILES = {
+  "pnpm project": { units: [{ id: "root", language: "typescript", packageManager: "pnpm",
+                              commands: { test: { cmd: "pnpm test", state: "present" } } }], risk: {} },
+  "npm project": { units: [{ id: "root", language: "typescript", packageManager: "npm",
+                             commands: { test: { cmd: "npm test", state: "present" } } }], risk: {} },
+  "python project": { units: [{ id: "root", language: "python", packageManager: "uv",
+                                commands: { test: { cmd: "pytest -q", state: "present" } } }], risk: {} },
+  // `javascript` is not a RUNTIMES key, so this worker gets no named runtime at
+  // all. The prompt must not invent one for it.
+  "unrecognised language": { units: [{ id: "root", language: "javascript", packageManager: "npm",
+                                       commands: { test: { cmd: "npm test", state: "present" } } }], risk: {} },
+  // Nothing declared: the prompt still has to name only what exists.
+  "no units": { units: [], risk: {} },
+};
+
+for (const [name, prof] of Object.entries(PROFILES)) {
+  const allow = sandboxFor({ profile: prof, action: "FIX_CI", worktree: "/tmp/wt", tmpDir: "/tmp/t" })
+    .settings.permissions.allow;
+  // The matcher compares from the START of the command, so a grant is a prefix.
+  const granted = allow.map(a => /^Bash\((.+):\*\)$/.exec(a)?.[1]).filter(Boolean);
+  const isGranted = cmd => granted.some(g => cmd === g || cmd.startsWith(g + " "));
+
+  const claimed = claimedCommands(prof);
+  check(claimed.length > 0, `control: ${name} claims at least one command`, JSON.stringify(claimed));
+
+  for (const cmd of claimed)
+    check(isGranted(cmd), `${name}: the prompt names \`${cmd}\`, and the grant carries it`,
+          `granted: ${granted.join(", ")}`);
+
+  // And the prose really does contain them, or the check above is measuring a
+  // list nobody reads.
+  const prompt = promptFor({ action: "FIX_CI", why: "x" },
+    { profile: prof, nwo: "o/r", pr: 1, head: "a".repeat(40), attempt: 1,
+      cause: { ok: true, job: "CI", step: "t", cause: [{ where: "f", message: "boom" }] } })?.prompt ?? "";
+  for (const cmd of claimed)
+    check(prompt.includes(`\`${cmd}`), `${name}: \`${cmd}\` appears in the prompt text`,
+          prompt.split("\n").filter(l => l.includes("permitted") || l.includes("plain command")).join(" | ").slice(0, 200));
+
+  // The direct property, read off the PROSE rather than off the list that built
+  // it: no backticked command in rule 0 may be one the grant does not carry.
+  // Without this, a hardcoded example could be reintroduced beside a correct
+  // claimedCommands() and both checks above would still pass.
+  const rule0 = /^0\.[\s\S]*?(?=\n1\.)/m.exec(prompt.slice(prompt.indexOf("RULES")))?.[0] ?? "";
+  check(rule0.length > 200, `control: ${name} rule 0 was extracted`, String(rule0.length));
+  // Shapes rule 0 names in order to forbid them. A sentence explaining what is
+  // refused is not a claim that it works.
+  const REFUSED_BY_DESIGN = ["env", "sh", "for"];
+  const mentioned = [...rule0.matchAll(/`([^`]+)`/g)]
+    .map(m => m[1].replace(/\s*…\s*$/, "").trim())
+    .filter(c => !c.includes("2>&1") && !REFUSED_BY_DESIGN.includes(c));
+  check(mentioned.length > 0, `control: ${name} rule 0 names commands at all`, JSON.stringify(mentioned));
+  for (const cmd of mentioned)
+    check(isGranted(cmd), `${name}: rule 0 names \`${cmd}\`, and it is granted`,
+          `granted: ${granted.join(", ")}`);
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

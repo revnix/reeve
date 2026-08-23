@@ -3627,13 +3627,22 @@ And a block for the unreadable case, which is the one this route is named for:
     const q = new DatabaseSync(snap, { readOnly: true });
     try { return q.prepare("SELECT COALESCE(max(seq),0) s FROM hub_event").get().s; } finally { q.close(); }
   })();
-  const tail = [{ seq: snapMax + 1, at: 1, kind: "task.transitioned", task: "bt:2",
+  const tailEvents = [{ seq: snapMax + 1, at: 1, kind: "task.transitioned", task: "bt:2",
                   payload: JSON.stringify({
                     id: "bt:2", project: "p", repo_id: 1, nwo_snapshot: "o/r", title: "t",
                     phase: "SIZING", generation: 1, source_kind: "founder", source_key: "k2",
                     repo_path: "/p", profile_path: "/f", profile_hash: "h",
                     default_branch: "main", visibility: "private", registry_version: 1,
                     created_at: 1, updated_at: 1 }) }];
+  // Through the REAL export format, like every other tail fixture here. A bare
+  // array carries neither a manifest nor an observed digest, so `restoreHub`
+  // refuses it before replay and NONE of this block's recovery assertions can
+  // run -- `yes.ok` is false for the envelope, not for anything this drill is
+  // about. Three fixtures in this file supply a tail; when the footer was
+  // introduced two were converted and this one was not.
+  const recoverPath = join(home, "recover-tail.jsonl");
+  writeTail(recoverPath, tailEvents);
+  const tail = readTail(recoverPath);
   const yes = restoreHub(snap, p, { isAlive: () => false, pid: process.pid, lstart: "L", force: true, tail });
   check(yes.ok, "restore --hub --tail recovers a hub too corrupt to open", JSON.stringify(yes));
   check(yes.quarantined && existsSync(yes.quarantined),
@@ -3674,8 +3683,16 @@ And a block for the unreadable case, which is the one this route is named for:
     // different and this fixture must exhibit only the second: written as a bare
     // array it was refused for its missing manifest and the assertion below went
     // green having never reached the payload it names.
+    // `snapMax + 1`, DERIVED -- the same rule the recovery fixture above states
+    // in as many words, and this one sat two blocks below it still carrying a
+    // literal 100. Against a snapshot whose max seq is 1 that makes the
+    // continuity check report 2..99 missing and return `{ok:false}` BEFORE
+    // replay ever parses the payload, so the refusal is about a gap, this
+    // block never reaches the staging-and-replay seam it exists to guard, and
+    // the byte-preservation assertions below pass even against an
+    // implementation that moves the canonical file and strands it.
     const badPath = join(home, "bad-tail.jsonl");
-    writeTail(badPath, [{ seq: 100, at: 1, kind: "task.transitioned", task: "bt:3", payload: "{not json" }]);
+    writeTail(badPath, [{ seq: snapMax + 1, at: 1, kind: "task.transitioned", task: "bt:3", payload: "{not json" }]);
     const bad = readTail(badPath);
     check(bad.manifest != null && bad.sha256 === bad.manifest.sha256,
       "fixture: the bad tail's ENVELOPE is valid, so the refusal below is about the payload",
@@ -3686,6 +3703,14 @@ And a block for the unreadable case, which is the one this route is named for:
     const before = readFileSync(p);
     const failed = restoreHub(snap, p, { isAlive: () => false, pid: process.pid, lstart: "L", force: true, tail: bad });
     check(!failed.ok, "fixture: a malformed tail fails the restore", JSON.stringify(failed));
+    // WHICH refusal, not just that there was one. Contiguity and the manifest
+    // both refuse earlier than replay, and either would satisfy the line above
+    // while this drill silently stopped short of the destructive seam. Naming
+    // the two earlier refusals and excluding them is what makes the
+    // byte-preservation assertions below mean anything.
+    check(!/not a complete run|manifest|digest/.test(String(failed.why)),
+      "and it is refused at REPLAY, not by contiguity or the footer -- the seam this drill guards",
+      String(failed.why));
     check(existsSync(p) && before.equals(readFileSync(p)),
       "a failed recovery leaves the database at the canonical path, byte for byte",
       `${existsSync(p)} ${readFileSync(p).length} vs ${before.length}`);
@@ -5114,8 +5139,19 @@ Add the case, and add `bin/reeve` to the commit:
                                      if (!f) return null;
                                      const path = join(dir, f);
                                      // The epoch in the FILENAME, not the mtime.
-                                     // (`basename` joins bin/reeve's node:path
-                                     //  import, which has join/dirname/resolve.)
+                                     //
+                                     // `basename` MUST be added to bin/reeve's
+                                     // node:path import, which reads
+                                     // `{ join, dirname, resolve }` on
+                                     // `16769e7` (bin/reeve:18) and becomes
+                                     // `{ join, dirname, resolve, basename }`.
+                                     // Stated as an instruction rather than a
+                                     // parenthetical because an unimported
+                                     // `basename` has already shipped once in
+                                     // this programme: both call sites below
+                                     // throw ReferenceError at the first
+                                     // `builder doctor` invocation, which is
+                                     // the whole command.
                                      // `snapshot()` writes `<epoch>.db`, and that
                                      // is the authoritative creation time; a copy
                                      // back from off-device storage carries a
@@ -5140,7 +5176,16 @@ Add the case, and add `bin/reeve` to the commit:
                                      // returns `integrity: null`, so labelling it "integrity_check
                                      // passed" reports a green H-2 for a snapshot with page corruption
                                      // outside the schema pages -- the one failure H-2 exists to find.
-                                     return s ? { path: s, at: statSync(s).mtimeMs / 1000,
+                                     // The epoch from the FILENAME, like
+                                     // `newestCandidate`. The comment above
+                                     // claimed this rule and the line below
+                                     // still read `statSync(s).mtimeMs`, which
+                                     // is the copy time -- so H-1 called a
+                                     // days-old snapshot restored from
+                                     // off-device fresh for another 24 hours,
+                                     // at exactly the moment an operator most
+                                     // needs the true age.
+                                     return s ? { path: s, at: Number(basename(s).split(".")[0]),
                                                   ...validateSnapshot(s, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true }) } : null;
                                    } });
     } finally { db.close(); }
@@ -5253,8 +5298,12 @@ shape this programme keeps finding:
 }
 ```
 
-`spawnSync` from `node:child_process` and `statSync` from `node:fs` join the
-imports. `renderHub` is `hubFindings`' human renderer, added in `src/doctor.mjs`
+`spawnSync` from `node:child_process` joins this file's imports. **`statSync`
+does not**: it was listed here for `snapshotFor`, which lives in `bin/reeve` and
+now reads the epoch from the filename via `basename` instead — so this test file
+never used it, and `bin/reeve` needs `basename` rather than `statSync`. That
+import is instructed at the `snapshotFor` call site itself, where it is used.
+`renderHub` is `hubFindings`' human renderer, added in `src/doctor.mjs`
 beside the existing `render`.
 
 Then wire `hubFindings` into that route's `--json` output. Then extend `selfaudit.mjs` **concretely** — a sentence is not an implementation direction, and the control below is what makes the check mean something:

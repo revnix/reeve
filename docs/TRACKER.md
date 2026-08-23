@@ -146,6 +146,29 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       approved direction; implementation gated by P0 closure. Merge stays dark
       behind `builder.capabilities.mergeBuilderPr` + `--actuate-merges`.
 - [x] Implementation plan for S0 + S1: `docs/superpowers/plans/2026-08-21-s1-worker-contract.md`
+- [x] **S2 plans, split into three (2026-08-23).** A single 5,300-line plan went
+      four Codex rounds on #8 and took **54 findings (15, 10, 13, 16 — not
+      converging)**. A majority of each round after the first was caused by the
+      PREVIOUS round's own fixes: an edit in a document that large cannot see its
+      neighbourhood. Split along the PR boundaries it already declared, one
+      document per PR, each self-contained and reviewed on its own:
+      `2026-08-23-s2a-hub-store.md` (13 tasks, #11) →
+      `2026-08-23-s2b-phase-machine.md` (7 tasks, #12) →
+      `2026-08-23-s2c-provider-scheduler.md` (5 tasks, #13), in that order.
+      **Only the S2-A document is in THIS commit**; B and C land with their own
+      PRs, so the links above resolve once those merge.
+      Review history kept in `2026-08-23-s2-review-history.md`; #8 closed as
+      superseded, its 54 resolved threads standing as the record. Founder
+      decisions unchanged: guardian fails OPEN on an unreadable hub;
+      `ci.flakePatterns` removal is PLANNED, in S2-A's Task 12 — it is still
+      declared at `src/profile/schema.mjs:183` after #9, and removing it from
+      `FIELDS` without stripping the live profile in the same change would make
+      every daemon start fail
+      (`docs/measured/2026-08-22-flakepatterns-has-no-readers.md`);
+      `repo_gate_state` ships with a pure derivation behind an injected fetcher.
+      **The durable finding is about plan SIZE**: a plan needing four rounds and
+      still finding sixteen defects at the fourth is one document doing three
+      documents' work.
 - [x] **PR-1 (S0 + S1 core) — LANDED 2026-08-21, revnix/reeve #3, merge
       `0d313502`.** Capability switches (all false on the live profile),
       authority baseline + doctor R-13 (live: matches), workerArgs hard-fail +

@@ -109,6 +109,12 @@ const PROFILES = {
   // worker may not run them, which is different from the project having none.
   "all commands denied": { units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm",
                                      commands: { release: { cmd: "npm publish", state: "present" } } }], risk: {} },
+  // No plain NAME survives, but a declared command does: an unrecognised language,
+  // no package manager, and `make test`, with git and the utilities forbidden.
+  // `Bash(make test:*)` is granted from the declaration alone.
+  "only a declared command": { units: [{ id: "root", root: ".", language: "cobol",
+                                         commands: { test: { cmd: "make test", state: "present" } } }],
+                               risk: { forbiddenCommands: ["git", "ls", "cat", "head", "tail", "wc", "find", "which", "pwd"] } },
   // Nothing runnable at all: no units, and git plus every read-only utility
   // forbidden.
   "nothing runnable": { units: [],
@@ -187,6 +193,10 @@ for (const [name, prof] of Object.entries(PROFILES)) {
 
   // A profile with nothing else granted still has the interpreter, by absolute
   // path, and must be pointed at it rather than told it has nothing.
+  if (name === "only a declared command") {
+    check(/make test/.test(rule0), "only a declared command: rule 0 names the command the declaration granted", rule0.slice(-300));
+    check(!/only shell command/.test(prompt), "and does not call the interpreter the only one", "");
+  }
   if (name === "nothing runnable") {
     check(prompt.includes(process.execPath), "nothing runnable: the worker is pointed at the interpreter it does have", "");
     check(!/no shell commands granted/.test(prompt), "and is not told it has none", "");

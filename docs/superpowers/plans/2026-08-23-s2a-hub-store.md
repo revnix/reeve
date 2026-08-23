@@ -1940,7 +1940,7 @@ Add to `bin/reeve`, beside the existing `case "run":`:
     const sub = process.argv[3];
     if (sub !== "run" && sub !== "status")
       die(`usage: reeve build run [--takeover] | reeve build status`);
-    const db = openHub(hubPathFor(reeveHome()));
+    const db = openHub(hubPathFor(HOME));
     if (sub === "status") {
       // Defined here rather than referenced: an advertised command that throws
       // ReferenceError is worse than one that does not exist.
@@ -2744,7 +2744,10 @@ Add to `bin/reeve`:
     // not itself a positional under this parser, so index 1 was always undefined
     // and the command could never run.
     const out = positionals[0] ?? die("usage: reeve export-events --hub <file>");
-    const db = openHub(hubPathFor(reeveHome()));
+    // RAW and read-only, not openHub: exporting is a read, and openHub would
+    // MIGRATE the very database the operator is trying to get history out of --
+    // quite possibly the one they are exporting because they do not trust it.
+    const db = new DatabaseSync(hubPathFor(HOME), { readOnly: true });
     const rows = db.prepare("SELECT seq,at,kind,task,payload FROM hub_event ORDER BY seq").all();
     writeFileSync(out, rows.map(r => JSON.stringify(r)).join("\n") + (rows.length ? "\n" : ""));
     console.log(`exported ${rows.length} hub events to ${out}`);
@@ -2997,7 +3000,33 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
 import { HUB_SCHEMA_VERSION } from "./build/hubdb.mjs";
 ```
 
-Wire `hubFindings` into `reeve builder doctor` and its `--json` output, and extend `selfaudit.mjs` to assert the hub's `integrity_check` alongside the per-repo stores.
+Wire `hubFindings` into `reeve builder doctor` and its `--json` output. Then extend `selfaudit.mjs` **concretely** — a sentence is not an implementation direction, and the control below is what makes the check mean something:
+
+```js
+// src/selfaudit.mjs, beside the per-repo integrity walk:
+const hub = hubPathFor(home);
+if (existsSync(hub)) {
+  const d = new DatabaseSync(hub, { readOnly: true });
+  try {
+    const r = Object.values(d.prepare("PRAGMA integrity_check").get())[0];
+    findings.push(r === "ok"
+      ? { level: "ok",    text: "hub integrity_check: ok" }
+      : { level: "error", text: `hub integrity_check: ${r}` });
+  } finally { d.close(); }
+}
+```
+
+```js
+// in test/hub-doctor.test.mjs:
+{
+  const p = join(dir, "audit.db"); openHub(p).close();
+  check(selfAudit(dir).some(f => /hub integrity_check: ok/.test(f.text)),
+    "self-audit reports the hub's integrity alongside the per-repo stores");
+  const fd = openSync(p, "r+"); writeSync(fd, Buffer.alloc(4096, 0x41), 0, 4096, 8192); closeSync(fd);
+  check(selfAudit(dir).some(f => f.level === "error" && /hub integrity/.test(f.text)),
+    "and reports an ERROR when the hub is corrupt, so a silent audit is not a passing one");
+}
+```
 
 - [ ] **Step 4: Run it, then commit**
 

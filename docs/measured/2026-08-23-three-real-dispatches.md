@@ -10,7 +10,7 @@ August (`f60fbbb` "record what the first real dispatch taught", `866b9ba` "what
 eight execute dispatches taught"), and `docs/HANDOFF.md:442` records **three
 complete dispatches that published, CI-verified on GitHub**. What is new here is
 the *contract*: the OS sandbox (`1a2fbea`, 2026-08-22 10:47, S1 PR-2) and
-standalone checkouts under a scratch HOME (`e2bb635`). These are the first three
+standalone checkouts under a scratch HOME (`0fdf351`). These are the first three
 runs under it.
 
 That distinction turned out to be the entire story. An earlier draft of this
@@ -193,15 +193,22 @@ reeve's own detection never emits `javascript` (`profile/detect.mjs:55` maps any
 nothing live is affected today. It is a fail-silent in a codebase whose posture
 everywhere else is fail-closed and say so.
 
-## Finding 4: the worker leaves litter it cannot delete
+## Finding 4: the worker leaves litter, and does not reach for the tool that would remove it
 
 While probing whether it could write, the worker created `scratch_write_test.txt`
 with a Bash redirect. `rm` is not in the grant, so three attempts to remove it
 were refused. That stray file counts as an uncommitted change and would block
 publication on its own.
 
-It is secondary. Even with the worktree spotless, Finding 1 means there would
-have been nothing committed to push.
+**It was not undeletable.** `Bash(git:*)` is granted, `git clean` is denied
+nowhere, and it removes untracked files without writing under `.git` — so
+`git clean -f -- scratch_write_test.txt` was available the whole time. What the
+transcript shows is three refused `rm` calls and no attempt at the tool that
+would have worked, which is a gap in what the worker was told rather than a
+boundary in what it was allowed.
+
+Secondary either way. Even with the worktree spotless, Finding 1 means there
+would have been nothing committed to push.
 
 ## What could not be re-measured
 

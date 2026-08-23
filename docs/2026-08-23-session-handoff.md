@@ -69,7 +69,7 @@ Full write-up: `docs/measured/2026-08-23-three-real-dispatches.md` (PR #15).
 20–21 August (`f60fbbb`, `866b9ba`) and `docs/HANDOFF.md:442` records three that
 published, CI-verified. These three are the first under the contract that landed
 on 22 August: the OS sandbox (`1a2fbea`) plus scratch-HOME standalone checkouts
-(`e2bb635`). That distinction is the whole story.
+(`0fdf351`). That distinction is the whole story.
 
 The experiment was built to find a **confidently bad fix**. It did not find one.
 
@@ -106,9 +106,12 @@ runs, routed at `daemon.mjs:1161` (`outcome !== OK`) before the gate at
    and there is no `javascript` key. The absolute `execPath` grant survives, but
    finding 2's instruction forbids using it. Nothing live is affected (detection
    only emits `typescript`).
-4. **The worker leaves litter it cannot delete.** A Bash-redirect scratch file;
-   `rm` is not granted. It would block a push on its own — but it is not why
-   nothing published, because nothing was committable in the first place.
+4. **The worker leaves litter, and does not reach for the tool that removes it.**
+   A Bash-redirect scratch file; `rm` is not granted, and three attempts at it
+   were refused. But `git clean -f --` was available the whole time (`Bash(git:*)`
+   is granted and `git clean` writes nothing under `.git`), so this is a gap in
+   what the worker was told, not a boundary. It would block a push on its own —
+   but it is not why nothing published, because nothing was committable anyway.
 
 **Withdrawn:** an earlier draft claimed the worker burned "28 of 40 turns"
 retrying refusals across runs 1–2. The fixture reuses one path, so run 3
@@ -121,8 +124,11 @@ everywhere; it is in the contract, not the fixture.
 
 **The standing cost:** `maxFixAttemptsPerFinding` is **1**, and the attempt is
 spent when the RUN succeeds (`daemon.mjs:857`), not when publication does —
-verified as one unrefunded `fix_attempt` row. So each red PR gets one shot, and
-on this evidence it is spent producing a fix that cannot ship.
+verified as one unrefunded `fix_attempt` row. Not every red PR spends it —
+`watcher.mjs:120-136` escalates a missing required check, an inherited-only
+failure, or one it cannot name without dispatching at all. But a caused, named
+failure gets one shot, and on this evidence it is spent producing a fix that
+cannot ship.
 
 ---
 

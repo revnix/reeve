@@ -131,22 +131,62 @@ export const INSTRUMENT_LOCAL_SOURCES = ["./canary.mjs", "./supervisor.mjs", "./
  * them changes what a pass means, from outside this file. (Codex #14-[19].)
  *
  * The rot guard below can see what canary.mjs imports; it cannot see what a
- * caller assembles. That blind spot is real and is not closed here: hashing
- * daemon.mjs would re-measure on every unrelated edit to the daemon, and
- * parsing one function's body for imports is a guard that breaks quietly. This
- * entry is declared by hand, and the comment is the reason a reader should
- * check it when `measuredContainment` grows a dependency.
+ * caller assembles, so this entry is declared by hand and asserted by name.
  */
 export const INSTRUMENT_CALLER_SOURCES = ["./workerenv.mjs"];
+
+/**
+ * ...and the assembly ITSELF, which naming its dependencies does not cover.
+ *
+ * `measuredContainment` chooses the arguments -- which HOME, which shims, which
+ * git configuration -- so a release that changes the call while leaving
+ * workerenv.mjs alone changes what a pass means and moves nothing.
+ *
+ * I first argued this could not be closed: hashing daemon.mjs re-measures on
+ * every unrelated edit to the daemon, and parsing for module references is a
+ * guard that breaks QUIETLY. A reviewer pushed, and the second objection is the
+ * one that does not hold -- a parse can be made to break LOUDLY. One function
+ * is sliced rather than the file, so unrelated daemon edits cost nothing; a
+ * slice that fails returns a marker that cannot collide with real source, which
+ * forces a re-measurement rather than a silent match; and a test asserts the
+ * slice actually finds the function, so a rename fails the suite instead of
+ * quietly hashing nothing. (Codex #14-[20].)
+ */
+const INSTRUMENT_ASSEMBLY = { file: "./daemon.mjs", fn: "measuredContainment" };
+
+export function assemblySource() {
+  const here = dirname(fileURLToPath(import.meta.url));
+  let text;
+  try { text = readFileSync(join(here, INSTRUMENT_ASSEMBLY.file), "utf8"); }
+  catch { return `<unreadable:${INSTRUMENT_ASSEMBLY.file}>`; }
+  const lines = text.split("\n");
+  const opens = [`export async function ${INSTRUMENT_ASSEMBLY.fn}(`, `export function ${INSTRUMENT_ASSEMBLY.fn}(`];
+  const start = lines.findIndex(l => opens.some(o => l.startsWith(o)));
+  if (start < 0) return `<not-found:${INSTRUMENT_ASSEMBLY.fn}>`;
+  const end = lines.findIndex((l, i) => i > start && l === "}");
+  if (end < 0) return `<unterminated:${INSTRUMENT_ASSEMBLY.fn}>`;
+  return lines.slice(start, end + 1).join("\n");
+}
 export const INSTRUMENT_SOURCES = [...INSTRUMENT_LOCAL_SOURCES, ...INSTRUMENT_CALLER_SOURCES];
 export const INSTRUMENT_NOT_SOURCES = [];
 
 let sourceHashCache = null;
-function instrumentSourceHash() {
-  if (sourceHashCache) return sourceHashCache;
+
+/**
+ * Injectable, so a test can VARY an input and watch the output move.
+ *
+ * It was not, and a stub that removed the assembly from the hash turned nothing
+ * red: the tests asserted that `assemblySource()` finds the function, never that
+ * its result reaches the digest. Checking a part works is not checking it is
+ * wired in, and only the default call is cached — a call with arguments is a
+ * question about behaviour, not the daemon's hot path.
+ */
+export function instrumentSourceHash({ sources = null, assembly = assemblySource } = {}) {
+  const dflt = sources === null && assembly === assemblySource;
+  if (dflt && sourceHashCache) return sourceHashCache;
   const here = dirname(fileURLToPath(import.meta.url));
   const h = createHash("sha256");
-  for (const rel of INSTRUMENT_SOURCES) {
+  for (const rel of sources ?? INSTRUMENT_SOURCES) {
     h.update(rel);
     // A source that cannot be read gets a marker rather than nothing: it cannot
     // collide with that file's real bytes, so the effect is a re-measurement
@@ -155,7 +195,9 @@ function instrumentSourceHash() {
     try { h.update(readFileSync(join(here, rel))); }
     catch { h.update(`<unreadable:${rel}>`); }
   }
-  return (sourceHashCache = h.digest("hex").slice(0, 12));
+  h.update(assembly());
+  const out = h.digest("hex").slice(0, 12);
+  return dflt ? (sourceHashCache = out) : out;
 }
 
 /**

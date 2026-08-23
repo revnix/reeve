@@ -356,6 +356,29 @@ imports is a guard that breaks quietly. The entry is declared by hand, asserted
 by name, and the comment says why a reader should check it when
 `measuredContainment` grows a dependency.
 
+## A read-only key answers the read and refuses the write
+
+Round nine, and it is the ssh half of a limit already conceded for https.
+
+`ls-remote` speaks to **git-upload-pack**; a push speaks to **git-receive-pack**.
+A read-only deploy key answers the first and refuses the second. The ssh branch
+said the reach had exercised the push transport's authentication — true of the
+transport, false of the authorisation, and the sentence claimed the second.
+
+It now says the reach exercised it **for reading**, and every destination —
+https or ssh — carries the same closing statement:
+
+```
+-> not established: whether a PUSH to <url> would be accepted — `ls-remote` speaks to
+   git-upload-pack and a push to git-receive-pack, so a read-only key or token answers
+   the read and refuses the write, and nothing here can tell them apart without pushing
+```
+
+The verdict stays OK, for the reason given when the same remedy was proposed for
+https credentials: there is no path from these observations to a proven write
+that does not push, so DEGRADED would be the permanent state of every remote and
+a permanently degraded check is one its reader skips.
+
 ## What this does not establish, said in the report rather than only here
 
 That a push would SUCCEED. `git credential fill` obtains the fields from the

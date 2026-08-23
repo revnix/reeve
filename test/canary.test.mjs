@@ -7,7 +7,7 @@
 // daemon at start (under the CLI); this file proves the judge.
 import { sandboxCanary, canaryIdFor, policyHashOf, canaryScript, CANARY_INSIDE_CONTROL, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, parseWriteProbe, isPolicyRefusal, netListener, CANARY_SENTINEL, instrumentHash } from "../src/canary.mjs";
 import { measureContainment } from "../src/containment.mjs";
-import { currentInstrument, INSTRUMENT_SOURCES, INSTRUMENT_LOCAL_SOURCES, INSTRUMENT_CALLER_SOURCES, INSTRUMENT_NOT_SOURCES } from "../src/canary.mjs";
+import { currentInstrument, assemblySource, instrumentSourceHash, INSTRUMENT_SOURCES, INSTRUMENT_LOCAL_SOURCES, INSTRUMENT_CALLER_SOURCES, INSTRUMENT_NOT_SOURCES } from "../src/canary.mjs";
 import { createHash } from "node:crypto";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
@@ -518,6 +518,31 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   // it, since it is not an import of this file, so it is asserted by name.
   check(INSTRUMENT_CALLER_SOURCES.includes("./workerenv.mjs") && INSTRUMENT_SOURCES.includes("./workerenv.mjs"),
     "  and workerenv.mjs, which builds the environment the probe measures the isolation of", INSTRUMENT_SOURCES.join(","));
+
+  // The ASSEMBLY itself, which naming its dependencies does not cover:
+  // `measuredContainment` chooses which HOME, which shims, which git config, so
+  // a release changing the CALL while leaving workerenv.mjs alone changes what a
+  // pass means. One function is sliced rather than the whole daemon, so
+  // unrelated edits cost nothing.
+  const asm = assemblySource();
+  check(asm.startsWith("export async function measuredContainment("),
+    "the caller's assembly is found and hashed, not merely its dependencies", JSON.stringify(asm.slice(0, 60)));
+  check(asm.split("\n").length > 20 && asm.trimEnd().endsWith("}"),
+    "  and it is the whole function, not a fragment", `${asm.split("\n").length} lines`);
+  // The point of asserting the above: a rename or a reformat that breaks the
+  // slice would otherwise hash a marker forever — fail-closed, but silently
+  // re-measuring on every release and telling nobody why. This turns that into
+  // a red test instead, which was the objection to parsing in the first place.
+  check(!/^</.test(asm), "  and a failed slice is a test failure, not a quiet marker", asm.slice(0, 40));
+
+  // ...and that it is WIRED IN. The three assertions above all passed with the
+  // assembly removed from the digest: they check that the slice works, which is
+  // not the same as checking its result reaches the hash. Vary the input and
+  // watch the output move.
+  check(instrumentSourceHash({ assembly: () => "ASSEMBLY-A" }) !== instrumentSourceHash({ assembly: () => "ASSEMBLY-B" }),
+    "  and a change to the assembly CHANGES the instrument, which is the part being claimed", "");
+  check(instrumentSourceHash({ assembly: () => "SAME" }) === instrumentSourceHash({ assembly: () => "SAME" }),
+    "  while an unchanged one does not, so the hash is a function of it and not of the clock", "");
 }
 
 // ── the recorded id IS the cache key ─────────────────────────────────────────

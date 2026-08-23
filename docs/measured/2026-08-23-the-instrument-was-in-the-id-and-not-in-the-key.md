@@ -215,3 +215,48 @@ The cost is one extra re-measurement for a sandbox.mjs edit that does NOT change
 the generated policy — because an edit that does change it already moves the
 policy hash and forces one anyway. So the coverage is complete and the added
 expense is close to nil.
+
+## The caller itself, and an objection that did not hold
+
+Round nine. Naming workerenv.mjs covered the assembly's DEPENDENCIES and not the
+assembly: `measuredContainment` chooses which HOME, which shims, which git
+configuration, so a release changing the CALL while leaving workerenv.mjs alone
+changes what a pass means and moves nothing.
+
+I had argued this could not be closed, for two reasons:
+
+1. hashing daemon.mjs re-measures on every unrelated edit to the daemon;
+2. parsing for module references is a guard that breaks QUIETLY.
+
+The first holds. **The second does not** — a parse can be made to break loudly.
+One function is sliced rather than the file, so unrelated daemon edits cost
+nothing; a slice that fails returns a marker that cannot collide with real
+source, which forces a re-measurement; and a test asserts the slice actually
+finds the function, so a rename fails the suite instead of hashing a marker
+forever and telling nobody why.
+
+The reviewer was right to push on an objection I had stated as though both
+halves were equally solid.
+
+## A guard that checked the part and not the wiring
+
+The first three assertions written for that slice all passed **with the assembly
+removed from the digest**. They checked that `assemblySource()` finds the
+function, is the whole function, and does not return a marker. None of them
+checked that its result reaches the hash.
+
+Found by the stub loop, which returned zero red for a stub that deleted the
+line — the clearest possible statement that the tests were about the part and
+not about it being wired in.
+
+`instrumentSourceHash` takes its inputs now, so a test can vary one and watch
+the output move:
+
+```js
+instrumentSourceHash({ assembly: () => "ASSEMBLY-A" })
+  !== instrumentSourceHash({ assembly: () => "ASSEMBLY-B" })
+```
+
+Only the default call is cached; a call with arguments is a question about
+behaviour rather than the daemon's hot path. Both the deletion stub and a stub
+that caches regardless of the injected inputs now turn it red.

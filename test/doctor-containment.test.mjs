@@ -96,8 +96,12 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
     const io = seams({}, { ok: true });
     const c = checkRemoteReach(pub, io);
     check(c.level === "OK", "control: reachable AND a credential available is OK", c.lines.join(" | "));
-    check(!/password|token|ghp_|gho_/.test(c.lines.join(" ")),
-      "  and no credential value appears anywhere in the report", c.lines.join(" | "));
+    // The SHAPE a credential reply has, not the bare words: `founderCredential`
+    // reads git's stdout, and the failure this guards against is echoing that
+    // into the report. Matching the word "token" instead made the assertion
+    // trip on prose that legitimately explains what a read-only token does.
+    check(!/password=|credential=|ghp_|gho_|github_pat_/.test(c.lines.join(" ")),
+      "  and nothing shaped like a credential reply appears in the report", c.lines.join(" | "));
   }
   {
     // ssh authenticates through the transport, so the reach already exercised it
@@ -437,6 +441,21 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
                      { ok: false, why: "no helper answered" });
     check(checkRemoteReach(pub, io).level === "DEGRADED",
       "a QUOTED netrc machine name is matched, not missed", checkRemoteReach(pub, io).lines.join(" | "));
+  }
+  {
+    // A read-only deploy key answers `ls-remote` and refuses the push:
+    // ls-remote speaks to git-upload-pack, a push to git-receive-pack. So the
+    // reach establishes the transport works, not that it may write — and the
+    // ssh branch had been claiming the second.
+    const io = seams({ url: "git@github.com:o/r.git" }, { ok: false, why: "should not be asked" });
+    const c = checkRemoteReach({ identity: { checkout: "/co", defaultBranch: "main" } }, io);
+    const all = c.lines.join(" ");
+    check(/exercised it for READING/.test(all),
+      "an ssh reach is reported as having exercised the READ service", all);
+    check(/not established/.test(all) && /git-receive-pack/.test(all) && /without pushing/.test(all),
+      "  and the write service is named as unestablished, as it is for https", all);
+    check(c.level === "OK",
+      "  the verdict stays OK: a permanently degraded check is one its reader skips", c.lines.join(" | "));
   }
   {
     // Control: no alternative configured, so a silent helper is still BROKEN.

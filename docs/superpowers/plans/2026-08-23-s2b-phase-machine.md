@@ -170,9 +170,17 @@ const seed = (db, over = {}, { events = 10 } = {}) => hubTx(db, () => {
                       created_at,updated_at)
      VALUES(?,?,?,?,?,?,?,'founder','k','/p','/f','h','main','private',1,unixepoch(),unixepoch())`)
     .run(t.id, t.project, t.repo_id, t.nwo, t.title, t.phase, t.generation);
-  for (let seq = 1; seq <= events; seq++)
+  // Sequence numbers CONTINUE from whatever is already there. Restarting at 1
+  // meant a second `seed` into the same database collided on phase_event's
+  // primary key and aborted setup -- so any block seeding a second task (a
+  // territory blocker, a drain owner) failed before reaching its assertions,
+  // and reported that as a defect in the code under test. Allocating instead of
+  // assuming removes the constraint on every present and future caller rather
+  // than on the one that noticed.
+  const base = db.prepare("SELECT COALESCE(max(seq),0) s FROM phase_event").get().s;
+  for (let i = 1; i <= events; i++)
     db.prepare(`INSERT INTO phase_event(seq,task,at,op,from_phase,to_phase,detail)
-                VALUES(?,?,unixepoch(),'seed',NULL,?,'{}')`).run(seq, t.id, t.phase);
+                VALUES(?,?,unixepoch(),'seed',NULL,?,'{}')`).run(base + i, t.id, t.phase);
   return t;
 });
 ```
@@ -214,7 +222,14 @@ Each task names any imports it needs **beyond** these.
   - `nextPhase(state, evidence) -> Transition | Refusal` where
     `state = { phase, generation, heldFrom, sliceCursor, drainRemaining, hasOpenPr, pinnedTerritory }`,
     `Transition = { ok: true, to, generation, bumps, compensations: string[] }`,
-    `Refusal = { ok: false, refusal: string, stackable?: true }`.
+    `Refusal = { ok: false, refusal: string, stackable?: true, persistDepth?: Depth, compensations?: string[] }`.
+  - **A refusal can carry a durable consequence**, and two do. `persistDepth` and
+    `compensations` both ride the refusal shape because a `depth.override` on
+    SIZING, RESEARCH or DESIGN refuses the *transition* — the phase genuinely
+    does not change — while accepting the *override*, which has to be written and
+    has to end the attempt running under the old depth. `applyTransition`'s
+    refusal branch applies both before it logs `transition.refused`. Every other
+    refusal carries neither, so those two steps are no-ops on the ordinary path.
   - **`stackable` is how the machine tells `applyTransition` that a refusal still
     carries a durable write.** Exactly one refusal sets it: a `hold` arriving on
     an already-held task, which appends a `hold_reason` and updates the open
@@ -824,7 +839,12 @@ export function nextPhase(state, evidence) {
       ? evidence.escalation
       : HOLD_ESCALATION[evidence.reason];
     return go("BLOCKED", { generation, escalate,
-      compensations: ["record-hold-reason","void-pending",
+      // A live worker keeps spending its budget and writing its worktree under
+      // a task that has just stopped. Cancel, regenerate and infeasible all
+      // terminate for exactly this; entering a held state was the remaining
+      // path that abandoned work in flight and left the process running.
+      compensations: [...(hasLiveRun ? ["terminate-worker"] : []),
+                      "record-hold-reason","void-pending",
                       ...(pinnedTerritory ? [] : ["release-territory"]),
                       ...(hasOpenPr ? ["write-pr-hold"] : [])] });
   }
@@ -908,9 +928,25 @@ export function nextPhase(state, evidence) {
       return refuse(`unknown depth ${JSON.stringify(evidence.depth)}; it must be one of ${DEPTHS.join(", ")}`);
     if (WORKER_PHASES.includes(phase) && ["SIZING","RESEARCH","DESIGN"].includes(phase))
       return refuse(`${phase} re-dispatches under the new depth as a new attempt; the phase does not change`,
-                    { persistDepth: evidence.depth });
+                    { persistDepth: evidence.depth,
+                      // The re-dispatch is a NEW attempt, so the old one has to
+                      // end. This branch is the awkward one: it refuses the
+                      // transition, so it cannot use `go`'s compensations -- and
+                      // without them the previous worker kept running under the
+                      // old depth's budget and fan-out while the new attempt was
+                      // dispatched beside it, which is the one outcome an
+                      // override must not produce. `compensations` therefore
+                      // travels on the refusal shape, exactly as `persistDepth`
+                      // already does and for the same reason: a refusal can
+                      // carry a durable consequence.
+                      compensations: hasLiveRun ? ["terminate-worker"] : [] });
     if (["SPEC_DRAFT","SPEC_PR_OPEN","GATE"].includes(phase))
-      return go("DESIGN", { generation, persistDepth: evidence.depth });
+      return go("DESIGN", { generation, persistDepth: evidence.depth,
+        // The running worker is mid-flight under the OLD depth's budget and
+        // fan-out, and the new depth is the whole point of the override. Left
+        // alone it keeps spending and keeps writing its artifact, and the
+        // re-dispatch that follows either races it or never happens.
+        compensations: hasLiveRun ? ["terminate-worker"] : [] });
     // Post-approval: holds, and records WHY like every other hold. Without
     // record-hold-reason this was the one BLOCKED entry with no reason, so
     // `task resume` would list nothing and the founder would see a held task
@@ -923,7 +959,12 @@ export function nextPhase(state, evidence) {
     // whatever took it.
     return go("BLOCKED", { generation, escalate: `bt:<id>:depth:post-approval`,
       persistDepth: evidence.depth,
-      compensations: ["record-hold-reason","void-pending",
+      // A live worker keeps spending its budget and writing its worktree under
+      // a task that has just stopped. Cancel, regenerate and infeasible all
+      // terminate for exactly this; entering a held state was the remaining
+      // path that abandoned work in flight and left the process running.
+      compensations: [...(hasLiveRun ? ["terminate-worker"] : []),
+                      "record-hold-reason","void-pending",
                       ...(pinnedTerritory ? [] : ["release-territory"]),
                       ...(hasOpenPr ? ["write-pr-hold"] : [])] });
   }
@@ -1344,9 +1385,9 @@ import { applyTransition } from "../src/build/transition.mjs";
 // -- before hubTx, before anything -- and `assertWritable` is called on the
 // first line inside the transaction.
 import { hubTx, hubEvent } from "./hubdb.mjs";
-import { nextPhase } from "./phases.mjs";      // HELD is no longer read here: the
-                                               // stacking branch keys on the
-                                               // machine's `stackable` flag
+import { nextPhase, HELD } from "./phases.mjs";   // HELD is still read by the
+                                                  // CAS below, at held_from and
+                                                  // blocked_reason
 import { assertWritable } from "./locks.mjs";
 import { isSameProcess } from "../supervisor.mjs";       // build/ is one level down
 import { enqueueEffect } from "./outbox.mjs";
@@ -1469,6 +1510,13 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
       // has to run under the new depth. Ignoring `persistDepth` here made every
       // accepted override on those three phases a no-op that reported success.
       if (decision.persistDepth) persistDepth(db, taskId, decision.persistDepth);
+      // And its compensations, in the same transaction, for the same reason:
+      // the depth override that refuses a transition still has to end the
+      // attempt running under the old depth. Ordinary refusals carry none, so
+      // this loop is empty for every other path and cannot change them.
+      for (const c of decision.compensations ?? [])
+        applyCompensation(db, { c, taskId, generation: expectedGeneration, seq: null, evidence,
+                                snapshot: evidence?.snapshot });
       // Absence is never success: a genuine refusal at the current state IS logged.
       // EVERY refusal, including the early ones. `task why` renders this history,
       // so a malformed report that returns before this point disappears entirely
@@ -1580,7 +1628,13 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
        WHERE id=? AND phase=? AND generation=?`)
       .run(decision.to, decision.generation,
            HELD.includes(decision.to) ? expectedPhase : (decision.to === "CANCELLING" ? task.held_from : null),
-           HELD.includes(decision.to) ? (evidence.reason ?? null) : null,
+           // `holdReason`, not `evidence.reason`. A post-approval `depth.override`
+           // carries no `reason` field, so reading the evidence directly wrote a
+           // NULL `blocked_reason` for exactly the hold the derivation above
+           // exists to name -- and then handed `record-hold-reason` nothing to
+           // insert against a NOT NULL column. Deriving a value and then not
+           // using it is the same as not deriving it.
+           HELD.includes(decision.to) ? holdReason : null,
            // The founder's words, stored where `task why` and dash read them.
            TERMINAL_WITH_REASON.includes(decision.to) ? (evidence.reason ?? null) : task.terminal_reason,
            decision.sliceCursor,          // null leaves it alone; slice.next advances it
@@ -2048,7 +2102,10 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
 // Nothing else in this suite creates a task_drain row, so an implementation that
 // omits either hook -- or both -- passed every outbox assertion above.
 {
-  const db = openHub(join(dir, "o5.db"));
+  // o6, not o5: the duplicate-delivery block above already opened o5 and seeded
+  // `bt:1`, so reopening it aborted on the task primary key before either
+  // settleDrainFor path ran.
+  const db = openHub(join(dir, "o6.db"));
   seed(db, { id: "bt:1", phase: "CANCELLING", generation: 1 });
   const drain = (id) => db.prepare(
     "INSERT INTO task_drain(task,outbox_id,recorded_at) VALUES('bt:1',?,unixepoch())").run(id);

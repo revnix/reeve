@@ -394,8 +394,19 @@ const EVIDENCE = [
     const r = nextPhase({ phase, generation: 1, heldFrom: "IMPLEMENTING" }, e);
     if (r.ok && r.to === "ESCALATED") entries.push(`${phase}:${e.kind}`);
   }
-  check(entries.every(x => x.endsWith(":phase.failed") || x === "GATE:gate.capReached"),
-    "ESCALATED is entered only by a worker phase's exhausted retries, or GATE at the cap", entries.join(", "));
+  // The EXACT set, not `every`. `entries.every(...)` is vacuously true on an
+  // empty array and true on any subset, so a machine refusing exhausted retries
+  // from four of the five worker phases satisfied it -- and the separate
+  // positive control covers only IMPLEMENTING, so nothing else would have
+  // noticed. Both directions in one comparison: no illegal entry, no missing
+  // legal one.
+  const WANT_ESCALATED = [
+    "SIZING:phase.failed", "RESEARCH:phase.failed", "DESIGN:phase.failed",
+    "SPEC_DRAFT:phase.failed", "IMPLEMENTING:phase.failed", "GATE:gate.capReached",
+  ].sort();
+  check(JSON.stringify([...new Set(entries)].sort()) === JSON.stringify(WANT_ESCALATED),
+    "ESCALATED is entered by exactly the five worker phases' exhausted retries and GATE at the cap",
+    `${[...new Set(entries)].sort().join(", ")} | want ${WANT_ESCALATED.join(", ")}`);
 
   // CANCELLING is excluded as a SOURCE from every 'any non-terminal' edge.
   for (const e of [{ kind: "hold", reason: "x" }, { kind: "founder.infeasible", reason: "r" }, { kind: "founder.cancel" }]) {
@@ -751,8 +762,11 @@ export function nextPhase(state, evidence) {
       // pending. Run in the other order it would void its own new rows, they
       // would be absent from `record-drain`'s snapshot, and CANCELLED would be
       // reachable with the close and comment effects never performed. The
-      // caller's `effects` parameter is likewise enqueued AFTER the compensation
-      // loop, for the same reason and stated in the same place.
+      // caller's `effects` parameter is enqueued in phase 2 of the three-phase
+      // ordering `applyTransition` documents: after `void-pending`, before every
+      // other compensation. An earlier revision of this note said "after the
+      // compensation loop" while the code put it before -- the rule now has one
+      // statement, in applyTransition, and this is a pointer to it.
       compensations: ["void-pending","close-prs","release-territory",
                       // A ledger claim that already LANDED is not undone by
                       // draining: another actor must be able to take the node.
@@ -796,9 +810,13 @@ export function nextPhase(state, evidence) {
     // both terminate; this is the third path that abandons work in flight and it
     // was the only one that left the process running.
     return go("INFEASIBLE", { generation, escalate: `bt:<id>:infeasible`,
+      // `record-drain` LAST for the same reason as cancel: an effect leased when
+      // this commits settles under the unchanged generation, and INFEASIBLE has
+      // no later phase to record it. `void-pending` clears the QUEUED ones; the
+      // drain is for the ones already in flight, which is a different set.
       compensations: [...(hasLiveRun ? ["terminate-worker"] : []),
                       "void-pending","close-prs","release-territory",
-                      ...(hasOpenPr ? ["write-pr-hold"] : [])] });
+                      ...(hasOpenPr ? ["write-pr-hold"] : []), "record-drain"] });
   }
 
   // Held states: exactly one exit verb each, and a hold that arrives while
@@ -953,7 +971,12 @@ export function nextPhase(state, evidence) {
     return go("SIZING", { generation });
   }
   if (phase === "CLAIMING" && kind === "claim.lost")
-    return go("LOST", { generation, compensations: ["void-pending","release-territory"] });
+    // `record-drain` LAST, as on every other terminal path. An effect already
+    // LEASED when this commits still settles under the unchanged generation, and
+    // with no drain row the hub has no record it was outstanding and no
+    // last-known outcome for `task why`. LOST is terminal: no later phase notices.
+    return go("LOST", { generation,
+      compensations: ["void-pending","release-territory","record-drain"] });
 
   if (phase === "GATE") {
     if (kind === "gate.approved")    return go("APPROVED", { generation });
@@ -1333,7 +1356,15 @@ import { applyTransition } from "../src/build/transition.mjs";
 {
   const db = openHub(join(dir, "t4.db"));
   seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
-  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,created_at) VALUES('bt:1',1,0,1,7,unixepoch())`);
+  // WITH a head sha. `write-pr-hold` persists `pr_hold.head_sha`, and a fixture
+  // that supplies no witness anywhere -- not on impl_pr, not as an inbox row, not
+  // on the evidence -- leaves a correct implementation with nothing to build the
+  // asserted row from: it either violates its own NOT NULL or invents a value,
+  // and the test cannot tell those apart from success. `impl_pr` is where the
+  // projection keeps the PR's current head, so it is where the compensation
+  // reads it, INSIDE the transaction rather than from the caller.
+  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1',1,0,1,7,'${"c".repeat(40)}',unixepoch())`);
   db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at) VALUES('p','prefix','packages/x','bt:1',unixepoch()+120)`);
   db.exec(`INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,cancellable,args,created_at,updated_at)
            VALUES('k1','gh.pr.comment','bt:1',1,1,1,'{}',unixepoch(),unixepoch())`);
@@ -1571,7 +1602,32 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
       db.prepare("INSERT INTO hold_reason(task,reason,detail,at) VALUES(?,?,?,unixepoch())")
         .run(taskId, evidence.reason, evidence.detail ?? null);
       db.prepare("UPDATE pr_hold SET reason=?, detail=? WHERE task=? AND cleared_at IS NULL")
-        .run(holdReasonFor(evidence.reason), evidence.detail ?? null, taskId);
+        // `evidence.escalation` for `blocked_other`, not just `detail`. The DDL
+        // gives that column its meaning -- "for blocked_other, the escalation
+        // identity" -- and the machine already refuses a `blocked_other` without
+        // one, so discarding it here throws away the only thing that says who to
+        // tell.
+        .run(holdReasonFor(evidence.reason),
+             evidence.reason === "blocked_other" ? (evidence.escalation ?? evidence.detail ?? null)
+                                                 : (evidence.detail ?? null), taskId);
+      // AND RAISE IT. This branch returns before the common `decision.escalate`
+      // handling, so a hold stacked onto an already-held task notified nobody --
+      // and a stacked hold is by definition a NEW independently actionable cause:
+      // an ownership loss or a lease conflict arriving on a task already blocked
+      // for something else. Fail-closed must never mean fail-quiet, and this was
+      // the one hold path where it did.
+      {
+        const why = (evidence.reason === "blocked_other"
+          ? (evidence.escalation ?? null)
+          : HOLD_ESCALATION[evidence.reason])?.replace("<id>", taskId);
+        if (why) {
+          db.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count)
+                      VALUES(?,1,unixepoch(),unixepoch(),0)
+                      ON CONFLICT(why) DO UPDATE SET count=count+1, last_seen_at=unixepoch()`).run(why);
+          hubEvent(db, { kind: "escalation.raised", task: taskId,
+            payload: db.prepare("SELECT why, count, first_seen_at, last_seen_at, announced_count FROM escalation WHERE why = ?").get(why) });
+        }
+      }
       // BOTH writes need row images. The hold_reason payload was hand-built (so
       // it lacked the row's id, which replay keys on) and the pr_hold update had
       // no event at all -- so a replay restored the stacked reason and left the
@@ -1771,6 +1827,25 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
     // `evidence` is passed through: record-hold-reason needs the reason and detail
     // the hold carried, and without them it can only write a row saying a hold
     // happened -- which is what `task resume` lists to the founder.
+    // THREE PHASES, in this order, and the ordering is the whole contract:
+    //
+    //   1. `void-pending` -- only that one, first, before anything new exists.
+    //   2. the caller's `effects`, and the enqueueing compensations.
+    //   3. every remaining compensation, ending with `record-drain`.
+    //
+    // Anything else loses effects. `void-pending` voids `cancellable=1 AND
+    // status='pending'`, and every effect enqueued here is cancellable and
+    // pending by default -- so enqueueing the caller's effects first, as this
+    // revision did, voided them immediately and left them out of
+    // `record-drain`'s snapshot. The task reached CANCELLED with its own close
+    // and comment effects never performed and no drain row naming them. Running
+    // `record-drain` early loses the other half, for the mirror reason.
+    //
+    // This is the second time the two halves of this rule disagreed: the
+    // compensation list's note said the caller's effects go AFTER the loop while
+    // the code put them before it. Stated once, here, as an ordering over three
+    // phases rather than as two remarks in different places.
+    //
     // Caller-supplied effects are enqueued BEFORE the compensations run, so
     // that `record-drain` -- which is ordered last precisely because it
     // snapshots what is outstanding -- actually sees them. Enqueueing them
@@ -1778,14 +1853,23 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
     // `effects` parameter was absent from `task_drain`, so `drainRemaining`
     // could reach zero and the task reach CANCELLED with that effect still
     // pending. Each carries the fence: the seq of the event that decided it.
+    // Phase 1: void first, alone.
+    for (const c of decision.compensations.filter(c => c === "void-pending"))
+      applyCompensation(db, { c, taskId, generation: decision.generation, seq, evidence, snapshot: evidence?.snapshot });
+    // Phase 2: the caller's effects, now that nothing will void them.
     for (const e of effects) enqueueEffect(db, { ...e, taskId, generation: decision.generation, fence: seq });
 
     // Same helper as the refusal path above, so an accepted override persists
     // whether or not the phase moved.
     if (decision.persistDepth) persistDepth(db, taskId, decision.persistDepth);
 
-    for (const c of decision.compensations)
+    // Phase 3. `void-pending` is SKIPPED here: it ran in phase 1, and running it
+    // again would void the effects phase 2 just enqueued -- the exact failure
+    // the ordering exists to prevent, reintroduced by the fix for it.
+    for (const c of decision.compensations) {
+      if (c === "void-pending") continue;
       applyCompensation(db, { c, taskId, generation: decision.generation, seq, evidence, snapshot: evidence?.snapshot });
+    }
 
     // (Effects were enqueued above, before the compensations, so record-drain
     // can count them. They are never performed here: the executor revalidates
@@ -1818,9 +1902,23 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
     // restored the task into SIZING with both columns back at their snapshot
     // values -- and merge pre-flight reads the task projection, so the task
     // looked like it had never claimed the node it is holding.
+    // The CONTRACT columns are in the image too. `adopt-snapshot` writes all
+    // eleven of them in this same transaction, and replay upserts exactly the
+    // columns the image lists -- so a snapshot predating a `founder.regenerate`
+    // came back at the NEW generation and phase with the OLD repository, profile
+    // and gate contract. That hybrid is the precise state this plan says must
+    // never exist, reached through the mechanism meant to prevent it.
+    //
+    // Carried unconditionally rather than only when adopt-snapshot ran: a row
+    // image is the row, and a conditional image is a second thing that can drift
+    // from the write.
     const wrote = db.prepare(`SELECT id, phase, generation, resume_seq, slice_cursor,
                                      held_from, blocked_reason, terminal_reason,
-                                     claim_event_id, projection_generation, updated_at
+                                     claim_event_id, projection_generation,
+                                     repo_id, nwo_snapshot, repo_path, profile_path, profile_hash,
+                                     default_branch, visibility, spec_repo_id,
+                                     gate_definition_hash, registry_version, founder_user_id,
+                                     updated_at
                               FROM task WHERE id=?`).get(taskId);
     hubEvent(db, { kind: "task.transitioned", task: taskId, payload: wrote });
 
@@ -1856,18 +1954,18 @@ Write `applyCompensation` as a switch over the closed set `phases.mjs` produces,
 | compensation | what it does |
 |---|---|
 | `void-pending` | voids rows with `cancellable=1 AND status='pending'` only; a non-cancellable push mid-transport is not a compensation |
-| `write-pr-hold` | one `pr_hold` row per open builder PR, reason from the closed set |
+| `write-pr-hold` | one `pr_hold` row per open builder PR, reason from the closed set, **with `head_sha` read from `impl_pr` inside this transaction** — the projection is where the PR's current head lives, and taking it from the caller instead would let a stale head be written as the hold's witness. As an **UPSERT on the open row**, never a bare insert. BLOCKED and ESCALATED are both legal sources for `founder.cancel` and `founder.infeasible`, and a held task already has an open hold for each of its PRs; the partial unique index `one_open_hold(repo_id, pr) WHERE cleared_at IS NULL` then aborts the whole terminal transition. So it updates the reason and detail of the existing uncleared row when there is one and inserts otherwise. Tested from BLOCKED and from ESCALATED, with both verbs |
 | `close-prs` | enqueues `gh.pr.close` plus the explanatory comment |
 | `release-territory` | deletes the task's `territory_lease` rows, and appends one `territory_lease.released` `hub_event` per row with the row image. `territory_lease` is a REPLAYED projection separate from `task_territory` (the claims are the task's, the lease is the grant), so without the event a post-snapshot release is undone by replay and the task's territory is held by a ghost |
 | `regrant-territory` | appends `territory_lease.granted` per row, and **re-runs the §10.2 intersection check inside this transaction**, and throws if it now conflicts, rolling the whole resume back. The machine's `territoryConflict` evidence is the caller's earlier read; this is the authoritative one, because only a check under `BEGIN IMMEDIATE` excludes a filing that landed in between |
-| `clear-holds` | sets `cleared_at` on every open `pr_hold` **and** `hold_reason` for the task |
+| `clear-holds` | sets `cleared_at` on every open `pr_hold` **and** `hold_reason` for the task, **and appends one `hold_reason.appended` and one `pr_hold.created` row image per row it clears**. Both kinds are keyed on the row id in S2-A's `HANDLERS`, so the same kind carries the clearing — a cleared row is the row, at a later state, not a different event. Without them a snapshot holding open reasons plus a later resume replays into a task that is active with its reasons still open, and `task why` then reports a cause that was cleared before the restore |
 | `annotate-resumed` | enqueues the compensating "resumed" comment for any hold comment left behind |
 | `record-hold-reason` | inserts the `hold_reason` row for **this** hold — the first one, not only the stacked ones |
 | `record-research-skip` | appends a `research.skipped` `hub_event` for the task, carrying the depth that justified it. The only compensation that writes nothing but history: RESEARCH produced no artifact, and the absence needs a reason attached to it or it reads as a lost phase |
 | `record-drain` | inserts one `task_drain` row per outbox row for this task in `status IN ('pending','inflight')`. **Runs last**, so it captures the close and comment effects the compensations above just enqueued — those are `pending`, not `inflight`, so an inflight-only select would have missed exactly the rows ordering it last was meant to catch |
 | `adopt-snapshot` | writes **every** field `nextPhase` validated — `repo_id`, `nwo_snapshot`, `repo_path`, `profile_path`, `profile_hash`, `default_branch`, `visibility`, `spec_repo_id`, `gate_definition_hash`, `registry_version`, `founder_user_id` — onto the task, from values the caller resolved BEFORE the transaction. Writing a subset is worse than writing none: the generation bump asserts the whole contract was re-resolved, and a task with a new profile hash and an old repository path is a hybrid nothing later can detect. Only `regenerate` emits it |
 | `release-ledger-claim` | enqueues `ledger.release` (`release <id> --if-owner reeve:bt:<ulid>`) through the typed CLI in the dedicated clone. `--if-owner` makes it inert when a human already owns the node |
-| `terminate-worker` | ends the task's live `phase_run` through the §4.5 lease path — revoke, SIGTERM, then SIGKILL the process **group**, and mark the run `killed`. Emitted by cancel and by `--redesign`; a no-op when no run is live |
+| `terminate-worker` | **inside the transaction it only REVOKES**: it writes the run's revocation and marks the `phase_run` `killed`, durably. The signals happen after commit. Killing a process is irreversible and `applyCompensation` runs inside `hubTx`, so a later compensation or event insert that throws rolls back the task and the `phase_run` while the worker stays dead — and the write lock would be held across the SIGTERM grace period besides, blocking every other hub writer for seconds. So the transaction records the intent, and a fenced reconciler on the loop performs the §4.5 sequence (SIGTERM, then SIGKILL the process **group**) for any run marked `killed` whose process is still alive, which is idempotent and safe to repeat. Emitted by cancel, `--redesign`, regenerate, infeasible and both hold paths; a no-op when no run is live |
 | `force-drain` | sets `forced=1` and `last_known` on every unsettled `task_drain` row, and moves their outbox rows to `forced`, so a `--force` cancel records what was never confirmed instead of leaving the projection claiming it is still in flight |
 
 - [ ] **Step 4: Run and commit**
@@ -1893,8 +1991,10 @@ git commit -m "feat(hub): generation-fenced transition with compensations"
 - Consumes: `hubTx`, `hubEvent`, **`assertWritable`** (S2-A); the `outbox` DDL. Every function here mutates hub state, so **each calls `assertWritable(db, { isAlive, inTx: true })` inside its own transaction** — `leaseEffect`, `settleEffect`, `recoverEffects` and `voidPending` alike. The executor runs on a loop, so without the check it can lease and settle rows — performing real external effects — while a restore replaces the file underneath it. It is the one writer that never stops on its own.
 - Produces:
   - `enqueueEffect(db, { idempotencyKey, kind, taskId, generation, fence, cancellable = true, args, notBefore = 0 }) -> { id, status }` — **must be called inside the caller's transaction**. Returns `status: 'superseded'` with no row performed when the key is round- or sha-keyed and a `done` row already carries it.
-  - `leaseEffect(db, { worker, leaseSeconds = 300, capabilities }) -> Row | null` — revalidates the fence **inside the lease transaction** and settles `fenced` (returning null and trying the next row) when the task has moved generation or the row was voided; settles `refused` when the effect's capability switch is off.
-  - `settleEffect(db, { id, ok, result, error, retryable })`, `recoverEffects(db, { reconcile })`, `voidPending(db, taskId)`.
+  - **`not_before` is enforced and tested.** `enqueueEffect` exposes `notBefore` and no assertion proved `leaseEffect` honours it, so an implementation ignoring the column satisfies every fence, capability, uniqueness, recovery and duplicate-delivery assertion in the task — and every delayed notification and every backoff retry fires immediately, which is the opposite of what scheduling one means. `leaseEffect` takes `now` (injected, as everywhere else here: the module has no clock) and skips rows with `not_before > now`. Three assertions: a row scheduled ahead is NOT leased before its boundary, IS leased at it, and a control that an unscheduled row beside it is leased throughout — without that control, "leases nothing" passes the first two.
+  - `leaseEffect(db, { worker, leaseSeconds = 300, capabilities, now }) -> Row | null` — revalidates the fence **inside the lease transaction** and settles `fenced` (returning null and trying the next row) when the task has moved generation or the row was voided; settles `refused` when the effect's capability switch is off.
+  - `settleEffect(db, { id, worker, leaseToken, ok, result, error, retryable })` — **fenced on the active lease**, not on the id alone. `leaseEffect` records a worker and a lease interval and returns a `leaseToken` (an opaque counter bumped on every lease of that row); `settleEffect`'s CAS requires `worker` and `lease_token` to match the row's current values, and returns `stale` otherwise without writing. Without it: worker A stalls past expiry, `recoverEffects` returns the row to `pending`, worker B leases it, and A — still running — settles B's active delivery, overwriting its status and result while B is mid-flight. An id is not an identity while a row can be re-leased. Tested with a stale settler after a re-lease, and a control that the CURRENT owner still settles normally.
+  - `recoverEffects(db, { reconcile })`, `voidPending(db, taskId)`.
   - **EVERY outbox mutation appends a row-image `hub_event`, in the same
     transaction as the write.** `outbox` is in S2-A's `COMPARISON_SET` and has
     four handlers there, and this plan emitted **none** of them — the same gap
@@ -2161,9 +2261,26 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
       idempotencyKey: key, kind: k, taskId: "bt:1", generation: 1, fence: 1, args: {} }));
     check(repeat.status === "pending",
       `${k}: a non-keyed re-enqueue is ADMITTED, for its reconciler to settle`, String(repeat.status));
-    // Recovery, not dispatch: the reconciler may only OBSERVE external truth.
-    // It never appends to `world`, so if the outbox needs a second external
-    // action to make progress, this drill cannot supply one.
+    // THROUGH THE LEASE PATH, which is what production does with a fresh
+    // pending row. Hand-editing it to an expired `inflight` and calling recovery
+    // skipped the one step that matters: `leaseEffect` hands the row to a worker,
+    // and nothing in the interface required the worker to reconcile before
+    // acting -- so a comment, a notification, a claim or a PR creation is
+    // performed a SECOND time while this drill, which exists to rule that out,
+    // passes. The drill has to use the executor's own route or it is testing a
+    // path production never takes.
+    //
+    // So the requirement is on the executor and is asserted here: a leased row
+    // whose idempotency key already appears in external truth is RECONCILED, not
+    // re-performed. `drain` below is that executor, and it appends to `world`
+    // whenever it performs -- so a second entry is the failure, visibly.
+    const before = world.filter(x => x === key).length;
+    drain();
+    check(world.filter(x => x === key).length === before,
+      `${k}: the re-enqueued row is reconciled through the normal lease path, not performed again`,
+      `${before} -> ${world.filter(x => x === key).length}`);
+    // And the row still has to SETTLE, or "never performed again" is satisfied by
+    // an executor that simply leaves it pending forever.
     db.exec(`UPDATE outbox SET status='inflight', lease_expires_at = unixepoch() - 1
              WHERE idempotency_key = '${key}' AND status = 'pending'`);
     recoverEffects(db, { reconcile: (row) =>
@@ -2515,6 +2632,17 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   check(normalizeClaim("packages/x/index.ts").kind === "prefix",
     "and the same string with no kind given is a prefix: the shape is declared, never inferred");
   check(normalizeClaim("./packages/x/").path === "packages/x", "leading ./ and trailing / are normalized away");
+  // INTERNAL aliases too. `packages/x`, `packages/./x` and `packages//x` name one
+  // filesystem location, and segment-based `overlaps` compares them as different
+  // paths -- so two tasks take concurrent leases over identical territory, which
+  // is the single invariant this whole subsystem exists to hold. Empty and `.`
+  // segments are dropped; `..` is already refused outright and stays refused,
+  // because normalising it away would let a claim escape upward silently.
+  for (const alias of ["packages/./x", "packages//x", "./packages/./x//"])
+    check(normalizeClaim(alias).path === "packages/x",
+      `${alias} canonicalises to packages/x`, JSON.stringify(normalizeClaim(alias)));
+  check(overlaps(normalizeClaim("packages/x"), normalizeClaim("packages/./x")),
+    "control: and the canonical forms therefore OVERLAP, which is the point");
   // Parent traversal is refused SEGMENT-WISE, not by prefix. A check for a
   // leading "../" accepts `packages/../secret`, which resolves outside the
   // claimed subtree while looking disjoint to the textual overlap comparison --
@@ -3076,6 +3204,16 @@ import { spawn } from "node:child_process";
 ```
 
 - [ ] **Step 2–4: Run it red, implement, run green, commit**
+
+**The permission comparison is EXACT, in both directions.** The positive case
+names the expected set, and the negative cases only removed required entries — so
+an installation carrying `workflows: write`, `members: write` or
+`deployments: write` alongside everything expected reported `pass`. That is
+permission drift, and permission drift is excess authority: the gate's whole
+claim is that the bound App can do exactly what the ruleset requires and nothing
+more. `gateStateFrom` compares the complete key/value set and records the
+difference in `permission_diff` — which the H-4 predicate already reads — with a
+control for an otherwise-valid installation carrying one extra permission.
 
 **On the broken implementation** — `app_installed` defaulting to `'pass'` when `installation` is present but has no `permissions` key — the four not-knowing cases go red as a group, which is exactly the signal wanted: the failure is "unknown became a pass", not one edge case.
 

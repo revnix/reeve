@@ -1,7 +1,8 @@
 // R-14 and R-15 report the two facts the daemon's dispatch refusal rests on,
 // from the same sources: the persisted canary result and the keychain probe.
 // Absent is UNKNOWN, never OK; a held credential is BROKEN with the fix named.
-import { checkCanary, checkKeychain, runDoctor } from "../src/doctor.mjs";
+import { checkCanary, checkKeychain, checkRemoteReach, founderCredential, runDoctor } from "../src/doctor.mjs";
+import { instrumentHash } from "../src/canary.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { policyHashOf } from "../src/canary.mjs";
 import { writeCanaryState } from "../src/canary.mjs";
@@ -17,6 +18,542 @@ const check = (ok, name, detail) => {
 
 const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
 
+// ── R-16: publication reach ──────────────────────────────────────────────────
+//
+// Publication is a `git push` from the founder's checkout, so it needs what that
+// checkout's origin needs -- a credential helper, a URL rewrite, an ssh key.
+// Nothing measured any of that, and on 2026-08-22 none of it worked.
+//
+// The credential half is the part that matters and the part that is easy to get
+// wrong: on a PUBLIC repository an anonymous `ls-remote` succeeds while a push
+// would not, so a check built on reachability alone reports OK for exactly the
+// repository reeve watches.
+{
+  const seams = (reach, cred) => {
+    const asked = [], askedFor = [];
+    return {
+      asked, askedFor,
+      run: (cwd, args) => {
+        asked.push(args[0] === "remote" && args.includes("--push") ? "remote --push" : args[0]);
+        if (args[0] === "remote") {
+          // git returns only the FIRST push url without `--all`. Modelling that
+          // is what lets a stub which drops the flag be seen at all.
+          const all = (args.includes("--push") ? reach.pushUrl : reach.url) ?? reach.url ?? "https://github.com/o/r.git";
+          return { ok: true, out: args.includes("--all") ? all : String(all).split("\n")[0] };
+        }
+        if (args[0] === "ls-remote") {
+          askedFor.push(args[1]);
+          const byUrl = reach.lsRemoteFor?.[args[1]];
+          if (byUrl) return byUrl;
+          return (args[1] === "origin" ? reach.lsRemote : reach.lsRemotePush) ?? { ok: true, out: "abcdef1234567890  refs/heads/main" };
+        }
+        // `git config --get-urlmatch http.<key> <url>` — exits 1 when nothing matches.
+        if (args[0] === "config") {
+          asked.push(args[1]);
+          // The key follows `--get-urlmatch`, which is not a fixed index: a
+          // boolean key is asked with `--type=bool` in front of it.
+          const i = args.indexOf("--get-urlmatch");
+          const hit = i >= 0 ? reach.httpAuth?.[args[i + 1]] : undefined;
+          return hit === undefined ? { ok: false, out: "", err: "" } : { ok: true, out: hit };
+        }
+        return { ok: false, out: "", err: "unexpected" };
+      },
+      credential: (cwd, url) => { asked.push("credential"); askedFor.push(url); return cred; },
+      // Explicit, never the machine's own: a fixture that reads the founder's
+      // ~/.netrc is green here and something else on a host that has one.
+      netrc: () => reach.netrc ?? "",
+    };
+  };
+  const pub = { identity: { checkout: "/co", defaultBranch: "main", visibility: "public" } };
+
+  {
+    const c = checkRemoteReach({ identity: {} }, seams({}, { ok: true }));
+    check(c.id === "R-16" && c.level === "UNKNOWN", "no checkout in the profile: UNKNOWN", JSON.stringify(c.lines));
+  }
+  {
+    const io = seams({ url: "" }, { ok: true });
+    io.run = args => ({ ok: false, out: "", err: "fatal: No such remote 'origin'" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "BROKEN" && /no origin/.test(c.lines[0]), "a checkout with no origin: BROKEN", c.lines.join(" | "));
+  }
+  {
+    const c = checkRemoteReach(pub, seams({ lsRemote: { ok: false, out: "", err: "fatal: could not read Username for 'https://github.com'" } }, { ok: true }));
+    check(c.level === "BROKEN" && /cannot reach it/.test(c.lines[1]) && /could not read Username/.test(c.lines[1]),
+      "a remote reeve's git cannot reach: BROKEN, in git's own words", c.lines.join(" | "));
+    check(/nothing else reports this/.test(c.lines.join(" ")),
+      "  and it says why no other check would notice", c.lines.join(" | "));
+  }
+  {
+    // The case a reachability-only check gets wrong.
+    const io = seams({}, { ok: false, why: "fatal: could not read Username for 'https://github.com'" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "BROKEN", "reachable but no credential: BROKEN, not OK", c.lines.join(" | "));
+    check(/PUBLIC/.test(c.lines.join(" ")) && /proves nothing about a push/.test(c.lines.join(" ")),
+      "  and it names the public-repository trap that makes the read misleading", c.lines.join(" | "));
+    check(io.asked.includes("credential"), "  the credential was actually asked for", io.asked.join(","));
+  }
+  {
+    const io = seams({}, { ok: true });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "OK", "control: reachable AND a credential available is OK", c.lines.join(" | "));
+    // The SHAPE a credential reply has, not the bare words: `founderCredential`
+    // reads git's stdout, and the failure this guards against is echoing that
+    // into the report. Matching the word "token" instead made the assertion
+    // trip on prose that legitimately explains what a read-only token does.
+    check(!/password=|credential=|ghp_|gho_|github_pat_/.test(c.lines.join(" ")),
+      "  and nothing shaped like a credential reply appears in the report", c.lines.join(" | "));
+  }
+  {
+    // ssh authenticates through the transport, so the reach already exercised it
+    // and there is no https credential to ask for.
+    const io = seams({ url: "git@github.com:o/r.git" }, { ok: false, why: "should not be asked" });
+    const c = checkRemoteReach({ identity: { checkout: "/co", defaultBranch: "main" } }, io);
+    check(c.level === "OK", "an ssh origin that answers is OK", c.lines.join(" | "));
+    check(!io.asked.includes("credential"),
+      "  and no https credential is asked for, which would be the wrong question", io.asked.join(","));
+  }
+  {
+    // ...but only when the reach WENT there. `ls-remote origin` uses the FETCH
+    // url, so an https fetch beside an ssh push url means the ssh transport was
+    // never touched — an anonymous public fetch plus an ssh push with no usable
+    // key reported healthy. The claim was written while the push destination
+    // still had a probe of its own and survived the round that removed it.
+    const io = seams({ url: "https://github.com/o/r.git", pushUrl: "git@github.com:o/r.git" }, { ok: true });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "DEGRADED", "an ssh PUSH url behind an https fetch url is not claimed as exercised", c.lines.join(" | "));
+    check(/did NOT exercise/.test(c.lines.join(" ")) && /fetch url/.test(c.lines.join(" ")),
+      "  and the report says which transport the reach actually went through", c.lines.join(" | "));
+    check(!io.asked.includes("credential"),
+      "  and it is still not asked for an https credential, which remains the wrong question", io.asked.join(","));
+  }
+}
+
+// ── R-16, the four ways it asked the wrong question ──────────────────────────
+{
+  const seams = (reach, cred) => {
+    const asked = [], askedFor = [];
+    return {
+      asked, askedFor,
+      run: (cwd, args) => {
+        asked.push(args[0] === "remote" && args.includes("--push") ? "remote --push" : args[0]);
+        if (args[0] === "remote") {
+          // git returns only the FIRST push url without `--all`. Modelling that
+          // is what lets a stub which drops the flag be seen at all.
+          const all = (args.includes("--push") ? reach.pushUrl : reach.url) ?? reach.url ?? "https://github.com/o/r.git";
+          return { ok: true, out: args.includes("--all") ? all : String(all).split("\n")[0] };
+        }
+        if (args[0] === "ls-remote") {
+          askedFor.push(args[1]);
+          const byUrl = reach.lsRemoteFor?.[args[1]];
+          if (byUrl) return byUrl;
+          return (args[1] === "origin" ? reach.lsRemote : reach.lsRemotePush) ?? { ok: true, out: "abcdef1234567890  refs/heads/main" };
+        }
+        // `git config --get-urlmatch http.<key> <url>` — exits 1 when nothing matches.
+        if (args[0] === "config") {
+          asked.push(args[1]);
+          // The key follows `--get-urlmatch`, which is not a fixed index: a
+          // boolean key is asked with `--type=bool` in front of it.
+          const i = args.indexOf("--get-urlmatch");
+          const hit = i >= 0 ? reach.httpAuth?.[args[i + 1]] : undefined;
+          return hit === undefined ? { ok: false, out: "", err: "" } : { ok: true, out: hit };
+        }
+        return { ok: false, out: "", err: "unexpected" };
+      },
+      credential: (cwd, url) => { asked.push("credential"); askedFor.push(url); return cred; },
+      // Explicit, never the machine's own: a fixture that reads the founder's
+      // ~/.netrc is green here and something else on a host that has one.
+      netrc: () => reach.netrc ?? "",
+    };
+  };
+  const pub = { identity: { checkout: "/co", defaultBranch: "main", visibility: "public" } };
+
+  {
+    // `git push origin` uses remote.origin.pushurl when it is set, so the fetch
+    // url is the wrong transport AND the wrong credential to ask about.
+    // Measured 2026-08-23: get-url and get-url --push return different values.
+    const io = seams({ url: "https://github.com/o/fetchside.git", pushUrl: "https://github.com/o/PUSHSIDE.git" }, { ok: true });
+    const c = checkRemoteReach(pub, io);
+    check(io.asked.includes("remote --push"), "the PUSH url is what gets probed", io.asked.join(","));
+    check(io.askedFor.includes("https://github.com/o/PUSHSIDE.git"),
+      "  and the credential is asked for that url, not the fetch one", io.askedFor.join(" "));
+    check(c.lines.some(l => /PUSHSIDE/.test(l)), "  and the report names it", c.lines.join(" | "));
+  }
+  {
+    // A separate push url is NOT probed for reachability, deliberately.
+    // `ls-remote <the literal url>` drops every remote-scoped setting, so it
+    // answers a different question from the one publication asks. Measured
+    // 2026-08-23 with an unreachable remote.origin.proxy: `ls-remote origin`
+    // fails through the proxy and `ls-remote <the same url>` bypasses it and
+    // succeeds. A probe that can be wrong in both directions is removed rather
+    // than tuned, and what it reached for is reported as not established.
+    const io = seams({ url: "https://github.com/o/r.git", pushUrl: "https://github.com/o/p.git",
+                       lsRemotePush: { ok: false, out: "", err: "fatal: repository not found" } }, { ok: true });
+    const c = checkRemoteReach(pub, io);
+    check(io.askedFor.filter(u => u === "https://github.com/o/p.git" ).length === 1,
+      "the push url is asked about ONCE — for its credential, not for a reachability probe", io.askedFor.join(" "));
+    check(!io.askedFor.some((u, i) => u === "https://github.com/o/p.git" && io.asked[i] === "ls-remote"),
+      "  so an unreachable push url does not decide the verdict", io.asked.join(","));
+    check(c.level === "OK" && /not probed for reachability/.test(c.lines.join(" ")),
+      "  and the report says the destination's reachability is not established", c.lines.join(" | "));
+  }
+  {
+    // `git remote get-url` EXPANDS insteadOf, so a rewrite to a credential-
+    // bearing URL hands the credential back and it was printed verbatim.
+    const io = seams({ url: "https://user:s3cr3t-token@example.com/o/r.git" }, { ok: true });
+    const c = checkRemoteReach(pub, io);
+    const all = c.lines.join(" | ");
+    check(!/s3cr3t-token/.test(all) && !/user:/.test(all),
+      "userinfo in an origin url never reaches the report", all);
+    check(/\[redacted\]@example\.com/.test(all), "  and its removal is visible rather than silent", all);
+  }
+  {
+    // credential.useHttpPath keeps separate credentials per repository on one
+    // host, so protocol+host is not the question a push asks. Measured 2026-08-23
+    // against a helper that records what git asked it: a host-only fill returns a
+    // HOST-WIDE credential where the path-qualified one has none.
+    const io = seams({ url: "https://example.com/o/two.git" }, { ok: true });
+    checkRemoteReach(pub, io);
+    check(io.askedFor.some(u => u === "https://example.com/o/two.git"),
+      "the whole url is what the check hands to the credential machinery", io.askedFor.join(" "));
+
+    // And what the credential machinery then ASKS git. The assertion above only
+    // covers the caller: with the seam injected, `founderCredential` never runs,
+    // so a version of it that threw the url away and asked by host would pass it.
+    let sent = null;
+    founderCredential("/co", "https://example.com/o/two.git",
+                      { run: (cwd, args, opts) => { sent = { args, input: opts?.input }; return { ok: true, out: "password=x\n" }; } });
+    check(sent?.args?.join(" ") === "credential fill", "  it runs `git credential fill`", JSON.stringify(sent?.args));
+    check(/(^|\n)url=https:\/\/example\.com\/o\/two\.git\n/.test(sent?.input ?? "") && !/protocol=|host=/.test(sent?.input ?? ""),
+      "  and asks it by url, not by protocol and host — the form that carries the path", JSON.stringify(sent?.input));
+    check(/capability\[\]=authtype/.test(sent?.input ?? ""),
+      "  advertising authtype, so a helper answering with a credential rather than a password is heard", JSON.stringify(sent?.input));
+  }
+  {
+    // http:// was grouped with ssh and local, so a public http repository
+    // reproduced the exact false green the https branch exists to prevent.
+    const io = seams({ url: "http://example.com/o/r.git" }, { ok: false, why: "no helper answered" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "BROKEN" && io.asked.includes("credential"),
+      "a plain http origin takes the credential path too", `${c.level} ${io.asked.join(",")}`);
+  }
+  {
+    // Control: no pushurl set, so git returns the fetch url for both and there
+    // is exactly one url to reach and one credential to ask for.
+    const io = seams({ url: "https://github.com/o/r.git", pushUrl: "https://github.com/o/r.git" }, { ok: true });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "OK", "control: one url for both is OK", c.lines.join(" | "));
+    check(io.askedFor.filter(u => u && u.startsWith("http")).length === 1,
+      "  and nothing is probed twice", io.askedFor.join(" "));
+    check(!c.lines.some(l => /push url/.test(l)), "  and no second url is reported", c.lines.join(" | "));
+  }
+}
+
+// ── R-16, round two ──────────────────────────────────────────────────────────
+{
+  const seams = (reach, cred) => {
+    const asked = [], askedFor = [];
+    return {
+      asked, askedFor,
+      run: (cwd, args) => {
+        asked.push(args[0] === "remote" && args.includes("--push") ? "remote --push" : args[0]);
+        if (args[0] === "remote") {
+          // git returns only the FIRST push url without `--all`. Modelling that
+          // is what lets a stub which drops the flag be seen at all.
+          const all = (args.includes("--push") ? reach.pushUrl : reach.url) ?? reach.url ?? "https://github.com/o/r.git";
+          return { ok: true, out: args.includes("--all") ? all : String(all).split("\n")[0] };
+        }
+        if (args[0] === "ls-remote") {
+          askedFor.push(args[1]);
+          const byUrl = reach.lsRemoteFor?.[args[1]];
+          if (byUrl) return byUrl;
+          return (args[1] === "origin" ? reach.lsRemote : reach.lsRemotePush) ?? { ok: true, out: "abcdef1234567890  refs/heads/main" };
+        }
+        if (args[0] === "config") {
+          asked.push(args[1]);
+          // The key follows `--get-urlmatch`, which is not a fixed index: a
+          // boolean key is asked with `--type=bool` in front of it.
+          const i = args.indexOf("--get-urlmatch");
+          const hit = i >= 0 ? reach.httpAuth?.[args[i + 1]] : undefined;
+          return hit === undefined ? { ok: false, out: "", err: "" } : { ok: true, out: hit };
+        }
+        return { ok: false, out: "", err: "unexpected" };
+      },
+      credential: (cwd, url) => { asked.push("credential"); askedFor.push(url); return cred; },
+      // Explicit, never the machine's own: a fixture that reads the founder's
+      // ~/.netrc is green here and something else on a host that has one.
+      netrc: () => reach.netrc ?? "",
+    };
+  };
+  const pub = { identity: { checkout: "/co", defaultBranch: "main", visibility: "public" } };
+
+  {
+    // `git push origin` affects EVERY configured pushurl, and `get-url --push`
+    // returns only the first — measured 2026-08-23, two pushurls give one value
+    // without `--all` and both with it. Checking the first alone reports OK for
+    // a remote whose second destination cannot be reached.
+    const io = seams({
+      url: "https://github.com/o/r.git",
+      pushUrl: "https://github.com/o/one.git\nhttps://github.com/o/two.git",
+      lsRemoteFor: { "https://github.com/o/two.git": { ok: false, out: "", err: "fatal: repository not found" } },
+    }, { ok: true });
+    const c = checkRemoteReach(pub, io);
+    check(io.askedFor.includes("https://github.com/o/one.git") && io.askedFor.includes("https://github.com/o/two.git"),
+      "every configured push url gets its own credential question, not just the first", io.askedFor.join(" "));
+    check(c.lines.filter(l => /a credential is obtained/.test(l)).length === 2,
+      "  and each destination is reported on in its own right", c.lines.join(" | "));
+  }
+  {
+    // A credential helper is not the only way http authenticates.
+    // `http.<url>.extraHeader` is used by ls-remote and by the real push while
+    // `credential fill` knows nothing about it, so a silent helper is not proof
+    // that publication is broken.
+    const io = seams({ url: "https://enterprise.example/o/r.git",
+                       httpAuth: { "http.extraHeader": "Authorization: Bearer SECRET-HEADER-VALUE" } },
+                     { ok: false, why: "no helper answered" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "DEGRADED", "http auth configured outside a helper is DEGRADED, not BROKEN", c.lines.join(" | "));
+    check(/http\.extraHeader/.test(c.lines.join(" ")) && /cannot verify/.test(c.lines.join(" ")),
+      "  and it names the mechanism and says it is unverified", c.lines.join(" | "));
+    check(!/SECRET-HEADER-VALUE/.test(c.lines.join(" ")),
+      "  and the header's VALUE never reaches the report", c.lines.join(" | "));
+    check(io.asked.includes("--get-urlmatch"), "  resolved with git's own per-url matching", io.asked.join(","));
+  }
+  {
+    // netrc is not git configuration at all: git hands libcurl CURL_NETRC_
+    // OPTIONAL and curl reads the file. Measured 2026-08-23 on git 2.50.1
+    // against a local server issuing a 401 Basic challenge — no netrc, exit 128
+    // and no Authorization header; with a matching netrc, exit 0 and the header
+    // SENT; `credential fill` with that same netrc, exit 128 and no password.
+    const io = seams({ url: "https://enterprise.example/o/r.git",
+                       netrc: "machine enterprise.example\n  login u\n  password SECRET-NETRC-VALUE\n" },
+                     { ok: false, why: "no helper answered" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "DEGRADED" && /~\/\.netrc/.test(c.lines.join(" ")),
+      "a netrc entry for the host is DEGRADED, not BROKEN", c.lines.join(" | "));
+    check(!/SECRET-NETRC-VALUE/.test(c.lines.join(" ")),
+      "  and nothing from the netrc reaches the report", c.lines.join(" | "));
+  }
+  {
+    // `default` matches any host, which is the whole point of it.
+    const io = seams({ url: "https://enterprise.example/o/r.git", netrc: "default\n  login u\n  password p\n" },
+                     { ok: false, why: "no helper answered" });
+    check(checkRemoteReach(pub, io).level === "DEGRADED",
+      "a netrc `default` entry covers the host too", "");
+  }
+  {
+    // Control: a netrc naming a DIFFERENT host says nothing about this one.
+    const io = seams({ url: "https://enterprise.example/o/r.git", netrc: "machine elsewhere.example\n  login u\n  password p\n" },
+                     { ok: false, why: "no helper answered" });
+    check(checkRemoteReach(pub, io).level === "BROKEN",
+      "control: a netrc for another host does not excuse this one", "");
+  }
+  {
+    // `http.emptyAuth` tells git to authenticate without seeking a username or
+    // password — Kerberos, GSS-Negotiate — so a push succeeds where `credential
+    // fill` returns nothing.
+    const io = seams({ url: "https://enterprise.example/o/r.git", httpAuth: { "http.emptyAuth": "true" } },
+                     { ok: false, why: "no helper answered" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "DEGRADED" && /http\.emptyAuth/.test(c.lines.join(" ")),
+      "an emptyAuth remote is DEGRADED, not BROKEN", c.lines.join(" | "));
+  }
+  {
+    // The trap in reading that key by PRESENCE. Measured 2026-08-23,
+    // `--get-urlmatch` returns `false` with EXIT 0 for a url configured
+    // `emptyAuth = false` — so configuration saying the OPPOSITE would have
+    // been taken as evidence for it, suppressing a refusal that is real.
+    const io = seams({ url: "https://enterprise.example/o/r.git", httpAuth: { "http.emptyAuth": "false" } },
+                     { ok: false, why: "no helper answered" });
+    check(checkRemoteReach(pub, io).level === "BROKEN",
+      "`emptyAuth = false` is configuration saying the opposite, and does not excuse anything",
+      checkRemoteReach(pub, io).lines.join(" | "));
+  }
+  {
+    // A client certificate is an authentication mechanism exactly as a header or
+    // a cookie jar is. Added without a reviewer asking, after three rounds of
+    // one being found missing.
+    const io = seams({ url: "https://enterprise.example/o/r.git", httpAuth: { "http.sslCert": "/path/to/client.pem" } },
+                     { ok: false, why: "no helper answered" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "DEGRADED" && /http\.sslCert/.test(c.lines.join(" ")),
+      "a client certificate is DEGRADED, not BROKEN", c.lines.join(" | "));
+  }
+  {
+    // A capability-negotiating helper answers with `credential=` and no
+    // password at all, and git forms the Authorization header from it. Not
+    // reproducible on git 2.50.1, which does not support the capability — this
+    // is forward insurance, and the fallback below is what keeps it safe.
+    let calls = 0;
+    const io = { run: (cwd, args) => {
+        if (args[0] === "remote") return { ok: true, out: "https://enterprise.example/o/r.git" };
+        if (args[0] === "ls-remote") return { ok: true, out: "abcdef1234567890  refs/heads/main" };
+        return { ok: false, out: "", err: "" };
+      }, netrc: () => "",
+      credential: (cwd, url) => founderCredential(cwd, url, { run: (c, a, o) => {
+        calls++;
+        return { ok: true, out: "protocol=https\nhost=enterprise.example\nauthtype=Bearer\ncredential=NOT-A-REAL-TOKEN\n" };
+      } }) };
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "OK", "a helper answering with a credential rather than a password counts", c.lines.join(" | "));
+    check(!/NOT-A-REAL-TOKEN/.test(c.lines.join(" ")), "  and its value still never reaches the report", c.lines.join(" | "));
+    check(calls === 1, "  asked once, since the capability form was accepted", `${calls}`);
+  }
+  {
+    // ...and a git that REJECTS the capability line is asked again without it,
+    // rather than being read as having no credential. 2.43 cannot be tested
+    // from here, so the fallback is what makes advertising safe to ship.
+    let inputs = [];
+    const r = founderCredential("/co", "https://enterprise.example/o/r.git", { run: (c, a, o) => {
+      inputs.push(o?.input ?? "");
+      return inputs.length === 1
+        ? { ok: false, out: "", err: "fatal: unknown credential option" }
+        : { ok: true, out: "password=x\n" };
+    } });
+    check(r.ok, "a git that refuses the capability line is asked the plain question instead", JSON.stringify(r));
+    check(inputs.length === 2 && /capability/.test(inputs[0]) && !/capability/.test(inputs[1]),
+      "  the retry drops it, and only the retry", JSON.stringify(inputs));
+  }
+  {
+    // `remote.origin.mirror` makes a push behave as --mirror, and reeve always
+    // names an explicit refspec. Measured: `fatal: --mirror can't be combined
+    // with refspecs`, where the same push without the setting succeeds.
+    const io = { run: (cwd, args) => {
+        if (args[0] === "remote") return { ok: true, out: "https://github.com/o/r.git" };
+        if (args[0] === "ls-remote") return { ok: true, out: "abcdef1234567890  refs/heads/main" };
+        if (args[0] === "config" && args.includes("remote.origin.mirror")) return { ok: true, out: "true" };
+        return { ok: false, out: "", err: "" };
+      }, credential: () => ({ ok: true }), netrc: () => "" };
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "BROKEN" && /mirror/.test(c.lines.join(" ")) && /refspec/.test(c.lines.join(" ")),
+      "a mirror remote is BROKEN: every publication reeve makes would be refused", c.lines.join(" | "));
+
+    // Control: the same check with mirror unset, or set false, is unaffected.
+    const off = { ...io, run: (cwd, args) => args[0] === "config" && args.includes("remote.origin.mirror")
+      ? { ok: true, out: "false" } : io.run(cwd, args) };
+    check(checkRemoteReach(pub, off).level === "OK", "control: `mirror = false` is not a mirror", "");
+  }
+  {
+    // curl permits a double-quoted netrc field, and measured 2026-08-23 against
+    // a 401 Basic server `machine "127.0.0.1"` authenticates exactly as the
+    // unquoted form does. Comparing raw tokens missed it.
+    const io = seams({ url: "https://enterprise.example/o/r.git",
+                       netrc: 'machine "enterprise.example"\n  login u\n  password p\n' },
+                     { ok: false, why: "no helper answered" });
+    check(checkRemoteReach(pub, io).level === "DEGRADED",
+      "a QUOTED netrc machine name is matched, not missed", checkRemoteReach(pub, io).lines.join(" | "));
+  }
+  {
+    // A read-only deploy key answers `ls-remote` and refuses the push:
+    // ls-remote speaks to git-upload-pack, a push to git-receive-pack. So the
+    // reach establishes the transport works, not that it may write — and the
+    // ssh branch had been claiming the second.
+    const io = seams({ url: "git@github.com:o/r.git" }, { ok: false, why: "should not be asked" });
+    const c = checkRemoteReach({ identity: { checkout: "/co", defaultBranch: "main" } }, io);
+    const all = c.lines.join(" ");
+    check(/exercised it for READING/.test(all),
+      "an ssh reach is reported as having exercised the READ service", all);
+    check(/not established/.test(all) && /git-receive-pack/.test(all) && /without pushing/.test(all),
+      "  and the write service is named as unestablished, as it is for https", all);
+    check(c.level === "OK",
+      "  the verdict stays OK: a permanently degraded check is one its reader skips", c.lines.join(" | "));
+  }
+  {
+    // Control: no alternative configured, so a silent helper is still BROKEN.
+    const io = seams({ url: "https://enterprise.example/o/r.git" }, { ok: false, why: "no helper answered" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "BROKEN", "control: a silent helper with nothing else configured is still BROKEN", c.lines.join(" | "));
+  }
+}
+
+// ── R-16: a pushurl that names nowhere ───────────────────────────────────────
+//
+// Measured 2026-08-23 on git 2.50.1: an explicitly empty `remote.origin.pushurl`
+// is DROPPED — `get-url --push --all` shows only the remaining url and a real
+// push succeeds. A reviewer reports git 2.43 exiting 128 with "no path
+// specified" instead, and 2.43 is what Ubuntu LTS ships, which reeve has to run
+// on. So the resolved list is exactly where the two gits agree and the raw
+// configuration is where they do not; the check reads the configuration.
+{
+  const withConfig = (values, cred = { ok: true }) => ({
+    run: (cwd, args) => {
+      if (args[0] === "remote") return { ok: true, out: "https://github.com/o/r.git" };
+      if (args[0] === "ls-remote") return { ok: true, out: "abcdef1234567890  refs/heads/main" };
+      if (args[0] === "config" && args[2] === "--get-all") {
+        // git -z terminates EVERY value with a NUL, so N values give N NULs.
+        return values === null ? { ok: false, out: "", err: "" } : { ok: true, out: values.map(v => v + "\0").join("") };
+      }
+      if (args[0] === "config") return { ok: false, out: "", err: "" };
+      return { ok: false, out: "", err: "unexpected" };
+    },
+    credential: () => cred,
+    netrc: () => "",
+  });
+  const pub = { identity: { checkout: "/co", defaultBranch: "main", visibility: "public" } };
+
+  const only = checkRemoteReach(pub, withConfig([""]));
+  check(only.level === "BROKEN" && /EMPTY value/.test(only.lines.join(" ")),
+    "a pushurl configured as an empty value is BROKEN", only.lines.join(" | "));
+  check(/2\.43/.test(only.lines.join(" ")) && /2\.50/.test(only.lines.join(" ")),
+    "  and the report names both gits, because the consequence differs between them", only.lines.join(" | "));
+
+  const mixed = checkRemoteReach(pub, withConfig(["https://github.com/o/one.git", ""]));
+  check(mixed.level === "BROKEN",
+    "an empty value ALONGSIDE a real one is still BROKEN — it is not filtered away", mixed.lines.join(" | "));
+
+  // Whitespace is neither empty by string comparison nor a url, and the trim in
+  // the url list turns it into one `filter(Boolean)` then drops. Found reviewing
+  // my own diff, not by a reviewer.
+  const blank = checkRemoteReach(pub, withConfig(["   "]));
+  check(blank.level === "BROKEN" && /EMPTY value/.test(blank.lines.join(" ")),
+    "a pushurl of whitespace is BROKEN too, not silently dropped", blank.lines.join(" | "));
+
+  // And the same hole from the other side: if every destination were dropped,
+  // the credential loop would run zero times and report OK having asked nothing.
+  const nowhere = {
+    run: (cwd, args) => {
+      if (args[0] === "remote") return { ok: true, out: args.includes("--push") ? "   " : "https://github.com/o/r.git" };
+      if (args[0] === "ls-remote") return { ok: true, out: "abcdef1234567890  refs/heads/main" };
+      return { ok: false, out: "", err: "" };
+    },
+    credential: () => { throw new Error("the credential must not be asked for: there is no destination"); },
+    netrc: () => "",
+  };
+  const n = checkRemoteReach(pub, nowhere);
+  check(n.level === "BROKEN" && /no push destination/.test(n.lines.join(" ")),
+    "a remote that resolves to no destination at all is BROKEN, not OK-by-absence", n.lines.join(" | "));
+
+  // Controls: a real pushurl, and none configured at all, both pass through.
+  const real = checkRemoteReach(pub, withConfig(["https://github.com/o/one.git"]));
+  check(real.level === "OK", "control: a configured, non-empty pushurl is unaffected", real.lines.join(" | "));
+  const none = checkRemoteReach(pub, withConfig(null));
+  check(none.level === "OK", "control: no pushurl configured at all is unaffected", none.lines.join(" | "));
+}
+
+// ── R-16: obtained is not validated ──────────────────────────────────────────
+//
+// `git credential fill` gets the fields from the helpers; it does not present
+// them to the server. An expired, revoked, wrong-account or read-only token
+// answers exactly as a working one does, so OK here cannot mean "publication
+// works" — and a reader will take it that way unless the line says otherwise.
+{
+  const io = {
+    run: (cwd, args) => {
+      if (args[0] === "remote") return { ok: true, out: "https://github.com/o/r.git" };
+      if (args[0] === "ls-remote") return { ok: true, out: "abcdef1234567890  refs/heads/main" };
+      return { ok: false, out: "", err: "" };
+    },
+    credential: () => ({ ok: true }),
+    netrc: () => "",
+  };
+  const c = checkRemoteReach({ identity: { checkout: "/co", defaultBranch: "main" } }, io);
+  const all = c.lines.join(" | ");
+  check(c.level === "OK", "control: an obtainable credential is still OK", all);
+  check(/obtained/.test(all) && /not validated against the server/.test(all),
+    "the line says the credential was OBTAINED, not validated", all);
+  check(/not established/.test(all) && /without pushing/.test(all),
+    "  and the report states what remains unknown, beside the verdict rather than only in the docs", all);
+}
+
 // ── R-14 ─────────────────────────────────────────────────────────────────────
 {
   const c = checkCanary("o/r", { stateDir: null });
@@ -27,21 +564,49 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
   check(c.level === "UNKNOWN" && /no canary has been recorded/.test(c.lines[0]), "no recorded canary: UNKNOWN, and it says dispatch is refused meanwhile", c.lines.join(" | "));
 }
 {
-  const rec = { id: "abc123", cliVersion: "2.1.237", bin: "/bin/claude", binaryId: "/bin/claude@1", policyHash: "pol1", ok: true, why: null, at: 1_000_000 };
+  const rec = { id: "abc123", cliVersion: "2.1.237", bin: "/bin/claude", binaryId: "/bin/claude@1", policyHash: "pol1", instrument: "inst1", ok: true, why: null, at: 1_000_000 };
   writeCanaryState(root, "o/r", rec);
-  const c = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 + 5 * 60_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol1" });
+  const c = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 + 5 * 60_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol1", currentInstrument: "inst1" });
   check(c.level === "OK" && /abc123 passed 5 min ago under 2\.1\.237/.test(c.lines[0]), "a passing canary under the SAME binary and policy is OK with id, age and CLI", c.lines.join(" | "));
-  const swapped = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@2", currentPolicyHash: "pol1" });
+  // The DEFAULT expectation, with nothing injected. `measuredContainment` always
+  // builds a netListener, so a record it writes carries the hasNet instrument —
+  // and doctor defaulting to the other variant reported every freshly recorded
+  // pass as a changed script, which is permanently DEGRADED on a healthy host.
+  // `instrumentHash({ hasNet: true })` explicitly, NOT `currentInstrument()`:
+  // the record has to carry what production writes, so that a default which
+  // drifts from it is visible. Written with the same function doctor defaults
+  // to, both sides move together and the assertion proves nothing.
+  writeCanaryState(root, "o/r", { ...rec, instrument: instrumentHash({ hasNet: true }) });
+  const live = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol1" });
+  check(live.level === "OK",
+    "a record carrying the instrument production writes is OK against doctor's DEFAULT", live.lines.join(" | "));
+  writeCanaryState(root, "o/r", rec);
+  const swapped = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@2", currentPolicyHash: "pol1", currentInstrument: "inst1" });
   check(swapped.level === "DEGRADED" && /DIFFERENT build/.test(swapped.lines[0]), "a passing canary under a REPLACED binary is DEGRADED, not OK", swapped.lines.join(" | "));
   // The binary can be unchanged while the policy the daemon generates has moved.
-  const repol = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol2" });
+  const repol = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol2", currentInstrument: "inst1" });
   check(repol.level === "DEGRADED" && /DIFFERENT sandbox policy/.test(repol.lines[0]), "an unchanged binary under a CHANGED policy is DEGRADED, not OK", repol.lines.join(" | "));
   // Unreconstructible policy: the comparison is left unmade rather than assumed.
-  const unk = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: null });
+  const unk = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: null, currentInstrument: "inst1" });
   check(unk.level === "OK", "a policy that cannot be recomputed does not manufacture a failure", unk.level);
   writeCanaryState(root, "o/r", { ...rec, policyHash: undefined });
-  const nopol = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1" });
+  const nopol = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentInstrument: "inst1" });
   check(nopol.level === "UNKNOWN" && /names no sandbox policy/.test(nopol.lines[0]), "a record with no policy to compare is UNKNOWN, never OK", nopol.lines.join(" | "));
+  // The INSTRUMENT is the third thing a record can be historical about. A canary
+  // script strengthened with a new probe leaves the binary and the policy
+  // identical while describing a weaker measurement, and doctor reads the
+  // PERSISTED record — which the daemon's in-memory cache does not speak for.
+  writeCanaryState(root, "o/r", { ...rec, instrument: "inst0" });
+  const reinst = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol1", currentInstrument: "inst1" });
+  check(reinst.level === "DEGRADED" && /DIFFERENT canary script/.test(reinst.lines[0]),
+    "an unchanged binary and policy under a CHANGED canary script is DEGRADED, not OK", reinst.lines.join(" | "));
+  // And a record written before the instrument was persisted at all: it cannot
+  // be compared, so it is UNKNOWN rather than inherited as a pass.
+  writeCanaryState(root, "o/r", { ...rec, instrument: undefined });
+  const noinst = checkCanary("o/r", { stateDir: root, now: () => 1_000_000, identity: () => "/bin/claude@1", currentPolicyHash: "pol1", currentInstrument: "inst1" });
+  check(noinst.level === "UNKNOWN" && /names no instrument/.test(noinst.lines[0]),
+    "a record from before the instrument was recorded is UNKNOWN, never OK", noinst.lines.join(" | "));
+  writeCanaryState(root, "o/r", rec);
   writeCanaryState(root, "o/r", { id: "old", cliVersion: "2.1.237", ok: true, at: 1_000_000 });
   const hist = checkCanary("o/r", { stateDir: root, now: () => 1_000_000 });
   check(hist.level === "UNKNOWN" && /names no CLI binary/.test(hist.lines[0]), "a record with no binary to compare is UNKNOWN, never OK", hist.lines.join(" | "));

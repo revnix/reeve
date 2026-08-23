@@ -5,7 +5,10 @@
 // assertion is on the verdict the daemon draws from those files. The real
 // boundary is measured in test/escape.test.mjs (under the runtime) and by the
 // daemon at start (under the CLI); this file proves the judge.
-import { sandboxCanary, canaryIdFor, policyHashOf, canaryScript, CANARY_INSIDE_CONTROL, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, parseWriteProbe, isPolicyRefusal, netListener, CANARY_SENTINEL } from "../src/canary.mjs";
+import { sandboxCanary, canaryIdFor, policyHashOf, canaryScript, CANARY_INSIDE_CONTROL, writeCanaryState, readCanaryState, canaryStatePath, parseReadProbe, parseWriteProbe, isPolicyRefusal, netListener, CANARY_SENTINEL, instrumentHash } from "../src/canary.mjs";
+import { measureContainment } from "../src/containment.mjs";
+import { currentInstrument, assemblySource, instrumentSourceHash, INSTRUMENT_SOURCES, INSTRUMENT_LOCAL_SOURCES, INSTRUMENT_CALLER_SOURCES, INSTRUMENT_NOT_SOURCES } from "../src/canary.mjs";
+import { createHash } from "node:crypto";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
@@ -147,8 +150,8 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   const r = await sandboxCanary({ ...base, runner: runnerThat() });
   check(r.ok === true && r.why === null, "every denial held and both controls succeeded: ok", r.why);
   check(r.id === canaryIdFor({ cliVersion: base.cliVersion, sandbox: base.sandbox, worktree: base.dir, permissionsDeny: base.permissionsDeny,
-                              allowedTools: base.allowedTools ?? null, script: scriptOf(base) }),
-    "the verdict carries the boundary's id");
+                              allowedTools: base.allowedTools ?? null, instrument: instrumentHash({ hasNet: true }) }),
+    "the verdict carries the boundary's id", r.id);
   check(!existsSync(base.dir) && !existsSync(base.outsideDir) && !existsSync(base.decoyPath), "a passing canary cleans up after itself");
 }
 {
@@ -396,12 +399,28 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
 // how the by-path keychain reach stayed unmeasured while a passing record said
 // containment was closed.
 {
-  const a = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, script: "probe A\n" });
-  const b = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, script: "probe A\nprobe B\n" });
-  check(a !== b, "adding a probe to the canary script is a different id", `${a} ${b}`);
-  const p1 = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, worktree: "/wt/inv-a", script: "cp /wt/inv-a/x .\n" });
-  const p2 = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, worktree: "/wt/inv-b", script: "cp /wt/inv-b/x .\n" });
-  check(p1 === p2, "while the same script under a different per-invocation directory is the SAME id", `${p1} ${p2}`);
+  // The instrument's identity comes from `canaryScript`'s own text with every
+  // per-invocation value placeholdered, not from the script string a particular
+  // run produced. Hashing that string put a random listener port and two mkdtemp
+  // paths into the id: measured 2026-08-23, two runs of the SAME policy and the
+  // SAME script produced different ids, so the cache key had to be computed
+  // without the script to stay stable — which left the instrument in the
+  // recorded id and NOT in the key, and a strengthened script never invalidated
+  // a pass taken before it.
+  const withNet = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, instrument: instrumentHash({ hasNet: true }) });
+  const without = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, instrument: instrumentHash({ hasNet: false }) });
+  check(withNet !== without, "a canary run WITHOUT the network control is a different id", `${withNet} ${without}`);
+  check(instrumentHash({ hasNet: true }) === instrumentHash({ hasNet: true }),
+    "the instrument hash is stable — the same instrument is the same value", instrumentHash({ hasNet: true }));
+
+  // And the property the old id could not hold: two invocations differing only
+  // in their per-run scratch paths and listener port are the SAME id.
+  const inv = (n, port) => canaryIdFor({
+    cliVersion: "1", sandbox: block.sandbox, worktree: `/wt/inv-${n}`,
+    instrument: instrumentHash({ hasNet: true }), permissionsDeny: [`Read(//wt/inv-${n}/x)`],
+  });
+  check(inv("a", 54321) === inv("b", 61234),
+    "two invocations of one instrument and one policy are the SAME id", `${inv("a", 1)} ${inv("b", 2)}`);
 }
 
 // ── a probe that cannot tell DENIAL from ABSENCE decides nothing ─────────────
@@ -457,6 +476,133 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   check(h1 !== h2, "the recorded policy hash moves with the rules too, so R-14 cannot report OK across the change", `${h1} ${h2}`);
 }
 
+// ── the instrument is more than the script ───────────────────────────────────
+//
+// `canaryScript` is one part of it. `canaryPromptFor` decides what the worker is
+// told to attempt, `parseReadProbe` and `parseWriteProbe` decide what the event
+// stream is read to mean, and the assertions in `sandboxCanary` decide which
+// combination is a pass. A release strengthening any of those changes what a
+// pass MEANS while leaving the script untouched — and `binaryId` identifies the
+// Claude executable, not reeve's own code, so nothing else would notice.
+{
+  const scriptOnly = createHash("sha256").update(canaryScript({
+    tmpDir: "<tmp>", outsideDir: "<outside>", decoyPath: "<decoy>", netUrl: "<net>",
+    fileDecoyPath: "<file-decoy>", fileControlPath: "<file-control>",
+  })).digest("hex").slice(0, 12);
+  check(instrumentHash({ hasNet: true }) !== scriptOnly,
+    "the instrument hash is not the script's hash — it carries the code that judges too",
+    `${instrumentHash({ hasNet: true })} ${scriptOnly}`);
+
+  // The rot guard. A new local import of canary.mjs has to be classified as
+  // part of the instrument or explicitly not, rather than silently ignored.
+  const src = readFileSync(new URL("../src/canary.mjs", import.meta.url), "utf8");
+  const imported = [...src.matchAll(/from "(\.\/[^"]+)"/g)].map(m => m[1]).sort();
+  // The LOCAL list: the guard reads this file's imports, so a caller-side source
+  // is not one of them and must not be expected here.
+  const classified = [...INSTRUMENT_LOCAL_SOURCES, ...INSTRUMENT_NOT_SOURCES].filter(f => f !== "./canary.mjs").sort();
+  check(JSON.stringify(imported) === JSON.stringify(classified),
+    "every module canary.mjs imports is classified as instrument or not-instrument",
+    `imports ${imported.join(",")} | classified ${classified.join(",")}`);
+  check(INSTRUMENT_SOURCES.includes("./canary.mjs"),
+    "  and this file counts itself, since the probes and the verdicts live here", INSTRUMENT_SOURCES.join(","));
+  // sandbox.mjs was excluded on the grounds that it contributes the POLICY and
+  // the policy is hashed into the id. True of the PRODUCTION policy; false of
+  // the canary's own grant, which `canaryGrant` builds from `scopedFileTools`
+  // and `ruleFor`, whose `allowRead` comes from `carveOuts`, and which
+  // `validateSettings` then accepts or refuses. None of that reaches the id.
+  check(INSTRUMENT_SOURCES.includes("./sandbox.mjs"),
+    "  and so does sandbox.mjs, which builds the grant the probe runs under", INSTRUMENT_SOURCES.join(","));
+  // The caller side: `measuredContainment` assembles the probe's environment
+  // from workerenv.mjs — the HOME, the PATH shims and the git configuration
+  // whose isolation the canary exists to measure. The guard above cannot see
+  // it, since it is not an import of this file, so it is asserted by name.
+  check(INSTRUMENT_CALLER_SOURCES.includes("./workerenv.mjs") && INSTRUMENT_SOURCES.includes("./workerenv.mjs"),
+    "  and workerenv.mjs, which builds the environment the probe measures the isolation of", INSTRUMENT_SOURCES.join(","));
+
+  // The ASSEMBLY itself, which naming its dependencies does not cover:
+  // `measuredContainment` chooses which HOME, which shims, which git config, so
+  // a release changing the CALL while leaving workerenv.mjs alone changes what a
+  // pass means. One function is sliced rather than the whole daemon, so
+  // unrelated edits cost nothing.
+  const asm = assemblySource();
+  check(asm.startsWith("export async function measuredContainment("),
+    "the caller's assembly is found and hashed, not merely its dependencies", JSON.stringify(asm.slice(0, 60)));
+  check(asm.split("\n").length > 20 && asm.trimEnd().endsWith("}"),
+    "  and it is the whole function, not a fragment", `${asm.split("\n").length} lines`);
+  // The point of asserting the above: a rename or a reformat that breaks the
+  // slice would otherwise hash a marker forever — fail-closed, but silently
+  // re-measuring on every release and telling nobody why. This turns that into
+  // a red test instead, which was the objection to parsing in the first place.
+  check(!/^</.test(asm), "  and a failed slice is a test failure, not a quiet marker", asm.slice(0, 40));
+
+  // ...and that it is WIRED IN. The three assertions above all passed with the
+  // assembly removed from the digest: they check that the slice works, which is
+  // not the same as checking its result reaches the hash. Vary the input and
+  // watch the output move.
+  check(instrumentSourceHash({ assembly: () => "ASSEMBLY-A" }) !== instrumentSourceHash({ assembly: () => "ASSEMBLY-B" }),
+    "  and a change to the assembly CHANGES the instrument, which is the part being claimed", "");
+  check(instrumentSourceHash({ assembly: () => "SAME" }) === instrumentSourceHash({ assembly: () => "SAME" }),
+    "  while an unchanged one does not, so the hash is a function of it and not of the clock", "");
+}
+
+// ── the recorded id IS the cache key ─────────────────────────────────────────
+//
+// These were two different values. `sandboxCanary` computed the id it RECORDS
+// with the script in it; `measureContainment` computed its cache KEY without,
+// because the script carried a random listener port and two mkdtemp paths and a
+// key built on it could never hit. So the instrument was in the id and not in
+// the key, and a canary script strengthened with a new probe went on reusing a
+// pass taken before that probe existed — which is the exact reuse the script was
+// put in the id to prevent.
+//
+// Nothing caught it because every cache test injected a canary FUNCTION, so the
+// real id producer never ran. This one drives both call sites.
+{
+  const cache = new Map();
+  const clean = { measured: true, items: [], why: null };
+  // The stub runner and its event stream are bound to `base`'s directories by
+  // name, so those are what each ask uses; a passing canary removes them, hence
+  // the recreate. What varies between asks is the LISTENER PORT, which is the
+  // value measured to move the old id — the per-invocation directory half is
+  // covered by the normalisation test above.
+  const paths = () => {
+    for (const d of [base.dir, base.outsideDir, base.tmpDir]) mkdirSync(d, { recursive: true });
+    return { dir: base.dir, outsideDir: base.outsideDir, tmpDir: base.tmpDir, decoyPath: base.decoyPath };
+  };
+  // A listener on a different port each time, which is what actually differs
+  // between two ticks and what used to move the id.
+  const netOn = port => ({ url: `http://127.0.0.1:${port}/canary`, selfReachable: () => true, wasHit: () => false });
+  const ask = (port, netProbe) => measureContainment({
+    cliVersion: base.cliVersion, sandbox: base.sandbox, permissionsDeny: base.permissionsDeny,
+    allowedTools: base.allowedTools ?? null, binaryId: "/x@1",
+    canaryPaths: paths(), bin: base.bin, env: base.env,
+    netProbe: netProbe === undefined ? netOn(port) : netProbe,
+    keychain: clean, isolated: true, platform: "darwin", cache,
+    canary: a => sandboxCanary({ ...a, runner: runnerThat() }),
+  });
+
+  const first = await ask(54321);
+  check(first.canary?.ok === true && !first.canary.cached,
+    "control: the first ask runs the canary for real", JSON.stringify({ ok: first.canary?.ok, why: first.canary?.why }));
+  // The other end of the invariant doctor's default rests on: what a run WITH a
+  // listener — which is every production run — records as its instrument.
+  check(instrumentHash({ hasNet: true }) === currentInstrument(),
+    "the instrument a listener-carrying run uses IS the one anything reading a record expects",
+    `${instrumentHash({ hasNet: true })} ${currentInstrument()}`);
+
+  const second = await ask(61234);
+  check(second.canary?.cached === true,
+    "a second ask under a new listener port HITS the cache", JSON.stringify({ cached: second.canary?.cached, id: second.canary?.id }));
+  check(second.canary?.id === first.canary?.id,
+    "  because the recorded id is the same value the key is built from", `${first.canary?.id} ${second.canary?.id}`);
+
+  // And the guarantee the instrument was put in the id for: a WEAKER instrument
+  // must not inherit a stronger instrument's pass.
+  const weaker = await ask(0, null);
+  check(!weaker.canary?.cached,
+    "a run WITHOUT the network control does not reuse the pass measured with it", JSON.stringify({ cached: weaker.canary?.cached, id: weaker.canary?.id }));
+}
+
 // ── the binary identity is part of the id ────────────────────────────────────
 {
   const a = canaryIdFor({ cliVersion: "1", sandbox: block.sandbox, binaryId: "/x@1" });
@@ -464,8 +610,8 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
   check(a !== b, "a swapped binary (same version) is a different id", `${a} ${b}`);
   const r = await sandboxCanary({ ...base, binaryId: "/x@1", runner: runnerThat() });
   check(r.id === canaryIdFor({ cliVersion: base.cliVersion, sandbox: base.sandbox, binaryId: "/x@1", worktree: base.dir, permissionsDeny: base.permissionsDeny,
-                              allowedTools: base.allowedTools ?? null, script: scriptOf(base) }),
-    "and the canary carries the binary-aware id");
+                              allowedTools: base.allowedTools ?? null, instrument: instrumentHash({ hasNet: true }) }),
+    "and the canary carries the binary-aware id", r.id);
 }
 
 // ── the decoy must survive the probe ─────────────────────────────────────────

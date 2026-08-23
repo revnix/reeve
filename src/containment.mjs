@@ -20,7 +20,7 @@
 // open. A probe that cannot run is open. Closed is a conclusion, never a default.
 import { spawnSync } from "node:child_process";
 import { realpathSync, statSync } from "node:fs";
-import { sandboxCanary, canaryIdFor, policyHashOf, readCanaryState, writeCanaryState } from "./canary.mjs";
+import { sandboxCanary, canaryIdFor, instrumentHash, policyHashOf, readCanaryState, writeCanaryState } from "./canary.mjs";
 
 /**
  * Is the isolation the profile declares actually implemented?
@@ -138,7 +138,12 @@ export async function measureContainment({
   // the CACHE key must be computed the same way or it changes every tick and the
   // cache can never hit, so every wanted task pays another five-minute model
   // canary. (Codex #4h-[1].)
-  const id = cliVersion && sandbox ? canaryIdFor({ cliVersion, sandbox, binaryId, worktree: canaryPaths?.dir ?? null, permissionsDeny, allowedTools }) : null;
+  // The INSTRUMENT belongs in the key, not only in the recorded id. It was in
+  // the id alone, and the id was unstable, so the two were different values: a
+  // canary script strengthened with a new probe did not invalidate a pass taken
+  // before it, which is the reuse the instrument was put in the id to prevent.
+  const id = cliVersion && sandbox ? canaryIdFor({ cliVersion, sandbox, binaryId, worktree: canaryPaths?.dir ?? null, permissionsDeny, allowedTools,
+                                                   instrument: instrumentHash({ hasNet: !!netProbe }) }) : null;
   const cheapReasons = reasons.length > 0;
   if (canary && typeof canary !== "function") cn = canary;
   else if (cheapReasons) cn = { ok: false, id, why: "not run: containment is already open for a cheaper reason", skipped: true };
@@ -151,7 +156,7 @@ export async function measureContainment({
     cn = await run({ cliVersion, sandbox, permissionsDeny, allowedTools, binaryId, ...canaryPaths, bin, env, ...(netProbe ? { netProbe } : {}) });
     cn = { ...cn, at: now() };
     cache.set(id, cn);
-    if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, bin, binaryId, policyHash: policyHashOf(sandbox, canaryPaths?.dir ?? null, { permissionsDeny, allowedTools }), stateRoots, allowedTools, canaryDir: canaryPaths?.dir ?? null, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }
+    if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, bin, binaryId, instrument: instrumentHash({ hasNet: !!netProbe }), policyHash: policyHashOf(sandbox, canaryPaths?.dir ?? null, { permissionsDeny, allowedTools }), stateRoots, allowedTools, canaryDir: canaryPaths?.dir ?? null, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }
   }
   // A skipped canary adds no reason of its own (the cheaper reasons already stand);
   // a run-or-injected canary that failed does.

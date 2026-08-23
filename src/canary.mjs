@@ -21,6 +21,7 @@ import { createServer, connect } from "node:net";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const canonical = v => {
   if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
@@ -36,18 +37,167 @@ const canonical = v => {
  * every run and says nothing about what the sandbox denies.
  */
 export function canaryIdFor({ cliVersion, sandbox, binaryId = null, worktree = null, permissionsDeny = null, allowedTools = null,
-                              script = null }) {
+                              instrument = null }) {
   if (!cliVersion || !sandbox) throw new Error("canaryIdFor: cliVersion and the sandbox block are required");
-  // The SCRIPT is part of the identity too, because it is the instrument. A
-  // record made before a probe existed describes a weaker measurement than the
-  // one being asked for now, and reusing it is how the by-path keychain reach
-  // stayed unmeasured while a passing record said containment was closed.
-  // Per-invocation paths inside it (the decoy, the tmp dir) normalise out, or
-  // every tick would pay for another five-minute canary.
-  const instrument = script ? createHash("sha256").update(canonical(normaliseRules(String(script).split("\n"), worktree))).digest("hex").slice(0, 12) : "?";
+  // The INSTRUMENT is part of the identity too. A record made before a probe
+  // existed describes a weaker measurement than the one being asked for now, and
+  // reusing it is how the by-path keychain reach stayed unmeasured while a
+  // passing record said containment was closed.
+  //
+  // It arrives as `instrumentHash()`, not as the script text. Hashing the script
+  // itself put a per-invocation listener port and two mkdtemp paths into the id,
+  // so two runs of the SAME policy and the SAME script produced different ids --
+  // measured 2026-08-23, changing only the listener port changed the id. The
+  // cache key was computed WITHOUT the script to stay stable, which meant the
+  // instrument was in the recorded id and not in the key, and a changed script
+  // never invalidated a cached pass. The normalised hash is stable, so one value
+  // serves as both. (Codex #10-[4] adjacent; found while measuring it.)
   return createHash("sha256").update(
-    `${cliVersion}\n${binaryId ?? "?"}\n${canonical(normalisePolicy(sandbox, worktree))}\n${canonical(normaliseRules(permissionsDeny, worktree))}\n${canonical(normaliseRules(allowedTools, worktree))}\n${instrument}`,
+    `${cliVersion}\n${binaryId ?? "?"}\n${canonical(normalisePolicy(sandbox, worktree))}\n${canonical(normaliseRules(permissionsDeny, worktree))}\n${canonical(normaliseRules(allowedTools, worktree))}\n${instrument ?? "?"}`,
   ).digest("hex").slice(0, 16);
+}
+
+/**
+ * The identity of the canary INSTRUMENT: its script with every per-invocation
+ * value replaced by a placeholder.
+ *
+ * The script embeds the run's tmp and outside directories, its decoy paths and
+ * the daemon-local listener's URL. All of those move every invocation, so the
+ * script's own text cannot identify the instrument -- but what the script DOES
+ * is exactly what must be identified, so that adding a probe invalidates a pass
+ * taken before it existed.
+ *
+ * `hasNet` is the one thing that changes what the script does rather than where
+ * it points: with no listener the network positive control is absent, and a pass
+ * measured without it is a weaker measurement.
+ */
+/**
+ * The instrument the daemon would run TODAY.
+ *
+ * `measuredContainment` always builds a `netListener`, so every canary it
+ * records carries the network positive control and its instrument is the
+ * hasNet form. Anything reading a persisted record has to compare against
+ * THAT, not against the default: doctor defaulting to the no-network variant
+ * reported every freshly recorded pass as a different script, which is
+ * permanently DEGRADED and exit code 3 on a host whose canary had just passed.
+ *
+ * One function so the two cannot drift again. If the daemon ever stops
+ * guaranteeing a listener, this is the line that has to change with it.
+ */
+export const currentInstrument = () => instrumentHash({ hasNet: true });
+
+export function instrumentHash({ hasNet = false } = {}) {
+  return createHash("sha256").update(canaryScript({
+    tmpDir: "<tmp>", outsideDir: "<outside>", decoyPath: "<decoy>",
+    netUrl: hasNet ? "<net>" : null,
+    fileDecoyPath: "<file-decoy>", fileControlPath: "<file-control>",
+  }) + "\n" + instrumentSourceHash()).digest("hex").slice(0, 12);
+}
+
+/**
+ * The modules whose CODE decides what the canary does.
+ *
+ * The script is only part of the instrument. `canaryPromptFor` decides what the
+ * worker is told to attempt, `parseReadProbe` and `parseWriteProbe` decide what
+ * the event stream is read to mean, and the assertions in `sandboxCanary`
+ * decide which combination is a pass — all of them in this file. `workerArgs`
+ * in supervisor.mjs decides how the worker is launched at all. A release that
+ * strengthens any of those changes what a pass MEANS while leaving the script
+ * untouched, and `binaryId` identifies the Claude executable, not reeve's own
+ * code — so nothing else would have noticed. (Codex #14-[12].)
+ *
+ * sandbox.mjs is here too, and excluding it was wrong. The reasoning was that
+ * what it contributes is the POLICY and the policy is hashed into the id
+ * directly -- true of the PRODUCTION policy, and false of the canary's own
+ * grant: `canaryGrant` builds `permissions.allow` from `scopedFileTools` and
+ * `ruleFor`, `carveOuts` builds the canary's `allowRead`, and `validateSettings`
+ * decides whether the result is accepted. None of those reach the id, which
+ * carries the production `permissionsDeny` and `allowedTools` it was handed. A
+ * change to any of them alters what the probe may attempt while leaving the
+ * hash still. (Codex #14-[14].)
+ *
+ * Nothing is excluded now. The mechanism stays because a future import might
+ * genuinely contribute nothing to the measurement -- and a test asserts both
+ * lists against the local imports this file actually has, so that decision has
+ * to be made rather than defaulted into.
+ */
+export const INSTRUMENT_LOCAL_SOURCES = ["./canary.mjs", "./supervisor.mjs", "./sandbox.mjs"];
+
+/**
+ * And the caller side. `measuredContainment` assembles the probe's environment
+ * from workerenv.mjs -- `workerEnv`, `writeGitConfig`, `workerHomeFor` choose
+ * the HOME, the PATH shims and the git configuration the canary runs under, and
+ * those are the very mechanisms whose isolation it measures. A release changing
+ * them changes what a pass means, from outside this file. (Codex #14-[19].)
+ *
+ * The rot guard below can see what canary.mjs imports; it cannot see what a
+ * caller assembles, so this entry is declared by hand and asserted by name.
+ */
+export const INSTRUMENT_CALLER_SOURCES = ["./workerenv.mjs"];
+
+/**
+ * ...and the assembly ITSELF, which naming its dependencies does not cover.
+ *
+ * `measuredContainment` chooses the arguments -- which HOME, which shims, which
+ * git configuration -- so a release that changes the call while leaving
+ * workerenv.mjs alone changes what a pass means and moves nothing.
+ *
+ * I first argued this could not be closed: hashing daemon.mjs re-measures on
+ * every unrelated edit to the daemon, and parsing for module references is a
+ * guard that breaks QUIETLY. A reviewer pushed, and the second objection is the
+ * one that does not hold -- a parse can be made to break LOUDLY. One function
+ * is sliced rather than the file, so unrelated daemon edits cost nothing; a
+ * slice that fails returns a marker that cannot collide with real source, which
+ * forces a re-measurement rather than a silent match; and a test asserts the
+ * slice actually finds the function, so a rename fails the suite instead of
+ * quietly hashing nothing. (Codex #14-[20].)
+ */
+const INSTRUMENT_ASSEMBLY = { file: "./daemon.mjs", fn: "measuredContainment" };
+
+export function assemblySource() {
+  const here = dirname(fileURLToPath(import.meta.url));
+  let text;
+  try { text = readFileSync(join(here, INSTRUMENT_ASSEMBLY.file), "utf8"); }
+  catch { return `<unreadable:${INSTRUMENT_ASSEMBLY.file}>`; }
+  const lines = text.split("\n");
+  const opens = [`export async function ${INSTRUMENT_ASSEMBLY.fn}(`, `export function ${INSTRUMENT_ASSEMBLY.fn}(`];
+  const start = lines.findIndex(l => opens.some(o => l.startsWith(o)));
+  if (start < 0) return `<not-found:${INSTRUMENT_ASSEMBLY.fn}>`;
+  const end = lines.findIndex((l, i) => i > start && l === "}");
+  if (end < 0) return `<unterminated:${INSTRUMENT_ASSEMBLY.fn}>`;
+  return lines.slice(start, end + 1).join("\n");
+}
+export const INSTRUMENT_SOURCES = [...INSTRUMENT_LOCAL_SOURCES, ...INSTRUMENT_CALLER_SOURCES];
+export const INSTRUMENT_NOT_SOURCES = [];
+
+let sourceHashCache = null;
+
+/**
+ * Injectable, so a test can VARY an input and watch the output move.
+ *
+ * It was not, and a stub that removed the assembly from the hash turned nothing
+ * red: the tests asserted that `assemblySource()` finds the function, never that
+ * its result reaches the digest. Checking a part works is not checking it is
+ * wired in, and only the default call is cached — a call with arguments is a
+ * question about behaviour, not the daemon's hot path.
+ */
+export function instrumentSourceHash({ sources = null, assembly = assemblySource } = {}) {
+  const dflt = sources === null && assembly === assemblySource;
+  if (dflt && sourceHashCache) return sourceHashCache;
+  const here = dirname(fileURLToPath(import.meta.url));
+  const h = createHash("sha256");
+  for (const rel of sources ?? INSTRUMENT_SOURCES) {
+    h.update(rel);
+    // A source that cannot be read gets a marker rather than nothing: it cannot
+    // collide with that file's real bytes, so the effect is a re-measurement
+    // rather than a silent match, and it stays the same across processes so the
+    // re-measurement happens once instead of on every tick.
+    try { h.update(readFileSync(join(here, rel))); }
+    catch { h.update(`<unreadable:${rel}>`); }
+  }
+  h.update(assembly());
+  const out = h.digest("hex").slice(0, 12);
+  return dflt ? (sourceHashCache = out) : out;
 }
 
 /**
@@ -337,7 +487,12 @@ export async function sandboxCanary({
   // belongs in the id: a record made before a probe existed describes a weaker
   // measurement than the one being asked for now.
   const scriptText = canaryScript({ tmpDir, outsideDir, decoyPath, netUrl: netProbe?.url ?? null, fileDecoyPath, fileControlPath });
-  const id = canaryIdFor({ cliVersion, sandbox, binaryId, worktree: dir, permissionsDeny, allowedTools, script: scriptText });
+  // `!!netProbe`, not `!!netProbe.url`, so this is computable BEFORE the script
+  // exists -- which is what lets `measureContainment` key its cache on the same
+  // value. The two can only disagree when a listener was handed over and failed
+  // to bind, and a canary whose network control is missing fails on that alone.
+  const id = canaryIdFor({ cliVersion, sandbox, binaryId, worktree: dir, permissionsDeny, allowedTools,
+                           instrument: instrumentHash({ hasNet: !!netProbe }) });
   const evidence = { id, cliVersion, dir, outcome: null, why: null, results: null, readTool: null, writeTool: null, network: null };
   const fail = why => ({ ok: false, id, why, evidence });
 

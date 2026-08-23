@@ -2694,8 +2694,17 @@ const NOW = 1_800_000_000;
   check(settledAt(a.id) === null,
     "control: a recorded drain row starts unsettled", String(settledAt(a.id)));
   const before = events();
-  leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
-  settleEffect(db, { id: a.id, worker: a.worker, leaseToken: a.lease_token, ok: true, result: {} });
+  // The LEASE's identity, not the enqueue's. `enqueueEffect` returns the row as
+  // inserted, before any worker holds it, so `a.worker` and `a.lease_token` are
+  // null -- and `settleEffect`'s owner/token CAS is precisely what those fields
+  // have to match. Discarding the lease result left the row inflight and its
+  // `task_drain` row unsettled, so both positive assertions below went red
+  // against the implementation this plan prescribes.
+  const leasedA = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  check(leasedA?.id === a.id,
+    "fixture: the row leased is the one just enqueued, so the settle below addresses it",
+    `${leasedA?.id} vs ${a.id}`);
+  settleEffect(db, { id: leasedA.id, worker: leasedA.worker, leaseToken: leasedA.lease_token, ok: true, result: {} });
   check(settledAt(a.id) !== null,
     "settleEffect settles the drain row for the effect it just completed", String(settledAt(a.id)));
   check(events() === before + 1,

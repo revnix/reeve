@@ -348,6 +348,36 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       have caught the founder-config one, and it is deliberately NOT in this PR.
       REMAINING: the PR's remaining Codex rounds, and the founder's merge grant.
 
+- [ ] **Two instruments that could not have caught what they are for (2026-08-23).**
+      Both found after #10 merged, while checking it live. In `fix/reach-and-instrument`.
+      · **Nothing measured whether reeve can reach the remote it publishes to.**
+        Every other check reads GitHub through `gh`, which carries its own token;
+        publication is a `git push` from the founder's checkout. The obvious check
+        would not have caught it either — measured, on **public** `nextlyhq/nextly`
+        the broken configuration REACHED `ls-remote` anonymously while a credential
+        could not be obtained, so a reachability check reports healthy for the one
+        repository reeve watches. **R-16 asks the credential question** via
+        `git credential fill`, which is what a push does and writes nothing. The
+        value is never read into reeve.
+        (`docs/measured/2026-08-23-a-read-proves-nothing-about-a-push.md`)
+      · **The canary's instrument was in its recorded id and NOT in its cache key.**
+        `canaryIdFor` documents the script as part of the identity so a pass taken
+        under a weaker instrument cannot be reused — but only `sandboxCanary`
+        passed one, and the key in `containment.mjs` did not. It could not: the
+        script embeds a random listener port and two mkdtemp paths, and measured,
+        changing only the port changed the id. So a strengthened script never
+        invalidated a cached pass. `instrumentHash()` hashes the script's own text
+        with the per-invocation values placeholdered, so one stable value serves
+        as both. **Every existing cache test injected a canary FUNCTION**, so the
+        real id producer never ran and the drift could not be seen.
+        (`docs/measured/2026-08-23-the-instrument-was-in-the-id-and-not-in-the-key.md`)
+      Live after #10: canary **PASSED** (`7e14000fb54d28f5`), `credentialRead:
+      closed`; founder-side git reaches both remotes; the worker isolation still
+      refuses both, which is the fix confirmed from the other side. **Canary ids
+      recorded before this change identify nothing** — `dae5b2c1f1f59777` and
+      `7e14000fb54d28f5` are very likely one measurement.
+      REMAINING: the PR's Codex rounds, and the founder's merge grant.
+
 - [ ] **Guardian: the review shadow week RESET on 2026-08-22.** `#1134` diverged
       — `resolved differs: live 13, derived 18` (55 comparisons, 52 agreements;
       every other PR 161/161 that day). The 5-clean-day run for PR-5 restarts

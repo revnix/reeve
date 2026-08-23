@@ -12,12 +12,14 @@
 
 import { checkBaseline } from "./baseline.mjs";
 import { sandboxFor } from "./sandbox.mjs";
-import { readCanaryState, policyHashOf } from "./canary.mjs";
+import { readCanaryState, policyHashOf, currentInstrument as instrumentInForce } from "./canary.mjs";
 import { probeKeychain, isolationTopologyReady, binaryIdentity } from "./containment.mjs";
+import { GIT_NEUTRALISE_FOUNDER, founderGitEnv } from "./gitguard.mjs";
 import { readOauthToken } from "./workerenv.mjs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 const BROKEN = "BROKEN";
@@ -392,7 +394,7 @@ function checkDetectors(db, profile) {
 // a refusal in the log can be understood here without the daemon.
 
 /** The last sandbox canary this daemon recorded, if any. */
-export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now = () => Date.now(), identity = binaryIdentity, currentPolicyHash = null } = {}) {
+export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now = () => Date.now(), identity = binaryIdentity, currentPolicyHash = null, currentInstrument = instrumentInForce() } = {}) {
   const id = "R-14", title = "worker sandbox canary";
   if (!stateDir) return { id, level: UNKNOWN, title, lines: ["no state directory to read the canary from"] };
   const st = read(stateDir, nwo);
@@ -423,6 +425,19 @@ export function checkCanary(nwo, { stateDir = null, read = readCanaryState, now 
   if (currentPolicyHash && currentPolicyHash !== st.policyHash) return { id, level: DEGRADED, title, lines: [
     `the last canary passed ${when} under a DIFFERENT sandbox policy (${st.policyHash}, now ${currentPolicyHash})`,
     "the daemon re-measures before dispatching under the policy in force now"] };
+  // And the INSTRUMENT. A record can carry the same binary and the same policy
+  // and still describe a weaker measurement, because the canary script itself
+  // changed -- which is the whole reason the instrument is in the id. The
+  // daemon's in-memory cache notices on its next run, but doctor reads the
+  // PERSISTED record, and a record written before this comparison existed has no
+  // instrument to compare at all. Neither is OK: a measurement that cannot be
+  // matched to today's instrument is UNKNOWN.
+  if (!st.instrument) return { id, level: UNKNOWN, title, lines: [
+    `canary ${st.id ?? "?"} passed ${when}, but the record names no instrument`,
+    "so it cannot be checked against the canary script in use now; the daemon re-measures before it dispatches"] };
+  if (currentInstrument && currentInstrument !== st.instrument) return { id, level: DEGRADED, title, lines: [
+    `the last canary passed ${when} under a DIFFERENT canary script (${st.instrument}, now ${currentInstrument})`,
+    "an older instrument proves less than the one being asked for; the daemon re-measures before dispatching"] };
   return { id, level: OK, title, lines: [`canary ${st.id ?? "?"} passed ${when} under ${st.cliVersion ?? "?"}, and the CLI binary is unchanged`,
     "network, outside writes and credential-file reads denied; inside and tmp writes allowed"] };
 }
@@ -508,9 +523,372 @@ function currentPolicy(profile, { read = readCanaryState, stateDir = null, nwo =
   } catch { return null; }
 }
 
+// ── R-16: can reeve reach the remote it would publish to? ─────────────────
+//
+// Every other check reads GitHub through `gh`, which carries its own token.
+// Publication does not: it is a `git push` from the founder's checkout, and it
+// needs whatever that checkout's origin needs -- a credential helper, a URL
+// rewrite, an ssh key. Nothing measured any of that, and on 2026-08-22 none of
+// it worked: the worker isolation had been applied to the founder's own
+// repository, so `ls-remote origin` failed with "could not read Username". Every
+// publication reeve would have made was going to fail, and no instrument said so.
+//
+// The instrument has to ask the CREDENTIAL question, not just the reachability
+// one. Measured that day, on the public repository reeve actually watches:
+//
+//   ls-remote, worker isolation      -> REACHED   (public, so anonymous)
+//   credential fill, worker isolation -> REFUSED  ("could not read Username")
+//
+// A read proves nothing about a push on a public repository. `git credential
+// fill` is what a push does to obtain the credential, costs no network write,
+// and is the only half that can tell those two apart.
+
+/** git in the founder's own checkout, exactly as `founderGit` runs it. */
+function founderRun(cwd, args, { input = null, timeout = 20_000 } = {}) {
+  try {
+    return { ok: true, out: execFileSync("git", ["-C", cwd, ...GIT_NEUTRALISE_FOUNDER, ...args],
+      { encoding: "utf8", stdio: [input === null ? "ignore" : "pipe", "pipe", "pipe"],
+        ...(input === null ? {} : { input }), env: founderGitEnv(), timeout }).trim() };
+  } catch (e) {
+    const line = String(e.stderr || e.message).split("\n").filter(Boolean).pop() ?? "git failed";
+    return { ok: false, out: "", err: line.slice(0, 140) };
+  }
+}
+
+/**
+ * Whether a credential can be OBTAINED for this remote.
+ *
+ * Asked with `url=`, the whole target, rather than protocol and host. With
+ * `credential.useHttpPath` set -- which is how a founder keeps separate
+ * credentials for repositories on one host -- a host-only question is not the
+ * question a push asks. Measured 2026-08-23 against a helper that records what
+ * git asked it:
+ *
+ *   protocol+host      -> git asks without a path, a HOST-WIDE credential answers
+ *   url=.../two.git    -> git asks with path=two.git, and nothing answers
+ *
+ * So the host-only form reports a credential is available while the real
+ * path-qualified push has none. `url=` also carries the port and any username.
+ *
+ * `git credential fill` prints the credential on stdout. Nothing is kept: this
+ * returns a boolean and git's own error line, never the value, and the reply is
+ * not logged, recorded, or included in any evidence file.
+ */
+export function founderCredential(cwd, url, { run = founderRun } = {}) {
+  // `capability[]=authtype` is advertised, because a helper that negotiates it
+  // answers with `authtype=Bearer` and `credential=...` INSTEAD of a password,
+  // and git forms the Authorization header from those. A password-only test
+  // calls that a missing credential.
+  //
+  // Measured 2026-08-23 on git 2.50.1 (Apple Git-155): this build does not
+  // support the capability -- a helper returning those fields has them
+  // discarded -- so the case is not reproducible here and this is forward
+  // insurance rather than a fixed defect. Unknown input keys are tolerated
+  // silently on that build (exit 0, no warning), but 2.43 on Ubuntu LTS cannot
+  // be tested from here, so a call that FAILS is retried without the line. A
+  // git that rejects the key gets the plain question rather than a wrong BROKEN.
+  let r = run(cwd, ["credential", "fill"], { input: `capability[]=authtype\nurl=${url}\n\n` });
+  if (!r.ok) r = run(cwd, ["credential", "fill"], { input: `url=${url}\n\n` });
+  if (!r.ok) return { ok: false, why: r.err };
+  // `credential=` is as much an answer as `password=`. Neither value is read.
+  return { ok: r.out.split("\n").some(l => l.startsWith("password=") || l.startsWith("credential=")),
+           why: "the credential helpers returned no password or credential for it" };
+}
+
+/**
+ * HTTP authentication configured somewhere other than a credential helper.
+ *
+ * `http.<url>.extraHeader` carrying an Authorization header, and
+ * `http.<url>.cookieFile`, are both used by `ls-remote` and by the real push
+ * while `git credential fill` knows nothing about them. `--get-urlmatch` is
+ * git's own resolution for per-url http config: measured 2026-08-23, it exits 0
+ * for a url the section matches and 1 for one it does not.
+ *
+ * Only the KEY is returned. The value is an Authorization header or a path to a
+ * cookie jar, so it is never returned, printed or recorded — the same rule the
+ * credential itself gets.
+ */
+/**
+ * Per-url http settings that mean authentication is arranged somewhere `git
+ * credential fill` cannot see. Any non-empty value counts.
+ *
+ * `sslCert` is here without a reviewer having asked: a client certificate is an
+ * authentication mechanism exactly as the other two are, and this is the third
+ * round in which one of these was found missing. The list is incomplete BY
+ * NATURE -- git keeps adding ways to authenticate -- so what matters is which
+ * way its incompleteness errs. A mechanism missing from it turns a working
+ * checkout BROKEN, which is loud and wrong; a mechanism wrongly in it turns a
+ * broken checkout DEGRADED, which is quiet and wrong. Neither is good, and the
+ * first is the recoverable one, so the list stays explicit rather than becoming
+ * "any http.* key at all" -- `http.postBuffer` says nothing about authentication
+ * and would suppress a real refusal.
+ */
+const HTTP_AUTH_VALUE_KEYS = ["http.extraHeader", "http.cookieFile", "http.sslCert"];
+
+/**
+ * And one that is a BOOLEAN, which is not the same question.
+ *
+ * `http.emptyAuth` tells git to attempt authentication without seeking a
+ * username or password -- Kerberos and GSS-Negotiate -- so a push succeeds where
+ * `credential fill` returns nothing. But measured 2026-08-23, `--get-urlmatch`
+ * returns `false` with EXIT 0 for a url configured `emptyAuth = false`:
+ *
+ *   http.emptyAuth  https://enterprise.example/o/r.git -> [true]  exit=0
+ *   http.emptyAuth  https://other.example/x.git        -> [false] exit=0
+ *   http.emptyAuth  https://nowhere.example/x.git      -> []      exit=1
+ *
+ * Reading presence rather than value would take configuration that says the
+ * OPPOSITE as evidence for it, and suppress a refusal that is real.
+ */
+const HTTP_AUTH_FLAG_KEYS = ["http.emptyAuth"];
+
+/**
+ * The founder's netrc, if they have one. Read for one question only -- whether
+ * it has an entry for a host -- and no token from it is ever returned.
+ *
+ * `_netrc` as well as `.netrc`, because reeve has to run on Windows and that is
+ * the name curl looks for there.
+ */
+function readNetrcFile() {
+  for (const name of [".netrc", "_netrc"]) {
+    try { return readFileSync(join(homedir(), name), "utf8"); } catch { /* the next one, or none */ }
+  }
+  return "";
+}
+
+/**
+ * Does the netrc name this host?
+ *
+ * Tokens are whitespace-separated. `default` matches any host, which is the
+ * whole point of it. A `machine` token inside a `macdef` body could match
+ * spuriously -- that direction is harmless here, since the consequence is
+ * reporting a credential as UNVERIFIED rather than as absent.
+ */
+function netrcNames(text, host) {
+  const bare = String(host ?? "").split(":")[0];
+  if (!bare) return false;
+  // Quotes come off: curl permits a double-quoted field, and measured
+  // 2026-08-23 against a 401 Basic server, `machine "127.0.0.1"` authenticates
+  // exactly as the unquoted form does. Comparing the raw token missed it and
+  // reported a working checkout BROKEN.
+  const unquote = t => (t.startsWith('"') && t.endsWith('"') && t.length > 1 ? t.slice(1, -1) : t);
+  const toks = String(text ?? "").split(/\s+/).filter(Boolean).map(unquote);
+  for (let i = 0; i < toks.length; i++) {
+    if (toks[i] === "default") return true;
+    if (toks[i] === "machine" && (toks[i + 1] === bare || toks[i + 1] === host)) return true;
+  }
+  return false;
+}
+
+/**
+ * HTTP authentication configured somewhere other than a credential helper.
+ *
+ * The keys above and `~/.netrc` are all used by `ls-remote` and by the real push
+ * while `git credential fill` knows nothing about them. `--get-urlmatch` is
+ * git's own resolution for the config ones: measured 2026-08-23, it exits 0 for
+ * a url the section matches and 1 for one it does not.
+ *
+ * netrc is not git configuration at all -- git hands libcurl `CURL_NETRC_
+ * OPTIONAL` and curl reads the file itself. Measured 2026-08-23 on git 2.50.1
+ * against a local server issuing a 401 Basic challenge:
+ *
+ *   no netrc              -> exit 128, no Authorization header sent
+ *   with a matching netrc -> exit 0, Authorization header SENT
+ *   credential fill       -> exit 128, no password
+ *
+ * Worth recording that it did NOT reproduce against GitHub over https, where
+ * git's own credential lookup fails first and the request is never made. So the
+ * exposure is real and narrower than the general case: it needs a server that
+ * answers with a challenge rather than one git pre-empts. (Codex #14-[15].)
+ *
+ * Only the KEY, or the name of the file, is returned. The values are an
+ * Authorization header, a cookie jar and a password file, and they get the same
+ * treatment as the credential itself.
+ */
+function httpAuthElsewhere(run, cwd, url, { netrc = readNetrcFile } = {}) {
+  for (const key of HTTP_AUTH_VALUE_KEYS) {
+    const r = run(cwd, ["config", "--get-urlmatch", key, url]);
+    if (r.ok && r.out) return key;
+  }
+  for (const key of HTTP_AUTH_FLAG_KEYS) {
+    const r = run(cwd, ["config", "--type=bool", "--get-urlmatch", key, url]);
+    if (r.ok && r.out === "true") return key;
+  }
+  if (netrcNames(netrc(), hostOf(url))) return "~/.netrc";
+  return null;
+}
+
+/** The authority of an http(s) url, without any userinfo. */
+const hostOf = url => String(url).replace(/^https?:\/\//, "").split("/")[0].split("@").pop();
+
+/**
+ * A remote URL with its userinfo removed, for printing.
+ *
+ * `git remote get-url` EXPANDS `url.<base>.insteadOf`, so a rewrite pointing at
+ * a credential-bearing URL hands one straight back. Measured 2026-08-23: a
+ * rewrite to `https://user:s3cr3t-token@example.com/` made `get-url` return that
+ * URL verbatim, token included, and this check prints the URL in its report and
+ * its `--json`. Only the part before `@` in an authority is removed; an
+ * scp-style `git@host:path` has no authority and is left alone.
+ */
+const withoutUserinfo = url => String(url).replace(/^([a-zA-Z][a-zA-Z0-9+.\-]*:\/\/)[^/@]*@/, "$1[redacted]@");
+
+export function checkRemoteReach(profile, { run = founderRun, credential = founderCredential, netrc = readNetrcFile } = {}) {
+  const id = "R-16", title = "publication reach";
+  const checkout = profile?.identity?.checkout;
+  if (!checkout) return { id, level: UNKNOWN, title,
+    lines: ["the profile names no checkout, so there is nothing to publish from"] };
+
+  const fetchUrl = run(checkout, ["remote", "get-url", "origin"]);
+  if (!fetchUrl.ok || !fetchUrl.out) return { id, level: BROKEN, title,
+    lines: [`no origin in ${checkout}${fetchUrl.err ? `: ${fetchUrl.err}` : ""}`,
+            "-> reeve publishes by pushing to origin; a checkout without one can publish nothing"] };
+  // EVERY push url. `git push origin` affects all configured `remote.origin.
+  // pushurl` values, and `get-url --push` returns only the first — measured, two
+  // pushurls give one value without `--all` and both with it. Each destination
+  // gets its own CREDENTIAL question below, so reading only the first would
+  // report OK on the strength of a credential for somewhere else.
+  // `--push --all` falls back to the fetch url when no pushurl is set, which is
+  // git's own behaviour.
+  const pushed = run(checkout, ["remote", "get-url", "--push", "--all", "origin"]);
+  const pushUrls = (pushed.ok && pushed.out ? pushed.out.split("\n") : [fetchUrl.out]).map(u => u.trim()).filter(Boolean);
+  const separate = pushUrls.length > 1 || pushUrls[0] !== fetchUrl.out;
+
+  // An explicitly EMPTY pushurl, read from the configuration rather than from
+  // the resolved list -- because the resolved list is exactly where the two
+  // gits agree. Measured 2026-08-23 on git 2.50.1: an empty value is dropped,
+  // `get-url --push --all` shows only the remaining url, and a real push
+  // succeeds. A reviewer reports git 2.43 instead exiting 128 with "no path
+  // specified", and 2.43 is what Ubuntu LTS ships, so it is a git reeve has to
+  // run on. Either way the configuration is wrong; only its consequence moves.
+  // `-z`, because `--get-all` alone loses an empty value to the trim.
+  const configured = run(checkout, ["config", "-z", "--get-all", "remote.origin.pushurl"]);
+  if (configured.ok && configured.out.split("\0").slice(0, -1).some(v => v.trim() === "")) return { id, level: BROKEN, title,
+    lines: [`origin ${withoutUserinfo(fetchUrl.out)}`,
+            "remote.origin.pushurl is configured with an EMPTY value",
+            "git 2.50.1 ignores it and pushes to the remaining url; git 2.43 fails the push with `no path specified`",
+            "-> whichever git is in front of it, the configuration does not say where to publish"] };
+
+  // Nothing left to publish to. `filter(Boolean)` above drops a value that was
+  // only whitespace, and if that took the last one the loop below would run zero
+  // times and the check would report OK having asked nothing — an absence read
+  // as success, from the one direction the empty-value guard does not cover.
+  if (!pushUrls.length) return { id, level: BROKEN, title,
+    lines: [`origin ${withoutUserinfo(fetchUrl.out)}`,
+            "origin resolves to no push destination at all",
+            "-> reeve publishes by pushing to origin; there is nowhere for that to go"] };
+
+  // A MIRROR remote refuses the only kind of push reeve makes. `publishRunWork`
+  // always names an explicit refspec, and `remote.<name>.mirror` makes a push
+  // behave as `--mirror`, which git will not combine with one. Measured
+  // 2026-08-23:
+  //
+  //   $ git config remote.origin.mirror true
+  //   $ git push origin HEAD:refs/heads/main
+  //   fatal: --mirror can't be combined with refspecs
+  //
+  // and the same push without the setting succeeds. So every publication fails,
+  // for a reason no credential or reachability probe can see. (Codex #14-[18].)
+  const mirror = run(checkout, ["config", "--type=bool", "--get", "remote.origin.mirror"]);
+  if (mirror.ok && mirror.out === "true") return { id, level: BROKEN, title,
+    lines: [`origin ${withoutUserinfo(fetchUrl.out)}`,
+            "remote.origin.mirror is set, so a push to origin behaves as --mirror",
+            "reeve publishes with an explicit refspec, and git refuses that combination outright",
+            "-> every publication would fail with `--mirror can't be combined with refspecs`"] };
+
+  const branch = profile.identity?.defaultBranch ?? "main";
+  const lines = [`origin ${withoutUserinfo(fetchUrl.out)}`];
+  if (separate) lines.push(`push url(s) ${pushUrls.map(withoutUserinfo).join(", ")}`);
+
+  // Through `origin`, never through a literal url: this is the one probe that
+  // carries origin's whole configuration, which is what reeve's own fetch uses.
+  // Why the push destinations get no probe of their own is below.
+  const reach = run(checkout, ["ls-remote", "origin", `refs/heads/${branch}`]);
+  if (!reach.ok) return { id, level: BROKEN, title,
+    lines: [...lines, `reeve's git cannot reach it: ${reach.err}`,
+            "-> every publication would fail; the reads reeve makes through `gh` are unaffected, so nothing else reports this"] };
+  lines.push(`reachable: ${branch} is at ${(reach.out.split(/\s+/)[0] ?? "").slice(0, 10) || "(no such ref)"}`);
+
+  // A push url of its own is NOT probed for reachability, deliberately.
+  //
+  // `ls-remote <the literal url>` answers a different question from the one
+  // publication asks: it drops every remote-scoped setting. Measured 2026-08-23
+  // against this repository with an unreachable `remote.origin.proxy`:
+  //
+  //   ls-remote origin    -> fatal: Failed to connect to 127.0.0.1 port 1
+  //   ls-remote <the same url literally> -> e41cd287e2  (the proxy bypassed)
+  //
+  // So the literal probe can report BROKEN for a checkout that publishes, and
+  // report reachable for one that cannot. Making it faithful means reproducing
+  // git's own remote resolution -- `remote.<name>.proxy`, `uploadpack`, `vcs`,
+  // and whatever the next version adds -- and this is the third round of
+  // findings against that probe. The reading is removed rather than tuned; what
+  // it was reaching for is stated as not established instead.
+  //
+  // `ls-remote origin` above still exercises origin's full configuration, which
+  // is what reeve's own fetch uses. The credential question below needs no
+  // network and no proxy, so it is asked per destination as before.
+  const unverified = [], unproven = [];
+  for (const url of pushUrls) {
+    const shown = withoutUserinfo(url);
+    // ssh and local transports authenticate through the transport itself -- but
+    // "the reach above exercised it" is only true when the reach WENT there.
+    // `ls-remote origin` uses the FETCH url, so an https fetch beside an ssh
+    // push url means the ssh transport was never touched: an anonymous public
+    // fetch plus an ssh push with no usable key reported healthy. That claim was
+    // written while the push destination still had a probe of its own, and
+    // survived the round that removed it. (Codex #14-[13].)
+    //
+    // http and https never authenticate on a read of a PUBLIC repository, so
+    // they take the credential path whether or not they are the fetch url --
+    // git's credential subsystem covers both schemes.
+    if (!/^https?:\/\//.test(url)) {
+      // For READING. `ls-remote` speaks to git-upload-pack and a push speaks to
+      // git-receive-pack, so a read-only deploy key answers the first and
+      // refuses the second — the reach establishes the transport works, not
+      // that it may write. (Codex #14-[21].)
+      if (url === fetchUrl.out) { unproven.push(shown); lines.push(`${shown} carries its own authentication, and the reach above exercised it for READING`); }
+      else { unverified.push(shown); lines.push(`${shown} carries its own authentication, which the reach above did NOT exercise: it went to the fetch url`); }
+      continue;
+    }
+    unproven.push(shown);
+    const cred = credential(checkout, url);
+    // OBTAINED, not validated. `git credential fill` gets the fields from the
+    // helpers; it does not present them to the server, so an expired, revoked,
+    // wrong-account or read-only token answers exactly as a working one does.
+    // Said in the line rather than only in the docs, because a reader takes OK
+    // to mean publication works. (Codex #14-[11].)
+    if (cred.ok) { lines.push(`a credential is obtained for ${shown}, though not validated against the server (its value is never read into reeve)`); continue; }
+    // A credential helper is not the only way http authenticates. `http.
+    // <url>.extraHeader` carrying an Authorization header, and a cookie file,
+    // are both used by `ls-remote` and by the real push while `credential fill`
+    // knows nothing about them — so reporting BROKEN on the helper's silence
+    // alone calls a working checkout broken. What reeve can say is that it
+    // cannot verify this one, which is neither of the two confident answers.
+    const elsewhere = httpAuthElsewhere(run, checkout, url, { netrc });
+    if (elsewhere) { unverified.push(shown); lines.push(`${shown} authenticates through ${elsewhere}, which this check cannot verify`); continue; }
+    return { id, level: BROKEN, title,
+      lines: [...lines,
+              `but no credential can be obtained for ${shown}: ${cred.why}`,
+              ...(profile.identity?.visibility === "public"
+                ? ["this repository is PUBLIC, so the read above succeeded anonymously and proves nothing about a push"] : []),
+              "-> a push authenticates; reeve would fetch, judge and refuse at the last step"] };
+  }
+  if (separate) lines.push("the push destination(s) are not probed for reachability: a literal-url probe drops remote.origin.proxy and answers a different question");
+  // One statement for every destination, whatever its transport. An https
+  // credential is obtained rather than validated; an ssh key answered the READ
+  // service. Neither says a push would be accepted, and both were previously
+  // claimed as though they did.
+  if (unproven.length) lines.push(`-> not established: whether a PUSH to ${unproven.join(", ")} would be accepted — ` +
+    "`ls-remote` speaks to git-upload-pack and a push to git-receive-pack, so a read-only key or token answers the read and refuses the write, and nothing here can tell them apart without pushing");
+  if (unverified.length) return { id, level: DEGRADED, title,
+    lines: [...lines, `-> publication to ${unverified.join(", ")} rests on configuration this check cannot exercise without pushing`] };
+  return { id, level: OK, title, lines };
+}
+
 // ── driver ────────────────────────────────────────────────────────────────
 
-export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {}, stateDir = null, canaryIo = {}, keychainIo = {} }) {
+export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {}, stateDir = null, canaryIo = {}, keychainIo = {}, reachIo = {} }) {
   const checks = [
     checkMergeAuthority(nwo),
     pluginCacheRoot ? checkArtifactDrift(pluginCacheRoot, repoPluginDir) : null,
@@ -524,6 +902,7 @@ export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null
     checkBaseline(nwo, profile, baselineIo),
     checkCanary(nwo, { stateDir, currentPolicyHash: currentPolicy(profile, { ...canaryIo, stateDir, nwo }), ...canaryIo }),
     checkKeychain({ isolation: profile.worker?.isolation, ...keychainIo }),
+    checkRemoteReach(profile, reachIo),
   ].filter(Boolean);
 
   const broken = checks.filter(c => c.level === BROKEN);

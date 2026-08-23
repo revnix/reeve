@@ -88,6 +88,16 @@ const PROFILES = {
   "a publishing command": { units: [{ id: "root", language: "typescript", packageManager: "npm",
                                       commands: { release: { cmd: "npm publish --access public", state: "present" },
                                                   test: { cmd: "npm test", state: "present" } } }], risk: {} },
+  // The profile forbids `git` itself, which the prompt otherwise hardcodes as
+  // always available.
+  "git forbidden": { units: [{ id: "root", language: "typescript", packageManager: "npm",
+                               commands: { test: { cmd: "npm test", state: "present" } } }],
+                     risk: { forbiddenCommands: ["git"] } },
+  // A declared command of nothing but whitespace. It is truthy, so it passes
+  // profile validation, and it trims to an empty head.
+  "a blank command": { units: [{ id: "root", language: "typescript", packageManager: "npm",
+                                 commands: { lint: { cmd: "   ", state: "present" },
+                                             test: { cmd: "npm test", state: "present" } } }], risk: {} },
   // The profile forbids one of its own language's runners.
   "a forbidden runner": { units: [{ id: "root", language: "typescript", packageManager: "npm",
                                     commands: { test: { cmd: "npm test", state: "present" } } }],
@@ -137,6 +147,7 @@ for (const [name, prof] of Object.entries(PROFILES)) {
     .map(m => m[1].replace(/\s*…\s*$/, "").trim())
     .filter(c => !c.includes("2>&1") && !REFUSED_BY_DESIGN.includes(c));
   check(mentioned.length > 0, `control: ${name} rule 0 names commands at all`, JSON.stringify(mentioned));
+  check(!mentioned.some(c => c === ""), `${name}: rule 0 names no EMPTY command`, JSON.stringify(mentioned));
   for (const cmd of mentioned)
     check(isGranted(cmd), `${name}: rule 0 names \`${cmd}\`, and it is granted`,
           `granted: ${granted.join(", ")}`);

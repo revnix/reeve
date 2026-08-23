@@ -11,6 +11,8 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -396,6 +398,36 @@ import { hubEvent, migrationPlan } from "../src/build/hubdb.mjs";
   const p = db.prepare("SELECT payload FROM hub_event ORDER BY seq DESC LIMIT 1").get().payload;
   check(p === '{"a":2,"z":1}', "payloads are canonical JSON with sorted keys", p);
   db.close();
+}
+
+// Migration 1 is FROZEN. A store that already applied v1 will never re-run it,
+// so an edit here changes what new machines get and leaves every existing one
+// behind with no error anywhere. New schema goes in a NEW numbered migration.
+//
+// BOTH halves. Hashing hub.sql alone freezes the DDL text and leaves the `up`
+// function free to add, drop or reorder operations around it -- existing stores
+// never re-run an edited migration, fresh ones do, and this test stays green
+// while the two diverge. The function source is the other half of what
+// migration 1 IS.
+//
+// `migrationPlan` is NOT re-imported: it is already in scope from the Task 6
+// block above, and a second import is a duplicate declaration that would stop
+// this file parsing -- a worse failure than the missing binding it would fix.
+{
+  const frozen = JSON.parse(readFileSync(new URL("./fixtures/hub-schema-v1.json", import.meta.url), "utf8"));
+  const sqlNow = createHash("sha256")
+    .update(readFileSync(new URL("../src/build/hub.sql", import.meta.url), "utf8")).digest("hex");
+  // Through the EXPORT, and the same value the fixture command recorded, so the
+  // two cannot compute it differently.
+  const upNow = migrationPlan().find(m => m.version === 1).implHash;
+  check(frozen.version === 1, "the fixture records which migration it froze", String(frozen.version));
+  check(sqlNow === frozen.sha256,
+    "migration 1's SQL is frozen: new schema goes in a NEW numbered migration",
+    `${sqlNow} vs ${frozen.sha256}\n        If this change is intentional it does not belong in hub.sql: ` +
+    `add MIGRATIONS[{version: N+1, up}] and bump HUB_SCHEMA_VERSION.`);
+  check(upNow === frozen.up_sha256,
+    "and so is its up() implementation, which is the other half of what migration 1 IS",
+    `${upNow} vs ${frozen.up_sha256}`);
 }
 
 rmSync(dir, { recursive: true, force: true });

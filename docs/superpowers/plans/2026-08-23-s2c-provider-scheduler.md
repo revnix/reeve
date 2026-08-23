@@ -299,6 +299,20 @@ if (ctx.hub && repoId != null) {
   // builder-admission race the queue exists to close, and does it silently.
   const live = new Set(wanted.map(d => `pr:${d.e.pr}`));     // dispatch-worthy only
   if (execute && wanted.length && !containment) live.add(`canary:${nwo}`);
+  // AND the PRs that could not be evaluated this tick. The paragraph above
+  // promised this and the code did not do it, which is the worse of the two
+  // failures: a reader checking the rule finds it stated. `evaluatePr` failing
+  // transiently executes `continue` with no decision (`src/daemon.mjs:579` on
+  // `16769e7`), so such a PR is absent from `wanted` and the sweep cancels a
+  // request nobody withdrew -- a builder takes the priority slot, and the
+  // guardian request becomes dispatchable again on the next successful read.
+  // Not knowing is not the same as knowing it is finished.
+  //
+  // `tick` collects them in the per-PR loop beside `waiting`:
+  //     const unevaluated = new Set();
+  //     ... if (!e.ok) { unevaluated.add(pr); ...; continue; }
+  // and the sweep runs after that loop, so the set is complete when it is read.
+  for (const pr of unevaluated) live.add(`pr:${pr}`);
 
   // FAIL OPEN. This sweep is a hub read on the guardian's path, and the founder
   // decision is that an unreadable scheduler never silences guardian dispatch.
@@ -745,7 +759,6 @@ import { OUTCOMES } from "../src/supervisor.mjs";   // the normalised rate-limit
 import { openHub } from "../src/build/hubdb.mjs";
 import { claimProvider } from "../src/provider.mjs";
 /* ... standard harness, plus: ... */
-import { OUTCOMES } from "../src/supervisor.mjs";
 
 // The fixture ctx from test/worker-contract.test.mjs, and the three helpers this
 // file needs that neither the harness nor that file supplies. Named here because
@@ -857,7 +870,11 @@ const escalatedWith = (result, why) =>
 {
   for (const [label, hub] of [["no hub at all", null], ["a hub that throws", throwingHub()]]) {
     let dispatched = 0;
-    const ctx = { ...fixtureCtx(dir), hub, repoId: 1,
+    // `lstart` is REQUIRED here. `claimProvider` returns `no-identity` when it is
+    // null, so without it a conforming implementation refuses before it ever
+    // touches `throwingHub()` -- the block would pass for the wrong reason and
+    // prove nothing about the exception-driven fail-open path it exists for.
+    const ctx = { ...fixtureCtx(dir), hub, repoId: 1, lstart: LSTART,
       spawnWorker: async () => { dispatched++; return { outcome: "ok" }; } };
     const result = await tick(ctx);
     check(dispatched === 1, `with ${label}, the guardian dispatches exactly as it does today`, String(dispatched));
@@ -876,7 +893,9 @@ const escalatedWith = (result, why) =>
   // came to be written outside a catch in the first place.
   {
     let canaryRan = 0, dispatched = 0;
-    const ctx = { ...fixtureCtx(dir), hub: throwingHub(), repoId: 1, containment: null,
+    // `lstart` for the same reason as the block above: identity is validated
+    // before the hub is touched, so a fixture without it never reaches the throw.
+    const ctx = { ...fixtureCtx(dir), hub: throwingHub(), repoId: 1, lstart: LSTART, containment: null,
       // A PRODUCTION-SHAPED verdict. `{ ok: true }` is not one: the daemon
       // enters the dispatch loop on `containment.credentialRead === "closed"`,
       // so an `ok` stub leaves containment open and `dispatched === 1` below
@@ -1157,7 +1176,17 @@ before dispatch`). **This task does not move or duplicate the halt check:**
       // "called on every path out of the dispatch block that did not launch"
       // while having exactly one caller: the sweep.
       //
-      // Insert `abandonClaim(...)` before the `continue` on each of those paths.
+      // Insert `abandonClaim(...)` before the `continue` on each of those paths
+      // -- and on the ones ABOVE this block too, which is why it is defined here
+      // rather than beside the claim. A PR queued on an earlier tick can evaluate
+      // as dispatch-worthy and then hit the no-root-cause, demonstrated-flake,
+      // prompt-build or checkout refusal: it is in `wanted`, so the live-set
+      // sweep keeps its queued row, and the refusal `continue`s past every
+      // withdrawal path. The row then survives every future tick for the same
+      // reason and blocks builder admission indefinitely. `abandonClaim` is
+      // already safe before a claim exists -- its release is guarded on
+      // `lease != null` -- so the rule is uniform: **every `continue` below the
+      // evaluation calls it**, whether or not a lease was taken.
       const abandonClaim = (why) => {
         if (lease != null) {
           const ref = { owner: "guardian", repoId, runRef: `pr:${e.pr}` };
@@ -1499,6 +1528,11 @@ plan assumes the other declared it.
 import { openHubAsGuest } from "../src/build/hubguest.mjs";
 import { openHub } from "../src/build/hubdb.mjs";
 import { claimProvider } from "../src/provider.mjs";   // the end-to-end guest assertion
+// For the raw-handle control below. The `DatabaseSync` import in the
+// implementation snippet belongs to src/build/hubguest.mjs and binds nothing
+// here -- so the control that proves the prototype reach is real would have
+// thrown ReferenceError even against a correct facade.
+import { DatabaseSync } from "node:sqlite";
 /* ... standard harness ... */
 
 const p = join(dir, "g.db");
@@ -1955,6 +1989,7 @@ hottest read path and does not belong in a PR about the provider scheduler.
 // run at the head goes failure, and the ruleset requires that check. Every link
 // in that chain is somewhere else; this is the one that reads the row.
 import { holdClause } from "../src/verdict.mjs";
+import { isBuilderPr } from "../src/pr.mjs";           // the classifier table below
 import { openHub } from "../src/build/hubdb.mjs";
 import { openHubAsGuest } from "../src/build/hubguest.mjs";
 /* ... standard harness ... */
@@ -2155,7 +2190,11 @@ check(VERDICT_CLAUSES.includes("hold"),
 
   // And the clause consumes the classification rather than re-deriving it, which
   // is the half a pure-function test cannot see.
-  check(holdClause(hub, { repoId: 1, pr: 7, isBuilderPr: isBuilderPr({ headRef: "mp/bt-1-s0", authorIsApp: false }) }).state === "BLOCK",
+  // PR **11**, not 7. This file cleared PR 7's only hold earlier and then asserts
+  // it returns PASS, so expecting BLOCK for it here fails against a CORRECT
+  // implementation -- the assertion would have been red for the one reason that
+  // proves nothing. 11 is the uncleared fixture this section created.
+  check(holdClause(hub, { repoId: 1, pr: 11, isBuilderPr: isBuilderPr({ headRef: "mp/bt-1-s0", authorIsApp: false }) }).state === "BLOCK",
     "and a PR the classifier accepts reaches the hold clause as a builder PR");
 
   // CONTROLS, both directions. The first proves the extractor found a real call

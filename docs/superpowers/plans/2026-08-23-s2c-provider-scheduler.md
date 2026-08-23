@@ -1164,6 +1164,10 @@ for (const [sql, name] of [
   ["/* guest */ BEGIN EXCLUSIVE", "an exclusive BEGIN behind a block comment"],
   ["-- guest\nBEGIN EXCLUSIVE", "an exclusive BEGIN behind a line comment"],
   ["\t/*x*/BEGIN EXCLUSIVE", "an exclusive BEGIN behind leading whitespace and a comment"],
+  // The two that defeated the regex version. A comment marker inside a string
+  // literal is not a comment, and treating it as one hid the semicolon too.
+  ["SELECT '--'; BEGIN EXCLUSIVE", "an exclusive BEGIN behind a line-comment marker in a LITERAL"],
+  ["SELECT '/*'; BEGIN EXCLUSIVE", "an exclusive BEGIN behind a block-comment marker in a LITERAL"],
   ["SAVEPOINT sp", "a savepoint"],
 ]) {
   for (const via of ["prepare", "exec"]) {
@@ -1177,6 +1181,18 @@ for (const via of ["prepare", "exec"]) {
   let ok = true; try { g[via]("BEGIN IMMEDIATE"); } catch { ok = false; }
   check(ok, `control: BEGIN IMMEDIATE is still permitted via ${via}`);
   try { g.exec("ROLLBACK"); } catch {}
+}
+// CONTROLS for the scanner itself. A gate that refuses ordinary SQL containing
+// a semicolon, a `--`, or an escaped quote inside a literal would pass every
+// refusal above and then break providerdb.mjs in production -- the over-fix.
+for (const [sql, name] of [
+  ["SELECT * FROM provider_lease WHERE run_ref = 'a;b'", "a semicolon inside a literal"],
+  ["UPDATE provider_state SET last_signature = 'x--y' WHERE provider='claude'", "a comment marker inside a literal"],
+  ["SELECT * FROM provider_lease WHERE run_ref = 'it''s'", "a doubled-quote escape"],
+  ["SELECT count(*) c FROM provider_state -- trailing comment", "a genuine trailing comment"],
+]) {
+  let ok = true; try { g.prepare(sql); } catch { ok = false; }
+  check(ok, `control: ordinary SQL with ${name} is still permitted`, sql);
 }
 for (const [sql, name] of refused) {
   let why = null; try { g.prepare(sql); } catch (e) { why = e.message; }
@@ -1292,28 +1308,51 @@ export function openHubAsGuest(path) {
   // only way it can be wrong is to refuse a statement it should have allowed.
   // SAVEPOINT needs no clause here -- it arrives as its own action (32) and the
   // authorizer's `default: DENY` already refuses it.
-  const gate = (sql) => {
-    // Strip comments BEFORE looking for the keyword. Measured 2026-08-23: all
-    // three of `/* guest */ BEGIN EXCLUSIVE`, `-- guest\nBEGIN EXCLUSIVE` and
-    // `\t/*x*/BEGIN EXCLUSIVE` run to completion and fire SQLITE_TRANSACTION
-    // with arg1 "BEGIN", while a check anchored at the start of the trimmed
-    // text matches none of them -- so the guest takes the exclusive lock this
-    // gate exists to forbid, through a comment.
-    //
-    // The stripper is naive about comment markers inside string literals, and
-    // that is the SAFE direction: stripping can only make more text look like a
-    // BEGIN, so its mistakes are refusals, never admissions. The original text
-    // is what runs, comments and all.
-    const bare = String(sql)
-      .replace(/\/\*[\s\S]*?\*\//g, " ")     // block comments
-      .replace(/--[^\n]*/g, " ");             // line comments
-    for (const part of bare.split(";")) {
-      if (!part.trim()) continue;
-      if (/^\s*BEGIN\b/i.test(part) && !/^\s*BEGIN\s+IMMEDIATE\s*$/i.test(part))
-        throw new Error(`only BEGIN IMMEDIATE is permitted on the guest hub connection: ${part.trim()}`);
+  // A SCANNER, not regexes over the raw text. Measured 2026-08-23: the previous
+  // stripper treated `--` inside a STRING LITERAL as a comment, so
+  // `SELECT '--'; BEGIN EXCLUSIVE` had its semicolon and its BEGIN swallowed
+  // into the "comment", passed the gate, and ran -- taking the exclusive lock.
+  // The reasoning attached to that version ("stripping can only make more text
+  // look like a BEGIN, so its mistakes are refusals") was wrong in exactly the
+  // direction that matters: a comment marker inside a literal makes LESS text
+  // visible, not more.
+  //
+  // `statements` walks the string once, tracking quoted literals ('', "" and
+  // backticks, with doubled-quote escapes), bracketed identifiers, and both
+  // comment forms, and splits on the semicolons that are actually separators.
+  const statements = (sql) => {
+    const out = []; let cur = "", i = 0; const s = String(sql);
+    while (i < s.length) {
+      const c = s[i], d = s[i + 1];
+      if (c === "'" || c === '"' || c === "`") {          // literal or quoted identifier
+        const q = c; let j = i + 1;
+        while (j < s.length) { if (s[j] === q) { if (s[j + 1] === q) { j += 2; continue; } break; } j++; }
+        cur += s.slice(i, j + 1); i = j + 1; continue;
+      }
+      if (c === "[") { const j = s.indexOf("]", i); cur += s.slice(i, j < 0 ? s.length : j + 1); i = (j < 0 ? s.length : j + 1); continue; }
+      if (c === "-" && d === "-") { const j = s.indexOf("\n", i); i = j < 0 ? s.length : j + 1; cur += " "; continue; }
+      if (c === "/" && d === "*") { const j = s.indexOf("*/", i + 2); i = j < 0 ? s.length : j + 2; cur += " "; continue; }
+      if (c === ";") { out.push(cur); cur = ""; i++; continue; }
+      cur += c; i++;
     }
-    return sql;
+    if (cur.trim()) out.push(cur);
+    return out.filter(t => t.trim());
   };
+
+  const gate = (sql) => {
+    const parts = statements(sql);
+    // A guest never needs a multi-statement string: providerdb.mjs issues one
+    // statement per call, plus BEGIN IMMEDIATE / COMMIT / ROLLBACK. Refusing the
+    // whole class removes every "hidden second statement" variant at once,
+    // instead of trying to out-parse them one at a time.
+    if (parts.length > 1)
+      throw new Error(`multi-statement SQL is not permitted on the guest hub connection: ${String(sql).trim()}`);
+    const one = parts[0] ?? "";
+    if (/^\s*BEGIN\b/i.test(one) && !/^\s*BEGIN\s+IMMEDIATE\s*$/i.test(one))
+      throw new Error(`only BEGIN IMMEDIATE is permitted on the guest hub connection: ${one.trim()}`);
+    return sql;                       // the ORIGINAL text runs, comments and all
+  };
+
   const rawExec = db.exec.bind(db), rawPrepare = db.prepare.bind(db);
   Object.defineProperty(db, "exec",    { value: (sql) => rawExec(gate(sql)) });
   Object.defineProperty(db, "prepare", { value: (sql) => rawPrepare(gate(sql)) });

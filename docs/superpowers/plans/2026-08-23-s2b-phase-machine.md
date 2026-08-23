@@ -350,6 +350,13 @@ const EVIDENCE = [
     ["APPROVED",     { kind: "phase.succeeded", phase: "APPROVED" },           "IMPLEMENTING"],
     ["IMPLEMENTING", { kind: "phase.succeeded", phase: "IMPLEMENTING" },       "IMPL_PR_OPEN"],
     ["IMPL_PR_OPEN", { kind: "phase.succeeded", phase: "IMPL_PR_OPEN" },       "VERDICT_WAIT"],
+    // The SUCCESSFUL claim edge, by name. The totality loop accepts a reasoned
+    // refusal as a legal answer for every cell, so a machine that refuses every
+    // `claim.won` passed the whole phase suite -- and every ledger-sourced task
+    // would sit in CLAIMING forever, which no other assertion here can see. The
+    // witness fields are required, so they are supplied: the missing-witness
+    // refusal is its own control, below.
+    ["CLAIMING",     { kind: "claim.won", claimEventId: "e1", projectionGeneration: 7 }, "SIZING"],
     ["CLAIMING",     { kind: "claim.lost" },                                  "LOST"],
   ];
   const wrong = EXPECTED.filter(([from, ev, to]) => {
@@ -665,7 +672,9 @@ const refuse = (refusal, extra = {}) => ({ ok: false, refusal, ...extra });
 // CHECK set minus the two that never arrive as a `hold` (`cancel` is CANCELLING,
 // `escalated` is the exhausted-retries edge), so the map is closed against the
 // schema rather than against memory. `<id>` is substituted by applyTransition.
-const HOLD_ESCALATION = Object.freeze({
+// EXPORTED: transition.mjs indexes this map in the stacked-hold branch, and a
+// second copy there would be a second closed set to drift from the DDL.
+export const HOLD_ESCALATION = Object.freeze({
   ownership_lost:      "bt:<id>:intake:ownership-lost",
   harness_touched:     "bt:<id>:impl:harness-touched",
   over_budget:         "bt:<id>:impl:over-budget",
@@ -681,6 +690,21 @@ const HOLD_ESCALATION = Object.freeze({
 // the transaction instead of returning a reasoned refusal, and a
 // `blocked_other` with no escalation identity stacked a hold that reaches
 // nobody. One validator, called from both.
+/**
+ * A hold_reason -> the `pr_hold.reason` the DDL admits.
+ *
+ * Exported because `applyTransition`'s stacked-hold branch writes that column
+ * and had no way to derive the value. The two sets are nearly the same and NOT
+ * identical -- `pr_hold` also admits `cancel` and `escalated`, which no hold
+ * reason produces -- so the mapping is written out rather than assumed to be
+ * the identity, and an unknown reason throws here rather than reaching the CHECK.
+ */
+export const holdReasonFor = (reason) => {
+  if (!HOLD_ESCALATION.hasOwnProperty(reason))
+    throw new Error(`no pr_hold reason for hold reason ${JSON.stringify(reason)}`);
+  return reason;                     // the hold-reason names are a subset of pr_hold's
+};
+
 const holdReasonRefusal = (evidence) => {
   if (!HOLD_ESCALATION.hasOwnProperty(evidence?.reason))
     return `unknown hold reason ${JSON.stringify(evidence?.reason)}; ` +
@@ -1250,7 +1274,13 @@ Append to `test/hub-crosscheck.test.mjs`:
 
 ```bash
 $N test/hub-phases.test.mjs && $N test/hub-crosscheck.test.mjs
-git add src/build/phases.mjs test/hub-phases.test.mjs test/hub-crosscheck.test.mjs
+# `src/profile/schema.mjs` too -- this task declares `builder.cancel.drainMinutes`
+# with its default and container, and the validator is fail-closed. Testing with
+# the edit present locally and committing only the phase files ships a PR whose
+# daemon rejects the very setting this task documents. Named in the Modify list
+# above; this is the line that stages it.
+git add src/build/phases.mjs src/profile/schema.mjs \
+        test/hub-phases.test.mjs test/hub-crosscheck.test.mjs
 git commit -m "feat(hub): the pure, total phase machine"
 ```
 
@@ -1452,17 +1482,41 @@ import { applyTransition } from "../src/build/transition.mjs";
   seed(db, { id: "bt:0", phase: "CANCELLED", generation: 1 });
   db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at)
            VALUES('p','prefix','packages/x','bt:0',unixepoch()-1)`);   // expired: regrant must succeed
-  // ASSERTED, not assumed. This block previously proved only that the resume did
-  // not throw:
-  //   check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task='bt:1'").get().c === 1,
-  //     "the resume re-granted the task's own territory");
-  // And the CONTROL in the other direction: with a LIVE overlapping lease held
-  // by another task the same resume must roll back entirely, because the §10.2
-  // check `regrant-territory` re-runs inside the transaction is the
-  // authoritative one. Without it the branch could grant unconditionally and
-  // still pass:
-  //   check(!resumed.applied && db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "BLOCKED",
-  //     "control: a live overlapping lease rolls the whole resume back");
+  const resumed = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(resumed.applied, "the resume applies", JSON.stringify(resumed));
+  // ASSERTED, not described. This block previously proved only that the resume
+  // did not throw, so an empty `regrant-territory` branch passed it while the
+  // task returned to IMPLEMENTING holding no lease at all.
+  check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task='bt:1'").get().c === 1,
+    "the resume re-granted the task's own territory",
+    JSON.stringify(db.prepare("SELECT * FROM territory_lease").all()));
+  db.close();
+}
+
+// ── and a LIVE overlapping lease rolls the whole resume back ─────────────────
+// The other direction, and the one an unconditional `regrant-territory` fails.
+// §10.2's intersection check is re-run INSIDE the transaction precisely because
+// the machine's `territoryConflict` evidence is the caller's earlier read; only
+// a check under BEGIN IMMEDIATE excludes a filing that landed in between.
+{
+  const db = openHub(join(dir, "t2.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  seed(db, { id: "bt:2", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',0)`);
+  // Another task holds it, and its lease is LIVE -- not expired, so the regrant
+  // must lose rather than reap.
+  db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at)
+           VALUES('p','prefix','packages/x','bt:2',unixepoch()+3600)`);
+  const blocked = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(!blocked.applied, "a resume whose territory is now held by a live task does not apply",
+    JSON.stringify(blocked));
+  check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "BLOCKED",
+    "and the WHOLE transaction rolled back: the task is still BLOCKED");
+  check(db.prepare("SELECT task FROM territory_lease WHERE path='packages/x'").get().task === "bt:2",
+    "control: the other task still holds the lease, so the regrant did not overwrite it");
   check(db.prepare("SELECT count(*) c FROM hold_reason WHERE cleared_at IS NULL").get().c === 2,
     "fixture: the task is BLOCKED with two open hold reasons and one open pr_hold");
 
@@ -1543,12 +1597,36 @@ import { applyTransition } from "../src/build/transition.mjs";
 // -- before hubTx, before anything -- and `assertWritable` is called on the
 // first line inside the transaction.
 import { hubTx, hubEvent } from "./hubdb.mjs";
-import { nextPhase, HELD } from "./phases.mjs";   // HELD is still read by the
-                                                  // CAS below, at held_from and
-                                                  // blocked_reason
+// (the phases.mjs import is above, with HOLD_ESCALATION and holdReasonFor;
+//  HELD is still read by the CAS below, at held_from and blocked_reason)
 import { assertWritable } from "./locks.mjs";
+// `HOLD_ESCALATION` and `holdReasonFor` are EXPORTED by phases.mjs and imported
+// here. The stacked-hold branch below indexes the first and calls the second,
+// and neither existed outside phases.mjs's module scope -- so a second hold on
+// BLOCKED or ESCALATED threw and rolled the transaction back instead of
+// stacking. `holdReasonFor` maps a hold_reason to the `pr_hold.reason` the DDL
+// admits; they are one closed set expressed twice, so it lives beside the map
+// rather than being re-derived here.
+import { nextPhase, HELD, HOLD_ESCALATION, holdReasonFor } from "./phases.mjs";
 import { isSameProcess } from "../supervisor.mjs";       // build/ is one level down
 import { enqueueEffect } from "./outbox.mjs";
+
+// The two projection reads `nextPhase`'s input needs, as DECLARATIONS -- an
+// earlier revision put them in a comment, which is the same as not having them:
+// every transition for an existing task threw a ReferenceError while BUILDING
+// the machine state, before `nextPhase` or the CAS could run, so the whole
+// plan's behaviour was unreachable. Both read inside the caller's transaction,
+// like every other input on that object; reading them before BEGIN IMMEDIATE
+// would decide the transition from a state the transaction does not hold.
+const hasOpenBuilderPr = (db, taskId) => db.prepare(
+  `SELECT count(*) c FROM impl_pr i
+    WHERE i.task = ?
+      AND NOT EXISTS (SELECT 1 FROM pr_hold h
+                       WHERE h.repo_id = i.repo_id AND h.pr = i.pr
+                         AND h.cleared_at IS NULL)`).get(taskId).c > 0;
+
+const hasLivePin = (db, taskId) => db.prepare(
+  `SELECT count(*) c FROM task_territory WHERE task = ? AND pinned = 1`).get(taskId).c > 0;
 
 export function applyTransition(db, { taskId, expectedPhase, expectedGeneration, evidence,
                                       artifactSha = null, op, effects = [], slice = null,
@@ -1590,26 +1668,6 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
       hasLiveRun: db.prepare(
         "SELECT count(*) c FROM phase_run WHERE task=? AND status IN ('live','adopted')").get(taskId).c > 0,
       phase: expectedPhase, generation: expectedGeneration, heldFrom: task.held_from,
-      // Both helpers are DEFINED in this module, immediately above
-      // `applyTransition`. A repo-wide search found only these two call sites,
-      // so every transition for an existing task threw a ReferenceError while
-      // building the machine state -- before `nextPhase` or the CAS could run,
-      // which means the whole plan's behaviour was unreachable:
-      //
-      //   const hasOpenBuilderPr = (db, taskId) => db.prepare(
-      //     `SELECT count(*) c FROM impl_pr i
-      //       WHERE i.task = ?
-      //         AND NOT EXISTS (SELECT 1 FROM pr_hold h
-      //                          WHERE h.repo_id = i.repo_id AND h.pr = i.pr
-      //                            AND h.cleared_at IS NULL)`).get(taskId).c > 0;
-      //
-      //   const hasLivePin = (db, taskId) => db.prepare(
-      //     `SELECT count(*) c FROM task_territory
-      //       WHERE task = ? AND pinned = 1`).get(taskId).c > 0;
-      //
-      // Both read inside the caller's transaction, like every other input on
-      // this object: reading them before `BEGIN IMMEDIATE` would decide the
-      // transition from a state the transaction does not hold.
       sliceCursor: task.slice_cursor, hasOpenPr: hasOpenBuilderPr(db, taskId),
       pinnedTerritory: hasLivePin(db, taskId),
       drainRemaining: db.prepare("SELECT count(*) c FROM task_drain WHERE task=? AND settled_at IS NULL").get(taskId).c,
@@ -1954,7 +2012,16 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
     // the ordering exists to prevent, reintroduced by the fix for it.
     for (const c of decision.compensations) {
       if (c === "void-pending") continue;
-      applyCompensation(db, { c, taskId, generation: decision.generation, seq, evidence, snapshot: evidence?.snapshot });
+      // `holdReason`, not the raw evidence. A post-approval `depth.override`
+      // carries no `reason` field, so `record-hold-reason` -- which the plan says
+      // consumes this evidence -- inserted a NULL into `hold_reason.reason`,
+      // hitting the NOT NULL and rolling the whole override back instead of
+      // entering BLOCKED. The value was derived correctly one block above and
+      // then not handed to the thing that needs it, which is the same shape as
+      // deriving it and not using it for `blocked_reason`.
+      applyCompensation(db, { c, taskId, generation: decision.generation, seq,
+                              evidence: { ...evidence, reason: evidence?.reason ?? holdReason },
+                              snapshot: evidence?.snapshot });
     }
 
     // (Effects were enqueued above, before the compensations, so record-drain
@@ -2164,7 +2231,7 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
 
   const good = leaseEffect(db, { worker: "w", capabilities: allOn });
   check(good?.kind === "gh.pr.comment", "an effect whose fence still validates is leased", JSON.stringify(good));
-  settleEffect(db, { id: good.id, ok: true, result: {} });
+  settleEffect(db, { id: good.id, worker: good.worker, leaseToken: good.lease_token, ok: true, result: {} });
 
   // now the task is redesigned out from under a second effect
   hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g3:SPEC_DRAFT:comment:1", kind: "gh.pr.comment",
@@ -2205,7 +2272,7 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
   const db = openHub(join(dir, "o3.db")); seed(db, { id: "bt:1", phase: "SPEC_DRAFT", generation: 1 });
   const K = "bt:1:g1:r0:SPEC_DRAFT:push:2";                       // round-keyed
   const a = hubTx(db, () => enqueueEffect(db, { idempotencyKey: K, kind: "git.push.branch", taskId: "bt:1", generation: 1, fence: 1, args: {} }));
-  settleEffect(db, { id: a.id, ok: true, result: { sha: "deadbeef" } });
+  settleEffect(db, { id: a.id, worker: a.worker, leaseToken: a.lease_token, ok: true, result: { sha: "deadbeef" } });
 
   const b = hubTx(db, () => enqueueEffect(db, { idempotencyKey: K, kind: "git.push.branch", taskId: "bt:1", generation: 1, fence: 5, args: {} }));
   check(b.status === "superseded",
@@ -2217,7 +2284,7 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
   // the reconciler decides against external truth rather than the key.
   const C = "bt:1:g1:SPEC_DRAFT:comment:0";
   const c1 = hubTx(db, () => enqueueEffect(db, { idempotencyKey: C, kind: "gh.pr.comment", taskId: "bt:1", generation: 1, fence: 1, args: {} }));
-  settleEffect(db, { id: c1.id, ok: true, result: {} });
+  settleEffect(db, { id: c1.id, worker: c1.worker, leaseToken: c1.lease_token, ok: true, result: {} });
   const c2 = hubTx(db, () => enqueueEffect(db, { idempotencyKey: C, kind: "gh.pr.comment", taskId: "bt:1", generation: 1, fence: 6, args: {} }));
   check(c2.status === "pending",
     "control: a non-round-keyed kind with a done row IS re-enqueued and left to its reconciler", JSON.stringify(c2));
@@ -2285,10 +2352,21 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
     "control: KINDS is the outbox DDL's whole kind enumeration, not a subset",
     JSON.stringify(declared.filter(k => !KINDS.includes(k))));
   const world = [];                       // what really happened out there
+  // RECONCILE BEFORE ACTUATE, in the executable definition rather than in a
+  // comment further down. Appending every leased key unconditionally performs a
+  // re-enqueued effect a SECOND time -- which is the duplicate delivery this
+  // whole drill exists to rule out, committed by the drill's own executor.
   const drain = () => {
     for (let row; (row = leaseEffect(db, { worker: "w", capabilities: allOn })); ) {
+      // External truth FIRST. Only an UNOBSERVED effect is performed.
+      if (world.includes(row.idempotency_key)) {
+        settleEffect(db, { id: row.id, worker: row.worker, leaseToken: row.lease_token,
+                           ok: true, result: { reconciled: true } });
+        continue;
+      }
       world.push(row.idempotency_key);    // the external action
-      settleEffect(db, { id: row.id, ok: true, result: {} });
+      settleEffect(db, { id: row.id, worker: row.worker, leaseToken: row.lease_token,
+                         ok: true, result: {} });
     }
   };
 
@@ -2353,26 +2431,9 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
     // the assertion below could never pass -- the previous fix was right about
     // the path and left the executor unable to take it.
     //
-    // So `drain` is defined with the reconciler production uses:
-    //
-    //     const drain = () => {
-    //       for (;;) {
-    //         const row = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
-    //         if (!row) break;
-    //         // External truth FIRST. Only an UNOBSERVED effect is performed.
-    //         if (world.includes(row.idempotency_key)) {
-    //           settleEffect(db, { id: row.id, worker: row.worker, leaseToken: row.lease_token,
-    //                              ok: true, result: { reconciled: true } });
-    //           continue;
-    //         }
-    //         world.push(row.idempotency_key);          // the external action
-    //         settleEffect(db, { id: row.id, worker: row.worker, leaseToken: row.lease_token,
-    //                            ok: true, result: {} });
-    //       }
-    //     };
-    //
-    // Consult-before-actuate is the property this whole drill exists to
-    // establish, so it belongs in the executor and not in the assertions about it.
+    // `drain` above is defined with that reconciler; consult-before-actuate is
+    // the property this drill exists to establish, so it lives in the executor
+    // and not in the assertions about it.
     //
     // THROUGH THE LEASE PATH, which is what production does with a fresh
     // pending row. Hand-editing it to an expired `inflight` and calling recovery
@@ -2478,7 +2539,7 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
     "control: a recorded drain row starts unsettled", String(settledAt(a.id)));
   const before = events();
   leaseEffect(db, { worker: "w", capabilities: allOn });
-  settleEffect(db, { id: a.id, ok: true, result: {} });
+  settleEffect(db, { id: a.id, worker: a.worker, leaseToken: a.lease_token, ok: true, result: {} });
   check(settledAt(a.id) !== null,
     "settleEffect settles the drain row for the effect it just completed", String(settledAt(a.id)));
   check(events() === before + 1,
@@ -2513,6 +2574,95 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
   check(db.prepare(
     "SELECT count(*) c FROM task_drain WHERE task='bt:1' AND settled_at IS NULL").get().c === 1,
     "control: so drainRemaining still counts exactly the one outstanding effect");
+  db.close();
+}
+
+// ── every outbox mutation appends its row image ──────────────────────────────
+// A DELTA per path, executable. The requirement was written into the interface
+// and asserted nowhere, so an implementation emitting none of these row images
+// passed Task 16 -- and replay then loses an admitted effect, or restores an
+// older `pending`/`inflight` status and performs an external action a second
+// time. A cumulative floor would not do: it stays green when a LATER path
+// appends nothing, which is exactly how five of six could be missing.
+{
+  const db = openHub(join(dir, "o7.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const evs = (kind, id) => db.prepare(
+    `SELECT count(*) c FROM hub_event WHERE kind=? AND json_extract(payload,'$.id') = ?`).get(kind, id).c;
+  const delta = (label, kind, id, fn) => {
+    const before = evs(kind, id);
+    const out = fn();
+    check(evs(kind, id) === before + 1, `${label} appends exactly one ${kind}`,
+      `${before} -> ${evs(kind, id)}`);
+    return out;
+  };
+
+  // enqueue
+  let row;
+  delta("enqueueEffect", "outbox.enqueued", null, () => {
+    row = hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:IMPLEMENTING:comment:0",
+      kind: "gh.pr.comment", taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+    return row;
+  });
+  // lease -- the row becomes `inflight`, which replay must not lose
+  const leased = delta("leaseEffect", "outbox.settled", row.id,
+    () => leaseEffect(db, { worker: "w", capabilities: allOn }));
+  // settle
+  delta("settleEffect", "outbox.settled", leased.id, () =>
+    settleEffect(db, { id: leased.id, worker: leased.worker, leaseToken: leased.lease_token,
+                       ok: true, result: {} }));
+
+  // fence: a row whose generation moved settles `fenced` inside leaseEffect
+  const stale = hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:IMPLEMENTING:comment:1",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 1, fence: 2, args: {} }));
+  db.exec("UPDATE task SET generation=2 WHERE id='bt:1'");
+  delta("leaseEffect fencing", "outbox.fenced", stale.id,
+    () => leaseEffect(db, { worker: "w", capabilities: allOn }));
+
+  // void
+  const doomed = hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g2:IMPLEMENTING:comment:0",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 2, fence: 3, args: {} }));
+  delta("voidPending", "outbox.voided", doomed.id, () => hubTx(db, () => voidPending(db, "bt:1")));
+  // CONTROL: one per ROW voided, never one for the batch. Two pending rows, two
+  // events -- an implementation appending a single batch event passes every
+  // delta above, because each of those voided exactly one row.
+  const v1 = hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g2:IMPLEMENTING:comment:1",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 2, fence: 4, args: {} }));
+  const v2 = hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g2:IMPLEMENTING:comment:2",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 2, fence: 5, args: {} }));
+  const beforeBatch = db.prepare("SELECT count(*) c FROM hub_event WHERE kind='outbox.voided'").get().c;
+  hubTx(db, () => voidPending(db, "bt:1"));
+  check(db.prepare("SELECT count(*) c FROM hub_event WHERE kind='outbox.voided'").get().c === beforeBatch + 2,
+    "control: voidPending appends one event per ROW, not one for the batch",
+    `${beforeBatch} -> ${db.prepare("SELECT count(*) c FROM hub_event WHERE kind='outbox.voided'").get().c}`);
+  check(evs("outbox.voided", v1.id) === 1 && evs("outbox.voided", v2.id) === 1,
+    "control: and each event names its own row");
+  db.close();
+}
+
+// ── not_before is honoured, at the boundary ──────────────────────────────────
+// `enqueueEffect` exposed `notBefore` and nothing asserted `leaseEffect` reads
+// it, so an implementation ignoring the column satisfied every fence,
+// capability, uniqueness, recovery and duplicate-delivery assertion in the task
+// -- while every delayed notification and every backoff retry fired at once.
+{
+  const db = openHub(join(dir, "o8.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const T = 1_800_000_000;
+  const later = hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:IMPLEMENTING:comment:0",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 1, fence: 1, args: {}, notBefore: T + 60 }));
+  check(leaseEffect(db, { worker: "w", capabilities: allOn, now: T }) === null,
+    "a row scheduled ahead is not leased before its boundary");
+  check(leaseEffect(db, { worker: "w", capabilities: allOn, now: T + 59 }) === null,
+    "nor one second before it");
+  check(leaseEffect(db, { worker: "w", capabilities: allOn, now: T + 60 })?.id === later.id,
+    "and IS leased at the boundary itself");
+  // CONTROL: an unscheduled row beside it is leasable throughout, or "leases
+  // nothing" satisfies both refusals above.
+  const now = hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:IMPLEMENTING:comment:1",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 1, fence: 2, args: {} }));
+  check(leaseEffect(db, { worker: "w", capabilities: allOn, now: T })?.id === now.id,
+    "control: an unscheduled row beside it is leased immediately");
   db.close();
 }
 ```
@@ -2744,6 +2894,33 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
     check(t[col] === want, `the snapshot's ${col} is persisted`, `${col}=${JSON.stringify(t[col])}`);
   check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task='bt:1'").get().c === 1,
     "and the territory lease is granted in the same transaction");
+  // The CLAIM's own row image, one per child. S2-A declares a
+  // `task_territory.claimed` handler and nothing emitted it, so a snapshot
+  // predating admission replayed the task and its lease with no claims beneath
+  // them -- and after the next release or resume the task has no territory to
+  // rebuild a lease from or to validate its diff against.
+  check(db.prepare(
+    "SELECT count(*) c FROM hub_event WHERE kind='task_territory.claimed' AND task='bt:1'").get().c === 1,
+    "and each territory claim appends its own row image",
+    JSON.stringify(db.prepare("SELECT kind FROM hub_event WHERE task='bt:1'").all()));
+
+  // ACROSS REPLAY, which is the only thing that proves the image is usable.
+  // Replay the admission's tail into an EMPTY hub and require the claim back:
+  // an implementation emitting the lease event but not the claim event passes
+  // every assertion above and fails exactly here.
+  {
+    const tail = db.prepare("SELECT seq, at, kind, task, payload FROM hub_event ORDER BY seq").all();
+    const back = openHub(join(dir, "r-replay.db"));
+    replayHub(back, tail);
+    check(back.prepare("SELECT count(*) c FROM task_territory WHERE task='bt:1'").get().c === 1,
+      "and a replay of the admission restores the claim, not only the lease",
+      JSON.stringify(back.prepare("SELECT * FROM task_territory").all()));
+    // CONTROL: the replay did something at all, so the assertion above is not
+    // satisfied by a hub that happens to be identical for another reason.
+    check(back.prepare("SELECT count(*) c FROM task WHERE id='bt:1'").get().c === 1,
+      "control: the replay restored the task too, so it ran");
+    back.close();
+  }
   db.close();
 }
 
@@ -2848,6 +3025,50 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   // prefix that is its SIBLING still do not.
   check(!overlaps({kind:"file",path:"packages/x"}, {kind:"prefix",path:"packages/z"}),
     "control: a file claim and an unrelated sibling prefix do not overlap");
+}
+
+// ── a claim for a path that does not exist yet is ORDINARY ───────────────────
+// Described in the interface and asserted nowhere: an implementation that
+// lstats every component and refuses on the first ENOENT blocks the commonest
+// filing there is -- a task whose whole job is to add a module -- while one that
+// stops before consulting the index admits territory inside another repository.
+// Both directions are executable here.
+{
+  const ENOENT = () => { const e = new Error("ENOENT"); e.code = "ENOENT"; throw e; };
+  const dirEntry = { isSymbolicLink: () => false };
+
+  // (a) the LEAF is missing: ordinary, admitted.
+  const leaf = resolveClaims([normalizeClaim("packages/x/new.ts")], "/repo", {
+    lstat: (p) => (p.endsWith("/new.ts") ? ENOENT() : dirEntry),
+    lsTree: () => ({ mode: "040000" }) });
+  check(!leaf.refusal, "a claim whose LEAF does not exist yet is admitted", JSON.stringify(leaf));
+
+  // (b) a MIDDLE ancestor is missing: also ordinary. Nothing below a path that
+  //     does not exist can be a symlink.
+  const mid = resolveClaims([normalizeClaim("packages/new/deep/file.ts")], "/repo", {
+    lstat: (p) => (p.includes("/new") ? ENOENT() : dirEntry),
+    lsTree: () => ({ mode: "040000" }) });
+  check(!mid.refusal, "and one whose MIDDLE ancestor does not exist is admitted", JSON.stringify(mid));
+
+  // (c) CONTROL: a symlink ABOVE a missing leaf is still refused, or "stop at
+  //     ENOENT" has quietly become "stop checking".
+  const above = resolveClaims([normalizeClaim("packages/linked/new.ts")], "/repo", {
+    lstat: (p) => (p.endsWith("/new.ts") ? ENOENT() : { isSymbolicLink: () => p.endsWith("/linked") }),
+    lsTree: () => ({ mode: "040000" }) });
+  check(!!above.refusal && /linked/.test(above.refusal),
+    "control: a symlink ABOVE a missing leaf is still refused", JSON.stringify(above));
+
+  // (d) CONTROL, and the escape: an UNINITIALISED submodule has no worktree
+  //     directory -- lstat says ENOENT -- while the superproject still records
+  //     the same path as a 160000 gitlink. Honouring ENOENT without asking the
+  //     index hands the task territory in a different repository, whose changed
+  //     files the superproject's diff cannot inspect.
+  const sub = resolveClaims([normalizeClaim("vendor/lib/src/x.ts")], "/repo", {
+    lstat: (p) => (p.includes("/vendor/lib") ? ENOENT() : dirEntry),
+    lsTree: (_r, p) => (p === "vendor/lib" ? { mode: "160000" } : { mode: "040000" }) });
+  check(!!sub.refusal && /vendor\/lib/.test(sub.refusal),
+    "control: a missing component that the INDEX records as a gitlink is refused anyway",
+    JSON.stringify(sub));
   check(overlaps({kind:"file",path:"packages/x/y.ts"}, {kind:"file",path:"packages/x/y.ts"}),
     "control: two identical file claims still overlap");
   check(!overlaps({kind:"prefix",path:"packages/x"}, {kind:"prefix",path:"packages/xy"}),
@@ -3304,6 +3525,10 @@ import { spawn } from "node:child_process";
   refused("enqueueEffect", () => hubTx(db, () => enqueueEffect(db, { idempotencyKey: "x", kind: "notify",
     taskId: "bt:1", generation: 1, fence: 1, args: {} })));
   refused("leaseEffect", () => leaseEffect(db, { worker: "w", capabilities: allOn }));
+  // Deliberately id-only, and deliberately a row that does not exist: this probe
+  // asserts the write is REFUSED while maintenance_lock is held, so it must fail
+  // at the lock and not at the lease fence -- a call that never reaches the write
+  // proves nothing about whether the write is guarded.
   refused("settleEffect", () => settleEffect(db, { id: 1, ok: true, result: {} }));
   refused("recoverEffects", () => recoverEffects(db, { reconcile: () => ({ settled: false }) }));
   refused("voidPending", () => voidPending(db, "bt:1"));
@@ -3327,6 +3552,35 @@ import { spawn } from "node:child_process";
     "control: with the lock released the same call succeeds, so the refusals above were the lock",
     JSON.stringify(after));
   holder.kill("SIGKILL");
+  db.close();
+}
+
+// ── an EXTRA permission is drift, and drift is excess authority ──────────────
+// The negative cases only removed required entries, so an installation carrying
+// everything expected PLUS `workflows: write` reported `pass`. The gate's whole
+// claim is that the bound App can do exactly what the ruleset requires and
+// nothing more, and a minima-only comparison cannot make it.
+{
+  const db = openHub(join(dir, "g9.db"));
+  const extra = {
+    ...ok,
+    installation: { ...ok.installation,
+      permissions: { ...ok.installation.permissions, workflows: "write" } },
+  };
+  const row = await refreshGateState(db, { name: "nextly", repoId: 1, nwo: "o/r", expectedAppId: EXPECTED },
+    () => extra);
+  check(row.app_installed !== "pass",
+    "an otherwise-valid installation with one EXTRA permission is not a pass",
+    JSON.stringify(row));
+  check(/workflows/.test(row.permission_diff ?? ""),
+    "and permission_diff names the excess key, so the founder can see what to remove",
+    String(row.permission_diff));
+  // CONTROL: the same fetcher without the extra key IS a pass, so the assertion
+  // above is about the excess permission and not about the fixture.
+  const clean = await refreshGateState(db, { name: "nextly", repoId: 2, nwo: "o/two", expectedAppId: EXPECTED },
+    () => ok);
+  check(clean.app_installed === "pass" && clean.permission_diff == null,
+    "control: the exact expected set still passes with no diff", JSON.stringify(clean));
   db.close();
 }
 ```
@@ -3510,6 +3764,27 @@ for (let i = 0; i < 500; i++) {
   // rather than reporting red. A hanging test is worse than a failing one: CI
   // reports a timeout with no assertion to read.
   if (caught !== "exited") {
+    // KILL WHILE THE TRANSACTION IS OPEN, not merely after observing that one was.
+    // `SQLITE_BUSY` proves the child held the write lock at the moment the probe
+    // failed; between that observation and this line there is a promise handoff,
+    // and the child can have committed in it. The kill then lands between
+    // transactions, every task is intact for the ordinary reason, and the
+    // `pe > 0 && pe < 500` control still passes -- so the drill reports atomicity
+    // green against an implementation whose writes tear when interrupted.
+    //
+    // The child therefore holds the door open: after its BEGIN IMMEDIATE and
+    // before its COMMIT it writes a byte to fd 3 and then blocks on a read from
+    // fd 4, so it is provably inside the transaction and cannot leave it. The
+    // parent kills on that byte. The pipes make the handshake, not the clock:
+    //
+    //     const kid = spawn(process.execPath, [worker, p],
+    //                       { stdio: ["ignore","ignore","ignore","pipe","pipe"] });
+    //     const inside = new Promise(res => kid.stdio[3].once("data", res));
+    //     await Promise.race([inside, exit]);
+    //
+    // The SQLITE_BUSY probe stays as the CONTROL: it proves the lock really is
+    // held when the byte arrives, so the handshake cannot pass on a child that
+    // signals without having opened anything.
     kid.kill("SIGKILL");
     await exit;                       // already resolved if it has since exited
   }

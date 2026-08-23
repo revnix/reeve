@@ -1552,7 +1552,7 @@ git commit -m "feat(hub): inbox, fenced outbox, merge decisions and leases"
 
 **Interfaces:**
 - Consumes: `openHub`, `hubTx`, `MIGRATIONS` from Task 1.
-- Produces: `hubEvent(db, { kind, task = null, payload = {} }) -> number` — appends one `hub_event` row and returns its seq. **Must be called inside the caller's transaction**, never opening its own; that is what makes the projection replayable. `migrationPlan() -> [{version}]` — exported for the invariant test.
+- Produces: `hubEvent(db, { kind, task = null, payload = {} }) -> number` — appends one `hub_event` row and returns its seq. **Must be called inside the caller's transaction**, never opening its own; that is what makes the projection replayable. `migrationPlan() -> [{ version, implHash }]` — exported for the invariant test and for the migration freeze. `implHash` is `sha256(String(m.up))`, computed inside `hubdb.mjs`; `MIGRATIONS` itself stays module-private, because exporting it hands out runnable `up` functions. **`hubdb.mjs` therefore imports `createHash` from `node:crypto`.**
 - The **freeze fixture** that stops migration 1 from ever being edited after merge lands in Task 13, once `hub.sql` has stopped moving.
 
 - [ ] **Step 1: Append the failing assertions**
@@ -1638,7 +1638,18 @@ export function hubEvent(db, { kind, task = null, payload = {} }) {
 
 /** The migration list, for the invariant test. Versions are 1..N, no gaps. */
 export function migrationPlan() {
-  return MIGRATIONS.map(m => ({ version: m.version }));
+  // `implHash` travels beside the version because the freeze test needs a stable
+  // representation of what migration 1 IS, and `MIGRATIONS` stays module-private
+  // on purpose: exporting the array hands callers the `up` functions themselves,
+  // which are runnable against any handle. A hash is comparable and inert.
+  //
+  // Two call sites referenced the bare `MIGRATIONS` constant from outside this
+  // module -- the fixture-writing command and the freeze test -- and both would
+  // have thrown ReferenceError, so the freeze the test advertises never existed.
+  return MIGRATIONS.map(m => ({
+    version: m.version,
+    implHash: createHash("sha256").update(String(m.up)).digest("hex"),
+  }));
 }
 ```
 
@@ -2407,6 +2418,25 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo", de
     if (deep) {
       integrity = Object.values(probe.prepare("PRAGMA integrity_check").get())[0];
       if (integrity !== "ok") return { ok: false, why: `integrity_check says: ${integrity}`, version: null, integrity };
+      // AND the declared foreign keys, which integrity_check does not look at.
+      // Measured 2026-08-23 on SQLite 3.53.0 (node v24.17.0): a database holding
+      // one orphaned child row answers `ok` to integrity_check and returns the
+      // violation only from foreign_key_check --
+      // docs/measured/2026-08-23-integrity-check-misses-foreign-keys.md, with a
+      // positive control showing the same integrity_check does report real page
+      // corruption, so the `ok` is an answer and not a broken instrument.
+      //
+      // It matters here and nowhere else: this snapshot is about to REPLACE a
+      // live hub, and restoreHub opens the result with foreign_keys ON. An
+      // orphaned authority row -- an `outbox` whose `phase_event` is gone, a
+      // `task_territory` whose `task` is gone -- would therefore surface later,
+      // as a write failure inside an unrelated transaction, with nothing left to
+      // fall back to.
+      const fk = probe.prepare("PRAGMA foreign_key_check").all();
+      if (fk.length)
+        return { ok: false, integrity, version: null,
+                 why: `${fk.length} foreign-key violation(s), e.g. ` +
+                      fk.slice(0, 3).map(r => `${r.table} rowid ${r.rowid} -> ${r.parent}`).join(", ") };
     }
 
     // Each store is validated against ITS OWN marker. A guardian per-repo store
@@ -2513,8 +2543,27 @@ Then, inside `snapshotAll`, validate what was just written and refuse to keep a 
           results.push({ nwo, ok: false, why: `snapshot failed validation and was deleted: ${v.why}`, escalate: "builder:backup:failed" });
           continue;
         }
-        // Valid, so it has earned its slot: prune now, with the real `keep`.
-        prune(join(root, slug(nwo)), keep);
+        // Valid, so it has earned its slot: prune now, with the real `keep` --
+        // and with a usability predicate, because `keep` means "keep the newest
+        // N RECOVERY POINTS", not "the newest N filenames". A snapshot that was
+        // valid when written can be unreadable later (a bad sector, a truncated
+        // copy, the future-timestamped corrupt candidate this task's own test
+        // deliberately leaves on disk), and counting it toward retention evicts
+        // an older GOOD snapshot to make room for a file `latestSnapshot`
+        // already refuses to return. Enough of those in a row and every usable
+        // recovery point is gone, one per backup, each deletion looking correct
+        // on its own.
+        //
+        // CHEAP validation per candidate, not deep: this runs over every
+        // retained file on every backup, and 2026-08-23-integrity-check-cost.md
+        // is the measurement that says a full scan does not belong on a repeated
+        // path. The marker query is flat at ~0.3 ms, which is what makes doing it
+        // per candidate affordable at all.
+        prune(join(root, slug(nwo)), keep, {
+          usable: (p) => (nwo === "hub"
+            ? validateSnapshot(p, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION })
+            : validateSnapshot(p, { kind: "repo" })).ok,
+        });
       }
       results.push({ nwo, ...taken });
 ```
@@ -2522,6 +2571,21 @@ Then, inside `snapshotAll`, validate what was just written and refuse to keep a 
 `prune` is module-private today (`src/backup.mjs:53`) and `snapshotAll` is in
 the same module, so it needs no export — but `slug` is used with it, and both
 must stay in scope.
+
+**`prune` gains a third parameter**, `{ usable }`, defaulting to `() => true` so
+every existing caller keeps today's behaviour exactly. When supplied, it deletes
+every candidate the predicate rejects **first**, then keeps the newest `keep` of
+what remains. Deleting rather than merely skipping is deliberate: a file that
+fails validation is not a recovery point, `latestSnapshot` already refuses to
+return it, and leaving it on disk means paying to validate it again on every
+future backup forever.
+
+The test for this needs a control in the over-fix direction, because "delete
+what does not validate" is one careless step from "delete everything": assert
+that a directory of `keep` GOOD snapshots plus one corrupt file keeps all `keep`
+good ones and loses only the corrupt one — on the broken implementation (the
+corrupt file counted toward retention) the oldest good snapshot is gone and that
+assertion is the single line that goes red.
 
 **`HUB_TABLES` is a new export of `src/build/hubdb.mjs`**, added by this task:
 the tables migration 1 creates, derived from `hub.sql` at module load rather
@@ -2547,9 +2611,24 @@ spellings of the same path is how they drift, and the freeze test hashes the fil
 this constant names.
 
 Task 11's cross-check already asserts the live `sqlite_master` table set equals
-`TABLE_OWNERS`'s keys; it now asserts `HUB_TABLES` equals it too, so a schema
-file the regex cannot parse fails loudly instead of yielding a short list that
-validates every snapshot.
+`TABLE_OWNERS`'s keys; **its "direction 0" block now asserts `HUB_TABLES` equals
+it too**, in both directions and with a non-empty control, so a schema file the
+regex cannot parse fails loudly instead of yielding a short list that validates
+every snapshot. That assertion was promised by this paragraph for several
+revisions and did not exist — the test never imported `HUB_TABLES` at all, so
+the advertised guard was green because it was absent.
+
+**`bin/reeve`'s doctor import must gain both hub helpers.** It reads
+`import { runDoctor, render, checkAppIdentity } from "../src/doctor.mjs";`
+(`bin/reeve:7` on `16769e7`), and the route below calls `hubFindings` and
+`renderHub` — neither of them bound. An existing-hub invocation throws on the
+first, and the no-hub path throws on the second before it, so **every**
+`reeve builder doctor` invocation is a ReferenceError. Both are new exports of
+`src/doctor.mjs` in this task, and the import becomes:
+
+```js
+import { runDoctor, render, checkAppIdentity, hubFindings, renderHub } from "../src/doctor.mjs";
+```
 
 Add the imports `HUB_SCHEMA_VERSION` and `HUB_TABLES` from `./build/hubdb.mjs`,
 and keep `existsSync` (already imported).
@@ -2831,7 +2910,19 @@ const ENUMS = {
   // the comparison set is about -- a live one would be cleared by restoreHub and
   // never survive to be compared.
   "phase_run.status": "succeeded",
-  "approval.kind": "review", "approval.verdict": "approved",
+  // 'codex_clean'/'clean', not 'review'/'approved'. Neither of those is in the
+  // DDL's CHECK -- `approval.kind ∈ {founder_review, founder_cli,
+  // founder_silence, codex_clean}` and `approval.verdict ∈ {approve,
+  // changes_requested, clean}` -- so the moment `approval` moved from its
+  // hand-written writer to `writeRow`, both would abort the insert. They were
+  // dead entries that documented the wrong schema, which is the failure this map
+  // exists to prevent.
+  "approval.kind": "codex_clean", "approval.verdict": "clean",
+  // The CHECK admits only ('delivered','founder_ack'). With no entry here
+  // minimalRow generated the literal 'notice_receipt-kind' and the destructive
+  // drill aborted on the CHECK before it destroyed anything -- so the drill
+  // reported a corruption-handling failure that was really a fixture defect.
+  "notice_receipt.kind": "delivered",
   "attested_push.pusher": "builder", "attested_push.source_kind": "outbox",
   "guardian_receipt.status": "imported",
   "pr_hold.reason": "cancel",
@@ -2867,6 +2958,41 @@ const minimalRow = (db, table, over = {}) => {
 // A CHECK this map misses makes the INSERT throw, and the coverage control below
 // catches a table that ended up empty -- so both failure modes are loud. That is
 // the point of deriving: the fixture cannot silently drift from the schema.
+
+// Except it CAN, in the one direction a throw does not cover: an entry that is
+// present and ILLEGAL. Three were -- `notice_receipt.kind` absent, and
+// `approval.kind`/`approval.verdict` naming values no CHECK admits, harmless
+// only because `approval` happens to use a hand-written writer. So the map is
+// checked against the schema rather than trusted, ONCE, before the drill runs:
+{
+  const probe = openHub(join(dir, "enums-probe.db"));
+  const wrong = [];
+  for (const t of COMPARISON_SET) {
+    const ddl = probe.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(t)?.sql ?? "";
+    for (const c of probe.prepare(`PRAGMA table_info(${t})`).all()) {
+      if (!c.notnull || c.dflt_value !== null) continue;
+      // The column's own CHECK list, read out of the stored DDL. A column with
+      // no enumeration is not this check's business.
+      const m = new RegExp(`\\b${c.name}\\b[^,]*?CHECK\\s*\\([^)]*?IN\\s*\\(([^)]*)\\)`, "s").exec(ddl);
+      if (!m) continue;
+      const legal = [...m[1].matchAll(/'([^']+)'/g)].map(x => x[1]);
+      const key = `${t}.${c.name}`;
+      const got = ENUMS[key];
+      if (got === undefined || !legal.includes(got)) wrong.push(`${key}=${JSON.stringify(got)} legal=${legal.join("|")}`);
+    }
+  }
+  check(wrong.length === 0,
+    "every enumerated NOT NULL column in the comparison set has a LEGAL value in ENUMS",
+    wrong.join("; "));
+  // CONTROL: the reader found enumerations at all. An empty scan satisfies the
+  // assertion above for every possible map, and a regex that stops matching the
+  // stored DDL is exactly how this check would rot into a green no-op.
+  check(Object.keys(ENUMS).length > 0 && /CHECK/.test(
+      probe.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='task'").get().sql),
+    "control: the DDL really carries CHECK constraints for this scan to read");
+  probe.close();
+}
 
 const POST_SNAPSHOT = {
   task:              (db, t) => writeRow("task", "task.transitioned")(db, t),
@@ -2907,6 +3033,70 @@ $N test/hub-backup-restore.test.mjs
 ```
 
 Expected: import failure on `restoreHub` / `replayHub`.
+
+And a block for the unreadable case, which is the one this route is named for:
+
+```js
+// ── a hub too corrupt to open is still restorable from a snapshot + tail ─────
+{
+  const home = mkdtempSync(join(tmpdir(), "reeve-unreadable-"));
+  mkdirSync(join(home, "state"), { recursive: true });
+  const p = hubPathFor(home);
+  const good = openHub(p);
+  hubTx(good, () => hubEvent(good, { kind: "task.transitioned", task: "bt:1",
+    payload: { id: "bt:1", phase: "GATE", generation: 1 } }));
+  good.close();
+  const snap = join(home, "snap.db");
+  copyFileSync(p, snap);
+
+  // Corrupt the LIVE hub past the point of answering a query, derived from the
+  // file rather than hardcoded -- see 2026-08-23-sqlite-page-corruption.md: an
+  // offset past the end of a short file corrupts nothing, and every assertion
+  // below would then pass having done nothing at all.
+  const geom = new DatabaseSync(p, { readOnly: true });
+  const pageSize  = geom.prepare("PRAGMA page_size").get().page_size;
+  const pageCount = geom.prepare("PRAGMA page_count").get().page_count;
+  geom.close();
+  const fd = openSync(p, "r+");
+  for (let i = 1; i < pageCount; i++) writeSync(fd, Buffer.alloc(pageSize, 0x41), 0, pageSize, i * pageSize);
+  closeSync(fd);
+  // CONTROL, and the load-bearing one: it really is unreadable NOW. Without it
+  // the refusal below is equally satisfied by a hub that opens perfectly well
+  // and was refused for some unrelated reason, and the force path that follows
+  // would be exercising the ordinary readable branch under a different name.
+  let readable = true;
+  try { const q = new DatabaseSync(p, { readOnly: true });
+        q.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get(); q.close(); }
+  catch { readable = false; }
+  check(!readable, "control: the live hub really cannot be read now", String(readable));
+
+  // Without force: REFUSED, because no holder can be enumerated either way.
+  const no = restoreHub(snap, p, { isAlive: () => false, pid: process.pid, lstart: "L", force: false });
+  check(!no.ok && /cannot be read/.test(no.why ?? ""),
+    "an unreadable hub is refused without force, naming why the holders are unknowable", JSON.stringify(no));
+
+  // With force and a supplied tail: recovered. This is the whole point of the
+  // route, and before the unreadable branch existed it returned
+  // `could not restore: ...` from the outer catch instead.
+  const tail = [{ seq: 99, at: 1, kind: "task.transitioned", task: "bt:2",
+                  payload: JSON.stringify({ id: "bt:2", phase: "SIZING", generation: 1 }) }];
+  const yes = restoreHub(snap, p, { isAlive: () => false, pid: process.pid, lstart: "L", force: true, tail });
+  check(yes.ok, "restore --hub --tail recovers a hub too corrupt to open", JSON.stringify(yes));
+  check(yes.quarantined && existsSync(yes.quarantined),
+    "and the unreadable file is quarantined and NAMED in the result, not deleted", String(yes.quarantined));
+  const back = openHub(p);
+  check(back.prepare("SELECT count(*) c FROM task WHERE id='bt:2'").get().c === 1,
+    "and the supplied tail was replayed, so events after the snapshot survived");
+  back.close();
+  // CONTROL: the sibling lock was RELEASED. A canonical `.restore-lock` left
+  // held makes every later restore refuse, naming a pid that exited long ago --
+  // and because the lock is not inside the hub, nothing else in this suite or
+  // any other would ever notice.
+  const second = restoreHub(snap, p, { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+  check(second.ok, "control: a second restore is not blocked by the first one's sibling lock",
+    JSON.stringify(second));
+}
+```
 
 **On the broken implementation** — the existing `restore()` reused for the hub — every refusal assertion goes red at once, because `restore()` probes `pgrep -fl "bin/reeve run"`, which matches a **guardian** and knows nothing about the singleton lease, the writer leases, or provider leases. The single most important assertion here is the **control**: `with nothing live, restore proceeds`. Without it a `restoreHub` that returns `{ok:false}` unconditionally satisfies all four refusal tests and would ship.
 
@@ -2967,6 +3157,15 @@ export const NON_REPLAYED_KINDS = Object.freeze([
   // RESEARCH was skipped, not lost. The reason is durable in hub_event as
   // history; there is no row it projects into.
   "research.skipped",
+  // The singleton lease is PROCESS-scoped: `singleton_lease` is cleared by
+  // `restoreHub` along with every other row naming a pid, because no process
+  // from before the restore still holds anything. Replaying a grant would
+  // reinstate a lease for a pid that is gone and lock out the builder that
+  // starts next. Both kinds are emitted by `locks.mjs`, which the scanner below
+  // reads -- so leaving them undeclared fails the cross-check on the very
+  // implementation this plan prescribes.
+  "lease.singleton.granted",
+  "lease.singleton.released",
 ]);
 
 /** kind -> the table its payload is a row of. */
@@ -3096,8 +3295,20 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     try { return p.prepare("SELECT COALESCE(max(seq),0) s FROM hub_event").get().s; } finally { p.close(); }
   })();
 
-  let live = null, locked = false;
+  let live = null, locked = false, lockDb = null, quarantined = null;
   const staging = dbPath + ".restoring";
+  // The raw open AND the first query, together. Either can throw on a file that
+  // is corrupt enough, and the branch below used to do them as two statements
+  // with nothing between -- so the throw escaped to the outer catch and the
+  // command reported a failure instead of performing the recovery it exists for.
+  const rawOpen = (p) => {
+    let d = null;
+    try {
+      d = new DatabaseSync(p, { timeout: 10000 });
+      d.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get();
+      return d;
+    } catch { try { d?.close(); } catch {} return null; }
+  };
   try {
     // When dbPath is ABSENT -- the destructive drill's case, and a real total
     // loss -- the holder scan is skipped and NO lock exists at the canonical
@@ -3116,13 +3327,59 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       const got = acquireMaintenanceLock(live, { pid, lstart, isAlive });
       if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
       locked = true;
+    } else if ((live = rawOpen(dbPath)) === null) {
+      // EXISTS, and UNREADABLE. This is the state the route's own description
+      // names -- recovering a hub "too corrupt to open" -- and the readable
+      // branch below could never reach it: its first act is to query
+      // `schema_version`, so a file too damaged to answer threw straight past
+      // every recovery path to the outer catch. `restore --hub --tail <export>`,
+      // the one command for exactly this situation, could not run.
+      //
+      // Three things the readable path takes from the live file are unavailable
+      // here, and each needs an answer rather than a silent skip:
+      //
+      // 1. EXCLUSION. `maintenance_lock` lives INSIDE the hub. So the lock moves
+      //    to a sibling at a CANONICAL path -- `<dbPath>.restore-lock`, a fixed
+      //    name, not a temporary -- opened as its own store and taken with the
+      //    same `acquireMaintenanceLock` call, so two concurrent restores of an
+      //    unreadable hub still contend for one row.
+      // 2. THE HOLDER SCAN. `singleton_lease`, `liveWriters` and `provider_lease`
+      //    are all unreadable, so no holder can be enumerated and none can be
+      //    ruled out. The command therefore REFUSES unless `force` is passed.
+      //    Note this INVERTS the readable path's rule, deliberately: there,
+      //    `force` is refused while a holder is provably alive, because the
+      //    evidence exists; here it is REQUIRED, because it cannot, and the
+      //    operator is the only one who can say the daemons are stopped.
+      // 3. THE FORWARD-VERSION REFUSAL. Unreadable means the version is UNKNOWN,
+      //    not that it is old, so that check cannot be evaluated at all. The
+      //    snapshot's version was already checked against HUB_SCHEMA_VERSION at
+      //    the top of this function, which is the store about to be installed
+      //    and is readable -- that is the guarantee that survives here.
+      if (!force)
+        return { ok: false, holders: [],
+                 why: `the hub at ${dbPath} exists but cannot be read, so its live writers cannot be ` +
+                      `enumerated and none can be ruled out. Stop the builder and any reeve CLI, then ` +
+                      `re-run with force. Pass --tail from a durable export-events --hub to carry ` +
+                      `forward everything after the snapshot; without one, events since ${snapSeq} are lost.` };
+      lockDb = openHub(dbPath + ".restore-lock");
+      const got = acquireMaintenanceLock(lockDb, { pid, lstart, isAlive });
+      if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
+      locked = true;
+      // QUARANTINE, never delete. The unreadable file is the only evidence of
+      // what went wrong, and a recovery that destroys it leaves nothing to
+      // diagnose afterwards. Moved aside BEFORE the staged copy is renamed into
+      // place, so the two never occupy the path at once.
+      quarantined = `${dbPath}.corrupt-${Math.floor(Date.now() / 1000)}`;
+      renameSync(dbPath, quarantined);
+      // `live` stays null, which the tail read below already handles: with no
+      // readable hub, `suppliedTail` is the ONLY source of post-snapshot events.
     } else {
       // RAW DatabaseSync, not openHub. openHub applies forward migrations, and
       // migrating a database is a write -- so opening that way would upgrade a
       // hub that a builder or a CLI is actively using, before this command has
       // established it is allowed to touch it at all. The exclusion has to come
       // before any write, including a well-intentioned one.
-      live = new DatabaseSync(dbPath, { timeout: 10000 });
+      // (already opened by `rawOpen` above, which is also what proved it readable)
       // A RAW open skips openHub's forward-version refusal, so this command must
       // repeat it before it touches anything. Without it an older binary can
       // restore beside a hub a newer binary already migrated: it collects event
@@ -3261,12 +3518,26 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
              `because a stale write-ahead log beside a restored file is replayed into it on the next open` }; }
     }
     renameSync(staging, dbPath);
-    return { ok: true, why: null, holders: [], replayed, tail: tail.length };
+    // `quarantined` is REPORTED, not merely done. When the live hub was
+    // unreadable it was moved aside rather than deleted, and this result is the
+    // only place its path is ever named -- an operator who is not told where the
+    // broken file went cannot diagnose what happened, and the next restore's
+    // quarantine will not overwrite it either, so copies accumulate in silence.
+    // Null on every ordinary restore.
+    return { ok: true, why: null, holders: [], replayed, tail: tail.length, quarantined };
   } catch (e) {
     return { ok: false, why: `could not restore: ${e.message}`, holders: [] };
   } finally {
-    if (locked && live) { try { releaseMaintenanceLock(live, { pid, lstart }); } catch {} }
+    // The lock lives in ONE of two places: inside the live hub on the ordinary
+    // path, or in the sibling `.restore-lock` store when the hub was unreadable.
+    // Releasing only the first leaves an unreadable-hub restore holding its lock
+    // forever -- and because that lock sits at a CANONICAL path, every later
+    // attempt then refuses with "another restore is running", naming a pid that
+    // exited long ago.
+    if (locked && live)   { try { releaseMaintenanceLock(live,   { pid, lstart }); } catch {} }
+    if (locked && lockDb) { try { releaseMaintenanceLock(lockDb, { pid, lstart }); } catch {} }
     try { live?.close(); } catch {}
+    try { lockDb?.close(); } catch {}
     try { rmSync(staging, { force: true }); } catch {}
   }
 }
@@ -3432,7 +3703,7 @@ git commit -m "feat(hub): restore refuses live writers; destructive drill"
 
 **Interfaces:**
 - Consumes: `everyStore`, `latestSnapshot`, `validateSnapshot` (Task 8); `COMPARISON_SET` (Task 9); `openHub` (Task 1).
-- Produces: `hubFindings(db, { root, now, snapshotFor, projects, offDevice }) -> Finding[]` where `projects` is the registry set `[{ name, repoId, nwo }]` where `Finding = { id, severity, classification, title, detail, action }` and `classification ∈ {'configuration','dependency-outage','stale-evidence','unsafe-authority'}`. Findings `H-1` snapshot age, `H-2` last integrity result, `H-3` restore compatibility, `H-4` `repo_gate_state` per registry project, `H-5` provider scheduler state and stale leases, `H-6` off-device copy missing.
+- Produces: `hubFindings(db, { root, now, snapshotFor, projects, offDevice }) -> Finding[]` where `projects` is the registry set `[{ name, nwo }]` where `Finding = { id, severity, classification, title, detail, action }` and `classification ∈ {'configuration','dependency-outage','stale-evidence','unsafe-authority'}`. Findings `H-1` snapshot age, `H-2` last integrity result, `H-3` restore compatibility, `H-4` `repo_gate_state` per registry project, `H-5` provider scheduler state and stale leases, `H-6` off-device copy missing.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3476,9 +3747,21 @@ import { mkdirSync, openSync, writeSync, closeSync } from "node:fs";
 
   // A registry project with NO row is the case doctor was blind to: it emitted
   // nothing at all, which reads as "fine".
-  const PROJECTS = [{ name: "nextly", repoId: 1, nwo: "o/r" }, { name: "other", repoId: 2, nwo: "o/other" }];
+  // No repoId: the registry format has none, so a fixture that supplies one
+  // tests a lookup the CLI can never perform.
+  const PROJECTS = [{ name: "nextly", nwo: "o/r" }, { name: "other", nwo: "o/other" }];
   f = hubFindings(db, { root: "/b", now: NOW, snapshotFor: () => null, projects: PROJECTS });
-  const absent = f.filter(x => x.id === "H-4");
+  // `H-4:<nwo>`, not the bare id. The implementation scopes the identity per
+  // project (a failing project and a healthy one both emitting `H-4` is the
+  // defect that change fixed), so a filter on the bare id matches NOTHING and
+  // every assertion in this block passes vacuously on an empty array.
+  const absent = f.filter(x => x.id.startsWith("H-4:"));
+  // CONTROL: the bare id is gone. Without it this block goes green again the
+  // moment someone reverts the scoping, since `startsWith("H-4:")` and
+  // `=== "H-4"` are both satisfied by a set containing only the other one.
+  check(f.filter(x => x.id === "H-4").length === 0,
+    "control: no finding carries the unscoped H-4 id",
+    JSON.stringify(f.map(x => x.id)));
   check(absent.length === 2 && absent.every(x => x.classification === "unsafe-authority"),
     "a registry project with no gate-state row still produces a failing H-4",
     JSON.stringify(absent.map(x => x.title)));
@@ -3487,16 +3770,16 @@ import { mkdirSync, openSync, writeSync, closeSync } from "node:fs";
   db.exec(`INSERT INTO repo_gate_state(repo_id,nwo_snapshot,ruleset_requires_check,bound_app_id,expected_app_id,app_installed,verified_at)
            VALUES(1,'o/r',0,NULL,42,'unknown',${NOW - 60})`);
   f = hubFindings(db, { root: "/b", now: NOW, snapshotFor: () => null });
-  const gate = f.find(x => x.id === "H-4");
+  const gate = f.find(x => x.id.startsWith("H-4:"));
   check(gate?.classification === "unsafe-authority", "a ruleset that does not require the bound check is unsafe authority", JSON.stringify(gate));
 
   db.exec(`UPDATE repo_gate_state SET ruleset_requires_check=1, bound_app_id=42, app_installed='pass' WHERE repo_id=1`);
   f = hubFindings(db, { root: "/b", now: NOW, snapshotFor: () => null });
-  check(f.find(x => x.id === "H-4")?.severity === "pass", "control: a ruleset requiring the bound app passes");
+  check(f.find(x => x.id.startsWith("H-4:"))?.severity === "pass", "control: a ruleset requiring the bound app passes");
 
   db.exec(`UPDATE repo_gate_state SET verified_at=${NOW - 3600 * 3} WHERE repo_id=1`);
   f = hubFindings(db, { root: "/b", now: NOW, snapshotFor: () => null });
-  check(f.find(x => x.id === "H-4")?.classification === "stale-evidence",
+  check(f.find(x => x.id.startsWith("H-4:"))?.classification === "stale-evidence",
     "a row older than the freshness bound is stale, whatever it says");
 
   // THE assertion of this task: doctor is a reader.
@@ -3538,15 +3821,15 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
   if (!snap) {
     out.push({ id: "H-1", severity: "fail", classification: "configuration",
       title: "the hub has no snapshot", detail: `nothing under ${root}/hub`,
-      action: "reeve backup" });
+      action: "reeve backup --hub" });
   } else if (!snap.ok) {
     out.push({ id: "H-1", severity: "fail", classification: "configuration",
-      title: "the newest hub snapshot does not validate", detail: String(snap.why), action: "reeve backup" });
+      title: "the newest hub snapshot does not validate", detail: String(snap.why), action: "reeve backup --hub" });
   } else if (now - snap.at > snapshotMaxHours * 3600) {
     out.push({ id: "H-1", severity: "warn", classification: "stale-evidence",
       title: "the hub snapshot is stale",
       detail: `${Math.round((now - snap.at) / 3600)}h old, taken ${new Date(snap.at * 1000).toISOString()}`,
-      action: "reeve backup" });
+      action: "reeve backup --hub" });
   } else {
     out.push({ id: "H-1", severity: "pass", classification: "stale-evidence",
       title: "hub snapshot is fresh", detail: `${Math.round((now - snap.at) / 60)}m old`, action: null });
@@ -3562,9 +3845,14 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
   // that indexes findings by id keeps whichever was appended last, which is
   // whichever project the registry happened to list second. The id carries the
   // repository, exactly as `#<pr>:` scopes the guardian's per-PR escalations.
-  const have = new Map(db.prepare("SELECT * FROM repo_gate_state").all().map(r => [r.repo_id, r]));
+  // Keyed by `nwo_snapshot`, because that is the field the registry and the
+  // table share. Keying on `repo_id` compared a column against a registry field
+  // that does not exist -- `proj.repoId` was always null, `have.has(null)` always
+  // false, and EVERY project reported "no gate-state row" including ones whose
+  // row was present and healthy.
+  const have = new Map(db.prepare("SELECT * FROM repo_gate_state").all().map(r => [r.nwo_snapshot, r]));
   for (const proj of projects) {
-    if (have.has(proj.repoId)) continue;
+    if (have.has(proj.nwo)) continue;
     out.push({ id: `H-4:${proj.nwo}`, severity: "fail", classification: "unsafe-authority",
       title: `${proj.nwo} has no gate-state row`,
       detail: "the builder loop has never recorded one; clause U4 reads UNKNOWN, which is never PASS",
@@ -3615,10 +3903,10 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
       action: ok ? null : "run the matching binary, or take a fresh snapshot" });
   } else if (snap) {
     out.push({ id: "H-2", severity: "fail", classification: "configuration",
-      title: "the newest hub snapshot does not read back", detail: String(snap.why), action: "reeve backup" });
+      title: "the newest hub snapshot does not read back", detail: String(snap.why), action: "reeve backup --hub" });
     out.push({ id: "H-3", severity: "fail", classification: "configuration",
       title: "restore compatibility is unknown: the snapshot does not open",
-      detail: String(snap.why), action: "reeve backup" });
+      detail: String(snap.why), action: "reeve backup --hub" });
   }
 
   // H-6: the off-device copy is a REQUIREMENT of this design whose destination is
@@ -3751,10 +4039,23 @@ registry, not from the table:
 // one yields NO projects rather than throwing: doctor must still report the
 // findings it can compute, and "the registry could not be read" is itself a
 // finding rather than a crash.
+// The TOP-LEVEL object, not `reg.projects`. The design doc fixes the format at
+// §1.5: `~/.reeve/projects.json` is `{name: {repoPath, nwo, profilePath,
+// worktreeRoot, specRepo?, ledger?}}` -- there is no `projects` wrapper, so
+// reading one returned [] on every real file and the CLI passed no projects at
+// all, silently suppressing the absent-row H-4 failures this loader was added to
+// expose. A defaulted `?? {}` is what made it silent.
+//
+// `nwo`, and no `repoId`: the registry format carries no numeric repository id
+// (§1.5, and measured -- resolving one needs the App client, which
+// `builder doctor` deliberately does not use). So H-4 matches projects to
+// `repo_gate_state` rows by `nwo_snapshot`, which both sides have.
 const registryProjects = (home) => {
   try {
     const reg = JSON.parse(readFileSync(join(home, "projects.json"), "utf8"));
-    return Object.entries(reg.projects ?? {}).map(([name, p]) => ({ name, repoId: p.repoId ?? null, nwo: p.nwo ?? null }));
+    return Object.entries(reg)
+      .filter(([, p]) => p && typeof p === "object")
+      .map(([name, p]) => ({ name, nwo: p.nwo ?? null }));
   } catch { return []; }
 };
 ```
@@ -4047,6 +4348,7 @@ Create `test/hub-crosscheck.test.mjs`:
 import { openHub } from "../src/build/hubdb.mjs";
 import { replayableKinds } from "../src/build/replay.mjs";
 import { TABLE_OWNERS, PROSE_TABLES } from "../src/build/tables.mjs";
+import { HUB_TABLES } from "../src/build/hubdb.mjs";
 /* ... standard harness ... */
 
 const db = openHub(join(mkdtempSync(join(tmpdir(), "reeve-xc-")), "x.db"));
@@ -4055,6 +4357,27 @@ const inDb = new Set(db.prepare(
 const declared = new Set(Object.keys(TABLE_OWNERS));
 
 check(inDb.size === 32, `the hub has exactly 32 tables (got ${inDb.size})`, [...inDb].sort().join(","));
+
+// direction 0: HUB_TABLES, the set snapshot validation uses, equals the live one.
+// Task 8's paragraph promised this assertion and no test made it: HUB_TABLES is
+// derived by a REGEX over hub.sql, so a declaration the regex stops recognising
+// yields a SHORTER list -- and a short list makes validateSnapshot accept a
+// snapshot that is missing exactly the authority-bearing table it dropped. That
+// failure is silent in both directions at once, which is why it needs its own
+// assertion rather than being implied by the two below.
+check(HUB_TABLES.length === inDb.size,
+  `HUB_TABLES has one entry per live table (${HUB_TABLES.length} vs ${inDb.size})`);
+const notLive = HUB_TABLES.filter(t => !inDb.has(t));
+const notDerived = [...inDb].filter(t => !HUB_TABLES.includes(t));
+check(notLive.length === 0 && notDerived.length === 0,
+  "HUB_TABLES equals the live table set exactly, so snapshot validation checks every table",
+  `regex-only: ${notLive.join(",") || "none"}; live-only: ${notDerived.join(",") || "none"}`);
+// CONTROL: the comparison can fail. Both lists being empty satisfies the
+// assertion above, and an empty HUB_TABLES is precisely what a broken regex
+// produces -- the exact case this direction exists to catch.
+check(HUB_TABLES.length > 0 && inDb.size > 0,
+  "control: both sides of that comparison are non-empty",
+  `${HUB_TABLES.length} / ${inDb.size}`);
 
 // direction 1: prose -> DDL
 for (const t of PROSE_TABLES) check(inDb.has(t), `the prose names ${t}, and the DDL creates it`);
@@ -4367,11 +4690,15 @@ $N -e '
   // existing stores never re-run an edited migration, fresh stores do, and the
   // freeze test stays green while the two diverge. The function source is the
   // other half of what migration 1 IS.
-  const impl = String(MIGRATIONS.find(m => m.version === 1).up);
+  // Through the EXPORT. `MIGRATIONS` is module-private, so naming it here threw
+  // ReferenceError and the fixture was never written -- after which the freeze
+  // test compared against a file that did not exist.
+  const { migrationPlan } = await import("./src/build/hubdb.mjs");
+  const impl = migrationPlan().find(m => m.version === 1).implHash;
   writeFileSync("test/fixtures/hub-schema-v1.json",
     JSON.stringify({ version: 1,
                      sha256: createHash("sha256").update(sql).digest("hex"),
-                     up_sha256: createHash("sha256").update(impl).digest("hex"),
+                     up_sha256: impl,
                      frozen_at: "2026-08-22", note: "migration 1; new schema goes in a new numbered migration" }, null, 2) + "\n");
   console.log(readFileSync("test/fixtures/hub-schema-v1.json", "utf8"));
 '
@@ -4384,7 +4711,9 @@ $N test/hub-schema.test.mjs
 // test/hub-schema.test.mjs
 const frozen = JSON.parse(readFileSync("test/fixtures/hub-schema-v1.json", "utf8"));
 const sqlNow = createHash("sha256").update(readFileSync("src/build/hub.sql", "utf8")).digest("hex");
-const upNow  = createHash("sha256").update(String(MIGRATIONS.find(m => m.version === 1).up)).digest("hex");
+// Also through the export, and the same value the fixture command recorded --
+// so the two cannot compute the hash differently.
+const upNow  = migrationPlan().find(m => m.version === 1).implHash;
 check(sqlNow === frozen.sha256,
   "migration 1's SQL is frozen: new schema goes in a NEW numbered migration", `${sqlNow} vs ${frozen.sha256}`);
 check(upNow === frozen.up_sha256,

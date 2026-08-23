@@ -160,7 +160,7 @@ Each task names any imports it needs **beyond** these.
     `Transition = { ok: true, to, generation, bumps, compensations: string[] }`,
     `Refusal = { ok: false, refusal: string }`.
   - `escalate` (optional) names the §11.7 identity this transition must raise, or is absent. `applyTransition` raises it in the same transaction. The identities are **bare**: no counts, durations, SHAs or paths in the key — those ride in the body. Three transitions carry one: `INFEASIBLE` raises `bt:<id>:infeasible` (a success state, but never a quiet one — it is the one builder escalation retired by the terminal state itself), the post-approval depth override raises `bt:<id>:depth:post-approval`, and a worker phase's exhausted retries raise `bt:<id>:phase:failed:<phase>`.
-  - `compensations` is a list drawn from the closed set `['void-pending','write-pr-hold','close-prs','release-territory','regrant-territory','clear-holds','annotate-resumed','record-hold-reason','adopt-snapshot','release-ledger-claim','record-drain','force-drain']`, so the transaction in Task 15 has nothing to decide.
+  - `compensations` is a list drawn from the closed set `['void-pending','write-pr-hold','close-prs','release-territory','regrant-territory','clear-holds','annotate-resumed','record-hold-reason','adopt-snapshot','release-ledger-claim','terminate-worker','record-drain','force-drain']`, so the transaction in Task 15 has nothing to decide.
   - **The list is ORDERED, and `applyCompensation` runs it in that order.** `record-drain` is last because it snapshots the outbox rows that are in flight *at that moment*: run before `close-prs`, it captures only rows that were already inflight and misses the PR-close and comment effects the cancellation itself just enqueued, so `drainRemaining` reads zero and the task can reach CANCELLED with its own compensations still pending. Anything that enqueues must run before the thing that counts what is outstanding.
   - Every name in that set has a branch in `applyCompensation` (Task 15). A compensation the machine can emit and the transaction cannot apply either throws and rolls back the transition, or silently does nothing — and `regrant-territory` was emitted for a round with no branch to run it, which would have made every resume either fail or return without its lease.
 
@@ -191,6 +191,8 @@ const EVIDENCE = [
   { kind: "gate.approved" }, { kind: "gate.revise" }, { kind: "gate.capReached" },
   { kind: "depth.override" }, { kind: "slice.merged" }, { kind: "claim.lost" },
   { kind: "slice.next", moreSlices: true }, { kind: "slice.next", moreSlices: false },
+  { kind: "claim.won" }, { kind: "claim.won", claimEventId: "e1", projectionGeneration: 3 },
+  { kind: "phase.succeeded" },                              // no phase identity: must refuse
   { kind: "finalize.settled", outstanding: 0 }, { kind: "finalize.settled", outstanding: 2 },
   { kind: "founder.regenerate" },
   { kind: "hold", reason: "ownership_lost" },
@@ -414,6 +416,8 @@ const ADVANCE = {
   DESIGN: "SPEC_DRAFT", SPEC_DRAFT: "SPEC_PR_OPEN", SPEC_PR_OPEN: "GATE",
   APPROVED: "IMPLEMENTING", IMPLEMENTING: "IMPL_PR_OPEN", IMPL_PR_OPEN: "VERDICT_WAIT",
 };
+// CLAIMING is deliberately absent from the spine: it leaves only on claim.won or
+// claim.lost, both of which carry evidence a phase report does not have.
 // VERDICT_WAIT and FINALIZING are deliberately ABSENT from the spine.
 //
 // VERDICT_WAIT leaves only on the reconciler's `slice.merged` witness -- a real
@@ -426,7 +430,10 @@ const ADVANCE = {
 // cleanup). A task that reached DONE with those outstanding would be terminal
 // with externally visible work still in flight, and DONE has no edges out.
 
-const refuse = (refusal) => ({ ok: false, refusal });
+// A refusal may still carry state the caller must persist: a depth override that
+// does not change the phase is still an accepted override, and discarding it
+// would leave the promised redispatch with nothing new to dispatch under.
+const refuse = (refusal, extra = {}) => ({ ok: false, refusal, ...extra });
 const go = (to, { generation, bumps = false, compensations = [], sliceCursor = null, escalate = null }) =>
   ({ ok: true, to, generation, bumps, sliceCursor, escalate, compensations: Object.freeze(compensations) });
 
@@ -488,6 +495,12 @@ export function nextPhase(state, evidence) {
                       // human already owns it, so it is safe whenever the claim
                       // may have landed or is still in flight.
                       ...(evidence.ledgerClaimLanded ? ["release-ledger-claim"] : []),
+                      // A live phase worker keeps consuming provider capacity and
+                      // writing to its worktree after the cancel commits.
+                      // Section 4.5 terminates through the lease; this schedules
+                      // it as a compensation so it is part of the same tx's
+                      // effects rather than something the loop might forget.
+                      "terminate-worker",
                       ...(hasOpenPr ? ["write-pr-hold"] : []), "record-drain"] });
   if (kind === "founder.infeasible") {
     // INFEASIBLE from IMPL_PR_OPEN or VERDICT_WAIT leaves an open builder PR
@@ -547,9 +560,15 @@ export function nextPhase(state, evidence) {
   // already-held branch in applyTransition inserted one: the first hold on a
   // task recorded no reason at all, so `task resume` listed the stacked reasons
   // and silently dropped the original.
+  // A live --pin-territory survives BLOCKED exactly as it survives ESCALATED:
+  // section 10.2 makes the exception apply to BOTH held states. Releasing a
+  // pinned lease here lets an overlapping filing take territory the founder
+  // explicitly reserved, and `resume` then refuses naming a blocker the founder
+  // created by pinning.
   if (kind === "hold")
     return go("BLOCKED", { generation,
-      compensations: ["record-hold-reason","void-pending","release-territory",
+      compensations: ["record-hold-reason","void-pending",
+                      ...(pinnedTerritory ? [] : ["release-territory"]),
                       ...(hasOpenPr ? ["write-pr-hold"] : [])] });
 
   // A worker phase whose bounded retries are exhausted. ESCALATED voids
@@ -567,6 +586,17 @@ export function nextPhase(state, evidence) {
   // has pending effects enqueued during CLAIMING; leaving them pending means the
   // executor performs them for a task that never owned the work -- the ledger
   // claim being the one that matters, since another actor now holds it.
+  // CLAIMING leaves on a claim-specific witness, never the generic spine. The
+  // claim's proof is durable provenance -- the ledger event id and the
+  // projection generation the claim was made against (section 2.1) -- and a
+  // generic phase.succeeded carries neither, so a misrouted report would move a
+  // task into SIZING with no record of what it claimed or against which
+  // projection. applyTransition persists both from this evidence.
+  if (phase === "CLAIMING" && kind === "claim.won") {
+    if (!evidence.claimEventId || evidence.projectionGeneration == null)
+      return refuse("claim.won without a ledger event id and projection generation is not a claim witness");
+    return go("SIZING", { generation });
+  }
   if (phase === "CLAIMING" && kind === "claim.lost")
     return go("LOST", { generation, compensations: ["void-pending","release-territory"] });
 
@@ -597,9 +627,16 @@ export function nextPhase(state, evidence) {
   // RESEARCH there would discard the research the new depth just asked for.
   // Only the phases whose OUTPUT is already written go back to DESIGN, which is
   // exactly the three edges section 3.1 draws (SPEC_DRAFT, SPEC_PR_OPEN, GATE).
+  // Every accepted override PERSISTS: applyTransition writes task.depth and
+  // appends `sizing.overridden` from evidence.depth, including on the refusal
+  // paths below -- a refusal here means "the phase does not change", not "the
+  // override is discarded". Without that the SIZING/RESEARCH/DESIGN branch
+  // promises a redispatch under a new depth and records no new depth to
+  // dispatch under.
   if (kind === "depth.override") {
     if (WORKER_PHASES.includes(phase) && ["SIZING","RESEARCH","DESIGN"].includes(phase))
-      return refuse(`${phase} re-dispatches under the new depth as a new attempt; the phase does not change`);
+      return refuse(`${phase} re-dispatches under the new depth as a new attempt; the phase does not change`,
+                    { persistDepth: evidence.depth });
     if (["SPEC_DRAFT","SPEC_PR_OPEN","GATE"].includes(phase)) return go("DESIGN", { generation });
     // Post-approval: holds, and records WHY like every other hold. Without
     // record-hold-reason this was the one BLOCKED entry with no reason, so
@@ -643,9 +680,14 @@ export function nextPhase(state, evidence) {
     // purpose. applyTransition writes the resolved snapshot columns in the same
     // transaction (`adopt-snapshot`) from the values the caller resolved before
     // the transaction opened -- network first, transaction second, as at filing.
+    // An open implementation PR from the OLD generation is now bound to a
+    // contract nobody approved: the spec it was built from is about to be
+    // re-rendered and re-gated. It has to be held and closed like every other
+    // path that abandons work, or it stays mergeable against a superseded plan.
     return go(PAST_GATE.includes(phase) ? "SPEC_DRAFT" : phase,
       { generation: generation + 1, bumps: true,
-        compensations: ["adopt-snapshot","annotate-resumed"] });
+        compensations: ["adopt-snapshot","annotate-resumed",
+                        ...(hasOpenPr ? ["write-pr-hold","close-prs"] : [])] });
   }
 
   if (kind === "phase.succeeded") {
@@ -654,7 +696,13 @@ export function nextPhase(state, evidence) {
     // DESIGN, and the generation fence does not catch it: a stale report from
     // the same generation is exactly what an adopted worker produces after a
     // restart.
-    if (evidence.phase && evidence.phase !== phase)
+    // The report must NAME its phase, and it must be this one. Guarding only the
+    // mismatch lets a malformed or misrouted bare {kind:"phase.succeeded"}
+    // advance whatever the task currently occupies -- bypassing the
+    // report-to-source binding exactly as effectively as naming the wrong phase.
+    if (!evidence.phase)
+      return refuse("a phase report must name the phase it came from; an unattributed success advances nothing");
+    if (evidence.phase !== phase)
       return refuse(`a ${evidence.phase} report cannot advance a task in ${phase}`);
     if (phase === "SIZING" && evidence.depth === "trivial")
       return go("DESIGN", { generation });          // RESEARCH skipped, recorded as research.skipped
@@ -885,7 +933,7 @@ import { nextPhase, HELD } from "./phases.mjs";
 
 export function applyTransition(db, { taskId, expectedPhase, expectedGeneration, evidence,
                                       artifactSha = null, op, effects = [], slice = null,
-                                      isAlive = pidAlive }) {
+                                      isAlive = isSameProcess }) {
   return hubTx(db, () => {
     // Every hub writer checks the restore exclusion first, inside its own
     // transaction. This is the busiest writer in the system; omitting it here
@@ -1085,6 +1133,7 @@ Write `applyCompensation` as a switch over the closed set `phases.mjs` produces,
 | `record-drain` | inserts one `task_drain` row per outbox row for this task in `status IN ('pending','inflight')`. **Runs last**, so it captures the close and comment effects the compensations above just enqueued — those are `pending`, not `inflight`, so an inflight-only select would have missed exactly the rows ordering it last was meant to catch |
 | `adopt-snapshot` | writes the re-resolved registry snapshot columns (`profile_hash`, `registry_version`, `gate_definition_hash`, `default_branch`, `visibility`) onto the task, from values the caller resolved BEFORE the transaction. Only `regenerate` emits it |
 | `release-ledger-claim` | enqueues `ledger.release` (`release <id> --if-owner reeve:bt:<ulid>`) through the typed CLI in the dedicated clone. `--if-owner` makes it inert when a human already owns the node |
+| `terminate-worker` | ends the task's live `phase_run` through the §4.5 lease path — revoke, SIGTERM, then SIGKILL the process **group**, and mark the run `killed`. Emitted by cancel and by `--redesign`; a no-op when no run is live |
 | `force-drain` | sets `forced=1` and `last_known` on every unsettled `task_drain` row, and moves their outbox rows to `forced`, so a `--force` cancel records what was never confirmed instead of leaving the projection claiming it is still in flight |
 
 - [ ] **Step 4: Run and commit**

@@ -14,6 +14,10 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { canonical } from "../db/ops.mjs";
+// `migrationPlan` hashes each migration's `up` so the freeze test has a stable,
+// INERT representation of what migration 1 is. Exporting MIGRATIONS itself would
+// hand callers runnable `up` functions.
+import { createHash } from "node:crypto";
 
 export const HUB_SCHEMA_VERSION = 1;
 
@@ -152,3 +156,43 @@ export function hubTx(db, fn) {
 
 /** Both stores serialize payloads identically, so a replay compares byte for byte. */
 export const canonicalHub = canonical;
+
+/**
+ * Append one row to the append-only log, IN THE CALLER'S TRANSACTION.
+ *
+ * This function deliberately does not open a transaction. Every
+ * authority-bearing write appends one of these in the same tx that performs
+ * it -- an approval, a gate request, a notice receipt, an impl_pr, an attested
+ * push, a guardian receipt, a harness acceptance, a gate run, a pr_hold create
+ * or clear, a hold reason, a project authority grant, a merge decision, a
+ * territory or singleton lease grant or release, and every outbox enqueue,
+ * void, fence or settle. That is what makes the projection replayable from
+ * this table plus artifacts and external receipts, and it is why the
+ * destructive restore drill has anything to compare against.
+ *
+ * If this opened its own transaction, a transition that rolled back would
+ * leave its event behind and the replay would rebuild a fact that never
+ * happened.
+ */
+export function hubEvent(db, { kind, task = null, payload = {} }) {
+  const r = db.prepare(
+    `INSERT INTO hub_event(at, kind, task, payload) VALUES(unixepoch(), ?, ?, ?) RETURNING seq`)
+    .get(kind, task, canonical(payload));
+  return r.seq;
+}
+
+/** The migration list, for the invariant test. Versions are 1..N, no gaps. */
+export function migrationPlan() {
+  // `implHash` travels beside the version because the freeze test needs a stable
+  // representation of what migration 1 IS, and `MIGRATIONS` stays module-private
+  // on purpose: exporting the array hands callers the `up` functions themselves,
+  // which are runnable against any handle. A hash is comparable and inert.
+  //
+  // Two call sites referenced the bare `MIGRATIONS` constant from outside this
+  // module -- the fixture-writing command and the freeze test -- and both would
+  // have thrown ReferenceError, so the freeze the test advertises never existed.
+  return MIGRATIONS.map(m => ({
+    version: m.version,
+    implHash: createHash("sha256").update(String(m.up)).digest("hex"),
+  }));
+}

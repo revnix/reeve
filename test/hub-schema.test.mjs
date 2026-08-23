@@ -104,6 +104,300 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hub-"));
   db.close();
 }
 
+// ── family 1: identity and state ─────────────────────────────────────────────
+{
+  const db = openHub(join(dir, "f1.db"));
+  const tables = new Set(db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().map(r => r.name));
+  for (const t of ["task","task_territory","task_drain","phase_event","hold_reason","hub_event","phase_run","gate_run"])
+    check(tables.has(t), `openHub creates ${t}`);
+
+  // STRICT is the point of the whole file: without it a TEXT lands in an
+  // INTEGER column and nothing complains until something reads it back.
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?");
+  for (const t of ["task","phase_event","hub_event","phase_run","gate_run"])
+    check(/\bSTRICT\b/.test(sql.get(t).sql), `${t} is STRICT`);
+  for (const t of ["task_territory","task_drain","phase_run"])
+    check(/WITHOUT ROWID/.test(sql.get(t).sql), `${t} is WITHOUT ROWID (its identity is composite)`);
+
+  // The phase CHECK is the authoritative enumeration of section 3.1. If this
+  // list and phases.mjs ever disagree, one of them is admitting a state the
+  // other refuses, and the database is the half that cannot be argued with.
+  const ins = (phase) => {
+    try {
+      db.prepare(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,source_kind,source_key,
+                                   repo_path,profile_path,profile_hash,default_branch,visibility,
+                                   registry_version,created_at,updated_at)
+                  VALUES(?,'p',1,'o/r','t',?,'founder',?, '/p','/f','h','main','private',1,unixepoch(),unixepoch())`)
+        .run(`bt:${phase}`, phase, `k:${phase}`);
+      return true;
+    } catch { return false; }
+  };
+  const LEGAL = ["FILED","CLAIMING","SIZING","RESEARCH","DESIGN","SPEC_DRAFT","SPEC_PR_OPEN","GATE",
+                 "APPROVED","IMPLEMENTING","IMPL_PR_OPEN","VERDICT_WAIT","SLICE_MERGED","FINALIZING",
+                 "BLOCKED","ESCALATED","CANCELLING","DONE","CANCELLED","LOST","INFEASIBLE"];
+  check(LEGAL.every(ins), "every one of the 21 phases in the section 3.1 enumeration is accepted");
+  check(!ins("REVISING"), "REVISING is refused: a revision is an edge, never a state");
+  check(!ins("PHASE_FAILED"), "PHASE_FAILED is refused: it is a phase_run outcome, never a state");
+  check(!ins("implementing"), "control: the CHECK is case-sensitive, so a lowercased phase cannot slip in");
+
+  // A territory claim that is not one of the two accepted shapes is refused by
+  // the database as well as by the grammar, because the grammar is code and
+  // this is the row that outlives it.
+  const terr = (kind) => { try {
+    db.prepare("INSERT INTO task_territory(task,kind,path) VALUES('bt:FILED',?,'packages/x')").run(kind);
+    return true; } catch { return false; } };
+  // Both kinds, asserted separately. `a === false || b` is SATISFIED when the
+  // schema wrongly rejects 'file' (the left side becomes true), so the original
+  // passed on exactly the breakage it was written to catch.
+  check(terr("file"), "task_territory accepts an exact-file claim");
+  check(terr("prefix"), "and a recursive-prefix claim");
+  check(!terr("glob"), "and refuses anything else, including glob");
+
+  // At most one live run per task. The guardian's run table learned this the
+  // hard way; the hub is not going to relearn it.
+  const run = (attempt, status) => { try {
+    db.prepare(`INSERT INTO phase_run(task,generation,phase,slice,attempt,resume_seq,status,started_at,heartbeat_at,lease_expires_at,out_path,err_path)
+                VALUES('bt:FILED',1,'RESEARCH',0,?,0,?,unixepoch(),unixepoch(),unixepoch()+120,'/o','/e')`).run(attempt, status);
+    return true; } catch { return false; } };
+  check(run(1, "live"), "a live run is admitted");
+  check(!run(2, "live"), "a SECOND live run for the same task is refused by one_live_run");
+  check(run(3, "succeeded"), "control: a settled run beside a live one is fine, so the index is partial and not a blanket");
+
+  db.close();
+}
+
+// ── family 2: gate evidence and the attested chain ───────────────────────────
+{
+  const db = openHub(join(dir, "f2.db"));
+  const tables = new Set(db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().map(r => r.name));
+  for (const t of ["gate_request","approval","notice_receipt","impl_pr","attested_push","guardian_receipt","ownership_check","harness_acceptance"])
+    check(tables.has(t), `openHub creates ${t}`);
+
+  db.exec(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,source_kind,source_key,
+             repo_path,profile_path,profile_hash,default_branch,visibility,registry_version,created_at,updated_at)
+           VALUES('bt:1','p',1,'o/r','t','GATE','founder','k','/p','/f','h','main','private',1,unixepoch(),unixepoch())`);
+
+  const approve = (kind, verdict, path) => { try {
+    db.prepare(`INSERT INTO approval(task,spec_repo_id,spec_pr,head_sha,actor_id,actor_login_snapshot,kind,verdict,path,observed_at,source_id,task_generation)
+                VALUES('bt:1',9,1,?,5,'m',?,?,?,unixepoch(),?,1)`)
+      .run("a".repeat(40), kind, verdict, path, `${kind}:${verdict}:${path}`);
+    return true; } catch { return false; } };
+  check(approve("codex_clean", "clean", null), "a Codex clean pass is a legal approval row");
+  check(approve("founder_silence", "approve", "codex_clean_silence"), "so is a silence approval carrying its path");
+  check(!approve("waiver", "approve", null), "there is no waiver kind: the Codex-unavailable path is an approval row, not a waiver");
+  check(!approve("founder_review", "lgtm", null), "control: an invented verdict is refused, so the CHECK is on verdict too");
+
+  // A merge witness must be traceable to a pusher AND to the mechanism that
+  // recorded it. builder pushes arrive through the outbox; guardian pushes
+  // arrive as imported receipts. A row claiming a builder push arrived as a
+  // guardian_event is a chain nobody can verify, so the pairing is a CHECK.
+  const push = (pusher, sourceKind) => { try {
+    db.prepare(`INSERT INTO attested_push(task,generation,slice,pr,sha,pusher,source_kind,source_ref,at)
+                VALUES('bt:1',1,0,7,?,?,?,'r',unixepoch())`).run(`${pusher}${sourceKind}`.padEnd(40,"0").slice(0,40), pusher, sourceKind);
+    return true; } catch { return false; } };
+  check(push("builder", "outbox"), "a builder push attests through the outbox");
+  check(push("guardian", "guardian_event"), "a guardian push attests through an imported receipt");
+  check(!push("builder", "guardian_event"), "a builder push claiming a guardian receipt is refused");
+  check(!push("guardian", "outbox"), "and a guardian push claiming the hub outbox is refused");
+
+  // At-least-once delivery is the guardian receipt contract. Importing the same
+  // seq twice must be inert, not a second row and not an error the caller has
+  // to special-case away.
+  const receipt = () => db.prepare(
+    `INSERT INTO guardian_receipt(repo_id,guardian_event_seq,kind,pr,head_before,head_after,payload_hash,received_at,status)
+     VALUES(1,42,'push.settled',7,'a','b','h',unixepoch(),'imported') ON CONFLICT DO NOTHING`).run();
+  receipt(); receipt();
+  check(db.prepare("SELECT count(*) c FROM guardian_receipt WHERE repo_id=1 AND guardian_event_seq=42").get().c === 1,
+    "importing the same guardian_event seq twice leaves exactly one receipt");
+
+  // impl_pr binds a PR to a slice, and UNIQUE(repo_id, pr) is what the receipt
+  // importer joins on. Two slices claiming one PR would make that join
+  // ambiguous and a merge would be attributed to the wrong slice.
+  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at) VALUES('bt:1',1,0,1,7,'h0',unixepoch())`);
+  let dup = true;
+  try { db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at) VALUES('bt:1',1,1,1,7,'h1',unixepoch())`); }
+  catch { dup = false; }
+  check(!dup, "two slices cannot bind the same (repo_id, pr)");
+
+  db.close();
+}
+
+// ── family 3: holds and authority ────────────────────────────────────────────
+{
+  const db = openHub(join(dir, "f3.db"));
+  for (const t of ["pr_hold","project_authority","repo_gate_state"]) {
+    const has = db.prepare("SELECT count(*) c FROM sqlite_master WHERE type='table' AND name=?").get(t).c === 1;
+    check(has, `openHub creates ${t}`);
+  }
+  db.exec(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,source_kind,source_key,
+             repo_path,profile_path,profile_hash,default_branch,visibility,registry_version,created_at,updated_at)
+           VALUES('bt:1','p',1,'o/r','t','BLOCKED','founder','k','/p','/f','h','main','private',1,unixepoch(),unixepoch())`);
+
+  const hold = (reason) => { try {
+    db.prepare(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at) VALUES('bt:1',1,7,?,?,unixepoch())`)
+      .run("a".repeat(40), reason); return true; } catch { return false; } };
+  check(hold("cancel"), "a hold is written for an open builder PR");
+
+  // The whole point of one_open_hold: a task that is held twice must not
+  // accumulate two open rows, because the guardian's verdict clause asks "is
+  // there an uncleared hold" and clearing one of two would answer no while the
+  // other still stands.
+  check(!hold("escalated"), "a SECOND open hold on the same (repo_id, pr) is refused");
+  db.exec("UPDATE pr_hold SET cleared_at=unixepoch() WHERE cleared_at IS NULL");
+  check(hold("escalated"), "control: once cleared, the same PR can be held again");
+  check(!hold("because-i-said-so"), "an invented hold reason is refused; the set is closed");
+
+  // An expired authority row authorizes nothing. Storing `until` as an INTEGER
+  // is what makes that a comparison rather than a string parse at merge time.
+  db.exec(`INSERT INTO project_authority(project_id,kind,granted_by,until,created_at)
+           VALUES('nextly','review-witness',5,unixepoch()+3600,unixepoch())`);
+  const live = db.prepare(
+    `SELECT count(*) c FROM project_authority WHERE project_id='nextly' AND kind='review-witness' AND until > unixepoch()`).get().c;
+  check(live === 1, "a live review-witness grant is findable by a plain comparison");
+  let badKind = true;
+  try { db.exec(`INSERT INTO project_authority(project_id,kind,granted_by,until,created_at) VALUES('n','merge',5,1,1)`); }
+  catch { badKind = false; }
+  check(!badKind, "review-witness is the only authority kind there is");
+
+  // repo_gate_state has no merge-permission probe column, by design: nothing in
+  // this system ever attempts a merge against a production repository to find
+  // out whether it could.
+  const cols = new Set(db.prepare("PRAGMA table_info(repo_gate_state)").all().map(c => c.name));
+  check(cols.has("ruleset_requires_check") && cols.has("bound_app_id") && cols.has("expected_app_id") && cols.has("verified_at"),
+    "repo_gate_state records what the ruleset requires and which app is bound", [...cols].join(","));
+  check(![...cols].some(c => /merge.*(probe|permission)|can_merge/.test(c)),
+    "and carries no merge-permission probe column", [...cols].join(","));
+  db.close();
+}
+
+// ── family 4: effects, transport, coordination ───────────────────────────────
+{
+  const db = openHub(join(dir, "f4.db"));
+  for (const t of ["inbox","outbox","merge_decision","singleton_lease","writer_lease","maintenance_lock",
+                   "directory_lease","territory_lease","provider_lease","provider_state","intake_event","escalation"]) {
+    const has = db.prepare("SELECT count(*) c FROM sqlite_master WHERE type='table' AND name=?").get(t).c === 1;
+    check(has, `openHub creates ${t}`);
+  }
+  db.exec(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,source_kind,source_key,
+             repo_path,profile_path,profile_hash,default_branch,visibility,registry_version,created_at,updated_at)
+           VALUES('bt:1','p',1,'o/r','t','SPEC_DRAFT','founder','k','/p','/f','h','main','private',1,unixepoch(),unixepoch())`);
+
+  // outbox.fence is a FOREIGN KEY to phase_event(seq), so the authorising event
+  // has to exist before any effect can reference it. Seq 1 is minted here for
+  // the same reason the transition transaction writes phase_event before it
+  // enqueues: an effect whose authorisation cannot be checked should be
+  // impossible to store, not merely unusual.
+  db.exec(`INSERT INTO phase_event(seq,task,at,op,from_phase,to_phase,detail)
+           VALUES(1,'bt:1',unixepoch(),'seed',NULL,'SPEC_DRAFT','{}')`);
+
+  // The builder never publishes a check run on any production repository; the
+  // guardian is the sole publisher of ops/merge-policy there. That is not a
+  // convention to remember at the call site -- there is no kind to enqueue.
+  const kind = (k) => { try {
+    db.prepare(`INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,cancellable,args,created_at,updated_at)
+                VALUES(?,?, 'bt:1',1,1,1,'{}',unixepoch(),unixepoch())`).run(`k:${k}`, k); return true; } catch { return false; } };
+  check(kind("git.push.branch") && kind("gh.pr.create") && kind("notify"), "the ordinary effect kinds are enqueueable");
+  check(!kind("gh.check.publish"), "there is NO builder check-publish kind: the guardian is the sole publisher");
+  check(!kind("gh.pr.forceMerge"), "control: an invented kind is refused, so the enumeration is closed and not open");
+
+  // The fence FK, asserted rather than merely declared. Without this line the
+  // REFERENCES clause is a claim the plan makes and no test checks, and a
+  // migration that quietly dropped it would go unnoticed.
+  const orphan = () => { try {
+    db.prepare(`INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,cancellable,args,created_at,updated_at)
+                VALUES('bt:1:orphan','notify','bt:1',1,9999,1,'{}',unixepoch(),unixepoch())`).run();
+    return true; } catch { return false; } };
+  check(!orphan(), "an effect whose fence names no phase_event is refused: authorisation must be checkable");
+
+  // Key uniqueness is over LIVE rows only. A completed, voided, fenced or
+  // failed row is history: a plain resume re-enqueues the same key and must be
+  // ADMITTED beside it, then settled inert by its reconciler against external
+  // truth. A blanket UNIQUE would either swallow the re-enqueue or refuse it.
+  const again = () => { try {
+    db.prepare(`INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,cancellable,args,created_at,updated_at)
+                VALUES('bt:1:g1:SPEC_DRAFT:push:0','git.push.branch','bt:1',1,1,1,'{}',unixepoch(),unixepoch())`).run();
+    return true; } catch { return false; } };
+  check(again(), "a key is enqueueable once");
+  check(!again(), "and refused while the first row is still live");
+  db.exec("UPDATE outbox SET status='voided' WHERE idempotency_key='bt:1:g1:SPEC_DRAFT:push:0'");
+  check(again(), "but admitted again once the earlier row is voided, because uniqueness is over live rows only");
+
+  for (const s of ["voided","fenced","refused","superseded","forced"]) {
+    let ok = true;
+    try { db.exec(`UPDATE outbox SET status='${s}' WHERE id=1`); } catch { ok = false; }
+    check(ok, `the hub-only outbox status '${s}' is legal`);
+  }
+
+  // The measured fact from the shadow week: pull_request.updated_at does NOT
+  // change when a review thread is resolved. A column by that name invites
+  // exactly the ordering that was blind, so the hub inbox does not have one.
+  const inboxCols = new Set(db.prepare("PRAGMA table_info(inbox)").all().map(c => c.name));
+  check(!inboxCols.has("updated_at"), "the hub inbox has no updated_at column", [...inboxCols].join(","));
+  check(inboxCols.has("edited_at") && inboxCols.has("content_hash") && inboxCols.has("generation"),
+    "it carries edited_at, content_hash and generation instead, so an edit is a new generation", [...inboxCols].join(","));
+  check(inboxCols.has("complete") && inboxCols.has("payload_hash") && inboxCols.has("delivery_id"),
+    "and completeness, payload hash and delivery id, so an incomplete page reads as UNKNOWN", [...inboxCols].join(","));
+
+  // A clone belongs to no task; a worktree always belongs to one. Getting that
+  // pairing wrong means a reaper that frees a live task's worktree.
+  const dl = (kindV, task) => { try {
+    db.prepare(`INSERT INTO directory_lease(path,owner_kind,task,pid,lstart,expires_at)
+                VALUES(?,?,?,1,'x',unixepoch()+120)`).run(`/p/${kindV}/${task}`, kindV, task); return true; } catch { return false; } };
+  check(dl("worktree", "bt:1"), "a worktree lease names its task");
+  check(dl("clone", null), "a clone lease has no task");
+  check(!dl("worktree", null), "a worktree lease WITHOUT a task is refused");
+  check(!dl("clone", "bt:1"), "and a clone lease WITH one is refused");
+
+  const pl = (owner, status) => { try {
+    db.prepare(`INSERT INTO provider_lease(owner,repo_id,run_ref,pid,lstart,priority,status,requested_at,expires_at)
+                VALUES(?,1,?,1,'x',0,?,unixepoch(),unixepoch()+120)`).run(owner, `${owner}${status}`, status); return true; } catch { return false; } };
+  check(pl("guardian", "held") && pl("builder", "queued"), "both daemons can hold a provider lease row");
+  check(!pl("worker", "held"), "and nothing else can");
+  check(!pl("builder", "running"), "control: the status set is closed too");
+
+  db.close();
+}
+
+// ── hub_event and migration shape ────────────────────────────────────────────
+import { hubEvent, migrationPlan } from "../src/build/hubdb.mjs";
+{
+  const versions = migrationPlan().map(m => m.version);
+  check(versions.length > 0, "there is at least one migration");
+  check(versions.every((v, i) => v === i + 1), "migration versions are 1..N with no gaps and no reordering", versions.join(","));
+  check(Math.max(...versions) === HUB_SCHEMA_VERSION, "HUB_SCHEMA_VERSION is the highest migration", `${Math.max(...versions)} vs ${HUB_SCHEMA_VERSION}`);
+
+  const db = openHub(join(dir, "ev.db"));
+  db.exec(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,source_kind,source_key,
+             repo_path,profile_path,profile_hash,default_branch,visibility,registry_version,created_at,updated_at)
+           VALUES('bt:1','p',1,'o/r','t','FILED','founder','k','/p','/f','h','main','private',1,unixepoch(),unixepoch())`);
+
+  // hub_event must join the CALLER's transaction. If it opened its own, a
+  // transition that rolled back would still leave its event behind, and the
+  // replay would rebuild a fact that never happened.
+  // A hubEvent that opened its OWN transaction throws on the nested BEGIN, and a
+  // bare catch swallows that -- leaving the row count at 0 for the wrong reason,
+  // so the assertion passes against the very implementation it targets.
+  let nested = null;
+  try { hubTx(db, () => { hubEvent(db, { kind: "approval.recorded", task: "bt:1", payload: { a: 1 } }); throw new Error("SENTINEL"); }); }
+  catch (e) { nested = e.message; }
+  check(nested === "SENTINEL",
+    "hubEvent joins the caller's transaction rather than opening its own",
+    `the body's own error should surface; got ${nested} -- a BEGIN error means hubEvent wrapped itself`);
+  check(db.prepare("SELECT count(*) c FROM hub_event").get().c === 0,
+    "and a hub_event written in a transaction that rolls back leaves nothing");
+  const seq = hubTx(db, () => hubEvent(db, { kind: "approval.recorded", task: "bt:1", payload: { b: 2 } }));
+  check(typeof seq === "number" && seq > 0, "control: it returns its seq when the transaction commits", String(seq));
+
+  // Payloads are canonical, so a replay compares byte for byte rather than
+  // depending on whatever key order the writer happened to use.
+  hubTx(db, () => hubEvent(db, { kind: "k", payload: { z: 1, a: 2 } }));
+  const p = db.prepare("SELECT payload FROM hub_event ORDER BY seq DESC LIMIT 1").get().payload;
+  check(p === '{"a":2,"z":1}', "payloads are canonical JSON with sorted keys", p);
+  db.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

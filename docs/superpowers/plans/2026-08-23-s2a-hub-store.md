@@ -583,7 +583,12 @@ CREATE TABLE IF NOT EXISTS task_territory (
 -- about them -- neither of which a blob can be joined against.
 CREATE TABLE IF NOT EXISTS task_drain (
   task        TEXT    NOT NULL REFERENCES task(id) ON DELETE CASCADE,
-  outbox_id   INTEGER NOT NULL,
+  -- Declared FK, like every other child here (section 11.1). Without it a bad
+  -- transition or a replay can record an outbox id that does not exist: no
+  -- reconciler can settle that row, the task sits in CANCELLING until the
+  -- founder forces it, and the forced record then names an effect nobody can
+  -- look up.
+  outbox_id   INTEGER NOT NULL REFERENCES outbox(id),
   recorded_at INTEGER NOT NULL,
   settled_at  INTEGER,
   forced      INTEGER NOT NULL DEFAULT 0 CHECK (forced IN (0,1)),
@@ -1380,13 +1385,14 @@ CREATE TABLE IF NOT EXISTS provider_lease (
   -- why it is a flag here rather than a revocation. S2-C writes and reads it;
   -- the column lives here because migration 1 owns the whole schema and a table
   -- gaining a column later would need a numbered migration for no reason.
-  preempt_requested INTEGER NOT NULL DEFAULT 0 CHECK (preempt_requested IN (0,1)),
-  -- Set when a release was refused because a restore held maintenance_lock. The
-  -- daemon can restart before its retry, and an in-memory id does not survive
-  -- that, so the reaper treats a row marked here as releasable once the lock
-  -- clears -- rather than holding the slot for a full lease window after every
-  -- restore. Written and cleared by S2-C's scheduler.
-  refused_release   INTEGER NOT NULL DEFAULT 0 CHECK (refused_release IN (0,1))
+  preempt_requested INTEGER NOT NULL DEFAULT 0 CHECK (preempt_requested IN (0,1))
+  -- There is deliberately NO `refused_release` marker. It was added and then
+  -- removed: a release refused because maintenance_lock is held cannot write the
+  -- marker either, since assertWritable blocks that write in exactly the
+  -- scenario the marker represents. Nor is it needed -- restoreHub CLEARS every
+  -- process-scoped row, provider_lease included, from the restored file, so a
+  -- lease held across a restore does not survive it at all. An abandoned restore
+  -- is covered by ordinary expiry.
 ) STRICT;
 CREATE INDEX IF NOT EXISTS provider_lease_live ON provider_lease(status, owner, requested_at);
 -- One LIVE request per run. A capacity-blocked guardian calls claimProvider again
@@ -2869,10 +2875,15 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
         title: `gate state for ${r.nwo_snapshot} is stale`,
         detail: `verified ${Math.round((now - r.verified_at) / 60)}m ago; the bound is ${freshMinutes}m`,
         action: "start the builder, or wait one tick" });
-    } else if (!bound || !installed) {
+    } else if (!bound || !installed || r.permission_diff != null || r.error != null) {
       out.push({ id: "H-4", severity: "fail", classification: "unsafe-authority",
         title: `${r.nwo_snapshot} does not enforce the bound check`,
-        detail: `requires=${r.ruleset_requires_check} bound_app=${r.bound_app_id} expected=${r.expected_app_id} installed=${r.app_installed}`,
+        // permission_diff and error are part of the answer, not colour: a row can
+        // name the right app and still record a missing permission, or that the
+        // read failed. Both are unsafe authority, and leaving them out of the
+        // predicate let a drifted installation report PASS.
+        detail: `requires=${r.ruleset_requires_check} bound_app=${r.bound_app_id} expected=${r.expected_app_id} ` +
+                `installed=${r.app_installed} permission_diff=${r.permission_diff ?? "none"} error=${r.error ?? "none"}`,
         action: "merge stays dark until the ruleset requires ops/merge-policy from the expected app" });
     } else {
       out.push({ id: "H-4", severity: "pass", classification: "unsafe-authority",
@@ -2919,11 +2930,16 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
 
   // A held lease whose holder is gone still occupies a slot until something reaps
   // it, and a scheduler full of dead holders looks exactly like a busy one.
+  // 'held' AND 'queued'. A queued guardian request is scheduler authority in its
+  // own right -- admission blocks every builder while one is outstanding -- so a
+  // request whose daemon died before it was admitted starves builder dispatch
+  // indefinitely, while a held-only query reports nothing wrong.
   const staleLeases = db.prepare(
-    `SELECT count(*) c FROM provider_lease WHERE status='held' AND expires_at < ?`).get(now).c;
+    `SELECT count(*) c FROM provider_lease WHERE status IN ('held','queued') AND expires_at < ?`).get(now).c;
   if (staleLeases > 0) out.push({ id: "H-5", severity: "warn", classification: "stale-evidence",
-    title: "provider leases are past their expiry",
-    detail: `${staleLeases} held lease(s) expired; a dead holder's slot starves every claim behind it`,
+    title: "provider requests are past their expiry",
+    detail: `${staleLeases} held or queued request(s) expired; a dead holder starves every claim behind it, ` +
+            `and an expired QUEUED request blocks builder admission by itself`,
     action: "the next tick reaps them; if it persists, the reaper is not running" });
 
   const st = db.prepare("SELECT * FROM provider_state WHERE provider='claude'").get();

@@ -14,14 +14,20 @@ Durable companions: `docs/TRACKER.md` (done / in flight), `docs/HANDOFF.md`
 ## 0. The one-paragraph truth
 
 **reeve is armed, and it cannot publish.** `--execute` is live on the running
-daemon, `worker.isolation` is `scratch-home`, and it will dispatch a real worker
-at the next red CI on `nextlyhq/nextly`. Three dispatches under this contract
-produced three correct fixes and published none of them, because **the worker
-cannot run `git add` or `git commit`** — the sandbox that landed on 22 August
-denies Bash writes to `.git`. This is a regression, not a worker quirk: reeve
-published successfully three times on 21 August, before that sandbox existed.
-Measured and controlled: `docs/measured/2026-08-23-three-real-dispatches.md`,
-Finding 1.
+daemon, `worker.isolation` is `scratch-home`, and the next ELIGIBLE red CI on
+`nextlyhq/nextly` will dispatch a real worker. Eligible is narrower than red: a
+missing required check, an inherited-only failure, one reeve cannot name, and a
+demonstrated flake (`daemon.mjs:808-812`) all escalate without dispatching, and
+containment and capacity can defer one earlier still.
+
+Three dispatches under this contract produced three correct fixes and published
+none of them, **for two different reasons**. Runs 1 and 2 hit `max_turns` and
+never reached the publication gate at all. Only run 3 finished, and it could not
+publish because **the worker cannot run `git add` or `git commit`** — the sandbox
+that landed on 22 August denies Bash writes to `.git`. That part is a regression,
+not a worker quirk: reeve published successfully three times on 21 August, before
+that sandbox existed. Measured and controlled:
+`docs/measured/2026-08-23-three-real-dispatches.md`, Finding 1.
 
 ---
 

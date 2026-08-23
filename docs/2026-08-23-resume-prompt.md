@@ -17,10 +17,12 @@ docs/2026-08-22-session-handoff-2.md as history.
 
 ## In one line
 
-reeve is ARMED and CANNOT PUBLISH. `--execute` is live and it will dispatch at
-the next red CI on nextlyhq/nextly, but the worker cannot run `git add` or
-`git commit` — the sandbox that landed 22 Aug denies Bash writes to `.git`. Three
-dispatches, three correct fixes, zero published. That is a regression: reeve
+reeve is ARMED and CANNOT PUBLISH. `--execute` is live and the next ELIGIBLE red
+CI on nextlyhq/nextly will dispatch (see task 3: several kinds of red escalate
+without dispatching), but the worker cannot run `git add` or `git commit` — the
+sandbox that landed 22 Aug denies Bash writes to `.git`. Three dispatches, three
+correct fixes, zero published — though only run 3 demonstrates the commit block;
+runs 1 and 2 hit max_turns first. That is a regression: reeve
 published three times on 21 Aug, on its OWN repo, before that sandbox existed.
 
 ## VERIFY the state before trusting any of it, and tell me what drifted
@@ -46,8 +48,11 @@ ONLY (both mine), and the running process carrying `--execute`.
    `docs/measured/2026-08-23-three-real-dispatches.md` Finding 1 in full — it has
    the evidence and both controls. Then bring me a decision, do not just start
    coding: the two shapes are (a) grant the worker `.git` writes, or (b) have
-   reeve stage and commit on the worker's behalf after the diff gate, leaving the
-   worker unable to touch git at all. (b) is probably right — the diff gate
+   reeve stage and commit on the worker's behalf after the diff gate, removing the
+   worker's STAGING and MUTATION authority while keeping read-only git — it still
+   needs `git status`, `git diff`, `git log` and `git show` to inspect its own
+   work, and `sandbox.mjs:368-376` grants git broadly on purpose after narrower
+   subcommand matching failed on a real dispatch. (b) is probably right — the diff gate
    already decides what may ship, and a worker that cannot commit cannot rewrite
    history either — but it changes the worker contract, so it is my call.
    Whatever we choose needs a test that FAILS on today's code.

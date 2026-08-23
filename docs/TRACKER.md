@@ -155,6 +155,8 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       `2026-08-23-s2a-hub-store.md` (13 tasks, #11) →
       `2026-08-23-s2b-phase-machine.md` (7 tasks, #12) →
       `2026-08-23-s2c-provider-scheduler.md` (5 tasks, #13), in that order.
+      **Only the S2-A document is in THIS commit**; B and C land with their own
+      PRs, so the links above resolve once those merge.
       Review history kept in `2026-08-23-s2-review-history.md`; #8 closed as
       superseded, its 54 resolved threads standing as the record. Founder
       decisions unchanged: guardian fails OPEN on an unreadable hub;

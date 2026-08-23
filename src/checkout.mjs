@@ -515,8 +515,15 @@ export function founderIdentity(repoRoot) {
  * so a stray file is refused by the gate that exists for exactly that -- rather
  * than by a guess made here about which of a worker's files it meant to leave.
  */
-export function commitRunWork({ repoRoot, path, branch, message }) {
+export function commitRunWork({ repoRoot, path, branch, message, exclude = [], secrets = [] }) {
   if (!String(message ?? "").trim()) return { ok: false, why: "no commit message was given" };
+
+  // The message is built from the worker's report, which is model output that has
+  // read untrusted CI logs. The publication gate scans commit messages for these
+  // values too, but only after the commit exists -- and a secret in git history is
+  // not undone by refusing the push. Checked here so the commit is never made.
+  const leaked = secrets.find(s => typeof s?.value === "string" && s.value.length >= 16 && message.includes(s.value));
+  if (leaked) return { ok: false, why: `the commit message reeve derived carries ${leaked.label}` };
 
   // The commit has to land on the branch that gets published. A worker that
   // checked out something else would otherwise have its work committed where
@@ -528,12 +535,25 @@ export function commitRunWork({ repoRoot, path, branch, message }) {
   // checks out another would have been reported as "wrong branch" rather than as
   // carrying a token. Not committing is enough -- the gates still judge the ref,
   // and the uncommitted-work check still refuses anything that would be lost.
-  const on = git(path, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+  //
+  // `branch --show-current` because it is the only one of the three that answers
+  // for every state of HEAD: it prints the branch on an unborn one, prints the
+  // branch normally, and prints NOTHING while exiting zero when detached.
+  // `symbolic-ref --quiet` exits nonzero when detached and `rev-parse
+  // --abbrev-ref` exits nonzero when unborn -- both of which read as an
+  // unreadable repository and take the hard-failure return, which happens BEFORE
+  // the gate that scans the pushed ref for reeve's own token.
+  const on = git(path, ["branch", "--show-current"]);
   if (!on.ok) return { ok: false, why: `could not read the checked-out branch: ${on.err}` };
   if (on.out !== branch)
     return { ok: true, committed: false, files: [], why: `not committing: the checkout is on ${on.out || "a detached head"}, not ${branch}` };
 
-  const added = git(path, ["add", "--all", "--"]);
+  // Dependency trees are copied in by `prepareRunCheckout` BEFORE the worker
+  // starts, so they are not the worker's work. A repository that does not ignore
+  // its own `node_modules` or `.venv` would otherwise have the whole tree staged
+  // into the repair: published wholesale where the lane is broad, and refusing
+  // every valid repair where it is narrow.
+  const added = git(path, ["add", "--all", "--", ".", ...exclude.map(e => `:(exclude)${e}`)]);
   if (!added.ok) return { ok: false, why: `could not stage the work: ${added.err}` };
 
   const staged = git(path, ["diff", "--cached", "--name-only"]);
@@ -546,8 +566,16 @@ export function commitRunWork({ repoRoot, path, branch, message }) {
   const id = founderIdentity(repoRoot);
   if (!id) return { ok: false, why: "the founder's git identity is not configured, so a commit would carry an address nobody owns" };
 
-  const done = git(path, ["-c", `user.name=${id.name}`, "-c", `user.email=${id.email}`,
-                          "commit", "--quiet", "-m", message]);
+  // As ENVIRONMENT, not as `-c user.*`. Git gives GIT_AUTHOR_* and GIT_COMMITTER_*
+  // precedence over configuration, and `gitEnv()` passes the daemon's own
+  // environment through: measured, `GIT_AUTHOR_NAME=Injected` beside
+  // `-c user.name=Founder` produces `Injected`. A daemon launched from a wrapper
+  // that exports them would have attributed every repair to that identity, and a
+  // ruleset requiring a verified committer would refuse the push.
+  const done = run(path, GIT_NEUTRALISE, ["commit", "--quiet", "-m", message], gitEnv({
+    GIT_AUTHOR_NAME: id.name, GIT_AUTHOR_EMAIL: id.email,
+    GIT_COMMITTER_NAME: id.name, GIT_COMMITTER_EMAIL: id.email,
+  }));
   if (!done.ok) return { ok: false, why: `commit refused: ${done.err}` };
 
   const head = git(path, ["rev-parse", "HEAD"]);

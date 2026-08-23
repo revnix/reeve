@@ -1224,6 +1224,10 @@ export async function tick(ctx) {
         const landed = (ctx.commitWork ?? commitRunWork)({
           repoRoot: repoCheckout, path: worktree, branch: e.headRef,
           message: repairMessage(r.report, decision),
+          // What reeve itself copied in before the worker started is not the
+          // worker's work, and must not be staged as part of the repair.
+          exclude: dependencyPathsFor(profile).paths,
+          secrets: [{ label: "reeve's worker authentication token", value: workerToken }],
         });
         if (!landed.ok) {
           const rel = releaseRunCheckout(worktree, { workFetched: false });

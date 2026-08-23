@@ -2604,6 +2604,33 @@ openHub(hubPathFor(home)).close();
     JSON.stringify(readdirSync(join(root, "hub"))));
 }
 
+// ── and snapshotAll REPORTS a lost publish rather than claiming it ───────────
+// A loser that falls through to the ordinary success push reports `ok: true`
+// for a file it never validated and does not own -- and the winner deletes that
+// file if its own deep validation fails, so this process has reported a
+// successful backup for a path that no longer exists. The third outcome is
+// `deferred`: not a success, and not a failure that escalates.
+{
+  const at2 = Math.floor(Date.now() / 1000) + 200;
+  // Claim the second first, so snapshotAll's own snapshot() is the loser.
+  const claimDb = openHub(hubPathFor(home));
+  const claimed = snapshot(claimDb, root, "hub", at2, { keep: Infinity });
+  claimDb.close();
+  check(claimed.ok === true && claimed.mine === true,
+    "fixture: the pre-claim won the publish, so snapshotAll below must lose it", JSON.stringify(claimed));
+  const res = snapshotAll(home, root, { at: at2, keep: Infinity });
+  const hub = res.find(r => r.nwo === "hub");
+  check(hub?.ok === false && hub?.deferred === true,
+    "snapshotAll reports a lost publish as deferred, not as a backup it can vouch for",
+    JSON.stringify(hub));
+  check(hub != null && !hub.escalate,
+    "control: and does NOT escalate -- a same-second race is not a backup failure",
+    String(hub?.escalate));
+  check(existsSync(claimed.path),
+    "control: and the winner's file is untouched, because a loser may not judge or delete it",
+    String(claimed.path));
+}
+
 rmSync(home, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);
@@ -2950,6 +2977,31 @@ Then, inside `snapshotAll`, validate what was just written and refuse to keep a 
       // WITHOUT this block validating or deleting it -- `taken.mine` is false,
       // and only a snapshot this process wrote is one this process may judge.
       const taken = snapshot(db, root, nwo, at, { keep: Infinity });
+      // The LOSER reports neither success nor failure, and this branch exists
+      // because it previously fell through to `results.push({ nwo, ...taken })`
+      // and reported `ok: true` for a file it never validated and does not own.
+      //
+      // It cannot vouch for that file. The winner is still deep-validating and
+      // will DELETE it if validation fails -- so this process would have
+      // reported a successful backup for a path that no longer exists. A winner
+      // killed between publish and validation leaves the same file with nobody
+      // having checked it. And the loser must not validate-and-delete on the
+      // owner's behalf: that is the exact cross-process deletion `mine` was
+      // introduced to stop.
+      //
+      // Reporting `ok: false` is equally untrue: a backup DID happen, by another
+      // process, and raising `builder:backup:failed` for a benign same-second
+      // race is a false alarm on the one signal that has to stay trustworthy.
+      //
+      // So the third answer: `deferred`. Validity is the owner's to establish,
+      // the operator is told plainly which file and why, and neither the exit
+      // status nor any escalation turns on it.
+      if (taken.ok && taken.path && !taken.mine) {
+        results.push({ nwo, ...taken, ok: false, deferred: true, escalate: null,
+          why: `another process published ${taken.path} this second; ` +
+               `its validity is that process's to establish, not this one's` });
+        continue;
+      }
       // A snapshot that cannot be read back is worse than no snapshot: it makes
       // `latestSnapshot` answer with a file that will fail at restore time.
       if (taken.ok && taken.path && taken.mine) {
@@ -4579,8 +4631,15 @@ its own branch.
       const root = opt("to") ?? join(HOME, "backups");
       const results = snapshotAll(HOME, root, { keep: Number(opt("keep") ?? 14) });
       for (const r of results)
-        console.log(r.ok ? `snapshot ${r.nwo} -> ${r.path}` : `FAILED ${r.nwo}: ${r.why}`);
-      process.exit(results.some(r => !r.ok) ? 1 : 0);
+        console.log(r.ok        ? `snapshot ${r.nwo} -> ${r.path}`
+                  : r.deferred  ? `deferred ${r.nwo}: ${r.why}`
+                  :               `FAILED   ${r.nwo}: ${r.why}`);
+      // `deferred` is neither, and must not fail the exit status. A same-second
+      // race with another daemon is not a backup failure, and a command that
+      // exits non-zero for one teaches an operator to stop reading its output --
+      // which is the real cost, because this is the command they run when
+      // something has already gone wrong.
+      process.exit(results.some(r => !r.ok && !r.deferred) ? 1 : 0);
     }
     // ...the existing per-repo backup, unchanged, below.
 ```

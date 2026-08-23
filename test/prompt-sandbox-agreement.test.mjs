@@ -98,6 +98,17 @@ const PROFILES = {
   "a blank command": { units: [{ id: "root", language: "typescript", packageManager: "npm",
                                  commands: { lint: { cmd: "   ", state: "present" },
                                              test: { cmd: "npm test", state: "present" } } }], risk: {} },
+  // A deny rule LONGER than the head the sandbox grants: `Bash(npm run:*)` is
+  // allowed, and `npm run release` is refused, so the head looks clean while the
+  // command the worker is told to run is not.
+  "a long deny rule": { units: [{ id: "root", language: "typescript", packageManager: "npm",
+                                  commands: { release: { cmd: "npm run release", state: "present" },
+                                              test: { cmd: "npm test", state: "present" } } }],
+                        risk: { forbiddenCommands: ["npm run release"] } },
+  // Nothing runnable at all: no units, and git plus every read-only utility
+  // forbidden.
+  "nothing runnable": { units: [],
+                        risk: { forbiddenCommands: ["git", "ls", "cat", "head", "tail", "wc", "find", "which", "pwd"] } },
   // The profile forbids one of its own language's runners.
   "a forbidden runner": { units: [{ id: "root", language: "typescript", packageManager: "npm",
                                     commands: { test: { cmd: "npm test", state: "present" } } }],
@@ -119,7 +130,11 @@ for (const [name, prof] of Object.entries(PROFILES)) {
   const isGranted = cmd => matches(cmd, granted) && !matches(cmd, refused);
 
   const claimed = claimedCommands(prof);
-  check(claimed.length > 0, `control: ${name} claims at least one command`, JSON.stringify(claimed));
+  // "nothing runnable" is the one profile where an empty list is correct.
+  if (name !== "nothing runnable")
+    check(claimed.length > 0, `control: ${name} claims at least one command`, JSON.stringify(claimed));
+  else
+    check(claimed.length === 0, `control: ${name} claims nothing, because nothing survives`, JSON.stringify(claimed));
 
   for (const cmd of claimed)
     check(isGranted(cmd), `${name}: the prompt names \`${cmd}\`, and the grant carries it`,
@@ -146,7 +161,22 @@ for (const [name, prof] of Object.entries(PROFILES)) {
   const mentioned = [...rule0.matchAll(/`([^`]+)`/g)]
     .map(m => m[1].replace(/\s*…\s*$/, "").trim())
     .filter(c => !c.includes("2>&1") && !REFUSED_BY_DESIGN.includes(c));
-  check(mentioned.length > 0, `control: ${name} rule 0 names commands at all`, JSON.stringify(mentioned));
+  if (name !== "nothing runnable")
+    check(mentioned.length > 0, `control: ${name} rule 0 names commands at all`, JSON.stringify(mentioned));
+  // The verify section is the other place the prompt names commands, and a rule
+  // above may forbid one BY NAME while this section prints it as the way to check
+  // the work. Measured: a profile forbidding `npm run release` was told never to
+  // run it and then handed it as its release command.
+  const verify = /HOW TO VERIFY\n([\s\S]*?)\n\n/.exec(prompt)?.[1] ?? "";
+  check(!/\bundefined\b/.test(verify), `${name}: the verify section names no undefined root`, verify.slice(0, 140));
+  for (const line of verify.split("\n")) {
+    const cmd = /^\s{2}\S+\s+(\S.*)$/.exec(line)?.[1];
+    if (!cmd) continue;
+    check(isGranted(cmd.trim()), `${name}: the verify section offers \`${cmd.trim()}\`, and it is granted`, `granted: ${granted.join(", ")}`);
+  }
+
+  check(!/`undefined|`null/.test(rule0), `${name}: rule 0 never prints a placeholder as a command`,
+        rule0.split("\n").filter(l => /undefined|null/.test(l)).join(" | ").slice(0, 160));
   check(!mentioned.some(c => c === ""), `${name}: rule 0 names no EMPTY command`, JSON.stringify(mentioned));
   for (const cmd of mentioned)
     check(isGranted(cmd), `${name}: rule 0 names \`${cmd}\`, and it is granted`,

@@ -1227,7 +1227,18 @@ export async function tick(ctx) {
         // this decides nothing about what may ship. It only makes the work
         // pushable; the gates then judge the ref that results, exactly as they
         // judged the worker's own commits before.
-        const landed = (ctx.commitWork ?? commitRunWork)({
+        // A worker that says it did NOT fix this must not have its exploration
+        // published. `classifyResult` judges the process, so a declined run still
+        // arrives as OK, and the output contract calls `fixed: false` a good
+        // outcome. Before reeve committed, such a run was stopped by the
+        // uncommitted-work gate below; committing first would turn a declared
+        // non-fix into a publishable repair. The edits are left exactly where they
+        // are, so that gate preserves them and names a human.
+        const declined = r.report?.fixed === false ? "the worker reported it did not fix this"
+          : r.report?.needsHuman ? `the worker reported it needs a human: ${printable(String(r.report.needsHuman)).slice(0, 160)}`
+          : null;
+        const landed = declined ? { ok: true, committed: false, files: [], why: `not committing: ${declined}` }
+                                : (ctx.commitWork ?? commitRunWork)({
           repoRoot: repoCheckout, path: worktree, branch: e.headRef,
           message: repairMessage(r.report, decision),
           // What reeve itself copied in before the worker started is not the

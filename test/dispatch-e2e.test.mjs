@@ -461,6 +461,44 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(dirV, { recursive: true, force: true });
 }
 
+// --- a worker that DECLINES must not have its exploration published ----------
+//
+// `classifyResult` judges the process, so a run that reports `fixed: false`
+// still arrives as OK -- and the output contract calls that a good outcome.
+// Before reeve committed, the uncommitted-work gate stopped those edits. If reeve
+// commits first, a declared non-fix becomes a publishable repair.
+for (const [what, report] of [
+  ["fixed: false", { fixed: false, cause: "could not reproduce it", change: "nothing" }],
+  ["needsHuman", { fixed: true, needsHuman: "this needs a schema migration", cause: "c", change: "ch" }],
+]) {
+  const dirD = mkdtempSync(join(tmpdir(), "reeve-e2e-declined-"));
+  const wtD = mkdtempSync(join(dirD, "wt-"));
+  execFileSync("git", ["-C", wtD, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtD, "seed.js"), "seed\n");
+  execFileSync("git", ["-C", wtD, "add", "-A"]);
+  execFileSync("git", ["-C", wtD, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"]);
+  const pinnedD = execFileSync("git", ["-C", wtD, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  // What it leaves behind while deciding it cannot finish.
+  writeFileSync(join(wtD, "explored.js"), "half an idea\n");
+
+  let publishedD = 0;
+  const ctxD = { ...baseCtx(), db: open(join(dirD, "d.db")), logPath: join(dirD, "log.txt"),
+                 evaluate: () => ({ ...evaluation, head: pinnedD, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtD, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedD++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", report }) };
+  const rD = await tick(ctxD);
+  const escD = [...rD.escalations.keys()].join(" | ");
+  const kept = existsSync(join(`${wtD}.unfetched`, "explored.js")) || existsSync(join(wtD, "explored.js"));
+
+  check(publishedD === 0, `a worker reporting ${what} publishes nothing`, `published=${publishedD} esc=${escD}`);
+  check(kept, "and its exploration is kept rather than deleted", `${wtD}`);
+  ctxD.db.close();
+  rmSync(dirD, { recursive: true, force: true });
+  rmSync(`${wtD}.unfetched`, { recursive: true, force: true });
+}
+
 // --- a token in the COMMIT MESSAGE travels with the push too -----------------
 //
 // The first version of this check ran `git diff`, which emits the file patch and

@@ -515,7 +515,7 @@ export function founderIdentity(repoRoot) {
  * so a stray file is refused by the gate that exists for exactly that -- rather
  * than by a guess made here about which of a worker's files it meant to leave.
  */
-export function commitRunWork({ repoRoot, path, branch, message, exclude = [], secrets = [] }) {
+export function commitRunWork({ repoRoot, path, branch, message, exclude = [], secrets = [], declared = null }) {
   if (!String(message ?? "").trim()) return { ok: false, why: "no commit message was given" };
 
   // The message is built from the worker's report, which is model output that has
@@ -562,6 +562,25 @@ export function commitRunWork({ repoRoot, path, branch, message, exclude = [], s
   // A worker that committed its own work, or changed nothing, leaves nothing to
   // stage. Not an error: the gates below judge whatever the branch now holds.
   if (!files.length) return { ok: true, why: null, committed: false, files: [] };
+
+  // What the worker SAID it changed has to account for what is there. The diff
+  // gate judges paths and territory, never intent, so an ordinary scratch file
+  // inside the lane -- a reproduction script, a debug dump -- passes it and would
+  // be published as part of the repair. Refusing on the disagreement is the only
+  // check that can tell those apart, because only the worker knows which of its
+  // files were the fix.
+  if (declared !== null) {
+    const said = new Set(declared
+      .filter(f => typeof f === "string")
+      .map(f => f.trim().replace(/^\.\//, "").replace(/^\/+/, "")));
+    const undeclared = files.filter(f => !said.has(f));
+    if (undeclared.length) {
+      // Nothing is staged when this fires: the index is reset so the checkout is
+      // handed to a human exactly as the worker left it.
+      git(path, ["reset", "--quiet", "HEAD", "--"]);
+      return { ok: false, why: `the checkout holds ${undeclared.length} change(s) the worker did not report: ${undeclared.slice(0, 5).join(", ")}` };
+    }
+  }
 
   const id = founderIdentity(repoRoot);
   if (!id) return { ok: false, why: "the founder's git identity is not configured, so a commit would carry an address nobody owns" };

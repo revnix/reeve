@@ -25,7 +25,7 @@ import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPaths
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
-import { canaryIdFor, netListener } from "./canary.mjs";
+import { canaryIdFor, netListener, instrumentHash } from "./canary.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256 } from "./db/ops.mjs";
@@ -393,7 +393,8 @@ export async function measuredContainment(ctx, profile, nwo, logPath) {
     // Computed exactly as measureContainment computes it. A cache key that
     // drifts from the id is how every tick came to pay for a five-minute canary.
     const before = cache.get(canaryIdFor({ cliVersion: version, sandbox: policy.settings.sandbox, binaryId, worktree: canaryPaths.dir,
-                                           permissionsDeny: policy.settings.permissions.deny, allowedTools: policy.allowedTools }))?.ok === true;
+                                           permissionsDeny: policy.settings.permissions.deny, allowedTools: policy.allowedTools,
+                                           instrument: instrumentHash({ hasNet: !!netProbe }) }))?.ok === true;
     if (!before) log(logPath, `containment: running the sandbox canary under ${version}`);
     let c;
     try {

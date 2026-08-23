@@ -132,10 +132,21 @@ effects and only one of them defined it:
 // from every lease and every assertion below it fails for the same unrelated
 // reason -- which reads as a broken outbox rather than a missing fixture.
 // The switch names are the outbox `kind` values.
-const allOn = Object.fromEntries(
-  ["git.push.branch","gh.pr.create","gh.pr.comment","gh.pr.close","gh.pr.body",
-   "gh.review.request","gh.pr.merge","notify","gate.clean_notice",
-   "ledger.claim","ledger.release"].map(k => [k, true]));
+// The PROFILE's capability switches, from `src/profile/schema.mjs:206-210` --
+// not the outbox `kind` values, which are what an earlier version of this
+// fixture set. They are different vocabularies: `leaseEffect` asks the profile
+// whether the CAPABILITY behind an effect is enabled, and capabilities default
+// FALSE, so a fixture keyed by effect kind leaves every real switch absent and a
+// correct executor settles every supposedly-good lease `refused`. Every positive
+// assertion in this file would have failed against the implementation it
+// specifies.
+const allOn = {
+  "builder.capabilities.observe":        true,
+  "builder.capabilities.draftSpec":      true,
+  "builder.capabilities.implementLocal": true,
+  "builder.capabilities.publishPr":      true,
+  "builder.capabilities.mergeBuilderPr": true,
+};
 ```
 
 Where a task writes `/* ... standard harness, plus seed ... */`, it means the
@@ -572,12 +583,19 @@ const HOLD_ESCALATION = Object.freeze({
   blocked_other:       null,          // supplied by the caller; see the hold branch
 });
 
-const go = (to, { generation, bumps = false, compensations = [], sliceCursor = null, escalate = null }) =>
-  ({ ok: true, to, generation, bumps, sliceCursor, escalate, compensations: Object.freeze(compensations) });
+// The depths section 5 defines. Closed, so an override to a name nobody
+// implements is refused rather than persisted and dispatched under.
+const DEPTHS = Object.freeze(["trivial", "standard", "deep"]);
+
+const go = (to, { generation, bumps = false, compensations = [], sliceCursor = null,
+                  escalate = null, persistDepth = null }) =>
+  ({ ok: true, to, generation, bumps, sliceCursor, escalate, persistDepth,
+     compensations: Object.freeze(compensations) });
 
 export function nextPhase(state, evidence) {
   const { phase, generation = 1, heldFrom = null, drainRemaining = 0,
-          hasOpenPr = false, pinnedTerritory = false, sourceKind = "founder" } = state ?? {};
+          hasOpenPr = false, pinnedTerritory = false, sourceKind = "founder",
+          hasLiveRun = false } = state ?? {};
   const kind = evidence?.kind;
 
   if (!PHASES.includes(phase)) return refuse(`unknown phase ${JSON.stringify(phase)}`);
@@ -821,16 +839,33 @@ export function nextPhase(state, evidence) {
   // promises a redispatch under a new depth and records no new depth to
   // dispatch under.
   if (kind === "depth.override") {
+    // `persistDepth` travels on BOTH shapes. The prose above promised every
+    // accepted override writes task.depth, and only the refusal shape carried
+    // the field -- which applyTransition's refusal branch then ignored, and the
+    // DESIGN branch never carried at all. So no accepted override persisted
+    // anything, and the SIZING/RESEARCH/DESIGN branch promised a redispatch
+    // under a depth nothing had recorded.
+    if (!DEPTHS.includes(evidence.depth))
+      return refuse(`unknown depth ${JSON.stringify(evidence.depth)}; it must be one of ${DEPTHS.join(", ")}`);
     if (WORKER_PHASES.includes(phase) && ["SIZING","RESEARCH","DESIGN"].includes(phase))
       return refuse(`${phase} re-dispatches under the new depth as a new attempt; the phase does not change`,
                     { persistDepth: evidence.depth });
-    if (["SPEC_DRAFT","SPEC_PR_OPEN","GATE"].includes(phase)) return go("DESIGN", { generation });
+    if (["SPEC_DRAFT","SPEC_PR_OPEN","GATE"].includes(phase))
+      return go("DESIGN", { generation, persistDepth: evidence.depth });
     // Post-approval: holds, and records WHY like every other hold. Without
     // record-hold-reason this was the one BLOCKED entry with no reason, so
     // `task resume` would list nothing and the founder would see a held task
     // with no explanation.
+    //
+    // The pin exception applies HERE too. This branch had an unconditional
+    // `release-territory` while the generic hold path honours `pinnedTerritory`,
+    // so a post-approval override handed away territory the founder had
+    // explicitly pinned -- and the resume that follows then conflicts with
+    // whatever took it.
     return go("BLOCKED", { generation, escalate: `bt:<id>:depth:post-approval`,
-      compensations: ["record-hold-reason","void-pending","release-territory",
+      persistDepth: evidence.depth,
+      compensations: ["record-hold-reason","void-pending",
+                      ...(pinnedTerritory ? [] : ["release-territory"]),
                       ...(hasOpenPr ? ["write-pr-hold"] : [])] });
   }
 
@@ -880,15 +915,31 @@ export function nextPhase(state, evidence) {
     //
     // Every field is required, and named, because a partial snapshot is the
     // failure that looks like success: the columns it does carry are correct.
-    const SNAPSHOT_FIELDS = ["profileHash", "registryVersion", "gateDefinitionHash",
-                             "defaultBranch", "visibility"];
+    // The COMPLETE section 1.5 admission snapshot, not the five columns
+    // `adopt-snapshot` happened to write. A regenerate that re-resolves the
+    // registry and adopts only half of it leaves ONE task carrying a hybrid
+    // contract -- new profile hash, old repository path -- at a generation that
+    // asserts the whole thing was deliberately re-resolved. `founder_user_id` is
+    // in the list because comment-based depth overrides are authorised against
+    // that immutable identity (section 5), so a task without it cannot
+    // authenticate the very evidence this branch exists to handle.
+    const SNAPSHOT_FIELDS = ["repoId", "nwo", "repoPath", "profilePath", "profileHash",
+                             "defaultBranch", "visibility", "specRepoId",
+                             "gateDefinitionHash", "registryVersion", "founderUserId"];
     const missing = SNAPSHOT_FIELDS.filter(f => evidence.snapshot?.[f] == null);
     if (missing.length)
       return refuse(`regenerate needs a resolved registry snapshot; missing ${missing.join(", ")}. ` +
                     `Resolve it before the transaction, as section 2.2 requires`);
+    // A live worker is still writing under the OLD contract. Regenerate adopts a
+    // new snapshot and bumps the generation, so a process left running produces
+    // artifacts attributed to a contract that no longer exists -- and its report,
+    // when it lands, is fenced and discarded, which looks like the worker
+    // failed. `--redesign` already terminates for exactly this reason; regenerate
+    // had the same exposure and none of the handling.
     return go(PAST_GATE.includes(phase) ? "SPEC_DRAFT" : phase,
       { generation: generation + 1, bumps: true,
-        compensations: ["adopt-snapshot","annotate-resumed",
+        compensations: [...(hasLiveRun ? ["terminate-worker"] : []),
+                        "adopt-snapshot","annotate-resumed",
                         ...(hasOpenPr ? ["write-pr-hold","close-prs"] : [])] });
   }
 
@@ -975,7 +1026,29 @@ git commit -m "feat(hub): the pure, total phase machine"
 
 **Files:**
 - Create: `src/build/transition.mjs`
-- **Modify: `src/build/replay.mjs`** — every `hub_event` kind this plan introduces needs a `HANDLERS` entry and, where it belongs in the projection, a `COMPARISON_SET` line. The kinds this task adds: `task.transitioned`, `phase_event.appended`, `hold_reason.appended`, `pr_hold.created`, `pr_hold.cleared`, `task_drain.recorded`, `task_drain.settled`, `task_territory.claimed`, `escalation.raised`. S2-A's cross-check fails loudly on a kind with no handler, which is the intended feedback — but the plan has to name the file, or an executor writes the emitters and never opens the reader.
+- **Modify: `src/build/replay.mjs`** — every `hub_event` kind this plan introduces needs a `HANDLERS` entry and, where it belongs in the projection, a `COMPARISON_SET` line. The kinds this task adds, and where each one goes:
+
+| kind | destination |
+|---|---|
+| `task.transitioned` | `HANDLERS` → `task` |
+| `phase_event.appended` | `HANDLERS` → `phase_event` |
+| `hold_reason.appended` | `HANDLERS` → `hold_reason` |
+| `pr_hold.created`, `pr_hold.cleared` | `HANDLERS` → `pr_hold` |
+| `task_drain.recorded`, `task_drain.settled` | `HANDLERS` → `task_drain` |
+| `task_territory.claimed` | `HANDLERS` → `task_territory` |
+| `sizing.overridden` | `HANDLERS` → `task` (a partial row image; the upsert sets `depth`) |
+| `transition.refused` | **`NON_REPLAYED_KINDS`** — a record that nothing happened, with no row to project |
+| `escalation.raised` | **`NON_REPLAYED_KINDS`** — re-derived by the next evaluation of the same condition |
+| `research.skipped` | **`NON_REPLAYED_KINDS`** — history for an artifact that was never produced |
+
+The last three were the gap: `applyTransition` emits `transition.refused` and
+`escalation.raised`, and the compensation table emits `research.skipped`, and all
+three previously appeared in neither map — so replay would have skipped them in
+silence, indistinguishable from a misspelled kind. S2-A now carries
+`NON_REPLAYED_KINDS` and a cross-check that scans these modules for emitted kinds
+and requires every one to be in exactly one of the two sets. It fails loudly on a
+kind that is in neither, which is the intended feedback — but the plan has to
+name the file, or an executor writes the emitters and never opens the reader.
 - Test: `test/hub-transition.test.mjs`
 
 **Interfaces:**
@@ -1008,7 +1081,6 @@ import { applyTransition } from "../src/build/transition.mjs";
     evidence: { kind: "phase.succeeded", phase: "RESEARCH" }, artifactSha: "sha-research", op: "phase.advanced" });
   check(r.applied === true && r.to === "DESIGN", "a legal transition advances the task", JSON.stringify(r));
   check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "DESIGN", "and the projection moved");
-  const eventsBefore = db.prepare("SELECT count(*) c FROM phase_event").get().c;
   const ev = db.prepare("SELECT * FROM phase_event WHERE task='bt:1' ORDER BY seq DESC LIMIT 1").get();
   check(ev.from_phase === "RESEARCH" && ev.to_phase === "DESIGN" && ev.from_generation === 2 && ev.to_generation === 2,
     "the phase_event records both phases and both generations", JSON.stringify(ev));
@@ -1030,6 +1102,11 @@ import { applyTransition } from "../src/build/transition.mjs";
 // ── the lost race is a NO-OP, not an error ───────────────────────────────────
 {
   const db = openHub(join(dir, "t2.db")); seed(db, { id: "bt:1", phase: "DESIGN", generation: 2 });
+  // Captured HERE, from THIS database, immediately before the stale call. `seed`
+  // mints a run of phase_event rows, so the count is not zero, and reading a
+  // baseline declared in another block would be both out of scope and about a
+  // different file.
+  const eventsBefore = db.prepare("SELECT count(*) c FROM phase_event").get().c;
   let threw = null;
   let r; try {
     r = applyTransition(db, { taskId: "bt:1", expectedPhase: "RESEARCH", expectedGeneration: 2,
@@ -1037,6 +1114,10 @@ import { applyTransition } from "../src/build/transition.mjs";
   } catch (e) { threw = e.message; }
   check(threw === null, "a concurrent actor winning the race does not throw", String(threw));
   check(r?.applied === false && r.reason === "lost-race", "it is reported as a lost race", JSON.stringify(r));
+  // The baseline belongs to THIS block and THIS database. It was previously read
+  // from a `const` declared inside the preceding block -- out of scope here, and
+  // counting a different file besides -- so the assertion below reached a
+  // ReferenceError instead of checking anything.
   check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "DESIGN", "the projection is untouched");
   // A DELTA, not an absolute count: `seed` mints a run of phase_event rows so
   // that outbox fences have events to reference, and an assertion written as
@@ -1107,7 +1188,22 @@ import { applyTransition } from "../src/build/transition.mjs";
 
 // ── resume clears every hold in one transaction ──────────────────────────────
 {
-  /* seed a BLOCKED task with two hold_reason rows and one open pr_hold */
+  // Executable setup, not a prose comment. The block previously opened with
+  // `/* seed a BLOCKED task ... */` and then used `db`, which the standard
+  // harness does not supply -- so the file stopped at `ReferenceError: db is not
+  // defined` before exercising any resume compensation.
+  const db = openHub(join(dir, "t7.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  for (const reason of ["over_budget", "ownership_lost"])
+    db.prepare(`INSERT INTO hold_reason(task,reason,at) VALUES('bt:1',?,unixepoch())`).run(reason);
+  db.prepare(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at)
+              VALUES('bt:1',1,7,?,'blocked_other',unixepoch())`).run("a".repeat(40));
+  db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at)
+           VALUES('p','prefix','packages/x','bt:0',unixepoch()-1)`);   // expired: regrant must succeed
+  check(db.prepare("SELECT count(*) c FROM hold_reason WHERE cleared_at IS NULL").get().c === 2,
+    "fixture: the task is BLOCKED with two open hold reasons and one open pr_hold");
+
   const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
     evidence: { kind: "founder.resume", redesign: false }, op: "task.resumed" });
   check(r.applied && r.to === "IMPLEMENTING" && r.generation === 1,
@@ -1116,6 +1212,7 @@ import { applyTransition } from "../src/build/transition.mjs";
   check(db.prepare("SELECT count(*) c FROM hold_reason WHERE cleared_at IS NULL").get().c === 0, "and every stacked reason");
   check(db.prepare("SELECT resume_seq FROM task WHERE id='bt:1'").get().resume_seq === 1,
     "and increments resume_seq, so a re-minted spec round gets a distinct idempotency key");
+  db.close();
 }
 
 // ── the force-cancel drain window, either side of the boundary ───────────────
@@ -1202,6 +1299,16 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
     if (!task) return { applied: false, reason: "no-such-task" };
 
     const decision = nextPhase({
+      // From the TASK ROW, not defaulted. `nextPhase` defaults sourceKind to
+      // "founder" and the ledger-ownership guard applies only to ledger tasks --
+      // so a caller that omits it lets a bare `founder.resume` reactivate a
+      // ledger-sourced task with no sync witness, which is exactly the case the
+      // guard exists for.
+      sourceKind: task.source_kind,
+      // Also from the database: regenerate terminates a live worker, and only
+      // the phase_run rows know whether one is live.
+      hasLiveRun: db.prepare(
+        "SELECT count(*) c FROM phase_run WHERE task=? AND status IN ('live','adopted')").get(taskId).c > 0,
       phase: expectedPhase, generation: expectedGeneration, heldFrom: task.held_from,
       sliceCursor: task.slice_cursor, hasOpenPr: hasOpenBuilderPr(db, taskId),
       pinnedTerritory: hasLivePin(db, taskId),
@@ -1261,11 +1368,27 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
       // -hold branch needed it: any path that returns early must fence itself.
       if (task.phase !== expectedPhase || task.generation !== expectedGeneration)
         return { applied: false, reason: "lost-race" };
+      // A refusal can still carry a durable consequence. `depth.override` on
+      // SIZING/RESEARCH/DESIGN refuses the TRANSITION -- the phase does not
+      // change -- while accepting the OVERRIDE, and the redispatch that follows
+      // has to run under the new depth. Ignoring `persistDepth` here made every
+      // accepted override on those three phases a no-op that reported success.
+      if (decision.persistDepth) persistDepth(db, taskId, decision.persistDepth);
       // Absence is never success: a genuine refusal at the current state IS logged.
       hubEvent(db, { kind: "transition.refused", task: taskId,
         payload: { from: expectedPhase, evidence: evidence?.kind ?? null, refusal: decision.refusal } });
       return { applied: false, reason: "refused", refusal: decision.refusal };
     }
+
+    // One writer for both shapes, so the refusal path and the success path
+    // cannot drift. `sizing.overridden` is the durable record of WHO changed the
+    // depth and to what -- without it `task why` shows a task dispatched under a
+    // depth nothing explains.
+    const persistDepth = (db, taskId, depth) => {
+      db.prepare("UPDATE task SET depth=?, updated_at=unixepoch() WHERE id=?").run(depth, taskId);
+      hubEvent(db, { kind: "sizing.overridden", task: taskId,
+        payload: db.prepare("SELECT id, depth, generation, updated_at FROM task WHERE id = ?").get(taskId) });
+    };
 
     const TERMINAL_WITH_REASON = ["INFEASIBLE", "CANCELLED", "LOST"];
     // Re-check the outstanding count from the DATABASE before committing a
@@ -1324,17 +1447,23 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
       // from through a fresh row -- blocks FINALIZING -> DONE forever, and DONE
       // is terminal with no edges out. The task would be permanently
       // unfinishable because of a failure that was already handled.
-      const finalizingAt = db.prepare(
-        `SELECT at FROM phase_event WHERE task=? AND to_phase='FINALIZING'
-           AND to_generation=? ORDER BY seq DESC LIMIT 1`).get(taskId, expectedGeneration)?.at;
-      if (finalizingAt == null)
+      // Scoped by the authorising FENCE, not by a clock. `created_at >= at` is
+      // seconds-resolution, so an effect from an earlier phase that reached
+      // `failed` during the same second FINALIZING was entered is still selected
+      // -- and DONE is terminal with no edges out, so that task can never finish.
+      // Every outbox row already carries `fence`, the seq of the phase_event that
+      // enqueued it, and seq is monotonic and exact. There is no tie to break.
+      const finalizingSeq = db.prepare(
+        `SELECT seq FROM phase_event WHERE task=? AND to_phase='FINALIZING'
+           AND to_generation=? ORDER BY seq DESC LIMIT 1`).get(taskId, expectedGeneration)?.seq;
+      if (finalizingSeq == null)
         return { applied: false, reason: "refused",
                  refusal: "there is no FINALIZING entry for this generation to scope the completion check to" };
       const bad = db.prepare(
         `SELECT status, count(*) c FROM outbox
-         WHERE task_id=? AND task_generation=? AND created_at >= ?
+         WHERE task_id=? AND task_generation=? AND fence >= ?
            AND status IN ('pending','inflight','failed','dead_letter','refused')
-         GROUP BY status`).all(taskId, expectedGeneration, finalizingAt);
+         GROUP BY status`).all(taskId, expectedGeneration, finalizingSeq);
       if (bad.length)
         return { applied: false, reason: "refused",
                  refusal: `finalization is not complete: ` + bad.map(r => `${r.c} ${r.status}`).join(", ") +
@@ -1359,7 +1488,24 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
       `INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,slice,artifact_sha,detail)
        VALUES(?,unixepoch(),?,?,?,?,?,?,?,?) RETURNING seq`)
       .get(taskId, op, expectedPhase, decision.to, expectedGeneration, decision.generation,
-           slice, artifactSha, JSON.stringify({ evidence: evidence?.kind ?? null }));
+           slice, artifactSha, JSON.stringify({
+             evidence: evidence?.kind ?? null,
+             // The CLAIMING witness, durable. `nextPhase` refuses a claim.won
+             // without these two precisely so the provenance exists -- and then
+             // nothing wrote them, so a task could reach SIZING with no record of
+             // which ledger event won it or which projection it was checked
+             // against. `task` carries `claim_event_id` and
+             // `projection_generation` columns for the same reason.
+             ...(evidence?.kind === "claim.won"
+               ? { claimEventId: evidence.claimEventId,
+                   projectionGeneration: evidence.projectionGeneration }
+               : {}) }));
+
+    // ...and onto the task row, which is what `task why` and the merge
+    // pre-flight read. The event is the log; the columns are the projection.
+    if (evidence?.kind === "claim.won")
+      db.prepare("UPDATE task SET claim_event_id=?, projection_generation=? WHERE id=?")
+        .run(evidence.claimEventId, evidence.projectionGeneration, taskId);
 
     // The transition LOG needs its own row image, or replay restores the task
     // projection and loses every transition after the snapshot -- and restored
@@ -1382,6 +1528,10 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
     // could reach zero and the task reach CANCELLED with that effect still
     // pending. Each carries the fence: the seq of the event that decided it.
     for (const e of effects) enqueueEffect(db, { ...e, taskId, generation: decision.generation, fence: seq });
+
+    // Same helper as the refusal path above, so an accepted override persists
+    // whether or not the phase moved.
+    if (decision.persistDepth) persistDepth(db, taskId, decision.persistDepth);
 
     for (const c of decision.compensations)
       applyCompensation(db, { c, taskId, generation: decision.generation, seq, evidence, snapshot: evidence?.snapshot });
@@ -1425,7 +1575,18 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
       db.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count)
                   VALUES(?,1,unixepoch(),unixepoch(),0)
                   ON CONFLICT(why) DO UPDATE SET count=count+1, last_seen_at=unixepoch()`).run(why);
-      hubEvent(db, { kind: "escalation.raised", task: taskId, payload: { why } });
+      // The ROW, not the key. Every authority-bearing write in this system logs
+      // the row it wrote -- that is the contract replay is built on, and it is
+      // the audit trail besides. `{ why }` alone loses the counters and the
+      // timestamps this statement just changed, so the log records that an
+      // escalation happened and not what the escalation now says.
+      //
+      // `escalation.raised` is in NON_REPLAYED_KINDS (S2-A): the row is
+      // re-derived by the next evaluation of the same condition, which is also
+      // what a founder wants after a restore. The row image is written for the
+      // record, not for the replay.
+      hubEvent(db, { kind: "escalation.raised", task: taskId,
+        payload: db.prepare("SELECT why, count, first_seen_at, last_seen_at, announced_count FROM escalation WHERE why = ?").get(why) });
     }
     return { applied: true, to: decision.to, generation: decision.generation, seq };
   });
@@ -1633,8 +1794,23 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
 // what the hub chose to hand out.
 {
   const db = openHub(join(dir, "o5.db")); seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  // Every kind the DDL's CHECK admits, derived from it rather than retyped --
+  // `gate.clean_notice` was missing, and it is the one whose double delivery
+  // matters most: its settle writes the notice_receipt row that STARTS the
+  // founder silence window, so delivering it twice restarts the clock.
   const KINDS = ["git.push.branch","gh.pr.create","gh.pr.comment","gh.pr.close","gh.pr.body",
-                 "gh.review.request","gh.pr.merge","notify","ledger.claim","ledger.release"];
+                 "gh.review.request","gh.pr.merge","notify","gate.clean_notice",
+                 "ledger.claim","ledger.release"];
+  // The list must be the DDL's whole enumeration, read from the schema rather
+  // than counted by hand -- a drill claiming to cover "every kind" while quietly
+  // covering ten of eleven is the shape that let gate.clean_notice slip.
+  const declared = [...db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='outbox'").get().sql
+      .match(/kind\s+TEXT\s+NOT NULL CHECK \(kind IN\s*\(([^)]*)\)/s)[1]
+      .matchAll(/'([a-z._]+)'/g)].map(m => m[1]);
+  check(declared.length === KINDS.length && declared.every(k => KINDS.includes(k)),
+    "control: KINDS is the outbox DDL's whole kind enumeration, not a subset",
+    JSON.stringify(declared.filter(k => !KINDS.includes(k))));
   const world = [];                       // what really happened out there
   const drain = () => {
     for (let row; (row = leaseEffect(db, { worker: "w", capabilities: allOn })); ) {
@@ -1656,6 +1832,16 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
   // Partitioned from the module's own KEY_KINDS rather than a list retyped
   // here, so the test cannot disagree with the implementation about which is
   // which.
+  // Assert the EXACT set first, from section 3.2, before using it to partition.
+  // Deriving the expectation from KEY_KINDS makes the test adapt to whatever the
+  // module exports: swap `gh.pr.merge` out and an unrelated kind in, and both
+  // partitions stay non-empty and every loop below follows the mistake. The
+  // design says push and merge kinds are sha-keyed and spec pushes are
+  // round-keyed; that is the claim, so that is what is checked.
+  check(JSON.stringify([...KEY_KINDS].sort()) === JSON.stringify(["gh.pr.merge", "git.push.branch"]),
+    "KEY_KINDS is exactly the sha-/round-keyed kinds section 3.2 names",
+    JSON.stringify([...KEY_KINDS].sort()));
+
   const keyed = KINDS.filter(k => KEY_KINDS.includes(k));
   const plain = KINDS.filter(k => !KEY_KINDS.includes(k));
   check(keyed.length > 0 && plain.length > 0,
@@ -1763,8 +1949,9 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
 **Interfaces:**
 - Consumes: `hubTx`, `hubEvent`, **`assertWritable`** (S2-A), `applyTransition` (Tasks 1, 6, 15).
 - Produces:
-  - `resolveSnapshot(registry, project, claims, io) -> Snapshot` — takes the filing's normalised claims, because it is the only place with both the repository path and an I/O capability, and it returns them resolved. Without the parameter `resolveClaims` had no caller and the symlink refusal was unreachable from the filing path. where `io = { repoId, visibility, specRepoId, profileHash, defaultBranch, gateDefinitionHash, lstat, lsTree }`, each a function. **Async, and it is where every network call lives.** `lstat` and `lsTree` are in that list because `resolveSnapshot` calls `resolveClaims`, which needs both — the symlink refusal and the gitlink (submodule) refusal are its entire purpose. An `io` carrying only the lookup functions makes the composition throw when snapshot resolution reaches the filesystem-aware stage, or silently skip both refusals; the tests call `resolveClaims` directly, so they exercise the half that works and not the seam that does not.
-  - `admitTask(db, snapshot, filing) -> { ok, taskId, refusal }` — **synchronous, one `BEGIN IMMEDIATE`, and it performs no I/O of its own.** Inserts the task row at generation 1, its `task_territory` children, the `task.filed` event, and grants the territory lease **with the full intersection check**, refusing the whole filing and naming the blocker on a conflict. It calls **`assertWritable(db, { isAlive, inTx: true })` first, inside that transaction**: it writes four authority-bearing rows, so admitting a filing while a restore holds `maintenance_lock` races the snapshot replacement and can be lost by the replay that follows it. "Every hub writer calls it" is a rule with no exceptions, and admission was one.
+  - `resolveSnapshot(registry, project, claims, io) -> Snapshot` — takes the filing's normalised claims, because it is the only place with both the repository path and an I/O capability, and it returns them resolved. Without the parameter `resolveClaims` had no caller and the symlink refusal was unreachable from the filing path. where `io = { repoId, visibility, specRepoId, profileHash, defaultBranch, gateDefinitionHash, founderUserId, lstat, lsTree }`, each a function. **Async, and it is where every network call lives.** `lstat` and `lsTree` are in that list because `resolveSnapshot` calls `resolveClaims`, which needs both — the symlink refusal and the gitlink (submodule) refusal are its entire purpose. An `io` carrying only the lookup functions makes the composition throw when snapshot resolution reaches the filesystem-aware stage, or silently skip both refusals; the tests call `resolveClaims` directly, so they exercise the half that works and not the seam that does not.
+  - **`filing.idempotencyKey` is carried into the transaction and enforced.** `task.idempotency_key` and its partial unique index `task_idem` already exist in S2-A's migration 1, and the command contract says a repeated `--idempotency-key` request returns the ORIGINAL task and performs nothing. Without the lookup a retried script — a shell loop, a re-run CI step — mints a second task for the same work, which then competes with the first for its own territory and is refused, so the retry looks like a conflict with a stranger. `admitTask` returns `{ ok: true, taskId, replayed: true }` when the key already exists, and inserts nothing.
+  - `admitTask(db, snapshot, filing) -> { ok, taskId, refusal, replayed }` — **synchronous, one `BEGIN IMMEDIATE`, and it performs no I/O of its own.** Inserts the task row at generation 1, its `task_territory` children, the `task.filed` event, and grants the territory lease **with the full intersection check**, refusing the whole filing and naming the blocker on a conflict. It calls **`assertWritable(db, { isAlive, inTx: true })` first, inside that transaction**: it writes four authority-bearing rows, so admitting a filing while a restore holds `maintenance_lock` races the snapshot replacement and can be lost by the replay that follows it. "Every hub writer calls it" is a rule with no exceptions, and admission was one.
   - `normalizeClaim(raw) -> { kind, path } | { refusal }` — **pure**, and grammar only: shape, normalisation, and the refused constructs (`*`, `**`, `!`, braces, character classes, absolute paths, `..`). It cannot and does not check symlinks.
   - `resolveClaims(claims, repoPath, io) -> { ok, claims } | { refusal }` — the **filesystem-aware** half, run by `resolveSnapshot` in the network-first phase (§2.2). It walks each normalised claim **and every ancestor** and refuses:
     - any component that is a **symlink** (`io.lstat`), naming it; and
@@ -1784,6 +1971,8 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
 // That is asserted rather than described: admitTask is handed an `io` whose
 // every method throws, and it must still succeed.
 /* ... standard harness ... */
+import { openHub } from "../src/build/hubdb.mjs";
+import { resolveSnapshot, admitTask, resolveClaims, normalizeClaim, overlaps } from "../src/build/registry.mjs";
 import { readFileSync } from "node:fs";
 import { dirname, resolve, basename } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1792,9 +1981,16 @@ import { fileURLToPath } from "node:url";
 // scope. An earlier revision left it in a comment, which is the same as not
 // declaring it: the standard harness contains no snapshot, so `snap.repoPath`
 // raised a ReferenceError before the first assertion ran.
+// `founderUserId` is part of the snapshot, not an afterthought: section 5
+// authorises comment-based depth overrides against the founder's IMMUTABLE
+// numeric id, and a task admitted without it cannot authenticate the very
+// `/reeve depth` comments the depth-override edges exist to handle. It is
+// snapshotted at admission for the same reason as the profile hash -- a later
+// change to who the founder is must not retroactively authorise old comments.
 const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
                profileHash: "h", defaultBranch: "main", visibility: "private",
-               specRepoId: 9, gateDefinitionHash: "g", registryVersion: 3 };
+               specRepoId: 9, gateDefinitionHash: "g", registryVersion: 3,
+               founderUserId: 4242 };
 
 // ── admitTask CANNOT perform I/O ─────────────────────────────────────────────
 // This is a negative property, and the only sound way to establish a negative is
@@ -1814,9 +2010,21 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
 // opens, and nothing in its module's import graph can reach the filesystem or
 // the network. That is checkable, transitively.
 {
-  const IO_MODULE = /^node:(fs|net|http|https|dns|tls|dgram|child_process|worker_threads|http2|cluster|inspector)(\/|$)/;
-  const importsOf = (f) => [...readFileSync(f, "utf8")
-    .matchAll(/^\s*import\s(?:[^;]*?from\s+)?["']([^"']+)["']/gm)].map(m => m[1]);
+  // `module` is in this list because `createRequire` is a door to every other
+  // one, and `vm` because it can evaluate a specifier the walk never sees.
+  const IO_MODULE = /^node:(fs|net|http|https|dns|tls|dgram|child_process|worker_threads|http2|cluster|inspector|module|vm)(\/|$)/;
+  // Every module EDGE, not just static `import ... from`. A static-import scan
+  // reports a clean graph for a module that does
+  // `createRequire(import.meta.url)("node:fs")`, or reaches an I/O module
+  // through `export ... from`, or `await import("node:fs")` -- three ways to the
+  // same capability that the check was blind to, which makes "cannot reach the
+  // filesystem" a claim about syntax rather than about capability.
+  //
+  // `node:module` is itself in IO_MODULE below, so createRequire cannot be
+  // reached without tripping the walk regardless of what it is later used for.
+  // That is deliberate: the boundary is easier to defend at the door.
+  const EDGE = /(?:^\s*(?:import|export)\s(?:[^;]*?from\s+)?|\brequire\s*\(\s*|\bimport\s*\(\s*)["']([^"']+)["']/gm;
+  const importsOf = (f) => [...readFileSync(f, "utf8").matchAll(EDGE)].map(m => m[1]);
   const walk = (file, seen = new Set()) => {
     if (seen.has(file)) return [];
     seen.add(file);
@@ -1843,6 +2051,22 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   check(capable.length > 0,
     "control: the same walk finds the I/O in a module that really does it",
     JSON.stringify(capable));
+
+  // CONTROLS for the three edge forms the static-import scan missed. Each is a
+  // synthetic source string, not a file, because the point is the SCANNER --
+  // whether it can see the edge at all -- and writing three decoy modules into
+  // src/ to prove it would be worse than the bug.
+  const scan = (text) => [...text.matchAll(EDGE)].map(m => m[1]).filter(s => IO_MODULE.test(s));
+  for (const [form, text] of [
+    ["createRequire",  'import { createRequire } from "node:module";'],
+    ["require call",   'const fs = require("node:fs");'],
+    ["dynamic import", 'const fs = await import("node:fs");'],
+    ["re-export",      'export { readFileSync } from "node:fs";'],
+  ]) {
+    check(scan(text).length > 0, `control: the walk sees an I/O edge reached by ${form}`, text);
+  }
+  check(scan('import { join } from "node:path";').length === 0,
+    "control: and does NOT flag a module that is not I/O, so the check is not just 'contains node:'");
 }
 
 // ── the transaction is synchronous, and admits the filing ────────────────────
@@ -1866,8 +2090,15 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   check(r.ok === true, "and admits the filing", JSON.stringify(r));
   const t = db.prepare("SELECT * FROM task WHERE id='bt:1'").get();
   check(t.generation === 1 && t.phase === "FILED", "at generation 1, in FILED");
-  check(t.registry_version === 3 && t.profile_hash === "h" && t.visibility === "private",
-    "carrying the whole registry snapshot, so a later edit to projects.json cannot move it", JSON.stringify(t));
+  // The WHOLE snapshot, column by column, not three of it. A task carrying a
+  // hybrid contract -- new profile hash, old repository path -- is the failure
+  // this assertion exists to catch, and checking three columns cannot see it.
+  for (const [col, want] of [["repo_id", 1], ["nwo_snapshot", "o/r"], ["repo_path", "/p"],
+                             ["profile_path", "/f"], ["profile_hash", "h"],
+                             ["default_branch", "main"], ["visibility", "private"],
+                             ["spec_repo_id", 9], ["gate_definition_hash", "g"],
+                             ["registry_version", 3], ["founder_user_id", 4242]])
+    check(t[col] === want, `the snapshot's ${col} is persisted`, `${col}=${JSON.stringify(t[col])}`);
   check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task='bt:1'").get().c === 1,
     "and the territory lease is granted in the same transaction");
   db.close();
@@ -1913,7 +2144,13 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   check(normalizeClaim(decomposed).path === "packages/caf\u00e9",
     "claims are normalised to NFC, so one composition cannot hide beside another",
     JSON.stringify(normalizeClaim(decomposed).path));
-  const io = { lstat: (p) => ({ isSymbolicLink: () => p.endsWith("/linked") }) };
+  // `lsTree` too. resolveClaims checks EVERY component with both predicates, so
+  // an io carrying only `lstat` makes a correct implementation throw on
+  // `io.lsTree is not a function` the moment it reaches a non-symlink component
+  // -- which is every ancestor in the control cases below. The fixture must
+  // answer both questions, not just the interesting one.
+  const io = { lstat: (p) => ({ isSymbolicLink: () => p.endsWith("/linked") }),
+               lsTree: () => ({ mode: "040000" }) };
   const viaLink = resolveClaims([{ kind: "prefix", path: "packages/linked" }], "/repo", io);
   check(!!viaLink.refusal && /linked/.test(viaLink.refusal),
     "a claim ENDING at a symlink is refused, naming the path", JSON.stringify(viaLink));
@@ -1952,6 +2189,40 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   check(overlaps({kind:"prefix",path:"packages/x"}, {kind:"prefix",path:"packages/x"}), "control: equal claims overlap");
 }
 
+// ── resolveSnapshot COMPOSES with resolveClaims ──────────────────────────────
+// Calling resolveClaims standalone tests the resolver and says nothing about
+// whether the filing path reaches it. An implementation can accept the declared
+// `lstat`/`lsTree` and never call resolveClaims at all, leaving the real path
+// with no symlink and no gitlink refusal while every assertion above passes.
+{
+  const lookups = { repoId: async () => 1, visibility: async () => "private",
+                    specRepoId: async () => 9, profileHash: async () => "h",
+                    defaultBranch: async () => "main", gateDefinitionHash: async () => "g",
+                    founderUserId: async () => 4242 };
+  const registry = { projects: { nextly: { repoPath: "/repo" } } };
+
+  const viaLink = await resolveSnapshot(registry, "nextly", [normalizeClaim("packages/linked/x")],
+    { ...lookups, lstat: (p) => ({ isSymbolicLink: () => p.endsWith("/linked") }),
+      lsTree: () => ({ mode: "040000" }) });
+  check(!!viaLink.refusal && /linked/.test(viaLink.refusal),
+    "resolveSnapshot refuses a symlinked claim, so the filing path really reaches resolveClaims",
+    JSON.stringify(viaLink));
+
+  const inSub = await resolveSnapshot(registry, "nextly", [normalizeClaim("vendor/lib/src")],
+    { ...lookups, lstat: () => ({ isSymbolicLink: () => false }),
+      lsTree: (_r, p) => (p === "vendor/lib" ? { mode: "160000" } : { mode: "040000" }) });
+  check(!!inSub.refusal && /vendor\/lib/.test(inSub.refusal),
+    "and refuses a claim inside a submodule, naming the submodule root", JSON.stringify(inSub));
+
+  // CONTROL: an ordinary claim resolves and comes back RESOLVED, or the two
+  // refusals above are satisfied by a resolveSnapshot that refuses everything.
+  const ok = await resolveSnapshot(registry, "nextly", [normalizeClaim("packages/x")],
+    { ...lookups, lstat: () => ({ isSymbolicLink: () => false }), lsTree: () => ({ mode: "040000" }) });
+  check(!ok.refusal && ok.claims?.length === 1 && ok.founderUserId === 4242,
+    "control: an ordinary claim resolves, and the snapshot carries the founder identity",
+    JSON.stringify(ok));
+}
+
 // ── an empty or unparseable claim is the ROOT, never no-claim ────────────────
 // The absence of a territory claim must never read as the absence of conflict.
 {
@@ -1983,6 +2254,34 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   // a root claim in project q blocks q, and still does not touch p.
   const alsoBlocked = admitTask(db, snap, { id: "bt:3", project: "p", title: "t", claims: claim("packages/other") });
   check(alsoBlocked.ok === false, "control: project p is still blocked by its own root claim");
+  db.close();
+}
+
+// ── the same filing key twice admits ONE task ────────────────────────────────
+// The retry is the ordinary case, not the exotic one: a script that times out
+// mid-request re-runs the whole command. Two tasks for one filing then compete
+// for the same territory, and the second is refused as a conflict -- naming the
+// first, which is itself.
+{
+  const db = openHub(join(dir, "r4.db"));
+  const filing = { id: "bt:idem", project: "p", title: "t",
+                   idempotencyKey: "founder:2026-08-23:001", claims: [normalizeClaim("packages/x")] };
+  const first = admitTask(db, snap, filing);
+  check(first.ok === true && first.replayed !== true, "the first filing is admitted", JSON.stringify(first));
+  const again = admitTask(db, snap, { ...filing, id: "bt:different" });
+  check(again.ok === true && again.replayed === true,
+    "and the same key again returns the ORIGINAL task rather than minting a second",
+    JSON.stringify(again));
+  check(again.taskId === "bt:idem", "naming the first task's id, not the retry's", String(again.taskId));
+  check(db.prepare("SELECT count(*) c FROM task").get().c === 1,
+    "exactly one task exists", String(db.prepare("SELECT count(*) c FROM task").get().c));
+  check(db.prepare("SELECT count(*) c FROM territory_lease").get().c === 1,
+    "and exactly one territory lease, so the retry did not conflict with itself");
+  // CONTROL: a DIFFERENT key still admits, or "idempotent" has become "admits once".
+  const other = admitTask(db, snap, { id: "bt:other", project: "p", title: "t",
+    idempotencyKey: "founder:2026-08-23:002", claims: [normalizeClaim("packages/y")] });
+  check(other.ok === true && other.replayed !== true,
+    "control: a different key admits a new task", JSON.stringify(other));
   db.close();
 }
 
@@ -2041,7 +2340,15 @@ file exists it has nothing to import.
 // Clause U4 reads this row at merge time. The whole value of a derivation this
 // small is that every way of not knowing lands on UNKNOWN rather than on a
 // default that happens to look like a pass.
-/* ... standard harness ... */
+/* ... standard harness, plus seed ... */
+import { openHub, hubTx } from "../src/build/hubdb.mjs";
+import { gateStateFrom, refreshGateState } from "../src/build/gatestate.mjs";
+import { buildTick } from "../src/build/loop.mjs";
+import { DatabaseSync } from "node:sqlite";
+// `plus seed`, not the bare harness: the writer-exclusion block at the end of
+// this file calls seed(), and the commented import list further down declares
+// nothing -- a comment is not a binding.
+
 const EXPECTED = 42;
 // The COMPLETE section 1.8 contract, defined ONCE at file scope and shared by
 // the positive fixture and the per-permission negative loop below. When `FULL`
@@ -2169,6 +2476,20 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
                     fetchGateState: () => ok, once: true });
   check(db.prepare("SELECT count(*) c FROM repo_gate_state WHERE repo_id=1").get().c === 1,
     "one pass of the builder tick writes the gate-state row");
+
+  // And with NO fetcher at all, which is the S2 default and therefore the only
+  // configuration that actually ships in this stage. An implementation that
+  // calls ctx.fetchGateState blindly passes the assertion above and throws on
+  // every real tick, where no live GitHub client is wired.
+  db.exec("DELETE FROM repo_gate_state");
+  await buildTick({ hub: db, projects: [{ name: "nextly", repoId: 1, nwo: "o/r", expectedAppId: EXPECTED }],
+                    once: true });
+  const dflt = db.prepare("SELECT * FROM repo_gate_state WHERE repo_id=1").get();
+  check(dflt?.app_installed === "unknown",
+    "a tick with no fetchGateState wired writes an UNKNOWN row rather than throwing",
+    JSON.stringify(dflt));
+  check(typeof dflt?.error === "string" && dflt.error.length > 0,
+    "and records why it is unknown: reeve has not looked", String(dflt?.error));
   db.close();
 }
 
@@ -2226,9 +2547,20 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
                  defaultBranch: "main", visibility: "private", specRepoId: 9,
                  gateDefinitionHash: "g", registryVersion: 3 };
 
-  // Someone else's live restore. A DIFFERENT pid, because a lock held by this
-  // process is exactly the case assertWritable is allowed to permit.
-  acquireMaintenanceLock(db, { pid: 999_999, lstart: "L999999", isAlive: () => true });
+  // Someone else's live restore, held by a pid that is REALLY ALIVE. A
+  // fabricated pid+lstart pair cannot match the writers' default
+  // `isSameProcess`, so every one of them reaps the lock as stale and proceeds --
+  // and the assertions below then report that no writer honours the restore
+  // lock, against an implementation that honours it perfectly.
+  //
+  // A DIFFERENT process, because a lock held by this one is exactly the case
+  // assertWritable is allowed to permit. A sleeping child is the cheapest real
+  // one, and `readStart` gives the same lstart token the writers compare against.
+  const holder = spawn(process.execPath, ["-e", "setTimeout(()=>{},60000)"], { stdio: "ignore" });
+  for (let i = 0; i < 200 && readStart(holder.pid) == null; i++) await new Promise(r => setTimeout(r, 10));
+  const holderStart = readStart(holder.pid);
+  check(holderStart != null, "fixture: the lock holder is a real live process", String(holder.pid));
+  acquireMaintenanceLock(db, { pid: holder.pid, lstart: holderStart, isAlive: isSameProcess });
 
   // Every writer below is synchronous. refreshGateState is the one async writer
   // and is awaited separately, so this helper deliberately does not accept a
@@ -2270,6 +2602,7 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
   check(after.app_installed === "pass",
     "control: with the lock released the same call succeeds, so the refusals above were the lock",
     JSON.stringify(after));
+  holder.kill("SIGKILL");
   db.close();
 }
 ```
@@ -2280,7 +2613,10 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
 
 ```bash
 $N test/hub-gatestate.test.mjs
-git add src/build/gatestate.mjs bin/reeve test/hub-gatestate.test.mjs
+# loop.mjs too: this task CREATES it (the buildTick seam), and both the CLI
+# import and the wiring test refer to it. Omitted, the PR carries a test that
+# imports a module the PR does not contain.
+git add src/build/gatestate.mjs src/build/loop.mjs bin/reeve test/hub-gatestate.test.mjs
 git commit -m "feat(hub): pure repo gate state derivation behind a seam"
 ```
 
@@ -2305,6 +2641,24 @@ git commit -m "feat(hub): pure repo gate state derivation behind a seam"
 // SQLite's atomicity is the thing being relied on, and a same-process test with
 // a mocked failure proves that the MOCK rolled back.
 /* ... standard harness, plus seed ... */
+import { openHub, hubTx } from "../src/build/hubdb.mjs";
+import { applyTransition } from "../src/build/transition.mjs";
+import { enqueueEffect, leaseEffect, settleEffect, recoverEffects } from "../src/build/outbox.mjs";
+import { snapshotAll, latestSnapshot } from "../src/backup.mjs";
+import { DatabaseSync } from "node:sqlite";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { openSync, writeSync, closeSync, mkdirSync } from "node:fs";
+
+// The child the crash drill spawns imports from the checkout, so the paths in
+// its generated source must be ABSOLUTE -- a relative specifier resolves from
+// the temp directory the worker is written into, where there is no src/.
+const SRC = join(process.cwd(), "src");
+// `home` and `root` are this file's own, not the harness's `dir`: the corruption
+// drill takes a snapshot, and snapshotAll wants a machine root and a backup root.
+const home = mkdtempSync(join(tmpdir(), "reeve-drills-"));
+const root = join(home, "backups");
+mkdirSync(join(home, "state"), { recursive: true });
 
 // ── a transition interrupted by SIGKILL is all or nothing ────────────────────
 {
@@ -2449,6 +2803,17 @@ for (let i = 0; i < 500; i++) {
 {
   const p = join(dir, "corrupt.db");
   openHub(p).close();
+  // A known-good snapshot FIRST. The refusal is required to name the newest
+  // usable snapshot by path, and in an isolated test directory there is none --
+  // so `latestSnapshot` returns null and the final assertion fails on fixture
+  // setup while reporting itself as a corruption-handling defect.
+  {
+    const good = openHub(p);
+    snapshotAll(home, root, { at: Math.floor(Date.now() / 1000) - 60, open: () => good });
+    good.close();
+    check(latestSnapshot(root, "hub") !== null,
+      "fixture: a usable snapshot exists for the refusal to name", String(latestSnapshot(root, "hub")));
+  }
   // Corrupt a page the database ACTUALLY USES, derived from the file rather than
   // hardcoded. Offset 8192 is page 3; it is a live page here only because
   // openHub creates 32 tables and their indexes (67 pages, measured 2026-08-23

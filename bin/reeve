@@ -6,16 +6,20 @@
 // it might one day become.
 import { runDoctor, render, checkAppIdentity } from "../src/doctor.mjs";
 import { open } from "../src/db/ops.mjs";
-import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor } from "../src/paths.mjs";
-import { snapshot, restore, latestSnapshot, exportEvents } from "../src/backup.mjs";
+import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor, hubPathFor } from "../src/paths.mjs";
+import { snapshot, restore, latestSnapshot, exportEvents,
+         snapshotAll, restoreHub, validateSnapshot } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick, measuredContainment } from "../src/daemon.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
 import { writeDash } from "../src/dash.mjs";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, renameSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
+// `export-events --hub` writes the manifest digest and `restore --hub --tail`
+// recomputes it over the bytes it read. Both routes live in this file.
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 // The build route. `HUB_TABLES` is deliberately NOT here: Task 9 adds that
@@ -30,7 +34,7 @@ import { openHub, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
 import { HEARTBEAT_SECONDS } from "../src/db/ops.mjs";
-import { hubPathFor } from "../src/paths.mjs";
+
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -158,6 +162,26 @@ switch (cmd) {
     process.exit(result.exitCode);
   }
   case "backup": {
+    if (flag("hub")) {
+      // snapshotAll walks every store INCLUDING the hub (Task 8), so this is the
+      // whole-machine backup, not a hub-only one. That is deliberate: an operator
+      // reaching for `backup --hub` is protecting the machine, and taking the
+      // per-repo stores at the same moment costs nothing and keeps the set
+      // mutually consistent.
+      const root = opt("to") ?? join(HOME, "backups");
+      const results = snapshotAll(HOME, root, { keep: Number(opt("keep") ?? 14) });
+      for (const r of results)
+        console.log(r.ok        ? `snapshot ${r.nwo} -> ${r.path}`
+                  : r.deferred  ? `deferred ${r.nwo}: ${r.why}`
+                  :               `FAILED   ${r.nwo}: ${r.why}`);
+      // `deferred` is neither, and must not fail the exit status. A same-second
+      // race with another daemon is not a backup failure, and a command that
+      // exits non-zero for one teaches an operator to stop reading its output --
+      // which is the real cost, because this is the command they run when
+      // something has already gone wrong.
+      process.exit(results.some(r => !r.ok && !r.deferred) ? 1 : 0);
+    }
+    // ...the existing per-repo backup, unchanged, below.
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     if (!nwo) { console.error("reeve backup: no repo."); process.exit(1); }
     const dbPath = opt("db") ?? stateFor(nwo);
@@ -176,7 +200,103 @@ switch (cmd) {
     process.exit(r.ok ? 0 : 1);
   }
 
+  case "export-events": {
+    if (!flag("hub")) die("usage: reeve export-events --hub <file>");
+    // positionals[0] is the destination: `export-events` is the subcommand and is
+    // not itself a positional under this parser, so index 1 was always undefined
+    // and the command could never run.
+    const out = positionals[0] ?? die("usage: reeve export-events --hub <file>");
+    // RAW and read-only, not openHub: exporting is a read, and openHub would
+    // MIGRATE the very database the operator is trying to get history out of --
+    // quite possibly the one they are exporting because they do not trust it.
+    const db = new DatabaseSync(hubPathFor(HOME), { readOnly: true });
+    const rows = db.prepare("SELECT seq,at,kind,task,payload FROM hub_event ORDER BY seq").all();
+    // The FOOTER, appended last, is the whole truncation detector -- and an
+    // earlier revision of this plan described it here and then wrote only the
+    // event lines, so every `restore --hub --tail` was refused for a footer no
+    // exporter had ever produced. It is written, not described.
+    const lines = rows.map(r => JSON.stringify(r));
+    const body = lines.length ? lines.join("\n") + "\n" : "";
+    const manifest = {
+      count: rows.length,
+      first: rows.length ? rows[0].seq : null,
+      last: rows.length ? rows[rows.length - 1].seq : null,
+      // Over the EVENT LINES ONLY, so a reader can recompute it without having
+      // to strip the footer that carries it out of its own input.
+      sha256: createHash("sha256").update(body).digest("hex"),
+    };
+    // Body first, footer last, one write. Order is the point: a copy that is cut
+    // short loses the footer before it loses any event, which is what turns
+    // "the file ends here" into a claim that can be false.
+    writeFileSync(out, body + JSON.stringify({ _manifest: manifest }) + "\n");
+    console.log(`exported ${rows.length} hub events to ${out}`);
+    break;
+  }
+
   case "restore": {
+    if (flag("hub")) {
+      // DEEP for the restore path. Cheap validation reads markers and the table
+      // set; a corrupt data page or a foreign-key violation passes all of it, so
+      // the newest candidate was selected here and then rejected by restoreHub's
+      // own deep check -- with no fallthrough to the next older snapshot, which
+      // is precisely the fallback this selection advertises. Paid once, on the
+      // file about to be installed.
+      const from = opt("from") ?? latestSnapshot(opt("to") ?? join(HOME, "backups"), "hub", { deep: true });
+      if (!from) die(`reeve restore --hub: no usable snapshot under ${opt("to") ?? join(HOME, "backups")}`);
+      // The durable tail, written by `reeve export-events --hub`. Optional: a
+      // restore with no tail is still correct, it just recovers less.
+      let tail = null;
+      const tailPath = opt("tail");
+      if (tailPath) {
+        if (!existsSync(tailPath)) die(`reeve restore --hub: no tail file at ${tailPath}`);
+        // The last line is the MANIFEST, not an event. Splitting it off here is
+        // what makes `manifest.count === rawTail.length` a comparison rather
+        // than an off-by-one, and leaving it in the array would replay a footer
+        // into `hub_event` as if it were history.
+        const rawLines = readFileSync(tailPath, "utf8").split("\n").filter(Boolean);
+        const parsed = rawLines.map(l => JSON.parse(l));
+        const hasFooter = parsed.length > 0 && parsed[parsed.length - 1]?._manifest != null;
+        const footer = hasFooter ? parsed.pop()._manifest : null;
+        if (hasFooter) rawLines.pop();
+        // An array WITH properties, because that is the shape `restoreHub`
+        // already consumes: it indexes `suppliedTail` as the event list and
+        // reads `suppliedTail.manifest` beside it.
+        tail = parsed;
+        tail.manifest = footer;
+        // The digest the FILE actually carries, computed over its RAW BYTES and
+        // never over re-serialised objects. `JSON.stringify(JSON.parse(x)) === x`
+        // is a property of today's rows, not a guarantee, and a digest that
+        // depends on it would fail for a reason no operator could diagnose.
+        // `restoreHub` cannot compute this itself -- by the time it has the
+        // parsed events the bytes are gone -- so the reader of the file reports
+        // what it observed and the validator decides.
+        tail.sha256 = createHash("sha256")
+          .update(rawLines.length ? rawLines.join("\n") + "\n" : "").digest("hex");
+      }
+      const r = restoreHub(from, hubPathFor(HOME), {
+        isAlive: isSameProcess, pid: process.pid, lstart: readStart(process.pid),
+        force: flag("force"), tail });
+      if (!r.ok) {
+        console.error(`refused: ${r.why}`);
+        for (const h of r.holders ?? []) console.error(`  held by ${h.what} pid ${h.pid} (${h.command})`);
+        process.exit(1);
+      }
+      console.log(`restored ${from} -> ${hubPathFor(HOME)} (replayed ${r.replayed} of ${r.tail} tail events)`);
+      // A recovery whose live source could not be read, with no `--tail`
+      // supplied, restored the snapshot and NOTHING after it -- and said exactly
+      // what a recovery that inspected a genuinely empty tail says. The two are
+      // not the same event and must not print the same line: one lost every
+      // event since the snapshot, the other lost none. `r.quarantined` is the
+      // tell, because it is set only on the unreadable path; an absent hub is
+      // caught by the same condition through `r.tail === 0` with no `--tail`.
+      if (!r.liveTailRead && !opt("tail"))
+        console.warn(
+          `WARNING: the live hub could not be read, and no --tail was supplied, so nothing after the\n` +
+          `snapshot was recovered. If a durable export exists, re-run with --tail <export> to carry\n` +
+          (r.quarantined ? `those events forward. The unreadable database is kept at ${r.quarantined}.` : `those events forward.`));
+      process.exit(0);
+    }
+    // ...the existing per-repo restore, unchanged, below.
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     if (!nwo) { console.error("reeve restore: no repo."); process.exit(1); }
     const from = opt("from") ?? latestSnapshot(opt("to") ?? join(HOME, "backups"), nwo);

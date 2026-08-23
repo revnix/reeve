@@ -43,7 +43,8 @@ function exampleCommand(profile) {
   for (const u of profile?.units ?? []) {
     for (const c of Object.values(u.commands ?? {})) {
       if (c?.state !== "present" || !c.cmd) continue;
-      const head = c.cmd.trim().split(/\s+/).slice(0, 2).join(" ");
+      const full = c.cmd.trim();
+      const head = full.split(/\s+/).slice(0, 2).join(" ");
       // A command of nothing but whitespace is truthy, so it passes validation and
       // trims to "". Returning it would print an empty backtick pair as the
       // permitted example, and the nullish fallback in `invariants` would not
@@ -52,7 +53,12 @@ function exampleCommand(profile) {
       // Declared and granted is not the same as runnable: `npm publish` is in
       // NEVER, and deny beats allow. Offering one of those as the example is the
       // very contradiction this derivation exists to close.
-      if (commandDenied(head, profile)) continue;
+      //
+      // Both forms, because a deny rule can be LONGER than the head that gets
+      // granted: `forbiddenCommands: ["npm run release"]` leaves the head
+      // `npm run` looking clean while the command the worker is actually told to
+      // run below is refused.
+      if (commandDenied(head, profile) || commandDenied(full, profile)) continue;
       return head;
     }
   }
@@ -69,7 +75,7 @@ function exampleCommand(profile) {
 function invariants(profile) {
   const risk = profile.risk ?? {};
   const named = namedRunners(profile);
-  const runnable = exampleCommand(profile) ?? named[0];
+  const runnable = exampleCommand(profile) ?? named[0] ?? null;
   const nameList = named.map(r => `\`${r}\``).join(", ");
   const lines = [
     "RULES, in order of precedence:",
@@ -80,12 +86,22 @@ function invariants(profile) {
     // worker reads that as "I am not allowed to run tests" rather than "say it
     // differently". This is about the shape of the request, not about restraint.
     "0. Run ONE command per tool call. Do not chain with && or ; , do not pipe, and do",
-    `   not redirect. A command is matched from its START, so \`${runnable} …\` is`,
-    `   permitted while \`${runnable} … 2>&1 | tail -20\` is refused as a different command.`,
+    "   not redirect.",
+    // A profile can forbid `git` and every read-only utility and declare no units,
+    // which leaves nothing runnable at all. Naming an example then printed
+    // `undefined …` as permitted and an empty list of command names -- the same
+    // contradiction, reached from the other end. Say nothing rather than something
+    // untrue.
+    ...(runnable ? [
+      `   A command is matched from its START, so \`${runnable} …\` is permitted while`,
+      `   \`${runnable} … 2>&1 | tail -20\` is refused as a different command.`,
+    ] : []),
     "   If output is long, read the file instead.",
-    `   Use plain command names — ${nameList} — never an absolute path to a`,
-    "   binary and never `env` or `sh` as a wrapper. The permissions are written",
-    "   against the names, so a path or a wrapper reads as something else entirely.",
+    ...(nameList ? [
+      `   Use plain command names — ${nameList} — never an absolute path to a`,
+      "   binary and never `env` or `sh` as a wrapper. The permissions are written",
+      "   against the names, so a path or a wrapper reads as something else entirely.",
+    ] : ["   You have no shell commands granted at all: work from the files alone."]),
     "   A `for` loop is a compound command too, and will be refused. To run the",
     "   suite, use the project's own command below rather than inventing a loop",
     "   over test files — a worker did exactly that and lost the run to it.",
@@ -120,9 +136,14 @@ function verification(profile) {
   for (const unit of profile.units ?? []) {
     const cmds = Object.entries(unit.commands ?? {})
       .filter(([, c]) => c.state === "present")
+      // A command the sandbox refuses is not a way to verify anything. The rules
+      // above already forbid it BY NAME, so printing it here as how to check the
+      // work makes one prompt say both things.
+      .filter(([, c]) => !commandDenied(String(c?.cmd ?? "").trim(), profile))
       .map(([intent, c]) => `  ${intent.padEnd(10)} ${c.cmd}`);
     if (!cmds.length) continue;
-    out.push(`In ${unit.root === "." ? "the repository root" : unit.root}:`, ...cmds);
+    // `root` is optional, and an absent one printed "In undefined:".
+    out.push(`In ${!unit.root || unit.root === "." ? "the repository root" : unit.root}:`, ...cmds);
     // An advisory command reports success regardless, so a green from it is not evidence.
     const advisory = Object.entries(unit.commands ?? {}).filter(([, c]) => c.state === "advisory").map(([i]) => i);
     if (advisory.length) out.push(`  (${advisory.join(", ")} are advisory here: they report success regardless, so a pass from them is not evidence)`);

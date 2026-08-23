@@ -75,6 +75,8 @@ function exampleCommand(profile) {
 function invariants(profile) {
   const risk = profile.risk ?? {};
   const named = namedRunners(profile);
+  // Unconditional in `sandboxFor`, but a profile may forbid it by absolute path.
+  const interpreter = commandDenied(process.execPath, profile) ? null : process.execPath;
   const runnable = exampleCommand(profile) ?? named[0] ?? null;
   const nameList = named.map(r => `\`${r}\``).join(", ");
   const lines = [
@@ -113,12 +115,24 @@ function invariants(profile) {
       // telling it so would send it away from the shell it does have. The
       // plain-names rule above cannot apply here, because these grants are a path
       // and a two-word head.
-      ...(runnable ? [`   The shell commands granted here are \`${runnable} …\` and the interpreter`,
-                      `   itself, at \`${process.execPath}\`.`]
-                   : [`   The only shell command granted here is the interpreter itself, at`,
-                      `   \`${process.execPath}\`.`]),
-      "   Use those exactly as written: the rule about plain names does not apply to",
-      "   them, because these grants are written against a path and a whole command.",
+      // The interpreter grant is unconditional in `sandboxFor`, but the profile
+      // schema accepts any non-empty string in `forbiddenCommands` -- including
+      // this absolute path -- and deny beats allow. Advertising it then names a
+      // command the sandbox refuses, which is the defect this file exists to stop.
+      ...(interpreter && runnable
+            ? [`   The shell commands granted here are \`${runnable} …\` and the interpreter`,
+               `   itself, at \`${interpreter}\`.`,
+               "   Use those exactly as written: the rule about plain names does not apply",
+               "   to them, because these grants are written against a path and a whole command."]
+        : interpreter
+            ? [`   The only shell command granted here is the interpreter itself, at`,
+               `   \`${interpreter}\`. Use that exact path: the rule about plain names does`,
+               "   not apply to it, because the grant is written against a path."]
+        : runnable
+            ? [`   The only shell command granted here is \`${runnable} …\`. Use it exactly as`,
+               "   written: the rule about plain names does not apply, because the grant is",
+               "   written against the whole command."]
+            : ["   You have no shell commands granted at all: work from the files alone."]),
     ]),
     "   A `for` loop is a compound command too, and will be refused. To run the",
     "   suite, use the project's own command below rather than inventing a loop",

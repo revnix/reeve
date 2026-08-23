@@ -1934,7 +1934,7 @@ Add to `bin/reeve`, beside the existing `case "run":`:
 ```js
   case "build": {
     // HOME is the value bin/reeve already resolved (--home, REEVE_HOME, or the
-    // default). An earlier draft called `reeveHome()`, which is not defined in
+    // default). An earlier draft called `HOME`, which is not defined in
     // this file, so every build run and build status threw before reaching the
     // lease -- the two commands this task exists to add.
     const sub = process.argv[3];
@@ -1946,7 +1946,7 @@ Add to `bin/reeve`, beside the existing `case "run":`:
       // ReferenceError is worse than one that does not exist.
       const row = db.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get();
       if (!row) { console.log("builder: not running (no singleton lease)"); break; }
-      const alive = pidAlive(row.pid, row.lstart);
+      const alive = isSameProcess(row.pid, row.lstart);
       console.log(`builder: ${alive ? "running" : "LEASE HELD BY A DEAD PROCESS"}`);
       console.log(`  pid      ${row.pid} (started ${row.lstart})`);
       console.log(`  command  ${row.command}`);
@@ -1970,7 +1970,7 @@ Add to `bin/reeve`, beside the existing `case "run":`:
 
     const claim = acquireSingleton(db, {
       name: "builder", pid: process.pid, lstart,
-      command: process.argv.slice(1).join(" "), isAlive: pidAlive,
+      command: process.argv.slice(1).join(" "), isAlive: isSameProcess,
       takeover: flag("takeover"),
     });
     if (!claim.ok) {

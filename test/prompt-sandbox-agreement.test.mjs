@@ -9,7 +9,7 @@
 // A prompt that instructs an action the sandbox forbids is a contradiction the
 // worker cannot resolve, and it costs a whole dispatch to discover.
 import { promptFor, claimedCommands } from "../src/prompts.mjs";
-import { sandboxFor, commandDenied } from "../src/sandbox.mjs";
+import { sandboxFor, commandDenied, commandDenied as commandDeniedIn } from "../src/sandbox.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -275,6 +275,13 @@ for (const [name, prof] of Object.entries(PROFILES)) {
           verify.slice(0, 160) || prompt.split("HOW TO VERIFY")[1]?.slice(0, 200) || "");
     check(!/declares no verification commands/.test(prompt), "and does not claim the project declares none", "");
   }
+  // The landing section points the worker at `git clean` for scratch files it
+  // cannot rm. A profile that forbids git must not be told to run it.
+  if (commandDeniedIn("git", prof))
+    check(!/git clean/.test(prompt), `${name}: the worker is not told to run git clean when git is forbidden`,
+          prompt.split("\n").filter(l => /git clean/.test(l)).join(" | ").slice(0, 160));
+  else
+    check(/git clean/.test(prompt), `control: ${name} is told how to remove a scratch file`, "");
 
   // Rule 0 says a more specific rule can still deny a form, and it has to NAME
   // those rather than gesture at rules it does not render. `git remote` is the

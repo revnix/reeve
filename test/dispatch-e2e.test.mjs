@@ -395,9 +395,17 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   writeFileSync(join(wtV, ".gitignore"), "ignored.log\n");
   writeFileSync(join(wtV, "fix.js"), "the fix the worker could not commit\n");
   writeFileSync(join(wtV, "ignored.log"), "build noise\n");
+  // And a dependency tree the DAEMON copied in, which this repository does not
+  // ignore. It must not be staged into the repair -- and, having been excluded,
+  // must not then make the checkout look dirty and quarantine the whole thing.
+  mkdirSync(join(wtV, "node_modules", "pkg"), { recursive: true });
+  writeFileSync(join(wtV, "node_modules", "pkg", "index.js"), "vendored\n");
 
   let publishedV = 0, atPublish = null;
   const ctxV = { ...baseCtx(), db: open(join(dirV, "v.db")), logPath: join(dirV, "log.txt"),
+                 // Declared so `dependencyPathsFor` yields node_modules, which is
+                 // what the daemon copies in and must exclude on both sides.
+                 profile: { ...profile, units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm" }] },
                  evaluate: () => ({ ...evaluation, head: pinnedV, headRef: "f" }),
                  prepareCheckout: () => ({ ok: true, path: wtV, why: null, deps: { ok: true, cow: false } }),
                  verifyConfig: () => ({ ok: true, why: null }),
@@ -407,7 +415,12 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
                  publishWork: ({ path }) => {
                    publishedV++;
                    const gv = (...a) => execFileSync("git", ["-C", path, ...a], { encoding: "utf8" }).trim();
-                   atPublish = { head: gv("rev-parse", "f"), dirty: gv("status", "--porcelain"),
+                   atPublish = { head: gv("rev-parse", "f"),
+                                 // Excluding what the daemon copied in: the
+                                 // invariant is that nothing the WORKER did is
+                                 // dropped, not that the directory is pristine.
+                                 dirty: gv("status", "--porcelain", "--", ".", ":(exclude)node_modules"),
+                                 leftover: gv("status", "--porcelain"),
                                  shipped: gv("diff", "--name-only", `${pinnedV}..refs/heads/f`).split("\n").filter(Boolean),
                                  who: gv("log", "-1", "--format=%an <%ae>"),
                                  subject: gv("log", "-1", "--format=%s"), body: gv("log", "-1", "--format=%b") };
@@ -427,9 +440,11 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 
   check(reached && at.head !== pinnedV, "reeve commits the work the worker left in the files", `${pinnedV.slice(0, 8)} -> ${String(at.head ?? "(never published)").slice(0, 8)}`);
   check(reached && publishedV === 1, "and publishes it", `published=${publishedV} esc=${escV}`);
-  check(reached && at.dirty === "", "leaving the checkout clean, so nothing is silently dropped", String(at.dirty ?? "(never published)"));
+  check(reached && at.dirty === "", "leaving nothing of the worker's uncommitted, so nothing is silently dropped", String(at.dirty ?? "(never published)"));
+  check(reached && /node_modules/.test(at.leftover ?? ""), "control: the dependency tree really was still sitting there untracked", String(at.leftover ?? "(never published)").slice(0, 120));
   check(reached && shipped.includes("fix.js"), "the fix travels", shipped.join(", ") || "(never published)");
   check(reached && !shipped.includes("ignored.log"), "an ignored file does not", shipped.join(", ") || "(never published)");
+  check(reached && !shipped.some(f => f.startsWith("node_modules/")), "and neither does the dependency tree reeve copied in", shipped.join(", ") || "(never published)");
 
   // The commit must carry the FOUNDER's identity. With GIT_CONFIG_GLOBAL at
   // /dev/null a worker checkout has none, and git invents one from the username

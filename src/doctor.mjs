@@ -69,10 +69,10 @@ function hashTree(dir, filter = () => true) {
  * both surfaces because they disagree: classic protection and rulesets are
  * separate systems and a repo can be governed by either, neither, or both.
  */
-function checkMergeAuthority(nwo) {
+export function checkMergeAuthority(nwo, { api = gh } = {}) {
   const lines = [];
-  const prot = gh(`repos/${nwo}/branches/main/protection`);
-  const rules = gh(`repos/${nwo}/rulesets`);
+  const prot = api(`repos/${nwo}/branches/main/protection`);
+  const rules = api(`repos/${nwo}/rulesets`);
 
   if (!prot.ok && /403/.test(prot.err)) {
     return {
@@ -113,7 +113,7 @@ function checkMergeAuthority(nwo) {
 
   if (rules.ok) {
     for (const r of JSON.parse(rules.out)) {
-      const detail = gh(`repos/${nwo}/rulesets/${r.id}`);
+      const detail = api(`repos/${nwo}/rulesets/${r.id}`);
       if (!detail.ok) continue;
       const d = JSON.parse(detail.out);
       const bypass = d.bypass_actors ?? [];
@@ -130,9 +130,25 @@ function checkMergeAuthority(nwo) {
       // is the isolation this design exists to keep. Under this rule every repair
       // is rejected at the push, AFTER a worker run has been paid for. Said here
       // rather than discovered there.
-      if ((d.rules ?? []).some(x => x.type === "required_signatures")) {
-        level = BROKEN;
-        lines.push(`ruleset ${d.name}: requires signed commits, and reeve commits unsigned — every repair it makes will be refused at the push`);
+      // Only when the rule can actually reach a repair. A disabled ruleset, one
+      // targeting tags, or one scoped to `release/*` governs nothing reeve pushes,
+      // and reporting those as BROKEN would condemn a repository that is fine.
+      //
+      // The branch a repair lands on is a pull request's head, which is not known
+      // here, so the test is whether the ruleset covers EVERY branch: `~ALL` is
+      // the only condition guaranteed to include whatever head a PR turns up
+      // with. A narrower one is reported as a possibility, not a certainty.
+      if ((d.rules ?? []).some(x => x.type === "required_signatures")
+          && d.enforcement === "active" && (d.target ?? "branch") === "branch") {
+        const cond = d.conditions?.ref_name;
+        const everyBranch = !cond || ((cond.include ?? []).includes("~ALL") && !(cond.exclude ?? []).length);
+        if (everyBranch) {
+          level = BROKEN;
+          lines.push(`ruleset ${d.name}: requires signed commits on every branch, and reeve commits unsigned — every repair it makes will be refused at the push`);
+        } else {
+          if (level === OK) level = DEGRADED;
+          lines.push(`ruleset ${d.name}: requires signed commits on ${(cond.include ?? []).join(", ") || "some branches"} — reeve commits unsigned, so a repair on a branch it covers will be refused at the push`);
+        }
       }
     }
   }

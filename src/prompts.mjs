@@ -241,8 +241,10 @@ function landing(profile) {
     "  Change only the files your fix needs, and leave nothing else behind.",
     "  EVERYTHING left in the checkout is committed as your fix, so a scratch file",
     "  you wrote while working becomes part of the change and the gate refuses it.",
-    "  `rm` is not granted; `git clean -f -- <path>` is, and it removes an untracked",
-    "  file without touching anything you are not allowed to touch.",
+    ...(commandDenied("git", profile) ? [] : [
+      "  `rm` is not granted; `git clean -f -- <path>` is, and it removes an untracked",
+      "  file without touching anything you are not allowed to touch.",
+    ]),
     "",
     "  You do not write the commit message. reeve writes it from the `cause` and",
     "  `change` sentences of your report, so make those two accurate and specific.",

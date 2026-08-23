@@ -1991,8 +1991,21 @@ Add to `bin/reeve`, beside the existing `case "run":`:
     const sub = process.argv[3];
     if (sub !== "run" && sub !== "status")
       die(`usage: reeve build run [--takeover] | reeve build status`);
-    const db = openHub(hubPathFor(HOME));
+    // `status` opens READ-ONLY and RAW; only `run` may open through openHub.
+    // openHub applies forward migrations, and a migration is a write -- so once
+    // migration 2 exists, `reeve build status` would silently upgrade the
+    // database under a live builder, or during a restore, while holding neither
+    // a writer lease nor assertWritable. A read command must not be able to
+    // change what it reports.
+    const db = sub === "status"
+      ? new DatabaseSync(hubPathFor(HOME), { readOnly: true })
+      : openHub(hubPathFor(HOME));
     if (sub === "status") {
+      // Reading an unmigrated store is fine; reading a NEWER one is not. Refuse
+      // rather than render columns this binary does not understand.
+      const v = db.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+      if (v > HUB_SCHEMA_VERSION)
+        die(`the hub is at schema version ${v}; this reeve knows ${HUB_SCHEMA_VERSION}. Upgrade reeve.`);
       // Defined here rather than referenced: an advertised command that throws
       // ReferenceError is worse than one that does not exist.
       const row = db.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get();
@@ -2310,12 +2323,30 @@ export function everyStore(home) {
  * snapshot is opened, integrity-checked, and its schema version compared with
  * the binary that would have to read it back.
  */
-export function validateSnapshot(path, { expectVersion = null, kind = "repo" } = {}) {
+/**
+ * Two depths, because the callers ask two different questions.
+ *
+ * CHEAP (the default) answers "would this restore?" -- not a database, wrong
+ * schema version, missing marker table, missing authority-bearing tables. Flat
+ * cost: it touches the schema and one b-tree root.
+ *
+ * DEEP adds `PRAGMA integrity_check`, which reads every page. Measured
+ * 2026-08-23 at ~1.1 ms per megabyte -- 52 ms on a 47 MB store, against 0.66 ms
+ * for the cheap path (docs/measured/2026-08-23-integrity-check-cost.md). That
+ * belongs at the two places a full scan earns its cost: verifying a snapshot
+ * just written, and verifying one about to replace a live database. It does NOT
+ * belong on `latestSnapshot`, which `selfaudit.mjs` calls once per store on
+ * every guardian tick -- a repeated full scan of an immutable file.
+ */
+export function validateSnapshot(path, { expectVersion = null, kind = "repo", deep = false } = {}) {
   let probe = null;
   try {
     probe = new DatabaseSync(path, { readOnly: true });
-    const integrity = Object.values(probe.prepare("PRAGMA integrity_check").get())[0];
-    if (integrity !== "ok") return { ok: false, why: `integrity_check says: ${integrity}`, version: null, integrity };
+    let integrity = null;
+    if (deep) {
+      integrity = Object.values(probe.prepare("PRAGMA integrity_check").get())[0];
+      if (integrity !== "ok") return { ok: false, why: `integrity_check says: ${integrity}`, version: null, integrity };
+    }
 
     // Each store is validated against ITS OWN marker. A guardian per-repo store
     // has no schema_version table -- that is the hub's mechanism -- so querying
@@ -2323,6 +2354,19 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo" } =
     // unusable, and the caller DELETES it. That would leave the hub as the only
     // backed-up store on the machine, while reporting success for it.
     if (kind === "hub") {
+      // The FULL table set, not two markers. A physically valid database holding
+      // only `hub_event` and `schema_version` passed every earlier check, and
+      // then `restoreHub` called `openHub`, whose `CREATE TABLE IF NOT EXISTS`
+      // migration silently recreated `approval`, `outbox`, `merge_decision` and
+      // the rest -- EMPTY. The snapshot was reported usable, the restore
+      // reported success, and every authority-bearing row was already gone.
+      // A missing table is the one corruption that repairs itself into silence.
+      const present = new Set(probe.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table'").all().map(r => r.name));
+      const missing = HUB_TABLES.filter(t => !present.has(t));
+      if (missing.length)
+        return { ok: false, why: `snapshot is missing ${missing.length} table(s): ${missing.slice(0, 5).join(", ")}`,
+                 version: null, integrity };
       // schema_version alone is too weak a marker: a physically valid SQLite file
       // carrying only that table passes, is retained as a usable backup, and is
       // discovered to be empty at the moment it is restored. hub_event is the
@@ -2362,6 +2406,11 @@ export function latestSnapshot(root, nwo) {
     files = readdirSync(dir).filter(f => /^\d+\.db$/.test(f))
       .sort((a, b) => Number(b.split(".")[0]) - Number(a.split(".")[0]));
   } catch { return null; }
+  // CHEAP validation, deliberately. This runs on the guardian's per-tick path
+  // through selfaudit.mjs (:48 and :56, once per store), and snapshots are
+  // immutable -- a full integrity scan here re-reads every page of every
+  // retained backup every 90 seconds to learn what it learned last time.
+  // The restore path validates deeply before it replaces anything.
   const opts = nwo === "hub" ? { kind: "hub", expectVersion: HUB_SCHEMA_VERSION } : { kind: "repo" };
   for (const f of files) {
     const p = join(dir, f);
@@ -2391,9 +2440,11 @@ Then, inside `snapshotAll`, validate what was just written and refuse to keep a 
       // A snapshot that cannot be read back is worse than no snapshot: it makes
       // `latestSnapshot` answer with a file that will fail at restore time.
       if (taken.ok && taken.path) {
+        // DEEP: this is a snapshot written one line ago, and "can it be read
+        // back" is the entire question. Once per store per backup interval.
         const v = nwo === "hub"
-          ? validateSnapshot(taken.path, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION })
-          : validateSnapshot(taken.path, { kind: "repo" });
+          ? validateSnapshot(taken.path, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true })
+          : validateSnapshot(taken.path, { kind: "repo", deep: true });
         if (!v.ok) {
           try { rmSync(taken.path, { force: true }); } catch {}
           // NOT pruned. The retention window still holds every good snapshot it
@@ -2409,8 +2460,26 @@ Then, inside `snapshotAll`, validate what was just written and refuse to keep a 
 
 `prune` is module-private today (`src/backup.mjs:53`) and `snapshotAll` is in
 the same module, so it needs no export — but `slug` is used with it, and both
-must stay in scope. Add the import `HUB_SCHEMA_VERSION` from
-`./build/hubdb.mjs` and keep `existsSync` (already imported).
+must stay in scope.
+
+**`HUB_TABLES` is a new export of `src/build/hubdb.mjs`**, added by this task:
+the tables migration 1 creates, derived from `hub.sql` at module load rather
+than retyped, so it cannot drift from the DDL it describes.
+
+```js
+// src/build/hubdb.mjs
+export const HUB_TABLES = Object.freeze(
+  [...readFileSync(SCHEMA_PATH, "utf8")
+      .matchAll(/CREATE TABLE IF NOT EXISTS ([a-z_]+)\s*\(/g)].map(m => m[1]));
+```
+
+Task 11's cross-check already asserts the live `sqlite_master` table set equals
+`TABLE_OWNERS`'s keys; it now asserts `HUB_TABLES` equals it too, so a schema
+file the regex cannot parse fails loudly instead of yielding a short list that
+validates every snapshot.
+
+Add the imports `HUB_SCHEMA_VERSION` and `HUB_TABLES` from `./build/hubdb.mjs`,
+and keep `existsSync` (already imported).
 
 **The full import line `src/backup.mjs` must carry after Tasks 8 and 9.** It
 currently imports only `DatabaseSync`, `execFileSync` and
@@ -2422,7 +2491,7 @@ rather than left to be discovered one `ReferenceError` at a time:
 ```js
 import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync,
          writeFileSync, renameSync } from "node:fs";
-import { openHub, hubEvent, HUB_SCHEMA_VERSION } from "./build/hubdb.mjs";
+import { openHub, hubEvent, HUB_SCHEMA_VERSION, HUB_TABLES } from "./build/hubdb.mjs";
 import { acquireMaintenanceLock, releaseMaintenanceLock, liveWriters } from "./build/locks.mjs";
 import { replayHub, COMPARISON_SET } from "./build/replay.mjs";
 ```
@@ -2522,10 +2591,32 @@ import { acquireSingleton, withWriterLease } from "../src/build/locks.mjs";
   const snap = join(snapDir, "1.db");
   db.exec(`VACUUM INTO '${snap}'`);
 
-  // post-snapshot authority-bearing writes, each appending its hub_event
-  writeApproval(db, "bt:d", "a".repeat(40));
-  writeHold(db, "bt:d", 7, "cancel");
-  writeAuthority(db, "nextly");
+  // A post-snapshot write for EVERY table in COMPARISON_SET. Three was not a
+  // drill: the other sixteen tables were empty on both sides, so `[] === []`
+  // passed for each of them and a replay with its `phase_event`, `outbox`,
+  // `merge_decision` or `guardian_receipt` handler deleted outright would have
+  // been accepted as a correct recovery.
+  //
+  // Table-driven, and the coverage is ASSERTED rather than eyeballed, so adding
+  // a table to COMPARISON_SET without a writer fails here instead of quietly
+  // reintroducing an empty comparison.
+  const missingWriters = COMPARISON_SET.filter(t => !POST_SNAPSHOT[t]);
+  check(missingWriters.length === 0,
+    "every compared table has a post-snapshot writer, so no comparison is [] vs []",
+    JSON.stringify(missingWriters));
+  // COMPARISON_SET's ORDER is load-bearing here: `task` is first and
+  // `phase_event` is fourth, both before `outbox` -- whose `task_id` and `fence`
+  // are foreign keys to them. Iterating it in declaration order satisfies every
+  // FK without a separate ordering list to keep in step.
+  for (const t of COMPARISON_SET) POST_SNAPSHOT[t](db, "bt:d");
+  // And each one really landed: a writer that silently no-ops leaves the same
+  // empty-vs-empty comparison this block exists to remove.
+  const emptyAfterWrite = COMPARISON_SET.filter(
+    t => db.prepare(`SELECT count(*) c FROM ${t}`).get().c === 0);
+  check(emptyAfterWrite.length === 0,
+    "control: every compared table actually holds a post-snapshot row now",
+    JSON.stringify(emptyAfterWrite));
+
   const before = exportComparison(db);
   // Exported to DISK before the destruction, the way an operator would have it:
   // once the file is gone there is nothing left to read a tail out of, so a test
@@ -2590,6 +2681,86 @@ function writeHold(db, task, pr, reason) {
     .run(task, JSON.stringify(Object.fromEntries(Object.keys(row).sort().map(k => [k, row[k]]))));
   db.exec("COMMIT");
 }
+// One writer per COMPARISON_SET table, each appending its own hub_event exactly
+// as the production path does -- that is what makes replay's primary-key upsert
+// the thing under test rather than the fixture. `writeRow` is the shared shape;
+// the three hand-written functions above predate it and are kept because their
+// column lists document the authority-bearing tables in full.
+const writeRow = (table, kind) => (db, task, over = {}) => {
+  const row = minimalRow(db, table, over);
+  // Only tables that HAVE a task column get one: guardian_receipt and
+  // project_authority do not, and setting it unconditionally would insert a
+  // column the DDL never declared.
+  if ("task" in row && !("task" in over)) row.task = task;
+  const cols = Object.keys(row);
+  db.exec("BEGIN IMMEDIATE");
+  db.prepare(`INSERT INTO ${table}(${cols.join(",")}) VALUES(${cols.map(() => "?").join(",")})`)
+    .run(...cols.map(c => row[c]));
+  db.prepare(`INSERT INTO hub_event(at,kind,task,payload) VALUES(unixepoch(),?,?,?)`)
+    .run(kind, task, JSON.stringify(Object.fromEntries(cols.sort().map(c => [c, row[c]]))));
+  db.exec("COMMIT");
+};
+
+// The minimum legal row for a table, DERIVED from its own schema rather than
+// transcribed. Nineteen hand-copied column lists is nineteen chances to bake in
+// a typo that makes an INSERT throw or -- worse -- silently insert nothing, and
+// the drill is back to comparing [] with [].
+//
+// PRAGMA table_info gives name, type, notnull, dflt_value and pk, which is
+// everything needed for a minimal row. Only CHECK constraints need help: they
+// are the one thing table_info does not report, so the columns carrying one are
+// listed explicitly and nothing else is.
+const ENUMS = {
+  "task.phase": "GATE", "task.source_kind": "founder", "task.visibility": "private",
+  "task_territory.kind": "prefix",
+  "phase_run.status": "settled",
+  "approval.kind": "review", "approval.verdict": "approved",
+  "attested_push.pusher": "builder", "attested_push.source_kind": "outbox",
+  "guardian_receipt.status": "imported",
+  "pr_hold.reason": "cancel",
+  "outbox.kind": "notify", "outbox.status": "pending",
+  "merge_decision.phase": "enqueue",
+  "merge_decision.witness_outcome": "UNKNOWN", "merge_decision.actuation_outcome": "UNKNOWN",
+  "territory_lease.kind": "prefix",
+  "project_authority.kind": "review-witness",
+};
+const minimalRow = (db, table, over = {}) => {
+  const row = {};
+  for (const c of db.prepare(`PRAGMA table_info(${table})`).all()) {
+    if (c.pk && /INTEGER/i.test(c.type)) continue;        // rowid alias: SQLite assigns it
+    if (!c.notnull || c.dflt_value !== null) continue;    // nullable, or already defaulted
+    row[c.name] = ENUMS[`${table}.${c.name}`]
+      ?? (/INT/i.test(c.type) ? 1 : `${table}-${c.name}`);
+  }
+  return { ...row, ...over };
+};
+
+// A CHECK this map misses makes the INSERT throw, and the coverage control below
+// catches a table that ended up empty -- so both failure modes are loud. That is
+// the point of deriving: the fixture cannot silently drift from the schema.
+
+const POST_SNAPSHOT = {
+  task:              (db, t) => writeRow("task", "task.transitioned")(db, t),
+  task_territory:    writeRow("task_territory", "task_territory.granted"),
+  task_drain:        writeRow("task_drain", "task_drain.recorded"),
+  phase_event:       writeRow("phase_event", "phase_event.appended"),
+  phase_run:         writeRow("phase_run", "phase_run.settled"),
+  approval:          (db, t) => writeApproval(db, t, "a".repeat(40)),
+  gate_request:      writeRow("gate_request", "gate_request.minted"),
+  notice_receipt:    writeRow("notice_receipt", "notice_receipt.written"),
+  impl_pr:           writeRow("impl_pr", "impl_pr.opened"),
+  attested_push:     writeRow("attested_push", "attested_push.recorded"),
+  guardian_receipt:  writeRow("guardian_receipt", "guardian_receipt.imported"),
+  harness_acceptance: writeRow("harness_acceptance", "harness_acceptance.recorded"),
+  gate_run:          writeRow("gate_run", "gate_run.settled"),
+  pr_hold:           (db, t) => writeHold(db, t, 7, "cancel"),
+  hold_reason:       writeRow("hold_reason", "hold_reason.recorded"),
+  project_authority: (db) => writeAuthority(db, "nextly"),
+  outbox:            writeRow("outbox", "outbox.enqueued"),
+  territory_lease:   writeRow("territory_lease", "territory_lease.granted"),
+  merge_decision:    writeRow("merge_decision", "merge_decision.recorded"),
+};
+
 function writeAuthority(db, project) {
   const row = { project_id: project, kind: "review-witness", granted_by: 5, until: 9999999999, created_at: 1 };
   db.exec("BEGIN IMMEDIATE");
@@ -2634,10 +2805,15 @@ import { hubTx } from "./hubdb.mjs";
  * not exist after a restore, and comparing them would fail every drill for the
  * one reason that is correct.
  */
+// §11.4's comparison set. The invariant Task 11 asserts BOTH WAYS: every table
+// with a replay handler appears here, and every table here has a handler.
+// `guardian_receipt` was handled and not compared, so a replay that silently
+// dropped every imported receipt passed the recovery acceptance test -- and
+// those receipts are what clause B1 reads to decide a push was attested.
 export const COMPARISON_SET = [
   "task", "task_territory", "task_drain", "phase_event", "phase_run", "approval", "gate_request", "notice_receipt", "impl_pr", "attested_push",
   "harness_acceptance", "gate_run", "pr_hold", "hold_reason", "project_authority",
-  "outbox", "territory_lease", "merge_decision",
+  "outbox", "territory_lease", "merge_decision", "guardian_receipt",
 ];
 
 /** kind -> the table its payload is a row of. */
@@ -2751,7 +2927,10 @@ export function replayHub(db, events) {
 export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force = false, tail: suppliedTail = null } = {}) {
   if (!existsSync(snapshotPath)) return { ok: false, why: `no snapshot at ${snapshotPath}`, holders: [] };
 
-  const v = validateSnapshot(snapshotPath, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION });
+  // DEEP, and worth every millisecond: this file is about to replace the live
+  // hub, and a page-level fault found afterwards is found with nothing to fall
+  // back to.
+  const v = validateSnapshot(snapshotPath, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true });
   if (!v.ok) return { ok: false, why: `the snapshot is not restorable: ${v.why}`, holders: [] };
 
   const snapSeq = (() => {
@@ -2856,6 +3035,21 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
           if (t !== "maintenance_lock") back.exec(`DELETE FROM ${t}`);
         // maintenance_lock is deliberately last and deliberately not cleared:
         // this restore holds it. It is released below.
+
+        // phase_run is NOT a lease table and is not process-scoped as a whole:
+        // its SETTLED rows are the attempt history the retry budget counts, so
+        // they have to survive. But a normal snapshot is taken by a RUNNING
+        // daemon, so it can contain rows still marked `live` or `adopted` whose
+        // processes are long gone. Left alone, `one_live_run` refuses the task
+        // a replacement attempt forever, and adopt-or-kill reads a dead pid's
+        // heartbeat as if it meant something.
+        //
+        // Settled terminally rather than deleted: deleting them would return an
+        // attempt to the budget, so a task that had burned its retries would
+        // quietly get them back -- a restore handing out free retries.
+        back.exec(`UPDATE phase_run
+                      SET status = 'lost', ended_at = COALESCE(ended_at, unixepoch())
+                    WHERE status IN ('live','adopted')`);
 
         if (tail.length) replayed = replayHub(back, tail).applied;
         releaseMaintenanceLock(back, { pid, lstart });
@@ -3139,28 +3333,43 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
   // own right -- admission blocks every builder while one is outstanding -- so a
   // request whose daemon died before it was admitted starves builder dispatch
   // indefinitely, while a held-only query reports nothing wrong.
+  // ONE H-5, worst-case. Lease freshness and provider-state measurement are two
+  // observations about one check, and pushing both produced a report saying the
+  // scheduler is stale AND healthy in the same breath -- with any consumer that
+  // indexes findings by id keeping whichever came last, which was the pass. A
+  // finding id is an identity; it gets one verdict.
   const staleLeases = db.prepare(
     `SELECT count(*) c FROM provider_lease WHERE status IN ('held','queued') AND expires_at < ?`).get(now).c;
-  if (staleLeases > 0) out.push({ id: "H-5", severity: "warn", classification: "stale-evidence",
-    title: "provider requests are past their expiry",
-    detail: `${staleLeases} held or queued request(s) expired; a dead holder starves every claim behind it, ` +
-            `and an expired QUEUED request blocks builder admission by itself`,
-    action: "the next tick reaps them; if it persists, the reaper is not running" });
-
   const st = db.prepare("SELECT * FROM provider_state WHERE provider='claude'").get();
-  if (!st) {
-    out.push({ id: "H-5", severity: "warn", classification: "configuration",
-      title: "the provider scheduler has no state row", detail: "limits fall back to the defaults 2/1",
+
+  const notes = [];
+  if (staleLeases > 0)
+    notes.push({ classification: "stale-evidence",
+      why: `${staleLeases} held or queued provider request(s) expired; a dead holder starves every claim ` +
+           `behind it, and an expired QUEUED request blocks builder admission by itself`,
+      action: "the next tick reaps them; if it persists, the reaper is not running" });
+  if (!st)
+    notes.push({ classification: "configuration",
+      why: "the provider scheduler has no state row; limits fall back to the defaults 2/1",
       action: "reeve build measure-provider (S3)" });
-  } else if (st.measured_at == null) {
-    out.push({ id: "H-5", severity: "warn", classification: "stale-evidence",
-      title: "provider limits are the unmeasured defaults",
-      detail: `limit=${st.concurrency_limit} reserved=${st.guardian_reserved}, never measured`,
+  else if (st.measured_at == null)
+    notes.push({ classification: "stale-evidence",
+      why: `provider limits are the unmeasured defaults: limit=${st.concurrency_limit} reserved=${st.guardian_reserved}`,
       action: "reeve build measure-provider (S3)" });
-  } else {
+
+  if (notes.length === 0) {
     out.push({ id: "H-5", severity: "pass", classification: "stale-evidence",
-      title: "provider limits are measured",
-      detail: `limit=${st.concurrency_limit} reserved=${st.guardian_reserved}, measured ${new Date(st.measured_at * 1000).toISOString()}`, action: null });
+      title: "the provider scheduler is healthy",
+      detail: `limit=${st.concurrency_limit} reserved=${st.guardian_reserved}, ` +
+              `measured ${new Date(st.measured_at * 1000).toISOString()}; no expired requests`, action: null });
+  } else {
+    // Every reason is still reported; only the SEVERITY is folded. Dropping the
+    // second reason would be this same defect in the other direction.
+    out.push({ id: "H-5", severity: "warn",
+      classification: notes.some(n => n.classification === "configuration") ? "configuration" : "stale-evidence",
+      title: "the provider scheduler needs attention",
+      detail: notes.map(n => n.why).join("; "),
+      action: notes.map(n => n.action).join("; ") });
   }
   return out;
 }
@@ -3172,7 +3381,77 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
 import { HUB_SCHEMA_VERSION } from "./build/hubdb.mjs";
 ```
 
-Wire `hubFindings` into `reeve builder doctor` and its `--json` output. Then extend `selfaudit.mjs` **concretely** — a sentence is not an implementation direction, and the control below is what makes the check mean something:
+**The `builder` route, as code.** `bin/reeve` has no `builder` command today, so
+`reeve builder doctor` falls through to the unknown-command path — and Task 10's
+`git add` names only `src/doctor.mjs`, `src/selfaudit.mjs` and the direct-function
+test, so the unit tests go green while the advertised command does not exist.
+Add the case, and add `bin/reeve` to the commit:
+
+```js
+  case "builder": {
+    if (process.argv[3] !== "doctor") die("usage: reeve builder doctor [--json]");
+    // READ-ONLY, like every doctor path: a reporter that can write what it
+    // reports can agree with itself.
+    const p = hubPathFor(HOME);
+    if (!existsSync(p)) {
+      const none = [{ id: "H-0", severity: "fail", classification: "configuration",
+                      title: "there is no hub database", detail: p,
+                      action: "reeve build run creates it" }];
+      console.log(flag("json") ? JSON.stringify(none, null, 2) : renderHub(none));
+      process.exit(1);
+    }
+    const db = new DatabaseSync(p, { readOnly: true });
+    let findings;
+    try {
+      findings = hubFindings(db, { root: opt("backups") ?? join(HOME, "backups"),
+                                   now: Math.floor(Date.now() / 1000),
+                                   snapshotFor: (nwo) => {
+                                     const s = latestSnapshot(opt("backups") ?? join(HOME, "backups"), nwo);
+                                     return s ? { path: s, at: statSync(s).mtimeMs / 1000,
+                                                  ...validateSnapshot(s, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION }) } : null;
+                                   } });
+    } finally { db.close(); }
+    console.log(flag("json") ? JSON.stringify(findings, null, 2) : renderHub(findings));
+    process.exit(findings.some(f => f.severity === "fail") ? 1 : 0);
+  }
+```
+
+and a CLI test, because a unit-tested function reached by no command is the
+shape this programme keeps finding:
+
+```js
+// test/hub-doctor.test.mjs, at the end
+{
+  const home = mkdtempSync(join(tmpdir(), "reeve-cli-"));
+  mkdirSync(join(home, "state"), { recursive: true });
+  openHub(hubPathFor(home)).close();
+  const run = (args) => spawnSync(process.execPath, ["bin/reeve", ...args, "--home", home],
+    { encoding: "utf8" });
+  const j = run(["builder", "doctor", "--json"]);
+  check(j.status === 0 || j.status === 1,
+    "`reeve builder doctor --json` runs rather than falling through to unknown-command",
+    `status=${j.status} stderr=${j.stderr?.slice(0, 200)}`);
+  check(!/unknown command|usage:/i.test(j.stderr ?? ""),
+    "and is not reported as an unknown command", String(j.stderr).slice(0, 200));
+  let parsed = null;
+  try { parsed = JSON.parse(j.stdout); } catch {}
+  check(Array.isArray(parsed) && parsed.every(f => f.id && f.severity),
+    "and --json emits the finding array", String(j.stdout).slice(0, 200));
+  // CONTROL: a command that really IS unknown must fail differently, or the
+  // assertions above pass for any exit status at all.
+  const bogus = run(["builder", "nonsense"]);
+  check(bogus.status !== 0 && /usage:/i.test(bogus.stderr ?? ""),
+    "control: an unknown builder subcommand is refused with usage",
+    `status=${bogus.status} stderr=${bogus.stderr?.slice(0, 120)}`);
+  rmSync(home, { recursive: true, force: true });
+}
+```
+
+`spawnSync` from `node:child_process` and `statSync` from `node:fs` join the
+imports. `renderHub` is `hubFindings`' human renderer, added in `src/doctor.mjs`
+beside the existing `render`.
+
+Then wire `hubFindings` into that route's `--json` output. Then extend `selfaudit.mjs` **concretely** — a sentence is not an implementation direction, and the control below is what makes the check mean something:
 
 `selfAudit`'s signature is `selfAudit(db, opts)` and it reads the machine root
 as `opts.home`, so the block below destructures it rather than assuming a bare
@@ -3290,7 +3569,7 @@ if (hub && existsSync(hub)) {
 ```bash
 $N test/hub-doctor.test.mjs
 $N test/doctor-state.test.mjs && $N test/selfaudit.test.mjs
-git add src/doctor.mjs src/selfaudit.mjs test/hub-doctor.test.mjs
+git add src/doctor.mjs src/selfaudit.mjs bin/reeve test/hub-doctor.test.mjs
 git commit -m "feat(doctor): report hub snapshot, gate state and provider state"
 ```
 
@@ -3447,13 +3726,40 @@ export const TABLE_OWNERS = {
   hub_event:       { writer: "every authority-bearing tx",  reader: "replay.mjs, the restore drill",      replayed: false, section: "11.4" },
   phase_run:       { writer: "loop.mjs at dispatch",        reader: "why, adopt-or-kill, retry budget",   replayed: true,  section: "4.5"  },
   gate_run:        { writer: "gates.mjs",                   reader: "merge clause B2, why",               replayed: true,  section: "8.3"  },
-  // ...and so on for all 32, each transcribed from the checklist row above.
-  // The cross-check asserts the key set equals sqlite_master exactly, so an
-  // incomplete transcription fails loudly rather than passing quietly.
+  gate_request:    { writer: "gate.mjs per round",          reader: "revision cap, why",                  replayed: true,  section: "7.3"  },
+  approval:        { writer: "gate.mjs from the inbox",     reader: "merge clauses B4/U2, why",           replayed: true,  section: "7.3"  },
+  notice_receipt:  { writer: "gate.mjs on notice settle",   reader: "the silence clock",                  replayed: true,  section: "7.3"  },
+  impl_pr:         { writer: "chain.mjs (pr-create settle)", reader: "receipt importer, merge.mjs",       replayed: true,  section: "8.5"  },
+  attested_push:   { writer: "chain.mjs",                   reader: "merge clause B1",                    replayed: true,  section: "8.5"  },
+  guardian_receipt:{ writer: "chain.mjs receipt importer",  reader: "clause B1 via attested_push",        replayed: true,  section: "8.5"  },
+  ownership_check: { writer: "the VERDICT_WAIT poller",     reader: "merge clause B6, pre-flight",        replayed: true,  section: "2.5"  },
+  harness_acceptance:{ writer: "task resume --accept-harness", reader: "merge clause B7",                 replayed: true,  section: "8.4"  },
+  pr_hold:         { writer: "transition.mjs, chain.mjs",   reader: "the GUARDIAN's verdict (PR-C)",      replayed: true,  section: "9.6"  },
+  project_authority:{ writer: "intake.mjs at registry read", reader: "admission, doctor",                 replayed: true,  section: "2.1"  },
+  repo_gate_state: { writer: "loop.mjs per tick (PR-B)",    reader: "merge clause U4",                    replayed: true,  section: "9.3"  },
+  inbox:           { writer: "ingest.mjs",                  reader: "gate.mjs, the post-GATE watcher",    replayed: true,  section: "7.6"  },
+  outbox:          { writer: "transition.mjs; the executor", reader: "executor, recoverOutbox, drain",    replayed: true,  section: "3.2"  },
+  merge_decision:  { writer: "merge.mjs at each phase",     reader: "task why, the false-merge metric",   replayed: true,  section: "9.3"  },
+  escalation:      { writer: "applyTransition, the loop",   reader: "notify.mjs, dash, task resolve",     replayed: true,  section: "11.7" },
+  intake_event:    { writer: "intake.mjs per candidate",    reader: "the starvation check, why",          replayed: true,  section: "2.4"  },
+  schema_version:  { writer: "hubdb.mjs migrations only",   reader: "openHub, validateSnapshot",          replayed: false, section: "11.1" },
+  // The five process-scoped tables. NOT replayed and NOT compared, for the same
+  // reason restoreHub clears them: they record which PROCESS holds authority,
+  // and every one of those processes is gone by the time a restore runs.
+  singleton_lease: { writer: "locks.mjs",                   reader: "build run, restore refusal",         replayed: false, section: "1.2"  },
+  writer_lease:    { writer: "locks.mjs per CLI command",   reader: "restore refusal",                    replayed: false, section: "11.4" },
+  maintenance_lock:{ writer: "restoreHub only",             reader: "every writer's assertWritable",      replayed: false, section: "11.4" },
+  directory_lease: { writer: "worktree.mjs",                reader: "the reaper, dispatch guard",         replayed: false, section: "10.2" },
+  territory_lease: { writer: "intake.mjs, transition.mjs",  reader: "the overlap check",                  replayed: true,  section: "10.2" },
+  provider_lease:  { writer: "provider.mjs (both daemons)", reader: "admission, reaper, restore refusal", replayed: false, section: "10.4" },
+  provider_state:  { writer: "provider.mjs, measure-provider", reader: "admission, doctor H-5",           replayed: false, section: "10.4" },
 };
 
 export const PROSE_TABLES = [
-  "task", "task_territory", "phase_event", "hold_reason", "hub_event", "phase_run", "gate_run",
+  // task_drain was missing here for several revisions while the cross-check
+  // this list feeds was described as complete: 31 of 32, and the one absent was
+  // the table the CANCELLING drain depends on.
+  "task", "task_territory", "task_drain", "phase_event", "hold_reason", "hub_event", "phase_run", "gate_run",
   "gate_request", "approval", "notice_receipt", "impl_pr", "attested_push", "guardian_receipt",
   "ownership_check", "harness_acceptance", "pr_hold", "project_authority", "repo_gate_state",
   "inbox", "outbox", "merge_decision", "singleton_lease", "writer_lease", "maintenance_lock",
@@ -3631,15 +3937,28 @@ $N -e '
   const { createHash } = await import("node:crypto");
   const { readFileSync, writeFileSync } = await import("node:fs");
   const sql = readFileSync("src/build/hub.sql", "utf8");
+  // BOTH halves of migration 1. Hashing hub.sql alone freezes the DDL text and
+  // leaves the `up` function free to add, drop or reorder operations around it:
+  // existing stores never re-run an edited migration, fresh stores do, and the
+  // freeze test stays green while the two diverge. The function source is the
+  // other half of what migration 1 IS.
+  const impl = String(MIGRATIONS.find(m => m.version === 1).up);
   writeFileSync("test/fixtures/hub-schema-v1.json",
-    JSON.stringify({ version: 1, sha256: createHash("sha256").update(sql).digest("hex"),
+    JSON.stringify({ version: 1,
+                     sha256: createHash("sha256").update(sql).digest("hex"),
+                     up_sha256: createHash("sha256").update(impl).digest("hex"),
                      frozen_at: "2026-08-22", note: "migration 1; new schema goes in a new numbered migration" }, null, 2) + "\n");
   console.log(readFileSync("test/fixtures/hub-schema-v1.json", "utf8"));
 '
 $N test/hub-schema.test.mjs
 ```
 
-Verify the guard actually guards, with the four-check stub loop: append a blank line to `hub.sql`, re-run (expect the freeze assertion **red** and nothing else), then `git checkout src/build/hub.sql` and re-run (expect green). A guard that has never been seen red is a guard nobody has tested.
+Verify the guard actually guards, with the four-check stub loop, **twice — once per half**:
+
+1. Append a blank line to `hub.sql`, re-run (expect the freeze assertion **red** and nothing else), `git checkout src/build/hub.sql`, re-run (expect green).
+2. Add a no-op statement inside migration 1's `up` function in `hubdb.mjs` — `db.exec("SELECT 1");` — re-run (expect the freeze assertion **red**), `git checkout src/build/hubdb.mjs`, re-run (expect green).
+
+The second run is the one that matters: it is the half that was unguarded, and a freeze verified only against the file it already covered proves nothing about the half that was added. A guard that has never been seen red is a guard nobody has tested.
 
 - [ ] **Step 2: Full suite, from a clean checkout**
 

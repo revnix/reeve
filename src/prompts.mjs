@@ -30,7 +30,11 @@ export function claimedCommands(profile) {
 /** `git` first because it is granted for every action, then the language's own
  * runners. Two is enough to make the point without listing the whole grant. */
 function namedRunners(profile) {
-  return ["git", ...[...projectRunners(profile)].slice(0, 2)];
+  // `git` is granted for every action -- unless the profile forbids it, in which
+  // case naming it tells the worker to use a command the sandbox refuses, which
+  // is the contradiction this whole derivation exists to close.
+  const always = commandDenied("git", profile) ? [] : ["git"];
+  return [...always, ...[...projectRunners(profile)].slice(0, 2)];
 }
 
 /** The project's own verification command, as the grant sees it: the runner and
@@ -40,6 +44,11 @@ function exampleCommand(profile) {
     for (const c of Object.values(u.commands ?? {})) {
       if (c?.state !== "present" || !c.cmd) continue;
       const head = c.cmd.trim().split(/\s+/).slice(0, 2).join(" ");
+      // A command of nothing but whitespace is truthy, so it passes validation and
+      // trims to "". Returning it would print an empty backtick pair as the
+      // permitted example, and the nullish fallback in `invariants` would not
+      // catch it. `sandboxFor` already skips these.
+      if (!head) continue;
       // Declared and granted is not the same as runnable: `npm publish` is in
       // NEVER, and deny beats allow. Offering one of those as the example is the
       // very contradiction this derivation exists to close.

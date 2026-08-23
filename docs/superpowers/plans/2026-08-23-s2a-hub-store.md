@@ -27,7 +27,16 @@ Their review history — all 54 findings and what each changed — is `2026-08-2
 - **Node:** always `~/.nvm/versions/node/v24.17.0/bin/node`. Alias it `N` in every shell: `N=~/.nvm/versions/node/v24.17.0/bin/node`. `node` on PATH is v22 and `node:sqlite` emits an ExperimentalWarning there; CI asserts a floor of 24.
 - **Tests:** plain scripts, no framework. Use the `check(ok, name, detail)` helper shape every existing test file uses; `console.log("PASS  name")` / `"FAIL  name"`; end with `process.exit(fail ? 1 : 0)`. New files under `test/` are discovered by CI automatically.
 - **The four-check stub loop for every fix:** control green, stub verified applied, the RIGHT assertion red, restore verified. Never commit a test that has not been seen red against the broken code. Every task below names the stub explicitly.
-- **Run the full suite before every commit:** `for f in test/*.test.mjs; do $N "$f" >/dev/null || echo "FAILED $f"; done`. **Measured 2026-08-22 on `9dbd3a0`: 59 test files exist; 58 were run and all 58 passed.** `test/escape.test.mjs` was NOT run, because it writes decoy files into the shared `~/.reeve/canary/` directory that the live daemon also reads; run it once on a quiet machine to complete the baseline. That run had `node_modules` absent, and a green file can hide a skip, so skips were counted rather than assumed: exactly two files carry one `SKIP` each (`policy-self-exclusion`, `supervisor-contract`). That 58-file pass is the base every task is measured against, and it is the same base for all three PRs — never a chained comparison against the previous task.
+- **Run the full suite before every commit**, with the one exclusion the next sentence explains:
+
+  ```bash
+  for f in test/*.test.mjs; do
+    case "$f" in */escape.test.mjs) continue;; esac    # see below: not while the daemon is live
+    $N "$f" >/dev/null || echo "FAILED $f"
+  done
+  ```
+
+  The glob must not simply be `test/*.test.mjs`: that includes `escape.test.mjs`, which writes decoys into the shared `~/.reeve/canary/` tree the live daemon reads and probes the login keychain. Advertising a command that contradicts the warning beside it means the warning loses. **Measured 2026-08-22 on `9dbd3a0`: 59 test files exist; 58 were run and all 58 passed.** `test/escape.test.mjs` was NOT run, because it writes decoy files into the shared `~/.reeve/canary/` directory that the live daemon also reads; run it once on a quiet machine to complete the baseline. That run had `node_modules` absent, and a green file can hide a skip, so skips were counted rather than assumed: exactly two files carry one `SKIP` each (`policy-self-exclusion`, `supervisor-contract`). That 58-file pass is the base every task is measured against, and it is the same base for all three PRs — never a chained comparison against the previous task.
 - **Conventional Commits**, lowercase, `type(scope): subject`, ≤72 characters. **No attribution trailer of any kind.** Never `--no-verify`.
 - Every change carries a what/why comment in the style of the file it lands in. Comments never reference tasks, plans, findings, or this document.
 - **No raw SQL outside `src/db/` and `src/build/`.** `hubdb.mjs` owns every hub statement the way `ops.mjs` owns every guardian statement.
@@ -69,6 +78,35 @@ Recorded so no executor re-litigates them.
 
 ---
 
+
+## The test harness every file in this plan opens with
+
+Where a task writes `/* ... standard harness ... */`, it means exactly this block. It is written once here rather than repeated in each task, but it is **not** optional shorthand: without it `check`, `dir` and the imports are undefined and the file fails before reaching its first assertion.
+
+```js
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+let fail = 0;
+const check = (ok, name, detail) => {
+  console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+  if (!ok) { if (detail) console.log("        " + detail); fail++; }
+};
+const dir = mkdtempSync(join(tmpdir(), "reeve-<slug>-"));
+```
+
+and closes with:
+
+```js
+rmSync(dir, { recursive: true, force: true });
+console.log(fail ? `\nfailed=${fail}` : "\nall green");
+process.exit(fail ? 1 : 0);
+```
+
+Each task names any imports it needs **beyond** these.
+
+## File structure
 
 | File | Responsibility after this plan |
 |---|---|
@@ -244,7 +282,8 @@ Create `src/build/hubdb.mjs`:
 // versioned instead: a numbered, forward-only list, each step in its own
 // transaction, and a store recorded above this binary's version does not open.
 import { DatabaseSync } from "node:sqlite";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { canonical } from "../db/ops.mjs";
 
 export const HUB_SCHEMA_VERSION = 1;
@@ -258,6 +297,10 @@ const MIGRATIONS = [
 ];
 
 export function openHub(path) {
+  // state/ may not exist yet: on a fresh REEVE_HOME no guardian store has
+  // created it, and DatabaseSync will not create a missing parent. Without this
+  // the very first hub-writing command fails before migration 1 can run.
+  mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path, { timeout: 10000 });
 
   // Set before anything else: foreign_keys cannot be changed inside a
@@ -1039,7 +1082,7 @@ git commit -m "feat(hub): pr holds, project authority and repo gate state"
 **Interfaces:**
 - Consumes: `task` from Task 2.
 - Produces: tables `inbox`, `outbox` (with `outbox_live_key`), `merge_decision`, `singleton_lease`, `writer_lease`, `maintenance_lock`, `directory_lease`, `territory_lease`, `provider_lease`, `provider_state`, `intake_event`, `escalation`. **32 tables total** after this task; Task 11 asserts that number and its membership.
-- The hub outbox kind enumeration, which is closed and contains **no** check-publish kind: `git.push.branch`, `gh.pr.create`, `gh.pr.comment`, `gh.pr.close`, `gh.pr.body`, `gh.review.request`, `gh.pr.merge`, `notify`, `ledger.claim`, `ledger.release`.
+- The hub outbox kind enumeration, which is closed and contains **no** check-publish kind: `git.push.branch`, `gh.pr.create`, `gh.pr.comment`, `gh.pr.close`, `gh.pr.body`, `gh.review.request`, `gh.pr.merge`, `notify`, `gate.clean_notice`, `ledger.claim`, `ledger.release`.
 
 - [ ] **Step 1: Append the failing assertions**
 
@@ -1187,7 +1230,14 @@ CREATE TABLE IF NOT EXISTS outbox (
   idempotency_key TEXT NOT NULL,
   kind         TEXT    NOT NULL CHECK (kind IN
                  ('git.push.branch','gh.pr.create','gh.pr.comment','gh.pr.close','gh.pr.body',
-                  'gh.review.request','gh.pr.merge','notify','ledger.claim','ledger.release')),
+                  'gh.review.request','gh.pr.merge','notify','gate.clean_notice',
+                  'ledger.claim','ledger.release')),
+                 -- gate.clean_notice is its own kind, not a plain notify: its
+                 -- settle writes the notice_receipt row that STARTS the founder
+                 -- silence window (section 7.3), and the window is measured from
+                 -- max(clean comment, notice delivered). A generic notify has no
+                 -- such settlement, so without this kind the clock never starts
+                 -- and no silence approval can ever be legitimate.
   task_id      TEXT REFERENCES task(id) ON DELETE CASCADE,
   task_generation INTEGER NOT NULL,
   fence        INTEGER NOT NULL,                   -- the phase_event seq that enqueued it
@@ -1838,15 +1888,35 @@ Add to `bin/reeve`, beside the existing `case "run":`:
     if (sub !== "run" && sub !== "status")
       die(`usage: reeve build run [--takeover] | reeve build status`);
     const db = openHub(hubPathFor(reeveHome()));
-    if (sub === "status") { printBuildStatus(db); break; }
+    if (sub === "status") {
+      // Defined here rather than referenced: an advertised command that throws
+      // ReferenceError is worse than one that does not exist.
+      const row = db.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get();
+      if (!row) { console.log("builder: not running (no singleton lease)"); break; }
+      const alive = pidAlive(row.pid, row.lstart);
+      console.log(`builder: ${alive ? "running" : "LEASE HELD BY A DEAD PROCESS"}`);
+      console.log(`  pid      ${row.pid} (started ${row.lstart})`);
+      console.log(`  command  ${row.command}`);
+      console.log(`  lease    expires ${new Date(row.expires_at * 1000).toISOString()}`);
+      if (!alive) console.log(`  recover  reeve build run --takeover`);
+      break;
+    }
     // --takeover is PRINTED as the one recovery command, so it has to work.
     // Without parsing it, an operator who follows the instruction is refused
     // exactly as before and the builder stays down until the lease expires --
     // a recovery path that does not recover. Takeover still requires the holder
     // to be provably dead; it only waives the "and the lease has expired" half,
     // which is the half that has nothing to do with whether anyone is there.
+    // ONE startup identity, computed once and reused by the claim, every
+    // heartbeat and the release. Recomputing per call is worse than redundant:
+    // readStart can transiently return null, and a heartbeat passing a different
+    // lstart than the claim silently stops matching its own row. `lstartOf` was
+    // referenced here and never defined; this is the definition.
+    const lstart = readStart(process.pid);
+    if (!lstart) die("cannot read this process's start time; refusing a lease that liveness could never match");
+
     const claim = acquireSingleton(db, {
-      name: "builder", pid: process.pid, lstart: lstartOf(process.pid),
+      name: "builder", pid: process.pid, lstart,
       command: process.argv.slice(1).join(" "), isAlive: pidAlive,
       takeover: flag("takeover"),
     });
@@ -2024,10 +2094,14 @@ openHub(hubPathFor(home)).close();
     `${latestSnapshot(root, "hub")}`);
   const v = validateSnapshot(path, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION });
   check(v.ok === false, "a file that is not a database does not validate");
-  // The real requirement: snapshotAll must not leave one behind either.
-  const before = latestSnapshot(root, "hub");
-  check(before !== path || !existsSync(path),
-    "and the newest snapshot is never a file that failed validation", `${before}`);
+  // The deletion is snapshotAll's job, so the test has to RUN snapshotAll.
+  // Calling validateSnapshot alone leaves the corrupt file in place and the
+  // assertion below passes for the wrong reason -- it never exercised the
+  // code that is supposed to remove it.
+  snapshotAll(home, root);
+  check(!existsSync(path), "and snapshotAll deletes it rather than leaving it as the newest candidate");
+  check(latestSnapshot(root, "hub") !== path,
+    "so latestSnapshot no longer offers a file that would fail at restore time", String(latestSnapshot(root, "hub")));
 }
 
 rmSync(home, { recursive: true, force: true });
@@ -2102,6 +2176,12 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo" } =
     // unusable, and the caller DELETES it. That would leave the hub as the only
     // backed-up store on the machine, while reporting success for it.
     if (kind === "hub") {
+      // schema_version alone is too weak a marker: a physically valid SQLite file
+      // carrying only that table passes, is retained as a usable backup, and is
+      // discovered to be empty at the moment it is restored. hub_event is the
+      // table replay reads and the one migration 1 guarantees, so it is the
+      // marker that actually means "this is a hub".
+      probe.prepare("SELECT count(*) c FROM hub_event").get();
       const version = probe.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
       if (expectVersion != null && version > expectVersion)
         return { ok: false, why: `snapshot is schema version ${version}; this binary knows ${expectVersion}`, version, integrity };
@@ -2448,20 +2528,31 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
   const v = validateSnapshot(snapshotPath, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION });
   if (!v.ok) return { ok: false, why: `the snapshot is not restorable: ${v.why}`, holders: [] };
 
-  let db = null, locked = false;
+  const snapSeq = (() => {
+    const p = new DatabaseSync(snapshotPath, { readOnly: true });
+    try { return p.prepare("SELECT COALESCE(max(seq),0) s FROM hub_event").get().s; } finally { p.close(); }
+  })();
+
+  let live = null, locked = false;
+  const staging = dbPath + ".restoring";
   try {
     if (existsSync(dbPath)) {
-      db = openHub(dbPath);
-      const got = acquireMaintenanceLock(db, { pid, lstart, isAlive });
+      // RAW DatabaseSync, not openHub. openHub applies forward migrations, and
+      // migrating a database is a write -- so opening that way would upgrade a
+      // hub that a builder or a CLI is actively using, before this command has
+      // established it is allowed to touch it at all. The exclusion has to come
+      // before any write, including a well-intentioned one.
+      live = new DatabaseSync(dbPath, { timeout: 10000 });
+      const got = acquireMaintenanceLock(live, { pid, lstart, isAlive });
       if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
       locked = true;
 
       const holders = [];
-      for (const r of db.prepare("SELECT * FROM singleton_lease").all())
+      for (const r of live.prepare("SELECT * FROM singleton_lease").all())
         if (isAlive(r.pid, r.lstart)) holders.push({ what: "builder", pid: r.pid, lstart: r.lstart, command: r.command });
-      for (const r of liveWriters(db, { isAlive }))
+      for (const r of liveWriters(live, { isAlive }))
         holders.push({ what: "cli", pid: r.pid, lstart: r.lstart, command: r.command });
-      for (const r of db.prepare("SELECT * FROM provider_lease WHERE status='held'").all())
+      for (const r of live.prepare("SELECT * FROM provider_lease WHERE status='held'").all())
         if (isAlive(r.pid, r.lstart)) holders.push({ what: r.owner, pid: r.pid, lstart: r.lstart, command: r.run_ref });
 
       if (holders.length && !force) {
@@ -2472,51 +2563,57 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
                `guardian is a normal reason to see this; stop the daemons, or pass force if you are certain.` };
       }
     }
-    // Capture the post-snapshot event tail BEFORE the file is replaced, and
-    // replay it after. Without this the command restores the snapshot and
-    // silently discards every approval, transition and settled effect since it
-    // was taken. The destructive drill passed only because the TEST held the
-    // events in memory and called replayHub itself -- which proves the harness
-    // works and says nothing about what `reeve restore --hub` gives an operator.
-    // The tail can arrive two ways, and both are real. When the live file is
-    // still readable -- a bad restore, an operator rolling back -- the command
-    // reads it itself. When the file is GONE, which is what "destructive" means,
-    // there is nothing to read and the tail must come from a durable export
-    // (`reeve export-events`). Supplying it is therefore not a test affordance:
-    // it is the only path available in the case the drill exists to simulate.
-    let tail = suppliedTail ?? [];
-    if (!suppliedTail && db) {
-      const probe = new DatabaseSync(snapshotPath, { readOnly: true });
-      let snapSeq = 0;
-      try { snapSeq = probe.prepare("SELECT COALESCE(max(seq),0) s FROM hub_event").get().s; } finally { probe.close(); }
-      tail = db.prepare("SELECT seq, at, kind, task, payload FROM hub_event WHERE seq > ? ORDER BY seq").all(snapSeq);
-    }
-    for (const s of ["-wal", "-shm"]) { try { rmSync(dbPath + s, { force: true }); } catch {} }
-    try { db?.close(); db = null; } catch {}
-    copyFileSync(snapshotPath, dbPath);
 
-    // The copy replaced the file the lock lived in, so the restored database
-    // carries whatever lock state the SNAPSHOT had -- almost always none. The
-    // exclusion has to be re-established in the new file BEFORE the replay,
-    // not declared over: a CLI or daemon starting in that window sees an
-    // unlocked database and writes into it while replayHub is still applying
-    // older row images, leaving a projection that mixes the two.
+    // The tail arrives two ways and both are real: read from the live file when
+    // it is still readable, or supplied from a durable `export-events --hub`
+    // when it is gone -- which is what "destructive" means. Either way it is
+    // FILTERED to events after the snapshot's own max seq: the export command
+    // writes the whole log from seq 1, and replaying pre-snapshot rows would
+    // re-apply row images the snapshot already contains, in an order the
+    // snapshot has already superseded.
+    const rawTail = suppliedTail ?? (live
+      ? live.prepare("SELECT seq, at, kind, task, payload FROM hub_event WHERE seq > ? ORDER BY seq").all(snapSeq)
+      : []);
+    const tail = rawTail.filter(e => e.seq > snapSeq).sort((a, b) => a.seq - b.seq);
+
+    // Build the restored database BESIDE the live one, then move it into place
+    // in a single rename. A copy directly over dbPath leaves a window in which
+    // the file at the real path is a fresh database carrying the SNAPSHOT's lock
+    // state -- which is none -- so any writer starting in that window sees an
+    // unlocked hub and writes into it while the replay is still running. There
+    // is no such window here: the live file keeps its maintenance lock right up
+    // until the instant it is replaced, and rename is atomic.
+    try { rmSync(staging, { force: true }); } catch {}
+    copyFileSync(snapshotPath, staging);
     let replayed = 0;
-    const back = openHub(dbPath);
-    try {
-      acquireMaintenanceLock(back, { pid, lstart, isAlive });
-      if (tail.length) replayed = replayHub(back, tail).applied;
-    } finally {
-      try { releaseMaintenanceLock(back, { pid, lstart }); } catch {}
-      back.close();
+    {
+      const back = openHub(staging);
+      try {
+        acquireMaintenanceLock(back, { pid, lstart, isAlive });
+        if (tail.length) replayed = replayHub(back, tail).applied;
+        releaseMaintenanceLock(back, { pid, lstart });
+      } finally { back.close(); }
     }
-    locked = false;   // released above, in the restored file
+
+    // Close the live handle BEFORE removing its sidecars, and treat a failed
+    // removal as fatal rather than swallowing it: a -wal left beside a replaced
+    // main file is replayed into the new database on the next open, which is a
+    // silent merge of two unrelated stores.
+    try { live?.close(); live = null; locked = false; } catch {}
+    for (const ext of ["-wal", "-shm"]) {
+      try { rmSync(dbPath + ext, { force: true }); }
+      catch (e) { return { ok: false, holders: [],
+        why: `could not remove ${dbPath}${ext} (${e.message}); refusing to replace the database, ` +
+             `because a stale write-ahead log beside a restored file is replayed into it on the next open` }; }
+    }
+    renameSync(staging, dbPath);
     return { ok: true, why: null, holders: [], replayed, tail: tail.length };
   } catch (e) {
     return { ok: false, why: `could not restore: ${e.message}`, holders: [] };
   } finally {
-    if (locked && db) { try { releaseMaintenanceLock(db, { pid, lstart }); } catch {} }
-    try { db?.close(); } catch {}
+    if (locked && live) { try { releaseMaintenanceLock(live, { pid, lstart }); } catch {} }
+    try { live?.close(); } catch {}
+    try { rmSync(staging, { force: true }); } catch {}
   }
 }
 ```
@@ -2530,7 +2627,10 @@ Add to `bin/reeve`:
 ```js
   case "export-events": {
     if (!flag("hub")) die("usage: reeve export-events --hub <file>");
-    const out = positionals[1] ?? die("export-events --hub needs a destination file");
+    // positionals[0] is the destination: `export-events` is the subcommand and is
+    // not itself a positional under this parser, so index 1 was always undefined
+    // and the command could never run.
+    const out = positionals[0] ?? die("usage: reeve export-events --hub <file>");
     const db = openHub(hubPathFor(reeveHome()));
     const rows = db.prepare("SELECT seq,at,kind,task,payload FROM hub_event ORDER BY seq").all();
     writeFileSync(out, rows.map(r => JSON.stringify(r)).join("\n") + (rows.length ? "\n" : ""));
@@ -2766,6 +2866,12 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
   }
   return out;
 }
+```
+
+`src/doctor.mjs` must import what `hubFindings` reads — the healthy-snapshot path evaluates `HUB_SCHEMA_VERSION`, so without the import the ordinary case throws `ReferenceError` and only the already-broken cases return a finding:
+
+```js
+import { HUB_SCHEMA_VERSION } from "./build/hubdb.mjs";
 ```
 
 Wire `hubFindings` into `reeve builder doctor` and its `--json` output, and extend `selfaudit.mjs` to assert the hub's `integrity_check` alongside the per-repo stores.
@@ -3197,6 +3303,6 @@ Codex is a mandatory serial witness; a clean pass at the current head opens the 
 
 **Placeholder scan.** Clean; every `TBD` hit is the guard test in Task 11 that forbids them.
 
-**Type consistency.** `hubPathFor`, `openHub`, `hubTx`, `hubEvent -> seq`, `COMPARISON_SET`, `validateSnapshot({kind, expectVersion})`, `restoreHub({..., tail}) -> {ok, why, holders, replayed, tail}`, `acquireSingleton({..., takeover})`, `assertWritable({..., inTx})`. The `task.phase` CHECK is asserted equal to S2-B's `phases.mjs` enumeration by Task 11's cross-check, which is why that check lives in this plan and not in B.
+**Type consistency.** `hubPathFor`, `openHub`, `hubTx`, `hubEvent -> seq`, `COMPARISON_SET`, `validateSnapshot({kind, expectVersion})`, `restoreHub({..., tail}) -> {ok, why, holders, replayed, tail}`, `acquireSingleton({..., takeover})`, `assertWritable({..., inTx})`. The `task.phase` CHECK is the authoritative 21-state enumeration. The assertion comparing it with S2-B's `phases.mjs` lives **in S2-B**, not here: `phases.mjs` does not exist until B, so importing it from this plan's cross-check would fail on every run. B introduces the second copy and B asserts the two agree. Stated plainly because an earlier draft of this self-review claimed the check was here — the kind of claim a reader believes without checking.
 
 **What the four review rounds changed here**, in `2026-08-23-s2-review-history.md`: the 20-way race made genuinely concurrent; the crash drill given a real precondition (the SQLITE_BUSY probe); `validateSnapshot` stopped deleting every guardian snapshot; `restore --hub` made to replay its own tail, with a CLI route to produce one; the migration version re-read under the lock; `build run` made to hold and release its lease.

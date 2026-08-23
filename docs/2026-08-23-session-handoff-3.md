@@ -20,13 +20,33 @@ The companion resume prompt is `docs/2026-08-23-resume-prompt-3.md`.
 
 ### The three open PRs
 
-| PR | Branch | Worktree | Head | Threads | Open |
-|---|---|---|---|---|---|
-| **#11** S2-A: the hub store | `plan/s2a-hub-store` | `~/Work/Products/reeve-wt/pa` | `69cccdf` | 46 | **0** |
-| **#12** S2-B: the phase machine | `plan/s2b-phase-machine` | `~/Work/Products/reeve-wt/pb` | `73086e7` | 72 | **12** |
-| **#13** S2-C: the provider scheduler | `plan/s2c-provider-scheduler` | `~/Work/Products/reeve-wt/pc` | `6209dda` | 75 | **13** |
+| PR | Branch | Worktree |
+|---|---|---|
+| **#11** S2-A: the hub store | `plan/s2a-hub-store` | `~/Work/Products/reeve-wt/pa` |
+| **#12** S2-B: the phase machine | `plan/s2b-phase-machine` | `~/Work/Products/reeve-wt/pb` |
+| **#13** S2-C: the provider scheduler | `plan/s2c-provider-scheduler` | `~/Work/Products/reeve-wt/pc` |
 
-**193 review threads total. 25 open. No Codex clean pass on any PR yet.**
+**Head SHAs and open-thread counts are deliberately not written here.** A new
+Codex round has landed roughly every twenty minutes for the whole programme —
+one arrived three minutes after a push — so any number transcribed into this
+document is wrong by the time it is read, and a stale number that looks
+authoritative is worse than no number. Read the live state instead:
+
+```bash
+for n in 11 12 13; do
+  echo -n "#$n head=$(gh api repos/revnix/reeve/pulls/$n --jq .head.sha | cut -c1-7) open="
+  gh api graphql -f query='query($n:Int!){repository(owner:"revnix",name:"reeve"){pullRequest(number:$n){
+    reviewThreads(first:100){nodes{id isResolved path line comments(first:1){nodes{author{login} body}}}}}}}' \
+    -F n=$n --jq '[.data.repository.pullRequest.reviewThreads.nodes[]|select(.isResolved==false)]|length'
+done
+```
+
+**No Codex clean pass has ever arrived on any of the three.** Verified with a
+positive control on 2026-08-23: `repos/revnix/reeve/issues/<n>/comments` returns
+comments (all of them `@codex review` requests from the founder's account) and
+**zero** from any bot — so every verdict so far has been a review object with
+findings, and the absence of a clean pass is real rather than a query artefact.
+
 **Nothing may be merged without Mobeen's explicit per-PR grant.**
 
 ---
@@ -66,16 +86,9 @@ refused in code. S2 does not change that.
 5. **Armed a 15-minute watcher** and worked review rounds continuously: 54 more
    findings in round 1 of the split, then 36, then 33, then 32.
 
-### Cumulative findings per plan
-
-| | r1 | r2 | r3 | r4 | r5 |
-|---|---|---|---|---|---|
-| **A** (#11) | 16 | 13 | 4 | 6→0 | 7→0 |
-| **B** (#12) | 21 | 14 | 18 | 7→0 | 12 open |
-| **C** (#13) | 17 | 9 | 22 | 14→0 | 13 open |
-
-All three have reached zero at least once. Re-openings are **new rounds against
-newly-added text**, not regressions — every fix adds surface.
+6. **Worked the rounds continuously** through 2026-08-23. The per-round counts
+   are in §8; the summary is that every plan has reached zero open at least
+   twice, and a new round has arrived against the newly-added text each time.
 
 ---
 
@@ -186,7 +199,43 @@ pattern in those rounds.
 
 ---
 
-## 8. What remains — the 25 open findings
+## 8. What remains — read it live, not from here
+
+The open findings are whatever the query in §1 returns. They are **not** listed
+here: two full rounds were worked on 2026-08-23 after this document was first
+written, every thread named in the original version of this section has been
+resolved, and a new round landed against the newly-added text within minutes of
+each push. A transcribed list would send a fresh session to chase threads that
+closed hours earlier.
+
+What is durable is the *shape* of what comes back, which has been stable for six
+rounds and is worth knowing before reading any of them:
+
+- **Roughly one finding in ten needs reframing rather than applying.** Two in the
+  2026-08-23 rounds were factually wrong and were refuted with a measurement
+  rather than applied (see §11's SQLite page-corruption row). Several others were
+  sharper than they first read.
+- **The commonest real defect is a test that would pass on the broken
+  implementation.** Verify that property yourself for every test the round
+  touches, whether or not the finding mentions it.
+- **The second commonest is an interface that a task's own implementation does
+  not honour** — a declared parameter the signature drops, a documented
+  escalation nothing emits, a promised recording no code produces.
+- **When a finding names one instance, sweep the class.** Fixing the named site
+  and leaving its siblings has been a repeat finding in its own right.
+
+### The rounds worked on 2026-08-23 (for the pattern, not to re-do)
+
+| | r1 | r2 | r3 | r4 | r5 | r6 | r7 |
+|---|---|---|---|---|---|---|---|
+| **A** (#11) | 16 | 13 | 4 | 6 | 7 | 8 | 5 |
+| **B** (#12) | 21 | 14 | 18 | 7 | 12 | 13 | — |
+| **C** (#13) | 17 | 9 | 22 | 14 | 13 | 16 | — |
+
+Every one of the three has reached zero open at least twice. Re-openings are new
+rounds against text a previous round's fixes added, not regressions.
+
+### The original section 8, for reference
 
 ### #12 (S2-B) — 12 open
 

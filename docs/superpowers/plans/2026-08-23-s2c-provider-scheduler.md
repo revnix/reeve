@@ -29,7 +29,7 @@ Both must be merged first, in that order.
 | from | name | shape |
 |---|---|---|
 | S2-A `src/build/hubdb.mjs` | `openHub`, `hubTx`, `hubEvent` | as in S2-A |
-| S2-A `src/build/hub.sql` | `provider_lease`, `provider_state` | including `provider_one_live_request` UNIQUE over `(owner, repo_id, run_ref)` where status is live |
+| S2-A `src/build/hub.sql` | `provider_lease`, `provider_state` | including `provider_one_live_request` UNIQUE over `(owner, repo_id, run_ref)` where status is live, plus the `preempt_requested` and `refused_release` columns this plan writes |
 | | `pr_hold` | with `one_open_hold` partial UNIQUE on `(repo_id, pr)` where `cleared_at IS NULL` |
 | | `maintenance_lock` | the restore exclusion |
 | S2-A `src/build/locks.mjs` | `assertWritable(db, {isAlive, at, inTx})` | **every provider mutation calls it**, inside its own transaction |
@@ -147,8 +147,10 @@ Each task names any imports it needs **beyond** these.
 ### Task 21: `src/provider.mjs` — the admission rule
 
 **Files:**
-- Create: `src/provider.mjs`
-- Test: `test/provider-scheduler.test.mjs`
+- Create: `src/build/providerdb.mjs` (every scheduler statement — the hub owns its own SQL, as `hubdb.mjs` does), `src/provider.mjs` (the shared policy layer that imports them)
+- Test: `test/provider-scheduler.test.mjs`, `test/provider-race.test.mjs`
+
+`src/provider.mjs` holds **no SQL**. It holds the admission rule, the reservation arithmetic and the cooldown comparison, and calls `providerdb.mjs` for every read and write. That keeps "no raw SQL outside `src/db/` and `src/build/`" true, and means the guardian imports a policy function rather than a query builder.
 
 **Interfaces:**
 - Consumes: `openHub`, `hubTx`, `hubEvent` (PR-A).
@@ -156,11 +158,12 @@ Each task names any imports it needs **beyond** these.
   - `claimProvider(db, { owner, repoId, runRef, pid, lstart, priority = 0, budgetUsd = null, isAlive, now }) -> { ok: true, id } | { ok: false, reason: 'queued'|'cooldown'|'at-limit'|'maintenance', until }`
   - **Where the SQL lives.** The Global Constraints say no raw SQL outside `src/db/` and `src/build/`, and `src/provider.mjs` is neither — it sits at the top level because both daemons import it. Resolve it by keeping the statements in `src/build/providerdb.mjs` (the hub owns its own SQL, as `hubdb.mjs` does) and making `src/provider.mjs` the shared **policy** layer that imports them: the admission rule, the reservation arithmetic, the cooldown comparison. That also puts the boundary in the right place — the guardian imports a policy function, not a query builder, and the statement allowlist in Task 23 is checking a surface that has exactly one definition.
   - **Every provider mutation calls `assertWritable` inside its own transaction** (`inTx: true`), exactly as `withWriterLease` does. Without it a guardian can take a held lease and launch a worker after `restoreHub` has acquired `maintenance_lock` and finished its holder scan — reopening the writer race the lock exists to close, from the one code path that is allowed to write the hub without holding a writer lease. `assertWritable` throws; `claimProvider` catches and returns `reason: 'maintenance'`, which the guardian treats exactly like `at-limit`: it does not dispatch, and it does not escalate, because a restore in progress is an operator action rather than a fault.
-  - `releaseProvider(db, { id, force })` — deletes the row. **A release refused because a restore holds `maintenance_lock` must not be dropped**: `assertWritable` throws, and the caller retries on the next tick with the lease id recorded in memory; until it succeeds the row is reaped by expiry anyway, so the slot is never lost permanently. Silently swallowing the refusal is what would leak a held lease for a full lease window.
+  - `releaseProvider(db, { id, force })` — deletes the row. **A release refused because a restore holds `maintenance_lock` must not be dropped**: `assertWritable` throws, and the caller retries on the next tick with the lease id recorded in memory; the refusal is ALSO recorded durably on the row (`refused_release`), because the daemon can restart before the retry and an in-memory id does not survive that. The reaper treats a row so marked as releasable once the lock clears, in addition to the pid+lstart expiry path — expiry alone would hold the slot for a full lease window after every restore.
   - `heartbeatProvider(db, { id, now })`, `reapProviderLeases(db, { isAlive, now })`
+  - `bindProviderLease(db, { id, pid, lstart })` — re-binds a held row from the daemon to the spawned worker.
   - `cancelQueued(db, { owner, repoId, runRef })` — removes a `queued` request whose dispatch is no longer going to happen. A guardian that queues and then finds the PR closed, the head moved, or the tick abandoned must withdraw: a queued guardian request **blocks the next builder admission by design**, so an abandoned one starves the builder indefinitely and looks exactly like a busy guardian. Called on every path out of the dispatch block that did not launch.
   - **The lease is bound to the WORKER, not the daemon.** `claimProvider` records the daemon's pid+lstart at request time because the worker does not exist yet; the dispatch path then re-binds the row to the spawned process (`pid`, `lstart` from the same fail-closed `onSpawn` that records the run) via `bindProviderLease(db, { id, pid, lstart })`. Without that, liveness is asked about a long-lived daemon that is always alive, so a worker that dies takes its slot with it until expiry, and `reapProviderLeases` — whose whole basis is pid+lstart death — can never fire.
-  - **Preemption at a safe boundary** (§10.4, `builder.provider.preemptAtBoundary`, default true): when a guardian request is `queued` and every slot is held by builder leases, the builder marks the youngest builder lease `preempt_requested` rather than revoking it. The builder loop reads that flag **at phase boundaries only** and releases there; nothing is ever killed mid-phase. S2 ships the flag, the write, and the read; the builder loop that acts on it is S4's, and until then the flag is set and observed by the doctor rather than acted on — stated so it is a declared gap and not a silent one.
+  - **Preemption at a safe boundary** (§10.4, `builder.provider.preemptAtBoundary`, default true): when a guardian request is `queued` and every slot is held by builder leases, the builder marks the youngest builder lease `preempt_requested` rather than revoking it. **The column is `provider_lease.preempt_requested`, added by S2-A's migration 1** (`INTEGER NOT NULL DEFAULT 0 CHECK (preempt_requested IN (0,1))`), and it is listed in this plan's consumed-interfaces table: a flag with nowhere to live is a contract with no storage. The builder loop reads that flag **at phase boundaries only** and releases there; nothing is ever killed mid-phase. S2 ships the flag, the write, and the read; the builder loop that acts on it is S4's, and until then the flag is set and observed by the doctor rather than acted on — stated so it is a declared gap and not a silent one.
   - `noteRateLimit(db, { signature, now, cooldownSeconds })` — sets `cooldown_until`, `last_429_at`, `last_signature`.
   - `providerDefaults()` → `{ concurrencyLimit: 2, guardianReserved: 1 }` until S3's `build measure-provider` writes measured values with `measured_at`.
 
@@ -252,8 +255,37 @@ const ALIVE = () => true, DEAD = () => false;
 
 // ── two daemons racing for the last slot: real processes ─────────────────────
 {
-  /* same 20-child pattern as test/hub-locks.test.mjs, with limit=1 and
-     ten guardian children racing ten builder children */
+  // Written out, not referred to. A comment pointing at another file's pattern
+  // is not a test, and this is the ONLY check that admission is transactional:
+  // every single-process assertion above passes against a read-then-write
+  // implementation with no transaction at all.
+  const p = join(dir, "race.db");
+  openHub(p).close();
+  const worker = join(dir, "provider-race-worker.mjs");
+  writeFileSync(worker, `
+import { existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { openHub } from "${SRC}/build/hubdb.mjs";
+import { claimProvider } from "${SRC}/provider.mjs";
+const db = openHub(process.argv[2]);
+const [, , , id, go, ready] = process.argv;
+writeFileSync(join(ready, id), "");
+while (!existsSync(go)) {}
+const r = claimProvider(db, { owner: Number(id) % 2 ? "guardian" : "builder", repoId: 1,
+  runRef: "r:" + id, pid: 1000 + Number(id), lstart: "L" + id, isAlive: () => true });
+console.log(r.ok ? "HELD" : "no");
+`);
+  const go = join(dir, "go"), ready = join(dir, "ready");
+  mkdirSync(ready, { recursive: true });
+  const kids = Array.from({ length: 20 }, (_, i) => new Promise((res) => {
+    const c = spawn(process.execPath, [worker, p, String(i), go, ready], { encoding: "utf8" });
+    let out = ""; c.stdout.on("data", d => out += d);
+    c.on("exit", () => res(out.trim()));
+  }));
+  for (let i = 0; i < 400 && readdirSync(ready).length < 20; i++) await new Promise(r => setTimeout(r, 25));
+  check(readdirSync(ready).length === 20, "control: all 20 children reached the barrier before the start");
+  writeFileSync(go, "");
+  const held = (await Promise.all(kids)).filter(r => r === "HELD").length;
   check(held === 1, `exactly one of 20 racing processes holds the last slot (got ${held})`);
 }
 ```
@@ -419,7 +451,12 @@ In `src/daemon.mjs`, immediately after the halt check at line 712:
       let lease = null;
       // Resolved once per tick, not per PR. A missing numeric id is a
       // configuration error, not a reason to write a colliding lease row.
-      const repoId = ctx.repoId ?? profile.identity?.repoId ?? null;
+      // `profile.identity.repoId` is not a field the profile schema defines, so
+      // that fallback was always null. The numeric id reeve already holds is the
+      // one the inbox recorded when it observed this repository; read it from
+      // the store and fail closed if absent, rather than inventing a profile key
+      // this plan does not add to FIELDS.
+      const repoId = ctx.repoId ?? repoIdFor(ctx.db, ctx.nwo);
       if (ctx.hub && repoId == null) {
         escalations.set("the repository numeric id is missing from the profile; provider leases cannot be scoped", 1);
       } else if (ctx.hub) {
@@ -493,11 +530,19 @@ And on a rate-limit exit, before the `finally` releases:
 
 ```js
     // in bin/reeve, case "run": beside `db: open(dbPath)`
-    hub: (() => {
+    // A GETTER, not a value computed once. A destructive restore replaces the
+    // file underneath this connection, and a long-lived handle then points at a
+    // deleted inode for the rest of the process's life -- failing open forever
+    // while the hub is in fact healthy, which is the worst version of fail-open
+    // because nothing ever reports it. Each access cheaply probes the handle and
+    // reopens if it has gone stale.
+    get hub() {
       const hp = hubPathFor(HOME);
-      if (!existsSync(hp)) return null;          // no hub yet: fail open, by design
-      try { return openHubAsGuest(hp); } catch { return null; }
-    })(),
+      if (!existsSync(hp)) { this._hub = null; return null; }
+      try { this._hub?.prepare("SELECT 1").get(); return this._hub; }
+      catch { try { this._hub = openHubAsGuest(hp); } catch { this._hub = null; } }
+      return this._hub;
+    },
     lstart: readStart(process.pid),
 ```
 
@@ -538,6 +583,7 @@ git commit -m "feat(daemon): claim provider quota before dispatch, fail open"
 
 **Interfaces:**
 - Consumes: `hubPathFor` (PR-A).
+- **Implement this task's `src/build/hubguest.mjs` FIRST.** Task 22 appears earlier in this document and its production initialisation imports `openHubAsGuest`; an executor working in document order needs the module to exist before that wiring resolves.
 - Produces: `openHubAsGuest(path) -> DatabaseSync` — a connection whose `prepare`/`exec` refuse any statement outside the allowlist: `INSERT`/`UPDATE`/`DELETE`/`SELECT` on `provider_lease` and `provider_state`, `SELECT` on `pr_hold`, `SELECT`/`DELETE` on `maintenance_lock`, and the three transaction-control statements `BEGIN IMMEDIATE`, `COMMIT`, `ROLLBACK`.
 
 **On §13's "exactly two touches".** §13 says the guardian *writes* the provider scheduler and *reads* `pr_hold`, and nothing else. `maintenance_lock` is a third table, so the wording and this allowlist have to be reconciled rather than quietly diverged. They are reconciled this way: the lock is not a third **surface**, it is the precondition on the two it already has. Every hub writer checks it before writing — that is the property S2-A established for the singleton, the writer lease and every provider mutation alike — and a guardian that could write `provider_lease` while a restore is replacing the file would reopen the race the lock exists to close. The `DELETE` is the ordinary reap of a lock whose holder is provably dead, identical to what every other writer does; it grants no new reach. The design's sentence describes surfaces the guardian acts *on*; this is the check it acts *under*. Worth a line in §13 when the design is next amended, so the two do not read as contradictory to someone checking. Everything else throws, naming the statement.
@@ -601,6 +647,13 @@ const refused = [
   ["DROP TABLE task", "drop anything"],
   ["ATTACH DATABASE 'other.db' AS o", "attach another database"],
   ["PRAGMA writable_schema=ON", "reach the schema sideways"],
+  // A verb-and-table extraction does not enforce a table boundary: the FROM
+  // clause names only the FIRST table. Each of these reaches a forbidden table
+  // through a permitted one.
+  ["SELECT * FROM provider_lease JOIN task ON 1=1", "join a forbidden table onto a permitted one"],
+  ["SELECT (SELECT count(*) FROM approval) FROM provider_lease", "read a forbidden table in a subquery"],
+  ["SELECT * FROM provider_lease UNION SELECT * FROM merge_decision", "union a forbidden table"],
+  ["INSERT INTO provider_lease SELECT * FROM merge_decision", "insert FROM a forbidden table"],
 ];
 for (const [sql, name] of refused) {
   let why = null; try { g.prepare(sql); } catch (e) { why = e.message; }
@@ -643,7 +696,7 @@ for (const [sql, name] of refused) {
 
 - [ ] **Step 2–4: Run it red, implement, run green, commit**
 
-Implement `openHubAsGuest` by wrapping `DatabaseSync` and gating `prepare`/`exec` on a parsed statement: extract the verb and the table, and refuse anything not in the map. Refuse `ATTACH`, `PRAGMA` writes, and multi-statement strings outright — a permissive parser is a hole, so the wrapper allows a **closed list of statement shapes** rather than trying to spot forbidden ones.
+Implement `openHubAsGuest` by wrapping `DatabaseSync` and gating `prepare`/`exec`. **Extracting the verb and the first table is not enough**: the first table is only the first one named, so a join, a subquery, a UNION or an `INSERT ... SELECT` reaches a forbidden table through a permitted one. Match against a closed list of permitted statement shapes, and additionally refuse any statement whose text mentions a table identifier outside the allowlist **anywhere**, whatever its position. Refuse `ATTACH`, `PRAGMA` writes, and multi-statement strings outright — a permissive parser is a hole, so the wrapper allows a **closed list of statement shapes** rather than trying to spot forbidden ones.
 
 **On the broken implementation** — an allowlist checked by table name with a naive `sql.includes("provider_lease")` — the allowed list passes and `refused: enqueue an effect` goes red, because `INSERT INTO outbox ... VALUES('k','notify',...)` contains no table from the allowlist and yet a substring check that looks for *forbidden* names rather than matching *permitted shapes* lets it through. That inversion is the most likely wrong implementation here.
 
@@ -817,6 +870,6 @@ Do **not** restart the daemon or run `launchctl` as part of executing this plan.
 
 **Placeholder scan.** Clean.
 
-**Type consistency.** `claimProvider -> {ok, id} | {ok:false, reason, until}` with `reason ∈ {queued, cooldown, at-limit, maintenance}`; `holdClause(hub, {repoId, pr, isBuilderPr}) -> {id, state, detail}` with `state ∈ {PASS, BLOCK, UNKNOWN}`; `openHubAsGuest(path)`.
+**Type consistency.** `claimProvider -> {ok, id} | {ok:false, reason, until}` with `reason ∈ {queued, cooldown, at-limit, maintenance, no-identity}` (`no-identity` is the fail-closed result when `readStart` returns null: a distinct reason rather than a throw or a silent admit, because "quota says no" and "this process cannot be identified" need different responses — the first retries next tick, the second must not start the work at all); `holdClause(hub, {repoId, pr, isBuilderPr}) -> {id, state, detail}` with `state ∈ {PASS, BLOCK, UNKNOWN}`; `openHubAsGuest(path)`.
 
 **The two things this plan must not get wrong.** The guardian **fails open** when the hub is unreadable (founder decision, 2026-08-22): the scheduler restrains the builder and must never become a new way to silence the watchman, and a `ctx` with no `hub` key at all still dispatches — asserted directly, because that is what keeps every pre-existing guardian test green. And the allowlist must permit what `assertWritable` needs (`SELECT`/`DELETE` on `maintenance_lock`) and the transaction-control statements `hubTx` issues; an allowlist scoped to tables alone refuses the guardian its own admission transaction, which review caught only after a round in which one fix broke another.

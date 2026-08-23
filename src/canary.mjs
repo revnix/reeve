@@ -36,18 +36,46 @@ const canonical = v => {
  * every run and says nothing about what the sandbox denies.
  */
 export function canaryIdFor({ cliVersion, sandbox, binaryId = null, worktree = null, permissionsDeny = null, allowedTools = null,
-                              script = null }) {
+                              instrument = null }) {
   if (!cliVersion || !sandbox) throw new Error("canaryIdFor: cliVersion and the sandbox block are required");
-  // The SCRIPT is part of the identity too, because it is the instrument. A
-  // record made before a probe existed describes a weaker measurement than the
-  // one being asked for now, and reusing it is how the by-path keychain reach
-  // stayed unmeasured while a passing record said containment was closed.
-  // Per-invocation paths inside it (the decoy, the tmp dir) normalise out, or
-  // every tick would pay for another five-minute canary.
-  const instrument = script ? createHash("sha256").update(canonical(normaliseRules(String(script).split("\n"), worktree))).digest("hex").slice(0, 12) : "?";
+  // The INSTRUMENT is part of the identity too. A record made before a probe
+  // existed describes a weaker measurement than the one being asked for now, and
+  // reusing it is how the by-path keychain reach stayed unmeasured while a
+  // passing record said containment was closed.
+  //
+  // It arrives as `instrumentHash()`, not as the script text. Hashing the script
+  // itself put a per-invocation listener port and two mkdtemp paths into the id,
+  // so two runs of the SAME policy and the SAME script produced different ids --
+  // measured 2026-08-23, changing only the listener port changed the id. The
+  // cache key was computed WITHOUT the script to stay stable, which meant the
+  // instrument was in the recorded id and not in the key, and a changed script
+  // never invalidated a cached pass. The normalised hash is stable, so one value
+  // serves as both. (Codex #10-[4] adjacent; found while measuring it.)
   return createHash("sha256").update(
-    `${cliVersion}\n${binaryId ?? "?"}\n${canonical(normalisePolicy(sandbox, worktree))}\n${canonical(normaliseRules(permissionsDeny, worktree))}\n${canonical(normaliseRules(allowedTools, worktree))}\n${instrument}`,
+    `${cliVersion}\n${binaryId ?? "?"}\n${canonical(normalisePolicy(sandbox, worktree))}\n${canonical(normaliseRules(permissionsDeny, worktree))}\n${canonical(normaliseRules(allowedTools, worktree))}\n${instrument ?? "?"}`,
   ).digest("hex").slice(0, 16);
+}
+
+/**
+ * The identity of the canary INSTRUMENT: its script with every per-invocation
+ * value replaced by a placeholder.
+ *
+ * The script embeds the run's tmp and outside directories, its decoy paths and
+ * the daemon-local listener's URL. All of those move every invocation, so the
+ * script's own text cannot identify the instrument -- but what the script DOES
+ * is exactly what must be identified, so that adding a probe invalidates a pass
+ * taken before it existed.
+ *
+ * `hasNet` is the one thing that changes what the script does rather than where
+ * it points: with no listener the network positive control is absent, and a pass
+ * measured without it is a weaker measurement.
+ */
+export function instrumentHash({ hasNet = false } = {}) {
+  return createHash("sha256").update(canaryScript({
+    tmpDir: "<tmp>", outsideDir: "<outside>", decoyPath: "<decoy>",
+    netUrl: hasNet ? "<net>" : null,
+    fileDecoyPath: "<file-decoy>", fileControlPath: "<file-control>",
+  })).digest("hex").slice(0, 12);
 }
 
 /**
@@ -337,7 +365,12 @@ export async function sandboxCanary({
   // belongs in the id: a record made before a probe existed describes a weaker
   // measurement than the one being asked for now.
   const scriptText = canaryScript({ tmpDir, outsideDir, decoyPath, netUrl: netProbe?.url ?? null, fileDecoyPath, fileControlPath });
-  const id = canaryIdFor({ cliVersion, sandbox, binaryId, worktree: dir, permissionsDeny, allowedTools, script: scriptText });
+  // `!!netProbe`, not `!!netProbe.url`, so this is computable BEFORE the script
+  // exists -- which is what lets `measureContainment` key its cache on the same
+  // value. The two can only disagree when a listener was handed over and failed
+  // to bind, and a canary whose network control is missing fails on that alone.
+  const id = canaryIdFor({ cliVersion, sandbox, binaryId, worktree: dir, permissionsDeny, allowedTools,
+                           instrument: instrumentHash({ hasNet: !!netProbe }) });
   const evidence = { id, cliVersion, dir, outcome: null, why: null, results: null, readTool: null, writeTool: null, network: null };
   const fail = why => ({ ok: false, id, why, evidence });
 

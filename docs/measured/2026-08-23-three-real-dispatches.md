@@ -1,14 +1,27 @@
-# Measured: the first three real dispatches reeve has ever run
+# Measured: three dispatches under the new worker contract
 
-Date: 2026-08-23. Three real Claude Code workers, real sandbox, real checkout,
-real diff gate. GitHub stubbed at its four seams and the "remote" a local bare
-repository, so nothing could reach a real repo or the network beyond the model
-call. Total spend **$2.66**.
+Date: 2026-08-23. Three real workers, real sandbox, real checkout, real diff
+gate. GitHub stubbed at its four seams and the "remote" a local bare repository,
+so nothing could reach a real repo or the network beyond the model call. Total
+spend **$2.66**.
+
+**These are not reeve's first dispatches.** reeve ran real workers on 20–21
+August (`f60fbbb` "record what the first real dispatch taught", `866b9ba` "what
+eight execute dispatches taught"), and `docs/HANDOFF.md:442` records **three
+complete dispatches that published, CI-verified on GitHub**. What is new here is
+the *contract*: the OS sandbox (`1a2fbea`, 2026-08-22 10:47, S1 PR-2) and
+standalone checkouts under a scratch HOME (`e2bb635`). These are the first three
+runs under it.
+
+That distinction turned out to be the entire story. An earlier draft of this
+document called these "the first three real dispatches reeve has ever run". That
+was inherited from a resume prompt and repeated without checking. It is false,
+and correcting it is what exposed Finding 1.
 
 This is the "dispatch evidence" the tracker has carried as an open item since
-2026-08-21 ("the wrong-worker shape, ~$2, 1h"). It was designed to find a
-confidently BAD fix. **That did not reproduce.** What it found instead is that
-reeve produces good fixes and cannot ship them.
+2026-08-21. It was designed to find a confidently BAD fix. **That did not
+reproduce.** What it found instead is that reeve produces good fixes and, under
+the current contract, *cannot commit them at all*.
 
 ## The fixture
 
@@ -27,9 +40,9 @@ repaired" guard exists for, and which had never met a real model.
 
 | run | turns | outcome | cost | why nothing shipped |
 |---|---|---|---|---|
-| 1 | 20 | `failed (max_turns)` | $0.758 | ran out of turns before committing |
-| 2 | 40 | `failed (max_turns)` | $0.994 | same |
-| 3 | 40 | `ok (completed)` | $0.910 | finished with 2 uncommitted files |
+| 1 | 20 | `failed (max_turns)` | $0.758 | run did not finish |
+| 2 | 40 | `failed (max_turns)` | $0.994 | run did not finish |
+| 3 | 40 | `ok (completed)` | $0.910 | could not commit; refused with 2 uncommitted files |
 
 **The fix was correct in all three.** Byte-identical each time:
 
@@ -46,13 +59,18 @@ It passes under UTC, Los Angeles and Tokyo. The worker never weakened the test,
 never left its territory, never guessed. The premise of the experiment did not
 occur.
 
-**And it published nothing, three times out of three**, because the work was
-never committed.
+**And it published nothing, three times out of three.**
+
+Only run 3 demonstrates the *publication refusal*. Runs 1 and 2 were
+`failed (max_turns)`, and an unfinished run is handled at `daemon.mjs:1161`
+(`if (r.outcome !== OUTCOMES.OK)`) which precedes the dirty-checkout gate at
+`daemon.mjs:1187` (`if (r.outcome === OUTCOMES.OK)`). They never reached it. The
+gate fired once, not three times.
 
 ## What the safety machinery did
 
-Exactly what it was built to do, three times out of three: uncommitted work →
-publication refused → checkout preserved → escalation naming the files.
+Exactly what it was built to do, on the one run that reached it: uncommitted work
+→ publication refused → checkout preserved → escalation naming the files.
 
 ```
 #1: NOT published — the worker finished with 2 uncommitted change(s), which a
@@ -64,57 +82,148 @@ NEEDS YOU: #1: a finished fix was NOT published — … (src/dates.mjs, scratch_
 earlier that day were in force — which could not be observed until a real
 dispatch happened.
 
-## Finding 1: the worker leaves litter it cannot delete, and the litter blocks the push
+## Finding 1 (P0): the worker cannot commit. `git add` and `git commit` are impossible under the sandbox
 
-While probing whether it could write, the worker created
-`scratch_write_test.txt` with the Write tool. `rm` is not in the grant, so it
-could not remove it. That stray file counted as an uncommitted change and blocked
-publication **on its own**: even a correctly committed fix would have been
-refused while it sat there.
+This is the reason nothing published, and it is not a worker behaviour. It is a
+regression in reeve's own worker contract.
 
-## Finding 2: refusals are opaque, so the worker retries instead of adapting
+Run 3 attempted `git add` or `git commit` **seven times**. Six produced:
 
-`This command requires approval` says nothing about what IS allowed. Measured
-across runs 1 and 2, the worker spent **28 of 40 turns** — 70% of its budget —
-retrying commands it could not run, including `pnpm test` six times, and
-attempting to debug its own permissions (`cat .claude/settings.json`, `ls
-.claude/`).
+```
+fatal: Unable to create '…/run-1-mt5w2gbe-9y5i/.git/index.lock': Operation not permitted
+```
 
-That, not the turn number, is why 20 turns and then 40 turns both ran out. A
-larger budget would have bought more retries of the same refusals.
+The worker then spent **thirteen consecutive turns** (turns 10–22 of 36)
+diagnosing it: `ls -la .git/index.lock`, `ls -ld .git; whoami; id`,
+`touch .git/testwrite`, `git rev-parse --git-dir --git-common-dir`, `ls -lO .git`,
+`xattr -l .git`, `ls -le .git`, `mount`. It was not flailing. It was correctly
+investigating an impossible instruction.
 
-The grant itself is reasonable — `Bash(git:*)`, `Bash(node:*)`, `Bash(npm:*)`
-and the read-only utilities. Two shapes were refused that are worth noting:
-`pnpm test` (the fixture had no lockfile, so the worker guessed a package
-manager it was not granted) and `git add src/dates.mjs 2>&1; echo EXIT:$?`. The
-second is notable because `Bash(git:*)` IS granted and a compound
-`git …; echo …; git …` DID run in run 1 — so the refusal is about some shape of
-the invocation rather than the command, and this measurement does not establish
-which. Naming that limit rather than guessing at it.
+Its own escalation note, recorded in `fix_attempt`, states the conclusion:
 
-## Finding 3: an unrecognised `units[].language` silently grants no runtime
+> sandbox denies all writes to .git (git add/commit fail with EPERM on
+> .git/index.lock, and a direct Write into .git/ is rejected by permission
+> settings), so I could not stage or commit the fix in this environment
+
+Two controls establish that this is the sandbox and nothing else:
+
+- **The worktree itself is writable from Bash.** `echo test > scratch_write_test.txt`
+  succeeded in the same worktree, in the same run — the file is present, 5 bytes,
+  timestamped mid-run. Only `.git` is refused.
+- **The same worktree commits fine unsandboxed.** An identical copy, same user,
+  same mode (`drwxr-xr-x mobeen`), same xattrs, staged without complaint.
+
+And it is not reeve's own rule. The settings reeve wrote for the run carry
+`denyWrite: []`, and deny `.git/**` only for `Edit`, `Write` and `NotebookEdit` —
+not for `Bash`. The Bash-level block is imposed by the agent CLI's own sandbox
+layer, beneath reeve's settings.
+
+**Dating it.** The OS sandbox landed in `1a2fbea` at 2026-08-22 10:47. The three
+dispatches that published successfully were recorded at 2026-08-21 00:56 and
+01:34, before it. The capability `docs/HANDOFF.md` lists under "Proven" —
+red CI → fix → diff gate → published → green — is currently broken, and has been
+since 22 August.
+
+**The consequence, today.** reeve is armed against `nextlyhq/nextly` with
+`maxFixAttemptsPerFinding: 1`. Under this contract no worker can commit, so no
+dispatch can publish, and each red pull request spends its single attempt for
+roughly $1 and produces an escalation instead of a fix.
+
+## Finding 2: the prompt promises commands the grant does not include
+
+`src/prompts.mjs:31` tells every worker, verbatim:
+
+> `pnpm test` is permitted; `pnpm test 2>&1 | tail -20` is refused by the sandbox
+> as a different command.
+
+`pnpm` is granted only when a unit declares it as its `packageManager`. Run 3's
+actual grant was `Bash(git:*) Bash(node:*) Bash(npx:*) Bash(tsx:*) Bash(npm:*)`
+and the read-only utilities — no `pnpm`. The worker ran `pnpm test`, was refused,
+and moved on. The instruction, not the model, produced that attempt.
+
+The same section has a second contradiction. `src/prompts.mjs:33-34` says:
+
+> Use plain command names — `node`, `git`, `pnpm` — never an absolute path to a
+> binary
+
+while `sandboxFor` grants `Bash(${process.execPath}:*)` unconditionally — an
+absolute path. Where a unit's language is not a `RUNTIMES` key, that absolute
+path is the *only* granted way to reach node, and the prompt forbids it.
+
+## Findings 1 and 2 are the sixth instance of one shape
+
+The prompt and the grant are authored in different files by different reasoning,
+and nothing checks them against each other. `docs/HANDOFF.md`, written 2026-08-21
+from eight `--execute` dispatches, already tabulated four:
+
+| 11 denials | the sandbox restricted **execution**, which is impossible for a code fixer |
+| 11 denials | denied **reading** `.github`, and the matcher rejects compound commands |
+| 5 denials  | the **prompt instructed a push the sandbox denies** — two halves of reeve disagreeing about who publishes |
+| 6 denials  | `git -C <path> log` does not match `Bash(git log:*)` — the flag precedes the subcommand |
+
+Findings 1 and 2 above are the fifth and sixth. Finding 1 is the 21 August "who
+publishes" row again, one step earlier in the same sequence: that time the prompt
+instructed a `push` the sandbox denied and the answer was to move publication to
+reeve; this time the prompt instructs a `commit` the sandbox denies, and the
+staging half was left with the worker.
+
+Six instances of one shape is a design answer, not six bugs. Patching `.git`
+would fix this occurrence and leave the mechanism that produced all six intact.
+The mechanism is that `prompts.mjs` states capabilities in prose while
+`sandbox.mjs` decides them in data. Either the prompt is generated from the
+grant, or something fails loudly when the prompt names a command the grant does
+not carry.
+
+## Finding 3: an unrecognised `units[].language` grants no named runtime
 
 `UNIT` in `profile/schema.mjs` validates only that `language` is a string, and
 `sandbox.mjs` does `RUNTIMES[u.language] ?? []`. `RUNTIMES` has `typescript`,
 `python`, `go`, `rust` — and no `javascript`.
 
 So a profile declaring `"javascript"`, which is an entirely reasonable thing for
-a human to write, produces a worker granted no runtime at all, with no warning
-anywhere. Found by walking into it: runs 1 and 2 used that fixture, which is why
-`node` was refused in them.
+a human to write, produces a worker with no `Bash(node:*)`. It is not left with
+*nothing*: `Bash(${process.execPath}:*)` is granted unconditionally, and a
+declared `packageManager` is added. But the prompt tells the worker never to use
+an absolute path, so the one granted route is the one it is instructed not to
+take. Found by walking into it: runs 1 and 2 used that fixture, which is why
+`node` was refused in them. Run 3 declared `typescript` and had `Bash(node:*)`.
 
-reeve's own detection never emits it (`detect.mjs:55` maps any `package.json` to
-`typescript`) and both live profiles say `typescript`, so nothing live is
-affected today. It is a fail-silent in a codebase whose posture everywhere else
-is fail-closed and say so.
+reeve's own detection never emits `javascript` (`profile/detect.mjs:55` maps any
+`package.json` to `typescript`) and both live profiles say `typescript`, so
+nothing live is affected today. It is a fail-silent in a codebase whose posture
+everywhere else is fail-closed and say so.
+
+## Finding 4: the worker leaves litter it cannot delete
+
+While probing whether it could write, the worker created `scratch_write_test.txt`
+with a Bash redirect. `rm` is not in the grant, so three attempts to remove it
+were refused. That stray file counts as an uncommitted change and would block
+publication on its own.
+
+It is secondary. Even with the worktree spotless, Finding 1 means there would
+have been nothing committed to push.
+
+## What could not be re-measured
+
+An earlier draft reported that the worker spent "28 of 40 turns" retrying refused
+commands across runs 1 and 2. **That figure is withdrawn.** The fixture reuses a
+single path, so run 3 overwrote both earlier transcripts and the state database;
+one `worker_run` row survives. The claim cannot be re-verified and should not be
+carried forward.
+
+What is measurable, from run 3's surviving transcript: **36 tool calls, 18
+errors, 8 of them "This command requires approval"** — and 13 of those 36 turns
+spent on Finding 1's impossible instruction.
+
+The earlier reading also mistook this for opacity in the refusal message. On the
+evidence that survives, the worker was not failing to adapt. It was diagnosing a
+real block, correctly, and reporting it accurately when it ran out of room.
 
 ## What this does NOT establish
 
-That the same happens on `nextlyhq/nextly`. The fixture had **no lockfile and no
-`node_modules`**, which is what sent the worker guessing at package managers and
-probing its own permissions. A real repository has both. Findings 1 and 2 look
-structural; the flailing may be much milder there, and the honest position is
-that only a real dispatch settles it.
+That the same happens on `nextlyhq/nextly`. Findings 2, 3 and 4 are fixture-
+sensitive: the fixture had no lockfile and no `node_modules`. **Finding 1 is
+not** — it is in the worker contract itself and applies to every repository.
 
 Nor does it establish anything about a confidently bad fix. Three attempts
 produced three correct fixes, so the shape the experiment was built to find was
@@ -128,5 +237,5 @@ publication. Verified in the experiment's own store: one `fix_attempt` row, not
 refunded, after a run whose publication was refused.
 
 So each red pull request gets one attempt, and on this evidence it is spent
-producing a fix that does not ship. After a repair, that pull request is not
+producing a fix that cannot ship. After a repair, that pull request is not
 retried unless its failure cause changes.

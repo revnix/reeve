@@ -1366,7 +1366,7 @@ hottest read path and does not belong in a PR about the provider scheduler.
 
 **Interfaces:**
 - Consumes: `openHubAsGuest` (Task 23).
-- Produces: `holdClause(hub, { repoId, pr, isBuilderPr }) -> { id: 'hold', state: 'PASS'|'BLOCK'|'UNKNOWN', detail }`, added to the verdict's clause list. Ordinary PRs are **not evaluated**: the clause returns `PASS` with `detail: 'not a builder PR'` and never opens the hub.
+- Produces: `holdClause(hub, { repoId, pr, isBuilderPr }) -> { id: 'hold', state: 'PASS'|'BLOCK'|'UNKNOWN', detail }`, and **`computeVerdict` gains one input, `i.hold`**, which it appends to its clause list through the same `add(...)` call every other clause uses. That is the whole routing change, and it has to be an input: `computeVerdict` builds its clauses from inputs and accepts no clause array, so a caller cannot inject one. Ordinary PRs are **not evaluated**: the clause returns `PASS` with `detail: 'not a builder PR'` and never opens the hub.
 
 **Why this task exists.** Task 23 proves the guest connection is *permitted* to `SELECT` on `pr_hold`. Permission is not wiring. Without a reader, §9.6's entire mechanism is inert: cancellation, escalation and blocking write `pr_hold` rows that nothing consults, the required `ops/merge-policy` check stays green at the head, and a held builder PR remains mergeable — which is the exact failure the hold was invented to prevent. A capability nobody calls is indistinguishable from one that was never added.
 
@@ -1435,10 +1435,11 @@ import { VERDICT_CLAUSES, computeVerdict } from "../src/verdict.mjs";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-// A clause set that PASSES on its own, so anything the fold reports below comes
-// from the clause under test. Built from the same shape computeVerdict consumes
-// (src/verdict.mjs:52); the control two blocks down asserts it really does pass.
-const passingInputs = { clauses: [{ id: "checks", state: "PASS", detail: "green" }] };
+// The INPUTS computeVerdict consumes -- not a clause list, which it does not
+// accept. Deliberately sparse: the other clauses land on UNKNOWN, the correct
+// reading of "not supplied", and that is enough for the control below, which
+// asserts `!== BLOCK` rather than PASS.
+const baseInputs = { checks: { settled: true, verdict: "GREEN" } };
 check(VERDICT_CLAUSES.includes("hold"),
   "and the clause is IN the worst-wins list, not merely defined beside it", VERDICT_CLAUSES.join(","));
 
@@ -1466,17 +1467,33 @@ check(VERDICT_CLAUSES.includes("hold"),
 //     exported (src/verdict.mjs:52), so the question "does the hold clause's
 //     value actually reach the verdict" is answerable without any network.
 {
+  // computeVerdict takes INPUTS and builds its own clause list from them
+  // (src/verdict.mjs:52 -- `const clauses = []`, then one `add(...)` per
+  // clause). It accepts no clause array, so passing one tests an API that does
+  // not exist. The hold arrives as its own input, and Task 23b's additive
+  // change is the `add("hold", ...)` that consumes it -- which is the routing
+  // under test.
   const blocking = holdClause(hub, { repoId: 1, pr: 7, isBuilderPr: true });
   check(blocking.state === "BLOCK", "fixture: the hold clause blocks", JSON.stringify(blocking));
-  const v = computeVerdict({ ...passingInputs, clauses: [...passingInputs.clauses, blocking] });
-  check(v.state === "BLOCK",
-    "the hold clause's BLOCK reaches the verdict's worst-wins fold", JSON.stringify(v.state));
 
-  // CONTROL: the same inputs WITHOUT the clause pass, so the BLOCK above came
-  // from the hold and not from a fixture that was already failing.
-  const control = computeVerdict({ ...passingInputs });
-  check(control.state === "PASS",
-    "control: the same inputs without the hold clause pass", JSON.stringify(control.state));
+  const withHold    = computeVerdict({ ...baseInputs, hold: blocking });
+  const withoutHold = computeVerdict({ ...baseInputs });
+  check(withHold.state === "BLOCK",
+    "the hold clause's BLOCK reaches the verdict's worst-wins fold", JSON.stringify(withHold.state));
+  check(withHold.clauses.some(c => c.id === "hold" && c.state === "BLOCK"),
+    "and appears in the rendered clause list, so `task why` can name it",
+    JSON.stringify(withHold.clauses.map(c => `${c.id}:${c.state}`)));
+
+  // CONTROL: `!== "BLOCK"`, not `=== "PASS"`. With sparse inputs the other six
+  // clauses are UNKNOWN, and demanding PASS would mean building complete
+  // production fixtures for six unrelated clauses in order to test one. The
+  // claim that matters is that the BLOCK came from the hold, and this is it.
+  check(withoutHold.state !== "BLOCK",
+    "control: the same inputs without the hold do NOT produce BLOCK",
+    JSON.stringify(withoutHold.state));
+  check(!withoutHold.clauses.some(c => c.id === "hold" && c.state === "BLOCK"),
+    "control: and no hold clause is rendered when none was supplied",
+    JSON.stringify(withoutHold.clauses.map(c => `${c.id}:${c.state}`)));
 }
 
 // (b) THE WIRING from evaluatePr into that fold, which no runnable assertion can

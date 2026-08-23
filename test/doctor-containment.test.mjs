@@ -1,7 +1,7 @@
 // R-14 and R-15 report the two facts the daemon's dispatch refusal rests on,
 // from the same sources: the persisted canary result and the keychain probe.
 // Absent is UNKNOWN, never OK; a held credential is BROKEN with the fix named.
-import { checkCanary, checkKeychain, runDoctor } from "../src/doctor.mjs";
+import { checkCanary, checkKeychain, checkRemoteReach, runDoctor } from "../src/doctor.mjs";
 import { sandboxFor } from "../src/sandbox.mjs";
 import { policyHashOf } from "../src/canary.mjs";
 import { writeCanaryState } from "../src/canary.mjs";
@@ -16,6 +16,76 @@ const check = (ok, name, detail) => {
 };
 
 const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
+
+// ── R-16: publication reach ──────────────────────────────────────────────────
+//
+// Publication is a `git push` from the founder's checkout, so it needs what that
+// checkout's origin needs -- a credential helper, a URL rewrite, an ssh key.
+// Nothing measured any of that, and on 2026-08-22 none of it worked.
+//
+// The credential half is the part that matters and the part that is easy to get
+// wrong: on a PUBLIC repository an anonymous `ls-remote` succeeds while a push
+// would not, so a check built on reachability alone reports OK for exactly the
+// repository reeve watches.
+{
+  const seams = (reach, cred) => {
+    const asked = [];
+    return {
+      asked,
+      run: (cwd, args) => {
+        asked.push(args[0]);
+        if (args[0] === "remote") return { ok: true, out: reach.url ?? "https://github.com/o/r.git" };
+        if (args[0] === "ls-remote") return reach.lsRemote ?? { ok: true, out: "abcdef1234567890  refs/heads/main" };
+        return { ok: false, out: "", err: "unexpected" };
+      },
+      credential: () => { asked.push("credential"); return cred; },
+    };
+  };
+  const pub = { identity: { checkout: "/co", defaultBranch: "main", visibility: "public" } };
+
+  {
+    const c = checkRemoteReach({ identity: {} }, seams({}, { ok: true }));
+    check(c.id === "R-16" && c.level === "UNKNOWN", "no checkout in the profile: UNKNOWN", JSON.stringify(c.lines));
+  }
+  {
+    const io = seams({ url: "" }, { ok: true });
+    io.run = args => ({ ok: false, out: "", err: "fatal: No such remote 'origin'" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "BROKEN" && /no origin/.test(c.lines[0]), "a checkout with no origin: BROKEN", c.lines.join(" | "));
+  }
+  {
+    const c = checkRemoteReach(pub, seams({ lsRemote: { ok: false, out: "", err: "fatal: could not read Username for 'https://github.com'" } }, { ok: true }));
+    check(c.level === "BROKEN" && /cannot reach it/.test(c.lines[1]) && /could not read Username/.test(c.lines[1]),
+      "a remote reeve's git cannot reach: BROKEN, in git's own words", c.lines.join(" | "));
+    check(/nothing else reports this/.test(c.lines.join(" ")),
+      "  and it says why no other check would notice", c.lines.join(" | "));
+  }
+  {
+    // The case a reachability-only check gets wrong.
+    const io = seams({}, { ok: false, why: "fatal: could not read Username for 'https://github.com'" });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "BROKEN", "reachable but no credential: BROKEN, not OK", c.lines.join(" | "));
+    check(/PUBLIC/.test(c.lines.join(" ")) && /proves nothing about a push/.test(c.lines.join(" ")),
+      "  and it names the public-repository trap that makes the read misleading", c.lines.join(" | "));
+    check(io.asked.includes("credential"), "  the credential was actually asked for", io.asked.join(","));
+  }
+  {
+    const io = seams({}, { ok: true });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "OK", "control: reachable AND a credential available is OK", c.lines.join(" | "));
+    check(!/password|token|ghp_|gho_/.test(c.lines.join(" ")),
+      "  and no credential value appears anywhere in the report", c.lines.join(" | "));
+  }
+  {
+    // ssh authenticates through the transport, so the reach already exercised it
+    // and there is no https credential to ask for.
+    const io = seams({ url: "git@github.com:o/r.git" }, { ok: false, why: "should not be asked" });
+    const c = checkRemoteReach({ identity: { checkout: "/co", defaultBranch: "main" } }, io);
+    check(c.level === "OK", "an ssh origin that answers is OK", c.lines.join(" | "));
+    check(!io.asked.includes("credential"),
+      "  and no https credential is asked for, which would be the wrong question", io.asked.join(","));
+  }
+}
 
 // ── R-14 ─────────────────────────────────────────────────────────────────────
 {

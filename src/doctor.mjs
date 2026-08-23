@@ -14,6 +14,7 @@ import { checkBaseline } from "./baseline.mjs";
 import { sandboxFor } from "./sandbox.mjs";
 import { readCanaryState, policyHashOf } from "./canary.mjs";
 import { probeKeychain, isolationTopologyReady, binaryIdentity } from "./containment.mjs";
+import { GIT_NEUTRALISE_FOUNDER, founderGitEnv } from "./gitguard.mjs";
 import { readOauthToken } from "./workerenv.mjs";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -508,9 +509,94 @@ function currentPolicy(profile, { read = readCanaryState, stateDir = null, nwo =
   } catch { return null; }
 }
 
+// ── R-16: can reeve reach the remote it would publish to? ─────────────────
+//
+// Every other check reads GitHub through `gh`, which carries its own token.
+// Publication does not: it is a `git push` from the founder's checkout, and it
+// needs whatever that checkout's origin needs -- a credential helper, a URL
+// rewrite, an ssh key. Nothing measured any of that, and on 2026-08-22 none of
+// it worked: the worker isolation had been applied to the founder's own
+// repository, so `ls-remote origin` failed with "could not read Username". Every
+// publication reeve would have made was going to fail, and no instrument said so.
+//
+// The instrument has to ask the CREDENTIAL question, not just the reachability
+// one. Measured that day, on the public repository reeve actually watches:
+//
+//   ls-remote, worker isolation      -> REACHED   (public, so anonymous)
+//   credential fill, worker isolation -> REFUSED  ("could not read Username")
+//
+// A read proves nothing about a push on a public repository. `git credential
+// fill` is what a push does to obtain the credential, costs no network write,
+// and is the only half that can tell those two apart.
+
+/** git in the founder's own checkout, exactly as `founderGit` runs it. */
+function founderRun(cwd, args, { input = null, timeout = 20_000 } = {}) {
+  try {
+    return { ok: true, out: execFileSync("git", ["-C", cwd, ...GIT_NEUTRALISE_FOUNDER, ...args],
+      { encoding: "utf8", stdio: [input === null ? "ignore" : "pipe", "pipe", "pipe"],
+        ...(input === null ? {} : { input }), env: founderGitEnv(), timeout }).trim() };
+  } catch (e) {
+    const line = String(e.stderr || e.message).split("\n").filter(Boolean).pop() ?? "git failed";
+    return { ok: false, out: "", err: line.slice(0, 140) };
+  }
+}
+
+/**
+ * Whether a credential can be OBTAINED for this remote's host.
+ *
+ * `git credential fill` prints the credential on stdout. Nothing is kept: this
+ * returns a boolean and git's own error line, never the value, and the reply is
+ * not logged, recorded or included in any evidence file.
+ */
+function founderCredential(cwd, host) {
+  const r = founderRun(cwd, ["credential", "fill"], { input: `protocol=https\nhost=${host}\n\n` });
+  if (!r.ok) return { ok: false, why: r.err };
+  return { ok: r.out.split("\n").some(l => l.startsWith("password=")),
+           why: "the helper returned no password for this host" };
+}
+
+export function checkRemoteReach(profile, { run = founderRun, credential = founderCredential } = {}) {
+  const id = "R-16", title = "publication reach";
+  const checkout = profile?.identity?.checkout;
+  if (!checkout) return { id, level: UNKNOWN, title,
+    lines: ["the profile names no checkout, so there is nothing to publish from"] };
+
+  const url = run(checkout, ["remote", "get-url", "origin"]);
+  if (!url.ok || !url.out) return { id, level: BROKEN, title,
+    lines: [`no origin in ${checkout}${url.err ? `: ${url.err}` : ""}`,
+            "-> reeve publishes by pushing to origin; a checkout without one can publish nothing"] };
+
+  const branch = profile.identity?.defaultBranch ?? "main";
+  const reach = run(checkout, ["ls-remote", "origin", `refs/heads/${branch}`]);
+  const lines = [`origin ${url.out}`];
+  if (!reach.ok) return { id, level: BROKEN, title,
+    lines: [...lines, `reeve's git cannot reach it: ${reach.err}`,
+            "-> every publication would fail; the reads reeve makes through `gh` are unaffected, so nothing else reports this"] };
+  lines.push(`reachable: ${branch} is at ${(reach.out.split(/\s+/)[0] ?? "").slice(0, 10) || "(no such ref)"}`);
+
+  // ssh and local transports authenticate through the transport itself, so the
+  // reach above already exercised it. https does not, on a PUBLIC repository.
+  const https = /^https:\/\//.test(url.out);
+  if (!https) {
+    lines.push("the transport carries its own authentication, so the reach above exercised it");
+    return { id, level: OK, title, lines };
+  }
+
+  const host = url.out.replace(/^https:\/\//, "").split("/")[0].split("@").pop();
+  const cred = credential(checkout, host);
+  if (!cred.ok) return { id, level: BROKEN, title,
+    lines: [...lines,
+            `but no credential can be obtained for ${host}: ${cred.why}`,
+            ...(profile.identity?.visibility === "public"
+              ? ["this repository is PUBLIC, so the read above succeeded anonymously and proves nothing about a push"] : []),
+            "-> a push authenticates; reeve would fetch, judge and refuse at the last step"] };
+  lines.push(`a credential is available for ${host} (its value is never read into reeve)`);
+  return { id, level: OK, title, lines };
+}
+
 // ── driver ────────────────────────────────────────────────────────────────
 
-export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {}, stateDir = null, canaryIo = {}, keychainIo = {} }) {
+export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null, repoPluginDir = null, appCheck = null, baselineIo = {}, stateDir = null, canaryIo = {}, keychainIo = {}, reachIo = {} }) {
   const checks = [
     checkMergeAuthority(nwo),
     pluginCacheRoot ? checkArtifactDrift(pluginCacheRoot, repoPluginDir) : null,
@@ -524,6 +610,7 @@ export function runDoctor({ nwo, profile = {}, db = null, pluginCacheRoot = null
     checkBaseline(nwo, profile, baselineIo),
     checkCanary(nwo, { stateDir, currentPolicyHash: currentPolicy(profile, { ...canaryIo, stateDir, nwo }), ...canaryIo }),
     checkKeychain({ isolation: profile.worker?.isolation, ...keychainIo }),
+    checkRemoteReach(profile, reachIo),
   ].filter(Boolean);
 
   const broken = checks.filter(c => c.level === BROKEN);

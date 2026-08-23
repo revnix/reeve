@@ -93,15 +93,28 @@ function invariants(profile) {
     // contradiction, reached from the other end. Say nothing rather than something
     // untrue.
     ...(runnable ? [
-      `   A command is matched from its START, so \`${runnable} …\` is permitted while`,
-      `   \`${runnable} … 2>&1 | tail -20\` is refused as a different command.`,
+      // Deliberately about MATCHING rather than about permission. Saying
+      // "`git …` is permitted" promises every suffix, and `git push` is denied;
+      // a more specific deny can always sit under a granted prefix.
+      `   Permission is decided by matching a command from its START, so \`${runnable} …\``,
+      `   is what the grant is written against, while \`${runnable} … 2>&1 | tail -20\` is`,
+      "   a different command and is refused. A more specific rule can still deny a",
+      "   particular form; the rules below say which.",
     ] : []),
     "   If output is long, read the file instead.",
     ...(nameList ? [
       `   Use plain command names — ${nameList} — never an absolute path to a`,
       "   binary and never `env` or `sh` as a wrapper. The permissions are written",
       "   against the names, so a path or a wrapper reads as something else entirely.",
-    ] : ["   You have no shell commands granted at all: work from the files alone."]),
+    ] : [
+      // `sandboxFor` grants `Bash(<process.execPath>:*)` unconditionally, so a
+      // profile that forbids everything else has NOT been left with nothing --
+      // and telling it so would send it away from its only shell. The
+      // plain-names rule above cannot apply here, because this grant is a path.
+      `   The only shell command granted here is the interpreter itself, at`,
+      `   \`${process.execPath}\`. Use that exact path: the rule about plain names`,
+      "   does not apply to it, because the grant is written against the path.",
+    ]),
     "   A `for` loop is a compound command too, and will be refused. To run the",
     "   suite, use the project's own command below rather than inventing a loop",
     "   over test files — a worker did exactly that and lost the run to it.",
@@ -150,7 +163,15 @@ function verification(profile) {
     const broken = Object.entries(unit.commands ?? {}).filter(([, c]) => c.state === "broken").map(([i]) => i);
     if (broken.length) out.push(`  (${broken.join(", ")} are declared but broken here: do not rely on them)`);
   }
-  return out.length ? out.join("\n") : "This project declares no verification commands. Say so in your report rather than inventing one.";
+  if (out.length) return out.join("\n");
+  // Declared-but-refused is materially different from never declared, and the
+  // worker is asked to report which. Saying "declares none" would have it report
+  // something false about the project.
+  const declared = (profile.units ?? []).some(u =>
+    Object.values(u.commands ?? {}).some(c => c?.state === "present" && String(c.cmd ?? "").trim()));
+  return declared
+    ? "This project's declared verification commands are all refused by this sandbox, so you cannot run them. Say THAT in your report — the project has them; you were not permitted to use them."
+    : "This project declares no verification commands. Say so in your report rather than inventing one.";
 }
 
 /**

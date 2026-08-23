@@ -48,10 +48,18 @@ S2-A must be merged first. These are the exact names this plan builds on; if any
 - **Run the full suite before every commit**, skipping the one file the next sentence explains:
 
   ```bash
+  fail=0
   for f in test/*.test.mjs; do
     case "$f" in */escape.test.mjs) continue;; esac
-    $N "$f" >/dev/null || echo "FAILED $f"
+    $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
   done
+  # NONZERO on red. `|| echo` turns a failing node process into a SUCCESSFUL
+  # command, so this loop exited 0 with any number of red files -- and this is
+  # the mandatory pre-commit and close-out gate, so an executor checking the
+  # command status commits and publishes a broken implementation on a suite that
+  # just failed. The flag is set inside the loop because a pipeline's status is
+  # its last command's, and the last command here is `done`.
+  [ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
   ```
 
   `escape.test.mjs` writes decoys into the shared `~/.reeve/canary/` tree the live daemon reads. A command that contradicts the warning beside it means the warning loses. **Measured 2026-08-22 on `9dbd3a0`: 59 test files exist; 58 were run and all 58 passed.** `test/escape.test.mjs` was NOT run, because it writes decoy files into the shared `~/.reeve/canary/` directory that the live daemon also reads; run it once on a quiet machine to complete the baseline. That run had `node_modules` absent, and a green file can hide a skip, so skips were counted rather than assumed: exactly two files carry one `SKIP` each (`policy-self-exclusion`, `supervisor-contract`). That 58-file pass is the base every task is measured against, and it is the same base for all three PRs — never a chained comparison against the previous task.
@@ -229,6 +237,13 @@ Each task names any imports it needs **beyond** these.
     `state = { phase, generation, heldFrom, sliceCursor, drainRemaining, hasOpenPr, pinnedTerritory }`,
     `Transition = { ok: true, to, generation, bumps, compensations: string[] }`,
     `Refusal = { ok: false, refusal: string, stackable?: true, persistDepth?: Depth, compensations?: string[] }`.
+  - **`applyTransition` returns `reason: 'accepted-no-transition'` for a depth
+    override the machine accepted without a phase change**, carrying the `depth`
+    it persisted. `applied` stays false because the phase really did not move;
+    `reason` is what separates that from a rejected command. Returning `refused`
+    for it — as an earlier revision did — logged `transition.refused` against a
+    mutation that succeeded, and left the caller to report failure or retry an
+    override that had already been applied.
   - **A refusal can carry a durable consequence**, and two do. `persistDepth` and
     `compensations` both ride the refusal shape because a `depth.override` on
     SIZING, RESEARCH or DESIGN refuses the *transition* — the phase genuinely
@@ -932,10 +947,16 @@ export function nextPhase(state, evidence) {
       // a task that has just stopped. Cancel, regenerate and infeasible all
       // terminate for exactly this; entering a held state was the remaining
       // path that abandoned work in flight and left the process running.
+      // `record-drain` LAST here too. `void-pending` reaches only the QUEUED
+      // rows; an effect already INFLIGHT when the hold lands is untouched by it,
+      // and §3.2 requires a BLOCKED entry to record the in-flight set. Without a
+      // drain row the task can be resumed while that effect is still resolving,
+      // with nothing for diagnostics, replay or settlement to key on -- and the
+      // resume's own transition has no way to know it was outstanding.
       compensations: [...(hasLiveRun ? ["terminate-worker"] : []),
                       "record-hold-reason","void-pending",
                       ...(pinnedTerritory ? [] : ["release-territory"]),
-                      ...(hasOpenPr ? ["write-pr-hold"] : [])] });
+                      ...(hasOpenPr ? ["write-pr-hold"] : []), "record-drain"] });
   }
 
   // A worker phase whose bounded retries are exhausted. ESCALATED voids
@@ -1069,10 +1090,16 @@ export function nextPhase(state, evidence) {
       // a task that has just stopped. Cancel, regenerate and infeasible all
       // terminate for exactly this; entering a held state was the remaining
       // path that abandoned work in flight and left the process running.
+      // `record-drain` LAST here too. `void-pending` reaches only the QUEUED
+      // rows; an effect already INFLIGHT when the hold lands is untouched by it,
+      // and §3.2 requires a BLOCKED entry to record the in-flight set. Without a
+      // drain row the task can be resumed while that effect is still resolving,
+      // with nothing for diagnostics, replay or settlement to key on -- and the
+      // resume's own transition has no way to know it was outstanding.
       compensations: [...(hasLiveRun ? ["terminate-worker"] : []),
                       "record-hold-reason","void-pending",
                       ...(pinnedTerritory ? [] : ["release-territory"]),
-                      ...(hasOpenPr ? ["write-pr-hold"] : [])] });
+                      ...(hasOpenPr ? ["write-pr-hold"] : []), "record-drain"] });
   }
 
   // SLICE_MERGED must exit, or a task that merged its first slice sits there
@@ -1413,12 +1440,29 @@ import { applyTransition } from "../src/build/transition.mjs";
     db.prepare(`INSERT INTO hold_reason(task,reason,at) VALUES('bt:1',?,unixepoch())`).run(reason);
   db.prepare(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at)
               VALUES('bt:1',1,7,?,'blocked_other',unixepoch())`).run("a".repeat(40));
+  // `bt:1` needs a CLAIM of its own, or `regrant-territory` has nothing to
+  // grant and an implementation whose regrant branch is empty passes this block
+  // while the task returns to IMPLEMENTING holding no lease at all -- which
+  // makes the expired `bt:0` lease beside it irrelevant to what is tested.
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned)
+           VALUES('bt:1','prefix','packages/x',0)`);
   // The lease's task must EXIST -- territory_lease references task(id) and
   // openHub enables foreign keys, so a lease owned by an unseeded `bt:0` fails
   // at setup and the block never reaches regrant-territory at all.
   seed(db, { id: "bt:0", phase: "CANCELLED", generation: 1 });
   db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at)
            VALUES('p','prefix','packages/x','bt:0',unixepoch()-1)`);   // expired: regrant must succeed
+  // ASSERTED, not assumed. This block previously proved only that the resume did
+  // not throw:
+  //   check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task='bt:1'").get().c === 1,
+  //     "the resume re-granted the task's own territory");
+  // And the CONTROL in the other direction: with a LIVE overlapping lease held
+  // by another task the same resume must roll back entirely, because the §10.2
+  // check `regrant-territory` re-runs inside the transaction is the
+  // authoritative one. Without it the branch could grant unconditionally and
+  // still pass:
+  //   check(!resumed.applied && db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "BLOCKED",
+  //     "control: a live overlapping lease rolls the whole resume back");
   check(db.prepare("SELECT count(*) c FROM hold_reason WHERE cleared_at IS NULL").get().c === 2,
     "fixture: the task is BLOCKED with two open hold reasons and one open pr_hold");
 
@@ -1546,6 +1590,26 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
       hasLiveRun: db.prepare(
         "SELECT count(*) c FROM phase_run WHERE task=? AND status IN ('live','adopted')").get(taskId).c > 0,
       phase: expectedPhase, generation: expectedGeneration, heldFrom: task.held_from,
+      // Both helpers are DEFINED in this module, immediately above
+      // `applyTransition`. A repo-wide search found only these two call sites,
+      // so every transition for an existing task threw a ReferenceError while
+      // building the machine state -- before `nextPhase` or the CAS could run,
+      // which means the whole plan's behaviour was unreachable:
+      //
+      //   const hasOpenBuilderPr = (db, taskId) => db.prepare(
+      //     `SELECT count(*) c FROM impl_pr i
+      //       WHERE i.task = ?
+      //         AND NOT EXISTS (SELECT 1 FROM pr_hold h
+      //                          WHERE h.repo_id = i.repo_id AND h.pr = i.pr
+      //                            AND h.cleared_at IS NULL)`).get(taskId).c > 0;
+      //
+      //   const hasLivePin = (db, taskId) => db.prepare(
+      //     `SELECT count(*) c FROM task_territory
+      //       WHERE task = ? AND pinned = 1`).get(taskId).c > 0;
+      //
+      // Both read inside the caller's transaction, like every other input on
+      // this object: reading them before `BEGIN IMMEDIATE` would decide the
+      // transition from a state the transaction does not hold.
       sliceCursor: task.slice_cursor, hasOpenPr: hasOpenBuilderPr(db, taskId),
       pinnedTerritory: hasLivePin(db, taskId),
       drainRemaining: db.prepare("SELECT count(*) c FROM task_drain WHERE task=? AND settled_at IS NULL").get(taskId).c,
@@ -1650,6 +1714,28 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
       // -hold branch needed it: any path that returns early must fence itself.
       if (task.phase !== expectedPhase || task.generation !== expectedGeneration)
         return { applied: false, reason: "lost-race" };
+      // AN ACCEPTED OVERRIDE IS NOT A REFUSAL. `depth.override` on
+      // SIZING/RESEARCH/DESIGN writes the new depth and may terminate the live
+      // worker -- it is a mutation that succeeded -- and routing it through
+      // `refuseDurably` returned the same `{applied:false, reason:"refused"}`
+      // shape as a rejected command and logged `transition.refused` for it. A
+      // caller cannot tell those apart: it reports failure to the founder, or
+      // retries a mutation that has already been applied.
+      //
+      // So it returns its own shape, and logs its own kind. The phase genuinely
+      // did not change, which is what `applied: false` says; `reason` is what
+      // distinguishes "accepted, no phase change" from "rejected".
+      if (decision.persistDepth && !decision.ok && evidence?.kind === "depth.override") {
+        persistDepth(db, taskId, decision.persistDepth);
+        for (const c of decision.compensations ?? [])
+          applyCompensation(db, { c, taskId, generation: expectedGeneration, seq: null, evidence,
+                                  snapshot: evidence?.snapshot });
+        // `sizing.overridden` is already the declared kind for this, and
+        // `persistDepth` appends it -- so nothing extra is logged here, and
+        // nothing false is.
+        return { applied: false, reason: "accepted-no-transition", depth: decision.persistDepth,
+                 why: decision.refusal };
+      }
       // A refusal can still carry a durable consequence. `depth.override` on
       // SIZING/RESEARCH/DESIGN refuses the TRANSITION -- the phase does not
       // change -- while accepting the OVERRIDE, and the redispatch that follows
@@ -1993,7 +2079,7 @@ git commit -m "feat(hub): generation-fenced transition with compensations"
   - `enqueueEffect(db, { idempotencyKey, kind, taskId, generation, fence, cancellable = true, args, notBefore = 0 }) -> { id, status }` — **must be called inside the caller's transaction**. Returns `status: 'superseded'` with no row performed when the key is round- or sha-keyed and a `done` row already carries it.
   - **`not_before` is enforced and tested.** `enqueueEffect` exposes `notBefore` and no assertion proved `leaseEffect` honours it, so an implementation ignoring the column satisfies every fence, capability, uniqueness, recovery and duplicate-delivery assertion in the task — and every delayed notification and every backoff retry fires immediately, which is the opposite of what scheduling one means. `leaseEffect` takes `now` (injected, as everywhere else here: the module has no clock) and skips rows with `not_before > now`. Three assertions: a row scheduled ahead is NOT leased before its boundary, IS leased at it, and a control that an unscheduled row beside it is leased throughout — without that control, "leases nothing" passes the first two.
   - `leaseEffect(db, { worker, leaseSeconds = 300, capabilities, now }) -> Row | null` — revalidates the fence **inside the lease transaction** and settles `fenced` (returning null and trying the next row) when the task has moved generation or the row was voided; settles `refused` when the effect's capability switch is off.
-  - `settleEffect(db, { id, worker, leaseToken, ok, result, error, retryable })` — **fenced on the active lease**, not on the id alone. `leaseEffect` records a worker and a lease interval and returns a `leaseToken` (an opaque counter bumped on every lease of that row); `settleEffect`'s CAS requires `worker` and `lease_token` to match the row's current values, and returns `stale` otherwise without writing. Without it: worker A stalls past expiry, `recoverEffects` returns the row to `pending`, worker B leases it, and A — still running — settles B's active delivery, overwriting its status and result while B is mid-flight. An id is not an identity while a row can be re-leased. Tested with a stale settler after a re-lease, and a control that the CURRENT owner still settles normally.
+  - `settleEffect(db, { id, worker, leaseToken, ok, result, error, retryable })` — **fenced on the active lease**, not on the id alone. **Every caller passes both**, taken from the row `leaseEffect` returned: `const r = leaseEffect(...); settleEffect(db, { id: r.id, worker: r.worker, leaseToken: r.lease_token, ok: true, result })`. Adding the fence without updating the callers makes every ordinary settlement return `stale` and leaves the row inflight — the fence refusing the legitimate owner, which is worse than the race it closes. The round-keyed blocks that "settle" a row they never leased must lease it first: a row with no lease has no owner to be, and settling one is the very thing this fence exists to refuse. `leaseEffect` records a worker and a lease interval and returns a `leaseToken` (an opaque counter bumped on every lease of that row); `settleEffect`'s CAS requires `worker` and `lease_token` to match the row's current values, and returns `stale` otherwise without writing. Without it: worker A stalls past expiry, `recoverEffects` returns the row to `pending`, worker B leases it, and A — still running — settles B's active delivery, overwriting its status and result while B is mid-flight. An id is not an identity while a row can be re-leased. Tested with a stale settler after a re-lease, and a control that the CURRENT owner still settles normally.
   - `recoverEffects(db, { reconcile })`, `voidPending(db, taskId)`.
   - **EVERY outbox mutation appends a row-image `hub_event`, in the same
     transaction as the write.** `outbox` is in S2-A's `COMPARISON_SET` and has
@@ -2261,6 +2347,33 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
       idempotencyKey: key, kind: k, taskId: "bt:1", generation: 1, fence: 1, args: {} }));
     check(repeat.status === "pending",
       `${k}: a non-keyed re-enqueue is ADMITTED, for its reconciler to settle`, String(repeat.status));
+    // `drain` RECONCILES before it performs. The executor appended every leased
+    // key to `world` unconditionally and had no seam to consult external truth,
+    // so routing the repeat through it performed the effect a SECOND time and
+    // the assertion below could never pass -- the previous fix was right about
+    // the path and left the executor unable to take it.
+    //
+    // So `drain` is defined with the reconciler production uses:
+    //
+    //     const drain = () => {
+    //       for (;;) {
+    //         const row = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+    //         if (!row) break;
+    //         // External truth FIRST. Only an UNOBSERVED effect is performed.
+    //         if (world.includes(row.idempotency_key)) {
+    //           settleEffect(db, { id: row.id, worker: row.worker, leaseToken: row.lease_token,
+    //                              ok: true, result: { reconciled: true } });
+    //           continue;
+    //         }
+    //         world.push(row.idempotency_key);          // the external action
+    //         settleEffect(db, { id: row.id, worker: row.worker, leaseToken: row.lease_token,
+    //                            ok: true, result: {} });
+    //       }
+    //     };
+    //
+    // Consult-before-actuate is the property this whole drill exists to
+    // establish, so it belongs in the executor and not in the assertions about it.
+    //
     // THROUGH THE LEASE PATH, which is what production does with a fresh
     // pending row. Hand-editing it to an expired `inflight` and calling recovery
     // skipped the one step that matters: `leaseEffect` hands the row to a worker,
@@ -2436,15 +2549,30 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
     earlier revision prescribed throws `ENOENT` on the first missing one and
     refuses the filing, reporting a normal claim as a broken path.
     The rule: walk the ancestors that DO exist, refusing on a symlink or a
-    gitlink among them exactly as now; on the first `ENOENT`, stop — everything
-    below a path that does not exist cannot be a symlink, so there is nothing
-    left to check. The refusals keep their whole force over the existing prefix,
+    gitlink among them exactly as now; on the first `ENOENT`, ask `lsTree` about that
+    component BEFORE stopping. An uninitialised submodule has no worktree
+    directory — `lstat` says ENOENT — while the superproject still records the
+    same path as a mode-`160000` gitlink, so stopping on ENOENT alone hands a
+    task territory inside a DIFFERENT repository, whose changed files the
+    superproject's diff cannot inspect: the gitlink refusal defeated by the very
+    case it exists for. Only once `lsTree` also reports nothing is there
+    genuinely nothing below to check, because a path in neither the worktree nor
+    the index can be neither a symlink nor a submodule. The refusals keep their whole force over the existing prefix,
     which is where the escape they guard against would have to live.
     Tested with a claim whose leaf is missing, one whose middle ancestor is
-    missing, and a control in which a symlink sits *above* a missing leaf and is
-    still refused — without that control, "stop at ENOENT" degrades into "stop
-    checking".
+    missing, a control in which a symlink sits *above* a missing leaf and is
+    still refused, and one where `lstat` reports the component missing while
+    `lsTree` reports `160000` and the claim is refused anyway — without those two
+    controls, "stop at ENOENT" degrades into "stop checking".
   - `resolveSnapshot(registry, project, claims, io) -> Snapshot` — takes the filing's normalised claims, because it is the only place with both the repository path and an I/O capability, and it returns them resolved. Without the parameter `resolveClaims` had no caller and the symlink refusal was unreachable from the filing path. where `io = { repoId, visibility, specRepoId, profileHash, defaultBranch, gateDefinitionHash, founderUserId, lstat, lsTree }`, each a function. **Async, and it is where every network call lives.** `lstat` and `lsTree` are in that list because `resolveSnapshot` calls `resolveClaims`, which needs both — the symlink refusal and the gitlink (submodule) refusal are its entire purpose. An `io` carrying only the lookup functions makes the composition throw when snapshot resolution reaches the filesystem-aware stage, or silently skip both refusals; the tests call `resolveClaims` directly, so they exercise the half that works and not the seam that does not.
+  - **Each `task_territory` child appends its own row image**, kind
+    `task_territory.claimed`, keyed as S2-A's handler declares. That handler was
+    there and nothing emitted it — the third table in this plan with that shape.
+    A snapshot taken before admission otherwise replays the task and its lease
+    with no claims beneath them, and after the next release or resume the task
+    has no territory to rebuild a lease from or to validate its diff against.
+    Covered by an admission-across-replay case in the drill, not only by the
+    admission test.
   - **The territory grant appends its event.** `admitTask` writes `territory_lease` rows and must append one `territory_lease.granted` `hub_event` each, with the row image — S2-A has the handler and the table is in `COMPARISON_SET`, so an ungranted event means a post-snapshot admission loses its lease at replay and the task runs with territory nothing records it holding.
   - **`filing.idempotencyKey` is carried into the transaction and enforced.** `task.idempotency_key` and its partial unique index `task_idem` already exist in S2-A's migration 1, and the command contract says a repeated `--idempotency-key` request returns the ORIGINAL task and performs nothing. Without the lookup a retried script — a shell loop, a re-run CI step — mints a second task for the same work, which then competes with the first for its own territory and is refused, so the retry looks like a conflict with a stranger. `admitTask` returns `{ ok: true, taskId, replayed: true }` when the key already exists, and inserts nothing.
   - `admitTask(db, snapshot, filing) -> { ok, taskId, refusal, replayed }` — **synchronous, one `BEGIN IMMEDIATE`, and it performs no I/O of its own.** Inserts the task row at generation 1, its `task_territory` children, the `task.filed` event, and grants the territory lease **with the full intersection check**, refusing the whole filing and naming the blocker on a conflict. It calls **`assertWritable(db, { isAlive, inTx: true })` first, inside that transaction**: it writes four authority-bearing rows, so admitting a filing while a restore holds `maintenance_lock` races the snapshot replacement and can be lost by the replay that follows it. "Every hub writer calls it" is a rule with no exceptions, and admission was one.

@@ -366,6 +366,26 @@ export function openHub(path) {
 
   // Read once here only to refuse a NEWER store early with a clear message.
   const seen = db.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get().v;
+  // And the history has to be CONTIGUOUS, not merely tall. `max(version)` alone
+  // reads a store recording versions 1 and 3 with 2 missing as fully migrated,
+  // so the loop below skips every `m.version <= seen` and the store is used with
+  // migration 2's columns and data transformations absent -- while reporting
+  // version 3. A damaged or hand-repaired `schema_version` produces exactly that,
+  // and it is the table an operator is most likely to have touched by hand after
+  // a bad restore. Refusing is the only safe answer: the missing migration
+  // cannot be re-run, because the ones above it have already been applied.
+  {
+    const rows = db.prepare("SELECT version FROM schema_version ORDER BY version").all().map(r => r.version);
+    const gaps = [];
+    for (let v = 1; v <= seen; v++) if (!rows.includes(v)) gaps.push(v);
+    if (gaps.length) {
+      db.close();
+      throw new Error(
+        `hub store at ${path} records schema version ${seen} but is missing migration(s) ` +
+        `${gaps.join(", ")}. The history has holes, so the store's real shape is unknown and the ` +
+        `missing migrations cannot be re-run beneath the ones above them. Restore a snapshot.`);
+    }
+  }
   if (seen > HUB_SCHEMA_VERSION) {
     db.close();
     throw new Error(
@@ -2068,6 +2088,16 @@ Add to `bin/reeve`, beside the existing `case "run":`:
       console.log("builder: not running (no hub database yet)");
       break;
     }
+    // FIRST RUN has no hub at all, and the reordering below cannot bootstrap one:
+    // a raw `DatabaseSync` on a missing `<home>/state` throws outright, and on an
+    // existing directory it creates an EMPTY file whose `schema_version` query
+    // then fails, because no migration has run. So the command whose job is to
+    // create the hub could never reach `openHub`.
+    //
+    // An absent store has nothing to exclude anyone from and no version to
+    // refuse, so it takes the plain path: create it, then claim. The ordering
+    // below exists for a store that already carries state.
+    const bootstrapping = sub === "run" && !existsSync(hubPathFor(HOME));
     // `openHub` MIGRATES. So `build run` must not call it until it has taken
     // exclusion, and that ordering is the point rather than an implementation
     // detail: once migration 2 exists, a newer `reeve build run` started beside a
@@ -2081,10 +2111,15 @@ Add to `bin/reeve`, beside the existing `case "run":`:
     // So: raw open, refuse a newer store, take the singleton, and only then
     // migrate. The raw handle is the one the lease is taken on; `openHub` runs
     // afterwards on the same path and the migration happens under the lease.
-    const raw = sub === "status"
-      ? new DatabaseSync(hubPathFor(HOME), { readOnly: true })
-      : new DatabaseSync(hubPathFor(HOME), { timeout: 10000 });
-    const db = raw;
+    // `db` is the handle the lease is taken on and the loop keeps. On the
+    // bootstrap path that is the migrated handle directly; otherwise it is the
+    // raw one, swapped for the migrated handle after the claim.
+    let raw = null;
+    let db = bootstrapping
+      ? openHub(hubPathFor(HOME))
+      : (raw = sub === "status"
+          ? new DatabaseSync(hubPathFor(HOME), { readOnly: true })
+          : new DatabaseSync(hubPathFor(HOME), { timeout: 10000 }));
     if (sub === "status") {
       // Reading an unmigrated store is fine; reading a NEWER one is not. Refuse
       // rather than render columns this binary does not understand.
@@ -2120,7 +2155,11 @@ Add to `bin/reeve`, beside the existing `case "run":`:
     // The forward-version refusal on the RAW handle, before anything is written.
     // `build status` does this already; `build run` needs it for the same reason
     // and one step earlier, because its next act would be to migrate.
-    {
+    // Skipped when bootstrapping: `openHub` has already made the store, and it
+    // performs this same refusal itself, so re-asking is redundant rather than
+    // wrong -- but the query would run against a store this branch just created,
+    // which is a check that can only ever pass.
+    if (!bootstrapping) {
       const v = db.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
       if (v > HUB_SCHEMA_VERSION)
         die(`the hub is at schema version ${v}; this reeve knows ${HUB_SCHEMA_VERSION}. Upgrade reeve.`);
@@ -2151,8 +2190,15 @@ Add to `bin/reeve`, beside the existing `case "run":`:
     // The lease row survives the swap. It is a row in the database, not state on
     // the handle, and `acquireSingleton` is re-entrant for the same (pid,
     // lstart) -- which is exactly the property the re-entrancy test exists for.
-    raw.close();
-    const hub = openHub(hubPathFor(HOME));
+    // REBIND `db`, do not shadow it. An earlier revision closed `raw` -- which
+    // `db` aliased -- and bound the migrated handle to a NEW name, so every
+    // later `releaseSingleton(db, ...)` and `heartbeatSingleton(db, ...)` ran
+    // against a closed database: the first heartbeat threw, the loop died, and
+    // the lease row was left behind by a process that never ran a tick. The
+    // whole reordering made `build run` worse than it was.
+    //
+    // Nothing to do on the bootstrap path: `db` is already the migrated handle.
+    if (raw) { raw.close(); db = openHub(hubPathFor(HOME)); }
     // Hold the lease for the life of the process, and give it back on the way
     // out. Claiming and then returning would exit immediately: the service
     // manager (KeepAlive) relaunches, the new process finds a lease held by a
@@ -3244,6 +3290,28 @@ And a block for the unreadable case, which is the one this route is named for:
   // throws, the finally clears staging, and the canonical path is left empty for
   // the next writer to create a fresh hub at.
   {
+    // RE-CORRUPT FIRST. The successful restore above replaced the file with a
+    // healthy hub, so without this the attempt below takes the ordinary
+    // readable-live branch -- and both assertions stay green whether or not the
+    // unreadable branch moves the database too early, which is the one thing
+    // they exist to detect. A fixture that cannot reach the mechanism it names
+    // proves nothing by passing.
+    {
+      const g = new DatabaseSync(p, { readOnly: true });
+      const ps = g.prepare("PRAGMA page_size").get().page_size;
+      const pc = g.prepare("PRAGMA page_count").get().page_count;
+      g.close();
+      const fd2 = openSync(p, "r+");
+      for (let i = 1; i < pc; i++) writeSync(fd2, Buffer.alloc(ps, 0x41), 0, ps, i * ps);
+      closeSync(fd2);
+    }
+    // CONTROL: it is unreadable again, so the branch below is the one under test.
+    let stillReadable = true;
+    try { const q = new DatabaseSync(p, { readOnly: true });
+          q.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get(); q.close(); }
+    catch { stillReadable = false; }
+    check(!stillReadable, "control: the hub is unreadable again before the failing attempt", String(stillReadable));
+
     const bad = [{ seq: 100, at: 1, kind: "task.transitioned", task: "bt:3", payload: "{not json" }];
     const before = readFileSync(p).length;
     const failed = restoreHub(snap, p, { isAlive: () => false, pid: process.pid, lstart: "L", force: true, tail: bad });
@@ -3499,7 +3567,7 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     try { return p.prepare("SELECT COALESCE(max(seq),0) s FROM hub_event").get().s; } finally { p.close(); }
   })();
 
-  let live = null, locked = false, lockDb = null, quarantined = null;
+  let live = null, locked = false, lockDb = null, quarantined = null, synthetic = false, swapped = false;
   const staging = dbPath + ".restoring";
   // The raw open AND the first query, together. Either can throw on a file that
   // is corrupt enough, and the branch below used to do them as two statements
@@ -3521,6 +3589,15 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // fresh hub at dbPath which the rename then silently destroys. So an absent
     // hub gets a minimal one created first, purely to hold the lock.
     if (!existsSync(dbPath)) {
+      // SYNTHETIC, and tracked as such. This file exists only to carry the
+      // maintenance lock while the real one is staged; nothing has restored
+      // into it. If staging or replay then fails -- a malformed supplied tail
+      // is the likely case, and this is the total-loss path where an operator
+      // supplies one by hand -- the function returns failure, releases the
+      // lock, and used to leave a fully migrated EMPTY hub at the canonical
+      // path. A restarted builder finds a healthy-looking store with no state
+      // in it, which is worse than finding nothing: nothing is obviously wrong.
+      synthetic = true;
       live = openHub(dbPath);
       // The result is CHECKED here too. Two restores started after a total loss
       // both pass the existsSync above, both race through openHub, and one of
@@ -3638,7 +3715,14 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
           why: `the hub has live writers; stop them first:\n` +
                holders.map(h => `  ${h.what.padEnd(8)} pid ${h.pid} (started ${h.lstart})  ${h.command}`).join("\n") +
                `\n  a guardian holds a provider lease whenever it is dispatching a worker, so a busy ` +
-               `guardian is a normal reason to see this; stop the daemons, or pass force if you are certain.` };
+               `guardian is a normal reason to see this. STOP the processes above and re-run.` +
+               // NOT "or pass force". The branch immediately above refuses every
+               // forced restore while any holder is provably alive, so an
+               // operator following that advice got a second refusal and no way
+               // forward -- a recovery instruction that cannot recover. `force`
+               // is for holders whose processes are already gone, and for the
+               // unreadable-hub path where liveness cannot be established at all.
+               `\n  force does not override a live holder; it only clears dead ones.` };
       }
     }
 
@@ -3649,6 +3733,12 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // writes the whole log from seq 1, and replaying pre-snapshot rows would
     // re-apply row images the snapshot already contains, in an order the
     // snapshot has already superseded.
+    // CAPTURED HERE, before anything clears `live`. Computing it at the return
+    // read a handle that the sidecar cleanup below sets to null on every
+    // successful restore, so the flag was false on the readable path too -- and
+    // the CLI printed the data-loss warning after a recovery that had inspected
+    // and replayed the live tail perfectly.
+    const liveTailRead = suppliedTail == null && live != null;
     const rawTail = suppliedTail ?? (live
       ? live.prepare("SELECT seq, at, kind, task, payload FROM hub_event WHERE seq > ? ORDER BY seq").all(snapSeq)
       : []);
@@ -3761,6 +3851,7 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // meantime.
     if (quarantined) renameSync(dbPath, quarantined);
     renameSync(staging, dbPath);
+    swapped = true;                    // past here the file at dbPath is the restored one
     // `quarantined` is REPORTED, not merely done. When the live hub was
     // unreadable it was moved aside rather than deleted, and this result is the
     // only place its path is ever named -- an operator who is not told where the
@@ -3772,7 +3863,7 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // guessing at it from `quarantined` and a lock file, which is two proxies for
     // one fact and both wrong when the hub was simply absent.
     return { ok: true, why: null, holders: [], replayed, tail: tail.length, quarantined,
-             liveTailRead: suppliedTail == null && live != null };
+             liveTailRead };
   } catch (e) {
     return { ok: false, why: `could not restore: ${e.message}`, holders: [] };
   } finally {
@@ -3787,6 +3878,12 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     try { live?.close(); } catch {}
     try { lockDb?.close(); } catch {}
     try { rmSync(staging, { force: true }); } catch {}
+    // The synthetic hub goes with the failure that stranded it. Only when it was
+    // synthetic AND the swap never happened: a successful restore replaced it,
+    // and a real pre-existing hub is never this function's to delete.
+    if (synthetic && !swapped) {
+      for (const ext of ["", "-wal", "-shm"]) { try { rmSync(dbPath + ext, { force: true }); } catch {} }
+    }
   }
 }
 ```
@@ -3851,7 +3948,22 @@ its own branch.
     // ...the existing per-repo backup, unchanged, below.
 ```
 
-`snapshotAll` joins `bin/reeve`'s `src/backup.mjs` import. The exit status is
+**`bin/reeve`'s `src/backup.mjs` import gains three names, not one.** It reads
+`import { snapshot, restore, latestSnapshot, exportEvents } from "../src/backup.mjs";`
+(`bin/reeve:10` on `16769e7`), and the routes these tasks add call `snapshotAll`
+(backup --hub), **`restoreHub`** (restore --hub) and **`validateSnapshot`**
+(`builder doctor`'s snapshot callbacks). Instructing only the first leaves the
+other two unbound: `restore --hub` exits with a ReferenceError instead of
+restoring, and `builder doctor` works only while NO snapshot exists — which is
+the state the CLI test creates, and the opposite of the installation it is meant
+to diagnose. It becomes:
+
+```js
+import { snapshot, restore, latestSnapshot, exportEvents,
+         snapshotAll, restoreHub, validateSnapshot } from "../src/backup.mjs";
+```
+
+The exit status is
 non-zero when any store failed, so the CLI drill's `runCli(["backup", "--hub"])`
 can be asserted rather than assumed to have worked.
 
@@ -4081,6 +4193,7 @@ Expected: `hubFindings` is not exported.
  * clause U4's whole value is that it reads something another actor established.
  */
 export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), snapshotFor,
+                                  newestCandidate = () => null,
                                   freshMinutes = 60, snapshotMaxHours = 24, offDevice = null,
                                   projects = [] }) {
   const out = [];
@@ -4101,6 +4214,25 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
     out.push({ id: "H-1", severity: "pass", classification: "stale-evidence",
       title: "hub snapshot is fresh", detail: `${Math.round((now - snap.at) / 60)}m old`, action: null });
   }
+
+  // The NEWEST FILE, reported separately from the newest USABLE one. This was
+  // added to the interface and to the CLI call and then read by nothing, which
+  // is the worst of the three states: the argument arrived, the finding did not,
+  // and a repository-wide search for the name found only the call site.
+  //
+  // They differ exactly when the most recent backup is broken. `latestSnapshot`
+  // skips it and returns an older good file, so `snapshotFor` describes the
+  // fallback and H-1/H-2/H-3 all answer `pass` -- and the broken newest backup
+  // stays invisible for as long as the older recovery point remains fresh, which
+  // is precisely the window in which the next backup fails too.
+  const newest = newestCandidate("hub");
+  if (newest && (!snap || newest.path !== snap.path))
+    out.push({ id: "H-2", severity: newest.ok ? "warn" : "fail", classification: "configuration",
+      title: "the newest hub snapshot is not the one a restore would use",
+      detail: newest.ok
+        ? `${newest.path} is newer than ${snap?.path ?? "(none)"} but was not selected`
+        : `${newest.path} does not validate: ${newest.why}`,
+      action: "reeve backup --hub, and investigate why the newest snapshot is unusable" });
 
   // A project with NO row produces no finding at all unless it is asked for by
   // name. That is absence read as success on the clause whose entire job is to

@@ -588,8 +588,9 @@ In `src/daemon.mjs`, immediately after the halt check at line 712:
             // from the profile's numeric id and fail closed if it is absent,
             // rather than writing a row that collides by construction.
             // isSameProcess(pid, storedStart) is the shipped predicate
-            // (src/supervisor.mjs:67). `pidAlive` was a name this plan invented
-            // and nothing exports it, so the claim argument would have thrown.
+            // (src/supervisor.mjs:67). An earlier draft of these plans used the
+            // name `pid` + `Alive` joined, which nothing exports, so the claim
+            // argument would have thrown at every dispatch.
             owner: "guardian", repoId, runRef: `pr:${e.pr}`,
             pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess,
           });

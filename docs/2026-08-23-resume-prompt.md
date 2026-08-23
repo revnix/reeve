@@ -179,8 +179,9 @@ origin/main <your-pushed-head>` should be empty).
     Agreed to fix at the end; it is why every gate on nextly is decorative.
   - Capability 3 routing. The outbox EXISTS (src/db/schema.sql:110-130,
     src/db/ops.mjs:239-284) with zero callers and no drainer, so the options are
-    wire it now, wait for the builder's drainer at S2/S4, or use the direct `gh`
-    path reeve already uses from 16 call sites across src/.
+    wire and drain it now, or wait to reuse the builder's drainer at S2/S4. NOT a
+    third option: docs/TRACKER.md:39-43 requires those effects go through the
+    outbox, and reeve's 16 direct `gh` call sites elsewhere do not relax it.
   - ntfy read user (needs shell on 95.217.11.127).
   - Whether to raise the fix-attempt cap from 1.
 
@@ -193,7 +194,7 @@ verified that you have not run.
 ## Why the prompt is shaped this way
 
 - **It leads with the P0**, because reeve is armed against a repository it cannot
-  publish to, and every red PR there spends a paid attempt to prove it.
+  publish to, and every ELIGIBLE red PR there spends a paid attempt to prove it.
 - **It makes the `ps` check non-optional**, because the plist/process divergence
   already bit once and is invisible to anyone reading files.
 - **It tells the reader not to trust it**, first house rule. The document it

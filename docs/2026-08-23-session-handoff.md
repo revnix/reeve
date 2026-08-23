@@ -103,8 +103,9 @@ runs, routed at `daemon.mjs:1161` (`outcome !== OK`) before the gate at
    the agent CLI's sandbox layer imposes it. **Publication is structurally
    impossible under this contract, for every repository.**
 2. **The prompt promises commands the grant does not include.**
-   `src/prompts.mjs:31` says "`pnpm test` is permitted"; `pnpm` is granted only
-   when a unit declares it as `packageManager`, and run 3's grant had `npm`.
+   `src/prompts.mjs:31` says "`pnpm test` is permitted"; this fixture granted
+   `pnpm` by neither route — no `packageManager` and no declared command whose
+   runner was `pnpm` — and run 3's grant had `npm`.
    `prompts.mjs:33-34` also tells the worker never to use an absolute path,
    while `sandboxFor` grants `Bash(${process.execPath}:*)` unconditionally.
 3. **An unrecognised `units[].language` grants no named runtime.** `UNIT`
@@ -128,9 +129,11 @@ which survives: 36 tool calls, 18 errors, 8 "requires approval".
 fixture had no lockfile and no `node_modules`. **Finding 1 does** apply
 everywhere; it is in the contract, not the fixture.
 
-**The standing cost:** `maxFixAttemptsPerFinding` is **1**, and the attempt is
-spent when the RUN succeeds (`daemon.mjs:857`), not when publication does —
-verified as one unrefunded `fix_attempt` row. Not every red PR spends it —
+**The standing cost:** `maxFixAttemptsPerFinding` is **1**. The attempt is
+recorded when the run starts (`daemon.mjs:857`) and refunded if preparation or a
+pre-bind cancellation fails (`:1043`, `:1066`), so it is spent once worker
+execution begins — never conditional on publication. Verified as one unrefunded
+`fix_attempt` row after a refused publication. Not every red PR spends it —
 `watcher.mjs:120-136` escalates a missing required check, an inherited-only
 failure, or one it cannot name without dispatching at all. But a caused, named
 failure gets one shot, and on this evidence it is spent producing a fix that
@@ -265,7 +268,8 @@ PR #14 took 10 rounds and 22 findings.
 - **R-01, the ruleset.** Admins bypass every rule and no CI check is required.
   Agreed to fix "at the end", but reeve now has `propose_and_merge` + admin, so
   nothing outside reeve stops a bad publish from merging.
-- **The capability-3 routing** (outbox now / outbox later / direct `gh`).
+- **The capability-3 routing**: wire and drain the outbox now, or wait for the
+  builder's at S2/S4. Direct `gh` is not on the table — see §7.
 - **ntfy read user** — all 5 tokens are write-only.
 - **Whether to raise `maxFixAttemptsPerFinding`** from 1, given §3.
 
@@ -290,8 +294,9 @@ armed.
 ## 10. Open risks
 
 - **reeve is armed and cannot publish.** Not "has not yet" — cannot, by the
-  contract, in any repository. Each red nextly PR spends its one attempt for
-  ~$1 and escalates. This supersedes the earlier framing that the founder
+  contract, in any repository. Each ELIGIBLE red nextly PR — caused, named,
+  not a demonstrated flake, past the containment and capacity gates — spends its
+  one attempt for ~$1 and escalates. This supersedes the earlier framing that the founder
   accepted; they accepted a slower reeve, not a broken one.
 - **`docs/HANDOFF.md:442` overstates the current state.** Its "Proven — three
   complete dispatches … reeve published → green" was true on 21 August and is

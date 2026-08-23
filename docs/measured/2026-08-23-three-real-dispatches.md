@@ -84,8 +84,11 @@ dispatch happened.
 
 ## Finding 1 (P0): the worker cannot commit. `git add` and `git commit` are impossible under the sandbox
 
-This is the reason nothing published, and it is not a worker behaviour. It is a
-regression in reeve's own worker contract.
+This is why RUN 3 published nothing, and it is not a worker behaviour. It is a
+regression in reeve's own worker contract. Runs 1 and 2 hit `max_turns` and were
+routed at `daemon.mjs:1161-1181` before the publication gate, so they would have
+published nothing whatever the commit rules were; only run 3 reached far enough
+to demonstrate this.
 
 Run 3 attempted `git add` or `git commit` **seven times**. Six produced:
 
@@ -126,8 +129,10 @@ since 22 August.
 
 **The consequence, today.** reeve is armed against `nextlyhq/nextly` with
 `maxFixAttemptsPerFinding: 1`. Under this contract no worker can commit, so no
-dispatch can publish, and each red pull request spends its single attempt for
-roughly $1 and produces an escalation instead of a fix.
+dispatch can publish, and each ELIGIBLE red pull request — caused, named, not a
+demonstrated flake (`daemon.mjs:808-812`), past the containment and capacity
+gates — spends its single attempt for roughly $1 and produces an escalation
+instead of a fix.
 
 ## Finding 2: the prompt promises commands the grant does not include
 
@@ -136,7 +141,10 @@ roughly $1 and produces an escalation instead of a fix.
 > `pnpm test` is permitted; `pnpm test 2>&1 | tail -20` is refused by the sandbox
 > as a different command.
 
-`pnpm` is granted only when a unit declares it as its `packageManager`. Run 3's
+In this fixture `pnpm` was granted by nothing: its unit declared `npm` as the
+`packageManager` and no command whose runner was `pnpm`. (Either would have
+granted it — a declared `commands.test.cmd: "pnpm test"` yields
+`Bash(pnpm test:*)` on its own, `sandbox.mjs:348-355`.) Run 3's
 actual grant was `Bash(git:*) Bash(node:*) Bash(npx:*) Bash(tsx:*) Bash(npm:*)`
 and the read-only utilities — no `pnpm`. The worker ran `pnpm test`, was refused,
 and moved on. The instruction, not the model, produced that attempt.
@@ -259,11 +267,14 @@ not observed and remains unmeasured.
 
 ## The standing cost, while this is unresolved
 
-`rounds.maxFixAttemptsPerFinding` is **1** on the live profile, and the attempt
-is recorded when the RUN succeeds — `daemon.mjs:857`, not conditional on
-publication. Verified in the experiment's own store: one `fix_attempt` row, not
-refunded, after a run whose publication was refused.
+`rounds.maxFixAttemptsPerFinding` is **1** on the live profile. The attempt is
+RECORDED when the run starts (`daemon.mjs:857`) and is not conditional on
+publication — but it is not always kept: a checkout, auth or settings failure
+refunds it (`daemon.mjs:1043`), as does cancellation before the worker binds
+(`daemon.mjs:1066`). The accurate rule is that the attempt is spent once worker
+execution begins. Verified for the run that matters here: one `fix_attempt` row,
+NOT refunded, after a run whose publication was refused.
 
-So each red pull request gets one attempt, and on this evidence it is spent
-producing a fix that cannot ship. After a repair, that pull request is not
+So each eligible red pull request gets one attempt, and on this evidence it is
+spent producing a fix that cannot ship. After a repair, that pull request is not
 retried unless its failure cause changes.

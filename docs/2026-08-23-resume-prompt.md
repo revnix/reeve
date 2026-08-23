@@ -17,12 +17,12 @@ docs/2026-08-22-session-handoff-2.md as history.
 
 ## In one line
 
-reeve is ARMED and CANNOT PUBLISH. `--execute` is live and the next ELIGIBLE red
-CI on nextlyhq/nextly will dispatch (see task 3: several kinds of red escalate
-without dispatching), but the worker cannot run `git add` or `git commit` — the
-sandbox that landed 22 Aug denies Bash writes to `.git`. Three dispatches, three
-correct fixes, zero published — though only run 3 demonstrates the commit block;
-runs 1 and 2 hit max_turns first. That is a regression: reeve
+reeve is DISARMED, because it could not publish. `--execute` was removed from the
+plist on 23 Aug and the running process verified without it. The reason: the
+worker cannot run `git add` or `git commit` — the sandbox that landed 22 Aug
+denies Bash writes to `.git`. Three dispatches, three correct fixes, zero
+published — though only run 3 demonstrates the commit block; runs 1 and 2 hit
+max_turns first. That is a regression: reeve
 published three times on 21 Aug, on its OWN repo, before that sandbox existed.
 
 ## VERIFY the state before trusting any of it, and tell me what drifted
@@ -39,8 +39,10 @@ armed: `launchctl kickstart` restarts from launchd's cached plist, so the file
 can say `--execute` while the running process does not have it. That happened on
 23 Aug and I nearly reported it as done.
 
-Expected: main `16769e7`, 60 test files green, doctor `broken` on R-01 and R-03
-ONLY (both mine), and the running process carrying `--execute`.
+Expected: main at least `bc17a06` (#17), the test files green, doctor `broken` on
+R-01 and R-03 ONLY (both mine), and the running process WITHOUT `--execute`. If
+it has `--execute`, someone re-armed it — find out who before doing anything
+else.
 
 ## Your task, in priority order
 
@@ -94,9 +96,13 @@ ONLY (both mine), and the running process carrying `--execute`.
    failure whose checks are ALL demonstrated flakes — before `startRun`, so there
    is no transcript, no worktree and no spent attempt to capture. Only a caused,
    named, not-wholly-flaky failure past the containment and capacity gates reaches
-   `recordFixAttempt`. For those the attempt is spent even when nothing publishes,
-   so it is one-shot data: capture the worker transcript, the worktree diff and
-   the escalation, not just a log tail.
+   `recordFixAttempt`. Even then it is not necessarily spent: preparation happens
+   AFTER the record, and a checkout, auth or settings failure refunds it
+   (`daemon.mjs:1043`), as does pre-bind cancellation (`:1066`) — in those cases
+   there is no transcript and the fingerprint stays retryable. Once worker
+   EXECUTION begins the attempt is spent even if nothing publishes, and that run
+   is the one-shot data: capture the transcript, the worktree diff and the
+   escalation, not just a log tail.
 
 ## The daemon freeze is LIFTED; the tracker entry is still owed
 
@@ -168,22 +174,29 @@ once those PRs land, not before.
     still took 6, four of which were my own false claims.
   - **Do not merge.** Every PR needs my explicit grant, and the last one is spent.
 
-## Other sessions are alive — check before starting anything
+## Who owns what — all three S2 plan PRs have MERGED
 
-  - S2-A/B/C plans: PRs #11, #12, #13, worktrees ~/Work/Products/reeve-wt/{pa,pb,pc}.
-    These are CHAINED (#12 bases on #11's merge, #13 on #12's) and cannot be
-    parallelised — their own plans say why.
-  - threadDetails wiring: a session I started, branch `feat/thread-details`.
-    It owns `src/daemon.mjs` until it lands.
+  - S2-A/B/C plans (#11, #12, #13) and their follow-up #17 are IN main. S2 is
+    planned, not built. Do not wait on or coordinate with those lanes.
+  - threadDetails wiring: never started, no branch was ever pushed. Nobody owns
+    `src/daemon.mjs`; PR #19 edits it.
+  - Mine and open: #15 (docs), #18 (prompt/grant), #19 (the P0 fix). #19 is
+    stacked on #18 because both touch `src/prompts.mjs`.
 
 Use ListAgents and SendMessage to check what peers are on before touching
 anything outside your lane, and tell them what you are on.
 
 Do NOT `git pull` or switch branches in ~/Work/Products/reeve — that is the
-running daemon's checkout AND REEVE IS ARMED, so a restart there has real
-consequences. Restarting after a merge is fine and expected, after verifying the
-merge by CONTENT (squash merges break SHA ancestry: `git diff --name-only
-origin/main <your-pushed-head>` should be empty).
+running daemon's checkout. reeve is disarmed, so a restart is less dangerous than
+it was, but the checkout is still live and a half-applied tree is still a bad
+thing to hand a daemon. Restarting after a merge is fine and expected, after verifying the merge by
+CONTENT. Squash merges break SHA ancestry, so compare the PATHS YOU CHANGED
+rather than whole trees — unrelated commits landing on main while your PR is open
+make a whole-tree diff non-empty even on a perfect merge:
+
+  BASE=$(git merge-base origin/main <your-pushed-head>)
+  PATHS=$(git diff --name-only $BASE <your-pushed-head>)
+  git diff origin/main <your-pushed-head> -- $PATHS   # empty == your work landed
 
 ## What needs me, so you do not wait on it silently
 
@@ -206,8 +219,9 @@ verified that you have not run.
 
 ## Why the prompt is shaped this way
 
-- **It leads with the P0**, because reeve is armed against a repository it cannot
-  publish to, and every ELIGIBLE red PR there spends a paid attempt to prove it.
+- **It leads with the P0**, because it is why reeve is switched off, and turning
+  it back on before the fix lands would spend a paid attempt per eligible red PR
+  to re-prove something already measured.
 - **It makes the `ps` check non-optional**, because the plist/process divergence
   already bit once and is invisible to anyone reading files.
 - **It tells the reader not to trust it**, first house rule. The document it

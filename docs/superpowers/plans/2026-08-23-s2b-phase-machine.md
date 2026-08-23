@@ -1642,6 +1642,43 @@ import { applyTransition } from "../src/build/transition.mjs";
     JSON.stringify(complete));
   db.close();
 }
+
+// ── a replacement must POSTDATE the void it forgives ─────────────────────────
+// The correlation on `idempotency_key` alone matches any historical `done` row.
+// This is the plain-resume sequence, which the design deliberately permits: an
+// effect completes, the resume re-enqueues the same key beside its history, and
+// a hold then voids the NEW row. The old completion satisfies a key-only
+// subquery, so FINALIZING commits DONE while the delivery that actually
+// mattered was abandoned. `d.id > v.id` is what makes "replacement" mean
+// "afterwards" -- `outbox.id` is INTEGER PRIMARY KEY and therefore monotonic.
+{
+  const db = openHub(join(dir, "t8.db"));
+  seed(db, { id: "bt:1", phase: "FINALIZING", generation: 1 });
+  db.prepare(`INSERT INTO phase_event(seq,task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+              VALUES(200,'bt:1',unixepoch(),'phase.advanced','SLICE_MERGED','FINALIZING',1,1,'{}')`).run();
+  const put = (key, status) => db.prepare(
+    `INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,status,args,created_at,updated_at)
+     VALUES(?,'gh.pr.comment','bt:1',1,200,?,'{}',unixepoch(),unixepoch())`).run(key, status);
+  const settle = () => applyTransition(db, { taskId: "bt:1", expectedPhase: "FINALIZING",
+    expectedGeneration: 1, evidence: { kind: "finalize.settled", outstanding: 0 }, op: "phase.advanced" });
+
+  put("bt:1:g1:comment", "done");        // the ORIGINAL delivery -- lower id
+  put("bt:1:g1:comment", "voided");      // re-enqueued, then voided -- HIGHER id
+  const stale = settle();
+  check(stale.applied === false && /1 voided/.test(String(stale.refusal)),
+    "a done row that PREDATES the void does not forgive it: a replacement has to postdate what it replaces",
+    JSON.stringify(stale));
+
+  // CONTROL: enqueue the replacement AFTER the void and the same call commits.
+  // Without it, an over-fix that never forgives a voided row at all -- which
+  // would deadlock every legitimate resume in FINALIZING -- passes the line
+  // above.
+  put("bt:1:g1:comment", "done");
+  const after = settle();
+  check(after.applied === true && after.to === "DONE",
+    "control: a replacement enqueued AFTER the void does forgive it", JSON.stringify(after));
+  db.close();
+}
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -2024,7 +2061,21 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
                              WHERE d.task_id          = v.task_id
                                AND d.task_generation  = v.task_generation
                                AND d.idempotency_key  = v.idempotency_key
-                               AND d.status           = 'done')`)
+                               AND d.status           = 'done'
+                               -- LATER than the voided row, not merely equal in
+                               -- key. `outbox.id` is INTEGER PRIMARY KEY and so
+                               -- monotonic, which makes it the ordering.
+                               --
+                               -- Without it any HISTORICAL `done` row with the
+                               -- same key forgives the void, and a plain resume
+                               -- deliberately re-enqueues a completed non-keyed
+                               -- effect beside its history: the sequence
+                               -- done(id=5) -> re-enqueue(id=9) -> hold voids 9
+                               -- leaves row 5 satisfying this subquery, so
+                               -- FINALIZING commits DONE while the delivery that
+                               -- actually mattered was abandoned. A replacement
+                               -- has to POSTDATE what it replaces.
+                               AND d.id               > v.id)`)
         .get(taskId, expectedGeneration, finalizingSeq).c;
       // Same fence scope as the group above, so the two halves cannot disagree
       // about which effects belong to this finalization.

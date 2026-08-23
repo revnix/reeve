@@ -322,6 +322,27 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
   check(mixed.level === "BROKEN",
     "an empty value ALONGSIDE a real one is still BROKEN — it is not filtered away", mixed.lines.join(" | "));
 
+  // Whitespace is neither empty by string comparison nor a url, and the trim in
+  // the url list turns it into one `filter(Boolean)` then drops. Found reviewing
+  // my own diff, not by a reviewer.
+  const blank = checkRemoteReach(pub, withConfig(["   "]));
+  check(blank.level === "BROKEN" && /EMPTY value/.test(blank.lines.join(" ")),
+    "a pushurl of whitespace is BROKEN too, not silently dropped", blank.lines.join(" | "));
+
+  // And the same hole from the other side: if every destination were dropped,
+  // the credential loop would run zero times and report OK having asked nothing.
+  const nowhere = {
+    run: (cwd, args) => {
+      if (args[0] === "remote") return { ok: true, out: args.includes("--push") ? "   " : "https://github.com/o/r.git" };
+      if (args[0] === "ls-remote") return { ok: true, out: "abcdef1234567890  refs/heads/main" };
+      return { ok: false, out: "", err: "" };
+    },
+    credential: () => { throw new Error("the credential must not be asked for: there is no destination"); },
+  };
+  const n = checkRemoteReach(pub, nowhere);
+  check(n.level === "BROKEN" && /no push destination/.test(n.lines.join(" ")),
+    "a remote that resolves to no destination at all is BROKEN, not OK-by-absence", n.lines.join(" | "));
+
   // Controls: a real pushurl, and none configured at all, both pass through.
   const real = checkRemoteReach(pub, withConfig(["https://github.com/o/one.git"]));
   check(real.level === "OK", "control: a configured, non-empty pushurl is unaffected", real.lines.join(" | "));

@@ -149,13 +149,22 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
     check(c.lines.some(l => /PUSHSIDE/.test(l)), "  and the report names it", c.lines.join(" | "));
   }
   {
-    // A separate push url is reached in its own right: `ls-remote origin` reads
-    // through the FETCH url and says nothing about the other one.
+    // A separate push url is NOT probed for reachability, deliberately.
+    // `ls-remote <the literal url>` drops every remote-scoped setting, so it
+    // answers a different question from the one publication asks. Measured
+    // 2026-08-23 with an unreachable remote.origin.proxy: `ls-remote origin`
+    // fails through the proxy and `ls-remote <the same url>` bypasses it and
+    // succeeds. A probe that can be wrong in both directions is removed rather
+    // than tuned, and what it reached for is reported as not established.
     const io = seams({ url: "https://github.com/o/r.git", pushUrl: "https://github.com/o/p.git",
                        lsRemotePush: { ok: false, out: "", err: "fatal: repository not found" } }, { ok: true });
     const c = checkRemoteReach(pub, io);
-    check(c.level === "BROKEN" && /push url https:\/\/github\.com\/o\/p\.git cannot be reached/.test(c.lines.join(" ")),
-      "a push url that does not answer is BROKEN even when the fetch url does", c.lines.join(" | "));
+    check(io.askedFor.filter(u => u === "https://github.com/o/p.git" ).length === 1,
+      "the push url is asked about ONCE — for its credential, not for a reachability probe", io.askedFor.join(" "));
+    check(!io.askedFor.some((u, i) => u === "https://github.com/o/p.git" && io.asked[i] === "ls-remote"),
+      "  so an unreachable push url does not decide the verdict", io.asked.join(","));
+    check(c.level === "OK" && /not probed for reachability/.test(c.lines.join(" ")),
+      "  and the report says the destination's reachability is not established", c.lines.join(" | "));
   }
   {
     // `git remote get-url` EXPANDS insteadOf, so a rewrite to a credential-
@@ -251,9 +260,9 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
     }, { ok: true });
     const c = checkRemoteReach(pub, io);
     check(io.askedFor.includes("https://github.com/o/one.git") && io.askedFor.includes("https://github.com/o/two.git"),
-      "every configured push url is probed, not just the first", io.askedFor.join(" "));
-    check(c.level === "BROKEN" && /two\.git cannot be reached/.test(c.lines.join(" ")),
-      "  and a later push destination that cannot be reached is BROKEN", c.lines.join(" | "));
+      "every configured push url gets its own credential question, not just the first", io.askedFor.join(" "));
+    check(c.lines.filter(l => /a credential is available/.test(l)).length === 2,
+      "  and each destination is reported on in its own right", c.lines.join(" | "));
   }
   {
     // A credential helper is not the only way http authenticates.
@@ -277,6 +286,47 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
     const c = checkRemoteReach(pub, io);
     check(c.level === "BROKEN", "control: a silent helper with nothing else configured is still BROKEN", c.lines.join(" | "));
   }
+}
+
+// ── R-16: a pushurl that names nowhere ───────────────────────────────────────
+//
+// Measured 2026-08-23 on git 2.50.1: an explicitly empty `remote.origin.pushurl`
+// is DROPPED — `get-url --push --all` shows only the remaining url and a real
+// push succeeds. A reviewer reports git 2.43 exiting 128 with "no path
+// specified" instead, and 2.43 is what Ubuntu LTS ships, which reeve has to run
+// on. So the resolved list is exactly where the two gits agree and the raw
+// configuration is where they do not; the check reads the configuration.
+{
+  const withConfig = (values, cred = { ok: true }) => ({
+    run: (cwd, args) => {
+      if (args[0] === "remote") return { ok: true, out: "https://github.com/o/r.git" };
+      if (args[0] === "ls-remote") return { ok: true, out: "abcdef1234567890  refs/heads/main" };
+      if (args[0] === "config" && args[2] === "--get-all") {
+        // git -z terminates EVERY value with a NUL, so N values give N NULs.
+        return values === null ? { ok: false, out: "", err: "" } : { ok: true, out: values.map(v => v + "\0").join("") };
+      }
+      if (args[0] === "config") return { ok: false, out: "", err: "" };
+      return { ok: false, out: "", err: "unexpected" };
+    },
+    credential: () => cred,
+  });
+  const pub = { identity: { checkout: "/co", defaultBranch: "main", visibility: "public" } };
+
+  const only = checkRemoteReach(pub, withConfig([""]));
+  check(only.level === "BROKEN" && /EMPTY value/.test(only.lines.join(" ")),
+    "a pushurl configured as an empty value is BROKEN", only.lines.join(" | "));
+  check(/2\.43/.test(only.lines.join(" ")) && /2\.50/.test(only.lines.join(" ")),
+    "  and the report names both gits, because the consequence differs between them", only.lines.join(" | "));
+
+  const mixed = checkRemoteReach(pub, withConfig(["https://github.com/o/one.git", ""]));
+  check(mixed.level === "BROKEN",
+    "an empty value ALONGSIDE a real one is still BROKEN — it is not filtered away", mixed.lines.join(" | "));
+
+  // Controls: a real pushurl, and none configured at all, both pass through.
+  const real = checkRemoteReach(pub, withConfig(["https://github.com/o/one.git"]));
+  check(real.level === "OK", "control: a configured, non-empty pushurl is unaffected", real.lines.join(" | "));
+  const none = checkRemoteReach(pub, withConfig(null));
+  check(none.level === "OK", "control: no pushurl configured at all is unaffected", none.lines.join(" | "));
 }
 
 // ── R-14 ─────────────────────────────────────────────────────────────────────

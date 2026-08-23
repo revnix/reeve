@@ -147,6 +147,56 @@ which would claim a verification that did not happen. Only the KEY is reported;
 the value is an Authorization header, and it gets the same treatment as the
 credential.
 
+## Round three: the push-url reachability probe is removed
+
+The probe was mine, not asked for. It generated a finding in each of the two
+rounds after it, and the third settles it.
+
+`ls-remote <the literal url>` drops every REMOTE-SCOPED setting. Measured
+2026-08-23 against this repository with an unreachable `remote.origin.proxy`:
+
+```
+$ git -c remote.origin.proxy=http://127.0.0.1:1 ls-remote origin refs/heads/main
+fatal: unable to access 'https://github.com/revnix/reeve.git/': Failed to connect to 127.0.0.1 port 1
+$ git -c remote.origin.proxy=http://127.0.0.1:1 ls-remote https://github.com/revnix/reeve.git refs/heads/main
+e41cd287e2e592faad884e7b2e236f19760d0a4e	refs/heads/main
+```
+
+So the literal probe answers a different question in both directions: it can
+report reachable for a remote whose only route is a proxy it ignored, and it
+would have reported BROKEN for a checkout that publishes.
+
+Making it faithful means reproducing git's own remote resolution —
+`remote.<name>.proxy`, `uploadpack`, `vcs`, and whatever the next version adds.
+An attempt to sidestep that with `-c remote.origin.url=<pushUrl> ls-remote
+origin` does not work either: measured, the override is ignored, because the key
+is multi-valued and git takes the first.
+
+The reading is removed rather than tuned, and what it reached for is stated as
+not established. `ls-remote origin` still exercises origin's full configuration,
+which is what reeve's own fetch uses, and the credential question needs no
+network and no proxy so it is still asked per destination.
+
+## An empty pushurl, where the two gits disagree
+
+```
+$ git config remote.origin.pushurl ""
+$ git remote get-url --push --all origin
+/tmp/r16d/A.git                       # git 2.50.1 DROPS the empty value
+$ git push --dry-run origin HEAD:refs/heads/main
+Everything up-to-date                 # and the push succeeds
+```
+
+A reviewer reports git 2.43 exiting 128 with `fatal: no path specified` instead.
+That is not reproducible here, and 2.43 is what Ubuntu LTS ships — a platform
+reeve has to run on — so it is taken rather than dismissed.
+
+The resolved list is exactly where the two gits agree, so the check reads the raw
+configuration: `git config -z --get-all remote.origin.pushurl`, with `-z` because
+`--get-all` alone loses an empty value to the trim. Any empty value is BROKEN,
+and the report names both gits so a reader is not misled about which behaviour
+their own git has.
+
 ## What this does not establish
 
 That a push would SUCCEED. It establishes that the credential a push needs can be

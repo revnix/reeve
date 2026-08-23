@@ -634,6 +634,21 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
   const pushUrls = (pushed.ok && pushed.out ? pushed.out.split("\n") : [fetchUrl.out]).map(u => u.trim()).filter(Boolean);
   const separate = pushUrls.length > 1 || pushUrls[0] !== fetchUrl.out;
 
+  // An explicitly EMPTY pushurl, read from the configuration rather than from
+  // the resolved list -- because the resolved list is exactly where the two
+  // gits agree. Measured 2026-08-23 on git 2.50.1: an empty value is dropped,
+  // `get-url --push --all` shows only the remaining url, and a real push
+  // succeeds. A reviewer reports git 2.43 instead exiting 128 with "no path
+  // specified", and 2.43 is what Ubuntu LTS ships, so it is a git reeve has to
+  // run on. Either way the configuration is wrong; only its consequence moves.
+  // `-z`, because `--get-all` alone loses an empty value to the trim.
+  const configured = run(checkout, ["config", "-z", "--get-all", "remote.origin.pushurl"]);
+  if (configured.ok && configured.out.split("\0").slice(0, -1).some(v => v === "")) return { id, level: BROKEN, title,
+    lines: [`origin ${withoutUserinfo(fetchUrl.out)}`,
+            "remote.origin.pushurl is configured with an EMPTY value",
+            "git 2.50.1 ignores it and pushes to the remaining url; git 2.43 fails the push with `no path specified`",
+            "-> whichever git is in front of it, the configuration does not say where to publish"] };
+
   const branch = profile.identity?.defaultBranch ?? "main";
   const lines = [`origin ${withoutUserinfo(fetchUrl.out)}`];
   if (separate) lines.push(`push url(s) ${pushUrls.map(withoutUserinfo).join(", ")}`);
@@ -646,16 +661,28 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
             "-> every publication would fail; the reads reeve makes through `gh` are unaffected, so nothing else reports this"] };
   lines.push(`reachable: ${branch} is at ${(reach.out.split(/\s+/)[0] ?? "").slice(0, 10) || "(no such ref)"}`);
 
+  // A push url of its own is NOT probed for reachability, deliberately.
+  //
+  // `ls-remote <the literal url>` answers a different question from the one
+  // publication asks: it drops every remote-scoped setting. Measured 2026-08-23
+  // against this repository with an unreachable `remote.origin.proxy`:
+  //
+  //   ls-remote origin    -> fatal: Failed to connect to 127.0.0.1 port 1
+  //   ls-remote <the same url literally> -> e41cd287e2  (the proxy bypassed)
+  //
+  // So the literal probe can report BROKEN for a checkout that publishes, and
+  // report reachable for one that cannot. Making it faithful means reproducing
+  // git's own remote resolution -- `remote.<name>.proxy`, `uploadpack`, `vcs`,
+  // and whatever the next version adds -- and this is the third round of
+  // findings against that probe. The reading is removed rather than tuned; what
+  // it was reaching for is stated as not established instead.
+  //
+  // `ls-remote origin` above still exercises origin's full configuration, which
+  // is what reeve's own fetch uses. The credential question below needs no
+  // network and no proxy, so it is asked per destination as before.
   const unverified = [];
   for (const url of pushUrls) {
     const shown = withoutUserinfo(url);
-    if (url !== fetchUrl.out) {
-      const reachPush = run(checkout, ["ls-remote", url, `refs/heads/${branch}`]);
-      if (!reachPush.ok) return { id, level: BROKEN, title,
-        lines: [...lines, `but the push url ${shown} cannot be reached: ${reachPush.err}`,
-                "-> reeve would fetch and judge normally, then fail at the push"] };
-      lines.push(`the push url ${shown} answers too`);
-    }
     // ssh and local transports authenticate through the transport itself, so the
     // reach above already exercised them. http and https do not, on a PUBLIC
     // repository -- git's credential subsystem covers both schemes, and a plain
@@ -681,6 +708,7 @@ export function checkRemoteReach(profile, { run = founderRun, credential = found
                 ? ["this repository is PUBLIC, so the read above succeeded anonymously and proves nothing about a push"] : []),
               "-> a push authenticates; reeve would fetch, judge and refuse at the last step"] };
   }
+  if (separate) lines.push("the push destination(s) are not probed for reachability: a literal-url probe drops remote.origin.proxy and answers a different question");
   if (unverified.length) return { id, level: DEGRADED, title,
     lines: [...lines, `-> publication to ${unverified.join(", ")} rests on configuration this check cannot exercise without pushing`] };
   return { id, level: OK, title, lines };

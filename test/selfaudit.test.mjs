@@ -85,6 +85,31 @@ check(healthy.length === 0, "control: a healthy reeve produces no findings", JSO
   check(f.some(x => x.id === "backup.unreadable" || x.id === "backup.empty"),
     "a fresh file that is not a usable store is caught — it is the one a restore reaches for",
     JSON.stringify(f));
+  // WHICH fault, and whether the sentence is TRUE. `latestSnapshot` skips
+  // candidates that fail validation, so a directory full of corrupt snapshots
+  // answers null exactly like an empty one -- and reporting that as "reeve has
+  // never backed up X" is false. The backups ARE running; they are producing
+  // files that cannot be restored, which is the more urgent fault and sends the
+  // operator somewhere completely different.
+  const junkFinding = f.find(x => x.id === "backup.unreadable" || x.id === "backup.empty");
+  // `junkFinding != null` FIRST. A negative regex over `String(undefined)`
+  // matches nothing and passes, so without this the assertion is satisfied by
+  // the finding being ABSENT -- which is the exact failure it exists to catch.
+  check(junkFinding != null &&
+        !/never backed up|nothing under/.test(String(junkFinding.why) + String(junkFinding.detail)),
+    "and it is NOT reported as 'never backed up', because a corrupt backup is not an absent one",
+    JSON.stringify(junkFinding));
+  check(/fails validation|cannot be read|cannot be restored/.test(String(junkFinding?.why) + String(junkFinding?.detail)),
+    "and the finding says the snapshots exist and do not validate, which is what an operator has to act on",
+    JSON.stringify(junkFinding));
+  // CONTROL: a genuinely empty directory still reports absence. Without it, a
+  // fix that renames every backup fault to 'unreadable' passes both lines above.
+  const emptyRoot = join(dir, "empty-root");
+  mkdirSync(join(emptyRoot, "revnix-reeve"), { recursive: true });
+  const e = selfAudit(db, { nwo: NWO, profile: PROFILE, backupRoot: emptyRoot, at: NOW, io: fresh });
+  check(e.some(x => x.id === "backup.missing"),
+    "control: a directory with no snapshots at all is still reported as never backed up",
+    JSON.stringify(e.map(x => x.id)));
 }
 
 // ── never backed up at all ───────────────────────────────────────────────────

@@ -2865,12 +2865,46 @@ export function latestSnapshot(root, nwo, { deep = false } = {}) {
 }
 ```
 
-**Two call sites change meaning, and both change for the better.** `bin/reeve
-restore` now defaults `--from` to the newest snapshot that will actually restore
-(it already handles `null` at `bin/reeve:166`), and `selfaudit.mjs` now counts a
-store whose every snapshot is corrupt as un-backed-up -- which is what it is. Both
-already branch on `null`, so neither needs a change here; `test/backup.test.mjs`
-must stay green, and Step 4 runs it.
+**Two call sites change meaning. One improves; the other needed a fix, and this
+paragraph previously claimed otherwise.** `bin/reeve restore` now defaults
+`--from` to the newest snapshot that will actually restore (it already handles
+`null` at `bin/reeve:166`), which is a straight improvement.
+
+`selfaudit.mjs` is the one that needed work. It was described here as "now counts
+a store whose every snapshot is corrupt as un-backed-up -- which is what it is",
+and that is wrong twice. It is not what it is: the backups ARE running, and they
+are producing files that cannot be restored. And the finding it emits says
+`reeve has never backed up <nwo>` / `nothing under <root>` -- a false sentence
+that sends an operator to check a schedule which is working perfectly, when the
+urgent fault is that every recovery point is rubbish. Measured while executing
+this task: `test/selfaudit.test.mjs` goes RED on
+`a fresh file that is not a usable store is caught`, because `latestSnapshot`
+now skips the junk file and returns `null`, which selfaudit reads as absence.
+
+**So this task also changes `selfaudit.mjs`, and `backup.mjs` gains one export.**
+`snapshotCandidates(root, nwo)` returns the snapshot filenames without judging
+any of them -- exported rather than reimplemented in selfaudit, because `slug` is
+private to `backup.mjs` and a second spelling of that path is how the two drift.
+`selfAudit` then separates the two causes of a `null`, in BOTH the per-store
+sweep and the single-store path:
+
+- files present, none valid -> `backup.unreadable`, "none of reeve's backups of
+  X can be restored", detail naming how many exist and that every one fails
+  validation.
+- nothing present -> `backup.missing`, unchanged.
+
+**Step 4 runs `test/selfaudit.test.mjs` as well as `test/backup.test.mjs`.**
+Naming only the second is what let this through: the test that breaks is not the
+test the plan pointed at. Three assertions cover it -- that the fault is caught,
+that it is NOT worded as "never backed up", and that the wording names the real
+problem -- plus a control that a genuinely empty directory still reports absence,
+so a fix that renames every backup fault to `unreadable` fails.
+
+One note on writing those assertions, because the first attempt was wrong in a
+way this plan warns about elsewhere: a negative regex over
+`String(finding?.why)` PASSES when the finding is absent, since `String(undefined)`
+matches nothing. It is satisfied by exactly the failure it exists to catch.
+Guard it with `finding != null &&` first.
 
 **`snapshot()` gains one field, `mine`, and publishes with `link`, not `rename`.**
 There are two separate hazards here and only one operation closes both.

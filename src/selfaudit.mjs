@@ -24,7 +24,7 @@
 // BROKEN until the ruleset is repaired. Escalating that hourly would report a
 // known, accepted condition forever. doctor stays a command a human runs.
 
-import { latestSnapshot, everyStore } from "./backup.mjs";
+import { latestSnapshot, everyStore, snapshotCandidates } from "./backup.mjs";
 import { statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
@@ -45,7 +45,17 @@ function checkBackups(nwo, { backupRoot, interval, at, io, home }) {
   // unaudited AND unbacked, which is the pair that loses data.
   if (home) {
     const stores = (io.everyStore ?? everyStore)(home);
-    const missing = stores.filter(st => !(io.latestSnapshot ?? latestSnapshot)(backupRoot, st.nwo));
+    const unbacked = stores.filter(st => !(io.latestSnapshot ?? latestSnapshot)(backupRoot, st.nwo));
+    // Split for the same reason as below: "never backed up" and "every snapshot
+    // is corrupt" both surface as a null from `latestSnapshot`, and only one of
+    // them is a scheduling problem.
+    const corrupt = unbacked.filter(st => (io.snapshotCandidates ?? snapshotCandidates)(backupRoot, st.nwo).length);
+    const missing = unbacked.filter(st => !corrupt.includes(st));
+    if (corrupt.length) {
+      return { id: "backup.unreadable", level: BROKEN,
+               why: "a state store on this machine has backups and none of them can be restored",
+               detail: corrupt.map(m => m.nwo).join(", ") };
+    }
     if (missing.length) {
       return { id: "backup.missing", level: BROKEN,
                why: "a state store on this machine has never been backed up",
@@ -55,6 +65,19 @@ function checkBackups(nwo, { backupRoot, interval, at, io, home }) {
 
   const newest = (io.latestSnapshot ?? latestSnapshot)(backupRoot, nwo);
   if (!newest) {
+    // A null here has TWO causes and they are different operator problems.
+    // `latestSnapshot` now skips candidates that fail validation, so a store
+    // whose every snapshot is corrupt answers null exactly like one that was
+    // never backed up. Reporting the second as "has never been backed up" is
+    // FALSE, and it sends an operator to check a schedule that is working
+    // perfectly -- the backups are running and producing rubbish, which is both
+    // the more urgent fault and the one this line named before validation moved
+    // into the read path.
+    const present = (io.snapshotCandidates ?? snapshotCandidates)(backupRoot, nwo);
+    if (present.length)
+      return { id: "backup.unreadable", level: BROKEN,
+               why: `none of reeve's backups of ${nwo} can be restored`,
+               detail: `${present.length} snapshot(s) under ${backupRoot}, and every one fails validation` };
     return { id: "backup.missing", level: BROKEN,
              why: `reeve has never backed up ${nwo}`,
              detail: `nothing under ${backupRoot}` };

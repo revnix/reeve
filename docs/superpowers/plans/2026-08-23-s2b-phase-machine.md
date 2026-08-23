@@ -679,6 +679,23 @@ export function nextPhase(state, evidence) {
       // the CANCELLING entry timestamp inside the transaction before committing,
       // for the same reason FINALIZING re-counts its effects: this is a terminal
       // transition and the machine cannot see a clock.
+      // `builder.cancel.drainMinutes` MUST be declared in `FIELDS`, in this task.
+      // `src/profile/schema.mjs` is fail-closed on unknown keys (`unknown key:
+      // ${p}` at src/profile/schema.mjs:352 on 16769e7), so an operator who sets
+      // the one control this branch documents kills every `reeve run` at profile
+      // load instead of tuning the drain window. Add:
+      //
+      //   "builder.cancel.drainMinutes": [false, v => (Number.isInteger(v) && v > 0
+      //                                    ? null : "must be a positive integer")],
+      //
+      // with a DEFAULTS entry of 30 and "builder.cancel" added to the container
+      // list at src/profile/schema.mjs:338 -- that list is separate from the
+      // derived container set, and without the entry a profile carrying
+      // `builder: { cancel: "oops" }` takes the defaults as named properties and
+      // validates. Found by sweeping all three plans' `builder.*` reads against
+      // the declared set; S2-C declares the three `builder.provider.*` keys the
+      // same sweep found, so neither plan assumes the other did it.
+      //
       // Section 3.5 permits --force only after builder.cancel.drainMinutes has
       // passed. Without that guard a founder can force a cancel one second in,
       // recording rows as `forced` whose reconcilers had not been tried even

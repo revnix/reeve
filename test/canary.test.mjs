@@ -503,6 +503,13 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     `imports ${imported.join(",")} | classified ${classified.join(",")}`);
   check(INSTRUMENT_SOURCES.includes("./canary.mjs"),
     "  and this file counts itself, since the probes and the verdicts live here", INSTRUMENT_SOURCES.join(","));
+  // sandbox.mjs was excluded on the grounds that it contributes the POLICY and
+  // the policy is hashed into the id. True of the PRODUCTION policy; false of
+  // the canary's own grant, which `canaryGrant` builds from `scopedFileTools`
+  // and `ruleFor`, whose `allowRead` comes from `carveOuts`, and which
+  // `validateSettings` then accepts or refuses. None of that reaches the id.
+  check(INSTRUMENT_SOURCES.includes("./sandbox.mjs"),
+    "  and so does sandbox.mjs, which builds the grant the probe runs under", INSTRUMENT_SOURCES.join(","));
 }
 
 // ── the recorded id IS the cache key ─────────────────────────────────────────

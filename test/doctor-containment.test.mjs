@@ -102,6 +102,20 @@ const root = mkdtempSync(join(tmpdir(), "reeve-doctor-cont-"));
     check(!io.asked.includes("credential"),
       "  and no https credential is asked for, which would be the wrong question", io.asked.join(","));
   }
+  {
+    // ...but only when the reach WENT there. `ls-remote origin` uses the FETCH
+    // url, so an https fetch beside an ssh push url means the ssh transport was
+    // never touched — an anonymous public fetch plus an ssh push with no usable
+    // key reported healthy. The claim was written while the push destination
+    // still had a probe of its own and survived the round that removed it.
+    const io = seams({ url: "https://github.com/o/r.git", pushUrl: "git@github.com:o/r.git" }, { ok: true });
+    const c = checkRemoteReach(pub, io);
+    check(c.level === "DEGRADED", "an ssh PUSH url behind an https fetch url is not claimed as exercised", c.lines.join(" | "));
+    check(/did NOT exercise/.test(c.lines.join(" ")) && /fetch url/.test(c.lines.join(" ")),
+      "  and the report says which transport the reach actually went through", c.lines.join(" | "));
+    check(!io.asked.includes("credential"),
+      "  and it is still not asked for an https credential, which remains the wrong question", io.asked.join(","));
+  }
 }
 
 // ── R-16, the four ways it asked the wrong question ──────────────────────────

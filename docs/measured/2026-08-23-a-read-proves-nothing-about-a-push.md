@@ -197,6 +197,27 @@ configuration: `git config -z --get-all remote.origin.pushurl`, with `-z` becaus
 and the report names both gits so a reader is not misled about which behaviour
 their own git has.
 
+## The claim that outlived its probe
+
+Round five, and the third stale claim this branch produced. The non-http branch
+said the push transport's authentication had been exercised by the reach above.
+That was true while the push destination still had a probe of its own; the round
+that removed the probe left the sentence behind.
+
+`ls-remote origin` uses the FETCH url. So an https fetch beside an ssh push url
+means the ssh transport was never touched, and an anonymous public fetch plus an
+ssh push with no usable key reported healthy.
+
+The claim now depends on where the reach actually went: when the push url IS the
+fetch url the reach went through it and the verdict stands; when it differs, the
+destination is unverified and the check is DEGRADED with the reason naming which
+transport was exercised.
+
+All three of this branch's stale claims have the same shape — a sentence written
+when the code did more than it does now. Two were found by a reviewer and one by
+re-reading my own diff. What they have in common is that removing a reading is
+not finished until every sentence that depended on it is re-read.
+
 ## What this does not establish, said in the report rather than only here
 
 That a push would SUCCEED. `git credential fill` obtains the fields from the

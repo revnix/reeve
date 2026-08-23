@@ -594,7 +594,39 @@ export function founderCredential(cwd, url, { run = founderRun } = {}) {
  * cookie jar, so it is never returned, printed or recorded — the same rule the
  * credential itself gets.
  */
-const HTTP_AUTH_KEYS = ["http.extraHeader", "http.cookieFile"];
+/**
+ * Per-url http settings that mean authentication is arranged somewhere `git
+ * credential fill` cannot see. Any non-empty value counts.
+ *
+ * `sslCert` is here without a reviewer having asked: a client certificate is an
+ * authentication mechanism exactly as the other two are, and this is the third
+ * round in which one of these was found missing. The list is incomplete BY
+ * NATURE -- git keeps adding ways to authenticate -- so what matters is which
+ * way its incompleteness errs. A mechanism missing from it turns a working
+ * checkout BROKEN, which is loud and wrong; a mechanism wrongly in it turns a
+ * broken checkout DEGRADED, which is quiet and wrong. Neither is good, and the
+ * first is the recoverable one, so the list stays explicit rather than becoming
+ * "any http.* key at all" -- `http.postBuffer` says nothing about authentication
+ * and would suppress a real refusal.
+ */
+const HTTP_AUTH_VALUE_KEYS = ["http.extraHeader", "http.cookieFile", "http.sslCert"];
+
+/**
+ * And one that is a BOOLEAN, which is not the same question.
+ *
+ * `http.emptyAuth` tells git to attempt authentication without seeking a
+ * username or password -- Kerberos and GSS-Negotiate -- so a push succeeds where
+ * `credential fill` returns nothing. But measured 2026-08-23, `--get-urlmatch`
+ * returns `false` with EXIT 0 for a url configured `emptyAuth = false`:
+ *
+ *   http.emptyAuth  https://enterprise.example/o/r.git -> [true]  exit=0
+ *   http.emptyAuth  https://other.example/x.git        -> [false] exit=0
+ *   http.emptyAuth  https://nowhere.example/x.git      -> []      exit=1
+ *
+ * Reading presence rather than value would take configuration that says the
+ * OPPOSITE as evidence for it, and suppress a refusal that is real.
+ */
+const HTTP_AUTH_FLAG_KEYS = ["http.emptyAuth"];
 
 /**
  * The founder's netrc, if they have one. Read for one question only -- whether
@@ -632,11 +664,10 @@ function netrcNames(text, host) {
 /**
  * HTTP authentication configured somewhere other than a credential helper.
  *
- * `http.<url>.extraHeader`, `http.<url>.cookieFile` and `~/.netrc` are all used
- * by `ls-remote` and by the real push while `git credential fill` knows nothing
- * about them. `--get-urlmatch` is git's own resolution for the first two:
- * measured 2026-08-23, it exits 0 for a url the section matches and 1 for one it
- * does not.
+ * The keys above and `~/.netrc` are all used by `ls-remote` and by the real push
+ * while `git credential fill` knows nothing about them. `--get-urlmatch` is
+ * git's own resolution for the config ones: measured 2026-08-23, it exits 0 for
+ * a url the section matches and 1 for one it does not.
  *
  * netrc is not git configuration at all -- git hands libcurl `CURL_NETRC_
  * OPTIONAL` and curl reads the file itself. Measured 2026-08-23 on git 2.50.1
@@ -656,9 +687,13 @@ function netrcNames(text, host) {
  * treatment as the credential itself.
  */
 function httpAuthElsewhere(run, cwd, url, { netrc = readNetrcFile } = {}) {
-  for (const key of HTTP_AUTH_KEYS) {
+  for (const key of HTTP_AUTH_VALUE_KEYS) {
     const r = run(cwd, ["config", "--get-urlmatch", key, url]);
     if (r.ok && r.out) return key;
+  }
+  for (const key of HTTP_AUTH_FLAG_KEYS) {
+    const r = run(cwd, ["config", "--type=bool", "--get-urlmatch", key, url]);
+    if (r.ok && r.out === "true") return key;
   }
   if (netrcNames(netrc(), hostOf(url))) return "~/.netrc";
   return null;

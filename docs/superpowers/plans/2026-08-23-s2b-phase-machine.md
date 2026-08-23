@@ -1028,11 +1028,18 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
     }
 
     if (decision.to === "DONE") {
-      const outstanding = db.prepare(
-        `SELECT count(*) c FROM outbox WHERE task_id=? AND status IN ('pending','inflight')`).get(taskId).c;
-      if (outstanding > 0)
+      // Unsettled AND unsuccessful. Section 9.7 requires every finalization effect
+      // to have SETTLED THROUGH ITS RECONCILER -- a ledger write-back that
+      // reached `failed`, `dead_letter` or `refused` never happened, and DONE is
+      // terminal with no edges out, so the task can never come back to do it.
+      const bad = db.prepare(
+        `SELECT status, count(*) c FROM outbox
+         WHERE task_id=? AND status IN ('pending','inflight','failed','dead_letter','refused')
+         GROUP BY status`).all(taskId);
+      if (bad.length)
         return { applied: false, reason: "refused",
-                 refusal: `${outstanding} finalization effect(s) still unsettled at commit time` };
+                 refusal: `finalization is not complete: ` + bad.map(r => `${r.c} ${r.status}`).join(", ") +
+                          `; DONE is terminal and cannot be revisited` };
     }
 
     const upd = db.prepare(
@@ -1153,7 +1160,7 @@ git commit -m "feat(hub): generation-fenced transition with compensations"
 - Test: `test/hub-outbox.test.mjs`
 
 **Interfaces:**
-- Consumes: `hubTx`, `hubEvent` (Tasks 1, 6); the `outbox` DDL (Task 5).
+- Consumes: `hubTx`, `hubEvent`, **`assertWritable`** (S2-A); the `outbox` DDL. Every function here mutates hub state, so **each calls `assertWritable(db, { isAlive, inTx: true })` inside its own transaction** — `leaseEffect`, `settleEffect`, `recoverEffects` and `voidPending` alike. The executor runs on a loop, so without the check it can lease and settle rows — performing real external effects — while a restore replaces the file underneath it. It is the one writer that never stops on its own.
 - Produces:
   - `enqueueEffect(db, { idempotencyKey, kind, taskId, generation, fence, cancellable = true, args, notBefore = 0 }) -> { id, status }` — **must be called inside the caller's transaction**. Returns `status: 'superseded'` with no row performed when the key is round- or sha-keyed and a `done` row already carries it.
   - `leaseEffect(db, { worker, leaseSeconds = 300, capabilities }) -> Row | null` — revalidates the fence **inside the lease transaction** and settles `fenced` (returning null and trying the next row) when the task has moved generation or the row was voided; settles `refused` when the effect's capability switch is off.
@@ -1362,7 +1369,9 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
   - `resolveSnapshot(registry, project, claims, io) -> Snapshot` — takes the filing's normalised claims, because it is the only place with both the repository path and an I/O capability, and it returns them resolved. Without the parameter `resolveClaims` had no caller and the symlink refusal was unreachable from the filing path. where `io = { repoId, visibility, specRepoId, profileHash, defaultBranch, gateDefinitionHash }`, each a function. **Async, and it is where every network call lives.**
   - `admitTask(db, snapshot, filing) -> { ok, taskId, refusal }` — **synchronous, one `BEGIN IMMEDIATE`, and it performs no I/O of its own.** Inserts the task row at generation 1, its `task_territory` children, the `task.filed` event, and grants the territory lease **with the full intersection check**, refusing the whole filing and naming the blocker on a conflict.
   - `normalizeClaim(raw) -> { kind, path } | { refusal }` — **pure**, and grammar only: shape, normalisation, and the refused constructs (`*`, `**`, `!`, braces, character classes, absolute paths, `..`). It cannot and does not check symlinks.
-  - `resolveClaims(claims, repoPath, io) -> { ok, claims } | { refusal }` — the **filesystem-aware** half, run by `resolveSnapshot` in the network-first phase (§2.2) alongside every other I/O. It walks each normalised claim against `repoPath` with `io.lstat` and refuses any path that traverses a symlink, naming it.
+  - `resolveClaims(claims, repoPath, io) -> { ok, claims } | { refusal }` — the **filesystem-aware** half, run by `resolveSnapshot` in the network-first phase (§2.2). It walks each normalised claim **and every ancestor** and refuses:
+    - any component that is a **symlink** (`io.lstat`), naming it; and
+    - any component that is a **submodule root**, naming it. §10.1 lists submodule paths among the refused shapes, and `lstat` cannot see one — a submodule root is an ordinary directory. The tell is git's own: the superproject records a **gitlink** (mode `160000`) there, so `io.lsTree(repoPath, path)` returning that mode is the check. Claiming inside one puts a territory lease on a path whose content belongs to a different repository, where §10.1's diff comparison cannot see changes at all.
   - `overlaps(a, b) -> boolean` — prefix overlap by path segment.
 
 **Why the split.** §10.1 requires symlinked paths to be refused at claim time, and §2.2 requires `admitTask` to perform **no I/O**. Both cannot hold in one function: a `normalizeClaim` given only a string can either skip the check or resolve against whatever the process's current directory happens to be — which is not the repository, and would let two textually different claims resolve through a symlink to the same tree while overlap says they are disjoint. So the check moves to where the I/O already legitimately happens, before the transaction opens.
@@ -1456,6 +1465,16 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
   const belowLink = resolveClaims([{ kind: "file", path: "packages/linked/child.ts" }], "/repo", io);
   check(!!belowLink.refusal && /linked/.test(belowLink.refusal),
     "and so is a claim whose ANCESTOR is a symlink, naming the ancestor", JSON.stringify(belowLink));
+
+  // A submodule root is an ordinary directory to lstat, so the symlink check
+  // cannot see it. git's gitlink mode is what distinguishes it.
+  const subIo = { lstat: () => ({ isSymbolicLink: () => false }),
+                  lsTree: (_r, p) => (p === "vendor/lib" ? { mode: "160000" } : { mode: "040000" }) };
+  const inSub = resolveClaims([{ kind: "prefix", path: "vendor/lib/src" }], "/repo", subIo);
+  check(!!inSub.refusal && /vendor\/lib/.test(inSub.refusal),
+    "a claim inside a SUBMODULE is refused, naming the submodule root", JSON.stringify(inSub));
+  check(resolveClaims([{ kind: "prefix", path: "packages/x" }], "/repo", subIo).ok === true,
+    "control: an ordinary directory still resolves");
   const plain = resolveClaims([{ kind: "prefix", path: "packages/x" }], "/repo", io);
   check(plain.ok === true, "control: an ordinary path resolves", JSON.stringify(plain));
   check(/packages\/x/.test(normalizeClaim("packages/*").refusal ?? ""),
@@ -1520,8 +1539,15 @@ git commit -m "feat(hub): registry snapshot and territory admission"
 ### Task 18: `repo_gate_state` — a pure derivation behind an injected fetcher
 
 **Files:**
-- Create: `src/build/gatestate.mjs`
-- Modify: `bin/reeve` (the `build run` tick calls it)
+- Create: `src/build/gatestate.mjs`, **`src/build/loop.mjs`**
+- Modify: `bin/reeve` (the `build run` loop calls `buildTick`)
+
+`src/build/loop.mjs` exports **`buildTick(ctx)`** — the tick body, importable and
+testable without spawning the CLI. S2's tick does exactly one thing: refresh
+`repo_gate_state` for every registry project through `ctx.fetchGateState`.
+`bin/reeve`'s `build run` loop calls it between heartbeats; the phase work that
+fills it out is S4's. The wiring test calls `buildTick` directly, and until this
+file exists it has nothing to import.
 - Test: `test/hub-gatestate.test.mjs`
 
 **Interfaces:**
@@ -1586,8 +1612,14 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
   // One permission at a time. A fixture missing several at once is satisfied by
   // an implementation that checks only the first, which then passes an
   // installation with read-only contents or no pull_requests write.
-  const FULL = { checks: "write", contents: "write", pull_requests: "write" };
-  for (const missing of ["checks", "contents", "pull_requests"]) {
+  // The COMPLETE contract from section 1.8, all eight. An incomplete FULL means
+  // the loop below never removes the five it omits, so an installation missing
+  // Actions read or Statuses write passes. Administration is READ: administration
+  // write is refused in code, so requiring write would be wrong the other way.
+  const FULL = { actions: "read", administration: "read", checks: "write",
+                 contents: "write", issues: "write", metadata: "read",
+                 pull_requests: "write", statuses: "write" };
+  for (const missing of Object.keys(FULL)) {
     const perms = { ...FULL }; delete perms[missing];
     const p = gateStateFrom({ ruleset: ok.ruleset, installation: { permissions: perms },
                               expectedAppId: EXPECTED, repoId: 1, nwo: "o/r", now: 100 });
@@ -1598,6 +1630,12 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
                                      expectedAppId: EXPECTED, repoId: 1, nwo: "o/r", now: 100 });
   check(downgraded.app_installed === "fail",
     "and a permission present but downgraded to read is also a fail", JSON.stringify(downgraded));
+  // The other direction: administration must NOT be write. The design refuses
+  // administration write in code, so an installation carrying it is a finding.
+  const over = gateStateFrom({ ruleset: ok.ruleset, installation: { permissions: { ...FULL, administration: "write" } },
+                               expectedAppId: EXPECTED, repoId: 1, nwo: "o/r", now: 100 });
+  check(over.app_installed === "fail",
+    "and administration WRITE is a fail: the contract is read, and more is not better", JSON.stringify(over));
 }
 
 // ── the tick writes it; S2 makes no network call ─────────────────────────────
@@ -1847,11 +1885,18 @@ git commit -m "test(hub): crash, recovery and corruption drills"
 - [ ] **Step 1: Full suite**
 
 ```bash
+fail=0
 for f in test/*.test.mjs; do
   case "$f" in */escape.test.mjs) continue;; esac   # writes into the live daemon's ~/.reeve/canary
-  $N "$f" >/dev/null || echo "FAILED $f"
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
 done
+exit $fail
 ```
+
+The accumulator is not decoration: `|| echo` turns a failure into a successful
+`echo`, so the loop exits with the status of whichever test ran last, and an
+automated executor proceeds to the tracker commit and the PR on a green signal
+over a red suite.
 
 Expected: no `FAILED` lines. Base is PR-A's merge commit, not `9dbd3a0` — measure this pass against the one base PR-B started from.
 

@@ -20,14 +20,20 @@ import { execFileSync } from "node:child_process";
 // `linkSync` is the snapshot PUBLISH: it is atomic AND exclusive, where
 // `renameSync` is atomic but REPLACES an existing destination -- so two
 // same-second writers would both believe they won.
-import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync } from "node:fs";
+import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { open as openStore, exportJsonl } from "./db/ops.mjs";
 // Task 8's subset. `TABLES_AT` and `HUB_TABLES` are what a snapshot's table set
 // is validated against; Task 9 adds the locks, replay and hubEvent imports when
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
 // naming a module that does not exist yet breaks every import of this file.
-import { HUB_SCHEMA_VERSION, HUB_TABLES, TABLES_AT } from "./build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION, HUB_TABLES, TABLES_AT } from "./build/hubdb.mjs";
+// Task 9's additions. `restoreHub` takes the maintenance lock before it refuses,
+// enumerates live writers to name them, and replays the tail -- and it needs
+// `replayableKinds`/`NON_REPLAYED_KINDS` to refuse a tail exported by a NEWER
+// binary rather than silently rebuilding a log without its projection.
+import { acquireMaintenanceLock, releaseMaintenanceLock, liveWriters } from "./build/locks.mjs";
+import { replayHub, replayableKinds, NON_REPLAYED_KINDS } from "./build/replay.mjs";
 
 export { openStore as open };
 
@@ -493,4 +499,462 @@ export function exportEvents(db, path, { sinceSeq = 0 } = {}) {
     writeFileSync(path, text);
     return { ok: true, count: text ? text.trimEnd().split("\n").length : 0, path };
   } catch (e) { return { ok: false, why: e.message }; }
+}
+
+/**
+ * Put a hub snapshot back.
+ *
+ * The existing restore() asks a process question -- is `bin/reeve run` alive --
+ * because for a per-repo store the daemon is the only writer. The hub has
+ * three kinds of writer and pgrep can see none of them properly: the builder
+ * holds a singleton lease row, every hub-writing CLI command holds a writer
+ * lease for its duration, and a GUARDIAN holds a provider lease whenever it is
+ * dispatching a worker. So the refusal is asked of the database.
+ *
+ * The maintenance lock is taken FIRST and released last. Without it there is a
+ * window between the check and the copy, and a command started inside that
+ * window writes into a file that is about to be replaced underneath it.
+ */
+export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force = false, tail: suppliedTail = null } = {}) {
+  if (!existsSync(snapshotPath)) return { ok: false, why: `no snapshot at ${snapshotPath}`, holders: [] };
+
+  // DEEP, and worth every millisecond: this file is about to replace the live
+  // hub, and a page-level fault found afterwards is found with nothing to fall
+  // back to.
+  const v = validateSnapshot(snapshotPath, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true });
+  if (!v.ok) return { ok: false, why: `the snapshot is not restorable: ${v.why}`, holders: [] };
+
+  const snapSeq = (() => {
+    const p = new DatabaseSync(snapshotPath, { readOnly: true });
+    try { return p.prepare("SELECT COALESCE(max(seq),0) s FROM hub_event").get().s; } finally { p.close(); }
+  })();
+
+  let live = null, locked = false, lockDb = null, quarantined = null, synthetic = false, swapped = false;
+  const staging = dbPath + ".restoring";
+  // The raw open AND the first query, together. Either can throw on a file that
+  // is corrupt enough, and the branch below used to do them as two statements
+  // with nothing between -- so the throw escaped to the outer catch and the
+  // command reported a failure instead of performing the recovery it exists for.
+  const rawOpen = (p) => {
+    let d = null;
+    try {
+      d = new DatabaseSync(p, { timeout: 10000 });
+      d.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get();
+      return d;
+    } catch { try { d?.close(); } catch {} return null; }
+  };
+  try {
+    // When dbPath is ABSENT -- the destructive drill's case, and a real total
+    // loss -- the holder scan is skipped and NO lock exists at the canonical
+    // path while the snapshot is copied and replayed into staging. A
+    // service-manager restart or a CLI write landing in that window creates a
+    // fresh hub at dbPath which the rename then silently destroys. So an absent
+    // hub gets a minimal one created first, purely to hold the lock.
+    if (!existsSync(dbPath)) {
+      // SYNTHETIC, and tracked as such. This file exists only to carry the
+      // maintenance lock while the real one is staged; nothing has restored
+      // into it. If staging or replay then fails -- a malformed supplied tail
+      // is the likely case, and this is the total-loss path where an operator
+      // supplies one by hand -- the function returns failure, releases the
+      // lock, and used to leave a fully migrated EMPTY hub at the canonical
+      // path. A restarted builder finds a healthy-looking store with no state
+      // in it, which is worse than finding nothing: nothing is obviously wrong.
+      synthetic = true;
+      live = openHub(dbPath);
+      // The result is CHECKED here too. Two restores started after a total loss
+      // both pass the existsSync above, both race through openHub, and one of
+      // them loses the lock -- and an ignored `{ ok: false }` let the loser mark
+      // itself `locked` and stage a replacement against the same path as the
+      // winner. This branch is where a race is MOST likely, because "the hub is
+      // gone" is exactly when two people start a restore.
+      const got = acquireMaintenanceLock(live, { pid, lstart, isAlive });
+      if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
+      locked = true;
+    } else if ((live = rawOpen(dbPath)) === null) {
+      // EXISTS, and UNREADABLE. This is the state the route's own description
+      // names -- recovering a hub "too corrupt to open" -- and the readable
+      // branch below could never reach it: its first act is to query
+      // `schema_version`, so a file too damaged to answer threw straight past
+      // every recovery path to the outer catch. `restore --hub --tail <export>`,
+      // the one command for exactly this situation, could not run.
+      //
+      // Three things the readable path takes from the live file are unavailable
+      // here, and each needs an answer rather than a silent skip:
+      //
+      // 1. EXCLUSION. `maintenance_lock` lives INSIDE the hub. So the lock moves
+      //    to a sibling at a CANONICAL path -- `<dbPath>.restore-lock`, a fixed
+      //    name, not a temporary -- opened as its own store and taken with the
+      //    same `acquireMaintenanceLock` call, so two concurrent restores of an
+      //    unreadable hub still contend for one row.
+      // 2. THE HOLDER SCAN. `singleton_lease`, `liveWriters` and `provider_lease`
+      //    are all unreadable, so no holder can be enumerated and none can be
+      //    ruled out. The command therefore REFUSES unless `force` is passed.
+      //    Note this INVERTS the readable path's rule, deliberately: there,
+      //    `force` is refused while a holder is provably alive, because the
+      //    evidence exists; here it is REQUIRED, because it cannot, and the
+      //    operator is the only one who can say the daemons are stopped.
+      // 3. THE FORWARD-VERSION REFUSAL. Unreadable means the version is UNKNOWN,
+      //    not that it is old, so that check cannot be evaluated at all. The
+      //    snapshot's version was already checked against HUB_SCHEMA_VERSION at
+      //    the top of this function, which is the store about to be installed
+      //    and is readable -- that is the guarantee that survives here.
+      if (!force)
+        return { ok: false, holders: [],
+                 why: `the hub at ${dbPath} exists but cannot be read, so its live writers cannot be ` +
+                      `enumerated and none can be ruled out. Stop the builder and any reeve CLI, then ` +
+                      `re-run with force. Pass --tail from a durable export-events --hub to carry ` +
+                      `forward everything after the snapshot; without one, events since ${snapSeq} are lost.` };
+      lockDb = openHub(dbPath + ".restore-lock");
+      const got = acquireMaintenanceLock(lockDb, { pid, lstart, isAlive });
+      if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
+      locked = true;
+      // QUARANTINE, never delete: the unreadable file is the only evidence of
+      // what went wrong, and a recovery that destroys it leaves nothing to
+      // diagnose. But the NAME is chosen here and the move happens later, one
+      // step before the staged copy takes the path.
+      //
+      // Renaming now would vacate the canonical path for the whole of staging --
+      // the copy, the open, the migration and the replay. Any failure in that
+      // window (a malformed supplied tail makes `replayHub` throw, and the
+      // operator on this path is supplying one by hand) returns through the
+      // catch, the finally deletes staging, and NOTHING moves the quarantine
+      // back: `dbPath` is simply absent, and the next writer to start creates a
+      // fresh empty hub there. Losing a corrupt database to a failed recovery is
+      // bad; replacing it with an empty one that looks healthy is worse.
+      quarantined = `${dbPath}.corrupt-${Math.floor(Date.now() / 1000)}`;
+      // `live` stays null, which the tail read below already handles: with no
+      // readable hub, `suppliedTail` is the ONLY source of post-snapshot events.
+    } else {
+      // RAW DatabaseSync, not openHub. openHub applies forward migrations, and
+      // migrating a database is a write -- so opening that way would upgrade a
+      // hub that a builder or a CLI is actively using, before this command has
+      // established it is allowed to touch it at all. The exclusion has to come
+      // before any write, including a well-intentioned one.
+      // (already opened by `rawOpen` above, which is also what proved it readable)
+      // A RAW open skips openHub's forward-version refusal, so this command must
+      // repeat it before it touches anything. Without it an older binary can
+      // restore beside a hub a newer binary already migrated: it collects event
+      // kinds it does not recognise, `replayHub` counts them as skipped, and the
+      // newer database is replaced by one built only through the old binary's
+      // migrations -- state lost, exit status 0.
+      //
+      // Before the lock and before staging: refusing after either has already
+      // interfered with a database this binary has just established it must not
+      // touch.
+      const liveVersion = live.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+      if (liveVersion > HUB_SCHEMA_VERSION) {
+        try { live.close(); } catch {}
+        return { ok: false, holders: [],
+                 why: `the live hub is at schema version ${liveVersion} and this reeve knows ` +
+                      `${HUB_SCHEMA_VERSION}; restoring would replace it with an older store. Upgrade reeve.` };
+      }
+      const got = acquireMaintenanceLock(live, { pid, lstart, isAlive });
+      if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
+      locked = true;
+
+      const holders = [];
+      for (const r of live.prepare("SELECT * FROM singleton_lease").all())
+        if (isAlive(r.pid, r.lstart)) holders.push({ what: "builder", pid: r.pid, lstart: r.lstart, command: r.command });
+      for (const r of liveWriters(live, { isAlive }))
+        holders.push({ what: "cli", pid: r.pid, lstart: r.lstart, command: r.command });
+      for (const r of live.prepare("SELECT * FROM provider_lease WHERE status='held'").all())
+        if (isAlive(r.pid, r.lstart)) holders.push({ what: r.owner, pid: r.pid, lstart: r.lstart, command: r.run_ref });
+
+      // `force` overrides the operator-judgement half of this check, never the
+      // safety half. A live builder or CLI writer holds a descriptor to the file
+      // being replaced and carries on issuing external effects against a
+      // database that no longer exists; no flag makes that safe, and the whole
+      // point of the maintenance lock is that no writer is running here. So
+      // force is refused outright while anything is provably alive — it is for
+      // clearing holders whose processes are already gone.
+      if (holders.length && force)
+        return { ok: false, holders,
+          why: `force does not override a LIVE holder; it only clears dead ones. Still running:\n` +
+               holders.map(h => `  ${h.what.padEnd(8)} pid ${h.pid} (started ${h.lstart})  ${h.command}`).join("\n") +
+               `\n  stop them, then re-run.` };
+      if (holders.length && !force) {
+        return { ok: false, holders,
+          why: `the hub has live writers; stop them first:\n` +
+               holders.map(h => `  ${h.what.padEnd(8)} pid ${h.pid} (started ${h.lstart})  ${h.command}`).join("\n") +
+               `\n  a guardian holds a provider lease whenever it is dispatching a worker, so a busy ` +
+               `guardian is a normal reason to see this. STOP the processes above and re-run.` +
+               // NOT "or pass force". The branch immediately above refuses every
+               // forced restore while any holder is provably alive, so an
+               // operator following that advice got a second refusal and no way
+               // forward -- a recovery instruction that cannot recover. `force`
+               // is for holders whose processes are already gone, and for the
+               // unreadable-hub path where liveness cannot be established at all.
+               `\n  force does not override a live holder; it only clears dead ones.` };
+      }
+    }
+
+    // The tail arrives two ways and both are real: read from the live file when
+    // it is still readable, or supplied from a durable `export-events --hub`
+    // when it is gone -- which is what "destructive" means. Either way it is
+    // FILTERED to events after the snapshot's own max seq: the export command
+    // writes the whole log from seq 1, and replaying pre-snapshot rows would
+    // re-apply row images the snapshot already contains, in an order the
+    // snapshot has already superseded.
+    // CAPTURED HERE, before anything clears `live`. Computing it at the return
+    // read a handle that the sidecar cleanup below sets to null on every
+    // successful restore, so the flag was false on the readable path too -- and
+    // the CLI printed the data-loss warning after a recovery that had inspected
+    // and replayed the live tail perfectly.
+    const liveTailRead = suppliedTail == null && live != null;
+    const rawTail = suppliedTail ?? (live
+      ? live.prepare("SELECT seq, at, kind, task, payload FROM hub_event WHERE seq > ? ORDER BY seq").all(snapSeq)
+      : []);
+    const tail = rawTail.filter(e => e.seq > snapSeq).sort((a, b) => a.seq - b.seq);
+    // A SUPPLIED tail is checked for holes and duplicates before anything is
+    // replayed. The live-read tail cannot have either -- it comes straight off
+    // `hub_event`, whose seq is a primary key -- but `--tail` is a file an
+    // operator hands over, and the likely damage to a JSONL export is a partial
+    // copy. Two failures, both silent:
+    //
+    //   a MISSING seq drops whatever projection row it carried, and the restore
+    //   reports success, so an authority-bearing row is gone with nothing saying
+    //   so;
+    //
+    //   a DUPLICATE seq replays two payloads into the projection while
+    //   `INSERT ... ON CONFLICT(seq) DO NOTHING` keeps only the first in
+    //   `hub_event` -- so the log and the tables disagree afterwards, and the log
+    //   is what every later audit reads.
+    //
+    // Contiguity is checkable without a manifest because the tail's own first
+    // seq must follow the snapshot's max.
+    if (suppliedTail) {
+      // The FOOTER first. Contiguity finds holes in the middle and cannot see a
+      // file that simply stops early -- the remaining run is gapless, so every
+      // check below passes on a tail missing its newest records. The manifest is
+      // written last by `export-events --hub`, so its absence IS the truncation
+      // signal, and its `count`/`sha256` catch the rarer case of a file that was
+      // truncated and then had a footer appended by something else.
+      const manifest = suppliedTail.manifest ?? null;
+      if (!manifest)
+        return { ok: false, holders: [],
+                 why: `the supplied tail has no manifest footer, so it cannot be distinguished from ` +
+                      `a partial copy that lost its newest events. Re-export it with export-events --hub.` };
+      if (manifest.count !== rawTail.length)
+        return { ok: false, holders: [],
+                 why: `the supplied tail claims ${manifest.count} events and carries ${rawTail.length}; ` +
+                      `it is truncated or was edited.` };
+      // The DIGEST, which is the check the count cannot make: a file that lost
+      // its last event and had its `count` edited to match passes the line above
+      // and fails here. `suppliedTail.sha256` is what the READER observed over
+      // the raw bytes; `manifest.sha256` is what the exporter CLAIMED. This
+      // function never sees the bytes -- by the time it holds parsed events they
+      // are gone -- so the two have to arrive separately and be compared here.
+      if (typeof suppliedTail.sha256 !== "string")
+        return { ok: false, holders: [],
+                 why: `the supplied tail carries a manifest but no observed digest, so the manifest cannot ` +
+                      `be checked against the bytes it describes. Re-export it with export-events --hub.` };
+      if (manifest.sha256 !== suppliedTail.sha256)
+        return { ok: false, holders: [],
+                 why: `the supplied tail's manifest claims digest ${String(manifest.sha256).slice(0, 12)} and its ` +
+                      `own bytes hash to ${suppliedTail.sha256.slice(0, 12)}; it was edited or corrupted in transit.` };
+      // `first` and `last` are DECLARED in the footer, so they are CHECKED. A
+      // manifest carrying fields nothing reads is a manifest whose other fields
+      // nobody has reason to trust either -- and this pair catches a tail that
+      // was truncated at the FRONT, which the contiguity walk below reports as a
+      // hole against the snapshot rather than as the edit it is.
+      if (rawTail.length && (manifest.first !== rawTail[0].seq ||
+                             manifest.last !== rawTail[rawTail.length - 1].seq))
+        return { ok: false, holders: [],
+                 why: `the supplied tail claims seq ${manifest.first}..${manifest.last} and carries ` +
+                      `${rawTail[0].seq}..${rawTail[rawTail.length - 1].seq}; it is not the export it says it is.` };
+      const seqs = tail.map(e => e.seq);
+      const dupes = seqs.filter((s, i) => i > 0 && s === seqs[i - 1]);
+      const holes = [];
+      for (let i = 1; i < seqs.length; i++)
+        for (let v = seqs[i - 1] + 1; v < seqs[i]; v++) holes.push(v);
+      if (seqs.length && seqs[0] !== snapSeq + 1)
+        holes.push(...Array.from({ length: seqs[0] - snapSeq - 1 }, (_, k) => snapSeq + 1 + k));
+      if (dupes.length || holes.length)
+        return { ok: false, holders: [],
+                 why: `the supplied tail is not a complete run after the snapshot: ` +
+                      `${holes.length} missing (${holes.slice(0, 5).join(", ")})` +
+                      `${dupes.length ? `, ${dupes.length} duplicated (${dupes.slice(0, 5).join(", ")})` : ""}. ` +
+                      `Re-export it; a partial copy restores silently and leaves the log and the ` +
+                      `projection disagreeing.` };
+    }
+
+    // Build the restored database BESIDE the live one, then move it into place
+    // in a single rename. A copy directly over dbPath leaves a window in which
+    // the file at the real path is a fresh database carrying the SNAPSHOT's lock
+    // state -- which is none -- so any writer starting in that window sees an
+    // unlocked hub and writes into it while the replay is still running. There
+    // is no such window here: the live file keeps its maintenance lock right up
+    // until the instant it is replaced, and rename is atomic.
+    // Remove the staging file AND its WAL sidecars. A restore killed after
+    // opening the staging database in WAL mode leaves -wal/-shm behind; the next
+    // attempt copies a fresh main file over the same path and the stale sidecar
+    // is replayed into it on open, which is a silent merge of two restores.
+    for (const ext of ["", "-wal", "-shm"]) { try { rmSync(staging + ext, { force: true }); } catch {} }
+    copyFileSync(snapshotPath, staging);
+    let replayed = 0;
+    {
+      const back = openHub(staging);
+      try {
+        // The SNAPSHOT's own maintenance_lock goes first, before this restore
+        // tries to take one. A snapshot is taken by a running daemon, so it can
+        // contain a lock row whose pid was alive at VACUUM INTO time --
+        // `acquireMaintenanceLock` then sees a live-looking foreign holder,
+        // returns { ok: false } and writes nothing. That result was ignored, and
+        // `maintenance_lock` is deliberately excluded from the clearing below on
+        // the grounds that "this restore holds it" -- which it does not. So the
+        // staged database was installed carrying a stranger's lock, the release
+        // names this restore's pid and cannot remove it, and every subsequent hub
+        // writer is refused by a holder that never existed on this machine.
+        //
+        // Clearing first makes the acquire meaningful, and the result is CHECKED:
+        // a lock that cannot be taken on a private staging file this function
+        // just created is not a race, it is a broken invariant, and continuing
+        // past it replays into a database nothing is protecting.
+        back.exec("DELETE FROM maintenance_lock");
+        const staged = acquireMaintenanceLock(back, { pid, lstart, isAlive });
+        if (!staged.ok)
+          return { ok: false, holders: [],
+                   why: `could not take the maintenance lock on the staging copy at ${staging}; ` +
+                        `refusing to replay into a database this restore does not hold` };
+
+        // Snapshots are taken by the running daemon, so a normal one CONTAINS
+        // live-looking process rows: a singleton lease held by a pid that was
+        // alive when VACUUM INTO ran, provider leases mid-dispatch, worktree
+        // leases. Restoring them resurrects authority that belongs to processes
+        // which no longer exist -- the next `build run` is refused by a ghost,
+        // and the reaper cannot help because pid+lstart may since have been
+        // reused by something unrelated. They are excluded from the comparison
+        // set for the same reason; they must be cleared from the restored file
+        // as well, not merely ignored when comparing.
+        for (const t of ["singleton_lease","writer_lease","directory_lease","provider_lease"])
+          back.exec(`DELETE FROM ${t}`);
+        // `maintenance_lock` is absent from that list because it was cleared and
+        // re-taken ABOVE, before the replay -- so the row present now is this
+        // restore's own, and it is released below. The previous version skipped
+        // it here while never having acquired it, which is how a stranger's lock
+        // reached the installed file.
+
+        // phase_run is NOT a lease table and is not process-scoped as a whole:
+        // its SETTLED rows are the attempt history the retry budget counts, so
+        // they have to survive. But a normal snapshot is taken by a RUNNING
+        // daemon, so it can contain rows still marked `live` or `adopted` whose
+        // processes are long gone. Left alone, `one_live_run` refuses the task
+        // a replacement attempt forever, and adopt-or-kill reads a dead pid's
+        // heartbeat as if it meant something.
+        //
+        // Settled terminally rather than deleted: deleting them would return an
+        // attempt to the budget, so a task that had burned its retries would
+        // quietly get them back -- a restore handing out free retries.
+        // `killed`, and no `ended_at`. Migration 1 declares neither `lost` nor
+        // that column -- statuses are ('live','succeeded','failed','adopted',
+        // 'killed') -- and SQLite validates the statement at PREPARE time even
+        // when no rows match, so the previous version made EVERY restore fail
+        // with `no such column: ended_at` before it replaced anything.
+        //
+        // `killed` is also the honest reading: adopt-or-kill uses it for a run
+        // whose process is gone, and a run that did not survive a restore is
+        // exactly that. `outcome` records why, since a killed run with no
+        // outcome is indistinguishable from one the reaper ended.
+        back.exec(`UPDATE phase_run
+                      SET status = 'killed',
+                          outcome = COALESCE(outcome, 'lost to a hub restore')
+                    WHERE status IN ('live','adopted')`);
+
+        if (tail.length) {
+          const r = replayHub(back, tail);
+          // `skipped` is CHECKED, not discarded. On the readable-live path an
+          // unknown kind cannot appear -- the forward-version refusal above has
+          // already established this binary is not older than the store. The
+          // unreadable and absent paths have no such guarantee: their tail comes
+          // from an `export-events --hub` file that may have been written by a
+          // NEWER binary, and every kind it carries that this one does not handle
+          // is a projection row that is never rebuilt. The restored `hub_event`
+          // log would then describe state the tables do not contain, and the
+          // command would exit 0.
+          //
+          // Declared-unreplayed kinds are not skips: `replayHub` counts them as
+          // skipped because it has no handler, and that is exactly right for
+          // them. So the refusal is over kinds that are neither handled NOR in
+          // NON_REPLAYED_KINDS -- the same predicate Task 11's cross-check uses,
+          // and the reason that constant is exported rather than internal.
+          const known = new Set([...replayableKinds(), ...NON_REPLAYED_KINDS]);
+          const unknown = [...new Set(tail.map(e => e.kind))].filter(k => !known.has(k));
+          if (unknown.length)
+            return { ok: false, holders: [],
+                     why: `the tail carries ${unknown.length} event kind(s) this reeve does not know ` +
+                          `(${unknown.slice(0, 5).join(", ")}); it was exported by a newer binary and ` +
+                          `replaying it would rebuild the log without the projection. Upgrade reeve.` };
+          replayed = r.applied;
+        }
+        releaseMaintenanceLock(back, { pid, lstart });
+      } finally { back.close(); }
+    }
+
+    // Close the live handle BEFORE removing its sidecars, and treat a failed
+    // removal as fatal rather than swallowing it: a -wal left beside a replaced
+    // main file is replayed into the new database on the next open, which is a
+    // silent merge of two unrelated stores.
+    try { live?.close(); live = null; locked = false; } catch {}
+    for (const ext of ["-wal", "-shm"]) {
+      try { rmSync(dbPath + ext, { force: true }); }
+      catch (e) { return { ok: false, holders: [],
+        why: `could not remove ${dbPath}${ext} (${e.message}); refusing to replace the database, ` +
+             `because a stale write-ahead log beside a restored file is replayed into it on the next open` }; }
+    }
+    // COPY to quarantine, then let the staging rename REPLACE the original. The
+    // path is never unoccupied at all.
+    //
+    // Two adjacent renames still leave a window, and it is not benign: hub
+    // writers check `maintenance_lock` in the CANONICAL database and know
+    // nothing about the sibling `.restore-lock`. A service restart or a CLI
+    // landing between them finds `dbPath` absent, creates a fresh hub, opens it,
+    // and goes on writing to that inode after the second rename has replaced its
+    // pathname -- split brain, with both halves reporting success. The lock
+    // cannot close it, because the lock lives in the file that is missing.
+    //
+    // Copying costs one file's worth of I/O on a path that has already copied a
+    // whole snapshot, and it removes the window rather than narrowing it. The
+    // rename that follows is atomic, so a writer either has the corrupt original
+    // or the restored replacement and never neither.
+    if (quarantined) copyFileSync(dbPath, quarantined);
+    renameSync(staging, dbPath);
+    swapped = true;                    // past here the file at dbPath is the restored one
+    // `quarantined` is REPORTED, not merely done. When the live hub was
+    // unreadable it was moved aside rather than deleted, and this result is the
+    // only place its path is ever named -- an operator who is not told where the
+    // broken file went cannot diagnose what happened, and the next restore's
+    // quarantine will not overwrite it either, so copies accumulate in silence.
+    // Null on every ordinary restore.
+    // `liveTailRead` is REPORTED, not inferred by the caller. Whether a live tail
+    // could be read is something only this function knows -- the CLI was left
+    // guessing at it from `quarantined` and a lock file, which is two proxies for
+    // one fact and both wrong when the hub was simply absent.
+    return { ok: true, why: null, holders: [], replayed, tail: tail.length, quarantined,
+             liveTailRead };
+  } catch (e) {
+    return { ok: false, why: `could not restore: ${e.message}`, holders: [] };
+  } finally {
+    // The lock lives in ONE of two places: inside the live hub on the ordinary
+    // path, or in the sibling `.restore-lock` store when the hub was unreadable.
+    // Releasing only the first leaves an unreadable-hub restore holding its lock
+    // forever -- and because that lock sits at a CANONICAL path, every later
+    // attempt then refuses with "another restore is running", naming a pid that
+    // exited long ago.
+    if (locked && live)   { try { releaseMaintenanceLock(live,   { pid, lstart }); } catch {} }
+    if (locked && lockDb) { try { releaseMaintenanceLock(lockDb, { pid, lstart }); } catch {} }
+    try { live?.close(); } catch {}
+    try { lockDb?.close(); } catch {}
+    try { rmSync(staging, { force: true }); } catch {}
+    // The synthetic hub goes with the failure that stranded it. Only when it was
+    // synthetic AND the swap never happened: a successful restore replaced it,
+    // and a real pre-existing hub is never this function's to delete.
+    if (synthetic && !swapped) {
+      for (const ext of ["", "-wal", "-shm"]) { try { rmSync(dbPath + ext, { force: true }); } catch {} }
+    }
+    // The quarantine is a COPY, made one step before the swap, so a failure
+    // before that point never created one and there is nothing to undo. A
+    // failure AFTER it means the swap succeeded, and the copy is the evidence an
+    // operator was promised. Neither case deletes it -- which is why copying is
+    // also simpler than moving: there is no rollback to get wrong.
+  }
 }

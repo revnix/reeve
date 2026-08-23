@@ -259,5 +259,34 @@ expectRefusal("an absolute dependency path: it is copied INTO the checkout",
 expectRefusal("a dependency path that climbs out of the checkout",
   (() => { const p = clone(base); p.worker = { dependencyPaths: ["../../secrets"] }; return p; })(), /relative/);
 
+
+// A key with zero readers is a false affordance: it looks like it configures
+// something. This one would have been worse than inert if wired -- the shipped
+// flake rule is DEMONSTRATED flake (a job seen both passing and failing across
+// attempts), and a name pattern asserts flakiness before any evidence, which
+// would let a reproducible failure be filed as noise.
+//
+// Written with THIS file's helpers. The plan's version calls `minimalProfile()`
+// and a bare `check()`, neither of which exists here -- the file is built on
+// `clone(base)` with `expectOk`/`expectRefusal`, and those carry the positive
+// control for free.
+expectRefusal("ci.flakePatterns, even as an empty array: the key has no readers",
+  (() => { const p = clone(base); p.ci.flakePatterns = []; return p; })(),
+  /unknown key: ci\.flakePatterns/);
+expectRefusal("ci.flakePatterns as a populated one",
+  (() => { const p = clone(base); p.ci.flakePatterns = ["timeout"]; return p; })(),
+  /unknown key: ci\.flakePatterns/);
+// CONTROL: the same profile WITHOUT the key still validates, so the two
+// refusals above are about that key and not about the fixture.
+expectOk("control: the same profile without ci.flakePatterns", clone(base));
+
+// And the key is gone from the declared field set itself, not merely refused by
+// an unknown-key path that some future edit could route around.
+{
+  const known = Object.keys(FIELDS).filter(k => /flakePattern/i.test(k));
+  console.log(`${known.length === 0 ? "PASS" : "FAIL"}  refuses: ci.flakePatterns is absent from FIELDS entirely`);
+  if (known.length) { console.log("        still declared:", known.join(", ")); fail++; }
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

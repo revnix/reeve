@@ -52,9 +52,16 @@ ONLY (both mine), and the running process carrying `--execute`.
    worker's STAGING and MUTATION authority while keeping read-only git — it still
    needs `git status`, `git diff`, `git log` and `git show` to inspect its own
    work, and `sandbox.mjs:368-376` grants git broadly on purpose after narrower
-   subcommand matching failed on a real dispatch. (b) is probably right — the diff gate
-   already decides what may ship, and a worker that cannot commit cannot rewrite
-   history either — but it changes the worker contract, so it is my call.
+   subcommand matching failed on a real dispatch. (b) is probably right, but it
+   changes the worker contract, so it is my call.
+
+   Do NOT assume the diff gate makes the rest free. `reviewDiff`
+   (`sandbox.mjs:714-767`) judges PATHS and territory, not whether an allowed edit
+   was intended, so committing whatever a worker left needs its own selection
+   rules — the prompt used to say "commit only the files your fix touches" and
+   that judgement has to go somewhere. This experiment produced
+   `scratch_write_test.txt`, which is exactly the case: inside the lane, allowed
+   by the gate, and not part of the fix.
    Whatever we choose needs a test that FAILS on today's code.
 
    Read the section above Finding 3 before proposing anything. This is the SIXTH

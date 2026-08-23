@@ -219,11 +219,17 @@ REQUEST_REVIEW/SPILL effects "must be performed by reeve through the outbox".
 **The outbox exists** — `src/db/schema.sql:110-130` defines the table with
 `gh.pr.comment` and `gh.thread.resolve` among its kinds, and `src/db/ops.mjs:239-284`
 implements enqueue / lease / complete / fail / recover. It has **zero callers
-outside `src/db/`**, and no drainer. So the choice is three ways, not two: wire
-the existing outbox now, wait for the builder's drainer at S2/S4, or use the
-direct `gh` path reeve already uses from **16 call sites across `src/`**
-(`status`, `pr`, `ci-rootcause`, `daemon`, `doctor`, `baseline`, `github/app`,
-`github/reconciler`, `profile/detect`, `db/reconcile`, `review/ingest`).
+outside `src/db/`**, and no drainer.
+
+The choice is WHEN, not whether. `docs/TRACKER.md:39-43` records the precondition
+in terms that do not leave a third option: before `watch.reviewActions` arms,
+those GitHub effects "must be performed by reeve through the outbox (the design's
+rule), never by a worker." So it is either wire and drain the existing skeleton
+now, or wait to reuse the builder's drainer at S2/S4. reeve calling `gh` directly
+from 16 other places does not relax a durability requirement written for these
+two actions — an earlier draft of this document listed it as a third route, and
+taking it would break the recorded rollout invariant rather than complete
+capability 3.
 
 Also open: ntfy read user (needs shell on 95.217.11.127), second project
 (`rextaihq/rext-backend`), PR-open size warning (optional).

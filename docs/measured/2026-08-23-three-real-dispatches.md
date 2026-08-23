@@ -167,12 +167,23 @@ instructed a `push` the sandbox denied and the answer was to move publication to
 reeve; this time the prompt instructs a `commit` the sandbox denies, and the
 staging half was left with the worker.
 
-Six instances of one shape is a design answer, not six bugs. Patching `.git`
-would fix this occurrence and leave the mechanism that produced all six intact.
-The mechanism is that `prompts.mjs` states capabilities in prose while
-`sandbox.mjs` decides them in data. Either the prompt is generated from the
-grant, or something fails loudly when the prompt names a command the grant does
-not carry.
+Six instances of one shape is a design answer, not six bugs. The mechanism is
+that `prompts.mjs` states capabilities in prose while `sandbox.mjs` decides them
+in data. Either the prompt is generated from the grant, or something fails loudly
+when the prompt names a command the grant does not carry.
+
+**But that answer does not reach Finding 1, and it is important not to believe it
+does.** Findings 2 through 6 are drift between two things reeve itself writes.
+Finding 1 is not: the policy reeve emits GRANTS `Bash(git:*)`, carries no
+add/commit deny, and sets `filesystem.denyWrite: []`. A generator reading that
+grant would cheerfully advertise `git commit` and the P0 would survive
+untouched. The refusal comes from the agent CLI's own sandbox layer, beneath
+anything reeve declares.
+
+So closing the class needs the effective restrictions represented or probed, not
+just the declared ones — reeve knowing what it cannot do, rather than only what
+it has not granted. The one-line version: the six share a shape, and five of them
+share a cause.
 
 ## Finding 3: an unrecognised `units[].language` grants no named runtime
 
@@ -182,10 +193,20 @@ not carry.
 
 So a profile declaring `"javascript"`, which is an entirely reasonable thing for
 a human to write, produces a worker with no `Bash(node:*)`. It is not left with
-*nothing*: `Bash(${process.execPath}:*)` is granted unconditionally, and a
-declared `packageManager` is added. But the prompt tells the worker never to use
-an absolute path, so the one granted route is the one it is instructed not to
-take. Found by walking into it: runs 1 and 2 used that fixture, which is why
+*nothing*. Three other things still grant it:
+
+- `Bash(${process.execPath}:*)`, unconditionally;
+- a declared `packageManager`;
+- and, for every declared command, `Bash(<runner> <first arg>:*)`
+  (`sandbox.mjs:348-355`) — so a unit declaring `node --test` gets
+  `Bash(node --test:*)` even with an unrecognised language, and one declaring
+  `pnpm test` gets `Bash(pnpm test:*)` with no `packageManager` at all.
+
+What the fixture proved is that THIS fixture lacked pnpm, not that a bare name is
+ever the only route. The gap that remains is narrower than it first looked: the
+prompt tells the worker never to use an absolute path, so where the language is
+unrecognised AND no command is declared, the one grant left is the one it is
+instructed not to take. Found by walking into it: runs 1 and 2 used that fixture, which is why
 `node` was refused in them. Run 3 declared `typescript` and had `Bash(node:*)`.
 
 reeve's own detection never emits `javascript` (`profile/detect.mjs:55` maps any

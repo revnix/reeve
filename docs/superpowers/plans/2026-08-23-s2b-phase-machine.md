@@ -229,6 +229,32 @@ const EVIDENCE = [
   }
   check(holes.length === 0, `every one of ${PHASES.length * EVIDENCE.length} cells returns a transition or a reasoned refusal`,
     holes.slice(0, 8).join("\n        "));
+
+  // Totality is necessary and nowhere near sufficient: "a transition OR a
+  // reasoned refusal" is satisfied by a machine that refuses every cell. The
+  // legal edges have to be asserted by NAME, or an implementation can omit the
+  // spine entirely and still pass.
+  const EXPECTED = [
+    ["FILED",        { kind: "phase.succeeded", phase: "FILED" },              "SIZING"],
+    ["SIZING",       { kind: "phase.succeeded", phase: "SIZING" },             "RESEARCH"],
+    ["SIZING",       { kind: "phase.succeeded", phase: "SIZING", depth: "trivial" }, "DESIGN"],
+    ["RESEARCH",     { kind: "phase.succeeded", phase: "RESEARCH" },           "DESIGN"],
+    ["DESIGN",       { kind: "phase.succeeded", phase: "DESIGN" },             "SPEC_DRAFT"],
+    ["SPEC_DRAFT",   { kind: "phase.succeeded", phase: "SPEC_DRAFT" },         "SPEC_PR_OPEN"],
+    ["SPEC_PR_OPEN", { kind: "phase.succeeded", phase: "SPEC_PR_OPEN" },       "GATE"],
+    ["GATE",         { kind: "gate.approved" },                               "APPROVED"],
+    ["GATE",         { kind: "gate.revise" },                                 "SPEC_DRAFT"],
+    ["GATE",         { kind: "gate.capReached" },                             "ESCALATED"],
+    ["APPROVED",     { kind: "phase.succeeded", phase: "APPROVED" },           "IMPLEMENTING"],
+    ["IMPLEMENTING", { kind: "phase.succeeded", phase: "IMPLEMENTING" },       "IMPL_PR_OPEN"],
+    ["IMPL_PR_OPEN", { kind: "phase.succeeded", phase: "IMPL_PR_OPEN" },       "VERDICT_WAIT"],
+    ["CLAIMING",     { kind: "claim.lost" },                                  "LOST"],
+  ];
+  const wrong = EXPECTED.filter(([from, ev, to]) => {
+    const r = nextPhase({ phase: from, generation: 1, heldFrom: null }, ev);
+    return !(r.ok && r.to === to);
+  }).map(([from, ev, to]) => `${from} --${ev.kind}--> expected ${to}`);
+  check(wrong.length === 0, "every named edge of the section 3.1 spine goes where 3.1 says", wrong.join("; "));
 }
 
 // ── terminals are terminal ───────────────────────────────────────────────────
@@ -401,8 +427,8 @@ const ADVANCE = {
 // with externally visible work still in flight, and DONE has no edges out.
 
 const refuse = (refusal) => ({ ok: false, refusal });
-const go = (to, { generation, bumps = false, compensations = [], sliceCursor = null }) =>
-  ({ ok: true, to, generation, bumps, sliceCursor, compensations: Object.freeze(compensations) });
+const go = (to, { generation, bumps = false, compensations = [], sliceCursor = null, escalate = null }) =>
+  ({ ok: true, to, generation, bumps, sliceCursor, escalate, compensations: Object.freeze(compensations) });
 
 export function nextPhase(state, evidence) {
   const { phase, generation = 1, heldFrom = null, drainRemaining = 0,
@@ -449,7 +475,12 @@ export function nextPhase(state, evidence) {
   // Founder verbs available from every non-terminal state.
   if (kind === "founder.cancel")
     return go("CANCELLING", { generation,
-      compensations: ["void-pending","record-drain","close-prs","release-territory", ...(hasOpenPr ? ["write-pr-hold"] : [])] });
+      // record-drain LAST, as the compensation table requires: it snapshots what
+      // is outstanding, so anything that ENQUEUES must run before it. Ahead of
+      // close-prs it missed the close and comment effects the cancellation
+      // itself had just created -- which is the whole set it exists to capture.
+      compensations: ["void-pending","close-prs","release-territory",
+                      ...(hasOpenPr ? ["write-pr-hold"] : []), "record-drain"] });
   if (kind === "founder.infeasible") {
     // INFEASIBLE from IMPL_PR_OPEN or VERDICT_WAIT leaves an open builder PR
     // behind. Without a hold the guardian's verdict has nothing to read, the
@@ -610,6 +641,13 @@ export function nextPhase(state, evidence) {
   }
 
   if (kind === "phase.succeeded") {
+    // The report must be FOR this phase. Without the check a delayed or
+    // misrouted RESEARCH report advances a task that has already moved to
+    // DESIGN, and the generation fence does not catch it: a stale report from
+    // the same generation is exactly what an adopted worker produces after a
+    // restart.
+    if (evidence.phase && evidence.phase !== phase)
+      return refuse(`a ${evidence.phase} report cannot advance a task in ${phase}`);
     if (phase === "SIZING" && evidence.depth === "trivial")
       return go("DESIGN", { generation });          // RESEARCH skipped, recorded as research.skipped
     if (phase === "VERDICT_WAIT")
@@ -674,6 +712,7 @@ git commit -m "feat(hub): the pure, total phase machine"
 
 **Files:**
 - Create: `src/build/transition.mjs`
+- **Modify: `src/build/replay.mjs`** — every `hub_event` kind this plan introduces needs a `HANDLERS` entry and, where it belongs in the projection, a `COMPARISON_SET` line. The kinds this task adds: `task.transitioned`, `phase_event.appended`, `hold_reason.appended`, `pr_hold.created`, `pr_hold.cleared`, `task_drain.recorded`, `task_drain.settled`, `task_territory.claimed`, `escalation.raised`. S2-A's cross-check fails loudly on a kind with no handler, which is the intended feedback — but the plan has to name the file, or an executor writes the emitters and never opens the reader.
 - Test: `test/hub-transition.test.mjs`
 
 **Interfaces:**
@@ -715,8 +754,12 @@ import { applyTransition } from "../src/build/transition.mjs";
   // assertion said one and the implementation emits both, so it contradicted the
   // plan it appears in.
   const kinds = db.prepare("SELECT kind FROM hub_event WHERE task='bt:1' ORDER BY seq").all().map(r => r.kind);
-  check(JSON.stringify(kinds) === '["task.transitioned","phase_event.appended"]',
-    "the transition appends BOTH row images in the same transaction", kinds.join(","));
+  // Order matches the implementation: phase_event.appended is emitted at the
+  // insert, task.transitioned after the projection is read back. The reversed
+  // expectation would have failed against correct code -- the worst kind of
+  // failing test, because it argues for changing the implementation.
+  check(JSON.stringify(kinds) === '["phase_event.appended","task.transitioned"]',
+    "the transition appends BOTH row images in the same transaction, in emit order", kinds.join(","));
   db.close();
 }
 
@@ -857,9 +900,17 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
     // justified it: section 3.2 requires the sha in the event, and a null one
     // records a transition whose evidence cannot be re-checked afterwards.
     const WORKER_PHASES = ["SIZING","RESEARCH","DESIGN","SPEC_DRAFT","IMPLEMENTING"];
-    if (evidence?.kind === "phase.succeeded" && WORKER_PHASES.includes(expectedPhase) && !artifactSha)
+    if (evidence?.kind === "phase.succeeded" && WORKER_PHASES.includes(expectedPhase) && !artifactSha) {
+      // Fence first. This is another path that returns before the CAS, so
+      // without the check a stale report writes a durable refusal claiming the
+      // CURRENT task refused evidence in a phase it has already left. Third
+      // instance of that class in this plan's life; the rule is stated at the
+      // top of applyTransition and every early return must honour it.
+      if (task.phase !== expectedPhase || task.generation !== expectedGeneration)
+        return { applied: false, reason: "lost-race" };
       return { applied: false, reason: "refused",
                refusal: `${expectedPhase} succeeded with no artifact sha; a transition must record what justified it` };
+    }
 
     if (!decision.ok && HELD.includes(expectedPhase) && evidence?.kind === "hold") {
       // This branch returns before the CAS, so it must do the CAS's job itself.
@@ -994,6 +1045,18 @@ export function applyTransition(db, { taskId, expectedPhase, expectedGeneration,
                                      held_from, blocked_reason, terminal_reason, updated_at
                               FROM task WHERE id=?`).get(taskId);
     hubEvent(db, { kind: "task.transitioned", task: taskId, payload: wrote });
+
+    // The identity the machine named, raised in the SAME transaction. Declared
+    // on the contract and dropped on the floor for a round: `go` did not carry
+    // it, so INFEASIBLE, the gate cap and the post-approval depth override each
+    // documented an escalation that no code path could ever raise.
+    if (decision.escalate) {
+      const why = decision.escalate.replace("<id>", taskId);
+      db.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count)
+                  VALUES(?,1,unixepoch(),unixepoch(),0)
+                  ON CONFLICT(why) DO UPDATE SET count=count+1, last_seen_at=unixepoch()`).run(why);
+      hubEvent(db, { kind: "escalation.raised", task: taskId, payload: { why } });
+    }
     return { applied: true, to: decision.to, generation: decision.generation, seq };
   });
 }
@@ -1162,8 +1225,13 @@ if (drained.changes) {
     generation: 1, fence: 1, args: { repo: "spec" } }));
   check(leaseEffect(db, { worker: "w", capabilities: { ...allOn, draftSpec: false } }) === null,
     "a SPEC-repo comment is not leased with draftSpec off");
+  // A refused settle is TERMINAL, so the row above is gone; enqueue a fresh one
+  // under a new key or this control has nothing to lease and fails against a
+  // correct implementation.
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "spec2", kind: "gh.pr.comment", taskId: "bt:1",
+    generation: 1, fence: 1, args: { repo: "spec" } }));
   check(leaseEffect(db, { worker: "w", capabilities: off })?.kind === "gh.pr.comment",
-    "control: the same spec effect IS leased when only publishPr is off, so the two switches are distinct");
+    "control: a spec effect IS leased when only publishPr is off, so the two switches are distinct");
   const row = db.prepare("SELECT * FROM outbox WHERE idempotency_key='k'").get();
   check(row.status === "refused", "it settles 'refused'", row.status);
   check(row.attempts === 0, "and burns no attempt: a switch the founder set is configuration, not a fault", String(row.attempts));
@@ -1178,10 +1246,6 @@ if (drained.changes) {
                  "gh.review.request","gh.pr.merge","notify","ledger.claim","ledger.release"];
   let performed = 0;
   const external = new Set();     // stands in for external truth: what really happened out there
-  // The reconciler seam, in the shape recoverEffects takes: given a leased row,
-  // answer from external truth whether the effect already happened.
-  const reconcileAgainst = (world, row) =>
-    ({ settled: true, ok: true, alreadyDone: world.has(row.idempotency_key) });
   for (const k of KINDS) {
     const key = `bt:1:g1:IMPLEMENTING:${k}:0`;
     for (let i = 0; i < 2; i++) {                   // delivered twice
@@ -1197,10 +1261,17 @@ if (drained.changes) {
       // recoverEffects's reconcile seam is what exercises the production
       // mechanism; a Set consulted in the loop proves only that the loop can
       // count, and would pass against an outbox with no reconciler at all.
-      const verdict = reconcileAgainst(external, leased);      // { settled, ok, alreadyDone }
-      if (verdict.alreadyDone) { settleEffect(db, { id: leased.id, ok: true, result: { reconciled: true } }); continue; }
-      external.add(key); performed++;
-      settleEffect(db, { id: leased.id, ok: true, result: {} });
+      // Hand the row BACK to recoverEffects with the reconciler as its seam,
+      // rather than consulting a helper in the loop. Calling the helper directly
+      // still leaves the suppression in the test: the production path is
+      // recoverEffects -> reconcile -> settle, and only driving that path proves
+      // re-delivery is inert in the code an operator runs.
+      db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${leased.id}`);
+      recoverEffects(db, { reconcile: (row) => {
+        if (external.has(row.idempotency_key)) return { settled: true, ok: true, result: { reconciled: true } };
+        external.add(row.idempotency_key); performed++;
+        return { settled: true, ok: true, result: {} };
+      }});
     }
   }
   check(performed === KINDS.length,
@@ -1254,12 +1325,30 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
 {
   const db = openHub(join(dir, "r1.db"));
   const EXPLODE = new Proxy({}, { get: () => () => { throw new Error("admitTask made a network call"); } });
-  // Declared at file scope, not inside this block: later blocks reference it.
-  // (Hoisted in the harness; shown here for readability.)
+  // Declared at FILE scope, above the first block, because later blocks read it.
+  // Saying "hoisted in the harness" was not enough: the standard harness this
+  // plan defines contains no snapshot, so an executor following it literally
+  // gets a ReferenceError.
+  //
+  //   const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
+  //                  profileHash: "h", defaultBranch: "main", visibility: "private",
+  //                  specRepoId: 9, gateDefinitionHash: "g", registryVersion: 3 };
   let threw = null;
+  // The property is "admitTask performs no I/O", and passing an unused `io`
+  // field cannot test it: a conforming implementation ignores the field, and a
+  // BROKEN one that imports node:fs directly ignores it too. Instrument the
+  // module boundary instead -- stub the filesystem the implementation would
+  // have to reach for.
+  const fs = await import("node:fs");
+  const realStat = fs.lstatSync, realRead = fs.readFileSync;
+  let ioTouched = false;
+  fs.lstatSync = (...a) => { ioTouched = true; return realStat(...a); };
+  fs.readFileSync = (...a) => { ioTouched = true; return realRead(...a); };
   let r; try {
-    r = admitTask(db, snap, { id: "bt:1", project: "nextly", title: "t", territory: ["packages/x"], io: EXPLODE });
+    r = admitTask(db, snap, { id: "bt:1", project: "nextly", title: "t", territory: ["packages/x"] });
   } catch (e) { threw = e.message; }
+  finally { fs.lstatSync = realStat; fs.readFileSync = realRead; }
+  check(!ioTouched, "admitTask touched no filesystem call during its transaction");
   check(threw === null, "admitTask performs no I/O", String(threw));
   check(r.ok === true, "and admits the filing", JSON.stringify(r));
   const t = db.prepare("SELECT * FROM task WHERE id='bt:1'").get();
@@ -1294,13 +1383,27 @@ git commit -m "feat(hub): fenced outbox with live-key uniqueness"
   const io = { lstat: (p) => ({ isSymbolicLink: () => p.endsWith("/linked") }) };
   const viaLink = resolveClaims([{ kind: "prefix", path: "packages/linked" }], "/repo", io);
   check(!!viaLink.refusal && /linked/.test(viaLink.refusal),
-    "a claim traversing a symlink is refused, naming the path", JSON.stringify(viaLink));
+    "a claim ENDING at a symlink is refused, naming the path", JSON.stringify(viaLink));
+  // The leaf case alone is passed by an implementation that lstats only the
+  // final component -- which then admits a claim whose ANCESTOR is the symlink,
+  // and that is the shape that actually escapes the repository.
+  const belowLink = resolveClaims([{ kind: "file", path: "packages/linked/child.ts" }], "/repo", io);
+  check(!!belowLink.refusal && /linked/.test(belowLink.refusal),
+    "and so is a claim whose ANCESTOR is a symlink, naming the ancestor", JSON.stringify(belowLink));
   const plain = resolveClaims([{ kind: "prefix", path: "packages/x" }], "/repo", io);
   check(plain.ok === true, "control: an ordinary path resolves", JSON.stringify(plain));
   check(/packages\/x/.test(normalizeClaim("packages/*").refusal ?? ""),
     "and the refusal shows an example of the accepted grammar", String(normalizeClaim("packages/*").refusal));
 
   check(overlaps({kind:"prefix",path:"packages/x"}, {kind:"file",path:"packages/x/y.ts"}), "a prefix contains a file beneath it");
+  // kind is part of the answer: an exact FILE claim has no descendants, so it
+  // cannot contain anything. Treating it as a prefix refuses concurrent filings
+  // that do not actually conflict -- a false conflict is as costly here as a
+  // missed one, because it blocks work with a message naming the wrong reason.
+  check(!overlaps({kind:"file",path:"packages/x"}, {kind:"prefix",path:"packages/x/y"}),
+    "an exact file claim does not contain a prefix beneath its own path");
+  check(overlaps({kind:"file",path:"packages/x/y.ts"}, {kind:"file",path:"packages/x/y.ts"}),
+    "control: two identical file claims still overlap");
   check(!overlaps({kind:"prefix",path:"packages/x"}, {kind:"prefix",path:"packages/xy"}),
     "packages/x and packages/xy do NOT overlap: prefix comparison is by path segment, not by string");
   check(overlaps({kind:"prefix",path:"packages/x"}, {kind:"prefix",path:"packages/x"}), "control: equal claims overlap");
@@ -1414,10 +1517,21 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
 
   // missing a permission is a fail, distinct from unknown: reeve looked and the
   // answer was no, which is a different thing to report and to act on.
-  const p = gateStateFrom({ ruleset: ok.ruleset, installation: { permissions: { contents: "read" } },
-                            expectedAppId: EXPECTED, repoId: 1, nwo: "o/r", now: 100 });
-  check(p.app_installed === "fail", "a missing permission is a fail, not an unknown", JSON.stringify(p));
-  check(p.permission_diff && p.permission_diff.includes("checks"), "and the diff names what is missing", String(p.permission_diff));
+  // One permission at a time. A fixture missing several at once is satisfied by
+  // an implementation that checks only the first, which then passes an
+  // installation with read-only contents or no pull_requests write.
+  const FULL = { checks: "write", contents: "write", pull_requests: "write" };
+  for (const missing of ["checks", "contents", "pull_requests"]) {
+    const perms = { ...FULL }; delete perms[missing];
+    const p = gateStateFrom({ ruleset: ok.ruleset, installation: { permissions: perms },
+                              expectedAppId: EXPECTED, repoId: 1, nwo: "o/r", now: 100 });
+    check(p.app_installed === "fail", `a missing ${missing} permission is a fail, not an unknown`, JSON.stringify(p));
+    check((p.permission_diff ?? "").includes(missing), `and the diff names ${missing}`, String(p.permission_diff));
+  }
+  const downgraded = gateStateFrom({ ruleset: ok.ruleset, installation: { permissions: { ...FULL, contents: "read" } },
+                                     expectedAppId: EXPECTED, repoId: 1, nwo: "o/r", now: 100 });
+  check(downgraded.app_installed === "fail",
+    "and a permission present but downgraded to read is also a fail", JSON.stringify(downgraded));
 }
 
 // ── the tick writes it; S2 makes no network call ─────────────────────────────
@@ -1440,7 +1554,9 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
   check(threw.app_installed === "unknown" && /403/.test(threw.error ?? ""),
     "a fetcher that throws still writes an unknown row, carrying WHY", JSON.stringify(threw));
 
-  const row = refreshGateState(db, { name: "nextly", repoId: 1, nwo: "o/r", expectedAppId: EXPECTED },
+  // Awaited: refreshGateState must be async to catch a rejected fetcher, so an
+  // unawaited call yields a Promise and every field read off it is undefined.
+  const row = await refreshGateState(db, { name: "nextly", repoId: 1, nwo: "o/r", expectedAppId: EXPECTED },
     () => null);                                   // the S2 default: reeve has not looked
   check(row.app_installed === "unknown", "with no fetcher wired, the row reads unknown rather than absent");
   check(db.prepare("SELECT count(*) c FROM repo_gate_state WHERE repo_id=1").get().c === 1, "and the row is written");
@@ -1451,7 +1567,7 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
     `SELECT count(*) c FROM hub_event WHERE kind='repo_gate_state.refreshed'
      AND json_extract(payload,'$.repo_id') = 1`).get().c >= 1,
     "with its hub_event, so the restore drill can replay it");
-  refreshGateState(db, { name: "nextly", repoId: 1, nwo: "o/r", expectedAppId: EXPECTED }, () => ok);
+  await refreshGateState(db, { name: "nextly", repoId: 1, nwo: "o/r", expectedAppId: EXPECTED }, () => ok);
   check(db.prepare("SELECT count(*) c FROM repo_gate_state WHERE repo_id=1").get().c === 1,
     "control: a second refresh upserts rather than inserting a second row for the same repo");
 
@@ -1568,12 +1684,17 @@ for (let i = 0; i < 500; i++) {
   // missed window as a failure of the code rather than of the timing. A child
   // that finished cleanly means the drill has to be re-run with more work, not
   // that atomicity is broken.
-  let exited = false;
-  kid.on("exit", () => { exited = true; });
-  const caught = await insideTx();
-  check(!exited || caught,
-    "control: the child had not already finished; if it had, raise the loop count and re-run",
-    "the kill window was missed because the worker completed first");
+  // RACE the probe against the child's exit rather than polling a flag. A
+  // boolean checked after insideTx() returns does not stop insideTx() from
+  // spinning its full 500 iterations when the child finished early, and the
+  // kill then targets a dead pid. Whichever settles first decides.
+  const exit = new Promise((res) => kid.on("exit", () => res("exited")));
+  const caught = await Promise.race([insideTx().then(v => v ? "locked" : "timeout"), exit]);
+  check(caught === "locked",
+    "control: the child was observed INSIDE an open write transaction",
+    caught === "exited"
+      ? "the worker finished before the probe saw a lock: raise the loop count and re-run"
+      : "never saw the write lock held; the kill would have proved nothing");
   check(caught, "control: the child was observed INSIDE an open write transaction",
     "never saw the write lock held; the kill would have landed between transactions and proved nothing");
   kid.kill("SIGKILL");
@@ -1634,7 +1755,12 @@ for (let i = 0; i < 500; i++) {
   let why = null;
   try { const d = openHub(p); d.prepare("SELECT count(*) FROM task").get(); } catch (e) { why = e.message; }
   check(why !== null, "a corrupt hub does not open silently");
-  check(/snapshot/i.test(why ?? ""), "and the refusal points at the restore path", String(why));
+  // Name the actual newest snapshot, not the word "snapshot". The interface
+  // promises the path an operator should restore, and `/snapshot/i` passes on a
+  // generic "the snapshot is unreadable" that tells them nothing.
+  const newest = latestSnapshot(root, "hub");
+  check(newest && (why ?? "").includes(newest),
+    "and the refusal names the newest usable snapshot by path", `${why}\n        newest=${newest}`);
 }
 ```
 
@@ -1655,7 +1781,10 @@ git commit -m "test(hub): crash, recovery and corruption drills"
 - [ ] **Step 1: Full suite**
 
 ```bash
-for f in test/*.test.mjs; do $N "$f" >/dev/null || echo "FAILED $f"; done
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac   # writes into the live daemon's ~/.reeve/canary
+  $N "$f" >/dev/null || echo "FAILED $f"
+done
 ```
 
 Expected: no `FAILED` lines. Base is PR-A's merge commit, not `9dbd3a0` — measure this pass against the one base PR-B started from.

@@ -106,7 +106,7 @@ const MAX_ATTRIBUTES_BYTES = 1 << 20;
  * the worker's. A gitignored dependency tree contributes none of these; only an
  * unignored one does, and a project with more than this in one is misdeclaring a
  * source directory as a dependency. */
-const MAX_COPIED_UNTRACKED = 20000;
+export const MAX_COPIED_UNTRACKED = 20000;
 
 /** The largest file reeve will hash to decide whether it is still its own copy.
  * A dependency file past this is treated as changed, which holds the work for a

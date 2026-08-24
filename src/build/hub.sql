@@ -97,6 +97,11 @@ CREATE TABLE IF NOT EXISTS task_territory (
   task TEXT NOT NULL REFERENCES task(id) ON DELETE CASCADE,
   kind TEXT NOT NULL CHECK (kind IN ('file','prefix')),
   path TEXT NOT NULL,
+  -- A pinned claim outlives a hold: it is the territory a held task keeps so a
+  -- resume can reclaim exactly what it had, rather than re-deriving it from a
+  -- worktree that may have moved on. PR-B's regrant reads it and its fixtures
+  -- insert it by name.
+  pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0,1)),
   PRIMARY KEY (task, kind, path)
 ) STRICT, WITHOUT ROWID;
 
@@ -507,6 +512,24 @@ CREATE TABLE IF NOT EXISTS outbox (
   status       TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN
                  ('pending','inflight','done','failed','dead_letter',
                   'voided','fenced','refused','superseded','forced')),
+  -- The LEASE IDENTITY, and it is a fencing token in the ordinary sense.
+  --
+  -- `settleEffect` is fenced on the ACTIVE LEASE, not on the row id: an id is
+  -- not an identity while a row can be re-leased. Without these two columns the
+  -- sequence is worker A stalls past its expiry, `recoverEffects` returns the
+  -- row to `pending`, worker B leases it and begins delivering -- and A, still
+  -- running, settles B's live delivery, overwriting its status and result while
+  -- B is mid-flight. Both writes look legitimate at their own call sites.
+  --
+  -- `lease_token` is bumped on every lease of the row, so it is monotonic per
+  -- row and survives a restart because it lives in the row rather than in a
+  -- process. The CAS requires BOTH to match the row's current values and
+  -- returns `stale` without writing otherwise. This is the mechanism the
+  -- literature calls fencing, and TTL-plus-liveness is not a substitute for it:
+  -- a paused process keeps its pid, so `isAlive` says yes for exactly the
+  -- process that must be refused.
+  worker       TEXT,                               -- null while pending; the holder while inflight
+  lease_token  INTEGER NOT NULL DEFAULT 0,         -- bumped per lease; the fence `settleEffect` matches on
   attempts     INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 8,
   not_before   INTEGER NOT NULL DEFAULT 0,

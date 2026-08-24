@@ -148,5 +148,54 @@ check(emitted.size > 0,
 const both = [...replayableKinds()].filter(k => NON_REPLAYED_KINDS.includes(k));
 check(both.length === 0, "control: no kind is both replayed and declared unreplayed", JSON.stringify(both));
 
+// ── every column the CONSUMING plans insert by name exists in this schema ────
+// S2-A's schema is consumed by S2-B and S2-C, and the cross-check above only
+// looks inward: it compares this plan's DDL against this plan's prose. Nothing
+// compared it against what the next two plans actually write, and three columns
+// were missing that way -- `impl_pr.head_sha`, and the `outbox.worker` /
+// `outbox.lease_token` pair that IS the owner fence stopping a stalled worker
+// from settling another worker's live delivery.
+//
+// INSERT column lists are the unambiguous half of that comparison: a name in
+// `INSERT INTO t(a,b,c)` is a column or it is nothing. A WHERE clause is not
+// scanned here, deliberately -- distinguishing a column from a JS identifier in
+// prose produced far more noise than signal when tried, and a check that reports
+// a hundred false candidates is one nobody reads.
+{
+  const planDir = fileURLToPath(new URL("../docs/superpowers/plans/", import.meta.url));
+  const consuming = readdirSync(planDir).filter(n => /s2[bc]-.*\.md$/.test(n));
+  check(consuming.length === 2,
+    "fixture: both consuming plans are present to scan", JSON.stringify(consuming));
+
+  const live = new Map();
+  for (const t of inDb)
+    live.set(t, new Set(db.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name)));
+
+  let scanned = 0;
+  const missing = [];
+  for (const f of consuming) {
+    const text = readFileSync(join(planDir, f), "utf8");
+    for (const m of text.matchAll(/INSERT\s+(?:OR\s+\w+\s+)?INTO\s+([a-z_]+)\s*\(([^)]*)\)/gi)) {
+      const table = m[1];
+      if (!live.has(table)) continue;                 // not a hub table
+      for (const raw of m[2].split(",")) {
+        const col = raw.trim();
+        if (!/^[a-z_]+$/.test(col)) continue;
+        scanned++;
+        if (!live.get(table).has(col)) missing.push(`${f.slice(11, 14)} ${table}.${col}`);
+      }
+    }
+  }
+  check(missing.length === 0,
+    "every column S2-B and S2-C insert by name exists in migration 1",
+    [...new Set(missing)].join(", "));
+  // CONTROL: the scan found real column references. A regex that stops matching
+  // -- a reformatted INSERT, a renamed plan file -- would otherwise report an
+  // empty `missing` list and read exactly like success.
+  check(scanned > 50,
+    "control: the scan actually read INSERT column lists, so an empty result means agreement",
+    `${scanned} column references across ${consuming.length} plans`);
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

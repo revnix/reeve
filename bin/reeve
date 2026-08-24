@@ -93,7 +93,6 @@ const registryProjects = (home) => {
 // not, so a scratch home redirected a project's state database but not the
 // profile describing it -- the two halves of one project's configuration read
 // from different roots, which is unusable for a test and wrong for an operator.
-const HOME = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
 
 const [major] = process.versions.node.split(".").map(Number);
 if (major < 24) {
@@ -105,7 +104,93 @@ const argv = process.argv.slice(2);
 const cmd = argv.shift();
 const flag = n => argv.includes(`--${n}`);
 const opt = n => { const i = argv.indexOf(`--${n}`); return i < 0 ? null : argv[i + 1]; };
-const VALUED = new Set(["db", "plugin-cache", "plugin-repo", "profile", "set", "log", "halt", "interval", "last", "out", "dash"]);
+
+// ── every flag this CLI accepts, declared ONCE ──────────────────────────────
+//
+// There were two facts about a flag -- does it exist, and does it take a value
+// -- and only the second was written down, in `VALUED`. They had already
+// drifted: `VALUED`'s own comment says it exists so "a valued flag consumes the
+// token after it, so that token is never mistaken for a repo name however much
+// it looks like one", and SIX flags that take values were missing from it.
+//
+// Measured before this change: `reeve backup --to some/place` answered
+// `no state at <home>/state/some/place.db` -- it had read the FLAG'S VALUE as
+// the repository name, which is exactly the failure that comment describes.
+// `--tail`, `--from`, `--keep`, `--days` and `--backups` were all in the same
+// state.
+//
+// So there is one declaration now and `VALUED` is derived from it. `what` is
+// here because a flag nobody can look up is a flag nobody uses correctly.
+const FLAGS = {
+  home:           { value: true,  what: "the reeve home to operate on (default $REEVE_HOME, else ~/.reeve)" },
+  db:             { value: true,  what: "path to a state database" },
+  log:            { value: true,  what: "path to the log file" },
+  halt:           { value: true,  what: "path to the halt marker" },
+  interval:       { value: true,  what: "seconds between ticks" },
+  last:           { value: true,  what: "how many recent entries to show" },
+  out:            { value: true,  what: "where to write output" },
+  dash:           { value: true,  what: "path to the dashboard html" },
+  profile:        { value: true,  what: "path to a profile json" },
+  set:            { value: true,  what: "a key=value profile override" },
+  "plugin-cache": { value: true,  what: "path to the plugin cache" },
+  "plugin-repo":  { value: true,  what: "path to the plugin repository" },
+  to:             { value: true,  what: "backup root to write into" },
+  from:           { value: true,  what: "snapshot to restore from" },
+  backups:        { value: true,  what: "backup root to read from" },
+  keep:           { value: true,  what: "how many snapshots to retain" },
+  days:           { value: true,  what: "how many days to consider" },
+  tail:           { value: true,  what: "a durable export-events file to replay" },
+
+  hub:            { value: false, what: "operate on the builder hub rather than a repository" },
+  json:           { value: false, what: "machine-readable output" },
+  force:          { value: false, what: "proceed past a refusal that is an operator judgement" },
+  overwrite:      { value: false, what: "replace an existing file" },
+  takeover:       { value: false, what: "take a lease whose holder is provably dead" },
+  execute:        { value: false, what: "actually act, rather than observe" },
+  enforce:        { value: false, what: "publish the merge policy as enforcing" },
+  events:         { value: false, what: "export the event log too" },
+  health:         { value: false, what: "report health only" },
+  open:           { value: false, what: "open the result" },
+  tick:           { value: false, what: "run a single tick and exit" },
+  write:          { value: false, what: "write the change rather than printing it" },
+  "as-app":       { value: false, what: "act as the GitHub App rather than the user" },
+  help:           { value: false, what: "show this help" },
+};
+const VALUED = new Set(Object.entries(FLAGS).filter(([, f]) => f.value).map(([n]) => n));
+
+// UNKNOWN FLAGS ARE REFUSED, not ignored.
+//
+// Ignoring them is how `--home /tmp/x` silently operated on the operator's real
+// ~/.reeve -- there was no such flag, so it and its value were skipped and the
+// command ran against the live home. It is also how `--keeep 3` looked like it
+// had set a retention while quietly using the default. A misspelled flag must
+// not be indistinguishable from an absent one, because the two mean opposite
+// things to whoever typed it.
+{
+  const near = (a, b) => {                       // Levenshtein, for did-you-mean
+    const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+    for (let j = 0; j <= b.length; j++) d[0][j] = j;
+    for (let i = 1; i <= a.length; i++)
+      for (let j = 1; j <= b.length; j++)
+        d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1,
+                           d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    return d[a.length][b.length];
+  };
+  const unknown = argv.filter(a => a.startsWith("--") && !FLAGS[a.slice(2)]);
+  if (unknown.length) {
+    for (const u of unknown) {
+      const name = u.slice(2);
+      const [best] = Object.keys(FLAGS)
+        .map(k => [k, near(name, k)])
+        .filter(([, d]) => d <= Math.max(2, Math.floor(name.length / 3)))
+        .sort((x, y) => x[1] - y[1]);
+      console.error(`reeve: unknown flag ${u}${best ? `  (did you mean --${best[0]}?)` : ""}`);
+    }
+    console.error(`-> reeve ${cmd ?? ""} accepts: ${Object.keys(FLAGS).sort().map(f => "--" + f).join(" ")}`);
+    process.exit(1);
+  }
+}
+
 // Positionals only. A valued flag consumes the token after it, so that token is
 // never mistaken for a repo name however much it looks like one.
 const positionals = (() => {
@@ -117,6 +202,10 @@ const positionals = (() => {
   }
   return out;
 })();
+
+// AFTER the parser, so `--home` can feed it. Order matters: this used to sit
+// above `argv` and could therefore only ever read the environment.
+const HOME = opt("home") ?? process.env.REEVE_HOME ?? join(homedir(), ".reeve");
 
 /** Repo identity is the remote, never the path: one repo can sit at two paths on two commits. */
 /**

@@ -21,6 +21,8 @@ import { createHash } from "node:crypto";
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+// The remediation must name the home the token check actually used.
+import { resolveHome } from "./home.mjs";
 // `hubFindings`'s healthy-snapshot path evaluates HUB_SCHEMA_VERSION; without
 // this import that branch throws a ReferenceError on a working installation.
 import { HUB_SCHEMA_VERSION } from "./build/hubdb.mjs";
@@ -491,7 +493,12 @@ export function checkKeychain({ probe = probeKeychain, isolation = "none", topol
     `${held} — and a worker cannot read it: its HOME is reeve's own scratch directory`,
     `but it has no credential of its own to run with: ${tk.why}`,
     "every dispatch under --execute would fail while preparing the worker; observation and review are unaffected",
-    "-> run `claude setup-token` and write the token to ~/.reeve/claude-token, mode 600",
+    // THE PATH THAT WAS CHECKED, not the default one. Once `readOauthToken`
+    // followed the resolved home, this instruction pointed somewhere the check
+    // had not looked -- so an operator under `--home` or a custom REEVE_HOME
+    // could follow it exactly and stay degraded, with every --execute dispatch
+    // still unable to authenticate.
+    `-> run \`claude setup-token\` and write the token to ${tk.path ?? join(resolveHome(), "claude-token")}, mode 600`,
   ] };
 
   return { id, level: OK, title, lines: [

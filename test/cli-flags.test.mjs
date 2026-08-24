@@ -18,6 +18,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { profilePath } from "../src/init.mjs";
 // A real hub is what the `--help` side-effect drill needs to observe a write.
 import { openHub } from "../src/build/hubdb.mjs";
+// R-15 is where the token path becomes an instruction to an operator.
+import { checkKeychain } from "../src/doctor.mjs";
 import { hubPathFor } from "../src/paths.mjs";
 
 let fail = 0;
@@ -459,6 +461,67 @@ check(existsSync(join(repo, ".git")),
   check(real.status === 0 && existsSync(out2),
     "control: without --help the same command writes the file",
     `status=${real.status} ${real.out.slice(0, 160)}`);
+}
+
+// ── an EMPTY value is a missing value ──────────────────────────────────────
+// `reeve restore --hub --home "$SCRATCH"` with the variable unset hands over
+// `""`, and `resolve("")` is the CURRENT DIRECTORY -- so a command explicitly
+// told to use another home would have backed up, built or restored against
+// `<cwd>/state`. An operator who names a home and gets nothing has said
+// something, and it is not "use wherever I happen to be standing".
+{
+  const empty = run("build", "status", "--home", "");
+  check(empty.status !== 0, "an empty valued flag is refused", `status=${empty.status} ${empty.out.slice(0, 160)}`);
+  check(/--home expects a value/.test(empty.out),
+    "and refused the same way a missing one is, because it is one", empty.out.slice(0, 200));
+  // The decisive half: it must not have resolved to the working directory. On
+  // the broken implementation this succeeds and reports on `<cwd>/state`.
+  check(!/not running/.test(empty.out),
+    "and the command did not run against the current directory", empty.out.slice(0, 200));
+}
+
+// ── a boolean flag is never recommended a value ────────────────────────────
+// `--flag=value` was answered "takes its value as the next argument" for EVERY
+// known flag, so `--force=false` got `write --force false` -- which turns force
+// ON and leaves `false` as an unused positional. The operator was asking for the
+// opposite, and on `restore` that flag waives the live-daemon safety refusal.
+{
+  const b = run("restore", "--hub", "--force=false");
+  check(b.status !== 0, "a boolean written with a value is refused", `status=${b.status}`);
+  check(/--force is a switch and takes no value/.test(b.out),
+    "and told that it is a switch", b.out.slice(0, 200));
+  check(!/write --force false/.test(b.out) && !/--force false/.test(b.out),
+    "and NOT handed a command that turns on the thing they asked to turn off", b.out.slice(0, 240));
+  check(/--force=false does not turn it off/.test(b.out),
+    "and told plainly that `=false` is not how it is turned off", b.out.slice(0, 240));
+
+  // CONTROL: a VALUED flag written the same way still gets the advice that is
+  // correct for it, so the fix did not simply delete the helpful message.
+  const v = run("build", "status", "--home=" + join(dir, "eqhome2"));
+  check(/--home takes its value as the next argument/.test(v.out),
+    "control: a valued flag written with = is still shown the form that works", v.out.slice(0, 200));
+}
+
+// ── the token remediation names the path that was checked ──────────────────
+// `readOauthToken`'s default follows the resolved home now, so R-15 looks under
+// a custom home while the instruction still said `~/.reeve/claude-token`. An
+// operator could follow it exactly and stay degraded, with every `--execute`
+// dispatch unable to authenticate.
+{
+  const tokenHome = join(dir, "token-home");
+  mkdirSync(tokenHome, { recursive: true });
+  const r = checkKeychain({ probe: () => ({ measured: true, items: [], why: null }),
+                            isolation: "scratch-home", topologyReady: () => true,
+                            token: () => ({ ok: false, path: join(tokenHome, "claude-token"),
+                                            why: `${join(tokenHome, "claude-token")} could not be read (ENOENT)` }) });
+  const advice = r.lines[r.lines.length - 1];
+  check(advice.includes(join(tokenHome, "claude-token")),
+    "the remediation names the file the check actually looked at", advice);
+  check(!/~\/\.reeve\/claude-token/.test(advice),
+    "and not the default one, which is where it used to send everybody", advice);
+  // CONTROL: the reported reason still names it too, so the two halves agree.
+  check(r.lines.some(l => l.includes(join(tokenHome, "claude-token")) && /could not be read/.test(l)),
+    "control: and the diagnosis and the remediation name the same file", r.lines.join(" | ").slice(0, 200));
 }
 
 rmSync(dir, { recursive: true, force: true });

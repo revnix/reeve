@@ -38,6 +38,7 @@
 // relative and resolves inside the tree, so the copy resolves within the run
 // checkout.
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { GIT_NEUTRALISE, GIT_NEUTRALISE_FOUNDER, REFUSING_HOOK, recordConfig, reason, gitEnv, founderGitEnv } from "./gitguard.mjs";
@@ -346,7 +347,13 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
       rmSync(path, { recursive: true, force: true });
       return { ok: false, path: null, why: `the dependency trees ${copied.join(", ")} put ${untracked.length} files into the checkout that git does not ignore, past the ${MAX_COPIED_UNTRACKED} reeve will track; ignore them or declare a narrower path` };
     }
-    deps = { ok: true, cow: anyCow, skipped: copied.length === 0, copied, untracked, why: null };
+    // Names alone cannot tell an untouched copy from one the worker EDITED: git
+    // reports the same `?? vendor/dep.js` either way, so a pathname baseline
+    // subtracts the modification and an incomplete repair publishes. The digest is
+    // what distinguishes them, and it is only paid for in the unignored case --
+    // a gitignored tree contributes no baseline at all.
+    deps = { ok: true, cow: anyCow, skipped: copied.length === 0, copied,
+             untracked: fingerprint(path, untracked), why: null };
   }
 
   return { ok: true, path, why: null, deps };
@@ -568,6 +575,29 @@ function badDeclaredPath(f) {
   return null;
 }
 
+/**
+ * A path -> content digest map, for telling a file reeve put somewhere from the
+ * same file after a worker has edited it.
+ *
+ * Hashed in-process rather than through `git hash-object --stdin-paths`, which
+ * takes NEWLINE-separated paths and would break on a filename containing one --
+ * a shape this codebase has already been bitten by once.
+ *
+ * An unreadable file is recorded as null, which never equals a later digest, so
+ * it reads as changed and fails closed.
+ */
+export function fingerprint(root, paths) {
+  const out = {};
+  for (const rel of paths) out[rel] = digestOf(join(root, rel));
+  return out;
+}
+
+/** The digest of one file, or null when it cannot be read. */
+export function digestOf(abs) {
+  try { return createHash("sha256").update(readFileSync(abs)).digest("hex"); }
+  catch { return null; }
+}
+
 export function commitRunWork({ repoRoot, path, branch, message, secrets = [], declared = [] }) {
   if (!String(message ?? "").trim()) return { ok: false, why: "no commit message was given" };
 
@@ -630,7 +660,11 @@ export function commitRunWork({ repoRoot, path, branch, message, secrets = [], d
   // Through stdin rather than argv: a repository-sized repair overruns ARG_MAX,
   // and `--pathspec-from-file=-` with `--pathspec-file-nul` is git's own answer
   // for a list of arbitrary length holding arbitrary bytes.
-  const added = git(path, ["add", "--force", "--pathspec-from-file=-", "--pathspec-file-nul"],
+  // `--literal-pathspecs` BEFORE the subcommand, because a filename may begin with
+  // `:` and git would read the entry as pathspec magic rather than as a name --
+  // measured, a real file called `:x` was rejected with "did not match any files"
+  // and every repair touching one would have been refused.
+  const added = git(path, ["--literal-pathspecs", "add", "--force", "--pathspec-from-file=-", "--pathspec-file-nul"],
                     { input: wanted.join("\0") + "\0" });
   if (!added.ok) return { ok: false, why: `could not stage the declared work: ${added.err}` };
 

@@ -1321,7 +1321,14 @@ export async function tick(ctx) {
         // still looks fresh and reports nothing -- and the failure stays silent
         // until that retained copy ages out, which is exactly the window in
         // which there is no working backup.
-        if (r.escalate) escalations.set(`${r.escalate}: ${r.nwo}`, 1);
+        // ON ctx, not only in this tick's map. `escalations` is rebuilt every
+        // tick and a backup is attempted once an INTERVAL, so the finding
+        // existed for one tick and was then absent -- which `announceable`
+        // reads as resolved, so the next ordinary tick could announce CLEARED
+        // while no backup had succeeded. The retained previous snapshot is
+        // still fresh enough that the self-audit does not recreate it either.
+        // It stands until a snapshot for that store is actually TAKEN.
+        if (r.escalate) (ctx.backupFailures ??= new Map()).set(r.nwo, `${r.escalate}: ${r.nwo}`);
       }
       // `taken`, not `ok`. A deferred result is `ok` -- another process
       // published this second and that is not a failure -- but this daemon did
@@ -1329,10 +1336,19 @@ export async function tick(ctx) {
       // not perform.
       const okd = all.filter(r => (r.outcome ?? (r.ok ? "taken" : "failed")) === "taken");
       if (okd.length) log(logPath, `backup: ${okd.length} store(s) — ${okd.map(r => r.nwo).join(", ")}`);
+      // A snapshot that was TAKEN clears that store's standing failure, and
+      // nothing else does. `deferred` does not: another process published this
+      // second, which says nothing about whether THIS daemon can.
+      for (const r of okd) ctx.backupFailures?.delete(r.nwo);
       // A tick that snapshotted nothing at all is a backup that is not happening.
       if (!all.length) log(logPath, "backup FAILED: no state store found to snapshot");
       ctx.lastBackupAt = at;
     }
+    // RE-EMITTED EVERY TICK, after the block above so a success this tick has
+    // already cleared it. Between backup attempts there is nothing to recreate
+    // the finding, and absence within a tick is what the layer below reads as
+    // resolved.
+    for (const line of (ctx.backupFailures ?? new Map()).values()) escalations.set(line, 1);
   }
 
   // AFTER the backup, deliberately. Running it first meant the audit reported a

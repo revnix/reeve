@@ -74,9 +74,21 @@ const registryProjects = (home) => {
   const path = join(home, "projects.json");
   try {
     const reg = JSON.parse(readFileSync(path, "utf8"));
-    return { projects: Object.entries(reg)
-               .filter(([, p]) => p && typeof p === "object")
-               .map(([name, p]) => ({ name, nwo: p.nwo ?? null })),
+    // A MALFORMED ENTRY IS AN ERROR, not a row to drop.
+    //
+    // Filtering it out returned `error: null`, so doctor set `projectsKnown:
+    // true` over a project set the registry did not actually describe -- and
+    // `hubFindings` then SUPPRESSES gate-state rows absent from that set. A
+    // registry of `{ "prod": "bad" }` therefore reported a clean hub while
+    // hiding exactly the H-4 authority findings the H-7 path exists to preserve.
+    // Silently narrowing the input is how a check answers a smaller question
+    // than the one it was asked.
+    if (reg === null || typeof reg !== "object" || Array.isArray(reg))
+      return { projects: [], error: `${path}: the registry must be an object of name -> project, not ${Array.isArray(reg) ? "an array" : typeof reg}` };
+    const bad = Object.entries(reg).filter(([, v]) => !v || typeof v !== "object" || Array.isArray(v)).map(([n]) => n);
+    if (bad.length)
+      return { projects: [], error: `${path}: ${bad.length} malformed entr${bad.length === 1 ? "y" : "ies"} (${bad.slice(0, 5).join(", ")}); each project must be an object` };
+    return { projects: Object.entries(reg).map(([name, p]) => ({ name, nwo: p.nwo ?? null })),
              error: null };
   } catch (e) {
     // The read failure is ITSELF a finding, and the route below emits it.
@@ -368,7 +380,22 @@ switch (cmd) {
         // than an off-by-one, and leaving it in the array would replay a footer
         // into `hub_event` as if it were history.
         const rawLines = readFileSync(tailPath, "utf8").split("\n").filter(Boolean);
-        const parsed = rawLines.map(l => JSON.parse(l));
+        // PARSED WITH A REFUSAL, not a throw. A partial copy is the likeliest
+        // damage to a recovery tail -- it is the case the manifest check exists
+        // to diagnose -- and a file that stops mid-line got there first, as an
+        // uncaught SyntaxError with a stack trace, from the one command an
+        // operator runs when the hub is already gone.
+        const parsed = [];
+        for (const [i, l] of rawLines.entries()) {
+          try { parsed.push(JSON.parse(l)); }
+          catch (e) {
+            die(`reeve restore --hub: ${tailPath} is not a valid event export -- line ${i + 1} of ${rawLines.length} ` +
+                `could not be parsed (${e.message})\n` +
+                `  line     ${l.length > 120 ? l.slice(0, 120) + "…" : l}\n` +
+                `  recover  re-export it with reeve export-events --hub; a copy that stopped part way ` +
+                `cannot be told from a complete one by its length`);
+          }
+        }
         const hasFooter = parsed.length > 0 && parsed[parsed.length - 1]?._manifest != null;
         const footer = hasFooter ? parsed.pop()._manifest : null;
         if (hasFooter) rawLines.pop();

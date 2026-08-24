@@ -798,7 +798,18 @@ function writeAuthority(db, project) {
     const q = new DatabaseSync(snap, { readOnly: true });
     try { return q.prepare("SELECT COALESCE(max(seq),0) s FROM hub_event").get().s; } finally { q.close(); }
   })();
-  const tailEvents = [{ seq: snapMax + 1, at: 1, kind: "task.transitioned", task: "bt:2",
+  // THE SNAPSHOT'S OWN EVENTS FIRST. `export-events --hub` writes the whole log
+  // from seq 1, so a real tail always carries the part the snapshot also has --
+  // and that prefix is the only thing tying the file to THIS hub rather than to
+  // some other one whose sequence numbers happen to line up. A fixture that
+  // starts after the snapshot is not the format the command produces, and the
+  // provenance check refuses it correctly.
+  const snapPrefix = (() => {
+    const q = new DatabaseSync(snap, { readOnly: true });
+    try { return q.prepare("SELECT seq, at, kind, task, payload FROM hub_event ORDER BY seq").all(); }
+    finally { q.close(); }
+  })();
+  const tailEvents = [...snapPrefix, { seq: snapMax + 1, at: 1, kind: "task.transitioned", task: "bt:2",
                   payload: JSON.stringify({
                     id: "bt:2", project: "p", repo_id: 1, nwo_snapshot: "o/r", title: "t",
                     phase: "SIZING", generation: 1, source_kind: "founder", source_key: "k2",
@@ -1357,6 +1368,155 @@ function writeAuthority(db, project) {
     "and leaves no half-made hub at the canonical path, sidecars included",
     `${existsSync(target)} ${existsSync(target + "-wal")} ${existsSync(target + "-shm")}`);
   rmSync(sHome, { recursive: true, force: true });
+}
+
+// ── a supplied tail must be THIS hub's, not merely a valid export ──────────
+// Every other check on `--tail` asks whether the file is internally consistent:
+// its manifest matches its bytes, its seqs run without holes, its first follows
+// the snapshot. A valid export from a DIFFERENT hub passes all of them --
+// sequence numbers start at 1 everywhere, so the post-snapshot part lines up --
+// and its events were replayed into the restored database, inserting unrelated
+// authority rows and reporting success.
+//
+// The prefix through snapSeq is the only evidence of provenance the file has,
+// and `export-events --hub` always writes it, because it writes the whole log.
+{
+  const fHome = mkdtempSync(join(tmpdir(), "reeve-foreign-"));
+  mkdirSync(join(fHome, "state"), { recursive: true });
+  const root = join(fHome, "backups");
+
+  // Hub A: the one being restored. Two events, so the snapshot has a prefix.
+  const a = join(fHome, "state", "a.db");
+  const dbA = openHub(a);
+  const mkTask = (db, id) => db.prepare(
+    `INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,source_kind,source_key,
+                      repo_path,profile_path,profile_hash,default_branch,visibility,
+                      registry_version,created_at,updated_at)
+     VALUES(?,'p',1,'o/r','t','FILED','founder',?, '/r','/p.json','h','main','private',1,1,1)`).run(id, id);
+  mkTask(dbA, "bt:a1");
+  hubEvent(dbA, { kind: "task.transitioned", task: "bt:a1", payload: { id: "bt:a1", phase: "SIZING" } });
+  const snapA = snapshot(dbA, root, "hub");
+  check(snapA.ok, "fixture: hub A is snapshotted", JSON.stringify(snapA));
+  dbA.close();
+
+  // Hub B: a DIFFERENT hub, with its own seq 1.. — a perfectly valid export.
+  const b = join(fHome, "state", "b.db");
+  const dbB = openHub(b);
+  mkTask(dbB, "bt:b1");
+  hubEvent(dbB, { kind: "task.transitioned", task: "bt:b1", payload: { id: "bt:b1", phase: "RESEARCH" } });
+  hubEvent(dbB, { kind: "task.transitioned", task: "bt:b1", payload: { id: "bt:b1", phase: "DESIGN" } });
+  const rowsB = dbB.prepare("SELECT seq, at, kind, task, payload FROM hub_event ORDER BY seq").all();
+  dbB.close();
+  const foreignPath = join(fHome, "foreign.jsonl");
+  writeTail(foreignPath, rowsB);
+  const foreign = readTail(foreignPath);
+  check(foreign.manifest != null && foreign.sha256 === foreign.manifest.sha256,
+    "fixture: the foreign tail's envelope is VALID, so the refusal is about provenance and nothing else",
+    JSON.stringify(foreign.manifest));
+
+  const target = join(fHome, "state", "target.db");
+  const bad = restoreHub(snapA.path, target, { isAlive: () => false, pid: process.pid, lstart: "L", force: true, tail: foreign });
+  check(!bad.ok, "a valid export from another hub is refused", JSON.stringify(bad).slice(0, 200));
+  check(/not from the hub this snapshot was taken from/.test(String(bad.why)),
+    "and the refusal says WHICH problem it is, not 'truncated' or 'has holes'", String(bad.why));
+  check(/at seq \d+/.test(String(bad.why)),
+    "and names the sequence where the two logs disagree, which is what an operator can act on", String(bad.why));
+
+  // CONTROL: this hub's OWN export, over the same snapshot, is accepted. Without
+  // it, refusing every tail satisfies all three assertions above.
+  const dbA2 = openHub(a);
+  hubEvent(dbA2, { kind: "task.transitioned", task: "bt:a1", payload: { id: "bt:a1", phase: "GATE" } });
+  const rowsA = dbA2.prepare("SELECT seq, at, kind, task, payload FROM hub_event ORDER BY seq").all();
+  dbA2.close();
+  const ownPath = join(fHome, "own.jsonl");
+  writeTail(ownPath, rowsA);
+  const target2 = join(fHome, "state", "target2.db");
+  const good = restoreHub(snapA.path, target2, { isAlive: () => false, pid: process.pid, lstart: "L", force: true, tail: readTail(ownPath) });
+  check(good.ok, "control: this hub's own export IS accepted over its own snapshot", JSON.stringify(good).slice(0, 200));
+  check(good.replayed === 1, "control: and the one post-snapshot event was replayed", JSON.stringify(good));
+
+  // A tail with no prefix at all cannot be bound to anything, and says so.
+  const noPrefixPath = join(fHome, "noprefix.jsonl");
+  writeTail(noPrefixPath, rowsA.filter(e => e.seq > 2));
+  const target3 = join(fHome, "state", "target3.db");
+  const nop = restoreHub(snapA.path, target3, { isAlive: () => false, pid: process.pid, lstart: "L", force: true, tail: readTail(noPrefixPath) });
+  check(!nop.ok && /carries no events at or before seq/.test(String(nop.why)),
+    "a tail that begins after the snapshot is refused for having no provenance at all", String(nop.why));
+  rmSync(fHome, { recursive: true, force: true });
+}
+
+// ── a version-zero hub is excluded where a bootstrapping builder looks ─────
+// `rawOpen` returns null for a store with no completed migration, which sent it
+// down the UNREADABLE path -- where the lock is taken in the SIBLING
+// `.restore-lock`. But a version-zero hub is not unreadable to a `build run`:
+// it bootstraps, completes migration 1 in the canonical file and takes its
+// singleton there, never consulting the sibling. The restore then replaced that
+// database without scanning its new holder.
+//
+// Exclusion has to live where the other writer will look for it, and that is
+// `maintenance_lock` in `hub.db` -- what `acquireSingleton` reads through
+// `assertWritable`.
+{
+  const zHome = mkdtempSync(join(tmpdir(), "reeve-zero-"));
+  mkdirSync(join(zHome, "state"), { recursive: true });
+  const root = join(zHome, "backups");
+  const src = openHub(join(zHome, "state", "src.db"));
+  const snapZ = snapshot(src, root, "hub");
+  src.close();
+  check(snapZ.ok, "fixture: a snapshot to restore from", JSON.stringify(snapZ));
+
+  // A store in exactly the interrupted-first-run state.
+  const target = join(zHome, "state", "zero.db");
+  { const d = new DatabaseSync(target);
+    d.exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT`);
+    d.close(); }
+
+  // A restore that FAILS after taking exclusion, so the lock is observable: a
+  // foreign tail is refused after the branch has been chosen.
+  //
+  // The decisive observation is WHERE the lock was taken. On the old path it was
+  // the sibling `.restore-lock`, and `hub.db` carried none -- which is what let
+  // a bootstrapping builder in.
+  let lockedIn = null;
+  const probe = restoreHub(snapZ.path, target, {
+    isAlive: () => false, pid: process.pid, lstart: "L", force: true,
+    tail: Object.assign([{ seq: 1, at: 1, kind: "task.transitioned", task: null, payload: "{}" }],
+                        { manifest: null, sha256: null }),
+  });
+  check(!probe.ok, "fixture: the restore fails after choosing its branch", JSON.stringify(probe).slice(0, 160));
+  check(!existsSync(target + ".restore-lock"),
+    "a version-zero hub does not send the restore to the sibling lock a builder never reads",
+    `${existsSync(target + ".restore-lock")}`);
+  // The file itself was kept, because a recovery that destroys what it replaced
+  // cannot be audited -- the property the unreadable path already had.
+  //
+  // ON DISK, not in the result: a FAILED restore returns { ok, why, holders }
+  // and never names its quarantine, so reading `probe.quarantined` here asks
+  // the wrong object and answers `undefined` whatever the truth is. The
+  // successful path's naming is asserted separately, further up this file.
+  const kept = readdirSync(join(zHome, "state")).filter(f => f.startsWith("zero.db.incomplete-"));
+  check(kept.length === 1,
+    "and the unfinished file is kept rather than destroyed by the migration",
+    readdirSync(join(zHome, "state")).join(" "));
+  check(kept.length === 1 && !kept[0].includes(".corrupt-"),
+    "and named incomplete rather than corrupt, since an operator is about to look at it",
+    kept.join(" "));
+
+  // CONTROL: a genuinely UNREADABLE hub still takes the sibling lock, so the
+  // assertion above is about version zero and not about the sibling path having
+  // been removed.
+  const corrupt = join(zHome, "state", "corrupt.db");
+  writeFileSync(corrupt, "this is not a database");
+  const c = restoreHub(snapZ.path, corrupt, {
+    isAlive: () => false, pid: process.pid, lstart: "L", force: true,
+    tail: Object.assign([{ seq: 1, at: 1, kind: "task.transitioned", task: null, payload: "{}" }],
+                        { manifest: null, sha256: null }),
+  });
+  check(!c.ok, "control: an unreadable hub's restore also fails on the same tail", JSON.stringify(c).slice(0, 160));
+  check(existsSync(corrupt + ".restore-lock"),
+    "control: and IT does use the sibling lock, because nothing can be written into it",
+    `${existsSync(corrupt + ".restore-lock")}`);
+  rmSync(zHome, { recursive: true, force: true });
 }
 
 rmSync(home, { recursive: true, force: true });

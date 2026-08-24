@@ -570,6 +570,10 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
   })();
 
   let live = null, locked = false, lockDb = null, quarantined = null, synthetic = false, swapped = false;
+  // The unreadable path names the quarantine here and copies it one step before
+  // the swap; the version-zero path has to copy immediately, because it migrates
+  // the file. This says which already happened.
+  let quarantineCopied = false;
   const staging = dbPath + ".restoring";
   // The raw open AND the first query, together. Either can throw on a file that
   // is corrupt enough, and the branch below used to do them as two statements
@@ -628,7 +632,45 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // service-manager restart or a CLI write landing in that window creates a
     // fresh hub at dbPath which the rename then silently destroys. So an absent
     // hub gets a minimal one created first, purely to hold the lock.
-    if (!existsSync(dbPath)) {
+    //
+    // A VERSION-ZERO HUB TAKES THIS BRANCH TOO, and that is the fix for a race
+    // the classification created. `rawOpen` returns null for a store with no
+    // completed migration, which sent it down the UNREADABLE path -- where the
+    // lock is taken in the sibling `.restore-lock`. But a version-zero hub is
+    // not unreadable to everyone: a concurrent `build run` sees version zero,
+    // bootstraps, completes migration 1 in the canonical `hub.db` and takes its
+    // singleton there, never consulting the sibling file. The restore then
+    // replaced that database without ever scanning its new holder, discarding
+    // the builder's writes while the builder went on against the unlinked inode.
+    //
+    // Exclusion has to live where the other writer will look for it. A
+    // version-zero store holds nothing, so opening it through `openHub` --
+    // completing exactly the migration `build run` would have completed -- and
+    // taking the maintenance lock IN IT is both safe and the only thing a
+    // bootstrapping builder honours: `acquireSingleton` calls `assertWritable`,
+    // which reads `maintenance_lock` in the canonical file.
+    //
+    // `synthetic` stays FALSE here. It means "this invocation created the file
+    // and may delete it", and a store that was already on disk is not this
+    // function's to remove -- it is left fully migrated and empty, which is
+    // precisely what `build run` would have left.
+    // READABLE and at version zero. `completedVersion` answers 0 for an
+    // UNREADABLE file too -- deliberately, because `build run` treats both as
+    // "nothing to exclude anyone from" -- and using it here sent a corrupt hub
+    // into `openHub`, which threw `database disk image is malformed` and broke
+    // the one recovery this command exists for. Measured, on the first attempt.
+    // The sidecars are already copied aside above, so this open cannot cost the
+    // WAL whatever it finds.
+    const readableVersion = (path) => {
+      let d = null;
+      try {
+        d = new DatabaseSync(path, { timeout: 10000 });
+        return d.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+      } catch { return null; }
+      finally { try { d?.close(); } catch {} }
+    };
+    const bootstrapZero = existsSync(dbPath) && readableVersion(dbPath) === 0;
+    if (!existsSync(dbPath) || bootstrapZero) {
       // SYNTHETIC, and tracked as such. This file exists only to carry the
       // maintenance lock while the real one is staged; nothing has restored
       // into it. If staging or replay then fails -- a malformed supplied tail
@@ -637,7 +679,24 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // lock, and used to leave a fully migrated EMPTY hub at the canonical
       // path. A restarted builder finds a healthy-looking store with no state
       // in it, which is worse than finding nothing: nothing is obviously wrong.
-      synthetic = true;
+      synthetic = !bootstrapZero;
+      // KEPT, before it is migrated. Sending a version-zero store down this
+      // branch bought exclusion where a bootstrapping builder looks for it, and
+      // it would have quietly sold something the unreadable path had chosen: the
+      // half-created file was QUARANTINED there, and here `openHub` migrates it
+      // in place, so the bytes an operator might want to look at are gone before
+      // the swap replaces them. It costs one copy of an empty database.
+      //
+      // `.incomplete-`, not `.corrupt-`: it is not damaged, it is unfinished,
+      // and telling an operator the wrong thing about the file they are about to
+      // examine is its own defect. The copy happens HERE rather than at the
+      // usual point one step before the swap, because by then this path has
+      // already migrated the file.
+      if (bootstrapZero) {
+        quarantined = `${dbPath}.incomplete-${Math.floor(Date.now() / 1000)}`;
+        try { copyFileSync(dbPath, quarantined); quarantineCopied = true; }
+        catch { quarantined = null; }
+      }
       live = openHub(dbPath);
       // The result is CHECKED here too. Two restores started after a total loss
       // both pass the existsSync above, both race through openHub, and one of
@@ -873,6 +932,44 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         return { ok: false, holders: [],
                  why: `the supplied tail claims seq ${manifest.first}..${manifest.last} and carries ` +
                       `${rawTail[0].seq}..${rawTail[rawTail.length - 1].seq}; it is not the export it says it is.` };
+      // AND THE TAIL MUST BE THIS HUB'S. Every check above is about the file
+      // being INTERNALLY consistent -- its manifest matches its bytes, its seqs
+      // run without holes, its first follows the snapshot. A valid export from a
+      // DIFFERENT hub, or from this one after it was reinitialised, passes all
+      // of them: its sequence numbers start at 1 like everyone's, so the
+      // post-snapshot part lines up and gets replayed, inserting unrelated
+      // authority rows into the restored database and reporting success.
+      //
+      // `export-events --hub` writes the whole log from seq 1, so the tail
+      // carries a PREFIX that the snapshot also contains, and the two must
+      // agree. That prefix is the only evidence of provenance the file has.
+      const prefix = rawTail.filter(e => e.seq <= snapSeq).sort((x, y) => x.seq - y.seq);
+      if (snapSeq > 0) {
+        if (!prefix.length)
+          return { ok: false, holders: [],
+                   why: `the supplied tail carries no events at or before seq ${snapSeq}, so nothing in it ties ` +
+                        `it to this snapshot. An export written by export-events --hub carries the whole log ` +
+                        `from seq 1; a file that begins after the snapshot could have come from any hub. ` +
+                        `Re-export from the hub this snapshot was taken from.` };
+        const snapRows = (() => {
+          const q = new DatabaseSync(snapshotPath, { readOnly: true });
+          try { return q.prepare("SELECT seq, at, kind, task, payload FROM hub_event WHERE seq <= ? ORDER BY seq").all(snapSeq); }
+          finally { q.close(); }
+        })();
+        // Compared row by row over the range the tail actually covers, and the
+        // FIRST disagreement is named: "the tails differ" is not something an
+        // operator can act on at the moment they have already lost the hub.
+        const bySeq = new Map(snapRows.map(r => [r.seq, r]));
+        const same = (x, y) => y != null && x.at === y.at && x.kind === y.kind &&
+                               (x.task ?? null) === (y.task ?? null) && x.payload === y.payload;
+        const differs = prefix.find(e => !same(e, bySeq.get(e.seq)));
+        if (differs)
+          return { ok: false, holders: [],
+                   why: `the supplied tail is not from the hub this snapshot was taken from: at seq ${differs.seq} ` +
+                        `the tail carries ${differs.kind} and the snapshot ` +
+                        `${bySeq.has(differs.seq) ? `carries ${bySeq.get(differs.seq).kind}` : "has no such event"}. ` +
+                        `Replaying it would insert another hub's rows into this one.` };
+      }
       const seqs = tail.map(e => e.seq);
       const dupes = seqs.filter((s, i) => i > 0 && s === seqs[i - 1]);
       const holes = [];
@@ -1018,7 +1115,7 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     //
     // On the unreadable path `live` is already null, so there is no handle to
     // close before copying; the copy is forensic either way.
-    if (quarantined) {
+    if (quarantined && !quarantineCopied) {
       copyFileSync(dbPath, quarantined);
       // From the ASIDE copies, not from `dbPath + ext`: those are gone by now,
       // deleted by SQLite when the failed open was closed.

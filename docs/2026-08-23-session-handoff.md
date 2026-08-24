@@ -175,9 +175,8 @@ evidence it is spent producing a fix that cannot ship.
 |---|---|---|
 | S2-A/B/C plans (#11/#12/#13, #17) | **merged** | — |
 | `threadDetails` wiring | never started; no branch was ever pushed | — |
-| docs PR #15 | this session | `docs/first-dispatches` @ `reeve-wt/paths` |
-| prompt/grant PR #18 | this session | `fix/prompt-grant-agreement` @ `reeve-wt/prompt-grant` |
-| the P0 fix PR #19 | this session | `fix/reeve-commits` @ `reeve-wt/commits` |
+| docs #15, prompt/grant #18, the P0 fix #19 | **all merged 24 Aug** | `main` is `8f2603a` |
+| dispatch follow-ups | this session | `fix/dispatch-followups` |
 
 **The daemon freeze was lifted on 23 Aug.** It was promised to a `threadDetails`
 session that never pushed a branch, and PR #19 needed `src/daemon.mjs` to fix the
@@ -225,7 +224,7 @@ once those PRs land.
 | # | capability | state |
 |---|---|---|
 | 1 | Watch, judge, escalate | **ON** |
-| 2 | Fix red CI | **off** — disarmed on 23 Aug because it could not publish; PR #19 is the fix (§3 Finding 1) |
+| 2 | Fix red CI | **built, not switched on** — the publish path is fixed (#19, merged 24 Aug); `--execute` is still off |
 | 3 | Work review threads | off — the `threadDetails` half was never started, so all of it is open |
 | 4 | Refuse an unsafe merge | off — needs shadow week + the ruleset flip |
 
@@ -268,10 +267,10 @@ PR #14 took 10 rounds and 22 findings.
 
 ## 8. What needs the founder
 
-- **Finding 1: decided and in flight.** The founder chose reeve-side staging and
-  committing, and disarmed reeve meanwhile — `--execute` is off, verified on the
-  running process. PR #19 implements it. Until that lands, reeve watches, judges
-  and escalates but does not dispatch, so no attempt is spent at all.
+- **Finding 1: FIXED and merged** (#19, 24 Aug). reeve stages and commits; the
+  worker never touches git's state. reeve is still DISARMED — `--execute` has not
+  been restored — so re-arming is its own decision, and it is worth taking against
+  a real dispatch rather than on the strength of the tests.
 
   Two details of the implementation are worth carrying, because the obvious
   reading of the decision is wrong on both. reeve commits BEFORE the gates, not

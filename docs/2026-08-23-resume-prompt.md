@@ -208,6 +208,13 @@ is present, which is a question about the change rather than about the tree:
   # run from a clean checkout of origin/main; exit 0 means every hunk you
   # proposed is already there
 
+Read a FAILURE carefully rather than as loss. It means your exact hunks are no
+longer reversible, which is also what a LATER commit touching the same lines
+produces — measured on 24 Aug: #18 merged fine and then #19 edited the same
+functions, so #18's patch stopped reverse-applying while every line of it was
+present. When it fails, spot-check the identifiers your change introduced before
+concluding anything was dropped.
+
 ## What needs me, so you do not wait on it silently
 
   - R-01: the ruleset lets admins bypass everything and requires no status check.

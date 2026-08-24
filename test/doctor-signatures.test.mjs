@@ -51,6 +51,28 @@ for (const cond of [undefined, { include: ["~ALL"] }, { include: ["~ALL"], exclu
   check(!r.lines.some(l => /bypass/.test(l)), "and does NOT tell the operator to remove a bypass", r.lines.join(" | "));
 }
 
+// A bypass actor changes whether the refusal is CERTAIN. An actuator inside an
+// `always` bypass pushes straight through the signature rule, so a flat "every
+// repair will be refused" points an operator at the wrong problem.
+{
+  const both = base({ rules: [{ type: "required_status_checks" }, { type: "required_signatures" }],
+                      bypass_actors: [{ actor_type: "OrganizationAdmin", bypass_mode: "always" }] });
+  const r = checkMergeAuthority("o/r", { api: apiFor(both) });
+  const sig = r.lines.filter(l => /signed commits/.test(l)).join(" | ");
+  check(/inside the bypass/.test(sig), "a signature rule beside an always-bypass is reported as conditional", sig);
+  check(/OrganizationAdmin/.test(sig), "and names the actor the caveat depends on", sig);
+}
+
+// Without one, it stays a flat prediction.
+{
+  const noBypass = base({ rules: [{ type: "required_status_checks" }, { type: "required_signatures" }],
+                          bypass_actors: [] });
+  const r = checkMergeAuthority("o/r", { api: apiFor(noBypass) });
+  const sig = r.lines.filter(l => /signed commits/.test(l)).join(" | ");
+  check(/will be refused at the push/.test(sig) && !/inside the bypass/.test(sig),
+    "control: with no bypass the refusal is stated flatly", sig);
+}
+
 // The bypass remedy is still there when a bypass is what broke it.
 {
   const withBypass = base({ bypass_actors: [{ actor_type: "OrganizationAdmin", bypass_mode: "always" }] });

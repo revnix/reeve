@@ -152,12 +152,18 @@ export function checkMergeAuthority(nwo, { api = gh } = {}) {
           && d.enforcement === "active" && (d.target ?? "branch") === "branch") {
         const cond = d.conditions?.ref_name;
         const everyBranch = !cond || ((cond.include ?? []).includes("~ALL") && !(cond.exclude ?? []).length);
+        // Whether it actually refuses also depends on the bypass actors this same
+        // loop already read: an actuator inside an `always` bypass pushes straight
+        // through the rule. Stating a certain refusal where a bypass exists sends
+        // an operator after the wrong problem -- and this check earns its place by
+        // being read BEFORE a worker run is paid for, so it has to be right.
+        const past = always.length ? ` — unless reeve's identity is inside the bypass (${always.map(b => b.actor_type).join(", ")}), which this check cannot tell` : "";
         if (everyBranch) {
           level = BROKEN;
-          lines.push(`ruleset ${d.name}: requires signed commits on every branch, and reeve commits unsigned — every repair it makes will be refused at the push`);
+          lines.push(`ruleset ${d.name}: requires signed commits on every branch, and reeve commits unsigned — every repair it makes will be refused at the push${past}`);
         } else {
           if (level === OK) level = DEGRADED;
-          lines.push(`ruleset ${d.name}: requires signed commits on ${(cond.include ?? []).join(", ") || "some branches"} — reeve commits unsigned, so a repair on a branch it covers will be refused at the push`);
+          lines.push(`ruleset ${d.name}: requires signed commits on ${(cond.include ?? []).join(", ") || "some branches"} — reeve commits unsigned, so a repair on a branch it covers will be refused at the push${past}`);
         }
       }
     }

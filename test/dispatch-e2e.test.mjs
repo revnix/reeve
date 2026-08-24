@@ -29,6 +29,8 @@ execFileSync("git", ["-C", clone, "config", "user.name", "Founder"]);
 execFileSync("git", ["-C", clone, "config", "user.email", "founder@example.invalid"]);
 const dbPath = join(dir, "e.db");
 const logPath = join(dir, "log.txt");
+import { fingerprint } from "../src/checkout.mjs";
+
 let fail = 0;
 const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
@@ -412,7 +414,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
                  // worker's however deep inside a copied tree it sits.
                  prepareCheckout: () => ({ ok: true, path: wtV, why: null,
                                            deps: { ok: true, cow: false, copied: ["node_modules"],
-                                                   untracked: ["node_modules/pkg/index.js"] } }),
+                                                   untracked: fingerprint(wtV, ["node_modules/pkg/index.js"]) } }),
                  verifyConfig: () => ({ ok: true, why: null }),
                  // Read at the moment reeve considers the work publishable: a
                  // successful publish releases the checkout, so nothing can be
@@ -499,7 +501,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
                  evaluate: () => ({ ...evaluation, head: pinnedB, headRef: "f" }),
                  prepareCheckout: () => ({ ok: true, path: wtB, why: null,
                                            deps: { ok: true, cow: false, copied: ["vendor"],
-                                                   untracked: ["vendor/dep.js"] } }),
+                                                   untracked: fingerprint(wtB, ["vendor/dep.js"]) } }),
                  verifyConfig: () => ({ ok: true, why: null }),
                  publishWork: () => { publishedB++; return { ok: true, why: null }; },
                  spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s",
@@ -515,6 +517,52 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   ctxB.db.close();
   rmSync(dirB, { recursive: true, force: true });
   rmSync(`${wtB}.unfetched`, { recursive: true, force: true });
+}
+
+// --- an EDIT to a file reeve copied is the worker's too -----------------------
+//
+// git reports an edited copy exactly as it reports an untouched one -- the same
+// `?? vendor/dep.js` -- so a baseline of PATHNAMES subtracted the worker's edit
+// and an incomplete repair published: the tests passed only with the omitted
+// dependency patch, and the checkout carrying it was then deleted. The digest is
+// what separates them.
+{
+  const dirE = mkdtempSync(join(tmpdir(), "reeve-e2e-edited-copy-"));
+  const wtE = mkdtempSync(join(dirE, "wt-"));
+  execFileSync("git", ["-C", wtE, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtE, "seed.js"), "seed\n");
+  execFileSync("git", ["-C", wtE, "add", "-A"]);
+  execFileSync("git", ["-C", wtE, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"]);
+  const pinnedE = execFileSync("git", ["-C", wtE, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  mkdirSync(join(wtE, "vendor"), { recursive: true });
+  writeFileSync(join(wtE, "vendor", "dep.js"), "as the daemon copied it\n");
+  // The baseline is taken HERE, exactly as preparation would take it.
+  const baseE = fingerprint(wtE, ["vendor/dep.js"]);
+  // Now the worker patches that copy and does not declare it.
+  writeFileSync(join(wtE, "vendor", "dep.js"), "patched by the worker\n");
+  writeFileSync(join(wtE, "fix.js"), "the declared companion\n");
+
+  let publishedE = 0;
+  const ctxE = { ...baseCtx(), db: open(join(dirE, "e.db")), logPath: join(dirE, "log.txt"),
+                 profile: { ...profile, worker: { dependencyPaths: ["vendor"] },
+                            units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm" }] },
+                 evaluate: () => ({ ...evaluation, head: pinnedE, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtE, why: null,
+                                           deps: { ok: true, cow: false, copied: ["vendor"], untracked: baseE } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedE++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s",
+                                             report: { fixed: true, cause: "c", change: "ch", filesTouched: ["fix.js"] } }) };
+  const rE = await tick(ctxE);
+  const escE = [...rE.escalations.keys()].join(" | ");
+  const keptE = existsSync(`${wtE}.unfetched`) ? `${wtE}.unfetched` : existsSync(wtE) ? wtE : null;
+
+  check(publishedE === 0, "an EDIT to a file reeve copied stops the publication", `published=${publishedE} esc=${escE}`);
+  check(!!keptE && readFileSync(join(keptE, "vendor", "dep.js"), "utf8").includes("patched by the worker"),
+    "and the patch is kept, not deleted with the checkout", String(keptE));
+  ctxE.db.close();
+  rmSync(dirE, { recursive: true, force: true });
+  rmSync(`${wtE}.unfetched`, { recursive: true, force: true });
 }
 
 // --- a DECLARED dependency path that was never copied is the worker's ---------

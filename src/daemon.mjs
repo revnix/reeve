@@ -21,7 +21,7 @@ import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTC
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE, gitEnv } from "./gitguard.mjs";
-import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor, commitRunWork } from "./checkout.mjs";
+import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor, commitRunWork, digestOf } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
@@ -161,7 +161,7 @@ export function repairMessage(report, decision) {
   return cause ? `${subject}\n\n${cause}` : subject;
 }
 
-function uncommittedFiles(worktree, copiedBaseline = []) {
+function uncommittedFiles(worktree, copiedBaseline = {}) {
   try {
     // Read over EVERYTHING, then subtract what the daemon itself put there.
     //
@@ -171,7 +171,15 @@ function uncommittedFiles(worktree, copiedBaseline = []) {
     // way an incomplete repair published and the checkout holding the omitted part
     // was deleted. The baseline recorded at prepare time is the only thing that
     // separates them, because it is the one fact only reeve knows.
-    const put = new Set(copiedBaseline);
+    // A path is only reeve's own if its CONTENT still matches what reeve left
+    // there. git reports an edited copy exactly as it reports an untouched one, so
+    // a pathname-only baseline subtracted the worker's edit and let an incomplete
+    // repair publish. Re-hashed per reported path, so the ordinary tick pays
+    // nothing: git mentions almost none of them.
+    const wasMine = rel => {
+      const want = copiedBaseline?.[rel];
+      return typeof want === "string" && digestOf(join(worktree, rel)) === want;
+    };
     // `--untracked-files=all`, because the default COLLAPSES an entirely untracked
     // directory to `node_modules/` while the baseline holds file paths -- so the
     // subtraction missed and every copied tree read as one uncommitted change. The
@@ -186,8 +194,8 @@ function uncommittedFiles(worktree, copiedBaseline = []) {
       const rec = records[i];
       if (!rec) continue;
       const xy = rec.slice(0, 2), file = rec.slice(3);
-      if (/[RC]/.test(xy)) { const src = records[++i]; if (src && !put.has(src)) left.push(src); }
-      if (file && !put.has(file)) left.push(file);
+      if (/[RC]/.test(xy)) { const src = records[++i]; if (src && !wasMine(src)) left.push(src); }
+      if (file && !wasMine(file)) left.push(file);
     }
     return left;
   } catch { return null; }
@@ -948,7 +956,7 @@ export async function tick(ctx) {
       // Declared out here, not inside the try: the publish path below reads it,
       // and a const in the try block is a ReferenceError at that point -- the
       // exact shape that once threw on every FIX_CI with every unit test green.
-      let r, prepFailed = false, worktree = null, workerToken = null, copiedDeps = [];  // the baseline: what preparation left untracked
+      let r, prepFailed = false, worktree = null, workerToken = null, copiedDeps = {};  // the baseline: path -> digest of what preparation left untracked
       try {
         // Everything from here runs inside the cleanup scope: the run is
         // already leased and its heartbeat already ticking, so a failure in
@@ -984,7 +992,7 @@ export async function tick(ctx) {
         // declared path that did not exist is skipped, and excluding it anyway
         // would hide the worker's own creation of it from staging AND from the
         // uncommitted check -- losing that part of the fix while the rest ships.
-        copiedDeps = prepared.deps?.untracked ?? [];
+        copiedDeps = prepared.deps?.untracked ?? {};
         log(logPath, `  #${e.pr}: checkout ready at ${worktree}` +
                      `${prepared.deps?.copied?.length ? ` (deps: ${prepared.deps.copied.join(", ")}${prepared.deps.cow ? ", copy-on-write" : ""})` : ""}`);
         if (wantDeps.unsupported.length)

@@ -1,7 +1,7 @@
 // A worker's checkout must share NOTHING with the founder's: not the ref store,
 // not the configuration, and not their uncommitted work. These assertions are
 // what makes the standalone clone a boundary rather than a convention.
-import { prepareRunCheckout, releaseRunCheckout, fetchRunWork, publishRunWork, copyDeps, canCloneFiles, runPathFor, dependencyPathsFor, commitRunWork, founderIdentity } from "../src/checkout.mjs";
+import { prepareRunCheckout, releaseRunCheckout, fetchRunWork, publishRunWork, copyDeps, canCloneFiles, runPathFor, dependencyPathsFor, commitRunWork, founderIdentity, fingerprint, digestOf } from "../src/checkout.mjs";
 import { verifyConfig } from "../src/gitguard.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
@@ -908,6 +908,38 @@ rmSync(root, { recursive: true, force: true });
                               declared: ["old.js", "new.js"] });
     check(r.ok && r.committed, "a rename with both sides declared commits", JSON.stringify(r).slice(0, 200));
     check(r.files.includes("old.js") && r.files.includes("new.js"), "and both sides are accounted for", r.files.join(", "));
+  }
+
+  {
+    // A filename beginning with `:` is pathspec MAGIC to git, not a name. Measured:
+    // a real file called `:x` was rejected with "did not match any files", so every
+    // repair touching one would have been refused before commit.
+    const w = mkWorktree("pathspec-magic");
+    for (const odd of [":x", ":(icase)y", ":!z"]) {
+      writeFileSync(join(w, odd), "the fix\n");
+      const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                                declared: [odd] });
+      check(r.ok && r.committed, `a filename starting with pathspec magic (${odd}) is committed`, JSON.stringify(r).slice(0, 180));
+      check(r.files.includes(odd), "and matched literally", JSON.stringify(r.files));
+    }
+  }
+
+  {
+    // The digest, not the name. git reports an edited copy exactly as it reports an
+    // untouched one, so a pathname baseline cannot tell them apart.
+    const w = mkWorktree("digest");
+    mkdirSync(join(w, "vendor"), { recursive: true });
+    writeFileSync(join(w, "vendor", "dep.js"), "as copied\n");
+    const base = fingerprint(w, ["vendor/dep.js"]);
+    check(typeof base["vendor/dep.js"] === "string" && base["vendor/dep.js"].length === 64,
+      "a baseline records a digest per path", JSON.stringify(base));
+    check(digestOf(join(w, "vendor", "dep.js")) === base["vendor/dep.js"],
+      "control: an untouched file still matches it", "");
+    writeFileSync(join(w, "vendor", "dep.js"), "patched\n");
+    check(digestOf(join(w, "vendor", "dep.js")) !== base["vendor/dep.js"],
+      "and an edited one does not", "");
+    check(digestOf(join(w, "vendor", "absent.js")) === null,
+      "an unreadable path is null, which never matches, so it fails closed", "");
   }
 
   rmSync(cRoot, { recursive: true, force: true });

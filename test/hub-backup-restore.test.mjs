@@ -1995,8 +1995,11 @@ function writeAuthority(db, project) {
   blocker.close();
 
   check(!r.ok, "a transient lock failure refuses the restore", JSON.stringify(r).slice(0, 160));
-  check(/busy or transient failure rather than damage/.test(String(r.why)),
-    "and says it is transient rather than treating the table as damaged", String(r.why).slice(0, 200));
+  // The PROPERTY, not the old phrasing: it must say the file is not damaged and
+  // point at the holder. The wording gained a permission/contention split later,
+  // and an assertion pinned to the original sentence broke on an improvement.
+  check(/is not damage/.test(String(r.why)) && /stop any running builder/i.test(String(r.why)),
+    "and says it is not damage, naming the holder to stop", String(r.why).slice(0, 240));
   // THE DECISIVE ONE. On the previous implementation the sibling store is
   // created and the restore proceeds under it — exclusion nothing else reads.
   check(!existsSync(t + ".restore-lock"),
@@ -2315,6 +2318,168 @@ function writeAuthority(db, project) {
       `recheck ${recheck}, swap ${swap}`);
   }
   rmSync(nHome, { recursive: true, force: true });
+}
+
+// ── a hub that cannot be EXAMINED is neither healthy nor damaged ──────────
+// Exposed by rebasing onto #24, which is exactly where it should have been:
+// the two branches' repairs met and disagreed. `isOperational` answers "is the
+// FILE intact"; the lock-failure split answers "will RETRYING help". They are
+// different questions, and a read-only hub answers yes to the first and no to
+// the second — so unifying them would have quarantined a healthy database
+// because a permission was wrong.
+//
+// And one level up, the classifier had the same conflation: in DELETE journal
+// mode an exclusive transaction blocks readers, so the version query threw and
+// `rawOpen` returned null — sending a healthy, HELD hub down the UNREADABLE
+// path, where `--force` replaced it under its holder.
+{
+  const cHome = mkdtempSync(join(tmpdir(), "reeve-conv-"));
+  mkdirSync(join(cHome, "state"), { recursive: true });
+  const src = openHub(join(cHome, "state", "src.db"));
+  const snapC = snapshot(src, join(cHome, "backups"), "hub");
+  src.close();
+
+  // BUSY: a real exclusive transaction, privilege-independent.
+  {
+    const t = join(cHome, "state", "busy.db");
+    { const d = openHub(t); d.exec("PRAGMA journal_mode = DELETE"); d.close(); }
+    const blocker = new DatabaseSync(t, { timeout: 100 });
+    blocker.exec("PRAGMA busy_timeout = 100");
+    blocker.exec("BEGIN EXCLUSIVE");
+    let r;
+    try { r = restoreHub(snapC.path, t, { isAlive: () => false, pid: process.pid, lstart: "me", force: true }); }
+    finally { try { blocker.exec("ROLLBACK"); } catch { /* close frees it */ } blocker.close(); }
+    check(!r.ok, "a hub that cannot be examined is not replaced, even with force",
+      JSON.stringify(r).slice(0, 160));
+    check(/could not be examined/.test(String(r.why)),
+      "and says it could not look, rather than claiming damage", String(r.why).slice(0, 200));
+    // THE DECISIVE ONE: the unreadable path would have taken the sibling lock
+    // and replaced the file. A healthy hub must not acquire one.
+    check(!existsSync(t + ".restore-lock"),
+      "and does not take the sibling lock a damaged hub would", `${existsSync(t + ".restore-lock")}`);
+    check(!r.quarantined, "and does not quarantine a file it never read", String(r.quarantined));
+
+    // CONTROL: with the blocker gone the same restore succeeds, so the refusal
+    // is about the hold rather than about this hub or snapshot.
+    const ok = restoreHub(snapC.path, t, { isAlive: () => false, pid: process.pid, lstart: "me" });
+    check(ok.ok, "control: unblocked, the same restore succeeds", JSON.stringify(ok).slice(0, 140));
+  }
+
+  // READ-ONLY: operational but NOT transient. It must refuse as a permission
+  // problem — never be quarantined as damage, which the errcode-only test did.
+  {
+    const t = join(cHome, "state", "ro.db");
+    { const d = openHub(t); d.exec("PRAGMA journal_mode = DELETE"); d.close(); }
+    chmodSync(t, 0o444);
+    chmodSync(join(cHome, "state"), 0o555);
+    let r;
+    try { r = restoreHub(snapC.path, t, { isAlive: () => false, pid: process.pid, lstart: "me", force: true }); }
+    finally { chmodSync(join(cHome, "state"), 0o755); chmodSync(t, 0o644); }
+    // Skipped rather than asserted when the mode bits are inert, which is what
+    // running as root does — and said out loud, because a silent skip would let
+    // "not exercised here" read as "verified".
+    if (r.ok) {
+      check(true, "SKIPPED: this user can write a 0444 file, so the read-only case cannot be built here", "root?");
+    } else {
+      check(!r.quarantined,
+        "a read-only hub is refused as a permission problem, not quarantined as damage",
+        String(r.quarantined));
+      check(/permission/i.test(String(r.why)),
+        "and the recovery names permissions rather than a restore", String(r.why).slice(0, 220));
+    }
+  }
+
+  // CONTROL: a genuinely damaged lock table still takes the damage path, so the
+  // two above are about distinguishing rather than about never quarantining.
+  {
+    const t = join(cHome, "state", "damaged.db");
+    const d = openHub(t);
+    d.exec("DROP TABLE maintenance_lock");
+    d.exec("CREATE TABLE maintenance_lock (wrong TEXT) STRICT");
+    d.close();
+    const r = restoreHub(snapC.path, t, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+    check(r.ok && /\.damaged-/.test(String(r.quarantined)),
+      "control: a structurally damaged lock table IS quarantined and recovered",
+      `${r.ok} ${r.quarantined}`);
+  }
+  rmSync(cHome, { recursive: true, force: true });
+}
+
+// ── the sibling lock is only valid when WRITERS cannot use the real one ───
+// That is the whole basis for moving the lock: an unreadable hub excludes
+// everyone, so a row in a sibling file is as good as one inside it.
+//
+// A `maintenance_lock` recreated WITHOUT its primary key breaks the assumption
+// exactly: `acquireMaintenanceLock`'s `ON CONFLICT(name)` throws for want of the
+// constraint, while `assertWritable`'s plain SELECT still succeeds and reports
+// NO LOCK. Writers carry on — so a restore holding the sibling holds a row
+// nothing consults, and under `--force` a live builder can take its lease after
+// the holder scan and be replaced.
+{
+  const wHome = mkdtempSync(join(tmpdir(), "reeve-nopk-"));
+  mkdirSync(join(wHome, "state"), { recursive: true });
+  const src = openHub(join(wHome, "state", "src.db"));
+  const snapW = snapshot(src, join(wHome, "backups"), "hub");
+  src.close();
+
+  const t = join(wHome, "state", "nopk.db");
+  const d = openHub(t);
+  d.exec("DROP TABLE maintenance_lock");
+  d.exec("CREATE TABLE maintenance_lock (name TEXT, pid INTEGER, lstart TEXT, acquired_at INTEGER) STRICT");
+  d.close();
+  // The fixture's decisive property, in two halves: a WRITER's own query still
+  // works, and OUR acquisition does not. Either alone describes a case already
+  // covered — a missing table fails both.
+  { const q = new DatabaseSync(t, { readOnly: true });
+    let writerReads = false;
+    try { q.prepare("SELECT * FROM maintenance_lock WHERE name='restore'").get(); writerReads = true; } catch { /* asserted */ }
+    q.close();
+    check(writerReads, "fixture: a writer's own lock query still succeeds", `${writerReads}`); }
+
+  const r = restoreHub(snapW.path, t, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+  check(!r.ok, "a lock table that writers can still read is not restored over", JSON.stringify(r).slice(0, 160));
+  check(!existsSync(t + ".restore-lock"),
+    "and does NOT move to the sibling, which no writer consults", `${existsSync(t + ".restore-lock")}`);
+  check(/a writer can still READ/.test(String(r.why)),
+    "and says why no lock would help", String(r.why).slice(0, 220));
+  check(/force clears dead holders; it cannot stop live ones/.test(String(r.why)),
+    "and that force is not the answer, because it stops nothing", String(r.why).slice(0, 300));
+
+  // CONTROL: a lock table that is MISSING fails a writer's query too, so nothing
+  // can be running and the sibling path is legitimate. Without this, refusing
+  // every damaged lock satisfies the assertions above.
+  const gone = join(wHome, "state", "gone.db");
+  { const g = openHub(gone); g.exec("DROP TABLE maintenance_lock"); g.close(); }
+  const ok = restoreHub(snapW.path, gone, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+  check(ok.ok && ok.quarantined,
+    "control: a MISSING lock table still takes the sibling path and recovers",
+    `${ok.ok} ${ok.quarantined}`);
+  rmSync(wHome, { recursive: true, force: true });
+}
+
+// ── a zero-byte quarantine is still evidence ─────────────────────────────
+// The reaper identified unpopulated reservations by SIZE, and a genuinely
+// zero-byte hub — a database truncated to nothing — copies into its quarantine
+// perfectly well and produces a zero-byte file that IS the artifact. Deleting it
+// by length erased the very path the result had just reported.
+{
+  const zHome = mkdtempSync(join(tmpdir(), "reeve-zerobyte-"));
+  mkdirSync(join(zHome, "state"), { recursive: true });
+  const src = openHub(join(zHome, "state", "src.db"));
+  const snapZ = snapshot(src, join(zHome, "backups"), "hub");
+  src.close();
+
+  const t = join(zHome, "state", "empty.db");
+  writeFileSync(t, "");
+  check(statSync(t).size === 0, "fixture: the live hub is genuinely zero bytes", `${statSync(t).size}`);
+  const r = restoreHub(snapZ.path, t, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+  check(r.ok, "a zero-byte hub is recovered", JSON.stringify(r).slice(0, 160));
+  check(r.quarantined && existsSync(r.quarantined),
+    "and the quarantine it REPORTS actually exists afterwards", String(r.quarantined));
+  check(r.quarantined && statSync(r.quarantined).size === 0,
+    "even though it is zero bytes, because that is what the hub was", 
+    `${r.quarantined && statSync(r.quarantined).size}`);
+  rmSync(zHome, { recursive: true, force: true });
 }
 
 rmSync(home, { recursive: true, force: true });

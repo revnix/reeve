@@ -109,7 +109,15 @@ const registryProjects = (home) => {
     // The first lookahead ends at the SLASH, not at the end of the string:
     // `(?!\\.+$)` on the owner asks whether the WHOLE REMAINDER is dots, so
     // `./repo` sailed through it. Measured, on the first attempt at this rule.
-    const NWO = /^(?!\.+\/)[\w.-]+\/(?!\.+$)[\w.-]+$/;
+    // THE OWNER IS A GITHUB LOGIN, and it does not obey the repository-name
+    // character class. `-/repo` passed the previous rule -- a segment that is
+    // not only dots, and therefore "a name" -- while `-` can never be an owner.
+    // A login is alphanumeric with single hyphens INSIDE it: it may not start
+    // or end with one. The repository half keeps the looser class, which really
+    // does allow `.`, `_` and `-` anywhere except as the whole name.
+    const OWNER = String.raw`[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?`;
+    const REPO  = String.raw`(?!\.+$)[\w.-]+`;
+    const NWO = new RegExp(`^${OWNER}/${REPO}$`);
     const bad = Object.entries(reg)
       .filter(([, v]) => !v || typeof v !== "object" || Array.isArray(v) ||
                          typeof v.nwo !== "string" || !NWO.test(v.nwo))

@@ -27,12 +27,12 @@ import { open as openStore, exportJsonl } from "./db/ops.mjs";
 // is validated against; Task 9 adds the locks, replay and hubEvent imports when
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
 // naming a module that does not exist yet breaks every import of this file.
-import { openHub, isOperational, HUB_SCHEMA_VERSION, HUB_TABLES, TABLES_AT } from "./build/hubdb.mjs";
+import { openHub, isOperational, faultKind, HUB_SCHEMA_VERSION, HUB_TABLES, TABLES_AT } from "./build/hubdb.mjs";
 // Task 9's additions. `restoreHub` takes the maintenance lock before it refuses,
 // enumerates live writers to name them, and replays the tail -- and it needs
 // `replayableKinds`/`NON_REPLAYED_KINDS` to refuse a tail exported by a NEWER
 // binary rather than silently rebuilding a log without its projection.
-import { acquireMaintenanceLock, releaseMaintenanceLock, liveWriters } from "./build/locks.mjs";
+import { acquireMaintenanceLock, releaseMaintenanceLock, liveWriters, assertWritable } from "./build/locks.mjs";
 import { replayHub, replayableKinds, NON_REPLAYED_KINDS } from "./build/replay.mjs";
 
 export { openStore as open };
@@ -758,6 +758,33 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
   // all, and the operator is the only one who can say the daemons are stopped.
   //
   // Returns a refusal, or null when the lock is held and the caller may proceed.
+  // CAN A WRITER STILL GET INTO THIS FILE?
+  //
+  // The sibling lock is honoured by NOBODY -- it is exclusion only when no writer
+  // can start. Asked with the statements a writer actually runs, because the
+  // shape does not answer it: `acquireMaintenanceLock` needs `ON CONFLICT(name)`
+  // and therefore the unique constraint, while `assertWritable` only runs a plain
+  // SELECT, so a `maintenance_lock` with every expected column and no constraint
+  // breaks the lock and leaves the writer's read working. A `SELECT *` probe says
+  // yes to both.
+  //
+  // `isAlive` says yes so the reaping DELETE is never reached: this asks about
+  // READS, and a write here would fail for reasons of its own. reeve's own
+  // `a restore is in progress` throw carries no errcode and means the read
+  // SUCCEEDED, which is the answer being sought.
+  const writersCanEnter = (handle) => {
+    const ask = (d) => {
+      try { assertWritable(d, { isAlive: () => true }); }
+      catch (e) { if (e?.errcode !== undefined) return false; }
+      try { d.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get(); return true; }
+      catch { return false; }
+    };
+    if (handle) return ask(handle);
+    let d = null;
+    try { d = new DatabaseSync(dbPath, { readOnly: true }); return ask(d); }
+    catch { return false; }
+    finally { try { d?.close(); } catch {} }
+  };
   const siblingLock = (why) => {
     if (!force) return { ok: false, holders: [], why };
     lockDb = openHub(dbPath + ".restore-lock");
@@ -889,7 +916,21 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // and telling them the wrong thing about it is its own defect. Unfinished
         // and damaged are not the same file.
         quarantined = quarantineName(versionTableGone ? "damaged" : "incomplete");
-        try { copyFileSync(dbPath, quarantined); quarantineCopied = true; populated.add(quarantined); }
+        try {
+          copyFileSync(dbPath, quarantined); quarantineCopied = true; populated.add(quarantined);
+          // THE SIDECARS COME WITH IT. Setting `quarantineCopied` skips the later
+          // block, which is the only place the preserved `-wal` and `-shm` were
+          // attached -- so on this path they were carried aside, never copied to
+          // the quarantine, and deleted in the finally. A WAL holds committed
+          // pages that were never checkpointed, so for a hub whose version marker
+          // is gone it can be the only copy of the newest state: the forensic
+          // copy was omitting exactly what this recovery promises to keep.
+          //
+          // From the ASIDE copies, like the later block, because SQLite deletes
+          // `dbPath + ext` when a failed open is closed.
+          for (const [ext, aside] of preservedSidecars)
+            try { copyFileSync(aside, quarantined + ext); } catch {}
+        }
         catch { quarantined = null; }
       }
       // ATTEMPTED, NOT INSPECTED -- and what it decides is which path is correct.
@@ -940,6 +981,37 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         canonicalFault = e;
         try { live?.close(); } catch {}
         live = null;
+      }
+      // AND "THE LOCK FAILED" DOES NOT MEAN "NOBODY CAN GET IN".
+      //
+      // The argument for falling back was that a writer reaches these tables
+      // through the same statements, so a lock that cannot be taken is a store
+      // nobody can enter. That is too strong, and the counter-example is exact:
+      // `acquireMaintenanceLock` needs `ON CONFLICT(name)` and therefore the
+      // unique constraint, while `assertWritable` only runs
+      // `SELECT * FROM maintenance_lock WHERE name='restore'`. A table with every
+      // expected column and no constraint on `name` breaks the lock and leaves
+      // the writer's read working -- so `acquireSingleton` admits a builder that
+      // never hears of the sibling file, and the restore replaces the database
+      // underneath it.
+      //
+      // The sibling lock is honoured by NOBODY. It is exclusion only when no
+      // writer can start, so that is asked directly, with the statements a writer
+      // actually runs rather than a `SELECT *` that any shape answers. Read-only,
+      // and `isAlive` says yes so the reaping DELETE is never reached: this is a
+      // question about reads, and a write here would fail for its own reasons.
+      if (canonicalFault) {
+        if (writersCanEnter(null)) {
+          synthetic = false;
+          return { ok: false, holders: [],
+            why: `the hub at ${dbPath} cannot serve a restore lock (${canonicalFault.message}), but a ` +
+                 `builder can still start in it -- the tables it reads still answer. There is no way to ` +
+                 `exclude one from this file, so replacing it could leave a live builder writing to a ` +
+                 `database with no name.\n` +
+                 `  recover  stop the builder and any reeve CLI, then repair or remove ${dbPath} by ` +
+                 `hand and re-run; reeve restore --hub --force installs the snapshot into a hub that ` +
+                 `is absent.` };
+        }
       }
       if (!canonicalFault) {
         // A VERSION-ZERO HUB STILL HAS AN EVENT LOG, and this branch never said so.
@@ -1263,6 +1335,12 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // not-damage does contention separate "re-run" from "fix the permission".
         const damaged = !isOperational(e);
         const transient = e?.errcode === 5 || e?.errcode === 6;
+        // AND A FULL STORE IS NEITHER. `restore --hub` was the one caller left
+        // rendering this from a boolean, so a lease write that answered
+        // SQLITE_FULL was told to fix its permissions -- the remedy that cannot
+        // free a byte, from the command an operator reaches for when the hub is
+        // already in trouble.
+        const outOfSpace = faultKind(e) === "full";
         // AND THE SIBLING IS ONLY VALID WHEN WRITERS CANNOT USE THE CANONICAL
         // TABLE EITHER. That is the whole basis of moving the lock: an
         // unreadable hub excludes everyone, so a sibling row is as good as one
@@ -1279,11 +1357,11 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // So: if the table still answers a writer's own query, exclusion cannot
         // be established anywhere and the honest answer is to refuse. `force`
         // cannot substitute -- it clears dead holders, it does not stop live ones.
-        let writersCanStillRead = false;
-        if (damaged) {
-          try { live.prepare("SELECT * FROM maintenance_lock WHERE name='restore'").get(); writersCanStillRead = true; }
-          catch { writersCanStillRead = false; }
-        }
+        // The same question, asked once. This branch probed only
+        // `maintenance_lock`; a writer also has to read `singleton_lease`, and a
+        // store where that one is unreadable admits nobody -- so the shared
+        // predicate is both the honest question and the stricter one.
+        const writersCanStillRead = damaged && writersCanEnter(live);
         if (damaged && writersCanStillRead) {
           return { ok: false, holders: [],
             why: `the hub's maintenance_lock at ${dbPath} is damaged in a way this restore cannot write ` +
@@ -1304,7 +1382,10 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
             why: `could not take the maintenance lock in ${dbPath} (${e.message}). ` +
                  `The lock table was readable when this restore classified the hub, so this is not ` +
                  `damage.\n` +
-                 (transient
+                 (outOfSpace
+                   ? `  recover  the store ran out of room -- free space on the filesystem holding ${dbPath} ` +
+                     `and re-run; reeve backup --hub --keep N prunes old snapshots.`
+                   : transient
                    ? `  recover  another process holds it -- stop any running builder or reeve CLI and re-run.`
                    : `  recover  the hub or its directory refuses writes -- fix the permissions and re-run.`) +
                  `\n  restoring without exclusion in the canonical hub would let a writer start underneath it, ` +

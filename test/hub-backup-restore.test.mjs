@@ -2718,6 +2718,123 @@ function writeAuthority(db, project) {
   rmSync(kHome, { recursive: true, force: true });
 }
 
+// ── a lock that cannot be TAKEN is not a store nobody can ENTER ────────────
+// The sibling lock is honoured by nobody, so it is exclusion only when no writer
+// can start -- and "the canonical lock threw" does not establish that. The
+// counter-example is exact: `acquireMaintenanceLock` needs `ON CONFLICT(name)`
+// and therefore the unique constraint, while `assertWritable` only runs
+// `SELECT * FROM maintenance_lock WHERE name='restore'`. A table with every
+// expected column and no constraint breaks the lock and leaves the writer's read
+// working, so a builder can still take its lease and be replaced underneath.
+{
+  const wHome = mkdtempSync(join(tmpdir(), "reeve-enter-"));
+  mkdirSync(join(wHome, "state"), { recursive: true });
+  const src = openHub(join(wHome, "state", "src.db"));
+  const snapE = snapshot(src, join(wHome, "backups"), "hub");
+  src.close();
+
+  const build = (name, lockDdl) => {
+    const t = join(wHome, "state", name);
+    const d = openHub(t);
+    d.exec("DROP TABLE maintenance_lock");
+    d.exec(lockDdl);
+    d.exec("DROP TABLE schema_version");
+    d.close();
+    return t;
+  };
+
+  // The two damaged shapes, and the fixture asserts they differ in the ONE way
+  // the decision turns on: whether a writer's own read still answers.
+  const wrongCols   = build("wrongcols.db", "CREATE TABLE maintenance_lock (x TEXT)");
+  const noConstraint = build("noconstraint.db",
+    "CREATE TABLE maintenance_lock (name TEXT, pid INTEGER, lstart TEXT, acquired_at INTEGER)");
+  const writerRead = (t) => {
+    const d = new DatabaseSync(t, { readOnly: true });
+    try { d.prepare("SELECT * FROM maintenance_lock WHERE name='restore'").get(); return true; }
+    catch { return false; }
+    finally { d.close(); }
+  };
+  check(!writerRead(wrongCols), "fixture: with the columns wrong, a writer's own read fails too", "");
+  check(writerRead(noConstraint), "fixture: with only the constraint gone, a writer's read still answers", "");
+  {
+    const d = new DatabaseSync(noConstraint);
+    let lockThrew = null;
+    try { acquireMaintenanceLock(d, { pid: process.pid, lstart: "L", isAlive: () => false }); }
+    catch (e) { lockThrew = e; }
+    d.close();
+    check(lockThrew !== null && /ON CONFLICT/.test(String(lockThrew.message)),
+      "fixture: while the lock itself still cannot be taken, for want of the constraint",
+      String(lockThrew?.message).slice(0, 90));
+  }
+
+  const enters = restoreHub(snapE.path, noConstraint,
+    { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+  check(!enters.ok,
+    "a store a builder can still enter is REFUSED, even with force",
+    JSON.stringify(enters).slice(0, 200));
+  check(/can still start in it|still READ/.test(String(enters.why)),
+    "and the reason given is that exclusion cannot be established anywhere",
+    String(enters.why).slice(0, 180));
+  check(!existsSync(noConstraint + ".restore-lock"),
+    "so no sibling lock is taken, since nothing would consult it",
+    `${existsSync(noConstraint + ".restore-lock")}`);
+  check(existsSync(noConstraint),
+    "and the file a builder may be writing to is left alone", `${existsSync(noConstraint)}`);
+
+  // CONTROL: the shape whose writer-read also fails still recovers. Without this
+  // the assertion above would pass against a fallback that had simply been
+  // removed, which is the repair the previous round added.
+  const closed = restoreHub(snapE.path, wrongCols,
+    { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+  check(closed.ok,
+    "control: the shape nobody can enter still recovers through the sibling lock",
+    JSON.stringify(closed).slice(0, 200));
+  check(existsSync(wrongCols + ".restore-lock"),
+    "control: and it really did use the sibling", `${existsSync(wrongCols + ".restore-lock")}`);
+  rmSync(wHome, { recursive: true, force: true });
+}
+
+// ── the early quarantine carries the sidecars it was given ─────────────────
+// The unversioned path copies the hub BEFORE `openHub` migrates it, and setting
+// `quarantineCopied` skips the later block -- which was the only place the
+// preserved `-wal` and `-shm` were attached. So they were carried aside, never
+// copied to the quarantine, and deleted in the finally. A WAL holds committed
+// pages that were never checkpointed, so for a hub whose version marker is gone
+// it can be the only copy of the newest state: the forensic copy was omitting
+// exactly what this recovery promises to keep.
+{
+  const sHome = mkdtempSync(join(tmpdir(), "reeve-qwal-"));
+  mkdirSync(join(sHome, "state"), { recursive: true });
+  const src = openHub(join(sHome, "state", "src.db"));
+  const snapS = snapshot(src, join(sHome, "backups"), "hub");
+  src.close();
+
+  const t = join(sHome, "state", "unversioned.db");
+  const d = openHub(t);
+  d.exec("DROP TABLE schema_version");
+  // A SECOND CONNECTION HELD OPEN is what leaves an un-checkpointed WAL on disk:
+  // the last connection to close checkpoints and removes it, so a fixture that
+  // closes everything has no sidecar and cannot exhibit this at all.
+  const keeper = new DatabaseSync(t);
+  // A write with no SEMANTIC content: an invented hub_event kind would be
+  // refused by the tail check and the restore would fail for a reason that has
+  // nothing to do with sidecars. What is needed here is dirty pages, not events.
+  keeper.exec("PRAGMA user_version = 7");
+  d.close();
+  check(existsSync(t + "-wal"), "fixture: the hub really has an un-checkpointed WAL beside it",
+    `${existsSync(t + "-wal")}`);
+
+  const r = restoreHub(snapS.path, t, { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+  keeper.close();
+  check(r.ok, "the unversioned hub is recovered", JSON.stringify(r).slice(0, 160));
+  check(r.quarantined && existsSync(r.quarantined),
+    "and the quarantine it reports exists", String(r.quarantined));
+  check(r.quarantined && existsSync(r.quarantined + "-wal"),
+    "and its WAL came with it, which may hold the only copy of the newest state",
+    `${r.quarantined && existsSync(r.quarantined + "-wal")}`);
+  rmSync(sHome, { recursive: true, force: true });
+}
+
 rmSync(home, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

@@ -785,6 +785,16 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   const out = (r.stdout ?? "") + (r.stderr ?? "");
   check(/reeve restore --hub --force/.test(out),
     "control: a corrupt hub IS told to restore", out.slice(0, 200));
+  // UNKNOWN ON THE CORRUPT BRANCH TOO. The verdict is about whether the lease
+  // could be READ, and this branch never got that far either -- so "not running"
+  // was the same mistake twice, and the more dangerous half: it invites the
+  // operator to follow the restore advice WITHOUT stopping a builder that may
+  // still be live.
+  check(/builder: UNKNOWN/.test(out),
+    "a corrupt hub reports UNKNOWN, not not-running", out.split("\n")[0]);
+  check(/STOP any running builder first/.test(out),
+    "and the recovery says to stop any builder before restoring, since it cannot tell",
+    out.slice(0, 300));
   check(/--tail/.test(out),
     "and told to pass --tail, so the first recovery is not the lossy one", out.slice(0, 320));
   check(!/Do NOT restore/.test(out),

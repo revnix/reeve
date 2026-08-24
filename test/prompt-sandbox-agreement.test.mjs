@@ -116,6 +116,12 @@ const PROFILES = {
   "a blank beside a real one": { units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm",
                                            commands: { lint: { cmd: "   ", state: "present" },
                                                        test: { cmd: "npm test", state: "present" } } }], risk: {} },
+  // Repeated internal whitespace. `sandboxFor` splits on whitespace to build the
+  // granted head, so this grants `Bash(npm publish:*)` while an unnormalised deny
+  // check against the raw string finds nothing.
+  "a command with doubled spaces": { units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm",
+                                               commands: { release: { cmd: "npm   publish", state: "present" },
+                                                           test: { cmd: "npm test", state: "present" } } }], risk: {} },
   // A deny rule LONGER than the head the sandbox grants: `Bash(npm run:*)` is
   // allowed, and `npm run release` is refused, so the head looks clean while the
   // command the worker is told to run is not.
@@ -165,7 +171,11 @@ for (const [name, prof] of Object.entries(PROFILES)) {
   const prefixes = list => list.map(a => /^Bash\((.+):\*\)$/.exec(a)?.[1]).filter(Boolean);
   const granted = prefixes(allow);
   const refused = prefixes(deny);
-  const matches = (cmd, set) => set.some(g => cmd === g || cmd.startsWith(g + " "));
+  // Normalised on both sides, the way `sandboxFor` builds the granted head. Without
+  // this the checker reproduced the very defect it is meant to catch: `npm   publish`
+  // matched the `npm` grant, missed the `npm publish` deny, and read as runnable.
+  const flat = s => String(s ?? "").trim().replace(/\s+/g, " ");
+  const matches = (cmd, set) => set.some(g => flat(cmd) === flat(g) || flat(cmd).startsWith(flat(g) + " "));
   const isGranted = cmd => matches(cmd, granted) && !matches(cmd, refused);
 
   const claimed = claimedCommands(prof);

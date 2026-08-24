@@ -312,11 +312,18 @@ const RUNTIMES = {
  * Matching is by prefix, because that is how the permission matcher compares.
  */
 export function commandDenied(cmd, profile) {
-  const rules = [...NEVER, ...(profile?.risk?.forbiddenCommands ?? []).map(c => `Bash(${c}:*)`)];
+  // Normalised on BOTH sides, because `sandboxFor` builds the granted head by
+  // splitting on whitespace -- so `npm   publish` grants `Bash(npm publish:*)`
+  // while an unnormalised comparison against the raw string finds no deny and
+  // reports it runnable. The grant and the check have to see the same command.
+  const flat = s => String(s ?? "").trim().replace(/\s+/g, " ");
+  const target = flat(cmd);
+  const rules = [...NEVER, ...(profile?.risk?.forbiddenCommands ?? []).map(c => `Bash(${flat(c)}:*)`)];
   return rules.some(rule => {
     const m = /^Bash\((.+):\*\)$/.exec(rule);
     if (!m) return false;
-    return cmd === m[1] || cmd.startsWith(m[1] + " ");
+    const prefix = flat(m[1]);
+    return target === prefix || target.startsWith(prefix + " ");
   });
 }
 

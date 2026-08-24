@@ -9,7 +9,7 @@
 // A prompt that instructs an action the sandbox forbids is a contradiction the
 // worker cannot resolve, and it costs a whole dispatch to discover.
 import { promptFor, claimedCommands } from "../src/prompts.mjs";
-import { sandboxFor } from "../src/sandbox.mjs";
+import { sandboxFor, commandDenied } from "../src/sandbox.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -56,7 +56,9 @@ for (const action of ["FIX_CI", "FIX_FINDINGS"]) {
   // suggested way to verify anything.
   for (const c of profile.risk.forbiddenCommands)
     for (const line of p.split("\n").filter(l => l.includes(c)))
-      check(/never|do not|forbidden|irreversible/i.test(line),
+      // `refused` belongs here: rule 0 now NAMES the built-in denials rather than
+      // gesturing at "the rules below", and that sentence is a forbidding one.
+      check(/never|do not|forbidden|irreversible|refused/i.test(line),
         `${action}: "${c}" is only ever mentioned as forbidden`, line.trim());
 }
 
@@ -98,6 +100,12 @@ const PROFILES = {
   "a blank command": { units: [{ id: "root", language: "typescript", packageManager: "npm",
                                  commands: { lint: { cmd: "   ", state: "present" },
                                              test: { cmd: "npm test", state: "present" } } }], risk: {} },
+  // An ADVISORY command and no named runner. `sandboxFor` grants a declared
+  // command whatever its state, so the grant inventory must name it even though
+  // it is not a useful way to verify anything.
+  "an advisory command only": { units: [{ id: "root", root: ".", language: "cobol",
+                                          commands: { lint: { cmd: "custom lint", state: "advisory" } } }],
+                                risk: { forbiddenCommands: ["git", "ls", "cat", "head", "tail", "wc", "find", "which", "pwd"] } },
   // A declared command that is ITSELF a wrapper or an absolute path. The grant is
   // written against that exact head, so the rule forbidding wrappers must not
   // forbid the very command HOW TO VERIFY recommends.
@@ -235,7 +243,7 @@ for (const [name, prof] of Object.entries(PROFILES)) {
     // It may appear ONLY in a sentence that forbids it -- rule 6 echoes the
     // profile's own list -- never in one that offers it. Same rule the forbidden
     // commands already get above.
-    const offers = prompt.split("\n").filter(l => l.includes(process.execPath) && !/NEVER run|never|do not/i.test(l));
+    const offers = prompt.split("\n").filter(l => l.includes(process.execPath) && !/NEVER run|never|do not|refused/i.test(l));
     check(offers.length === 0, "not even the interpreter: the path is only ever mentioned as forbidden",
           offers.join(" | ").slice(0, 160));
     check(/no shell commands granted at all/.test(prompt), "and says so plainly", "");
@@ -251,6 +259,21 @@ for (const [name, prof] of Object.entries(PROFILES)) {
           verify.slice(0, 160) || prompt.split("HOW TO VERIFY")[1]?.slice(0, 200) || "");
     check(!/declares no verification commands/.test(prompt), "and does not claim the project declares none", "");
   }
+
+  // Rule 0 says a more specific rule can still deny a form, and it has to NAME
+  // those rather than gesture at rules it does not render. `git remote` is the
+  // standing example: built into NEVER, absent from any profile's own list.
+  check(/git remote/.test(rule0), `${name}: rule 0 names the built-in denials rather than promising them`,
+        rule0.split("\n").filter(l => /refused whatever/.test(l)).join(" ").slice(0, 200));
+  // Every declared command the sandbox grants must appear in the inventory, at
+  // any state -- the grant does not check state, so neither may the inventory.
+  for (const u of prof.units ?? [])
+    for (const c of Object.values(u.commands ?? {})) {
+      const head = String(c?.cmd ?? "").trim().split(/\s+/).slice(0, 2).join(" ");
+      if (!head || commandDenied(head, prof) || !isGranted(head)) continue;
+      check(prompt.includes(head), `${name}: the declared command \`${head}\` (${c.state}) is named somewhere`,
+            rule0.slice(-260));
+    }
 
   check(!/`undefined|`null/.test(rule0), `${name}: rule 0 never prints a placeholder as a command`,
         rule0.split("\n").filter(l => /undefined|null/.test(l)).join(" | ").slice(0, 160));

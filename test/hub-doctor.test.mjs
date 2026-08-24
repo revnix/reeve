@@ -537,10 +537,14 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   // CONTROL: names that merely CONTAIN dots are still accepted -- the rule is
   // about a segment that is nothing but dots, and `owner/repo.js` is a real
   // repository name that must keep working.
-  writeFileSync(reg, JSON.stringify({ prod: { nwo: "o/orphan" }, dotted: { nwo: "some.owner/repo.js" } }));
+  // `owner/repo.js`, not `some.owner/repo.js`: a GitHub LOGIN is alphanumeric
+  // with inner hyphens and cannot contain a dot at all, so my first version of
+  // this control asserted something GitHub itself refuses. The repository half
+  // is the one that legitimately carries dots.
+  writeFileSync(reg, JSON.stringify({ prod: { nwo: "o/orphan" }, dotted: { nwo: "owner/repo.js" } }));
   const dotted = idsOf(run("builder", "doctor", "--json").stdout);
   check(dotted !== null && !dotted.includes("H-7"),
-    "control: a name containing dots is still a name", JSON.stringify(dotted));
+    "control: a repository name containing dots is still a name", JSON.stringify(dotted));
 
   // CONTROL: a WELL-FORMED registry is not reported as an error, so the
   // assertion above is about the malformed entry rather than about H-7 always
@@ -570,7 +574,10 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
                                ["an nwo that is not a string", { prod: { nwo: 7 } }],
                                ["an nwo of dot segments", { prod: { nwo: "../.." } }],
                                ["a relative-looking owner", { prod: { nwo: "./repo" } }],
-                               ["a dot repository name", { prod: { nwo: "owner/.." } }]]) {
+                               ["a dot repository name", { prod: { nwo: "owner/.." } }],
+                               ["a bare hyphen as the owner", { prod: { nwo: "-/repo" } }],
+                               ["an owner starting with a hyphen", { prod: { nwo: "-a/repo" } }],
+                               ["an owner ending with a hyphen", { prod: { nwo: "a-/repo" } }]]) {
     writeFileSync(reg, JSON.stringify(body));
     const ids = idsOf(run("builder", "doctor", "--json").stdout);
     check(ids?.includes("H-7"), `${label} is a registry error`, JSON.stringify(ids));

@@ -20,7 +20,7 @@ import { execFileSync } from "node:child_process";
 // `linkSync` is the snapshot PUBLISH: it is atomic AND exclusive, where
 // `renameSync` is atomic but REPLACES an existing destination -- so two
 // same-second writers would both believe they won.
-import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync, renameSync } from "node:fs";
+import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync, renameSync, openSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { open as openStore, exportJsonl } from "./db/ops.mjs";
 // Task 8's subset. `TABLES_AT` and `HUB_TABLES` are what a snapshot's table set
@@ -580,6 +580,31 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     try { return p.prepare("SELECT COALESCE(max(seq),0) s FROM hub_event").get().s; } finally { p.close(); }
   })();
 
+  /**
+   * The name a set-aside copy of this hub goes under, MINTED ONCE and EXCLUSIVE.
+   *
+   * Three sites used to spell this out, one per hub state -- `.corrupt-`,
+   * `.damaged-`, `.incomplete-` -- so a fourth state meant a fourth literal and
+   * the name could drift from the classification that produced it. It is one
+   * function now, which is also where the uniqueness lives: the old names were
+   * seconds-resolution, so a restore that copied its quarantine, failed before
+   * the swap and was retried inside the same second reused the path -- and
+   * `copyFileSync` overwrites, destroying the first forensic image while the
+   * function promises to keep it.
+   *
+   * `wx` fails EEXIST rather than truncating, so the name is proven free before
+   * it is returned; a collision takes the next suffix instead of the first one's
+   * evidence.
+   */
+  const quarantineName = (kind) => {
+    const at = Math.floor(Date.now() / 1000);
+    for (let n = 0; n < 100; n++) {
+      const candidate = `${dbPath}.${kind}-${at}${n ? `-${n}` : ""}`;
+      try { closeSync(openSync(candidate, "wx")); return candidate; }
+      catch (e) { if (e.code !== "EEXIST") return candidate; }
+    }
+    return `${dbPath}.${kind}-${at}-${pid}`;
+  };
   let live = null, locked = false, lockDb = null, quarantined = null, synthetic = false, swapped = false;
   // The unreadable path names the quarantine here and copies it one step before
   // the swap; the version-zero path has to copy immediately, because it migrates
@@ -746,7 +771,7 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // usual point one step before the swap, because by then this path has
       // already migrated the file.
       if (bootstrapZero) {
-        quarantined = `${dbPath}.incomplete-${Math.floor(Date.now() / 1000)}`;
+        quarantined = quarantineName("incomplete");
         try { copyFileSync(dbPath, quarantined); quarantineCopied = true; }
         catch { quarantined = null; }
       }
@@ -766,6 +791,22 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // answer -- there is nothing to carry forward.
       try { live.prepare("SELECT * FROM hub_event LIMIT 1").get(); liveHasEvents = true; }
       catch { liveHasEvents = false; }
+      // AND AN UNREADABLE LOG IS A REFUSAL HERE TOO, not a quiet `false`.
+      //
+      // Setting the flag and carrying on turned a fail-closed behaviour into
+      // silent accepted loss: the old code threw on the later tail query, which
+      // at least stopped; this branch derives no `historyLost` and requires no
+      // `force`, so the common tail code below simply skipped the read and the
+      // restore replaced the hub having discarded every post-snapshot event.
+      // The repair for one defect removed the safety property of another.
+      //
+      // A supplied tail answers the loss, exactly as on the readable branch.
+      if (!liveHasEvents && suppliedTail == null && !force)
+        return { ok: false, holders: [],
+          why: `the hub at ${dbPath} has no completed migration and its event log cannot be read, so ` +
+               `every event after the snapshot would be lost. Pass --tail from a durable ` +
+               `export-events --hub to carry them forward, or re-run with force to accept the loss.` };
+      if (!liveHasEvents) quarantined ??= quarantineName("damaged");
       // The result is CHECKED here too. Two restores started after a total loss
       // both pass the existsSync above, both race through openHub, and one of
       // them loses the lock -- and an ignored `{ ok: false }` let the loser mark
@@ -810,17 +851,36 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // does: the flag means "this invocation created it AND owns it", and a file
       // a builder is actively writing to is not this function's to delete --
       // deleting it is the very failure being refused.
+      // GUARDED, like the readable branch's scan. This one read its leases
+      // straight, so an unreadable `provider_lease` in a version-zero hub threw
+      // into the outer catch as `could not restore` -- past `--force`, and AFTER
+      // `openHub` had already migrated the canonical file. A table that cannot
+      // be read here is damage, and damage on this branch means the same thing
+      // it means on the other: force, and the file kept.
       const bornHolders = [];
-      for (const r of live.prepare("SELECT * FROM singleton_lease").all())
+      const bornMissing = [];
+      const bornScan = (table, fn) => {
+        try { return fn(); }
+        catch { bornMissing.push(table); return []; }
+      };
+      for (const r of bornScan("singleton_lease", () => live.prepare("SELECT * FROM singleton_lease").all()))
         if (isAlive(r.pid, r.lstart)) bornHolders.push({ what: "builder", pid: r.pid, lstart: r.lstart, command: r.command });
-      for (const r of liveWriters(live, { isAlive }))
+      for (const r of bornScan("writer_lease", () => liveWriters(live, { isAlive })))
         bornHolders.push({ what: "cli", pid: r.pid, lstart: r.lstart, command: r.command });
       // AND PROVIDER LEASES. A guardian holds one whenever it is dispatching, and
       // it can take one in the window this scan exists to close -- the readable
       // path has always counted a held provider lease as a live writer, and
       // leaving it out here made the two paths disagree about what "live" means.
-      for (const r of live.prepare("SELECT * FROM provider_lease WHERE status='held'").all())
+      for (const r of bornScan("provider_lease", () => live.prepare("SELECT * FROM provider_lease WHERE status='held'").all()))
         if (isAlive(r.pid, r.lstart)) bornHolders.push({ what: r.owner, pid: r.pid, lstart: r.lstart, command: r.run_ref });
+      // What the scan could not read is damage, and it costs the same as damage
+      // on the readable branch: the operator has to say yes, and the file is kept.
+      if (bornMissing.length && !force)
+        return { ok: false, holders: bornHolders,
+          why: `the hub at ${dbPath} is missing or cannot read ${bornMissing.join(", ")}, so a lease held ` +
+               `in ${bornMissing.length === 1 ? "it" : "them"} cannot be ruled out. Stop the builder and ` +
+               `any reeve CLI, then re-run with force.` };
+      if (bornMissing.length) quarantined ??= quarantineName("damaged");
       if (bornHolders.length) {
         synthetic = false;
         return { ok: false, holders: bornHolders,
@@ -881,7 +941,7 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // back: `dbPath` is simply absent, and the next writer to start creates a
       // fresh empty hub there. Losing a corrupt database to a failed recovery is
       // bad; replacing it with an empty one that looks healthy is worse.
-      quarantined = `${dbPath}.corrupt-${Math.floor(Date.now() / 1000)}`;
+      quarantined = quarantineName("corrupt");
       // `live` stays null, which the tail read below already handles: with no
       // readable hub, `suppliedTail` is the ONLY source of post-snapshot events.
     } else {
@@ -1084,7 +1144,7 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // `damaged`, not `partial`: a supplied tail answers the loss question and
       // waives the refusal, but it does not make the file whole -- and a hub that
       // lost its event log is exactly the one an operator will want to look at.
-      if (damaged) quarantined = `${dbPath}.damaged-${Math.floor(Date.now() / 1000)}`;
+      if (damaged) quarantined = quarantineName("damaged");
     }
 
     // The tail arrives two ways and both are real: read from the live file when
@@ -1128,7 +1188,7 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
             why: `the hub's event log cannot be read past the first page (${e.message}), so every event ` +
                  `after seq ${snapSeq} would be lost. Pass --tail from a durable export-events --hub to ` +
                  `carry them forward, or re-run with force to accept the loss.` };
-        quarantined ??= `${dbPath}.damaged-${Math.floor(Date.now() / 1000)}`;
+        quarantined ??= quarantineName("damaged");
       }
     }
     const tail = rawTail.filter(e => e.seq > snapSeq).sort((a, b) => a.seq - b.seq);

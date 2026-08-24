@@ -2098,6 +2098,96 @@ function writeAuthority(db, project) {
   rmSync(tHome, { recursive: true, force: true });
 }
 
+// ── the version-zero branch owes the same answers as the readable one ─────
+// Three findings, one cause: the creation branch was written as "we made this
+// file, so there is nothing to ask about it" — and a version-ZERO hub takes it
+// while being a real store full of real rows.
+{
+  const vHome = mkdtempSync(join(tmpdir(), "reeve-vzero-"));
+  mkdirSync(join(vHome, "state"), { recursive: true });
+  const src = openHub(join(vHome, "state", "src.db"));
+  const snapV = snapshot(src, join(vHome, "backups"), "hub");
+  src.close();
+  // Corrupt ONE table's first page, leaving the rest of the file intact.
+  const corruptTable = (t, table) => {
+    const q = new DatabaseSync(t, { readOnly: true });
+    const pages = q.prepare("SELECT pageno FROM dbstat WHERE name=? ORDER BY pageno").all(table);
+    const ps = q.prepare("PRAGMA page_size").get().page_size;
+    q.close();
+    const buf = readFileSync(t);
+    buf.fill(0x5a, (pages[0].pageno - 1) * ps, pages[0].pageno * ps);
+    writeFileSync(t, buf);
+  };
+  const zero = (t) => { const z = new DatabaseSync(t); z.exec("DELETE FROM schema_version"); z.close(); };
+
+  // 1. AN UNREADABLE EVENT LOG IS A REFUSAL, not a quiet `false`.
+  // Setting `liveHasEvents = false` and carrying on turned a fail-closed
+  // behaviour into silent accepted loss: the old code threw on the later tail
+  // query, which at least STOPPED. This branch derived no `historyLost` and
+  // required no force, so the tail read was skipped and the hub replaced.
+  {
+    const t = join(vHome, "state", "badlog.db");
+    const d = openHub(t);
+    d.prepare("INSERT INTO hub_event(at,kind,task,payload) VALUES(unixepoch(),'task.filed',NULL,'{}')").run();
+    d.close();
+    corruptTable(t, "hub_event");
+    zero(t);
+    const bare = restoreHub(snapV.path, t, { isAlive: () => false, pid: process.pid, lstart: "me" });
+    check(!bare.ok, "a version-zero hub with an unreadable event log is not restored silently",
+      JSON.stringify(bare).slice(0, 160));
+    check(/event log cannot be read/.test(String(bare.why)),
+      "and the refusal is about the LOSS", String(bare.why).slice(0, 200));
+    check(/--tail/.test(String(bare.why)),
+      "and names what recovers it", String(bare.why).slice(0, 240));
+    const forced = restoreHub(snapV.path, t, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+    check(forced.ok && forced.quarantined, "and force accepts the loss, keeping the file",
+      `${forced.ok} ${forced.quarantined}`);
+  }
+
+  // 2. THE CREATION BRANCH READS ITS LEASES GUARDED. It read them straight, so
+  // an unreadable `provider_lease` threw into the outer catch as
+  // `could not restore` — past --force, and AFTER openHub had already migrated
+  // the canonical file.
+  {
+    const t = join(vHome, "state", "badlease.db");
+    const d = openHub(t);
+    d.prepare(`INSERT INTO provider_lease(owner,repo_id,run_ref,pid,lstart,status,requested_at,expires_at)
+               VALUES('guardian',1,'r',1,'L','held',unixepoch(),unixepoch()+9)`).run();
+    d.close();
+    corruptTable(t, "provider_lease");
+    zero(t);
+    const bare = restoreHub(snapV.path, t, { isAlive: () => false, pid: process.pid, lstart: "me" });
+    check(!bare.ok, "a version-zero hub with an unreadable lease table refuses without force",
+      JSON.stringify(bare).slice(0, 160));
+    check(/cannot read provider_lease/.test(String(bare.why)),
+      "and names the table it could not read", String(bare.why).slice(0, 200));
+    check(!/could not restore/.test(String(bare.why)),
+      "and not through the outer catch, where --force could not reach it", String(bare.why).slice(0, 140));
+    const forced = restoreHub(snapV.path, t, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+    check(forced.ok, "and force carries it through", JSON.stringify(forced).slice(0, 160));
+  }
+
+  // 3. A QUARANTINE NEVER OVERWRITES AN EARLIER ONE. The names were
+  // seconds-resolution, so a restore that copied its quarantine, failed before
+  // the swap and was retried inside the same second reused the path — and
+  // `copyFileSync` overwrites, destroying the first forensic image while the
+  // function promises to keep it.
+  {
+    const t = join(vHome, "state", "quar.db");
+    for (let i = 0; i < 3; i++) {
+      openHub(t).close();
+      zero(t);
+      restoreHub(snapV.path, t, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+    }
+    const kept = readdirSync(join(vHome, "state")).filter(f => f.startsWith("quar.db.incomplete-"));
+    check(kept.length === 3,
+      "three restores inside one second leave three distinct quarantines",
+      kept.join(" ") || "(none)");
+    check(new Set(kept).size === kept.length, "and none of them is a reused name", kept.join(" "));
+  }
+  rmSync(vHome, { recursive: true, force: true });
+}
+
 rmSync(home, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

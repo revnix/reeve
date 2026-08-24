@@ -11,7 +11,7 @@ Resume the reeve build. I am the founder (Mobeen). reeve lives at
 ## Read these first, in this order
 
   ~/Work/Products/reeve/docs/2026-08-24-session-handoff.md   <- START HERE
-  ~/Work/Products/reeve/docs/TRACKER.md                      <- known stale, see below
+  ~/Work/Products/reeve/docs/TRACKER.md                      <- §0 says whether it is current
   ~/Work/Products/reeve/docs/measured/                        <- the measured facts
 
 Treat the handoff's §0 as the ONLY statement of current facts. This prompt
@@ -65,8 +65,9 @@ the tests you just ran.
    FIXED code before touching nextly. The harness is
    `build-fixture.sh` + `run.mjs` (ask me for the scratchpad path). It costs about
    $1, spends no real PR's fix attempt, and answers the only question that matters
-   — does reeve actually publish now? Today the tests say yes and zero real
-   dispatches do, in a project where a dispatch once found what ~640 green tests
+   — does reeve actually publish? The tests say yes; §0 says whether any real
+   dispatch has ever agreed with them. Weigh those two against each other before
+   deciding, in a project where a dispatch once found what ~640 green tests
    missed. Re-arming nextly is the step after that, not part of it.
 
    The other candidates, both real: write the OWED tracker entry (§6 — the tracker
@@ -100,7 +101,8 @@ they are right.
   lines produces one too).
 - Do not merge anything without asking me. Every PR needs its own grant and the
   last one is spent.
-- Do not re-arm reeve without asking. It is off deliberately.
+- Do not change reeve's arming without asking, in either direction. §0 says how
+  it is set; whatever it says was a deliberate call and is mine to reverse.
 - Never `--no-verify`. Conventional Commits. No AI attribution anywhere — a hook
   blocks the vendor's name in commits and PR bodies, including factual uses;
   rewrite rather than argue.

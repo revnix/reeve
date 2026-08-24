@@ -15,7 +15,7 @@
 //
 // So the invariant is enforced rather than intended: a present-tense claim about
 // state may appear in the resume prompt only as a POINTER to §0.
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -28,8 +28,17 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
 
-const PROMPT = "2026-08-23-resume-prompt.md";
-const HANDOFF = "2026-08-23-session-handoff.md";
+// The CURRENT pair, resolved rather than named. A test pinned to one date guards
+// the superseded documents and leaves the live ones unprotected the moment a new
+// handoff is written -- which is the same half-an-invariant failure this test was
+// widened to fix. Dates sort lexically here, so newest is last.
+const newest = suffix => {
+  const found = readdirSync(docs).filter(f => f.endsWith(suffix)).sort();
+  if (!found.length) throw new Error(`no docs/*${suffix} at all`);
+  return found[found.length - 1];
+};
+const PROMPT = newest("-resume-prompt.md");
+const HANDOFF = newest("-session-handoff.md");
 const prompt = readFileSync(join(docs, PROMPT), "utf8");
 const handoff = readFileSync(join(docs, HANDOFF), "utf8");
 
@@ -104,7 +113,10 @@ const offendersIn = text => {
   const zero = /^## 0\. STATE[\s\S]*?(?=^## )/m.exec(handoff)?.[0] ?? "";
   check(zero.length > 300, "control: §0 was extracted and is not empty", String(zero.length));
   // The rule has to be written where someone editing it will see it.
-  check(/change them HERE and nowhere else/i.test(zero),
+  // Whitespace-flexible: prose wraps, and where a line breaks is not a property
+  // worth asserting. The first version of this check failed because the phrase
+  // happened to span a newline.
+  check(/change\s+them\s+HERE\s+and\s+nowhere\s+else/i.test(zero),
     "§0 states the rule that keeps it single-sourced", zero.slice(0, 120));
   // And it must actually carry the volatile facts, or the pointers point at nothing.
   for (const fact of [/`main`/, /--execute/, /merged/])

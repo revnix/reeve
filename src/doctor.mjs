@@ -69,10 +69,14 @@ function hashTree(dir, filter = () => true) {
  * both surfaces because they disagree: classic protection and rulesets are
  * separate systems and a repo can be governed by either, neither, or both.
  */
-function checkMergeAuthority(nwo) {
+export function checkMergeAuthority(nwo, { api = gh } = {}) {
   const lines = [];
-  const prot = gh(`repos/${nwo}/branches/main/protection`);
-  const rules = gh(`repos/${nwo}/rulesets`);
+  // Whether the BROKEN verdict, if there is one, is about a gate that can be
+  // bypassed. A signature rule also breaks the check, for the opposite reason,
+  // and the remedy below only makes sense for the first kind.
+  let bypassable = false;
+  const prot = api(`repos/${nwo}/branches/main/protection`);
+  const rules = api(`repos/${nwo}/rulesets`);
 
   if (!prot.ok && /403/.test(prot.err)) {
     return {
@@ -105,29 +109,60 @@ function checkMergeAuthority(nwo) {
     const contexts = p.required_status_checks?.contexts ?? [];
     const strict = p.required_status_checks?.strict;
     const admins = p.enforce_admins?.enabled;
-    if (admins === false) { level = BROKEN; lines.push("enforce_admins: false — the admin identity is exempt from every rule"); }
-    if (contexts.length === 0) { level = BROKEN; lines.push("no required status checks — nothing CI reports can block a merge"); }
+    if (admins === false) { level = BROKEN; bypassable = true; lines.push("enforce_admins: false — the admin identity is exempt from every rule"); }
+    if (contexts.length === 0) { level = BROKEN; bypassable = true; lines.push("no required status checks — nothing CI reports can block a merge"); }
     else lines.push(`required contexts: ${contexts.join(", ")}`);
     if (strict === false) { if (level === OK) level = DEGRADED; lines.push("strict: false — a branch may merge without being up to date with its base"); }
   }
 
   if (rules.ok) {
     for (const r of JSON.parse(rules.out)) {
-      const detail = gh(`repos/${nwo}/rulesets/${r.id}`);
+      const detail = api(`repos/${nwo}/rulesets/${r.id}`);
       if (!detail.ok) continue;
       const d = JSON.parse(detail.out);
       const bypass = d.bypass_actors ?? [];
       const always = bypass.filter(b => b.bypass_mode === "always");
       if (always.length) {
         level = BROKEN;
+        bypassable = true;
         lines.push(`ruleset ${d.name}: bypass_actors allow ${always.map(b => b.actor_type).join(", ")} to bypass ALWAYS`);
       }
       const hasChecks = (d.rules ?? []).some(x => x.type === "required_status_checks");
-      if (!hasChecks) { level = BROKEN; lines.push(`ruleset ${d.name}: contains no required_status_checks rule at all`); }
+      if (!hasChecks) { level = BROKEN; bypassable = true; lines.push(`ruleset ${d.name}: contains no required_status_checks rule at all`); }
+      // reeve commits a worker's repair itself, in a checkout whose global and
+      // system configuration are /dev/null, so it has no signing key and cannot
+      // acquire one without reaching back into the founder's environment -- which
+      // is the isolation this design exists to keep. Under this rule every repair
+      // is rejected at the push, AFTER a worker run has been paid for. Said here
+      // rather than discovered there.
+      // Only when the rule can actually reach a repair. A disabled ruleset, one
+      // targeting tags, or one scoped to `release/*` governs nothing reeve pushes,
+      // and reporting those as BROKEN would condemn a repository that is fine.
+      //
+      // The branch a repair lands on is a pull request's head, which is not known
+      // here, so the test is whether the ruleset covers EVERY branch: `~ALL` is
+      // the only condition guaranteed to include whatever head a PR turns up
+      // with. A narrower one is reported as a possibility, not a certainty.
+      if ((d.rules ?? []).some(x => x.type === "required_signatures")
+          && d.enforcement === "active" && (d.target ?? "branch") === "branch") {
+        const cond = d.conditions?.ref_name;
+        const everyBranch = !cond || ((cond.include ?? []).includes("~ALL") && !(cond.exclude ?? []).length);
+        if (everyBranch) {
+          level = BROKEN;
+          lines.push(`ruleset ${d.name}: requires signed commits on every branch, and reeve commits unsigned — every repair it makes will be refused at the push`);
+        } else {
+          if (level === OK) level = DEGRADED;
+          lines.push(`ruleset ${d.name}: requires signed commits on ${(cond.include ?? []).join(", ") || "some branches"} — reeve commits unsigned, so a repair on a branch it covers will be refused at the push`);
+        }
+      }
     }
   }
 
-  if (level === BROKEN) lines.push("-> every gate written against this repo is decorative until the actuator loses its bypass");
+  // Only when a bypass or a missing gate caused it. A repository broken solely by
+  // a signature rule has the OPPOSITE problem -- its gates hold and reeve cannot
+  // get through them -- and telling an operator to remove a bypass there sends
+  // them after something that does not exist.
+  if (level === BROKEN && bypassable) lines.push("-> every gate written against this repo is decorative until the actuator loses its bypass");
   return { id: "R-01", level, title: "merge authority", lines: lines.length ? lines : ["enforced"] };
 }
 

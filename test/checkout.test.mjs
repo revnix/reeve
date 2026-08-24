@@ -1,7 +1,7 @@
 // A worker's checkout must share NOTHING with the founder's: not the ref store,
 // not the configuration, and not their uncommitted work. These assertions are
 // what makes the standalone clone a boundary rather than a convention.
-import { prepareRunCheckout, releaseRunCheckout, fetchRunWork, publishRunWork, copyDeps, canCloneFiles, runPathFor, dependencyPathsFor } from "../src/checkout.mjs";
+import { prepareRunCheckout, releaseRunCheckout, fetchRunWork, publishRunWork, copyDeps, canCloneFiles, runPathFor, dependencyPathsFor, commitRunWork, founderIdentity, fingerprint, digestOf } from "../src/checkout.mjs";
 import { verifyConfig } from "../src/gitguard.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
@@ -554,5 +554,406 @@ check(existsSync(join(r.path, "node_modules", "left-pad", "index.js")), "but the
 releaseRunCheckout(r.path, { workFetched: true });
 check(!existsSync(r.path), "a fetched checkout is removed", "");
 rmSync(root, { recursive: true, force: true });
+
+// ── reeve commits what the worker cannot ─────────────────────────────────────
+//
+// The worker's sandbox denies Bash writes to `.git`: `git add` and `git commit`
+// fail with EPERM on `.git/index.lock`. Measured 2026-08-23, seven attempts in a
+// single run, three dispatches that produced correct fixes and published none of
+// them. reeve does the committing now, before the gates that judge the result.
+{
+  const cRoot = mkdtempSync(join(tmpdir(), "reeve-commit-"));
+  // The founder's checkout, with a LOCAL identity so this test does not read the
+  // developer's global git configuration and pass for a reason CI would not have.
+  const cFounder = join(cRoot, "founder");
+  mkdirSync(cFounder);
+  g(cFounder, "init", "-q");
+  g(cFounder, "config", "user.name", "Founder");
+  g(cFounder, "config", "user.email", "founder@example.invalid");
+
+  const id = founderIdentity(cFounder);
+  check(id?.name === "Founder" && id?.email === "founder@example.invalid",
+    "the founder's identity is read from the founder's own repository", JSON.stringify(id));
+
+  // A worker checkout on the branch that gets published.
+  const mkWorktree = (name, branch = "f") => {
+    const w = join(cRoot, name);
+    mkdirSync(w);
+    g(w, "init", "-q", "-b", branch);
+    writeFileSync(join(w, "seed.js"), "seed\n");
+    g(w, "add", "-A");
+    g(w, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed");
+    return w;
+  };
+
+  {
+    const w = mkWorktree("clean-branch");
+    const before = g(w, "rev-parse", "HEAD");
+    writeFileSync(join(w, ".gitignore"), "noise.log\n");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    writeFileSync(join(w, "noise.log"), "build output\n");
+
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): repair the thing",
+                              declared: [".gitignore", "fix.js"] });
+    check(r.ok && r.committed === true, "an uncommitted fix is committed", JSON.stringify(r).slice(0, 200));
+    check(g(w, "rev-parse", "f") !== before, "and the branch that gets pushed moves", `${before.slice(0,8)} -> ${g(w, "rev-parse", "f").slice(0,8)}`);
+    check(g(w, "status", "--porcelain") === "", "leaving nothing behind to be silently dropped", g(w, "status", "--porcelain"));
+    check(r.files.includes("fix.js") && !r.files.includes("noise.log"),
+      "an ignored file is not staged with it", r.files.join(", "));
+    check(g(w, "log", "-1", "--format=%an <%ae>") === "Founder <founder@example.invalid>",
+      "the commit carries the founder's identity, not one git invents from the hostname",
+      g(w, "log", "-1", "--format=%an <%ae>"));
+    check(g(w, "log", "-1", "--format=%s") === "fix(ci): repair the thing", "and the message reeve was given", g(w, "log", "-1", "--format=%s"));
+  }
+
+  {
+    // Nothing left behind is not an error: a worker that changed nothing, or one
+    // whose work is already committed, leaves the branch for the gates to judge.
+    const w = mkWorktree("nothing-to-do");
+    const before = g(w, "rev-parse", "HEAD");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): nothing", declared: [] });
+    check(r.ok && r.committed === false, "a clean checkout produces no commit, and no error", JSON.stringify(r));
+    check(g(w, "rev-parse", "f") === before, "control: and the branch did not move", before.slice(0, 8));
+  }
+
+  {
+    // A checkout on another branch is SKIPPED rather than refused. Refusing here
+    // would return before the gate that reads the pushed ref for reeve's own
+    // worker token, and a worker that commits a credential on the branch then
+    // checks out elsewhere would be reported as "wrong branch" instead.
+    const w = mkWorktree("wrong-branch");
+    g(w, "checkout", "-q", "-b", "aux");
+    writeFileSync(join(w, "stray.js"), "not on the published branch\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x", declared: ["stray.js"] });
+    check(r.ok === true && r.committed === false, "a checkout on another branch is skipped, not refused", JSON.stringify(r));
+    check(/not committing/.test(r.why ?? ""), "and says why, so the log is not silent about it", String(r.why));
+    check(g(w, "status", "--porcelain") !== "", "control: the work is still there for the uncommitted check to catch", g(w, "status", "--porcelain"));
+  }
+
+  {
+    // No identity is a REFUSAL. git would otherwise invent one from the username
+    // and the hostname -- `Mobeen <mobeen@192.168.1.18>`, measured 2026-08-23 --
+    // and the commit would carry an address nobody owns.
+    const w = mkWorktree("needs-identity");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    const before = g(w, "rev-parse", "HEAD");
+    const r = commitRunWork({ repoRoot: "/nonexistent-repo-root", path: w, branch: "f", message: "fix(ci): x", declared: ["fix.js"] });
+    check(r.ok === false, "an unreadable founder identity refuses the commit", JSON.stringify(r));
+    check(/identity/.test(r.why ?? ""), "and names the identity as the reason", String(r.why));
+    check(g(w, "rev-parse", "f") === before, "control: nothing was committed under an invented address", before.slice(0, 8));
+  }
+
+  {
+    // A DETACHED head is a mismatch, not an unreadable repository.
+    // `symbolic-ref --quiet` exits nonzero when detached, which the first version
+    // read as a hard failure -- and a hard failure returns before the gate that
+    // scans the pushed ref for reeve's own token.
+    const w = mkWorktree("detached");
+    g(w, "checkout", "-q", "--detach", "HEAD");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x", declared: ["fix.js"] });
+    check(r.ok === true && r.committed === false, "a detached head is skipped, not reported as a broken repository", JSON.stringify(r));
+    check(/detached head/.test(r.why ?? ""), "and is named as what it is", String(r.why));
+  }
+
+  {
+    // An inherited GIT_AUTHOR_* must not decide who a repair is attributed to.
+    // Git gives the environment precedence over `-c user.*`: measured,
+    // GIT_AUTHOR_NAME=Injected beside -c user.name=Founder produces Injected.
+    const w = mkWorktree("inherited-identity");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    const saved = { n: process.env.GIT_AUTHOR_NAME, e: process.env.GIT_AUTHOR_EMAIL,
+                    cn: process.env.GIT_COMMITTER_NAME, ce: process.env.GIT_COMMITTER_EMAIL };
+    process.env.GIT_AUTHOR_NAME = "Injected";
+    process.env.GIT_AUTHOR_EMAIL = "injected@evil.invalid";
+    process.env.GIT_COMMITTER_NAME = "Injected";
+    process.env.GIT_COMMITTER_EMAIL = "injected@evil.invalid";
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x", declared: ["fix.js"] });
+    for (const [k, v] of [["GIT_AUTHOR_NAME", saved.n], ["GIT_AUTHOR_EMAIL", saved.e],
+                          ["GIT_COMMITTER_NAME", saved.cn], ["GIT_COMMITTER_EMAIL", saved.ce]])
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    check(r.ok && r.committed, "control: the commit was made with an identity in the environment", JSON.stringify(r).slice(0, 120));
+    check(g(w, "log", "-1", "--format=%an <%ae>") === "Founder <founder@example.invalid>",
+      "an inherited GIT_AUTHOR_* does not decide who a repair is attributed to", g(w, "log", "-1", "--format=%an <%ae>"));
+    check(g(w, "log", "-1", "--format=%cn <%ce>") === "Founder <founder@example.invalid>",
+      "and neither does an inherited GIT_COMMITTER_*", g(w, "log", "-1", "--format=%cn <%ce>"));
+  }
+
+  {
+    // What the DAEMON copied in before the worker started is not the worker's
+    // work. A repository that does not ignore its own dependency tree would
+    // otherwise have the whole thing staged into the repair.
+    const w = mkWorktree("deps-not-staged");
+    mkdirSync(join(w, "node_modules", "pkg"), { recursive: true });
+    writeFileSync(join(w, "node_modules", "pkg", "index.js"), "vendored\n");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x", declared: ["fix.js"] });
+    check(r.ok && r.committed, "control: a repair beside an unignored dependency tree still commits", JSON.stringify(r).slice(0, 140));
+    check(r.files.includes("fix.js"), "the fix is staged", r.files.join(", "));
+    check(!r.files.some(f => f.startsWith("node_modules/")), "the dependency tree reeve copied in is not", r.files.join(", "));
+  }
+
+  {
+    // The message is built from model output that has read untrusted CI logs.
+    // The publication gate scans commit messages too, but only once the commit
+    // exists, and a secret in history is not undone by refusing the push.
+    const w = mkWorktree("secret-in-message");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    const before = g(w, "rev-parse", "HEAD");
+    const TOKEN = "sk-ant-oat01-test-token-not-a-real-credential";
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f",
+                              message: `fix(ci): repair it\n\nthe log said ${TOKEN}`,
+                              secrets: [{ label: "reeve's worker authentication token", value: TOKEN }] });
+    check(r.ok === false, "a commit message carrying reeve's own token is refused", JSON.stringify(r));
+    check(g(w, "rev-parse", "f") === before, "and no commit is made, so it never enters history", before.slice(0, 8));
+  }
+
+  {
+    // The diff gate judges paths and territory, never intent, so a reproduction
+    // script inside the lane passes it. Only the worker knows which of its files
+    // were the repair, so the disagreement between what it reported and what it
+    // left is the check.
+    const w = mkWorktree("undeclared");
+    const before = g(w, "rev-parse", "HEAD");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    writeFileSync(join(w, "repro.js"), "console.log('reproducing')\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: ["fix.js"] });
+    // Staging from the declaration means an undeclared file is never staged in
+    // the first place, so this is no longer a refusal here -- it is an absence.
+    // What refuses is the uncommitted-work gate the daemon runs next, on exactly
+    // the file left behind.
+    check(r.ok && r.committed, "the declared fix commits", JSON.stringify(r).slice(0, 160));
+    check(r.files.length === 1 && r.files[0] === "fix.js", "and only it", r.files.join(", "));
+    check(g(w, "status", "--porcelain") === "?? repro.js", "leaving the undeclared file for the gate that refuses on it", g(w, "status", "--porcelain"));
+    check(g(w, "rev-parse", "f") !== before, "control: the branch did move, so this is not passing by doing nothing", `${before.slice(0,8)} -> ${g(w, "rev-parse", "f").slice(0,8)}`);
+  }
+
+  {
+    // Declared exactly: the ordinary case still commits.
+    const w = mkWorktree("declared-exactly");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    writeFileSync(join(w, "also.js"), "and this\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: ["./fix.js", "also.js"] });
+    check(r.ok && r.committed, "control: a fully declared change commits, leading ./ and all", JSON.stringify(r).slice(0, 160));
+  }
+
+  {
+    // git QUOTES a path it considers unusual, so `--name-only` returns
+    // `"k\\303\\251y.txt"` where the worker reported `kéy.txt` -- and the
+    // declaration check would quarantine a perfectly good repair on the mismatch.
+    const w = mkWorktree("quoted-path");
+    writeFileSync(join(w, "kéy.txt"), "the fix\n");
+    const quoted = g(w, "add", "-A") || g(w, "diff", "--cached", "--name-only");
+    check(/\\303/.test(quoted), "control: git really does quote this path without -z", quoted);
+    g(w, "reset", "--quiet", "HEAD", "--");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: ["kéy.txt"] });
+    check(r.ok && r.committed, "a non-ASCII filename the worker declared is committed, not quarantined", JSON.stringify(r).slice(0, 200));
+    check(r.files.includes("kéy.txt"), "and it is reported as the raw name", r.files.join(", "));
+  }
+
+  {
+    // A repository-sized answer must not fail on SIZE. `changedFiles` already
+    // raises this buffer because about 1,800 long paths overflowed the 1 MiB
+    // default, and the declaration gate reads the staged list the same way -- so
+    // without the same ceiling a bulk repair is quarantined for its length.
+    const w = mkWorktree("bulk");
+    const deep = "d".repeat(60);
+    mkdirSync(join(w, deep, deep), { recursive: true });
+    const many = [];
+    for (let i = 0; i < 7000; i++) {
+      const rel = `${deep}/${deep}/file-${String(i).padStart(6, "0")}-${"n".repeat(60)}.js`;
+      writeFileSync(join(w, rel), "x");
+      many.push(rel);
+    }
+    const bytes = many.join("\0").length;
+    check(bytes > 1024 * 1024, "control: the staged list really does exceed the 1 MiB default", `${bytes} bytes`);
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): a bulk repair", declared: many });
+    check(r.ok && r.committed, "a staged list larger than the default buffer still commits", String(r.why ?? "").slice(0, 160));
+    check(r.files.length === many.length, "and every path is accounted for", `${r.files.length} of ${many.length}`);
+  }
+
+  {
+    // A copied dependency tree can hold TRACKED files -- a vendored directory
+    // under version control -- and a worker editing one is doing real work.
+    // Excluding the whole path dropped that edit from the commit and hid it from
+    // the uncommitted check, publishing the rest as a complete fix.
+    const w = mkWorktree("tracked-inside-a-copied-tree");
+    mkdirSync(join(w, "vendor"), { recursive: true });
+    writeFileSync(join(w, "vendor", "a.js"), "vendored, and tracked\n");
+    g(w, "add", "-A");
+    g(w, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "vendor it");
+    // The worker edits the tracked vendored file AND a companion; preparation
+    // separately left untracked content in the same tree.
+    writeFileSync(join(w, "vendor", "a.js"), "vendored, and repaired\n");
+    writeFileSync(join(w, "vendor", "copied-in.js"), "what preparation put here\n");
+    writeFileSync(join(w, "fix.js"), "the companion\n");
+
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              exclude: ["vendor"], declared: ["fix.js", "vendor/a.js"] });
+    check(r.ok && r.committed, "a repair that edits a tracked file inside a copied tree commits", JSON.stringify(r).slice(0, 200));
+    check(r.files.includes("vendor/a.js"), "and that edit is part of it, not silently dropped", r.files.join(", "));
+    check(r.files.includes("fix.js"), "control: so is the companion", r.files.join(", "));
+    check(!r.files.includes("vendor/copied-in.js"), "while the untracked content preparation left is still excluded", r.files.join(", "));
+  }
+
+  {
+    // Leading and trailing whitespace are legal in a git filename, and trimming
+    // the declared entry made it match nothing the staged list holds.
+    const w = mkWorktree("whitespace-filename");
+    // BOTH ends, because the two trims destroy different halves and a fixture
+    // with one end only passes while the other defect stands. Measured: a
+    // NUL-terminated `" leading\0"` trimmed loses the leading space, while
+    // `"trailing \0"` does NOT -- NUL is not whitespace to JS, so it shields the
+    // trailing one. My first two fixtures here could each exhibit neither.
+    const odd = " both ";
+    writeFileSync(join(w, odd), "the fix\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: [odd] });
+    check(r.ok && r.committed, "a filename with leading and trailing whitespace the worker declared is committed", JSON.stringify(r).slice(0, 200));
+    check(r.files.includes(odd), "and matched byte for byte", JSON.stringify(r.files));
+  }
+
+  {
+    // A NEW file inside a copied dependency tree. The heuristic design staged
+    // tracked edits inside such a tree but not additions, so this part of a
+    // multi-file repair was dropped while the rest published as if complete.
+    const w = mkWorktree("new-file-inside-a-copied-tree");
+    mkdirSync(join(w, "vendor"), { recursive: true });
+    writeFileSync(join(w, "vendor", "tracked.js"), "vendored\n");
+    g(w, "add", "-A"); g(w, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "vendor it");
+    writeFileSync(join(w, "vendor", "new-fix.js"), "the new part\n");
+    writeFileSync(join(w, "vendor", "tracked.js"), "the edited part\n");
+    writeFileSync(join(w, "fix.js"), "the rest\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: ["fix.js", "vendor/new-fix.js", "vendor/tracked.js"] });
+    check(r.ok && r.committed, "a repair adding a file inside a copied tree commits", JSON.stringify(r).slice(0, 200));
+    check(r.files.includes("vendor/new-fix.js"), "and the ADDED file is in it", r.files.join(", "));
+    check(r.files.includes("vendor/tracked.js"), "control: so is the edited tracked one", r.files.join(", "));
+  }
+
+  {
+    // A path git would ignore, declared anyway. `--force` is what makes the
+    // worker's declaration outrank the ignore rule.
+    const w = mkWorktree("declared-but-ignored");
+    writeFileSync(join(w, ".gitignore"), "generated/\n");
+    mkdirSync(join(w, "generated"), { recursive: true });
+    writeFileSync(join(w, "generated", "out.js"), "a generated file the fix needs\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: [".gitignore", "generated/out.js"] });
+    check(r.ok && r.committed, "a declared path inside an ignored directory commits", JSON.stringify(r).slice(0, 200));
+    check(r.files.includes("generated/out.js"), "because the declaration outranks the ignore rule", r.files.join(", "));
+  }
+
+  {
+    // Declared but never changed. This is the direction that used to lose work:
+    // publishing the rest as a complete repair while the omitted part went in the
+    // bin with the checkout.
+    const w = mkWorktree("declared-but-unchanged");
+    const before = g(w, "rev-parse", "HEAD");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+
+    // A path that does not exist is refused by `git add` itself. Worth asserting,
+    // but it is NOT what the declared-vs-staged check is for -- my first fixture
+    // here used exactly that and passed on git's error while the check itself was
+    // stubbed out.
+    const gone = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                                 declared: ["fix.js", "never-existed.js"] });
+    check(gone.ok === false, "a declared file that does not exist is refused", JSON.stringify(gone).slice(0, 180));
+
+    // THIS is the case the check exists for: `seed.js` is tracked and unchanged,
+    // so `git add` accepts it happily and stages nothing. Declaring a file you
+    // did not change means the report and the tree disagree, and publishing the
+    // rest as a complete repair is how the disagreement gets buried.
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: ["fix.js", "seed.js"] });
+    check(r.ok === false, "a declared file that exists but is unchanged refuses the commit", JSON.stringify(r));
+    check(/seed\.js/.test(r.why ?? ""), "and names it", String(r.why));
+    check(g(w, "rev-parse", "f") === before, "control: nothing was committed", before.slice(0, 8));
+    check(g(w, "diff", "--cached", "--name-only") === "", "and the index is left clean for the human who gets this", g(w, "diff", "--cached", "--name-only"));
+  }
+
+  {
+    // Declarations reeve refuses to act on at all. git rejects an escaping
+    // pathspec itself, but the refusal a worker sees should be reeve's and name
+    // the rule, and `.git` is worth refusing here rather than by `add` declining.
+    const w = mkWorktree("hostile-declarations");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    for (const [what, path] of [["an absolute path", "/etc/passwd"],
+                                ["a climb out of the checkout", "../../etc/passwd"],
+                                ["git's own state", ".git/config"],
+                                ["a nested climb", "src/../../outside"]]) {
+      const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                                declared: ["fix.js", path] });
+      check(r.ok === false, `a declared path that is ${what} is refused`, `${path}: ${JSON.stringify(r)}`);
+    }
+    check(g(w, "status", "--porcelain") === "?? fix.js", "control: and the checkout is untouched by any of them", g(w, "status", "--porcelain"));
+  }
+
+  {
+    // A RENAME. `git diff --cached --name-only` applies rename detection and
+    // reports only the destination, so a repair that renames a file and correctly
+    // declares both sides had the source read as never-changed and was refused.
+    const w = mkWorktree("rename");
+    writeFileSync(join(w, "old.js"), "a".repeat(40) + "\n" + "b".repeat(30) + "\n");
+    g(w, "add", "-A"); g(w, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "add it");
+    g(w, "mv", "old.js", "new.js");
+    // Control: git really does collapse this to one path without --no-renames.
+    check(g(w, "diff", "--cached", "--name-only").split("\n").filter(Boolean).length === 1,
+      "control: rename detection really does report one side only", g(w, "diff", "--cached", "--name-only"));
+    g(w, "reset", "--quiet", "HEAD", "--");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: ["old.js", "new.js"] });
+    check(r.ok && r.committed, "a rename with both sides declared commits", JSON.stringify(r).slice(0, 200));
+    check(r.files.includes("old.js") && r.files.includes("new.js"), "and both sides are accounted for", r.files.join(", "));
+  }
+
+  {
+    // A filename beginning with `:` is pathspec MAGIC to git, not a name. Measured:
+    // a real file called `:x` was rejected with "did not match any files", so every
+    // repair touching one would have been refused before commit.
+    const w = mkWorktree("pathspec-magic");
+    for (const odd of [":x", ":(icase)y", ":!z"]) {
+      writeFileSync(join(w, odd), "the fix\n");
+      const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                                declared: [odd] });
+      check(r.ok && r.committed, `a filename starting with pathspec magic (${odd}) is committed`, JSON.stringify(r).slice(0, 180));
+      check(r.files.includes(odd), "and matched literally", JSON.stringify(r.files));
+    }
+  }
+
+  {
+    // The digest, not the name. git reports an edited copy exactly as it reports an
+    // untouched one, so a pathname baseline cannot tell them apart.
+    const w = mkWorktree("digest");
+    mkdirSync(join(w, "vendor"), { recursive: true });
+    writeFileSync(join(w, "vendor", "dep.js"), "as copied\n");
+    const base = fingerprint(w, ["vendor/dep.js"]);
+    check(typeof base["vendor/dep.js"] === "string" && base["vendor/dep.js"].length === 64,
+      "a baseline records a digest per path", JSON.stringify(base));
+    check(digestOf(join(w, "vendor", "dep.js")) === base["vendor/dep.js"],
+      "control: an untouched file still matches it", "");
+    writeFileSync(join(w, "vendor", "dep.js"), "patched\n");
+    check(digestOf(join(w, "vendor", "dep.js")) !== base["vendor/dep.js"],
+      "and an edited one does not", "");
+    check(digestOf(join(w, "vendor", "absent.js")) === null,
+      "an unreadable path is null, which never matches, so it fails closed", "");
+
+    // This runs in the DAEMON, unsandboxed, over paths a worker controls. A copied
+    // file replaced with a symlink to /dev/zero would be read forever.
+    symlinkSync("/dev/zero", join(w, "vendor", "as-device"));
+    check(digestOf(join(w, "vendor", "as-device")) === null,
+      "a symlink to a device is not followed, and reads as changed", "");
+    symlinkSync(join(w, "vendor", "dep.js"), join(w, "vendor", "as-link"));
+    check(digestOf(join(w, "vendor", "as-link")) === null,
+      "nor is a symlink to an ordinary file, since only a regular file is hashed", "");
+    check(digestOf(join(w, "vendor")) === null, "and a directory is not a file", "");
+  }
+
+  rmSync(cRoot, { recursive: true, force: true });
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

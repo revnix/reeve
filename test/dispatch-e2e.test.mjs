@@ -20,8 +20,17 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-e2e-"));
 // deployment must have them: the worker policy denies reads of the clone, so a
 // checkout INSIDE it would be denied its own code and the dispatch refuses.
 const clone = mkdtempSync(join(tmpdir(), "reeve-e2e-clone-"));
+// A real repository with a LOCAL identity. reeve reads user.name/user.email from
+// the founder's checkout to commit a worker's work, and a fixture that fell
+// through to the developer's global config would pass here and fail on a machine
+// that has none.
+execFileSync("git", ["-C", clone, "init", "-q"]);
+execFileSync("git", ["-C", clone, "config", "user.name", "Founder"]);
+execFileSync("git", ["-C", clone, "config", "user.email", "founder@example.invalid"]);
 const dbPath = join(dir, "e.db");
 const logPath = join(dir, "log.txt");
+import { fingerprint } from "../src/checkout.mjs";
+
 let fail = 0;
 const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
@@ -358,7 +367,7 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   const logU = readFileSync(join(dirU, "log.txt"), "utf8");
   const escU = [...rU.escalations.keys()].join(" | ");
 
-  check(publishedU === 0, "a checkout with uncommitted work is NOT published", `published=${publishedU}`);
+  check(publishedU === 0, "a checkout with uncommitted work on ANOTHER branch is NOT published", `published=${publishedU}`);
   check(!/published \d+ file/.test(logU), "and the log does not say it was", logU.split("\n").filter(l => /publish/.test(l)).join(" | ").slice(0, 200));
   check(/uncommitted/.test(escU), "the escalation says what is wrong with it", escU);
   check(existsSync(join(`${wtU}.unfetched`, "fix.js")) || existsSync(join(wtU, "fix.js")),
@@ -366,6 +375,338 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   ctxU.db.close();
   rmSync(dirU, { recursive: true, force: true });
   rmSync(`${wtU}.unfetched`, { recursive: true, force: true });
+}
+
+// --- reeve COMMITS what the worker could not, and then publishes it ----------
+//
+// The worker's sandbox denies Bash writes to `.git`, so `git add` and
+// `git commit` fail with EPERM on `.git/index.lock`. Measured 2026-08-23: three
+// dispatches, three correct fixes, nothing published, because the fix only ever
+// existed in the working tree. reeve commits before the gates, and the gates then
+// judge the ref that results.
+{
+  const dirV = mkdtempSync(join(tmpdir(), "reeve-e2e-reeve-commits-"));
+  const wtV = mkdtempSync(join(dirV, "wt-"));
+  execFileSync("git", ["-C", wtV, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtV, "seed.js"), "seed\n");
+  execFileSync("git", ["-C", wtV, "add", "-A"]);
+  execFileSync("git", ["-C", wtV, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"]);
+  const pinnedV = execFileSync("git", ["-C", wtV, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  // What a worker leaves behind now: the fix, in the files, uncommitted. Plus a
+  // file git is told to ignore, which must not travel.
+  writeFileSync(join(wtV, ".gitignore"), "ignored.log\n");
+  writeFileSync(join(wtV, "fix.js"), "the fix the worker could not commit\n");
+  writeFileSync(join(wtV, "ignored.log"), "build noise\n");
+  // And a dependency tree the DAEMON copied in, which this repository does not
+  // ignore. It must not be staged into the repair -- and, having been excluded,
+  // must not then make the checkout look dirty and quarantine the whole thing.
+  mkdirSync(join(wtV, "node_modules", "pkg"), { recursive: true });
+  writeFileSync(join(wtV, "node_modules", "pkg", "index.js"), "vendored\n");
+
+  let publishedV = 0, atPublish = null;
+  const ctxV = { ...baseCtx(), db: open(join(dirV, "v.db")), logPath: join(dirV, "log.txt"),
+                 // Declared so `dependencyPathsFor` yields node_modules, which is
+                 // what the daemon copies in and must exclude on both sides.
+                 profile: { ...profile, units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm" }] },
+                 evaluate: () => ({ ...evaluation, head: pinnedV, headRef: "f" }),
+                 // The BASELINE: what preparation itself left untracked. Reeve
+                 // subtracts exactly these, so a file it did not put there is the
+                 // worker's however deep inside a copied tree it sits.
+                 prepareCheckout: () => ({ ok: true, path: wtV, why: null,
+                                           deps: { ok: true, cow: false, copied: ["node_modules"],
+                                                   untracked: fingerprint(wtV, ["node_modules/pkg/index.js"]) } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 // Read at the moment reeve considers the work publishable: a
+                 // successful publish releases the checkout, so nothing can be
+                 // inspected after the tick returns.
+                 publishWork: ({ path }) => {
+                   publishedV++;
+                   const gv = (...a) => execFileSync("git", ["-C", path, ...a], { encoding: "utf8" }).trim();
+                   atPublish = { head: gv("rev-parse", "f"),
+                                 // Excluding what the daemon copied in: the
+                                 // invariant is that nothing the WORKER did is
+                                 // dropped, not that the directory is pristine.
+                                 dirty: gv("status", "--porcelain", "--", ".", ":(exclude)node_modules"),
+                                 leftover: gv("status", "--porcelain"),
+                                 shipped: gv("diff", "--name-only", `${pinnedV}..refs/heads/f`).split("\n").filter(Boolean),
+                                 who: gv("log", "-1", "--format=%an <%ae>"),
+                                 subject: gv("log", "-1", "--format=%s"), body: gv("log", "-1", "--format=%b") };
+                   return { ok: true, why: null };
+                 },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s",
+                                             report: { fixed: true, cause: "the day was read in local time",
+                                                       change: "use the UTC accessors",
+                                                       filesTouched: [".gitignore", "fix.js"] } }) };
+  const rV = await tick(ctxV);
+  const escV = [...rV.escalations.keys()].join(" | ");
+  check(atPublish !== null, "control: reeve reached the publish step at all", escV);
+  // Every assertion below is conditioned on having reached it. Without that, a
+  // run that never publishes leaves these undefined and `undefined !== pinned`
+  // reads as a pass -- the check would be green precisely when the fix is gone.
+  const at = atPublish ?? {};
+  const reached = atPublish !== null;
+  const shipped = at.shipped ?? [];
+
+  check(reached && at.head !== pinnedV, "reeve commits the work the worker left in the files", `${pinnedV.slice(0, 8)} -> ${String(at.head ?? "(never published)").slice(0, 8)}`);
+  check(reached && publishedV === 1, "and publishes it", `published=${publishedV} esc=${escV}`);
+  check(reached && at.dirty === "", "leaving nothing of the worker's uncommitted, so nothing is silently dropped", String(at.dirty ?? "(never published)"));
+  check(reached && /node_modules/.test(at.leftover ?? ""), "control: the dependency tree really was still sitting there untracked", String(at.leftover ?? "(never published)").slice(0, 120));
+  check(reached && shipped.includes("fix.js"), "the fix travels", shipped.join(", ") || "(never published)");
+  check(reached && !shipped.includes("ignored.log"), "an ignored file does not", shipped.join(", ") || "(never published)");
+  check(reached && !shipped.some(f => f.startsWith("node_modules/")), "and neither does the dependency tree reeve copied in", shipped.join(", ") || "(never published)");
+
+  // The commit must carry the FOUNDER's identity. With GIT_CONFIG_GLOBAL at
+  // /dev/null a worker checkout has none, and git invents one from the username
+  // and the hostname -- an address nobody owns, which a ruleset requiring a
+  // verified committer refuses.
+  check(reached && at.who === "Founder <founder@example.invalid>", "under the founder's identity, not one git invented", String(at.who ?? "(never published)"));
+
+  // And the message is reeve's, built from the worker's own two sentences.
+  check(reached && at.subject === "fix(ci): use the UTC accessors", "the subject is Conventional Commits, from the report's `change`", String(at.subject ?? "(never published)"));
+  check(reached && at.body === "the day was read in local time", "and the body is the report's `cause`", String(at.body ?? "(never published)"));
+  check(reached && String(at.subject ?? "x".repeat(99)).length <= 72, "control: the subject fits the 72-character limit", String((at.subject ?? "").length));
+
+  ctxV.db.close();
+  rmSync(dirV, { recursive: true, force: true });
+}
+
+// --- an UNDECLARED file inside a copied tree is still the worker's ------------
+//
+// Every path-exclusion shape hid this: `:(exclude)<tree>` dropped the tree
+// entirely, and `--untracked-files=no` inside it dropped exactly the new files.
+// So a worker could declare and commit `fix.js`, leave an undeclared
+// `vendor/patch.js`, and reeve would publish the incomplete repair and then
+// delete the only copy of the omitted part. The baseline recorded at prepare time
+// is what separates reeve's own files from the worker's.
+{
+  const dirB = mkdtempSync(join(tmpdir(), "reeve-e2e-baseline-"));
+  const wtB = mkdtempSync(join(dirB, "wt-"));
+  execFileSync("git", ["-C", wtB, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtB, "seed.js"), "seed\n");
+  execFileSync("git", ["-C", wtB, "add", "-A"]);
+  execFileSync("git", ["-C", wtB, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"]);
+  const pinnedB = execFileSync("git", ["-C", wtB, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  // Preparation copied `vendor/dep.js` in, and the repository does not ignore it.
+  mkdirSync(join(wtB, "vendor"), { recursive: true });
+  writeFileSync(join(wtB, "vendor", "dep.js"), "copied in by the daemon\n");
+  // The worker's work: one declared file, and one it did NOT declare, sitting
+  // inside that same tree where every exclusion shape lost it.
+  writeFileSync(join(wtB, "fix.js"), "the declared part\n");
+  writeFileSync(join(wtB, "vendor", "patch.js"), "the part it did not report\n");
+
+  let publishedB = 0;
+  const ctxB = { ...baseCtx(), db: open(join(dirB, "b.db")), logPath: join(dirB, "log.txt"),
+                 profile: { ...profile, worker: { dependencyPaths: ["vendor"] },
+                            units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm" }] },
+                 evaluate: () => ({ ...evaluation, head: pinnedB, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtB, why: null,
+                                           deps: { ok: true, cow: false, copied: ["vendor"],
+                                                   untracked: fingerprint(wtB, ["vendor/dep.js"]) } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedB++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s",
+                                             report: { fixed: true, cause: "c", change: "ch",
+                                                       filesTouched: ["fix.js"] } }) };
+  const rB = await tick(ctxB);
+  const escB = [...rB.escalations.keys()].join(" | ");
+  const keptB = existsSync(`${wtB}.unfetched`) ? `${wtB}.unfetched` : existsSync(wtB) ? wtB : null;
+
+  check(publishedB === 0, "an undeclared file inside a copied tree stops the publication", `published=${publishedB} esc=${escB}`);
+  check(/uncommitted/.test(escB), "and the escalation says what is wrong", escB);
+  check(!!keptB && existsSync(join(keptB, "vendor", "patch.js")), "and the omitted part is kept, not deleted with the checkout", String(keptB));
+  ctxB.db.close();
+  rmSync(dirB, { recursive: true, force: true });
+  rmSync(`${wtB}.unfetched`, { recursive: true, force: true });
+}
+
+// --- an EDIT to a file reeve copied is the worker's too -----------------------
+//
+// git reports an edited copy exactly as it reports an untouched one -- the same
+// `?? vendor/dep.js` -- so a baseline of PATHNAMES subtracted the worker's edit
+// and an incomplete repair published: the tests passed only with the omitted
+// dependency patch, and the checkout carrying it was then deleted. The digest is
+// what separates them.
+{
+  const dirE = mkdtempSync(join(tmpdir(), "reeve-e2e-edited-copy-"));
+  const wtE = mkdtempSync(join(dirE, "wt-"));
+  execFileSync("git", ["-C", wtE, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtE, "seed.js"), "seed\n");
+  execFileSync("git", ["-C", wtE, "add", "-A"]);
+  execFileSync("git", ["-C", wtE, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"]);
+  const pinnedE = execFileSync("git", ["-C", wtE, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  mkdirSync(join(wtE, "vendor"), { recursive: true });
+  writeFileSync(join(wtE, "vendor", "dep.js"), "as the daemon copied it\n");
+  // The baseline is taken HERE, exactly as preparation would take it.
+  const baseE = fingerprint(wtE, ["vendor/dep.js"]);
+  // Now the worker patches that copy and does not declare it.
+  writeFileSync(join(wtE, "vendor", "dep.js"), "patched by the worker\n");
+  writeFileSync(join(wtE, "fix.js"), "the declared companion\n");
+
+  let publishedE = 0;
+  const ctxE = { ...baseCtx(), db: open(join(dirE, "e.db")), logPath: join(dirE, "log.txt"),
+                 profile: { ...profile, worker: { dependencyPaths: ["vendor"] },
+                            units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm" }] },
+                 evaluate: () => ({ ...evaluation, head: pinnedE, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtE, why: null,
+                                           deps: { ok: true, cow: false, copied: ["vendor"], untracked: baseE } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedE++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s",
+                                             report: { fixed: true, cause: "c", change: "ch", filesTouched: ["fix.js"] } }) };
+  const rE = await tick(ctxE);
+  const escE = [...rE.escalations.keys()].join(" | ");
+  const keptE = existsSync(`${wtE}.unfetched`) ? `${wtE}.unfetched` : existsSync(wtE) ? wtE : null;
+
+  check(publishedE === 0, "an EDIT to a file reeve copied stops the publication", `published=${publishedE} esc=${escE}`);
+  check(!!keptE && readFileSync(join(keptE, "vendor", "dep.js"), "utf8").includes("patched by the worker"),
+    "and the patch is kept, not deleted with the checkout", String(keptE));
+  ctxE.db.close();
+  rmSync(dirE, { recursive: true, force: true });
+  rmSync(`${wtE}.unfetched`, { recursive: true, force: true });
+}
+
+// --- a DECLARED dependency path that was never copied is the worker's ---------
+//
+// Preparation skips a declared dependency path that does not exist in the
+// founder's checkout. Excluding the DECLARED list rather than what was actually
+// copied would then hide the worker's own creation of that path from staging and
+// from the uncommitted check at once: the rest of the fix ships and that part is
+// deleted with the checkout, silently.
+{
+  const dirP = mkdtempSync(join(tmpdir(), "reeve-e2e-declared-dep-"));
+  const wtP = mkdtempSync(join(dirP, "wt-"));
+  execFileSync("git", ["-C", wtP, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtP, "seed.js"), "seed\n");
+  execFileSync("git", ["-C", wtP, "add", "-A"]);
+  execFileSync("git", ["-C", wtP, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"]);
+  const pinnedP = execFileSync("git", ["-C", wtP, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  // The fix creates the very path the profile declares as a dependency tree --
+  // which preparation found nothing to copy for.
+  mkdirSync(join(wtP, "vendor"), { recursive: true });
+  writeFileSync(join(wtP, "vendor", "patch.js"), "the part of the fix that lives here\n");
+  writeFileSync(join(wtP, "fix.js"), "the rest of it\n");
+
+  let publishedP = 0, atP = null;
+  const ctxP = { ...baseCtx(), db: open(join(dirP, "p.db")), logPath: join(dirP, "log.txt"),
+                 profile: { ...profile, worker: { dependencyPaths: ["vendor"] },
+                            units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm" }] },
+                 evaluate: () => ({ ...evaluation, head: pinnedP, headRef: "f" }),
+                 // Declared "vendor", copied NOTHING: it did not exist to copy.
+                 prepareCheckout: () => ({ ok: true, path: wtP, why: null, deps: { ok: true, cow: false, copied: [] } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: ({ path }) => {
+                   publishedP++;
+                   atP = execFileSync("git", ["-C", path, "diff", "--name-only", `${pinnedP}..refs/heads/f`], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+                   return { ok: true, why: null };
+                 },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s",
+                                             report: { fixed: true, cause: "c", change: "ch",
+                                                       filesTouched: ["fix.js", "vendor/patch.js"] } }) };
+  const rP = await tick(ctxP);
+  const escP = [...rP.escalations.keys()].join(" | ");
+
+  check(publishedP === 1, "a fix that creates a declared-but-uncopied path is published", `published=${publishedP} esc=${escP}`);
+  check((atP ?? []).includes("vendor/patch.js"), "and that part of it travels rather than being dropped", (atP ?? ["(never published)"]).join(", "));
+  check((atP ?? []).includes("fix.js"), "control: so does the rest", (atP ?? ["(never published)"]).join(", "));
+  ctxP.db.close();
+  rmSync(dirP, { recursive: true, force: true });
+  rmSync(`${wtP}.unfetched`, { recursive: true, force: true });
+}
+
+// --- a report that does not account for the checkout is not a repair ---------
+//
+// The diff gate judges paths and territory, never intent, so a reproduction
+// script inside the lane passes it and would be published as part of the fix.
+// Only the worker knows which of its files were the repair, so a disagreement
+// between what it reported and what it left is the check.
+//
+// The absent and malformed report cases are the same rule read the other way: a
+// run that says nothing has not said it fixed anything.
+for (const [what, report, commits] of [
+  // The declared part DOES commit here: staging from the declaration means the
+  // undeclared file is never staged, and what refuses is the uncommitted-work
+  // gate on exactly what is left. Nothing publishes either way.
+  ["an undeclared scratch file", { fixed: true, cause: "c", change: "ch", filesTouched: ["fix.js"] }, true],
+  ["no report at all", null, false],
+  ["a report with no `fixed`", { cause: "c", change: "ch", filesTouched: ["fix.js", "repro.js"] }, false],
+  // An unusable `filesTouched` is refused before any staging happens at all.
+  ["no filesTouched at all", { fixed: true, cause: "c", change: "ch" }, false],
+  ["a filesTouched that is not an array", { fixed: true, cause: "c", change: "ch", filesTouched: "fix.js" }, false],
+]) {
+  const dirU2 = mkdtempSync(join(tmpdir(), "reeve-e2e-undeclared-"));
+  const wtU2 = mkdtempSync(join(dirU2, "wt-"));
+  execFileSync("git", ["-C", wtU2, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtU2, "seed.js"), "seed\n");
+  execFileSync("git", ["-C", wtU2, "add", "-A"]);
+  execFileSync("git", ["-C", wtU2, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"]);
+  const pinnedU2 = execFileSync("git", ["-C", wtU2, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  // The fix, and beside it a reproduction script the worker did not declare.
+  writeFileSync(join(wtU2, "fix.js"), "the fix\n");
+  writeFileSync(join(wtU2, "repro.js"), "console.log('reproducing')\n");
+
+  let publishedU2 = 0;
+  const ctxU2 = { ...baseCtx(), db: open(join(dirU2, "u2.db")), logPath: join(dirU2, "log.txt"),
+                  evaluate: () => ({ ...evaluation, head: pinnedU2, headRef: "f" }),
+                  prepareCheckout: () => ({ ok: true, path: wtU2, why: null, deps: { ok: true, cow: false, copied: [] } }),
+                  verifyConfig: () => ({ ok: true, why: null }),
+                  publishWork: () => { publishedU2++; return { ok: true, why: null }; },
+                  spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", report }) };
+  const rU2 = await tick(ctxU2);
+  const escU2 = [...rU2.escalations.keys()].join(" | ");
+  // Whichever path survived: a refusal quarantines, and a publish would have
+  // released the checkout entirely. Read defensively so a regression FAILS here
+  // rather than throwing and taking the rest of the file with it.
+  const keptAt = existsSync(`${wtU2}.unfetched`) ? `${wtU2}.unfetched` : existsSync(wtU2) ? wtU2 : null;
+  const movedU2 = keptAt
+    ? execFileSync("git", ["-C", keptAt, "rev-parse", "f"], { encoding: "utf8" }).trim()
+    : null;
+
+  check(publishedU2 === 0, `${what}: nothing is published`, `published=${publishedU2} esc=${escU2}`);
+  check(commits ? movedU2 !== pinnedU2 : movedU2 === pinnedU2,
+    commits ? "the declared part is committed, and held back rather than shipped" : "and nothing was committed either",
+    `${pinnedU2.slice(0, 8)} vs ${String(movedU2 ?? "(checkout gone)").slice(0, 8)}`);
+  check(!!keptAt && existsSync(join(keptAt, "repro.js")), "the work is kept for a human", String(keptAt));
+  ctxU2.db.close();
+  rmSync(dirU2, { recursive: true, force: true });
+  rmSync(`${wtU2}.unfetched`, { recursive: true, force: true });
+}
+
+// --- a worker that DECLINES must not have its exploration published ----------
+//
+// `classifyResult` judges the process, so a run that reports `fixed: false`
+// still arrives as OK -- and the output contract calls that a good outcome.
+// Before reeve committed, the uncommitted-work gate stopped those edits. If reeve
+// commits first, a declared non-fix becomes a publishable repair.
+for (const [what, report] of [
+  ["fixed: false", { fixed: false, cause: "could not reproduce it", change: "nothing" }],
+  ["needsHuman", { fixed: true, needsHuman: "this needs a schema migration", cause: "c", change: "ch" }],
+]) {
+  const dirD = mkdtempSync(join(tmpdir(), "reeve-e2e-declined-"));
+  const wtD = mkdtempSync(join(dirD, "wt-"));
+  execFileSync("git", ["-C", wtD, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtD, "seed.js"), "seed\n");
+  execFileSync("git", ["-C", wtD, "add", "-A"]);
+  execFileSync("git", ["-C", wtD, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"]);
+  const pinnedD = execFileSync("git", ["-C", wtD, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  // What it leaves behind while deciding it cannot finish.
+  writeFileSync(join(wtD, "explored.js"), "half an idea\n");
+
+  let publishedD = 0;
+  const ctxD = { ...baseCtx(), db: open(join(dirD, "d.db")), logPath: join(dirD, "log.txt"),
+                 evaluate: () => ({ ...evaluation, head: pinnedD, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtD, why: null, deps: { ok: true, cow: false } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedD++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s", report }) };
+  const rD = await tick(ctxD);
+  const escD = [...rD.escalations.keys()].join(" | ");
+  const kept = existsSync(join(`${wtD}.unfetched`, "explored.js")) || existsSync(join(wtD, "explored.js"));
+
+  check(publishedD === 0, `a worker reporting ${what} publishes nothing`, `published=${publishedD} esc=${escD}`);
+  check(kept, "and its exploration is kept rather than deleted", `${wtD}`);
+  ctxD.db.close();
+  rmSync(dirD, { recursive: true, force: true });
+  rmSync(`${wtD}.unfetched`, { recursive: true, force: true });
 }
 
 // --- a token in the COMMIT MESSAGE travels with the push too -----------------

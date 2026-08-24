@@ -35,6 +35,7 @@ import { join, dirname, resolve, basename } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { resolveHome } from "../src/home.mjs";
 // The build route. `HUB_TABLES` is deliberately NOT here: Task 9 adds that
 // export, and ESM rejects a missing named export at module instantiation, so
 // naming it now would stop EVERY reeve command from starting.
@@ -286,7 +287,17 @@ if (flag("help")) { usage(); process.exit(0); }
 
 // AFTER the parser, so `--home` can feed it. Order matters: this used to sit
 // above `argv` and could therefore only ever read the environment.
-const HOME = opt("home") ?? process.env.REEVE_HOME ?? join(homedir(), ".reeve");
+const HOME = resolveHome(opt("home"));
+// And WRITTEN BACK, before any route runs. `--home` used to change only this
+// constant, so `credentialPaths()` still denied the state root named by the
+// ENVIRONMENT and the canary still wrote its decoy under `~/.reeve` -- a
+// sandbox that omits the tree the operator asked to isolate, and a canary
+// measuring a file the policy was never about, which can answer "containment
+// closed" for a policy that contains nothing. Rather than thread the home
+// through the sandbox, the daemon, the canary and the App credentials -- four
+// more places to forget -- the flag and the variable become ONE mechanism.
+// Every consumer therefore reads it LAZILY; see src/home.mjs.
+process.env.REEVE_HOME = HOME;
 
 /** Repo identity is the remote, never the path: one repo can sit at two paths on two commits. */
 /**
@@ -371,8 +382,15 @@ switch (cmd) {
       // Where the daemon records its canary: the same HOME the daemon logs to.
       stateDir: HOME,
     });
-    if (flag("json")) console.log(JSON.stringify(result, null, 2));
-    else console.log(render(result, nwo));
+    // The home doctor is reporting FROM, and `resolveHome()` rather than
+    // `HOME` on purpose: this is the answer every module below will get, which
+    // is the value that can be wrong. The single most confusing thing about this
+    // CLI has been which home a command actually acted on -- it is how a hub
+    // came to exist in the operator's real ~/.reeve -- and "what is actually
+    // true right now" is precisely doctor's job.
+    const home = resolveHome();
+    if (flag("json")) console.log(JSON.stringify({ home, ...result }, null, 2));
+    else console.log(render(result, nwo) + `\n\nhome  ${home}`);
     if (!profile.path && !flag("json")) {
       console.log(`\nno profile for ${nwo}. Checks that need one were skipped.\n-> reeve init`);
     }
@@ -604,7 +622,10 @@ switch (cmd) {
       if (eq < 0) { console.error(`reeve init: --set expects key=value, got ${JSON.stringify(kv)}`); process.exit(1); }
       answers[kv.slice(0, eq)] = kv.slice(eq + 1);
     }
-    const r = init({ root: process.cwd(), answers, write: flag("write") });
+    // `home` explicitly, not just via the environment: init WRITES, and a
+    // function whose destination comes from an ambient variable is one whose
+    // destination is invisible at the call site.
+    const r = init({ root: process.cwd(), answers, write: flag("write"), home: HOME });
     console.log(r.output);
     process.exit(r.code);
   }

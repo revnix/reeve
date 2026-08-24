@@ -31,6 +31,7 @@
 import { writeFileSync, mkdirSync, chmodSync, renameSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
+import { resolveHome } from "./home.mjs";
 
 /**
  * What this environment can and cannot promise, read by the daemon before any
@@ -195,7 +196,7 @@ export function workerHomeFor(root, nwo) {
  * file even though it holds the value in its own environment (which no other
  * sandboxed process can read: measured 2026-08-22).
  */
-export function readOauthToken(path = join(homedir(), ".reeve", "claude-token")) {
+export function readOauthToken(path = join(resolveHome(), "claude-token")) {
   let raw;
   try { raw = readFileSync(path, "utf8"); }
   catch (e) { return { ok: false, why: `${path} could not be read (${e.code ?? e.message}); create one with \`claude setup-token\`` }; }

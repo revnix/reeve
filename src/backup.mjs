@@ -616,6 +616,23 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     return `${dbPath}.${kind}-${at}-${pid}`;
   };
   let live = null, locked = false, lockDb = null, quarantined = null, synthetic = false, swapped = false;
+  // DELETION AUTHORITY IS PROVEN, NOT REMEMBERED.
+  //
+  // `synthetic` says this invocation created the file. That alone never
+  // authorised removing it: the file may have been created by SOMEONE ELSE in
+  // the window between the existence check and `openHub`, and it may have picked
+  // up a live writer since. Three early returns learned that separately and each
+  // cleared the flag on its way out -- and the fourth, the one that refuses when
+  // the born scan could not READ a lease table, did not. So a refusal issued
+  // precisely because a creation-window writer could not be ruled out went on to
+  // unlink the database that writer may have been holding.
+  //
+  // Clearing a dangerous flag is a thing every future return has to remember.
+  // This is the same fact stated positively: the finally may delete only what
+  // the born scan positively proved is this invocation's alone -- every table
+  // read, no live holder, the version still ours, and the lock held. A return
+  // added below cannot forget to clear it, because it was never set.
+  let exclusive = false;
   // The unreadable path names the quarantine here and copies it one step before
   // the swap; the version-zero path has to copy immediately, because it migrates
   // the file. This says which already happened.
@@ -772,16 +789,48 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // the one recovery this command exists for. Measured, on the first attempt.
     // The sidecars are already copied aside above, so this open cannot cost the
     // WAL whatever it finds.
-    const readableVersion = (path) => {
+    // THREE ANSWERS, because a MISSING version table is not an unreadable file.
+    //
+    // A hub whose `schema_version` was DROPPED -- while its lease tables and its
+    // event log stayed intact -- made this query throw, and a bare `null` sent it
+    // down the UNREADABLE path, where the lock is taken in the sibling
+    // `.restore-lock`. That file is not unreadable to everyone. `openHub` creates
+    // `schema_version` as plain DDL, and migration 1 is `CREATE TABLE IF NOT
+    // EXISTS` for all 31 tables and 23 indexes -- so a concurrent `build run`
+    // opens exactly this store, completes migration 1 in it, and takes its
+    // singleton lease in the CANONICAL database, never consulting the sibling.
+    // The forced restore then replaced the file underneath a live writer.
+    // Measured: `openHub` on a hub with `schema_version` dropped returns version
+    // 1 with its existing lease row still present.
+    //
+    // The question this predicate really answers is "can another process become
+    // a writer in this file", and a dropped version table answers it exactly as
+    // version zero does: yes, through `openHub`. So it routes the same way --
+    // canonical lock, holder scan, event probe taken before the migration -- and
+    // the sibling lock is left to the file nobody can open at all.
+    const readVersion = (path) => {
       let d = null;
       try {
         d = new DatabaseSync(path, { timeout: 10000 });
-        return d.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+        // Asked of the CATALOGUE, because that is the fact `openHub` acts on:
+        // its `CREATE TABLE IF NOT EXISTS schema_version` keys off exactly this
+        // list. A table that IS listed and cannot be read is damage, and the
+        // query below is what discovers that -- absence and damage are two
+        // answers here, not one.
+        const listed = d.prepare(
+          "SELECT count(*) c FROM sqlite_master WHERE type='table' AND name='schema_version'").get().c;
+        if (!listed) return { absent: true };
+        return { v: d.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v };
       } catch { return null; }
       finally { try { d?.close(); } catch {} }
     };
-    const bootstrapZero = existsSync(dbPath) && readableVersion(dbPath) === 0;
-    if (!existsSync(dbPath) || bootstrapZero) {
+    const probedVersion = existsSync(dbPath) ? readVersion(dbPath) : null;
+    const versionTableGone = probedVersion?.absent === true;
+    const bootstrapZero = probedVersion?.v === 0;
+    // What the two share is the only thing this branch needs from them: no
+    // completed migration is visible, and `openHub` will complete one HERE.
+    const bootstrapCanonical = bootstrapZero || versionTableGone;
+    if (!existsSync(dbPath) || bootstrapCanonical) {
       // SYNTHETIC, and tracked as such. This file exists only to carry the
       // maintenance lock while the real one is staged; nothing has restored
       // into it. If staging or replay then fails -- a malformed supplied tail
@@ -790,7 +839,7 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // lock, and used to leave a fully migrated EMPTY hub at the canonical
       // path. A restarted builder finds a healthy-looking store with no state
       // in it, which is worse than finding nothing: nothing is obviously wrong.
-      synthetic = !bootstrapZero;
+      synthetic = !bootstrapCanonical;
       // KEPT, before it is migrated. Sending a version-zero store down this
       // branch bought exclusion where a bootstrapping builder looks for it, and
       // it would have quietly sold something the unreadable path had chosen: the
@@ -810,13 +859,17 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // treated as an empty tail. The question is whether the log was there when
       // we arrived, and only a read taken before the migration can answer it.
       let hadEventsBefore = false;
-      if (bootstrapZero) {
+      if (bootstrapCanonical) {
         try {
           const q = new DatabaseSync(dbPath, { readOnly: true });
           try { q.prepare("SELECT * FROM hub_event LIMIT 1").get(); hadEventsBefore = true; }
           finally { q.close(); }
         } catch { hadEventsBefore = false; }
-        quarantined = quarantineName("incomplete");
+        // `.incomplete-` for a half-created store and `.damaged-` for one whose
+        // version table was destroyed: an operator is about to look at this copy,
+        // and telling them the wrong thing about it is its own defect. Unfinished
+        // and damaged are not the same file.
+        quarantined = quarantineName(versionTableGone ? "damaged" : "incomplete");
         try { copyFileSync(dbPath, quarantined); quarantineCopied = true; populated.add(quarantined); }
         catch { quarantined = null; }
       }
@@ -836,7 +889,7 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // answer -- there is nothing to carry forward.
       // `hadEventsBefore` gates it on the version-zero path: after migration 1
       // the table always exists, so a post-migration probe can only ever say yes.
-      try { live.prepare("SELECT * FROM hub_event LIMIT 1").get(); liveHasEvents = !bootstrapZero || hadEventsBefore; }
+      try { live.prepare("SELECT * FROM hub_event LIMIT 1").get(); liveHasEvents = !bootstrapCanonical || hadEventsBefore; }
       catch { liveHasEvents = false; }
       // AND AN UNREADABLE LOG IS A REFUSAL HERE TOO, not a quiet `false`.
       //
@@ -948,12 +1001,17 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       if (bornHolders.length) {
         synthetic = false;
         return { ok: false, holders: bornHolders,
-          why: `a builder started in the ${bootstrapZero ? "unmigrated" : "absent"} hub at ${dbPath} while this ` +
+          why: `a builder started in the ${bootstrapCanonical ? (versionTableGone ? "unversioned" : "unmigrated") : "absent"} hub at ${dbPath} while this ` +
                `restore was preparing it, and is writing to it now:\n` +
                bornHolders.map(h => `  ${h.what.padEnd(8)} pid ${h.pid} (started ${h.lstart})  ${h.command}`).join("\n") +
                `\n  stop it and re-run. force does not override a live holder; replacing the file ` +
                `underneath it would leave it writing to a database with no name.` };
       }
+      // EVERY question answered, and every answer the safe one: the scan read
+      // each lease table, found nobody alive in them, the version under the lock
+      // is still one this binary wrote, and the maintenance lock is held. This is
+      // the only place that grants the finally its authority.
+      exclusive = true;
     } else if ((opened = rawOpen(dbPath))?.blocked) {
       // NOTHING IS KNOWN ABOUT THIS FILE YET. A blocked probe is not evidence of
       // damage and not evidence of health, and every branch below needs one or
@@ -1646,7 +1704,7 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // that no longer exists is not a release, it is a write to a ghost. This is
     // the remaining half of the synthetic problem -- the two-restore loser was
     // fixed by `synthetic = false`; this is the failure-path ordering.
-    const dropSynthetic = synthetic && !swapped;
+    const dropSynthetic = synthetic && exclusive && !swapped;
     if (dropSynthetic) {
       try { live?.close(); } catch {}
       live = null;

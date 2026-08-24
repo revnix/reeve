@@ -2482,6 +2482,142 @@ function writeAuthority(db, project) {
   rmSync(zHome, { recursive: true, force: true });
 }
 
+// ── a DROPPED version table is not an unreadable file ──────────────────────
+// The unreadable path locks a SIBLING, `<dbPath>.restore-lock`, because a file
+// nobody can open cannot hold a lock. A hub whose `schema_version` was dropped
+// while its lease tables and event log survived was sent down that path by a
+// failed version query -- and it is not unreadable to anyone. `openHub` creates
+// `schema_version` as plain DDL and migration 1 is `CREATE TABLE IF NOT EXISTS`
+// throughout, so a concurrent `build run` completes migration 1 in the CANONICAL
+// file and takes its singleton there, never looking at the sibling. The restore
+// then replaced the file underneath that live writer.
+{
+  const dHome = mkdtempSync(join(tmpdir(), "reeve-dropver-"));
+  mkdirSync(join(dHome, "state"), { recursive: true });
+  const src = openHub(join(dHome, "state", "src.db"));
+  const snapD = snapshot(src, join(dHome, "backups"), "hub");
+  src.close();
+  check(snapD.ok, "fixture: a hub snapshot exists to restore from", JSON.stringify(snapD));
+
+  const t = join(dHome, "state", "dropped.db");
+  const d = openHub(t);
+  // A LIVE HOLDER, which is the whole point: the canonical path can see it and
+  // the sibling path cannot. Without one, both paths refuse and the test would
+  // pass for the wrong reason.
+  d.prepare(`INSERT INTO singleton_lease(name,pid,lstart,command,acquired_at,expires_at)
+             VALUES('builder',4242,'L','reeve build run',unixepoch(),unixepoch()+60)`).run();
+  d.exec("DROP TABLE schema_version");
+  d.close();
+
+  // The fixture's three halves, each asserted. Together they are the state:
+  // the version table is GONE, the lease table still reads, and `openHub` can
+  // still complete a migration here -- which is what makes a concurrent writer
+  // possible and the sibling lock wrong.
+  {
+    const q = new DatabaseSync(t, { readOnly: true });
+    const listed = q.prepare("SELECT count(*) c FROM sqlite_master WHERE name='schema_version'").get().c;
+    const leases = q.prepare("SELECT count(*) c FROM singleton_lease").get().c;
+    q.close();
+    check(listed === 0, "fixture: schema_version is gone from the catalogue", `${listed}`);
+    check(leases === 1, "fixture: while the lease table still reads, and holds a live builder", `${leases}`);
+  }
+
+  const r = restoreHub(snapD.path, t, {
+    isAlive: (pid) => pid === 4242, pid: process.pid, lstart: "me" });
+  check(!r.ok, "a restore over a hub with no version table refuses", JSON.stringify(r).slice(0, 200));
+  check(r.holders?.some(h => h.pid === 4242),
+    "and ENUMERATES the live builder, which only the canonical path can do",
+    JSON.stringify(r.holders));
+  check(/unversioned/.test(String(r.why)),
+    "and names the state it found rather than calling the file unreadable", String(r.why).slice(0, 200));
+  check(!/exists but cannot be read/.test(String(r.why)),
+    "not the unreadable refusal, which would have demanded force and scanned nobody",
+    String(r.why).slice(0, 200));
+  check(!existsSync(t + ".restore-lock"),
+    "and the lock was NOT taken in the sibling file, where a bootstrapping builder never looks",
+    `${existsSync(t + ".restore-lock")}`);
+  check(existsSync(t), "and the hub the builder is writing to is still there", `${existsSync(t)}`);
+
+  // CONTROL: the same state with the holder DEAD proceeds -- so the refusal is
+  // about the live writer, not about the missing table.
+  //
+  // A SECOND FILE, not the one above. The refused restore still called `openHub`
+  // on `t`, which recreated `schema_version` and recorded migration 1 -- so `t`
+  // is an ordinary version-1 hub now and re-running against it would exercise the
+  // readable path and prove nothing about this one.
+  const t2 = join(dHome, "state", "dropped2.db");
+  {
+    const e = openHub(t2);
+    e.prepare(`INSERT INTO singleton_lease(name,pid,lstart,command,acquired_at,expires_at)
+               VALUES('builder',4243,'L','reeve build run',unixepoch(),unixepoch()+60)`).run();
+    e.exec("DROP TABLE schema_version");
+    e.close();
+  }
+  const r2 = restoreHub(snapD.path, t2, { isAlive: () => false, pid: process.pid, lstart: "me" });
+  check(r2.ok, "control: with the holder dead, the same state restores without force",
+    JSON.stringify(r2).slice(0, 220));
+  check(/\.damaged-/.test(String(r2.quarantined)),
+    "and the copy kept for the operator is named damaged, not incomplete: the file was destroyed, not unfinished",
+    String(r2.quarantined));
+  rmSync(dHome, { recursive: true, force: true });
+}
+
+// ── the finally may delete only what the scan PROVED is ours ────────────────
+// `synthetic` says this invocation created the file. Three early returns in the
+// creation branch each cleared it on the way out, and the fourth -- the refusal
+// issued when the born scan could not READ a lease table -- did not. So a
+// refusal made precisely because a creation-window writer could not be ruled out
+// went on to unlink the database that writer may have been holding.
+//
+// NOT TESTED end to end, and it cannot be from here: reaching that return needs
+// a hub that is populated or damaged at a path that was ABSENT one statement
+// earlier, which is a race with no seam in `restoreHub`. Measured that the
+// obvious fixture does not work either: a stale `-wal` copied beside an absent
+// database is NOT replayed into it -- SQLite creates an empty store and answers
+// `no such table: schema_version`.
+//
+// So the authority is asserted structurally, which is the part that generalises:
+// `exclusive` is granted in exactly ONE place, and the unlink is gated on it. A
+// return added below cannot reintroduce the defect by forgetting to clear a
+// flag, because it never set one.
+{
+  const src = readFileSync(join(ROOT, "src", "backup.mjs"), "utf8");
+  const grants = src.split("\n").filter(l => /^\s*exclusive = true;\s*$/.test(l)).length;
+  const gate = src.indexOf("const dropSynthetic = synthetic && exclusive && !swapped;");
+  const scanRefusal = src.indexOf("if (bornMissing.length && !force)");
+  const grantAt = src.indexOf("exclusive = true;");
+  check(gate > 0, "control: the synthetic unlink's gate was found in the source", `${gate}`);
+  check(scanRefusal > 0, "control: and the refusal that used to leak past it", `${scanRefusal}`);
+  check(grants === 1,
+    "deletion authority is granted in exactly one place, so no return can grant it by omission",
+    `${grants} assignments`);
+  check(grantAt > scanRefusal,
+    "and it is granted AFTER the scan refusal, so an unreadable lease table never reaches it",
+    `refusal at ${scanRefusal}, grant at ${grantAt}`);
+}
+{
+  // And the OUTCOME the gate must not break: a genuinely absent hub whose
+  // restore fails at replay still leaves nothing behind. This is the reachable
+  // half, and it is what goes red if `exclusive` is never granted.
+  const gHome = mkdtempSync(join(tmpdir(), "reeve-excl-"));
+  mkdirSync(join(gHome, "state"), { recursive: true });
+  const src = openHub(hubPathFor(gHome));
+  src.close();
+  const good = snapshot(openHub(hubPathFor(gHome)), join(gHome, "backups"), "hub");
+  check(good.ok, "fixture: a hub snapshot exists to restore from", JSON.stringify(good));
+  const target = join(gHome, "state", "absent.db");
+  check(!existsSync(target), "fixture: and the destination is absent, so the restore is synthetic", target);
+  const badTail = Object.assign(
+    [{ seq: 1, at: 1, kind: "territory_lease.released", payload: JSON.stringify({ project: "o/r", kind: "prefix" }) }],
+    { manifest: null, sha256: null });
+  const r = restoreHub(good.path, target, { isAlive: () => false, pid: process.pid, lstart: "L", force: true, tail: badTail });
+  check(!r.ok, "a synthetic restore that fails at replay still reports failure", JSON.stringify(r).slice(0, 160));
+  check(!existsSync(target),
+    "and the gate still lets it clean up the hub it created and proved was its own",
+    `${existsSync(target)}`);
+  rmSync(gHome, { recursive: true, force: true });
+}
+
 rmSync(home, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

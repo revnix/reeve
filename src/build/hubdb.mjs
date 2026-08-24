@@ -71,6 +71,12 @@ export function completedVersion(path) {
  *
  *   errcode 5  SQLITE_BUSY      another connection holds it
  *   errcode 8  SQLITE_READONLY  read-only file or directory
+ *   errcode 13 SQLITE_FULL      the filesystem or the page limit ran out
+ *
+ * The last is a RESOURCE the environment ran out of, not a fault in the file:
+ * the write is rolled back whole and every byte already on disk is exactly as
+ * SQLite left it. Calling it damage told an operator to restore over a healthy
+ * authority database when freeing space was the entire remedy.
  *
  * Everything else is treated as damage, and that direction is deliberate. The
  * "do NOT restore" message is a strong claim; making it only for codes proven
@@ -96,6 +102,13 @@ export function isOperational(e) {
       || e.errcode === 5      // SQLITE_BUSY
       || e.errcode === 6      // SQLITE_LOCKED
       || e.errcode === 8      // SQLITE_READONLY
+      // A FULL DISK IS THE SITUATION, NOT THE FILE. Measured against
+      // node:sqlite via `PRAGMA max_page_count`: the insert throws
+      // `database or disk is full` with errcode 13, the transaction is rolled
+      // back, and the store reads perfectly afterwards. Classified as damage it
+      // sent `build run` and `build status` at `restore --hub --force`, which
+      // replaces an intact hub and does not free a single byte.
+      || e.errcode === 13     // SQLITE_FULL
       || e.errcode === 14;    // SQLITE_CANTOPEN
 }
 

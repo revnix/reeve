@@ -6,7 +6,7 @@
 // It also must not write repo_gate_state. A reporter that can write what it
 // reports can agree with itself, and the row exists precisely so that clause U4
 // reads something the LOOP established.
-import { openHub, isOperational } from "../src/build/hubdb.mjs";
+import { openHub, isOperational, faultKind } from "../src/build/hubdb.mjs";
 import { hubFindings, renderHub } from "../src/doctor.mjs";
 // The self-audit block at the end of this task needs all of these. The standard
 // harness supplies only check, dir, join, tmpdir, mkdtempSync and rmSync.
@@ -899,6 +899,47 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     "and not told the opposite", out.slice(0, 260));
 }
 
+// ── a NEWER store is refused before any of its tables is read ─────────────
+// Collecting `build status`'s reads under one guard moved the lease query ahead
+// of the forward-version refusal. A future migration is free to reshape or drop
+// `singleton_lease`, and an older binary reading it would report a perfectly
+// healthy newer hub as unreadable and recommend `restore --hub --force` --
+// replacing a store whose only problem is that this reeve is too old for it.
+//
+// A version this binary does not know is not a shape it may assume.
+{
+  const nHome = mkdtempSync(join(tmpdir(), "reeve-newer-"));
+  mkdirSync(join(nHome, "state"), { recursive: true });
+  const d = openHub(hubPathFor(nHome));
+  d.exec("DROP TABLE singleton_lease");
+  d.prepare("INSERT INTO schema_version(version, applied_at) VALUES(2, unixepoch())").run();
+  d.close();
+
+  // The fixture's two halves: it really is marked newer, and the table this
+  // route would read really is gone.
+  {
+    const q = new DatabaseSync(hubPathFor(nHome), { readOnly: true });
+    const v = q.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+    const listed = q.prepare("SELECT count(*) c FROM sqlite_master WHERE name='singleton_lease'").get().c;
+    q.close();
+    check(v === 2, "fixture: the hub records a version this binary does not know", `${v}`);
+    check(listed === 0, "fixture: and the table build status reads is gone", `${listed}`);
+  }
+
+  const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), "build", "status"],
+    { encoding: "utf8", env: { ...process.env, REEVE_HOME: nHome }, timeout: 30_000 });
+  const out = (r.stdout ?? "") + (r.stderr ?? "");
+  check(/schema version 2/.test(out) && /Upgrade reeve/.test(out),
+    "a newer hub is answered with upgrade reeve", out.slice(0, 200));
+  check(!/cannot be read/.test(out),
+    "and is NOT called unreadable, which it is not", out.slice(0, 200));
+  check(!/restore --hub --force/.test(out),
+    "and the operator is never pointed at replacing it", out.slice(0, 240));
+  check(!/^\s+at\s+.*:\d+:\d+\)?$/m.test(out),
+    "and no stack frame reaches the operator", out.slice(0, 240));
+  rmSync(nHome, { recursive: true, force: true });
+}
+
 // ── the classifier's edges, and the guard's reach ─────────────────────────
 // The table itself first, because the CLI paths only exercise the codes they
 // happen to produce: measured, forcing an errcode-less error to "damage" left
@@ -947,6 +988,37 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     check(isOperational(err),
       "and the classifier calls it operational, so the operator is not sent at restore --hub --force",
       `${isOperational(err)}`);
+    // THREE ANSWERS, because "not damage" cannot be rendered. It covers both
+    // "someone holds it or a permission is wrong" and "the disk is full", and
+    // those have opposite remedies -- an operator on a full store told to check
+    // permissions follows advice that cannot free a byte.
+    check(faultKind(err) === "full",
+      "and names the fault FULL, so the recovery text can say the one thing that helps",
+      faultKind(err));
+    check(faultKind({ errcode: 5 }) === "operational" && faultKind({ errcode: 11 }) === "damage"
+          && faultKind(new Error("a restore is in progress")) === "operational",
+      "control: the other two answers are unchanged, so this is a split and not a rename",
+      `busy=${faultKind({ errcode: 5 })} corrupt=${faultKind({ errcode: 11 })}`);
+    // AND EVERY CALLER RENDERS IT. A third kind nothing branches on is a rename.
+    // These are the three places that turn a storage failure into advice.
+    {
+      const cli = readFileSync(join(ROOT, "bin", "reeve"), "utf8");
+      const hub = readFileSync(join(ROOT, "src", "build", "hubdb.mjs"), "utf8");
+      const sites = [["bin/reeve build status", cli], ["bin/reeve build run", cli], ["openHub", hub]];
+      check(sites.length === 3, "control: three recovery sites are being checked", `${sites.length}`);
+      check((cli.match(/faultKind\(/g) ?? []).length >= 2,
+        "both CLI recovery sites classify by kind rather than by a boolean",
+        `${(cli.match(/faultKind\(/g) ?? []).length} uses`);
+      // Case-insensitive: one of these sentences opens a line and one does not.
+      // Pinning an assertion to the capitalisation would break on an edit that
+      // improves the wording, which is not the property being asserted.
+      check((cli.match(/free space on the filesystem/gi) ?? []).length >= 2 && /free space on the filesystem/i.test(hub),
+        "and all three tell an operator on a full store to free space",
+        `cli ${(cli.match(/free space on the filesystem/gi) ?? []).length}, openHub ${/free space on the filesystem/i.test(hub)}`);
+      check(!/free space on the filesystem[\s\S]{0,400}restore --hub --force/.test(hub),
+        "and none of them follows that with a restore, which needs MORE room",
+        "checked");
+    }
     // AND THE STORE IS STILL THERE. That is the whole claim: a rolled-back write
     // on a full disk leaves an authority database a restore would have replaced.
     let stillReads = false;

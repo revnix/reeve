@@ -87,6 +87,24 @@ export function completedVersion(path) {
  *
  * All four codes measured against node:sqlite, not read from a table.
  */
+/**
+ * WHICH failure, in the operator's terms -- three answers, not two.
+ *
+ * `isOperational` answers a yes/no the recovery text cannot render: "not damage"
+ * covers both `someone else holds it or a permission is wrong` and `the disk is
+ * full`, and those have opposite remedies. Told to stop other processes and
+ * check permissions, an operator on a full filesystem follows advice that cannot
+ * work and never hears the one instruction that can.
+ *
+ * Two facts that look alike are not one fact. The classification is the same;
+ * only the sentence differs, so the kind travels and the boolean is derived
+ * from it rather than the other way round.
+ */
+export function faultKind(e) {
+  if (e?.errcode === 13) return "full";
+  return isOperational(e) ? "operational" : "damage";
+}
+
 export function isOperational(e) {
   // NOT A SQLITE STORAGE ERROR AT ALL. Every failure out of SQLite carries an
   // `errcode`; an error without one came from reeve's own code -- `assertWritable`
@@ -165,12 +183,19 @@ export function openHub(path) {
     //
     // Same mistake as the maintenance-lock catch: a failed operation is not
     // evidence of a damaged file. Only corruption earns the recovery advice.
-    const corrupt = !isOperational(e);
+    const kind = faultKind(e);
     throw new Error(
-      corrupt
+      kind === "damage"
         ? `the hub at ${path} cannot be read (${e.message}).\n` +
           `  recover  reeve restore --hub --force installs the newest usable snapshot\n` +
           `           pass --tail from a durable export-events --hub to carry history forward`
+        : kind === "full"
+        ? `the hub at ${path} could not be written because the store is full (${e.message}).\n` +
+          `  the file itself answered, so this is not damage: it ran out of room.\n` +
+          `  recover  free space on the filesystem holding ${path} and re-run. Old snapshots under ` +
+          `the backup root are usually the largest thing safe to remove -- reeve backup --hub --keep N ` +
+          `prunes them. Do NOT restore over it: a restore needs MORE room, not less, and there is ` +
+          `nothing wrong with the file.`
         : `the hub at ${path} could not be opened for writing (${e.message}).\n` +
           `  the file itself answered, so this is not damage: another process may hold it, or the ` +
           `file or its directory may be read-only.\n` +
@@ -276,7 +301,11 @@ export function openHub(path) {
       // failed" is wrong twice: no migration was attempted, and the wrapper hides
       // the two version numbers an operator needs to know which binary to run.
       if (/was migrated to schema version/.test(e.message)) throw e;
-      throw new Error(`hub migration ${m.version} failed, store unchanged: ${e.message}`);
+      // THE CAUSE TRAVELS. Without it this wrapper carries no `errcode`, so every
+      // caller's classifier reads a corrupt store as "not a SQLite storage error"
+      // and answers operational -- the one direction that tells an operator to
+      // leave a damaged hub alone.
+      throw new Error(`hub migration ${m.version} failed, store unchanged: ${e.message}`, { cause: e });
     }
   }
   return db;

@@ -9,7 +9,13 @@
 // A prompt that instructs an action the sandbox forbids is a contradiction the
 // worker cannot resolve, and it costs a whole dispatch to discover.
 import { promptFor, claimedCommands } from "../src/prompts.mjs";
-import { sandboxFor, commandDenied } from "../src/sandbox.mjs";
+import { sandboxFor, commandDenied, commandDenied as commandDeniedIn } from "../src/sandbox.mjs";
+
+// Does this line FORBID the thing it names, rather than offer it? Rule 6 echoes
+// the profile's forbidden list and rule 0 names the built-in denials, so a
+// command can appear legitimately in prose that refuses it. Three copies of this
+// test drifted apart in turn, each missing a word the prompt had started using.
+const forbids = line => /never|do not|cannot|not able|forbidden|irreversible|refused/i.test(line);
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -38,9 +44,15 @@ for (const action of ["FIX_CI", "FIX_FINDINGS"]) {
   // Anything the sandbox refuses outright must not be INSTRUCTED. A line that
   // explains why something is refused is not an instruction to do it, so the
   // check looks for the imperative form rather than for the word.
-  const instructions = p.split("\n").filter(l => /^\s*(?:[0-9]+\.|[-*])?\s*(?:then\s+)?(?:push|run|execute|merge)\b/i.test(l.trim()));
-  for (const [verb, rule] of [["push", "Bash(git push"], ["merge", "gh pr merge"]]) {
-    const told = instructions.some(l => new RegExp(`\\b${verb}\\b`, "i").test(l) && !/do not|never|cannot|not able/i.test(l));
+  const instructions = p.split("\n").filter(l => /^\s*(?:[0-9]+\.|[-*])?\s*(?:then\s+)?(?:push|run|execute|merge|commit|stage)\b/i.test(l.trim()));
+  // `commit` joined this list on 2026-08-23. The prompt said "Commit only the
+  // files your fix touches" while the sandbox denied every write to `.git`, so
+  // three dispatches produced correct fixes that could not be committed and were
+  // never published. It is the same defect as the `push` row above, one step
+  // earlier in the sequence, and this test did not have the verb for it.
+  for (const [verb, rule] of [["push", "Bash(git push"], ["merge", "gh pr merge"],
+                              ["commit", "Bash(git commit"], ["add", "Bash(git add"]]) {
+    const told = instructions.some(l => new RegExp(`\\b${verb}\\b`, "i").test(l) && !forbids(l));
     check(!(told && deny.includes(rule)),
       `${action}: never INSTRUCTED to ${verb}, which the sandbox denies`,
       instructions.filter(l => new RegExp(verb, "i").test(l)).join(" | ").slice(0, 160));
@@ -58,7 +70,7 @@ for (const action of ["FIX_CI", "FIX_FINDINGS"]) {
     for (const line of p.split("\n").filter(l => l.includes(c)))
       // `refused` belongs here: rule 0 now NAMES the built-in denials rather than
       // gesturing at "the rules below", and that sentence is a forbidding one.
-      check(/never|do not|forbidden|irreversible|refused/i.test(line),
+      check(forbids(line),
         `${action}: "${c}" is only ever mentioned as forbidden`, line.trim());
 }
 
@@ -90,6 +102,12 @@ const PROFILES = {
   "a publishing command": { units: [{ id: "root", language: "typescript", packageManager: "npm",
                                       commands: { release: { cmd: "npm publish --access public", state: "present" },
                                                   test: { cmd: "npm test", state: "present" } } }], risk: {} },
+  // The profile forbids `git clean` SPECIFICALLY. `commandDenied("git", ...)` is
+  // false here while `Bash(git clean:*)` sits in the deny list, so testing the
+  // bare name would still point the worker at a cleanup the sandbox refuses.
+  "git clean forbidden": { units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm",
+                                     commands: { test: { cmd: "npm test", state: "present" } } }],
+                           risk: { forbiddenCommands: ["git clean"] } },
   // The profile forbids `git` itself, which the prompt otherwise hardcodes as
   // always available.
   "git forbidden": { units: [{ id: "root", language: "typescript", packageManager: "npm",
@@ -253,7 +271,7 @@ for (const [name, prof] of Object.entries(PROFILES)) {
     // It may appear ONLY in a sentence that forbids it -- rule 6 echoes the
     // profile's own list -- never in one that offers it. Same rule the forbidden
     // commands already get above.
-    const offers = prompt.split("\n").filter(l => l.includes(process.execPath) && !/NEVER run|never|do not|refused/i.test(l));
+    const offers = prompt.split("\n").filter(l => l.includes(process.execPath) && !forbids(l));
     check(offers.length === 0, "not even the interpreter: the path is only ever mentioned as forbidden",
           offers.join(" | ").slice(0, 160));
     check(/no shell commands granted at all/.test(prompt), "and says so plainly", "");
@@ -269,6 +287,19 @@ for (const [name, prof] of Object.entries(PROFILES)) {
           verify.slice(0, 160) || prompt.split("HOW TO VERIFY")[1]?.slice(0, 200) || "");
     check(!/declares no verification commands/.test(prompt), "and does not claim the project declares none", "");
   }
+  // The landing section points the worker at `git clean` for scratch files it
+  // cannot rm. A profile that forbids it -- by the bare name OR by the specific
+  // subcommand -- must not be told to run it.
+  if (commandDeniedIn("git clean -f --", prof)) {
+    // It may appear in the sentence that FORBIDS it -- rule 6 echoes the profile's
+    // own list -- but never in one that offers it. Same distinction the forbidden
+    // commands and the interpreter path already get.
+    const offered = prompt.split("\n").filter(l => /git clean/.test(l) && !forbids(l));
+    check(offered.length === 0, `${name}: the worker is not told to run git clean when it is forbidden`,
+          offered.join(" | ").slice(0, 160));
+  }
+  else
+    check(/git clean/.test(prompt), `control: ${name} is told how to remove a scratch file`, "");
 
   // Rule 0 says a more specific rule can still deny a form, and it has to NAME
   // those rather than gesture at rules it does not render. `git remote` is the

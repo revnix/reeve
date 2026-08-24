@@ -21,7 +21,7 @@ import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTC
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE, gitEnv } from "./gitguard.mjs";
-import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor } from "./checkout.mjs";
+import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor, commitRunWork, digestOf } from "./checkout.mjs";
 import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.mjs";
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
@@ -129,10 +129,75 @@ function attemptsFor(db, nwo, pr, fp, logPath) {
  * passes the diff gate, is counted in "published N file(s)", and is then deleted
  * with the checkout, having never left the machine. (Codex #5-[2].)
  */
-function uncommittedFiles(worktree) {
+/**
+ * The commit message reeve writes for a worker's repair.
+ *
+ * Built from the worker's own report rather than from the failure text: `cause`
+ * and `change` are the two sentences it was asked for, and they are what someone
+ * reading `git log` a month later needs. The report is model output that has read
+ * untrusted CI logs, so it goes through `printable` like every other worker
+ * string that reaches a terminal.
+ */
+export function repairMessage(report, decision) {
+  const clean = s => printable(String(s ?? "")).replace(/\s+/g, " ").trim();
+  const change = clean(report?.change);
+  const cause = clean(report?.cause);
+  const scope = decision?.action === "FIX_FINDINGS" ? "review" : "ci";
+  // Conventional Commits: a lowercase subject of at most 72 characters and no
+  // trailing period. Truncation falls back to a word boundary, because a subject
+  // cut mid-word reads as corruption rather than as brevity.
+  const said = (change || "repair the failing check").replace(/\.+$/, "");
+  const prefix = `fix(${scope}): `;
+  const body = `${said.charAt(0).toLowerCase()}${said.slice(1)}`;
+  const room = 72 - prefix.length;
+  // A word boundary when there is one, a hard cut when there is not. Trimming to
+  // the last space deleted the ENTIRE description when the first token was longer
+  // than the room available -- measured, a 100-character first word produced
+  // exactly `fix(ci):`, which is uninformative history and not a valid
+  // Conventional Commit either, since the description is required.
+  const cut = body.length <= room ? body
+    : (body.slice(0, room).replace(/\s+\S*$/, "") || body.slice(0, room));
+  const subject = prefix + cut;
+  return cause ? `${subject}\n\n${cause}` : subject;
+}
+
+function uncommittedFiles(worktree, copiedBaseline = {}) {
   try {
-    const out = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "status", "--porcelain"], { encoding: "utf8", env: gitEnv() }).trim();
-    return out ? out.split("\n").map(l => l.slice(3).trim().split(" -> ").pop()).filter(Boolean) : [];
+    // Read over EVERYTHING, then subtract what the daemon itself put there.
+    //
+    // Excluding the copied trees by path could not tell reeve's files from the
+    // worker's: with `--` plus `:(exclude)` the tree vanished entirely, and with
+    // `--untracked-files=no` inside it an undeclared new file vanished too. Either
+    // way an incomplete repair published and the checkout holding the omitted part
+    // was deleted. The baseline recorded at prepare time is the only thing that
+    // separates them, because it is the one fact only reeve knows.
+    // A path is only reeve's own if its CONTENT still matches what reeve left
+    // there. git reports an edited copy exactly as it reports an untouched one, so
+    // a pathname-only baseline subtracted the worker's edit and let an incomplete
+    // repair publish. Re-hashed per reported path, so the ordinary tick pays
+    // nothing: git mentions almost none of them.
+    const wasMine = rel => {
+      const want = copiedBaseline?.[rel];
+      return typeof want === "string" && digestOf(join(worktree, rel)) === want;
+    };
+    // `--untracked-files=all`, because the default COLLAPSES an entirely untracked
+    // directory to `node_modules/` while the baseline holds file paths -- so the
+    // subtraction missed and every copied tree read as one uncommitted change. The
+    // two readings have to agree on granularity or the baseline cannot subtract.
+    const out = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "status", "--porcelain", "--untracked-files=all", "-z"],
+                             { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: gitEnv() });
+    // `-z` records are NUL-separated and a rename carries its source as the NEXT
+    // record, so the walk has to consume it rather than read it as a status line.
+    const records = out.split("\0");
+    const left = [];
+    for (let i = 0; i < records.length; i++) {
+      const rec = records[i];
+      if (!rec) continue;
+      const xy = rec.slice(0, 2), file = rec.slice(3);
+      if (/[RC]/.test(xy)) { const src = records[++i]; if (src && !wasMine(src)) left.push(src); }
+      if (file && !wasMine(file)) left.push(file);
+    }
+    return left;
   } catch { return null; }
 }
 
@@ -891,7 +956,7 @@ export async function tick(ctx) {
       // Declared out here, not inside the try: the publish path below reads it,
       // and a const in the try block is a ReferenceError at that point -- the
       // exact shape that once threw on every FIX_CI with every unit test green.
-      let r, prepFailed = false, worktree = null, workerToken = null;
+      let r, prepFailed = false, worktree = null, workerToken = null, copiedDeps = {};  // the baseline: path -> digest of what preparation left untracked
       try {
         // Everything from here runs inside the cleanup scope: the run is
         // already leased and its heartbeat already ticking, so a failure in
@@ -923,6 +988,11 @@ export async function tick(ctx) {
         });
         if (!prepared.ok) throw new Error(`could not prepare the checkout: ${prepared.why}`);
         worktree = prepared.path;
+        // What preparation ACTUALLY copied, not what the profile declared. A
+        // declared path that did not exist is skipped, and excluding it anyway
+        // would hide the worker's own creation of it from staging AND from the
+        // uncommitted check -- losing that part of the fix while the rest ships.
+        copiedDeps = prepared.deps?.untracked ?? {};
         log(logPath, `  #${e.pr}: checkout ready at ${worktree}` +
                      `${prepared.deps?.copied?.length ? ` (deps: ${prepared.deps.copied.join(", ")}${prepared.deps.cow ? ", copy-on-write" : ""})` : ""}`);
         if (wantDeps.unsupported.length)
@@ -1185,13 +1255,67 @@ export async function tick(ctx) {
       if (decision.action === "FIX_CI" && fp) noteFixAttempt(db, nwo, e.pr, fp, statedBlocker(r.report));
 
       if (r.outcome === OUTCOMES.OK) {
+        // The worker cannot commit its own work. Its sandbox denies Bash writes
+        // to `.git`, so `git add` and `git commit` fail with EPERM on
+        // `.git/index.lock`: measured 2026-08-23, seven attempts in one run and
+        // thirteen of its thirty-six turns spent correctly diagnosing an
+        // instruction it could not carry out. Three dispatches produced three
+        // correct fixes and published none of them
+        // (docs/measured/2026-08-23-three-real-dispatches.md).
+        //
+        // reeve commits instead, and does it HERE -- before every gate below, so
+        // this decides nothing about what may ship. It only makes the work
+        // pushable; the gates then judge the ref that results, exactly as they
+        // judged the worker's own commits before.
+        // A worker that says it did NOT fix this must not have its exploration
+        // published. `classifyResult` judges the process, so a declined run still
+        // arrives as OK, and the output contract calls `fixed: false` a good
+        // outcome. Before reeve committed, such a run was stopped by the
+        // uncommitted-work gate below; committing first would turn a declared
+        // non-fix into a publishable repair. The edits are left exactly where they
+        // are, so that gate preserves them and names a human.
+        // Affirmative, not merely not-negative. `parseReport` returns null when the
+        // worker omits the fenced JSON or emits something malformed, and
+        // `classifyResult` still says OK -- so optional-chained checks for
+        // `fixed: false` both read false and reeve would commit an exploratory
+        // edit under a generic message. A publication needs the worker to have
+        // SAID it fixed this.
+        const declined = !r.report ? "the worker returned no usable report"
+          : r.report.fixed !== true ? "the worker did not report a fix"
+          // An absent or malformed `filesTouched` would reach `commitRunWork` as
+          // null and turn the declaration check OFF, so a scratch file would be
+          // committed with the fix. A field reeve cannot read is not permission
+          // to skip the guard it feeds.
+          : !Array.isArray(r.report.filesTouched) ? "the worker did not report which files it changed"
+          : r.report.needsHuman ? `the worker reported it needs a human: ${printable(String(r.report.needsHuman)).slice(0, 160)}`
+          : null;
+        const landed = declined ? { ok: true, committed: false, files: [], why: `not committing: ${declined}` }
+                                : (ctx.commitWork ?? commitRunWork)({
+          repoRoot: repoCheckout, path: worktree, branch: e.headRef,
+          message: repairMessage(r.report, decision),
+          secrets: [{ label: "reeve's worker authentication token", value: workerToken }],
+          // The diff gate judges paths and territory, never intent, so a
+          // reproduction script inside the lane passes it. reeve commits what the
+          // worker SAID it changed, and refuses when the checkout holds anything
+          // it did not.
+          declared: r.report.filesTouched,
+        });
+        if (!landed.ok) {
+          const rel = releaseRunCheckout(worktree, { workFetched: false });
+          log(logPath, `  #${e.pr}: NOT published — reeve could not commit the work: ${landed.why}${rel.quarantined ? `; preserved at ${rel.path}` : ""}`);
+          escalations.set(`#${e.pr}: a finished fix was NOT published — reeve could not commit it: ${landed.why}`, 1);
+          continue;
+        }
+        if (landed.committed) log(logPath, `  #${e.pr}: committed ${landed.files.length} file(s) the worker left in the checkout`);
+        else if (landed.why) log(logPath, `  #${e.pr}: ${landed.why}`);
+
         // Everything accepted must be COMMITTED before anything is published or
         // released. reeve publishes by fetching the checkout's BRANCH, so an
         // uncommitted edit is invisible to the push and would then be deleted
         // with the checkout while the log said it was published. The work is
         // kept and a human is told, because a candidate fix nobody has a copy of
         // is not spare disk space. (Codex #5-[2].)
-        const stillDirty = uncommittedFiles(worktree);
+        const stillDirty = uncommittedFiles(worktree, copiedDeps);
         if (stillDirty === null || stillDirty.length) {
           const why = stillDirty === null
             ? "reeve could not read the checkout's status, so it cannot say the work was committed"

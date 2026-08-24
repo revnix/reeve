@@ -232,21 +232,31 @@ function landing(profile) {
   return [
     "WHEN YOU HAVE A FIX",
     "",
-    "  Commit only the files your fix touches. Do not commit build output, lockfile",
-    "  churn you did not intend, or unrelated formatting.",
+    "  STOP. Leave the change in the files and do nothing else with it. Do not run",
+    "  `git add`, `git commit` or `git push`: you are not able to, and reeve does all",
+    "  three once it has checked what you actually changed against the work you were",
+    "  given. Being told to do something the sandbox refuses is how a finished fix",
+    "  gets spent on diagnosing its own permissions and thrown away.",
     "",
-    "  The commit message follows Conventional Commits: a lowercase subject of at",
-    "  most 72 characters, then a body saying what was wrong and why the change is",
-    "  right. Describe the CODE, not the process: no task ids, no mention of a review,",
-    "  no mention of what tool wrote it, and no attribution trailer of any kind.",
+    "  List EVERY file you changed in `filesTouched`. reeve commits exactly those,",
+    "  and if the checkout holds any change you did not list it refuses to publish",
+    "  and calls a human — so a reproduction script or a debug dump you leave behind",
+    "  costs the whole repair unless you remove it or declare it.",
+    // The advertised command itself, not the bare `git`. A profile may forbid
+    // `git clean` specifically, which leaves `commandDenied("git", ...)` false
+    // while `Bash(git clean:*)` sits in the deny list -- so the worker would be
+    // pointed at a cleanup the sandbox refuses.
+    ...(commandDenied("git clean -f --", profile) ? [] : [
+      "  `rm` is not granted; `git clean -f -- <path>` is, and it removes an untracked",
+      "  file without touching anything you are not allowed to touch.",
+    ]),
     "",
-    "  STOP after committing. Do not push — you are not able to, and reeve does it",
-    "  once it has checked what you actually changed against the work you were given.",
-    "  Being told to push while the sandbox refuses it is how a finished fix gets",
-    "  marked untrustworthy and thrown away.",
+    "  You do not write the commit message. reeve writes it from the `cause` and",
+    "  `change` sentences of your report, so make those two accurate and specific.",
     "",
-    "  If your commit is rejected by a pre-commit hook, fix what the hook objects to.",
-    "  Never pass --no-verify.",
+    "  Nothing is published unless your report says `\"fixed\": true`. A missing or",
+    "  malformed report is treated as no fix at all, and the work is kept for a",
+    "  human rather than shipped.",
   ].join("\n");
 }
 
@@ -309,9 +319,7 @@ Finish with a single fenced json block, and nothing after it:
   "change": "one sentence: what you changed, or why you changed nothing",
   "test": {"added": true|false, "failedBefore": true|false, "passedAfter": true|false, "command": "..."},
   "needsHuman": false|"why",
-  "filesTouched": ["..."],
-  "committed": true|false,
-  "commit": "sha or null"
+  "filesTouched": ["..."]
 }
 \`\`\`
 

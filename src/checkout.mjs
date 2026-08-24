@@ -38,14 +38,15 @@
 // relative and resolves inside the tree, so the copy resolves within the run
 // checkout.
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { GIT_NEUTRALISE, GIT_NEUTRALISE_FOUNDER, REFUSING_HOOK, recordConfig, reason, gitEnv, founderGitEnv } from "./gitguard.mjs";
 import { writeFileSync, chmodSync } from "node:fs";
 
 /** Every daemon git command in a worker-controlled directory carries the neutralisers. */
-function git(cwd, args) {
-  return run(cwd, GIT_NEUTRALISE, args, gitEnv());
+function git(cwd, args, opts) {
+  return run(cwd, GIT_NEUTRALISE, args, gitEnv(), opts);
 }
 
 /**
@@ -75,10 +76,20 @@ function founderGit(cwd, args) {
   return run(cwd, GIT_NEUTRALISE_FOUNDER, args, founderGitEnv());
 }
 
-function run(cwd, neutralise, args, env) {
+function run(cwd, neutralise, args, env, { raw = false, input = undefined } = {}) {
   try {
-    return { ok: true, out: execFileSync("git", ["-C", cwd, ...neutralise, ...args],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env }).trim() };
+    // 64 MiB, because the default 1 MiB is not enough for a repository-sized
+    // answer: `changedFiles` raised it after about 1,800 long paths overflowed
+    // it, and a helper that fails on SIZE turns a valid repair into a refusal.
+    //
+    // `raw` for NUL-delimited output, which is DATA and not text: leading and
+    // trailing whitespace are legal in a git filename, and trimming ` leading`
+    // to `leading` made a correctly declared repair unrecognisable. Only callers
+    // reading a textual value want the trim.
+    const out = execFileSync("git", ["-C", cwd, ...neutralise, ...args],
+      { encoding: "utf8", stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+        maxBuffer: 64 * 1024 * 1024, env, input });
+    return { ok: true, out: raw ? out : out.trim() };
   // `reason` picks git's own fatal line rather than the last thing it printed,
   // which is usually progress narration and sends the reader somewhere else.
   } catch (e) { return { ok: false, out: "", err: reason(e.stderr || e.message) }; }
@@ -90,6 +101,17 @@ function run(cwd, neutralise, args, env) {
  * legitimate one. The TOTAL matters as much as the per-file bound: a tree can
  * commit any number of these, and the daemon reads all of them synchronously. */
 const MAX_ATTRIBUTES_BYTES = 1 << 20;
+
+/** How many daemon-copied files reeve will remember in order to tell them from
+ * the worker's. A gitignored dependency tree contributes none of these; only an
+ * unignored one does, and a project with more than this in one is misdeclaring a
+ * source directory as a dependency. */
+const MAX_COPIED_UNTRACKED = 20000;
+
+/** The largest file reeve will hash to decide whether it is still its own copy.
+ * A dependency file past this is treated as changed, which holds the work for a
+ * human rather than reading an unbounded amount of worker-controlled bytes. */
+const MAX_FINGERPRINT_BYTES = 64 * 1024 * 1024;
 const MAX_ATTRIBUTES_TOTAL = 4 << 20;
 
 /** The conventional directory for one run's checkout. Keyed by run, not by PR:
@@ -289,7 +311,7 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
   // `depsFrom` is a list of paths RELATIVE to the founder's checkout, copied to
   // the same place in the run's. A tree that is not there is not an error: a
   // project simply may not have one.
-  let deps = { ok: true, cow: false, skipped: true, copied: [], why: "no dependency source given" };
+  let deps = { ok: true, cow: false, skipped: true, copied: [], untracked: [], why: "no dependency source given" };
   if (depsFrom?.length) {
     const copied = [];
     let anyCow = false;
@@ -309,7 +331,34 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
       if (!one.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: one.why }; }
       if (!one.skipped) { copied.push(rel); anyCow = anyCow || one.cow; }
     }
-    deps = { ok: true, cow: anyCow, skipped: copied.length === 0, copied, why: null };
+    // What the DAEMON left untracked, recorded before the worker starts.
+    //
+    // Excluding the copied trees by PATH afterwards cannot tell reeve's own files
+    // from the worker's: an undeclared new file inside a copied, unignored tree
+    // was invisible to every exclusion shape tried, so an incomplete repair
+    // published and the checkout carrying the omitted part was deleted. A
+    // baseline is the only thing that distinguishes them, because it is the one
+    // fact only reeve knows.
+    //
+    // Empty for the ordinary case, where a dependency tree is gitignored and
+    // `--exclude-standard` never lists it. Bounded because an unignored tree can
+    // be enormous, and a refusal that says so beats a list nobody reads.
+    const listed = copied.length
+      ? git(path, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...copied], { raw: true })
+      : { ok: true, out: "" };
+    if (!listed.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not record what was copied in: ${listed.err}` }; }
+    const untracked = listed.out ? listed.out.split("\0").filter(Boolean) : [];
+    if (untracked.length > MAX_COPIED_UNTRACKED) {
+      rmSync(path, { recursive: true, force: true });
+      return { ok: false, path: null, why: `the dependency trees ${copied.join(", ")} put ${untracked.length} files into the checkout that git does not ignore, past the ${MAX_COPIED_UNTRACKED} reeve will track; ignore them or declare a narrower path` };
+    }
+    // Names alone cannot tell an untouched copy from one the worker EDITED: git
+    // reports the same `?? vendor/dep.js` either way, so a pathname baseline
+    // subtracts the modification and an incomplete repair publishes. The digest is
+    // what distinguishes them, and it is only paid for in the unignored case --
+    // a gitignored tree contributes no baseline at all.
+    deps = { ok: true, cow: anyCow, skipped: copied.length === 0, copied,
+             untracked: fingerprint(path, untracked), why: null };
   }
 
   return { ok: true, path, why: null, deps };
@@ -469,6 +518,223 @@ export function publishRunWork({ repoRoot, path, branch, expectedRemote = null }
   const pushed = founderGit(repoRoot, ["push", "origin", `${fetched.ref}:refs/heads/${branch}`]);
   if (!pushed.ok) return { ok: false, why: `push refused: ${pushed.err}` };
   return { ok: true, why: null, head: fetched.head };
+}
+
+/**
+ * The identity reeve commits under.
+ *
+ * A worker checkout runs with GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM at
+ * /dev/null, so git has no configured identity there and invents one from the
+ * username and the hostname -- measured 2026-08-23: `Mobeen <mobeen@192.168.1.18>`.
+ * That address is not routable, links to no account, and a ruleset requiring a
+ * verified committer refuses it. reeve pushes as the founder, so it commits as
+ * the founder, read from the founder's own repository where that configuration
+ * is deliberately still visible.
+ *
+ * Null when either half is missing, rather than half an identity: git would
+ * invent the other half and the commit would carry a plausible address nobody
+ * owns.
+ */
+export function founderIdentity(repoRoot) {
+  const read = key => {
+    const r = founderGit(repoRoot, ["config", "--get", key]);
+    return r.ok && r.out ? r.out : null;
+  };
+  const name = read("user.name");
+  const email = read("user.email");
+  return name && email ? { name, email } : null;
+}
+
+/**
+ * Stage and commit what the worker changed.
+ *
+ * The worker cannot do this itself. Its sandbox denies Bash writes to `.git`, so
+ * `git add` and `git commit` fail with EPERM on `.git/index.lock`: measured
+ * 2026-08-23 across seven attempts in one run, which then spent thirteen of its
+ * thirty-six turns correctly diagnosing an instruction it could not carry out.
+ * Nothing published, three runs of three, with a correct fix sitting in the
+ * working tree each time (docs/measured/2026-08-23-three-real-dispatches.md).
+ *
+ * Moving the commit here is the answer already applied to the PUSH, one step
+ * earlier in the same sequence: the party that decides what may ship is the party
+ * that writes it. The worker is now unable to touch git's state at all.
+ *
+ * What gets staged is exactly what the worker declared in `filesTouched`, and
+ * nothing is JUDGED here. The diff gate runs after this, against the ref that
+ * gets pushed, so what may ship is still decided where it was always decided.
+ */
+/**
+ * Why reeve will not stage this declared path, or null if it will.
+ *
+ * git rejects an escaping pathspec itself, but the refusal a worker sees should
+ * be reeve's and should name the rule, and `.git` is worth refusing here rather
+ * than relying on `add` to decline it. Nothing is normalised away beyond a
+ * leading `./`: leading and trailing whitespace are legal in a git filename.
+ */
+function badDeclaredPath(f) {
+  if (typeof f !== "string" || !f.length) return `${JSON.stringify(f)} is not a filename`;
+  const rel = f.replace(/^\.\//, "");
+  if (rel.startsWith("/")) return `${rel} is absolute`;
+  if (rel.split("/").includes("..")) return `${rel} climbs out of the checkout`;
+  if (rel === ".git" || rel.startsWith(".git/")) return `${rel} is git's own state`;
+  return null;
+}
+
+/**
+ * A path -> content digest map, for telling a file reeve put somewhere from the
+ * same file after a worker has edited it.
+ *
+ * Hashed in-process rather than through `git hash-object --stdin-paths`, which
+ * takes NEWLINE-separated paths and would break on a filename containing one --
+ * a shape this codebase has already been bitten by once.
+ *
+ * An unreadable file is recorded as null, which never equals a later digest, so
+ * it reads as changed and fails closed.
+ */
+export function fingerprint(root, paths) {
+  const out = {};
+  for (const rel of paths) out[rel] = digestOf(join(root, rel));
+  return out;
+}
+
+/**
+ * The digest of one REGULAR file within a bounded size, or null.
+ *
+ * `lstat`, not `stat`, and a size ceiling: this runs in the DAEMON, unsandboxed,
+ * over paths a worker controls. A copied file replaced with a symlink to
+ * `/dev/zero` would be followed and read forever; one pointed at a huge host file
+ * would exhaust memory before the catch could run. Neither is reachable if only a
+ * bounded regular file is ever opened.
+ *
+ * Anything else -- a symlink, a device, a directory, an oversized file, an
+ * unreadable one -- returns null, which never equals a recorded digest, so it
+ * reads as CHANGED and the work is held rather than published.
+ */
+export function digestOf(abs) {
+  try {
+    const st = lstatSync(abs);
+    if (!st.isFile() || st.size > MAX_FINGERPRINT_BYTES) return null;
+    return createHash("sha256").update(readFileSync(abs)).digest("hex");
+  } catch { return null; }
+}
+
+export function commitRunWork({ repoRoot, path, branch, message, secrets = [], declared = [] }) {
+  if (!String(message ?? "").trim()) return { ok: false, why: "no commit message was given" };
+
+  // The message is built from the worker's report, which is model output that has
+  // read untrusted CI logs. The publication gate scans commit messages for these
+  // values too, but only after the commit exists -- and a secret in git history is
+  // not undone by refusing the push. Checked here so the commit is never made.
+  const leaked = secrets.find(s => typeof s?.value === "string" && s.value.length >= 16 && message.includes(s.value));
+  if (leaked) return { ok: false, why: `the commit message reeve derived carries ${leaked.label}` };
+
+  // The commit has to land on the branch that gets published. A worker that
+  // checked out something else would otherwise have its work committed where
+  // nothing looks for it, while the push carried the pinned head.
+  //
+  // A mismatch is a SKIP, not a failure. Refusing outright here would return
+  // before the gates below, and one of them reads the pushed ref for reeve's own
+  // worker token: a worker that commits a credential on the branch and then
+  // checks out another would have been reported as "wrong branch" rather than as
+  // carrying a token. Not committing is enough -- the gates still judge the ref,
+  // and the uncommitted-work check still refuses anything that would be lost.
+  //
+  // `branch --show-current` because it is the only one of the three that answers
+  // for every state of HEAD: it prints the branch on an unborn one, prints the
+  // branch normally, and prints NOTHING while exiting zero when detached.
+  // `symbolic-ref --quiet` exits nonzero when detached and `rev-parse
+  // --abbrev-ref` exits nonzero when unborn -- both of which read as an
+  // unreadable repository and take the hard-failure return, which happens BEFORE
+  // the gate that scans the pushed ref for reeve's own token.
+  const on = git(path, ["branch", "--show-current"]);
+  if (!on.ok) return { ok: false, why: `could not read the checked-out branch: ${on.err}` };
+  if (on.out !== branch)
+    return { ok: true, committed: false, files: [], why: `not committing: the checkout is on ${on.out || "a detached head"}, not ${branch}` };
+
+  // reeve stages EXACTLY what the worker declared, and nothing else.
+  //
+  // The previous design staged by heuristic -- `git add --all` minus the
+  // dependency trees preparation had copied in -- and produced three separate
+  // defects in three review rounds: a tree excluded from staging still made the
+  // checkout dirty; a TRACKED file inside such a tree had its edit silently
+  // dropped; and a NEW file inside one was dropped while the rest published as if
+  // complete. Each fix was another exclusion rule, which is the shape that says
+  // the design is wrong rather than the instances.
+  //
+  // Only the worker can say which of its files were the repair and which were a
+  // reproduction script, so the declaration is the INSTRUCTION here rather than a
+  // cross-check applied afterwards. That removes every special case at once: a
+  // path inside a copied tree stages because it was declared, and a scratch file
+  // does not because it was not.
+  const bad = declared.map(badDeclaredPath).filter(Boolean);
+  if (bad.length) return { ok: false, why: `the worker declared ${bad.length} path(s) reeve will not stage: ${bad.slice(0, 5).join("; ")}` };
+  const wanted = [...new Set(declared.map(f => f.replace(/^\.\//, "")))];
+  // Nothing declared is not an error: the gates below judge whatever the branch
+  // already holds, and a worker that committed nothing has changed nothing.
+  if (!wanted.length) return { ok: true, why: null, committed: false, files: [] };
+
+  // `--force`, because a declared path may sit inside an ignored or copied tree,
+  // and the worker saying it is part of the repair outranks the ignore rule. The
+  // diff gate still judges the result.
+  //
+  // Through stdin rather than argv: a repository-sized repair overruns ARG_MAX,
+  // and `--pathspec-from-file=-` with `--pathspec-file-nul` is git's own answer
+  // for a list of arbitrary length holding arbitrary bytes.
+  // `--literal-pathspecs` BEFORE the subcommand, because a filename may begin with
+  // `:` and git would read the entry as pathspec magic rather than as a name --
+  // measured, a real file called `:x` was rejected with "did not match any files"
+  // and every repair touching one would have been refused.
+  const added = git(path, ["--literal-pathspecs", "add", "--force", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                    { input: wanted.join("\0") + "\0" });
+  if (!added.ok) return { ok: false, why: `could not stage the declared work: ${added.err}` };
+
+  // `-z` and RAW, because git quotes a path it considers unusual -- `kéy.txt`
+  // comes back as `"k\303\251y.txt"` from `--name-only` -- and because trimming
+  // the output would eat a leading space that is part of the filename.
+  // `--no-renames`, because rename detection reports only the DESTINATION: a
+  // repair that renames a file and correctly declares both sides had the source
+  // read as never-changed, and the bidirectional check refused it. Both
+  // filesystem paths the worker touched have to be visible to be compared.
+  const staged = git(path, ["diff", "--cached", "--name-only", "--no-renames", "-z"], { raw: true });
+  if (!staged.ok) return { ok: false, why: `could not read what was staged: ${staged.err}` };
+  const files = staged.out ? staged.out.split("\0").filter(Boolean) : [];
+
+  // BOTH directions, and the index is reset on either so a human gets the
+  // checkout exactly as the worker left it.
+  //
+  // Declared-but-unstaged is the one that used to lose work: a declared path with
+  // no change means the worker mis-reported or something dropped it, and
+  // publishing the remainder as a complete repair is how the omitted part goes in
+  // the bin with the checkout. Staged-but-undeclared cannot happen now by
+  // construction, and is asserted rather than assumed.
+  const have = new Set(files), said = new Set(wanted);
+  const missing = wanted.filter(f => !have.has(f));
+  const extra = files.filter(f => !said.has(f));
+  if (missing.length || extra.length) {
+    git(path, ["reset", "--quiet", "HEAD", "--"]);
+    return { ok: false, why: missing.length
+      ? `the worker reported ${missing.length} file(s) that are not changed in the checkout: ${missing.slice(0, 5).join(", ")}`
+      : `staging produced ${extra.length} file(s) the worker did not report: ${extra.slice(0, 5).join(", ")}` };
+  }
+
+  const id = founderIdentity(repoRoot);
+  if (!id) return { ok: false, why: "the founder's git identity is not configured, so a commit would carry an address nobody owns" };
+
+  // As ENVIRONMENT, not as `-c user.*`. Git gives GIT_AUTHOR_* and GIT_COMMITTER_*
+  // precedence over configuration, and `gitEnv()` passes the daemon's own
+  // environment through: measured, `GIT_AUTHOR_NAME=Injected` beside
+  // `-c user.name=Founder` produces `Injected`. A daemon launched from a wrapper
+  // that exports them would have attributed every repair to that identity, and a
+  // ruleset requiring a verified committer would refuse the push.
+  const done = run(path, GIT_NEUTRALISE, ["commit", "--quiet", "-m", message], gitEnv({
+    GIT_AUTHOR_NAME: id.name, GIT_AUTHOR_EMAIL: id.email,
+    GIT_COMMITTER_NAME: id.name, GIT_COMMITTER_EMAIL: id.email,
+  }));
+  if (!done.ok) return { ok: false, why: `commit refused: ${done.err}` };
+
+  const head = git(path, ["rev-parse", "HEAD"]);
+  if (!head.ok) return { ok: false, why: `committed, but the new head could not be read: ${head.err}` };
+  return { ok: true, why: null, committed: true, files, head: head.out };
 }
 
 /**

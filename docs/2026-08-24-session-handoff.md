@@ -178,9 +178,12 @@ effect twice. `settleOutbox` also updates by `id` with no lease check.
 three dispatches, the P0, the disarming and the PRs that fixed it. Whether it has
 been written yet is in §0.
 
-**`docs/HANDOFF.md:442` overstates.** Its "Proven — three complete dispatches …
-reeve published → green" was true on 21 August, false from 22 August, and is now
-true in CODE with no run behind it.
+**`docs/HANDOFF.md`'s "Proven" list has been dated.** Its "three complete
+dispatches … reeve published → green" was true on 21 August and false from 22
+August, when the OS sandbox took the publishing half away. The entry now carries
+that history, says the capability was rebuilt on reeve's side rather than restored
+on the worker's, and points at §0 for whether a real run has since agreed with the
+tests.
 
 **Also open:** ntfy read user (needs shell on 95.217.11.127); second project
 (`rextaihq/rext-backend`); R-01 the ruleset (admins bypass everything, no required

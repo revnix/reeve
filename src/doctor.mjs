@@ -74,6 +74,27 @@ function hashTree(dir, filter = () => true) {
  * both surfaces because they disagree: classic protection and rulesets are
  * separate systems and a repo can be governed by either, neither, or both.
  */
+/** How a bypass actor is NAMED in a diagnostic.
+ *
+ * `actor_type` on its own is a CLASS, not an actor: `Team:1` and `Team:2` both
+ * render as `Team`, and an operator is then told a bypass exists with no way to
+ * check whether it is reeve's. That is the single question the two lines below
+ * exist to answer, and for `actor_type: "Integration"` the id IS the App id reeve
+ * identifies itself by, so the id is the half that carries the answer.
+ *
+ * A missing id degrades to the bare type rather than printing a dangling colon:
+ * some types genuinely carry none, `OrganizationAdmin` being a class with one
+ * member.
+ *
+ * `baseline.mjs` renders the same field for its ruleset snapshot and deliberately
+ * does NOT share this. That string is a stored canonical form; rewording it would
+ * move every recorded baseline and report drift where nothing had changed.
+ */
+const bypassActorName = b =>
+  b.actor_id === undefined || b.actor_id === null
+    ? String(b.actor_type)
+    : `${b.actor_type}:${b.actor_id}`;
+
 export function checkMergeAuthority(nwo, { api = gh } = {}) {
   const lines = [];
   // Whether the BROKEN verdict, if there is one, is about a gate that can be
@@ -130,7 +151,7 @@ export function checkMergeAuthority(nwo, { api = gh } = {}) {
       if (always.length) {
         level = BROKEN;
         bypassable = true;
-        lines.push(`ruleset ${d.name}: bypass_actors allow ${always.map(b => b.actor_type).join(", ")} to bypass ALWAYS`);
+        lines.push(`ruleset ${d.name}: bypass_actors allow ${always.map(bypassActorName).join(", ")} to bypass ALWAYS`);
       }
       const hasChecks = (d.rules ?? []).some(x => x.type === "required_status_checks");
       if (!hasChecks) { level = BROKEN; bypassable = true; lines.push(`ruleset ${d.name}: contains no required_status_checks rule at all`); }
@@ -152,12 +173,18 @@ export function checkMergeAuthority(nwo, { api = gh } = {}) {
           && d.enforcement === "active" && (d.target ?? "branch") === "branch") {
         const cond = d.conditions?.ref_name;
         const everyBranch = !cond || ((cond.include ?? []).includes("~ALL") && !(cond.exclude ?? []).length);
+        // Whether it actually refuses also depends on the bypass actors this same
+        // loop already read: an actuator inside an `always` bypass pushes straight
+        // through the rule. Stating a certain refusal where a bypass exists sends
+        // an operator after the wrong problem -- and this check earns its place by
+        // being read BEFORE a worker run is paid for, so it has to be right.
+        const past = always.length ? ` — unless reeve's identity is inside the bypass (${always.map(bypassActorName).join(", ")}), which this check cannot tell` : "";
         if (everyBranch) {
           level = BROKEN;
-          lines.push(`ruleset ${d.name}: requires signed commits on every branch, and reeve commits unsigned — every repair it makes will be refused at the push`);
+          lines.push(`ruleset ${d.name}: requires signed commits on every branch, and reeve commits unsigned — every repair it makes will be refused at the push${past}`);
         } else {
           if (level === OK) level = DEGRADED;
-          lines.push(`ruleset ${d.name}: requires signed commits on ${(cond.include ?? []).join(", ") || "some branches"} — reeve commits unsigned, so a repair on a branch it covers will be refused at the push`);
+          lines.push(`ruleset ${d.name}: requires signed commits on ${(cond.include ?? []).join(", ") || "some branches"} — reeve commits unsigned, so a repair on a branch it covers will be refused at the push${past}`);
         }
       }
     }

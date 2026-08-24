@@ -1,5 +1,9 @@
 # Resume prompt — paste this into a new session
 
+> **SUPERSEDED by `docs/2026-08-24-resume-prompt.md` (2026-08-24).** Kept as history.
+> Its state claims were true when written and are not maintained. The
+> single-source test does not scan this file.
+
 Supersedes `docs/2026-08-22-resume-prompt-2.md`. Copy everything inside the fence.
 
 ---
@@ -15,15 +19,28 @@ order, and treat them as the source of truth over anything you infer:
 Ignore docs/2026-08-22-session-handoff.md (superseded banner) and treat
 docs/2026-08-22-session-handoff-2.md as history.
 
-## In one line
+## Read §0 of the handoff FIRST, then this
 
-reeve is DISARMED, because it could not publish. `--execute` was removed from the
-plist on 23 Aug and the running process verified without it. The reason: the
-worker cannot run `git add` or `git commit` — the sandbox that landed 22 Aug
-denies Bash writes to `.git`. Three dispatches, three correct fixes, zero
-published — though only run 3 demonstrates the commit block; runs 1 and 2 hit
-max_turns first. That is a regression: reeve
-published three times on 21 Aug, on its OWN repo, before that sandbox existed.
+**This document contains no current facts, deliberately.** What is merged, whether
+reeve is armed, what `main` is, which PRs are open — all of that lives in
+`docs/2026-08-23-session-handoff.md` §0 and nowhere else.
+
+That is not tidiness. The same three facts had been restated in about twenty
+places across these two files, and six review rounds in a row found a correction
+applied to one copy and left standing in the others. The sixth found this very
+paragraph claiming the prompt held no state while three sections still did. Twenty
+copies of a daily-changing fact will always drift, and patching whichever copy
+review lands on only moves which one is wrong.
+
+So: read §0 for STATE. Read this for what to DO and for the traps that cost hours.
+If the two ever disagree, §0 wins and this file is stale.
+
+The durable part, which does not go stale: reeve could not publish at all, because
+its worker could not run `git add` or `git commit` — the sandbox that landed 22
+Aug denied Bash writes to `.git`. Three dispatches produced three correct fixes
+and shipped none. Only run 3 reached far enough to demonstrate it; runs 1 and 2
+hit max_turns first. It was a regression — reeve published three times on 21 Aug,
+on its own repo, before that sandbox existed.
 
 ## VERIFY the state before trusting any of it, and tell me what drifted
 
@@ -39,27 +56,35 @@ armed: `launchctl kickstart` restarts from launchd's cached plist, so the file
 can say `--execute` while the running process does not have it. That happened on
 23 Aug and I nearly reported it as done.
 
-Expected: main at least `bc17a06` (#17), the test files green, doctor `broken` on
-R-01 and R-03 ONLY (both mine), and the running process WITHOUT `--execute`. If
-it has `--execute`, someone re-armed it — find out who before doing anything
-else.
+Expected: `main`, the arming, and what is open all match §0 — that is what you are
+checking against, and if the running process disagrees with §0 about `--execute`,
+someone changed one without the other, so find out which before doing anything
+else. Also expect doctor `broken` on R-01 and R-03 ONLY (both mine) and the test
+files green. Note the daemon's checkout may be BEHIND main, so the running process
+can be on older code than the tests you just ran.
 
 ## Your task, in priority order
 
-1. **The P0 is DECIDED and BUILT — land it, do not re-open it.** The worker
-   cannot commit; read `docs/measured/2026-08-23-three-real-dispatches.md`
-   Finding 1 for the evidence and both controls. I chose reeve-side staging and
-   committing. The worker keeps git's READ commands (`status`, `diff`, `log`,
-   `show`) and loses `add`, `commit`, `push` and `remote`. It also keeps
-   `git clean`, which is NOT read-only — it deletes untracked files, and with
-   `-d`/`-x` untracked directories and ignored files too. It is not the only route
-   either: any script-capable runner can unlink a file, and a TypeScript unit gets
-   `Bash(node:*)` with `node -e` usable. So the honest position is that the worker
-   already HAS a delete, `git clean` is the legible one to point it at, and what
-   bounds the risk is that nothing it can reach was ever committed — not that the
-   retained set is inert. Judge that trade on those terms. PR #19
-   implements all of it. Your job is to finish its review rounds and get it
-   merged, not to choose a shape again.
+1. **The P0 is FIXED and MERGED — do not re-open or rebuild it.** Read
+   `docs/measured/2026-08-23-three-real-dispatches.md` Finding 1 for why it
+   existed, and §0 of the handoff for what landed.
+
+   What was chosen: reeve stages and commits, and it stages EXACTLY the paths the
+   worker declared in `filesTouched`. The worker keeps git's READ commands
+   (`status`, `diff`, `log`, `show`) and loses `add`, `commit`, `push` and
+   `remote`. It also keeps `git clean`, which is NOT read-only — it deletes
+   untracked files, and with `-d`/`-x` untracked directories and ignored files
+   too. Nor is it the only route: any script-capable runner can unlink a file, and
+   a TypeScript unit gets `Bash(node:*)` with `node -e` usable. The honest
+   position is that the worker already HAS a delete, `git clean` is the legible
+   one to point it at, and what bounds the risk is that nothing it can reach was
+   ever committed — not that the retained set is inert.
+
+   Whether reeve is re-armed, and what is still open, are both in §0. What does
+   NOT go stale: re-arming is the founder's call, and it is worth taking against a
+   real dispatch rather than on the strength of the tests — the defect that
+   started all this was found by a dispatch, and roughly 640 green tests never saw
+   it.
 
    Do NOT assume the diff gate makes the rest free. `reviewDiff`
    (`sandbox.mjs:714-767`) judges PATHS and territory, not whether an allowed edit
@@ -82,12 +107,11 @@ else.
    comes from beneath them. Tell me what it would cost to represent or PROBE the
    effective restrictions, which is the only version that reaches all six.
 
-2. **PR #15** (`docs/first-dispatches`, worktree ~/Work/Products/reeve-wt/paths)
-   is open and AT its ten-round cap — ten review requests, ten correction pushes,
-   43 findings, every thread answered and resolved. Do NOT request an eleventh.
-   If more findings arrive, read them and bring me a judgement instead of another
-   round. The findings have been narrowing for several rounds, which is the signal
-   the cap exists to act on.
+2. **Work whatever PRs §0 lists as open, and respect the ten-round cap.** A PR at
+   ten review requests stops: answer and resolve what is there, do NOT request an
+   eleventh, and bring me a judgement instead. #15 hit that cap at 43 findings and
+   was merged on it. The signal is not the count alone — it is the count together
+   with findings that have been narrowing for several rounds.
 
 3. **Watch for the first real dispatch on nextly.** It has never dispatched there.
    Mind which table you use for that: `worker_run` only landed on 22 Aug
@@ -114,7 +138,7 @@ else.
 ## The daemon freeze is LIFTED; the tracker entry is still owed
 
 `src/daemon.mjs` was frozen for a `threadDetails` session that never pushed a
-branch. I lifted it on 23 Aug so the P0 could be fixed, and PR #19 edits it.
+branch. I lifted it on 23 Aug so the P0 could be fixed, and that work has merged.
 
 `docs/TRACKER.md` is still untouched, and an entry is OWED for: PR #14, the
 arming, the worker limits, the three dispatches, the P0 and its fix. Write it
@@ -186,17 +210,17 @@ once those PRs land, not before.
   - S2-A/B/C plans (#11, #12, #13) and their follow-up #17 are IN main. S2 is
     planned, not built. Do not wait on or coordinate with those lanes.
   - threadDetails wiring: never started, no branch was ever pushed. Nobody owns
-    `src/daemon.mjs`; PR #19 edits it.
-  - Mine and open: #15 (docs), #18 (prompt/grant), #19 (the P0 fix). #19 is
-    stacked on #18 because both touch `src/prompts.mjs`.
+    `src/daemon.mjs`.
+  - What is open and mine: see §0 of the handoff. It is the only list that stays
+    current.
 
 Use ListAgents and SendMessage to check what peers are on before touching
 anything outside your lane, and tell them what you are on.
 
 Do NOT `git pull` or switch branches in ~/Work/Products/reeve — that is the
-running daemon's checkout. reeve is disarmed, so a restart is less dangerous than
-it was, but the checkout is still live and a half-applied tree is still a bad
-thing to hand a daemon. Restarting after a merge is fine and expected, after verifying the merge by
+running daemon's checkout. How dangerous a restart is depends on whether
+`--execute` is on, which §0 has — but the checkout is live either way, and a
+half-applied tree is always a bad thing to hand a daemon. Restarting after a merge is fine and expected, after verifying the merge by
 CONTENT. Squash merges break SHA ancestry, and comparing SNAPSHOTS does not
 settle it either — restricting the diff to your paths still reports a difference
 once anything else touches those paths after the squash. Ask whether YOUR PATCH
@@ -207,6 +231,13 @@ is present, which is a question about the change rather than about the tree:
 
   # run from a clean checkout of origin/main; exit 0 means every hunk you
   # proposed is already there
+
+Read a FAILURE carefully rather than as loss. It means your exact hunks are no
+longer reversible, which is also what a LATER commit touching the same lines
+produces — measured on 24 Aug: #18 merged fine and then #19 edited the same
+functions, so #18's patch stopped reverse-applying while every line of it was
+present. When it fails, spot-check the identifiers your change introduced before
+concluding anything was dropped.
 
 ## What needs me, so you do not wait on it silently
 

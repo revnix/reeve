@@ -83,7 +83,7 @@ ok("only one outbox row", db.prepare("SELECT count(*) c FROM outbox").get().c===
 const job = leaseOutbox(db,{worker:"d1"});
 ok("outbox lease returns the job", job && job.kind==="gh.pr.create" && job.attempts===1);
 ok("no second drainer can lease it", leaseOutbox(db,{worker:"d2"})===undefined);
-settleOutbox(db,{id:job.id, ok:false, error:"gh: rate limited", retryable:true});
+settleOutbox(db,{id:job.id, leaseToken:job.lease_token, ok:false, error:"gh: rate limited", retryable:true});
 const after = db.prepare("SELECT status, attempts, not_before FROM outbox WHERE id=?").get(job.id);
 ok("retryable failure -> pending with backoff", after.status==="pending" && after.not_before>Math.floor(Date.now()/1000));
 
@@ -94,7 +94,7 @@ ok("recovered row is pending", db.prepare("SELECT status FROM outbox WHERE id=?"
 
 // 12. permanent failure -> dead_letter
 const j2 = leaseOutbox(db,{worker:"d1"});
-settleOutbox(db,{id:j2.id, ok:false, error:"422 branch has no diff", retryable:false});
+settleOutbox(db,{id:j2.id, leaseToken:j2.lease_token, ok:false, error:"422 branch has no diff", retryable:false});
 ok("non-retryable -> dead_letter", db.prepare("SELECT status FROM outbox WHERE id=?").get(j2.id).status==="dead_letter");
 
 // 13. deterministic export

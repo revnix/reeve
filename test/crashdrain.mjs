@@ -27,8 +27,8 @@ console.log("recovered rows:", recoverOutbox(db).length);
 const job2 = leaseOutbox(db,{worker:"d2",leaseSeconds:300});
 // THE RULE: reconcile before performing, always.
 const r = reconcile(job2.idem_key);
-if (r.done) settleOutbox(db,{id:job2.id, ok:true, result:{...r, reconciled:true}});
-else { const res = perform(job2.idem_key); settleOutbox(db,{id:job2.id, ok:true, result:res}); }
+if (r.done) settleOutbox(db,{id:job2.id, leaseToken:job2.lease_token, ok:true, result:{...r, reconciled:true}});
+else { const res = perform(job2.idem_key); settleOutbox(db,{id:job2.id, leaseToken:job2.lease_token, ok:true, result:res}); }
 console.log("external side effects after recovery:", readFileSync(EXT,"utf8").trim().split("\n").length, "(must still be 1)");
 const fin = db.prepare("SELECT status,attempts,result FROM outbox WHERE id=?").get(job.id);
 console.log("final outbox row:", fin);

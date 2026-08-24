@@ -25,6 +25,11 @@ const ADDED_COLUMNS = [
   // after the retry cap can say why no fix was possible, rather than claiming a
   // fix was tried and survived when the worker never attempted one.
   ["fix_attempt", "note", "TEXT"],
+  // The outbox fence. Additive and defaulted, so it lands on a populated table:
+  // every existing row starts at 0 and the first lease bumps it to 1, which is
+  // correct -- an unleased row has no holder to fence out. `RESHAPED` is for a
+  // changed UNIQUE constraint and refuses a non-empty table; this is neither.
+  ["outbox", "lease_token", "INTEGER NOT NULL DEFAULT 0"],
 ];
 
 function addMissingColumns(db) {
@@ -247,30 +252,63 @@ export function enqueue(db, { idemKey, kind, runId = null, args, notBefore = 0 }
   return r ? r.id : null;   // null = already enqueued; caller treats as success
 }
 
+/**
+ * Take the next due effect, and return the FENCE with it.
+ *
+ * `lease_token` is bumped in the same statement that takes the row, so a holder's
+ * token is the row's token only until someone else leases it. The caller must
+ * carry it back to `settleOutbox`; a settle without it is refused.
+ *
+ * `attempts` is bumped here too and that is deliberate: an attempt begins when the
+ * row is taken, because a drainer that dies mid-delivery has still consumed one of
+ * the tries the budget allows. The two counters move together on this path and
+ * apart on others, which is exactly why they are two columns.
+ */
 export function leaseOutbox(db, { worker, leaseSeconds = 300 }) {
   return tx(db, () => db.prepare(`
-    UPDATE outbox SET status='inflight', attempts=attempts+1,
+    UPDATE outbox SET status='inflight', attempts=attempts+1, lease_token=lease_token+1,
            lease_expires_at=unixepoch()+?, updated_at=unixepoch()
     WHERE id = (SELECT id FROM outbox
                 WHERE status='pending' AND not_before<=unixepoch()
                 ORDER BY id LIMIT 1)
-    RETURNING id, idem_key, kind, run_id, args, attempts, max_attempts`).get(leaseSeconds));
+    RETURNING id, idem_key, kind, run_id, args, attempts, max_attempts, lease_token`).get(leaseSeconds));
 }
 
-export function settleOutbox(db, { id, ok, result, error, retryable = true, actor = "drainer" }) {
+/**
+ * Record what happened to a leased effect — only if the caller still holds it.
+ *
+ * Returns `"stale"`, having written NOTHING, when the row has been leased by
+ * someone else since. That is the whole point: the previous version matched on
+ * `id` alone, so a drainer whose lease had expired could mark done a delivery
+ * another drainer was in the middle of making, overwriting its status and result.
+ *
+ * A missing `leaseToken` THROWS rather than settling. It is a programming error,
+ * and the failure it produces -- an unfenced settle -- is the exact defect this
+ * argument exists to prevent, so it must not be possible to reach it by omission.
+ */
+export function settleOutbox(db, { id, leaseToken, ok, result, error, retryable = true, actor = "drainer" }) {
+  if (!Number.isInteger(leaseToken))
+    throw new Error("settleOutbox: leaseToken is required; an unfenced settle can overwrite another drainer's live delivery");
   return tx(db, () => {
-    const row = db.prepare(`SELECT attempts, max_attempts, kind FROM outbox WHERE id=?`).get(id);
+    const row = db.prepare(`SELECT attempts, max_attempts, kind, lease_token, status FROM outbox WHERE id=?`).get(id);
+    // A row that is gone, or one whose fence has moved on, is not this caller's to
+    // settle. Reported rather than thrown: a drainer losing a race is an ordinary
+    // event, and the loser's job is to stop touching the row, not to crash.
+    if (!row || row.lease_token !== leaseToken) {
+      emit(db, { actor, op: "outbox.stale", payload: { id, held: leaseToken, now: row?.lease_token ?? null } });
+      return "stale";
+    }
     if (ok) {
       db.prepare(`UPDATE outbox SET status='done', result=?, lease_expires_at=0, updated_at=unixepoch()
-                  WHERE id=?`).run(canonical(result ?? {}), id);
+                  WHERE id=? AND lease_token=?`).run(canonical(result ?? {}), id, leaseToken);
       emit(db, { actor, op: "outbox.done", payload: { id, kind: row.kind } });
       return "done";
     }
     const dead = !retryable || row.attempts >= row.max_attempts;
     db.prepare(`UPDATE outbox SET status=?, last_error=?, not_before=unixepoch()+?,
-                lease_expires_at=0, updated_at=unixepoch() WHERE id=?`)
+                lease_expires_at=0, updated_at=unixepoch() WHERE id=? AND lease_token=?`)
       .run(dead ? "dead_letter" : "pending", String(error).slice(0, 2000),
-           dead ? 0 : backoffSeconds(row.attempts), id);
+           dead ? 0 : backoffSeconds(row.attempts), id, leaseToken);
     emit(db, { actor, op: dead ? "outbox.dead_letter" : "outbox.retry",
                payload: { id, kind: row.kind, attempts: row.attempts } });
     return dead ? "dead_letter" : "retry";

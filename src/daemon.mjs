@@ -28,7 +28,10 @@ import { measureContainment, revalidateContainment, probeKeychain, isolationTopo
 import { canaryIdFor, netListener, instrumentHash } from "./canary.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256 } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue } from "./db/ops.mjs";
+import { authenticate, apiAsInstallation } from "./github/app.mjs";
+import { drainOutbox } from "./outbox/drain.mjs";
+import { HANDLERS } from "./outbox/effects.mjs";
 import { writeDash } from "./dash.mjs";
 import { snapshot, snapshotAll } from "./backup.mjs";
 import { selfAudit } from "./selfaudit.mjs";
@@ -215,6 +218,16 @@ function trackedAmong(worktree, wanted) {
     try { unlinkSync(tmp); } catch {}
   }
 }
+
+/**
+ * Is reeve allowed to act on review threads at all?
+ *
+ * One reader, so the flag cannot be half-observed. It is OFF unless a profile says
+ * otherwise, and that default is the point: this whole path performs real, visible
+ * GitHub writes on someone else's pull request, and the founder turns it on
+ * deliberately after the shadow week rather than inheriting it from a merge.
+ */
+export const reviewActionsOn = profile => profile?.watch?.reviewActions === true;
 
 export function uncommittedFiles(worktree, copiedBaseline = {}, { digest = digestOf } = {}) {
   try {
@@ -954,6 +967,40 @@ export async function tick(ctx) {
 
     const PREP_BACKOFF = (ctx.prepBackoff ??= new Map());   // pr -> { until, failures }
     for (const { e, decision, cause, fp } of decisions) {
+      // REQUEST_REVIEW is no longer a worker task, and it never should have been.
+      // It posts each reviewer's trigger comment verbatim -- no judgement, no
+      // reading of the diff, nothing a model is needed for. It was a dispatch only
+      // because reeve could not act on GitHub itself, and it cost a paid worker run
+      // to produce a fixed string that the worker's own `gh` was then refused.
+      //
+      // Enqueued rather than posted here: the effect has to be durable with the
+      // decision that produced it, or a crash between the two leaves a state saying
+      // the round was requested and a pull request where nothing was said.
+      if (decision.action === "REQUEST_REVIEW" && reviewActionsOn(profile)) {
+        const triggers = (profile.reviewers ?? []).filter(r => r.trigger);
+        if (!triggers.length) {
+          log(logPath, `  #${e.pr}: REQUEST_REVIEW — no reviewer in this profile declares a trigger`);
+          escalations.set(`#${e.pr}: a review round is due but no reviewer declares a trigger comment`, 1);
+          continue;
+        }
+        // The key is what makes this at-most-once, and it is deliberately keyed on
+        // the HEAD: a new head is a new round and must ask again, while a repeated
+        // tick at the same head must not. `enqueue` returns null on a key it
+        // already holds, which is success and not a failure.
+        let queued = 0;
+        for (const r of triggers) {
+          const idemKey = `review-request:${nwo}:${e.pr}:${e.head}:${r.login}`;
+          const id = tx(db, () => enqueue(db, {
+            idemKey, kind: "gh.pr.comment",
+            args: { nwo, pr: e.pr, body: r.trigger },
+          }));
+          if (id !== null) queued++;
+        }
+        log(logPath, queued
+          ? `  #${e.pr}: REQUEST_REVIEW — queued ${queued} trigger comment(s) for reeve to post`
+          : `  #${e.pr}: REQUEST_REVIEW — already requested at this head`);
+        continue;
+      }
       if (UNBUILT_ACTIONS[decision.action]) {
         log(logPath, `  #${e.pr}: NOT dispatching ${decision.action} — ${UNBUILT_ACTIONS[decision.action]}`);
         escalations.set(`#${e.pr}: ${decision.action.toLowerCase().replace("_", " ")} needs a GitHub effect reeve does not yet perform`, 1);
@@ -1641,6 +1688,32 @@ export async function tick(ctx) {
   if (ctx.reviewIngest !== false) {
     try { (ctx.deriveSupply ?? deriveSupply)(db, nwo, profile, { at: now() }); }
     catch (err) { log(logPath, `supply derive failed — ${err.message}`); }
+  }
+
+  // Drain AFTER the decisions, so an effect enqueued in this tick goes out in this
+  // tick rather than waiting for the next one. Unconditional: with nothing
+  // enqueued it leases nothing and costs one query, and gating it as well as the
+  // producers would mean the path that performs the writes had never run by the
+  // time the flag was first flipped.
+  //
+  // A drain failure never fails the tick. Watching, judging and escalating do not
+  // depend on it, and a queue that cannot move is a reason to say so rather than to
+  // stop reading pull requests.
+  if (ctx.drain !== false) {
+    try {
+      const auth = await (ctx.authenticate ?? authenticate)(nwo);
+      if (!auth.ok) {
+        // Only worth saying when there is something waiting. Otherwise every tick
+        // on a machine with no App credential prints a line about an empty queue.
+        const waiting = db.prepare(`SELECT count(*) n FROM outbox WHERE status='pending'`).get().n;
+        if (waiting) log(logPath, `  outbox: ${waiting} effect(s) waiting; cannot authenticate — ${auth.why}`);
+      } else {
+        const api = args => apiAsInstallation(auth.token, args);
+        const r = await drainOutbox({ db, log: m => log(logPath, m), handlers: ctx.handlers ?? HANDLERS, api });
+        const posted = r.done.filter(d => d.verdict === "done").length;
+        if (posted) log(logPath, `  outbox: performed ${posted} effect(s)`);
+      }
+    } catch (err) { log(logPath, `  outbox: drain failed — ${err.message}`); }
   }
 
   noteTick(db);

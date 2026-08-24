@@ -579,7 +579,8 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
                                ["a bare hyphen as the owner", { prod: { nwo: "-/repo" } }],
                                ["an owner starting with a hyphen", { prod: { nwo: "-a/repo" } }],
                                ["an owner ending with a hyphen", { prod: { nwo: "a-/repo" } }],
-                               ["consecutive hyphens in the owner", { prod: { nwo: "a--b/repo" } }]]) {
+                               ["consecutive hyphens in the owner", { prod: { nwo: "a--b/repo" } }],
+                               ["an owner past GitHub's 39-character limit", { prod: { nwo: "a".repeat(40) + "/repo" } }]]) {
     writeFileSync(reg, JSON.stringify(body));
     const ids = idsOf(run("builder", "doctor", "--json").stdout);
     check(ids?.includes("H-7"), `${label} is a registry error`, JSON.stringify(ids));

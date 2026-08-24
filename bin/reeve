@@ -117,7 +117,10 @@ const registryProjects = (home) => {
     // does allow `.`, `_` and `-` anywhere except as the whole name.
     // SINGLE internal hyphens only. `[A-Za-z0-9-]*` allowed `a--b`, which GitHub
     // does not: a login is alphanumeric segments joined by ONE hyphen each.
-    const OWNER = String.raw`[A-Za-z0-9](?:-?[A-Za-z0-9])*`;
+    // AND BOUNDED. A GitHub login is at most 39 characters, so a 40-character
+    // owner cannot name one -- and an impossible name still marked the registry
+    // KNOWN, which is the suppression this validation exists to stop.
+    const OWNER = String.raw`[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}`;
     const REPO  = String.raw`(?!\.+$)[\w.-]+`;
     const NWO = new RegExp(`^${OWNER}/${REPO}$`);
     const bad = Object.entries(reg)

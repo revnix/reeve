@@ -35,6 +35,7 @@ import { join, dirname, resolve, basename } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { resolveHome } from "../src/home.mjs";
 // The build route. `HUB_TABLES` is deliberately NOT here: Task 9 adds that
 // export, and ESM rejects a missing named export at module instantiation, so
 // naming it now would stop EVERY reeve command from starting.
@@ -105,7 +106,6 @@ const registryProjects = (home) => {
 // not, so a scratch home redirected a project's state database but not the
 // profile describing it -- the two halves of one project's configuration read
 // from different roots, which is unusable for a test and wrong for an operator.
-const HOME = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
 
 const [major] = process.versions.node.split(".").map(Number);
 if (major < 24) {
@@ -114,21 +114,216 @@ if (major < 24) {
 }
 
 const argv = process.argv.slice(2);
-const cmd = argv.shift();
-const flag = n => argv.includes(`--${n}`);
-const opt = n => { const i = argv.indexOf(`--${n}`); return i < 0 ? null : argv[i + 1]; };
-const VALUED = new Set(["db", "plugin-cache", "plugin-repo", "profile", "set", "log", "halt", "interval", "last", "out", "dash"]);
-// Positionals only. A valued flag consumes the token after it, so that token is
-// never mistaken for a repo name however much it looks like one.
-const positionals = (() => {
-  const out = [];
+// The COMMAND IS THE FIRST POSITIONAL, and it is decided by the walk below
+// rather than before it.
+//
+// Two failures came from deciding it first. `argv.shift()` took the first token
+// whatever it was, so `reeve --help` consumed `--help` as the command name and
+// the one invocation everybody tries first printed the help and exited 1. Then
+// treating a leading flag as "no command" was worse: `reeve --home /scratch
+// backup --hub` left `backup` sitting in the positionals, fell through to the
+// default branch, printed the help and exited ZERO -- a backup that never ran,
+// reporting success to whatever automation asked for it. Silence with a
+// success code is the exact failure this whole change is about.
+//
+// Only the walk knows which tokens are values, so only the walk can say which
+// token is the command.
+
+// ── every flag this CLI accepts, declared ONCE ──────────────────────────────
+//
+// There were two facts about a flag -- does it exist, and does it take a value
+// -- and only the second was written down, in `VALUED`. They had already
+// drifted: `VALUED`'s own comment says it exists so "a valued flag consumes the
+// token after it, so that token is never mistaken for a repo name however much
+// it looks like one", and SIX flags that take values were missing from it.
+//
+// Measured before this change: `reeve backup --to some/place` answered
+// `no state at <home>/state/some/place.db` -- it had read the FLAG'S VALUE as
+// the repository name, which is exactly the failure that comment describes.
+// `--tail`, `--from`, `--keep`, `--days` and `--backups` were all in the same
+// state.
+//
+// So there is one declaration now and `VALUED` is derived from it. `what` is
+// here because a flag nobody can look up is a flag nobody uses correctly.
+const FLAGS = {
+  home:           { value: true,  what: "the reeve home to operate on (default $REEVE_HOME, else ~/.reeve)" },
+  db:             { value: true,  what: "path to a state database" },
+  log:            { value: true,  what: "path to the log file" },
+  halt:           { value: true,  what: "path to the halt marker" },
+  interval:       { value: true,  what: "seconds between ticks" },
+  last:           { value: true,  what: "how many recent entries to show" },
+  out:            { value: true,  what: "where to write output" },
+  dash:           { value: true,  what: "path to the dashboard html" },
+  profile:        { value: true,  what: "path to a profile json" },
+  set:            { value: true,  what: "a key=value profile override" },
+  "plugin-cache": { value: true,  what: "path to the plugin cache" },
+  "plugin-repo":  { value: true,  what: "path to the plugin repository" },
+  to:             { value: true,  what: "backup root to write into" },
+  from:           { value: true,  what: "snapshot to restore from" },
+  backups:        { value: true,  what: "backup root to read from" },
+  keep:           { value: true,  what: "how many snapshots to retain" },
+  days:           { value: true,  what: "how many days to consider" },
+  tail:           { value: true,  what: "a durable export-events file to replay" },
+
+  hub:            { value: false, what: "operate on the builder hub rather than a repository" },
+  json:           { value: false, what: "machine-readable output" },
+  force:          { value: false, what: "proceed past a refusal that is an operator judgement" },
+  overwrite:      { value: false, what: "replace an existing file" },
+  takeover:       { value: false, what: "take a lease whose holder is provably dead" },
+  execute:        { value: false, what: "actually act, rather than observe" },
+  enforce:        { value: false, what: "publish the merge policy as enforcing" },
+  events:         { value: false, what: "export the event log too" },
+  health:         { value: false, what: "report health only" },
+  open:           { value: false, what: "open the result" },
+  tick:           { value: false, what: "run a single tick and exit" },
+  write:          { value: false, what: "write the change rather than printing it" },
+  "as-app":       { value: false, what: "act as the GitHub App rather than the user" },
+  help:           { value: false, what: "show this help" },
+};
+const VALUED = new Set(Object.entries(FLAGS).filter(([, f]) => f.value).map(([n]) => n));
+
+// ── ONE walk over argv, which decides everything about it ───────────────────
+//
+// There were FOUR readers of `argv` -- `flag`, `opt`, the unknown-flag scan and
+// `positionals` -- and each carried its own idea of what a flag is. They
+// disagreed, and two of the disagreements were defects: the scan looked only at
+// `--` tokens, so `-w` was never examined at all and became an unused
+// positional; and `opt` returned whatever token happened to follow a flag
+// without asking whether it was a value, so a trailing `--home` produced
+// `undefined` and `??` turned that back into the environment the operator had
+// just overridden.
+//
+// Neither is a missing check. Both are what a repeated resolution does -- the
+// same thing this file already says about `stateFor`. So there is ONE walk, it
+// emits every refusal itself, and `flag`/`opt`/`positionals` are lookups into
+// its result rather than three more scans.
+//
+// UNKNOWN FLAGS ARE REFUSED, not ignored. Ignoring them is how `--home /tmp/x`
+// silently operated on the operator's real ~/.reeve -- there was no such flag,
+// so it and its value were skipped and the command ran against the live home.
+// It is also how `--keeep 3` looked like it had set a retention while quietly
+// using the default. A misspelled flag must not be indistinguishable from an
+// absent one, because the two mean opposite things to whoever typed it.
+const ARGS = (() => {
+  const near = (a, b) => {                       // Levenshtein, for did-you-mean
+    const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+    for (let j = 0; j <= b.length; j++) d[0][j] = j;
+    for (let i = 1; i <= a.length; i++)
+      for (let j = 1; j <= b.length; j++)
+        d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1,
+                           d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    return d[a.length][b.length];
+  };
+  const suggest = name => {
+    if (!name) return "";
+    const [best] = Object.keys(FLAGS)
+      .map(k => [k, near(name, k)])
+      // The second clause is what stops a suggestion that is not one: without
+      // it `-w` was answered "did you mean --db?", because an edit distance of
+      // 2 is inside the fixed floor of 2 while being the entire length of both
+      // names. A suggestion has to be nearer than "wholly different".
+      .filter(([k, d]) => d <= Math.max(2, Math.floor(name.length / 3)) && d < Math.max(name.length, k.length))
+      .sort((x, y) => x[1] - y[1]);
+    return best ? `  (did you mean --${best[0]}?)` : "";
+  };
+
+  const values = new Map(), flags = new Set(), positionals = [], errors = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a.startsWith("--")) { if (VALUED.has(a.slice(2))) i++; continue; }
-    out.push(a);
+    if (!a.startsWith("-")) { positionals.push(a); continue; }
+
+    // Neither is a repository and neither is a flag. `--` in particular is the
+    // POSIX end-of-options marker, which this CLI does not implement -- and
+    // accepting it as a positional is how it would come to look implemented.
+    if (a === "-" || a === "--") { errors.push(`reeve: ${a} is not a flag or a repository`); continue; }
+
+    // A short flag is not merely unsupported, it was never LOOKED at: the scan
+    // matched `--` only, so `reeve init -w` dropped `-w` into the positionals
+    // and ran as though the flag were absent. Same silence, one syntax over.
+    if (!a.startsWith("--")) {
+      errors.push(`reeve: unknown flag ${a}${suggest(a.slice(1))}  (this CLI has no single-dash flags)`);
+      continue;
+    }
+
+    const name = a.slice(2);
+    if (!FLAGS[name]) {
+      // `--home=/tmp/x` is a thing operators type, and `unknown flag
+      // --home=/tmp/x` reads as "there is no --home". Say what is wrong instead.
+      const eq = name.indexOf("=");
+      if (eq > 0 && FLAGS[name.slice(0, eq)])
+        errors.push(`reeve: --${name.slice(0, eq)} takes its value as the next argument: --${name.slice(0, eq)} ${name.slice(eq + 1)}`);
+      else errors.push(`reeve: unknown flag ${a}${suggest(name)}`);
+      continue;
+    }
+
+    if (!FLAGS[name].value) { flags.add(name); continue; }
+
+    // A valued flag with no value is REFUSED, never defaulted. `--home` last on
+    // the line gave `undefined`, and `--home --json` gave the string `--json`
+    // as a relative directory -- so the flag that exists to stop a command
+    // reaching the wrong home could send it to the wrong home, or to the live
+    // one. No value this CLI takes begins with `-`: every one is a path, a
+    // count, or a key=value.
+    // A NUMBER is a value, not a flag: no flag this CLI has begins with a
+    // digit, so `-1` is unambiguous and there is nothing to protect against.
+    // Refusing it here would take `--keep -1` away from `--keep`'s own
+    // validator, which says "--keep must be a positive whole number" -- a worse
+    // message for the same refusal, and a property already measured and tested
+    // (test/hub-doctor.test.mjs). The refusals this check exists for are a
+    // token that IS a flag, and a token that is absent.
+    const looksLikeFlag = v => v.startsWith("-") && !/^-?\d+(\.\d+)?$/.test(v);
+    const v = argv[i + 1];
+    if (v === undefined) { errors.push(`reeve: --${name} expects a value: ${FLAGS[name].what}`); continue; }
+    if (looksLikeFlag(v)) { errors.push(`reeve: --${name} expects a value: ${FLAGS[name].what}. Got the flag ${v}.`); continue; }
+    i++;
+    // Repeatable. `--set` is read as a LIST by `init`; every other valued flag
+    // reads the first occurrence, which is what `opt` did before.
+    if (!values.has(name)) values.set(name, []);
+    values.get(name).push(v);
   }
-  return out;
+
+  return { values, flags, positionals, errors };
 })();
+
+// The command, then the rest. `positionals` below excludes it, which is what
+// every route already assumes: `build`/`builder` read their subcommand from
+// `positionals[0]` and `doctor` scans for an owner/repo.
+const cmd = ARGS.positionals[0];
+if (ARGS.errors.length) {
+  for (const e of ARGS.errors) console.error(e);
+  console.error(`-> reeve ${cmd ?? ""} accepts: ${Object.keys(FLAGS).sort().map(f => "--" + f).join(" ")}`);
+  console.error(`-> reeve --help`);
+  process.exit(1);
+}
+
+const flag = n => ARGS.flags.has(n);
+const opt = n => ARGS.values.get(n)?.[0] ?? null;
+/** Every occurrence of a repeatable valued flag, in the order given. */
+const all = n => ARGS.values.get(n) ?? [];
+// A valued flag consumes the token after it, so that token is never mistaken
+// for a repo name however much it looks like one.
+const positionals = ARGS.positionals.slice(1);
+
+// `--help` is dispatched HERE, above every route. It was added to the registry
+// and described as "show this help" while NO route checked it, so
+// `reeve restore --hub --help` selected the newest snapshot and performed the
+// restore. A flag that asks a command to describe itself must never be able to
+// run it.
+if (flag("help")) { usage(); process.exit(0); }
+
+// AFTER the parser, so `--home` can feed it. Order matters: this used to sit
+// above `argv` and could therefore only ever read the environment.
+const HOME = resolveHome(opt("home"));
+// And WRITTEN BACK, before any route runs. `--home` used to change only this
+// constant, so `credentialPaths()` still denied the state root named by the
+// ENVIRONMENT and the canary still wrote its decoy under `~/.reeve` -- a
+// sandbox that omits the tree the operator asked to isolate, and a canary
+// measuring a file the policy was never about, which can answer "containment
+// closed" for a policy that contains nothing. Rather than thread the home
+// through the sandbox, the daemon, the canary and the App credentials -- four
+// more places to forget -- the flag and the variable become ONE mechanism.
+// Every consumer therefore reads it LAZILY; see src/home.mjs.
+process.env.REEVE_HOME = HOME;
 
 /** Repo identity is the remote, never the path: one repo can sit at two paths on two commits. */
 /**
@@ -213,8 +408,15 @@ switch (cmd) {
       // Where the daemon records its canary: the same HOME the daemon logs to.
       stateDir: HOME,
     });
-    if (flag("json")) console.log(JSON.stringify(result, null, 2));
-    else console.log(render(result, nwo));
+    // The home doctor is reporting FROM, and `resolveHome()` rather than
+    // `HOME` on purpose: this is the answer every module below will get, which
+    // is the value that can be wrong. The single most confusing thing about this
+    // CLI has been which home a command actually acted on -- it is how a hub
+    // came to exist in the operator's real ~/.reeve -- and "what is actually
+    // true right now" is precisely doctor's job.
+    const home = resolveHome();
+    if (flag("json")) console.log(JSON.stringify({ home, ...result }, null, 2));
+    else console.log(render(result, nwo) + `\n\nhome  ${home}`);
     if (!profile.path && !flag("json")) {
       console.log(`\nno profile for ${nwo}. Checks that need one were skipped.\n-> reeve init`);
     }
@@ -451,15 +653,20 @@ switch (cmd) {
   case "init": {
     // --set key=value, repeatable. Answers only the questions detection could not
     // settle; everything else comes from the repo and is not negotiable.
+    // From the ONE parse, not a fifth walk over argv. The old loop read its
+    // own `--set` tokens and so disagreed with the parser about what a value
+    // is: a missing value became the empty string and reported "expects
+    // key=value, got \"\"" where the parser now refuses the flag by name.
     const answers = {};
-    for (let i = 0; i < argv.length; i++) {
-      if (argv[i] !== "--set") continue;
-      const kv = argv[++i] ?? "";
+    for (const kv of all("set")) {
       const eq = kv.indexOf("=");
       if (eq < 0) { console.error(`reeve init: --set expects key=value, got ${JSON.stringify(kv)}`); process.exit(1); }
       answers[kv.slice(0, eq)] = kv.slice(eq + 1);
     }
-    const r = init({ root: process.cwd(), answers, write: flag("write") });
+    // `home` explicitly, not just via the environment: init WRITES, and a
+    // function whose destination comes from an ambient variable is one whose
+    // destination is invisible at the call site.
+    const r = init({ root: process.cwd(), answers, write: flag("write"), home: HOME });
     console.log(r.output);
     process.exit(r.code);
   }
@@ -596,7 +803,9 @@ switch (cmd) {
   }
 
   case "builder": {
-    if (process.argv[3] !== "doctor") die("usage: reeve builder doctor [--json]");
+    // `positionals[0]`, not `process.argv[3]`: a raw index counts flags as
+    // words, so `reeve builder --json doctor` refused a legitimate command.
+    if (positionals[0] !== "doctor") die("usage: reeve builder doctor [--json]");
     // READ-ONLY, like every doctor path: a reporter that can write what it
     // reports can agree with itself.
     const p = hubPathFor(HOME);
@@ -797,7 +1006,9 @@ switch (cmd) {
     // singleton lease in `~/.reeve`. Scope a test or an operator to a different
     // home with the ENVIRONMENT VARIABLE. A real `--home`, and a refusal for
     // unknown flags, belong to the CLI surface pass, not to this task.
-    const sub = process.argv[3];
+    // `positionals[0]`, not `process.argv[3]` -- see `builder`: a raw index
+    // makes `reeve build --takeover run` look like a typo.
+    const sub = positionals[0];
     if (sub !== "run" && sub !== "status")
       die(`usage: reeve build run [--takeover] | reeve build status`);
     // `status` opens READ-ONLY and RAW; only `run` may open through openHub.
@@ -1059,7 +1270,26 @@ switch (cmd) {
   }
 
   default:
-    console.log(`reeve ${JSON.parse(execFileSync("cat", [join(ROOT, "package.json")], { encoding: "utf8" })).version}
+    usage();
+    process.exit(cmd ? 1 : 0);
+}
+
+/**
+ * The only help this CLI has, printed by `--help` and by an unrecognised
+ * command alike.
+ *
+ * A `function` declaration on purpose: `--help` is dispatched above the switch,
+ * before any route can run, and only a declaration is hoisted that far. It also
+ * has to be ONE text -- `--help` that describes a different CLI from the one the
+ * bare command describes is two helps, and one of them is wrong.
+ *
+ * Every command in the switch is named here, and `test/cli-flags.test.mjs`
+ * asserts that both ways. `export-events`, `shadow`, `builder` and `build` were
+ * all shipped and none of them appeared here, so the only help reeve had
+ * described a CLI that no longer existed.
+ */
+function usage() {
+  console.log(`reeve ${JSON.parse(execFileSync("cat", [join(ROOT, "package.json")], { encoding: "utf8" })).version}
 
   doctor [owner/repo]   what is actually true right now   (0 ok · 1 broken · 3 degraded)
       --db <path>           state database to inspect
@@ -1068,7 +1298,7 @@ switch (cmd) {
       --json                machine-readable
 
   init                  detect this repo, preview a profile, then --write it
-      --set k=v             answer a question detection could not settle
+      --set k=v             answer a question detection could not settle (repeatable)
       --write               apply  (exit 0 no-op · 2 changed · 1 needs an answer)
 
   canary [owner/repo]   measure the worker sandbox for real, without arming anything
@@ -1078,9 +1308,19 @@ switch (cmd) {
   why <pr>              why reeve decided what it decided, newest first
   statusline            one line for the terminal statusline; reads state only
   dash                  write the one-page view  (--health, --out <path>, --open)
+  shadow [owner/repo]   compare what reeve would have decided against what happened
 
   backup [owner/repo]   a restorable snapshot of the store  (--events for JSONL, --to <dir>)
+      --hub                 snapshot the builder hub instead of a repository store
+      --keep <n>            how many snapshots to retain
   restore [owner/repo]  put one back  (--from <file>, --overwrite, --force)
+      --hub                 restore the builder hub  (--tail <file> replays events after it)
+  export-events --hub <file>
+                        write the hub's event log as a replayable JSONL tail
+
+  builder doctor        what is true about the builder hub  (--json)
+  build run             the builder loop; one at a time, by lease  (--takeover)
+  build status          who holds the builder lease, and since when
 
   run [owner/repo]      the daemon: watch, publish, decide, on a loop
       --tick                one pass and exit
@@ -1089,6 +1329,9 @@ switch (cmd) {
       --interval <seconds>  default 90
       --halt <path>         marker file that stops everything (default ~/.reeve/HALT)
 
+  everywhere:
+      --home <dir>          the reeve home to operate on (default $REEVE_HOME, else ~/.reeve)
+      --help                print this and do nothing else
+
 not yet built: next · plan · lane`);
-    process.exit(cmd ? 1 : 0);
 }

@@ -39,6 +39,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { resolveHome } from "./home.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -311,7 +312,7 @@ export function stateRootsFor(stateDir, logPath, worktree, dbPath = null) {
   // files: `--db` can name a path outside every other protected tree, and it
   // holds the event history, prompts and operational state. (Codex #4f-[7].)
   const dbFiles = dbPath ? [dbPath, `${dbPath}-wal`, `${dbPath}-shm`] : [];
-  const cands = [logPath, ...dbFiles, join(stateDir, "runs"), join(stateDir, "canary"), join(stateDir, "backups"), process.env.REEVE_HOME]
+  const cands = [logPath, ...dbFiles, join(stateDir, "runs"), join(stateDir, "canary"), join(stateDir, "backups"), resolveHome()]
     .filter(p => p && isAbsolute(p));
   return [...new Set(cands)].filter(p => !(worktree && under(p, worktree)));
 }
@@ -359,7 +360,11 @@ export async function measuredContainment(ctx, profile, nwo, logPath) {
       // Under the CONFIGURED state root (deny-read, so it is measurable), per
       // repository AND per invocation: two daemons sharing one decoy could delete
       // each other's and read the ENOENT as a denial. (Codex #4-[1], #4b-[11].)
-      decoyPath: join(process.env.REEVE_HOME ?? join(homedir(), ".reeve"), "canary", nwo.replace("/", "-"), `decoy-${process.pid}-${Date.now()}.txt`),
+      // `resolveHome()`: with `--home` the decoy used to be written under
+      // `~/.reeve` while the policy denied the home the operator named, so the
+      // canary measured a file the sandbox had no rule about and could report
+      // containment CLOSED for a policy that closed nothing.
+      decoyPath: join(resolveHome(), "canary", nwo.replace("/", "-"), `decoy-${process.pid}-${Date.now()}.txt`),
     };
     const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
     // The credential-less git config lives in the run's tmp, which the sandbox
@@ -1308,7 +1313,7 @@ export async function tick(ctx) {
       // watches is never snapshotted and never audited, and that is precisely
       // the one that is lost.
       const root = ctx.backupRoot ?? join(dirname(logPath ?? "/tmp/x"), "backups");
-      const home = ctx.home ?? dirname(logPath ?? join(homedir(), ".reeve", "x"));
+      const home = ctx.home ?? dirname(logPath ?? join(resolveHome(), "x"));
       const all = (ctx.snapshotAll ?? snapshotAll)(home, root, { at });
       for (const r of all) {
         if (r.ok) continue;
@@ -1369,7 +1374,7 @@ export async function tick(ctx) {
                 : (ctx.backupRoot ?? join(dirname(logPath ?? "/tmp/x"), "backups")),
       // Without this the store-wide backup check is inert, and an unwatched
       // store stays invisible exactly as it did before.
-      home: ctx.home ?? dirname(logPath ?? join(homedir(), ".reeve", "x")),
+      home: ctx.home ?? dirname(logPath ?? join(resolveHome(), "x")),
     })) {
       log(logPath, `self: ${f.level} ${f.why}${f.detail ? ` — ${f.detail}` : ""}`);
       escalations.set(f.why, f.count ?? 1);

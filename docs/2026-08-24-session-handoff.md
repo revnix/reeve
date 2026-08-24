@@ -83,8 +83,11 @@ each:
    that gets pushed, exactly as they judged the worker's own commits, so nothing
    about what may ship changed hands.
 2. **reeve stages exactly what the worker declared** in `filesTouched`, via
-   `git add --force --pathspec-from-file=- --pathspec-file-nul --literal-pathspecs`.
-   Not `git add --all`. See §4 for why.
+   `git --literal-pathspecs add --force --pathspec-from-file=- --pathspec-file-nul`.
+   Not `git add --all`. See §4 for why. `--literal-pathspecs` is a GLOBAL option and
+   must precede the subcommand: after it, git exits with "unknown option" and
+   stages nothing. It is there because a filename may begin with `:`, which git
+   would otherwise read as pathspec magic rather than as a name.
 3. **The worker keeps read-only git** (`status`, `diff`, `log`, `show`) and
    `git clean`. `git clean` is NOT read-only — it deletes untracked files, and
    `-d`/`-x` reach directories and ignored files. It is also not the worker's only
@@ -193,10 +196,11 @@ status check).
 
 ## 7. The builder programme
 
-Thirteen stages, S0–S12. S0 and S1 are done. **S2 is a peer's lane** —
-`nextly-integrations-28` merged S2-A (the hub store) and has #23 open. S3 onward
+Thirteen stages, S0–S12. S0 and S1 are done. **S2 is a peer's lane**, held by a
+session that has been renamed at least once — ask over SendMessage rather than
+going by the name written here, and see §0 for what of theirs is open. S3 onward
 is authorised only after S0–S2 land. Do not take builder work without checking
-with them.
+with them first.
 
 Design: `docs/2026-08-21-builder-design.md`.
 

@@ -250,8 +250,17 @@ const ARGS = (() => {
       // `--home=/tmp/x` is a thing operators type, and `unknown flag
       // --home=/tmp/x` reads as "there is no --home". Say what is wrong instead.
       const eq = name.indexOf("=");
-      if (eq > 0 && FLAGS[name.slice(0, eq)])
-        errors.push(`reeve: --${name.slice(0, eq)} takes its value as the next argument: --${name.slice(0, eq)} ${name.slice(eq + 1)}`);
+      const base = eq > 0 ? name.slice(0, eq) : null;
+      if (base && FLAGS[base]?.value)
+        errors.push(`reeve: --${base} takes its value as the next argument: --${base} ${name.slice(eq + 1)}`);
+      // A BOOLEAN IS NOT GIVEN A VALUE TO COPY. The message above was emitted for
+      // every known flag, so `--force=false` was answered "write --force false"
+      // -- which ENABLES force and leaves `false` as an unused positional. An
+      // operator who typed `=false` was asking for the opposite, and the refusal
+      // talked them into it. On `restore` that is the live-daemon safety check,
+      // waived by following the advice.
+      else if (base && FLAGS[base])
+        errors.push(`reeve: --${base} is a switch and takes no value; write --${base} to turn it on, or leave it out to turn it off. --${base}=${name.slice(eq + 1)} does not turn it off.`);
       else errors.push(`reeve: unknown flag ${a}${suggest(name)}`);
       continue;
     }
@@ -273,7 +282,13 @@ const ARGS = (() => {
     // token that IS a flag, and a token that is absent.
     const looksLikeFlag = v => v.startsWith("-") && !/^-?\d+(\.\d+)?$/.test(v);
     const v = argv[i + 1];
-    if (v === undefined) { errors.push(`reeve: --${name} expects a value: ${FLAGS[name].what}`); continue; }
+    // AN EMPTY VALUE IS A MISSING VALUE. `reeve --home "$SCRATCH"` with the
+    // variable unset hands over `""`, and `resolve("")` is the CURRENT
+    // DIRECTORY -- so a command that was explicitly told to use another home
+    // backed up, built or restored against `<cwd>/state` instead. An operator
+    // who names a home and gets nothing has said something, and it is not "use
+    // wherever I happen to be standing".
+    if (v === undefined || v === "") { errors.push(`reeve: --${name} expects a value: ${FLAGS[name].what}`); continue; }
     if (looksLikeFlag(v)) { errors.push(`reeve: --${name} expects a value: ${FLAGS[name].what}. Got the flag ${v}.`); continue; }
     i++;
     // Repeatable. `--set` is read as a LIST by `init`; every other valued flag

@@ -14,7 +14,7 @@ import { selfAudit, BROKEN } from "../src/selfaudit.mjs";
 import { open as openStore } from "../src/db/ops.mjs";
 import { hubPathFor } from "../src/paths.mjs";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, openSync, writeSync, closeSync, existsSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, openSync, writeSync, closeSync, existsSync, writeFileSync, readFileSync, chmodSync } from "node:fs";
 import { spawnSync } from "node:child_process";   // the CLI drill runs bin/reeve
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -701,6 +701,92 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   const ok = run("build", "status");
   check(ok.status === 0 && /not running/.test(ok.stdout),
     "control: a healthy hub with no builder still exits 0", `status=${ok.status} ${ok.stdout.slice(0, 60)}`);
+}
+
+// ── a hub that REFUSES A WRITE is not a hub that is damaged ───────────────
+// `openHub`'s pragmas WRITE, so they fail for reasons that have nothing to do
+// with the file being broken. Measured against node:sqlite:
+//
+//   errcode 26  SQLITE_NOTADB    file is not a database
+//   errcode 11  SQLITE_CORRUPT   disk image is malformed
+//   errcode  5  SQLITE_BUSY      another connection holds a read txn (DELETE mode)
+//   errcode  8  SQLITE_READONLY  read-only file or directory
+//
+// Labelling all four as corruption told an operator to RESTORE over a healthy
+// authority database because someone else was reading it, or because a
+// permission was wrong. That is worse than the crash the guard replaced — the
+// same mistake as treating a failed lock acquisition as a damaged lock table.
+{
+  const rHome = join(dir, "readonly-home");
+  const stateDir = join(rHome, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const env = { ...process.env, REEVE_HOME: rHome };
+  const run = (...args) => spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+    { encoding: "utf8", env, timeout: 20_000 });
+
+  const hub = hubPathFor(rHome);
+  { const d = openHub(hub); d.exec("PRAGMA journal_mode = DELETE"); d.close(); }
+  chmodSync(hub, 0o444);
+  chmodSync(stateDir, 0o555);
+  let out, status;
+  try {
+    const r = run("build", "run");
+    out = (r.stdout ?? "") + (r.stderr ?? "");
+    status = r.status;
+  } finally {
+    // ALWAYS restored, or the suite's own teardown cannot remove the directory.
+    chmodSync(stateDir, 0o755);
+    chmodSync(hub, 0o644);
+  }
+  check(status !== 0, "`build run` refuses a hub it cannot write to", `status=${status}`);
+  check(!/^\s+at\s+.*:\d+:\d+\)?$/m.test(out),
+    "and not with a stack trace out of locks.mjs", out.split("\n").slice(0, 3).join(" | "));
+  // THE DECISIVE ONE. Recommending a restore here points the operator at
+  // replacing a database that is not broken.
+  check(!/restore --hub/.test(out) || /Do NOT restore/.test(out),
+    "and does NOT tell the operator to restore over a healthy hub", out.slice(0, 300));
+  check(/read-only|permissions/.test(out),
+    "and names the actual cause", out.slice(0, 240));
+
+  // AND THE SAME THING ONE LAYER DOWN, in `openHub`'s own catch. The fixture
+  // above never reaches it: a version-1 hub takes the RAW path, so the failure
+  // came from the lease write. A VERSION-ZERO hub takes the bootstrap path,
+  // which calls `openHub` — and its first pragma is a WRITE, so on a read-only
+  // file it throws `SQLITE_READONLY` (errcode 8) rather than any corruption
+  // code. Without this, the corruption/operational split has no test at all:
+  // measured, forcing `corrupt = true` left every assertion above green.
+  {
+    rmSync(stateDir, { recursive: true, force: true });
+    mkdirSync(stateDir, { recursive: true });
+    const zero = new DatabaseSync(hub);
+    zero.exec("PRAGMA journal_mode = DELETE");
+    zero.exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT`);
+    zero.close();
+    chmodSync(hub, 0o444);
+    chmodSync(stateDir, 0o555);
+    let zout, zstatus;
+    try { const r = run("build", "run"); zout = (r.stdout ?? "") + (r.stderr ?? ""); zstatus = r.status; }
+    finally { chmodSync(stateDir, 0o755); chmodSync(hub, 0o644); }
+    check(zstatus !== 0, "a read-only hub reaching openHub is refused", `status=${zstatus}`);
+    check(/could not be opened for writing/.test(zout),
+      "and openHub says it could not WRITE, not that the file is unreadable", zout.slice(0, 220));
+    check(!/reeve restore --hub/.test(zout),
+      "and does not recommend restoring over it", zout.slice(0, 300));
+    check(/Do NOT restore/.test(zout),
+      "and says so explicitly, because that is the tempting wrong move", zout.slice(0, 320));
+  }
+
+  // CONTROL: a genuinely CORRUPT hub still gets the restore advice, so the line
+  // above is about distinguishing the two rather than about suppressing it.
+  rmSync(stateDir, { recursive: true, force: true });
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(hub, "this is not a database");
+  const corrupt = run("build", "status");
+  const cout = (corrupt.stdout ?? "") + (corrupt.stderr ?? "");
+  check(/reeve restore --hub --force/.test(cout),
+    "control: a corrupt hub IS told to restore", cout.slice(0, 200));
+  check(/--tail/.test(cout),
+    "and told to pass --tail, so the first recovery is not the lossy one", cout.slice(0, 320));
 }
 
 rmSync(dir, { recursive: true, force: true });

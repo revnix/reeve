@@ -1126,7 +1126,13 @@ switch (cmd) {
       if (sub === "status") {
         console.log(`builder: not running (the hub at ${hubPathFor(HOME)} cannot be read)`);
         console.log(`  why      ${String(e.message).split("\n")[0]}`);
+        // `--tail` NAMED HERE TOO. Every other recovery line in this change says
+        // it, and this one did not -- so an operator with a durable export who
+        // followed this exact command would restore the snapshot and silently
+        // drop every event after it, on the first recovery they attempt.
         console.log(`  recover  reeve restore --hub --force installs the newest usable snapshot`);
+        console.log(`           add --tail <file> from a durable export-events --hub to carry`);
+        console.log(`           forward every event after that snapshot; without one they are lost`);
         // EXIT 1, not the `break` the other "not running" cases take. Before this
         // guard the uncaught throw exited 1; catching it and breaking would have
         // turned a loud failure into a quiet success, which is the same
@@ -1199,11 +1205,27 @@ switch (cmd) {
       if (v > HUB_SCHEMA_VERSION)
         die(`the hub is at schema version ${v}; this reeve knows ${HUB_SCHEMA_VERSION}. Upgrade reeve.`);
     }
-    const claim = acquireSingleton(db, {
-      name: "builder", pid: process.pid, lstart,
-      command: process.argv.slice(1).join(" "), isAlive: isSameProcess,
-      takeover: flag("takeover"),
-    });
+    // TAKING THE LEASE IS A WRITE, and a hub can be perfectly readable and still
+    // refuse one -- a read-only file or directory, or another process holding
+    // it. Found while verifying this change's own guard: `openHub` and the
+    // version read both pass on a read-only hub, and the failure then escaped
+    // from `locks.mjs` as a raw `attempt to write a readonly database` with a
+    // stack trace. The guard above covers the open and the first READ; this is
+    // the first WRITE, and it needs its own answer for the same reason.
+    let claim;
+    try {
+      claim = acquireSingleton(db, {
+        name: "builder", pid: process.pid, lstart,
+        command: process.argv.slice(1).join(" "), isAlive: isSameProcess,
+        takeover: flag("takeover"),
+      });
+    } catch (e) {
+      die(`reeve build run: could not take the builder lease in ${hubPathFor(HOME)} (${e.message}).\n` +
+          `  the hub reads fine, so this is not damage: the file or its directory may be read-only, ` +
+          `or another process may hold it.\n` +
+          `  recover  check the permissions on ${hubPathFor(HOME)} and its directory, and stop any ` +
+          `other builder. Do NOT restore over it.`);
+    }
     if (!claim.ok) {
       const h = claim.holder;
       // A lock refusal that does not say who holds it turns a two-second

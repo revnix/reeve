@@ -543,6 +543,27 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   check(goodIds !== null && !goodIds.includes("H-7"),
     "control: a well-formed registry raises no registry error", JSON.stringify(goodIds));
 
+  // AN OBJECT IS NOT ENOUGH. Checking the shape was one shape short:
+  // `{ "prod": {} }` passed, `projectsKnown` went true over a project with
+  // `nwo: null`, and every real gate-state row was suppressed as unregistered
+  // while `H-4:null` was emitted in its place -- the same failure the shape
+  // check was added to close, reached through a different malformation.
+  //
+  // So the rule is what the registry must PROVIDE. `owner/repo` is the only
+  // form `nwo_snapshot` ever holds and the only form H-4 can match against; a
+  // name that cannot match is not a name.
+  for (const [label, body] of [["an entry with no nwo", { prod: {} }],
+                               ["an nwo that is not owner/repo", { prod: { nwo: "notanwo" } }],
+                               ["an nwo that is not a string", { prod: { nwo: 7 } }]]) {
+    writeFileSync(reg, JSON.stringify(body));
+    const ids = idsOf(run("builder", "doctor", "--json").stdout);
+    check(ids?.includes("H-7"), `${label} is a registry error`, JSON.stringify(ids));
+    check(ids?.includes("H-4:o/orphan"),
+      `and the authority finding survives it (${label})`, JSON.stringify(ids));
+    check(!ids?.includes("H-4:null"),
+      `and no finding about the missing name replaces it (${label})`, JSON.stringify(ids));
+  }
+
   // And a top level that is not an object at all.
   writeFileSync(reg, JSON.stringify(["prod"]));
   const arr = run("builder", "doctor", "--json");

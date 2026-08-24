@@ -772,12 +772,29 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
   // READS, and a write here would fail for reasons of its own. reeve's own
   // `a restore is in progress` throw carries no errcode and means the read
   // SUCCEEDED, which is the answer being sought.
+  // EVERY ADMISSION PATH, not the builder's one. `acquireSingleton` reads
+  // `singleton_lease`, but `withWriterLease` reads NEITHER -- it calls
+  // `assertWritable` and writes `writer_lease` -- and the provider path uses
+  // `provider_lease`. Probing only the builder's table answered "nobody can
+  // enter" for a hub whose `singleton_lease` was malformed while `writer_lease`
+  // was intact, so a CLI could still take a lease under a forced restore holding
+  // a sibling lock that CLI never consults.
+  //
+  // ANY path that can still admit a writer is enough to refuse. The conservative
+  // direction is deliberate: over-refusing leaves a damaged hub in place for an
+  // operator to repair, and under-refusing replaces a database out from under a
+  // live writer.
+  const ADMISSION_TABLES = ["singleton_lease", "writer_lease", "provider_lease"];
   const writersCanEnter = (handle) => {
     const ask = (d) => {
+      // `assertWritable` is the gate EVERY path passes through, so a store that
+      // cannot answer it admits nobody, whatever the lease tables say.
       try { assertWritable(d, { isAlive: () => true }); }
       catch (e) { if (e?.errcode !== undefined) return false; }
-      try { d.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get(); return true; }
-      catch { return false; }
+      return ADMISSION_TABLES.some(t => {
+        try { d.prepare(`SELECT * FROM ${t} LIMIT 1`).get(); return true; }
+        catch { return false; }
+      });
     };
     if (handle) return ask(handle);
     let d = null;
@@ -977,6 +994,17 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // operational -- so this fallback would rethrow for exactly the damaged
         // store it exists to recover, and be dead code for it.
         const cause = (e?.errcode === undefined && e?.cause) ? e.cause : e;
+        // A FULL STORE IS NOT A FAILED RESTORE. Rethrown, it reaches the outer
+        // catch and comes back as the generic `could not restore` -- the one
+        // answer that tells an operator nothing about a condition with an exact
+        // remedy. It is not damage either, so it must not take the fallback.
+        if (faultKind(cause) === "full")
+          return { ok: false, holders: [],
+            why: `the hub at ${dbPath} could not be prepared because the store is full ` +
+                 `(${cause.message}). Nothing is damaged and nothing was replaced.\n` +
+                 `  recover  free space on the filesystem holding ${dbPath} and re-run. Remove old ` +
+                 `snapshot files directly: reeve backup --hub --keep N cannot help here, because it ` +
+                 `writes a new snapshot before it prunes and so needs more room, not less.` };
         if (isOperational(cause)) throw e;
         canonicalFault = e;
         try { live?.close(); } catch {}
@@ -1384,7 +1412,8 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
                  `damage.\n` +
                  (outOfSpace
                    ? `  recover  the store ran out of room -- free space on the filesystem holding ${dbPath} ` +
-                     `and re-run; reeve backup --hub --keep N prunes old snapshots.`
+                     `and re-run. Remove old snapshot files directly; reeve backup --hub --keep N writes a ` +
+                     `whole new snapshot before it prunes, so it needs more room, not less.`
                    : transient
                    ? `  recover  another process holds it -- stop any running builder or reeve CLI and re-run.`
                    : `  recover  the hub or its directory refuses writes -- fix the permissions and re-run.`) +

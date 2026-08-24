@@ -413,11 +413,37 @@ export function settleOutbox(db, { id, leaseToken, ok, result, error, retryable 
   });
 }
 
-// recover outbox rows whose drainer died mid-flight
+/**
+ * Return rows whose drainer died mid-flight — and dead-letter the ones that have
+ * exhausted their budget on the way.
+ *
+ * The budget is checked in `settleOutbox`, which a hard crash never reaches. So a
+ * process that dies after leasing and before settling bumps `attempts` every time
+ * and is handed back every time: an effect that crashes its drainer could be
+ * retried forever, and `max_attempts` would never once be consulted. Recovery is
+ * the only place that failure mode passes through, so it is where the budget has
+ * to be enforced.
+ *
+ * Returns the rows made pending. A dead-lettered one is NOT among them — it is not
+ * a candidate any more — and is reported separately so a queue that stopped moving
+ * says why rather than going quiet.
+ */
 export function recoverOutbox(db) {
-  return tx(db, () => db.prepare(`
-    UPDATE outbox SET status='pending', updated_at=unixepoch()
-    WHERE status='inflight' AND lease_expires_at < unixepoch() RETURNING id`).all());
+  return tx(db, () => {
+    const dead = db.prepare(`
+      UPDATE outbox SET status='dead_letter', lease_expires_at=0, updated_at=unixepoch(),
+             last_error=coalesce(last_error,'') || ' | recovered past max_attempts without ever settling'
+      WHERE status='inflight' AND lease_expires_at < unixepoch() AND attempts >= max_attempts
+      RETURNING id, kind, attempts`).all();
+    for (const d of dead)
+      emit(db, { actor: "drainer", op: "outbox.dead_letter",
+                 payload: { id: d.id, kind: d.kind, attempts: d.attempts, why: "crash-loop" } });
+    const back = db.prepare(`
+      UPDATE outbox SET status='pending', updated_at=unixepoch()
+      WHERE status='inflight' AND lease_expires_at < unixepoch() RETURNING id`).all();
+    back.deadLettered = dead;
+    return back;
+  });
 }
 
 // ------------------------------------------------------------------ export

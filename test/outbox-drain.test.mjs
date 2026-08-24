@@ -116,6 +116,80 @@ const statusOf = key => db.prepare(`SELECT status, attempts, result, last_error 
   const left = db.prepare(`SELECT count(*) n FROM outbox WHERE status='pending' AND idem_key LIKE 'g%'`).get().n;
   check(left === 4, "and the rest stay pending for the next tick", String(left));
 }
+// --- a crash-loop dead-letters instead of retrying forever --------------------
+{
+  // Its OWN store. `leaseOutbox` takes the lowest-id due row, and earlier blocks
+  // deliberately leave retryable failures pending -- so leases meant for this
+  // fixture went to those instead and its budget never moved. The assertions then
+  // measured a row nothing had happened to. A fixture that cannot reach the
+  // mechanism passes for the wrong reason.
+  const d2 = mkdtempSync(join(tmpdir(), "reeve-loop-"));
+  const db2 = open(join(d2, "s.db"));
+  const put2 = key => tx(db2, () => enqueue(db2, { idemKey: key, kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "b" } }));
+  const status2 = key => db2.prepare(`SELECT status, attempts, last_error FROM outbox WHERE idem_key=?`).get(key);
+  put2("loop");
+  db2.prepare(`UPDATE outbox SET max_attempts=3 WHERE idem_key='loop'`).run();
+  // Three leases that never settle: a drainer dying between the API call and the
+  // settle, three times. `settleOutbox` is where the budget is checked, and a hard
+  // crash never reaches it -- so without a check on the recovery path this row is
+  // handed out forever and `max_attempts` is never once consulted.
+  for (let i = 0; i < 3; i++) {
+    const j = leaseOutbox(db2, { worker: "crasher", leaseSeconds: -5, kinds: ["gh.pr.comment"] });
+    check(j !== undefined, `control: lease ${i + 1} of the crashing drainer succeeded`, "");
+    if (i < 2) recoverOutbox(db2);
+  }
+  const before = status2("loop");
+  check(before.attempts === 3, "control: the row has spent its whole budget on leases", JSON.stringify(before));
+  const rec = recoverOutbox(db2);
+  const after = status2("loop");
+  check(after.status === "dead_letter", "a row recovered past its budget is dead-lettered, not handed out again",
+    JSON.stringify(after));
+  check(!rec.some(r => r.id === undefined) && (rec.deadLettered ?? []).length >= 1,
+    "and recovery reports it, because a crash-loop needs a person rather than another pass",
+    JSON.stringify(rec.deadLettered));
+  // Names the BUDGET, which is the fact, rather than a phrasing. I wrote this as a
+  // prose match first and it failed on a sentence that said the same thing in
+  // different words -- an hour after fixing three assertions for exactly that.
+  check(/max_attempts/.test(String(after.last_error)) && String(after.last_error).length > 0,
+    "with a reason naming the budget it exhausted", String(after.last_error));
+  // Control: a row still inside its budget is still recovered normally.
+  put2("ok-loop");
+  leaseOutbox(db2, { worker: "crasher", leaseSeconds: -5, kinds: ["gh.pr.comment"] });
+  recoverOutbox(db2);
+  check(status2("ok-loop").status === "pending",
+    "control: a row with budget left is still returned to pending", status2("ok-loop").status);
+  db2.close();
+  rmSync(d2, { recursive: true, force: true });
+}
+
+// --- a handler cannot outlive its lease --------------------------------------
+{
+  // Its own store, for the same reason as the block above: `max: 1` leases the
+  // lowest-id due row, and earlier blocks leave rows pending. Three of these
+  // assertions passed against a DIFFERENT row before I isolated it -- green, and
+  // measuring nothing the block is named for.
+  const d3 = mkdtempSync(join(tmpdir(), "reeve-slow-"));
+  const db3 = open(join(d3, "s.db"));
+  tx(db3, () => enqueue(db3, { idemKey: "slow", kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "b" } }));
+  const status3 = () => db3.prepare(`SELECT status, last_error FROM outbox WHERE idem_key='slow'`).get();
+
+  // A handler that never returns is a drainer sitting in a hung request while its
+  // claim expires around it. The fence would refuse its settle afterwards -- but a
+  // second drainer will already have posted, and a fence orders database writes,
+  // not GitHub ones.
+  const handlers = { "gh.pr.comment": () => new Promise(() => {}) };
+  const t0 = Date.now();
+  const r = await drainOutbox({ db: db3, handlers, max: 1, leaseSeconds: 3 });
+  const took = (Date.now() - t0) / 1000;
+  check(took < 3, "a hung handler is abandoned INSIDE its lease, not after it", `${took.toFixed(1)}s of a 3s lease`);
+  check(r.done[0]?.verdict === "retry", "and the row is settled as a retryable failure", JSON.stringify(r.done));
+  check(/did not finish within/.test(String(status3().last_error)),
+    "with an error saying so rather than a silent stall", String(status3().last_error));
+  check(status3().status === "pending", "so the effect is still owed, not lost", status3().status);
+  db3.close();
+  rmSync(d3, { recursive: true, force: true });
+}
+
 db.close();
 
 // --- the comment handler is at-most-once across a crash ----------------------
@@ -124,35 +198,52 @@ db.close();
   // before settling. Recovery re-leases the row and the retry must NOT post twice.
   const key = "review-request:o/r:1:abc:codex";
   const posted = [];
+  let lists = 0, paginated = 0;
+  // The comment list, as GitHub returns it: OLDEST FIRST. That ordering is the
+  // reason a fixed `page=1` was wrong -- on a busy pull request the first page is
+  // the page least likely to hold a comment posted seconds ago. Here the fake
+  // pads the history so a single unpaginated page could not reach the marker.
+  const history = Array.from({ length: 150 }, (_, i) => ({ id: i, body: `old ${i}` }));
   const api = args => {
-    if (args[0] === "-X" && args[1] === "GET")
-      return { ok: true, out: JSON.stringify(posted.map((b, i) => ({ id: 100 + i, body: b }))) };
+    if (args.includes("GET")) {
+      lists++;
+      if (args.includes("--paginate")) paginated++;
+      const all = [...history, ...posted.map((b, i) => ({ id: 1000 + i, body: b }))];
+      // Unpaginated reads return only the first hundred, as the real API does.
+      return { ok: true, out: JSON.stringify(args.includes("--paginate") ? all : all.slice(0, 100)) };
+    }
     posted.push(args[args.indexOf("-f") + 1].replace(/^body=/, ""));
-    return { ok: true, out: JSON.stringify({ id: 100 + posted.length - 1 }) };
+    return { ok: true, out: JSON.stringify({ id: 1000 + posted.length - 1 }) };
   };
   const args = { nwo: "o/r", pr: 1, body: "@codex review" };
-  const first = ghPrComment(args, { api, idemKey: key });
+
+  const first = ghPrComment(args, { api, idemKey: key, attempt: 1 });
   check(first.ok && posted.length === 1, "the first delivery posts the comment", JSON.stringify(first));
   check(posted[0].includes(markerFor(key)), "carrying an invisible key that identifies it", posted[0]);
+  // A first attempt cannot find a previous delivery, so looking for one is a
+  // paginated list call bought to answer a question already answered.
+  check(lists === 0, "and a FIRST attempt does not read the comment list at all", `${lists} list call(s)`);
 
-  const second = ghPrComment(args, { api, idemKey: key });
+  const second = ghPrComment(args, { api, idemKey: key, attempt: 2 });
   check(second.ok, "a retry after a crash still reports success", JSON.stringify(second));
   check(posted.length === 1, "and does NOT post a second comment", `posted ${posted.length}`);
   check(second.result.alreadyThere === true, "because it recognised its own earlier one", JSON.stringify(second.result));
+  check(paginated === 1, "having read EVERY page, not the arbitrary first one",
+    `${paginated} of ${lists} list call(s) paginated`);
 
   // Control: a DIFFERENT key must still post. Without this the assertion above
   // passes equally well on a handler that has simply stopped posting anything.
-  const other = ghPrComment(args, { api, idemKey: "review-request:o/r:1:def:codex" });
+  const other = ghPrComment(args, { api, idemKey: "review-request:o/r:1:def:codex", attempt: 2 });
   check(other.ok && posted.length === 2, "control: a different effect still posts", `posted ${posted.length}`);
 }
 
 // --- an unreadable list is not read as absence, nor as presence ---------------
 {
   const posted = [];
-  const api = args => (args[1] === "GET")
+  const api = args => args.includes("GET")
     ? { ok: false, err: "HTTP 502" }
     : (posted.push("x"), { ok: true, out: JSON.stringify({ id: 1 }) });
-  const r = ghPrComment({ nwo: "o/r", pr: 1, body: "b" }, { api, idemKey: "k" });
+  const r = ghPrComment({ nwo: "o/r", pr: 1, body: "b" }, { api, idemKey: "k", attempt: 2 });
   check(r.ok && posted.length === 1, "a failed pre-check falls through and posts, rather than assuming delivered",
     JSON.stringify(r));
 }

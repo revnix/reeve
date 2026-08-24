@@ -41,9 +41,10 @@ running process does not have it. That happened on 23 Aug and I nearly reported 
 as done. If the running process and §0 disagree about `--execute`, someone changed
 one without the other — find out which before doing anything else.
 
-Expect doctor `broken` on R-01 and R-03 ONLY. Both are mine. Note the daemon's
-checkout may be behind `main`, so the running process can be on older code than
-the tests you just ran.
+Compare doctor's `broken` findings against §0: the ones listed there are known
+and mine, and anything else is new and worth stopping for. The daemon's checkout
+can also drift behind `main`, which puts the running process on older code than
+the tests you just ran — §0 says where it stands, and `ps` says it better.
 
 ## Your tasks, in priority order
 
@@ -70,10 +71,10 @@ the tests you just ran.
    deciding, in a project where a dispatch once found what ~640 green tests
    missed. Re-arming nextly is the step after that, not part of it.
 
-   The other candidates, both real: write the OWED tracker entry (§6 — the tracker
-   has no record of 22–24 Aug at all), and wire capability 3 (§6 has the routing
-   decision and a known latent fencing defect, with the repair already worked out
-   and the wrong repair explicitly ruled out).
+   The other candidates, both real, both described in §6 and both with their
+   current standing in §0: the owed tracker entry, and wiring capability 3 — which
+   needs a routing decision from me and carries a known latent fencing defect whose
+   repair is already worked out, with the wrong repair explicitly ruled out.
 
 3. **Keep a 15-minute watcher on my open PRs**, if one is not already running. It
    must emit a HEARTBEAT as well as reporting changes — a watcher that reports only

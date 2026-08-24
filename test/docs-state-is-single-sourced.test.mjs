@@ -70,15 +70,47 @@ const STATE_CLAIMS = [
   /\bWITHOUT `--execute`/i, /\bwith `--execute`/i, /`--execute` is (on|off)\b/i,
 ];
 
-/** Lines making a present-tense state claim without pointing at §0. A pointer may
- * wrap, so the reference counts if it is within two lines either way. */
+/** Lines making a present-tense state claim without pointing at §0.
+ *
+ * The exemption is scoped to the claim's OWN block -- one bullet, or one
+ * paragraph -- and not to a window of nearby lines. The window was the real hole
+ * behind the eleventh copy: a legitimate pointer in the bullet ABOVE covered a
+ * stale claim in the bullet below it, so the more §0 pointers a section
+ * accumulated, the less of that section the test actually read. A guard that
+ * weakens as it is used is worse than none, because it is trusted.
+ *
+ * A PARENTHETICAL `(§0)` also does not count. The eleventh copy read "**The
+ * daemon's checkout is behind `main`** (§0)" -- it cited §0 and contradicted it in
+ * one breath. An appended citation is a footnote on a copy, not a pointer: the
+ * point of a pointer is that the fact is stated ONCE, so a line that both asserts
+ * and cites has kept the copy and added a reference to the original. Forms that
+ * defer -- "§0 says", "see §0", "is a §0 fact" -- survive, because they state
+ * nothing that can go stale.
+ *
+ * Blocks break on a blank line and on the start of a new list item, so a wrapped
+ * bullet still carries its own pointer while its neighbour's cannot reach it.
+ */
+const blocksOf = text => {
+  const blocks = [];
+  let cur = null;
+  text.split("\n").forEach((line, i) => {
+    const starts = /^\s*([-*+]|\d+\.|#{1,6}|\|)\s/.test(line);
+    if (!line.trim()) { cur = null; return; }
+    if (!cur || starts) { cur = { lines: [], nums: [] }; blocks.push(cur); }
+    cur.lines.push(line); cur.nums.push(i + 1);
+  });
+  return blocks;
+};
+
 const offendersIn = text => {
-  const lines = text.split("\n");
   const out = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (!STATE_CLAIMS.some(re => re.test(lines[i]))) continue;
-    const window = lines.slice(Math.max(0, i - 2), i + 3).join(" ");
-    if (!/§0/.test(window)) out.push(`${i + 1}: ${lines[i].trim().slice(0, 88)}`);
+  for (const b of blocksOf(text)) {
+    const joined = b.lines.join(" ");
+    const defers = /§0/.test(joined.replace(/\(§0\)/g, ""));
+    if (defers) continue;
+    b.lines.forEach((line, k) => {
+      if (STATE_CLAIMS.some(re => re.test(line))) out.push(`${b.nums[k]}: ${line.trim().slice(0, 88)}`);
+    });
   }
   return out;
 };
@@ -102,6 +134,42 @@ const offendersIn = text => {
   const offenders = offendersIn(withoutZero);
   check(offenders.length === 0,
     `${HANDOFF} states no current facts OUTSIDE §0`,
+    offenders.slice(0, 4).join("\n        "));
+}
+
+// --- DERIVED: §0's own row labels are the policed vocabulary ------------------
+//
+// The check that would have caught the eleventh copy, and the reason it is worth
+// having: every other matcher here enumerates something a person maintains, and a
+// person maintains it by remembering. This one reads §0's table. Each row label is
+// by construction the NAME of a fact that changes, so a block mentioning one and
+// not deferring to §0 is a copy -- whatever words it uses to make the claim. Add a
+// row to §0 and this starts policing that subject everywhere, with nothing to
+// remember.
+//
+// Only multi-word labels are used. A label like `main` is one common word and
+// would fire on correct prose everywhere, and a guard that fires on right text is
+// weakened until it catches nothing.
+{
+  const zero = /^## 0\. STATE[\s\S]*?(?=^## )/m.exec(handoff)?.[0] ?? "";
+  const subjects = [...zero.matchAll(/^\|\s*([^|]+?)\s*\|/gm)]
+    .map(m => m[1].replace(/`/g, "").trim())
+    .filter(s => s && !/^-+$/.test(s) && s.split(/\s+/).length >= 2 && s.length >= 12)
+    // A label carrying an em-dash gloss ("capability 1 — watch, judge, escalate")
+    // is policed by its stem, which is the part prose actually reuses.
+    .map(s => s.split(" — ")[0].trim());
+  check(subjects.length >= 4, "control: §0's table yielded subjects to police",
+    `${subjects.length}: ${subjects.join(" / ")}`);
+
+  const offenders = [];
+  for (const [label, text] of [[HANDOFF, handoff.replace(/^## 0\. STATE[\s\S]*?(?=^## )/m, "")], [PROMPT, prompt]])
+    for (const b of blocksOf(text)) {
+      const joined = b.lines.join(" ");
+      if (/§0/.test(joined.replace(/\(§0\)/g, ""))) continue;
+      const named = subjects.filter(s => joined.toLowerCase().includes(s.toLowerCase()));
+      if (named.length) offenders.push(`${label}:${b.nums[0]} names "${named[0]}" — ${joined.trim().slice(0, 70)}`);
+    }
+  check(offenders.length === 0, "no block outside §0 names a §0 subject without deferring to it",
     offenders.slice(0, 4).join("\n        "));
 }
 

@@ -149,8 +149,8 @@ compares content. It is the one fact only reeve knows.
 
 ## 6. Unfinished work, and what each piece needs
 
-**Capability 3 — working review threads.** Needs a routing decision that has been
-open since 23 August. The guardian's outbox table exists (`src/db/schema.sql:110`)
+**Capability 3 — working review threads.** Needs a routing decision; §0 says where
+the capability stands and whether the decision has been taken. The guardian's outbox table exists (`src/db/schema.sql:110`)
 with `gh.pr.comment` and `gh.thread.resolve` among its kinds, and enqueue / lease /
 complete / fail / recover implemented in `src/db/ops.mjs:239-284`. It has **zero
 callers and no drainer**. The hub (S2) is building its own, separate outbox for the
@@ -326,12 +326,14 @@ fenced block and nothing else, and a test enforces that.
 
 ## 12. Open risks
 
-- **The publish fix is UNPROVEN in the field.** 70 test files carry it and zero
-  real dispatches do. The defect it fixes was found by a dispatch that roughly 640
-  green tests never saw. Re-arming should be treated as an experiment with a result
-  to read.
-- **The daemon's checkout is behind `main`** (§0), so the running process is on
-  older code than anything the tests exercise.
+- **The publish fix may still be unproven in the field.** The test suite carries
+  it; §0 says whether a real dispatch ever has. The defect it fixes was found by a
+  dispatch that roughly 640 green tests never saw, so those two readings are not
+  interchangeable and the gap between them is the risk. Re-arming should be treated
+  as an experiment with a result to read.
+- **The daemon's checkout can drift behind `main`**, which puts the running process
+  on older code than anything the tests exercise. §0 says where it stands. Read it
+  from the process with `ps`, never from the plist, and never from this line.
 - **`maxTurns: 20` is probably too tight.** A correct fix ran out of turns twice —
   but 13 of one run's 36 tool calls went on an impossible instruction, so re-measure
   after the fix rather than raising it blind.

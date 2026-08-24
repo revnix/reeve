@@ -693,15 +693,52 @@ function openPrs(nwo, limit = 20) {   // bounded; the caller LOGS when the bound
  * Record what a tick decided, so the dashboard and `reeve why` can answer without
  * re-deriving anything, and so a restart knows how long a clause has been UNKNOWN.
  */
-function record(db, { pr, head, verdict, decision }) {
+function record(db, { pr, head, verdict, decision, effects = [] }) {
   try {
-    db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
-      .run(now(), "daemon", "pr.decided", `pr:${pr}`, JSON.stringify({
-        head, state: verdict.state, summary: verdict.summary,
-        action: decision.action, why: decision.why,
-        clauses: verdict.clauses.map(c => ({ id: c.id, state: c.state })),
-      }));
-  } catch { /* a store that cannot record must not stop the loop */ }
+    // ONE transaction, and that is the outbox's whole reason for existing. The
+    // decision and the side effect it implies have to become durable together or
+    // neither: a crash between them leaves a store saying a review round was
+    // requested and a pull request where nothing was said, and re-deriving on the
+    // next tick is not a repair -- the head, the profile, the PR's state or an
+    // UNKNOWN timeout can all have moved, so the next tick may legitimately decide
+    // something else and the effect is simply lost.
+    return tx(db, () => {
+      db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+        .run(now(), "daemon", "pr.decided", `pr:${pr}`, JSON.stringify({
+          head, state: verdict.state, summary: verdict.summary,
+          action: decision.action, why: decision.why,
+          clauses: verdict.clauses.map(c => ({ id: c.id, state: c.state })),
+        }));
+      // `enqueue` returns null for a key it already holds, which is success: the
+      // effect is durable, it was simply made durable by an earlier tick.
+      let queued = 0, known = 0;
+      for (const eff of effects) (enqueue(db, eff) !== null ? queued++ : known++);
+      return { ok: true, queued, known };
+    });
+  } catch (err) {
+    // A store that cannot record must not stop the loop -- but it must not report
+    // an effect as queued either. The caller says so out loud.
+    return { ok: false, queued: 0, known: 0, why: err.message };
+  }
+}
+
+/**
+ * The GitHub effects a decision implies, ready to be made durable WITH it.
+ *
+ * Built here rather than at dispatch, because dispatch is about workers and these
+ * are not worker tasks. Returns an empty list for every action that has no such
+ * effect, so the caller has one shape to handle.
+ *
+ * The key is per HEAD on purpose: a new head is a new round and must ask again,
+ * while a repeated tick at one head must not.
+ */
+function effectsFor({ nwo, e, decision, profile }) {
+  if (decision.action !== "REQUEST_REVIEW" || !reviewActionsOn(profile)) return [];
+  return (profile.reviewers ?? []).filter(r => r.trigger).map(r => ({
+    idemKey: `review-request:${nwo}:${e.pr}:${e.head}:${r.login}`,
+    kind: "gh.pr.comment",
+    args: { nwo, pr: e.pr, body: r.trigger },
+  }));
 }
 
 /** How long has this PR been sitting in UNKNOWN? Read from the event log, not memory. */
@@ -914,7 +951,23 @@ export async function tick(ctx) {
       fixAttempts: fp ? new Map([[fp, attemptsFor(db, nwo, pr, fp, logPath)]]) : new Map(),
     });
 
-    record(db, { pr, head: e.head, verdict: e.verdict, decision });
+    // Posting a comment launches no worker and hands no credential to one, so it
+    // is decided and made durable HERE -- not below, where dispatch is gated on
+    // worker containment. A review request withheld because a sandbox could not be
+    // proved closed is a pull request left without the round it needed, for a
+    // reason that has nothing to do with it.
+    const effects = effectsFor({ nwo, e, decision, profile });
+    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects });
+    if (effects.length && !decided.ok)
+      log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
+    else if (decided.queued)
+      log(logPath, `  #${pr}: REQUEST_REVIEW — queued ${decided.queued} trigger comment(s) for reeve to post`);
+    else if (effects.length)
+      log(logPath, `  #${pr}: REQUEST_REVIEW — already requested at this head`);
+    // A decision that WANTED effects and produced none names the reason, because
+    // a profile with no trigger declared looks identical to one already asked.
+    if (decision.action === "REQUEST_REVIEW" && reviewActionsOn(profile) && !effects.length)
+      log(logPath, `  #${pr}: REQUEST_REVIEW — no reviewer in this profile declares a trigger`);
     if (decision.action === ACTIONS.WAIT) waiting.add(pr);
     // Carried on the entry rather than left in this block's scope: the dispatch
     // loop below is a SEPARATE block, and reaching for these there threw a
@@ -949,7 +1002,11 @@ export async function tick(ctx) {
   // is open, and the founder is told once, by identity. The verdict is
   // injectable for tests only; the default measures, and measures only when a
   // worker task actually wants dispatching, so a quiet tick runs no canary.
-  const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action));
+  // A REQUEST_REVIEW reeve performs itself is not a worker task, so it must not
+  // count towards the worker gates -- otherwise an open containment blocks a
+  // comment that no worker was ever going to post.
+  const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action)
+                                    && !(d.decision.action === "REQUEST_REVIEW" && reviewActionsOn(profile)));
   let containment = ctx.containment ?? null;
   if (execute && wanted.length && !containment) containment = await measuredContainment(ctx, profile, nwo, logPath);
   if (execute && wanted.length && containment.credentialRead !== "closed") {
@@ -967,40 +1024,9 @@ export async function tick(ctx) {
 
     const PREP_BACKOFF = (ctx.prepBackoff ??= new Map());   // pr -> { until, failures }
     for (const { e, decision, cause, fp } of decisions) {
-      // REQUEST_REVIEW is no longer a worker task, and it never should have been.
-      // It posts each reviewer's trigger comment verbatim -- no judgement, no
-      // reading of the diff, nothing a model is needed for. It was a dispatch only
-      // because reeve could not act on GitHub itself, and it cost a paid worker run
-      // to produce a fixed string that the worker's own `gh` was then refused.
-      //
-      // Enqueued rather than posted here: the effect has to be durable with the
-      // decision that produced it, or a crash between the two leaves a state saying
-      // the round was requested and a pull request where nothing was said.
-      if (decision.action === "REQUEST_REVIEW" && reviewActionsOn(profile)) {
-        const triggers = (profile.reviewers ?? []).filter(r => r.trigger);
-        if (!triggers.length) {
-          log(logPath, `  #${e.pr}: REQUEST_REVIEW — no reviewer in this profile declares a trigger`);
-          escalations.set(`#${e.pr}: a review round is due but no reviewer declares a trigger comment`, 1);
-          continue;
-        }
-        // The key is what makes this at-most-once, and it is deliberately keyed on
-        // the HEAD: a new head is a new round and must ask again, while a repeated
-        // tick at the same head must not. `enqueue` returns null on a key it
-        // already holds, which is success and not a failure.
-        let queued = 0;
-        for (const r of triggers) {
-          const idemKey = `review-request:${nwo}:${e.pr}:${e.head}:${r.login}`;
-          const id = tx(db, () => enqueue(db, {
-            idemKey, kind: "gh.pr.comment",
-            args: { nwo, pr: e.pr, body: r.trigger },
-          }));
-          if (id !== null) queued++;
-        }
-        log(logPath, queued
-          ? `  #${e.pr}: REQUEST_REVIEW — queued ${queued} trigger comment(s) for reeve to post`
-          : `  #${e.pr}: REQUEST_REVIEW — already requested at this head`);
-        continue;
-      }
+      // Already handled at decision time, in the same transaction as the decision.
+      // Nothing to dispatch: reeve posts it.
+      if (decision.action === "REQUEST_REVIEW" && reviewActionsOn(profile)) continue;
       if (UNBUILT_ACTIONS[decision.action]) {
         log(logPath, `  #${e.pr}: NOT dispatching ${decision.action} — ${UNBUILT_ACTIONS[decision.action]}`);
         escalations.set(`#${e.pr}: ${decision.action.toLowerCase().replace("_", " ")} needs a GitHub effect reeve does not yet perform`, 1);
@@ -1701,17 +1727,26 @@ export async function tick(ctx) {
   // stop reading pull requests.
   if (ctx.drain !== false) {
     try {
+      // The QUEUE is read before the credential. Authenticating first meant an
+      // installation lookup and a fresh token mint on every ordinary tick --
+      // roughly a thousand a day per repository -- to discover there was nothing
+      // to do, which also made the comment above about an idle tick costing one
+      // query untrue. Rows recoverable from a dead drainer count as work, or a
+      // crashed delivery waits for a tick that happens to have new work in it.
+      const due = db.prepare(`SELECT count(*) n FROM outbox
+                              WHERE (status='pending' AND not_before<=unixepoch())
+                                 OR (status='inflight' AND lease_expires_at<unixepoch())`).get().n;
+      if (!due) { /* nothing to carry; do not mint a token to find that out */ }
+      else {
       const auth = await (ctx.authenticate ?? authenticate)(nwo);
       if (!auth.ok) {
-        // Only worth saying when there is something waiting. Otherwise every tick
-        // on a machine with no App credential prints a line about an empty queue.
-        const waiting = db.prepare(`SELECT count(*) n FROM outbox WHERE status='pending'`).get().n;
-        if (waiting) log(logPath, `  outbox: ${waiting} effect(s) waiting; cannot authenticate — ${auth.why}`);
+        log(logPath, `  outbox: ${due} effect(s) waiting; cannot authenticate — ${auth.why}`);
       } else {
         const api = args => apiAsInstallation(auth.token, args);
         const r = await drainOutbox({ db, log: m => log(logPath, m), handlers: ctx.handlers ?? HANDLERS, api });
         const posted = r.done.filter(d => d.verdict === "done").length;
         if (posted) log(logPath, `  outbox: performed ${posted} effect(s)`);
+      }
       }
     } catch (err) { log(logPath, `  outbox: drain failed — ${err.message}`); }
   }

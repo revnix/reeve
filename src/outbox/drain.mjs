@@ -20,6 +20,46 @@
  */
 import { leaseOutbox, settleOutbox, recoverOutbox, pendingWithNoHandler } from "../db/ops.mjs";
 
+/**
+ * Resolves to a retryable failure once `seconds` have passed. Never rejects.
+ *
+ * Cancelled explicitly by the winner rather than `unref`d. An unref'd timer does
+ * not hold the event loop open, which sounds like the tidy choice and is the wrong
+ * one: with nothing else pending the process exits while the race is unsettled, so
+ * the deadline never fires and a hung handler hangs forever instead of being
+ * abandoned. Measured -- the first version did exactly that and the test warned
+ * about an unsettled await rather than failing.
+ */
+const deadline = seconds => {
+  let timer;
+  const promise = new Promise(resolve => {
+    timer = setTimeout(() => resolve({
+      ok: false, retryable: true,
+      error: `the handler did not finish within ${Math.round(seconds)}s, which is inside its lease; abandoned before the claim could lapse mid-delivery`,
+    }), Math.max(1, seconds) * 1000);
+  });
+  promise.cancel = () => clearTimeout(timer);
+  return promise;
+};
+
+/**
+ * How long a single effect may take, as a fraction of its lease.
+ *
+ * A handler that outruns its lease is the one failure the fence cannot repair. The
+ * lease lapses mid-delivery, recovery hands the row to a second drainer, and if
+ * that one's pre-check runs before the first one's POST lands, BOTH post. The
+ * fence then correctly refuses the first drainer's settle -- and the duplicate
+ * comment is already on the pull request, because a fence orders writes to the
+ * DATABASE and has no authority over GitHub.
+ *
+ * So the handler is given a deadline strictly inside the lease and is abandoned at
+ * it. Two thirds leaves room for the settle that follows. This bounds the window
+ * rather than closing it: a POST that has already reached GitHub when the deadline
+ * fires still lands. What it removes is the case where a drainer sits in a hung
+ * request for minutes while its claim quietly expires around it.
+ */
+const HANDLER_DEADLINE = 2 / 3;
+
 export async function drainOutbox({ db, log = () => {}, handlers, api,
                                     worker = "drainer", max = 10, leaseSeconds = 300 }) {
   const kinds = Object.keys(handlers ?? {});
@@ -29,6 +69,10 @@ export async function drainOutbox({ db, log = () => {}, handlers, api,
   // dead holder's settle stale.
   const recovered = recoverOutbox(db);
   if (recovered.length) log(`  outbox: recovered ${recovered.length} row(s) from a drainer that did not finish`);
+  // Said separately, because a crash-loop is a different problem from a crash and
+  // needs a person rather than another pass.
+  for (const d of recovered.deadLettered ?? [])
+    log(`  outbox: ${d.kind} #${d.id} DEAD-LETTERED — ${d.attempts} lease(s) and never once settled; its drainer is crashing`);
 
   const done = [];
   for (let i = 0; i < max; i++) {
@@ -39,7 +83,14 @@ export async function drainOutbox({ db, log = () => {}, handlers, api,
     try {
       const args = JSON.parse(job.args);
       // A handler is awaited whether or not it is async, so one of each composes.
-      outcome = await handlers[job.kind](args, { api, idemKey: job.idem_key, log });
+      // `attempt` reaches the handler because idempotency depends on it: only a
+      // retry can find a previous delivery, and a first attempt that looked would
+      // be paying for an answer it already has.
+      const deliver = Promise.resolve(
+        handlers[job.kind](args, { api, idemKey: job.idem_key, attempt: job.attempts, log }));
+      const clock = deadline(leaseSeconds * HANDLER_DEADLINE);
+      try { outcome = await Promise.race([deliver, clock]); }
+      finally { clock.cancel(); }   // the loser's timer must not outlive the race
     } catch (e) {
       // A throw is the handler failing, not the drainer. Retryable by default: an
       // unrecognised fault is more often transient than terminal, and the budget

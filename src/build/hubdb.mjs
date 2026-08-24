@@ -87,10 +87,32 @@ export function openHub(path) {
     db.exec("PRAGMA busy_timeout = 10000");
   } catch (e) {
     try { db.close(); } catch { /* the throw below is the answer either way */ }
+    // WHICH FAILURE, not merely that one happened. These pragmas WRITE, so they
+    // fail for reasons that have nothing to do with the file being damaged:
+    //
+    //   errcode 26  SQLITE_NOTADB   file is not a database
+    //   errcode 11  SQLITE_CORRUPT  disk image is malformed
+    //   errcode  5  SQLITE_BUSY     another connection holds a read txn (DELETE mode)
+    //   errcode  8  SQLITE_READONLY read-only file or directory
+    //
+    // (all four measured against node:sqlite). Telling an operator to restore
+    // over a BUSY or READ-ONLY hub points them at replacing a healthy authority
+    // database because someone else was reading it, or because a permission is
+    // wrong. That is worse than the crash this guard replaced.
+    //
+    // Same mistake as the maintenance-lock catch: a failed operation is not
+    // evidence of a damaged file. Only corruption earns the recovery advice.
+    const corrupt = e.errcode === 26 || e.errcode === 11;
     throw new Error(
-      `the hub at ${path} cannot be read (${e.message}).\n` +
-      `  recover  reeve restore --hub --force installs the newest usable snapshot\n` +
-      `           pass --tail from a durable export-events --hub to carry history forward`,
+      corrupt
+        ? `the hub at ${path} cannot be read (${e.message}).\n` +
+          `  recover  reeve restore --hub --force installs the newest usable snapshot\n` +
+          `           pass --tail from a durable export-events --hub to carry history forward`
+        : `the hub at ${path} could not be opened for writing (${e.message}).\n` +
+          `  the file itself answered, so this is not damage: another process may hold it, or the ` +
+          `file or its directory may be read-only.\n` +
+          `  recover  stop any running builder or reeve CLI and re-run; check the permissions on ` +
+          `${path} and its directory. Do NOT restore over it -- there is no evidence it is broken.`,
       { cause: e });
   }
 

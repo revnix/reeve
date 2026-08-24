@@ -84,6 +84,56 @@ const NEVER = [
   "Bash(npm publish:*)", "Bash(pnpm publish:*)", "Bash(yarn publish:*)",
 ];
 
+/**
+ * Tools the CLI provides directly, which a worker never gets.
+ *
+ * This list exists separately from `NEVER` above because the two are not the same
+ * kind of thing, and conflating them is what left this gap open. `NEVER` is a list
+ * of SHELL COMMANDS: `Bash(curl:*)` stops a worker shelling out to curl. But
+ * `WebFetch` is not a shell command, so no `Bash(...)` rule can reach it, and the
+ * docblock above this file's grant has claimed "it cannot reach the network" while
+ * nothing in this module named a single one of these tools.
+ *
+ * MEASURED, 2026-08-24: the boundary held anyway. A real worker under reeve's own
+ * settings called `WebFetch` and was told "Claude requested permissions to use
+ * WebFetch, but you haven't granted it yet." Not being on the allow list is enough,
+ * because an ungranted tool falls through to a permission prompt and a headless run
+ * has nobody to answer one.
+ *
+ * That is a boundary by consequence, not by statement, and it is being written
+ * down for the two reasons this project has already paid for once:
+ *
+ *   · Nothing enforced it and no test read it, so a CLI default that changed would
+ *     open the door silently. The read deny list that turned out to be inert
+ *     (2026-08-22) and the `.git` block imposed a layer beneath reeve's settings
+ *     (2026-08-23) were both this shape.
+ *   · The worker spends PAID TURNS finding out. In the same measurement it burned
+ *     three of them on a tool it was never going to get. That is the `git commit`
+ *     lesson exactly: what stops the attempt costing a run is the prompt.
+ *
+ * Grouped by the capability each would hand over, because a name-by-name list
+ * invites additions that do not belong and omissions that do:
+ *
+ *   network egress          the one the docblock already claimed was closed
+ *   agent delegation        a spawned agent's grant is not this grant
+ *   cross-session reach     other sessions on this machine are outside the sandbox
+ *   work outliving the run  a schedule survives the checkout being released
+ *   leaving the checkout    the worktree IS the boundary; do not let it be left
+ *
+ * Deliberately NOT here: `ToolSearch`, `Skill`, `Monitor`, `Read`/`Edit`/`Write`
+ * and the rest. Those are how a worker does the job it was given, and the file
+ * tools are already scoped to the checkout by `permissions.deny`. Denying a tool a
+ * repair needs would produce a worker that reports success on work nothing checked,
+ * which is the failure `NEVER`'s own comment warns against.
+ */
+export const NEVER_TOOLS = [
+  "WebFetch", "WebSearch",
+  "Task", "Agent", "Workflow",
+  "SendMessage", "ListAgents",
+  "CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger", "PushNotification",
+  "EnterWorktree", "ExitWorktree",
+];
+
 /** The paths that judge the work. A worker EDITING these grades its own exam;
  * reading them is how it understands the exam. */
 const SELF_GOVERNING = [".github/**", ".git/**"];
@@ -555,9 +605,16 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
 
   return {
     allowedTools: tools.join(","),
+    // Both, on purpose, and they are not redundant. `--disallowedTools` is the
+    // flag the CLI documents for this; `permissions.deny` is what the settings
+    // file states, so a reader of the sandbox sees the boundary without having to
+    // reconstruct the command line. A bare tool name in `deny` removes the tool
+    // outright -- which for these is exactly the intent, unlike `Bash`, where the
+    // same move was measured to take the scoped grants with it.
+    disallowedTools: NEVER_TOOLS.join(","),
     settings: {
       permissions: {
-        deny,
+        deny: [...deny, ...NEVER_TOOLS],
         allow: tools.filter(t => t.startsWith("Bash(")),
         // Empty on purpose. The worktree is the boundary.
         additionalDirectories: [],

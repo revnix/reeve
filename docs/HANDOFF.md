@@ -440,7 +440,22 @@ drew 149 threads.
 
 - The daemon runs unattended for days, survives outages, restarts cleanly.
 - **Three complete dispatches**, CI-verified on GitHub: red CI → root cause → fix
-  in an isolated worktree → diff gate → reeve published → green.
+  in an isolated worktree → diff gate → reeve published → green. **Dated, and
+  read with the two entries below it.** Those three ran on 2026-08-21, under the
+  contract as it stood then. The OS sandbox landed the next morning (`1a2fbea`,
+  2026-08-22 10:47) and took the publishing half away without anything noticing:
+  it denies every write under `.git` at the Bash layer, beneath anything reeve
+  declares, so from that commit no worker could stage or commit its own fix.
+  `docs/measured/2026-08-23-three-real-dispatches.md` is where that was found,
+  and it was found by re-verifying this very line rather than by a failure.
+- **The publication half was rebuilt, not restored.** Staging and committing moved
+  to reeve, and the worker is now told not to touch git at all — which also closes
+  the older "who publishes" drift rather than patching around it. It is covered by
+  tests and by an end-to-end dispatch fixture.
+- **No real dispatch has exercised the rebuilt path.** The proof above is a proof
+  about the OLD contract; nothing has yet reproduced it under the new one. For
+  whether that is still true, and for whether reeve is dispatching at all, see §0
+  of the newest `docs/*-session-handoff.md` — this file does not track it.
 - **The retry brake, the diff-gate refusal and REPEATED_FAILURE have all fired on
   a real dispatch**, exercised by planting a failure whose fix lands in a
   sensitive path so the worker had to decline.

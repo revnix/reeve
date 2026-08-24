@@ -6,7 +6,7 @@
 // It also must not write repo_gate_state. A reporter that can write what it
 // reports can agree with itself, and the row exists precisely so that clause U4
 // reads something the LOOP established.
-import { openHub } from "../src/build/hubdb.mjs";
+import { openHub, isOperational } from "../src/build/hubdb.mjs";
 import { hubFindings, renderHub } from "../src/doctor.mjs";
 // The self-audit block at the end of this task needs all of these. The standard
 // harness supplies only check, dir, join, tmpdir, mkdtempSync and rmSync.
@@ -14,12 +14,12 @@ import { selfAudit, BROKEN } from "../src/selfaudit.mjs";
 import { open as openStore } from "../src/db/ops.mjs";
 import { hubPathFor } from "../src/paths.mjs";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, openSync, writeSync, closeSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, openSync, writeSync, closeSync, existsSync, writeFileSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";   // the CLI drill runs bin/reeve
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -584,6 +584,330 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   const okOut = (ok.stdout ?? "") + (ok.stderr ?? "");
   check(!/could not be parsed/.test(okOut),
     "control: a parseable tail reaches the manifest checks instead", okOut.slice(0, 240));
+}
+
+// ── NO hub route answers a broken hub with a stack trace ──────────────────
+// The version-zero sweep above covers ONE broken state. Sites six and seven were
+// found in a different one -- an UNREADABLE hub -- because that sweep was a list
+// of routes against a single fixture rather than a matrix.
+//
+//   build status  ->  Error: file is not a database   at bin/reeve:1109
+//   build run     ->  Error: file is not a database   at openHub (hubdb.mjs:72)
+//
+// Both live on main when this was written, and both are the two commands an
+// operator reaches for WHEN SOMETHING IS ALREADY WRONG. Six earlier findings of
+// this class were each fixed at the site reported, and each declared it swept.
+//
+// So the assertion is the MATRIX, and it is the thing that fails when an eighth
+// site appears rather than a reviewer noticing.
+{
+  const mHome = join(dir, "matrix-home");
+  const env = { ...process.env, REEVE_HOME: mHome };
+  const run = (...args) => spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+    { encoding: "utf8", env });
+
+  // The broken states a hub can actually be in, each built the way it really
+  // arises. `build run` is excluded from the matrix and driven separately below:
+  // it is a heartbeat LOOP, and a route that does not exit cannot be in a table
+  // of exit codes.
+  const STATES = {
+    absent:     () => { rmSync(join(mHome, "state"), { recursive: true, force: true }); mkdirSync(join(mHome, "state"), { recursive: true }); },
+    versionZero: () => { const d = new DatabaseSync(hubPathFor(mHome));
+                         d.exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT`);
+                         d.close(); },
+    unreadable: () => writeFileSync(hubPathFor(mHome), "this is not a database"),
+    truncated:  () => { const d = openHub(hubPathFor(mHome)); d.close();
+                        const buf = readFileSync(hubPathFor(mHome));
+                        writeFileSync(hubPathFor(mHome), buf.subarray(0, Math.floor(buf.length / 3))); },
+  };
+  const ROUTES = [
+    ["builder", "doctor"],
+    ["builder", "doctor", "--json"],
+    ["build", "status"],
+    ["export-events", "--hub", join(mHome, "tail.jsonl")],
+    ["backup", "--hub"],
+    ["restore", "--hub"],
+  ];
+  check(Object.keys(STATES).length >= 4 && ROUTES.length >= 6,
+    "control: the matrix covers every broken state against every hub route",
+    `${Object.keys(STATES).length} states x ${ROUTES.length} routes`);
+
+  const crashed = [];
+  let cells = 0;
+  for (const [state, build] of Object.entries(STATES)) {
+    rmSync(mHome, { recursive: true, force: true });
+    mkdirSync(join(mHome, "state"), { recursive: true });
+    build();
+    for (const args of ROUTES) {
+      cells++;
+      const r = run(...args);
+      const out = (r.stdout ?? "") + (r.stderr ?? "");
+      // A Node stack frame, by its own shape: `    at <thing> (<file>:<line>:<col>)`
+      // or the bare `    at <file>:<line>:<col>` form.
+      if (/^\s+at\s+.*:\d+:\d+\)?$/m.test(out))
+        crashed.push(`${state}/${args.join(" ")}: ${out.split("\n").find(l => /Error/.test(l))?.trim() ?? "(stack)"}`);
+    }
+  }
+  check(cells === Object.keys(STATES).length * ROUTES.length,
+    "control: every cell of the matrix ran", `${cells} cells`);
+  check(crashed.length === 0,
+    "no hub route answers a broken hub with a stack trace",
+    crashed.slice(0, 4).join("  |  "));
+
+  // And an unreadable hub is a FAULT, not "no builder is running". Before the
+  // guard the uncaught throw exited 1; catching it and breaking like the other
+  // not-running cases would have turned a loud failure into a quiet success.
+  rmSync(mHome, { recursive: true, force: true });
+  mkdirSync(join(mHome, "state"), { recursive: true });
+  STATES.unreadable();
+  const bad = run("build", "status");
+  check(bad.status === 1, "`build status` exits 1 on an unreadable hub, not 0", `status=${bad.status}`);
+  check(/cannot be read/.test(bad.stdout + bad.stderr),
+    "and says so in words", (bad.stdout + bad.stderr).slice(0, 160));
+  check(/reeve restore --hub --force/.test(bad.stdout + bad.stderr),
+    "and names the way back", (bad.stdout + bad.stderr).slice(0, 200));
+
+  // AND `build run`, which the matrix cannot hold. It is a heartbeat LOOP, so a
+  // table of exit codes has no cell for it on a healthy hub -- which is exactly
+  // why site seven hid there. On a BROKEN hub it must refuse and exit, and that
+  // is testable: a `timeout` on the spawn turns "it hung" into a failure rather
+  // than into a suite that never finishes.
+  //
+  // Site seven was `build run` dying inside `openHub` with a raw
+  // `file is not a database`, because `bootstrapping` is
+  // `completedVersion(...) === 0` and an UNREADABLE file answers 0 as well --
+  // the same conflation between "no completed migration" and "cannot be read"
+  // that `restoreHub` had, not carried across when that one was fixed.
+  for (const [state, build] of [["unreadable", STATES.unreadable], ["truncated", STATES.truncated]]) {
+    rmSync(mHome, { recursive: true, force: true });
+    mkdirSync(join(mHome, "state"), { recursive: true });
+    build();
+    const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), "build", "run"],
+      { encoding: "utf8", env, timeout: 20_000 });
+    const out = (r.stdout ?? "") + (r.stderr ?? "");
+    check(r.signal !== "SIGTERM",
+      `\`build run\` on a ${state} hub exits instead of entering the loop`, `signal=${r.signal}`);
+    check(r.status !== 0, `and refuses (${state})`, `status=${r.status}`);
+    check(!/^\s+at\s+.*:\d+:\d+\)?$/m.test(out),
+      `and not with a stack trace (${state})`, out.split("\n").slice(0, 3).join(" | "));
+    check(/cannot be read/.test(out), `and says the hub cannot be read (${state})`, out.slice(0, 160));
+  }
+
+  // CONTROL: a hub that is merely NOT RUNNING still exits 0, so the line above
+  // is about the fault rather than about `build status` having become noisy.
+  rmSync(mHome, { recursive: true, force: true });
+  mkdirSync(join(mHome, "state"), { recursive: true });
+  openHub(hubPathFor(mHome)).close();
+  const ok = run("build", "status");
+  check(ok.status === 0 && /not running/.test(ok.stdout),
+    "control: a healthy hub with no builder still exits 0", `status=${ok.status} ${ok.stdout.slice(0, 60)}`);
+}
+
+// ── a hub that REFUSES A WRITE is not a hub that is damaged ───────────────
+// `openHub`'s pragmas WRITE, and taking the builder lease writes, so both fail
+// for reasons that have nothing to do with the file being broken. Measured
+// against node:sqlite: NOTADB is errcode 26, CORRUPT 11, BUSY 5, READONLY 8.
+// Calling all four corruption told an operator to RESTORE over a healthy
+// authority database because someone else was reading it.
+//
+// The fixture is a BUSY hub, not a read-only one. chmod does nothing as root,
+// which is ordinary in containerised CI: the mode bits would be inert, both
+// `build run` children would enter the heartbeat loop until their timeouts, and
+// these assertions would fail for the environment rather than the code. An
+// exclusive transaction produces SQLITE_BUSY for any user.
+{
+  const bHome = join(dir, "busy-home");
+  mkdirSync(join(bHome, "state"), { recursive: true });
+  const env = { ...process.env, REEVE_HOME: bHome };
+  const run = (...args) => spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+    { encoding: "utf8", env, timeout: 30_000 });
+  const hub = hubPathFor(bHome);
+  { const d = openHub(hub); d.exec("PRAGMA journal_mode = DELETE"); d.close(); }
+
+  const blocker = new DatabaseSync(hub, { timeout: 100 });
+  blocker.exec("PRAGMA busy_timeout = 100");
+  blocker.exec("BEGIN EXCLUSIVE");
+  let outs;
+  try {
+    outs = { "build status": run("build", "status"), "build run": run("build", "run") };
+  } finally { try { blocker.exec("ROLLBACK"); } catch { /* the close still frees it */ } blocker.close(); }
+
+  for (const [label, r] of Object.entries(outs)) {
+    const out = (r.stdout ?? "") + (r.stderr ?? "");
+    check(r.signal !== "SIGTERM", `\`${label}\` on a busy hub exits instead of hanging`, `signal=${r.signal}`);
+    check(!/^\s+at\s+.*:\d+:\d+\)?$/m.test(out),
+      `and not with a stack trace (${label})`, out.split("\n").slice(0, 3).join(" | "));
+    // THE DECISIVE ONE: it must not point at replacing a database that is fine.
+    check(!/reeve restore --hub/.test(out) || /Do NOT restore/.test(out),
+      `and does not tell the operator to restore over a healthy hub (${label})`, out.slice(0, 300));
+    check(/locked|not available|read-only|permissions/.test(out),
+      `and names the actual cause (${label})`, out.slice(0, 200));
+    // AND `build status` says UNKNOWN. A status that could not be READ is not a
+    // reading of "not running" -- an exclusive transaction stops the command
+    // before the singleton lease can be consulted, and a live builder's lease
+    // may say otherwise. Asserted on the word, because "not running (… cannot be
+    // read)" also mentions the cause and would satisfy the line above.
+    if (label === "build status")
+      check(/builder: UNKNOWN/.test(out),
+        "and a status that could not be read is reported as UNKNOWN, not as not-running",
+        out.split("\n")[0]);
+  }
+
+  // AND THE OTHER DIRECTION, which the first version of this got wrong: a
+  // version-1 hub whose LOCK TABLE is gone answers the version probe, so the
+  // lease write throws `no such table: maintenance_lock` -- errcode 1, which is
+  // damage. Claiming "the hub reads fine, do NOT restore" there withholds the
+  // one thing that recovers it.
+  {
+    rmSync(join(bHome, "state"), { recursive: true, force: true });
+    mkdirSync(join(bHome, "state"), { recursive: true });
+    { const d = openHub(hub); d.exec("DROP TABLE maintenance_lock"); d.close(); }
+    const r = run("build", "run");
+    const out = (r.stdout ?? "") + (r.stderr ?? "");
+    check(r.status !== 0, "a hub whose lock table is gone refuses", `status=${r.status}`);
+    check(/reeve restore --hub --force/.test(out),
+      "and IS told to restore, because a missing table is damage", out.slice(0, 260));
+    check(!/Do NOT restore/.test(out),
+      "and not told the opposite", out.slice(0, 260));
+  }
+}
+
+// ── CONTROL: a genuinely CORRUPT hub still gets the restore advice ────────
+// Without this, a fix that simply never recommends restoring satisfies every
+// assertion in the block above.
+{
+  const cHome = join(dir, "corrupt-advice-home");
+  mkdirSync(join(cHome, "state"), { recursive: true });
+  const env = { ...process.env, REEVE_HOME: cHome };
+  writeFileSync(hubPathFor(cHome), "this is not a database");
+  const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), "build", "status"],
+    { encoding: "utf8", env, timeout: 30_000 });
+  const out = (r.stdout ?? "") + (r.stderr ?? "");
+  check(/reeve restore --hub --force/.test(out),
+    "control: a corrupt hub IS told to restore", out.slice(0, 200));
+  // UNKNOWN ON THE CORRUPT BRANCH TOO. The verdict is about whether the lease
+  // could be READ, and this branch never got that far either -- so "not running"
+  // was the same mistake twice, and the more dangerous half: it invites the
+  // operator to follow the restore advice WITHOUT stopping a builder that may
+  // still be live.
+  check(/builder: UNKNOWN/.test(out),
+    "a corrupt hub reports UNKNOWN, not not-running", out.split("\n")[0]);
+  check(/STOP any running builder first/.test(out),
+    "and the recovery says to stop any builder before restoring, since it cannot tell",
+    out.slice(0, 300));
+  check(/--tail/.test(out),
+    "and told to pass --tail, so the first recovery is not the lossy one", out.slice(0, 320));
+  check(!/Do NOT restore/.test(out),
+    "and not told the opposite", out.slice(0, 260));
+}
+
+// ── the classifier's edges, and the guard's reach ─────────────────────────
+// The table itself first, because the CLI paths only exercise the codes they
+// happen to produce: measured, forcing an errcode-less error to "damage" left
+// every end-to-end assertion below green, because `build run` catches the
+// restore-in-progress case by name before the classifier is consulted.
+{
+  const cases = [
+    [{ errcode: 3 },  true,  "SQLITE_PERM"],
+    [{ errcode: 5 },  true,  "SQLITE_BUSY"],
+    [{ errcode: 6 },  true,  "SQLITE_LOCKED"],
+    [{ errcode: 8 },  true,  "SQLITE_READONLY"],
+    [{ errcode: 14 }, true,  "SQLITE_CANTOPEN"],
+    [{ errcode: 11 }, false, "SQLITE_CORRUPT"],
+    [{ errcode: 26 }, false, "SQLITE_NOTADB"],
+    [{ errcode: 1 },  false, "SQLITE_ERROR (no such table)"],
+    [{ errcode: 10 }, false, "SQLITE_IOERR — a failing device is not 'the file is fine'"],
+    [new Error("a restore is in progress"), true, "reeve's own refusal, which carries no errcode"],
+  ];
+  const wrong = cases.filter(([e, want]) => isOperational(e) !== want).map(([, , name]) => name);
+  check(wrong.length === 0,
+    "every SQLite code is classified as damage or not on purpose, including CANTOPEN and errcode-less",
+    wrong.join(", "));
+  check(cases.filter(([, w]) => w).length >= 6 && cases.filter(([, w]) => !w).length >= 4,
+    "control: the table covers both answers, so a constant-true or constant-false fails it",
+    `${cases.filter(([, w]) => w).length} operational / ${cases.filter(([, w]) => !w).length} damage`);
+}
+{
+  const eHome = join(dir, "edges-home");
+  mkdirSync(join(eHome, "state"), { recursive: true });
+  const env = { ...process.env, REEVE_HOME: eHome };
+  const run = (...args) => spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+    { encoding: "utf8", env, timeout: 30_000 });
+  const hub = hubPathFor(eHome);
+
+  // 1. CORRUPTION IN THE SCHEMA PAGE, not the header. All four pragmas succeed,
+  // so the first version read threw OUTSIDE the guard and `build run` printed a
+  // bare `database disk image is malformed` with none of the recovery this
+  // guard exists to give. The guard has to reach as far as the first read that
+  // can find damage, not stop at the first write.
+  {
+    rmSync(join(eHome, "state"), { recursive: true, force: true });
+    mkdirSync(join(eHome, "state"), { recursive: true });
+    { const d = openHub(hub); d.close(); }
+    const meta = new DatabaseSync(hub, { readOnly: true });
+    const page = meta.prepare("SELECT pageno FROM dbstat WHERE name='schema_version' ORDER BY pageno LIMIT 1").get();
+    const ps = meta.prepare("PRAGMA page_size").get().page_size;
+    meta.close();
+    check(page != null && page.pageno > 1,
+      "fixture: schema_version lives past the header page", `page ${page?.pageno}`);
+    const buf = readFileSync(hub);
+    buf.fill(0x5a, (page.pageno - 1) * ps, page.pageno * ps);
+    writeFileSync(hub, buf);
+
+    const r = run("build", "run");
+    const out = (r.stdout ?? "") + (r.stderr ?? "");
+    check(r.status !== 0, "a hub corrupt in its schema page refuses", `status=${r.status}`);
+    check(!/^\s+at\s+.*:\d+:\d+\)?$/m.test(out),
+      "and not with a stack trace", out.split("\n").slice(0, 3).join(" | "));
+    check(/restore --hub --force/.test(out),
+      "and IS given the recovery, which it lost by throwing outside the guard", out.slice(0, 260));
+    check(/--tail/.test(out), "including --tail", out.slice(0, 300));
+  }
+
+  // 2. AN EXPECTED REFUSAL IS AN ANSWER, not a storage failure. `assertWritable`
+  // throws `a restore is in progress` deliberately, and that error carries no
+  // SQLite errcode — so it was routed through the damage branch and a normal
+  // concurrent `build run` was told its lock tables had failed and pointed at a
+  // second forced restore. The correct advice is to WAIT.
+  {
+    rmSync(join(eHome, "state"), { recursive: true, force: true });
+    mkdirSync(join(eHome, "state"), { recursive: true });
+    { const d = openHub(hub); d.close(); }
+    // A holder that is genuinely ALIVE: it takes the lock with its OWN pid and
+    // lstart, so reeve's `isSameProcess` agrees it is running. A dead pid is
+    // reaped by `assertWritable` and the refusal never fires — measured, on the
+    // first attempt at this fixture.
+    const holderSrc = join(eHome, "holder.mjs");
+    writeFileSync(holderSrc, `
+import { openHub } from ${JSON.stringify(pathToFileURL(join(ROOT, "src", "build", "hubdb.mjs")).href)};
+import { acquireMaintenanceLock } from ${JSON.stringify(pathToFileURL(join(ROOT, "src", "build", "locks.mjs")).href)};
+import { readStart, isSameProcess } from ${JSON.stringify(pathToFileURL(join(ROOT, "src", "supervisor.mjs")).href)};
+const d = openHub(${JSON.stringify(hub)});
+acquireMaintenanceLock(d, { pid: process.pid, lstart: readStart(process.pid), isAlive: isSameProcess });
+d.close();
+process.stderr.write("held\\n");
+setTimeout(() => {}, 45000);
+`);
+    const holder = spawnSync(process.execPath, ["-e", `
+      const { spawn } = require("node:child_process");
+      const h = spawn(process.execPath, [${JSON.stringify(holderSrc)}], { stdio: ["ignore","ignore","pipe"], detached: true });
+      h.stderr.once("data", () => { console.log(h.pid); h.unref(); process.exit(0); });
+      setTimeout(() => { console.log(h.pid); process.exit(0); }, 8000);
+    `], { encoding: "utf8", timeout: 15_000 });
+    const holderPid = Number((holder.stdout ?? "").trim());
+    try {
+      const r = run("build", "run");
+      const out = (r.stdout ?? "") + (r.stderr ?? "");
+      check(r.status !== 0, "a concurrent build run is refused while a restore holds the lock", `status=${r.status}`);
+      check(/restore is in progress/.test(out), "and told what is holding it", out.slice(0, 200));
+      check(/wait for it to finish/.test(out),
+        "and told to WAIT, which is the only correct action", out.slice(0, 240));
+      check(!/permissions|restore --hub --force/.test(out),
+        "and NOT sent at permissions or a second forced restore", out.slice(0, 300));
+    } finally {
+      if (Number.isFinite(holderPid) && holderPid > 0) { try { process.kill(holderPid, "SIGKILL"); } catch { /* already gone */ } }
+    }
+  }
 }
 
 rmSync(dir, { recursive: true, force: true });

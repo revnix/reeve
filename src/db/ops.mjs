@@ -338,14 +338,38 @@ export function enqueue(db, { idemKey, kind, runId = null, args, notBefore = 0 }
  * the tries the budget allows. The two counters move together on this path and
  * apart on others, which is exactly why they are two columns.
  */
-export function leaseOutbox(db, { worker, leaseSeconds = 300 }) {
+export function leaseOutbox(db, { worker, leaseSeconds = 300, kinds = null }) {
+  // A drainer leases only the kinds it can PERFORM. Without the filter it takes a
+  // row it has no handler for and must then decide what to do with it, and both
+  // available answers are wrong: dead-lettering discards an effect a later build
+  // would have delivered, and settling it back to pending burns an attempt each
+  // time around until the budget dead-letters it anyway. Not leasing it leaves it
+  // untouched and visible -- `pendingWithNoHandler` counts exactly those.
+  if (Array.isArray(kinds) && kinds.length === 0) return undefined;
+  const filter = Array.isArray(kinds) ? ` AND kind IN (${kinds.map(() => "?").join(",")})` : "";
   return tx(db, () => db.prepare(`
     UPDATE outbox SET status='inflight', attempts=attempts+1, lease_token=lease_token+1,
            lease_expires_at=unixepoch()+?, updated_at=unixepoch()
     WHERE id = (SELECT id FROM outbox
-                WHERE status='pending' AND not_before<=unixepoch()
+                WHERE status='pending' AND not_before<=unixepoch()${filter}
                 ORDER BY id LIMIT 1)
-    RETURNING id, idem_key, kind, run_id, args, attempts, max_attempts, lease_token`).get(leaseSeconds));
+    RETURNING id, idem_key, kind, run_id, args, attempts, max_attempts, lease_token`)
+    .get(leaseSeconds, ...(Array.isArray(kinds) ? kinds : [])));
+}
+
+/**
+ * Effects waiting for a handler that does not exist in this build.
+ *
+ * Read rather than inferred. A row nothing can perform sits pending forever and
+ * looks exactly like an idle queue, so the count is surfaced instead of being left
+ * for someone to notice a missing comment.
+ */
+export function pendingWithNoHandler(db, kinds) {
+  if (!Array.isArray(kinds) || !kinds.length)
+    return db.prepare(`SELECT kind, count(*) n FROM outbox WHERE status='pending' GROUP BY kind`).all();
+  return db.prepare(`SELECT kind, count(*) n FROM outbox
+                     WHERE status='pending' AND kind NOT IN (${kinds.map(() => "?").join(",")})
+                     GROUP BY kind`).all(...kinds);
 }
 
 /**

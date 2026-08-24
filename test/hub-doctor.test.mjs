@@ -1004,8 +1004,20 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     {
       const cli = readFileSync(join(ROOT, "bin", "reeve"), "utf8");
       const hub = readFileSync(join(ROOT, "src", "build", "hubdb.mjs"), "utf8");
-      const sites = [["bin/reeve build status", cli], ["bin/reeve build run", cli], ["openHub", hub]];
-      check(sites.length === 3, "control: three recovery sites are being checked", `${sites.length}`);
+      const bak = readFileSync(join(ROOT, "src", "backup.mjs"), "utf8");
+      // FOUR sites, not three. `restoreHub` renders its own maintenance-lock
+      // failure and was the one caller left deciding from a boolean -- so a lease
+      // write answering SQLITE_FULL was told to fix its permissions, from the
+      // command an operator reaches for when the hub is already in trouble.
+      const sites = [["bin/reeve build status", cli], ["bin/reeve build run", cli],
+                     ["openHub", hub], ["restoreHub", bak]];
+      check(sites.length === 4, "control: four recovery sites are being checked", `${sites.length}`);
+      check(/faultKind\(e\) === "full"/.test(bak),
+        "restoreHub classifies its lock failure by kind, not by a boolean",
+        `${/faultKind\(/.test(bak)}`);
+      check(/free space on the filesystem/i.test(bak),
+        "and tells an operator on a full store to free space",
+        `${/free space on the filesystem/i.test(bak)}`);
       check((cli.match(/faultKind\(/g) ?? []).length >= 2,
         "both CLI recovery sites classify by kind rather than by a boolean",
         `${(cli.match(/faultKind\(/g) ?? []).length} uses`);

@@ -15,24 +15,28 @@ order, and treat them as the source of truth over anything you infer:
 Ignore docs/2026-08-22-session-handoff.md (superseded banner) and treat
 docs/2026-08-22-session-handoff-2.md as history.
 
-## In one line
+## Read §0 of the handoff FIRST, then this
 
-reeve is DISARMED, and the reason it was disarmed is FIXED and merged. The worker
-could not run `git add` or `git commit` — the sandbox that landed 22 Aug denied
-Bash writes to `.git` — so three dispatches produced three correct fixes and
-published none. reeve stages and commits itself now. `--execute` has not been
-restored; that is a decision, not an oversight.
+**This document contains no current facts, deliberately.** What is merged, whether
+reeve is armed, what `main` is, which PRs are open — all of that lives in
+`docs/2026-08-23-session-handoff.md` §0 and nowhere else.
 
-Only run 3 demonstrated the commit block; runs 1 and 2 hit max_turns first. It was
-a regression: reeve published three times on 21 Aug, on its OWN repo, before that
-sandbox existed.
+That is not tidiness. The same three facts had been restated in about twenty
+places across these two files, and six review rounds in a row found a correction
+applied to one copy and left standing in the others. The sixth found this very
+paragraph claiming the prompt held no state while three sections still did. Twenty
+copies of a daily-changing fact will always drift, and patching whichever copy
+review lands on only moves which one is wrong.
 
-**One rule about this document.** The handoff's §0 is the only place that states
-current facts — what is merged, whether reeve is armed, what `main` is. This
-prompt repeats none of them on purpose: the same three facts were restated in
-about twenty places across both files, and five review rounds in a row found a
-correction applied to one copy and not the others. Read §0 for state; read this
-for what to DO.
+So: read §0 for STATE. Read this for what to DO and for the traps that cost hours.
+If the two ever disagree, §0 wins and this file is stale.
+
+The durable part, which does not go stale: reeve could not publish at all, because
+its worker could not run `git add` or `git commit` — the sandbox that landed 22
+Aug denied Bash writes to `.git`. Three dispatches produced three correct fixes
+and shipped none. Only run 3 reached far enough to demonstrate it; runs 1 and 2
+hit max_turns first. It was a regression — reeve published three times on 21 Aug,
+on its own repo, before that sandbox existed.
 
 ## VERIFY the state before trusting any of it, and tell me what drifted
 
@@ -96,12 +100,11 @@ process can be on older code than the tests you just ran.
    comes from beneath them. Tell me what it would cost to represent or PROBE the
    effective restrictions, which is the only version that reaches all six.
 
-2. **PR #15** (`docs/first-dispatches`, worktree ~/Work/Products/reeve-wt/paths)
-   is open and AT its ten-round cap — ten review requests, ten correction pushes,
-   43 findings, every thread answered and resolved. Do NOT request an eleventh.
-   If more findings arrive, read them and bring me a judgement instead of another
-   round. The findings have been narrowing for several rounds, which is the signal
-   the cap exists to act on.
+2. **Work whatever PRs §0 lists as open, and respect the ten-round cap.** A PR at
+   ten review requests stops: answer and resolve what is there, do NOT request an
+   eleventh, and bring me a judgement instead. #15 hit that cap at 43 findings and
+   was merged on it. The signal is not the count alone — it is the count together
+   with findings that have been narrowing for several rounds.
 
 3. **Watch for the first real dispatch on nextly.** It has never dispatched there.
    Mind which table you use for that: `worker_run` only landed on 22 Aug

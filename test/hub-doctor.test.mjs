@@ -534,6 +534,14 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     "and not a finding about the malformed entry's missing name, which is what replaced it",
     JSON.stringify(badIds));
 
+  // CONTROL: names that merely CONTAIN dots are still accepted -- the rule is
+  // about a segment that is nothing but dots, and `owner/repo.js` is a real
+  // repository name that must keep working.
+  writeFileSync(reg, JSON.stringify({ prod: { nwo: "o/orphan" }, dotted: { nwo: "some.owner/repo.js" } }));
+  const dotted = idsOf(run("builder", "doctor", "--json").stdout);
+  check(dotted !== null && !dotted.includes("H-7"),
+    "control: a name containing dots is still a name", JSON.stringify(dotted));
+
   // CONTROL: a WELL-FORMED registry is not reported as an error, so the
   // assertion above is about the malformed entry rather than about H-7 always
   // firing.
@@ -552,9 +560,17 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   // So the rule is what the registry must PROVIDE. `owner/repo` is the only
   // form `nwo_snapshot` ever holds and the only form H-4 can match against; a
   // name that cannot match is not a name.
+  // The dot cases are not decoration. `[\\w.-]+` accepts `.`, `..`, `../..` and
+  // `owner/..` -- names that are syntactically names and can never equal an
+  // `nwo_snapshot`, so the registry read as KNOWN and every real gate-state row
+  // was suppressed against a name matching nothing. That is the unsafe-authority
+  // hiding this validation exists to stop, reached through the front door.
   for (const [label, body] of [["an entry with no nwo", { prod: {} }],
                                ["an nwo that is not owner/repo", { prod: { nwo: "notanwo" } }],
-                               ["an nwo that is not a string", { prod: { nwo: 7 } }]]) {
+                               ["an nwo that is not a string", { prod: { nwo: 7 } }],
+                               ["an nwo of dot segments", { prod: { nwo: "../.." } }],
+                               ["a relative-looking owner", { prod: { nwo: "./repo" } }],
+                               ["a dot repository name", { prod: { nwo: "owner/.." } }]]) {
     writeFileSync(reg, JSON.stringify(body));
     const ids = idsOf(run("builder", "doctor", "--json").stdout);
     check(ids?.includes("H-7"), `${label} is a registry error`, JSON.stringify(ids));

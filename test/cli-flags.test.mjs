@@ -10,10 +10,12 @@
 // measured, `reeve backup --to some/place` answered
 // `no state at <home>/state/some/place.db`.
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, readFileSync, readdirSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+// `--home` has to reach the profile destination, which is init's to decide.
+import { profilePath } from "../src/init.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -274,6 +276,156 @@ const run = (...args) => {
   check(!/answer:\s+--set project\.kind/.test(two.out),
     "the SECOND --set is applied too, so a repeatable flag keeps every occurrence",
     two.out.slice(0, 400));
+}
+
+// ── the home is resolved in ONE place, and every consumer reads it lazily ───
+// `--home` reached only `bin/reeve`'s own constant. `credentialPaths()` denied
+// the root named by the ENVIRONMENT, the canary wrote its decoy under
+// `~/.reeve`, `init` consulted neither, and the App credentials were a
+// module-level constant built from `homedir()` at import time. A canary that
+// measures a decoy the policy has no rule about can report containment CLOSED.
+//
+// The fix makes the flag and the variable one mechanism, which only works if
+// nothing captures the home before `bin/reeve` writes it back. Both halves are
+// asserted: the structural one here, the behavioural one below.
+{
+  const files = [];
+  const walk = d => { for (const e of readdirSync(d, { withFileTypes: true })) {
+    if (e.name === "node_modules" || e.name.startsWith(".")) continue;
+    const p = join(d, e.name);
+    if (e.isDirectory()) walk(p); else if (/\.mjs$/.test(p)) files.push(p);
+  } };
+  walk(join(ROOT, "src"));
+  files.push(join(ROOT, "bin", "reeve"));
+
+  const offenders = [];
+  let scanned = 0;
+  for (const f of files) {
+    if (f.endsWith(join("src", "home.mjs"))) continue;         // the one resolver
+    const code = readFileSync(f, "utf8").split("\n")
+      .filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");  // comments are not code
+    scanned++;
+    for (const m of code.matchAll(/process\.env\.REEVE_HOME|homedir\(\)\s*,\s*"\.reeve"/g)) {
+      // `bin/reeve` writing the resolved home BACK is the mechanism itself.
+      if (f.endsWith(join("bin", "reeve")) && /process\.env\.REEVE_HOME = HOME/.test(code)
+          && m[0] === "process.env.REEVE_HOME") continue;
+      offenders.push(`${f.slice(ROOT.length + 1)}: ${m[0]}`);
+    }
+  }
+  check(scanned > 15, "control: the scan read the source tree", `${scanned} files`);
+  check(readFileSync(join(ROOT, "src", "home.mjs"), "utf8").includes("process.env.REEVE_HOME"),
+    "control: and it would have matched, because home.mjs itself contains the pattern", "");
+  check(offenders.length === 0,
+    "only src/home.mjs resolves the reeve home; nothing else reads the variable",
+    offenders.join("  |  "));
+}
+
+// ── the write-back is what makes --home reach anything at all ──────────────
+// The mechanism is one line in `bin/reeve`: the resolved home is written back
+// into `process.env.REEVE_HOME` before any route runs. Removing it leaves
+// `--home` changing bin/reeve's own constant and NOTHING else -- which is the
+// original defect exactly -- and the rest of this file did not notice: measured,
+// stubbing that line out produced zero failures across every assertion above.
+//
+// So the assertion is on a value a MODULE resolved, not on one bin/reeve held:
+// `doctor` reports `resolveHome()`, which equals the flag's home only if the
+// write-back happened. The environment is deliberately set to a DIFFERENT home,
+// so a fallback to it is a visible wrong answer rather than an invisible one.
+{
+  const custom = join(dir, "writeback-home");
+  mkdirSync(join(custom, "state"), { recursive: true });
+  const r = run("doctor", "revnix/reeve", "--home", custom, "--json");
+  let reported = null;
+  try { reported = JSON.parse(r.out.slice(r.out.indexOf("{"))).home; } catch { /* reported below */ }
+  check(reported !== null, "control: doctor --json parsed", r.out.slice(0, 200));
+  check(reported === custom,
+    "a module asked for the home gets the one --home named, not the environment's",
+    `reported ${reported}, expected ${custom}`);
+  // CONTROL: with no flag it IS the environment's, so the assertion above is
+  // about the flag rather than about `custom` appearing by some other route.
+  const env = run("doctor", "revnix/reeve", "--json");
+  let envHome = null;
+  try { envHome = JSON.parse(env.out.slice(env.out.indexOf("{"))).home; } catch { /* reported below */ }
+  check(envHome === join(dir, "envhome"),
+    "control: and with no flag it is the environment's home", `reported ${envHome}`);
+}
+
+// ── a home set after import is honoured, so nothing captured it eagerly ────
+// This is the half the structural scan cannot see. `CRED_DIR` was a
+// module-level constant: rewriting it to read the home would still have been
+// evaluated at import, which is BEFORE `bin/reeve` resolves `--home`.
+{
+  const probe = join(dir, "late-home");
+  const script = `
+    const s = await import(${JSON.stringify(pathToFileURL(join(ROOT, "src", "sandbox.mjs")).href)});
+    const a = await import(${JSON.stringify(pathToFileURL(join(ROOT, "src", "github", "app.mjs")).href)});
+    const w = await import(${JSON.stringify(pathToFileURL(join(ROOT, "src", "workerenv.mjs")).href)});
+    process.env.REEVE_HOME = ${JSON.stringify(probe)};          // AFTER every import
+    console.log(JSON.stringify({
+      denied: s.credentialPaths().includes(${JSON.stringify(probe)}),
+      creds:  a.loadAppCredentials("nope").why,
+      token:  w.readOauthToken().why,
+    }));`;
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8" });
+  let seen = null;
+  try { seen = JSON.parse((r.stdout ?? "").trim().split("\n").pop()); } catch { /* reported below */ }
+  check(seen !== null, "control: the late-home probe ran", (r.stderr ?? "").slice(0, 240));
+  check(seen?.denied === true,
+    "a home set after import still reaches the sandbox's deny list", JSON.stringify(seen));
+  check(typeof seen?.creds === "string" && seen.creds.includes(probe),
+    "and the App credentials, which were a module-level constant", seen?.creds);
+  check(typeof seen?.token === "string" && seen.token.includes(probe),
+    "and the worker's token path", seen?.token);
+}
+
+// ── --home reaches init's sidecar profiles ─────────────────────────────────
+// `profilePath` selected `~/.reeve/profiles` unconditionally -- it read neither
+// the flag nor REEVE_HOME -- so `reeve init --home /custom --write` could
+// overwrite the operator's real profile while the caller believed the run was
+// isolated. There IS a real profile at ~/.reeve/profiles/revnix/reeve.json, so
+// this was not hypothetical.
+//
+// NOT covered end to end: this repository detects as `committed`, so no CLI
+// invocation here takes the sidecar branch. The assertion is on profilePath and
+// on the route passing `home` down; the sidecar write itself is unexercised.
+{
+  const custom = join(dir, "sidecar-home");
+  check(profilePath("o/r", "sidecar", custom) === join(custom, "profiles", "o/r.json"),
+    "an explicit home decides where a sidecar profile goes",
+    profilePath("o/r", "sidecar", custom));
+  const saved = process.env.REEVE_HOME;
+  process.env.REEVE_HOME = custom;
+  check(profilePath("o/r", "sidecar") === join(custom, "profiles", "o/r.json"),
+    "and REEVE_HOME does too, which it also never did", profilePath("o/r", "sidecar"));
+  process.env.REEVE_HOME = saved;
+  // CONTROL: the committed branch is about the REPO, not the home, and must not
+  // have moved.
+  check(profilePath("o/r", "committed", custom) === join(process.cwd(), ".ops", "profile.json"),
+    "control: a committed profile still belongs to the repository", profilePath("o/r", "committed", custom));
+  // And the route hands it over, rather than relying on the ambient variable.
+  check(/init\(\{ root: process\.cwd\(\), answers, write: flag\("write"\), home: HOME \}\)/
+    .test(readFileSync(join(ROOT, "bin", "reeve"), "utf8")),
+    "and the init route passes the resolved home explicitly", "");
+}
+
+// ── --help does not run a MUTATING route, observed by its side effect ──────
+// The output test earlier shows restore's message is absent. This one is the
+// file: `reeve init --write` writes `.ops/profile.json` into this repository
+// (it detects as `committed`), so on the broken implementation the file exists
+// afterwards and on the fixed one it does not.
+{
+  const ops = join(ROOT, ".ops", "profile.json");
+  if (existsSync(ops)) {
+    check(false, "SKIPPED: .ops/profile.json already exists, so its absence proves nothing", ops);
+  } else {
+    const r = run("init", "--set", "project.kind=product", "--set", "authority.policy=propose_only",
+                  "--write", "--help");
+    const wrote = existsSync(ops);
+    if (wrote) rmSync(ops, { force: true });
+    check(!wrote, "`--help` on `init --write` writes no profile", `created ${ops}`);
+    check(r.status === 0 && /not yet built/.test(r.out), "and prints the usage instead", r.out.slice(0, 120));
+    check(!existsSync(ops), "control: and the check cleaned up after itself", ops);
+  }
 }
 
 rmSync(dir, { recursive: true, force: true });

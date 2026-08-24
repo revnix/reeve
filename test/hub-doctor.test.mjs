@@ -1021,15 +1021,31 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
       check((cli.match(/faultKind\(/g) ?? []).length >= 2,
         "both CLI recovery sites classify by kind rather than by a boolean",
         `${(cli.match(/faultKind\(/g) ?? []).length} uses`);
-      // Case-insensitive: one of these sentences opens a line and one does not.
-      // Pinning an assertion to the capitalisation would break on an edit that
-      // improves the wording, which is not the property being asserted.
-      check((cli.match(/free space on the filesystem/gi) ?? []).length >= 2 && /free space on the filesystem/i.test(hub),
+      // THE PROPERTY, not the sentence. This matched `free space on the
+      // filesystem` verbatim and broke the moment the remedy was rewritten to
+      // name the page limit beside the disk -- an assertion failing on an
+      // IMPROVEMENT, which is the shape this suite keeps having to remove. What
+      // matters is that every one of them tells the operator to free space.
+      // The three FILES, not the four call sites: `sites` lists bin/reeve twice
+      // because two of its routes render, and counting a file twice would let a
+      // remedy missing from hubdb.mjs still reach three.
+      const files = [["bin/reeve", cli], ["src/backup.mjs", bak], ["src/build/hubdb.mjs", hub]];
+      const freesSpace = files.filter(([, t]) => /free space/i.test(t)).map(([n]) => n);
+      check(freesSpace.length === 3,
         "and all three tell an operator on a full store to free space",
-        `cli ${(cli.match(/free space on the filesystem/gi) ?? []).length}, openHub ${/free space on the filesystem/i.test(hub)}`);
+        `named in: ${freesSpace.join(", ")}`);
       check(!/free space on the filesystem[\s\S]{0,400}restore --hub --force/.test(hub),
         "and none of them follows that with a restore, which needs MORE room",
         "checked");
+      // AND THE OTHER CAUSE. errcode 13 answers both a full filesystem and a
+      // store that has hit its own `max_page_count` -- and the second is exactly
+      // how the measured fixture above produces it, so an advice block naming
+      // only the disk sends an operator to free space that was never the problem.
+      // `faultKind` groups the two deliberately; the remedy is where they part.
+      const named = files.filter(([, t]) => /max_page_count/.test(t)).map(([n]) => n);
+      check(named.length === 3,
+        "every full-store remedy names the page limit as well as the filesystem",
+        `named in: ${named.join(", ")}`);
     }
     // AND THE STORE IS STILL THERE. That is the whole claim: a rolled-back write
     // on a full disk leaves an authority database a restore would have replaced.

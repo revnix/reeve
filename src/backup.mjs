@@ -902,7 +902,32 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // lock, and used to leave a fully migrated EMPTY hub at the canonical
       // path. A restarted builder finds a healthy-looking store with no state
       // in it, which is worse than finding nothing: nothing is obviously wrong.
-      synthetic = !bootstrapCanonical;
+      // OWNERSHIP IS MINTED, not inferred from having looked a moment ago.
+      //
+      // `synthetic` authorises the finally to unlink the file, and it was set
+      // from `existsSync` having answered no at the top of this branch. That is a
+      // read, not a claim: between that read and `openHub` another builder can
+      // create the hub, migrate it, write events, and exit -- and the born scan
+      // then finds no LIVE holder, because there is none. Every check passes and
+      // the finally deletes a database this invocation never made, with somebody
+      // else's events in it.
+      //
+      // `wx` is the only form that answers the question being asked. It creates
+      // the file or fails with EEXIST, atomically, so success IS the proof of
+      // creation -- the same exclusive mint `quarantineName` uses a few hundred
+      // lines above, for the same reason. A zero-length file is a valid empty
+      // SQLite database, so `openHub` goes on to initialise it exactly as before.
+      if (bootstrapCanonical) synthetic = false;
+      else {
+        try { closeSync(openSync(dbPath, "wx")); synthetic = true; }
+        catch (e) {
+          // EEXIST means somebody won the race. The file is theirs, this restore
+          // may still proceed against it -- the scan below decides that -- but it
+          // is not this invocation's to delete, ever.
+          if (e?.code !== "EEXIST") throw e;
+          synthetic = false;
+        }
+      }
       // KEPT, before it is migrated. Sending a version-zero store down this
       // branch bought exclusion where a bootstrapping builder looks for it, and
       // it would have quietly sold something the unreadable path had chosen: the
@@ -1002,9 +1027,11 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
           return { ok: false, holders: [],
             why: `the hub at ${dbPath} could not be prepared because the store is full ` +
                  `(${cause.message}). Nothing is damaged and nothing was replaced.\n` +
-                 `  recover  free space on the filesystem holding ${dbPath} and re-run. Remove old ` +
+                 `  recover  free space on the filesystem holding ${dbPath} and re-run, removing old ` +
                  `snapshot files directly: reeve backup --hub --keep N cannot help here, because it ` +
-                 `writes a new snapshot before it prunes and so needs more room, not less.` };
+                 `writes a new snapshot before it prunes and so needs more room, not less. If ` +
+                 `PRAGMA max_page_count and PRAGMA page_count have met, the page limit is the cause ` +
+                 `and freeing space will change nothing.` };
         if (isOperational(cause)) throw e;
         canonicalFault = e;
         try { live?.close(); } catch {}
@@ -1411,9 +1438,11 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
                  `The lock table was readable when this restore classified the hub, so this is not ` +
                  `damage.\n` +
                  (outOfSpace
-                   ? `  recover  the store ran out of room -- free space on the filesystem holding ${dbPath} ` +
-                     `and re-run. Remove old snapshot files directly; reeve backup --hub --keep N writes a ` +
-                     `whole new snapshot before it prunes, so it needs more room, not less.`
+                   ? `  recover  the store ran out of room, and two causes answer that. Free space on the ` +
+                     `filesystem holding ${dbPath} -- removing old snapshot files directly, since ` +
+                     `reeve backup --hub --keep N writes a whole new snapshot before it prunes -- or, if ` +
+                     `PRAGMA max_page_count and PRAGMA page_count have met, raise the page limit, which ` +
+                     `no amount of free space will do for you.`
                    : transient
                    ? `  recover  another process holds it -- stop any running builder or reeve CLI and re-run.`
                    : `  recover  the hub or its directory refuses writes -- fix the permissions and re-run.`) +
@@ -1897,7 +1926,25 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // that no longer exists is not a release, it is a write to a ghost. This is
     // the remaining half of the synthetic problem -- the two-restore loser was
     // fixed by `synthetic = false`; this is the failure-path ordering.
-    const dropSynthetic = synthetic && exclusive && !swapped;
+    // AND IT IS STILL THE EMPTY FILE THIS INVOCATION MADE. Creation ownership
+    // closes the race that starts before `openHub`; this closes the one after it.
+    // A writer that got in between the create and the maintenance lock, did its
+    // work and exited leaves no live holder for the scan to find -- so the scan
+    // cannot answer this and the file has to be asked directly.
+    //
+    // Read while the lock is still held, so nothing can join between the question
+    // and the unlink. Anything the store cannot answer counts as content: a file
+    // that will not say whether it is empty is not one to delete.
+    const stillOurs = () => {
+      if (!live) return false;
+      try {
+        if (live.prepare("SELECT count(*) c FROM hub_event").get().c > 0) return false;
+        for (const t of ["singleton_lease", "writer_lease", "provider_lease"])
+          if (live.prepare(`SELECT count(*) c FROM ${t}`).get().c > 0) return false;
+        return true;
+      } catch { return false; }
+    };
+    const dropSynthetic = synthetic && exclusive && !swapped && stillOurs();
     if (dropSynthetic) {
       try { live?.close(); } catch {}
       live = null;

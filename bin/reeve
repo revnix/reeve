@@ -1241,11 +1241,20 @@ switch (cmd) {
           // A FULL STORE HAS ITS OWN REMEDY. Folded into the benign branch it was
           // told to stop other processes and check permissions -- advice that
           // cannot work -- while the one instruction that can went unsaid.
+          // TWO CAUSES answer errcode 13, and the page limit is not the disk.
+          // A store that has hit `max_page_count` is unaffected by anything an
+          // operator deletes, so an advice block naming only the filesystem sends
+          // them to free space that was never the problem.
           console.log(`  recover  the file answered, so this is not damage: the store ran out of room.`);
-          console.log(`           Free space on the filesystem holding the hub and re-run. Remove old`);
-          console.log(`           snapshot files DIRECTLY -- reeve backup --hub --keep N writes a whole`);
-          console.log(`           new snapshot before it prunes, so it needs more room, not less. Do`);
-          console.log(`           NOT restore over it either, for the same reason.`);
+          console.log(`           Two causes answer this, and only one is the disk:`);
+          console.log(`           1. the filesystem is full -- free space on the one holding the hub.`);
+          console.log(`              Remove old snapshot files DIRECTLY: reeve backup --hub --keep N`);
+          console.log(`              writes a whole new snapshot before it prunes, so it needs more`);
+          console.log(`              room, not less.`);
+          console.log(`           2. the database hit its page limit -- compare PRAGMA max_page_count`);
+          console.log(`              with PRAGMA page_count; if they meet, freeing space changes`);
+          console.log(`              nothing and the limit is what has to move.`);
+          console.log(`           Do NOT restore over it in either case.`);
         } else if (benign) {
           console.log(`  recover  the file answered, so this is not damage: stop any running builder or`);
           console.log(`           reeve CLI and re-run, and check the permissions on the hub and its`);
@@ -1363,10 +1372,13 @@ switch (cmd) {
       die(leaseKind === "full"
         ? `reeve build run: could not take the builder lease in ${hubPathFor(HOME)} (${e.message}).\n` +
           `  the hub reads fine, so this is not damage: the store ran out of room.\n` +
-          `  recover  free space on the filesystem holding ${hubPathFor(HOME)} and re-run. Remove old\n` +
-          `           snapshot files DIRECTLY -- reeve backup --hub --keep N writes a whole new ` +
-          `snapshot before it prunes, so it needs more room, not less. Do NOT restore over it ` +
-          `either, for the same reason.`
+          `  recover  two causes answer this, and only one is the disk.\n` +
+          `           1. the filesystem is full -- free space on the one holding ${hubPathFor(HOME)}.\n` +
+          `              Remove old snapshot files DIRECTLY: reeve backup --hub --keep N writes a\n` +
+          `              whole new snapshot before it prunes, so it needs more room, not less.\n` +
+          `           2. the database hit its page limit -- compare PRAGMA max_page_count with\n` +
+          `              PRAGMA page_count; if they meet, freeing space changes nothing.\n` +
+          `           Do NOT restore over it in either case.`
         : leaseKind === "operational"
         ? `reeve build run: could not take the builder lease in ${hubPathFor(HOME)} (${e.message}).\n` +
           `  the hub reads fine, so this is not damage: the file or its directory may be read-only, ` +

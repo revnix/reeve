@@ -2583,7 +2583,7 @@ function writeAuthority(db, project) {
 {
   const src = readFileSync(join(ROOT, "src", "backup.mjs"), "utf8");
   const grants = src.split("\n").filter(l => /^\s*exclusive = true;\s*$/.test(l)).length;
-  const gate = src.indexOf("const dropSynthetic = synthetic && exclusive && !swapped;");
+  const gate = src.indexOf("const dropSynthetic = synthetic && exclusive && !swapped && stillOurs();");
   const scanRefusal = src.indexOf("if (bornMissing.length && !force)");
   const grantAt = src.indexOf("exclusive = true;");
   check(gate > 0, "control: the synthetic unlink's gate was found in the source", `${gate}`);
@@ -2594,6 +2594,24 @@ function writeAuthority(db, project) {
   check(grantAt > scanRefusal,
     "and it is granted AFTER the scan refusal, so an unreadable lease table never reaches it",
     `refusal at ${scanRefusal}, grant at ${grantAt}`);
+  // THREE facts, not one. `exclusive` says no writer is active NOW; it cannot say
+  // this invocation created the file, and it cannot say nothing got in and left
+  // between the create and the lock. Each has its own term in the gate, and the
+  // creation one is MINTED with `wx` rather than read from an earlier existsSync.
+  // THE ONLY WAY IT BECOMES TRUE, not merely one of them. Asserting the `wx`
+  // line is present passes against code that keeps the line and sets the flag
+  // from an earlier `existsSync` beside it -- which is exactly the pre-fix form,
+  // so the assertion would have been green on the defect it exists for.
+  const grantsSynthetic = (src.match(/synthetic = (?:true|!bootstrapCanonical)/g) ?? []);
+  check(grantsSynthetic.length === 1 && grantsSynthetic[0] === "synthetic = true",
+    "creation ownership is minted exclusively and nothing else grants it",
+    `assignments: ${grantsSynthetic.join(", ") || "(none)"}`);
+  check(/closeSync\(openSync\(dbPath, "wx"\)\); synthetic = true;/.test(src),
+    "and the one that does is the exclusive create, so success IS the proof this invocation made the file",
+    "checked");
+  check(/const stillOurs = \(\) => \{/.test(src) && gate > 0,
+    "and the unlink re-asks the file whether it is still the empty one that was made",
+    "checked");
 }
 {
   // And the OUTCOME the gate must not break: a genuinely absent hub whose
@@ -2890,9 +2908,13 @@ function writeAuthority(db, project) {
   const sources = [["bin/reeve", readFileSync(join(ROOT, "bin", "reeve"), "utf8")],
                    ["src/backup.mjs", readFileSync(join(ROOT, "src", "backup.mjs"), "utf8")],
                    ["src/build/hubdb.mjs", readFileSync(join(ROOT, "src", "build", "hubdb.mjs"), "utf8")]];
-  check(sources.every(([, t]) => /free space on the filesystem/i.test(t)),
+  // THE PROPERTY, not the sentence. Pinned to `free space on the filesystem`
+  // this failed the moment the remedy was rewritten to name the page limit
+  // beside the disk -- an assertion going red on an IMPROVEMENT, which is the
+  // second time this exact shape has cost a round here.
+  check(sources.every(([, t]) => /free space/i.test(t)),
     "control: every file that renders a storage failure carries a free-space remedy",
-    sources.map(([n, t]) => `${n}:${/free space on the filesystem/i.test(t)}`).join(" "));
+    sources.map(([n, t]) => `${n}:${/free space/i.test(t)}`).join(" "));
   const prescribes = sources.filter(([, t]) => /keep N prunes/.test(t)).map(([n]) => n);
   check(prescribes.length === 0,
     "and none of them prescribes the backup command as the way to free it",

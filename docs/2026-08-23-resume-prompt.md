@@ -17,13 +17,22 @@ docs/2026-08-22-session-handoff-2.md as history.
 
 ## In one line
 
-reeve is DISARMED, because it could not publish. `--execute` was removed from the
-plist on 23 Aug and the running process verified without it. The reason: the
-worker cannot run `git add` or `git commit` — the sandbox that landed 22 Aug
-denies Bash writes to `.git`. Three dispatches, three correct fixes, zero
-published — though only run 3 demonstrates the commit block; runs 1 and 2 hit
-max_turns first. That is a regression: reeve
-published three times on 21 Aug, on its OWN repo, before that sandbox existed.
+reeve is DISARMED, and the reason it was disarmed is FIXED and merged. The worker
+could not run `git add` or `git commit` — the sandbox that landed 22 Aug denied
+Bash writes to `.git` — so three dispatches produced three correct fixes and
+published none. reeve stages and commits itself now. `--execute` has not been
+restored; that is a decision, not an oversight.
+
+Only run 3 demonstrated the commit block; runs 1 and 2 hit max_turns first. It was
+a regression: reeve published three times on 21 Aug, on its OWN repo, before that
+sandbox existed.
+
+**One rule about this document.** The handoff's §0 is the only place that states
+current facts — what is merged, whether reeve is armed, what `main` is. This
+prompt repeats none of them on purpose: the same three facts were restated in
+about twenty places across both files, and five review rounds in a row found a
+correction applied to one copy and not the others. Read §0 for state; read this
+for what to DO.
 
 ## VERIFY the state before trusting any of it, and tell me what drifted
 
@@ -39,27 +48,32 @@ armed: `launchctl kickstart` restarts from launchd's cached plist, so the file
 can say `--execute` while the running process does not have it. That happened on
 23 Aug and I nearly reported it as done.
 
-Expected: main at least `bc17a06` (#17), the test files green, doctor `broken` on
-R-01 and R-03 ONLY (both mine), and the running process WITHOUT `--execute`. If
-it has `--execute`, someone re-armed it — find out who before doing anything
-else.
+Expected: `main` at or past what the handoff's §0 names, the test files green,
+doctor `broken` on R-01 and R-03 ONLY (both mine), and the running process WITHOUT
+`--execute`. If it has `--execute`, someone re-armed it — find out who before
+doing anything else. Note the daemon's checkout may be BEHIND main, so the running
+process can be on older code than the tests you just ran.
 
 ## Your task, in priority order
 
-1. **The P0 is DECIDED and BUILT — land it, do not re-open it.** The worker
-   cannot commit; read `docs/measured/2026-08-23-three-real-dispatches.md`
-   Finding 1 for the evidence and both controls. I chose reeve-side staging and
-   committing. The worker keeps git's READ commands (`status`, `diff`, `log`,
-   `show`) and loses `add`, `commit`, `push` and `remote`. It also keeps
-   `git clean`, which is NOT read-only — it deletes untracked files, and with
-   `-d`/`-x` untracked directories and ignored files too. It is not the only route
-   either: any script-capable runner can unlink a file, and a TypeScript unit gets
-   `Bash(node:*)` with `node -e` usable. So the honest position is that the worker
-   already HAS a delete, `git clean` is the legible one to point it at, and what
-   bounds the risk is that nothing it can reach was ever committed — not that the
-   retained set is inert. Judge that trade on those terms. PR #19
-   implements all of it. Your job is to finish its review rounds and get it
-   merged, not to choose a shape again.
+1. **The P0 is FIXED and MERGED — do not re-open or rebuild it.** Read
+   `docs/measured/2026-08-23-three-real-dispatches.md` Finding 1 for why it
+   existed, and §0 of the handoff for what landed.
+
+   What was chosen: reeve stages and commits, and it stages EXACTLY the paths the
+   worker declared in `filesTouched`. The worker keeps git's READ commands
+   (`status`, `diff`, `log`, `show`) and loses `add`, `commit`, `push` and
+   `remote`. It also keeps `git clean`, which is NOT read-only — it deletes
+   untracked files, and with `-d`/`-x` untracked directories and ignored files
+   too. Nor is it the only route: any script-capable runner can unlink a file, and
+   a TypeScript unit gets `Bash(node:*)` with `node -e` usable. The honest
+   position is that the worker already HAS a delete, `git clean` is the legible
+   one to point it at, and what bounds the risk is that nothing it can reach was
+   ever committed — not that the retained set is inert.
+
+   The remaining work is the follow-up PR, not the fix. What is genuinely open is
+   whether to RE-ARM, which is the founder's call and worth taking against a real
+   dispatch rather than on the strength of the tests.
 
    Do NOT assume the diff gate makes the rest free. `reviewDiff`
    (`sandbox.mjs:714-767`) judges PATHS and territory, not whether an allowed edit
@@ -114,7 +128,7 @@ else.
 ## The daemon freeze is LIFTED; the tracker entry is still owed
 
 `src/daemon.mjs` was frozen for a `threadDetails` session that never pushed a
-branch. I lifted it on 23 Aug so the P0 could be fixed, and PR #19 edits it.
+branch. I lifted it on 23 Aug so the P0 could be fixed, and that work has merged.
 
 `docs/TRACKER.md` is still untouched, and an entry is OWED for: PR #14, the
 arming, the worker limits, the three dispatches, the P0 and its fix. Write it
@@ -186,9 +200,9 @@ once those PRs land, not before.
   - S2-A/B/C plans (#11, #12, #13) and their follow-up #17 are IN main. S2 is
     planned, not built. Do not wait on or coordinate with those lanes.
   - threadDetails wiring: never started, no branch was ever pushed. Nobody owns
-    `src/daemon.mjs`; PR #19 edits it.
-  - Mine and open: #15 (docs), #18 (prompt/grant), #19 (the P0 fix). #19 is
-    stacked on #18 because both touch `src/prompts.mjs`.
+    `src/daemon.mjs`.
+  - What is open and mine: see §0 of the handoff. It is the only list that stays
+    current.
 
 Use ListAgents and SendMessage to check what peers are on before touching
 anything outside your lane, and tell them what you are on.

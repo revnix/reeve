@@ -11,12 +11,39 @@ Durable companions: `docs/TRACKER.md` (done / in flight), `docs/HANDOFF.md`
 
 ---
 
-## 0. The one-paragraph truth
+## 0. STATE — the only place that says what is true right now
 
-**reeve is DISARMED, because it could not publish.** `--execute` was removed from
-the plist on 23 Aug and the running process verified without it; `worker.isolation`
-remains `scratch-home`. It still watches, judges and escalates — it just does not
-dispatch, so no attempt is spent at all.
+Every other section in this document argues, explains or records. This one is the
+only one that states CURRENT FACTS, and it is the only one to update when they
+change.
+
+That separation exists because it was missing: the same three facts — whether the
+publish fix had landed, whether reeve was armed, what `main` was — had been
+restated in roughly twenty places across this file and the resume prompt, and
+five review rounds in a row found a correction applied in one of them and left
+standing in another. A fact stated once cannot drift from itself.
+
+| | as of 2026-08-24 |
+|---|---|
+| `main` | `1385071` (#20) |
+| the publish fix | **merged** — #19, `88165a8` |
+| prompt/grant fix | **merged** — #18, `fbd230d` |
+| the dispatch write-up | **merged** — #15, `8f2603a` |
+| `--execute` | **OFF.** reeve watches, judges and escalates; it does not dispatch |
+| the daemon's checkout | behind `main`; the running process is on older code |
+| open, mine | #22 (dispatch follow-ups) |
+| first real dispatch on nextly | still has not happened |
+
+**If you change any of these, change them HERE and nowhere else.** Where another
+section needs one, it says "see §0" rather than repeating it.
+
+---
+
+## 0a. The one-paragraph truth
+
+**reeve is disarmed and the reason it was disarmed is fixed** (state: §0).
+`--execute` came off the plist on 23 Aug because the worker could not commit;
+that defect is merged. `worker.isolation` remains `scratch-home`.
 
 When it is re-armed, eligible will be narrower than red: a missing required check,
 an inherited-only failure, one reeve cannot name, one already at cap, and a
@@ -45,8 +72,8 @@ that sandbox existed. Measured and controlled:
 | PRs #1, #2 | open since 20 Aug | **closed** — both superseded/empty |
 | dispatch evidence | last measured 21 Aug, pre-sandbox | **3 runs under the new contract, $2.66**, recorded |
 
-`main` was `16769e7` at the time of writing and is now `bc17a06` (#17). The
-daemon runs from `~/Work/Products/reeve`.
+`main` was `16769e7` when this was written; §0 has where it is now. The daemon
+runs from `~/Work/Products/reeve`.
 
 ---
 
@@ -175,7 +202,7 @@ evidence it is spent producing a fix that cannot ship.
 |---|---|---|
 | S2-A/B/C plans (#11/#12/#13, #17) | **merged** | — |
 | `threadDetails` wiring | never started; no branch was ever pushed | — |
-| docs #15, prompt/grant #18, the P0 fix #19 | **all merged 24 Aug** | `main` is `8f2603a` |
+| docs #15, prompt/grant #18, the P0 fix #19 | **merged** (§0) | — |
 | dispatch follow-ups | this session | `fix/dispatch-followups` |
 
 **The daemon freeze was lifted on 23 Aug.** It was promised to a `threadDetails`
@@ -224,7 +251,7 @@ once those PRs land.
 | # | capability | state |
 |---|---|---|
 | 1 | Watch, judge, escalate | **ON** |
-| 2 | Fix red CI | **built, not switched on** — the publish path is fixed (#19, merged 24 Aug); `--execute` is still off |
+| 2 | Fix red CI | **built, not switched on** — see §0 |
 | 3 | Work review threads | off — the `threadDetails` half was never started, so all of it is open |
 | 4 | Refuse an unsafe merge | off — needs shadow week + the ruleset flip |
 
@@ -267,10 +294,9 @@ PR #14 took 10 rounds and 22 findings.
 
 ## 8. What needs the founder
 
-- **Finding 1: FIXED and merged** (#19, 24 Aug). reeve stages and commits; the
-  worker never touches git's state. reeve is still DISARMED — `--execute` has not
-  been restored — so re-arming is its own decision, and it is worth taking against
-  a real dispatch rather than on the strength of the tests.
+- **Finding 1: fixed** (§0 for what landed). reeve stages and commits; the worker
+  never touches git's state. Re-arming is its own decision, and worth taking
+  against a real dispatch rather than on the strength of the tests.
 
   Two details of the implementation are worth carrying, because the obvious
   reading of the decision is wrong on both. reeve commits BEFORE the gates, not
@@ -319,15 +345,15 @@ armed.
 
 ## 10. Open risks
 
-- **reeve cannot publish, which is why it is disarmed.** Not "has not yet" —
-  cannot, by the contract, in any repository. That risk is currently held closed
-  by the disarm rather than by a fix; PR #19 is the fix. If anyone re-arms before
-  it lands, each ELIGIBLE red nextly PR — caused, named, not already at cap, not
-  a demonstrated flake, past the containment and capacity gates — spends its one
-  attempt for ~$1 and escalates.
-- **`docs/HANDOFF.md:442` overstates the current state.** Its "Proven — three
-  complete dispatches … reeve published → green" was true on 21 August and is
-  not true now. Fix it when PR #19 lands.
+- **The publish fix is merged but UNPROVEN in the field** (state: §0). It is
+  carried by 69 test files and by no real dispatch at all, and the evidence that
+  found the original defect came from a real dispatch rather than from tests. Re-
+  arming should be treated as an experiment with a result to read, not as
+  switching something back on.
+- **`docs/HANDOFF.md:442` still overstates.** Its "Proven — three complete
+  dispatches … reeve published → green" was true on 21 August, became false when
+  the OS sandbox landed, and is now true again in CODE without a run behind it.
+  Rewrite it once a real dispatch has published.
 - **The first real dispatch on nextly under this contract has not happened.**
   Everything in §3 is from a synthetic fixture. Finding 1 will reproduce there;
   findings 2–4 may not.

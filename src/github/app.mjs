@@ -13,14 +13,18 @@
 import { createSign } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { resolveHome } from "../home.mjs";
 
-const CRED_DIR = join(homedir(), ".reeve", "credentials");
+// A FUNCTION, not a constant. As a module-level constant this was evaluated
+// at import -- before `bin/reeve` had resolved `--home` -- and it consulted
+// `homedir()` rather than the reeve home at all, so no home setting of any
+// kind reached the App credentials.
+const credDir = () => join(resolveHome(), "credentials");
 
 /** Load App credentials. The key is read from disk each time and never cached to disk elsewhere. */
 export function loadAppCredentials(name = "merge-policy") {
-  const envPath = join(CRED_DIR, `${name}.env`);
+  const envPath = join(credDir(), `${name}.env`);
   if (!existsSync(envPath)) return { ok: false, why: `no credentials at ${envPath}` };
   const env = Object.fromEntries(
     readFileSync(envPath, "utf8").split("\n").filter(Boolean).map(l => {

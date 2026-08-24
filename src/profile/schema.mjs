@@ -180,7 +180,6 @@ export const FIELDS = {
   // by construction. These rows still reach the review pipeline, which can say
   // "refused"; classification only knows how to say "passing".
   "ci.reviewerStatusContexts": [false, isArr(isStr)],
-  "ci.flakePatterns":       [false, isArr(isStr)],
 
   "merge.method":           [true,  oneOf(MERGE_METHOD)],  // MEASURED from parent counts, not settings
   "merge.deleteBranch":     [false, isBool],

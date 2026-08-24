@@ -17,7 +17,7 @@
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { tick } from "../src/daemon.mjs";
 import { open } from "../src/db/ops.mjs";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -123,6 +123,117 @@ const ctxFor = (dir, identity, extra = {}) => ({
   const esc = [...(r.escalations?.keys() ?? [])].join(" | ");
   check(spawned.length === 0 && /identity\.checkout/.test(esc),
     "a worktreeRoot with no identity.checkout refuses — a checkout is made FROM a clone", `spawned=${spawned.length} ${esc}`);
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── a failed backup ESCALATES, and a same-second race does not ──────────────
+// `snapshotAll` has always returned an `escalate` key on a failed snapshot and
+// NOTHING anywhere consumed it -- measured with a repository-wide grep. So a
+// backup that wrote an unreadable file and deleted it produced one log line and
+// no finding, and the self-audit could not cover the gap either: the previous
+// GOOD snapshot is deliberately retained, so it still looks fresh and reports
+// nothing. The failure stayed silent until that retained copy aged out, which
+// is exactly the window in which there is no working backup.
+//
+// `snapshotAll` is injected through ctx, so this needs no real filesystem.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-bkfail-"));
+  spawned = [];
+  const r = await tick(ctxFor(dir, { worktreeRoot: real, checkout: real }, {
+    snapshotAll: () => [{ nwo: "hub", ok: false, outcome: "failed",
+                          escalate: "builder:backup:failed",
+                          why: "snapshot failed validation and was deleted: not a usable store" }],
+  }));
+  const esc = [...(r.escalations?.keys() ?? [])].join(" | ");
+  check(/builder:backup:failed/.test(esc),
+    "a snapshot that fails validation reaches the daemon's escalation path, not only its log",
+    esc || "(no escalations)");
+  check(/hub/.test(esc),
+    "and names the store, so an operator knows which backup is broken", esc);
+  rmSync(dir, { recursive: true, force: true });
+}
+{
+  // The other half: a deferred result must NOT raise anything. It is `ok`
+  // because another process published that second, and calling a benign
+  // multi-daemon race a backup failure is a false alert on the one signal that
+  // has to stay trustworthy.
+  const dir = mkdtempSync(join(tmpdir(), "reeve-bkdef-"));
+  spawned = [];
+  const r = await tick(ctxFor(dir, { worktreeRoot: real, checkout: real }, {
+    snapshotAll: () => [{ nwo: "hub", ok: true, outcome: "deferred", deferred: true,
+                          mine: false, escalate: null,
+                          path: "/tmp/x/1.db", why: "another process published it this second" }],
+  }));
+  const esc = [...(r.escalations?.keys() ?? [])].join(" | ");
+  check(!/backup/i.test(esc),
+    "a deferred same-second race raises no escalation",
+    esc || "(none, as intended)");
+  // And says nothing alarming in the LOG either, which is what the defect
+  // actually was: `escalate` is null on a deferred result, so an assertion over
+  // the escalations map alone stays green while the daemon writes
+  // `backup FAILED` on every benign collision. The log is the operator-facing
+  // half and it needs its own assertion.
+  const logged = readFileSync(join(dir, "log.txt"), "utf8");
+  check(!/backup FAILED/.test(logged),
+    "control: and does not write `backup FAILED` to the log for a benign collision",
+    (logged.split("\n").filter(l => /backup/i.test(l)).join(" | ")) || "(no backup lines)");
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── a backup failure STANDS between attempts ───────────────────────────────
+// `escalations` is rebuilt every tick and a backup is attempted once an
+// INTERVAL, so the finding existed for exactly one tick and was then absent --
+// which the layer below reads as resolved, so an ordinary tick could announce
+// CLEARED while no backup had succeeded. The self-audit cannot recreate it
+// either: the previous GOOD snapshot is deliberately retained, so it still looks
+// fresh.
+//
+// The control is the one that makes this mean anything: the second tick must NOT
+// have retried the backup. If it did, the finding would be re-raised by a fresh
+// failure rather than by having stood.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-bkstand-"));
+  spawned = [];
+  let attempts = 0;
+  const ctx = ctxFor(dir, { worktreeRoot: real, checkout: real }, {
+    snapshotAll: () => { attempts++; return [{ nwo: "hub", ok: false, outcome: "failed",
+                                               escalate: "builder:backup:failed",
+                                               why: "snapshot failed validation and was deleted" }]; },
+  });
+  const t1 = await tick(ctx);
+  check(/builder:backup:failed/.test([...(t1.escalations?.keys() ?? [])].join(" | ")),
+    "fixture: the failing tick raises the finding", [...(t1.escalations?.keys() ?? [])].join(" | "));
+
+  const t2 = await tick(ctx);
+  check(attempts === 1,
+    "control: the next tick does not retry the backup, which is the window this is about",
+    `${attempts} attempt(s)`);
+  check(/builder:backup:failed/.test([...(t2.escalations?.keys() ?? [])].join(" | ")),
+    "the failure still stands on a tick that took no backup at all",
+    [...(t2.escalations?.keys() ?? [])].join(" | ") || "(no escalations)");
+
+  // And it clears on a snapshot that is actually TAKEN -- not on a deferred one,
+  // which says another process published this second and nothing about whether
+  // this daemon can.
+  ctx.snapshotAll = () => [{ nwo: "hub", ok: true, outcome: "deferred", deferred: true,
+                             mine: false, escalate: null, path: "/tmp/x/1.db", why: "another process" }];
+  ctx.lastBackupAt = 0;
+  const t3 = await tick(ctx);
+  check(/builder:backup:failed/.test([...(t3.escalations?.keys() ?? [])].join(" | ")),
+    "a DEFERRED snapshot does not clear it, because it is not this daemon's success",
+    [...(t3.escalations?.keys() ?? [])].join(" | ") || "(none)");
+
+  ctx.snapshotAll = () => [{ nwo: "hub", ok: true, outcome: "taken", path: "/tmp/x/2.db" }];
+  ctx.lastBackupAt = 0;
+  const t4 = await tick(ctx);
+  check(!/backup/i.test([...(t4.escalations?.keys() ?? [])].join(" | ")),
+    "and a snapshot that IS taken clears it",
+    [...(t4.escalations?.keys() ?? [])].join(" | ") || "(none, as intended)");
+
+  const t5 = await tick(ctx);
+  check(!/backup/i.test([...(t5.escalations?.keys() ?? [])].join(" | ")),
+    "control: and it stays cleared on the tick after that, so clearing is not one-shot either",
+    [...(t5.escalations?.keys() ?? [])].join(" | ") || "(none, as intended)");
   rmSync(dir, { recursive: true, force: true });
 }
 

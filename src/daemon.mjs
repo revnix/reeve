@@ -39,6 +39,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { resolveHome } from "./home.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
 
@@ -376,7 +377,7 @@ export function stateRootsFor(stateDir, logPath, worktree, dbPath = null) {
   // files: `--db` can name a path outside every other protected tree, and it
   // holds the event history, prompts and operational state. (Codex #4f-[7].)
   const dbFiles = dbPath ? [dbPath, `${dbPath}-wal`, `${dbPath}-shm`] : [];
-  const cands = [logPath, ...dbFiles, join(stateDir, "runs"), join(stateDir, "canary"), join(stateDir, "backups"), process.env.REEVE_HOME]
+  const cands = [logPath, ...dbFiles, join(stateDir, "runs"), join(stateDir, "canary"), join(stateDir, "backups"), resolveHome()]
     .filter(p => p && isAbsolute(p));
   return [...new Set(cands)].filter(p => !(worktree && under(p, worktree)));
 }
@@ -424,7 +425,11 @@ export async function measuredContainment(ctx, profile, nwo, logPath) {
       // Under the CONFIGURED state root (deny-read, so it is measurable), per
       // repository AND per invocation: two daemons sharing one decoy could delete
       // each other's and read the ENOENT as a denial. (Codex #4-[1], #4b-[11].)
-      decoyPath: join(process.env.REEVE_HOME ?? join(homedir(), ".reeve"), "canary", nwo.replace("/", "-"), `decoy-${process.pid}-${Date.now()}.txt`),
+      // `resolveHome()`: with `--home` the decoy used to be written under
+      // `~/.reeve` while the policy denied the home the operator named, so the
+      // canary measured a file the sandbox had no rule about and could report
+      // containment CLOSED for a policy that closed nothing.
+      decoyPath: join(resolveHome(), "canary", nwo.replace("/", "-"), `decoy-${process.pid}-${Date.now()}.txt`),
     };
     const claudeBin = resolveClaude(ctx.claudeBin ?? "claude");
     // The credential-less git config lives in the run's tmp, which the sandbox
@@ -1432,17 +1437,47 @@ export async function tick(ctx) {
       // watches is never snapshotted and never audited, and that is precisely
       // the one that is lost.
       const root = ctx.backupRoot ?? join(dirname(logPath ?? "/tmp/x"), "backups");
-      const home = ctx.home ?? dirname(logPath ?? join(homedir(), ".reeve", "x"));
+      const home = ctx.home ?? dirname(logPath ?? join(resolveHome(), "x"));
       const all = (ctx.snapshotAll ?? snapshotAll)(home, root, { at });
       for (const r of all) {
-        if (!r.ok) log(logPath, `backup FAILED (${r.nwo}): ${r.why}`);
+        if (r.ok) continue;
+        log(logPath, `backup FAILED (${r.nwo}): ${r.why}`);
+        // ESCALATED, not only logged. `snapshotAll` has always returned an
+        // `escalate` key on a failed snapshot and nothing anywhere consumed it,
+        // so a backup that wrote an unreadable file and deleted it produced one
+        // log line and no finding. The self-audit below cannot cover the gap
+        // either: the previous GOOD snapshot is deliberately retained, so it
+        // still looks fresh and reports nothing -- and the failure stays silent
+        // until that retained copy ages out, which is exactly the window in
+        // which there is no working backup.
+        // ON ctx, not only in this tick's map. `escalations` is rebuilt every
+        // tick and a backup is attempted once an INTERVAL, so the finding
+        // existed for one tick and was then absent -- which `announceable`
+        // reads as resolved, so the next ordinary tick could announce CLEARED
+        // while no backup had succeeded. The retained previous snapshot is
+        // still fresh enough that the self-audit does not recreate it either.
+        // It stands until a snapshot for that store is actually TAKEN.
+        if (r.escalate) (ctx.backupFailures ??= new Map()).set(r.nwo, `${r.escalate}: ${r.nwo}`);
       }
-      const okd = all.filter(r => r.ok);
+      // `taken`, not `ok`. A deferred result is `ok` -- another process
+      // published this second and that is not a failure -- but this daemon did
+      // not take it, and counting it here would report a backup this tick did
+      // not perform.
+      const okd = all.filter(r => (r.outcome ?? (r.ok ? "taken" : "failed")) === "taken");
       if (okd.length) log(logPath, `backup: ${okd.length} store(s) — ${okd.map(r => r.nwo).join(", ")}`);
+      // A snapshot that was TAKEN clears that store's standing failure, and
+      // nothing else does. `deferred` does not: another process published this
+      // second, which says nothing about whether THIS daemon can.
+      for (const r of okd) ctx.backupFailures?.delete(r.nwo);
       // A tick that snapshotted nothing at all is a backup that is not happening.
       if (!all.length) log(logPath, "backup FAILED: no state store found to snapshot");
       ctx.lastBackupAt = at;
     }
+    // RE-EMITTED EVERY TICK, after the block above so a success this tick has
+    // already cleared it. Between backup attempts there is nothing to recreate
+    // the finding, and absence within a tick is what the layer below reads as
+    // resolved.
+    for (const line of (ctx.backupFailures ?? new Map()).values()) escalations.set(line, 1);
   }
 
   // AFTER the backup, deliberately. Running it first meant the audit reported a
@@ -1463,7 +1498,7 @@ export async function tick(ctx) {
                 : (ctx.backupRoot ?? join(dirname(logPath ?? "/tmp/x"), "backups")),
       // Without this the store-wide backup check is inert, and an unwatched
       // store stays invisible exactly as it did before.
-      home: ctx.home ?? dirname(logPath ?? join(homedir(), ".reeve", "x")),
+      home: ctx.home ?? dirname(logPath ?? join(resolveHome(), "x")),
     })) {
       log(logPath, `self: ${f.level} ${f.why}${f.detail ? ` — ${f.detail}` : ""}`);
       escalations.set(f.why, f.count ?? 1);

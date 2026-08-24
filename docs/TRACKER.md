@@ -169,6 +169,36 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       **The durable finding is about plan SIZE**: a plan needing four rounds and
       still finding sixteen defects at the fourth is one document doing three
       documents' work.
+- [ ] **S2-A, the hub store — BUILT, PR open (2026-08-24).** Branch
+      `feat/s2-hub-store`, based on `bc17a06`. All 13 tasks of
+      `docs/superpowers/plans/2026-08-23-s2a-hub-store.md` implemented:
+      `src/build/{hub.sql,hubdb.mjs,locks.mjs,replay.mjs,tables.mjs}`, the hub
+      half of `backup.mjs`/`doctor.mjs`/`selfaudit.mjs`, and the
+      `build run|status` / `builder doctor` / `backup|restore|export-events --hub`
+      routes. **32 tables** in a live store (31 in `hub.sql` plus
+      `schema_version`), 23 indexes, and `HUB_TABLES` equals the live table set
+      in both directions. Migration 1 is FROZEN by a fixture over BOTH halves —
+      the DDL text and the `up()` source — each verified red on its own stub.
+      **Measured 2026-08-24: suite 64 files, 0 failures**, `escape.test.mjs`
+      excluded as always (it writes into the live daemon's `~/.reeve/canary`).
+      Nothing here dispatches a worker or touches GitHub.
+      **`ci.flakePatterns` is now REMOVED**, not planned: out of
+      `src/profile/schema.mjs` and out of the live
+      `~/.reeve/profiles/nextlyhq/nextly.json`, which was the one profile
+      carrying it. The order was measured both ways first — profile as-is is
+      INVALID under the new code and valid under the running code, and with the
+      key removed it is valid under both — so the profile was stripped first,
+      with a backup beside it, and the daemon was not restarted.
+      **Fifteen defects were found by EXECUTING the plan** after it had taken
+      ~490 review findings over 16 rounds: a test that could not fail (the
+      forward-version fixture was refused by the contiguity check instead), a
+      `renderHub` that was called four times and never defined anywhere, a row
+      image with no key that made a restore die on
+      `Provided value cannot be bound to SQLite parameter 1`, an operator
+      message that said "never backed up" when every backup was corrupt, and a
+      `--home` flag that does not exist and is silently ignored. Recorded in the
+      PR body. The durable finding: **a plan can survive sixteen adversarial
+      review rounds and still contain a test that cannot fail.**
 - [x] **PR-1 (S0 + S1 core) — LANDED 2026-08-21, revnix/reeve #3, merge
       `0d313502`.** Capability switches (all false on the live profile),
       authority baseline + doctor R-13 (live: matches), workerArgs hard-fail +

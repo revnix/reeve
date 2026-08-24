@@ -732,6 +732,11 @@ CREATE TABLE IF NOT EXISTS task_territory (
   task TEXT NOT NULL REFERENCES task(id) ON DELETE CASCADE,
   kind TEXT NOT NULL CHECK (kind IN ('file','prefix')),
   path TEXT NOT NULL,
+  -- A pinned claim outlives a hold: it is the territory a held task keeps so a
+  -- resume can reclaim exactly what it had, rather than re-deriving it from a
+  -- worktree that may have moved on. PR-B's regrant reads it and its fixtures
+  -- insert it by name.
+  pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0,1)),
   PRIMARY KEY (task, kind, path)
 ) STRICT, WITHOUT ROWID;
 
@@ -1452,6 +1457,24 @@ CREATE TABLE IF NOT EXISTS outbox (
   status       TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN
                  ('pending','inflight','done','failed','dead_letter',
                   'voided','fenced','refused','superseded','forced')),
+  -- The LEASE IDENTITY, and it is a fencing token in the ordinary sense.
+  --
+  -- `settleEffect` is fenced on the ACTIVE LEASE, not on the row id: an id is
+  -- not an identity while a row can be re-leased. Without these two columns the
+  -- sequence is worker A stalls past its expiry, `recoverEffects` returns the
+  -- row to `pending`, worker B leases it and begins delivering -- and A, still
+  -- running, settles B's live delivery, overwriting its status and result while
+  -- B is mid-flight. Both writes look legitimate at their own call sites.
+  --
+  -- `lease_token` is bumped on every lease of the row, so it is monotonic per
+  -- row and survives a restart because it lives in the row rather than in a
+  -- process. The CAS requires BOTH to match the row's current values and
+  -- returns `stale` without writing otherwise. This is the mechanism the
+  -- literature calls fencing, and TTL-plus-liveness is not a substitute for it:
+  -- a paused process keeps its pid, so `isAlive` says yes for exactly the
+  -- process that must be refused.
+  worker       TEXT,                               -- null while pending; the holder while inflight
+  lease_token  INTEGER NOT NULL DEFAULT 0,         -- bumped per lease; the fence `settleEffect` matches on
   attempts     INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 8,
   not_before   INTEGER NOT NULL DEFAULT 0,
@@ -2141,10 +2164,19 @@ Add to `bin/reeve`, beside the existing `case "run":`:
 
 ```js
   case "build": {
-    // HOME is the value bin/reeve already resolved (--home, REEVE_HOME, or the
-    // default). An earlier draft called `HOME`, which is not defined in
-    // this file, so every build run and build status threw before reaching the
-    // lease -- the two commands this task exists to add.
+    // HOME is the value bin/reeve already resolved. An earlier draft called
+    // `HOME`, which is not defined in this file, so every build run and build
+    // status threw before reaching the lease -- the two commands this task
+    // exists to add.
+    //
+    // That resolution is `process.env.REEVE_HOME ?? join(homedir(), ".reeve")`
+    // and NOTHING ELSE -- `bin/reeve:45`. There is no `--home` flag, and this
+    // comment claimed one. Unknown flags are IGNORED rather than refused, so
+    // `reeve build run --home /tmp/x` silently operates on the operator's real
+    // home; that is how the first run of Task 7's CLI test created a hub and a
+    // singleton lease in `~/.reeve`. Scope a test or an operator to a different
+    // home with the ENVIRONMENT VARIABLE. A real `--home`, and a refusal for
+    // unknown flags, belong to the CLI surface pass, not to this task.
     const sub = process.argv[3];
     if (sub !== "run" && sub !== "status")
       die(`usage: reeve build run [--takeover] | reeve build status`);
@@ -2856,12 +2888,46 @@ export function latestSnapshot(root, nwo, { deep = false } = {}) {
 }
 ```
 
-**Two call sites change meaning, and both change for the better.** `bin/reeve
-restore` now defaults `--from` to the newest snapshot that will actually restore
-(it already handles `null` at `bin/reeve:166`), and `selfaudit.mjs` now counts a
-store whose every snapshot is corrupt as un-backed-up -- which is what it is. Both
-already branch on `null`, so neither needs a change here; `test/backup.test.mjs`
-must stay green, and Step 4 runs it.
+**Two call sites change meaning. One improves; the other needed a fix, and this
+paragraph previously claimed otherwise.** `bin/reeve restore` now defaults
+`--from` to the newest snapshot that will actually restore (it already handles
+`null` at `bin/reeve:166`), which is a straight improvement.
+
+`selfaudit.mjs` is the one that needed work. It was described here as "now counts
+a store whose every snapshot is corrupt as un-backed-up -- which is what it is",
+and that is wrong twice. It is not what it is: the backups ARE running, and they
+are producing files that cannot be restored. And the finding it emits says
+`reeve has never backed up <nwo>` / `nothing under <root>` -- a false sentence
+that sends an operator to check a schedule which is working perfectly, when the
+urgent fault is that every recovery point is rubbish. Measured while executing
+this task: `test/selfaudit.test.mjs` goes RED on
+`a fresh file that is not a usable store is caught`, because `latestSnapshot`
+now skips the junk file and returns `null`, which selfaudit reads as absence.
+
+**So this task also changes `selfaudit.mjs`, and `backup.mjs` gains one export.**
+`snapshotCandidates(root, nwo)` returns the snapshot filenames without judging
+any of them -- exported rather than reimplemented in selfaudit, because `slug` is
+private to `backup.mjs` and a second spelling of that path is how the two drift.
+`selfAudit` then separates the two causes of a `null`, in BOTH the per-store
+sweep and the single-store path:
+
+- files present, none valid -> `backup.unreadable`, "none of reeve's backups of
+  X can be restored", detail naming how many exist and that every one fails
+  validation.
+- nothing present -> `backup.missing`, unchanged.
+
+**Step 4 runs `test/selfaudit.test.mjs` as well as `test/backup.test.mjs`.**
+Naming only the second is what let this through: the test that breaks is not the
+test the plan pointed at. Three assertions cover it -- that the fault is caught,
+that it is NOT worded as "never backed up", and that the wording names the real
+problem -- plus a control that a genuinely empty directory still reports absence,
+so a fix that renames every backup fault to `unreadable` fails.
+
+One note on writing those assertions, because the first attempt was wrong in a
+way this plan warns about elsewhere: a negative regex over
+`String(finding?.why)` PASSES when the finding is absent, since `String(undefined)`
+matches nothing. It is satisfied by exactly the failure it exists to catch.
+Guard it with `finding != null &&` first.
 
 **`snapshot()` gains one field, `mine`, and publishes with `link`, not `rename`.**
 There are two separate hazards here and only one operation closes both.
@@ -5395,13 +5461,107 @@ import is instructed at the `snapshotFor` call site itself, where it is used.
 `renderHub` is `hubFindings`' human renderer, added in `src/doctor.mjs`
 beside the existing `render`.
 
+**It is written out here because it did not exist.** Four call sites in the
+route above name it, the import instruction lists it, and this sentence
+described it -- and no definition appeared anywhere in this plan or on `main`,
+so every `reeve builder doctor` invocation would have thrown
+`ReferenceError: renderHub is not defined`: the exact failure the import
+paragraph claims to prevent. A renderer described is not a renderer.
+
+It groups by **classification**, not severity. `hubFindings` documents its four
+classes as "the four different responses", so a renderer that sorts by severity
+prints the class as a slug and discards the only part of a finding that tells
+the reader what to do about it. Groups are ordered by what they demand:
+authority first because it blocks a merge, then what you fix, then what you wait
+for, then what you refresh. Passes are kept -- "is it healthy" is a question
+this command must answer -- but sort last inside their group.
+
+```js
+/**
+ * `hubFindings`' human renderer -- the companion `render` has for the guardian.
+ *
+ * This function did not exist. Four call sites in `bin/reeve`'s `builder doctor`
+ * route named it, an import instruction listed it, and the plan described it as
+ * "`hubFindings`' human renderer, added in `src/doctor.mjs` beside the existing
+ * `render`" -- so every `reeve builder doctor` invocation would have thrown
+ * `ReferenceError: renderHub is not defined`, which is the exact failure the
+ * paragraph naming it claimed to prevent.
+ *
+ * Grouped by CLASSIFICATION rather than by severity, because that is what the
+ * classes are for: `hubFindings` documents them as "the four different
+ * responses" -- a configuration error is fixed, a dependency outage is waited
+ * out, stale evidence is refreshed, and unsafe authority must stop a merge. A
+ * renderer that sorted by severity would print a slug and throw that away,
+ * leaving an operator to work out for themselves which of sixteen problems they
+ * can actually do something about right now.
+ *
+ * Groups are ordered by what they demand of the reader: authority first because
+ * it blocks a merge, then the things you fix, then the things you wait for, then
+ * the things you refresh. Passes are kept -- "is it healthy" is a question this
+ * command has to answer, and a report that shows only faults cannot answer it --
+ * but they sort last inside their group.
+ */
+const HUB_CLASSES = [
+  ["unsafe-authority",  "UNSAFE AUTHORITY   this stops a merge"],
+  ["configuration",     "CONFIGURATION      fix these"],
+  ["dependency-outage", "DEPENDENCY         wait for these"],
+  ["stale-evidence",    "STALE EVIDENCE     refresh these"],
+];
+const HUB_SEVERITY_RANK = { fail: 0, warn: 1, pass: 2 };
+const HUB_MARK = { fail: "FAIL", warn: "warn", pass: "ok  " };
+
+export function renderHub(findings) {
+  const all = Array.isArray(findings) ? findings : [];
+  const n = (sev) => all.filter(f => f.severity === sev).length;
+  const verdict = n("fail") ? "broken" : n("warn") ? "degraded" : all.length ? "ok" : "nothing to report";
+  const out = [`reeve builder doctor${" ".repeat(30)}${verdict}`,
+               `  ${n("fail")} failing · ${n("warn")} warning · ${n("pass")} ok`];
+
+  const seen = new Set();
+  for (const [cls, heading] of HUB_CLASSES) {
+    const group = all.filter(f => f.classification === cls)
+      .sort((a, b) => (HUB_SEVERITY_RANK[a.severity] ?? 9) - (HUB_SEVERITY_RANK[b.severity] ?? 9)
+                   || String(a.id).localeCompare(String(b.id)));
+    for (const f of group) seen.add(f);
+    if (!group.length) continue;
+    out.push("", heading);
+    for (const f of group) {
+      out.push(`  ${HUB_MARK[f.severity] ?? "?   "}  ${f.id}  ${f.title}`);
+      if (f.detail) out.push(`          ${f.detail}`);
+      // The house style for "what to do next", the same arrow every other reeve
+      // command uses. An action is the only part of a finding that is not a
+      // description, so it does not get buried in the detail.
+      if (f.action) out.push(`          -> ${f.action}`);
+    }
+  }
+
+  // A finding whose classification is not one of the four is REPORTED, not
+  // dropped. Silently omitting it would make this renderer the one place a new
+  // class could be added and never seen -- and the reader would have no way to
+  // tell an empty report from a swallowed one.
+  const unclassified = all.filter(f => !seen.has(f));
+  if (unclassified.length) {
+    out.push("", `UNCLASSIFIED       these carry a classification renderHub does not know`);
+    for (const f of unclassified)
+      out.push(`  ${HUB_MARK[f.severity] ?? "?   "}  ${f.id}  ${f.title}` +
+               `  [classification: ${JSON.stringify(f.classification)}]`);
+  }
+  if (!all.length) out.push("", "  no findings: the hub reported nothing at all");
+  return out.join("\n");
+}
+```
+
+
 Then wire `hubFindings` into that route's `--json` output. Then extend `selfaudit.mjs` **concretely** — a sentence is not an implementation direction, and the control below is what makes the check mean something:
 
 `selfAudit`'s signature is `selfAudit(db, opts)` and it reads the machine root
 as `opts.home`, so the block below destructures it rather than assuming a bare
-`home` is in scope. Add `import { hubPathFor } from "./paths.mjs";` and
-`import { DatabaseSync } from "node:sqlite";` to `src/selfaudit.mjs`; `existsSync`
-is already imported there.
+`home` is in scope. Add `import { hubPathFor } from "./paths.mjs";` to `src/selfaudit.mjs`, and add
+`existsSync` to its existing `node:fs` import. **Measured, because this paragraph
+had it backwards:** `DatabaseSync` is ALREADY imported there and `existsSync` is
+NOT, so following the previous wording literally produced a duplicate binding --
+a SyntaxError that kills the module -- and left the one that was actually
+missing unbound.
 
 **`selfAudit` returns FAULTS ONLY, and its findings have a fixed shape.** Both
 matter, and an earlier revision of this block got both wrong. Measured on

@@ -29,6 +29,7 @@
 import { writeFileSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
+import { resolveHome, DEFAULT_HOME } from "./home.mjs";
 
 /**
  * Read-only git. A fixer has to see what it is changing, and none of these can
@@ -206,9 +207,12 @@ const isCredentialFile = p => CREDENTIAL_FILE_NAMES.map(expandTilde).includes(p)
  * (Codex #4b-[11].)
  */
 export function credentialPaths() {
-  const root = process.env.REEVE_HOME;
-  const extra = (root && root.startsWith("/") && root.replace(/\/+$/, "") !== join(homedir(), ".reeve"))
-    ? [root.replace(/\/+$/, "")] : [];
+  // `resolveHome()`, not the raw variable: it applies `--home` (which
+  // `bin/reeve` writes back into the environment) and it makes a relative root
+  // absolute. The old `startsWith("/")` guard silently dropped a relative
+  // REEVE_HOME, leaving that state root readable by every worker.
+  const root = resolveHome().replace(/\/+$/, "");
+  const extra = root !== DEFAULT_HOME() ? [root] : [];
   // ABSOLUTE, always. Measured 2026-08-22: the sandbox expands `~` against the
   // PROCESS's home, and a worker's home is now reeve's scratch directory — so a
   // `~/.ssh` rule would expand to `<scratch>/.ssh` and protect nothing at all.

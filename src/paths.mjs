@@ -56,3 +56,15 @@ export function legacyDashPathFor(home, nwo) {
   const [, repo] = parts(nwo);
   return join(home, `${repo}.html`);
 }
+
+/**
+ * The hub store: one file for the whole builder, not one per repository.
+ *
+ * Every other store here is per-repo because a repository is what the guardian
+ * watches. The hub is the opposite by design -- a task spans projects, a lease
+ * is global, and the provider scheduler exists precisely to arbitrate between
+ * repositories. Keying it by nwo would make each of those unaskable.
+ */
+export function hubPathFor(home) {
+  return join(home, "state", "hub.db");
+}

@@ -267,7 +267,10 @@ const offendersIn = text => {
   // Whitespace-flexible: prose wraps, and where a line breaks is not a property
   // worth asserting. The first version of this check failed because the phrase
   // happened to span a newline.
-  check(/change\s+them\s+HERE\s+and\s+nowhere\s+else/i.test(zero),
+  // "them"/"these" both, and whitespace-flexible. Pinning a pronoun is the same
+  // brittleness as pinning a line break, which already broke this check once:
+  // the rule is the sentence, not the word chosen to point at its subject.
+  check(/change\s+(them|these)\s+HERE\s+and\s+nowhere\s+else/i.test(zero),
     "§0 states the rule that keeps it single-sourced", zero.slice(0, 120));
   // And it must actually carry the volatile facts, or the pointers point at nothing.
   for (const fact of [/`main`/, /--execute/, /merged/])

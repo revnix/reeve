@@ -7,34 +7,67 @@ or marked **intent**. If a claim has neither, distrust it.
 
 ---
 
-## 0. STATE — the only section that says what is true right now
+## 0. STATE — MEASURE first, then read what only a person can tell you
 
-Every other section argues, explains or records. This one states CURRENT FACTS
-and is the only one to update when they change. **Change them HERE and nowhere
-else**; elsewhere, write "see §0".
+Thirteen review rounds found a fact corrected in one place and left standing in
+another, so this section became the single place to write them down. Then `main`
+moved twice in one afternoon while this file said otherwise, which is the lesson
+the single-source rule could not teach on its own: **a fact a command can answer
+should not be written down at all.** Writing it down does not make it available,
+it makes it a second copy that ages, and the copy is the one people read.
 
-That separation is enforced, not intended. `test/docs-state-is-single-sourced.test.mjs`
-fails if a present-tense state claim appears anywhere in the resume prompt, or in
-this file outside §0, without pointing at §0.
+So §0 has two halves, and the split is the point.
 
-| | as of 2026-08-24 |
+### 0.1 Facts to MEASURE — never trust a file for these, this one included
+
+```bash
+export PATH="$HOME/.nvm/versions/node/v24.17.0/bin:$PATH"   # node 24 is a floor
+cd ~/Work/Products/reeve && git fetch -q origin
+
+git log --oneline -1 origin/main                     # what `main` is
+git log --oneline -1 HEAD                            # what the DAEMON runs; drift is normal
+gh pr list --state open --json number,headRefName,author \
+   -q '.[] | "#\(.number) \(.author.login) \(.headRefName)"'      # what is open, and whose
+
+# Is reeve ARMED? Read the PROCESS, never the plist: `launchctl kickstart`
+# replays launchd's cached copy, so the file and the process can disagree.
+ps -o args= -p "$(launchctl print gui/$(id -u)/com.revnix.reeve | awk '/pid = /{print $3}')"
+
+# Has a real dispatch ever happened? The store is PER REPO, and read-only here:
+# sqlite3 opens a missing path by CREATING it, so a wrong path answers "zero rows"
+# for a database it just made. This exact mistake produced a confident 0 from an
+# empty file at ~/.reeve/state.db.
+sqlite3 -readonly ~/.reeve/state/nextlyhq/nextly.db \
+  'select (select count(*) from run) as runs, (select count(*) from worker_run) as workers'
+./bin/reeve doctor nextlyhq/nextly --as-app           # what is broken today
+```
+
+If any of that disagrees with any prose in this repository, the command wins and
+the prose is stale. That includes this section.
+
+### 0.2 Facts no command answers — the ones that need a person
+
+These are decisions and intent. A command can tell you `--execute` is absent; only
+this can tell you that its absence is deliberate.
+
+| | |
 |---|---|
-| `main` | `1385071` (#20, S2-A hub store) |
-| the publish fix | **merged** — #19 |
+| `--execute` is OFF **on purpose** | it was disarmed on 2026-08-23 after a P0, and re-arming is the founder's call, not a resumed session's |
+| the publish fix | **merged** — #19. Repairs are staged and committed by reeve, not by the worker |
 | prompt/grant fix | **merged** — #18 |
 | the dispatch write-up | **merged** — #15 |
-| `--execute` | **OFF.** reeve watches, judges and escalates; it does not dispatch |
-| the daemon's checkout | at `main`; fast-forwarded and restarted 2026-08-24, verified by content and by `ps` |
-| open, mine | #22 `fix/dispatch-followups` @ `~/Work/Products/reeve-wt/followups` |
-| open, a peer's | #23 (hub post-merge) — `nextly-integrations-28` owns it |
-| first real dispatch on nextly | **still has not happened** — 0 rows in `run` |
-| the tracker | **stale**: no record of 22–24 Aug at all |
-| the guardian daemon | **running** under launchd |
-| the builder daemon | not running |
-| capability 1 — watch, judge, escalate | **ON** |
-| capability 2 — repair red CI | built; **off**, which is `--execute` above |
-| capability 3 — work review threads | half-built; §6 has what it needs |
-| capability 4 — refuse an unsafe merge | **off**; needs a shadow week and the R-01 flip |
+| what a real dispatch has proven | nothing yet under the current contract. If `run` is empty, the publish path is carried by tests alone |
+| the tracker | owed for 22–24 Aug; §6 says what belongs in it |
+| capability 1 — watch, judge, escalate | the one that is meant to be on |
+| capability 2 — repair red CI | built, and gated behind `--execute` above |
+| capability 3 — work review threads | half-built; §6 has what it needs and what it is waiting on |
+| capability 4 — refuse an unsafe merge | not started; needs a shadow week and the R-01 ruleset flip |
+| the builder daemon | not something this programme runs; S2 is a peer's lane, see §7 |
+
+**Change these HERE and nowhere else**; elsewhere, write "see §0". That is
+enforced rather than intended: `test/docs-state-is-single-sourced.test.mjs` fails
+if a present-tense state claim, or a block naming one of the subjects above,
+appears in the resume prompt or in this file outside §0 without deferring to it.
 
 ---
 

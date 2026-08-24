@@ -4,28 +4,108 @@
 // Node >=24 is a hard floor: node:sqlite still emits an ExperimentalWarning on
 // 22.x and the state layer is the authority, so it must not run under a warning
 // it might one day become.
-import { runDoctor, render, checkAppIdentity } from "../src/doctor.mjs";
+import { runDoctor, render, checkAppIdentity, hubFindings, renderHub } from "../src/doctor.mjs";
 import { open } from "../src/db/ops.mjs";
-import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor } from "../src/paths.mjs";
-import { snapshot, restore, latestSnapshot, exportEvents } from "../src/backup.mjs";
+import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor, hubPathFor } from "../src/paths.mjs";
+import { snapshot, restore, latestSnapshot, exportEvents,
+         snapshotAll, restoreHub, validateSnapshot } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { run, tick, measuredContainment } from "../src/daemon.mjs";
 import { readState, render as renderStatus, statusline, why, cleanMergeRate } from "../src/status.mjs";
 import { init } from "../src/init.mjs";
 import { writeDash } from "../src/dash.mjs";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, renameSync, readFileSync } from "node:fs";
-import { join, dirname, resolve } from "node:path";
+// `readdirSync` is `newestCandidate`'s. Its absence was WORSE than basename's:
+// that path catches its own errors and converts them to null, so an
+// unimported helper silently reported "no newest candidate" instead of
+// throwing -- hiding an invalid newest snapshot rather than announcing it.
+// `openSync`/`writeSync`/`fsyncSync`/`closeSync` and `rmSync` are
+// `export-events`': a durable tail is published temp-then-rename, and a rename
+// over a file whose bytes are still only in the page cache publishes a name for
+// content that a power loss can take away.
+import { existsSync, mkdirSync, renameSync, readFileSync, writeFileSync, readdirSync,
+         openSync, writeSync, fsyncSync, closeSync, rmSync } from "node:fs";
+// `basename` is `snapshotFor`/`newestCandidate`'s: they read a snapshot's
+// creation time from its `<epoch>.db` FILENAME rather than its mtime, because
+// a copy back from off-device carries a fresh mtime and would report a
+// days-old recovery point as fresh.
+import { join, dirname, resolve, basename } from "node:path";
+// `export-events --hub` writes the manifest digest and `restore --hub --tail`
+// recomputes it over the bytes it read. Both routes live in this file.
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { resolveHome } from "../src/home.mjs";
+// The build route. `HUB_TABLES` is deliberately NOT here: Task 9 adds that
+// export, and ESM rejects a missing named export at module instantiation, so
+// naming it now would stop EVERY reeve command from starting.
+// `build status` and `build run` both open the hub RAW before migrating: the
+// lease has to be taken before `openHub` applies a forward migration, or an old
+// builder migrates a store it is about to be refused from. Task 9 adds the same
+// import for the export/restore routes; whichever lands first owns it.
+import { DatabaseSync } from "node:sqlite";
+import { openHub, HUB_SCHEMA_VERSION, completedVersion } from "../src/build/hubdb.mjs";
+import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
+import { readStart, isSameProcess } from "../src/supervisor.mjs";
+import { HEARTBEAT_SECONDS } from "../src/db/ops.mjs";
+
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+
+// Every other command in this file is `console.error(...); process.exit(1)`.
+// One helper for the whole file, written once rather than invented per route.
+const die = (msg) => { console.error(msg); process.exit(1); };
+
+// The registry is projects.json under the reeve home. An unreadable or absent
+// one yields NO projects rather than throwing: doctor must still report the
+// findings it can compute, and "the registry could not be read" is itself a
+// finding rather than a crash.
+// The TOP-LEVEL object, not `reg.projects`. The design doc fixes the format at
+// §1.5: `~/.reeve/projects.json` is `{name: {repoPath, nwo, profilePath,
+// worktreeRoot, specRepo?, ledger?}}` -- there is no `projects` wrapper, so
+// reading one returned [] on every real file and the CLI passed no projects at
+// all, silently suppressing the absent-row H-4 failures this loader was added to
+// expose. A defaulted `?? {}` is what made it silent.
+//
+// `nwo`, and no `repoId`: the registry format carries no numeric repository id
+// (§1.5, and measured -- resolving one needs the App client, which
+// `builder doctor` deliberately does not use). So H-4 matches projects to
+// `repo_gate_state` rows by `nwo_snapshot`, which both sides have.
+const registryProjects = (home) => {
+  const path = join(home, "projects.json");
+  try {
+    const reg = JSON.parse(readFileSync(path, "utf8"));
+    // A MALFORMED ENTRY IS AN ERROR, not a row to drop.
+    //
+    // Filtering it out returned `error: null`, so doctor set `projectsKnown:
+    // true` over a project set the registry did not actually describe -- and
+    // `hubFindings` then SUPPRESSES gate-state rows absent from that set. A
+    // registry of `{ "prod": "bad" }` therefore reported a clean hub while
+    // hiding exactly the H-4 authority findings the H-7 path exists to preserve.
+    // Silently narrowing the input is how a check answers a smaller question
+    // than the one it was asked.
+    if (reg === null || typeof reg !== "object" || Array.isArray(reg))
+      return { projects: [], error: `${path}: the registry must be an object of name -> project, not ${Array.isArray(reg) ? "an array" : typeof reg}` };
+    const bad = Object.entries(reg).filter(([, v]) => !v || typeof v !== "object" || Array.isArray(v)).map(([n]) => n);
+    if (bad.length)
+      return { projects: [], error: `${path}: ${bad.length} malformed entr${bad.length === 1 ? "y" : "ies"} (${bad.slice(0, 5).join(", ")}); each project must be an object` };
+    return { projects: Object.entries(reg).map(([name, p]) => ({ name, nwo: p.nwo ?? null })),
+             error: null };
+  } catch (e) {
+    // The read failure is ITSELF a finding, and the route below emits it.
+    // Returning a bare [] made an unreadable registry indistinguishable from a
+    // legitimately empty one -- and since H-4 reports projects that have NO
+    // gate-state row, an empty expected set suppresses every one of them. So a
+    // machine whose registry cannot be parsed reported a clean hub, which is the
+    // exact absence-read-as-success this doctor exists to refuse.
+    return { projects: [], error: `${path}: ${e.message}` };
+  }
+};
 
 // One home for every command. Four of them read REEVE_HOME and loadProfile did
 // not, so a scratch home redirected a project's state database but not the
 // profile describing it -- the two halves of one project's configuration read
 // from different roots, which is unusable for a test and wrong for an operator.
-const HOME = process.env.REEVE_HOME ?? join(homedir(), ".reeve");
 
 const [major] = process.versions.node.split(".").map(Number);
 if (major < 24) {
@@ -34,21 +114,231 @@ if (major < 24) {
 }
 
 const argv = process.argv.slice(2);
-const cmd = argv.shift();
-const flag = n => argv.includes(`--${n}`);
-const opt = n => { const i = argv.indexOf(`--${n}`); return i < 0 ? null : argv[i + 1]; };
-const VALUED = new Set(["db", "plugin-cache", "plugin-repo", "profile", "set", "log", "halt", "interval", "last", "out", "dash"]);
-// Positionals only. A valued flag consumes the token after it, so that token is
-// never mistaken for a repo name however much it looks like one.
-const positionals = (() => {
-  const out = [];
+// The COMMAND IS THE FIRST POSITIONAL, and it is decided by the walk below
+// rather than before it.
+//
+// Two failures came from deciding it first. `argv.shift()` took the first token
+// whatever it was, so `reeve --help` consumed `--help` as the command name and
+// the one invocation everybody tries first printed the help and exited 1. Then
+// treating a leading flag as "no command" was worse: `reeve --home /scratch
+// backup --hub` left `backup` sitting in the positionals, fell through to the
+// default branch, printed the help and exited ZERO -- a backup that never ran,
+// reporting success to whatever automation asked for it. Silence with a
+// success code is the exact failure this whole change is about.
+//
+// Only the walk knows which tokens are values, so only the walk can say which
+// token is the command.
+
+// ── every flag this CLI accepts, declared ONCE ──────────────────────────────
+//
+// There were two facts about a flag -- does it exist, and does it take a value
+// -- and only the second was written down, in `VALUED`. They had already
+// drifted: `VALUED`'s own comment says it exists so "a valued flag consumes the
+// token after it, so that token is never mistaken for a repo name however much
+// it looks like one", and SIX flags that take values were missing from it.
+//
+// Measured before this change: `reeve backup --to some/place` answered
+// `no state at <home>/state/some/place.db` -- it had read the FLAG'S VALUE as
+// the repository name, which is exactly the failure that comment describes.
+// `--tail`, `--from`, `--keep`, `--days` and `--backups` were all in the same
+// state.
+//
+// So there is one declaration now and `VALUED` is derived from it. `what` is
+// here because a flag nobody can look up is a flag nobody uses correctly.
+const FLAGS = {
+  home:           { value: true,  what: "the reeve home to operate on (default $REEVE_HOME, else ~/.reeve)" },
+  db:             { value: true,  what: "path to a state database" },
+  log:            { value: true,  what: "path to the log file" },
+  halt:           { value: true,  what: "path to the halt marker" },
+  interval:       { value: true,  what: "seconds between ticks" },
+  last:           { value: true,  what: "how many recent entries to show" },
+  out:            { value: true,  what: "where to write output" },
+  dash:           { value: true,  what: "path to the dashboard html" },
+  profile:        { value: true,  what: "path to a profile json" },
+  set:            { value: true,  what: "a key=value profile override" },
+  "plugin-cache": { value: true,  what: "path to the plugin cache" },
+  "plugin-repo":  { value: true,  what: "path to the plugin repository" },
+  to:             { value: true,  what: "backup root to write into" },
+  from:           { value: true,  what: "snapshot to restore from" },
+  backups:        { value: true,  what: "backup root to read from" },
+  keep:           { value: true,  what: "how many snapshots to retain" },
+  days:           { value: true,  what: "how many days to consider" },
+  tail:           { value: true,  what: "a durable export-events file to replay" },
+
+  hub:            { value: false, what: "operate on the builder hub rather than a repository" },
+  json:           { value: false, what: "machine-readable output" },
+  force:          { value: false, what: "proceed past a refusal that is an operator judgement" },
+  overwrite:      { value: false, what: "replace an existing file" },
+  takeover:       { value: false, what: "take a lease whose holder is provably dead" },
+  execute:        { value: false, what: "actually act, rather than observe" },
+  enforce:        { value: false, what: "publish the merge policy as enforcing" },
+  events:         { value: false, what: "export the event log too" },
+  health:         { value: false, what: "report health only" },
+  open:           { value: false, what: "open the result" },
+  tick:           { value: false, what: "run a single tick and exit" },
+  write:          { value: false, what: "write the change rather than printing it" },
+  "as-app":       { value: false, what: "act as the GitHub App rather than the user" },
+  help:           { value: false, what: "show this help" },
+};
+const VALUED = new Set(Object.entries(FLAGS).filter(([, f]) => f.value).map(([n]) => n));
+
+// ── ONE walk over argv, which decides everything about it ───────────────────
+//
+// There were FOUR readers of `argv` -- `flag`, `opt`, the unknown-flag scan and
+// `positionals` -- and each carried its own idea of what a flag is. They
+// disagreed, and two of the disagreements were defects: the scan looked only at
+// `--` tokens, so `-w` was never examined at all and became an unused
+// positional; and `opt` returned whatever token happened to follow a flag
+// without asking whether it was a value, so a trailing `--home` produced
+// `undefined` and `??` turned that back into the environment the operator had
+// just overridden.
+//
+// Neither is a missing check. Both are what a repeated resolution does -- the
+// same thing this file already says about `stateFor`. So there is ONE walk, it
+// emits every refusal itself, and `flag`/`opt`/`positionals` are lookups into
+// its result rather than three more scans.
+//
+// UNKNOWN FLAGS ARE REFUSED, not ignored. Ignoring them is how `--home /tmp/x`
+// silently operated on the operator's real ~/.reeve -- there was no such flag,
+// so it and its value were skipped and the command ran against the live home.
+// It is also how `--keeep 3` looked like it had set a retention while quietly
+// using the default. A misspelled flag must not be indistinguishable from an
+// absent one, because the two mean opposite things to whoever typed it.
+const ARGS = (() => {
+  const near = (a, b) => {                       // Levenshtein, for did-you-mean
+    const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+    for (let j = 0; j <= b.length; j++) d[0][j] = j;
+    for (let i = 1; i <= a.length; i++)
+      for (let j = 1; j <= b.length; j++)
+        d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1,
+                           d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    return d[a.length][b.length];
+  };
+  const suggest = name => {
+    if (!name) return "";
+    const [best] = Object.keys(FLAGS)
+      .map(k => [k, near(name, k)])
+      // The second clause is what stops a suggestion that is not one: without
+      // it `-w` was answered "did you mean --db?", because an edit distance of
+      // 2 is inside the fixed floor of 2 while being the entire length of both
+      // names. A suggestion has to be nearer than "wholly different".
+      .filter(([k, d]) => d <= Math.max(2, Math.floor(name.length / 3)) && d < Math.max(name.length, k.length))
+      .sort((x, y) => x[1] - y[1]);
+    return best ? `  (did you mean --${best[0]}?)` : "";
+  };
+
+  const values = new Map(), flags = new Set(), positionals = [], errors = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a.startsWith("--")) { if (VALUED.has(a.slice(2))) i++; continue; }
-    out.push(a);
+    if (!a.startsWith("-")) { positionals.push(a); continue; }
+
+    // Neither is a repository and neither is a flag. `--` in particular is the
+    // POSIX end-of-options marker, which this CLI does not implement -- and
+    // accepting it as a positional is how it would come to look implemented.
+    if (a === "-" || a === "--") { errors.push(`reeve: ${a} is not a flag or a repository`); continue; }
+
+    // A short flag is not merely unsupported, it was never LOOKED at: the scan
+    // matched `--` only, so `reeve init -w` dropped `-w` into the positionals
+    // and ran as though the flag were absent. Same silence, one syntax over.
+    if (!a.startsWith("--")) {
+      errors.push(`reeve: unknown flag ${a}${suggest(a.slice(1))}  (this CLI has no single-dash flags)`);
+      continue;
+    }
+
+    const name = a.slice(2);
+    if (!FLAGS[name]) {
+      // `--home=/tmp/x` is a thing operators type, and `unknown flag
+      // --home=/tmp/x` reads as "there is no --home". Say what is wrong instead.
+      const eq = name.indexOf("=");
+      const base = eq > 0 ? name.slice(0, eq) : null;
+      if (base && FLAGS[base]?.value)
+        errors.push(`reeve: --${base} takes its value as the next argument: --${base} ${name.slice(eq + 1)}`);
+      // A BOOLEAN IS NOT GIVEN A VALUE TO COPY. The message above was emitted for
+      // every known flag, so `--force=false` was answered "write --force false"
+      // -- which ENABLES force and leaves `false` as an unused positional. An
+      // operator who typed `=false` was asking for the opposite, and the refusal
+      // talked them into it. On `restore` that is the live-daemon safety check,
+      // waived by following the advice.
+      else if (base && FLAGS[base])
+        errors.push(`reeve: --${base} is a switch and takes no value; write --${base} to turn it on, or leave it out to turn it off. --${base}=${name.slice(eq + 1)} does not turn it off.`);
+      else errors.push(`reeve: unknown flag ${a}${suggest(name)}`);
+      continue;
+    }
+
+    if (!FLAGS[name].value) { flags.add(name); continue; }
+
+    // A valued flag with no value is REFUSED, never defaulted. `--home` last on
+    // the line gave `undefined`, and `--home --json` gave the string `--json`
+    // as a relative directory -- so the flag that exists to stop a command
+    // reaching the wrong home could send it to the wrong home, or to the live
+    // one. No value this CLI takes begins with `-`: every one is a path, a
+    // count, or a key=value.
+    // A NUMBER is a value, not a flag: no flag this CLI has begins with a
+    // digit, so `-1` is unambiguous and there is nothing to protect against.
+    // Refusing it here would take `--keep -1` away from `--keep`'s own
+    // validator, which says "--keep must be a positive whole number" -- a worse
+    // message for the same refusal, and a property already measured and tested
+    // (test/hub-doctor.test.mjs). The refusals this check exists for are a
+    // token that IS a flag, and a token that is absent.
+    const looksLikeFlag = v => v.startsWith("-") && !/^-?\d+(\.\d+)?$/.test(v);
+    const v = argv[i + 1];
+    // AN EMPTY VALUE IS A MISSING VALUE. `reeve --home "$SCRATCH"` with the
+    // variable unset hands over `""`, and `resolve("")` is the CURRENT
+    // DIRECTORY -- so a command that was explicitly told to use another home
+    // backed up, built or restored against `<cwd>/state` instead. An operator
+    // who names a home and gets nothing has said something, and it is not "use
+    // wherever I happen to be standing".
+    if (v === undefined || v === "") { errors.push(`reeve: --${name} expects a value: ${FLAGS[name].what}`); continue; }
+    if (looksLikeFlag(v)) { errors.push(`reeve: --${name} expects a value: ${FLAGS[name].what}. Got the flag ${v}.`); continue; }
+    i++;
+    // Repeatable. `--set` is read as a LIST by `init`; every other valued flag
+    // reads the first occurrence, which is what `opt` did before.
+    if (!values.has(name)) values.set(name, []);
+    values.get(name).push(v);
   }
-  return out;
+
+  return { values, flags, positionals, errors };
 })();
+
+// The command, then the rest. `positionals` below excludes it, which is what
+// every route already assumes: `build`/`builder` read their subcommand from
+// `positionals[0]` and `doctor` scans for an owner/repo.
+const cmd = ARGS.positionals[0];
+if (ARGS.errors.length) {
+  for (const e of ARGS.errors) console.error(e);
+  console.error(`-> reeve ${cmd ?? ""} accepts: ${Object.keys(FLAGS).sort().map(f => "--" + f).join(" ")}`);
+  console.error(`-> reeve --help`);
+  process.exit(1);
+}
+
+const flag = n => ARGS.flags.has(n);
+const opt = n => ARGS.values.get(n)?.[0] ?? null;
+/** Every occurrence of a repeatable valued flag, in the order given. */
+const all = n => ARGS.values.get(n) ?? [];
+// A valued flag consumes the token after it, so that token is never mistaken
+// for a repo name however much it looks like one.
+const positionals = ARGS.positionals.slice(1);
+
+// `--help` is dispatched HERE, above every route. It was added to the registry
+// and described as "show this help" while NO route checked it, so
+// `reeve restore --hub --help` selected the newest snapshot and performed the
+// restore. A flag that asks a command to describe itself must never be able to
+// run it.
+if (flag("help")) { usage(); process.exit(0); }
+
+// AFTER the parser, so `--home` can feed it. Order matters: this used to sit
+// above `argv` and could therefore only ever read the environment.
+const HOME = resolveHome(opt("home"));
+// And WRITTEN BACK, before any route runs. `--home` used to change only this
+// constant, so `credentialPaths()` still denied the state root named by the
+// ENVIRONMENT and the canary still wrote its decoy under `~/.reeve` -- a
+// sandbox that omits the tree the operator asked to isolate, and a canary
+// measuring a file the policy was never about, which can answer "containment
+// closed" for a policy that contains nothing. Rather than thread the home
+// through the sandbox, the daemon, the canary and the App credentials -- four
+// more places to forget -- the flag and the variable become ONE mechanism.
+// Every consumer therefore reads it LAZILY; see src/home.mjs.
+process.env.REEVE_HOME = HOME;
 
 /** Repo identity is the remote, never the path: one repo can sit at two paths on two commits. */
 /**
@@ -133,14 +423,71 @@ switch (cmd) {
       // Where the daemon records its canary: the same HOME the daemon logs to.
       stateDir: HOME,
     });
-    if (flag("json")) console.log(JSON.stringify(result, null, 2));
-    else console.log(render(result, nwo));
+    // The home doctor is reporting FROM, and `resolveHome()` rather than
+    // `HOME` on purpose: this is the answer every module below will get, which
+    // is the value that can be wrong. The single most confusing thing about this
+    // CLI has been which home a command actually acted on -- it is how a hub
+    // came to exist in the operator's real ~/.reeve -- and "what is actually
+    // true right now" is precisely doctor's job.
+    const home = resolveHome();
+    if (flag("json")) console.log(JSON.stringify({ home, ...result }, null, 2));
+    else console.log(render(result, nwo) + `\n\nhome  ${home}`);
     if (!profile.path && !flag("json")) {
       console.log(`\nno profile for ${nwo}. Checks that need one were skipped.\n-> reeve init`);
     }
     process.exit(result.exitCode);
   }
   case "backup": {
+    if (flag("hub")) {
+      // snapshotAll walks every store INCLUDING the hub (Task 8), so this is the
+      // whole-machine backup, not a hub-only one. That is deliberate: an operator
+      // reaching for `backup --hub` is protecting the machine, and taking the
+      // per-repo stores at the same moment costs nothing and keeps the set
+      // mutually consistent.
+      const root = opt("to") ?? join(HOME, "backups");
+      // VALIDATED before anything is written. `Number()` alone accepts `0`,
+      // negatives, fractions and `NaN`, and each erases every recovery point
+      // while the command prints `snapshot hub -> ...` and exits 0. `keep: 0`
+      // prunes to nothing, and `slice(NaN)` is `slice(0)` in JavaScript -- so a
+      // typo like `--keep aa` deletes the entire backup set. Measured: all four
+      // of `0`, `-1`, `aa` and `2.5` reported success. A malformed option must
+      // not be the most destructive thing this command can do.
+      const keepRaw = opt("keep");
+      // `== null`, not `=== undefined`: this CLI's `opt()` returns NULL for an
+      // absent flag, so a strict undefined check rejected the DEFAULT path and
+      // broke every plain `backup --hub`. Found by running the command, not by
+      // reading the validation.
+      const keep = keepRaw == null ? 14 : Number(keepRaw);
+      if (!Number.isInteger(keep) || keep < 1)
+        die(`reeve backup --hub: --keep must be a positive whole number of snapshots to retain, ` +
+            `got ${JSON.stringify(keepRaw)}.\n-> omit it for the default of 14`);
+      const results = snapshotAll(HOME, root, { keep });
+      for (const r of results)
+        console.log(r.deferred ? `deferred ${r.nwo}: ${r.why}`
+                  : r.ok       ? `snapshot ${r.nwo} -> ${r.path}`
+                  :              `FAILED   ${r.nwo}: ${r.why}`);
+      // `deferred` is neither, and must not fail the exit status. A same-second
+      // race with another daemon is not a backup failure, and a command that
+      // exits non-zero for one teaches an operator to stop reading its output --
+      // which is the real cost, because this is the command they run when
+      // something has already gone wrong.
+      // The HUB specifically, not "did anything fail". `everyStore` returns only
+      // files that exist, so a missing hub is simply absent from `results` -- and
+      // an exit status computed from failures answers 0 for a run that backed up
+      // nothing at all. This is the command an operator reaches for to protect
+      // the authority database, including in the minutes after deleting it by
+      // accident, and it must not answer "done" then.
+      const hub = results.find(r => r.nwo === "hub");
+      if (!hub)
+        die(`reeve backup --hub: there is no hub database at ${hubPathFor(HOME)}, so nothing was backed up.\n` +
+            `-> reeve build run creates it`);
+      if (!hub.ok)
+        die(`reeve backup --hub: the hub snapshot failed: ${hub.why}`);
+      // `ok` alone now: a deferred result is `ok`, because another process
+      // published it and that is not this command's failure.
+      process.exit(results.some(r => !r.ok) ? 1 : 0);
+    }
+    // ...the existing per-repo backup, unchanged, below.
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     if (!nwo) { console.error("reeve backup: no repo."); process.exit(1); }
     const dbPath = opt("db") ?? stateFor(nwo);
@@ -159,7 +506,155 @@ switch (cmd) {
     process.exit(r.ok ? 0 : 1);
   }
 
+  case "export-events": {
+    if (!flag("hub")) die("usage: reeve export-events --hub <file>");
+    // positionals[0] is the destination: `export-events` is the subcommand and is
+    // not itself a positional under this parser, so index 1 was always undefined
+    // and the command could never run.
+    const out = positionals[0] ?? die("usage: reeve export-events --hub <file>");
+    // RAW and read-only, not openHub: exporting is a read, and openHub would
+    // MIGRATE the very database the operator is trying to get history out of --
+    // quite possibly the one they are exporting because they do not trust it.
+    // The FIFTH site of the version-zero class, and one the review round did
+    // not name -- found by running every hub route against an interrupted store
+    // rather than by fixing the site that was reported. `hub_event` does not
+    // exist at version 0, so this died with an uncaught `no such table` on the
+    // one command an operator runs to rescue history from a hub they no longer
+    // trust.
+    if (completedVersion(hubPathFor(HOME)) < 1)
+      die(`reeve export-events --hub: the hub's first migration never completed, so it holds no event log\n` +
+          `  hub      ${hubPathFor(HOME)}\n` +
+          `  recover  reeve build run finishes it, or reeve restore --hub --force installs a snapshot`);
+    const db = new DatabaseSync(hubPathFor(HOME), { readOnly: true });
+    const rows = db.prepare("SELECT seq,at,kind,task,payload FROM hub_event ORDER BY seq").all();
+    // The FOOTER, appended last, is the whole truncation detector -- and an
+    // earlier revision of this plan described it here and then wrote only the
+    // event lines, so every `restore --hub --tail` was refused for a footer no
+    // exporter had ever produced. It is written, not described.
+    const lines = rows.map(r => JSON.stringify(r));
+    const body = lines.length ? lines.join("\n") + "\n" : "";
+    const manifest = {
+      count: rows.length,
+      first: rows.length ? rows[0].seq : null,
+      last: rows.length ? rows[rows.length - 1].seq : null,
+      // Over the EVENT LINES ONLY, so a reader can recompute it without having
+      // to strip the footer that carries it out of its own input.
+      sha256: createHash("sha256").update(body).digest("hex"),
+    };
+    // Body first, footer last, one write. Order is the point: a copy that is cut
+    // short loses the footer before it loses any event, which is what turns
+    // "the file ends here" into a claim that can be false.
+    //
+    // And published TEMP-THEN-RENAME. `writeFileSync` truncates the destination
+    // before it writes a byte, so refreshing an existing tail destroyed the last
+    // valid one FIRST: a kill or a full disk then left a partial file with no
+    // manifest, and a later restore permanently lost every post-snapshot event
+    // that tail was protecting. The file this command exists to produce is the
+    // one an operator reaches for after losing the hub, so it is the last file
+    // in the system that may be replaced in place.
+    //
+    // Same directory, so the rename is within one filesystem and therefore
+    // atomic; unique by pid, so two exports to one path cannot share a temp.
+    // `fsync` before the rename because a rename is atomic with respect to the
+    // NAME, not to the bytes: without it a crash can publish a name for content
+    // that never reached the disk.
+    const tmp = `${out}.tmp-${process.pid}`;
+    try {
+      const fd = openSync(tmp, "w");
+      try {
+        writeSync(fd, body + JSON.stringify({ _manifest: manifest }) + "\n");
+        fsyncSync(fd);
+      } finally { closeSync(fd); }
+      renameSync(tmp, out);
+    } catch (e) {
+      // The previous tail is still whole -- that is the point of the temp file --
+      // so the refusal says so rather than leaving the operator to guess.
+      try { rmSync(tmp, { force: true }); } catch {}
+      die(`reeve export-events --hub: could not write ${out} (${e.message}); the previous export is untouched`);
+    }
+    console.log(`exported ${rows.length} hub events to ${out}`);
+    break;
+  }
+
   case "restore": {
+    if (flag("hub")) {
+      // DEEP for the restore path. Cheap validation reads markers and the table
+      // set; a corrupt data page or a foreign-key violation passes all of it, so
+      // the newest candidate was selected here and then rejected by restoreHub's
+      // own deep check -- with no fallthrough to the next older snapshot, which
+      // is precisely the fallback this selection advertises. Paid once, on the
+      // file about to be installed.
+      const from = opt("from") ?? latestSnapshot(opt("to") ?? join(HOME, "backups"), "hub", { deep: true });
+      if (!from) die(`reeve restore --hub: no usable snapshot under ${opt("to") ?? join(HOME, "backups")}`);
+      // The durable tail, written by `reeve export-events --hub`. Optional: a
+      // restore with no tail is still correct, it just recovers less.
+      let tail = null;
+      const tailPath = opt("tail");
+      if (tailPath) {
+        if (!existsSync(tailPath)) die(`reeve restore --hub: no tail file at ${tailPath}`);
+        // The last line is the MANIFEST, not an event. Splitting it off here is
+        // what makes `manifest.count === rawTail.length` a comparison rather
+        // than an off-by-one, and leaving it in the array would replay a footer
+        // into `hub_event` as if it were history.
+        const rawLines = readFileSync(tailPath, "utf8").split("\n").filter(Boolean);
+        // PARSED WITH A REFUSAL, not a throw. A partial copy is the likeliest
+        // damage to a recovery tail -- it is the case the manifest check exists
+        // to diagnose -- and a file that stops mid-line got there first, as an
+        // uncaught SyntaxError with a stack trace, from the one command an
+        // operator runs when the hub is already gone.
+        const parsed = [];
+        for (const [i, l] of rawLines.entries()) {
+          try { parsed.push(JSON.parse(l)); }
+          catch (e) {
+            die(`reeve restore --hub: ${tailPath} is not a valid event export -- line ${i + 1} of ${rawLines.length} ` +
+                `could not be parsed (${e.message})\n` +
+                `  line     ${l.length > 120 ? l.slice(0, 120) + "…" : l}\n` +
+                `  recover  re-export it with reeve export-events --hub; a copy that stopped part way ` +
+                `cannot be told from a complete one by its length`);
+          }
+        }
+        const hasFooter = parsed.length > 0 && parsed[parsed.length - 1]?._manifest != null;
+        const footer = hasFooter ? parsed.pop()._manifest : null;
+        if (hasFooter) rawLines.pop();
+        // An array WITH properties, because that is the shape `restoreHub`
+        // already consumes: it indexes `suppliedTail` as the event list and
+        // reads `suppliedTail.manifest` beside it.
+        tail = parsed;
+        tail.manifest = footer;
+        // The digest the FILE actually carries, computed over its RAW BYTES and
+        // never over re-serialised objects. `JSON.stringify(JSON.parse(x)) === x`
+        // is a property of today's rows, not a guarantee, and a digest that
+        // depends on it would fail for a reason no operator could diagnose.
+        // `restoreHub` cannot compute this itself -- by the time it has the
+        // parsed events the bytes are gone -- so the reader of the file reports
+        // what it observed and the validator decides.
+        tail.sha256 = createHash("sha256")
+          .update(rawLines.length ? rawLines.join("\n") + "\n" : "").digest("hex");
+      }
+      const r = restoreHub(from, hubPathFor(HOME), {
+        isAlive: isSameProcess, pid: process.pid, lstart: readStart(process.pid),
+        force: flag("force"), tail });
+      if (!r.ok) {
+        console.error(`refused: ${r.why}`);
+        for (const h of r.holders ?? []) console.error(`  held by ${h.what} pid ${h.pid} (${h.command})`);
+        process.exit(1);
+      }
+      console.log(`restored ${from} -> ${hubPathFor(HOME)} (replayed ${r.replayed} of ${r.tail} tail events)`);
+      // A recovery whose live source could not be read, with no `--tail`
+      // supplied, restored the snapshot and NOTHING after it -- and said exactly
+      // what a recovery that inspected a genuinely empty tail says. The two are
+      // not the same event and must not print the same line: one lost every
+      // event since the snapshot, the other lost none. `r.quarantined` is the
+      // tell, because it is set only on the unreadable path; an absent hub is
+      // caught by the same condition through `r.tail === 0` with no `--tail`.
+      if (!r.liveTailRead && !opt("tail"))
+        console.warn(
+          `WARNING: the live hub could not be read, and no --tail was supplied, so nothing after the\n` +
+          `snapshot was recovered. If a durable export exists, re-run with --tail <export> to carry\n` +
+          (r.quarantined ? `those events forward. The unreadable database is kept at ${r.quarantined}.` : `those events forward.`));
+      process.exit(0);
+    }
+    // ...the existing per-repo restore, unchanged, below.
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
     if (!nwo) { console.error("reeve restore: no repo."); process.exit(1); }
     const from = opt("from") ?? latestSnapshot(opt("to") ?? join(HOME, "backups"), nwo);
@@ -173,15 +668,20 @@ switch (cmd) {
   case "init": {
     // --set key=value, repeatable. Answers only the questions detection could not
     // settle; everything else comes from the repo and is not negotiable.
+    // From the ONE parse, not a fifth walk over argv. The old loop read its
+    // own `--set` tokens and so disagreed with the parser about what a value
+    // is: a missing value became the empty string and reported "expects
+    // key=value, got \"\"" where the parser now refuses the flag by name.
     const answers = {};
-    for (let i = 0; i < argv.length; i++) {
-      if (argv[i] !== "--set") continue;
-      const kv = argv[++i] ?? "";
+    for (const kv of all("set")) {
       const eq = kv.indexOf("=");
       if (eq < 0) { console.error(`reeve init: --set expects key=value, got ${JSON.stringify(kv)}`); process.exit(1); }
       answers[kv.slice(0, eq)] = kv.slice(eq + 1);
     }
-    const r = init({ root: process.cwd(), answers, write: flag("write") });
+    // `home` explicitly, not just via the environment: init WRITES, and a
+    // function whose destination comes from an ambient variable is one whose
+    // destination is invisible at the call site.
+    const r = init({ root: process.cwd(), answers, write: flag("write"), home: HOME });
     console.log(r.output);
     process.exit(r.code);
   }
@@ -317,6 +817,432 @@ switch (cmd) {
     process.exit(v.credentialRead === "closed" ? 0 : 1);
   }
 
+  case "builder": {
+    // `positionals[0]`, not `process.argv[3]`: a raw index counts flags as
+    // words, so `reeve builder --json doctor` refused a legitimate command.
+    if (positionals[0] !== "doctor") die("usage: reeve builder doctor [--json]");
+    // READ-ONLY, like every doctor path: a reporter that can write what it
+    // reports can agree with itself.
+    const p = hubPathFor(HOME);
+    if (!existsSync(p)) {
+      const none = [{ id: "H-0", severity: "fail", classification: "configuration",
+                      title: "there is no hub database", detail: p,
+                      action: "reeve build run creates it" }];
+      console.log(flag("json") ? JSON.stringify(none, null, 2) : renderHub(none));
+      process.exit(1);
+    }
+    // The open and the version probe TOGETHER, in a try. A hub that exists but
+    // cannot be opened -- or cannot answer for its schema version -- is an
+    // ordinary diagnostic scenario, and it is the scenario `builder doctor`
+    // exists for. Throwing an uncaught SQLite error produces no finding and no
+    // JSON at all, so the one command an operator runs to find out what is wrong
+    // answers with a stack trace. `selfAudit` in this same task already treats
+    // this as a structured integrity fault; doctor has to agree with it.
+    let db;
+    try {
+      db = new DatabaseSync(p, { readOnly: true });
+      db.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get();
+    } catch (e) {
+      try { db?.close(); } catch {}
+      const broken = [{ id: "H-0", severity: "fail", classification: "configuration",
+        title: "the hub database cannot be read", detail: `${p}: ${e.message}`,
+        action: "reeve restore --hub, and pass --tail from a durable export-events --hub if you have one" }];
+      console.log(flag("json") ? JSON.stringify(broken, null, 2) : renderHub(broken));
+      process.exit(1);
+    }
+    // The forward-version refusal, here too. `build status`, `build run` and
+    // both restore paths refuse a store above this binary's version; doctor read
+    // one and answered anyway, running queries shaped for the older schema. Its
+    // answers are then confidently wrong in the direction that matters most --
+    // omitted authority checks and passes for things it cannot see -- which is
+    // worse from the command an operator runs precisely to find out whether
+    // anything is wrong.
+    {
+      const v = db.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+      if (v > HUB_SCHEMA_VERSION) {
+        const stale = [{ id: "H-0", severity: "fail", classification: "configuration",
+          title: "the hub is newer than this reeve", detail: `hub is at schema version ${v}; this reeve knows ${HUB_SCHEMA_VERSION}`,
+          action: "upgrade reeve; this binary cannot report on a schema it does not know" }];
+        console.log(flag("json") ? JSON.stringify(stale, null, 2) : renderHub(stale));
+        process.exit(1);
+      }
+      // And BELOW, which this route did not ask. `hubFindings` queries
+      // `repo_gate_state` immediately, so an interrupted first migration made
+      // the one command an operator runs to find out what is wrong answer with
+      // an uncaught `no such table` stack trace instead of a finding.
+      if (v < 1) {
+        const half = [{ id: "H-0", severity: "fail", classification: "configuration",
+          title: "the hub's first migration never completed", detail: `${p}: schema_version records no completed migration`,
+          action: "reeve build run finishes it, or reeve restore --hub --force installs a snapshot" }];
+        console.log(flag("json") ? JSON.stringify(half, null, 2) : renderHub(half));
+        process.exit(1);
+      }
+    }
+    // Read ONCE, and its failure is carried rather than swallowed. H-7 below is
+    // what stops an unreadable registry from reading as an empty one.
+    const registry = registryProjects(HOME);
+    let findings;
+    try {
+      findings = hubFindings(db, { root: opt("backups") ?? join(HOME, "backups"),
+                                   now: Math.floor(Date.now() / 1000),
+                                   // The REGISTRY's projects, not the rows the table
+                                   // happens to hold. H-4 exists to report a project
+                                   // that has NEVER acquired a repo_gate_state row --
+                                   // unsafe authority, silently. Defaulting to []
+                                   // makes the CLI report only what is already
+                                   // present, so the exact absent-row case this task
+                                   // calls unsafe is the one case it cannot see.
+                                   projects: registry.projects,       // see registryProjects below
+                                   // Whether the registry was READ, not what it
+                                   // contained. `projects: []` means "none
+                                   // listed" and "could not be read" alike, and
+                                   // only the first is a reason to stop
+                                   // reporting a gate-state row.
+                                   projectsKnown: registry.error == null,
+                                   // The NEWEST on-disk candidate is reported
+                                   // separately from the one restore would pick.
+                                   // `latestSnapshot` skips a candidate that
+                                   // fails cheap validation and returns an older
+                                   // good file -- which is right for restore and
+                                   // wrong for doctor: H-1/H-2/H-3 then describe
+                                   // the fallback and report `pass`, so a broken
+                                   // newest backup is invisible for as long as
+                                   // the older recovery point stays fresh. That
+                                   // is the exact window in which the next backup
+                                   // fails too and nobody is told.
+                                   newestCandidate: (nwo) => {
+                                     // `slug` is module-private in src/backup.mjs
+                                     // and is NOT exported by Task 8. Evaluated
+                                     // before the try below, so an installation
+                                     // with no backup directory crashed rather
+                                     // than returning findings. `latestSnapshot`
+                                     // already owns this mapping, so the CLI asks
+                                     // it for the directory instead of
+                                     // reimplementing the slug rule -- two
+                                     // spellings of one convention is how they
+                                     // drift.
+                                     const dir = dirname(latestSnapshot(
+                                       opt("backups") ?? join(HOME, "backups"), nwo)
+                                       ?? join(opt("backups") ?? join(HOME, "backups"), "hub", "0.db"));
+                                     let f;
+                                     try { f = readdirSync(dir).filter(n => /^\d+\.db$/.test(n))
+                                             .sort((a, b) => Number(b.split(".")[0]) - Number(a.split(".")[0]))[0]; }
+                                     catch { return null; }
+                                     if (!f) return null;
+                                     const path = join(dir, f);
+                                     // The epoch in the FILENAME, not the mtime.
+                                     //
+                                     // `basename` MUST be added to bin/reeve's
+                                     // node:path import, which reads
+                                     // `{ join, dirname, resolve }` on
+                                     // `16769e7` (bin/reeve:18) and becomes
+                                     // `{ join, dirname, resolve, basename }`.
+                                     // Stated as an instruction rather than a
+                                     // parenthetical because an unimported
+                                     // `basename` has already shipped once in
+                                     // this programme: both call sites below
+                                     // throw ReferenceError at the first
+                                     // `builder doctor` invocation, which is
+                                     // the whole command.
+                                     // `snapshot()` writes `<epoch>.db`, and that
+                                     // is the authoritative creation time; a copy
+                                     // back from off-device storage carries a
+                                     // fresh mtime, so H-1 would call a days-old
+                                     // recovery point fresh for another 24 hours
+                                     // -- and the moment an operator most needs
+                                     // this answer is right after restoring from
+                                     // off-device.
+                                     return { path, at: Number(basename(path).split(".")[0]),
+                                              ...validateSnapshot(path, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true }) };
+                                   },
+                                   snapshotFor: (nwo) => {
+                                     // Same filename-epoch rule as
+                                     // `newestCandidate` below. Fixing one and
+                                     // not the other left H-1 reading a copy
+                                     // time for the snapshot a restore would
+                                     // actually use -- the one that matters most.
+                                     const s = latestSnapshot(opt("backups") ?? join(HOME, "backups"), nwo, { deep: true });
+                                     // DEEP, and the only deep call on this path. `builder doctor` is an
+                                     // operator command run on demand, not a loop, and H-2's whole claim
+                                     // is that the newest snapshot would restore. The cheap validation
+                                     // returns `integrity: null`, so labelling it "integrity_check
+                                     // passed" reports a green H-2 for a snapshot with page corruption
+                                     // outside the schema pages -- the one failure H-2 exists to find.
+                                     // The epoch from the FILENAME, like
+                                     // `newestCandidate`. The comment above
+                                     // claimed this rule and the line below
+                                     // still read `statSync(s).mtimeMs`, which
+                                     // is the copy time -- so H-1 called a
+                                     // days-old snapshot restored from
+                                     // off-device fresh for another 24 hours,
+                                     // at exactly the moment an operator most
+                                     // needs the true age.
+                                     return s ? { path: s, at: Number(basename(s).split(".")[0]),
+                                                  ...validateSnapshot(s, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true }) } : null;
+                                   } });
+    } finally { db.close(); }
+    // H-7 goes in BEFORE anything is printed. Unshifting after the render set the
+    // exit status correctly and told the operator nothing: neither the JSON nor
+    // the human output carried the registry error that explains the failure, and
+    // every suppressed H-4 stayed invisible. A finding that does not reach the
+    // output is not a finding.
+    if (registry.error)
+      findings.unshift({ id: "H-7", severity: "fail", classification: "configuration",
+        title: "the project registry could not be read",
+        detail: registry.error,
+        action: "fix or create ~/.reeve/projects.json; until then H-4 cannot report a missing gate-state row" });
+    console.log(flag("json") ? JSON.stringify(findings, null, 2) : renderHub(findings));
+    // The CLI's existing doctor convention, documented at `bin/reeve:364`:
+    // 0 ok, 1 broken, 3 degraded. Exiting 0 on warnings tells automation that a
+    // stale snapshot, unmeasured provider limits, expired requests or no
+    // off-device copy are all healthy -- which is the reading the `warn`
+    // severity exists to prevent.
+    // H-7 is emitted at the ROUTE rather than inside hubFindings, because
+    // hubFindings takes the project list as an input and cannot tell an empty
+    // list from a failed read -- that indistinguishability is the defect.
+    // Severity `fail`, not `warn`: with no expected projects every absent-row
+    // H-4 is suppressed, so this one finding stands in for an unknown number of
+    // hidden ones. It is unshifted above, before the render.
+    process.exit(findings.some(f => f.severity === "fail") ? 1
+               : findings.some(f => f.severity === "warn") ? 3 : 0);
+  }
+
+  case "build": {
+    // HOME is the value bin/reeve already resolved. An earlier draft called
+    // `HOME`, which is not defined in this file, so every build run and build
+    // status threw before reaching the lease -- the two commands this task
+    // exists to add.
+    //
+    // That resolution is `process.env.REEVE_HOME ?? join(homedir(), ".reeve")`
+    // and NOTHING ELSE -- `bin/reeve:45`. There is no `--home` flag, and this
+    // comment claimed one. Unknown flags are IGNORED rather than refused, so
+    // `reeve build run --home /tmp/x` silently operates on the operator's real
+    // home; that is how the first run of Task 7's CLI test created a hub and a
+    // singleton lease in `~/.reeve`. Scope a test or an operator to a different
+    // home with the ENVIRONMENT VARIABLE. A real `--home`, and a refusal for
+    // unknown flags, belong to the CLI surface pass, not to this task.
+    // `positionals[0]`, not `process.argv[3]` -- see `builder`: a raw index
+    // makes `reeve build --takeover run` look like a typo.
+    const sub = positionals[0];
+    if (sub !== "run" && sub !== "status")
+      die(`usage: reeve build run [--takeover] | reeve build status`);
+    // `status` opens READ-ONLY and RAW; only `run` may open through openHub.
+    // openHub applies forward migrations, and a migration is a write -- so once
+    // migration 2 exists, `reeve build status` would silently upgrade the
+    // database under a live builder, or during a restore, while holding neither
+    // a writer lease nor assertWritable. A read command must not be able to
+    // change what it reports.
+    // `status` on a fresh home, before any `build run`, must REPORT rather than
+    // throw: DatabaseSync with readOnly on a path that does not exist raises an
+    // uncaught SQLite open error, and "unable to open database file" is not an
+    // answer to "is the builder running".
+    // `DatabaseSync` is imported by THIS task, not by Task 9. Both routes below
+    // construct one, and the fresh-home guard immediately above is what hid the
+    // omission: on a machine with no hub yet, `build status` returns before it
+    // reaches the constructor, so the ReferenceError appears only on a populated
+    // home -- which is every machine that has ever run the builder.
+    //
+    //     import { DatabaseSync } from "node:sqlite";
+    //
+    // Task 9 adds the same import for the export/restore routes; whichever lands
+    // first owns it, and the other does not repeat it.
+    if (sub === "status" && !existsSync(hubPathFor(HOME))) {
+      console.log("builder: not running (no hub database yet)");
+      break;
+    }
+    // FIRST RUN has no hub at all, and the reordering below cannot bootstrap one:
+    // a raw `DatabaseSync` on a missing `<home>/state` throws outright, and on an
+    // existing directory it creates an EMPTY file whose `schema_version` query
+    // then fails, because no migration has run. So the command whose job is to
+    // create the hub could never reach `openHub`.
+    //
+    // An absent store has nothing to exclude anyone from and no version to
+    // refuse, so it takes the plain path: create it, then claim. The ordering
+    // below exists for a store that already carries state.
+    // EXISTENCE IS NOT READINESS, and testing the file was the bug.
+    //
+    // `openHub` creates `schema_version` as plain DDL -- committed the moment it
+    // runs -- and only THEN opens the transaction that applies migration 1. A
+    // process killed between those two points leaves a hub file that exists,
+    // carries `schema_version`, records NO version, and has none of the 31
+    // tables. `existsSync` sends that store down the non-bootstrap path, where
+    // `acquireSingleton` queries `singleton_lease` and `maintenance_lock` and
+    // throws `no such table` -- on every subsequent run, for ever, with no way
+    // out but deleting the file by hand. A half-created database is exactly the
+    // state a first run is most likely to be interrupted in.
+    //
+    // The question the branch is really asking is "has any migration COMPLETED",
+    // because that is what decides whether there is anything to exclude anyone
+    // from. An absent file and an interrupted first migration answer it the same
+    // way, and the same reasoning the comment above gives for an absent store
+    // applies unchanged to a store at version 0: nothing to refuse, nothing to
+    // lock, nobody to lock out.
+    // `completedVersion` is imported now rather than defined here. Four other
+    // routes needed the same question and each answered it for itself; the two
+    // that never asked it are why this is the fifth finding of one shape.
+    const bootstrapping = sub === "run" && completedVersion(hubPathFor(HOME)) === 0;
+    // `openHub` MIGRATES. So `build run` must not call it until it has taken
+    // exclusion, and that ordering is the point rather than an implementation
+    // detail: once migration 2 exists, a newer `reeve build run` started beside a
+    // live older builder would open, upgrade the database under that running
+    // process, and only then be refused by `acquireSingleton`. The refusal
+    // arrives correctly and the damage is already done -- the old builder is now
+    // operating on a schema it does not understand, which is precisely what the
+    // forward-version refusal exists to prevent, defeated by the check that
+    // enforces it.
+    //
+    // So: raw open, refuse a newer store, take the singleton, and only then
+    // migrate. The raw handle is the one the lease is taken on; `openHub` runs
+    // afterwards on the same path and the migration happens under the lease.
+    // `db` is the handle the lease is taken on and the loop keeps. On the
+    // bootstrap path that is the migrated handle directly; otherwise it is the
+    // raw one, swapped for the migrated handle after the claim.
+    let raw = null;
+    let db = bootstrapping
+      ? openHub(hubPathFor(HOME))
+      : (raw = sub === "status"
+          ? new DatabaseSync(hubPathFor(HOME), { readOnly: true })
+          : new DatabaseSync(hubPathFor(HOME), { timeout: 10000 }));
+    if (sub === "status") {
+      // Reading a NEWER store is refused, rather than rendering columns this
+      // binary does not understand.
+      const v = db.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+      if (v > HUB_SCHEMA_VERSION)
+        die(`the hub is at schema version ${v}; this reeve knows ${HUB_SCHEMA_VERSION}. Upgrade reeve.`);
+      // And version 0 is refused too. The comment here used to say "reading an
+      // unmigrated store is fine", which was the false premise: `openHub`
+      // commits `schema_version` as plain DDL BEFORE migration 1's transaction,
+      // so an interrupted first run leaves a store where the query above
+      // succeeds and returns 0 while `singleton_lease` -- queried immediately
+      // below -- does not exist. `build status` then died with an uncaught
+      // SQLite stack trace instead of reporting the builder state, which is the
+      // one thing it exists to do.
+      //
+      // THIRD site of one class. `build run` and `restoreHub` were fixed for the
+      // same reason and this was missed, because the sweep matched where I
+      // remembered the pattern rather than everywhere the invariant holds.
+      // Existence is not readiness, and neither is openability.
+      if (v < 1) {
+        console.log("builder: not running (the hub's first migration never completed)");
+        console.log(`  hub      ${hubPathFor(HOME)}`);
+        console.log(`  recover  reeve build run finishes it, or reeve restore --hub --force installs a snapshot`);
+        break;
+      }
+      // Defined here rather than referenced: an advertised command that throws
+      // ReferenceError is worse than one that does not exist.
+      const row = db.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get();
+      if (!row) { console.log("builder: not running (no singleton lease)"); break; }
+      const alive = isSameProcess(row.pid, row.lstart);
+      console.log(`builder: ${alive ? "running" : "LEASE HELD BY A DEAD PROCESS"}`);
+      console.log(`  pid      ${row.pid} (started ${row.lstart})`);
+      console.log(`  command  ${row.command}`);
+      console.log(`  lease    expires ${new Date(row.expires_at * 1000).toISOString()}`);
+      if (!alive) console.log(`  recover  reeve build run --takeover`);
+      break;
+    }
+    // --takeover is PRINTED as the one recovery command, so it has to work.
+    // Without parsing it, an operator who follows the instruction is refused
+    // exactly as before and the builder stays down until the lease expires --
+    // a recovery path that does not recover. Takeover still requires the holder
+    // to be provably dead; it only waives the "and the lease has expired" half,
+    // which is the half that has nothing to do with whether anyone is there.
+    // ONE startup identity, computed once and reused by the claim, every
+    // heartbeat and the release. Recomputing per call is worse than redundant:
+    // readStart can transiently return null, and a heartbeat passing a different
+    // lstart than the claim silently stops matching its own row. `lstartOf` was
+    // referenced here and never defined; this is the definition.
+    const lstart = readStart(process.pid);
+    if (!lstart) die("cannot read this process's start time; refusing a lease that liveness could never match");
+
+    // The forward-version refusal on the RAW handle, before anything is written.
+    // `build status` does this already; `build run` needs it for the same reason
+    // and one step earlier, because its next act would be to migrate.
+    // Skipped when bootstrapping: `openHub` has already made the store, and it
+    // performs this same refusal itself, so re-asking is redundant rather than
+    // wrong -- but the query would run against a store this branch just created,
+    // which is a check that can only ever pass.
+    if (!bootstrapping) {
+      const v = db.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+      if (v > HUB_SCHEMA_VERSION)
+        die(`the hub is at schema version ${v}; this reeve knows ${HUB_SCHEMA_VERSION}. Upgrade reeve.`);
+    }
+    const claim = acquireSingleton(db, {
+      name: "builder", pid: process.pid, lstart,
+      command: process.argv.slice(1).join(" "), isAlive: isSameProcess,
+      takeover: flag("takeover"),
+    });
+    if (!claim.ok) {
+      const h = claim.holder;
+      // A lock refusal that does not say who holds it turns a two-second
+      // problem into an investigation.
+      die(`another builder holds the lease\n` +
+          `  pid      ${h.pid} (started ${h.lstart})\n` +
+          `  command  ${h.command}\n` +
+          `  held     ${h.ageSeconds}s, expires at ${new Date(h.expiresAt * 1000).toISOString()}\n` +
+          `  recover  ${claim.recovery}`);
+    }
+    // MIGRATE NOW, under the lease, and only now. This is the second half of
+    // the reordering above: the raw handle established exclusion without
+    // writing, and `openHub` is what applies forward migrations -- so running it
+    // here means the upgrade happens with the singleton held and no other
+    // builder can be mid-tick against the old schema. The raw handle is closed
+    // first: two open handles to the same file is a WAL sidecar waiting to be
+    // read back by whichever closes last.
+    //
+    // The lease row survives the swap. It is a row in the database, not state on
+    // the handle, and `acquireSingleton` is re-entrant for the same (pid,
+    // lstart) -- which is exactly the property the re-entrancy test exists for.
+    // REBIND `db`, do not shadow it. An earlier revision closed `raw` -- which
+    // `db` aliased -- and bound the migrated handle to a NEW name, so every
+    // later `releaseSingleton(db, ...)` and `heartbeatSingleton(db, ...)` ran
+    // against a closed database: the first heartbeat threw, the loop died, and
+    // the lease row was left behind by a process that never ran a tick. The
+    // whole reordering made `build run` worse than it was.
+    //
+    // Nothing to do on the bootstrap path: `db` is already the migrated handle.
+    if (raw) { raw.close(); db = openHub(hubPathFor(HOME)); }
+    // Hold the lease for the life of the process, and give it back on the way
+    // out. Claiming and then returning would exit immediately: the service
+    // manager (KeepAlive) relaunches, the new process finds a lease held by a
+    // pid that just died, and the job flaps -- while `reeve build status`
+    // reports a holder that is never there. A lease nobody heartbeats is also
+    // indistinguishable from a crashed holder after LEASE_SECONDS.
+    //
+    // S2's loop does exactly two things; the phase tick lands in PR-B.
+    let running = true;
+    const stop = (sig) => {
+      if (!running) return;
+      running = false;
+      releaseSingleton(db, { name: "builder", pid: process.pid, lstart });
+      // `console.log`, not `log`. `bin/reeve` neither defines nor imports a
+      // `log` binding -- that is `src/daemon.mjs`'s file-scoped helper -- so the
+      // lease was released and the shutdown then threw ReferenceError instead of
+      // exiting cleanly, and the lost-heartbeat branch below crashed before
+      // printing the diagnostic that is its entire purpose. Both use the console.
+      console.log(`build run: released the singleton lease on ${sig}`);
+      process.exit(0);
+    };
+    for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => stop(sig));
+
+    while (running) {
+      // A heartbeat that fails means the row is no longer ours -- a takeover, or
+      // a restore that replaced the file. Authority is gone, so the loop stops
+      // rather than ticking on without it (section 1.2).
+      if (!heartbeatSingleton(db, { name: "builder", pid: process.pid, lstart })) {
+        // `console.error`, like the shutdown path. `bin/reeve` has no `log`
+        // binding, so this threw before printing the diagnostic that is the entire
+        // reason the branch exists -- a lost lease reported as a ReferenceError
+        // about logging.
+        console.error("build run: lost the singleton lease; another process holds it. Stopping.");
+        process.exit(1);
+      }
+      // refreshGateState lands with S2-B (its Task 18); until then the loop body
+      // is the heartbeat alone. `sleep` is not a global -- spelled out here.
+      await new Promise(r => setTimeout(r, HEARTBEAT_SECONDS * 1000));
+    }
+    break;
+  }
+
   case "run":
   case "tick": {
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();
@@ -359,7 +1285,26 @@ switch (cmd) {
   }
 
   default:
-    console.log(`reeve ${JSON.parse(execFileSync("cat", [join(ROOT, "package.json")], { encoding: "utf8" })).version}
+    usage();
+    process.exit(cmd ? 1 : 0);
+}
+
+/**
+ * The only help this CLI has, printed by `--help` and by an unrecognised
+ * command alike.
+ *
+ * A `function` declaration on purpose: `--help` is dispatched above the switch,
+ * before any route can run, and only a declaration is hoisted that far. It also
+ * has to be ONE text -- `--help` that describes a different CLI from the one the
+ * bare command describes is two helps, and one of them is wrong.
+ *
+ * Every command in the switch is named here, and `test/cli-flags.test.mjs`
+ * asserts that both ways. `export-events`, `shadow`, `builder` and `build` were
+ * all shipped and none of them appeared here, so the only help reeve had
+ * described a CLI that no longer existed.
+ */
+function usage() {
+  console.log(`reeve ${JSON.parse(execFileSync("cat", [join(ROOT, "package.json")], { encoding: "utf8" })).version}
 
   doctor [owner/repo]   what is actually true right now   (0 ok · 1 broken · 3 degraded)
       --db <path>           state database to inspect
@@ -368,7 +1313,7 @@ switch (cmd) {
       --json                machine-readable
 
   init                  detect this repo, preview a profile, then --write it
-      --set k=v             answer a question detection could not settle
+      --set k=v             answer a question detection could not settle (repeatable)
       --write               apply  (exit 0 no-op · 2 changed · 1 needs an answer)
 
   canary [owner/repo]   measure the worker sandbox for real, without arming anything
@@ -378,9 +1323,19 @@ switch (cmd) {
   why <pr>              why reeve decided what it decided, newest first
   statusline            one line for the terminal statusline; reads state only
   dash                  write the one-page view  (--health, --out <path>, --open)
+  shadow [owner/repo]   compare what reeve would have decided against what happened
 
   backup [owner/repo]   a restorable snapshot of the store  (--events for JSONL, --to <dir>)
+      --hub                 snapshot the builder hub instead of a repository store
+      --keep <n>            how many snapshots to retain
   restore [owner/repo]  put one back  (--from <file>, --overwrite, --force)
+      --hub                 restore the builder hub  (--tail <file> replays events after it)
+  export-events --hub <file>
+                        write the hub's event log as a replayable JSONL tail
+
+  builder doctor        what is true about the builder hub  (--json)
+  build run             the builder loop; one at a time, by lease  (--takeover)
+  build status          who holds the builder lease, and since when
 
   run [owner/repo]      the daemon: watch, publish, decide, on a loop
       --tick                one pass and exit
@@ -389,6 +1344,9 @@ switch (cmd) {
       --interval <seconds>  default 90
       --halt <path>         marker file that stops everything (default ~/.reeve/HALT)
 
+  everywhere:
+      --home <dir>          the reeve home to operate on (default $REEVE_HOME, else ~/.reeve)
+      --help                print this and do nothing else
+
 not yet built: next · plan · lane`);
-    process.exit(cmd ? 1 : 0);
 }

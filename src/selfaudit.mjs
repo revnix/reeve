@@ -24,8 +24,11 @@
 // BROKEN until the ruleset is repaired. Escalating that hourly would report a
 // known, accepted condition forever. doctor stays a command a human runs.
 
-import { latestSnapshot, everyStore } from "./backup.mjs";
-import { statSync } from "node:fs";
+import { latestSnapshot, everyStore, snapshotCandidates } from "./backup.mjs";
+import { statSync, existsSync } from "node:fs";
+import { hubPathFor } from "./paths.mjs";
+// `join` is the missing-hub check's: the backup root defaults to <home>/backups.
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 export const OK = "OK";
@@ -45,7 +48,17 @@ function checkBackups(nwo, { backupRoot, interval, at, io, home }) {
   // unaudited AND unbacked, which is the pair that loses data.
   if (home) {
     const stores = (io.everyStore ?? everyStore)(home);
-    const missing = stores.filter(st => !(io.latestSnapshot ?? latestSnapshot)(backupRoot, st.nwo));
+    const unbacked = stores.filter(st => !(io.latestSnapshot ?? latestSnapshot)(backupRoot, st.nwo));
+    // Split for the same reason as below: "never backed up" and "every snapshot
+    // is corrupt" both surface as a null from `latestSnapshot`, and only one of
+    // them is a scheduling problem.
+    const corrupt = unbacked.filter(st => (io.snapshotCandidates ?? snapshotCandidates)(backupRoot, st.nwo).length);
+    const missing = unbacked.filter(st => !corrupt.includes(st));
+    if (corrupt.length) {
+      return { id: "backup.unreadable", level: BROKEN,
+               why: "a state store on this machine has backups and none of them can be restored",
+               detail: corrupt.map(m => m.nwo).join(", ") };
+    }
     if (missing.length) {
       return { id: "backup.missing", level: BROKEN,
                why: "a state store on this machine has never been backed up",
@@ -55,6 +68,19 @@ function checkBackups(nwo, { backupRoot, interval, at, io, home }) {
 
   const newest = (io.latestSnapshot ?? latestSnapshot)(backupRoot, nwo);
   if (!newest) {
+    // A null here has TWO causes and they are different operator problems.
+    // `latestSnapshot` now skips candidates that fail validation, so a store
+    // whose every snapshot is corrupt answers null exactly like one that was
+    // never backed up. Reporting the second as "has never been backed up" is
+    // FALSE, and it sends an operator to check a schedule that is working
+    // perfectly -- the backups are running and producing rubbish, which is both
+    // the more urgent fault and the one this line named before validation moved
+    // into the read path.
+    const present = (io.snapshotCandidates ?? snapshotCandidates)(backupRoot, nwo);
+    if (present.length)
+      return { id: "backup.unreadable", level: BROKEN,
+               why: `none of reeve's backups of ${nwo} can be restored`,
+               detail: `${present.length} snapshot(s) under ${backupRoot}, and every one fails validation` };
     return { id: "backup.missing", level: BROKEN,
              why: `reeve has never backed up ${nwo}`,
              detail: `nothing under ${backupRoot}` };
@@ -179,6 +205,56 @@ export function selfAudit(db, opts = {}) {
     checkLeases(db, { at }),
     checkNotify(db, { profile }),
   ].filter(Boolean);
+
+  const home = opts.home ?? null;
+  const hub = home ? hubPathFor(home) : null;
+  if (hub && existsSync(hub)) {
+    // CHEAP on the tick path. `selfAudit` runs on every guardian tick, once per
+    // repository daemon, against a SHARED hub -- so a full-page integrity_check
+    // here re-scans a growing database every 90 seconds per daemon, which is the
+    // cost this plan measured OUT of `latestSnapshot` two rounds ago
+    // (~1.1 ms/MB; docs/measured/2026-08-23-integrity-check-cost.md). Moving it
+    // off one caller and onto a busier one is not a fix.
+    //
+    // `quick_check` walks the b-trees without the full page sweep, and the `(1)`
+    // argument stops at the first fault -- the audit reports "the hub is broken",
+    // not a catalogue. The deep scan stays where it earns its cost: `snapshotAll`
+    // on what it just wrote, `restoreHub` before it replaces anything, and
+    // `builder doctor` when an operator asks.
+    let integrity = null;
+    try {
+      const d = new DatabaseSync(hub, { readOnly: true });
+      try { integrity = Object.values(d.prepare("PRAGMA quick_check(1)").get())[0]; }
+      finally { d.close(); }
+    } catch (e) { integrity = `unreadable: ${e.message}`; }
+    // A hub that cannot be OPENED is also a fault, and lands here rather than
+    // throwing out of selfAudit and taking the whole per-repo audit with it.
+    if (integrity !== "ok")
+      findings.push({ id: "hub.integrity", level: BROKEN,
+                      why: "reeve's hub database fails its integrity check",
+                      detail: `${hub}: ${integrity}` });
+  } else if (hub) {
+    // A hub that is GONE is not a hub that never existed, and `existsSync` alone
+    // cannot tell them apart -- so the total-loss case produced NO finding at
+    // all, from the audit that runs on every guardian tick. `everyStore`
+    // enumerates only files that exist, so the same tick snapshotted every
+    // repository store and said nothing about the missing authority database.
+    // The CLI half was closed (`backup --hub` refuses without a hub result);
+    // this is the automatic half.
+    //
+    // The evidence that it existed is ON DISK: a retained hub snapshot. Positive
+    // knowledge, not an assumption -- no snapshots means the builder has
+    // genuinely never run, which is not a fault and must not be reported as one.
+    // (Same rule as `projectsKnown`: suppression requires knowing, not guessing.)
+    const root = backupRoot ?? (home ? join(home, "backups") : null);
+    let priorSnapshots = 0;
+    if (root) { try { priorSnapshots = snapshotCandidates(root, "hub").length; } catch { priorSnapshots = 0; } }
+    if (priorSnapshots > 0)
+      findings.push({ id: "hub.missing", level: BROKEN,
+                      why: "reeve's hub database is gone",
+                      detail: `${hub} does not exist, and ${priorSnapshots} retained snapshot(s) under ${root} show it did; ` +
+                              `reeve restore --hub installs the newest usable one` });
+  }
 
   const rank = { [BROKEN]: 0, [DEGRADED]: 1, [OK]: 2 };
   return findings.sort((a, b) => rank[a.level] - rank[b.level]);

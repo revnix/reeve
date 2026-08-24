@@ -20,13 +20,20 @@ import { detect } from "./profile/detect.mjs";
 import { validate, withDefaults } from "./profile/schema.mjs";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
+import { resolveHome } from "./home.mjs";
 
-/** Where a profile belongs, given what the repo is. */
-export function profilePath(nwo, location) {
+/**
+ * Where a profile belongs, given what the repo is.
+ *
+ * The sidecar branch used to be `~/.reeve/profiles` unconditionally -- it read
+ * neither `--home` nor `REEVE_HOME`, so `reeve init --home /custom --write`
+ * could overwrite the operator's real profile while the caller believed the
+ * whole run was isolated. Client and public repositories all take this branch.
+ */
+export function profilePath(nwo, location, home = resolveHome()) {
   return location === "committed"
     ? join(process.cwd(), ".ops", "profile.json")
-    : join(homedir(), ".reeve", "profiles", `${nwo}.json`);
+    : join(home, "profiles", `${nwo}.json`);
 }
 
 /** Stable key order, so a rewrite produces a readable diff rather than a reshuffle. */
@@ -286,13 +293,13 @@ export function renderPlan({ nwo, proposal, questions, notes, profile, unanswere
 }
 
 /** The whole flow. `write` is false for a plan-only run. */
-export function init({ root = process.cwd(), answers = {}, write = false }) {
+export function init({ root = process.cwd(), answers = {}, write = false, home = resolveHome() }) {
   const { proposal, questions, notes } = detect(root);
   if (!proposal) return { code: 1, output: `reeve init: ${notes.join("; ")}` };
 
   const nwo = proposal.identity.key;
   const { profile: detectedProfile, unanswered } = compose(proposal, questions, answers);
-  const path = profilePath(nwo, detectedProfile.authority.profileLocation);
+  const path = profilePath(nwo, detectedProfile.authority.profileLocation, home);
   const existingRaw = existsSync(path) ? readFileSync(path, "utf8") : null;
   let existingObj = null;
   if (existingRaw) {

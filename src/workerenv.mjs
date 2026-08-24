@@ -31,6 +31,7 @@
 import { writeFileSync, mkdirSync, chmodSync, renameSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
+import { resolveHome } from "./home.mjs";
 
 /**
  * What this environment can and cannot promise, read by the daemon before any
@@ -195,18 +196,22 @@ export function workerHomeFor(root, nwo) {
  * file even though it holds the value in its own environment (which no other
  * sandboxed process can read: measured 2026-08-22).
  */
-export function readOauthToken(path = join(homedir(), ".reeve", "claude-token")) {
+export function readOauthToken(path = join(resolveHome(), "claude-token")) {
   let raw;
   try { raw = readFileSync(path, "utf8"); }
-  catch (e) { return { ok: false, why: `${path} could not be read (${e.code ?? e.message}); create one with \`claude setup-token\`` }; }
+  // `path` IS RETURNED, on every shape. The checker knows which file it
+  // looked at and the reporter was reconstructing it -- and got it wrong the
+  // moment this default started following the resolved home, telling operators
+  // to write `~/.reeve/claude-token` after looking somewhere else entirely.
+  catch (e) { return { ok: false, path, why: `${path} could not be read (${e.code ?? e.message}); create one with \`claude setup-token\`` }; }
   const token = raw.trim();
-  if (!token) return { ok: false, why: `${path} is empty` };
+  if (!token) return { ok: false, path, why: `${path} is empty` };
   // Loose on purpose: the prefix is what today's tokens carry, and refusing an
   // unknown-but-plausible shape would strand a worker on a format change.
-  if (token.includes("\n") || token.length < 20) return { ok: false, why: `${path} does not look like a token` };
+  if (token.includes("\n") || token.length < 20) return { ok: false, path, why: `${path} does not look like a token` };
   try {
     const mode = statSync(path).mode & 0o077;
-    if (mode) return { ok: false, why: `${path} is readable by others (mode ${(statSync(path).mode & 0o777).toString(8)}); chmod 600 it` };
+    if (mode) return { ok: false, path, why: `${path} is readable by others (mode ${(statSync(path).mode & 0o777).toString(8)}); chmod 600 it` };
   } catch { /* the read already succeeded; a stat failure is not a refusal */ }
-  return { ok: true, token, why: null };
+  return { ok: true, token, path, why: null };
 }

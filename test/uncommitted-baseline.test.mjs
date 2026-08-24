@@ -5,6 +5,7 @@
 // however deep inside a copied tree it sits, and deciding that must not re-read
 // the whole tree after every paid worker run.
 import { uncommittedFiles } from "../src/daemon.mjs";
+import { MAX_COPIED_UNTRACKED } from "../src/checkout.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -109,6 +110,47 @@ const baseline = Object.fromEntries(copied.map(rel => [rel, "SAME"]));
   // exclusion has not simply switched the sweep off.
   check(left.includes("vendor/dep-011.js"),
     "control: the deleted copy is still caught alongside it", JSON.stringify(left).slice(0, 200));
+}
+
+// --- a baseline at the size preparation actually accepts ----------------------
+{
+  // The gate has to be able to DECIDE a baseline as large as preparation will
+  // hand it, and preparation accepts MAX_COPIED_UNTRACKED copied files. Naming
+  // each of them in argv is the narrower query and the one that breaks: the spawn
+  // exceeds ARG_MAX, `uncommittedFiles` catches and returns null, and a perfectly
+  // good worker result is quarantined as an unreadable checkout. Failing closed on
+  // a real ambiguity is right; failing closed because the question was asked in a
+  // way the OS cannot carry is not.
+  //
+  // The bound is imported rather than copied. A test that hardcodes 20000 keeps
+  // passing after the ceiling is raised, which is the moment the limit starts
+  // mattering again.
+  const long = "vendor/" + "n".repeat(96) + "/";
+  const many = {};
+  for (let i = 0; i < MAX_COPIED_UNTRACKED; i++) many[`${long}dep-${i}.js`] = "SAME";
+  const argv = Object.keys(many);
+
+  // Control: the fixture is genuinely past what a spawn can carry. Without this,
+  // a green below could mean the fix works OR that the paths were short enough
+  // that nothing was ever at risk -- and those read identically.
+  let blew = null;
+  try {
+    execFileSync("git", ["-C", root, "ls-files", "-z", "--", ...argv],
+                 { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  } catch (e) { blew = e.code ?? e.message; }
+  check(blew !== null, "control: naming every baseline path in argv really does fail the spawn", String(blew));
+
+  const left = uncommittedFiles(root, many, { digest });
+  check(left !== null, "a baseline at the accepted ceiling is decided, not quarantined",
+    "returned null, which the caller reads as an unreadable checkout");
+  // And the answer is the right one, not merely non-null: none of these paths is
+  // on disk or in the index, so every one of them is work the push would lose.
+  // Membership rather than a count, because `left` also carries what the blocks
+  // above left in this checkout -- an equality would be asserting on those too.
+  const got = new Set(left ?? []);
+  const absent = argv.filter(n => !got.has(n));
+  check(absent.length === 0, "and every missing copy in it is reported",
+    `${absent.length} of ${argv.length} unreported, e.g. ${absent[0]}`);
 }
 
 // --- an unreadable checkout fails closed -------------------------------------

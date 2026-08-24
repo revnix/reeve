@@ -228,10 +228,22 @@ export function uncommittedFiles(worktree, copiedBaseline = {}, { digest = diges
     // baseline precisely BECAUSE the repair is carried, so flagging it refused
     // exactly the case the declaration exists to permit. What the gate is looking
     // for is work the push would LOSE, and a committed file is not that.
+    //
+    // The whole index is read, with no pathspec, and the membership test happens
+    // here. Naming the baseline paths would be the narrower query, but preparation
+    // accepts up to MAX_COPIED_UNTRACKED of them, and spreading that many into
+    // argv exceeds ARG_MAX -- the spawn throws, this function returns null, and a
+    // perfectly good worker result is quarantined as unreadable. That is the third
+    // time an argv-sized path list has been a defect here, so the dependency is
+    // removed rather than sized: there is no batch constant to tune and no ceiling
+    // to breach later. `git ls-files` has no `--pathspec-from-file`, so the stdin
+    // route `commitRunWork` uses is not available to it. Reading the index costs
+    // one pass over the tracked paths, which is bounded by the repository rather
+    // than by how much preparation copied.
     const names = Object.keys(baseline);
     let tracked = new Set();
     if (names.length) {
-      const known = raw(["ls-files", "-z", "--", ...names]);
+      const known = raw(["ls-files", "-z"]);
       tracked = new Set(known ? known.split("\0").filter(Boolean) : []);
     }
     for (const rel of names)

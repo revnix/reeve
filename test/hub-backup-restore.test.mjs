@@ -1519,6 +1519,141 @@ function writeAuthority(db, project) {
   rmSync(zHome, { recursive: true, force: true });
 }
 
+// ── a hub whose LOCK SCHEMA is damaged is recoverable ──────────────────────
+// The version query answering is not readiness either. A version-1 hub that has
+// lost `maintenance_lock` passes `rawOpen`, and `acquireMaintenanceLock` then
+// throws `no such table: maintenance_lock` straight past every recovery path --
+// so `restore --hub --force`, the command for exactly this, refused to install a
+// snapshot it had already validated.
+//
+// Readable now means "this branch can do its work", and its work is the four
+// lock tables it queries.
+{
+  const lHome = mkdtempSync(join(tmpdir(), "reeve-lockdmg-"));
+  mkdirSync(join(lHome, "state"), { recursive: true });
+  const src = openHub(join(lHome, "state", "src.db"));
+  const snapL = snapshot(src, join(lHome, "backups"), "hub");
+  src.close();
+  check(snapL.ok, "fixture: a snapshot to restore from", JSON.stringify(snapL));
+
+  for (const dropped of ["maintenance_lock", "singleton_lease", "writer_lease", "provider_lease"]) {
+    const target = join(lHome, "state", `${dropped}.db`);
+    openHub(target).close();
+    { const d = new DatabaseSync(target); d.exec(`DROP TABLE ${dropped}`); d.close(); }
+    // CONTROL per table: the store still answers the version query, which is
+    // exactly what made it look readable.
+    { const q = new DatabaseSync(target, { readOnly: true });
+      const v = q.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+      q.close();
+      check(v === 1, `fixture: the hub missing ${dropped} still reports version 1`, `version ${v}`); }
+
+    const r = restoreHub(snapL.path, target, { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+    check(r.ok, `a hub missing ${dropped} is recovered rather than refused`, JSON.stringify(r).slice(0, 200));
+    check(!/no such table/.test(String(r.why ?? "")),
+      `and not with \`no such table: ${dropped}\``, String(r.why));
+    const q = new DatabaseSync(target, { readOnly: true });
+    const tables = q.prepare("SELECT count(*) c FROM sqlite_master WHERE type='table'").get().c;
+    q.close();
+    check(tables === 32, `and the store is whole afterwards (missing ${dropped})`, `${tables} tables`);
+  }
+
+  // CONTROL: an INTACT hub is still classified readable, so the check above did
+  // not simply route every restore down the recovery path -- which would pass
+  // every assertion here while quarantining healthy databases.
+  const intact = join(lHome, "state", "intact.db");
+  openHub(intact).close();
+  const ok = restoreHub(snapL.path, intact, { isAlive: () => false, pid: process.pid, lstart: "L" });
+  check(ok.ok, "control: an intact hub restores WITHOUT force", JSON.stringify(ok).slice(0, 160));
+  check(!ok.quarantined,
+    "control: and is not quarantined, because it was never classified unreadable", String(ok.quarantined));
+  rmSync(lHome, { recursive: true, force: true });
+}
+
+// ── the window between CREATING the hub and LOCKING it ─────────────────────
+// `openHub` creates and migrates the file; the next statement writes the lock
+// into it. A `build run` starting inside that window finds a fully migrated hub
+// with no lock, takes its singleton, and is still holding it when the restore
+// replaces the file. The readable branch has always scanned for holders; this
+// one never did, because "we just made it" was taken to mean nobody else could
+// be in it.
+//
+// The window cannot be closed by ordering -- there is no create-and-lock in one
+// step -- so it is closed by LOOKING afterwards, and anything that got in is
+// recorded in `singleton_lease`.
+{
+  const wHome = mkdtempSync(join(tmpdir(), "reeve-window-"));
+  mkdirSync(join(wHome, "state"), { recursive: true });
+  const src = openHub(join(wHome, "state", "src.db"));
+  const snapW = snapshot(src, join(wHome, "backups"), "hub");
+  src.close();
+
+  // The builder that got in, and a hub that takes the CREATION branch.
+  //
+  // A first fixture put the lease in a version-1 store, which `rawOpen` calls
+  // readable -- so the readable branch's own scan refused it and the new code
+  // never ran at all. The refusal looked right and proved nothing.
+  //
+  // This one is a store with migration 1's tables and NO version rows: exactly
+  // what an interrupted migration leaves, and what `readableVersion` answers 0
+  // for. It therefore takes the creation branch, `openHub` re-applies migration
+  // 1 over the existing tables, and the lease a builder took is still sitting
+  // there when the new scan looks. The refusal's own wording is the
+  // discriminator -- the readable branch says "the hub has live writers", and
+  // only this path says a builder started while the restore was preparing it.
+  const target = join(wHome, "state", "raced.db");
+  const born = openHub(target);
+  born.prepare(`INSERT INTO singleton_lease(name,pid,lstart,command,acquired_at,expires_at)
+                VALUES('builder',?,?, 'reeve build run', unixepoch(), unixepoch()+120)`)
+    .run(4242, "L4242");
+  born.exec("DELETE FROM schema_version");
+  born.close();
+  { const q = new DatabaseSync(target, { readOnly: true });
+    const v = q.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+    const leases = q.prepare("SELECT count(*) c FROM singleton_lease").get().c;
+    q.close();
+    check(v === 0 && leases === 1,
+      "fixture: the hub reports version 0 and already carries a builder's lease",
+      `version ${v}, ${leases} lease(s)`); }
+
+  const alive = (pid) => pid === 4242;
+  const r = restoreHub(snapW.path, target, { isAlive: alive, pid: process.pid, lstart: "me", force: true });
+  check(!r.ok, "a restore refuses while a builder holds the hub's singleton", JSON.stringify(r).slice(0, 200));
+  check(/while this restore was preparing it/.test(String(r.why)),
+    "and it is the CREATION branch that refused, not the readable one that always scanned",
+    String(r.why).slice(0, 200));
+  check(r.holders?.some(h => h.pid === 4242),
+    "and names the holder, so an operator knows what to stop", JSON.stringify(r.holders));
+  check(existsSync(target),
+    "and does NOT delete the file the builder is writing to", `${existsSync(target)}`);
+
+  // THAT ASSERTION IS TRUE HERE FOR A WEAKER REASON, and saying so is the point.
+  // This fixture's hub already EXISTS, so `synthetic` is false before the scan
+  // runs and the finally has no authority to delete anything: measured, removing
+  // the `synthetic = false` guard leaves every assertion above green.
+  //
+  // The case the guard is for is the ABSENT hub, where this invocation created
+  // the file and may delete it -- and that one has no deterministic seam: the
+  // builder has to arrive between `openHub` returning and the scan reading, and
+  // nothing in `restoreHub` can be driven to that instant from a test. So the
+  // guard is asserted from the source, with a control that both anchors exist.
+  {
+    const src = readFileSync(join(ROOT, "src", "backup.mjs"), "utf8");
+    const scan = src.indexOf("if (bornHolders.length) {");
+    const disown = src.indexOf("synthetic = false;", scan);
+    const ret = src.indexOf("return { ok: false, holders: bornHolders,", scan);
+    check(scan > 0 && ret > 0, "control: the creation-branch refusal was found in the source", `${scan} ${ret}`);
+    check(disown > 0 && disown < ret,
+      "the creation branch disowns the file before refusing, so the finally cannot delete a hub a builder holds",
+      `scan ${scan}, disown ${disown}, return ${ret}`);
+  }
+
+  // CONTROL: with the holder DEAD, the same restore proceeds -- so the refusal
+  // is about liveness rather than about any lease row at all.
+  const r2 = restoreHub(snapW.path, target, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+  check(r2.ok, "control: with the holder dead, the restore proceeds", JSON.stringify(r2).slice(0, 200));
+  rmSync(wHome, { recursive: true, force: true });
+}
+
 rmSync(home, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

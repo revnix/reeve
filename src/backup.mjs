@@ -598,6 +598,21 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // Same invariant as `build run`'s bootstrap test: existence is not
       // readiness, and neither is openability.
       if (v < 1) { try { d.close(); } catch {} return null; }
+      // AND THE TABLES THIS FUNCTION WILL ACTUALLY QUERY. The version answering
+      // is not readiness either: a version-1 hub that has LOST
+      // `maintenance_lock` -- dropped, or damaged past reading -- passes the
+      // check above, and `acquireMaintenanceLock` then throws
+      // `no such table: maintenance_lock` straight past every recovery path. So
+      // `restore --hub --force`, the command for exactly this, refused to
+      // install a snapshot it had already validated.
+      //
+      // Readable means "this branch can do its work", and its work is these four
+      // tables. Anything missing takes the corrupt-hub path, which quarantines
+      // the file and recovers from the snapshot -- which is what an operator
+      // wants from a hub whose schema has holes in it.
+      const need = ["maintenance_lock", "singleton_lease", "writer_lease", "provider_lease"];
+      const has = new Set(d.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(r => r.name));
+      if (need.some(t => !has.has(t))) { try { d.close(); } catch {} return null; }
       return d;
     } catch { try { d?.close(); } catch {} return null; }
   };
@@ -722,6 +737,40 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
       }
       locked = true;
+
+      // AND THEN SCAN, because the lock did not exist for the whole of creation.
+      //
+      // `openHub` creates and migrates the file, and only the NEXT statement
+      // writes `maintenance_lock` into it. A `build run` starting inside that
+      // window finds a fully migrated hub with no lock, takes its singleton, and
+      // is still holding it when this restore replaces the file -- writing to an
+      // unnamed inode while the canonical path carries a different database. The
+      // readable branch has always scanned for holders; this one never did,
+      // because "we just made it" was taken to mean nobody else could be in it.
+      //
+      // The window cannot be closed by ordering alone -- there is no create-and-
+      // lock in one step -- so it is closed by LOOKING afterwards. Anything that
+      // got in is still recorded in `singleton_lease`, and the lock this restore
+      // now holds stops any further writer from joining.
+      //
+      // `synthetic = false` before returning, exactly as the two-restore loser
+      // does: the flag means "this invocation created it AND owns it", and a file
+      // a builder is actively writing to is not this function's to delete --
+      // deleting it is the very failure being refused.
+      const bornHolders = [];
+      for (const r of live.prepare("SELECT * FROM singleton_lease").all())
+        if (isAlive(r.pid, r.lstart)) bornHolders.push({ what: "builder", pid: r.pid, lstart: r.lstart, command: r.command });
+      for (const r of liveWriters(live, { isAlive }))
+        bornHolders.push({ what: "cli", pid: r.pid, lstart: r.lstart, command: r.command });
+      if (bornHolders.length) {
+        synthetic = false;
+        return { ok: false, holders: bornHolders,
+          why: `a builder started in the ${bootstrapZero ? "unmigrated" : "absent"} hub at ${dbPath} while this ` +
+               `restore was preparing it, and is writing to it now:\n` +
+               bornHolders.map(h => `  ${h.what.padEnd(8)} pid ${h.pid} (started ${h.lstart})  ${h.command}`).join("\n") +
+               `\n  stop it and re-run. force does not override a live holder; replacing the file ` +
+               `underneath it would leave it writing to a database with no name.` };
+      }
     } else if ((live = rawOpen(dbPath)) === null) {
       // EXISTS, and UNREADABLE. This is the state the route's own description
       // names -- recovering a hub "too corrupt to open" -- and the readable

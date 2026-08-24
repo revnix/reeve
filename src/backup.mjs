@@ -640,8 +640,18 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // So this reports WHAT IS WRONG rather than THAT something is, and the
       // caller degrades one capability at a time. Unreadable stays unreadable:
       // a file that cannot answer `schema_version` reaches the outer catch.
+      // PROBED, not merely LISTED. `sqlite_master` records that a table was
+      // created, not that it can be read: a corrupt root page leaves the name in
+      // the catalogue and throws on first access, so a presence check called it
+      // available and the holder query then died in the outer catch -- `could not
+      // restore`, from the command that exists to recover exactly that file.
+      // One cheap read each, on a path that is about to copy a whole database.
       const has = new Set(d.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(r => r.name));
-      return { db: d, version: v, missing: LOCK_TABLES.filter(t => !has.has(t)), hasEvents: has.has("hub_event") };
+      const readable = (t) => {
+        if (!has.has(t)) return false;
+        try { d.prepare(`SELECT * FROM ${t} LIMIT 1`).get(); return true; } catch { return false; }
+      };
+      return { db: d, version: v, missing: LOCK_TABLES.filter(t => !readable(t)), hasEvents: readable("hub_event") };
     } catch { try { d?.close(); } catch {} return null; }
   };
   // PRESERVE THE SIDECARS BEFORE ANY OPEN ATTEMPT, because the open is what
@@ -868,7 +878,24 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // is paid for by requiring `force`. One code path, not a second branch --
       // a copy of this reasoning would drift from it.
       const missing = opened.missing;
-      const partial = missing.length > 0;
+      // TWO KINDS OF DAMAGE, and they cost different things.
+      //
+      // A missing LOCK table is a SAFETY question: a lease held in it cannot be
+      // ruled out. A missing EVENT LOG is a LOSS question: nothing held there can
+      // hurt anyone, but every event after the snapshot goes with it.
+      //
+      // Excluding `hub_event` from `LOCK_TABLES` was right for the first
+      // question and wrong for the second: a hub with all four lock tables and no
+      // event log read as INTACT, so it was replaced with no force, no quarantine
+      // and an empty tail -- discarding every post-snapshot projection change and
+      // exiting 0. Over-corrected from the opposite defect, where a READABLE log
+      // was thrown away because a lock table was gone.
+      //
+      // A supplied `--tail` answers the loss question, so it is not damage the
+      // operator needs to confirm; it is the recovery they have already performed.
+      const historyLost = !opened.hasEvents && suppliedTail == null;
+      const damaged = missing.length > 0 || !opened.hasEvents;
+      const partial = missing.length > 0 || historyLost;
       // RAW DatabaseSync, not openHub. openHub applies forward migrations, and
       // migrating a database is a write -- so opening that way would upgrade a
       // hub that a builder or a CLI is actively using, before this command has
@@ -970,21 +997,31 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // "nobody is running" and "nobody I could ask" is the whole reason the
       // unreadable path demands force. Partial damage is that same ignorance,
       // narrowed -- so the same rule applies, with the tables named.
-      if (partial && !force)
+      if (partial && !force) {
+        const why = [];
+        if (missing.length)
+          why.push(`it is missing ${missing.join(", ")}, so a lease held in ` +
+                   `${missing.length === 1 ? "it" : "them"} cannot be ruled out` +
+                   `${holders.length ? "" : " (nothing was found in the tables that remain)"}`);
+        if (historyLost)
+          why.push("its event log cannot be read, so every event after the snapshot would be lost");
         return { ok: false, holders,
-          why: `the hub at ${dbPath} is missing ${missing.join(", ")}, so a lease held in ` +
-               `${missing.length === 1 ? "it" : "them"} cannot be ruled out. ` +
-               `${holders.length ? "" : "Nothing was found in the tables that remain. "}` +
-               `Stop the builder and any reeve CLI, then re-run with force.` +
-               `\n  the event log ${opened.hasEvents ? "IS readable and will be carried forward" :
-                                                       "is gone too; pass --tail from a durable export-events --hub"}.` };
+          why: `the hub at ${dbPath} cannot be replaced safely: ${why.join("; and ")}.` +
+               (missing.length ? `\n  stop the builder and any reeve CLI, then re-run with force.` : "") +
+               (historyLost ? `\n  pass --tail from a durable export-events --hub to carry the history ` +
+                              `forward; without one, re-running with force accepts losing every event after ${snapSeq}.`
+                            : `\n  the event log IS readable and will be carried forward.`) };
+      }
 
       // QUARANTINED, like the unreadable path, and named for what it is. A
       // recovery that destroys what it replaced cannot be audited, and this file
       // is the only evidence of how a hub came to lose a table.
       // `.damaged-`, not `.corrupt-`: it opened and answered, which is a
       // different thing to look at than rubble.
-      if (partial) quarantined = `${dbPath}.damaged-${Math.floor(Date.now() / 1000)}`;
+      // `damaged`, not `partial`: a supplied tail answers the loss question and
+      // waives the refusal, but it does not make the file whole -- and a hub that
+      // lost its event log is exactly the one an operator will want to look at.
+      if (damaged) quarantined = `${dbPath}.damaged-${Math.floor(Date.now() / 1000)}`;
     }
 
     // The tail arrives two ways and both are real: read from the live file when

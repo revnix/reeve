@@ -1804,6 +1804,110 @@ function writeAuthority(db, project) {
   rmSync(gHome, { recursive: true, force: true });
 }
 
+// ── two kinds of damage, and they cost different things ───────────────────
+// A missing LOCK table is a SAFETY question: a lease held in it cannot be ruled
+// out. A missing EVENT LOG is a LOSS question: nothing held there can hurt
+// anyone, but every event after the snapshot goes with it.
+//
+// Excluding `hub_event` from the lock set was right for the first question and
+// wrong for the second: a hub with all four lock tables and no event log read as
+// INTACT, so it was replaced with no force, no quarantine and an empty tail --
+// discarding every post-snapshot projection change and exiting 0. Over-corrected
+// from the opposite defect, where a READABLE log was thrown away because a lock
+// table was gone.
+{
+  const eHome = mkdtempSync(join(tmpdir(), "reeve-noevents-"));
+  mkdirSync(join(eHome, "state"), { recursive: true });
+  const src = openHub(join(eHome, "state", "src.db"));
+  const snapE = snapshot(src, join(eHome, "backups"), "hub");
+  src.close();
+  const noLog = (name) => {
+    const t = join(eHome, "state", name + ".db");
+    openHub(t).close();
+    const d = new DatabaseSync(t); d.exec("DROP TABLE hub_event"); d.close();
+    return t;
+  };
+
+  const t1 = noLog("plain");
+  const bare = restoreHub(snapE.path, t1, { isAlive: () => false, pid: process.pid, lstart: "me" });
+  check(!bare.ok, "a hub whose event log is gone is not replaced silently", JSON.stringify(bare).slice(0, 160));
+  check(/event log cannot be read/.test(String(bare.why)),
+    "and the refusal is about the LOSS, not about a lock table", String(bare.why).slice(0, 200));
+  check(/every event after the snapshot would be lost/.test(String(bare.why)),
+    "and says what is at stake before anything is overwritten", String(bare.why).slice(0, 240));
+  check(/pass --tail from a durable export-events --hub/.test(String(bare.why)),
+    "and names the one thing that recovers it", String(bare.why).slice(0, 300));
+
+  const forced = restoreHub(snapE.path, t1, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+  check(forced.ok, "force accepts the loss and restores", JSON.stringify(forced).slice(0, 160));
+  check(/\.damaged-/.test(String(forced.quarantined)) && existsSync(forced.quarantined),
+    "and the file is kept, because a hub that lost its history is one to look at",
+    String(forced.quarantined));
+
+  // A SUPPLIED TAIL answers the loss question, so it is not damage the operator
+  // has to confirm -- it is the recovery they have already performed. No force.
+  const t2 = noLog("withtail");
+  const EMPTY_SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+  const tail = Object.assign([], { manifest: { count: 0, first: null, last: null, sha256: EMPTY_SHA }, sha256: EMPTY_SHA });
+  const withTail = restoreHub(snapE.path, t2, { isAlive: () => false, pid: process.pid, lstart: "me", tail });
+  check(withTail.ok, "a supplied tail restores it WITHOUT force, because the history is not lost",
+    JSON.stringify(withTail).slice(0, 200));
+  check(/\.damaged-/.test(String(withTail.quarantined)),
+    "and the damaged file is still kept, because a tail does not make it whole",
+    String(withTail.quarantined));
+  rmSync(eHome, { recursive: true, force: true });
+}
+
+// ── a table LISTED is not a table READABLE ────────────────────────────────
+// `sqlite_master` records that a table was created, not that it can be read. A
+// corrupt root page leaves the name in the catalogue and throws on first access,
+// so the presence check called it available and the holder query then died in
+// the outer catch -- `could not restore`, from the command that exists to
+// recover exactly that file.
+{
+  const cHome = mkdtempSync(join(tmpdir(), "reeve-btree-"));
+  mkdirSync(join(cHome, "state"), { recursive: true });
+  const src = openHub(join(cHome, "state", "src.db"));
+  const snapC = snapshot(src, join(cHome, "backups"), "hub");
+  src.close();
+
+  const t = join(cHome, "state", "corrupt.db");
+  const d = openHub(t);
+  d.prepare(`INSERT INTO provider_lease(owner,repo_id,run_ref,pid,lstart,status,requested_at,expires_at)
+             VALUES('guardian',1,'r',1,'L','held',unixepoch(),unixepoch()+9)`).run();
+  const root = d.prepare("SELECT rootpage FROM sqlite_master WHERE name='provider_lease'").get().rootpage;
+  const pageSize = d.prepare("PRAGMA page_size").get().page_size;
+  d.close();
+  // Overwrite that table's root page and nothing else, so the CATALOGUE stays
+  // intact and only this one b-tree is unreadable.
+  const buf = readFileSync(t);
+  buf.fill(0x5a, (root - 1) * pageSize, root * pageSize);
+  writeFileSync(t, buf);
+
+  // The fixture's two halves, asserted separately: the name is still listed, and
+  // reading it throws. Without both, this could pass against a file that is
+  // simply corrupt all over -- which the unreadable path already handled.
+  const probe = new DatabaseSync(t, { readOnly: true });
+  const listed = probe.prepare("SELECT count(*) c FROM sqlite_master WHERE name='provider_lease'").get().c;
+  let readThrows = false;
+  try { probe.prepare("SELECT * FROM provider_lease LIMIT 1").get(); } catch { readThrows = true; }
+  const versionStillReadable = probe.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+  probe.close();
+  check(listed === 1, "fixture: the corrupt table is still listed in sqlite_master", `${listed}`);
+  check(readThrows, "fixture: and reading it throws", `${readThrows}`);
+  check(versionStillReadable === 1,
+    "fixture: while the rest of the hub is fine, which is what made it look readable",
+    `version ${versionStillReadable}`);
+
+  const r = restoreHub(snapC.path, t, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+  check(r.ok, "a hub with one unreadable lease table is recovered, not abandoned", JSON.stringify(r).slice(0, 200));
+  check(!/could not restore/.test(String(r.why ?? "")),
+    "and not through the outer catch, which is where the holder query used to die", String(r.why));
+  check(/\.damaged-/.test(String(r.quarantined)),
+    "and it is treated as damaged, exactly like a table that is gone", String(r.quarantined));
+  rmSync(cHome, { recursive: true, force: true });
+}
+
 rmSync(home, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

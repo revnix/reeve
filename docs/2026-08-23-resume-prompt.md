@@ -46,16 +46,13 @@ else.
 
 ## Your task, in priority order
 
-1. **The P0: the worker cannot commit.** Read
-   `docs/measured/2026-08-23-three-real-dispatches.md` Finding 1 in full — it has
-   the evidence and both controls. Then bring me a decision, do not just start
-   coding: the two shapes are (a) grant the worker `.git` writes, or (b) have
-   reeve stage and commit on the worker's behalf after the diff gate, removing the
-   worker's STAGING and MUTATION authority while keeping read-only git — it still
-   needs `git status`, `git diff`, `git log` and `git show` to inspect its own
-   work, and `sandbox.mjs:368-376` grants git broadly on purpose after narrower
-   subcommand matching failed on a real dispatch. (b) is probably right, but it
-   changes the worker contract, so it is my call.
+1. **The P0 is DECIDED and BUILT — land it, do not re-open it.** The worker
+   cannot commit; read `docs/measured/2026-08-23-three-real-dispatches.md`
+   Finding 1 for the evidence and both controls. I chose reeve-side staging and
+   committing: the worker keeps read-only git (`git status`, `diff`, `log`,
+   `show`, `clean`) and loses `add`, `commit`, `push` and `remote`. PR #19
+   implements it. Your job is to finish its review rounds and get it merged, not
+   to choose a shape again.
 
    Do NOT assume the diff gate makes the rest free. `reviewDiff`
    (`sandbox.mjs:714-767`) judges PATHS and territory, not whether an allowed edit

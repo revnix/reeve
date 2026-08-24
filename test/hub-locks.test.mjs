@@ -12,6 +12,7 @@ import { acquireSingleton, heartbeatSingleton, releaseSingleton,
 // a ReferenceError before releasing the gun and the 20-way race never runs.
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readdirSync, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -242,6 +243,61 @@ function db_rows(p) { const d = openHub(p); const c = d.prepare("SELECT count(*)
     "and the command that holds it", out.slice(0, 300));
   check(/-> /.test(out) || /takeover/.test(out),
     "and tells the operator what to do next", out.slice(0, 400));
+}
+
+// ── an interrupted first migration is RECOVERED, not a permanent crash ──────
+// `openHub` creates `schema_version` as plain DDL, committed immediately, and
+// only then opens the transaction that applies migration 1. A process killed
+// between those two points leaves a file that exists, carries `schema_version`,
+// records no version, and has none of the lease tables. A `build run` that
+// decides "is this a first run" by asking whether the FILE exists sends that
+// store down the non-bootstrap path, where acquireSingleton queries
+// singleton_lease and throws `no such table` -- every run, for ever, with no
+// way out but deleting the file by hand.
+{
+  const home = join(dir, "interrupted");
+  mkdirSync(join(home, "state"), { recursive: true });
+  const p = join(home, "state", "hub.db");
+  const half = new DatabaseSync(p);
+  half.exec(`CREATE TABLE IF NOT EXISTS schema_version (
+               version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT`);
+  half.close();
+
+  const probe = new DatabaseSync(p, { readOnly: true });
+  const tablesBefore = probe.prepare(
+    "SELECT count(*) c FROM sqlite_master WHERE type='table'").get().c;
+  const versionBefore = probe.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+  probe.close();
+  check(tablesBefore === 1 && versionBefore === 0,
+    "fixture: the store exists, carries schema_version, and has completed no migration",
+    `${tablesBefore} table(s), version ${versionBefore}`);
+
+  // `build run` is a heartbeat loop, so it is started and killed rather than
+  // awaited. What matters is what it did to the store before it settled, and
+  // that it did not die naming a missing table.
+  const kid = spawn(process.execPath, [join(ROOT, "bin", "reeve"), "build", "run"],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, REEVE_HOME: home } });
+  let out = "";
+  kid.stdout.on("data", d => { out += d; });
+  kid.stderr.on("data", d => { out += d; });
+  await new Promise(r => setTimeout(r, 3000));
+  kid.kill("SIGKILL");
+
+  check(!/no such table/.test(out),
+    "`build run` does not die on a missing lease table when the first migration was interrupted",
+    out.slice(0, 240));
+
+  const after = new DatabaseSync(p, { readOnly: true });
+  const tablesAfter = after.prepare("SELECT count(*) c FROM sqlite_master WHERE type='table'").get().c;
+  const versionAfter = after.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+  after.close();
+  check(versionAfter === 1,
+    "and it COMPLETES the interrupted migration rather than refusing the store",
+    `version ${versionBefore} -> ${versionAfter}`);
+  check(tablesAfter > tablesBefore,
+    "control: the store really was incomplete before, so the recovery is observable",
+    `${tablesBefore} -> ${tablesAfter} tables`);
 }
 
 rmSync(dir, { recursive: true, force: true });

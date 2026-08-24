@@ -1022,6 +1022,42 @@ function writeAuthority(db, project) {
     "control: the same image carrying its id replays normally", JSON.stringify(good));
 }
 
+// ── restoring over a NEWER hub is refused, twice ────────────────────────────
+// A raw open skips openHub's forward-version refusal, so restoreHub has to make
+// it itself -- otherwise an older binary replaces a hub a newer one migrated,
+// collects event kinds it does not recognise, counts them as skipped, and exits
+// 0 with the newer state gone.
+//
+// The check is made TWICE and neither had a test. The first read is a fast,
+// clear message. The second happens after `acquireMaintenanceLock`, because the
+// window is exactly the wait for that lock: an older restore can read version 1,
+// wait while a newer builder migrates the hub, and find no live holder when it
+// wakes. A pre-lock read cannot close a window it opens.
+{
+  const p = join(home, "newer-hub.db");
+  const db = openHub(p);
+  db.exec(`INSERT INTO schema_version(version, applied_at) VALUES(${HUB_SCHEMA_VERSION + 1}, unixepoch())`);
+  db.close();
+  const snap = latestSnapshot(root, "hub");
+  const r = restoreHub(snap, p, { isAlive: () => false, pid: process.pid, lstart: "me" });
+  check(r.ok === false,
+    "restoring over a hub at a NEWER schema version is refused", JSON.stringify(r).slice(0, 220));
+  check(new RegExp(`schema version ${HUB_SCHEMA_VERSION + 1}\\b`).test(String(r.why)) &&
+        new RegExp(`knows ${HUB_SCHEMA_VERSION}\\b`).test(String(r.why)),
+    "and the refusal names both versions, so an operator knows which binary to run", String(r.why));
+  // WHICH refusal. The store is also readable and unheld, so a generic failure
+  // would satisfy the two lines above without the version check existing.
+  check(/Upgrade reeve/.test(String(r.why)) && !/could not restore/.test(String(r.why)),
+    "and it is the version refusal, not an incidental failure", String(r.why));
+  // CONTROL: the same call against a hub at THIS version proceeds, so the
+  // refusal is about the version and not about the fixture or the snapshot.
+  const okPath = join(home, "same-version.db");
+  openHub(okPath).close();
+  const ok2 = restoreHub(snap, okPath, { isAlive: () => false, pid: process.pid, lstart: "me" });
+  check(ok2.ok === true,
+    "control: a hub at this binary's own version restores normally", String(ok2.why));
+}
+
 rmSync(home, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

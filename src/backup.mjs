@@ -652,6 +652,24 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
       locked = true;
 
+      // The SAME refusal again, now that the lock is held. The read above is a
+      // fast, clear message; this is the one that holds under a race, and it is
+      // the same two-check shape `openHub` uses for exactly the same reason.
+      //
+      // Once migration 2 exists, an older restore can read version 1 here, then
+      // wait on this lock while a newer builder takes the singleton and migrates
+      // the hub. If that builder then exits -- cleanly or not -- the holder scan
+      // below finds nothing alive, the restore proceeds, and a version-2 hub is
+      // replaced by a version-1 snapshot. Every check passed; the state is gone.
+      // A pre-lock read cannot close that window, because the window is exactly
+      // the wait for the lock.
+      const lockedVersion = live.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+      if (lockedVersion > HUB_SCHEMA_VERSION)
+        return { ok: false, holders: [],
+                 why: `the live hub was migrated to schema version ${lockedVersion} while this restore ` +
+                      `waited for the maintenance lock; this reeve knows ${HUB_SCHEMA_VERSION}. ` +
+                      `Restoring would replace it with an older store. Upgrade reeve.` };
+
       const holders = [];
       for (const r of live.prepare("SELECT * FROM singleton_lease").all())
         if (isAlive(r.pid, r.lstart)) holders.push({ what: "builder", pid: r.pid, lstart: r.lstart, command: r.command });

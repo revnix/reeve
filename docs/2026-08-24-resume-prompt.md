@@ -143,21 +143,3 @@ ntfy read user; and whether to re-arm.
 Work autonomously, tell me when you need something, and do not claim anything is
 verified that you have not run.
 ```
-
----
-
-## Why the prompt is shaped this way
-
-- **It states no current facts at all**, and says so. Seven review rounds found the
-  same drift, twice inside the fix for it. The rule is now enforced by a test
-  rather than intended.
-- **It leads with verification** and makes the `ps` check non-optional, because the
-  plist/process divergence is invisible to anyone reading files and already bit
-  once.
-- **It carries the traps rather than the conclusions.** The conclusions are in the
-  handoff; the traps are what cost hours.
-- **It names the peers**, because cross-session work found real defects here rather
-  than merely avoiding collisions.
-- **It puts the experiment second, not first**, because the founder should choose —
-  and it states plainly what the recommendation rests on: tests say the fix works
-  and no dispatch has.

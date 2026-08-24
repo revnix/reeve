@@ -63,6 +63,43 @@ for (const cond of [undefined, { include: ["~ALL"] }, { include: ["~ALL"], exclu
   check(/OrganizationAdmin/.test(sig), "and names the actor the caveat depends on", sig);
 }
 
+// Naming the CLASS is not naming the actor. Two entries of the same type render
+// identically unless the id comes with them, and then the caveat tells an operator
+// a bypass exists while withholding the only field that could tell them whose it
+// is. For `Integration` that id is the App id reeve identifies itself by, so this
+// is the difference between a usable diagnostic and a rhetorical one.
+{
+  const two = base({ rules: [{ type: "required_status_checks" }, { type: "required_signatures" }],
+                     bypass_actors: [{ actor_type: "Team", actor_id: 1, bypass_mode: "always" },
+                                     { actor_type: "Team", actor_id: 2, bypass_mode: "always" },
+                                     { actor_type: "Integration", actor_id: 987654, bypass_mode: "always" }] });
+  const r = checkMergeAuthority("o/r", { api: apiFor(two) });
+  const sig = r.lines.filter(l => /signed commits/.test(l)).join(" | ");
+  const allow = r.lines.filter(l => /bypass ALWAYS/.test(l)).join(" | ");
+  for (const [where, line] of [["the signature caveat", sig], ["the bypass line", allow]]) {
+    check(/Team:1/.test(line) && /Team:2/.test(line),
+      `${where} tells two same-type actors apart`, line);
+    check(/Integration:987654/.test(line),
+      `${where} carries the App id, which is how reeve identifies itself`, line);
+  }
+  // Control: the fixture really does contain two actors that are identical apart
+  // from the id. Without this the assertions above pass equally well on a fixture
+  // that never had the ambiguity in it.
+  check(two.bypass_actors.filter(b => b.actor_type === "Team").length === 2,
+    "control: the fixture holds two actors of the same type", JSON.stringify(two.bypass_actors));
+}
+
+// An actor type carrying no id degrades to the bare type. A dangling colon reads
+// as a truncated id, which is worse than saying less.
+{
+  const noId = base({ rules: [{ type: "required_status_checks" }, { type: "required_signatures" }],
+                      bypass_actors: [{ actor_type: "OrganizationAdmin", bypass_mode: "always" }] });
+  const r = checkMergeAuthority("o/r", { api: apiFor(noId) });
+  const sig = r.lines.filter(l => /signed commits/.test(l)).join(" | ");
+  check(/OrganizationAdmin(?!:)/.test(sig) && !/OrganizationAdmin:/.test(sig),
+    "an actor with no id is named without a trailing colon", sig);
+}
+
 // Without one, it stays a flat prediction.
 {
   const noBypass = base({ rules: [{ type: "required_status_checks" }, { type: "required_signatures" }],

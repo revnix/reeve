@@ -295,6 +295,35 @@ stopped reverse-applying while every line was present.
 
 ---
 
+## 12a. Why the resume prompt is shaped the way it is
+
+Design rationale, kept here because this is where rationale belongs and because a
+prompt with prose around it grows facts in that prose. The prompt file is now the
+fenced block and nothing else, and a test enforces that.
+
+- **It states no current facts, and says so.** Ten review rounds found the same
+  drift, twice inside the fix for it. §0 exists so there is exactly one place to
+  correct.
+- **It leads with verification**, and makes the `ps` check non-optional: a
+  plist/process divergence is invisible to anyone reading files, and it already
+  cost a false "done" once.
+- **It carries the traps rather than the conclusions.** Conclusions are in this
+  document. The traps are what cost hours, and they are what a fresh session
+  cannot re-derive.
+- **It names the peers**, because cross-session work has found real defects here
+  rather than merely avoided collisions.
+- **It puts the experiment second, not first.** Which experiment is worth a dollar
+  is the founder's call, not a resumed session's, and the prompt's job is to hand
+  over the choice rather than to pre-empt it. What the recommendation rests on is
+  a comparison between two things that can each move: what the tests say, and what
+  a real dispatch has shown. §0 holds both.
+- **The epilogue that used to live in the prompt file is this section.** It was the
+  tenth place a state claim appeared outside §0, and it appeared there because
+  commentary about a document is exactly where facts about the document collect.
+  Removing the prose removed the surface.
+
+---
+
 ## 12. Open risks
 
 - **The publish fix is UNPROVEN in the field.** 70 test files carry it and zero

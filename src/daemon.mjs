@@ -1165,7 +1165,14 @@ export async function tick(ctx) {
         // override the grant, which is exactly the path that needs checking.
         const tv = (ctx.toolValidator ?? validateToolGrant)(tools, { worktree });
         if (!tv.ok) throw new Error(`tool grant invalid: ${tv.errors.join("; ")}`);
-        const argv = workerArgs({ prompt: spec.prompt, allowedTools: tools, settings: settingsPath, maxTurns });
+        // The disallow list comes from the SANDBOX, never from `spec`. A prompt
+        // spec may widen the allow grant, which is a lane's business; it may not
+        // narrow this one, because these are the tools no lane has a reason to
+        // hold and the whole point is that the refusal does not depend on who
+        // asked. Passed as a flag AND written into the settings file: the flag is
+        // what the CLI acts on, the file is what a reader of the sandbox sees.
+        const argv = workerArgs({ prompt: spec.prompt, allowedTools: tools, settings: settingsPath, maxTurns,
+                                  disallowedTools: sandbox.disallowedTools });
         // The complete argv is kept beside the hash: a hash proves what ran, the
         // file lets a later attempt run the same thing.
         mkdirSync(runDir, { recursive: true });

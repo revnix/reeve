@@ -162,7 +162,7 @@ export function repairMessage(report, decision) {
   return cause ? `${subject}\n\n${cause}` : subject;
 }
 
-function uncommittedFiles(worktree, copiedBaseline = {}) {
+export function uncommittedFiles(worktree, copiedBaseline = {}, { digest = digestOf } = {}) {
   try {
     // Read over EVERYTHING, then subtract what the daemon itself put there.
     //
@@ -178,9 +178,16 @@ function uncommittedFiles(worktree, copiedBaseline = {}) {
     // repair publish. Re-hashed per reported path, so the ordinary tick pays
     // nothing: git mentions almost none of them.
     const baseline = copiedBaseline ?? {};
+    // Memoised, because a path can be reached twice -- once from its status record
+    // and once from the baseline sweep -- and each miss is a synchronous read of
+    // up to MAX_FINGERPRINT_BYTES.
+    const answered = new Map();
     const wasMine = rel => {
+      if (answered.has(rel)) return answered.get(rel);
       const want = baseline[rel];
-      return typeof want === "string" && digestOf(join(worktree, rel)) === want;
+      const mine = typeof want === "string" && digest(join(worktree, rel)) === want;
+      answered.set(rel, mine);
+      return mine;
     };
     // `--untracked-files=all`, because the default COLLAPSES an entirely untracked
     // directory to `node_modules/` while the baseline holds file paths -- so the
@@ -191,25 +198,26 @@ function uncommittedFiles(worktree, copiedBaseline = {}) {
     // `-z` records are NUL-separated and a rename carries its source as the NEXT
     // record, so the walk has to consume it rather than read it as a status line.
     const records = out.split("\0");
-    const left = [];
+    const left = [], reported = new Set();
     for (let i = 0; i < records.length; i++) {
       const rec = records[i];
       if (!rec) continue;
       const xy = rec.slice(0, 2), file = rec.slice(3);
-      if (/[RC]/.test(xy)) { const src = records[++i]; if (src && !wasMine(src)) left.push(src); }
-      if (file && !wasMine(file)) left.push(file);
+      if (/[RC]/.test(xy)) { const src = records[++i]; if (src) { reported.add(src); if (!wasMine(src)) left.push(src); } }
+      if (file) { reported.add(file); if (!wasMine(file)) left.push(file); }
     }
-    // The baseline is walked separately, because DELETING an untracked file
-    // produces no status record at all -- there is nothing left for git to
+    // Only the baseline paths status never MENTIONED, because deleting an
+    // untracked file produces no record at all -- there is nothing left for git to
     // report. A worker that removes a dependency file its fix depended on would
     // otherwise leave the checkout reading clean, and the source half of the
     // repair would publish without it.
     //
-    // Covers the edited case too, so a path reported by status and also in the
-    // baseline is not counted twice.
-    const seen = new Set(left);
+    // Keyed on what status reported rather than on what failed the check: an
+    // untouched baseline file is mentioned by status and passes, so it never
+    // reaches `left`, and keying on `left` would have re-hashed every one of them
+    // after every paid worker run.
     for (const rel of Object.keys(baseline))
-      if (!seen.has(rel) && !wasMine(rel)) left.push(rel);
+      if (!reported.has(rel) && !wasMine(rel)) left.push(rel);
     return left;
   } catch { return null; }
 }

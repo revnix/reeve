@@ -82,7 +82,21 @@ export function completedVersion(path) {
  * All four codes measured against node:sqlite, not read from a table.
  */
 export function isOperational(e) {
-  return e?.errcode === 5 || e?.errcode === 8;
+  // NOT A SQLITE STORAGE ERROR AT ALL. Every failure out of SQLite carries an
+  // `errcode`; an error without one came from reeve's own code -- `assertWritable`
+  // throwing `a restore is in progress` is the case that matters, and routing it
+  // through the damage branch told a concurrent `build run` that its lock tables
+  // had failed and sent it at another forced restore, when the correct answer is
+  // to wait for the one already running.
+  if (e?.errcode === undefined) return true;
+  // Access and contention: the file is untouched and the situation is what
+  // failed. CANTOPEN is the one this list was missing -- a healthy hub the CLI
+  // user simply cannot open answers 14, and was being called corruption.
+  return e.errcode === 3      // SQLITE_PERM
+      || e.errcode === 5      // SQLITE_BUSY
+      || e.errcode === 6      // SQLITE_LOCKED
+      || e.errcode === 8      // SQLITE_READONLY
+      || e.errcode === 14;    // SQLITE_CANTOPEN
 }
 
 export function openHub(path) {
@@ -110,6 +124,17 @@ export function openHub(path) {
     db.exec("PRAGMA synchronous = FULL");   // authority-bearing and low-volume; NORMAL is not inherited
     db.exec("PRAGMA foreign_keys = ON");
     db.exec("PRAGMA busy_timeout = 10000");
+    // AND THE SCHEMA PROBE, inside the same guard. Corruption confined to the
+    // `schema_version` PAGE rather than the header lets all four pragmas
+    // succeed, so the first version read threw outside this catch and `build
+    // run` printed a bare `database disk image is malformed` with none of the
+    // recovery this guard exists to give. The guard has to reach as far as the
+    // first read that can find damage, not stop at the first write.
+    db.exec(`CREATE TABLE IF NOT EXISTS schema_version (
+               version    INTEGER PRIMARY KEY,
+               applied_at INTEGER NOT NULL
+             ) STRICT`);
+    db.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get();
   } catch (e) {
     try { db.close(); } catch { /* the throw below is the answer either way */ }
     // WHICH FAILURE, not merely that one happened. These pragmas WRITE, so they
@@ -141,11 +166,10 @@ export function openHub(path) {
       { cause: e });
   }
 
-  db.exec(`CREATE TABLE IF NOT EXISTS schema_version (
-             version    INTEGER PRIMARY KEY,
-             applied_at INTEGER NOT NULL
-           ) STRICT`);
-
+  // `schema_version` was created and first read INSIDE the guard above, so it
+  // is not repeated here -- two copies of one statement is the duplication this
+  // file keeps having to remove elsewhere.
+  //
   // Read once here only to refuse a NEWER store early with a clear message.
   const seen = db.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get().v;
   // And the history has to be CONTIGUOUS, not merely tall. `max(version)` alone

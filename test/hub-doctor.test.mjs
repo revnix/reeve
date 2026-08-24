@@ -6,7 +6,7 @@
 // It also must not write repo_gate_state. A reporter that can write what it
 // reports can agree with itself, and the row exists precisely so that clause U4
 // reads something the LOOP established.
-import { openHub } from "../src/build/hubdb.mjs";
+import { openHub, isOperational } from "../src/build/hubdb.mjs";
 import { hubFindings, renderHub } from "../src/doctor.mjs";
 // The self-audit block at the end of this task needs all of these. The standard
 // harness supplies only check, dir, join, tmpdir, mkdtempSync and rmSync.
@@ -19,7 +19,7 @@ import { spawnSync } from "node:child_process";   // the CLI drill runs bin/reev
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -742,6 +742,15 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
       `and does not tell the operator to restore over a healthy hub (${label})`, out.slice(0, 300));
     check(/locked|not available|read-only|permissions/.test(out),
       `and names the actual cause (${label})`, out.slice(0, 200));
+    // AND `build status` says UNKNOWN. A status that could not be READ is not a
+    // reading of "not running" -- an exclusive transaction stops the command
+    // before the singleton lease can be consulted, and a live builder's lease
+    // may say otherwise. Asserted on the word, because "not running (… cannot be
+    // read)" also mentions the cause and would satisfy the line above.
+    if (label === "build status")
+      check(/builder: UNKNOWN/.test(out),
+        "and a status that could not be read is reported as UNKNOWN, not as not-running",
+        out.split("\n")[0]);
   }
 
   // AND THE OTHER DIRECTION, which the first version of this got wrong: a
@@ -780,6 +789,115 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     "and told to pass --tail, so the first recovery is not the lossy one", out.slice(0, 320));
   check(!/Do NOT restore/.test(out),
     "and not told the opposite", out.slice(0, 260));
+}
+
+// ── the classifier's edges, and the guard's reach ─────────────────────────
+// The table itself first, because the CLI paths only exercise the codes they
+// happen to produce: measured, forcing an errcode-less error to "damage" left
+// every end-to-end assertion below green, because `build run` catches the
+// restore-in-progress case by name before the classifier is consulted.
+{
+  const cases = [
+    [{ errcode: 3 },  true,  "SQLITE_PERM"],
+    [{ errcode: 5 },  true,  "SQLITE_BUSY"],
+    [{ errcode: 6 },  true,  "SQLITE_LOCKED"],
+    [{ errcode: 8 },  true,  "SQLITE_READONLY"],
+    [{ errcode: 14 }, true,  "SQLITE_CANTOPEN"],
+    [{ errcode: 11 }, false, "SQLITE_CORRUPT"],
+    [{ errcode: 26 }, false, "SQLITE_NOTADB"],
+    [{ errcode: 1 },  false, "SQLITE_ERROR (no such table)"],
+    [{ errcode: 10 }, false, "SQLITE_IOERR — a failing device is not 'the file is fine'"],
+    [new Error("a restore is in progress"), true, "reeve's own refusal, which carries no errcode"],
+  ];
+  const wrong = cases.filter(([e, want]) => isOperational(e) !== want).map(([, , name]) => name);
+  check(wrong.length === 0,
+    "every SQLite code is classified as damage or not on purpose, including CANTOPEN and errcode-less",
+    wrong.join(", "));
+  check(cases.filter(([, w]) => w).length >= 6 && cases.filter(([, w]) => !w).length >= 4,
+    "control: the table covers both answers, so a constant-true or constant-false fails it",
+    `${cases.filter(([, w]) => w).length} operational / ${cases.filter(([, w]) => !w).length} damage`);
+}
+{
+  const eHome = join(dir, "edges-home");
+  mkdirSync(join(eHome, "state"), { recursive: true });
+  const env = { ...process.env, REEVE_HOME: eHome };
+  const run = (...args) => spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+    { encoding: "utf8", env, timeout: 30_000 });
+  const hub = hubPathFor(eHome);
+
+  // 1. CORRUPTION IN THE SCHEMA PAGE, not the header. All four pragmas succeed,
+  // so the first version read threw OUTSIDE the guard and `build run` printed a
+  // bare `database disk image is malformed` with none of the recovery this
+  // guard exists to give. The guard has to reach as far as the first read that
+  // can find damage, not stop at the first write.
+  {
+    rmSync(join(eHome, "state"), { recursive: true, force: true });
+    mkdirSync(join(eHome, "state"), { recursive: true });
+    { const d = openHub(hub); d.close(); }
+    const meta = new DatabaseSync(hub, { readOnly: true });
+    const page = meta.prepare("SELECT pageno FROM dbstat WHERE name='schema_version' ORDER BY pageno LIMIT 1").get();
+    const ps = meta.prepare("PRAGMA page_size").get().page_size;
+    meta.close();
+    check(page != null && page.pageno > 1,
+      "fixture: schema_version lives past the header page", `page ${page?.pageno}`);
+    const buf = readFileSync(hub);
+    buf.fill(0x5a, (page.pageno - 1) * ps, page.pageno * ps);
+    writeFileSync(hub, buf);
+
+    const r = run("build", "run");
+    const out = (r.stdout ?? "") + (r.stderr ?? "");
+    check(r.status !== 0, "a hub corrupt in its schema page refuses", `status=${r.status}`);
+    check(!/^\s+at\s+.*:\d+:\d+\)?$/m.test(out),
+      "and not with a stack trace", out.split("\n").slice(0, 3).join(" | "));
+    check(/restore --hub --force/.test(out),
+      "and IS given the recovery, which it lost by throwing outside the guard", out.slice(0, 260));
+    check(/--tail/.test(out), "including --tail", out.slice(0, 300));
+  }
+
+  // 2. AN EXPECTED REFUSAL IS AN ANSWER, not a storage failure. `assertWritable`
+  // throws `a restore is in progress` deliberately, and that error carries no
+  // SQLite errcode — so it was routed through the damage branch and a normal
+  // concurrent `build run` was told its lock tables had failed and pointed at a
+  // second forced restore. The correct advice is to WAIT.
+  {
+    rmSync(join(eHome, "state"), { recursive: true, force: true });
+    mkdirSync(join(eHome, "state"), { recursive: true });
+    { const d = openHub(hub); d.close(); }
+    // A holder that is genuinely ALIVE: it takes the lock with its OWN pid and
+    // lstart, so reeve's `isSameProcess` agrees it is running. A dead pid is
+    // reaped by `assertWritable` and the refusal never fires — measured, on the
+    // first attempt at this fixture.
+    const holderSrc = join(eHome, "holder.mjs");
+    writeFileSync(holderSrc, `
+import { openHub } from ${JSON.stringify(pathToFileURL(join(ROOT, "src", "build", "hubdb.mjs")).href)};
+import { acquireMaintenanceLock } from ${JSON.stringify(pathToFileURL(join(ROOT, "src", "build", "locks.mjs")).href)};
+import { readStart, isSameProcess } from ${JSON.stringify(pathToFileURL(join(ROOT, "src", "supervisor.mjs")).href)};
+const d = openHub(${JSON.stringify(hub)});
+acquireMaintenanceLock(d, { pid: process.pid, lstart: readStart(process.pid), isAlive: isSameProcess });
+d.close();
+process.stderr.write("held\\n");
+setTimeout(() => {}, 45000);
+`);
+    const holder = spawnSync(process.execPath, ["-e", `
+      const { spawn } = require("node:child_process");
+      const h = spawn(process.execPath, [${JSON.stringify(holderSrc)}], { stdio: ["ignore","ignore","pipe"], detached: true });
+      h.stderr.once("data", () => { console.log(h.pid); h.unref(); process.exit(0); });
+      setTimeout(() => { console.log(h.pid); process.exit(0); }, 8000);
+    `], { encoding: "utf8", timeout: 15_000 });
+    const holderPid = Number((holder.stdout ?? "").trim());
+    try {
+      const r = run("build", "run");
+      const out = (r.stdout ?? "") + (r.stderr ?? "");
+      check(r.status !== 0, "a concurrent build run is refused while a restore holds the lock", `status=${r.status}`);
+      check(/restore is in progress/.test(out), "and told what is holding it", out.slice(0, 200));
+      check(/wait for it to finish/.test(out),
+        "and told to WAIT, which is the only correct action", out.slice(0, 240));
+      check(!/permissions|restore --hub --force/.test(out),
+        "and NOT sent at permissions or a second forced restore", out.slice(0, 300));
+    } finally {
+      if (Number.isFinite(holderPid) && holderPid > 0) { try { process.kill(holderPid, "SIGKILL"); } catch { /* already gone */ } }
+    }
+  }
 }
 
 rmSync(dir, { recursive: true, force: true });

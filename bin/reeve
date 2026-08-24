@@ -1129,7 +1129,14 @@ switch (cmd) {
         // exclusive transaction answered `database is locked` and was handed the
         // corruption recovery -- an instruction to replace it.
         const benign = isOperational(e);
-        console.log(`builder: not running (the hub at ${hubPathFor(HOME)} ${benign ? "is not available" : "cannot be read"})`);
+        // UNKNOWN, not "not running". An exclusive transaction stops this before
+        // the singleton lease can be read, so the command was ANSWERING a
+        // question it had not been able to ask -- and answering it negatively,
+        // while a live builder's lease said otherwise. Absence of a reading is
+        // not a reading of absence.
+        console.log(benign
+          ? `builder: UNKNOWN (the hub at ${hubPathFor(HOME)} could not be read just now)`
+          : `builder: not running (the hub at ${hubPathFor(HOME)} cannot be read)`);
         console.log(`  why      ${String(e.message).split("\n")[0]}`);
         // `--tail` NAMED HERE TOO. Every other recovery line in this change says
         // it, and this one did not -- so an operator with a durable export who
@@ -1235,6 +1242,13 @@ switch (cmd) {
       // hub can answer the version probe with its lock tables gone -- and this
       // catch claimed the hub was fine and told the operator NOT to restore it,
       // which is the one thing that would have recovered it.
+      // A RESTORE IN PROGRESS IS AN ANSWER, not a failure. `assertWritable`
+      // throws it deliberately, and its advice is to WAIT -- not to check
+      // permissions, and certainly not to start a second restore.
+      if (/restore is in progress/.test(String(e.message)))
+        die(`reeve build run: ${e.message}.\n` +
+            `  recover  wait for it to finish and re-run; the hub is read-only until it does.\n` +
+            `           reeve build status shows whether it is still going.`);
       die(isOperational(e)
         ? `reeve build run: could not take the builder lease in ${hubPathFor(HOME)} (${e.message}).\n` +
           `  the hub reads fine, so this is not damage: the file or its directory may be read-only, ` +

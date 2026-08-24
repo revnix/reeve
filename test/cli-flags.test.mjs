@@ -16,6 +16,9 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 // `--home` has to reach the profile destination, which is init's to decide.
 import { profilePath } from "../src/init.mjs";
+// A real hub is what the `--help` side-effect drill needs to observe a write.
+import { openHub } from "../src/build/hubdb.mjs";
+import { hubPathFor } from "../src/paths.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -30,6 +33,33 @@ const run = (...args) => {
     { encoding: "utf8", env: { ...process.env, REEVE_HOME: join(dir, "envhome") } });
   return { status: r.status, out: (r.stdout ?? "") + (r.stderr ?? "") };
 };
+
+// A repository of our own, for the two drills that run `init`.
+//
+// They used to run in THIS checkout, and that made an otherwise valid build
+// fail for reasons unrelated to the parser: a source archive or a clone with no
+// `origin` answers `no git remote named origin` before the assertion is
+// reached, and a developer who has legitimately created `.ops/profile.json`
+// made the side-effect drill fail forever. A fixture removes both -- and it also
+// means `init --write` writes into a directory we made, so the drill has a real
+// observable side effect that cannot touch anyone's work.
+//
+// The remote is NAMED but never fetched from: detection reports what it could
+// not read (an HTTP 404 for the repo) and carries on, and neither assertion is
+// about anything it would have learned.
+const repo = join(dir, "fixture-repo");
+mkdirSync(repo, { recursive: true });
+for (const args of [["init", "-q"],
+                    ["remote", "add", "origin", "https://github.com/octo-example/fixture.git"],
+                    ["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "seed"]])
+  spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+const runIn = (...args) => {
+  const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+    { encoding: "utf8", cwd: repo, env: { ...process.env, REEVE_HOME: join(dir, "envhome") } });
+  return { status: r.status, out: (r.stdout ?? "") + (r.stderr ?? "") };
+};
+check(existsSync(join(repo, ".git")),
+  "control: the init fixture is a git repository of our own", repo);
 
 // ── the registry cannot be missing a flag the code reads ────────────────────
 // This is the control that matters most. A registry that omits a real flag
@@ -227,6 +257,33 @@ const run = (...args) => {
   const bareHelp = run("--help");
   check(bareHelp.status === 0 && /doctor \[owner\/repo\]/.test(bareHelp.out),
     "`reeve --help` with no command prints the usage and exits 0", `status=${bareHelp.status}`);
+
+  // AND A LEADING GLOBAL FLAG DOES NOT SWALLOW THE COMMAND. The first repair
+  // for the line above treated any leading flag as "no command", so
+  // `reeve --home /x backup --hub` left `backup` in the positionals, fell
+  // through to the default, printed the help and exited ZERO -- a backup that
+  // never ran, reporting success. The status is the discriminator: on that
+  // implementation this passes with 0 and no backup.
+  const leadHome = join(dir, "lead-home");
+  mkdirSync(join(leadHome, "state"), { recursive: true });
+  const lead = run("--home", leadHome, "backup", "--hub");
+  const trail = run("backup", "--hub", "--home", leadHome);
+  check(!/doctor \[owner\/repo\]/.test(lead.out),
+    "a global flag BEFORE the command does not turn the command into a positional",
+    lead.out.slice(0, 200));
+  check(lead.status === trail.status && lead.out === trail.out,
+    "and the command behaves identically whichever side the flag is on",
+    `lead(${lead.status}) ${lead.out.slice(0, 90)} | trail(${trail.status}) ${trail.out.slice(0, 90)}`);
+  // CONTROL: that pair is only meaningful if the command actually ran and said
+  // something of its own.
+  check(/there is no hub database/.test(trail.out),
+    "control: and the command really reached its route", trail.out.slice(0, 200));
+
+  // `reeve --home /x` with NO command is still just the help, and still 0.
+  const flagOnly = run("--home", leadHome);
+  check(flagOnly.status === 0 && /doctor \[owner\/repo\]/.test(flagOnly.out),
+    "a global flag with no command prints the usage, like the bare command",
+    `status=${flagOnly.status}`);
 }
 
 // ── the help describes THIS CLI, in both directions ────────────────────────
@@ -264,60 +321,21 @@ const run = (...args) => {
 // ── a repeatable valued flag keeps every occurrence ────────────────────────
 // `--set` used to be read by its own walk over argv, which collected all of
 // them; `opt` returns only the first. Reading it through the one parse had to
-// keep the list, so the SECOND `--set` is the one asserted: if only the first
-// survived, `project.kind` would still be listed as unanswered.
-//
-// `project.kind` is "not detectable", so init asks for it on every run and this
-// discriminates with or without network.
+// keep the list, so the SECOND `--set` is the one asserted: measured in the
+// fixture, answering only `authority.policy` leaves `project.kind` unanswered,
+// so if the second occurrence were dropped this would still be asking for it.
 {
-  const none = run("init");
-  check(/project\.kind/.test(none.out), "control: init asks for project.kind when nothing answers it", none.out.slice(0, 200));
-  const two = run("init", "--set", "authority.policy=owner", "--set", "project.kind=product");
-  check(!/answer:\s+--set project\.kind/.test(two.out),
+  const one = runIn("init", "--set", "authority.policy=propose_only");
+  check(/answer:\s+--set project\.kind/.test(one.out),
+    "control: with one answer given, init is still asking for the other",
+    one.out.slice(0, 300));
+  const two = runIn("init", "--set", "authority.policy=propose_only", "--set", "project.kind=product");
+  check(!/NEEDS AN ANSWER/.test(two.out),
     "the SECOND --set is applied too, so a repeatable flag keeps every occurrence",
     two.out.slice(0, 400));
-}
-
-// ── the home is resolved in ONE place, and every consumer reads it lazily ───
-// `--home` reached only `bin/reeve`'s own constant. `credentialPaths()` denied
-// the root named by the ENVIRONMENT, the canary wrote its decoy under
-// `~/.reeve`, `init` consulted neither, and the App credentials were a
-// module-level constant built from `homedir()` at import time. A canary that
-// measures a decoy the policy has no rule about can report containment CLOSED.
-//
-// The fix makes the flag and the variable one mechanism, which only works if
-// nothing captures the home before `bin/reeve` writes it back. Both halves are
-// asserted: the structural one here, the behavioural one below.
-{
-  const files = [];
-  const walk = d => { for (const e of readdirSync(d, { withFileTypes: true })) {
-    if (e.name === "node_modules" || e.name.startsWith(".")) continue;
-    const p = join(d, e.name);
-    if (e.isDirectory()) walk(p); else if (/\.mjs$/.test(p)) files.push(p);
-  } };
-  walk(join(ROOT, "src"));
-  files.push(join(ROOT, "bin", "reeve"));
-
-  const offenders = [];
-  let scanned = 0;
-  for (const f of files) {
-    if (f.endsWith(join("src", "home.mjs"))) continue;         // the one resolver
-    const code = readFileSync(f, "utf8").split("\n")
-      .filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join("\n");  // comments are not code
-    scanned++;
-    for (const m of code.matchAll(/process\.env\.REEVE_HOME|homedir\(\)\s*,\s*"\.reeve"/g)) {
-      // `bin/reeve` writing the resolved home BACK is the mechanism itself.
-      if (f.endsWith(join("bin", "reeve")) && /process\.env\.REEVE_HOME = HOME/.test(code)
-          && m[0] === "process.env.REEVE_HOME") continue;
-      offenders.push(`${f.slice(ROOT.length + 1)}: ${m[0]}`);
-    }
-  }
-  check(scanned > 15, "control: the scan read the source tree", `${scanned} files`);
-  check(readFileSync(join(ROOT, "src", "home.mjs"), "utf8").includes("process.env.REEVE_HOME"),
-    "control: and it would have matched, because home.mjs itself contains the pattern", "");
-  check(offenders.length === 0,
-    "only src/home.mjs resolves the reeve home; nothing else reads the variable",
-    offenders.join("  |  "));
+  check(/^PLAN /m.test(two.out),
+    "control: and with both answered it produces a plan, so the check above is not passing on an early exit",
+    two.out.split("\n").find(l => l.startsWith("PLAN")) ?? two.out.slice(0, 200));
 }
 
 // ── the write-back is what makes --home reach anything at all ──────────────
@@ -409,23 +427,38 @@ const run = (...args) => {
 }
 
 // ── --help does not run a MUTATING route, observed by its side effect ──────
-// The output test earlier shows restore's message is absent. This one is the
-// file: `reeve init --write` writes `.ops/profile.json` into this repository
-// (it detects as `committed`), so on the broken implementation the file exists
-// afterwards and on the fixed one it does not.
+// The output test earlier shows restore's message is absent. This one is a
+// FILE: `export-events --hub <path>` writes one, so on the broken
+// implementation the path exists afterwards and on the fixed one it does not.
+//
+// `export-events`, not `init --write`. The init drill ran in THIS checkout,
+// which made a developer's legitimate `.ops/profile.json` a permanent test
+// failure -- and moving it to a fixture only traded that for a refusal about
+// `merge.method`, which a fixture's history cannot supply. A control that
+// cannot perform the write proves nothing about `--help` having stopped one.
+// This route needs only a hub, which the test can make.
 {
-  const ops = join(ROOT, ".ops", "profile.json");
-  if (existsSync(ops)) {
-    check(false, "SKIPPED: .ops/profile.json already exists, so its absence proves nothing", ops);
-  } else {
-    const r = run("init", "--set", "project.kind=product", "--set", "authority.policy=propose_only",
-                  "--write", "--help");
-    const wrote = existsSync(ops);
-    if (wrote) rmSync(ops, { force: true });
-    check(!wrote, "`--help` on `init --write` writes no profile", `created ${ops}`);
-    check(r.status === 0 && /not yet built/.test(r.out), "and prints the usage instead", r.out.slice(0, 120));
-    check(!existsSync(ops), "control: and the check cleaned up after itself", ops);
-  }
+  const eHome = join(dir, "helpdrill-home");
+  mkdirSync(join(eHome, "state"), { recursive: true });
+  openHub(hubPathFor(eHome)).close();
+  const runH = (...args) => {
+    const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+      { encoding: "utf8", env: { ...process.env, REEVE_HOME: eHome } });
+    return { status: r.status, out: (r.stdout ?? "") + (r.stderr ?? "") };
+  };
+  const out1 = join(eHome, "helped.jsonl");
+  const helped = runH("export-events", "--hub", out1, "--help");
+  check(!existsSync(out1), "`--help` on a route that writes a file writes nothing", out1);
+  check(helped.status === 0 && /not yet built/.test(helped.out),
+    "and prints the usage instead", helped.out.slice(0, 120));
+
+  // CONTROL: the same command without `--help` DOES write it, so the assertion
+  // above is about `--help` and not about the route being unable to run here.
+  const out2 = join(eHome, "real.jsonl");
+  const real = runH("export-events", "--hub", out2);
+  check(real.status === 0 && existsSync(out2),
+    "control: without --help the same command writes the file",
+    `status=${real.status} ${real.out.slice(0, 160)}`);
 }
 
 rmSync(dir, { recursive: true, force: true });

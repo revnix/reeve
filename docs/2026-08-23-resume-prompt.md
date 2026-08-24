@@ -49,10 +49,15 @@ else.
 1. **The P0 is DECIDED and BUILT — land it, do not re-open it.** The worker
    cannot commit; read `docs/measured/2026-08-23-three-real-dispatches.md`
    Finding 1 for the evidence and both controls. I chose reeve-side staging and
-   committing: the worker keeps read-only git (`git status`, `diff`, `log`,
-   `show`, `clean`) and loses `add`, `commit`, `push` and `remote`. PR #19
-   implements it. Your job is to finish its review rounds and get it merged, not
-   to choose a shape again.
+   committing. The worker keeps git's READ commands (`status`, `diff`, `log`,
+   `show`) and loses `add`, `commit`, `push` and `remote`. It also keeps
+   `git clean`, which is NOT read-only — it deletes untracked files, and with
+   `-d`/`-x` untracked directories and ignored files too. That is deliberate: it
+   is the only way a worker can remove a scratch file it cannot `rm`, and
+   anything it deletes was never committed, so nothing reeve would publish is at
+   risk. Judge that trade rather than assuming the retained set is inert. PR #19
+   implements all of it. Your job is to finish its review rounds and get it
+   merged, not to choose a shape again.
 
    Do NOT assume the diff gate makes the rest free. `reviewDiff`
    (`sandbox.mjs:714-767`) judges PATHS and territory, not whether an allowed edit
@@ -76,8 +81,11 @@ else.
    effective restrictions, which is the only version that reaches all six.
 
 2. **PR #15** (`docs/first-dispatches`, worktree ~/Work/Products/reeve-wt/paths)
-   is open. Work its rounds: reply to AND resolve every thread via GraphQL, cap
-   10 rounds, do not merge. It is documents only.
+   is open and AT its ten-round cap — ten review requests, ten correction pushes,
+   43 findings, every thread answered and resolved. Do NOT request an eleventh.
+   If more findings arrive, read them and bring me a judgement instead of another
+   round. The findings have been narrowing for several rounds, which is the signal
+   the cap exists to act on.
 
 3. **Watch for the first real dispatch on nextly.** It has never dispatched there.
    Mind which table you use for that: `worker_run` only landed on 22 Aug
@@ -187,17 +195,19 @@ Do NOT `git pull` or switch branches in ~/Work/Products/reeve — that is the
 running daemon's checkout. reeve is disarmed, so a restart is less dangerous than
 it was, but the checkout is still live and a half-applied tree is still a bad
 thing to hand a daemon. Restarting after a merge is fine and expected, after verifying the merge by
-CONTENT. Squash merges break SHA ancestry, so compare the PATHS YOU CHANGED
-rather than whole trees — unrelated commits landing on main while your PR is open
-make a whole-tree diff non-empty even on a perfect merge:
+CONTENT. Squash merges break SHA ancestry, and comparing SNAPSHOTS does not
+settle it either — restricting the diff to your paths still reports a difference
+once anything else touches those paths after the squash. Ask whether YOUR PATCH
+is present, which is a question about the change rather than about the tree:
 
   BASE=$(git merge-base origin/main <your-pushed-head>)
-  PATHS=$(git diff --name-only $BASE <your-pushed-head>)
-  git diff origin/main <your-pushed-head> -- $PATHS   # empty == your work landed
+  git diff $BASE <your-pushed-head> | git apply --reverse --check -
+
+  # run from a clean checkout of origin/main; exit 0 means every hunk you
+  # proposed is already there
 
 ## What needs me, so you do not wait on it silently
 
-  - **The P0 fix shape** (task 1) — my call, not yours.
   - R-01: the ruleset lets admins bypass everything and requires no status check.
     Agreed to fix at the end; it is why every gate on nextly is decorative.
   - Capability 3 routing. The outbox EXISTS (src/db/schema.sql:110-130,

@@ -60,6 +60,31 @@ export function completedVersion(path) {
   } catch { return 0; }
 }
 
+/**
+ * Is this SQLite failure the FILE's fault, or the situation's?
+ *
+ * Three catches asked this question and two answered it differently -- one
+ * split BUSY and READONLY out, two called every failure corruption -- which is
+ * the same fact resolved in several places, and it drifted immediately.
+ *
+ * Only codes that are KNOWN to leave the file intact earn "this is not damage":
+ *
+ *   errcode 5  SQLITE_BUSY      another connection holds it
+ *   errcode 8  SQLITE_READONLY  read-only file or directory
+ *
+ * Everything else is treated as damage, and that direction is deliberate. The
+ * "do NOT restore" message is a strong claim; making it only for codes proven
+ * benign is the conservative reading. An unknown code answered as operational
+ * would tell an operator to leave a corrupt hub alone -- `no such table:
+ * maintenance_lock` is errcode 1 and is unambiguously damage. Recovery in the
+ * other direction is guarded by `--force` and quarantines what it replaces.
+ *
+ * All four codes measured against node:sqlite, not read from a table.
+ */
+export function isOperational(e) {
+  return e?.errcode === 5 || e?.errcode === 8;
+}
+
 export function openHub(path) {
   // state/ may not exist yet: on a fresh REEVE_HOME no guardian store has
   // created it, and DatabaseSync will not create a missing parent. Without this
@@ -102,7 +127,7 @@ export function openHub(path) {
     //
     // Same mistake as the maintenance-lock catch: a failed operation is not
     // evidence of a damaged file. Only corruption earns the recovery advice.
-    const corrupt = e.errcode === 26 || e.errcode === 11;
+    const corrupt = !isOperational(e);
     throw new Error(
       corrupt
         ? `the hub at ${path} cannot be read (${e.message}).\n` +

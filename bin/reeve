@@ -44,7 +44,7 @@ import { resolveHome } from "../src/home.mjs";
 // builder migrates a store it is about to be refused from. Task 9 adds the same
 // import for the export/restore routes; whichever lands first owns it.
 import { DatabaseSync } from "node:sqlite";
-import { openHub, HUB_SCHEMA_VERSION, completedVersion } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION, completedVersion, isOperational } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
 import { HEARTBEAT_SECONDS } from "../src/db/ops.mjs";
@@ -1124,15 +1124,26 @@ switch (cmd) {
     } catch (e) {
       try { raw?.close(); } catch { /* the refusal below is the answer either way */ }
       if (sub === "status") {
-        console.log(`builder: not running (the hub at ${hubPathFor(HOME)} cannot be read)`);
+        // WHICH failure, here too. This catch is independent of `openHub`'s and
+        // had no split at all, so a healthy DELETE-journal hub held by an
+        // exclusive transaction answered `database is locked` and was handed the
+        // corruption recovery -- an instruction to replace it.
+        const benign = isOperational(e);
+        console.log(`builder: not running (the hub at ${hubPathFor(HOME)} ${benign ? "is not available" : "cannot be read"})`);
         console.log(`  why      ${String(e.message).split("\n")[0]}`);
         // `--tail` NAMED HERE TOO. Every other recovery line in this change says
         // it, and this one did not -- so an operator with a durable export who
         // followed this exact command would restore the snapshot and silently
         // drop every event after it, on the first recovery they attempt.
-        console.log(`  recover  reeve restore --hub --force installs the newest usable snapshot`);
-        console.log(`           add --tail <file> from a durable export-events --hub to carry`);
-        console.log(`           forward every event after that snapshot; without one they are lost`);
+        if (benign) {
+          console.log(`  recover  the file answered, so this is not damage: stop any running builder or`);
+          console.log(`           reeve CLI and re-run, and check the permissions on the hub and its`);
+          console.log(`           directory. Do NOT restore over it.`);
+        } else {
+          console.log(`  recover  reeve restore --hub --force installs the newest usable snapshot`);
+          console.log(`           add --tail <file> from a durable export-events --hub to carry`);
+          console.log(`           forward every event after that snapshot; without one they are lost`);
+        }
         // EXIT 1, not the `break` the other "not running" cases take. Before this
         // guard the uncaught throw exited 1; catching it and breaking would have
         // turned a loud failure into a quiet success, which is the same
@@ -1220,11 +1231,20 @@ switch (cmd) {
         takeover: flag("takeover"),
       });
     } catch (e) {
-      die(`reeve build run: could not take the builder lease in ${hubPathFor(HOME)} (${e.message}).\n` +
+      // AND HERE. `no such table: maintenance_lock` is errcode 1 -- a version-1
+      // hub can answer the version probe with its lock tables gone -- and this
+      // catch claimed the hub was fine and told the operator NOT to restore it,
+      // which is the one thing that would have recovered it.
+      die(isOperational(e)
+        ? `reeve build run: could not take the builder lease in ${hubPathFor(HOME)} (${e.message}).\n` +
           `  the hub reads fine, so this is not damage: the file or its directory may be read-only, ` +
           `or another process may hold it.\n` +
           `  recover  check the permissions on ${hubPathFor(HOME)} and its directory, and stop any ` +
-          `other builder. Do NOT restore over it.`);
+          `other builder. Do NOT restore over it.`
+        : `reeve build run: the hub at ${hubPathFor(HOME)} could not take the builder lease (${e.message}).\n` +
+          `  the file opens and reports its version, but the tables the lease needs did not answer.\n` +
+          `  recover  reeve restore --hub --force installs the newest usable snapshot; add\n` +
+          `           --tail <file> from a durable export-events --hub to carry history forward`);
     }
     if (!claim.ok) {
       const h = claim.holder;

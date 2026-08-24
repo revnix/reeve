@@ -105,7 +105,11 @@ const sb = sandboxFor({ action: "FIX_CI", profile, worktree: root, tmp: join(roo
   const text = typeof spec === "string" ? spec : (spec?.prompt ?? JSON.stringify(spec));
   for (const tool of ["WebFetch", "Task", "SendMessage"])
     check(text.includes(tool), `the prompt names ${tool} as withheld`, "");
-  check(/no network/i.test(text), "and says plainly that there is no network", "");
+  // No phrase assertion here on purpose. "says plainly there is no network" was
+  // one, and it added nothing the check below does not already make: every
+  // withheld tool is named to the worker, WebFetch and WebSearch among them. A
+  // redundant assertion pinned to wording buys no coverage and goes red the day
+  // someone writes the sentence better, which trains people to loosen guards.
   // The prompt renders FROM the grant. If it were typed out separately the two
   // would drift, which is the defect this file has produced six times.
   const named = NEVER_TOOLS.filter(t => !text.includes(t));

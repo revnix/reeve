@@ -751,6 +751,21 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         catch { quarantined = null; }
       }
       live = openHub(dbPath);
+      // A VERSION-ZERO HUB STILL HAS AN EVENT LOG, and this branch never said so.
+      //
+      // `liveHasEvents` was set only where `rawOpen` classified the store, so a
+      // hub whose `schema_version` was emptied -- a damaged migration marker,
+      // with every table and every row intact -- came through here with the flag
+      // still false. The tail query was skipped, the restore reported success,
+      // and every post-snapshot event went with it. Measured: a version-zero hub
+      // holding one `task.filed` restored with `tail: 0` and the task absent.
+      //
+      // Probed rather than assumed: `openHub` has just run migration 1, so
+      // `hub_event` exists either way, and what matters is whether it can be
+      // READ. On the genuinely absent-hub path it is empty, which is the correct
+      // answer -- there is nothing to carry forward.
+      try { live.prepare("SELECT * FROM hub_event LIMIT 1").get(); liveHasEvents = true; }
+      catch { liveHasEvents = false; }
       // The result is CHECKED here too. Two restores started after a total loss
       // both pass the existsSync above, both race through openHub, and one of
       // them loses the lock -- and an ignored `{ ok: false }` let the loser mark
@@ -932,13 +947,28 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // rather than escaping to the outer catch -- where `--force` cannot reach
       // it, which is the whole failure being repaired.
       const sibling = () => (lockDb ??= openHub(dbPath + ".restore-lock"));
-      let lockTarget = missing.includes("maintenance_lock") ? sibling() : live;
+      const lockTarget = missing.includes("maintenance_lock") ? sibling() : live;
       let got;
       try { got = acquireMaintenanceLock(lockTarget, { pid, lstart, isAlive }); }
-      catch {
-        if (!missing.includes("maintenance_lock")) missing.push("maintenance_lock");
-        lockTarget = sibling();
-        got = acquireMaintenanceLock(lockTarget, { pid, lstart, isAlive });
+      catch (e) {
+        // A FAILED ACQUISITION IS NOT EVIDENCE OF DAMAGE, and my previous
+        // version treated it as such: any throw pushed `maintenance_lock` into
+        // `missing` and moved exclusion to the sibling. `SQLITE_BUSY` leaves the
+        // table perfectly readable -- the attempt failed, the table did not --
+        // and hub writers consult ONLY the canonical table, so that silently
+        // downgraded exclusion to a file nothing else reads. With `force` a
+        // writer could then start after the holder scan and be replaced.
+        //
+        // The classifier already probes this table; damage it establishes sends
+        // the lock to the sibling deliberately, before we get here. A throw it
+        // did NOT predict is anomalous, and the fail-closed answer to an
+        // anomaly is to refuse rather than to proceed with weaker exclusion.
+        return { ok: false, holders: [],
+          why: `could not take the maintenance lock in ${dbPath} (${e.message}). ` +
+               `The lock table was readable when this restore classified the hub, so this is a ` +
+               `busy or transient failure rather than damage -- stop any running builder or reeve ` +
+               `CLI and re-run. Restoring without exclusion in the canonical hub would let a ` +
+               `writer start underneath it.` };
       }
       if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
       locked = true;
@@ -1076,10 +1106,31 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // discarding all of them while exiting 0. Losing history is not implied by
     // losing exclusion, and treating them as one fact threw away the recoverable
     // half.
-    const liveTailRead = suppliedTail == null && live != null && liveHasEvents;
-    const rawTail = suppliedTail ?? (live && liveHasEvents
-      ? live.prepare("SELECT seq, at, kind, task, payload FROM hub_event WHERE seq > ? ORDER BY seq").all(snapSeq)
-      : []);
+    // AND THIS READ REPORTS ITS OWN FAILURE TOO. `hub_event` is the table most
+    // likely to span many leaves -- it is the only one that grows without bound
+    // -- so the probe passing and the full query throwing is likelier here than
+    // anywhere else, and the throw landed in the outer catch as
+    // `could not restore`, where `--force` could not reach it.
+    //
+    // Unlike the lease tables, this failure arrives AFTER the force decision has
+    // been made, so it cannot feed it. The honest handling is therefore to
+    // refuse unless the operator has already accepted a loss: with `force` the
+    // restore proceeds against the snapshot alone and the damaged file is kept.
+    let liveTailRead = suppliedTail == null && live != null && liveHasEvents;
+    let rawTail = suppliedTail ?? [];
+    if (liveTailRead) {
+      try {
+        rawTail = live.prepare("SELECT seq, at, kind, task, payload FROM hub_event WHERE seq > ? ORDER BY seq").all(snapSeq);
+      } catch (e) {
+        liveTailRead = false;
+        if (!force)
+          return { ok: false, holders: [],
+            why: `the hub's event log cannot be read past the first page (${e.message}), so every event ` +
+                 `after seq ${snapSeq} would be lost. Pass --tail from a durable export-events --hub to ` +
+                 `carry them forward, or re-run with force to accept the loss.` };
+        quarantined ??= `${dbPath}.damaged-${Math.floor(Date.now() / 1000)}`;
+      }
+    }
     const tail = rawTail.filter(e => e.seq > snapSeq).sort((a, b) => a.seq - b.seq);
     // A SUPPLIED tail is checked for holes and duplicates before anything is
     // replayed. The live-read tail cannot have either -- it comes straight off

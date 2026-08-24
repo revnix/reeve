@@ -120,7 +120,15 @@ const registryProjects = (home) => {
     // AND BOUNDED. A GitHub login is at most 39 characters, so a 40-character
     // owner cannot name one -- and an impossible name still marked the registry
     // KNOWN, which is the suppression this validation exists to stop.
-    const OWNER = String.raw`[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}`;
+    // A REPETITION BOUND COUNTS REPETITIONS, NOT CHARACTERS. `{0,38}` limits how
+    // many alphanumerics may follow the first, and each of those repetitions may
+    // bring a hyphen with it -- so `Array(39).fill("a").join("-")` is 77
+    // characters and matched the shape rule perfectly. The length has to be
+    // measured over the whole segment, which is what the lookahead does: it
+    // requires a slash within 39 non-slash characters before the shape rule runs
+    // at all. Shape and length are two facts, and one quantifier cannot carry
+    // both.
+    const OWNER = String.raw`(?=[^/]{1,39}/)[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}`;
     const REPO  = String.raw`(?!\.+$)[\w.-]+`;
     const NWO = new RegExp(`^${OWNER}/${REPO}$`);
     const bad = Object.entries(reg)
@@ -1152,6 +1160,24 @@ switch (cmd) {
     // version query, into an answer rather than a crash.
     let raw = null;
     let db;
+    // EVERY READ `build status` NEEDS, TAKEN INSIDE THE GUARD -- not just the
+    // first one.
+    //
+    // Extending the guard through the schema probe closed the case where
+    // corruption sits in the `schema_version` page, and stopped there. A hub
+    // whose `schema_version` page is healthy and whose populated
+    // `singleton_lease` page is not answers the probe, leaves the try, and then
+    // throws `database disk image is malformed` at the lease query -- a raw Node
+    // stack trace from the command an operator runs to find out what is wrong.
+    // Eighth finding of one class, and every previous one was fixed by moving
+    // the guard to the read that had just been discovered.
+    //
+    // So the guard is no longer positioned against a known read: this collects
+    // everything the route reads, and nothing below it touches the database.
+    // Rendering cannot throw a SQLite error because rendering does not query.
+    // A read added here later is inside the guard by construction; one added
+    // below has nothing left to read.
+    let status = null;
     try {
       db = bootstrapping
         ? openHub(hubPathFor(HOME))
@@ -1160,7 +1186,18 @@ switch (cmd) {
             : new DatabaseSync(hubPathFor(HOME), { timeout: 10000 }));
       // The first read is what proves the file answers at all. On the raw path
       // nothing has touched it yet, so this is where a corrupt store surfaces.
-      if (raw) raw.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get();
+      // Its VALUE is kept: `build status` re-read the same version a few lines
+      // later, outside the guard, which is one more read than the route needs
+      // and one the guard did not cover.
+      const probed = raw ? raw.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v : null;
+      if (sub === "status")
+        // The lease is read only when a migration has completed. Below version 1
+        // `singleton_lease` may not exist at all, and asking for it there would
+        // report an unmigrated hub as unreadable -- a different wrong answer.
+        status = { version: probed,
+                   lease: probed >= 1
+                     ? (db.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get() ?? null)
+                     : null };
     } catch (e) {
       try { raw?.close(); } catch { /* the refusal below is the answer either way */ }
       if (sub === "status") {
@@ -1210,7 +1247,7 @@ switch (cmd) {
     if (sub === "status") {
       // Reading a NEWER store is refused, rather than rendering columns this
       // binary does not understand.
-      const v = db.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+      const v = status.version;
       if (v > HUB_SCHEMA_VERSION)
         die(`the hub is at schema version ${v}; this reeve knows ${HUB_SCHEMA_VERSION}. Upgrade reeve.`);
       // And version 0 is refused too. The comment here used to say "reading an
@@ -1232,9 +1269,9 @@ switch (cmd) {
         console.log(`  recover  reeve build run finishes it, or reeve restore --hub --force installs a snapshot`);
         break;
       }
-      // Defined here rather than referenced: an advertised command that throws
-      // ReferenceError is worse than one that does not exist.
-      const row = db.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get();
+      // Read above, under the guard. Querying it here is what put the eighth
+      // readiness finding outside every recovery this route offers.
+      const row = status.lease;
       if (!row) { console.log("builder: not running (no singleton lease)"); break; }
       const alive = isSameProcess(row.pid, row.lstart);
       console.log(`builder: ${alive ? "running" : "LEASE HELD BY A DEAD PROCESS"}`);

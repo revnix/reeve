@@ -192,11 +192,17 @@ export function openHub(path) {
         : kind === "full"
         ? `the hub at ${path} could not be written because the store is full (${e.message}).\n` +
           `  the file itself answered, so this is not damage: it ran out of room.\n` +
-          `  recover  free space on the filesystem holding ${path} and re-run. Old snapshot files ` +
-          `under the backup root are usually the largest thing safe to remove, and they have to be ` +
-          `removed DIRECTLY: reeve backup --hub --keep N writes a whole new snapshot with VACUUM INTO ` +
-          `and prunes only after publishing it, so it needs more room before it frees any. Do NOT ` +
-          `restore over it either, for the same reason, and there is nothing wrong with the file.`
+          `  recover  TWO causes answer 13, and only one of them is the disk.\n` +
+          `           1. the filesystem is full -- free space on the one holding ${path} and re-run.\n` +
+          `              Old snapshot files under the backup root are usually the largest thing safe\n` +
+          `              to remove, and they have to be removed DIRECTLY: reeve backup --hub --keep N\n` +
+          `              writes a whole new snapshot with VACUUM INTO and prunes only after publishing\n` +
+          `              it, so it needs more room before it frees any.\n` +
+          `           2. the database has hit its own page limit -- check PRAGMA max_page_count\n` +
+          `              against PRAGMA page_count; if they meet, no amount of free space helps and\n` +
+          `              the limit is what has to change.\n` +
+          `           Do NOT restore over it in either case: there is nothing wrong with the file, ` +
+          `and a restore needs more room rather than less.`
         : `the hub at ${path} could not be opened for writing (${e.message}).\n` +
           `  the file itself answered, so this is not damage: another process may hold it, or the ` +
           `file or its directory may be read-only.\n` +

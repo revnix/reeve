@@ -262,6 +262,105 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     "an empty finding list says so, rather than rendering a bare header", renderHub([]));
 }
 
+// ── builder doctor with a snapshot present: the path the fresh-home test misses ─
+// The existing CLI drill runs against a home with no hub, so `builder doctor`
+// returns at the H-0 guard before it ever reaches `snapshotFor`. That is the
+// branch where `basename` and `readdirSync` are called -- so an unimported
+// helper there is invisible to every assertion above and appears only on a
+// machine that has actually taken a backup, which is every machine that has run
+// the builder. The absent-hub guard hides it exactly like the DatabaseSync
+// omission it hid before.
+{
+  const home = join(dir, "doctor-live");
+  mkdirSync(join(home, "state"), { recursive: true });
+  const db = openHub(hubPathFor(home));
+  db.close();
+  const env = { ...process.env, REEVE_HOME: home };
+  const run = (args) => spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+    { encoding: "utf8", env });
+
+  const backup = run(["backup", "--hub"]);
+  check(backup.status === 0,
+    "fixture: `reeve backup --hub` takes a snapshot so the doctor has one to read",
+    `${backup.status} ${(backup.stderr || backup.stdout || "").slice(0, 200)}`);
+
+  const doc = run(["builder", "doctor"]);
+  const all = (doc.stdout ?? "") + (doc.stderr ?? "");
+  check(!/ReferenceError/.test(all),
+    "`reeve builder doctor` runs against a hub that HAS a snapshot, without a ReferenceError",
+    all.slice(0, 300));
+  // Name the two helpers, so the failure says which import is missing rather
+  // than only that something threw.
+  check(!/basename is not defined/.test(all), "and `basename` is bound", all.slice(0, 200));
+  check(!/readdirSync is not defined/.test(all), "and `readdirSync` is bound", all.slice(0, 200));
+  check(/H-1|snapshot/i.test(all),
+    "and it reports on the snapshot it found, rather than stopping at the absent-hub guard",
+    all.slice(0, 300));
+}
+
+// ── `backup --hub` must not report success without a hub snapshot ────────────
+// `everyStore` only returns files that exist, so a missing hub is simply absent
+// from the results -- and an exit status computed from "did anything fail"
+// answers 0 for a run that backed up nothing at all. This is the command an
+// operator runs to protect the authority database, including right after
+// deleting it by accident.
+{
+  const home = join(dir, "no-hub-home");
+  mkdirSync(join(home, "state"), { recursive: true });
+  const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), "backup", "--hub"],
+    { encoding: "utf8", env: { ...process.env, REEVE_HOME: home } });
+  const all = (r.stdout ?? "") + (r.stderr ?? "");
+  check(r.status !== 0,
+    "`reeve backup --hub` fails when there is no hub to back up, rather than exiting 0 on an empty result",
+    `status=${r.status} ${all.slice(0, 200)}`);
+  check(/hub/i.test(all),
+    "and says the hub is what was missing", all.slice(0, 200));
+}
+
+// ── a de-registered project's gate-state row, and the trap in suppressing it ─
+// A `repo_gate_state` row outlives the project's entry in projects.json, and a
+// doctor that reports every row keeps failing for a repository the builder no
+// longer manages. But `projects: []` means BOTH "the registry lists nothing" and
+// "the registry could not be read", and filtering on the second would hide every
+// unsafe-authority finding on the machine -- the absence-read-as-success this
+// whole command exists to refuse. So suppression takes positive knowledge.
+{
+  const db = openHub(join(dir, "dereg.db"));
+  const NOW = 1_800_000_000;
+  const row = (id, nwo) => db.exec(
+    `INSERT INTO repo_gate_state(repo_id,nwo_snapshot,ruleset_requires_check,bound_app_id,
+                                 expected_app_id,app_installed,verified_at)
+     VALUES(${id},'${nwo}',0,NULL,42,'fail',${NOW})`);
+  row(1, "o/current");
+  row(2, "o/removed");
+  const args = { root: join(dir, "backups"), now: NOW, snapshotFor: () => null };
+  const idsOf = (f) => f.filter(x => String(x.id).startsWith("H-4")).map(x => x.id).sort();
+
+  // The registry was READ and lists only o/current.
+  const known = hubFindings(db, { ...args, projects: [{ name: "cur", nwo: "o/current" }], projectsKnown: true });
+  check(!idsOf(known).includes("H-4:o/removed"),
+    "a gate-state row for a project the registry no longer lists is not reported",
+    JSON.stringify(idsOf(known)));
+  check(idsOf(known).includes("H-4:o/current"),
+    "control: the row for a project that IS registered is still reported",
+    JSON.stringify(idsOf(known)));
+
+  // The registry could NOT be read. Same rows, same empty-looking project list,
+  // and the opposite answer: report everything.
+  const blind = hubFindings(db, { ...args, projects: [], projectsKnown: false });
+  check(idsOf(blind).includes("H-4:o/removed") && idsOf(blind).includes("H-4:o/current"),
+    "but with the registry unreadable every row is reported, because an empty list is not evidence",
+    JSON.stringify(idsOf(blind)));
+
+  // And the DEFAULT is the safe one. A caller that says nothing gets the noisy
+  // answer, not the silent one.
+  const dflt = hubFindings(db, { ...args, projects: [] });
+  check(idsOf(dflt).length === 2,
+    "control: `projectsKnown` defaults to false, so an unaware caller cannot silently suppress authority findings",
+    JSON.stringify(idsOf(dflt)));
+  db.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

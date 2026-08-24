@@ -945,7 +945,7 @@ export function render({ verdict, checks }, nwo) {
 export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), snapshotFor,
                                   newestCandidate = () => null,
                                   freshMinutes = 60, snapshotMaxHours = 24, offDevice = null,
-                                  projects = [] }) {
+                                  projects = [], projectsKnown = false }) {
   const out = [];
   const snap = snapshotFor("hub");
   if (!snap) {
@@ -1011,7 +1011,20 @@ export function hubFindings(db, { root, now = Math.floor(Date.now() / 1000), sna
       detail: "the builder loop has never recorded one; clause U4 reads UNKNOWN, which is never PASS",
       action: "start the builder and let one tick refresh it" });
   }
+  // Rows for projects the registry no longer lists are DEAD HISTORY, and a
+  // de-registered repository must not keep `builder doctor` failing for ever.
+  //
+  // But suppression requires POSITIVE KNOWLEDGE. `projects` is `[]` both when
+  // the registry legitimately lists nothing and when it could not be read at
+  // all, and filtering on an empty set in the second case would silently hide
+  // every unsafe-authority finding on the machine -- the exact absence-read-as-
+  // success this doctor exists to refuse, committed by the fix for a different
+  // problem. So the caller has to SAY that it knows, and the default is that it
+  // does not: an unreadable registry reports everything and is noisy, which is
+  // the failure direction an authority check should have.
+  const registered = new Set(projects.map(p => p.nwo).filter(Boolean));
   for (const r of have.values()) {
+    if (projectsKnown && !registered.has(r.nwo_snapshot)) continue;
     const stale = now - r.verified_at > freshMinutes * 60;
     const bound = r.ruleset_requires_check === 1 && r.bound_app_id != null && r.bound_app_id === r.expected_app_id;
     const installed = r.app_installed === "pass";

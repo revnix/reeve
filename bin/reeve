@@ -15,8 +15,16 @@ import { readState, render as renderStatus, statusline, why, cleanMergeRate } fr
 import { init } from "../src/init.mjs";
 import { writeDash } from "../src/dash.mjs";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, renameSync, readFileSync, writeFileSync } from "node:fs";
-import { join, dirname, resolve } from "node:path";
+// `readdirSync` is `newestCandidate`'s. Its absence was WORSE than basename's:
+// that path catches its own errors and converts them to null, so an
+// unimported helper silently reported "no newest candidate" instead of
+// throwing -- hiding an invalid newest snapshot rather than announcing it.
+import { existsSync, mkdirSync, renameSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
+// `basename` is `snapshotFor`/`newestCandidate`'s: they read a snapshot's
+// creation time from its `<epoch>.db` FILENAME rather than its mtime, because
+// a copy back from off-device carries a fresh mtime and would report a
+// days-old recovery point as fresh.
+import { join, dirname, resolve, basename } from "node:path";
 // `export-events --hub` writes the manifest digest and `restore --hub --tail`
 // recomputes it over the bytes it read. Both routes live in this file.
 import { createHash } from "node:crypto";
@@ -213,6 +221,18 @@ switch (cmd) {
       // exits non-zero for one teaches an operator to stop reading its output --
       // which is the real cost, because this is the command they run when
       // something has already gone wrong.
+      // The HUB specifically, not "did anything fail". `everyStore` returns only
+      // files that exist, so a missing hub is simply absent from `results` -- and
+      // an exit status computed from failures answers 0 for a run that backed up
+      // nothing at all. This is the command an operator reaches for to protect
+      // the authority database, including in the minutes after deleting it by
+      // accident, and it must not answer "done" then.
+      const hub = results.find(r => r.nwo === "hub");
+      if (!hub)
+        die(`reeve backup --hub: there is no hub database at ${hubPathFor(HOME)}, so nothing was backed up.\n` +
+            `-> reeve build run creates it`);
+      if (!hub.ok && !hub.deferred)
+        die(`reeve backup --hub: the hub snapshot failed: ${hub.why}`);
       process.exit(results.some(r => !r.ok && !r.deferred) ? 1 : 0);
     }
     // ...the existing per-repo backup, unchanged, below.
@@ -551,6 +571,12 @@ switch (cmd) {
                                    // present, so the exact absent-row case this task
                                    // calls unsafe is the one case it cannot see.
                                    projects: registry.projects,       // see registryProjects below
+                                   // Whether the registry was READ, not what it
+                                   // contained. `projects: []` means "none
+                                   // listed" and "could not be read" alike, and
+                                   // only the first is a reason to stop
+                                   // reporting a gate-state row.
+                                   projectsKnown: registry.error == null,
                                    // The NEWEST on-disk candidate is reported
                                    // separately from the one restore would pick.
                                    // `latestSnapshot` skips a candidate that
@@ -709,7 +735,40 @@ switch (cmd) {
     // An absent store has nothing to exclude anyone from and no version to
     // refuse, so it takes the plain path: create it, then claim. The ordering
     // below exists for a store that already carries state.
-    const bootstrapping = sub === "run" && !existsSync(hubPathFor(HOME));
+    // EXISTENCE IS NOT READINESS, and testing the file was the bug.
+    //
+    // `openHub` creates `schema_version` as plain DDL -- committed the moment it
+    // runs -- and only THEN opens the transaction that applies migration 1. A
+    // process killed between those two points leaves a hub file that exists,
+    // carries `schema_version`, records NO version, and has none of the 31
+    // tables. `existsSync` sends that store down the non-bootstrap path, where
+    // `acquireSingleton` queries `singleton_lease` and `maintenance_lock` and
+    // throws `no such table` -- on every subsequent run, for ever, with no way
+    // out but deleting the file by hand. A half-created database is exactly the
+    // state a first run is most likely to be interrupted in.
+    //
+    // The question the branch is really asking is "has any migration COMPLETED",
+    // because that is what decides whether there is anything to exclude anyone
+    // from. An absent file and an interrupted first migration answer it the same
+    // way, and the same reasoning the comment above gives for an absent store
+    // applies unchanged to a store at version 0: nothing to refuse, nothing to
+    // lock, nobody to lock out.
+    const completedVersion = (path) => {
+      if (!existsSync(path)) return 0;
+      try {
+        const q = new DatabaseSync(path, { readOnly: true });
+        // COALESCE, because `schema_version` existing and being EMPTY is the
+        // interrupted case this predicate was added for.
+        try { return q.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get().v; }
+        finally { q.close(); }
+      } catch {
+        // No `schema_version` table, or a file too damaged to read one. Neither
+        // has a completed migration, and `openHub` gives a far better account of
+        // a corrupt store than `no such table: singleton_lease` does.
+        return 0;
+      }
+    };
+    const bootstrapping = sub === "run" && completedVersion(hubPathFor(HOME)) === 0;
     // `openHub` MIGRATES. So `build run` must not call it until it has taken
     // exclusion, and that ordering is the point rather than an implementation
     // detail: once migration 2 exists, a newer `reeve build run` started beside a

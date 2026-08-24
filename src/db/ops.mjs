@@ -221,16 +221,53 @@ export function reap(db, { actor = "daemon", isAlive = () => false } = {}) {
 }
 
 // --------------------------------------------------------------- checkpoint
+/**
+ * Record progress within a run — only while the run still holds its lease.
+ *
+ * Returns `{ ok: false, reason }` and writes NOTHING when it does not. Callers
+ * carry the same contract as `heartbeat`: a false here means another run may
+ * already own this task, and the caller has to stop.
+ *
+ * The guard is the same one `heartbeat` states three functions above, and it is
+ * here because this function used to walk straight around it. `heartbeat`
+ * deliberately refuses to renew a lapsed lease -- "reviving it here would let that
+ * worker finish and publish under a lease that had lapsed" -- and `checkpoint`
+ * then set `lease_expires_at` forward with no status and no expiry check at all.
+ * Measured 2026-08-24: a run 60 seconds past its deadline was refused by
+ * `heartbeat`, checkpointed once, and `heartbeat` reported it alive again.
+ *
+ * That made a documented boundary decorative, and the run's own step and cursor
+ * were written into a record `reap` may already have abandoned and handed on.
+ *
+ * The shape is the one the outbox fence closes, one layer up: matching on `id`
+ * asked "does this row exist", when the fact needed was "do I still own it". An id
+ * is not an identity while a row can be re-leased.
+ */
 export function checkpoint(db, { runId, step, seq, state, actor = "lane" }) {
   return tx(db, () => {
+    // The claim is taken FIRST, so nothing is written on a run this caller has
+    // lost. Doing it the other way round leaves the checkpoint row behind as a
+    // record of progress by a holder that no longer held anything.
+    const held = db.prepare(`
+      UPDATE run SET step=?, cursor=json_patch(cursor, ?), heartbeat_at=unixepoch(),
+             lease_expires_at=unixepoch()+?
+      WHERE id=? AND status IN ('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')
+        AND lease_expires_at > unixepoch()
+      RETURNING id`).get(step, canonical(state), LEASE_SECONDS, runId);
+    if (!held) {
+      const row = db.prepare(`SELECT status, lease_expires_at FROM run WHERE id=?`).get(runId);
+      const reason = !row ? "no-such-run"
+        : row.lease_expires_at <= Math.floor(Date.now() / 1000) ? "lease-expired"
+        : "lease-lost";
+      emit(db, { actor, op: "run.checkpoint.refused", run_id: runId, payload: { step, seq, reason } });
+      return { ok: false, reason };
+    }
     db.prepare(`INSERT INTO checkpoint(run_id,step,seq,state,at)
                 VALUES(?,?,?,?,unixepoch())
                 ON CONFLICT(run_id,step) DO UPDATE SET state=excluded.state, at=excluded.at`)
       .run(runId, step, seq, canonical(state));
-    db.prepare(`UPDATE run SET step=?, cursor=json_patch(cursor, ?), heartbeat_at=unixepoch(),
-                lease_expires_at=unixepoch()+? WHERE id=?`)
-      .run(step, canonical(state), LEASE_SECONDS, runId);
     emit(db, { actor, op: "run.checkpoint", run_id: runId, payload: { step, seq } });
+    return { ok: true };
   });
 }
 

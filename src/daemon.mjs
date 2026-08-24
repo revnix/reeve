@@ -36,9 +36,10 @@ import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, fstatSync, statSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, fstatSync, statSync, readFileSync, writeFileSync, rmSync, openSync, closeSync, readSync, unlinkSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { randomBytes } from "node:crypto";
 import { resolveHome } from "./home.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -162,7 +163,60 @@ export function repairMessage(report, decision) {
   return cause ? `${subject}\n\n${cause}` : subject;
 }
 
-function uncommittedFiles(worktree, copiedBaseline = {}) {
+/**
+ * Which of `wanted` are tracked in `worktree`, without buffering the index.
+ *
+ * `git ls-files -z` writes to a temp file rather than a pipe, so the output size
+ * is the filesystem's problem rather than a subprocess buffer's, and the file is
+ * then read in fixed chunks. Only the record being assembled and the caller's
+ * bounded set are ever in memory, so a repository with any number of tracked
+ * paths is answered the same way -- which is the point, because the alternative
+ * failure mode is not a slow answer but a THROWN one, and this function's caller
+ * reads a throw as "the checkout is unreadable" and holds back a finished repair.
+ *
+ * Returns only the intersection: the caller asked a membership question, and
+ * returning the whole index would put the unbounded thing back in memory one
+ * frame up.
+ */
+function trackedAmong(worktree, wanted) {
+  const found = new Set();
+  const tmp = join(tmpdir(), `reeve-lsfiles-${process.pid}-${randomBytes(6).toString("hex")}`);
+  let fh = null;
+  try {
+    const sink = openSync(tmp, "w");
+    try {
+      execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "ls-files", "-z"],
+                   { stdio: ["ignore", sink, "pipe"], env: gitEnv() });
+    } finally { closeSync(sink); }
+
+    fh = openSync(tmp, "r");
+    const buf = Buffer.allocUnsafe(1 << 16);
+    // A path can straddle a chunk boundary, so the tail of one read is the head of
+    // the next. Kept as a Buffer, not a string: a multi-byte character split
+    // across two reads would be corrupted by decoding each half on its own.
+    let carry = Buffer.alloc(0);
+    for (;;) {
+      const n = readSync(fh, buf, 0, buf.length, null);
+      if (n <= 0) break;
+      let hay = carry.length ? Buffer.concat([carry, buf.subarray(0, n)]) : Buffer.from(buf.subarray(0, n));
+      let from = 0, nul;
+      while ((nul = hay.indexOf(0, from)) !== -1) {
+        const rel = hay.toString("utf8", from, nul);
+        if (rel && wanted.has(rel)) found.add(rel);
+        from = nul + 1;
+      }
+      carry = hay.subarray(from);
+    }
+    // git terminates every record with NUL, so a non-empty carry means the output
+    // was truncated. Nothing is inferred from it.
+    return found;
+  } finally {
+    if (fh !== null) { try { closeSync(fh); } catch {} }
+    try { unlinkSync(tmp); } catch {}
+  }
+}
+
+export function uncommittedFiles(worktree, copiedBaseline = {}, { digest = digestOf } = {}) {
   try {
     // Read over EVERYTHING, then subtract what the daemon itself put there.
     //
@@ -177,27 +231,80 @@ function uncommittedFiles(worktree, copiedBaseline = {}) {
     // a pathname-only baseline subtracted the worker's edit and let an incomplete
     // repair publish. Re-hashed per reported path, so the ordinary tick pays
     // nothing: git mentions almost none of them.
+    const baseline = copiedBaseline ?? {};
+    // Memoised, because a path can be reached twice -- once from its status record
+    // and once from the baseline sweep -- and each miss is a synchronous read of
+    // up to MAX_FINGERPRINT_BYTES.
+    const answered = new Map();
     const wasMine = rel => {
-      const want = copiedBaseline?.[rel];
-      return typeof want === "string" && digestOf(join(worktree, rel)) === want;
+      if (answered.has(rel)) return answered.get(rel);
+      const want = baseline[rel];
+      const mine = typeof want === "string" && digest(join(worktree, rel)) === want;
+      answered.set(rel, mine);
+      return mine;
     };
     // `--untracked-files=all`, because the default COLLAPSES an entirely untracked
     // directory to `node_modules/` while the baseline holds file paths -- so the
     // subtraction missed and every copied tree read as one uncommitted change. The
     // two readings have to agree on granularity or the baseline cannot subtract.
-    const out = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "status", "--porcelain", "--untracked-files=all", "-z"],
-                             { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: gitEnv() });
+    // NOT trimmed: `-z` output is data, and a filename may begin or end with
+    // whitespace. Callers split on NUL and drop the empty tail themselves.
+    const raw = args => execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args],
+                                     { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: gitEnv() });
+    const out = raw(["status", "--porcelain", "--untracked-files=all", "-z"]);
     // `-z` records are NUL-separated and a rename carries its source as the NEXT
     // record, so the walk has to consume it rather than read it as a status line.
     const records = out.split("\0");
-    const left = [];
+    const left = [], reported = new Set();
     for (let i = 0; i < records.length; i++) {
       const rec = records[i];
       if (!rec) continue;
       const xy = rec.slice(0, 2), file = rec.slice(3);
-      if (/[RC]/.test(xy)) { const src = records[++i]; if (src && !wasMine(src)) left.push(src); }
-      if (file && !wasMine(file)) left.push(file);
+      if (/[RC]/.test(xy)) { const src = records[++i]; if (src) { reported.add(src); if (!wasMine(src)) left.push(src); } }
+      if (file) { reported.add(file); if (!wasMine(file)) left.push(file); }
     }
+    // Only the baseline paths status never MENTIONED, because deleting an
+    // untracked file produces no record at all -- there is nothing left for git to
+    // report. A worker that removes a dependency file its fix depended on would
+    // otherwise leave the checkout reading clean, and the source half of the
+    // repair would publish without it.
+    //
+    // Keyed on what status reported rather than on what failed the check: an
+    // untouched baseline file is mentioned by status and passes, so it never
+    // reaches `left`, and keying on `left` would have re-hashed every one of them
+    // after every paid worker run.
+    //
+    // TRACKED baseline paths are excluded, and that is not an exception to the
+    // rule but the same rule read correctly. A worker may legitimately declare a
+    // copied dependency it patched; reeve then force-stages and COMMITS it, after
+    // which status is silent about it for the same reason a deletion is silent --
+    // there is nothing outstanding. Its digest no longer matches the pre-worker
+    // baseline precisely BECAUSE the repair is carried, so flagging it refused
+    // exactly the case the declaration exists to permit. What the gate is looking
+    // for is work the push would LOSE, and a committed file is not that.
+    //
+    // Which baseline paths are TRACKED, decided without ever holding a list whose
+    // size the repository controls.
+    //
+    // Two sizes meet here and only one of them is bounded. Preparation accepts up
+    // to MAX_COPIED_UNTRACKED baseline paths, so naming them as pathspecs put that
+    // many into argv and breached ARG_MAX. Reading the index instead moved the
+    // unbounded side to git's output, where a large enough repository breaches the
+    // subprocess buffer. Both failures land in the same place -- the call throws,
+    // this returns null, and the caller quarantines a repair that was fine -- so
+    // both were the same defect wearing different limits, and swapping one for the
+    // other is not a fix.
+    //
+    // So neither list is held. git streams the index to a file, and it is read
+    // back in fixed-size chunks with only the current record and the bounded
+    // baseline set in memory. There is no constant to tune, no ceiling for a
+    // repository to breach, and the cost is one pass over the index. It stays
+    // synchronous because the publication gate that calls it is.
+    const names = Object.keys(baseline);
+    let tracked = new Set();
+    if (names.length) tracked = trackedAmong(worktree, new Set(names));
+    for (const rel of names)
+      if (!reported.has(rel) && !tracked.has(rel) && !wasMine(rel)) left.push(rel);
     return left;
   } catch { return null; }
 }

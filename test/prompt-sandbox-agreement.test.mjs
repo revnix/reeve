@@ -284,9 +284,14 @@ for (const [name, prof] of Object.entries(PROFILES)) {
   // The landing section points the worker at `git clean` for scratch files it
   // cannot rm. A profile that forbids it -- by the bare name OR by the specific
   // subcommand -- must not be told to run it.
-  if (commandDeniedIn("git clean -f --", prof))
-    check(!/git clean/.test(prompt), `${name}: the worker is not told to run git clean when git is forbidden`,
-          prompt.split("\n").filter(l => /git clean/.test(l)).join(" | ").slice(0, 160));
+  if (commandDeniedIn("git clean -f --", prof)) {
+    // It may appear in the sentence that FORBIDS it -- rule 6 echoes the profile's
+    // own list -- but never in one that offers it. Same distinction the forbidden
+    // commands and the interpreter path already get.
+    const offered = prompt.split("\n").filter(l => /git clean/.test(l) && !/NEVER run|never|do not|cannot/i.test(l));
+    check(offered.length === 0, `${name}: the worker is not told to run git clean when it is forbidden`,
+          offered.join(" | ").slice(0, 160));
+  }
   else
     check(/git clean/.test(prompt), `control: ${name} is told how to remove a scratch file`, "");
 

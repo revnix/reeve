@@ -21,7 +21,7 @@ import { execFileSync } from "node:child_process";
 // `renameSync` is atomic but REPLACES an existing destination -- so two
 // same-second writers would both believe they won.
 import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync, renameSync, openSync, closeSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { open as openStore, exportJsonl } from "./db/ops.mjs";
 // Task 8's subset. `TABLES_AT` and `HUB_TABLES` are what a snapshot's table set
 // is validated against; Task 9 adds the locks, replay and hubEvent imports when
@@ -785,22 +785,44 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
   // operator to repair, and under-refusing replaces a database out from under a
   // live writer.
   const ADMISSION_TABLES = ["singleton_lease", "writer_lease", "provider_lease"];
+  // THREE ANSWERS, because a probe that could not run has not answered.
+  //
+  // `"no"` is what authorises the sibling lock, and it is a strong claim: nobody
+  // can get into this file, so a lock nothing consults is still exclusion. A
+  // catch-all `false` made every failure say that -- and in DELETE journal mode
+  // an exclusive transaction blocks READERS, so a live writer holding the store
+  // is precisely the case that answered "nobody can enter". A forced restore then
+  // replaced the database underneath the writer whose presence caused the probe
+  // to fail. The same shape `rawOpen` already had to learn one layer up.
+  //
+  //   "yes"     -- an admission path answered; a writer can still get in
+  //   "no"      -- a DEFINITIVE schema failure; no path can admit anyone
+  //   "unknown" -- the probe itself was blocked or refused; nothing is known
   const writersCanEnter = (handle) => {
     const ask = (d) => {
       // `assertWritable` is the gate EVERY path passes through, so a store that
-      // cannot answer it admits nobody, whatever the lease tables say.
+      // definitively cannot answer it admits nobody, whatever the lease tables
+      // say. Its own errcode-less throw -- `a restore is in progress` -- means
+      // the read SUCCEEDED, which is the answer being sought.
       try { assertWritable(d, { isAlive: () => true }); }
-      catch (e) { if (e?.errcode !== undefined) return false; }
-      return ADMISSION_TABLES.some(t => {
-        try { d.prepare(`SELECT * FROM ${t} LIMIT 1`).get(); return true; }
-        catch { return false; }
-      });
+      catch (e) {
+        if (e?.errcode !== undefined) return isOperational(e) ? "unknown" : "no";
+      }
+      let blocked = false;
+      for (const t of ADMISSION_TABLES) {
+        try { d.prepare(`SELECT * FROM ${t} LIMIT 1`).get(); return "yes"; }
+        catch (e) { if (isOperational(e)) blocked = true; }
+      }
+      // Every path failed. If ANY of them failed for a reason that is not the
+      // file's fault, the set was never fully examined.
+      return blocked ? "unknown" : "no";
     };
     if (handle) return ask(handle);
     let d = null;
-    try { d = new DatabaseSync(dbPath, { readOnly: true }); return ask(d); }
-    catch { return false; }
-    finally { try { d?.close(); } catch {} }
+    try { d = new DatabaseSync(dbPath, { readOnly: true }); }
+    catch (e) { return isOperational(e) ? "unknown" : "no"; }
+    try { return ask(d); }
+    finally { try { d.close(); } catch {} }
   };
   const siblingLock = (why) => {
     if (!force) return { ok: false, holders: [], why };
@@ -919,6 +941,13 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // SQLite database, so `openHub` goes on to initialise it exactly as before.
       if (bootstrapCanonical) synthetic = false;
       else {
+        // THE PARENT FIRST. `openHub` is what normally creates `state/`, and this
+        // mint now runs BEFORE it -- so on a fresh home, or after the total loss
+        // this path exists to recover from, the exclusive open answered ENOENT
+        // and a valid snapshot came back as `could not restore`. Creating the
+        // directory changes nothing about the claim: `wx` is exclusive on the
+        // FILE, and a directory that already exists is not an error.
+        mkdirSync(dirname(dbPath), { recursive: true });
         try { closeSync(openSync(dbPath, "wx")); synthetic = true; }
         catch (e) {
           // EEXIST means somebody won the race. The file is theirs, this restore
@@ -1056,13 +1085,20 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // and `isAlive` says yes so the reaping DELETE is never reached: this is a
       // question about reads, and a write here would fail for its own reasons.
       if (canonicalFault) {
-        if (writersCanEnter(null)) {
+        // ONLY a definitive "no" authorises the sibling lock. "unknown" is not a
+        // quieter "no": it is the state in which replacing the file is exactly
+        // as dangerous as it is when a writer is provably there.
+        const entry = writersCanEnter(null);
+        if (entry !== "no") {
           synthetic = false;
           return { ok: false, holders: [],
-            why: `the hub at ${dbPath} cannot serve a restore lock (${canonicalFault.message}), but a ` +
-                 `builder can still start in it -- the tables it reads still answer. There is no way to ` +
-                 `exclude one from this file, so replacing it could leave a live builder writing to a ` +
-                 `database with no name.\n` +
+            why: `the hub at ${dbPath} cannot serve a restore lock (${canonicalFault.message}), and ` +
+                 (entry === "yes"
+                   ? `a builder can still start in it -- the tables it reads still answer.`
+                   : `whether one can still start in it could not be determined: the probe itself was ` +
+                     `blocked or refused, which is what a live writer holding the store looks like.`) +
+                 ` There is no way to exclude a writer from this file, so replacing it could leave one ` +
+                 `writing to a database with no name.\n` +
                  `  recover  stop the builder and any reeve CLI, then repair or remove ${dbPath} by ` +
                  `hand and re-run; reeve restore --hub --force installs the snapshot into a hub that ` +
                  `is absent.` };
@@ -1416,7 +1452,10 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // `maintenance_lock`; a writer also has to read `singleton_lease`, and a
         // store where that one is unreadable admits nobody -- so the shared
         // predicate is both the honest question and the stricter one.
-        const writersCanStillRead = damaged && writersCanEnter(live);
+        // Anything but a definitive "no" refuses. An operational probe failure
+        // here means the same thing it means on the fallback path: the question
+        // was not answered, and a sibling lock is only exclusion when it is.
+        const writersCanStillRead = damaged && writersCanEnter(live) !== "no";
         if (damaged && writersCanStillRead) {
           return { ok: false, holders: [],
             why: `the hub's maintenance_lock at ${dbPath} is damaged in a way this restore cannot write ` +

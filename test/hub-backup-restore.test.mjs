@@ -13,10 +13,17 @@ import { openHub, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
 import { hubPathFor } from "../src/paths.mjs";
 import { DatabaseSync } from "node:sqlite";
 // `statSync` reads the inode, which is what tells `link` and `rename` apart.
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
+// `chmodSync` is the atomic-export drill's: a read-only destination directory
+// is how a write failure is arranged where it cannot happen by accident.
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readdirSync, statSync, chmodSync } from "node:fs";
 import { spawnSync } from "node:child_process";   // the CLI drill runs bin/reeve
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+// The repository root, from THIS FILE rather than from the working directory.
+// `spawnSync(..., ["bin/reeve"])` below resolved against cwd, so the drill ran
+// whatever `bin/reeve` the caller happened to be standing next to -- or none.
+const ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..");
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -956,7 +963,7 @@ function writeAuthority(db, project) {
   mkdirSync(join(home2, "state"), { recursive: true });
   const hub = hubPathFor(home2);
   openHub(hub).close();
-  const runCli = (args) => spawnSync(process.execPath, ["bin/reeve", ...args],
+  const runCli = (args) => spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
     { encoding: "utf8", env: { ...process.env, REEVE_HOME: home2 } });
 
   const bk = runCli(["backup", "--hub"]);
@@ -1171,6 +1178,185 @@ function writeAuthority(db, project) {
   // otherwise be replayed into the restored database on its next open.
   check(!existsSync(p + "-wal") && !existsSync(p + "-shm"),
     "control: the stale sidecars are gone from the canonical path, so nothing replays them into the restore");
+}
+
+// ── a durable tail is published, never overwritten in place ────────────────
+// `export-events --hub` used `writeFileSync`, which TRUNCATES the destination
+// before writing a byte. Refreshing an existing tail therefore destroyed the
+// last valid one first: a kill or a full disk left a partial file with no
+// manifest, and a later restore permanently lost every post-snapshot event that
+// tail was protecting. It is the file an operator reaches for after losing the
+// hub, so it is the last file in the system that may be replaced in place.
+{
+  const eHome = mkdtempSync(join(tmpdir(), "reeve-export-"));
+  mkdirSync(join(eHome, "state"), { recursive: true });
+  openHub(hubPathFor(eHome)).close();
+  const env = { ...process.env, REEVE_HOME: eHome };
+  const runCli = (...args) => spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+    { encoding: "utf8", env });
+
+  const dest = join(eHome, "tail.jsonl");
+  const first = runCli("export-events", "--hub", dest);
+  check(first.status === 0 && existsSync(dest),
+    "fixture: a first export writes the tail", (first.stdout + first.stderr).slice(0, 160));
+  const before = readFileSync(dest);
+  check(before.length > 0 && /_manifest/.test(String(before)),
+    "fixture: and it carries the manifest footer, so 'still valid' below means something",
+    String(before).slice(-80));
+  check(readdirSync(eHome).filter(f => f.includes(".tmp-")).length === 0,
+    "a successful export leaves no temp file beside the tail", readdirSync(eHome).join(" "));
+
+  // THE INODE is the discriminator for the publish mechanism, and the only one
+  // that holds. A truncating writer rewrites the destination in place and keeps
+  // its inode; a temp-then-rename publish replaces the directory entry, so the
+  // inode CHANGES. Measured: the failure-path assertions below cannot carry this
+  // on their own -- a read-only directory stops the temp file from being
+  // created, but an in-place `writeFileSync` on an existing writable file
+  // succeeds regardless, so under that stub the "previous tail survives" check
+  // passes because nothing failed at all.
+  const inoBefore = statSync(dest).ino;
+  const second = runCli("export-events", "--hub", dest);
+  check(second.status === 0, "fixture: a second export over the same path succeeds",
+    (second.stdout + second.stderr).slice(0, 160));
+  check(statSync(dest).ino !== inoBefore,
+    "a refreshed tail is PUBLISHED over the old one, never written into it",
+    `ino ${inoBefore} -> ${statSync(dest).ino}`);
+
+  // The failure is arranged where it cannot be arranged by accident: the
+  // destination's DIRECTORY is read-only, so creating the temp file fails.
+  //
+  // NOT established here: that a write failing PART WAY leaves the old tail
+  // whole. That needs a full disk or a failing device, and neither can be
+  // arranged from a test. What is established is that the failure path never
+  // opens the destination at all, which is the property that makes the
+  // part-way case safe -- and the inode assertion above is what proves the
+  // successful path does not open it either.
+  const roDir = join(eHome, "ro");
+  mkdirSync(roDir, { recursive: true });
+  const roDest = join(roDir, "tail.jsonl");
+  writeFileSync(roDest, before);
+  const roBefore = readFileSync(roDest);
+  chmodSync(roDir, 0o500);
+  const failed = runCli("export-events", "--hub", roDest);
+  chmodSync(roDir, 0o700);
+  check(failed.status !== 0, "an export that cannot be written refuses",
+    (failed.stdout + failed.stderr).slice(0, 200));
+  check(/the previous export is untouched/.test(failed.stdout + failed.stderr),
+    "and says so, rather than leaving the operator to check", (failed.stdout + failed.stderr).slice(0, 240));
+  // The BYTES. A length comparison passes on a file rewritten to the same size,
+  // and truncate-then-fail is exactly the case being excluded.
+  check(readFileSync(roDest).equals(roBefore),
+    "and the previous tail survives the failure, byte for byte",
+    `${readFileSync(roDest).length} vs ${roBefore.length}`);
+  check(readdirSync(roDir).filter(f => f.includes(".tmp-")).length === 0,
+    "and the temp file is reaped rather than left beside it", readdirSync(roDir).join(" "));
+  rmSync(eHome, { recursive: true, force: true });
+}
+
+// ── a replayed key is validated BEFORE the delete branch ───────────────────
+// The guard sat below the `h.delete` branch, so a `territory_lease.released`
+// image with an incomplete key never reached it. Two distinct failures:
+// an ABSENT column bound as `undefined` and aborted the restore with `Provided
+// value cannot be bound to SQLite parameter 1` -- the opaque message the guard
+// exists to replace; and a NULL one matched no row (`x = NULL` is never true in
+// SQL), was still counted as `applied`, and appended the release event anyway,
+// leaving the restored projection holding a lease its own log says was released.
+//
+// The guard WAS tested -- on the upsert path, via `pr_hold.created` above --
+// which is why this survived: the covered path was the one that reached it.
+{
+  const rHome = mkdtempSync(join(tmpdir(), "reeve-replay-"));
+  mkdirSync(join(rHome, "state"), { recursive: true });
+  const db = openHub(hubPathFor(rHome));
+
+  // The REAL columns. My first fixture invented `granted_at` and used a `kind`
+  // the CHECK forbids, so it could not have replayed at all -- and `task` is a
+  // NOT NULL foreign key, so the lease needs a task to point at.
+  db.prepare(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,source_kind,source_key,
+                          repo_path,profile_path,profile_hash,default_branch,visibility,
+                          registry_version,created_at,updated_at)
+              VALUES('bt:1','o/r',1,'o/r','t','FILED','founder','k',
+                     '/r','/p.json','h','main','private',1,1,1)`).run();
+  const grant = { project: "o/r", kind: "prefix", path: "src/**", task: "bt:1", expires_at: 9, pinned_until: null };
+  // `at` and `task` too: replayHub re-appends each event into hub_event, whose
+  // columns are NOT NULL, so an event shaped only for the handler cannot replay.
+  const ev = (kind, payload, seq) => ({ seq, at: seq, task: null, kind, payload: JSON.stringify(payload) });
+
+  // CONTROL FIRST: a complete pair replays, so the refusals below are about the
+  // key and not about the fixture being unreplayable.
+  const okRun = replayHub(db, [ev("territory_lease.granted", grant, 1),
+                               ev("territory_lease.released", { project: "o/r", kind: "prefix", path: "src/**" }, 2)]);
+  check(okRun.applied === 2,
+    "control: a grant and a well-keyed release both replay", JSON.stringify(okRun));
+  check(db.prepare("SELECT count(*) c FROM territory_lease").get().c === 0,
+    "control: and the release actually removed the row", "");
+
+  db.prepare("INSERT INTO territory_lease(project,kind,path,task,expires_at) VALUES(?,?,?,?,?)")
+    .run(grant.project, grant.kind, grant.path, grant.task, grant.expires_at);
+
+  let why = null;
+  try { replayHub(db, [ev("territory_lease.released", { project: "o/r", kind: "prefix" }, 3)]); }
+  catch (e) { why = e.message; }
+  check(why != null && /missing or null in the key column\(s\) path/.test(why),
+    "a delete whose image omits a key column is refused BY NAME, not by SQLite's binder", String(why));
+  check(why != null && !/cannot be bound to SQLite parameter/.test(why),
+    "and not with the opaque binder message the guard exists to replace", String(why));
+
+  let nullWhy = null;
+  try { replayHub(db, [ev("territory_lease.released", { project: "o/r", kind: "prefix", path: null }, 4)]); }
+  catch (e) { nullWhy = e.message; }
+  check(nullWhy != null && /missing or null in the key column\(s\) path/.test(nullWhy),
+    "a key serialised as null is refused too, because `x = NULL` matches nothing", String(nullWhy));
+  check(db.prepare("SELECT count(*) c FROM territory_lease").get().c === 1,
+    "and the lease it claimed to release is still there, so nothing was counted as applied", "");
+
+  db.close();
+  rmSync(rHome, { recursive: true, force: true });
+}
+
+// ── a failed synthetic restore removes the file before it releases the lock ─
+// The lock that keeps a builder out lives INSIDE the synthetic hub. Releasing
+// it first opens a window in which a `reeve build run` starting in that instant
+// opens the file, finds no maintenance lock, takes the singleton lease, and then
+// has the file removed underneath it -- writing to an unnamed inode while the
+// canonical path is absent.
+//
+// NOT TESTED, and it cannot be from here: the window itself has no deterministic
+// seam. `restoreHub` exposes no hook between the release and the unlink, and
+// racing a real builder against it would assert a timing, not a property. So the
+// ORDER is asserted from the source, with controls that both anchors were found,
+// and the outcome is asserted for real below.
+{
+  const src = readFileSync(join(ROOT, "src", "backup.mjs"), "utf8");
+  const drop = src.indexOf(`for (const ext of ["", "-wal", "-shm"]) { try { rmSync(dbPath + ext, { force: true }); } catch {} }`);
+  const release = src.indexOf(`if (locked && live)   { try { releaseMaintenanceLock(live,`);
+  check(drop > 0, "control: the synthetic unlink was found in the source", String(drop));
+  check(release > 0, "control: and the maintenance-lock release was found", String(release));
+  check(drop > 0 && release > 0 && drop < release,
+    "the synthetic hub is removed while the restore still holds exclusion, before any release",
+    `unlink at ${drop}, release at ${release}`);
+}
+{
+  // And the outcome, for real: an absent hub plus a tail that fails at replay.
+  const sHome = mkdtempSync(join(tmpdir(), "reeve-synth-"));
+  mkdirSync(join(sHome, "state"), { recursive: true });
+  const src = openHub(hubPathFor(sHome));
+  src.close();
+  const snapRoot = join(sHome, "backups");
+  const good = snapshot(openHub(hubPathFor(sHome)), snapRoot, "hub");
+  check(good.ok, "fixture: a hub snapshot exists to restore from", JSON.stringify(good));
+
+  const target = join(sHome, "state", "gone.db");
+  check(!existsSync(target), "fixture: and the destination hub is absent, so the restore is synthetic", target);
+  const badTail = Object.assign(
+    [{ seq: 1, at: 1, kind: "territory_lease.released", payload: JSON.stringify({ project: "o/r", kind: "prefix" }) }],
+    { manifest: null, sha256: null });
+  const r = restoreHub(good.path, target, { isAlive: () => false, pid: process.pid, lstart: "L", force: true, tail: badTail });
+  check(!r.ok, "a synthetic restore that fails at replay reports failure", JSON.stringify(r));
+  check(!existsSync(target) && !existsSync(target + "-wal") && !existsSync(target + "-shm"),
+    "and leaves no half-made hub at the canonical path, sidecars included",
+    `${existsSync(target)} ${existsSync(target + "-wal")} ${existsSync(target + "-shm")}`);
+  rmSync(sHome, { recursive: true, force: true });
 }
 
 rmSync(home, { recursive: true, force: true });

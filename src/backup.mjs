@@ -1071,6 +1071,32 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // forever -- and because that lock sits at a CANONICAL path, every later
     // attempt then refuses with "another restore is running", naming a pid that
     // exited long ago.
+    // THE SYNTHETIC HUB GOES FIRST, while this restore still has exclusion.
+    //
+    // The lock that keeps a builder out lives INSIDE the synthetic file. Releasing
+    // it before the unlink opens a window in which a `reeve build run` starting
+    // in that instant opens the file, finds no maintenance lock, takes the
+    // singleton lease -- and then has the file removed underneath it. On POSIX it
+    // goes on writing to an inode with no name while the canonical hub path is
+    // absent, so the next builder creates a fresh hub there and both halves report
+    // success. That is the same split brain the copy-then-rename above exists to
+    // prevent, arriving through the failure path instead.
+    //
+    // (`acquireSingleton` refuses rather than blocks, so the process that loses is
+    // a builder that STARTS in the window, not one waiting in it. The ordering
+    // closes both readings: a fresh opener finds either the file with the lock
+    // held, or no file at all.)
+    //
+    // Its lock goes with it, and is not released: releasing a lock in a database
+    // that no longer exists is not a release, it is a write to a ghost. This is
+    // the remaining half of the synthetic problem -- the two-restore loser was
+    // fixed by `synthetic = false`; this is the failure-path ordering.
+    const dropSynthetic = synthetic && !swapped;
+    if (dropSynthetic) {
+      try { live?.close(); } catch {}
+      live = null;
+      for (const ext of ["", "-wal", "-shm"]) { try { rmSync(dbPath + ext, { force: true }); } catch {} }
+    }
     if (locked && live)   { try { releaseMaintenanceLock(live,   { pid, lstart }); } catch {} }
     if (locked && lockDb) { try { releaseMaintenanceLock(lockDb, { pid, lstart }); } catch {} }
     try { live?.close(); } catch {}
@@ -1080,12 +1106,6 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // there was one, and discarded either way so a healthy restore leaves no
     // litter beside the hub.
     for (const [, aside] of preservedSidecars) { try { rmSync(aside, { force: true }); } catch {} }
-    // The synthetic hub goes with the failure that stranded it. Only when it was
-    // synthetic AND the swap never happened: a successful restore replaced it,
-    // and a real pre-existing hub is never this function's to delete.
-    if (synthetic && !swapped) {
-      for (const ext of ["", "-wal", "-shm"]) { try { rmSync(dbPath + ext, { force: true }); } catch {} }
-    }
     // The quarantine is a COPY, made one step before the swap, so a failure
     // before that point never created one and there is nothing to undo. A
     // failure AFTER it means the swap succeeded, and the copy is the evidence an

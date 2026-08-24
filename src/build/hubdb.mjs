@@ -11,7 +11,7 @@
 // versioned instead: a numbered, forward-only list, each step in its own
 // transaction, and a store recorded above this binary's version does not open.
 import { DatabaseSync } from "node:sqlite";
-import { readFileSync, mkdirSync } from "node:fs";
+import { readFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { canonical } from "../db/ops.mjs";
 // `migrationPlan` hashes each migration's `up` so the freeze test has a stable,
@@ -32,6 +32,33 @@ export const HUB_SCHEMA_VERSION = 1;
 const MIGRATIONS = [
   { version: 1, up: (db) => db.exec(readFileSync(SCHEMA_PATH, "utf8")) },
 ];
+
+/**
+ * The highest COMPLETED migration for a hub, or 0.
+ *
+ * `openHub` commits `schema_version` as plain DDL BEFORE migration 1's
+ * transaction, so an interrupted first run leaves a file that opens, answers
+ * the version query with 0, and has none of the 31 tables. Existence is not
+ * readiness, and neither is openability.
+ *
+ * This has now been the shape of FIVE findings -- `build run`, `restoreHub`,
+ * `build status`, `builder doctor` and `export-events` -- because each site
+ * asked the question for itself and the sweep matched where the pattern was
+ * remembered rather than everywhere the invariant holds. There is one reader
+ * now. Absent, unreadable, and interrupted all answer 0: none of them has a
+ * completed migration, and `openHub` gives a far better account of a corrupt
+ * store than `no such table: singleton_lease` does.
+ */
+export function completedVersion(path) {
+  if (!existsSync(path)) return 0;
+  try {
+    const q = new DatabaseSync(path, { readOnly: true });
+    // COALESCE, because `schema_version` existing and being EMPTY is the
+    // interrupted case this predicate was added for.
+    try { return q.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get().v; }
+    finally { q.close(); }
+  } catch { return 0; }
+}
 
 export function openHub(path) {
   // state/ may not exist yet: on a fresh REEVE_HOME no guardian store has

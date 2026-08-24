@@ -27,6 +27,8 @@
 import { latestSnapshot, everyStore, snapshotCandidates } from "./backup.mjs";
 import { statSync, existsSync } from "node:fs";
 import { hubPathFor } from "./paths.mjs";
+// `join` is the missing-hub check's: the backup root defaults to <home>/backups.
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 export const OK = "OK";
@@ -231,6 +233,27 @@ export function selfAudit(db, opts = {}) {
       findings.push({ id: "hub.integrity", level: BROKEN,
                       why: "reeve's hub database fails its integrity check",
                       detail: `${hub}: ${integrity}` });
+  } else if (hub) {
+    // A hub that is GONE is not a hub that never existed, and `existsSync` alone
+    // cannot tell them apart -- so the total-loss case produced NO finding at
+    // all, from the audit that runs on every guardian tick. `everyStore`
+    // enumerates only files that exist, so the same tick snapshotted every
+    // repository store and said nothing about the missing authority database.
+    // The CLI half was closed (`backup --hub` refuses without a hub result);
+    // this is the automatic half.
+    //
+    // The evidence that it existed is ON DISK: a retained hub snapshot. Positive
+    // knowledge, not an assumption -- no snapshots means the builder has
+    // genuinely never run, which is not a fault and must not be reported as one.
+    // (Same rule as `projectsKnown`: suppression requires knowing, not guessing.)
+    const root = backupRoot ?? (home ? join(home, "backups") : null);
+    let priorSnapshots = 0;
+    if (root) { try { priorSnapshots = snapshotCandidates(root, "hub").length; } catch { priorSnapshots = 0; } }
+    if (priorSnapshots > 0)
+      findings.push({ id: "hub.missing", level: BROKEN,
+                      why: "reeve's hub database is gone",
+                      detail: `${hub} does not exist, and ${priorSnapshots} retained snapshot(s) under ${root} show it did; ` +
+                              `reeve restore --hub installs the newest usable one` });
   }
 
   const rank = { [BROKEN]: 0, [DEGRADED]: 1, [OK]: 2 };

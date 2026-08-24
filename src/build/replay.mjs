@@ -156,6 +156,27 @@ export function replayHub(db, events) {
       // is not part of the projection. Counted, never guessed at.
       if (!h) { skipped++; continue; }
       const row = JSON.parse(e.payload);
+      // THE KEY GUARD RUNS FIRST, above the delete branch.
+      //
+      // It sat below, so a `territory_lease.released` image with an incomplete
+      // key never reached it: an absent column was bound as `undefined` and
+      // aborted the restore with `Provided value cannot be bound to SQLite
+      // parameter 1` -- the opaque message this guard exists to replace, at the
+      // worst moment in the system to be handed one.
+      //
+      // `== null` catches null as well as undefined, and null is the more
+      // dangerous of the two: every key column here is a primary key, `x = NULL`
+      // is never true in SQL, so a delete keyed on one matched NOTHING, was
+      // counted as `applied`, and appended the release event anyway -- leaving
+      // the restored projection holding a lease its own log says was released.
+      // A key that cannot identify a row is not a key.
+      const badKey = h.key.filter(k => row[k] == null);
+      if (badKey.length)
+        throw new Error(
+          `hub_event seq ${e.seq} of kind ${e.kind} cannot be replayed into ${h.table}: its row image is ` +
+          `missing or null in the key column(s) ${badKey.join(", ")}. The image carries ${Object.keys(row).join(", ")}. ` +
+          `A row image must be the row AS WRITTEN, read back after the insert -- an autoincrement id is ` +
+          `assigned by SQLite and is not in the values the writer supplied.`);
       if (h.delete) {
         db.prepare(`DELETE FROM ${h.table} WHERE ${h.key.map(k => `${k}=?`).join(" AND ")}`).run(...h.key.map(k => row[k]));
         applied++; continue;
@@ -186,13 +207,6 @@ export function replayHub(db, events) {
       // merge_decision, outbox), so a writer that emits its image from the
       // values it passed IN, rather than reading the row back, produces exactly
       // this and only at replay time -- long after the write looked fine.
-      const missingKey = h.key.filter(k => row[k] === undefined);
-      if (missingKey.length)
-        throw new Error(
-          `hub_event seq ${e.seq} of kind ${e.kind} cannot be replayed into ${h.table}: its row image is ` +
-          `missing the key column(s) ${missingKey.join(", ")}. The image carries ${Object.keys(row).join(", ")}. ` +
-          `A row image must be the row AS WRITTEN, read back after the insert -- an autoincrement id is ` +
-          `assigned by SQLite and is not in the values the writer supplied.`);
       const exists = db.prepare(`SELECT 1 FROM ${h.table} WHERE ${where}`).get(...keyVals);
       if (exists) {
         // No columns beyond the key means the image says nothing to change --

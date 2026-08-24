@@ -19,7 +19,12 @@ import { execFileSync } from "node:child_process";
 // that path catches its own errors and converts them to null, so an
 // unimported helper silently reported "no newest candidate" instead of
 // throwing -- hiding an invalid newest snapshot rather than announcing it.
-import { existsSync, mkdirSync, renameSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
+// `openSync`/`writeSync`/`fsyncSync`/`closeSync` and `rmSync` are
+// `export-events`': a durable tail is published temp-then-rename, and a rename
+// over a file whose bytes are still only in the page cache publishes a name for
+// content that a power loss can take away.
+import { existsSync, mkdirSync, renameSync, readFileSync, writeFileSync, readdirSync,
+         openSync, writeSync, fsyncSync, closeSync, rmSync } from "node:fs";
 // `basename` is `snapshotFor`/`newestCandidate`'s: they read a snapshot's
 // creation time from its `<epoch>.db` FILENAME rather than its mtime, because
 // a copy back from off-device carries a fresh mtime and would report a
@@ -38,7 +43,7 @@ import { homedir } from "node:os";
 // builder migrates a store it is about to be refused from. Task 9 adds the same
 // import for the export/restore routes; whichever lands first owns it.
 import { DatabaseSync } from "node:sqlite";
-import { openHub, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION, completedVersion } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
 import { HEARTBEAT_SECONDS } from "../src/db/ops.mjs";
@@ -281,6 +286,16 @@ switch (cmd) {
     // RAW and read-only, not openHub: exporting is a read, and openHub would
     // MIGRATE the very database the operator is trying to get history out of --
     // quite possibly the one they are exporting because they do not trust it.
+    // The FIFTH site of the version-zero class, and one the review round did
+    // not name -- found by running every hub route against an interrupted store
+    // rather than by fixing the site that was reported. `hub_event` does not
+    // exist at version 0, so this died with an uncaught `no such table` on the
+    // one command an operator runs to rescue history from a hub they no longer
+    // trust.
+    if (completedVersion(hubPathFor(HOME)) < 1)
+      die(`reeve export-events --hub: the hub's first migration never completed, so it holds no event log\n` +
+          `  hub      ${hubPathFor(HOME)}\n` +
+          `  recover  reeve build run finishes it, or reeve restore --hub --force installs a snapshot`);
     const db = new DatabaseSync(hubPathFor(HOME), { readOnly: true });
     const rows = db.prepare("SELECT seq,at,kind,task,payload FROM hub_event ORDER BY seq").all();
     // The FOOTER, appended last, is the whole truncation detector -- and an
@@ -300,7 +315,34 @@ switch (cmd) {
     // Body first, footer last, one write. Order is the point: a copy that is cut
     // short loses the footer before it loses any event, which is what turns
     // "the file ends here" into a claim that can be false.
-    writeFileSync(out, body + JSON.stringify({ _manifest: manifest }) + "\n");
+    //
+    // And published TEMP-THEN-RENAME. `writeFileSync` truncates the destination
+    // before it writes a byte, so refreshing an existing tail destroyed the last
+    // valid one FIRST: a kill or a full disk then left a partial file with no
+    // manifest, and a later restore permanently lost every post-snapshot event
+    // that tail was protecting. The file this command exists to produce is the
+    // one an operator reaches for after losing the hub, so it is the last file
+    // in the system that may be replaced in place.
+    //
+    // Same directory, so the rename is within one filesystem and therefore
+    // atomic; unique by pid, so two exports to one path cannot share a temp.
+    // `fsync` before the rename because a rename is atomic with respect to the
+    // NAME, not to the bytes: without it a crash can publish a name for content
+    // that never reached the disk.
+    const tmp = `${out}.tmp-${process.pid}`;
+    try {
+      const fd = openSync(tmp, "w");
+      try {
+        writeSync(fd, body + JSON.stringify({ _manifest: manifest }) + "\n");
+        fsyncSync(fd);
+      } finally { closeSync(fd); }
+      renameSync(tmp, out);
+    } catch (e) {
+      // The previous tail is still whole -- that is the point of the temp file --
+      // so the refusal says so rather than leaving the operator to guess.
+      try { rmSync(tmp, { force: true }); } catch {}
+      die(`reeve export-events --hub: could not write ${out} (${e.message}); the previous export is untouched`);
+    }
     console.log(`exported ${rows.length} hub events to ${out}`);
     break;
   }
@@ -573,6 +615,17 @@ switch (cmd) {
         console.log(flag("json") ? JSON.stringify(stale, null, 2) : renderHub(stale));
         process.exit(1);
       }
+      // And BELOW, which this route did not ask. `hubFindings` queries
+      // `repo_gate_state` immediately, so an interrupted first migration made
+      // the one command an operator runs to find out what is wrong answer with
+      // an uncaught `no such table` stack trace instead of a finding.
+      if (v < 1) {
+        const half = [{ id: "H-0", severity: "fail", classification: "configuration",
+          title: "the hub's first migration never completed", detail: `${p}: schema_version records no completed migration`,
+          action: "reeve build run finishes it, or reeve restore --hub --force installs a snapshot" }];
+        console.log(flag("json") ? JSON.stringify(half, null, 2) : renderHub(half));
+        process.exit(1);
+      }
     }
     // Read ONCE, and its failure is carried rather than swallowed. H-7 below is
     // what stops an unreadable registry from reading as an empty one.
@@ -771,21 +824,9 @@ switch (cmd) {
     // way, and the same reasoning the comment above gives for an absent store
     // applies unchanged to a store at version 0: nothing to refuse, nothing to
     // lock, nobody to lock out.
-    const completedVersion = (path) => {
-      if (!existsSync(path)) return 0;
-      try {
-        const q = new DatabaseSync(path, { readOnly: true });
-        // COALESCE, because `schema_version` existing and being EMPTY is the
-        // interrupted case this predicate was added for.
-        try { return q.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get().v; }
-        finally { q.close(); }
-      } catch {
-        // No `schema_version` table, or a file too damaged to read one. Neither
-        // has a completed migration, and `openHub` gives a far better account of
-        // a corrupt store than `no such table: singleton_lease` does.
-        return 0;
-      }
-    };
+    // `completedVersion` is imported now rather than defined here. Four other
+    // routes needed the same question and each answered it for itself; the two
+    // that never asked it are why this is the fifth finding of one shape.
     const bootstrapping = sub === "run" && completedVersion(hubPathFor(HOME)) === 0;
     // `openHub` MIGRATES. So `build run` must not call it until it has taken
     // exclusion, and that ordering is the point rather than an implementation

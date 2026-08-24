@@ -14,7 +14,7 @@ import { selfAudit, BROKEN } from "../src/selfaudit.mjs";
 import { open as openStore } from "../src/db/ops.mjs";
 import { hubPathFor } from "../src/paths.mjs";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, openSync, writeSync, closeSync } from "node:fs";
+import { mkdirSync, openSync, writeSync, closeSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";   // the CLI drill runs bin/reeve
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -413,6 +413,84 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     "and says what is wrong in words", out.slice(0, 200));
   check(/recover/.test(out),
     "and tells the operator what to do next", out.slice(0, 240));
+}
+
+// ── EVERY hub route survives an interrupted first migration ────────────────
+// `openHub` commits `schema_version` as plain DDL BEFORE migration 1's
+// transaction, so a store can exist, open, answer the version query with 0, and
+// have none of the 31 tables. Existence is not readiness, and neither is
+// openability.
+//
+// This has been the shape of FIVE findings. `build run`, `restoreHub` and
+// `build status` were each fixed on their own; `builder doctor` was reported as
+// the fourth; and running every hub route against a version-0 store -- rather
+// than fixing the one that was named -- turned up `export-events --hub` as the
+// fifth, dying with an uncaught `no such table: hub_event` on the command an
+// operator reaches for when they no longer trust the hub.
+//
+// So the assertion is the INVARIANT, over the routes, rather than one more
+// site: no hub route may answer an interrupted store with a stack trace.
+{
+  const home = join(dir, "v0-home");
+  mkdirSync(join(home, "state"), { recursive: true });
+  const env = { ...process.env, REEVE_HOME: home };
+  const run = (...args) => spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+    { encoding: "utf8", env });
+
+  // A store in exactly the state an interrupted first run leaves: schema_version
+  // created and committed, EMPTY, and no other table.
+  const hub = hubPathFor(home);
+  {
+    const d = new DatabaseSync(hub);
+    d.exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT`);
+    d.close();
+  }
+  // POSITIVE CONTROL: the fixture really is version 0 and really is openable --
+  // otherwise every route below refuses it for being absent or corrupt and the
+  // sweep proves nothing about this state.
+  {
+    const d = new DatabaseSync(hub, { readOnly: true });
+    const v = d.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+    const tables = d.prepare("SELECT count(*) c FROM sqlite_master WHERE type='table'").get().c;
+    d.close();
+    check(v === 0 && tables === 1,
+      "fixture: the hub opens, records no completed migration, and has only schema_version",
+      `version=${v} tables=${tables}`);
+  }
+
+  const ROUTES = [
+    ["builder", "doctor"],
+    ["builder", "doctor", "--json"],
+    ["build", "status"],
+    ["export-events", "--hub", join(home, "tail.jsonl")],
+    ["backup", "--hub"],
+    ["restore", "--hub"],
+  ];
+  check(ROUTES.length >= 6, "control: the sweep covers every route that opens the hub", `${ROUTES.length} routes`);
+  const crashed = [];
+  for (const args of ROUTES) {
+    const r = run(...args);
+    const out = (r.stdout ?? "") + (r.stderr ?? "");
+    // A stack trace, by its own shape: node prints `    at ` frames, and the
+    // missing-table message is the specific one this class produces.
+    if (/no such table|^\s+at .*\(.*:\d+:\d+\)$/m.test(out)) crashed.push(`${args.join(" ")}: ${out.split("\n").find(l => /no such table|Error/.test(l)) ?? ""}`);
+  }
+  check(crashed.length === 0,
+    "no hub route answers an interrupted first migration with a stack trace",
+    crashed.join("  |  "));
+
+  // And the two that were fixed here say what to do, rather than only refusing.
+  const doc = run("builder", "doctor");
+  check(/first migration never completed/.test(doc.stdout + doc.stderr) &&
+        /reeve build run finishes it/.test(doc.stdout + doc.stderr),
+    "`builder doctor` reports it as an H-0 finding with a recovery",
+    (doc.stdout + doc.stderr).slice(0, 240));
+  const exp = run("export-events", "--hub", join(home, "tail.jsonl"));
+  check(exp.status !== 0 && /holds no event log/.test(exp.stdout + exp.stderr),
+    "`export-events --hub` refuses instead of querying a table that does not exist",
+    (exp.stdout + exp.stderr).slice(0, 240));
+  check(!existsSync(join(home, "tail.jsonl")),
+    "and writes no file, so a refused export cannot be mistaken for an empty history", "");
 }
 
 rmSync(dir, { recursive: true, force: true });

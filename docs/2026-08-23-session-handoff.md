@@ -41,9 +41,9 @@ section needs one, it says "see §0" rather than repeating it.
 
 ## 0a. The one-paragraph truth
 
-**reeve is disarmed and the reason it was disarmed is fixed** (state: §0).
-`--execute` came off the plist on 23 Aug because the worker could not commit;
-that defect is merged. `worker.isolation` remains `scratch-home`.
+**§0 has whether reeve is armed and what has landed.** What does not change: it
+was disarmed on 23 Aug because the worker could not commit, and `worker.isolation`
+is `scratch-home`.
 
 When it is re-armed, eligible will be narrower than red: a missing required check,
 an inherited-only failure, one reeve cannot name, one already at cap, and a

@@ -193,8 +193,11 @@ export function uncommittedFiles(worktree, copiedBaseline = {}, { digest = diges
     // directory to `node_modules/` while the baseline holds file paths -- so the
     // subtraction missed and every copied tree read as one uncommitted change. The
     // two readings have to agree on granularity or the baseline cannot subtract.
-    const out = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "status", "--porcelain", "--untracked-files=all", "-z"],
-                             { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: gitEnv() });
+    // NOT trimmed: `-z` output is data, and a filename may begin or end with
+    // whitespace. Callers split on NUL and drop the empty tail themselves.
+    const raw = args => execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args],
+                                     { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: gitEnv() });
+    const out = raw(["status", "--porcelain", "--untracked-files=all", "-z"]);
     // `-z` records are NUL-separated and a rename carries its source as the NEXT
     // record, so the walk has to consume it rather than read it as a status line.
     const records = out.split("\0");
@@ -216,8 +219,23 @@ export function uncommittedFiles(worktree, copiedBaseline = {}, { digest = diges
     // untouched baseline file is mentioned by status and passes, so it never
     // reaches `left`, and keying on `left` would have re-hashed every one of them
     // after every paid worker run.
-    for (const rel of Object.keys(baseline))
-      if (!reported.has(rel) && !wasMine(rel)) left.push(rel);
+    //
+    // TRACKED baseline paths are excluded, and that is not an exception to the
+    // rule but the same rule read correctly. A worker may legitimately declare a
+    // copied dependency it patched; reeve then force-stages and COMMITS it, after
+    // which status is silent about it for the same reason a deletion is silent --
+    // there is nothing outstanding. Its digest no longer matches the pre-worker
+    // baseline precisely BECAUSE the repair is carried, so flagging it refused
+    // exactly the case the declaration exists to permit. What the gate is looking
+    // for is work the push would LOSE, and a committed file is not that.
+    const names = Object.keys(baseline);
+    let tracked = new Set();
+    if (names.length) {
+      const known = raw(["ls-files", "-z", "--", ...names]);
+      tracked = new Set(known ? known.split("\0").filter(Boolean) : []);
+    }
+    for (const rel of names)
+      if (!reported.has(rel) && !tracked.has(rel) && !wasMine(rel)) left.push(rel);
     return left;
   } catch { return null; }
 }

@@ -172,6 +172,57 @@ const baseline = Object.fromEntries(copied.map(rel => [rel, "SAME"]));
     `${absent.length} of ${argv.length} unreported, e.g. ${absent[0]}`);
 }
 
+// --- an index larger than one read, with paths across the boundaries ----------
+{
+  // The tracked check reads git's index in fixed 64 KiB chunks, so a path can be
+  // split across two reads and a multi-byte character can be split inside a path.
+  // Decoding each half on its own would corrupt the name, and a corrupted name
+  // fails the membership test silently -- the file reads as untracked, which the
+  // gate then reports as work the push would lose. It refuses a good repair and
+  // says nothing about why.
+  //
+  // So the fixture is deliberately several chunks long and carries names that
+  // cannot survive a naive split: multi-byte characters, and a name with spaces at
+  // both ends (a middle space proves nothing -- only the ends are at risk).
+  const big = mkdtempSync(join(tmpdir(), "reeve-chunk-"));
+  const gb = (...a) => execFileSync("git", ["-C", big, ...a], { encoding: "utf8" }).trim();
+  gb("init", "-q", "-b", "f");
+  mkdirSync(join(big, "deep"), { recursive: true });
+  const made = [];
+  for (let i = 0; i < 400; i++) {
+    const flavour = i % 10 === 0 ? "日本語-café-Ω" : "plain";
+    const pad = "p".repeat(150);
+    const rel = `deep/${String(i).padStart(4, "0")}-${flavour}-${pad}.js`;
+    writeFileSync(join(big, rel), "x\n");
+    made.push(rel);
+  }
+  const spaced = "deep/ leading and trailing .js";
+  writeFileSync(join(big, spaced), "x\n");
+  made.push(spaced);
+  gb("add", "-A");
+  gb("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "a large index");
+
+  // Control: the index really is bigger than one read, or the boundary case the
+  // block exists for never occurs and every assertion below passes for free.
+  const indexBytes = Buffer.byteLength(
+    execFileSync("git", ["-C", big, "ls-files", "-z"], { encoding: "buffer", maxBuffer: 1 << 28 }).toString("binary"), "binary");
+  check(indexBytes > 65536, "control: the index spans more than one 64 KiB read",
+    `${indexBytes} bytes`);
+  check(made.some(r => /[^\x00-\x7F]/.test(r)), "control: and carries multi-byte names", "");
+
+  // Every one of these is TRACKED and its digest deliberately does NOT match the
+  // baseline, so `tracked` is the only thing that can keep it out of the report.
+  // If the chunked reader mangles or drops a name, that name lands in `left`.
+  const baselineBig = Object.fromEntries(made.map(r => [r, "A-DIGEST-THAT-WILL-NOT-MATCH"]));
+  const left = uncommittedFiles(big, baselineBig, { digest: () => "SOMETHING-ELSE" });
+  check(left !== null, "an index spanning many reads is decided, not quarantined", "returned null");
+  const wrongly = (left ?? []).filter(r => baselineBig[r] !== undefined);
+  check(wrongly.length === 0,
+    "every tracked path is recognised across chunk boundaries and multi-byte splits",
+    `${wrongly.length} lost, e.g. ${JSON.stringify(wrongly[0])}`);
+  rmSync(big, { recursive: true, force: true });
+}
+
 // --- an unreadable checkout fails closed -------------------------------------
 {
   const gone = join(root, "does-not-exist");

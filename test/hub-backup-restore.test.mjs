@@ -2188,6 +2188,135 @@ function writeAuthority(db, project) {
   rmSync(vHome, { recursive: true, force: true });
 }
 
+// ── damage that arrives BEFORE the code that would have seen it ───────────
+{
+  const nHome = mkdtempSync(join(tmpdir(), "reeve-r9-"));
+  mkdirSync(join(nHome, "state"), { recursive: true });
+  const src = openHub(join(nHome, "state", "src.db"));
+  const snapN = snapshot(src, join(nHome, "backups"), "hub");
+  src.close();
+  const zero = (t) => { const z = new DatabaseSync(t); z.exec("DELETE FROM schema_version"); z.close(); };
+
+  // 1. A DROPPED EVENT LOG, on a version-zero hub. `openHub` runs migration 1
+  // BEFORE the probe and recreates `hub_event` empty, so the probe reported it
+  // readable and the restore proceeded with no force at all — replacing the
+  // post-snapshot projection rows while treating their lost events as an empty
+  // tail. The question is whether the log was there when we ARRIVED, and only a
+  // read taken before the migration can answer it.
+  {
+    const t = join(nHome, "state", "droppedlog.db");
+    const d = openHub(t); d.exec("DROP TABLE hub_event"); d.close();
+    zero(t);
+    const bare = restoreHub(snapN.path, t, { isAlive: () => false, pid: process.pid, lstart: "me" });
+    check(!bare.ok, "a version-zero hub whose event log was DROPPED is not restored silently",
+      JSON.stringify(bare).slice(0, 160));
+    check(/event log cannot be read/.test(String(bare.why)),
+      "and the refusal is about the loss", String(bare.why).slice(0, 200));
+    const forced = restoreHub(snapN.path, t, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+    check(forced.ok, "and force accepts it", JSON.stringify(forced).slice(0, 140));
+
+    // CONTROL: a version-zero hub that HAS its log still restores without force,
+    // so the refusal is about the missing table rather than about version zero.
+    const ok = join(nHome, "state", "haslog.db");
+    { const d2 = openHub(ok); d2.close(); }
+    zero(ok);
+    const fine = restoreHub(snapN.path, ok, { isAlive: () => false, pid: process.pid, lstart: "me" });
+    check(fine.ok, "control: a version-zero hub with its log intact needs no force",
+      JSON.stringify(fine).slice(0, 160));
+  }
+
+  // 2. A LOCK TABLE THAT READS BUT DOES NOT WORK. `SELECT *` succeeds on a
+  // `maintenance_lock` recreated without its `name` column, so the classifier
+  // calls it readable and `acquireMaintenanceLock` throws `no such column` —
+  // errcode 1, still there on every retry. Refusing that as "busy" locked
+  // `--force` out of the one state it exists for.
+  {
+    const t = join(nHome, "state", "badlock.db");
+    const d = openHub(t);
+    d.exec("DROP TABLE maintenance_lock");
+    d.exec("CREATE TABLE maintenance_lock (wrong TEXT) STRICT");
+    d.close();
+    // CONTROL: the fixture really does read and really does fail to work.
+    { const q = new DatabaseSync(t, { readOnly: true });
+      let reads = false, works = true;
+      try { q.prepare("SELECT * FROM maintenance_lock LIMIT 1").get(); reads = true; } catch { /* asserted */ }
+      try { q.prepare("SELECT name FROM maintenance_lock LIMIT 1").get(); } catch { works = false; }
+      q.close();
+      check(reads && !works, "fixture: the lock table reads but has no `name` column", `reads=${reads} works=${works}`); }
+
+    const r = restoreHub(snapN.path, t, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+    check(r.ok, "a structurally damaged lock table is recovered under force, not called transient",
+      JSON.stringify(r).slice(0, 200));
+    check(/\.damaged-/.test(String(r.quarantined)),
+      "and the file is quarantined as damage", String(r.quarantined));
+  }
+
+  // 3. A FAILED RESTORE LEAVES NO EMPTY RESERVATION. `quarantineName` opens `wx`
+  // to prove the name free, which creates a zero-byte file; a restore that then
+  // fails before the copy left it behind looking like forensic evidence and
+  // holding none.
+  {
+    // An UNREADABLE hub, not a version-zero one. The version-zero path COPIES
+    // into its quarantine immediately, so the reservation is never unpopulated
+    // there and the fixture proved nothing: measured, removing the reap left it
+    // green. The unreadable path names the quarantine at classification and
+    // copies one step before the swap, so a failure in between is exactly the
+    // window that leaves an empty file behind.
+    const t = join(nHome, "state", "reserve.db");
+    writeFileSync(t, "this is not a database");
+    const bad = Object.assign([{ seq: 1, at: 1, kind: "x", task: null, payload: "{}" }],
+                              { manifest: null, sha256: null });
+    const r = restoreHub(snapN.path, t, { isAlive: () => false, pid: process.pid, lstart: "me", force: true, tail: bad });
+    check(!r.ok, "fixture: the restore fails after a quarantine name is reserved", JSON.stringify(r).slice(0, 140));
+    const left = readdirSync(join(nHome, "state"))
+      .filter(f => f.startsWith("reserve.db.") && /\.(corrupt|damaged|incomplete)-/.test(f));
+    const empty = left.filter(f => { try { return statSync(join(nHome, "state", f)).size === 0; } catch { return false; } });
+    check(empty.length === 0,
+      "and leaves no zero-byte quarantine pretending to be evidence", empty.join(" ") || "(none)");
+    // CONTROL, and it needs its own fixture: this restore fails BEFORE the copy,
+    // so there is no populated quarantine here to survive. A restore that gets
+    // far enough to copy one must still keep it — otherwise the reap could
+    // simply delete everything and satisfy the assertion above.
+    {
+      const kept = join(nHome, "state", "kept.db");
+      { const d = openHub(kept); d.exec("DROP TABLE writer_lease"); d.close(); }
+      const okr = restoreHub(snapN.path, kept, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+      check(okr.ok && okr.quarantined && existsSync(okr.quarantined),
+        "control: a quarantine that WAS populated survives the reap",
+        `${okr.ok} ${okr.quarantined}`);
+      check(okr.quarantined && statSync(okr.quarantined).size > 0,
+        "and it has the database in it, rather than being the empty reservation",
+        `${okr.quarantined && statSync(okr.quarantined).size} bytes`);
+    }
+  }
+
+  // 4. THE LOCKED VERSION RECHECK on the creation branch.
+  //
+  // NOT TESTED behaviourally, and it cannot be while HUB_SCHEMA_VERSION is 1:
+  // the window is a newer binary migrating the hub between `openHub` and the
+  // lock, and `openHub` itself can only reach version 1, so `after` can never
+  // exceed this binary's version. The guard exists for the moment migration 2
+  // does, which is exactly when it stops being possible to add safely.
+  //
+  // So it is asserted from the source, with a control that both anchors were
+  // found and that the recheck comes BEFORE the branch commits to replacing.
+  {
+    const src2 = readFileSync(join(ROOT, "src", "backup.mjs"), "utf8");
+    const branch = src2.indexOf("bornHolders.push({ what: r.owner");
+    // The CONDITION, not the message. Asserting on the refusal text left the
+    // string in place when the guard itself was stubbed out — measured, the
+    // stub passed. What must exist is the comparison.
+    const recheck = src2.indexOf("if (after > HUB_SCHEMA_VERSION)", branch);
+    const swap = src2.indexOf("renameSync(staging, dbPath)", branch);
+    check(branch > 0 && swap > 0, "control: the creation branch and the swap were found in the source",
+      `${branch} ${swap}`);
+    check(recheck > 0 && recheck < swap,
+      "the creation branch rechecks the schema version before it replaces anything",
+      `recheck ${recheck}, swap ${swap}`);
+  }
+  rmSync(nHome, { recursive: true, force: true });
+}
+
 rmSync(home, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

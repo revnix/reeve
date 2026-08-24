@@ -519,6 +519,50 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   rmSync(`${wtB}.unfetched`, { recursive: true, force: true });
 }
 
+// --- a DELETED file reeve copied is the worker's too --------------------------
+//
+// Deleting an untracked file produces no status record at all -- there is nothing
+// left for git to report -- so a per-status check never sees it. A worker that
+// removes a dependency file its fix depended on would leave the checkout reading
+// clean, and the source half would publish without it.
+{
+  const dirD = mkdtempSync(join(tmpdir(), "reeve-e2e-deleted-copy-"));
+  const wtD = mkdtempSync(join(dirD, "wt-"));
+  execFileSync("git", ["-C", wtD, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtD, "seed.js"), "seed\n");
+  execFileSync("git", ["-C", wtD, "add", "-A"]);
+  execFileSync("git", ["-C", wtD, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"]);
+  const pinnedD = execFileSync("git", ["-C", wtD, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  mkdirSync(join(wtD, "vendor"), { recursive: true });
+  writeFileSync(join(wtD, "vendor", "dep.js"), "as the daemon copied it\n");
+  const baseD = fingerprint(wtD, ["vendor/dep.js"]);
+  // The worker deletes that copy and declares only its source change.
+  rmSync(join(wtD, "vendor", "dep.js"));
+  writeFileSync(join(wtD, "fix.js"), "the declared companion\n");
+  check(execFileSync("git", ["-C", wtD, "status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" })
+          .split("\n").filter(l => /vendor/.test(l)).length === 0,
+    "control: git reports NOTHING for the deleted untracked file", "");
+
+  let publishedD = 0;
+  const ctxD = { ...baseCtx(), db: open(join(dirD, "d.db")), logPath: join(dirD, "log.txt"),
+                 profile: { ...profile, worker: { dependencyPaths: ["vendor"] },
+                            units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm" }] },
+                 evaluate: () => ({ ...evaluation, head: pinnedD, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtD, why: null,
+                                           deps: { ok: true, cow: false, copied: ["vendor"], untracked: baseD } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedD++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s",
+                                             report: { fixed: true, cause: "c", change: "ch", filesTouched: ["fix.js"] } }) };
+  const rD = await tick(ctxD);
+  const escD = [...rD.escalations.keys()].join(" | ");
+  check(publishedD === 0, "a DELETED file reeve copied stops the publication", `published=${publishedD} esc=${escD}`);
+  check(/vendor\/dep\.js/.test(escD), "and the escalation names it", escD);
+  ctxD.db.close();
+  rmSync(dirD, { recursive: true, force: true });
+  rmSync(`${wtD}.unfetched`, { recursive: true, force: true });
+}
+
 // --- an EDIT to a file reeve copied is the worker's too -----------------------
 //
 // git reports an edited copy exactly as it reports an untouched one -- the same

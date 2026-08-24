@@ -177,8 +177,9 @@ function uncommittedFiles(worktree, copiedBaseline = {}) {
     // a pathname-only baseline subtracted the worker's edit and let an incomplete
     // repair publish. Re-hashed per reported path, so the ordinary tick pays
     // nothing: git mentions almost none of them.
+    const baseline = copiedBaseline ?? {};
     const wasMine = rel => {
-      const want = copiedBaseline?.[rel];
+      const want = baseline[rel];
       return typeof want === "string" && digestOf(join(worktree, rel)) === want;
     };
     // `--untracked-files=all`, because the default COLLAPSES an entirely untracked
@@ -198,6 +199,17 @@ function uncommittedFiles(worktree, copiedBaseline = {}) {
       if (/[RC]/.test(xy)) { const src = records[++i]; if (src && !wasMine(src)) left.push(src); }
       if (file && !wasMine(file)) left.push(file);
     }
+    // The baseline is walked separately, because DELETING an untracked file
+    // produces no status record at all -- there is nothing left for git to
+    // report. A worker that removes a dependency file its fix depended on would
+    // otherwise leave the checkout reading clean, and the source half of the
+    // repair would publish without it.
+    //
+    // Covers the edited case too, so a path reported by status and also in the
+    // baseline is not counted twice.
+    const seen = new Set(left);
+    for (const rel of Object.keys(baseline))
+      if (!seen.has(rel) && !wasMine(rel)) left.push(rel);
     return left;
   } catch { return null; }
 }

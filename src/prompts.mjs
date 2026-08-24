@@ -242,7 +242,11 @@ function landing(profile) {
     "  and if the checkout holds any change you did not list it refuses to publish",
     "  and calls a human — so a reproduction script or a debug dump you leave behind",
     "  costs the whole repair unless you remove it or declare it.",
-    ...(commandDenied("git", profile) ? [] : [
+    // The advertised command itself, not the bare `git`. A profile may forbid
+    // `git clean` specifically, which leaves `commandDenied("git", ...)` false
+    // while `Bash(git clean:*)` sits in the deny list -- so the worker would be
+    // pointed at a cleanup the sandbox refuses.
+    ...(commandDenied("git clean -f --", profile) ? [] : [
       "  `rm` is not granted; `git clean -f -- <path>` is, and it removes an untracked",
       "  file without touching anything you are not allowed to touch.",
     ]),

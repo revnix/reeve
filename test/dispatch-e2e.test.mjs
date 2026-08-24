@@ -407,9 +407,12 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
                  // what the daemon copies in and must exclude on both sides.
                  profile: { ...profile, units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm" }] },
                  evaluate: () => ({ ...evaluation, head: pinnedV, headRef: "f" }),
-                 // `copied`, not the declared list: the exclusion follows what
-                 // preparation actually put there.
-                 prepareCheckout: () => ({ ok: true, path: wtV, why: null, deps: { ok: true, cow: false, copied: ["node_modules"] } }),
+                 // The BASELINE: what preparation itself left untracked. Reeve
+                 // subtracts exactly these, so a file it did not put there is the
+                 // worker's however deep inside a copied tree it sits.
+                 prepareCheckout: () => ({ ok: true, path: wtV, why: null,
+                                           deps: { ok: true, cow: false, copied: ["node_modules"],
+                                                   untracked: ["node_modules/pkg/index.js"] } }),
                  verifyConfig: () => ({ ok: true, why: null }),
                  // Read at the moment reeve considers the work publishable: a
                  // successful publish releases the checkout, so nothing can be
@@ -463,6 +466,55 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 
   ctxV.db.close();
   rmSync(dirV, { recursive: true, force: true });
+}
+
+// --- an UNDECLARED file inside a copied tree is still the worker's ------------
+//
+// Every path-exclusion shape hid this: `:(exclude)<tree>` dropped the tree
+// entirely, and `--untracked-files=no` inside it dropped exactly the new files.
+// So a worker could declare and commit `fix.js`, leave an undeclared
+// `vendor/patch.js`, and reeve would publish the incomplete repair and then
+// delete the only copy of the omitted part. The baseline recorded at prepare time
+// is what separates reeve's own files from the worker's.
+{
+  const dirB = mkdtempSync(join(tmpdir(), "reeve-e2e-baseline-"));
+  const wtB = mkdtempSync(join(dirB, "wt-"));
+  execFileSync("git", ["-C", wtB, "init", "-q", "-b", "f"]);
+  writeFileSync(join(wtB, "seed.js"), "seed\n");
+  execFileSync("git", ["-C", wtB, "add", "-A"]);
+  execFileSync("git", ["-C", wtB, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "seed"]);
+  const pinnedB = execFileSync("git", ["-C", wtB, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  // Preparation copied `vendor/dep.js` in, and the repository does not ignore it.
+  mkdirSync(join(wtB, "vendor"), { recursive: true });
+  writeFileSync(join(wtB, "vendor", "dep.js"), "copied in by the daemon\n");
+  // The worker's work: one declared file, and one it did NOT declare, sitting
+  // inside that same tree where every exclusion shape lost it.
+  writeFileSync(join(wtB, "fix.js"), "the declared part\n");
+  writeFileSync(join(wtB, "vendor", "patch.js"), "the part it did not report\n");
+
+  let publishedB = 0;
+  const ctxB = { ...baseCtx(), db: open(join(dirB, "b.db")), logPath: join(dirB, "log.txt"),
+                 profile: { ...profile, worker: { dependencyPaths: ["vendor"] },
+                            units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm" }] },
+                 evaluate: () => ({ ...evaluation, head: pinnedB, headRef: "f" }),
+                 prepareCheckout: () => ({ ok: true, path: wtB, why: null,
+                                           deps: { ok: true, cow: false, copied: ["vendor"],
+                                                   untracked: ["vendor/dep.js"] } }),
+                 verifyConfig: () => ({ ok: true, why: null }),
+                 publishWork: () => { publishedB++; return { ok: true, why: null }; },
+                 spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s",
+                                             report: { fixed: true, cause: "c", change: "ch",
+                                                       filesTouched: ["fix.js"] } }) };
+  const rB = await tick(ctxB);
+  const escB = [...rB.escalations.keys()].join(" | ");
+  const keptB = existsSync(`${wtB}.unfetched`) ? `${wtB}.unfetched` : existsSync(wtB) ? wtB : null;
+
+  check(publishedB === 0, "an undeclared file inside a copied tree stops the publication", `published=${publishedB} esc=${escB}`);
+  check(/uncommitted/.test(escB), "and the escalation says what is wrong", escB);
+  check(!!keptB && existsSync(join(keptB, "vendor", "patch.js")), "and the omitted part is kept, not deleted with the checkout", String(keptB));
+  ctxB.db.close();
+  rmSync(dirB, { recursive: true, force: true });
+  rmSync(`${wtB}.unfetched`, { recursive: true, force: true });
 }
 
 // --- a DECLARED dependency path that was never copied is the worker's ---------

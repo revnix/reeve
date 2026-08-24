@@ -892,6 +892,24 @@ rmSync(root, { recursive: true, force: true });
     check(g(w, "status", "--porcelain") === "?? fix.js", "control: and the checkout is untouched by any of them", g(w, "status", "--porcelain"));
   }
 
+  {
+    // A RENAME. `git diff --cached --name-only` applies rename detection and
+    // reports only the destination, so a repair that renames a file and correctly
+    // declares both sides had the source read as never-changed and was refused.
+    const w = mkWorktree("rename");
+    writeFileSync(join(w, "old.js"), "a".repeat(40) + "\n" + "b".repeat(30) + "\n");
+    g(w, "add", "-A"); g(w, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "add it");
+    g(w, "mv", "old.js", "new.js");
+    // Control: git really does collapse this to one path without --no-renames.
+    check(g(w, "diff", "--cached", "--name-only").split("\n").filter(Boolean).length === 1,
+      "control: rename detection really does report one side only", g(w, "diff", "--cached", "--name-only"));
+    g(w, "reset", "--quiet", "HEAD", "--");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: ["old.js", "new.js"] });
+    check(r.ok && r.committed, "a rename with both sides declared commits", JSON.stringify(r).slice(0, 200));
+    check(r.files.includes("old.js") && r.files.includes("new.js"), "and both sides are accounted for", r.files.join(", "));
+  }
+
   rmSync(cRoot, { recursive: true, force: true });
 }
 

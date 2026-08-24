@@ -96,6 +96,12 @@ const PROFILES = {
   "a publishing command": { units: [{ id: "root", language: "typescript", packageManager: "npm",
                                       commands: { release: { cmd: "npm publish --access public", state: "present" },
                                                   test: { cmd: "npm test", state: "present" } } }], risk: {} },
+  // The profile forbids `git clean` SPECIFICALLY. `commandDenied("git", ...)` is
+  // false here while `Bash(git clean:*)` sits in the deny list, so testing the
+  // bare name would still point the worker at a cleanup the sandbox refuses.
+  "git clean forbidden": { units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm",
+                                     commands: { test: { cmd: "npm test", state: "present" } } }],
+                           risk: { forbiddenCommands: ["git clean"] } },
   // The profile forbids `git` itself, which the prompt otherwise hardcodes as
   // always available.
   "git forbidden": { units: [{ id: "root", language: "typescript", packageManager: "npm",
@@ -276,8 +282,9 @@ for (const [name, prof] of Object.entries(PROFILES)) {
     check(!/declares no verification commands/.test(prompt), "and does not claim the project declares none", "");
   }
   // The landing section points the worker at `git clean` for scratch files it
-  // cannot rm. A profile that forbids git must not be told to run it.
-  if (commandDeniedIn("git", prof))
+  // cannot rm. A profile that forbids it -- by the bare name OR by the specific
+  // subcommand -- must not be told to run it.
+  if (commandDeniedIn("git clean -f --", prof))
     check(!/git clean/.test(prompt), `${name}: the worker is not told to run git clean when git is forbidden`,
           prompt.split("\n").filter(l => /git clean/.test(l)).join(" | ").slice(0, 160));
   else

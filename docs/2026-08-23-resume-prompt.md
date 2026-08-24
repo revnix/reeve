@@ -52,11 +52,12 @@ armed: `launchctl kickstart` restarts from launchd's cached plist, so the file
 can say `--execute` while the running process does not have it. That happened on
 23 Aug and I nearly reported it as done.
 
-Expected: `main` at or past what the handoff's §0 names, the test files green,
-doctor `broken` on R-01 and R-03 ONLY (both mine), and the running process WITHOUT
-`--execute`. If it has `--execute`, someone re-armed it — find out who before
-doing anything else. Note the daemon's checkout may be BEHIND main, so the running
-process can be on older code than the tests you just ran.
+Expected: `main`, the arming, and what is open all match §0 — that is what you are
+checking against, and if the running process disagrees with §0 about `--execute`,
+someone changed one without the other, so find out which before doing anything
+else. Also expect doctor `broken` on R-01 and R-03 ONLY (both mine) and the test
+files green. Note the daemon's checkout may be BEHIND main, so the running process
+can be on older code than the tests you just ran.
 
 ## Your task, in priority order
 

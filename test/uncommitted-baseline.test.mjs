@@ -87,6 +87,30 @@ const baseline = Object.fromEntries(copied.map(rel => [rel, "SAME"]));
     "a deleted copy is still the worker's, though status never mentions it", JSON.stringify(left).slice(0, 200));
 }
 
+// --- a copy the worker patched AND declared, which reeve then committed --------
+{
+  // The legitimate case the declaration exists to permit. reeve force-stages and
+  // commits the patched dependency, after which status is silent about it for the
+  // same reason a deletion is silent -- nothing is outstanding. Its digest no
+  // longer matches the pre-worker baseline precisely BECAUSE the repair is
+  // carried, so a sweep that only compares digests refuses the very thing it was
+  // asked to ship.
+  writeFileSync(join(root, "vendor", "dep-003.js"), "patched by the worker\n");
+  g("add", "--force", "--", "vendor/dep-003.js");
+  g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "fix(ci): patch the dep");
+  check(!g("status", "--porcelain", "--untracked-files=all").includes("dep-003"),
+    "control: git says nothing about it once committed", g("status", "--porcelain", "--untracked-files=all").slice(0, 100));
+  check(g("ls-files", "--", "vendor/dep-003.js") === "vendor/dep-003.js",
+    "control: and it is tracked now", "");
+  const left = uncommittedFiles(root, baseline, { digest });
+  check(!left.includes("vendor/dep-003.js"),
+    "a committed dependency patch is NOT reported as uncommitted work", JSON.stringify(left).slice(0, 200));
+  // And the deleted one from the block above must still be caught, so this
+  // exclusion has not simply switched the sweep off.
+  check(left.includes("vendor/dep-011.js"),
+    "control: the deleted copy is still caught alongside it", JSON.stringify(left).slice(0, 200));
+}
+
 // --- an unreadable checkout fails closed -------------------------------------
 {
   const gone = join(root, "does-not-exist");

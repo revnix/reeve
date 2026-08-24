@@ -39,20 +39,55 @@ const handoff = readFileSync(join(docs, HANDOFF), "utf8");
 const STATE_CLAIMS = [
   /\bis open\b/i, /\bstill open\b/i, /\bcurrently open\b/i, /\bremaining work\b/i,
   /\bis armed\b/i, /\bis disarmed\b/i, /\bawaiting review\b/i, /\bnot yet merged\b/i,
+  // The SEMANTIC forms, added after the first version passed while two copies
+  // remained: it matched the words I happened to have used rather than the claims
+  // they made.
+  //
+  // PRESENT TENSE ONLY, and that is the whole distinction. "reeve is disarmed" is
+  // a claim that expires; "reeve was disarmed on 23 Aug" is history and never
+  // will. My first widening caught both and flagged three correct sentences --
+  // a guard that fires on right text gets weakened or ignored, which costs more
+  // than the copies it was added to catch.
+  // No `is re-armed`: it only ever appears in a CONDITIONAL here ("when it is
+  // re-armed, eligible will be narrower"), which is a durable statement about
+  // behaviour rather than a claim about now. The `--execute` forms below already
+  // cover the arming state, so this one bought nothing but a false positive.
+  /\bis merged\b/i, /\bdefect is merged\b/i,
+  /\bWITHOUT `--execute`/i, /\bwith `--execute`/i, /`--execute` is (on|off)\b/i,
 ];
+
+/** Lines making a present-tense state claim without pointing at §0. A pointer may
+ * wrap, so the reference counts if it is within two lines either way. */
+const offendersIn = text => {
+  const lines = text.split("\n");
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!STATE_CLAIMS.some(re => re.test(lines[i]))) continue;
+    const window = lines.slice(Math.max(0, i - 2), i + 3).join(" ");
+    if (!/§0/.test(window)) out.push(`${i + 1}: ${lines[i].trim().slice(0, 88)}`);
+  }
+  return out;
+};
 
 // --- the prompt states no current facts except as a pointer ------------------
 {
-  const lines = prompt.split("\n");
-  const offenders = [];
-  for (let i = 0; i < lines.length; i++) {
-    if (!STATE_CLAIMS.some(re => re.test(lines[i]))) continue;
-    // A pointer may wrap: the reference can be on this line or the next two.
-    const window = lines.slice(i, i + 3).join(" ");
-    if (!/§0/.test(window)) offenders.push(`${i + 1}: ${lines[i].trim().slice(0, 90)}`);
-  }
+  const offenders = offendersIn(prompt);
   check(offenders.length === 0,
     `${PROMPT} states no current facts except as a §0 pointer`,
+    offenders.slice(0, 4).join("\n        "));
+}
+
+// --- and NEITHER does the handoff, outside §0 --------------------------------
+//
+// The first version of this test checked only the prompt, and passed while the
+// handoff restated the same facts three sections down. Half an invariant reads
+// exactly like a whole one.
+{
+  const withoutZero = handoff.replace(/^## 0\. STATE[\s\S]*?(?=^## )/m, "");
+  check(withoutZero.length > 1000, "control: the handoff minus §0 is still most of the file", String(withoutZero.length));
+  const offenders = offendersIn(withoutZero);
+  check(offenders.length === 0,
+    `${HANDOFF} states no current facts OUTSIDE §0`,
     offenders.slice(0, 4).join("\n        "));
 }
 

@@ -102,11 +102,20 @@ if (major < 24) {
 }
 
 const argv = process.argv.slice(2);
-// A LEADING FLAG IS NOT A COMMAND. `argv.shift()` took the first token
-// whatever it was, so `reeve --help` consumed `--help` as the command name --
-// the parser then saw no flags, the switch fell through to the default, and the
-// one invocation everybody tries first printed the help and exited 1.
-const cmd = argv[0]?.startsWith("-") ? undefined : argv.shift();
+// The COMMAND IS THE FIRST POSITIONAL, and it is decided by the walk below
+// rather than before it.
+//
+// Two failures came from deciding it first. `argv.shift()` took the first token
+// whatever it was, so `reeve --help` consumed `--help` as the command name and
+// the one invocation everybody tries first printed the help and exited 1. Then
+// treating a leading flag as "no command" was worse: `reeve --home /scratch
+// backup --hub` left `backup` sitting in the positionals, fell through to the
+// default branch, printed the help and exited ZERO -- a backup that never ran,
+// reporting success to whatever automation asked for it. Silence with a
+// success code is the exact failure this whole change is about.
+//
+// Only the walk knows which tokens are values, so only the walk can say which
+// token is the command.
 
 // ── every flag this CLI accepts, declared ONCE ──────────────────────────────
 //
@@ -261,14 +270,19 @@ const ARGS = (() => {
     values.get(name).push(v);
   }
 
-  if (errors.length) {
-    for (const e of errors) console.error(e);
-    console.error(`-> reeve ${cmd ?? ""} accepts: ${Object.keys(FLAGS).sort().map(f => "--" + f).join(" ")}`);
-    console.error(`-> reeve --help`);
-    process.exit(1);
-  }
-  return { values, flags, positionals };
+  return { values, flags, positionals, errors };
 })();
+
+// The command, then the rest. `positionals` below excludes it, which is what
+// every route already assumes: `build`/`builder` read their subcommand from
+// `positionals[0]` and `doctor` scans for an owner/repo.
+const cmd = ARGS.positionals[0];
+if (ARGS.errors.length) {
+  for (const e of ARGS.errors) console.error(e);
+  console.error(`-> reeve ${cmd ?? ""} accepts: ${Object.keys(FLAGS).sort().map(f => "--" + f).join(" ")}`);
+  console.error(`-> reeve --help`);
+  process.exit(1);
+}
 
 const flag = n => ARGS.flags.has(n);
 const opt = n => ARGS.values.get(n)?.[0] ?? null;
@@ -276,7 +290,7 @@ const opt = n => ARGS.values.get(n)?.[0] ?? null;
 const all = n => ARGS.values.get(n) ?? [];
 // A valued flag consumes the token after it, so that token is never mistaken
 // for a repo name however much it looks like one.
-const positionals = ARGS.positionals;
+const positionals = ARGS.positionals.slice(1);
 
 // `--help` is dispatched HERE, above every route. It was added to the registry
 // and described as "show this help" while NO route checked it, so

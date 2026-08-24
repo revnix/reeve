@@ -141,9 +141,11 @@ pre-bind cancellation fails (`:1043`, `:1066`), so it is spent once worker
 execution begins — never conditional on publication. Verified as one unrefunded
 `fix_attempt` row after a refused publication. Not every red PR spends it —
 `watcher.mjs:120-136` escalates a missing required check, an inherited-only
-failure, or one it cannot name without dispatching at all. But a caused, named
-failure gets one shot, and on this evidence it is spent producing a fix that
-cannot ship.
+failure, one already at cap, or one it cannot name without dispatching at all,
+and `daemon.mjs:808-812` then declines a caused, named failure whose checks are
+ALL demonstrated flakes before `startRun`. A caused, named, not-wholly-flaky
+failure past the containment and capacity gates gets one shot, and on this
+evidence it is spent producing a fix that cannot ship.
 
 ---
 

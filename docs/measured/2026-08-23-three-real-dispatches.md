@@ -130,8 +130,10 @@ dispatches that published successfully were recorded at 2026-08-21 00:56 and
 red CI → fix → diff gate → published → green — is currently broken, and has been
 since 22 August.
 
-**The consequence, today.** reeve is armed against `nextlyhq/nextly` with
-`maxFixAttemptsPerFinding: 1`. Under this contract no worker can commit, so no
+**The consequence.** At the time of measurement reeve was armed against
+`nextlyhq/nextly` with `maxFixAttemptsPerFinding: 1`. It was DISARMED later the
+same day, once this finding was understood, so no dispatch can currently occur at
+all; what follows is what returns the moment it is re-armed. Under this contract no worker can commit, so no
 dispatch can publish, and each ELIGIBLE red pull request — caused, named, not a
 demonstrated flake (`daemon.mjs:808-812`), past the containment and capacity
 gates — spends its single attempt for roughly $1 and produces an escalation

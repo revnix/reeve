@@ -2781,6 +2781,46 @@ function writeAuthority(db, project) {
   check(existsSync(noConstraint),
     "and the file a builder may be writing to is left alone", `${existsSync(noConstraint)}`);
 
+  // AND THE CLI'S PATH, which reads neither of the tables above. `withWriterLease`
+  // calls `assertWritable` and writes `writer_lease`; it never touches
+  // `singleton_lease`. So a hub whose builder table is malformed while the CLI's
+  // is intact still admits a writer, and a predicate that probed only the
+  // builder's table answered "nobody can enter" for exactly that hub.
+  {
+    const t = join(wHome, "state", "clientry.db");
+    const d = openHub(t);
+    d.exec("DROP TABLE maintenance_lock");
+    d.exec("CREATE TABLE maintenance_lock (name TEXT, pid INTEGER, lstart TEXT, acquired_at INTEGER)");
+    // REPLACED, not dropped. A dropped table is recreated by migration 1 --
+    // every CREATE is IF NOT EXISTS -- so `openHub` repairs it before the
+    // predicate ever looks, and the fixture then refuses for a reason that has
+    // nothing to do with the hole: measured, the builder-only predicate passed
+    // this test against a dropped table. A table that EXISTS with the wrong
+    // columns survives migration 1 untouched, which is the state a writer
+    // actually meets.
+    d.exec("DROP TABLE singleton_lease");
+    d.exec("CREATE TABLE singleton_lease (x TEXT)");
+    d.exec("DROP TABLE schema_version");
+    d.close();
+    const q = new DatabaseSync(t, { readOnly: true });
+    // The BUILDER's own query, not a bare SELECT *: `acquireSingleton` reads
+    // `WHERE name=?`, and that is what fails on a wrong-column table while the
+    // CLI's path never touches it at all.
+    const sl = (() => { try { q.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get(); return true; } catch { return false; } })();
+    const wl = (() => { try { q.prepare("SELECT * FROM writer_lease LIMIT 1").get(); return true; } catch { return false; } })();
+    q.close();
+    check(!sl && wl,
+      "fixture: the builder's own lease query fails while the CLI's table still answers",
+      `singleton_lease(builder query)=${sl} writer_lease=${wl}`);
+    const r = restoreHub(snapE.path, t, { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+    check(!r.ok,
+      "a hub only the CLI can still enter is refused too: every admission path counts",
+      JSON.stringify(r).slice(0, 200));
+    check(!existsSync(t + ".restore-lock") && existsSync(t),
+      "no sibling lock, and the file a CLI may be writing to is left alone",
+      `${existsSync(t + ".restore-lock")} ${existsSync(t)}`);
+  }
+
   // CONTROL: the shape whose writer-read also fails still recovers. Without this
   // the assertion above would pass against a fallback that had simply been
   // removed, which is the repair the previous round added.
@@ -2833,6 +2873,40 @@ function writeAuthority(db, project) {
     "and its WAL came with it, which may hold the only copy of the newest state",
     `${r.quarantined && existsSync(r.quarantined + "-wal")}`);
   rmSync(sHome, { recursive: true, force: true });
+}
+
+// ── a remedy for a full store must be one that WORKS on a full store ───────
+// `reeve backup --hub --keep N` cannot free space: `snapshot()` writes a whole
+// new database with VACUUM INTO and calls `prune()` only after publishing it, so
+// it needs more room before it removes any. Prescribing it to an operator whose
+// filesystem is full is advice that fails at the first step.
+//
+// Asserted from the source rather than end to end, and the reason is measured:
+// `PRAGMA max_page_count` is PER-CONNECTION (set to 2 on one handle, a fresh
+// handle reads 4294967294), so a subprocess cannot be driven to SQLITE_FULL, and
+// a genuinely full filesystem is not something this suite can create on the
+// three platforms reeve has to run on.
+{
+  const sources = [["bin/reeve", readFileSync(join(ROOT, "bin", "reeve"), "utf8")],
+                   ["src/backup.mjs", readFileSync(join(ROOT, "src", "backup.mjs"), "utf8")],
+                   ["src/build/hubdb.mjs", readFileSync(join(ROOT, "src", "build", "hubdb.mjs"), "utf8")]];
+  check(sources.every(([, t]) => /free space on the filesystem/i.test(t)),
+    "control: every file that renders a storage failure carries a free-space remedy",
+    sources.map(([n, t]) => `${n}:${/free space on the filesystem/i.test(t)}`).join(" "));
+  const prescribes = sources.filter(([, t]) => /keep N prunes/.test(t)).map(([n]) => n);
+  check(prescribes.length === 0,
+    "and none of them prescribes the backup command as the way to free it",
+    prescribes.join(", "));
+  // The ORDER inside snapshot() is the fact the remedy depends on, so it is
+  // asserted rather than remembered: if prune ever moved ahead of the vacuum the
+  // advice above would become wrong in the other direction.
+  const bak = sources.find(([n]) => n === "src/backup.mjs")[1];
+  const vacuum = bak.indexOf("VACUUM INTO");
+  const pruneCall = bak.indexOf("prune(dir, keep);");
+  check(vacuum > 0 && pruneCall > 0, "control: both anchors were found in snapshot()", `${vacuum} ${pruneCall}`);
+  check(vacuum < pruneCall,
+    "snapshot() still writes the new database BEFORE it prunes, which is why the remedy says to delete directly",
+    `vacuum at ${vacuum}, prune at ${pruneCall}`);
 }
 
 rmSync(home, { recursive: true, force: true });

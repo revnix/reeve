@@ -1242,9 +1242,10 @@ switch (cmd) {
           // told to stop other processes and check permissions -- advice that
           // cannot work -- while the one instruction that can went unsaid.
           console.log(`  recover  the file answered, so this is not damage: the store ran out of room.`);
-          console.log(`           Free space on the filesystem holding the hub and re-run;`);
-          console.log(`           reeve backup --hub --keep N prunes old snapshots. Do NOT restore`);
-          console.log(`           over it -- a restore needs more room, not less.`);
+          console.log(`           Free space on the filesystem holding the hub and re-run. Remove old`);
+          console.log(`           snapshot files DIRECTLY -- reeve backup --hub --keep N writes a whole`);
+          console.log(`           new snapshot before it prunes, so it needs more room, not less. Do`);
+          console.log(`           NOT restore over it either, for the same reason.`);
         } else if (benign) {
           console.log(`  recover  the file answered, so this is not damage: stop any running builder or`);
           console.log(`           reeve CLI and re-run, and check the permissions on the hub and its`);
@@ -1362,9 +1363,10 @@ switch (cmd) {
       die(leaseKind === "full"
         ? `reeve build run: could not take the builder lease in ${hubPathFor(HOME)} (${e.message}).\n` +
           `  the hub reads fine, so this is not damage: the store ran out of room.\n` +
-          `  recover  free space on the filesystem holding ${hubPathFor(HOME)} and re-run;\n` +
-          `           reeve backup --hub --keep N prunes old snapshots. Do NOT restore over it -- ` +
-          `a restore needs more room, not less.`
+          `  recover  free space on the filesystem holding ${hubPathFor(HOME)} and re-run. Remove old\n` +
+          `           snapshot files DIRECTLY -- reeve backup --hub --keep N writes a whole new ` +
+          `snapshot before it prunes, so it needs more room, not less. Do NOT restore over it ` +
+          `either, for the same reason.`
         : leaseKind === "operational"
         ? `reeve build run: could not take the builder lease in ${hubPathFor(HOME)} (${e.message}).\n` +
           `  the hub reads fine, so this is not damage: the file or its directory may be read-only, ` +

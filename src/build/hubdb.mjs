@@ -192,10 +192,11 @@ export function openHub(path) {
         : kind === "full"
         ? `the hub at ${path} could not be written because the store is full (${e.message}).\n` +
           `  the file itself answered, so this is not damage: it ran out of room.\n` +
-          `  recover  free space on the filesystem holding ${path} and re-run. Old snapshots under ` +
-          `the backup root are usually the largest thing safe to remove -- reeve backup --hub --keep N ` +
-          `prunes them. Do NOT restore over it: a restore needs MORE room, not less, and there is ` +
-          `nothing wrong with the file.`
+          `  recover  free space on the filesystem holding ${path} and re-run. Old snapshot files ` +
+          `under the backup root are usually the largest thing safe to remove, and they have to be ` +
+          `removed DIRECTLY: reeve backup --hub --keep N writes a whole new snapshot with VACUUM INTO ` +
+          `and prunes only after publishing it, so it needs more room before it frees any. Do NOT ` +
+          `restore over it either, for the same reason, and there is nothing wrong with the file.`
         : `the hub at ${path} could not be opened for writing (${e.message}).\n` +
           `  the file itself answered, so this is not damage: another process may hold it, or the ` +
           `file or its directory may be read-only.\n` +

@@ -2931,6 +2931,97 @@ function writeAuthority(db, project) {
     `vacuum at ${vacuum}, prune at ${pruneCall}`);
 }
 
+// ── a total loss restores into a home that no longer has a state directory ──
+// The ownership mint runs BEFORE `openHub`, and `openHub` is what creates the
+// parent. So on a fresh home -- or after exactly the total loss this path exists
+// to recover from -- the exclusive open answered ENOENT and a perfectly valid
+// snapshot came back as `could not restore`.
+{
+  const fHome = mkdtempSync(join(tmpdir(), "reeve-fresh-"));
+  mkdirSync(join(fHome, "state"), { recursive: true });
+  const src = openHub(join(fHome, "state", "src.db"));
+  const snapF = snapshot(src, join(fHome, "backups"), "hub");
+  src.close();
+
+  const target = join(fHome, "newhome", "state", "hub.db");
+  check(!existsSync(join(fHome, "newhome", "state")),
+    "fixture: the target's parent directory does not exist", `${existsSync(join(fHome, "newhome", "state"))}`);
+  const r = restoreHub(snapF.path, target, { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+  check(r.ok, "a restore into a home with no state directory succeeds", JSON.stringify(r).slice(0, 200));
+  check(!/ENOENT/.test(String(r.why ?? "")),
+    "and does not fail on the directory the mint had to create", String(r.why ?? "(no why)"));
+  check(existsSync(target), "and the hub is there afterwards", `${existsSync(target)}`);
+  {
+    const h = openHub(target);
+    const v = h.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+    h.close();
+    check(v === 1, "and it is a whole hub, not just a minted empty file", `version ${v}`);
+  }
+  rmSync(fHome, { recursive: true, force: true });
+}
+
+// ── a hub a live writer is holding is never replaced ───────────────────────
+// The property, end to end. Which refusal delivers it depends on where the
+// exclusive transaction lands relative to the version probe, and that ordering
+// is not something a test can choose -- so the assertion is about the OUTCOME,
+// which is the same either way: the file is kept and no sibling lock is taken.
+//
+// The three-answer predicate is asserted from the source beside it, because the
+// interleaving that reaches it -- a store that reads cleanly at the version
+// probe and is blocked by the time the admission probe runs -- requires a writer
+// to arrive between two statements of this function, and nothing here can drive
+// that. What CAN be established is that a blocked probe is never read as "nobody
+// can enter", which is the whole defect.
+{
+  const bHome = mkdtempSync(join(tmpdir(), "reeve-busyw-"));
+  mkdirSync(join(bHome, "state"), { recursive: true });
+  const src = openHub(join(bHome, "state", "src.db"));
+  const snapB = snapshot(src, join(bHome, "backups"), "hub");
+  src.close();
+
+  const t = join(bHome, "state", "busy.db");
+  const d = openHub(t);
+  d.exec("DROP TABLE maintenance_lock");
+  d.exec("CREATE TABLE maintenance_lock (name TEXT, pid INTEGER, lstart TEXT, acquired_at INTEGER)");
+  d.exec("DROP TABLE schema_version");
+  d.close();
+  // DELETE journal mode, exclusive: in that mode an exclusive transaction blocks
+  // READERS, which is what makes a live writer look like an unanswerable probe.
+  // A permission would be inert as root, which is ordinary in a container.
+  const holder = new DatabaseSync(t);
+  holder.exec("PRAGMA journal_mode = DELETE");
+  holder.exec("BEGIN EXCLUSIVE");
+  const r = restoreHub(snapB.path, t, { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+  try { holder.exec("ROLLBACK"); } catch {}
+  holder.close();
+  check(!r.ok, "a forced restore does not replace a hub a live writer is holding", JSON.stringify(r).slice(0, 200));
+  check(!existsSync(t + ".restore-lock"),
+    "and takes no sibling lock, which that writer would never consult",
+    `${existsSync(t + ".restore-lock")}`);
+  check(existsSync(t), "and the file the writer is holding is still there", `${existsSync(t)}`);
+
+  // The predicate's three answers, from the source. `"no"` is the only one that
+  // authorises the sibling lock, and a catch-all `false` gave that answer to
+  // every failure -- including the BUSY a live writer causes.
+  const src2 = readFileSync(join(ROOT, "src", "backup.mjs"), "utf8");
+  // COUNTED, not merely present. The predicate classifies at THREE points -- the
+  // `assertWritable` catch, the read-only open, and the exhausted-table fallback
+  // -- and a regex that only has to match somewhere is satisfied by any one of
+  // them. Measured: stubbing the first back to a bare `return "no"` left this
+  // assertion green, because the second still matched. An assertion that a
+  // pattern EXISTS cannot say that every site uses it.
+  const classifiers = (src2.match(/isOperational\(e\) \? "unknown" : "no"/g) ?? []).length;
+  const fallback = (src2.match(/return blocked \? "unknown" : "no";/g) ?? []).length;
+  check(classifiers === 2 && fallback === 1,
+    "every point where the admission probe can fail classifies operational as unknown, never no",
+    `isOperational classifiers: ${classifiers} (want 2), exhausted-table fallback: ${fallback} (want 1)`);
+  check(/if \(entry !== "no"\)/.test(src2),
+    "and only a definitive no authorises the sibling lock", "checked");
+  check(/writersCanEnter\(live\) !== "no"/.test(src2),
+    "on the readable path too, so the two cannot disagree about an unanswered probe", "checked");
+  rmSync(bHome, { recursive: true, force: true });
+}
+
 rmSync(home, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

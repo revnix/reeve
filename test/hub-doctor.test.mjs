@@ -731,6 +731,7 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   }
 
   const crashed = [];
+  const mute = [];
   let cells = 0;
   for (const [state, build] of Object.entries(STATES)) {
     rmSync(mHome, { recursive: true, force: true });
@@ -744,8 +745,18 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
       // or the bare `    at <file>:<line>:<col>` form.
       if (/^\s+at\s+.*:\d+:\d+\)?$/m.test(out))
         crashed.push(`${state}/${args.join(" ")}: ${out.split("\n").find(l => /Error/.test(l))?.trim() ?? "(stack)"}`);
+      // AND IT SAID SOMETHING. "No stack frame" is an ABSENCE, and a route that
+      // dies silently satisfies it perfectly -- so the sweep would read a route
+      // that printed nothing at all as evidence of good behaviour. An operator
+      // running a hub command against a broken hub and getting no output is not
+      // a route that handled it; the whole point of these paths is that they say
+      // what is wrong and what to do.
+      if (!out.trim()) mute.push(`${state}/${args.join(" ")}`);
     }
   }
+  check(mute.length === 0,
+    "control: every cell SAID something, so the no-stack-trace sweep is not satisfied by silence",
+    mute.slice(0, 4).join("  |  "));
   check(cells === Object.keys(STATES).length * ROUTES.length,
     "control: every cell of the matrix ran", `${cells} cells`);
   check(crashed.length === 0,

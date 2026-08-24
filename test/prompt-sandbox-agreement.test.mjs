@@ -98,6 +98,16 @@ const PROFILES = {
   "a blank command": { units: [{ id: "root", language: "typescript", packageManager: "npm",
                                  commands: { lint: { cmd: "   ", state: "present" },
                                              test: { cmd: "npm test", state: "present" } } }], risk: {} },
+  // A declared command that is ITSELF a wrapper or an absolute path. The grant is
+  // written against that exact head, so the rule forbidding wrappers must not
+  // forbid the very command HOW TO VERIFY recommends.
+  "a wrapper command": { units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm",
+                                   commands: { test: { cmd: "sh scripts/test.sh", state: "present" } } }], risk: {} },
+  // A present command of only whitespace, beside a real one. It is truthy, so it
+  // passes profile validation, and `commandDenied("")` accepts it.
+  "a blank beside a real one": { units: [{ id: "root", root: ".", language: "typescript", packageManager: "npm",
+                                           commands: { lint: { cmd: "   ", state: "present" },
+                                                       test: { cmd: "npm test", state: "present" } } }], risk: {} },
   // A deny rule LONGER than the head the sandbox grants: `Bash(npm run:*)` is
   // allowed, and `npm run release` is refused, so the head looks clean while the
   // command the worker is told to run is not.
@@ -189,6 +199,15 @@ for (const [name, prof] of Object.entries(PROFILES)) {
   // the work. Measured: a profile forbidding `npm run release` was told never to
   // run it and then handed it as its release command.
   const verify = /HOW TO VERIFY\n([\s\S]*?)\n\n/.exec(prompt)?.[1] ?? "";
+  // An intent with no command beside it. The parser below skips a malformed line
+  // silently, so without this the section could print one and nothing would say.
+  for (const line of verify.split("\n").filter(l => /^\s{2}\S/.test(l)))
+    check(/^\s{2}\S+\s+\S/.test(line), `${name}: the verify section prints no intent without a command`, JSON.stringify(line));
+  // A wrapper or absolute path the project itself declares must be exempted from
+  // the plain-names rule, or the prompt forbids what it recommends.
+  if (/^\s{2}\S+\s+(sh|env|\/)/m.test(verify))
+    check(/exception: they are granted/.test(prompt),
+      `${name}: a declared wrapper is exempted from the plain-names rule`, verify.slice(0, 140));
   check(!/\bundefined\b/.test(verify), `${name}: the verify section names no undefined root`, verify.slice(0, 140));
   for (const line of verify.split("\n")) {
     const cmd = /^\s{2}\S+\s+(\S.*)$/.exec(line)?.[1];

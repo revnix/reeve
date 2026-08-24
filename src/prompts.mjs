@@ -118,6 +118,12 @@ function invariants(profile) {
       `   Use plain command names — ${nameList} — never an absolute path to a`,
       "   binary and never `env` or `sh` as a wrapper. The permissions are written",
       "   against the names, so a path or a wrapper reads as something else entirely.",
+      // A DECLARED command may itself be `sh test.sh`, `env npm test` or
+      // `/usr/bin/make test`, and the grant is written against that exact head --
+      // so the prohibition above would forbid the very command HOW TO VERIFY goes
+      // on to recommend. The exemption is what makes the two consistent.
+      "   The project's own commands below are the exception: they are granted",
+      "   exactly as written, wrapper or path included, so run those verbatim.",
     ] : [
       // `sandboxFor` grants `Bash(<process.execPath>:*)` unconditionally, and a
       // declared command as `Bash(<runner> <first arg>:*)`, so a profile that
@@ -171,6 +177,12 @@ function verification(profile) {
   for (const unit of profile.units ?? []) {
     const cmds = Object.entries(unit.commands ?? {})
       .filter(([, c]) => c.state === "present")
+      // A command of only whitespace is truthy, so it passes profile validation
+      // and `commandDenied("")` accepts it -- and this section printed an intent
+      // with nothing beside it. `sandboxFor` skips the empty head entirely, so
+      // there is no grant behind it either. Same non-empty test `runnableCommands`
+      // applies.
+      .filter(([, c]) => String(c?.cmd ?? "").trim().length > 0)
       // A command the sandbox refuses is not a way to verify anything. The rules
       // above already forbid it BY NAME, so printing it here as how to check the
       // work makes one prompt say both things.

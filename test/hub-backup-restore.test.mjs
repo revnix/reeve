@@ -1113,6 +1113,66 @@ function writeAuthority(db, project) {
     "and the half-created file is quarantined and named, not deleted", String(r.quarantined));
 }
 
+// ── abandoned temporaries are reaped, live ones are not ─────────────────────
+// A process killed between `VACUUM INTO` and the hard-link publish leaves a
+// full database copy under `.<epoch>.<pid>.tmp`. Nothing else would ever remove
+// one: `prune` and every candidate reader filter on `/^\d+\.db$/` precisely so a
+// partial file is invisible, and `snapshot()` only removes its own current
+// path. So each interrupted backup leaked a database-sized file for ever, on
+// the disk whose job is holding the backups.
+{
+  const hubDir = join(root, "hub");
+  // A pid that is not running: ESRCH, so this temp is abandoned.
+  const dead = join(hubDir, ".1700000000.999999.tmp");
+  // pid 1 exists and is not ours: `kill(1, 0)` raises EPERM, which must be read
+  // as "running", not as "gone". Reaping on any error would delete the
+  // temporary of a live writer mid-VACUUM.
+  const live = join(hubDir, ".1700000001.1.tmp");
+  writeFileSync(dead, "abandoned");
+  writeFileSync(live, "in flight");
+
+  const db = openHub(hubPathFor(home));
+  snapshot(db, root, "hub", Math.floor(Date.now() / 1000) + 300, { keep: Infinity });
+  db.close();
+
+  check(!existsSync(dead),
+    "a temporary whose owning process is gone is reaped by the next snapshot", dead);
+  check(existsSync(live),
+    "control: one whose pid is still running is left alone, because deleting it would corrupt a live backup",
+    live);
+  try { rmSync(live, { force: true }); } catch {}
+}
+
+// ── the quarantine keeps the WAL, which may be the only copy of the newest events ─
+// A WAL holds committed pages that have not been checkpointed into the main
+// file, so after the crash that made recovery necessary it can be the ONLY copy
+// of the newest history. The sidecars were removed BEFORE the quarantine copy
+// was taken, so "the damaged database is kept at <path>" was a half-truth and
+// the rest was destroyed permanently.
+{
+  const p = join(home, "wal-hub.db");
+  const snap = latestSnapshot(root, "hub");
+  // A hub that cannot be opened, WITH sidecars beside it, which is the shape a
+  // crash leaves.
+  writeFileSync(p, "this is not a database");
+  writeFileSync(p + "-wal", "pretend committed pages nobody has checkpointed");
+  writeFileSync(p + "-shm", "shared memory index");
+  const r = restoreHub(snap, p, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+  check(r.ok === true, "an unreadable hub with sidecars still restores", JSON.stringify(r).slice(0, 200));
+  check(r.quarantined && existsSync(r.quarantined),
+    "and the main file is quarantined", String(r.quarantined));
+  check(existsSync(r.quarantined + "-wal"),
+    "and its -wal goes WITH it, because that may be the only copy of the newest events",
+    `${r.quarantined}-wal`);
+  check(readFileSync(r.quarantined + "-wal", "utf8").includes("committed pages"),
+    "control: the quarantined -wal is the real one, not an empty placeholder",
+    readFileSync(r.quarantined + "-wal", "utf8").slice(0, 40));
+  // And the canonical path no longer carries the stale sidecars, which would
+  // otherwise be replayed into the restored database on its next open.
+  check(!existsSync(p + "-wal") && !existsSync(p + "-shm"),
+    "control: the stale sidecars are gone from the canonical path, so nothing replays them into the restore");
+}
+
 rmSync(home, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

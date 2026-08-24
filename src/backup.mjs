@@ -55,6 +55,29 @@ export function snapshot(db, root, nwo, at = Math.floor(Date.now() / 1000), { ke
   // `/^\d+\.db$/` filter, which is what makes the partial file unobservable.
   const temp = join(dir, `.${at}.${process.pid}.tmp`);
   try { rmSync(temp, { force: true }); } catch {}
+  // ABANDONED temporaries, from a process killed between `VACUUM INTO` and the
+  // publish. Each is a full database copy, and nothing else will ever remove
+  // one: `prune` and every candidate reader filter on `/^\d+\.db$/` precisely
+  // so a partial file is invisible, and the line above only removes THIS
+  // process's own `(epoch, pid)` path. So each interrupted backup leaked a
+  // database-sized file for ever, on the disk whose job is holding the backups.
+  //
+  // The owning pid is in the name, so liveness decides rather than age: a temp
+  // whose process is gone is abandoned, and one whose process is running might
+  // be mid-VACUUM. `kill(pid, 0)` only asks whether the pid exists, and a
+  // REUSED pid simply means the file is not reaped this time -- leaking is the
+  // safe direction, deleting a live writer's temp is not.
+  try {
+    for (const f of readdirSync(dir)) {
+      const m = /^\.(\d+)\.(\d+)\.tmp$/.exec(f);
+      if (!m) continue;
+      const owner = Number(m[2]);
+      if (owner === process.pid) continue;              // ours, handled above
+      try { process.kill(owner, 0); continue; }          // still running: leave it
+      catch (e) { if (e.code === "EPERM") continue; }    // exists, not ours to judge
+      rmSync(join(dir, f), { force: true });
+    }
+  } catch { /* reaping is housekeeping and must never fail a backup */ }
   try {
     // Quoted and escaped: a path is data here, not syntax.
     db.exec(`VACUUM INTO '${temp.replace(/'/g, "''")}'`);
@@ -574,6 +597,30 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       return d;
     } catch { try { d?.close(); } catch {} return null; }
   };
+  // PRESERVE THE SIDECARS BEFORE ANY OPEN ATTEMPT, because the open is what
+  // destroys them.
+  //
+  // Measured: `new DatabaseSync(corruptFile)` fails with `file is not a
+  // database`, and CLOSING that failed handle deletes `-wal` and `-shm`. So by
+  // the time this function has established the hub is unreadable, the WAL it
+  // most wants to keep is already gone -- and nothing here removed it. SQLite
+  // did, on close, inside `rawOpen`'s own cleanup.
+  //
+  // That matters because a WAL holds committed pages that were never
+  // checkpointed into the main file, so after the crash that made this recovery
+  // necessary it can be the ONLY copy of the newest events. "The unreadable
+  // database is kept at <path>" was a half-truth: the main file was kept and the
+  // rest was destroyed a few statements earlier.
+  //
+  // Copied aside first, then either promoted into the quarantine or discarded
+  // once the store proves readable. Only the sidecars are copied, never the
+  // database, so a healthy restore pays almost nothing for this.
+  const preservedSidecars = [];
+  for (const ext of ["-wal", "-shm"]) {
+    if (!existsSync(dbPath + ext)) continue;
+    const aside = `${dbPath}${ext}.preserved-${pid}`;
+    try { copyFileSync(dbPath + ext, aside); preservedSidecars.push([ext, aside]); } catch {}
+  }
   try {
     // When dbPath is ABSENT -- the destructive drill's case, and a real total
     // loss -- the holder scan is skipped and NO lock exists at the canonical
@@ -599,7 +646,22 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // winner. This branch is where a race is MOST likely, because "the hub is
       // gone" is exactly when two people start a restore.
       const got = acquireMaintenanceLock(live, { pid, lstart, isAlive });
-      if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
+      if (!got.ok) {
+        // `synthetic` AUTHORISES DELETION in the finally, and a loser has no
+        // such authority. Both restores observed `dbPath` absent and both got
+        // here, but only one holds the lock -- and it holds it IN THIS FILE,
+        // with the file open. Leaving the flag set made the loser unlink the
+        // winner's database: on POSIX the winner keeps writing to an inode with
+        // no name while the canonical path sits empty, so a builder starting in
+        // that window creates a fresh hub there and the winner's eventual swap
+        // silently discards it.
+        //
+        // The flag means "this invocation created it AND owns it", which is what
+        // the finally assumes. Winning the lock is the only proof of ownership
+        // available, so it is the thing that sets it.
+        synthetic = false;
+        return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
+      }
       locked = true;
     } else if ((live = rawOpen(dbPath)) === null) {
       // EXISTS, and UNREADABLE. This is the state the route's own description
@@ -943,6 +1005,26 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // removal as fatal rather than swallowing it: a -wal left beside a replaced
     // main file is replayed into the new database on the next open, which is a
     // silent merge of two unrelated stores.
+    // QUARANTINE FIRST, and WITH its sidecars. The removal below deletes
+    // `-wal`/`-shm`, and the copy used to happen after it -- so the quarantine
+    // an operator was handed was the main file alone.
+    //
+    // That is worst on exactly the path that produces a quarantine. A WAL holds
+    // committed pages that have not been checkpointed into the main file yet,
+    // so after the crash that made this recovery necessary it can be the ONLY
+    // copy of the newest events. Deleting it first turned "the damaged database
+    // is kept at <path>" into a half-truth and destroyed history that a
+    // determined operator could otherwise have read out.
+    //
+    // On the unreadable path `live` is already null, so there is no handle to
+    // close before copying; the copy is forensic either way.
+    if (quarantined) {
+      copyFileSync(dbPath, quarantined);
+      // From the ASIDE copies, not from `dbPath + ext`: those are gone by now,
+      // deleted by SQLite when the failed open was closed.
+      for (const [ext, aside] of preservedSidecars)
+        try { copyFileSync(aside, quarantined + ext); } catch {}
+    }
     try { live?.close(); live = null; locked = false; } catch {}
     for (const ext of ["-wal", "-shm"]) {
       try { rmSync(dbPath + ext, { force: true }); }
@@ -965,7 +1047,7 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // whole snapshot, and it removes the window rather than narrowing it. The
     // rename that follows is atomic, so a writer either has the corrupt original
     // or the restored replacement and never neither.
-    if (quarantined) copyFileSync(dbPath, quarantined);
+    // (the quarantine copy happened above, before the sidecars were removed)
     renameSync(staging, dbPath);
     swapped = true;                    // past here the file at dbPath is the restored one
     // `quarantined` is REPORTED, not merely done. When the live hub was
@@ -994,6 +1076,10 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     try { live?.close(); } catch {}
     try { lockDb?.close(); } catch {}
     try { rmSync(staging, { force: true }); } catch {}
+    // The aside copies are housekeeping: promoted into the quarantine above when
+    // there was one, and discarded either way so a healthy restore leaves no
+    // litter beside the hub.
+    for (const [, aside] of preservedSidecars) { try { rmSync(aside, { force: true }); } catch {} }
     // The synthetic hub goes with the failure that stranded it. Only when it was
     // synthetic AND the swap never happened: a successful restore replaced it,
     // and a real pre-existing hub is never this function's to delete.

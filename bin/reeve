@@ -211,7 +211,23 @@ switch (cmd) {
       // per-repo stores at the same moment costs nothing and keeps the set
       // mutually consistent.
       const root = opt("to") ?? join(HOME, "backups");
-      const results = snapshotAll(HOME, root, { keep: Number(opt("keep") ?? 14) });
+      // VALIDATED before anything is written. `Number()` alone accepts `0`,
+      // negatives, fractions and `NaN`, and each erases every recovery point
+      // while the command prints `snapshot hub -> ...` and exits 0. `keep: 0`
+      // prunes to nothing, and `slice(NaN)` is `slice(0)` in JavaScript -- so a
+      // typo like `--keep aa` deletes the entire backup set. Measured: all four
+      // of `0`, `-1`, `aa` and `2.5` reported success. A malformed option must
+      // not be the most destructive thing this command can do.
+      const keepRaw = opt("keep");
+      // `== null`, not `=== undefined`: this CLI's `opt()` returns NULL for an
+      // absent flag, so a strict undefined check rejected the DEFAULT path and
+      // broke every plain `backup --hub`. Found by running the command, not by
+      // reading the validation.
+      const keep = keepRaw == null ? 14 : Number(keepRaw);
+      if (!Number.isInteger(keep) || keep < 1)
+        die(`reeve backup --hub: --keep must be a positive whole number of snapshots to retain, ` +
+            `got ${JSON.stringify(keepRaw)}.\n-> omit it for the default of 14`);
+      const results = snapshotAll(HOME, root, { keep });
       for (const r of results)
         console.log(r.deferred ? `deferred ${r.nwo}: ${r.why}`
                   : r.ok       ? `snapshot ${r.nwo} -> ${r.path}`
@@ -794,11 +810,30 @@ switch (cmd) {
           ? new DatabaseSync(hubPathFor(HOME), { readOnly: true })
           : new DatabaseSync(hubPathFor(HOME), { timeout: 10000 }));
     if (sub === "status") {
-      // Reading an unmigrated store is fine; reading a NEWER one is not. Refuse
-      // rather than render columns this binary does not understand.
+      // Reading a NEWER store is refused, rather than rendering columns this
+      // binary does not understand.
       const v = db.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
       if (v > HUB_SCHEMA_VERSION)
         die(`the hub is at schema version ${v}; this reeve knows ${HUB_SCHEMA_VERSION}. Upgrade reeve.`);
+      // And version 0 is refused too. The comment here used to say "reading an
+      // unmigrated store is fine", which was the false premise: `openHub`
+      // commits `schema_version` as plain DDL BEFORE migration 1's transaction,
+      // so an interrupted first run leaves a store where the query above
+      // succeeds and returns 0 while `singleton_lease` -- queried immediately
+      // below -- does not exist. `build status` then died with an uncaught
+      // SQLite stack trace instead of reporting the builder state, which is the
+      // one thing it exists to do.
+      //
+      // THIRD site of one class. `build run` and `restoreHub` were fixed for the
+      // same reason and this was missed, because the sweep matched where I
+      // remembered the pattern rather than everywhere the invariant holds.
+      // Existence is not readiness, and neither is openability.
+      if (v < 1) {
+        console.log("builder: not running (the hub's first migration never completed)");
+        console.log(`  hub      ${hubPathFor(HOME)}`);
+        console.log(`  recover  reeve build run finishes it, or reeve restore --hub --force installs a snapshot`);
+        break;
+      }
       // Defined here rather than referenced: an advertised command that throws
       // ReferenceError is worse than one that does not exist.
       const row = db.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get();

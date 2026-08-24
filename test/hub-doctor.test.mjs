@@ -361,6 +361,60 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   db.close();
 }
 
+// ── two CLI options that could destroy a backup set or crash a report ───────
+{
+  const home = join(dir, "opts-home");
+  mkdirSync(join(home, "state"), { recursive: true });
+  const env = { ...process.env, REEVE_HOME: home };
+  const run = (...args) => spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+    { encoding: "utf8", env });
+
+  // `--keep` reaches `prune`, and `Number()` alone accepts 0, negatives,
+  // fractions and NaN. Each ERASES EVERY RECOVERY POINT while the command
+  // prints `snapshot hub -> ...` and exits 0 -- `keep: 0` prunes to nothing, and
+  // `slice(NaN)` is `slice(0)` in JavaScript, so a typo deletes the whole set.
+  // Measured before the fix: all four reported success.
+  openHub(hubPathFor(home)).close();
+  for (const bad of ["0", "-1", "aa", "2.5"]) {
+    const r = run("backup", "--hub", "--keep", bad);
+    check(r.status !== 0 && /--keep must be a positive whole number/.test((r.stderr ?? "") + (r.stdout ?? "")),
+      `\`--keep ${bad}\` is refused before anything is written`,
+      `status=${r.status} ${((r.stderr ?? "") + (r.stdout ?? "")).slice(0, 120)}`);
+  }
+  // CONTROL, and it is the one that matters: `opt()` returns NULL for an absent
+  // flag, so a strict `=== undefined` check rejected the DEFAULT path and broke
+  // every plain `backup --hub`. That regression was introduced by the fix above
+  // and caught only by running the command.
+  const dflt = run("backup", "--hub");
+  check(dflt.status === 0,
+    "control: with no --keep at all the default is used, not rejected",
+    `status=${dflt.status} ${((dflt.stderr ?? "") + (dflt.stdout ?? "")).slice(0, 140)}`);
+  const good = run("backup", "--hub", "--keep", "3");
+  check(good.status === 0, "control: and a valid --keep still works", `status=${good.status}`);
+
+  // `build status` on a hub whose first migration never completed. `openHub`
+  // commits `schema_version` as plain DDL before migration 1's transaction, so
+  // the version query succeeds and returns 0 while `singleton_lease` does not
+  // exist -- and the command died with an uncaught SQLite stack trace instead of
+  // reporting the builder state, which is the one thing it is for.
+  const v0 = join(dir, "v0-home");
+  mkdirSync(join(v0, "state"), { recursive: true });
+  const half = new DatabaseSync(join(v0, "state", "hub.db"));
+  half.exec(`CREATE TABLE IF NOT EXISTS schema_version (
+               version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT`);
+  half.close();
+  const st = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), "build", "status"],
+    { encoding: "utf8", env: { ...process.env, REEVE_HOME: v0 } });
+  const out = (st.stdout ?? "") + (st.stderr ?? "");
+  check(!/no such table|SqliteError|at Database/.test(out),
+    "`build status` reports on a hub whose first migration never completed, rather than throwing",
+    out.slice(0, 200));
+  check(/first migration never completed/.test(out),
+    "and says what is wrong in words", out.slice(0, 200));
+  check(/recover/.test(out),
+    "and tells the operator what to do next", out.slice(0, 240));
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

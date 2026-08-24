@@ -100,6 +100,12 @@ function run(cwd, neutralise, args, env, { raw = false, input = undefined } = {}
  * legitimate one. The TOTAL matters as much as the per-file bound: a tree can
  * commit any number of these, and the daemon reads all of them synchronously. */
 const MAX_ATTRIBUTES_BYTES = 1 << 20;
+
+/** How many daemon-copied files reeve will remember in order to tell them from
+ * the worker's. A gitignored dependency tree contributes none of these; only an
+ * unignored one does, and a project with more than this in one is misdeclaring a
+ * source directory as a dependency. */
+const MAX_COPIED_UNTRACKED = 20000;
 const MAX_ATTRIBUTES_TOTAL = 4 << 20;
 
 /** The conventional directory for one run's checkout. Keyed by run, not by PR:
@@ -299,7 +305,7 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
   // `depsFrom` is a list of paths RELATIVE to the founder's checkout, copied to
   // the same place in the run's. A tree that is not there is not an error: a
   // project simply may not have one.
-  let deps = { ok: true, cow: false, skipped: true, copied: [], why: "no dependency source given" };
+  let deps = { ok: true, cow: false, skipped: true, copied: [], untracked: [], why: "no dependency source given" };
   if (depsFrom?.length) {
     const copied = [];
     let anyCow = false;
@@ -319,7 +325,28 @@ export function prepareRunCheckout({ repoRoot, root, pr, runId, branch, head = n
       if (!one.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: one.why }; }
       if (!one.skipped) { copied.push(rel); anyCow = anyCow || one.cow; }
     }
-    deps = { ok: true, cow: anyCow, skipped: copied.length === 0, copied, why: null };
+    // What the DAEMON left untracked, recorded before the worker starts.
+    //
+    // Excluding the copied trees by PATH afterwards cannot tell reeve's own files
+    // from the worker's: an undeclared new file inside a copied, unignored tree
+    // was invisible to every exclusion shape tried, so an incomplete repair
+    // published and the checkout carrying the omitted part was deleted. A
+    // baseline is the only thing that distinguishes them, because it is the one
+    // fact only reeve knows.
+    //
+    // Empty for the ordinary case, where a dependency tree is gitignored and
+    // `--exclude-standard` never lists it. Bounded because an unignored tree can
+    // be enormous, and a refusal that says so beats a list nobody reads.
+    const listed = copied.length
+      ? git(path, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...copied], { raw: true })
+      : { ok: true, out: "" };
+    if (!listed.ok) { rmSync(path, { recursive: true, force: true }); return { ok: false, path: null, why: `could not record what was copied in: ${listed.err}` }; }
+    const untracked = listed.out ? listed.out.split("\0").filter(Boolean) : [];
+    if (untracked.length > MAX_COPIED_UNTRACKED) {
+      rmSync(path, { recursive: true, force: true });
+      return { ok: false, path: null, why: `the dependency trees ${copied.join(", ")} put ${untracked.length} files into the checkout that git does not ignore, past the ${MAX_COPIED_UNTRACKED} reeve will track; ignore them or declare a narrower path` };
+    }
+    deps = { ok: true, cow: anyCow, skipped: copied.length === 0, copied, untracked, why: null };
   }
 
   return { ok: true, path, why: null, deps };
@@ -610,7 +637,11 @@ export function commitRunWork({ repoRoot, path, branch, message, secrets = [], d
   // `-z` and RAW, because git quotes a path it considers unusual -- `kéy.txt`
   // comes back as `"k\303\251y.txt"` from `--name-only` -- and because trimming
   // the output would eat a leading space that is part of the filename.
-  const staged = git(path, ["diff", "--cached", "--name-only", "-z"], { raw: true });
+  // `--no-renames`, because rename detection reports only the DESTINATION: a
+  // repair that renames a file and correctly declares both sides had the source
+  // read as never-changed, and the bidirectional check refused it. Both
+  // filesystem paths the worker touched have to be visible to be compared.
+  const staged = git(path, ["diff", "--cached", "--name-only", "--no-renames", "-z"], { raw: true });
   if (!staged.ok) return { ok: false, why: `could not read what was staged: ${staged.err}` };
   const files = staged.out ? staged.out.split("\0").filter(Boolean) : [];
 

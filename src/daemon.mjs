@@ -161,23 +161,35 @@ export function repairMessage(report, decision) {
   return cause ? `${subject}\n\n${cause}` : subject;
 }
 
-function uncommittedFiles(worktree, exclude = []) {
+function uncommittedFiles(worktree, copiedBaseline = []) {
   try {
-    // The daemon copies dependency trees in BEFORE the worker starts, and their
-    // untracked content is deliberately not staged. A repository that does not
-    // ignore its own `node_modules` would otherwise leave `?? node_modules/`
-    // behind and this gate would quarantine every valid repair -- the exclusion
-    // from staging turning into a refusal here.
+    // Read over EVERYTHING, then subtract what the daemon itself put there.
     //
-    // Read in the same two parts the staging uses, or this hides the half it does
-    // not exclude: everything outside the copied trees, then TRACKED changes
-    // inside them. A worker editing a vendored file under version control is
-    // doing real work, and a gate blind to it lets an incomplete fix publish.
-    const run = args => execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, ...args], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: gitEnv() }).trim();
-    const outside = run(["status", "--porcelain", ...(exclude.length ? ["--", ".", ...exclude.map(e => `:(exclude)${e}`)] : [])]);
-    const inside = exclude.length ? run(["status", "--porcelain", "--untracked-files=no", "--", ...exclude]) : "";
-    const out = [outside, inside].filter(Boolean).join("\n");
-    return out ? out.split("\n").map(l => l.slice(3).trim().split(" -> ").pop()).filter(Boolean) : [];
+    // Excluding the copied trees by path could not tell reeve's files from the
+    // worker's: with `--` plus `:(exclude)` the tree vanished entirely, and with
+    // `--untracked-files=no` inside it an undeclared new file vanished too. Either
+    // way an incomplete repair published and the checkout holding the omitted part
+    // was deleted. The baseline recorded at prepare time is the only thing that
+    // separates them, because it is the one fact only reeve knows.
+    const put = new Set(copiedBaseline);
+    // `--untracked-files=all`, because the default COLLAPSES an entirely untracked
+    // directory to `node_modules/` while the baseline holds file paths -- so the
+    // subtraction missed and every copied tree read as one uncommitted change. The
+    // two readings have to agree on granularity or the baseline cannot subtract.
+    const out = execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "status", "--porcelain", "--untracked-files=all", "-z"],
+                             { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: gitEnv() });
+    // `-z` records are NUL-separated and a rename carries its source as the NEXT
+    // record, so the walk has to consume it rather than read it as a status line.
+    const records = out.split("\0");
+    const left = [];
+    for (let i = 0; i < records.length; i++) {
+      const rec = records[i];
+      if (!rec) continue;
+      const xy = rec.slice(0, 2), file = rec.slice(3);
+      if (/[RC]/.test(xy)) { const src = records[++i]; if (src && !put.has(src)) left.push(src); }
+      if (file && !put.has(file)) left.push(file);
+    }
+    return left;
   } catch { return null; }
 }
 
@@ -936,7 +948,7 @@ export async function tick(ctx) {
       // Declared out here, not inside the try: the publish path below reads it,
       // and a const in the try block is a ReferenceError at that point -- the
       // exact shape that once threw on every FIX_CI with every unit test green.
-      let r, prepFailed = false, worktree = null, workerToken = null, copiedDeps = [];
+      let r, prepFailed = false, worktree = null, workerToken = null, copiedDeps = [];  // the baseline: what preparation left untracked
       try {
         // Everything from here runs inside the cleanup scope: the run is
         // already leased and its heartbeat already ticking, so a failure in
@@ -972,7 +984,7 @@ export async function tick(ctx) {
         // declared path that did not exist is skipped, and excluding it anyway
         // would hide the worker's own creation of it from staging AND from the
         // uncommitted check -- losing that part of the fix while the rest ships.
-        copiedDeps = prepared.deps?.copied ?? [];
+        copiedDeps = prepared.deps?.untracked ?? [];
         log(logPath, `  #${e.pr}: checkout ready at ${worktree}` +
                      `${prepared.deps?.copied?.length ? ` (deps: ${prepared.deps.copied.join(", ")}${prepared.deps.cow ? ", copy-on-write" : ""})` : ""}`);
         if (wantDeps.unsupported.length)

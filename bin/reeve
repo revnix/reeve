@@ -86,10 +86,50 @@ const registryProjects = (home) => {
     // than the one it was asked.
     if (reg === null || typeof reg !== "object" || Array.isArray(reg))
       return { projects: [], error: `${path}: the registry must be an object of name -> project, not ${Array.isArray(reg) ? "an array" : typeof reg}` };
-    const bad = Object.entries(reg).filter(([, v]) => !v || typeof v !== "object" || Array.isArray(v)).map(([n]) => n);
+    // The SHAPE and the FIELD. Checking that an entry is an object was one shape
+    // short: `{ "prod": {} }` passed, `projectsKnown` went true over a project
+    // with `nwo: null`, and `hubFindings` then suppressed every real
+    // `repo_gate_state` row as unregistered while emitting `H-4:null` in their
+    // place. That is the same failure the object check was added to close,
+    // reached through a different malformation -- so the rule is what the
+    // registry has to PROVIDE, not what it has to avoid being.
+    //
+    // `owner/repo`, because that is the only form `nwo_snapshot` ever holds and
+    // the only form H-4 can match a gate-state row against. A name that cannot
+    // match is not a name.
+    // A SEGMENT MUST BE MORE THAN DOTS. `[\w.-]+` accepts `.`, `..`, `../..` and
+    // `owner/..`, none of which can ever equal an `nwo_snapshot` -- so a registry
+    // carrying one still set `projectsKnown`, and `hubFindings` went on
+    // suppressing every real gate-state row against a name that matches nothing.
+    // That is the unsafe-authority hiding this validation exists to stop,
+    // reached through a name that is syntactically a name and semantically not.
+    //
+    // GitHub's own rule for the repository half is the same one: a segment may
+    // hold letters, digits, `-`, `_` and `.`, and may not be `.` or `..`.
+    // The first lookahead ends at the SLASH, not at the end of the string:
+    // `(?!\\.+$)` on the owner asks whether the WHOLE REMAINDER is dots, so
+    // `./repo` sailed through it. Measured, on the first attempt at this rule.
+    // THE OWNER IS A GITHUB LOGIN, and it does not obey the repository-name
+    // character class. `-/repo` passed the previous rule -- a segment that is
+    // not only dots, and therefore "a name" -- while `-` can never be an owner.
+    // A login is alphanumeric with single hyphens INSIDE it: it may not start
+    // or end with one. The repository half keeps the looser class, which really
+    // does allow `.`, `_` and `-` anywhere except as the whole name.
+    // SINGLE internal hyphens only. `[A-Za-z0-9-]*` allowed `a--b`, which GitHub
+    // does not: a login is alphanumeric segments joined by ONE hyphen each.
+    // AND BOUNDED. A GitHub login is at most 39 characters, so a 40-character
+    // owner cannot name one -- and an impossible name still marked the registry
+    // KNOWN, which is the suppression this validation exists to stop.
+    const OWNER = String.raw`[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}`;
+    const REPO  = String.raw`(?!\.+$)[\w.-]+`;
+    const NWO = new RegExp(`^${OWNER}/${REPO}$`);
+    const bad = Object.entries(reg)
+      .filter(([, v]) => !v || typeof v !== "object" || Array.isArray(v) ||
+                         typeof v.nwo !== "string" || !NWO.test(v.nwo))
+      .map(([n]) => n);
     if (bad.length)
-      return { projects: [], error: `${path}: ${bad.length} malformed entr${bad.length === 1 ? "y" : "ies"} (${bad.slice(0, 5).join(", ")}); each project must be an object` };
-    return { projects: Object.entries(reg).map(([name, p]) => ({ name, nwo: p.nwo ?? null })),
+      return { projects: [], error: `${path}: ${bad.length} malformed entr${bad.length === 1 ? "y" : "ies"} (${bad.slice(0, 5).join(", ")}); each project must be an object with an "owner/repo" nwo` };
+    return { projects: Object.entries(reg).map(([name, p]) => ({ name, nwo: p.nwo })),
              error: null };
   } catch (e) {
     // The read failure is ITSELF a finding, and the route below emits it.

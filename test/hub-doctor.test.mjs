@@ -534,6 +534,19 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     "and not a finding about the malformed entry's missing name, which is what replaced it",
     JSON.stringify(badIds));
 
+  // CONTROL: names that merely CONTAIN dots are still accepted -- the rule is
+  // about a segment that is nothing but dots, and `owner/repo.js` is a real
+  // repository name that must keep working.
+  // `owner/repo.js`, not `some.owner/repo.js`: a GitHub LOGIN is alphanumeric
+  // with inner hyphens and cannot contain a dot at all, so my first version of
+  // this control asserted something GitHub itself refuses. The repository half
+  // is the one that legitimately carries dots.
+  writeFileSync(reg, JSON.stringify({ prod: { nwo: "o/orphan" }, dotted: { nwo: "owner/repo.js" },
+                                      hyphened: { nwo: "octo-example/my-repo" } }));
+  const dotted = idsOf(run("builder", "doctor", "--json").stdout);
+  check(dotted !== null && !dotted.includes("H-7"),
+    "control: a repository name containing dots is still a name", JSON.stringify(dotted));
+
   // CONTROL: a WELL-FORMED registry is not reported as an error, so the
   // assertion above is about the malformed entry rather than about H-7 always
   // firing.
@@ -542,6 +555,40 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   const goodIds = idsOf(good.stdout);
   check(goodIds !== null && !goodIds.includes("H-7"),
     "control: a well-formed registry raises no registry error", JSON.stringify(goodIds));
+
+  // AN OBJECT IS NOT ENOUGH. Checking the shape was one shape short:
+  // `{ "prod": {} }` passed, `projectsKnown` went true over a project with
+  // `nwo: null`, and every real gate-state row was suppressed as unregistered
+  // while `H-4:null` was emitted in its place -- the same failure the shape
+  // check was added to close, reached through a different malformation.
+  //
+  // So the rule is what the registry must PROVIDE. `owner/repo` is the only
+  // form `nwo_snapshot` ever holds and the only form H-4 can match against; a
+  // name that cannot match is not a name.
+  // The dot cases are not decoration. `[\\w.-]+` accepts `.`, `..`, `../..` and
+  // `owner/..` -- names that are syntactically names and can never equal an
+  // `nwo_snapshot`, so the registry read as KNOWN and every real gate-state row
+  // was suppressed against a name matching nothing. That is the unsafe-authority
+  // hiding this validation exists to stop, reached through the front door.
+  for (const [label, body] of [["an entry with no nwo", { prod: {} }],
+                               ["an nwo that is not owner/repo", { prod: { nwo: "notanwo" } }],
+                               ["an nwo that is not a string", { prod: { nwo: 7 } }],
+                               ["an nwo of dot segments", { prod: { nwo: "../.." } }],
+                               ["a relative-looking owner", { prod: { nwo: "./repo" } }],
+                               ["a dot repository name", { prod: { nwo: "owner/.." } }],
+                               ["a bare hyphen as the owner", { prod: { nwo: "-/repo" } }],
+                               ["an owner starting with a hyphen", { prod: { nwo: "-a/repo" } }],
+                               ["an owner ending with a hyphen", { prod: { nwo: "a-/repo" } }],
+                               ["consecutive hyphens in the owner", { prod: { nwo: "a--b/repo" } }],
+                               ["an owner past GitHub's 39-character limit", { prod: { nwo: "a".repeat(40) + "/repo" } }]]) {
+    writeFileSync(reg, JSON.stringify(body));
+    const ids = idsOf(run("builder", "doctor", "--json").stdout);
+    check(ids?.includes("H-7"), `${label} is a registry error`, JSON.stringify(ids));
+    check(ids?.includes("H-4:o/orphan"),
+      `and the authority finding survives it (${label})`, JSON.stringify(ids));
+    check(!ids?.includes("H-4:null"),
+      `and no finding about the missing name replaces it (${label})`, JSON.stringify(ids));
+  }
 
   // And a top level that is not an object at all.
   writeFileSync(reg, JSON.stringify(["prod"]));

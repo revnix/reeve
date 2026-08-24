@@ -150,6 +150,30 @@ const offendersIn = text => {
     "control: a state column is recognised when one is present", "");
 }
 
+// --- STRUCTURAL: the prompt file is the fenced block and nothing else ---------
+//
+// The tenth copy was not in the prompt a session receives. It was in the epilogue
+// UNDER it -- "why the prompt is shaped this way" -- which is commentary about the
+// document, and commentary about a document is exactly where facts about the
+// document collect. No phrasing check would have been the answer; the answer was
+// that there was prose there at all.
+//
+// So the surface is gone rather than policed: the file is a short header, one
+// fenced block, and nothing after it. The rationale moved into the handoff, where
+// rationale belongs. This is the third check here that decides structure instead
+// of wording, and structure is the only thing about prose a test reads reliably.
+{
+  const lines = prompt.split("\n");
+  const fences = lines.map((l, i) => [l, i]).filter(([l]) => l.startsWith("```")).map(([, i]) => i);
+  check(fences.length === 2, `${PROMPT} has exactly one fenced block`, `found ${fences.length} fence lines`);
+  const trailing = fences.length === 2 ? lines.slice(fences[1] + 1).join("").trim() : "";
+  check(trailing === "", `${PROMPT} has nothing after the closing fence`,
+    `${trailing.length} characters follow it, starting: ${trailing.slice(0, 70)}`);
+  // Control: the scan can find a fence at all, so an empty result cannot be read
+  // as a well-formed file.
+  check(fences.length > 0, "control: the fence scan found the block it measures", "");
+}
+
 // --- and it says so, so a reader knows the rule -------------------------------
 {
   check(/contains no current facts/i.test(prompt),

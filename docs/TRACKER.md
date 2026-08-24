@@ -5,8 +5,14 @@ Update it the moment a decision lands or a state changes — never in batches.
 Rule of the house: every claim here is either **measured** (say when) or marked
 **intent**. Absence from this file means "not planned", not "done".
 
-Last full re-verification: 2026-08-21 (suite 45/45, daemon observe-only,
-`HEAD == origin/main`).
+Last full re-verification: 2026-08-24 (suite 71/71, daemon observe-only on
+`3f9ba6f`, checkout fast-forwarded and restarted, `--execute` absent from the
+RUNNING process).
+
+Read the live switches from the machine, not from this file. Whether reeve is
+armed, what `main` is and what the daemon runs are answered by the commands in §0
+of `docs/2026-08-24-session-handoff.md`; recording them here would make a second
+copy that ages. What belongs here is what was DECIDED and what was FOUND.
 
 ---
 
@@ -17,7 +23,7 @@ The four capabilities, measured 2026-08-21:
 | # | Capability | Switch | State | Unblocks when |
 |---|---|---|---|---|
 | 1 | Watch, judge, escalate | — | **ON** | live on nextlyhq/nextly |
-| 2 | Fix red CI itself | `--execute` | off | dispatch evidence (not time-bound) |
+| 2 | Fix red CI itself | `--execute` | off | evidence obtained 2026-08-24; re-arming is now a founder decision, not a blocked one |
 | 3 | Work review threads | `watch.reviewActions` | off | PR-5 → PR-6 after the shadow week |
 | 4 | Refuse an unsafe merge | `--enforce` + ruleset | off | 7 clean shadow days + founder decision |
 
@@ -51,7 +57,18 @@ The four capabilities, measured 2026-08-21:
       no attempt spent); mixed causes dispatch with the flaky job named as
       noise. Follow-up noted: `ci.flakePatterns` is declared in the schema with
       ZERO readers — wire or remove when the builder design lands.
-- [ ] Dispatch evidence: the wrong-worker shape (a confidently bad fix). ~$2, 1h.
+- [x] **Dispatch evidence — DONE 2026-08-23 and re-run 2026-08-24.** Four real
+      workers across two sessions, on a deterministic timezone bug whose tempting
+      shortcut is deleting the cross-timezone assertion.
+      **The shape it was built to find did not occur.** All four produced the same
+      byte-identical CORRECT fix and none weakened the test, so "a confidently bad
+      fix" remains unmeasured rather than disproved.
+      What it found instead was a P0 in reeve itself (see 23 Aug below), and after
+      the repair, the first end-to-end publication under the new contract:
+      **61s, $0.42, 16 turns, 0 permission denials, published.** Verified from a
+      fresh clone of the bare remote rather than from the log — correct fix, test
+      file untouched, passing under UTC, Los Angeles, Tokyo and Karachi.
+      `docs/measured/2026-08-23-three-real-dispatches.md` has the failing run.
 - [x] `release` lane dead-by-construction — DONE 2026-08-21 (`4998f66`).
       `lanes[].sensitiveOk` lifts the tool-layer deny (verbatim globs only) and
       the diff-gate sensitive refusal (territory-scoped, per file); quarantine
@@ -61,16 +78,74 @@ The four capabilities, measured 2026-08-21:
 - [ ] *Optional (founder: "if beneficial")* — PR-open size warning (>10 files →
       expect 4+ rounds), reinstate Greptile (best critical hit rate, out of credits).
 
+### 22–24 August — arming, the P0, and the repair
+
+Three days this file had no record of at all. Written 2026-08-24, from the
+measured notes rather than from memory.
+
+**22 Aug.** The OS sandbox landed (`1a2fbea`, 10:47) and reeve was armed against
+`nextlyhq/nextly` with `rounds.maxFixAttemptsPerFinding: 1`. The sandbox took the
+publishing half away the same morning without anything noticing — see the P0 row
+in the defect log. The founder ruled out a dedicated macOS user for workers
+("I'm not going to make another user"), which settles the worker-identity item
+below in favour of the OS sandbox's read deny.
+
+**23 Aug.** Three real dispatches against the wrong-worker fixture, $2.66, none
+published. The experiment's own premise did not occur — all three fixes were
+correct and none weakened the test. It found the P0 instead. **reeve was DISARMED
+the same day**, deliberately, and re-arming has been the founder's call since.
+
+**24 Aug.** Four PRs merged, in this order:
+
+| PR | what it did |
+|---|---|
+| #15 | the dispatch write-up: `docs/measured/2026-08-23-three-real-dispatches.md` |
+| #18 | the prompt renders from the grant, closing the sixth instance of that drift |
+| #19 | **reeve commits the worker's fix, because the worker cannot** — the P0 repair |
+| #22 | the follow-ups: a lost deletion, the unbounded path list, the R-01 actor id |
+
+Then: the daemon's checkout was fast-forwarded and restarted (it had been eight
+commits back, running pre-repair code all day while watching pull requests), and
+the wrong-worker experiment was re-run against the merged code and **published**.
+
+Two peer lanes ran alongside — S2-A (#20), the hub post-merge work (#23) and the
+unreadable-hub refusal (#24). Coordination was by SendMessage, and it paid twice:
+a peer's watcher bug prompted a check that found a worse one in mine (an API blip
+made a live PR read as CLOSED and silently ended the watch), and a peer's note that
+`gh`'s `headRefOid` is the MERGED head pairs with the finding that a review
+comment's `original_commit_id` is the only field answering "what did this verdict
+actually look at" — used the same day to establish that one finding had already
+been fixed in the commit after the one it reviewed.
+
+**Standing decisions from these days, so they are not re-litigated:**
+
+- reeve commits and pushes; the worker never touches git state. Not a workaround —
+  it also closes the older "who publishes" drift rather than patching around it.
+- Staging is DECLARATION-driven. reeve stages exactly `filesTouched` and refuses
+  when the staged set does not match. Four staging defects in four review rounds
+  became one design change, and every exclusion heuristic disappeared with it.
+- A fence and a retry budget are two facts. The outbox's `lease_token` must NOT
+  reuse `attempts`: a fence increments on every lease including a no-op one, a
+  budget only on a real attempt. There is **no deadline** on this — an earlier note
+  claimed one by reading `RESHAPED`'s refusal, which is for a changed UNIQUE
+  constraint and not for an added column.
+- Commit signing stays a doctor check rather than a build step.
+
 ### Needs the founder
 
 - [ ] **ntfy read user** — all 5 tokens write-only; needs shell on 95.217.11.127
       (`ntfy user add mobeen`; `ntfy access mobeen revnix-reeve read-only`;
       `upstream-base-url` for iOS). Desktop notifications work meanwhile.
 - [ ] **Second project** (`rextaihq/rext-backend`) — needs PR-gating CI + App install.
-- [ ] **Worker identity decision** — a dedicated macOS user for workers (the only
-      non-sandbox way to make the keychain and `~/.config/gh` unreachable) vs
-      relying on the OS sandbox's read deny once measured in PR-2. Until one is
-      proven, no worker dispatches (`guardian:containment:open`).
+- [x] **Worker identity decision — RULED 2026-08-22.** The founder declined a
+      dedicated macOS user ("I'm not going to make another user"), so containment
+      rests on the OS sandbox's read deny plus the keychain path denies measured in
+      PR-2. Do not re-propose the extra user.
+- [ ] **Re-arming decision.** The dispatch evidence the arming was waiting on now
+      exists (24 Aug, published end-to-end). What it rests on, stated fairly: ONE
+      successful dispatch on a toy fixture, against a repository that has never had
+      one. Each real attempt costs about $1 and is spent whether or not it
+      publishes.
 - [ ] **Ruleset flip decision** (after the verdict shadow week).
 
 ### Closed by ruling — do not reopen
@@ -464,6 +539,11 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
 
 | Date | Defect | Fix |
 |---|---|---|
+| 2026-08-24 | **The sandbox had no opinion about CLI tools.** Every rule in it was a SHELL COMMAND rule — `Bash(curl:*)` and 39 others — while the grant's own docblock claimed "it cannot reach the network". `WebFetch` is not a shell command, and neither are `WebSearch`, `Task`, `Workflow`, `SendMessage`, `ListAgents`, `CronCreate`, `ScheduleWakeup`, `RemoteTrigger` or `EnterWorktree`; not one of those names appeared anywhere in `src/`, counted with a positive control. Measured before changing anything, the boundary HELD: a real worker under reeve's own settings called `WebFetch` and got "you haven't granted it yet". It held by CONSEQUENCE — a tool off the allow list falls through to a permission prompt, and a headless run has nobody to answer one. Third instance of that shape after the inert read deny list (22 Aug) and the `.git` block imposed beneath reeve's settings (23 Aug). The worker also spent three of its turns finding out | `NEVER_TOOLS`, grouped by the capability each hands over rather than listed by name, carried into `permissions.deny` AND `--disallowedTools` (a `workerArgs` parameter that had existed with no caller), and rendered into the worker's rules FROM the same constant so prompt and grant cannot drift. It comes from the sandbox, not the prompt spec, so a lane cannot widen it. Measured after: the tool is GONE from the session rather than refused within it — `ToolSearch` reports "No matching deferred tools found" and the worker stops in one call instead of three. Read/Edit/Write/Bash/Grep/Glob deliberately excluded, with the converse asserted: denying a tool a repair needs produces a worker that reports success on work nothing checked |
+| 2026-08-24 | **The dirty gate lost a deletion, and then the fix for it was unbounded twice.** A worker removing a copied dependency file produces NO status record at all, so the checkout read clean and the source half of a repair could publish without it. The repair — subtracting the preparation baseline by content — then had to decide which baseline paths were tracked, and did it by naming up to `MAX_COPIED_UNTRACKED` paths as pathspecs, which breaches `ARG_MAX` on macOS (1 MiB) and Windows (32,767 chars). Reading the whole index instead breached the 64 MiB subprocess buffer. Both throw, both return `null`, and both make the caller quarantine a repair that was fine: one defect wearing two limits. A regression test for the first version also asserted a platform's number as a property of the code — green on macOS, red on the Ubuntu runner | the gate keys on what status REPORTED and subtracts the baseline by content, so an untouched tree is not re-hashed after every paid run, and a dependency patch the worker declared and reeve committed is no longer refused as uncommitted work. Neither path list is held now: git streams the index to a file and it is read in fixed 64 KiB chunks, with the carry kept as a Buffer because a multi-byte character split across two reads corrupts a name SILENTLY and the file then reads as untracked. The control probes the platform and PRINTS which of the two happened, rather than asserting one platform's limit — reeve has to run on macOS, Windows and Ubuntu. Stated plainly in the PR: reverting to the buffered read leaves the test green, because a 64 MiB index needs ~1M tracked paths and no fixture builds that. The buffer removal is argued, not demonstrated |
+| 2026-08-24 | R-01's bypass caveat named the CLASS of a bypass actor and not the actor. `actor_type` renders `Team:1` and `Team:2` identically, so "unless reeve's identity is inside the bypass" was a question the operator had no way to answer — and for `actor_type: "Integration"` the withheld id IS the App id reeve identifies itself by. The check earns its place by being read BEFORE a worker run is paid for, so a caveat that cannot be acted on is worse than none | one `bypassActorName` behind both renderings, so the fix cannot be half-applied. `baseline.mjs` renders the same field and deliberately does NOT share it — that string is a stored canonical form and rewording it would move every recorded baseline and report drift where nothing changed; the reason is in the helper's comment so the next person does not "finish" the centralisation. An actor with no id degrades to the bare type, because a dangling colon reads as a truncated id |
+| 2026-08-23 | **P0 — the worker could not commit, so no dispatch could publish.** The OS sandbox (`1a2fbea`, 22 Aug 10:47) denies every write under `.git` at the Bash layer, BENEATH anything reeve declares: reeve's own settings carried `denyWrite: []` and denied `.git/**` only for the file tools. A worker attempted `git add`/`git commit` seven times, got `Unable to create .git/index.lock: Operation not permitted`, and spent 13 of its 36 tool calls correctly diagnosing an impossible instruction. Publication had been PROVEN working on 21 Aug and broke the next morning with nothing noticing, because the capability was recorded in a handoff as a standing fact rather than a dated one. Found by re-verifying that very line, not by a failure. While it stood, each eligible red PR spent its single attempt for ~$1 and produced an escalation | staging and committing moved to reeve (`commitRunWork`), which stages EXACTLY the paths the worker declared in `filesTouched` via `git --literal-pathspecs add --force --pathspec-from-file=- --pathspec-file-nul` — never `git add --all` — and refuses when what staged does not match what was declared. The worker is told it cannot commit, which is what stops the attempt costing a run; it keeps `status`/`diff`/`log`/`show` and is pointed at `git clean -f --` because `rm` is not granted. `Bash(git add:*)` and `Bash(git commit:*)` added to `NEVER` as DIAGNOSTICS, so the refusal reads as a boundary rather than a broken machine. reeve was DISARMED the same day and the repair verified end-to-end on 24 Aug |
+| 2026-08-23 | The prompt promised commands the grant did not carry — the sixth instance of one shape, after four tabulated on 21 Aug. Rule 0 told every worker `pnpm test` was permitted while the fixture granted no `pnpm` at all, and the prompt forbade absolute binary paths while `sandboxFor` grants the interpreter by absolute path as the only route left when a unit's language is unrecognised. Five of the six are drift between two things reeve itself writes; the P0 above is NOT — a generator reading the grant would have cheerfully advertised `git commit` | the prompt renders FROM the grant (`claimedCommands`, `runnableCommands`, `namedRunners`, `exampleCommand`), with the wrapper exemption so a declared `sh test.sh` is not forbidden by the plain-names rule; `test/prompt-sandbox-agreement.test.mjs` drives 15 profiles through one `forbids()` predicate. Closing the class does not reach the P0, and the write-up says so: that needs the EFFECTIVE restrictions probed, not just the declared ones |
 | 2026-08-22 | **PR-3 Codex round 3, 8 findings (7×P1), arriving after the merge** — deeper attacks on the checkout and publish path, all real. The publication gates read `HEAD` while `publishRunWork` pushes `e.headRef`, so a worker could commit anything on the branch, check out an auxiliary branch with an allowed change, and have content NO gate inspected pushed. The credential check read the NET patch, so a token committed and then deleted was published in the intermediate commit, and binary blobs never appear in patch text at all. `git clone` copied every one of the founder's local branches and their objects into the worker's checkout, so a private branch arrived as `origin/private` — readable, and copyable into an allowed path, which the path-deny does nothing about. A worker could `git replace <pinned> <fake>` so every diff the daemon took reported an innocuous change while the push carried the real commits. A global `filter.<name>.smudge` in the founder's config runs, unsandboxed, as the daemon, when PR-controlled `.gitattributes` names it — before the worker starts, so no fingerprint can help. A PR-committed symlink where a unit root belongs made the dependency copy write OUTSIDE the checkout as the daemon. Concurrent workers under one worktreeRoot could read each other's checkouts and homes. And (P2) an empty `git ls-remote` read as "unchanged", so a branch the contributor deleted mid-run was RECREATED by the push | every gate judges `refs/heads/<headRef>` and refuses when it cannot be read; the credential check walks every newly reachable object (`rev-list --objects` + `cat-file --batch`), so intermediate commits and binary blobs are covered; the checkout is `git init` plus a single-ref fetch of the pinned revision, not a clone; `--no-replace-objects` and `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_ATTR_NOSYSTEM=1` on every daemon git call in worker-controlled trees; every component of a dependency destination is checked for symlinks and the resolved path must stay under the checkout; the shared worktree root is deny-read with only this run's own checkout carved back out (a root, not a list, because a list goes stale the moment another run starts); an empty ls-remote refuses the publish. The live canary caught TWO regressions from these fixes within a minute each: its own directory denied by the sibling rule, and its readable-neighbour control denied with it |
 | 2026-08-22 | The review shadow week's four divergences were the INSTRUMENT, not the derivation. Taken back to back, live and derived agree exactly on all four PRs (#1134 31/26, #1128 55/7, #1131 8/8, #1133 20/19). In a tick they are not taken together: `evaluate()` reads GitHub live, `observe()`+`ingest()` read it AGAIN afterwards, the projection is built from what that ingest wrote, and `compare()` then holds the FIRST reading against the THIRD. Any PR that moved in between was recorded as the derivation disagreeing — the probe's own ingest was still inserting five threads on #1128, which is exactly that PR's reported gap. The instrument that decides whether PR-5 is safe could not tell a moved pull request from a broken derivation | the live read is retaken after the ingest, and only when the ingest wrote something (a quiet PR costs no extra call); a retake that fails makes the tick INCOMPARABLE, which counts as neither agreement nor disagreement. Whether the ingest also MISSES threads is a separate question and is now answerable: a divergence that survives this is a real one |
 | 2026-08-22 | **PR-3 Codex round 1, 6 findings, 5 genuine P1.** The one that matters most: **a scratch HOME does not close the keychain** — it empties the keychain SEARCH LIST. Measured: `security find-internet-password -s github.com <login.keychain-db>` returns **0 (FOUND)** from a scratch home, because the file does not move, is unlocked with no timeout, and the worker runs as the same OS user. Every probe reeve had asked the search list, so nothing could see it — **including the canary, which had certified containment on that basis and PASSED**. Also: `git clone --branch <b>` asks the source for a LOCAL head and a PR branch exists only as `origin/<b>`, so **every ordinary dispatch would have failed at the first step** (every fixture created the branch locally first); a finished worker that never committed had its work **deleted** while the log said it was published, because a push carries commits and `changedFiles` counts uncommitted paths; the worker's OAuth token can be written into an ordinary source file that the filename-only diff gate passes and reeve then pushes; dependencies were hard-coded to `node_modules` while every worker got an empty scratch HOME, so python/go/rust checks could not resolve anything; and (P2) the per-invocation canary tree was built before the cache lookup, leaking a directory per tick under a cached pass | `~/Library/Keychains` denied by path (measured with a positive control: 44 under the deny, 0 without) and the canary probes BOTH shapes and refuses to pass if the by-path probes are absent; plain clone plus an explicit remote-tracking refspec; dispatch refuses to publish or release a checkout with uncommitted work, and `publishRunWork` refuses when the fetched head equals the remote head; the diff is scanned for reeve's own token before publishing (a literal match, and the code says so); dependency trees come from the profile's languages with `worker.dependencyPaths` overriding and the unsupported case LOGGED; cached/skipped canary results marked and the tree removed unless the canary holds it for evidence |

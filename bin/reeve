@@ -213,9 +213,9 @@ switch (cmd) {
       const root = opt("to") ?? join(HOME, "backups");
       const results = snapshotAll(HOME, root, { keep: Number(opt("keep") ?? 14) });
       for (const r of results)
-        console.log(r.ok        ? `snapshot ${r.nwo} -> ${r.path}`
-                  : r.deferred  ? `deferred ${r.nwo}: ${r.why}`
-                  :               `FAILED   ${r.nwo}: ${r.why}`);
+        console.log(r.deferred ? `deferred ${r.nwo}: ${r.why}`
+                  : r.ok       ? `snapshot ${r.nwo} -> ${r.path}`
+                  :              `FAILED   ${r.nwo}: ${r.why}`);
       // `deferred` is neither, and must not fail the exit status. A same-second
       // race with another daemon is not a backup failure, and a command that
       // exits non-zero for one teaches an operator to stop reading its output --
@@ -231,9 +231,11 @@ switch (cmd) {
       if (!hub)
         die(`reeve backup --hub: there is no hub database at ${hubPathFor(HOME)}, so nothing was backed up.\n` +
             `-> reeve build run creates it`);
-      if (!hub.ok && !hub.deferred)
+      if (!hub.ok)
         die(`reeve backup --hub: the hub snapshot failed: ${hub.why}`);
-      process.exit(results.some(r => !r.ok && !r.deferred) ? 1 : 0);
+      // `ok` alone now: a deferred result is `ok`, because another process
+      // published it and that is not this command's failure.
+      process.exit(results.some(r => !r.ok) ? 1 : 0);
     }
     // ...the existing per-repo backup, unchanged, below.
     const nwo = positionals.find(a => /^[\w.-]+\/[\w.-]+$/.test(a)) || detectNwo();

@@ -321,7 +321,22 @@ export function snapshotAll(home, root, { at = Math.floor(Date.now() / 1000), ke
       // the operator is told plainly which file and why, and neither the exit
       // status nor any escalation turns on it.
       if (taken.ok && taken.path && !taken.mine) {
-        results.push({ nwo, ...taken, ok: false, deferred: true, escalate: null,
+        // `ok: true`, and this REVERSES an earlier choice in this PR.
+        //
+        // It was `ok: false` on the reasoning that a loser cannot vouch for a
+        // file it did not write -- which is true, and is not the question `ok`
+        // is asked. Every programmatic consumer asks `ok` one thing: "is this a
+        // failure I should act on". Two independent callers then got it wrong
+        // the same way: `bin/reeve` exited non-zero on a benign same-second
+        // race, and `src/daemon.mjs:1314` logged `backup FAILED` for it on the
+        // automatic path -- a false alert on the one signal that has to stay
+        // trustworthy.
+        //
+        // Two callers making the same mistake is not two bugs, it is a field
+        // whose meaning does not match its use. So `ok` now means "not a
+        // failure", which is safe by DEFAULT for a caller that checks nothing
+        // else, and the distinction moves to `outcome` for anyone who wants it.
+        results.push({ nwo, ...taken, ok: true, outcome: "deferred", deferred: true, escalate: null,
           why: `another process published ${taken.path} this second; ` +
                `its validity is that process's to establish, not this one's` });
         continue;
@@ -338,7 +353,8 @@ export function snapshotAll(home, root, { at = Math.floor(Date.now() / 1000), ke
           try { rmSync(taken.path, { force: true }); } catch {}
           // NOT pruned. The retention window still holds every good snapshot it
           // held before this attempt, which is the whole point of deferring it.
-          results.push({ nwo, ok: false, why: `snapshot failed validation and was deleted: ${v.why}`, escalate: "builder:backup:failed" });
+          results.push({ nwo, ok: false, outcome: "failed", escalate: "builder:backup:failed",
+                         why: `snapshot failed validation and was deleted: ${v.why}` });
           continue;
         }
         // Valid, so it has earned its slot: prune now, with the real `keep` --
@@ -363,9 +379,10 @@ export function snapshotAll(home, root, { at = Math.floor(Date.now() / 1000), ke
             : validateSnapshot(p, { kind: "repo" })).ok,
         });
       }
-      results.push({ nwo, ...taken });
+      results.push({ nwo, outcome: taken.ok ? "taken" : "failed", ...taken });
     } catch (e) {
-      results.push({ nwo, ok: false, why: `could not open ${path}: ${e.message}` });
+      results.push({ nwo, ok: false, outcome: "failed", escalate: "builder:backup:failed",
+                     why: `could not open ${path}: ${e.message}` });
     } finally {
       try { db?.close(); } catch { /* a close that fails must not lose the result */ }
     }
@@ -539,7 +556,21 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     let d = null;
     try {
       d = new DatabaseSync(p, { timeout: 10000 });
-      d.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get();
+      const v = d.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+      // A store with NO COMPLETED MIGRATION is not readable for this command's
+      // purposes, whatever the version query says. `openHub` creates
+      // `schema_version` as plain DDL, committed before migration 1's
+      // transaction, so an interrupted first run leaves a file where that query
+      // succeeds and returns 0 -- while `maintenance_lock`, `singleton_lease`
+      // and every other table this function goes on to query do not exist.
+      // Classified as readable, `restore --hub` then dies with
+      // `no such table: maintenance_lock` instead of installing a snapshot it
+      // has already validated, which is the exact state this command exists to
+      // recover from.
+      //
+      // Same invariant as `build run`'s bootstrap test: existence is not
+      // readiness, and neither is openability.
+      if (v < 1) { try { d.close(); } catch {} return null; }
       return d;
     } catch { try { d?.close(); } catch {} return null; }
   };

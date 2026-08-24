@@ -1311,9 +1311,23 @@ export async function tick(ctx) {
       const home = ctx.home ?? dirname(logPath ?? join(homedir(), ".reeve", "x"));
       const all = (ctx.snapshotAll ?? snapshotAll)(home, root, { at });
       for (const r of all) {
-        if (!r.ok) log(logPath, `backup FAILED (${r.nwo}): ${r.why}`);
+        if (r.ok) continue;
+        log(logPath, `backup FAILED (${r.nwo}): ${r.why}`);
+        // ESCALATED, not only logged. `snapshotAll` has always returned an
+        // `escalate` key on a failed snapshot and nothing anywhere consumed it,
+        // so a backup that wrote an unreadable file and deleted it produced one
+        // log line and no finding. The self-audit below cannot cover the gap
+        // either: the previous GOOD snapshot is deliberately retained, so it
+        // still looks fresh and reports nothing -- and the failure stays silent
+        // until that retained copy ages out, which is exactly the window in
+        // which there is no working backup.
+        if (r.escalate) escalations.set(`${r.escalate}: ${r.nwo}`, 1);
       }
-      const okd = all.filter(r => r.ok);
+      // `taken`, not `ok`. A deferred result is `ok` -- another process
+      // published this second and that is not a failure -- but this daemon did
+      // not take it, and counting it here would report a backup this tick did
+      // not perform.
+      const okd = all.filter(r => (r.outcome ?? (r.ok ? "taken" : "failed")) === "taken");
       if (okd.length) log(logPath, `backup: ${okd.length} store(s) — ${okd.map(r => r.nwo).join(", ")}`);
       // A tick that snapshotted nothing at all is a backup that is not happening.
       if (!all.length) log(logPath, "backup FAILED: no state store found to snapshot");

@@ -247,8 +247,21 @@ openHub(hubPathFor(home)).close();
     "fixture: the pre-claim won the publish, so snapshotAll below must lose it", JSON.stringify(claimed));
   const res = snapshotAll(home, root, { at: at2, keep: Infinity });
   const hub = res.find(r => r.nwo === "hub");
-  check(hub?.ok === false && hub?.deferred === true,
-    "snapshotAll reports a lost publish as deferred, not as a backup it can vouch for",
+  // BOTH halves, because the contract changed once already and each half has a
+  // caller depending on it.
+  //
+  // Not a failure: `ok` is what every programmatic consumer branches on, and
+  // both of them -- `bin/reeve backup --hub` and the daemon's automatic backup
+  // path -- treated a benign same-second race as `backup FAILED` when this was
+  // `ok: false`. Two callers making the same mistake is a field whose meaning
+  // does not match its use.
+  check(hub?.ok === true,
+    "a lost publish is NOT a failure: another process published it, and `ok` is what callers branch on",
+    JSON.stringify(hub));
+  // And still distinguishable: it is not a backup THIS process took, so a
+  // caller counting its own snapshots must be able to exclude it.
+  check(hub?.deferred === true && hub?.outcome === "deferred" && hub?.mine === false,
+    "and it is still marked deferred, so a caller counting its own snapshots can exclude it",
     JSON.stringify(hub));
   check(hub != null && !hub.escalate,
     "control: and does NOT escalate -- a same-second race is not a backup failure",
@@ -1056,6 +1069,48 @@ function writeAuthority(db, project) {
   const ok2 = restoreHub(snap, okPath, { isAlive: () => false, pid: process.pid, lstart: "me" });
   check(ok2.ok === true,
     "control: a hub at this binary's own version restores normally", String(ok2.why));
+}
+
+// ── a version-0 hub is RECOVERABLE, not a dead end ─────────────────────────
+// `openHub` creates `schema_version` as plain DDL before migration 1's
+// transaction, so an interrupted first run leaves a file where the version query
+// SUCCEEDS -- returning 0 -- while `maintenance_lock` and every other table this
+// path queries does not exist. Classified as readable, `restore --hub` died with
+// `no such table: maintenance_lock` instead of installing a snapshot it had
+// already validated, which is precisely the state the command exists to recover.
+{
+  const p = join(home, "v0-hub.db");
+  const snap = latestSnapshot(root, "hub");
+  const half = new DatabaseSync(p);
+  half.exec(`CREATE TABLE IF NOT EXISTS schema_version (
+               version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT`);
+  half.close();
+  {
+    const probe = new DatabaseSync(p, { readOnly: true });
+    const v = probe.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+    const tables = probe.prepare("SELECT count(*) c FROM sqlite_master WHERE type='table'").get().c;
+    probe.close();
+    check(v === 0 && tables === 1,
+      "fixture: the version query succeeds and returns 0, which is what made this look readable",
+      `version ${v}, ${tables} table(s)`);
+  }
+  const r = restoreHub(snap, p, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+  check(r.ok === true,
+    "restore --hub recovers a hub whose first migration never completed",
+    JSON.stringify(r).slice(0, 220));
+  check(!/no such table/.test(String(r.why ?? "")),
+    "and does not die on a table migration 1 never created", String(r.why));
+  const back = new DatabaseSync(p, { readOnly: true });
+  const tablesAfter = back.prepare("SELECT count(*) c FROM sqlite_master WHERE type='table'").get().c;
+  const versionAfter = back.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+  back.close();
+  check(versionAfter === 1 && tablesAfter > 1,
+    "and the store is whole afterwards", `version ${versionAfter}, ${tablesAfter} tables`);
+  // The half-created file is KEPT. It carries no completed migration, but a
+  // recovery that silently deletes what it replaced is one an operator cannot
+  // audit -- and this path quarantines rather than deletes for that reason.
+  check(r.quarantined && existsSync(r.quarantined),
+    "and the half-created file is quarantined and named, not deleted", String(r.quarantined));
 }
 
 rmSync(home, { recursive: true, force: true });

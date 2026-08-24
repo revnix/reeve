@@ -24,7 +24,7 @@ this file outside §0, without pointing at §0.
 | prompt/grant fix | **merged** — #18 |
 | the dispatch write-up | **merged** — #15 |
 | `--execute` | **OFF.** reeve watches, judges and escalates; it does not dispatch |
-| the daemon's checkout | behind `main`; the running process is on older code |
+| the daemon's checkout | at `main`; fast-forwarded and restarted 2026-08-24, verified by content and by `ps` |
 | open, mine | #22 `fix/dispatch-followups` @ `~/Work/Products/reeve-wt/followups` |
 | open, a peer's | #23 (hub post-merge) — `nextly-integrations-28` owns it |
 | first real dispatch on nextly | **still has not happened** — 0 rows in `run` |

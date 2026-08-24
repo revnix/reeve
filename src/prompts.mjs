@@ -10,7 +10,7 @@
 // protocol containing instructions that contradicted each other and a path to a
 // checkout 47 commits stale.
 
-import { projectRunners, commandDenied } from "./sandbox.mjs";
+import { projectRunners, commandDenied, deniedCommands } from "./sandbox.mjs";
 
 /**
  * The commands this prompt presents to a worker as runnable, in the order it
@@ -23,8 +23,11 @@ import { projectRunners, commandDenied } from "./sandbox.mjs";
  * measured instance of the prompt claiming what the sandbox refuses.
  */
 export function claimedCommands(profile) {
-  const example = exampleCommand(profile);
-  return [...(example ? [example] : []), ...namedRunners(profile)];
+  // Every declared command the prompt names, at any state, plus the runners. An
+  // advisory or broken command is granted by `sandboxFor` and named in rule 0's
+  // inventory, so leaving it out here made the two disagree about what the prompt
+  // presents -- which is the drift this export exists to let a test catch.
+  return [...new Set([...runnableCommands(profile, { anyState: true }), ...namedRunners(profile)])];
 }
 
 /** `git` first because it is granted for every action, then the language's own
@@ -47,11 +50,17 @@ function exampleCommand(profile) {
  * declaration order. The fallback below has to name all of them: `sandboxFor`
  * grants one per declared command, so describing only the first tells a worker
  * that a command HOW TO VERIFY goes on to recommend is not available. */
-function runnableCommands(profile) {
+function runnableCommands(profile, { anyState = false } = {}) {
   const out = [];
   for (const u of profile?.units ?? []) {
     for (const c of Object.values(u.commands ?? {})) {
-      if (c?.state !== "present" || !c.cmd) continue;
+      // `sandboxFor` grants a declared command whatever its state, so the GRANT
+      // inventory has to include an advisory or broken one -- rule 0 claiming to
+      // list everything granted while omitting `Bash(custom lint:*)` is the same
+      // prose-versus-data drift this file exists to close. The EXAMPLE still
+      // prefers a present command, because that is about usefulness.
+      if (!anyState && c?.state !== "present") continue;
+      if (!c?.cmd) continue;
       const full = c.cmd.trim();
       const head = full.split(/\s+/).slice(0, 2).join(" ");
       // A command of nothing but whitespace is truthy, so it passes validation and
@@ -86,7 +95,8 @@ function invariants(profile) {
   const named = namedRunners(profile);
   // Unconditional in `sandboxFor`, but a profile may forbid it by absolute path.
   const interpreter = commandDenied(process.execPath, profile) ? null : process.execPath;
-  const runnableList = runnableCommands(profile);
+  const runnableList = runnableCommands(profile, { anyState: true });
+  const denials = deniedCommands(profile);
   const runnable = exampleCommand(profile) ?? named[0] ?? null;
   const nameList = named.map(r => `\`${r}\``).join(", ");
   const lines = [
@@ -111,8 +121,14 @@ function invariants(profile) {
       `   Permission is decided by matching a command from its START, so \`${runnable} …\``,
       `   is what the grant is written against, while \`${runnable} … 2>&1 | tail -20\` is`,
       "   a different command and is refused. A more specific rule can still deny a",
-      "   particular form; the rules below say which.",
+      "   particular form.",
     ] : []),
+    // OUTSIDE the branch above: these hold whatever is granted, so a profile with
+    // nothing runnable still needs them. NAMED, not gestured at -- this used to say
+    // "the rules below say which" while rendering only the profile's own forbidden
+    // list, so a worker could read `git remote -v` as a qualified allowance and
+    // spend a turn discovering it is in NEVER.
+    `   Refused whatever else is granted: ${denials.join(", ")}.`,
     "   If output is long, read the file instead.",
     ...(nameList ? [
       `   Use plain command names — ${nameList} — never an absolute path to a`,

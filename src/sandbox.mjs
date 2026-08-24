@@ -320,6 +320,21 @@ export function commandDenied(cmd, profile) {
   });
 }
 
+/**
+ * The commands the sandbox refuses, as a worker should read them.
+ *
+ * Exported because the prompt used to tell the worker that "the rules below say
+ * which" specific forms are denied, while rendering only the profile's own
+ * `forbiddenCommands` -- so `git remote -v` looked like a qualified allowance and
+ * was refused. Naming them is the only version of that sentence that is true, and
+ * it is cheaper for the worker than discovering each one by spending a turn.
+ */
+export function deniedCommands(profile) {
+  const own = (profile?.risk?.forbiddenCommands ?? []).filter(c => typeof c === "string" && c.length);
+  const built = NEVER.map(rule => /^Bash\((.+):\*\)$/.exec(rule)?.[1]).filter(Boolean);
+  return [...new Set([...built, ...own])];
+}
+
 /** Utilities that make a checkout readable. A fixer that cannot list a directory
  * is reduced to guessing at filenames. */
 const READ_ONLY_UTILITIES = ["ls", "cat", "head", "tail", "wc", "find", "which", "pwd"];

@@ -940,6 +940,16 @@ rmSync(root, { recursive: true, force: true });
       "and an edited one does not", "");
     check(digestOf(join(w, "vendor", "absent.js")) === null,
       "an unreadable path is null, which never matches, so it fails closed", "");
+
+    // This runs in the DAEMON, unsandboxed, over paths a worker controls. A copied
+    // file replaced with a symlink to /dev/zero would be read forever.
+    symlinkSync("/dev/zero", join(w, "vendor", "as-device"));
+    check(digestOf(join(w, "vendor", "as-device")) === null,
+      "a symlink to a device is not followed, and reads as changed", "");
+    symlinkSync(join(w, "vendor", "dep.js"), join(w, "vendor", "as-link"));
+    check(digestOf(join(w, "vendor", "as-link")) === null,
+      "nor is a symlink to an ordinary file, since only a regular file is hashed", "");
+    check(digestOf(join(w, "vendor")) === null, "and a directory is not a file", "");
   }
 
   rmSync(cRoot, { recursive: true, force: true });

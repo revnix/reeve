@@ -107,6 +107,11 @@ const MAX_ATTRIBUTES_BYTES = 1 << 20;
  * unignored one does, and a project with more than this in one is misdeclaring a
  * source directory as a dependency. */
 const MAX_COPIED_UNTRACKED = 20000;
+
+/** The largest file reeve will hash to decide whether it is still its own copy.
+ * A dependency file past this is treated as changed, which holds the work for a
+ * human rather than reading an unbounded amount of worker-controlled bytes. */
+const MAX_FINGERPRINT_BYTES = 64 * 1024 * 1024;
 const MAX_ATTRIBUTES_TOTAL = 4 << 20;
 
 /** The conventional directory for one run's checkout. Keyed by run, not by PR:
@@ -592,10 +597,25 @@ export function fingerprint(root, paths) {
   return out;
 }
 
-/** The digest of one file, or null when it cannot be read. */
+/**
+ * The digest of one REGULAR file within a bounded size, or null.
+ *
+ * `lstat`, not `stat`, and a size ceiling: this runs in the DAEMON, unsandboxed,
+ * over paths a worker controls. A copied file replaced with a symlink to
+ * `/dev/zero` would be followed and read forever; one pointed at a huge host file
+ * would exhaust memory before the catch could run. Neither is reachable if only a
+ * bounded regular file is ever opened.
+ *
+ * Anything else -- a symlink, a device, a directory, an oversized file, an
+ * unreadable one -- returns null, which never equals a recorded digest, so it
+ * reads as CHANGED and the work is held rather than published.
+ */
 export function digestOf(abs) {
-  try { return createHash("sha256").update(readFileSync(abs)).digest("hex"); }
-  catch { return null; }
+  try {
+    const st = lstatSync(abs);
+    if (!st.isFile() || st.size > MAX_FINGERPRINT_BYTES) return null;
+    return createHash("sha256").update(readFileSync(abs)).digest("hex");
+  } catch { return null; }
 }
 
 export function commitRunWork({ repoRoot, path, branch, message, secrets = [], declared = [] }) {

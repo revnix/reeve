@@ -1134,9 +1134,14 @@ switch (cmd) {
         // question it had not been able to ask -- and answering it negatively,
         // while a live builder's lease said otherwise. Absence of a reading is
         // not a reading of absence.
-        console.log(benign
-          ? `builder: UNKNOWN (the hub at ${hubPathFor(HOME)} could not be read just now)`
-          : `builder: not running (the hub at ${hubPathFor(HOME)} cannot be read)`);
+        // UNKNOWN EITHER WAY. The verdict is about whether the lease could be
+        // READ, and neither branch got that far -- so reporting "not running"
+        // on the corrupt one was the same mistake, made twice, and the more
+        // dangerous half: it invites the operator to follow the forced-restore
+        // advice below WITHOUT stopping a builder that may still be live.
+        //
+        // What differs between the branches is the RECOVERY, not the verdict.
+        console.log(`builder: UNKNOWN (the hub at ${hubPathFor(HOME)} ${benign ? "could not be read just now" : "cannot be read"})`);
         console.log(`  why      ${String(e.message).split("\n")[0]}`);
         // `--tail` NAMED HERE TOO. Every other recovery line in this change says
         // it, and this one did not -- so an operator with a durable export who
@@ -1147,7 +1152,9 @@ switch (cmd) {
           console.log(`           reeve CLI and re-run, and check the permissions on the hub and its`);
           console.log(`           directory. Do NOT restore over it.`);
         } else {
-          console.log(`  recover  reeve restore --hub --force installs the newest usable snapshot`);
+          console.log(`  recover  STOP any running builder first -- this command could not read the`);
+          console.log(`           lease, so it cannot tell you whether one is live.`);
+          console.log(`           reeve restore --hub --force then installs the newest usable snapshot;`);
           console.log(`           add --tail <file> from a durable export-events --hub to carry`);
           console.log(`           forward every event after that snapshot; without one they are lost`);
         }

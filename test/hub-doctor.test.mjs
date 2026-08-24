@@ -14,7 +14,7 @@ import { selfAudit, BROKEN } from "../src/selfaudit.mjs";
 import { open as openStore } from "../src/db/ops.mjs";
 import { hubPathFor } from "../src/paths.mjs";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, openSync, writeSync, closeSync, existsSync } from "node:fs";
+import { mkdirSync, openSync, writeSync, closeSync, existsSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";   // the CLI drill runs bin/reeve
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -491,6 +491,99 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     (exp.stdout + exp.stderr).slice(0, 240));
   check(!existsSync(join(home, "tail.jsonl")),
     "and writes no file, so a refused export cannot be mistaken for an empty history", "");
+}
+
+// ── a malformed registry is an ERROR, not a set of rows silently dropped ───
+// `{ "prod": "bad" }` parsed, so the loader returned `error: null` and filtered
+// the entry away. Doctor then set `projectsKnown: true` over a project set the
+// registry did not describe, and `hubFindings` SUPPRESSES gate-state rows absent
+// from that set -- so a broken registry reported a clean hub while hiding the
+// H-4 authority findings the H-7 path exists to preserve. Narrowing the input
+// answers a smaller question than the one that was asked.
+{
+  const home = join(dir, "registry-home");
+  mkdirSync(join(home, "state"), { recursive: true });
+  const env = { ...process.env, REEVE_HOME: home };
+  const run = (...args) => spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+    { encoding: "utf8", env });
+  const db = openHub(hubPathFor(home));
+  // A gate-state row with no matching project is the H-4 case being hidden.
+  db.prepare(`INSERT INTO repo_gate_state(repo_id, nwo_snapshot, ruleset_requires_check,
+                                        app_installed, verified_at)
+              VALUES(1,'o/orphan',1,'pass',unixepoch())`).run();
+  db.close();
+
+  const reg = join(home, "projects.json");
+  const idsOf = out => { try { return JSON.parse(out.slice(out.indexOf("["))).map(f => f.id); } catch { return null; } };
+
+  writeFileSync(reg, JSON.stringify({ prod: "bad" }));
+  const bad = run("builder", "doctor", "--json");
+  const badIds = idsOf(bad.stdout);
+  check(badIds !== null, "control: builder doctor --json parsed", (bad.stdout + bad.stderr).slice(0, 200));
+  check(badIds?.includes("H-7"),
+    "a malformed registry entry is reported as a registry error", JSON.stringify(badIds));
+  // THE EXACT ID, `H-4:o/orphan`. A prefix match is what a weak version of this
+  // assertion looks like, and it passed against the old loader: measured, the
+  // old behaviour emits `H-4:null` -- a finding about the malformed entry's
+  // absent `nwo` -- while SUPPRESSING `H-4:o/orphan`, the row that actually
+  // has unsafe authority. Both start with "H-4". Which finding, not whether one.
+  check(badIds?.includes("H-4:o/orphan"),
+    "and the authority finding it used to hide is reported, for the project it is about",
+    JSON.stringify(badIds));
+  check(!badIds?.includes("H-4:null"),
+    "and not a finding about the malformed entry's missing name, which is what replaced it",
+    JSON.stringify(badIds));
+
+  // CONTROL: a WELL-FORMED registry is not reported as an error, so the
+  // assertion above is about the malformed entry rather than about H-7 always
+  // firing.
+  writeFileSync(reg, JSON.stringify({ prod: { nwo: "o/orphan" } }));
+  const good = run("builder", "doctor", "--json");
+  const goodIds = idsOf(good.stdout);
+  check(goodIds !== null && !goodIds.includes("H-7"),
+    "control: a well-formed registry raises no registry error", JSON.stringify(goodIds));
+
+  // And a top level that is not an object at all.
+  writeFileSync(reg, JSON.stringify(["prod"]));
+  const arr = run("builder", "doctor", "--json");
+  check(/must be an object/.test(arr.stdout + arr.stderr) || idsOf(arr.stdout)?.includes("H-7"),
+    "a registry that is an array is refused rather than read as empty",
+    (arr.stdout + arr.stderr).slice(0, 240));
+}
+
+// ── a malformed recovery tail refuses; it does not throw a stack trace ─────
+// A partial copy is the likeliest damage to a recovery tail -- it is the case
+// the manifest check exists to diagnose -- and a file that stopped mid-line got
+// there first, as an uncaught SyntaxError, from the one command an operator runs
+// when the hub is already gone.
+{
+  const home = join(dir, "badtail-home");
+  mkdirSync(join(home, "state"), { recursive: true });
+  const env = { ...process.env, REEVE_HOME: home };
+  const run = (...args) => spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+    { encoding: "utf8", env });
+  openHub(hubPathFor(home)).close();
+  const snap = run("backup", "--hub");
+  check(snap.status === 0, "fixture: a snapshot exists to restore from", (snap.stdout + snap.stderr).slice(0, 160));
+
+  const cut = join(home, "cut.jsonl");
+  writeFileSync(cut, `{"seq":1,"at":1,"kind":"task.transitioned","task":null,"payload":"{}"}\n{"seq":2,"at":1,"kin`);
+  const r = run("restore", "--hub", "--tail", cut, "--force");
+  const out = (r.stdout ?? "") + (r.stderr ?? "");
+  check(r.status !== 0, "a tail that stops mid-line is refused", `status=${r.status}`);
+  check(!/^\s+at .*:\d+:\d+$/m.test(out) && !/SyntaxError/.test(out),
+    "and not with an uncaught stack trace", out.slice(0, 300));
+  check(/line 2 of 2/.test(out), "and it names WHICH line, so the file can be inspected", out.slice(0, 300));
+  check(/re-export it with reeve export-events --hub/.test(out),
+    "and says how to get a good one", out.slice(0, 300));
+
+  // CONTROL: a well-formed tail gets past the parse and is judged on its merits.
+  const okTail = join(home, "ok.jsonl");
+  writeFileSync(okTail, `{"seq":1,"at":1,"kind":"task.transitioned","task":null,"payload":"{}"}\n{"_manifest":{"count":1,"first":1,"last":1,"sha256":"x"}}\n`);
+  const ok = run("restore", "--hub", "--tail", okTail, "--force");
+  const okOut = (ok.stdout ?? "") + (ok.stderr ?? "");
+  check(!/could not be parsed/.test(okOut),
+    "control: a parseable tail reaches the manifest checks instead", okOut.slice(0, 240));
 }
 
 rmSync(dir, { recursive: true, force: true });

@@ -205,13 +205,38 @@ const EVIDENCE = [
       "control: and the witnessed claim.won edge still reaches SIZING", JSON.stringify(won));
   }
 
-  // There is no IMPLEMENTING -> SPEC_DRAFT edge. A plan that turns out wrong
-  // mid-implementation is a founder decision, never an automatic respec.
-  const respec = PHASES.filter(p => {
-    const r = nextPhase({ phase: "IMPLEMENTING", generation: 1 }, { kind: "phase.failed", retriesExhausted: true });
-    return r.ok && r.to === "SPEC_DRAFT";
-  });
-  check(respec.length === 0, "there is no IMPLEMENTING -> SPEC_DRAFT edge");
+  // A plan that turns out wrong mid-implementation is a founder DECISION, never
+  // an automatic respec.
+  //
+  // The claim has to be stated that precisely, because the blanket version is
+  // false: `founder.regenerate` moves IMPLEMENTING to SPEC_DRAFT deliberately,
+  // and that is the whole point of the verb. What must not exist is an edge the
+  // machine takes ON ITS OWN.
+  //
+  // The previous form asserted the blanket claim and passed anyway, by looking at
+  // one evidence kind: it mapped over PHASES with a callback that ignored the
+  // loop variable entirely and re-tested `phase.failed` twenty-one times. Green,
+  // named for a property it never examined, and wrong about that property
+  // besides. Every kind is swept now, and the founder verb is named as the one
+  // exception rather than hidden by a narrow probe.
+  const FOUNDER_RESPEC = "founder.regenerate";
+  const respec = EVIDENCE
+    .map(e => [e, nextPhase({ phase: "IMPLEMENTING", generation: 1, heldFrom: "IMPLEMENTING" }, e)])
+    .filter(([, r]) => r.ok && r.to === "SPEC_DRAFT")
+    .map(([e]) => e.kind);
+  check(respec.every(k => k === FOUNDER_RESPEC),
+    "nothing but the founder's regenerate takes IMPLEMENTING to SPEC_DRAFT",
+    `reached it: ${respec.join(", ") || "(nothing)"}`);
+  // CONTROL, so this is not satisfied by a machine with no such edge at all --
+  // which would break `regenerate` and leave the assertion above green.
+  const SNAP_R = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f", profileHash: "h",
+                   defaultBranch: "main", visibility: "private", specRepoId: 9,
+                   gateDefinitionHash: "g", registryVersion: 3, founderUserId: 4242 };
+  const deliberate = nextPhase({ phase: "IMPLEMENTING", generation: 1 },
+    { kind: FOUNDER_RESPEC, snapshot: SNAP_R });
+  check(deliberate.ok && deliberate.to === "SPEC_DRAFT",
+    "control: and the founder's regenerate really does make that edge, so the sweep has something to exclude",
+    JSON.stringify(deliberate).slice(0, 140));
 
   // Both held states exit, and only --redesign bumps.
   for (const held of HELD) {

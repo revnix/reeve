@@ -60,6 +60,45 @@ export function completedVersion(path) {
   } catch { return 0; }
 }
 
+/**
+ * Is this SQLite failure the FILE's fault, or the situation's?
+ *
+ * Three catches asked this question and two answered it differently -- one
+ * split BUSY and READONLY out, two called every failure corruption -- which is
+ * the same fact resolved in several places, and it drifted immediately.
+ *
+ * Only codes that are KNOWN to leave the file intact earn "this is not damage":
+ *
+ *   errcode 5  SQLITE_BUSY      another connection holds it
+ *   errcode 8  SQLITE_READONLY  read-only file or directory
+ *
+ * Everything else is treated as damage, and that direction is deliberate. The
+ * "do NOT restore" message is a strong claim; making it only for codes proven
+ * benign is the conservative reading. An unknown code answered as operational
+ * would tell an operator to leave a corrupt hub alone -- `no such table:
+ * maintenance_lock` is errcode 1 and is unambiguously damage. Recovery in the
+ * other direction is guarded by `--force` and quarantines what it replaces.
+ *
+ * All four codes measured against node:sqlite, not read from a table.
+ */
+export function isOperational(e) {
+  // NOT A SQLITE STORAGE ERROR AT ALL. Every failure out of SQLite carries an
+  // `errcode`; an error without one came from reeve's own code -- `assertWritable`
+  // throwing `a restore is in progress` is the case that matters, and routing it
+  // through the damage branch told a concurrent `build run` that its lock tables
+  // had failed and sent it at another forced restore, when the correct answer is
+  // to wait for the one already running.
+  if (e?.errcode === undefined) return true;
+  // Access and contention: the file is untouched and the situation is what
+  // failed. CANTOPEN is the one this list was missing -- a healthy hub the CLI
+  // user simply cannot open answers 14, and was being called corruption.
+  return e.errcode === 3      // SQLITE_PERM
+      || e.errcode === 5      // SQLITE_BUSY
+      || e.errcode === 6      // SQLITE_LOCKED
+      || e.errcode === 8      // SQLITE_READONLY
+      || e.errcode === 14;    // SQLITE_CANTOPEN
+}
+
 export function openHub(path) {
   // state/ may not exist yet: on a fresh REEVE_HOME no guardian store has
   // created it, and DatabaseSync will not create a missing parent. Without this
@@ -67,18 +106,70 @@ export function openHub(path) {
   mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path, { timeout: 10000 });
 
-  // Set before anything else: foreign_keys cannot be changed inside a
-  // transaction, and a migration is a transaction.
-  db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA synchronous = FULL");     // authority-bearing and low-volume; NORMAL is not inherited
-  db.exec("PRAGMA foreign_keys = ON");
-  db.exec("PRAGMA busy_timeout = 10000");
+  // AN UNREADABLE FILE IS REFUSED HERE, ONCE, FOR EVERY CALLER.
+  //
+  // Opening a corrupt database SUCCEEDS -- SQLite reads nothing until it is
+  // asked to -- so the failure surfaced on the first pragma below, as a raw
+  // `file is not a database` with a stack trace naming a line in hubdb.mjs.
+  // `build run` and `build status` both died that way, from the two commands an
+  // operator reaches for WHEN SOMETHING IS ALREADY WRONG.
+  //
+  // Guarding each caller is what produced six previous findings of this class,
+  // each one declaring it swept. There is one guard, and it is where the damage
+  // is first touched rather than in the routes that touch it.
+  try {
+    // Set before anything else: foreign_keys cannot be changed inside a
+    // transaction, and a migration is a transaction.
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA synchronous = FULL");   // authority-bearing and low-volume; NORMAL is not inherited
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec("PRAGMA busy_timeout = 10000");
+    // AND THE SCHEMA PROBE, inside the same guard. Corruption confined to the
+    // `schema_version` PAGE rather than the header lets all four pragmas
+    // succeed, so the first version read threw outside this catch and `build
+    // run` printed a bare `database disk image is malformed` with none of the
+    // recovery this guard exists to give. The guard has to reach as far as the
+    // first read that can find damage, not stop at the first write.
+    db.exec(`CREATE TABLE IF NOT EXISTS schema_version (
+               version    INTEGER PRIMARY KEY,
+               applied_at INTEGER NOT NULL
+             ) STRICT`);
+    db.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get();
+  } catch (e) {
+    try { db.close(); } catch { /* the throw below is the answer either way */ }
+    // WHICH FAILURE, not merely that one happened. These pragmas WRITE, so they
+    // fail for reasons that have nothing to do with the file being damaged:
+    //
+    //   errcode 26  SQLITE_NOTADB   file is not a database
+    //   errcode 11  SQLITE_CORRUPT  disk image is malformed
+    //   errcode  5  SQLITE_BUSY     another connection holds a read txn (DELETE mode)
+    //   errcode  8  SQLITE_READONLY read-only file or directory
+    //
+    // (all four measured against node:sqlite). Telling an operator to restore
+    // over a BUSY or READ-ONLY hub points them at replacing a healthy authority
+    // database because someone else was reading it, or because a permission is
+    // wrong. That is worse than the crash this guard replaced.
+    //
+    // Same mistake as the maintenance-lock catch: a failed operation is not
+    // evidence of a damaged file. Only corruption earns the recovery advice.
+    const corrupt = !isOperational(e);
+    throw new Error(
+      corrupt
+        ? `the hub at ${path} cannot be read (${e.message}).\n` +
+          `  recover  reeve restore --hub --force installs the newest usable snapshot\n` +
+          `           pass --tail from a durable export-events --hub to carry history forward`
+        : `the hub at ${path} could not be opened for writing (${e.message}).\n` +
+          `  the file itself answered, so this is not damage: another process may hold it, or the ` +
+          `file or its directory may be read-only.\n` +
+          `  recover  stop any running builder or reeve CLI and re-run; check the permissions on ` +
+          `${path} and its directory. Do NOT restore over it -- there is no evidence it is broken.`,
+      { cause: e });
+  }
 
-  db.exec(`CREATE TABLE IF NOT EXISTS schema_version (
-             version    INTEGER PRIMARY KEY,
-             applied_at INTEGER NOT NULL
-           ) STRICT`);
-
+  // `schema_version` was created and first read INSIDE the guard above, so it
+  // is not repeated here -- two copies of one statement is the duplication this
+  // file keeps having to remove elsewhere.
+  //
   // Read once here only to refuse a NEWER store early with a clear message.
   const seen = db.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get().v;
   // And the history has to be CONTIGUOUS, not merely tall. `max(version)` alone

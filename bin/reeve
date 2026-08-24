@@ -44,7 +44,7 @@ import { resolveHome } from "../src/home.mjs";
 // builder migrates a store it is about to be refused from. Task 9 adds the same
 // import for the export/restore routes; whichever lands first owns it.
 import { DatabaseSync } from "node:sqlite";
-import { openHub, HUB_SCHEMA_VERSION, completedVersion } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION, completedVersion, isOperational } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
 import { HEARTBEAT_SECONDS } from "../src/db/ops.mjs";
@@ -990,7 +990,13 @@ switch (cmd) {
       findings.unshift({ id: "H-7", severity: "fail", classification: "configuration",
         title: "the project registry could not be read",
         detail: registry.error,
-        action: "fix or create ~/.reeve/projects.json; until then H-4 cannot report a missing gate-state row" });
+        // THE PATH IT ACTUALLY READ, not the default. `detail` carries
+        // `registry.error`, which names the real file; the action named
+        // `~/.reeve` regardless, so under `--home` or a custom REEVE_HOME an
+        // operator could follow it exactly and stay broken. Third instance of
+        // this shape today -- a remediation reconstructing what the diagnosis
+        // already knew.
+        action: `fix or create ${join(HOME, "projects.json")}; until then H-4 cannot report a missing gate-state row` });
     console.log(flag("json") ? JSON.stringify(findings, null, 2) : renderHub(findings));
     // The CLI's existing doctor convention, documented at `bin/reeve:364`:
     // 0 ok, 1 broken, 3 degraded. Exiting 0 on warnings tells automation that a
@@ -1097,12 +1103,70 @@ switch (cmd) {
     // `db` is the handle the lease is taken on and the loop keeps. On the
     // bootstrap path that is the migrated handle directly; otherwise it is the
     // raw one, swapped for the migrated handle after the claim.
+    // THE OPEN AND THE FIRST READ, TOGETHER, because opening a corrupt
+    // database SUCCEEDS and the failure arrives on the first query. Split apart,
+    // `build status` died with a raw `file is not a database` and a stack
+    // trace, and `build run` died inside `openHub` -- the two commands an
+    // operator runs when something is already wrong. `openHub` now refuses an
+    // unreadable file with a recovery; this turns that, and the raw path's own
+    // version query, into an answer rather than a crash.
     let raw = null;
-    let db = bootstrapping
-      ? openHub(hubPathFor(HOME))
-      : (raw = sub === "status"
-          ? new DatabaseSync(hubPathFor(HOME), { readOnly: true })
-          : new DatabaseSync(hubPathFor(HOME), { timeout: 10000 }));
+    let db;
+    try {
+      db = bootstrapping
+        ? openHub(hubPathFor(HOME))
+        : (raw = sub === "status"
+            ? new DatabaseSync(hubPathFor(HOME), { readOnly: true })
+            : new DatabaseSync(hubPathFor(HOME), { timeout: 10000 }));
+      // The first read is what proves the file answers at all. On the raw path
+      // nothing has touched it yet, so this is where a corrupt store surfaces.
+      if (raw) raw.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get();
+    } catch (e) {
+      try { raw?.close(); } catch { /* the refusal below is the answer either way */ }
+      if (sub === "status") {
+        // WHICH failure, here too. This catch is independent of `openHub`'s and
+        // had no split at all, so a healthy DELETE-journal hub held by an
+        // exclusive transaction answered `database is locked` and was handed the
+        // corruption recovery -- an instruction to replace it.
+        const benign = isOperational(e);
+        // UNKNOWN, not "not running". An exclusive transaction stops this before
+        // the singleton lease can be read, so the command was ANSWERING a
+        // question it had not been able to ask -- and answering it negatively,
+        // while a live builder's lease said otherwise. Absence of a reading is
+        // not a reading of absence.
+        // UNKNOWN EITHER WAY. The verdict is about whether the lease could be
+        // READ, and neither branch got that far -- so reporting "not running"
+        // on the corrupt one was the same mistake, made twice, and the more
+        // dangerous half: it invites the operator to follow the forced-restore
+        // advice below WITHOUT stopping a builder that may still be live.
+        //
+        // What differs between the branches is the RECOVERY, not the verdict.
+        console.log(`builder: UNKNOWN (the hub at ${hubPathFor(HOME)} ${benign ? "could not be read just now" : "cannot be read"})`);
+        console.log(`  why      ${String(e.message).split("\n")[0]}`);
+        // `--tail` NAMED HERE TOO. Every other recovery line in this change says
+        // it, and this one did not -- so an operator with a durable export who
+        // followed this exact command would restore the snapshot and silently
+        // drop every event after it, on the first recovery they attempt.
+        if (benign) {
+          console.log(`  recover  the file answered, so this is not damage: stop any running builder or`);
+          console.log(`           reeve CLI and re-run, and check the permissions on the hub and its`);
+          console.log(`           directory. Do NOT restore over it.`);
+        } else {
+          console.log(`  recover  STOP any running builder first -- this command could not read the`);
+          console.log(`           lease, so it cannot tell you whether one is live.`);
+          console.log(`           reeve restore --hub --force then installs the newest usable snapshot;`);
+          console.log(`           add --tail <file> from a durable export-events --hub to carry`);
+          console.log(`           forward every event after that snapshot; without one they are lost`);
+        }
+        // EXIT 1, not the `break` the other "not running" cases take. Before this
+        // guard the uncaught throw exited 1; catching it and breaking would have
+        // turned a loud failure into a quiet success, which is the same
+        // absence-reads-as-healthy trap the crash at least avoided by accident.
+        // An unreadable hub is not "no builder is running", it is a fault.
+        process.exit(1);
+      }
+      die(`reeve build run: ${e.message}`);
+    }
     if (sub === "status") {
       // Reading a NEWER store is refused, rather than rendering columns this
       // binary does not understand.
@@ -1166,11 +1230,43 @@ switch (cmd) {
       if (v > HUB_SCHEMA_VERSION)
         die(`the hub is at schema version ${v}; this reeve knows ${HUB_SCHEMA_VERSION}. Upgrade reeve.`);
     }
-    const claim = acquireSingleton(db, {
-      name: "builder", pid: process.pid, lstart,
-      command: process.argv.slice(1).join(" "), isAlive: isSameProcess,
-      takeover: flag("takeover"),
-    });
+    // TAKING THE LEASE IS A WRITE, and a hub can be perfectly readable and still
+    // refuse one -- a read-only file or directory, or another process holding
+    // it. Found while verifying this change's own guard: `openHub` and the
+    // version read both pass on a read-only hub, and the failure then escaped
+    // from `locks.mjs` as a raw `attempt to write a readonly database` with a
+    // stack trace. The guard above covers the open and the first READ; this is
+    // the first WRITE, and it needs its own answer for the same reason.
+    let claim;
+    try {
+      claim = acquireSingleton(db, {
+        name: "builder", pid: process.pid, lstart,
+        command: process.argv.slice(1).join(" "), isAlive: isSameProcess,
+        takeover: flag("takeover"),
+      });
+    } catch (e) {
+      // AND HERE. `no such table: maintenance_lock` is errcode 1 -- a version-1
+      // hub can answer the version probe with its lock tables gone -- and this
+      // catch claimed the hub was fine and told the operator NOT to restore it,
+      // which is the one thing that would have recovered it.
+      // A RESTORE IN PROGRESS IS AN ANSWER, not a failure. `assertWritable`
+      // throws it deliberately, and its advice is to WAIT -- not to check
+      // permissions, and certainly not to start a second restore.
+      if (/restore is in progress/.test(String(e.message)))
+        die(`reeve build run: ${e.message}.\n` +
+            `  recover  wait for it to finish and re-run; the hub is read-only until it does.\n` +
+            `           reeve build status shows whether it is still going.`);
+      die(isOperational(e)
+        ? `reeve build run: could not take the builder lease in ${hubPathFor(HOME)} (${e.message}).\n` +
+          `  the hub reads fine, so this is not damage: the file or its directory may be read-only, ` +
+          `or another process may hold it.\n` +
+          `  recover  check the permissions on ${hubPathFor(HOME)} and its directory, and stop any ` +
+          `other builder. Do NOT restore over it.`
+        : `reeve build run: the hub at ${hubPathFor(HOME)} could not take the builder lease (${e.message}).\n` +
+          `  the file opens and reports its version, but the tables the lease needs did not answer.\n` +
+          `  recover  reeve restore --hub --force installs the newest usable snapshot; add\n` +
+          `           --tail <file> from a durable export-events --hub to carry history forward`);
+    }
     if (!claim.ok) {
       const h = claim.holder;
       // A lock refusal that does not say who holds it turns a two-second

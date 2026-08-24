@@ -52,10 +52,12 @@ else.
    committing. The worker keeps git's READ commands (`status`, `diff`, `log`,
    `show`) and loses `add`, `commit`, `push` and `remote`. It also keeps
    `git clean`, which is NOT read-only — it deletes untracked files, and with
-   `-d`/`-x` untracked directories and ignored files too. That is deliberate: it
-   is the only way a worker can remove a scratch file it cannot `rm`, and
-   anything it deletes was never committed, so nothing reeve would publish is at
-   risk. Judge that trade rather than assuming the retained set is inert. PR #19
+   `-d`/`-x` untracked directories and ignored files too. It is not the only route
+   either: any script-capable runner can unlink a file, and a TypeScript unit gets
+   `Bash(node:*)` with `node -e` usable. So the honest position is that the worker
+   already HAS a delete, `git clean` is the legible one to point it at, and what
+   bounds the risk is that nothing it can reach was ever committed — not that the
+   retained set is inert. Judge that trade on those terms. PR #19
    implements all of it. Your job is to finish its review rounds and get it
    merged, not to choose a shape again.
 

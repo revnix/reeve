@@ -155,11 +155,11 @@ evidence it is spent producing a fix that cannot ship.
    `propose_and_merge` + admin + a bypassable ruleset was raised and the founder
    reaffirmed. GitHub rules get fixed "at the end".
 2. **Worker limits: 10 min / 20 turns / 1 worker.** Applied.
-3. **Leave the attempt cap at 1** and leave reeve armed, after seeing that each
-   red PR spends its only attempt on a fix that will not publish. Reason given:
-   *"we can turn on it properly once reeve's builder part is done."* Note this
-   decision was made before Finding 1 was understood — it was taken on the
-   belief that publication merely *had not* worked, not that it *cannot*.
+3. **Leave the attempt cap at 1.** Still current. The other half of this
+   decision — leave reeve ARMED — was SUPERSEDED the same day: it was taken on the
+   belief that publication merely *had not* worked, and once Finding 1 showed it
+   *cannot*, reeve was disarmed. Do not restore the armed half from this list; it
+   is recorded here only so the reversal is legible.
 4. **Close PRs #1 and #2.** Done, with the reasoning recorded on each.
 5. **One parallel session on the `threadDetails` wiring.** A prompt was written
    and handed over, and that session never pushed a branch. The work is still
@@ -286,8 +286,12 @@ PR #14 took 10 rounds and 22 findings.
   prompt claiming a capability the grant does not carry; `docs/HANDOFF.md`
   tabulated four more on 21 August, including this exact one a step later in the
   sequence ("the prompt instructed a push the sandbox denies"). Patching `.git`
-  alone leaves the mechanism intact, so the decision worth making is whether the
-  prompt is generated from the grant.
+  alone leaves the mechanism intact — but generating the prompt from the DECLARED
+  grant does not reach it either: reeve's own policy grants `Bash(git:*)`, carries
+  no add/commit deny and emits `denyWrite: []`, so a generator reading it would
+  still have advertised `git commit`. Five of the six are drift between two things
+  reeve writes; the sixth comes from beneath them. The decision worth making is
+  whether reeve represents or PROBES the EFFECTIVE restrictions.
 - **R-01, the ruleset.** Admins bypass every rule and no CI check is required.
   Agreed to fix "at the end", but reeve now has `propose_and_merge` + admin, so
   nothing outside reeve stops a bad publish from merging.

@@ -117,6 +117,23 @@ CREATE TABLE IF NOT EXISTS outbox (
   args         TEXT NOT NULL,                 -- JSON
   status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN
                  ('pending','inflight','done','failed','dead_letter')),
+  -- The fence. Bumped on EVERY lease, so it is monotonic per row and survives a
+  -- restart because it lives in the row rather than in a process. `settleOutbox`
+  -- matches on it and refuses to write when it does not hold, which is the only
+  -- thing standing between a stalled drainer and a delivery it no longer owns:
+  -- A's lease expires, B leases the row and starts posting the comment, and A --
+  -- still running -- settles B's live delivery, overwriting its status and result.
+  -- This is what the literature calls fencing, and a TTL plus a liveness check is
+  -- NOT a substitute: a paused process keeps its pid, so `isAlive` answers yes for
+  -- exactly the process that has to be refused.
+  --
+  -- It is a SEPARATE column from `attempts` and must stay one. `attempts` is the
+  -- retry BUDGET -- `dead = attempts >= max_attempts` -- so it may only count real
+  -- attempts, while a fence has to count every lease including one that delivered
+  -- nothing. Two facts that both increase are still two facts; merging them is
+  -- overloading, not deduplication. reeve's hub store carries both side by side
+  -- for this reason.
+  lease_token  INTEGER NOT NULL DEFAULT 0,
   attempts     INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 8,
   not_before   INTEGER NOT NULL DEFAULT 0,

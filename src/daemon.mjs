@@ -36,9 +36,10 @@ import { observe, ingest, noteHead } from "./review/ingest.mjs";
 import { derivePr, deriveSupply, reviewState } from "./review/derive.mjs";
 import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, fstatSync, statSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { appendFileSync, mkdirSync, fstatSync, statSync, readFileSync, writeFileSync, rmSync, openSync, closeSync, readSync, unlinkSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { randomBytes } from "node:crypto";
 import { resolveHome } from "./home.mjs";
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -162,6 +163,59 @@ export function repairMessage(report, decision) {
   return cause ? `${subject}\n\n${cause}` : subject;
 }
 
+/**
+ * Which of `wanted` are tracked in `worktree`, without buffering the index.
+ *
+ * `git ls-files -z` writes to a temp file rather than a pipe, so the output size
+ * is the filesystem's problem rather than a subprocess buffer's, and the file is
+ * then read in fixed chunks. Only the record being assembled and the caller's
+ * bounded set are ever in memory, so a repository with any number of tracked
+ * paths is answered the same way -- which is the point, because the alternative
+ * failure mode is not a slow answer but a THROWN one, and this function's caller
+ * reads a throw as "the checkout is unreadable" and holds back a finished repair.
+ *
+ * Returns only the intersection: the caller asked a membership question, and
+ * returning the whole index would put the unbounded thing back in memory one
+ * frame up.
+ */
+function trackedAmong(worktree, wanted) {
+  const found = new Set();
+  const tmp = join(tmpdir(), `reeve-lsfiles-${process.pid}-${randomBytes(6).toString("hex")}`);
+  let fh = null;
+  try {
+    const sink = openSync(tmp, "w");
+    try {
+      execFileSync("git", ["-C", worktree, ...GIT_NEUTRALISE, "ls-files", "-z"],
+                   { stdio: ["ignore", sink, "pipe"], env: gitEnv() });
+    } finally { closeSync(sink); }
+
+    fh = openSync(tmp, "r");
+    const buf = Buffer.allocUnsafe(1 << 16);
+    // A path can straddle a chunk boundary, so the tail of one read is the head of
+    // the next. Kept as a Buffer, not a string: a multi-byte character split
+    // across two reads would be corrupted by decoding each half on its own.
+    let carry = Buffer.alloc(0);
+    for (;;) {
+      const n = readSync(fh, buf, 0, buf.length, null);
+      if (n <= 0) break;
+      let hay = carry.length ? Buffer.concat([carry, buf.subarray(0, n)]) : Buffer.from(buf.subarray(0, n));
+      let from = 0, nul;
+      while ((nul = hay.indexOf(0, from)) !== -1) {
+        const rel = hay.toString("utf8", from, nul);
+        if (rel && wanted.has(rel)) found.add(rel);
+        from = nul + 1;
+      }
+      carry = hay.subarray(from);
+    }
+    // git terminates every record with NUL, so a non-empty carry means the output
+    // was truncated. Nothing is inferred from it.
+    return found;
+  } finally {
+    if (fh !== null) { try { closeSync(fh); } catch {} }
+    try { unlinkSync(tmp); } catch {}
+  }
+}
+
 export function uncommittedFiles(worktree, copiedBaseline = {}, { digest = digestOf } = {}) {
   try {
     // Read over EVERYTHING, then subtract what the daemon itself put there.
@@ -229,23 +283,26 @@ export function uncommittedFiles(worktree, copiedBaseline = {}, { digest = diges
     // exactly the case the declaration exists to permit. What the gate is looking
     // for is work the push would LOSE, and a committed file is not that.
     //
-    // The whole index is read, with no pathspec, and the membership test happens
-    // here. Naming the baseline paths would be the narrower query, but preparation
-    // accepts up to MAX_COPIED_UNTRACKED of them, and spreading that many into
-    // argv exceeds ARG_MAX -- the spawn throws, this function returns null, and a
-    // perfectly good worker result is quarantined as unreadable. That is the third
-    // time an argv-sized path list has been a defect here, so the dependency is
-    // removed rather than sized: there is no batch constant to tune and no ceiling
-    // to breach later. `git ls-files` has no `--pathspec-from-file`, so the stdin
-    // route `commitRunWork` uses is not available to it. Reading the index costs
-    // one pass over the tracked paths, which is bounded by the repository rather
-    // than by how much preparation copied.
+    // Which baseline paths are TRACKED, decided without ever holding a list whose
+    // size the repository controls.
+    //
+    // Two sizes meet here and only one of them is bounded. Preparation accepts up
+    // to MAX_COPIED_UNTRACKED baseline paths, so naming them as pathspecs put that
+    // many into argv and breached ARG_MAX. Reading the index instead moved the
+    // unbounded side to git's output, where a large enough repository breaches the
+    // subprocess buffer. Both failures land in the same place -- the call throws,
+    // this returns null, and the caller quarantines a repair that was fine -- so
+    // both were the same defect wearing different limits, and swapping one for the
+    // other is not a fix.
+    //
+    // So neither list is held. git streams the index to a file, and it is read
+    // back in fixed-size chunks with only the current record and the bounded
+    // baseline set in memory. There is no constant to tune, no ceiling for a
+    // repository to breach, and the cost is one pass over the index. It stays
+    // synchronous because the publication gate that calls it is.
     const names = Object.keys(baseline);
     let tracked = new Set();
-    if (names.length) {
-      const known = raw(["ls-files", "-z"]);
-      tracked = new Set(known ? known.split("\0").filter(Boolean) : []);
-    }
+    if (names.length) tracked = trackedAmong(worktree, new Set(names));
     for (const rel of names)
       if (!reported.has(rel) && !tracked.has(rel) && !wasMine(rel)) left.push(rel);
     return left;

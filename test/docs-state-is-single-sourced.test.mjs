@@ -154,7 +154,16 @@ const offendersIn = text => {
   const zero = /^## 0\. STATE[\s\S]*?(?=^## )/m.exec(handoff)?.[0] ?? "";
   const subjects = [...zero.matchAll(/^\|\s*([^|]+?)\s*\|/gm)]
     .map(m => m[1].replace(/`/g, "").trim())
-    .filter(s => s && !/^-+$/.test(s) && s.split(/\s+/).length >= 2 && s.length >= 12)
+    // A label is usable as a search term when it has more than one word AND at
+    // least one word distinctive enough not to appear everywhere. The first
+    // version used a character count, which is a proxy for that and a bad one:
+    // "the tracker" is eleven characters, fell under it, and the twelfth copy --
+    // "the tracker has no record of 22-24 Aug at all" -- walked straight through.
+    // Length was never the property that mattered; having a word worth searching
+    // for was.
+    .filter(s => s && !/^-+$/.test(s)
+                 && s.split(/\s+/).length >= 2
+                 && s.split(/[\s,]+/).some(w => w.length >= 6))
     // A label carrying an em-dash gloss ("capability 1 — watch, judge, escalate")
     // is policed by its stem, which is the part prose actually reuses.
     .map(s => s.split(" — ")[0].trim());

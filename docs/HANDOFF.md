@@ -448,10 +448,19 @@ drew 149 threads.
   declares, so from that commit no worker could stage or commit its own fix.
   `docs/measured/2026-08-23-three-real-dispatches.md` is where that was found,
   and it was found by re-verifying this very line rather than by a failure.
-- **The publication half was rebuilt, not restored.** Staging and committing moved
-  to reeve, and the worker is now told not to touch git at all — which also closes
-  the older "who publishes" drift rather than patching around it. It is covered by
-  tests and by an end-to-end dispatch fixture.
+- **The publication half was rebuilt, not restored.** Staging, committing and
+  pushing moved to reeve, and the worker is told it cannot do those three — which
+  also closes the older "who publishes" drift rather than patching around it. It is
+  covered by tests and by an end-to-end dispatch fixture.
+  **This is not "the worker has no git".** It keeps the read commands it needs to
+  work — `status`, `diff`, `log`, `show` — and it is deliberately pointed at
+  `git clean -f -- <path>`, because `rm` is not granted and it still has to be able
+  to remove a scratch file it left behind. `clean` DELETES, so a deletion route
+  remains open on purpose. That is what the content-digest baseline and the
+  declared-paths check are for: reeve compares what came back against what it put
+  there and against what the worker said it touched, rather than trusting that
+  nothing could have moved. Describing the boundary as "no git access" would hide
+  the one capability those checks exist to cover.
 - **No real dispatch has exercised the rebuilt path.** The proof above is a proof
   about the OLD contract; nothing has yet reproduced it under the new one. For
   whether that is still true, and for whether reeve is dispatching at all, see §0

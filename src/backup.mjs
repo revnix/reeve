@@ -20,7 +20,7 @@ import { execFileSync } from "node:child_process";
 // `linkSync` is the snapshot PUBLISH: it is atomic AND exclusive, where
 // `renameSync` is atomic but REPLACES an existing destination -- so two
 // same-second writers would both believe they won.
-import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync, renameSync, openSync, closeSync } from "node:fs";
+import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync, renameSync, openSync, closeSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { open as openStore, exportJsonl } from "./db/ops.mjs";
 // Task 8's subset. `TABLES_AT` and `HUB_TABLES` are what a snapshot's table set
@@ -596,11 +596,18 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
    * it is returned; a collision takes the next suffix instead of the first one's
    * evidence.
    */
+  const reservations = [];
   const quarantineName = (kind) => {
     const at = Math.floor(Date.now() / 1000);
     for (let n = 0; n < 100; n++) {
       const candidate = `${dbPath}.${kind}-${at}${n ? `-${n}` : ""}`;
-      try { closeSync(openSync(candidate, "wx")); return candidate; }
+      // The `wx` open PROVES the name free, and in doing so creates a zero-byte
+      // file. If the restore then fails before the copy -- a rejected tail, a
+      // failed replay -- that empty file is left behind looking like forensic
+      // evidence while holding none, and they accumulate across retries. Every
+      // reservation is recorded so the `finally` can reap the ones nothing was
+      // written into.
+      try { closeSync(openSync(candidate, "wx")); reservations.push(candidate); return candidate; }
       catch (e) { if (e.code !== "EEXIST") return candidate; }
     }
     return `${dbPath}.${kind}-${at}-${pid}`;
@@ -770,7 +777,19 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // examine is its own defect. The copy happens HERE rather than at the
       // usual point one step before the swap, because by then this path has
       // already migrated the file.
+      // BEFORE `openHub`, because migration 1 RECREATES a dropped `hub_event`.
+      // Probing after it reported the log readable and empty, so a version-zero
+      // hub whose event table had been dropped restored with no force at all and
+      // its post-snapshot projection rows were replaced while their events were
+      // treated as an empty tail. The question is whether the log was there when
+      // we arrived, and only a read taken before the migration can answer it.
+      let hadEventsBefore = false;
       if (bootstrapZero) {
+        try {
+          const q = new DatabaseSync(dbPath, { readOnly: true });
+          try { q.prepare("SELECT * FROM hub_event LIMIT 1").get(); hadEventsBefore = true; }
+          finally { q.close(); }
+        } catch { hadEventsBefore = false; }
         quarantined = quarantineName("incomplete");
         try { copyFileSync(dbPath, quarantined); quarantineCopied = true; }
         catch { quarantined = null; }
@@ -789,7 +808,9 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // `hub_event` exists either way, and what matters is whether it can be
       // READ. On the genuinely absent-hub path it is empty, which is the correct
       // answer -- there is nothing to carry forward.
-      try { live.prepare("SELECT * FROM hub_event LIMIT 1").get(); liveHasEvents = true; }
+      // `hadEventsBefore` gates it on the version-zero path: after migration 1
+      // the table always exists, so a post-migration probe can only ever say yes.
+      try { live.prepare("SELECT * FROM hub_event LIMIT 1").get(); liveHasEvents = !bootstrapZero || hadEventsBefore; }
       catch { liveHasEvents = false; }
       // AND AN UNREADABLE LOG IS A REFUSAL HERE TOO, not a quiet `false`.
       //
@@ -881,6 +902,23 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
                `in ${bornMissing.length === 1 ? "it" : "them"} cannot be ruled out. Stop the builder and ` +
                `any reeve CLI, then re-run with force.` };
       if (bornMissing.length) quarantined ??= quarantineName("damaged");
+      // AND THE VERSION, AGAIN, UNDER THE LOCK. The readable branch has always
+      // done this; this one did not. A newer binary can open and migrate the
+      // just-created or version-zero hub between `openHub` above and the lock
+      // below, then exit without leaving a live lease -- so the holder scan finds
+      // nothing, and once migration 2 exists this restore replaces a version-2
+      // hub with its version-1 snapshot and reports success. A pre-lock read
+      // cannot close that window, because the window IS the wait for the lock.
+      {
+        const after = live.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+        if (after > HUB_SCHEMA_VERSION) {
+          synthetic = false;
+          return { ok: false, holders: [],
+                   why: `the hub was migrated to schema version ${after} while this restore was ` +
+                        `preparing it; this reeve knows ${HUB_SCHEMA_VERSION}. Restoring would replace ` +
+                        `it with an older store. Upgrade reeve.` };
+        }
+      }
       if (bornHolders.length) {
         synthetic = false;
         return { ok: false, holders: bornHolders,
@@ -1023,12 +1061,33 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // the lock to the sibling deliberately, before we get here. A throw it
         // did NOT predict is anomalous, and the fail-closed answer to an
         // anomaly is to refuse rather than to proceed with weaker exclusion.
-        return { ok: false, holders: [],
-          why: `could not take the maintenance lock in ${dbPath} (${e.message}). ` +
-               `The lock table was readable when this restore classified the hub, so this is a ` +
-               `busy or transient failure rather than damage -- stop any running builder or reeve ` +
-               `CLI and re-run. Restoring without exclusion in the canonical hub would let a ` +
-               `writer start underneath it.` };
+        // ...BUT ONLY CONTENTION IS TRANSIENT. `SELECT *` succeeds on a
+        // `maintenance_lock` recreated WITHOUT its `name` column, so the
+        // classifier calls the table readable and this throws
+        // `no such column: name` -- errcode 1, which will still be there on
+        // every retry. Refusing that as "busy" meant `--force` could never
+        // repair the hub: the recovery command was locked out of the one state
+        // it exists for.
+        //
+        // A permanent fault is damage, and damage takes the sibling lock, the
+        // force requirement and the quarantine, exactly as a missing table does.
+        // (Same codes as `isOperational` on the sibling branch; they converge on
+        // rebase.)
+        if (e?.errcode !== 5 && e?.errcode !== 6) {
+          if (!missing.includes("maintenance_lock")) missing.push("maintenance_lock");
+          lockDb = openHub(dbPath + ".restore-lock");
+          got = acquireMaintenanceLock(lockDb, { pid, lstart, isAlive });
+          if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
+          locked = true;
+          quarantined ??= quarantineName("damaged");
+        } else {
+          return { ok: false, holders: [],
+            why: `could not take the maintenance lock in ${dbPath} (${e.message}). ` +
+                 `The lock table was readable when this restore classified the hub, so this is a ` +
+                 `busy or transient failure rather than damage -- stop any running builder or reeve ` +
+                 `CLI and re-run. Restoring without exclusion in the canonical hub would let a ` +
+                 `writer start underneath it.` };
+        }
       }
       if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
       locked = true;
@@ -1520,6 +1579,12 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // there was one, and discarded either way so a healthy restore leaves no
     // litter beside the hub.
     for (const [, aside] of preservedSidecars) { try { rmSync(aside, { force: true }); } catch {} }
+    // Reservations nothing was written into. `quarantineName` creates a
+    // zero-byte file to prove the name free, and a restore that fails before the
+    // copy would otherwise leave it there looking like evidence.
+    for (const r of reservations) {
+      try { if (statSync(r).size === 0) rmSync(r, { force: true }); } catch { /* copied, or already gone */ }
+    }
     // The quarantine is a COPY, made one step before the swap, so a failure
     // before that point never created one and there is nothing to undo. A
     // failure AFTER it means the swap succeeded, and the copy is the evidence an

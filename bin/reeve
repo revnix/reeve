@@ -115,7 +115,9 @@ const registryProjects = (home) => {
     // A login is alphanumeric with single hyphens INSIDE it: it may not start
     // or end with one. The repository half keeps the looser class, which really
     // does allow `.`, `_` and `-` anywhere except as the whole name.
-    const OWNER = String.raw`[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?`;
+    // SINGLE internal hyphens only. `[A-Za-z0-9-]*` allowed `a--b`, which GitHub
+    // does not: a login is alphanumeric segments joined by ONE hyphen each.
+    const OWNER = String.raw`[A-Za-z0-9](?:-?[A-Za-z0-9])*`;
     const REPO  = String.raw`(?!\.+$)[\w.-]+`;
     const NWO = new RegExp(`^${OWNER}/${REPO}$`);
     const bad = Object.entries(reg)

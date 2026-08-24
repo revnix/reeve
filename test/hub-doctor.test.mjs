@@ -541,7 +541,8 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   // with inner hyphens and cannot contain a dot at all, so my first version of
   // this control asserted something GitHub itself refuses. The repository half
   // is the one that legitimately carries dots.
-  writeFileSync(reg, JSON.stringify({ prod: { nwo: "o/orphan" }, dotted: { nwo: "owner/repo.js" } }));
+  writeFileSync(reg, JSON.stringify({ prod: { nwo: "o/orphan" }, dotted: { nwo: "owner/repo.js" },
+                                      hyphened: { nwo: "octo-example/my-repo" } }));
   const dotted = idsOf(run("builder", "doctor", "--json").stdout);
   check(dotted !== null && !dotted.includes("H-7"),
     "control: a repository name containing dots is still a name", JSON.stringify(dotted));
@@ -577,7 +578,8 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
                                ["a dot repository name", { prod: { nwo: "owner/.." } }],
                                ["a bare hyphen as the owner", { prod: { nwo: "-/repo" } }],
                                ["an owner starting with a hyphen", { prod: { nwo: "-a/repo" } }],
-                               ["an owner ending with a hyphen", { prod: { nwo: "a-/repo" } }]]) {
+                               ["an owner ending with a hyphen", { prod: { nwo: "a-/repo" } }],
+                               ["consecutive hyphens in the owner", { prod: { nwo: "a--b/repo" } }]]) {
     writeFileSync(reg, JSON.stringify(body));
     const ids = idsOf(run("builder", "doctor", "--json").stdout);
     check(ids?.includes("H-7"), `${label} is a registry error`, JSON.stringify(ids));

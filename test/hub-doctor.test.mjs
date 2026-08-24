@@ -14,7 +14,7 @@ import { selfAudit, BROKEN } from "../src/selfaudit.mjs";
 import { open as openStore } from "../src/db/ops.mjs";
 import { hubPathFor } from "../src/paths.mjs";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, openSync, writeSync, closeSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, openSync, writeSync, closeSync, existsSync, writeFileSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";   // the CLI drill runs bin/reeve
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -584,6 +584,123 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   const okOut = (ok.stdout ?? "") + (ok.stderr ?? "");
   check(!/could not be parsed/.test(okOut),
     "control: a parseable tail reaches the manifest checks instead", okOut.slice(0, 240));
+}
+
+// ── NO hub route answers a broken hub with a stack trace ──────────────────
+// The version-zero sweep above covers ONE broken state. Sites six and seven were
+// found in a different one -- an UNREADABLE hub -- because that sweep was a list
+// of routes against a single fixture rather than a matrix.
+//
+//   build status  ->  Error: file is not a database   at bin/reeve:1109
+//   build run     ->  Error: file is not a database   at openHub (hubdb.mjs:72)
+//
+// Both live on main when this was written, and both are the two commands an
+// operator reaches for WHEN SOMETHING IS ALREADY WRONG. Six earlier findings of
+// this class were each fixed at the site reported, and each declared it swept.
+//
+// So the assertion is the MATRIX, and it is the thing that fails when an eighth
+// site appears rather than a reviewer noticing.
+{
+  const mHome = join(dir, "matrix-home");
+  const env = { ...process.env, REEVE_HOME: mHome };
+  const run = (...args) => spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
+    { encoding: "utf8", env });
+
+  // The broken states a hub can actually be in, each built the way it really
+  // arises. `build run` is excluded from the matrix and driven separately below:
+  // it is a heartbeat LOOP, and a route that does not exit cannot be in a table
+  // of exit codes.
+  const STATES = {
+    absent:     () => { rmSync(join(mHome, "state"), { recursive: true, force: true }); mkdirSync(join(mHome, "state"), { recursive: true }); },
+    versionZero: () => { const d = new DatabaseSync(hubPathFor(mHome));
+                         d.exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT`);
+                         d.close(); },
+    unreadable: () => writeFileSync(hubPathFor(mHome), "this is not a database"),
+    truncated:  () => { const d = openHub(hubPathFor(mHome)); d.close();
+                        const buf = readFileSync(hubPathFor(mHome));
+                        writeFileSync(hubPathFor(mHome), buf.subarray(0, Math.floor(buf.length / 3))); },
+  };
+  const ROUTES = [
+    ["builder", "doctor"],
+    ["builder", "doctor", "--json"],
+    ["build", "status"],
+    ["export-events", "--hub", join(mHome, "tail.jsonl")],
+    ["backup", "--hub"],
+    ["restore", "--hub"],
+  ];
+  check(Object.keys(STATES).length >= 4 && ROUTES.length >= 6,
+    "control: the matrix covers every broken state against every hub route",
+    `${Object.keys(STATES).length} states x ${ROUTES.length} routes`);
+
+  const crashed = [];
+  let cells = 0;
+  for (const [state, build] of Object.entries(STATES)) {
+    rmSync(mHome, { recursive: true, force: true });
+    mkdirSync(join(mHome, "state"), { recursive: true });
+    build();
+    for (const args of ROUTES) {
+      cells++;
+      const r = run(...args);
+      const out = (r.stdout ?? "") + (r.stderr ?? "");
+      // A Node stack frame, by its own shape: `    at <thing> (<file>:<line>:<col>)`
+      // or the bare `    at <file>:<line>:<col>` form.
+      if (/^\s+at\s+.*:\d+:\d+\)?$/m.test(out))
+        crashed.push(`${state}/${args.join(" ")}: ${out.split("\n").find(l => /Error/.test(l))?.trim() ?? "(stack)"}`);
+    }
+  }
+  check(cells === Object.keys(STATES).length * ROUTES.length,
+    "control: every cell of the matrix ran", `${cells} cells`);
+  check(crashed.length === 0,
+    "no hub route answers a broken hub with a stack trace",
+    crashed.slice(0, 4).join("  |  "));
+
+  // And an unreadable hub is a FAULT, not "no builder is running". Before the
+  // guard the uncaught throw exited 1; catching it and breaking like the other
+  // not-running cases would have turned a loud failure into a quiet success.
+  rmSync(mHome, { recursive: true, force: true });
+  mkdirSync(join(mHome, "state"), { recursive: true });
+  STATES.unreadable();
+  const bad = run("build", "status");
+  check(bad.status === 1, "`build status` exits 1 on an unreadable hub, not 0", `status=${bad.status}`);
+  check(/cannot be read/.test(bad.stdout + bad.stderr),
+    "and says so in words", (bad.stdout + bad.stderr).slice(0, 160));
+  check(/reeve restore --hub --force/.test(bad.stdout + bad.stderr),
+    "and names the way back", (bad.stdout + bad.stderr).slice(0, 200));
+
+  // AND `build run`, which the matrix cannot hold. It is a heartbeat LOOP, so a
+  // table of exit codes has no cell for it on a healthy hub -- which is exactly
+  // why site seven hid there. On a BROKEN hub it must refuse and exit, and that
+  // is testable: a `timeout` on the spawn turns "it hung" into a failure rather
+  // than into a suite that never finishes.
+  //
+  // Site seven was `build run` dying inside `openHub` with a raw
+  // `file is not a database`, because `bootstrapping` is
+  // `completedVersion(...) === 0` and an UNREADABLE file answers 0 as well --
+  // the same conflation between "no completed migration" and "cannot be read"
+  // that `restoreHub` had, not carried across when that one was fixed.
+  for (const [state, build] of [["unreadable", STATES.unreadable], ["truncated", STATES.truncated]]) {
+    rmSync(mHome, { recursive: true, force: true });
+    mkdirSync(join(mHome, "state"), { recursive: true });
+    build();
+    const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), "build", "run"],
+      { encoding: "utf8", env, timeout: 20_000 });
+    const out = (r.stdout ?? "") + (r.stderr ?? "");
+    check(r.signal !== "SIGTERM",
+      `\`build run\` on a ${state} hub exits instead of entering the loop`, `signal=${r.signal}`);
+    check(r.status !== 0, `and refuses (${state})`, `status=${r.status}`);
+    check(!/^\s+at\s+.*:\d+:\d+\)?$/m.test(out),
+      `and not with a stack trace (${state})`, out.split("\n").slice(0, 3).join(" | "));
+    check(/cannot be read/.test(out), `and says the hub cannot be read (${state})`, out.slice(0, 160));
+  }
+
+  // CONTROL: a hub that is merely NOT RUNNING still exits 0, so the line above
+  // is about the fault rather than about `build status` having become noisy.
+  rmSync(mHome, { recursive: true, force: true });
+  mkdirSync(join(mHome, "state"), { recursive: true });
+  openHub(hubPathFor(mHome)).close();
+  const ok = run("build", "status");
+  check(ok.status === 0 && /not running/.test(ok.stdout),
+    "control: a healthy hub with no builder still exits 0", `status=${ok.status} ${ok.stdout.slice(0, 60)}`);
 }
 
 rmSync(dir, { recursive: true, force: true });

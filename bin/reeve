@@ -990,7 +990,13 @@ switch (cmd) {
       findings.unshift({ id: "H-7", severity: "fail", classification: "configuration",
         title: "the project registry could not be read",
         detail: registry.error,
-        action: "fix or create ~/.reeve/projects.json; until then H-4 cannot report a missing gate-state row" });
+        // THE PATH IT ACTUALLY READ, not the default. `detail` carries
+        // `registry.error`, which names the real file; the action named
+        // `~/.reeve` regardless, so under `--home` or a custom REEVE_HOME an
+        // operator could follow it exactly and stay broken. Third instance of
+        // this shape today -- a remediation reconstructing what the diagnosis
+        // already knew.
+        action: `fix or create ${join(HOME, "projects.json")}; until then H-4 cannot report a missing gate-state row` });
     console.log(flag("json") ? JSON.stringify(findings, null, 2) : renderHub(findings));
     // The CLI's existing doctor convention, documented at `bin/reeve:364`:
     // 0 ok, 1 broken, 3 degraded. Exiting 0 on warnings tells automation that a
@@ -1097,12 +1103,39 @@ switch (cmd) {
     // `db` is the handle the lease is taken on and the loop keeps. On the
     // bootstrap path that is the migrated handle directly; otherwise it is the
     // raw one, swapped for the migrated handle after the claim.
+    // THE OPEN AND THE FIRST READ, TOGETHER, because opening a corrupt
+    // database SUCCEEDS and the failure arrives on the first query. Split apart,
+    // `build status` died with a raw `file is not a database` and a stack
+    // trace, and `build run` died inside `openHub` -- the two commands an
+    // operator runs when something is already wrong. `openHub` now refuses an
+    // unreadable file with a recovery; this turns that, and the raw path's own
+    // version query, into an answer rather than a crash.
     let raw = null;
-    let db = bootstrapping
-      ? openHub(hubPathFor(HOME))
-      : (raw = sub === "status"
-          ? new DatabaseSync(hubPathFor(HOME), { readOnly: true })
-          : new DatabaseSync(hubPathFor(HOME), { timeout: 10000 }));
+    let db;
+    try {
+      db = bootstrapping
+        ? openHub(hubPathFor(HOME))
+        : (raw = sub === "status"
+            ? new DatabaseSync(hubPathFor(HOME), { readOnly: true })
+            : new DatabaseSync(hubPathFor(HOME), { timeout: 10000 }));
+      // The first read is what proves the file answers at all. On the raw path
+      // nothing has touched it yet, so this is where a corrupt store surfaces.
+      if (raw) raw.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get();
+    } catch (e) {
+      try { raw?.close(); } catch { /* the refusal below is the answer either way */ }
+      if (sub === "status") {
+        console.log(`builder: not running (the hub at ${hubPathFor(HOME)} cannot be read)`);
+        console.log(`  why      ${String(e.message).split("\n")[0]}`);
+        console.log(`  recover  reeve restore --hub --force installs the newest usable snapshot`);
+        // EXIT 1, not the `break` the other "not running" cases take. Before this
+        // guard the uncaught throw exited 1; catching it and breaking would have
+        // turned a loud failure into a quiet success, which is the same
+        // absence-reads-as-healthy trap the crash at least avoided by accident.
+        // An unreadable hub is not "no builder is running", it is a fault.
+        process.exit(1);
+      }
+      die(`reeve build run: ${e.message}`);
+    }
     if (sub === "status") {
       // Reading a NEWER store is refused, rather than rendering columns this
       // binary does not understand.

@@ -67,12 +67,32 @@ export function openHub(path) {
   mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path, { timeout: 10000 });
 
-  // Set before anything else: foreign_keys cannot be changed inside a
-  // transaction, and a migration is a transaction.
-  db.exec("PRAGMA journal_mode = WAL");
-  db.exec("PRAGMA synchronous = FULL");     // authority-bearing and low-volume; NORMAL is not inherited
-  db.exec("PRAGMA foreign_keys = ON");
-  db.exec("PRAGMA busy_timeout = 10000");
+  // AN UNREADABLE FILE IS REFUSED HERE, ONCE, FOR EVERY CALLER.
+  //
+  // Opening a corrupt database SUCCEEDS -- SQLite reads nothing until it is
+  // asked to -- so the failure surfaced on the first pragma below, as a raw
+  // `file is not a database` with a stack trace naming a line in hubdb.mjs.
+  // `build run` and `build status` both died that way, from the two commands an
+  // operator reaches for WHEN SOMETHING IS ALREADY WRONG.
+  //
+  // Guarding each caller is what produced six previous findings of this class,
+  // each one declaring it swept. There is one guard, and it is where the damage
+  // is first touched rather than in the routes that touch it.
+  try {
+    // Set before anything else: foreign_keys cannot be changed inside a
+    // transaction, and a migration is a transaction.
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA synchronous = FULL");   // authority-bearing and low-volume; NORMAL is not inherited
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec("PRAGMA busy_timeout = 10000");
+  } catch (e) {
+    try { db.close(); } catch { /* the throw below is the answer either way */ }
+    throw new Error(
+      `the hub at ${path} cannot be read (${e.message}).\n` +
+      `  recover  reeve restore --hub --force installs the newest usable snapshot\n` +
+      `           pass --tail from a durable export-events --hub to carry history forward`,
+      { cause: e });
+  }
 
   db.exec(`CREATE TABLE IF NOT EXISTS schema_version (
              version    INTEGER PRIMARY KEY,

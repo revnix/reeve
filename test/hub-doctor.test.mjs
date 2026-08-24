@@ -6,7 +6,7 @@
 // It also must not write repo_gate_state. A reporter that can write what it
 // reports can agree with itself, and the row exists precisely so that clause U4
 // reads something the LOOP established.
-import { openHub, isOperational } from "../src/build/hubdb.mjs";
+import { openHub, isOperational, faultKind } from "../src/build/hubdb.mjs";
 import { hubFindings, renderHub } from "../src/doctor.mjs";
 // The self-audit block at the end of this task needs all of these. The standard
 // harness supplies only check, dir, join, tmpdir, mkdtempSync and rmSync.
@@ -541,8 +541,13 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   // with inner hyphens and cannot contain a dot at all, so my first version of
   // this control asserted something GitHub itself refuses. The repository half
   // is the one that legitimately carries dots.
+  // The 39-character hyphenated owner is the POSITIVE CONTROL for the length
+  // bound: a rule that rejected the 77-character case by rejecting hyphens, or by
+  // counting characters one too strictly, would fail here. The longest legal
+  // login shape has to keep working.
   writeFileSync(reg, JSON.stringify({ prod: { nwo: "o/orphan" }, dotted: { nwo: "owner/repo.js" },
-                                      hyphened: { nwo: "octo-example/my-repo" } }));
+                                      hyphened: { nwo: "octo-example/my-repo" },
+                                      longest: { nwo: Array(20).fill("a").join("-") + "/repo" } }));
   const dotted = idsOf(run("builder", "doctor", "--json").stdout);
   check(dotted !== null && !dotted.includes("H-7"),
     "control: a repository name containing dots is still a name", JSON.stringify(dotted));
@@ -580,7 +585,14 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
                                ["an owner starting with a hyphen", { prod: { nwo: "-a/repo" } }],
                                ["an owner ending with a hyphen", { prod: { nwo: "a-/repo" } }],
                                ["consecutive hyphens in the owner", { prod: { nwo: "a--b/repo" } }],
-                               ["an owner past GitHub's 39-character limit", { prod: { nwo: "a".repeat(40) + "/repo" } }]]) {
+                               ["an owner past GitHub's 39-character limit", { prod: { nwo: "a".repeat(40) + "/repo" } }],
+                               // 77 CHARACTERS, and the shape rule accepted it. `{0,38}` bounds
+                               // alphanumeric REPETITIONS, and each repetition may bring a hyphen
+                               // -- so the quantifier counted 39 letters and let 38 hyphens
+                               // through with them. An impossible login still marked the registry
+                               // KNOWN, which is the authority suppression this rule exists to stop.
+                               ["a hyphenated owner whose total length is past the limit",
+                                { prod: { nwo: Array(39).fill("a").join("-") + "/repo" } }]]) {
     writeFileSync(reg, JSON.stringify(body));
     const ids = idsOf(run("builder", "doctor", "--json").stdout);
     check(ids?.includes("H-7"), `${label} is a registry error`, JSON.stringify(ids));
@@ -666,6 +678,28 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     truncated:  () => { const d = openHub(hubPathFor(mHome)); d.close();
                         const buf = readFileSync(hubPathFor(mHome));
                         writeFileSync(hubPathFor(mHome), buf.subarray(0, Math.floor(buf.length / 3))); },
+    // LOCALIZED DAMAGE, and it is the state the first four could not represent.
+    //
+    // `unreadable` and `truncated` both fail at the header or the first page, so
+    // every route dies inside its FIRST read -- which is exactly where each of
+    // the previous seven fixes put its guard. A hub whose `schema_version` page
+    // is healthy and whose populated `singleton_lease` page is not passes every
+    // one of those guards and throws at the second read. That is the eighth site,
+    // and the matrix could not see it because no state in it survived read one.
+    //
+    // The lease table is chosen because it is the one a route reads AFTER the
+    // version: corrupting the version page tests nothing new.
+    localCorruption: () => {
+      const d = openHub(hubPathFor(mHome));
+      d.prepare(`INSERT INTO singleton_lease(name,pid,lstart,command,acquired_at,expires_at)
+                 VALUES('builder',424242,'L','reeve build run',unixepoch(),unixepoch()+60)`).run();
+      const root = d.prepare("SELECT rootpage FROM sqlite_master WHERE name='singleton_lease'").get().rootpage;
+      const pageSize = d.prepare("PRAGMA page_size").get().page_size;
+      d.close();
+      const buf = readFileSync(hubPathFor(mHome));
+      buf.fill(0x5a, (root - 1) * pageSize, root * pageSize);
+      writeFileSync(hubPathFor(mHome), buf);
+    },
   };
   const ROUTES = [
     ["builder", "doctor"],
@@ -675,11 +709,29 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     ["backup", "--hub"],
     ["restore", "--hub"],
   ];
-  check(Object.keys(STATES).length >= 4 && ROUTES.length >= 6,
+  check(Object.keys(STATES).length >= 5 && ROUTES.length >= 6,
     "control: the matrix covers every broken state against every hub route",
     `${Object.keys(STATES).length} states x ${ROUTES.length} routes`);
 
+  // THE FIXTURE'S TWO HALVES, asserted separately and before the sweep. A state
+  // that is simply corrupt all over would pass the sweep for the reason the
+  // OTHER states pass it, and prove nothing about a second read. Both halves are
+  // required: the version answers, and the lease does not.
+  {
+    rmSync(mHome, { recursive: true, force: true });
+    mkdirSync(join(mHome, "state"), { recursive: true });
+    STATES.localCorruption();
+    const probe = new DatabaseSync(hubPathFor(mHome), { readOnly: true });
+    const version = probe.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+    let leaseThrows = false;
+    try { probe.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get(); } catch { leaseThrows = true; }
+    probe.close();
+    check(version === 1, "fixture: the localized state still answers the version query", `version ${version}`);
+    check(leaseThrows, "fixture: and throws on the lease read that comes after it", `${leaseThrows}`);
+  }
+
   const crashed = [];
+  const mute = [];
   let cells = 0;
   for (const [state, build] of Object.entries(STATES)) {
     rmSync(mHome, { recursive: true, force: true });
@@ -693,8 +745,18 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
       // or the bare `    at <file>:<line>:<col>` form.
       if (/^\s+at\s+.*:\d+:\d+\)?$/m.test(out))
         crashed.push(`${state}/${args.join(" ")}: ${out.split("\n").find(l => /Error/.test(l))?.trim() ?? "(stack)"}`);
+      // AND IT SAID SOMETHING. "No stack frame" is an ABSENCE, and a route that
+      // dies silently satisfies it perfectly -- so the sweep would read a route
+      // that printed nothing at all as evidence of good behaviour. An operator
+      // running a hub command against a broken hub and getting no output is not
+      // a route that handled it; the whole point of these paths is that they say
+      // what is wrong and what to do.
+      if (!out.trim()) mute.push(`${state}/${args.join(" ")}`);
     }
   }
+  check(mute.length === 0,
+    "control: every cell SAID something, so the no-stack-trace sweep is not satisfied by silence",
+    mute.slice(0, 4).join("  |  "));
   check(cells === Object.keys(STATES).length * ROUTES.length,
     "control: every cell of the matrix ran", `${cells} cells`);
   check(crashed.length === 0,
@@ -848,6 +910,47 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     "and not told the opposite", out.slice(0, 260));
 }
 
+// ── a NEWER store is refused before any of its tables is read ─────────────
+// Collecting `build status`'s reads under one guard moved the lease query ahead
+// of the forward-version refusal. A future migration is free to reshape or drop
+// `singleton_lease`, and an older binary reading it would report a perfectly
+// healthy newer hub as unreadable and recommend `restore --hub --force` --
+// replacing a store whose only problem is that this reeve is too old for it.
+//
+// A version this binary does not know is not a shape it may assume.
+{
+  const nHome = mkdtempSync(join(tmpdir(), "reeve-newer-"));
+  mkdirSync(join(nHome, "state"), { recursive: true });
+  const d = openHub(hubPathFor(nHome));
+  d.exec("DROP TABLE singleton_lease");
+  d.prepare("INSERT INTO schema_version(version, applied_at) VALUES(2, unixepoch())").run();
+  d.close();
+
+  // The fixture's two halves: it really is marked newer, and the table this
+  // route would read really is gone.
+  {
+    const q = new DatabaseSync(hubPathFor(nHome), { readOnly: true });
+    const v = q.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+    const listed = q.prepare("SELECT count(*) c FROM sqlite_master WHERE name='singleton_lease'").get().c;
+    q.close();
+    check(v === 2, "fixture: the hub records a version this binary does not know", `${v}`);
+    check(listed === 0, "fixture: and the table build status reads is gone", `${listed}`);
+  }
+
+  const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), "build", "status"],
+    { encoding: "utf8", env: { ...process.env, REEVE_HOME: nHome }, timeout: 30_000 });
+  const out = (r.stdout ?? "") + (r.stderr ?? "");
+  check(/schema version 2/.test(out) && /Upgrade reeve/.test(out),
+    "a newer hub is answered with upgrade reeve", out.slice(0, 200));
+  check(!/cannot be read/.test(out),
+    "and is NOT called unreadable, which it is not", out.slice(0, 200));
+  check(!/restore --hub --force/.test(out),
+    "and the operator is never pointed at replacing it", out.slice(0, 240));
+  check(!/^\s+at\s+.*:\d+:\d+\)?$/m.test(out),
+    "and no stack frame reaches the operator", out.slice(0, 240));
+  rmSync(nHome, { recursive: true, force: true });
+}
+
 // ── the classifier's edges, and the guard's reach ─────────────────────────
 // The table itself first, because the CLI paths only exercise the codes they
 // happen to produce: measured, forcing an errcode-less error to "damage" left
@@ -860,6 +963,7 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     [{ errcode: 6 },  true,  "SQLITE_LOCKED"],
     [{ errcode: 8 },  true,  "SQLITE_READONLY"],
     [{ errcode: 14 }, true,  "SQLITE_CANTOPEN"],
+    [{ errcode: 13 }, true,  "SQLITE_FULL — a full disk is the situation, not the file"],
     [{ errcode: 11 }, false, "SQLITE_CORRUPT"],
     [{ errcode: 26 }, false, "SQLITE_NOTADB"],
     [{ errcode: 1 },  false, "SQLITE_ERROR (no such table)"],
@@ -873,6 +977,96 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   check(cases.filter(([, w]) => w).length >= 6 && cases.filter(([, w]) => !w).length >= 4,
     "control: the table covers both answers, so a constant-true or constant-false fails it",
     `${cases.filter(([, w]) => w).length} operational / ${cases.filter(([, w]) => !w).length} damage`);
+
+  // AND THE CODE ITSELF IS MEASURED, not read from a table. Every other entry
+  // above is a hand-written object, so the table proves what the classifier does
+  // with a number and nothing about which number SQLite actually raises. A hub
+  // on a full filesystem is not reproducible here; `max_page_count` is the same
+  // refusal from the same code path, and it is what pins 13 to this meaning.
+  {
+    const fHome = mkdtempSync(join(tmpdir(), "reeve-full-"));
+    const d = new DatabaseSync(join(fHome, "f.db"));
+    d.exec("PRAGMA journal_mode = WAL");
+    d.exec("CREATE TABLE t (a TEXT)");
+    d.exec("PRAGMA max_page_count = 2");
+    let err = null;
+    try { for (let i = 0; i < 5000; i++) d.prepare("INSERT INTO t(a) VALUES(?)").run("x".repeat(200)); }
+    catch (e) { err = e; }
+    check(err !== null, "control: the page limit really did refuse a write", String(err?.message));
+    check(err?.errcode === 13,
+      "SQLite answers a full store with errcode 13, measured against node:sqlite",
+      `errcode ${err?.errcode} (${err?.message})`);
+    check(isOperational(err),
+      "and the classifier calls it operational, so the operator is not sent at restore --hub --force",
+      `${isOperational(err)}`);
+    // THREE ANSWERS, because "not damage" cannot be rendered. It covers both
+    // "someone holds it or a permission is wrong" and "the disk is full", and
+    // those have opposite remedies -- an operator on a full store told to check
+    // permissions follows advice that cannot free a byte.
+    check(faultKind(err) === "full",
+      "and names the fault FULL, so the recovery text can say the one thing that helps",
+      faultKind(err));
+    check(faultKind({ errcode: 5 }) === "operational" && faultKind({ errcode: 11 }) === "damage"
+          && faultKind(new Error("a restore is in progress")) === "operational",
+      "control: the other two answers are unchanged, so this is a split and not a rename",
+      `busy=${faultKind({ errcode: 5 })} corrupt=${faultKind({ errcode: 11 })}`);
+    // AND EVERY CALLER RENDERS IT. A third kind nothing branches on is a rename.
+    // These are the three places that turn a storage failure into advice.
+    {
+      const cli = readFileSync(join(ROOT, "bin", "reeve"), "utf8");
+      const hub = readFileSync(join(ROOT, "src", "build", "hubdb.mjs"), "utf8");
+      const bak = readFileSync(join(ROOT, "src", "backup.mjs"), "utf8");
+      // FOUR sites, not three. `restoreHub` renders its own maintenance-lock
+      // failure and was the one caller left deciding from a boolean -- so a lease
+      // write answering SQLITE_FULL was told to fix its permissions, from the
+      // command an operator reaches for when the hub is already in trouble.
+      const sites = [["bin/reeve build status", cli], ["bin/reeve build run", cli],
+                     ["openHub", hub], ["restoreHub", bak]];
+      check(sites.length === 4, "control: four recovery sites are being checked", `${sites.length}`);
+      check(/faultKind\(e\) === "full"/.test(bak),
+        "restoreHub classifies its lock failure by kind, not by a boolean",
+        `${/faultKind\(/.test(bak)}`);
+      check(/free space on the filesystem/i.test(bak),
+        "and tells an operator on a full store to free space",
+        `${/free space on the filesystem/i.test(bak)}`);
+      check((cli.match(/faultKind\(/g) ?? []).length >= 2,
+        "both CLI recovery sites classify by kind rather than by a boolean",
+        `${(cli.match(/faultKind\(/g) ?? []).length} uses`);
+      // THE PROPERTY, not the sentence. This matched `free space on the
+      // filesystem` verbatim and broke the moment the remedy was rewritten to
+      // name the page limit beside the disk -- an assertion failing on an
+      // IMPROVEMENT, which is the shape this suite keeps having to remove. What
+      // matters is that every one of them tells the operator to free space.
+      // The three FILES, not the four call sites: `sites` lists bin/reeve twice
+      // because two of its routes render, and counting a file twice would let a
+      // remedy missing from hubdb.mjs still reach three.
+      const files = [["bin/reeve", cli], ["src/backup.mjs", bak], ["src/build/hubdb.mjs", hub]];
+      const freesSpace = files.filter(([, t]) => /free space/i.test(t)).map(([n]) => n);
+      check(freesSpace.length === 3,
+        "and all three tell an operator on a full store to free space",
+        `named in: ${freesSpace.join(", ")}`);
+      check(!/free space on the filesystem[\s\S]{0,400}restore --hub --force/.test(hub),
+        "and none of them follows that with a restore, which needs MORE room",
+        "checked");
+      // AND THE OTHER CAUSE. errcode 13 answers both a full filesystem and a
+      // store that has hit its own `max_page_count` -- and the second is exactly
+      // how the measured fixture above produces it, so an advice block naming
+      // only the disk sends an operator to free space that was never the problem.
+      // `faultKind` groups the two deliberately; the remedy is where they part.
+      const named = files.filter(([, t]) => /max_page_count/.test(t)).map(([n]) => n);
+      check(named.length === 3,
+        "every full-store remedy names the page limit as well as the filesystem",
+        `named in: ${named.join(", ")}`);
+    }
+    // AND THE STORE IS STILL THERE. That is the whole claim: a rolled-back write
+    // on a full disk leaves an authority database a restore would have replaced.
+    let stillReads = false;
+    try { d.prepare("SELECT count(*) c FROM t").get(); stillReads = true; } catch {}
+    check(stillReads, "and the database reads perfectly afterwards, which is why it is not damage",
+      `${stillReads}`);
+    d.close();
+    rmSync(fHome, { recursive: true, force: true });
+  }
 }
 {
   const eHome = join(dir, "edges-home");

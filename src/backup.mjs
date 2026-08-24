@@ -21,18 +21,18 @@ import { execFileSync } from "node:child_process";
 // `renameSync` is atomic but REPLACES an existing destination -- so two
 // same-second writers would both believe they won.
 import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync, renameSync, openSync, closeSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { open as openStore, exportJsonl } from "./db/ops.mjs";
 // Task 8's subset. `TABLES_AT` and `HUB_TABLES` are what a snapshot's table set
 // is validated against; Task 9 adds the locks, replay and hubEvent imports when
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
 // naming a module that does not exist yet breaks every import of this file.
-import { openHub, isOperational, HUB_SCHEMA_VERSION, HUB_TABLES, TABLES_AT } from "./build/hubdb.mjs";
+import { openHub, isOperational, faultKind, HUB_SCHEMA_VERSION, HUB_TABLES, TABLES_AT } from "./build/hubdb.mjs";
 // Task 9's additions. `restoreHub` takes the maintenance lock before it refuses,
 // enumerates live writers to name them, and replays the tail -- and it needs
 // `replayableKinds`/`NON_REPLAYED_KINDS` to refuse a tail exported by a NEWER
 // binary rather than silently rebuilding a log without its projection.
-import { acquireMaintenanceLock, releaseMaintenanceLock, liveWriters } from "./build/locks.mjs";
+import { acquireMaintenanceLock, releaseMaintenanceLock, liveWriters, assertWritable } from "./build/locks.mjs";
 import { replayHub, replayableKinds, NON_REPLAYED_KINDS } from "./build/replay.mjs";
 
 export { openStore as open };
@@ -616,6 +616,23 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     return `${dbPath}.${kind}-${at}-${pid}`;
   };
   let live = null, locked = false, lockDb = null, quarantined = null, synthetic = false, swapped = false;
+  // DELETION AUTHORITY IS PROVEN, NOT REMEMBERED.
+  //
+  // `synthetic` says this invocation created the file. That alone never
+  // authorised removing it: the file may have been created by SOMEONE ELSE in
+  // the window between the existence check and `openHub`, and it may have picked
+  // up a live writer since. Three early returns learned that separately and each
+  // cleared the flag on its way out -- and the fourth, the one that refuses when
+  // the born scan could not READ a lease table, did not. So a refusal issued
+  // precisely because a creation-window writer could not be ruled out went on to
+  // unlink the database that writer may have been holding.
+  //
+  // Clearing a dangerous flag is a thing every future return has to remember.
+  // This is the same fact stated positively: the finally may delete only what
+  // the born scan positively proved is this invocation's alone -- every table
+  // read, no live holder, the version still ours, and the lock held. A return
+  // added below cannot forget to clear it, because it was never set.
+  let exclusive = false;
   // The unreadable path names the quarantine here and copies it one step before
   // the swap; the version-zero path has to copy immediately, because it migrates
   // the file. This says which already happened.
@@ -730,6 +747,91 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
   // Copied aside first, then either promoted into the quarantine or discarded
   // once the store proves readable. Only the sidecars are copied, never the
   // database, so a healthy restore pays almost nothing for this.
+  // THE UNREADABLE PATH'S EXCLUSION, in one place, because two branches need it.
+  //
+  // `maintenance_lock` lives INSIDE the hub, so a store that cannot serve it is
+  // held from a sibling at a CANONICAL path -- `<dbPath>.restore-lock`, a fixed
+  // name, not a temporary -- taken with the same `acquireMaintenanceLock` call,
+  // so two concurrent restores of the same unusable hub still contend for one
+  // row. `force` is REQUIRED here, inverting the readable path's rule on
+  // purpose: there a holder can be proven alive, here none can be enumerated at
+  // all, and the operator is the only one who can say the daemons are stopped.
+  //
+  // Returns a refusal, or null when the lock is held and the caller may proceed.
+  // CAN A WRITER STILL GET INTO THIS FILE?
+  //
+  // The sibling lock is honoured by NOBODY -- it is exclusion only when no writer
+  // can start. Asked with the statements a writer actually runs, because the
+  // shape does not answer it: `acquireMaintenanceLock` needs `ON CONFLICT(name)`
+  // and therefore the unique constraint, while `assertWritable` only runs a plain
+  // SELECT, so a `maintenance_lock` with every expected column and no constraint
+  // breaks the lock and leaves the writer's read working. A `SELECT *` probe says
+  // yes to both.
+  //
+  // `isAlive` says yes so the reaping DELETE is never reached: this asks about
+  // READS, and a write here would fail for reasons of its own. reeve's own
+  // `a restore is in progress` throw carries no errcode and means the read
+  // SUCCEEDED, which is the answer being sought.
+  // EVERY ADMISSION PATH, not the builder's one. `acquireSingleton` reads
+  // `singleton_lease`, but `withWriterLease` reads NEITHER -- it calls
+  // `assertWritable` and writes `writer_lease` -- and the provider path uses
+  // `provider_lease`. Probing only the builder's table answered "nobody can
+  // enter" for a hub whose `singleton_lease` was malformed while `writer_lease`
+  // was intact, so a CLI could still take a lease under a forced restore holding
+  // a sibling lock that CLI never consults.
+  //
+  // ANY path that can still admit a writer is enough to refuse. The conservative
+  // direction is deliberate: over-refusing leaves a damaged hub in place for an
+  // operator to repair, and under-refusing replaces a database out from under a
+  // live writer.
+  const ADMISSION_TABLES = ["singleton_lease", "writer_lease", "provider_lease"];
+  // THREE ANSWERS, because a probe that could not run has not answered.
+  //
+  // `"no"` is what authorises the sibling lock, and it is a strong claim: nobody
+  // can get into this file, so a lock nothing consults is still exclusion. A
+  // catch-all `false` made every failure say that -- and in DELETE journal mode
+  // an exclusive transaction blocks READERS, so a live writer holding the store
+  // is precisely the case that answered "nobody can enter". A forced restore then
+  // replaced the database underneath the writer whose presence caused the probe
+  // to fail. The same shape `rawOpen` already had to learn one layer up.
+  //
+  //   "yes"     -- an admission path answered; a writer can still get in
+  //   "no"      -- a DEFINITIVE schema failure; no path can admit anyone
+  //   "unknown" -- the probe itself was blocked or refused; nothing is known
+  const writersCanEnter = (handle) => {
+    const ask = (d) => {
+      // `assertWritable` is the gate EVERY path passes through, so a store that
+      // definitively cannot answer it admits nobody, whatever the lease tables
+      // say. Its own errcode-less throw -- `a restore is in progress` -- means
+      // the read SUCCEEDED, which is the answer being sought.
+      try { assertWritable(d, { isAlive: () => true }); }
+      catch (e) {
+        if (e?.errcode !== undefined) return isOperational(e) ? "unknown" : "no";
+      }
+      let blocked = false;
+      for (const t of ADMISSION_TABLES) {
+        try { d.prepare(`SELECT * FROM ${t} LIMIT 1`).get(); return "yes"; }
+        catch (e) { if (isOperational(e)) blocked = true; }
+      }
+      // Every path failed. If ANY of them failed for a reason that is not the
+      // file's fault, the set was never fully examined.
+      return blocked ? "unknown" : "no";
+    };
+    if (handle) return ask(handle);
+    let d = null;
+    try { d = new DatabaseSync(dbPath, { readOnly: true }); }
+    catch (e) { return isOperational(e) ? "unknown" : "no"; }
+    try { return ask(d); }
+    finally { try { d.close(); } catch {} }
+  };
+  const siblingLock = (why) => {
+    if (!force) return { ok: false, holders: [], why };
+    lockDb = openHub(dbPath + ".restore-lock");
+    const got = acquireMaintenanceLock(lockDb, { pid, lstart, isAlive });
+    if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
+    locked = true;
+    return null;
+  };
   const preservedSidecars = [];
   for (const ext of ["-wal", "-shm"]) {
     if (!existsSync(dbPath + ext)) continue;
@@ -772,16 +874,48 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // the one recovery this command exists for. Measured, on the first attempt.
     // The sidecars are already copied aside above, so this open cannot cost the
     // WAL whatever it finds.
-    const readableVersion = (path) => {
+    // THREE ANSWERS, because a MISSING version table is not an unreadable file.
+    //
+    // A hub whose `schema_version` was DROPPED -- while its lease tables and its
+    // event log stayed intact -- made this query throw, and a bare `null` sent it
+    // down the UNREADABLE path, where the lock is taken in the sibling
+    // `.restore-lock`. That file is not unreadable to everyone. `openHub` creates
+    // `schema_version` as plain DDL, and migration 1 is `CREATE TABLE IF NOT
+    // EXISTS` for all 31 tables and 23 indexes -- so a concurrent `build run`
+    // opens exactly this store, completes migration 1 in it, and takes its
+    // singleton lease in the CANONICAL database, never consulting the sibling.
+    // The forced restore then replaced the file underneath a live writer.
+    // Measured: `openHub` on a hub with `schema_version` dropped returns version
+    // 1 with its existing lease row still present.
+    //
+    // The question this predicate really answers is "can another process become
+    // a writer in this file", and a dropped version table answers it exactly as
+    // version zero does: yes, through `openHub`. So it routes the same way --
+    // canonical lock, holder scan, event probe taken before the migration -- and
+    // the sibling lock is left to the file nobody can open at all.
+    const readVersion = (path) => {
       let d = null;
       try {
         d = new DatabaseSync(path, { timeout: 10000 });
-        return d.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+        // Asked of the CATALOGUE, because that is the fact `openHub` acts on:
+        // its `CREATE TABLE IF NOT EXISTS schema_version` keys off exactly this
+        // list. A table that IS listed and cannot be read is damage, and the
+        // query below is what discovers that -- absence and damage are two
+        // answers here, not one.
+        const listed = d.prepare(
+          "SELECT count(*) c FROM sqlite_master WHERE type='table' AND name='schema_version'").get().c;
+        if (!listed) return { absent: true };
+        return { v: d.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v };
       } catch { return null; }
       finally { try { d?.close(); } catch {} }
     };
-    const bootstrapZero = existsSync(dbPath) && readableVersion(dbPath) === 0;
-    if (!existsSync(dbPath) || bootstrapZero) {
+    const probedVersion = existsSync(dbPath) ? readVersion(dbPath) : null;
+    const versionTableGone = probedVersion?.absent === true;
+    const bootstrapZero = probedVersion?.v === 0;
+    // What the two share is the only thing this branch needs from them: no
+    // completed migration is visible, and `openHub` will complete one HERE.
+    const bootstrapCanonical = bootstrapZero || versionTableGone;
+    if (!existsSync(dbPath) || bootstrapCanonical) {
       // SYNTHETIC, and tracked as such. This file exists only to carry the
       // maintenance lock while the real one is staged; nothing has restored
       // into it. If staging or replay then fails -- a malformed supplied tail
@@ -790,7 +924,39 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // lock, and used to leave a fully migrated EMPTY hub at the canonical
       // path. A restarted builder finds a healthy-looking store with no state
       // in it, which is worse than finding nothing: nothing is obviously wrong.
-      synthetic = !bootstrapZero;
+      // OWNERSHIP IS MINTED, not inferred from having looked a moment ago.
+      //
+      // `synthetic` authorises the finally to unlink the file, and it was set
+      // from `existsSync` having answered no at the top of this branch. That is a
+      // read, not a claim: between that read and `openHub` another builder can
+      // create the hub, migrate it, write events, and exit -- and the born scan
+      // then finds no LIVE holder, because there is none. Every check passes and
+      // the finally deletes a database this invocation never made, with somebody
+      // else's events in it.
+      //
+      // `wx` is the only form that answers the question being asked. It creates
+      // the file or fails with EEXIST, atomically, so success IS the proof of
+      // creation -- the same exclusive mint `quarantineName` uses a few hundred
+      // lines above, for the same reason. A zero-length file is a valid empty
+      // SQLite database, so `openHub` goes on to initialise it exactly as before.
+      if (bootstrapCanonical) synthetic = false;
+      else {
+        // THE PARENT FIRST. `openHub` is what normally creates `state/`, and this
+        // mint now runs BEFORE it -- so on a fresh home, or after the total loss
+        // this path exists to recover from, the exclusive open answered ENOENT
+        // and a valid snapshot came back as `could not restore`. Creating the
+        // directory changes nothing about the claim: `wx` is exclusive on the
+        // FILE, and a directory that already exists is not an error.
+        mkdirSync(dirname(dbPath), { recursive: true });
+        try { closeSync(openSync(dbPath, "wx")); synthetic = true; }
+        catch (e) {
+          // EEXIST means somebody won the race. The file is theirs, this restore
+          // may still proceed against it -- the scan below decides that -- but it
+          // is not this invocation's to delete, ever.
+          if (e?.code !== "EEXIST") throw e;
+          synthetic = false;
+        }
+      }
       // KEPT, before it is migrated. Sending a version-zero store down this
       // branch bought exclusion where a bootstrapping builder looks for it, and
       // it would have quietly sold something the unreadable path had chosen: the
@@ -810,149 +976,291 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // treated as an empty tail. The question is whether the log was there when
       // we arrived, and only a read taken before the migration can answer it.
       let hadEventsBefore = false;
-      if (bootstrapZero) {
+      if (bootstrapCanonical) {
         try {
           const q = new DatabaseSync(dbPath, { readOnly: true });
           try { q.prepare("SELECT * FROM hub_event LIMIT 1").get(); hadEventsBefore = true; }
           finally { q.close(); }
         } catch { hadEventsBefore = false; }
-        quarantined = quarantineName("incomplete");
-        try { copyFileSync(dbPath, quarantined); quarantineCopied = true; populated.add(quarantined); }
+        // `.incomplete-` for a half-created store and `.damaged-` for one whose
+        // version table was destroyed: an operator is about to look at this copy,
+        // and telling them the wrong thing about it is its own defect. Unfinished
+        // and damaged are not the same file.
+        quarantined = quarantineName(versionTableGone ? "damaged" : "incomplete");
+        try {
+          copyFileSync(dbPath, quarantined); quarantineCopied = true; populated.add(quarantined);
+          // THE SIDECARS COME WITH IT. Setting `quarantineCopied` skips the later
+          // block, which is the only place the preserved `-wal` and `-shm` were
+          // attached -- so on this path they were carried aside, never copied to
+          // the quarantine, and deleted in the finally. A WAL holds committed
+          // pages that were never checkpointed, so for a hub whose version marker
+          // is gone it can be the only copy of the newest state: the forensic
+          // copy was omitting exactly what this recovery promises to keep.
+          //
+          // From the ASIDE copies, like the later block, because SQLite deletes
+          // `dbPath + ext` when a failed open is closed.
+          for (const [ext, aside] of preservedSidecars)
+            try { copyFileSync(aside, quarantined + ext); } catch {}
+        }
         catch { quarantined = null; }
       }
-      live = openHub(dbPath);
-      // A VERSION-ZERO HUB STILL HAS AN EVENT LOG, and this branch never said so.
+      // ATTEMPTED, NOT INSPECTED -- and what it decides is which path is correct.
       //
-      // `liveHasEvents` was set only where `rawOpen` classified the store, so a
-      // hub whose `schema_version` was emptied -- a damaged migration marker,
-      // with every table and every row intact -- came through here with the flag
-      // still false. The tail query was skipped, the restore reported success,
-      // and every post-snapshot event went with it. Measured: a version-zero hub
-      // holding one `task.filed` restored with `tail: 0` and the task absent.
+      // This branch exists because a store with no completed migration is one a
+      // concurrent `build run` can finish and take a lease in, so exclusion has
+      // to live in the CANONICAL file where that builder will look for it. That
+      // reasoning has a precondition nobody stated: the file must actually be
+      // able to serve the canonical lock.
       //
-      // Probed rather than assumed: `openHub` has just run migration 1, so
-      // `hub_event` exists either way, and what matters is whether it can be
-      // READ. On the genuinely absent-hub path it is empty, which is the correct
-      // answer -- there is nothing to carry forward.
-      // `hadEventsBefore` gates it on the version-zero path: after migration 1
-      // the table always exists, so a post-migration probe can only ever say yes.
-      try { live.prepare("SELECT * FROM hub_event LIMIT 1").get(); liveHasEvents = !bootstrapZero || hadEventsBefore; }
-      catch { liveHasEvents = false; }
-      // AND AN UNREADABLE LOG IS A REFUSAL HERE TOO, not a quiet `false`.
+      // A hub whose `schema_version` is gone AND whose `maintenance_lock` has the
+      // wrong shape satisfies neither half. Measured: `openHub` succeeds on it --
+      // every CREATE is IF NOT EXISTS, so the mis-shaped table is left alone --
+      // and `acquireMaintenanceLock` then throws `no such column: name`, errcode
+      // 1, straight past every recovery. Even `--force` answered `could not
+      // restore`, from the command that exists to recover exactly that file.
       //
-      // Setting the flag and carrying on turned a fail-closed behaviour into
-      // silent accepted loss: the old code threw on the later tail query, which
-      // at least stopped; this branch derives no `historyLost` and requires no
-      // `force`, so the common tail code below simply skipped the read and the
-      // restore replaced the hub having discarded every post-snapshot event.
-      // The repair for one defect removed the safety property of another.
+      // The failure is its own answer. A writer's `assertWritable` and
+      // `acquireSingleton` read the same tables through the same statements, so a
+      // NON-OPERATIONAL failure here means no other writer can get in either --
+      // and the sibling lock, which needed no cooperation from this file, is not
+      // a downgrade but the correct exclusion. An OPERATIONAL failure says
+      // nothing of the sort: someone may hold the file or a permission may be
+      // wrong, and that must still escape rather than quietly change paths.
       //
-      // A supplied tail answers the loss, exactly as on the readable branch.
-      if (!liveHasEvents && suppliedTail == null && !force)
-        return { ok: false, holders: [],
-          why: `the hub at ${dbPath} has no completed migration and its event log cannot be read, so ` +
-               `every event after the snapshot would be lost. Pass --tail from a durable ` +
-               `export-events --hub to carry them forward, or re-run with force to accept the loss.` };
-      if (!liveHasEvents) quarantined ??= quarantineName("damaged");
-      // The result is CHECKED here too. Two restores started after a total loss
-      // both pass the existsSync above, both race through openHub, and one of
-      // them loses the lock -- and an ignored `{ ok: false }` let the loser mark
-      // itself `locked` and stage a replacement against the same path as the
-      // winner. This branch is where a race is MOST likely, because "the hub is
-      // gone" is exactly when two people start a restore.
-      const got = acquireMaintenanceLock(live, { pid, lstart, isAlive });
-      if (!got.ok) {
-        // `synthetic` AUTHORISES DELETION in the finally, and a loser has no
-        // such authority. Both restores observed `dbPath` absent and both got
-        // here, but only one holds the lock -- and it holds it IN THIS FILE,
-        // with the file open. Leaving the flag set made the loser unlink the
-        // winner's database: on POSIX the winner keeps writing to an inode with
-        // no name while the canonical path sits empty, so a builder starting in
-        // that window creates a fresh hub there and the winner's eventual swap
-        // silently discards it.
-        //
-        // The flag means "this invocation created it AND owns it", which is what
-        // the finally assumes. Winning the lock is the only proof of ownership
-        // available, so it is the thing that sets it.
-        synthetic = false;
-        return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
+      // Checking the table's SHAPE instead would be the same mistake one size up:
+      // `maintenance_lock(x TEXT)` answers `SELECT *` perfectly and fails on the
+      // write. The statement that decides is the statement that must report.
+      // THE LOCK IS PART OF THE ATTEMPT, not a step that follows it. The failure
+      // this guard exists for is `acquireMaintenanceLock` throwing, not `openHub`
+      // -- so acquiring it anywhere after the decision leaves the decision made
+      // on the wrong evidence. `locked` is set here for the same reason: a
+      // refusal below returns with the lock held, and the finally is what
+      // releases it.
+      let canonicalFault = null, canonicalGot = null;
+      try {
+        live = openHub(dbPath);
+        canonicalGot = acquireMaintenanceLock(live, { pid, lstart, isAlive });
+        if (canonicalGot.ok) locked = true;
+      } catch (e) {
+        // CLASSIFIED ON THE CAUSE, because `openHub` WRAPS its failure and the
+        // wrapper carries no `errcode`. Classified on the wrapper, every failure
+        // out of `openHub` answers "not a SQLite storage error" and therefore
+        // operational -- so this fallback would rethrow for exactly the damaged
+        // store it exists to recover, and be dead code for it.
+        const cause = (e?.errcode === undefined && e?.cause) ? e.cause : e;
+        // A FULL STORE IS NOT A FAILED RESTORE. Rethrown, it reaches the outer
+        // catch and comes back as the generic `could not restore` -- the one
+        // answer that tells an operator nothing about a condition with an exact
+        // remedy. It is not damage either, so it must not take the fallback.
+        if (faultKind(cause) === "full")
+          return { ok: false, holders: [],
+            why: `the hub at ${dbPath} could not be prepared because the store is full ` +
+                 `(${cause.message}). Nothing is damaged and nothing was replaced.\n` +
+                 `  recover  free space on the filesystem holding ${dbPath} and re-run, removing old ` +
+                 `snapshot files directly: reeve backup --hub --keep N cannot help here, because it ` +
+                 `writes a new snapshot before it prunes and so needs more room, not less. If ` +
+                 `PRAGMA max_page_count and PRAGMA page_count have met, the page limit is the cause ` +
+                 `and freeing space will change nothing.` };
+        if (isOperational(cause)) throw e;
+        canonicalFault = e;
+        try { live?.close(); } catch {}
+        live = null;
       }
-      locked = true;
-
-      // AND THEN SCAN, because the lock did not exist for the whole of creation.
+      // AND "THE LOCK FAILED" DOES NOT MEAN "NOBODY CAN GET IN".
       //
-      // `openHub` creates and migrates the file, and only the NEXT statement
-      // writes `maintenance_lock` into it. A `build run` starting inside that
-      // window finds a fully migrated hub with no lock, takes its singleton, and
-      // is still holding it when this restore replaces the file -- writing to an
-      // unnamed inode while the canonical path carries a different database. The
-      // readable branch has always scanned for holders; this one never did,
-      // because "we just made it" was taken to mean nobody else could be in it.
+      // The argument for falling back was that a writer reaches these tables
+      // through the same statements, so a lock that cannot be taken is a store
+      // nobody can enter. That is too strong, and the counter-example is exact:
+      // `acquireMaintenanceLock` needs `ON CONFLICT(name)` and therefore the
+      // unique constraint, while `assertWritable` only runs
+      // `SELECT * FROM maintenance_lock WHERE name='restore'`. A table with every
+      // expected column and no constraint on `name` breaks the lock and leaves
+      // the writer's read working -- so `acquireSingleton` admits a builder that
+      // never hears of the sibling file, and the restore replaces the database
+      // underneath it.
       //
-      // The window cannot be closed by ordering alone -- there is no create-and-
-      // lock in one step -- so it is closed by LOOKING afterwards. Anything that
-      // got in is still recorded in `singleton_lease`, and the lock this restore
-      // now holds stops any further writer from joining.
-      //
-      // `synthetic = false` before returning, exactly as the two-restore loser
-      // does: the flag means "this invocation created it AND owns it", and a file
-      // a builder is actively writing to is not this function's to delete --
-      // deleting it is the very failure being refused.
-      // GUARDED, like the readable branch's scan. This one read its leases
-      // straight, so an unreadable `provider_lease` in a version-zero hub threw
-      // into the outer catch as `could not restore` -- past `--force`, and AFTER
-      // `openHub` had already migrated the canonical file. A table that cannot
-      // be read here is damage, and damage on this branch means the same thing
-      // it means on the other: force, and the file kept.
-      const bornHolders = [];
-      const bornMissing = [];
-      const bornScan = (table, fn) => {
-        try { return fn(); }
-        catch { bornMissing.push(table); return []; }
-      };
-      for (const r of bornScan("singleton_lease", () => live.prepare("SELECT * FROM singleton_lease").all()))
-        if (isAlive(r.pid, r.lstart)) bornHolders.push({ what: "builder", pid: r.pid, lstart: r.lstart, command: r.command });
-      for (const r of bornScan("writer_lease", () => liveWriters(live, { isAlive })))
-        bornHolders.push({ what: "cli", pid: r.pid, lstart: r.lstart, command: r.command });
-      // AND PROVIDER LEASES. A guardian holds one whenever it is dispatching, and
-      // it can take one in the window this scan exists to close -- the readable
-      // path has always counted a held provider lease as a live writer, and
-      // leaving it out here made the two paths disagree about what "live" means.
-      for (const r of bornScan("provider_lease", () => live.prepare("SELECT * FROM provider_lease WHERE status='held'").all()))
-        if (isAlive(r.pid, r.lstart)) bornHolders.push({ what: r.owner, pid: r.pid, lstart: r.lstart, command: r.run_ref });
-      // What the scan could not read is damage, and it costs the same as damage
-      // on the readable branch: the operator has to say yes, and the file is kept.
-      if (bornMissing.length && !force)
-        return { ok: false, holders: bornHolders,
-          why: `the hub at ${dbPath} is missing or cannot read ${bornMissing.join(", ")}, so a lease held ` +
-               `in ${bornMissing.length === 1 ? "it" : "them"} cannot be ruled out. Stop the builder and ` +
-               `any reeve CLI, then re-run with force.` };
-      if (bornMissing.length) quarantined ??= quarantineName("damaged");
-      // AND THE VERSION, AGAIN, UNDER THE LOCK. The readable branch has always
-      // done this; this one did not. A newer binary can open and migrate the
-      // just-created or version-zero hub between `openHub` above and the lock
-      // below, then exit without leaving a live lease -- so the holder scan finds
-      // nothing, and once migration 2 exists this restore replaces a version-2
-      // hub with its version-1 snapshot and reports success. A pre-lock read
-      // cannot close that window, because the window IS the wait for the lock.
-      {
-        const after = live.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
-        if (after > HUB_SCHEMA_VERSION) {
+      // The sibling lock is honoured by NOBODY. It is exclusion only when no
+      // writer can start, so that is asked directly, with the statements a writer
+      // actually runs rather than a `SELECT *` that any shape answers. Read-only,
+      // and `isAlive` says yes so the reaping DELETE is never reached: this is a
+      // question about reads, and a write here would fail for its own reasons.
+      if (canonicalFault) {
+        // ONLY a definitive "no" authorises the sibling lock. "unknown" is not a
+        // quieter "no": it is the state in which replacing the file is exactly
+        // as dangerous as it is when a writer is provably there.
+        const entry = writersCanEnter(null);
+        if (entry !== "no") {
           synthetic = false;
           return { ok: false, holders: [],
-                   why: `the hub was migrated to schema version ${after} while this restore was ` +
-                        `preparing it; this reeve knows ${HUB_SCHEMA_VERSION}. Restoring would replace ` +
-                        `it with an older store. Upgrade reeve.` };
+            why: `the hub at ${dbPath} cannot serve a restore lock (${canonicalFault.message}), and ` +
+                 (entry === "yes"
+                   ? `a builder can still start in it -- the tables it reads still answer.`
+                   : `whether one can still start in it could not be determined: the probe itself was ` +
+                     `blocked or refused, which is what a live writer holding the store looks like.`) +
+                 ` There is no way to exclude a writer from this file, so replacing it could leave one ` +
+                 `writing to a database with no name.\n` +
+                 `  recover  stop the builder and any reeve CLI, then repair or remove ${dbPath} by ` +
+                 `hand and re-run; reeve restore --hub --force installs the snapshot into a hub that ` +
+                 `is absent.` };
         }
       }
-      if (bornHolders.length) {
+      if (!canonicalFault) {
+        // A VERSION-ZERO HUB STILL HAS AN EVENT LOG, and this branch never said so.
+        //
+        // `liveHasEvents` was set only where `rawOpen` classified the store, so a
+        // hub whose `schema_version` was emptied -- a damaged migration marker,
+        // with every table and every row intact -- came through here with the flag
+        // still false. The tail query was skipped, the restore reported success,
+        // and every post-snapshot event went with it. Measured: a version-zero hub
+        // holding one `task.filed` restored with `tail: 0` and the task absent.
+        //
+        // Probed rather than assumed: `openHub` has just run migration 1, so
+        // `hub_event` exists either way, and what matters is whether it can be
+        // READ. On the genuinely absent-hub path it is empty, which is the correct
+        // answer -- there is nothing to carry forward.
+        // `hadEventsBefore` gates it on the version-zero path: after migration 1
+        // the table always exists, so a post-migration probe can only ever say yes.
+        try { live.prepare("SELECT * FROM hub_event LIMIT 1").get(); liveHasEvents = !bootstrapCanonical || hadEventsBefore; }
+        catch { liveHasEvents = false; }
+        // AND AN UNREADABLE LOG IS A REFUSAL HERE TOO, not a quiet `false`.
+        //
+        // Setting the flag and carrying on turned a fail-closed behaviour into
+        // silent accepted loss: the old code threw on the later tail query, which
+        // at least stopped; this branch derives no `historyLost` and requires no
+        // `force`, so the common tail code below simply skipped the read and the
+        // restore replaced the hub having discarded every post-snapshot event.
+        // The repair for one defect removed the safety property of another.
+        //
+        // A supplied tail answers the loss, exactly as on the readable branch.
+        if (!liveHasEvents && suppliedTail == null && !force)
+          return { ok: false, holders: [],
+            why: `the hub at ${dbPath} has no completed migration and its event log cannot be read, so ` +
+                 `every event after the snapshot would be lost. Pass --tail from a durable ` +
+                 `export-events --hub to carry them forward, or re-run with force to accept the loss.` };
+        if (!liveHasEvents) quarantined ??= quarantineName("damaged");
+        // The result is CHECKED here too. Two restores started after a total loss
+        // both pass the existsSync above, both race through openHub, and one of
+        // them loses the lock -- and an ignored `{ ok: false }` let the loser mark
+        // itself `locked` and stage a replacement against the same path as the
+        // winner. This branch is where a race is MOST likely, because "the hub is
+        // gone" is exactly when two people start a restore.
+        const got = canonicalGot;
+        if (!got.ok) {
+          // `synthetic` AUTHORISES DELETION in the finally, and a loser has no
+          // such authority. Both restores observed `dbPath` absent and both got
+          // here, but only one holds the lock -- and it holds it IN THIS FILE,
+          // with the file open. Leaving the flag set made the loser unlink the
+          // winner's database: on POSIX the winner keeps writing to an inode with
+          // no name while the canonical path sits empty, so a builder starting in
+          // that window creates a fresh hub there and the winner's eventual swap
+          // silently discards it.
+          //
+          // The flag means "this invocation created it AND owns it", which is what
+          // the finally assumes. Winning the lock is the only proof of ownership
+          // available, so it is the thing that sets it.
+          synthetic = false;
+          return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
+        }
+
+        // AND THEN SCAN, because the lock did not exist for the whole of creation.
+        //
+        // `openHub` creates and migrates the file, and only the NEXT statement
+        // writes `maintenance_lock` into it. A `build run` starting inside that
+        // window finds a fully migrated hub with no lock, takes its singleton, and
+        // is still holding it when this restore replaces the file -- writing to an
+        // unnamed inode while the canonical path carries a different database. The
+        // readable branch has always scanned for holders; this one never did,
+        // because "we just made it" was taken to mean nobody else could be in it.
+        //
+        // The window cannot be closed by ordering alone -- there is no create-and-
+        // lock in one step -- so it is closed by LOOKING afterwards. Anything that
+        // got in is still recorded in `singleton_lease`, and the lock this restore
+        // now holds stops any further writer from joining.
+        //
+        // `synthetic = false` before returning, exactly as the two-restore loser
+        // does: the flag means "this invocation created it AND owns it", and a file
+        // a builder is actively writing to is not this function's to delete --
+        // deleting it is the very failure being refused.
+        // GUARDED, like the readable branch's scan. This one read its leases
+        // straight, so an unreadable `provider_lease` in a version-zero hub threw
+        // into the outer catch as `could not restore` -- past `--force`, and AFTER
+        // `openHub` had already migrated the canonical file. A table that cannot
+        // be read here is damage, and damage on this branch means the same thing
+        // it means on the other: force, and the file kept.
+        const bornHolders = [];
+        const bornMissing = [];
+        const bornScan = (table, fn) => {
+          try { return fn(); }
+          catch { bornMissing.push(table); return []; }
+        };
+        for (const r of bornScan("singleton_lease", () => live.prepare("SELECT * FROM singleton_lease").all()))
+          if (isAlive(r.pid, r.lstart)) bornHolders.push({ what: "builder", pid: r.pid, lstart: r.lstart, command: r.command });
+        for (const r of bornScan("writer_lease", () => liveWriters(live, { isAlive })))
+          bornHolders.push({ what: "cli", pid: r.pid, lstart: r.lstart, command: r.command });
+        // AND PROVIDER LEASES. A guardian holds one whenever it is dispatching, and
+        // it can take one in the window this scan exists to close -- the readable
+        // path has always counted a held provider lease as a live writer, and
+        // leaving it out here made the two paths disagree about what "live" means.
+        for (const r of bornScan("provider_lease", () => live.prepare("SELECT * FROM provider_lease WHERE status='held'").all()))
+          if (isAlive(r.pid, r.lstart)) bornHolders.push({ what: r.owner, pid: r.pid, lstart: r.lstart, command: r.run_ref });
+        // What the scan could not read is damage, and it costs the same as damage
+        // on the readable branch: the operator has to say yes, and the file is kept.
+        if (bornMissing.length && !force)
+          return { ok: false, holders: bornHolders,
+            why: `the hub at ${dbPath} is missing or cannot read ${bornMissing.join(", ")}, so a lease held ` +
+                 `in ${bornMissing.length === 1 ? "it" : "them"} cannot be ruled out. Stop the builder and ` +
+                 `any reeve CLI, then re-run with force.` };
+        if (bornMissing.length) quarantined ??= quarantineName("damaged");
+        // AND THE VERSION, AGAIN, UNDER THE LOCK. The readable branch has always
+        // done this; this one did not. A newer binary can open and migrate the
+        // just-created or version-zero hub between `openHub` above and the lock
+        // below, then exit without leaving a live lease -- so the holder scan finds
+        // nothing, and once migration 2 exists this restore replaces a version-2
+        // hub with its version-1 snapshot and reports success. A pre-lock read
+        // cannot close that window, because the window IS the wait for the lock.
+        {
+          const after = live.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+          if (after > HUB_SCHEMA_VERSION) {
+            synthetic = false;
+            return { ok: false, holders: [],
+                     why: `the hub was migrated to schema version ${after} while this restore was ` +
+                          `preparing it; this reeve knows ${HUB_SCHEMA_VERSION}. Restoring would replace ` +
+                          `it with an older store. Upgrade reeve.` };
+          }
+        }
+        if (bornHolders.length) {
+          synthetic = false;
+          return { ok: false, holders: bornHolders,
+            why: `a builder started in the ${bootstrapCanonical ? (versionTableGone ? "unversioned" : "unmigrated") : "absent"} hub at ${dbPath} while this ` +
+                 `restore was preparing it, and is writing to it now:\n` +
+                 bornHolders.map(h => `  ${h.what.padEnd(8)} pid ${h.pid} (started ${h.lstart})  ${h.command}`).join("\n") +
+                 `\n  stop it and re-run. force does not override a live holder; replacing the file ` +
+                 `underneath it would leave it writing to a database with no name.` };
+        }
+        // EVERY question answered, and every answer the safe one: the scan read
+        // each lease table, found nobody alive in them, the version under the lock
+        // is still one this binary wrote, and the maintenance lock is held. This is
+        // the only place that grants the finally its authority.
+        exclusive = true;
+      }
+      if (canonicalFault) {
+        // NOT OURS TO DELETE. The file was already on disk -- `synthetic` is
+        // false for every state that reaches here -- and it is said out loud
+        // because this is the one path that reaches the finally without having
+        // proved anything about the store.
+        try { live?.close(); } catch {}
+        live = null;
         synthetic = false;
-        return { ok: false, holders: bornHolders,
-          why: `a builder started in the ${bootstrapZero ? "unmigrated" : "absent"} hub at ${dbPath} while this ` +
-               `restore was preparing it, and is writing to it now:\n` +
-               bornHolders.map(h => `  ${h.what.padEnd(8)} pid ${h.pid} (started ${h.lstart})  ${h.command}`).join("\n") +
-               `\n  stop it and re-run. force does not override a live holder; replacing the file ` +
-               `underneath it would leave it writing to a database with no name.` };
+        const refused = siblingLock(
+          `the hub at ${dbPath} cannot hold a restore lock (${canonicalFault.message}), so its live ` +
+          `writers cannot be enumerated and none can be ruled out -- though nothing else can take a ` +
+          `lease in it either. Stop the builder and any reeve CLI, then re-run with force. Pass ` +
+          `--tail from a durable export-events --hub to carry forward everything after the snapshot; ` +
+          `without one, events since ${snapSeq} are lost.`);
+        if (refused) return refused;
+        // The same evidence the unreadable path keeps, under the name that says
+        // what happened: this file's schema is damaged, not merely unfinished.
+        quarantined ??= quarantineName("damaged");
       }
     } else if ((opened = rawOpen(dbPath))?.blocked) {
       // NOTHING IS KNOWN ABOUT THIS FILE YET. A blocked probe is not evidence of
@@ -994,16 +1302,12 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       //    snapshot's version was already checked against HUB_SCHEMA_VERSION at
       //    the top of this function, which is the store about to be installed
       //    and is readable -- that is the guarantee that survives here.
-      if (!force)
-        return { ok: false, holders: [],
-                 why: `the hub at ${dbPath} exists but cannot be read, so its live writers cannot be ` +
-                      `enumerated and none can be ruled out. Stop the builder and any reeve CLI, then ` +
-                      `re-run with force. Pass --tail from a durable export-events --hub to carry ` +
-                      `forward everything after the snapshot; without one, events since ${snapSeq} are lost.` };
-      lockDb = openHub(dbPath + ".restore-lock");
-      const got = acquireMaintenanceLock(lockDb, { pid, lstart, isAlive });
-      if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
-      locked = true;
+      const refused = siblingLock(
+        `the hub at ${dbPath} exists but cannot be read, so its live writers cannot be ` +
+        `enumerated and none can be ruled out. Stop the builder and any reeve CLI, then ` +
+        `re-run with force. Pass --tail from a durable export-events --hub to carry ` +
+        `forward everything after the snapshot; without one, events since ${snapSeq} are lost.`);
+      if (refused) return refused;
       // QUARANTINE, never delete: the unreadable file is the only evidence of
       // what went wrong, and a recovery that destroys it leaves nothing to
       // diagnose. But the NAME is chosen here and the move happens later, one
@@ -1122,6 +1426,12 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // not-damage does contention separate "re-run" from "fix the permission".
         const damaged = !isOperational(e);
         const transient = e?.errcode === 5 || e?.errcode === 6;
+        // AND A FULL STORE IS NEITHER. `restore --hub` was the one caller left
+        // rendering this from a boolean, so a lease write that answered
+        // SQLITE_FULL was told to fix its permissions -- the remedy that cannot
+        // free a byte, from the command an operator reaches for when the hub is
+        // already in trouble.
+        const outOfSpace = faultKind(e) === "full";
         // AND THE SIBLING IS ONLY VALID WHEN WRITERS CANNOT USE THE CANONICAL
         // TABLE EITHER. That is the whole basis of moving the lock: an
         // unreadable hub excludes everyone, so a sibling row is as good as one
@@ -1138,11 +1448,14 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // So: if the table still answers a writer's own query, exclusion cannot
         // be established anywhere and the honest answer is to refuse. `force`
         // cannot substitute -- it clears dead holders, it does not stop live ones.
-        let writersCanStillRead = false;
-        if (damaged) {
-          try { live.prepare("SELECT * FROM maintenance_lock WHERE name='restore'").get(); writersCanStillRead = true; }
-          catch { writersCanStillRead = false; }
-        }
+        // The same question, asked once. This branch probed only
+        // `maintenance_lock`; a writer also has to read `singleton_lease`, and a
+        // store where that one is unreadable admits nobody -- so the shared
+        // predicate is both the honest question and the stricter one.
+        // Anything but a definitive "no" refuses. An operational probe failure
+        // here means the same thing it means on the fallback path: the question
+        // was not answered, and a sibling lock is only exclusion when it is.
+        const writersCanStillRead = damaged && writersCanEnter(live) !== "no";
         if (damaged && writersCanStillRead) {
           return { ok: false, holders: [],
             why: `the hub's maintenance_lock at ${dbPath} is damaged in a way this restore cannot write ` +
@@ -1163,7 +1476,13 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
             why: `could not take the maintenance lock in ${dbPath} (${e.message}). ` +
                  `The lock table was readable when this restore classified the hub, so this is not ` +
                  `damage.\n` +
-                 (transient
+                 (outOfSpace
+                   ? `  recover  the store ran out of room, and two causes answer that. Free space on the ` +
+                     `filesystem holding ${dbPath} -- removing old snapshot files directly, since ` +
+                     `reeve backup --hub --keep N writes a whole new snapshot before it prunes -- or, if ` +
+                     `PRAGMA max_page_count and PRAGMA page_count have met, raise the page limit, which ` +
+                     `no amount of free space will do for you.`
+                   : transient
                    ? `  recover  another process holds it -- stop any running builder or reeve CLI and re-run.`
                    : `  recover  the hub or its directory refuses writes -- fix the permissions and re-run.`) +
                  `\n  restoring without exclusion in the canonical hub would let a writer start underneath it, ` +
@@ -1646,7 +1965,25 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
     // that no longer exists is not a release, it is a write to a ghost. This is
     // the remaining half of the synthetic problem -- the two-restore loser was
     // fixed by `synthetic = false`; this is the failure-path ordering.
-    const dropSynthetic = synthetic && !swapped;
+    // AND IT IS STILL THE EMPTY FILE THIS INVOCATION MADE. Creation ownership
+    // closes the race that starts before `openHub`; this closes the one after it.
+    // A writer that got in between the create and the maintenance lock, did its
+    // work and exited leaves no live holder for the scan to find -- so the scan
+    // cannot answer this and the file has to be asked directly.
+    //
+    // Read while the lock is still held, so nothing can join between the question
+    // and the unlink. Anything the store cannot answer counts as content: a file
+    // that will not say whether it is empty is not one to delete.
+    const stillOurs = () => {
+      if (!live) return false;
+      try {
+        if (live.prepare("SELECT count(*) c FROM hub_event").get().c > 0) return false;
+        for (const t of ["singleton_lease", "writer_lease", "provider_lease"])
+          if (live.prepare(`SELECT count(*) c FROM ${t}`).get().c > 0) return false;
+        return true;
+      } catch { return false; }
+    };
+    const dropSynthetic = synthetic && exclusive && !swapped && stillOurs();
     if (dropSynthetic) {
       try { live?.close(); } catch {}
       live = null;

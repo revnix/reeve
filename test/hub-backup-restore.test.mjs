@@ -288,7 +288,7 @@ import { restoreHub } from "../src/backup.mjs";
 import { replayHub, replayableKinds, COMPARISON_SET } from "../src/build/replay.mjs";
 import { hubTx, hubEvent } from "../src/build/hubdb.mjs";
 import { copyFileSync, openSync, writeSync, closeSync } from "node:fs";
-import { acquireSingleton, withWriterLease } from "../src/build/locks.mjs";
+import { acquireSingleton, withWriterLease, acquireMaintenanceLock } from "../src/build/locks.mjs";
 import { createHash } from "node:crypto";
 
 // The durable-tail format, written and read EXACTLY as `reeve export-events
@@ -2480,6 +2480,546 @@ function writeAuthority(db, project) {
     "even though it is zero bytes, because that is what the hub was", 
     `${r.quarantined && statSync(r.quarantined).size}`);
   rmSync(zHome, { recursive: true, force: true });
+}
+
+// ── a DROPPED version table is not an unreadable file ──────────────────────
+// The unreadable path locks a SIBLING, `<dbPath>.restore-lock`, because a file
+// nobody can open cannot hold a lock. A hub whose `schema_version` was dropped
+// while its lease tables and event log survived was sent down that path by a
+// failed version query -- and it is not unreadable to anyone. `openHub` creates
+// `schema_version` as plain DDL and migration 1 is `CREATE TABLE IF NOT EXISTS`
+// throughout, so a concurrent `build run` completes migration 1 in the CANONICAL
+// file and takes its singleton there, never looking at the sibling. The restore
+// then replaced the file underneath that live writer.
+{
+  const dHome = mkdtempSync(join(tmpdir(), "reeve-dropver-"));
+  mkdirSync(join(dHome, "state"), { recursive: true });
+  const src = openHub(join(dHome, "state", "src.db"));
+  const snapD = snapshot(src, join(dHome, "backups"), "hub");
+  src.close();
+  check(snapD.ok, "fixture: a hub snapshot exists to restore from", JSON.stringify(snapD));
+
+  const t = join(dHome, "state", "dropped.db");
+  const d = openHub(t);
+  // A LIVE HOLDER, which is the whole point: the canonical path can see it and
+  // the sibling path cannot. Without one, both paths refuse and the test would
+  // pass for the wrong reason.
+  d.prepare(`INSERT INTO singleton_lease(name,pid,lstart,command,acquired_at,expires_at)
+             VALUES('builder',4242,'L','reeve build run',unixepoch(),unixepoch()+60)`).run();
+  d.exec("DROP TABLE schema_version");
+  d.close();
+
+  // The fixture's three halves, each asserted. Together they are the state:
+  // the version table is GONE, the lease table still reads, and `openHub` can
+  // still complete a migration here -- which is what makes a concurrent writer
+  // possible and the sibling lock wrong.
+  {
+    const q = new DatabaseSync(t, { readOnly: true });
+    const listed = q.prepare("SELECT count(*) c FROM sqlite_master WHERE name='schema_version'").get().c;
+    const leases = q.prepare("SELECT count(*) c FROM singleton_lease").get().c;
+    q.close();
+    check(listed === 0, "fixture: schema_version is gone from the catalogue", `${listed}`);
+    check(leases === 1, "fixture: while the lease table still reads, and holds a live builder", `${leases}`);
+  }
+
+  const r = restoreHub(snapD.path, t, {
+    isAlive: (pid) => pid === 4242, pid: process.pid, lstart: "me" });
+  check(!r.ok, "a restore over a hub with no version table refuses", JSON.stringify(r).slice(0, 200));
+  check(r.holders?.some(h => h.pid === 4242),
+    "and ENUMERATES the live builder, which only the canonical path can do",
+    JSON.stringify(r.holders));
+  check(/unversioned/.test(String(r.why)),
+    "and names the state it found rather than calling the file unreadable", String(r.why).slice(0, 200));
+  check(!/exists but cannot be read/.test(String(r.why)),
+    "not the unreadable refusal, which would have demanded force and scanned nobody",
+    String(r.why).slice(0, 200));
+  check(!existsSync(t + ".restore-lock"),
+    "and the lock was NOT taken in the sibling file, where a bootstrapping builder never looks",
+    `${existsSync(t + ".restore-lock")}`);
+  check(existsSync(t), "and the hub the builder is writing to is still there", `${existsSync(t)}`);
+
+  // CONTROL: the same state with the holder DEAD proceeds -- so the refusal is
+  // about the live writer, not about the missing table.
+  //
+  // A SECOND FILE, not the one above. The refused restore still called `openHub`
+  // on `t`, which recreated `schema_version` and recorded migration 1 -- so `t`
+  // is an ordinary version-1 hub now and re-running against it would exercise the
+  // readable path and prove nothing about this one.
+  const t2 = join(dHome, "state", "dropped2.db");
+  {
+    const e = openHub(t2);
+    e.prepare(`INSERT INTO singleton_lease(name,pid,lstart,command,acquired_at,expires_at)
+               VALUES('builder',4243,'L','reeve build run',unixepoch(),unixepoch()+60)`).run();
+    e.exec("DROP TABLE schema_version");
+    e.close();
+  }
+  const r2 = restoreHub(snapD.path, t2, { isAlive: () => false, pid: process.pid, lstart: "me" });
+  check(r2.ok, "control: with the holder dead, the same state restores without force",
+    JSON.stringify(r2).slice(0, 220));
+  check(/\.damaged-/.test(String(r2.quarantined)),
+    "and the copy kept for the operator is named damaged, not incomplete: the file was destroyed, not unfinished",
+    String(r2.quarantined));
+  rmSync(dHome, { recursive: true, force: true });
+}
+
+// ── the finally may delete only what the scan PROVED is ours ────────────────
+// `synthetic` says this invocation created the file. Three early returns in the
+// creation branch each cleared it on the way out, and the fourth -- the refusal
+// issued when the born scan could not READ a lease table -- did not. So a
+// refusal made precisely because a creation-window writer could not be ruled out
+// went on to unlink the database that writer may have been holding.
+//
+// NOT TESTED end to end, and it cannot be from here: reaching that return needs
+// a hub that is populated or damaged at a path that was ABSENT one statement
+// earlier, which is a race with no seam in `restoreHub`. Measured that the
+// obvious fixture does not work either: a stale `-wal` copied beside an absent
+// database is NOT replayed into it -- SQLite creates an empty store and answers
+// `no such table: schema_version`.
+//
+// So the authority is asserted structurally, which is the part that generalises:
+// `exclusive` is granted in exactly ONE place, and the unlink is gated on it. A
+// return added below cannot reintroduce the defect by forgetting to clear a
+// flag, because it never set one.
+{
+  const src = readFileSync(join(ROOT, "src", "backup.mjs"), "utf8");
+  const grants = src.split("\n").filter(l => /^\s*exclusive = true;\s*$/.test(l)).length;
+  const gate = src.indexOf("const dropSynthetic = synthetic && exclusive && !swapped && stillOurs();");
+  const scanRefusal = src.indexOf("if (bornMissing.length && !force)");
+  const grantAt = src.indexOf("exclusive = true;");
+  check(gate > 0, "control: the synthetic unlink's gate was found in the source", `${gate}`);
+  check(scanRefusal > 0, "control: and the refusal that used to leak past it", `${scanRefusal}`);
+  check(grants === 1,
+    "deletion authority is granted in exactly one place, so no return can grant it by omission",
+    `${grants} assignments`);
+  check(grantAt > scanRefusal,
+    "and it is granted AFTER the scan refusal, so an unreadable lease table never reaches it",
+    `refusal at ${scanRefusal}, grant at ${grantAt}`);
+  // THREE facts, not one. `exclusive` says no writer is active NOW; it cannot say
+  // this invocation created the file, and it cannot say nothing got in and left
+  // between the create and the lock. Each has its own term in the gate, and the
+  // creation one is MINTED with `wx` rather than read from an earlier existsSync.
+  // THE ONLY WAY IT BECOMES TRUE, not merely one of them. Asserting the `wx`
+  // line is present passes against code that keeps the line and sets the flag
+  // from an earlier `existsSync` beside it -- which is exactly the pre-fix form,
+  // so the assertion would have been green on the defect it exists for.
+  const grantsSynthetic = (src.match(/synthetic = (?:true|!bootstrapCanonical)/g) ?? []);
+  check(grantsSynthetic.length === 1 && grantsSynthetic[0] === "synthetic = true",
+    "creation ownership is minted exclusively and nothing else grants it",
+    `assignments: ${grantsSynthetic.join(", ") || "(none)"}`);
+  check(/closeSync\(openSync\(dbPath, "wx"\)\); synthetic = true;/.test(src),
+    "and the one that does is the exclusive create, so success IS the proof this invocation made the file",
+    "checked");
+  check(/const stillOurs = \(\) => \{/.test(src) && gate > 0,
+    "and the unlink re-asks the file whether it is still the empty one that was made",
+    "checked");
+}
+{
+  // And the OUTCOME the gate must not break: a genuinely absent hub whose
+  // restore fails at replay still leaves nothing behind. This is the reachable
+  // half, and it is what goes red if `exclusive` is never granted.
+  const gHome = mkdtempSync(join(tmpdir(), "reeve-excl-"));
+  mkdirSync(join(gHome, "state"), { recursive: true });
+  const src = openHub(hubPathFor(gHome));
+  src.close();
+  const good = snapshot(openHub(hubPathFor(gHome)), join(gHome, "backups"), "hub");
+  check(good.ok, "fixture: a hub snapshot exists to restore from", JSON.stringify(good));
+  const target = join(gHome, "state", "absent.db");
+  check(!existsSync(target), "fixture: and the destination is absent, so the restore is synthetic", target);
+  const badTail = Object.assign(
+    [{ seq: 1, at: 1, kind: "territory_lease.released", payload: JSON.stringify({ project: "o/r", kind: "prefix" }) }],
+    { manifest: null, sha256: null });
+  const r = restoreHub(good.path, target, { isAlive: () => false, pid: process.pid, lstart: "L", force: true, tail: badTail });
+  check(!r.ok, "a synthetic restore that fails at replay still reports failure", JSON.stringify(r).slice(0, 160));
+  check(!existsSync(target),
+    "and the gate still lets it clean up the hub it created and proved was its own",
+    `${existsSync(target)}`);
+  rmSync(gHome, { recursive: true, force: true });
+}
+
+// ── a store that cannot hold the canonical lock keeps its recovery ─────────
+// Routing every missing version table through the canonical bootstrap has a
+// precondition: the file must actually be able to SERVE that lock. A hub whose
+// `schema_version` is gone AND whose `maintenance_lock` has the wrong shape
+// satisfies neither half -- `openHub` succeeds (every CREATE is IF NOT EXISTS,
+// so the mis-shaped table is left alone) and `acquireMaintenanceLock` then
+// throws `no such column: name` past every recovery, so even `--force` answered
+// `could not restore` from the command that exists to recover that file.
+//
+// The failure is its own answer: a writer reads the same tables through the same
+// statements, so a non-operational failure here means nobody else can take a
+// lease either, and the sibling lock is the correct exclusion rather than a
+// downgrade.
+{
+  const kHome = mkdtempSync(join(tmpdir(), "reeve-nolock-"));
+  mkdirSync(join(kHome, "state"), { recursive: true });
+  const src = openHub(join(kHome, "state", "src.db"));
+  const snapK = snapshot(src, join(kHome, "backups"), "hub");
+  src.close();
+  check(snapK.ok, "fixture: a hub snapshot exists to restore from", JSON.stringify(snapK));
+
+  const build = (name) => {
+    const t = join(kHome, "state", name);
+    const d = openHub(t);
+    d.exec("DROP TABLE maintenance_lock");
+    d.exec("CREATE TABLE maintenance_lock (x TEXT)");
+    d.exec("DROP TABLE schema_version");
+    d.close();
+    return t;
+  };
+
+  // The fixture's two halves, asserted separately: `openHub` really does
+  // succeed on it, and the lock really does throw. Without both, this could pass
+  // against a file that simply cannot be opened -- which branch C already handled.
+  {
+    const probe = build("probe.db");
+    let opened = false, lockThrew = null;
+    try {
+      const h = openHub(probe); opened = true;
+      try { acquireMaintenanceLock(h, { pid: process.pid, lstart: "L", isAlive: () => false }); }
+      catch (e) { lockThrew = e; }
+      h.close();
+    } catch { opened = false; }
+    check(opened, "fixture: openHub succeeds on the damaged hub", `${opened}`);
+    check(lockThrew !== null && lockThrew.errcode === 1,
+      "fixture: and the canonical lock throws a non-operational SQLite error",
+      `${lockThrew?.message} errcode=${lockThrew?.errcode}`);
+  }
+
+  const t1 = build("nolock1.db");
+  const no = restoreHub(snapK.path, t1, { isAlive: () => false, pid: process.pid, lstart: "L" });
+  check(!no.ok, "without force the restore refuses", JSON.stringify(no).slice(0, 160));
+  check(/cannot hold a restore lock/.test(String(no.why)),
+    "and says WHY it cannot use the hub's own lock, rather than calling the file unreadable",
+    String(no.why).slice(0, 160));
+
+  const t2 = build("nolock2.db");
+  const yes = restoreHub(snapK.path, t2, { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+  check(yes.ok, "and with force it installs the validated snapshot after all",
+    JSON.stringify(yes).slice(0, 220));
+  check(!/could not restore/.test(String(yes.why ?? "")),
+    "not through the outer catch, which is where it used to die", String(yes.why));
+  check(existsSync(t2 + ".restore-lock"),
+    "using the SIBLING lock, since the hub itself cannot serve one",
+    `${existsSync(t2 + ".restore-lock")}`);
+  check(/\.damaged-/.test(String(yes.quarantined)),
+    "and the file it replaced is quarantined as damaged", String(yes.quarantined));
+  {
+    const h = openHub(t2);
+    const v = h.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+    const lock = h.prepare("SELECT count(*) c FROM pragma_table_info('maintenance_lock') WHERE name='name'").get().c;
+    h.close();
+    check(v === 1 && lock === 1,
+      "and the hub at the canonical path is a whole one afterwards",
+      `version ${v}, maintenance_lock.name present ${lock}`);
+  }
+
+  // CONTROL: an OPERATIONAL failure must NOT downgrade. Nothing about a hub
+  // someone else is holding says no writer can get in -- the opposite -- so the
+  // fallback must not swallow it and replace the file. An exclusive transaction
+  // is used rather than a permission, because chmod does nothing as root and a
+  // read-only fixture would be inert in a container.
+  {
+    const busy = build("busy.db");
+    const holder = new DatabaseSync(busy);
+    holder.exec("PRAGMA journal_mode = DELETE");
+    holder.exec("BEGIN EXCLUSIVE");
+    let threw = null, out = null;
+    try { out = restoreHub(snapK.path, busy, { isAlive: () => false, pid: process.pid, lstart: "L", force: true }); }
+    catch (e) { threw = e; }
+    try { holder.exec("ROLLBACK"); } catch {}
+    holder.close();
+    const refusedNotReplaced = threw !== null || (out && !out.ok);
+    check(refusedNotReplaced,
+      "control: a hub held by another connection is NOT quietly downgraded to the sibling path",
+      threw ? `threw ${String(threw.message).split("\n")[0].slice(0, 90)}` : JSON.stringify(out).slice(0, 160));
+  }
+  rmSync(kHome, { recursive: true, force: true });
+}
+
+// ── a lock that cannot be TAKEN is not a store nobody can ENTER ────────────
+// The sibling lock is honoured by nobody, so it is exclusion only when no writer
+// can start -- and "the canonical lock threw" does not establish that. The
+// counter-example is exact: `acquireMaintenanceLock` needs `ON CONFLICT(name)`
+// and therefore the unique constraint, while `assertWritable` only runs
+// `SELECT * FROM maintenance_lock WHERE name='restore'`. A table with every
+// expected column and no constraint breaks the lock and leaves the writer's read
+// working, so a builder can still take its lease and be replaced underneath.
+{
+  const wHome = mkdtempSync(join(tmpdir(), "reeve-enter-"));
+  mkdirSync(join(wHome, "state"), { recursive: true });
+  const src = openHub(join(wHome, "state", "src.db"));
+  const snapE = snapshot(src, join(wHome, "backups"), "hub");
+  src.close();
+
+  const build = (name, lockDdl) => {
+    const t = join(wHome, "state", name);
+    const d = openHub(t);
+    d.exec("DROP TABLE maintenance_lock");
+    d.exec(lockDdl);
+    d.exec("DROP TABLE schema_version");
+    d.close();
+    return t;
+  };
+
+  // The two damaged shapes, and the fixture asserts they differ in the ONE way
+  // the decision turns on: whether a writer's own read still answers.
+  const wrongCols   = build("wrongcols.db", "CREATE TABLE maintenance_lock (x TEXT)");
+  const noConstraint = build("noconstraint.db",
+    "CREATE TABLE maintenance_lock (name TEXT, pid INTEGER, lstart TEXT, acquired_at INTEGER)");
+  const writerRead = (t) => {
+    const d = new DatabaseSync(t, { readOnly: true });
+    try { d.prepare("SELECT * FROM maintenance_lock WHERE name='restore'").get(); return true; }
+    catch { return false; }
+    finally { d.close(); }
+  };
+  check(!writerRead(wrongCols), "fixture: with the columns wrong, a writer's own read fails too", "");
+  check(writerRead(noConstraint), "fixture: with only the constraint gone, a writer's read still answers", "");
+  {
+    const d = new DatabaseSync(noConstraint);
+    let lockThrew = null;
+    try { acquireMaintenanceLock(d, { pid: process.pid, lstart: "L", isAlive: () => false }); }
+    catch (e) { lockThrew = e; }
+    d.close();
+    check(lockThrew !== null && /ON CONFLICT/.test(String(lockThrew.message)),
+      "fixture: while the lock itself still cannot be taken, for want of the constraint",
+      String(lockThrew?.message).slice(0, 90));
+  }
+
+  const enters = restoreHub(snapE.path, noConstraint,
+    { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+  check(!enters.ok,
+    "a store a builder can still enter is REFUSED, even with force",
+    JSON.stringify(enters).slice(0, 200));
+  check(/can still start in it|still READ/.test(String(enters.why)),
+    "and the reason given is that exclusion cannot be established anywhere",
+    String(enters.why).slice(0, 180));
+  check(!existsSync(noConstraint + ".restore-lock"),
+    "so no sibling lock is taken, since nothing would consult it",
+    `${existsSync(noConstraint + ".restore-lock")}`);
+  check(existsSync(noConstraint),
+    "and the file a builder may be writing to is left alone", `${existsSync(noConstraint)}`);
+
+  // AND THE CLI'S PATH, which reads neither of the tables above. `withWriterLease`
+  // calls `assertWritable` and writes `writer_lease`; it never touches
+  // `singleton_lease`. So a hub whose builder table is malformed while the CLI's
+  // is intact still admits a writer, and a predicate that probed only the
+  // builder's table answered "nobody can enter" for exactly that hub.
+  {
+    const t = join(wHome, "state", "clientry.db");
+    const d = openHub(t);
+    d.exec("DROP TABLE maintenance_lock");
+    d.exec("CREATE TABLE maintenance_lock (name TEXT, pid INTEGER, lstart TEXT, acquired_at INTEGER)");
+    // REPLACED, not dropped. A dropped table is recreated by migration 1 --
+    // every CREATE is IF NOT EXISTS -- so `openHub` repairs it before the
+    // predicate ever looks, and the fixture then refuses for a reason that has
+    // nothing to do with the hole: measured, the builder-only predicate passed
+    // this test against a dropped table. A table that EXISTS with the wrong
+    // columns survives migration 1 untouched, which is the state a writer
+    // actually meets.
+    d.exec("DROP TABLE singleton_lease");
+    d.exec("CREATE TABLE singleton_lease (x TEXT)");
+    d.exec("DROP TABLE schema_version");
+    d.close();
+    const q = new DatabaseSync(t, { readOnly: true });
+    // The BUILDER's own query, not a bare SELECT *: `acquireSingleton` reads
+    // `WHERE name=?`, and that is what fails on a wrong-column table while the
+    // CLI's path never touches it at all.
+    const sl = (() => { try { q.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get(); return true; } catch { return false; } })();
+    const wl = (() => { try { q.prepare("SELECT * FROM writer_lease LIMIT 1").get(); return true; } catch { return false; } })();
+    q.close();
+    check(!sl && wl,
+      "fixture: the builder's own lease query fails while the CLI's table still answers",
+      `singleton_lease(builder query)=${sl} writer_lease=${wl}`);
+    const r = restoreHub(snapE.path, t, { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+    check(!r.ok,
+      "a hub only the CLI can still enter is refused too: every admission path counts",
+      JSON.stringify(r).slice(0, 200));
+    check(!existsSync(t + ".restore-lock") && existsSync(t),
+      "no sibling lock, and the file a CLI may be writing to is left alone",
+      `${existsSync(t + ".restore-lock")} ${existsSync(t)}`);
+  }
+
+  // CONTROL: the shape whose writer-read also fails still recovers. Without this
+  // the assertion above would pass against a fallback that had simply been
+  // removed, which is the repair the previous round added.
+  const closed = restoreHub(snapE.path, wrongCols,
+    { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+  check(closed.ok,
+    "control: the shape nobody can enter still recovers through the sibling lock",
+    JSON.stringify(closed).slice(0, 200));
+  check(existsSync(wrongCols + ".restore-lock"),
+    "control: and it really did use the sibling", `${existsSync(wrongCols + ".restore-lock")}`);
+  rmSync(wHome, { recursive: true, force: true });
+}
+
+// ── the early quarantine carries the sidecars it was given ─────────────────
+// The unversioned path copies the hub BEFORE `openHub` migrates it, and setting
+// `quarantineCopied` skips the later block -- which was the only place the
+// preserved `-wal` and `-shm` were attached. So they were carried aside, never
+// copied to the quarantine, and deleted in the finally. A WAL holds committed
+// pages that were never checkpointed, so for a hub whose version marker is gone
+// it can be the only copy of the newest state: the forensic copy was omitting
+// exactly what this recovery promises to keep.
+{
+  const sHome = mkdtempSync(join(tmpdir(), "reeve-qwal-"));
+  mkdirSync(join(sHome, "state"), { recursive: true });
+  const src = openHub(join(sHome, "state", "src.db"));
+  const snapS = snapshot(src, join(sHome, "backups"), "hub");
+  src.close();
+
+  const t = join(sHome, "state", "unversioned.db");
+  const d = openHub(t);
+  d.exec("DROP TABLE schema_version");
+  // A SECOND CONNECTION HELD OPEN is what leaves an un-checkpointed WAL on disk:
+  // the last connection to close checkpoints and removes it, so a fixture that
+  // closes everything has no sidecar and cannot exhibit this at all.
+  const keeper = new DatabaseSync(t);
+  // A write with no SEMANTIC content: an invented hub_event kind would be
+  // refused by the tail check and the restore would fail for a reason that has
+  // nothing to do with sidecars. What is needed here is dirty pages, not events.
+  keeper.exec("PRAGMA user_version = 7");
+  d.close();
+  check(existsSync(t + "-wal"), "fixture: the hub really has an un-checkpointed WAL beside it",
+    `${existsSync(t + "-wal")}`);
+
+  const r = restoreHub(snapS.path, t, { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+  keeper.close();
+  check(r.ok, "the unversioned hub is recovered", JSON.stringify(r).slice(0, 160));
+  check(r.quarantined && existsSync(r.quarantined),
+    "and the quarantine it reports exists", String(r.quarantined));
+  check(r.quarantined && existsSync(r.quarantined + "-wal"),
+    "and its WAL came with it, which may hold the only copy of the newest state",
+    `${r.quarantined && existsSync(r.quarantined + "-wal")}`);
+  rmSync(sHome, { recursive: true, force: true });
+}
+
+// ── a remedy for a full store must be one that WORKS on a full store ───────
+// `reeve backup --hub --keep N` cannot free space: `snapshot()` writes a whole
+// new database with VACUUM INTO and calls `prune()` only after publishing it, so
+// it needs more room before it removes any. Prescribing it to an operator whose
+// filesystem is full is advice that fails at the first step.
+//
+// Asserted from the source rather than end to end, and the reason is measured:
+// `PRAGMA max_page_count` is PER-CONNECTION (set to 2 on one handle, a fresh
+// handle reads 4294967294), so a subprocess cannot be driven to SQLITE_FULL, and
+// a genuinely full filesystem is not something this suite can create on the
+// three platforms reeve has to run on.
+{
+  const sources = [["bin/reeve", readFileSync(join(ROOT, "bin", "reeve"), "utf8")],
+                   ["src/backup.mjs", readFileSync(join(ROOT, "src", "backup.mjs"), "utf8")],
+                   ["src/build/hubdb.mjs", readFileSync(join(ROOT, "src", "build", "hubdb.mjs"), "utf8")]];
+  // THE PROPERTY, not the sentence. Pinned to `free space on the filesystem`
+  // this failed the moment the remedy was rewritten to name the page limit
+  // beside the disk -- an assertion going red on an IMPROVEMENT, which is the
+  // second time this exact shape has cost a round here.
+  check(sources.every(([, t]) => /free space/i.test(t)),
+    "control: every file that renders a storage failure carries a free-space remedy",
+    sources.map(([n, t]) => `${n}:${/free space/i.test(t)}`).join(" "));
+  const prescribes = sources.filter(([, t]) => /keep N prunes/.test(t)).map(([n]) => n);
+  check(prescribes.length === 0,
+    "and none of them prescribes the backup command as the way to free it",
+    prescribes.join(", "));
+  // The ORDER inside snapshot() is the fact the remedy depends on, so it is
+  // asserted rather than remembered: if prune ever moved ahead of the vacuum the
+  // advice above would become wrong in the other direction.
+  const bak = sources.find(([n]) => n === "src/backup.mjs")[1];
+  const vacuum = bak.indexOf("VACUUM INTO");
+  const pruneCall = bak.indexOf("prune(dir, keep);");
+  check(vacuum > 0 && pruneCall > 0, "control: both anchors were found in snapshot()", `${vacuum} ${pruneCall}`);
+  check(vacuum < pruneCall,
+    "snapshot() still writes the new database BEFORE it prunes, which is why the remedy says to delete directly",
+    `vacuum at ${vacuum}, prune at ${pruneCall}`);
+}
+
+// ── a total loss restores into a home that no longer has a state directory ──
+// The ownership mint runs BEFORE `openHub`, and `openHub` is what creates the
+// parent. So on a fresh home -- or after exactly the total loss this path exists
+// to recover from -- the exclusive open answered ENOENT and a perfectly valid
+// snapshot came back as `could not restore`.
+{
+  const fHome = mkdtempSync(join(tmpdir(), "reeve-fresh-"));
+  mkdirSync(join(fHome, "state"), { recursive: true });
+  const src = openHub(join(fHome, "state", "src.db"));
+  const snapF = snapshot(src, join(fHome, "backups"), "hub");
+  src.close();
+
+  const target = join(fHome, "newhome", "state", "hub.db");
+  check(!existsSync(join(fHome, "newhome", "state")),
+    "fixture: the target's parent directory does not exist", `${existsSync(join(fHome, "newhome", "state"))}`);
+  const r = restoreHub(snapF.path, target, { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+  check(r.ok, "a restore into a home with no state directory succeeds", JSON.stringify(r).slice(0, 200));
+  check(!/ENOENT/.test(String(r.why ?? "")),
+    "and does not fail on the directory the mint had to create", String(r.why ?? "(no why)"));
+  check(existsSync(target), "and the hub is there afterwards", `${existsSync(target)}`);
+  {
+    const h = openHub(target);
+    const v = h.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+    h.close();
+    check(v === 1, "and it is a whole hub, not just a minted empty file", `version ${v}`);
+  }
+  rmSync(fHome, { recursive: true, force: true });
+}
+
+// ── a hub a live writer is holding is never replaced ───────────────────────
+// The property, end to end. Which refusal delivers it depends on where the
+// exclusive transaction lands relative to the version probe, and that ordering
+// is not something a test can choose -- so the assertion is about the OUTCOME,
+// which is the same either way: the file is kept and no sibling lock is taken.
+//
+// The three-answer predicate is asserted from the source beside it, because the
+// interleaving that reaches it -- a store that reads cleanly at the version
+// probe and is blocked by the time the admission probe runs -- requires a writer
+// to arrive between two statements of this function, and nothing here can drive
+// that. What CAN be established is that a blocked probe is never read as "nobody
+// can enter", which is the whole defect.
+{
+  const bHome = mkdtempSync(join(tmpdir(), "reeve-busyw-"));
+  mkdirSync(join(bHome, "state"), { recursive: true });
+  const src = openHub(join(bHome, "state", "src.db"));
+  const snapB = snapshot(src, join(bHome, "backups"), "hub");
+  src.close();
+
+  const t = join(bHome, "state", "busy.db");
+  const d = openHub(t);
+  d.exec("DROP TABLE maintenance_lock");
+  d.exec("CREATE TABLE maintenance_lock (name TEXT, pid INTEGER, lstart TEXT, acquired_at INTEGER)");
+  d.exec("DROP TABLE schema_version");
+  d.close();
+  // DELETE journal mode, exclusive: in that mode an exclusive transaction blocks
+  // READERS, which is what makes a live writer look like an unanswerable probe.
+  // A permission would be inert as root, which is ordinary in a container.
+  const holder = new DatabaseSync(t);
+  holder.exec("PRAGMA journal_mode = DELETE");
+  holder.exec("BEGIN EXCLUSIVE");
+  const r = restoreHub(snapB.path, t, { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+  try { holder.exec("ROLLBACK"); } catch {}
+  holder.close();
+  check(!r.ok, "a forced restore does not replace a hub a live writer is holding", JSON.stringify(r).slice(0, 200));
+  check(!existsSync(t + ".restore-lock"),
+    "and takes no sibling lock, which that writer would never consult",
+    `${existsSync(t + ".restore-lock")}`);
+  check(existsSync(t), "and the file the writer is holding is still there", `${existsSync(t)}`);
+
+  // The predicate's three answers, from the source. `"no"` is the only one that
+  // authorises the sibling lock, and a catch-all `false` gave that answer to
+  // every failure -- including the BUSY a live writer causes.
+  const src2 = readFileSync(join(ROOT, "src", "backup.mjs"), "utf8");
+  // COUNTED, not merely present. The predicate classifies at THREE points -- the
+  // `assertWritable` catch, the read-only open, and the exhausted-table fallback
+  // -- and a regex that only has to match somewhere is satisfied by any one of
+  // them. Measured: stubbing the first back to a bare `return "no"` left this
+  // assertion green, because the second still matched. An assertion that a
+  // pattern EXISTS cannot say that every site uses it.
+  const classifiers = (src2.match(/isOperational\(e\) \? "unknown" : "no"/g) ?? []).length;
+  const fallback = (src2.match(/return blocked \? "unknown" : "no";/g) ?? []).length;
+  check(classifiers === 2 && fallback === 1,
+    "every point where the admission probe can fail classifies operational as unknown, never no",
+    `isOperational classifiers: ${classifiers} (want 2), exhausted-table fallback: ${fallback} (want 1)`);
+  check(/if \(entry !== "no"\)/.test(src2),
+    "and only a definitive no authorises the sibling lock", "checked");
+  check(/writersCanEnter\(live\) !== "no"/.test(src2),
+    "on the readable path too, so the two cannot disagree about an unanswered probe", "checked");
+  rmSync(bHome, { recursive: true, force: true });
 }
 
 rmSync(home, { recursive: true, force: true });

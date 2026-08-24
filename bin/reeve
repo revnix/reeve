@@ -44,7 +44,7 @@ import { resolveHome } from "../src/home.mjs";
 // builder migrates a store it is about to be refused from. Task 9 adds the same
 // import for the export/restore routes; whichever lands first owns it.
 import { DatabaseSync } from "node:sqlite";
-import { openHub, HUB_SCHEMA_VERSION, completedVersion, isOperational } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION, completedVersion, faultKind } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
 import { HEARTBEAT_SECONDS } from "../src/db/ops.mjs";
@@ -120,7 +120,15 @@ const registryProjects = (home) => {
     // AND BOUNDED. A GitHub login is at most 39 characters, so a 40-character
     // owner cannot name one -- and an impossible name still marked the registry
     // KNOWN, which is the suppression this validation exists to stop.
-    const OWNER = String.raw`[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}`;
+    // A REPETITION BOUND COUNTS REPETITIONS, NOT CHARACTERS. `{0,38}` limits how
+    // many alphanumerics may follow the first, and each of those repetitions may
+    // bring a hyphen with it -- so `Array(39).fill("a").join("-")` is 77
+    // characters and matched the shape rule perfectly. The length has to be
+    // measured over the whole segment, which is what the lookahead does: it
+    // requires a slash within 39 non-slash characters before the shape rule runs
+    // at all. Shape and length are two facts, and one quantifier cannot carry
+    // both.
+    const OWNER = String.raw`(?=[^/]{1,39}/)[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}`;
     const REPO  = String.raw`(?!\.+$)[\w.-]+`;
     const NWO = new RegExp(`^${OWNER}/${REPO}$`);
     const bad = Object.entries(reg)
@@ -1152,6 +1160,24 @@ switch (cmd) {
     // version query, into an answer rather than a crash.
     let raw = null;
     let db;
+    // EVERY READ `build status` NEEDS, TAKEN INSIDE THE GUARD -- not just the
+    // first one.
+    //
+    // Extending the guard through the schema probe closed the case where
+    // corruption sits in the `schema_version` page, and stopped there. A hub
+    // whose `schema_version` page is healthy and whose populated
+    // `singleton_lease` page is not answers the probe, leaves the try, and then
+    // throws `database disk image is malformed` at the lease query -- a raw Node
+    // stack trace from the command an operator runs to find out what is wrong.
+    // Eighth finding of one class, and every previous one was fixed by moving
+    // the guard to the read that had just been discovered.
+    //
+    // So the guard is no longer positioned against a known read: this collects
+    // everything the route reads, and nothing below it touches the database.
+    // Rendering cannot throw a SQLite error because rendering does not query.
+    // A read added here later is inside the guard by construction; one added
+    // below has nothing left to read.
+    let status = null;
     try {
       db = bootstrapping
         ? openHub(hubPathFor(HOME))
@@ -1160,7 +1186,30 @@ switch (cmd) {
             : new DatabaseSync(hubPathFor(HOME), { timeout: 10000 }));
       // The first read is what proves the file answers at all. On the raw path
       // nothing has touched it yet, so this is where a corrupt store surfaces.
-      if (raw) raw.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get();
+      // Its VALUE is kept: `build status` re-read the same version a few lines
+      // later, outside the guard, which is one more read than the route needs
+      // and one the guard did not cover.
+      const probed = raw ? raw.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v : null;
+      if (sub === "status")
+        // ONLY WHAT THIS BINARY IS ENTITLED TO READ.
+        //
+        // Below version 1 `singleton_lease` may not exist at all, and asking for
+        // it there would report an unmigrated hub as unreadable -- a different
+        // wrong answer. ABOVE this binary's version the shape is UNKNOWN, and
+        // that is the half collecting the reads under the guard introduced: the
+        // forward-version refusal happens after this block, so a future
+        // migration that reshapes or drops `singleton_lease` would make an older
+        // `build status` call a healthy newer hub unreadable and recommend
+        // `restore --hub --force` -- replacing a store whose only problem is that
+        // this binary is too old to read it. Reproducible with a version-2 marker
+        // and no `singleton_lease`.
+        //
+        // A version this binary does not know is not a shape it may assume. The
+        // refusal below is the answer, and it needs no table but `schema_version`.
+        status = { version: probed,
+                   lease: (probed >= 1 && probed <= HUB_SCHEMA_VERSION)
+                     ? (db.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get() ?? null)
+                     : null };
     } catch (e) {
       try { raw?.close(); } catch { /* the refusal below is the answer either way */ }
       if (sub === "status") {
@@ -1168,7 +1217,8 @@ switch (cmd) {
         // had no split at all, so a healthy DELETE-journal hub held by an
         // exclusive transaction answered `database is locked` and was handed the
         // corruption recovery -- an instruction to replace it.
-        const benign = isOperational(e);
+        const kind = faultKind(e);
+        const benign = kind !== "damage";
         // UNKNOWN, not "not running". An exclusive transaction stops this before
         // the singleton lease can be read, so the command was ANSWERING a
         // question it had not been able to ask -- and answering it negatively,
@@ -1187,7 +1237,25 @@ switch (cmd) {
         // it, and this one did not -- so an operator with a durable export who
         // followed this exact command would restore the snapshot and silently
         // drop every event after it, on the first recovery they attempt.
-        if (benign) {
+        if (kind === "full") {
+          // A FULL STORE HAS ITS OWN REMEDY. Folded into the benign branch it was
+          // told to stop other processes and check permissions -- advice that
+          // cannot work -- while the one instruction that can went unsaid.
+          // TWO CAUSES answer errcode 13, and the page limit is not the disk.
+          // A store that has hit `max_page_count` is unaffected by anything an
+          // operator deletes, so an advice block naming only the filesystem sends
+          // them to free space that was never the problem.
+          console.log(`  recover  the file answered, so this is not damage: the store ran out of room.`);
+          console.log(`           Two causes answer this, and only one is the disk:`);
+          console.log(`           1. the filesystem is full -- free space on the one holding the hub.`);
+          console.log(`              Remove old snapshot files DIRECTLY: reeve backup --hub --keep N`);
+          console.log(`              writes a whole new snapshot before it prunes, so it needs more`);
+          console.log(`              room, not less.`);
+          console.log(`           2. the database hit its page limit -- compare PRAGMA max_page_count`);
+          console.log(`              with PRAGMA page_count; if they meet, freeing space changes`);
+          console.log(`              nothing and the limit is what has to move.`);
+          console.log(`           Do NOT restore over it in either case.`);
+        } else if (benign) {
           console.log(`  recover  the file answered, so this is not damage: stop any running builder or`);
           console.log(`           reeve CLI and re-run, and check the permissions on the hub and its`);
           console.log(`           directory. Do NOT restore over it.`);
@@ -1210,7 +1278,7 @@ switch (cmd) {
     if (sub === "status") {
       // Reading a NEWER store is refused, rather than rendering columns this
       // binary does not understand.
-      const v = db.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+      const v = status.version;
       if (v > HUB_SCHEMA_VERSION)
         die(`the hub is at schema version ${v}; this reeve knows ${HUB_SCHEMA_VERSION}. Upgrade reeve.`);
       // And version 0 is refused too. The comment here used to say "reading an
@@ -1232,9 +1300,9 @@ switch (cmd) {
         console.log(`  recover  reeve build run finishes it, or reeve restore --hub --force installs a snapshot`);
         break;
       }
-      // Defined here rather than referenced: an advertised command that throws
-      // ReferenceError is worse than one that does not exist.
-      const row = db.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get();
+      // Read above, under the guard. Querying it here is what put the eighth
+      // readiness finding outside every recovery this route offers.
+      const row = status.lease;
       if (!row) { console.log("builder: not running (no singleton lease)"); break; }
       const alive = isSameProcess(row.pid, row.lstart);
       console.log(`builder: ${alive ? "running" : "LEASE HELD BY A DEAD PROCESS"}`);
@@ -1296,7 +1364,22 @@ switch (cmd) {
         die(`reeve build run: ${e.message}.\n` +
             `  recover  wait for it to finish and re-run; the hub is read-only until it does.\n` +
             `           reeve build status shows whether it is still going.`);
-      die(isOperational(e)
+      // THE SAME THREE ANSWERS AS `build status`. A lease write on a full
+      // filesystem answered SQLITE_FULL, and this branch told the operator to
+      // check permissions and stop other builders -- neither of which frees a
+      // byte. The kind decides the sentence; the classification is unchanged.
+      const leaseKind = faultKind(e);
+      die(leaseKind === "full"
+        ? `reeve build run: could not take the builder lease in ${hubPathFor(HOME)} (${e.message}).\n` +
+          `  the hub reads fine, so this is not damage: the store ran out of room.\n` +
+          `  recover  two causes answer this, and only one is the disk.\n` +
+          `           1. the filesystem is full -- free space on the one holding ${hubPathFor(HOME)}.\n` +
+          `              Remove old snapshot files DIRECTLY: reeve backup --hub --keep N writes a\n` +
+          `              whole new snapshot before it prunes, so it needs more room, not less.\n` +
+          `           2. the database hit its page limit -- compare PRAGMA max_page_count with\n` +
+          `              PRAGMA page_count; if they meet, freeing space changes nothing.\n` +
+          `           Do NOT restore over it in either case.`
+        : leaseKind === "operational"
         ? `reeve build run: could not take the builder lease in ${hubPathFor(HOME)} (${e.message}).\n` +
           `  the hub reads fine, so this is not damage: the file or its directory may be read-only, ` +
           `or another process may hold it.\n` +

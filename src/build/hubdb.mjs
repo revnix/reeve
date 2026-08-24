@@ -71,6 +71,12 @@ export function completedVersion(path) {
  *
  *   errcode 5  SQLITE_BUSY      another connection holds it
  *   errcode 8  SQLITE_READONLY  read-only file or directory
+ *   errcode 13 SQLITE_FULL      the filesystem or the page limit ran out
+ *
+ * The last is a RESOURCE the environment ran out of, not a fault in the file:
+ * the write is rolled back whole and every byte already on disk is exactly as
+ * SQLite left it. Calling it damage told an operator to restore over a healthy
+ * authority database when freeing space was the entire remedy.
  *
  * Everything else is treated as damage, and that direction is deliberate. The
  * "do NOT restore" message is a strong claim; making it only for codes proven
@@ -81,6 +87,24 @@ export function completedVersion(path) {
  *
  * All four codes measured against node:sqlite, not read from a table.
  */
+/**
+ * WHICH failure, in the operator's terms -- three answers, not two.
+ *
+ * `isOperational` answers a yes/no the recovery text cannot render: "not damage"
+ * covers both `someone else holds it or a permission is wrong` and `the disk is
+ * full`, and those have opposite remedies. Told to stop other processes and
+ * check permissions, an operator on a full filesystem follows advice that cannot
+ * work and never hears the one instruction that can.
+ *
+ * Two facts that look alike are not one fact. The classification is the same;
+ * only the sentence differs, so the kind travels and the boolean is derived
+ * from it rather than the other way round.
+ */
+export function faultKind(e) {
+  if (e?.errcode === 13) return "full";
+  return isOperational(e) ? "operational" : "damage";
+}
+
 export function isOperational(e) {
   // NOT A SQLITE STORAGE ERROR AT ALL. Every failure out of SQLite carries an
   // `errcode`; an error without one came from reeve's own code -- `assertWritable`
@@ -96,6 +120,13 @@ export function isOperational(e) {
       || e.errcode === 5      // SQLITE_BUSY
       || e.errcode === 6      // SQLITE_LOCKED
       || e.errcode === 8      // SQLITE_READONLY
+      // A FULL DISK IS THE SITUATION, NOT THE FILE. Measured against
+      // node:sqlite via `PRAGMA max_page_count`: the insert throws
+      // `database or disk is full` with errcode 13, the transaction is rolled
+      // back, and the store reads perfectly afterwards. Classified as damage it
+      // sent `build run` and `build status` at `restore --hub --force`, which
+      // replaces an intact hub and does not free a single byte.
+      || e.errcode === 13     // SQLITE_FULL
       || e.errcode === 14;    // SQLITE_CANTOPEN
 }
 
@@ -152,12 +183,26 @@ export function openHub(path) {
     //
     // Same mistake as the maintenance-lock catch: a failed operation is not
     // evidence of a damaged file. Only corruption earns the recovery advice.
-    const corrupt = !isOperational(e);
+    const kind = faultKind(e);
     throw new Error(
-      corrupt
+      kind === "damage"
         ? `the hub at ${path} cannot be read (${e.message}).\n` +
           `  recover  reeve restore --hub --force installs the newest usable snapshot\n` +
           `           pass --tail from a durable export-events --hub to carry history forward`
+        : kind === "full"
+        ? `the hub at ${path} could not be written because the store is full (${e.message}).\n` +
+          `  the file itself answered, so this is not damage: it ran out of room.\n` +
+          `  recover  TWO causes answer 13, and only one of them is the disk.\n` +
+          `           1. the filesystem is full -- free space on the one holding ${path} and re-run.\n` +
+          `              Old snapshot files under the backup root are usually the largest thing safe\n` +
+          `              to remove, and they have to be removed DIRECTLY: reeve backup --hub --keep N\n` +
+          `              writes a whole new snapshot with VACUUM INTO and prunes only after publishing\n` +
+          `              it, so it needs more room before it frees any.\n` +
+          `           2. the database has hit its own page limit -- check PRAGMA max_page_count\n` +
+          `              against PRAGMA page_count; if they meet, no amount of free space helps and\n` +
+          `              the limit is what has to change.\n` +
+          `           Do NOT restore over it in either case: there is nothing wrong with the file, ` +
+          `and a restore needs more room rather than less.`
         : `the hub at ${path} could not be opened for writing (${e.message}).\n` +
           `  the file itself answered, so this is not damage: another process may hold it, or the ` +
           `file or its directory may be read-only.\n` +
@@ -263,7 +308,11 @@ export function openHub(path) {
       // failed" is wrong twice: no migration was attempted, and the wrapper hides
       // the two version numbers an operator needs to know which binary to run.
       if (/was migrated to schema version/.test(e.message)) throw e;
-      throw new Error(`hub migration ${m.version} failed, store unchanged: ${e.message}`);
+      // THE CAUSE TRAVELS. Without it this wrapper carries no `errcode`, so every
+      // caller's classifier reads a corrupt store as "not a SQLite storage error"
+      // and answers operational -- the one direction that tells an operator to
+      // leave a damaged hub alone.
+      throw new Error(`hub migration ${m.version} failed, store unchanged: ${e.message}`, { cause: e });
     }
   }
   return db;

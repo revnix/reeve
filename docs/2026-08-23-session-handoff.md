@@ -159,8 +159,9 @@ cannot ship.
    decision was made before Finding 1 was understood — it was taken on the
    belief that publication merely *had not* worked, not that it *cannot*.
 4. **Close PRs #1 and #2.** Done, with the reasoning recorded on each.
-5. **One parallel session on the `threadDetails` wiring.** Prompt was written and
-   handed over.
+5. **One parallel session on the `threadDetails` wiring.** A prompt was written
+   and handed over, and that session never pushed a branch. The work is still
+   open and nobody holds it.
 6. **`git push --dry-run` in doctor: declined.** The one-off check was run by
    hand instead — both repos returned PUSH AUTHORISED.
 
@@ -222,8 +223,8 @@ once those PRs land.
 | # | capability | state |
 |---|---|---|
 | 1 | Watch, judge, escalate | **ON** |
-| 2 | Fix red CI | **armed but cannot publish** — §3 Finding 1 |
-| 3 | Work review threads | off — half claimed (threadDetails), half open |
+| 2 | Fix red CI | **off** — disarmed on 23 Aug because it could not publish; PR #19 is the fix (§3 Finding 1) |
+| 3 | Work review threads | off — the `threadDetails` half was never started, so all of it is open |
 | 4 | Refuse an unsafe merge | off — needs shadow week + the ruleset flip |
 
 Capability 3's other half needs a routing decision. The tracker says
@@ -265,11 +266,20 @@ PR #14 took 10 rounds and 22 findings.
 
 ## 8. What needs the founder
 
-- **Finding 1: decided and in flight.** The founder chose to have reeve stage
-  and commit after the diff gate, and disarmed reeve meanwhile — `--execute` is
-  off, verified on the running process. PR #19 implements it. Until that lands,
-  reeve watches, judges and escalates but does not dispatch, so no attempt is
-  spent at all.
+- **Finding 1: decided and in flight.** The founder chose reeve-side staging and
+  committing, and disarmed reeve meanwhile — `--execute` is off, verified on the
+  running process. PR #19 implements it. Until that lands, reeve watches, judges
+  and escalates but does not dispatch, so no attempt is spent at all.
+
+  Two details of the implementation are worth carrying, because the obvious
+  reading of the decision is wrong on both. reeve commits BEFORE the gates, not
+  after: the gates then judge the ref that gets pushed, exactly as they judged the
+  worker's own commits, so nothing about what may ship changed hands. And reeve
+  stages exactly the paths the worker declared in `filesTouched` rather than
+  everything it left — staging by heuristic and excluding the dependency trees
+  preparation had copied in produced four defects in four review rounds, each fix
+  another exclusion rule, which is the shape that says the design is wrong rather
+  than the instances.
   **Findings 1 and 2 are the fifth and sixth instance of the same shape** — the
   prompt claiming a capability the grant does not carry; `docs/HANDOFF.md`
   tabulated four more on 21 August, including this exact one a step later in the

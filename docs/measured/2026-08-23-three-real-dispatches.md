@@ -158,8 +158,12 @@ The same section has a second contradiction. `src/prompts.mjs:33-34` says:
 > binary
 
 while `sandboxFor` grants `Bash(${process.execPath}:*)` unconditionally — an
-absolute path. Where a unit's language is not a `RUNTIMES` key, that absolute
-path is the *only* granted way to reach node, and the prompt forbids it.
+absolute path. That path is the only granted way to reach node when a unit's
+language is not a `RUNTIMES` key AND it declares no `packageManager`
+(`sandbox.mjs:361`) AND no command whose head reaches node
+(`:348-355`, so `node --test` would grant `Bash(node --test:*)` by itself). Any
+one of the three is enough to make the plain name reachable; with none of them,
+the prompt forbids the one route left.
 
 ## Findings 1 and 2 are the sixth instance of one shape
 

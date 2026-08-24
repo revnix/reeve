@@ -300,6 +300,79 @@ const RUNTIMES = {
   rust: ["cargo"],
 };
 
+/**
+ * Does the sandbox refuse this command whatever else it grants?
+ *
+ * Deny beats allow, so a declared project command can be in the allowlist and
+ * still be refused: a profile whose test command is `npm publish` gets
+ * `Bash(npm publish:*)` granted from its own declaration and denied by NEVER.
+ * The prompt must not offer one of those as an example, and a check that reads
+ * only `permissions.allow` cannot tell.
+ *
+ * Matching is by prefix, because that is how the permission matcher compares.
+ */
+export function commandDenied(cmd, profile) {
+  // Normalised on BOTH sides, because `sandboxFor` builds the granted head by
+  // splitting on whitespace -- so `npm   publish` grants `Bash(npm publish:*)`
+  // while an unnormalised comparison against the raw string finds no deny and
+  // reports it runnable. The grant and the check have to see the same command.
+  const flat = s => String(s ?? "").trim().replace(/\s+/g, " ");
+  const target = flat(cmd);
+  const rules = [...NEVER, ...(profile?.risk?.forbiddenCommands ?? []).map(c => `Bash(${flat(c)}:*)`)];
+  return rules.some(rule => {
+    const m = /^Bash\((.+):\*\)$/.exec(rule);
+    if (!m) return false;
+    const prefix = flat(m[1]);
+    return target === prefix || target.startsWith(prefix + " ");
+  });
+}
+
+/**
+ * The commands the sandbox refuses, as a worker should read them.
+ *
+ * Exported because the prompt used to tell the worker that "the rules below say
+ * which" specific forms are denied, while rendering only the profile's own
+ * `forbiddenCommands` -- so `git remote -v` looked like a qualified allowance and
+ * was refused. Naming them is the only version of that sentence that is true, and
+ * it is cheaper for the worker than discovering each one by spending a turn.
+ */
+export function deniedCommands(profile) {
+  const own = (profile?.risk?.forbiddenCommands ?? []).filter(c => typeof c === "string" && c.length);
+  const built = NEVER.map(rule => /^Bash\((.+):\*\)$/.exec(rule)?.[1]).filter(Boolean);
+  return [...new Set([...built, ...own])];
+}
+
+/** Utilities that make a checkout readable. A fixer that cannot list a directory
+ * is reduced to guessing at filenames. */
+const READ_ONLY_UTILITIES = ["ls", "cat", "head", "tail", "wc", "find", "which", "pwd"];
+
+/**
+ * The bare command names a worker may run for this profile, before `git` and the
+ * interpreter's absolute path are added: the language's runners, the declared
+ * package manager, and the read-only utilities.
+ *
+ * Exported because the worker PROMPT also names commands, in prose, and prose
+ * that disagrees with this set is the single most repeated defect measured in
+ * this codebase: six times by 2026-08-23, most recently a prompt promising
+ * `pnpm test` to a worker granted `npm`. Two derivations can disagree; one,
+ * read by both, cannot.
+ */
+export function projectRunners(profile) {
+  const runners = new Set();
+  for (const u of profile?.units ?? []) {
+    // The language's own runner, because a declared command is often a wrapper.
+    // reeve's `npm test` is a shell loop over `node <file>`, and a fixer that
+    // cannot run ONE test has to run the whole suite to check a one-line change,
+    // or give up -- which is what it did.
+    for (const r of RUNTIMES[u.language] ?? []) runners.add(r);
+    if (u.packageManager) runners.add(u.packageManager);
+  }
+  for (const r of READ_ONLY_UTILITIES) runners.add(r);
+  // A profile may forbid a command that is otherwise a runner, and deny wins.
+  for (const r of [...runners]) if (commandDenied(r, profile)) runners.delete(r);
+  return runners;
+}
+
 const denyAllVerbs = glob =>
   ["Read", "Edit", "Write", "NotebookEdit"].map(v => `${v}(./${glob.replace(/^\.\//, "")})`);
 
@@ -344,7 +417,6 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
   // cannot tell whether its fix worked, so this is the minimum that makes the
   // work verifiable rather than asserted.
   const projectCmds = [];
-  const runners = new Set();
   for (const u of units) {
     for (const c of Object.values(u.commands ?? {})) {
       if (!c?.cmd) continue;
@@ -353,17 +425,9 @@ export function sandboxFor({ profile, action, worktree, lane = null, tmpDir = nu
       const head = c.cmd.trim().split(/\s+/).slice(0, 2).join(" ");
       if (head) projectCmds.push(`Bash(${head}:*)`);
     }
-    // The language's own runner, because a declared command is often a wrapper.
-    // reeve's `npm test` is a shell loop over `node <file>`, and a fixer that
-    // cannot run ONE test has to run the whole suite to check a one-line change,
-    // or give up -- which is what it did.
-    for (const r of RUNTIMES[u.language] ?? []) runners.add(r);
-    if (u.packageManager) runners.add(u.packageManager);
   }
-
-  // Reading the workspace. A fixer that cannot list a directory is reduced to
-  // guessing at filenames.
-  for (const r of ["ls", "cat", "head", "tail", "wc", "find", "which", "pwd"]) runners.add(r);
+  // Shared with the prompt, so the prose and the grant cannot drift apart.
+  const runners = projectRunners(profile);
 
   // `git` as a whole, not subcommand by subcommand. The matcher compares from the
   // start of the command, and a worker handed a worktree path writes

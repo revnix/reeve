@@ -288,7 +288,7 @@ import { restoreHub } from "../src/backup.mjs";
 import { replayHub, replayableKinds, COMPARISON_SET } from "../src/build/replay.mjs";
 import { hubTx, hubEvent } from "../src/build/hubdb.mjs";
 import { copyFileSync, openSync, writeSync, closeSync } from "node:fs";
-import { acquireSingleton, withWriterLease } from "../src/build/locks.mjs";
+import { acquireSingleton, withWriterLease, acquireMaintenanceLock } from "../src/build/locks.mjs";
 import { createHash } from "node:crypto";
 
 // The durable-tail format, written and read EXACTLY as `reeve export-events
@@ -2616,6 +2616,106 @@ function writeAuthority(db, project) {
     "and the gate still lets it clean up the hub it created and proved was its own",
     `${existsSync(target)}`);
   rmSync(gHome, { recursive: true, force: true });
+}
+
+// ── a store that cannot hold the canonical lock keeps its recovery ─────────
+// Routing every missing version table through the canonical bootstrap has a
+// precondition: the file must actually be able to SERVE that lock. A hub whose
+// `schema_version` is gone AND whose `maintenance_lock` has the wrong shape
+// satisfies neither half -- `openHub` succeeds (every CREATE is IF NOT EXISTS,
+// so the mis-shaped table is left alone) and `acquireMaintenanceLock` then
+// throws `no such column: name` past every recovery, so even `--force` answered
+// `could not restore` from the command that exists to recover that file.
+//
+// The failure is its own answer: a writer reads the same tables through the same
+// statements, so a non-operational failure here means nobody else can take a
+// lease either, and the sibling lock is the correct exclusion rather than a
+// downgrade.
+{
+  const kHome = mkdtempSync(join(tmpdir(), "reeve-nolock-"));
+  mkdirSync(join(kHome, "state"), { recursive: true });
+  const src = openHub(join(kHome, "state", "src.db"));
+  const snapK = snapshot(src, join(kHome, "backups"), "hub");
+  src.close();
+  check(snapK.ok, "fixture: a hub snapshot exists to restore from", JSON.stringify(snapK));
+
+  const build = (name) => {
+    const t = join(kHome, "state", name);
+    const d = openHub(t);
+    d.exec("DROP TABLE maintenance_lock");
+    d.exec("CREATE TABLE maintenance_lock (x TEXT)");
+    d.exec("DROP TABLE schema_version");
+    d.close();
+    return t;
+  };
+
+  // The fixture's two halves, asserted separately: `openHub` really does
+  // succeed on it, and the lock really does throw. Without both, this could pass
+  // against a file that simply cannot be opened -- which branch C already handled.
+  {
+    const probe = build("probe.db");
+    let opened = false, lockThrew = null;
+    try {
+      const h = openHub(probe); opened = true;
+      try { acquireMaintenanceLock(h, { pid: process.pid, lstart: "L", isAlive: () => false }); }
+      catch (e) { lockThrew = e; }
+      h.close();
+    } catch { opened = false; }
+    check(opened, "fixture: openHub succeeds on the damaged hub", `${opened}`);
+    check(lockThrew !== null && lockThrew.errcode === 1,
+      "fixture: and the canonical lock throws a non-operational SQLite error",
+      `${lockThrew?.message} errcode=${lockThrew?.errcode}`);
+  }
+
+  const t1 = build("nolock1.db");
+  const no = restoreHub(snapK.path, t1, { isAlive: () => false, pid: process.pid, lstart: "L" });
+  check(!no.ok, "without force the restore refuses", JSON.stringify(no).slice(0, 160));
+  check(/cannot hold a restore lock/.test(String(no.why)),
+    "and says WHY it cannot use the hub's own lock, rather than calling the file unreadable",
+    String(no.why).slice(0, 160));
+
+  const t2 = build("nolock2.db");
+  const yes = restoreHub(snapK.path, t2, { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
+  check(yes.ok, "and with force it installs the validated snapshot after all",
+    JSON.stringify(yes).slice(0, 220));
+  check(!/could not restore/.test(String(yes.why ?? "")),
+    "not through the outer catch, which is where it used to die", String(yes.why));
+  check(existsSync(t2 + ".restore-lock"),
+    "using the SIBLING lock, since the hub itself cannot serve one",
+    `${existsSync(t2 + ".restore-lock")}`);
+  check(/\.damaged-/.test(String(yes.quarantined)),
+    "and the file it replaced is quarantined as damaged", String(yes.quarantined));
+  {
+    const h = openHub(t2);
+    const v = h.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
+    const lock = h.prepare("SELECT count(*) c FROM pragma_table_info('maintenance_lock') WHERE name='name'").get().c;
+    h.close();
+    check(v === 1 && lock === 1,
+      "and the hub at the canonical path is a whole one afterwards",
+      `version ${v}, maintenance_lock.name present ${lock}`);
+  }
+
+  // CONTROL: an OPERATIONAL failure must NOT downgrade. Nothing about a hub
+  // someone else is holding says no writer can get in -- the opposite -- so the
+  // fallback must not swallow it and replace the file. An exclusive transaction
+  // is used rather than a permission, because chmod does nothing as root and a
+  // read-only fixture would be inert in a container.
+  {
+    const busy = build("busy.db");
+    const holder = new DatabaseSync(busy);
+    holder.exec("PRAGMA journal_mode = DELETE");
+    holder.exec("BEGIN EXCLUSIVE");
+    let threw = null, out = null;
+    try { out = restoreHub(snapK.path, busy, { isAlive: () => false, pid: process.pid, lstart: "L", force: true }); }
+    catch (e) { threw = e; }
+    try { holder.exec("ROLLBACK"); } catch {}
+    holder.close();
+    const refusedNotReplaced = threw !== null || (out && !out.ok);
+    check(refusedNotReplaced,
+      "control: a hub held by another connection is NOT quietly downgraded to the sibling path",
+      threw ? `threw ${String(threw.message).split("\n")[0].slice(0, 90)}` : JSON.stringify(out).slice(0, 160));
+  }
+  rmSync(kHome, { recursive: true, force: true });
 }
 
 rmSync(home, { recursive: true, force: true });

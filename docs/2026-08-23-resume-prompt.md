@@ -75,9 +75,11 @@ process can be on older code than the tests you just ran.
    one to point it at, and what bounds the risk is that nothing it can reach was
    ever committed — not that the retained set is inert.
 
-   The remaining work is the follow-up PR, not the fix. What is genuinely open is
-   whether to RE-ARM, which is the founder's call and worth taking against a real
-   dispatch rather than on the strength of the tests.
+   Whether reeve is re-armed, and what is still open, are both in §0. What does
+   NOT go stale: re-arming is the founder's call, and it is worth taking against a
+   real dispatch rather than on the strength of the tests — the defect that
+   started all this was found by a dispatch, and roughly 640 green tests never saw
+   it.
 
    Do NOT assume the diff gate makes the rest free. `reviewDiff`
    (`sandbox.mjs:714-767`) judges PATHS and territory, not whether an allowed edit
@@ -211,9 +213,9 @@ Use ListAgents and SendMessage to check what peers are on before touching
 anything outside your lane, and tell them what you are on.
 
 Do NOT `git pull` or switch branches in ~/Work/Products/reeve — that is the
-running daemon's checkout. reeve is disarmed, so a restart is less dangerous than
-it was, but the checkout is still live and a half-applied tree is still a bad
-thing to hand a daemon. Restarting after a merge is fine and expected, after verifying the merge by
+running daemon's checkout. How dangerous a restart is depends on whether
+`--execute` is on, which §0 has — but the checkout is live either way, and a
+half-applied tree is always a bad thing to hand a daemon. Restarting after a merge is fine and expected, after verifying the merge by
 CONTENT. Squash merges break SHA ancestry, and comparing SNAPSHOTS does not
 settle it either — restricting the diff to your paths still reports a difference
 once anything else touches those paths after the squash. Ask whether YOUR PATCH

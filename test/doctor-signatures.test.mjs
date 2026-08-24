@@ -45,6 +45,18 @@ for (const cond of [undefined, { include: ["~ALL"] }, { include: ["~ALL"], exclu
   const r = checkMergeAuthority("o/r", { api: apiFor(base(cond ? { conditions: { ref_name: cond } } : {})) });
   check(r.level === "BROKEN", `required_signatures over ${JSON.stringify(cond) ?? "no condition"} is BROKEN`, `${r.level}: ${r.lines.join(" | ")}`);
   check(r.lines.some(l => /every branch/.test(l) && /unsigned/.test(l)), "and says reeve commits unsigned", r.lines.join(" | "));
+  // The bypass remedy describes the OPPOSITE failure. Here the gates hold and
+  // reeve cannot get through them; telling an operator to remove a bypass sends
+  // them after something that is not there.
+  check(!r.lines.some(l => /bypass/.test(l)), "and does NOT tell the operator to remove a bypass", r.lines.join(" | "));
+}
+
+// The bypass remedy is still there when a bypass is what broke it.
+{
+  const withBypass = base({ bypass_actors: [{ actor_type: "OrganizationAdmin", bypass_mode: "always" }] });
+  const r = checkMergeAuthority("o/r", { api: apiFor(withBypass) });
+  check(r.level === "BROKEN", "control: a bypass actor is still BROKEN", `${r.level}: ${r.lines.join(" | ")}`);
+  check(r.lines.some(l => /bypass/.test(l) && /decorative/.test(l)), "and the bypass remedy is still given for it", r.lines.join(" | "));
 }
 
 // Scoped to branches a repair will not land on: a possibility, not a certainty.

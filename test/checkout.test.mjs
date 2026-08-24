@@ -593,7 +593,8 @@ rmSync(root, { recursive: true, force: true });
     writeFileSync(join(w, "fix.js"), "the fix\n");
     writeFileSync(join(w, "noise.log"), "build output\n");
 
-    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): repair the thing" });
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): repair the thing",
+                              declared: [".gitignore", "fix.js"] });
     check(r.ok && r.committed === true, "an uncommitted fix is committed", JSON.stringify(r).slice(0, 200));
     check(g(w, "rev-parse", "f") !== before, "and the branch that gets pushed moves", `${before.slice(0,8)} -> ${g(w, "rev-parse", "f").slice(0,8)}`);
     check(g(w, "status", "--porcelain") === "", "leaving nothing behind to be silently dropped", g(w, "status", "--porcelain"));
@@ -610,7 +611,7 @@ rmSync(root, { recursive: true, force: true });
     // whose work is already committed, leaves the branch for the gates to judge.
     const w = mkWorktree("nothing-to-do");
     const before = g(w, "rev-parse", "HEAD");
-    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): nothing" });
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): nothing", declared: [] });
     check(r.ok && r.committed === false, "a clean checkout produces no commit, and no error", JSON.stringify(r));
     check(g(w, "rev-parse", "f") === before, "control: and the branch did not move", before.slice(0, 8));
   }
@@ -623,7 +624,7 @@ rmSync(root, { recursive: true, force: true });
     const w = mkWorktree("wrong-branch");
     g(w, "checkout", "-q", "-b", "aux");
     writeFileSync(join(w, "stray.js"), "not on the published branch\n");
-    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x" });
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x", declared: ["stray.js"] });
     check(r.ok === true && r.committed === false, "a checkout on another branch is skipped, not refused", JSON.stringify(r));
     check(/not committing/.test(r.why ?? ""), "and says why, so the log is not silent about it", String(r.why));
     check(g(w, "status", "--porcelain") !== "", "control: the work is still there for the uncommitted check to catch", g(w, "status", "--porcelain"));
@@ -636,7 +637,7 @@ rmSync(root, { recursive: true, force: true });
     const w = mkWorktree("needs-identity");
     writeFileSync(join(w, "fix.js"), "the fix\n");
     const before = g(w, "rev-parse", "HEAD");
-    const r = commitRunWork({ repoRoot: "/nonexistent-repo-root", path: w, branch: "f", message: "fix(ci): x" });
+    const r = commitRunWork({ repoRoot: "/nonexistent-repo-root", path: w, branch: "f", message: "fix(ci): x", declared: ["fix.js"] });
     check(r.ok === false, "an unreadable founder identity refuses the commit", JSON.stringify(r));
     check(/identity/.test(r.why ?? ""), "and names the identity as the reason", String(r.why));
     check(g(w, "rev-parse", "f") === before, "control: nothing was committed under an invented address", before.slice(0, 8));
@@ -650,7 +651,7 @@ rmSync(root, { recursive: true, force: true });
     const w = mkWorktree("detached");
     g(w, "checkout", "-q", "--detach", "HEAD");
     writeFileSync(join(w, "fix.js"), "the fix\n");
-    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x" });
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x", declared: ["fix.js"] });
     check(r.ok === true && r.committed === false, "a detached head is skipped, not reported as a broken repository", JSON.stringify(r));
     check(/detached head/.test(r.why ?? ""), "and is named as what it is", String(r.why));
   }
@@ -667,7 +668,7 @@ rmSync(root, { recursive: true, force: true });
     process.env.GIT_AUTHOR_EMAIL = "injected@evil.invalid";
     process.env.GIT_COMMITTER_NAME = "Injected";
     process.env.GIT_COMMITTER_EMAIL = "injected@evil.invalid";
-    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x" });
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x", declared: ["fix.js"] });
     for (const [k, v] of [["GIT_AUTHOR_NAME", saved.n], ["GIT_AUTHOR_EMAIL", saved.e],
                           ["GIT_COMMITTER_NAME", saved.cn], ["GIT_COMMITTER_EMAIL", saved.ce]])
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
@@ -686,7 +687,7 @@ rmSync(root, { recursive: true, force: true });
     mkdirSync(join(w, "node_modules", "pkg"), { recursive: true });
     writeFileSync(join(w, "node_modules", "pkg", "index.js"), "vendored\n");
     writeFileSync(join(w, "fix.js"), "the fix\n");
-    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x", exclude: ["node_modules"] });
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x", declared: ["fix.js"] });
     check(r.ok && r.committed, "control: a repair beside an unignored dependency tree still commits", JSON.stringify(r).slice(0, 140));
     check(r.files.includes("fix.js"), "the fix is staged", r.files.join(", "));
     check(!r.files.some(f => f.startsWith("node_modules/")), "the dependency tree reeve copied in is not", r.files.join(", "));
@@ -718,10 +719,14 @@ rmSync(root, { recursive: true, force: true });
     writeFileSync(join(w, "repro.js"), "console.log('reproducing')\n");
     const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
                               declared: ["fix.js"] });
-    check(r.ok === false, "a change the worker did not report refuses the commit", JSON.stringify(r));
-    check(/repro\.js/.test(r.why ?? ""), "and names the file", String(r.why));
-    check(g(w, "rev-parse", "f") === before, "control: nothing was committed", before.slice(0, 8));
-    check(g(w, "diff", "--cached", "--name-only") === "", "and the index is left clean for the human who gets this", g(w, "diff", "--cached", "--name-only"));
+    // Staging from the declaration means an undeclared file is never staged in
+    // the first place, so this is no longer a refusal here -- it is an absence.
+    // What refuses is the uncommitted-work gate the daemon runs next, on exactly
+    // the file left behind.
+    check(r.ok && r.committed, "the declared fix commits", JSON.stringify(r).slice(0, 160));
+    check(r.files.length === 1 && r.files[0] === "fix.js", "and only it", r.files.join(", "));
+    check(g(w, "status", "--porcelain") === "?? repro.js", "leaving the undeclared file for the gate that refuses on it", g(w, "status", "--porcelain"));
+    check(g(w, "rev-parse", "f") !== before, "control: the branch did move, so this is not passing by doing nothing", `${before.slice(0,8)} -> ${g(w, "rev-parse", "f").slice(0,8)}`);
   }
 
   {
@@ -798,14 +803,93 @@ rmSync(root, { recursive: true, force: true });
     // Leading and trailing whitespace are legal in a git filename, and trimming
     // the declared entry made it match nothing the staged list holds.
     const w = mkWorktree("whitespace-filename");
-    // TRAILING space, which is what `.trim()` destroys. A space in the middle
-    // survives trimming and would have passed while the defect stood.
-    const odd = "trailing ";
+    // BOTH ends, because the two trims destroy different halves and a fixture
+    // with one end only passes while the other defect stands. Measured: a
+    // NUL-terminated `" leading\0"` trimmed loses the leading space, while
+    // `"trailing \0"` does NOT -- NUL is not whitespace to JS, so it shields the
+    // trailing one. My first two fixtures here could each exhibit neither.
+    const odd = " both ";
     writeFileSync(join(w, odd), "the fix\n");
     const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
                               declared: [odd] });
-    check(r.ok && r.committed, "a filename with trailing whitespace the worker declared is committed", JSON.stringify(r).slice(0, 200));
+    check(r.ok && r.committed, "a filename with leading and trailing whitespace the worker declared is committed", JSON.stringify(r).slice(0, 200));
     check(r.files.includes(odd), "and matched byte for byte", JSON.stringify(r.files));
+  }
+
+  {
+    // A NEW file inside a copied dependency tree. The heuristic design staged
+    // tracked edits inside such a tree but not additions, so this part of a
+    // multi-file repair was dropped while the rest published as if complete.
+    const w = mkWorktree("new-file-inside-a-copied-tree");
+    mkdirSync(join(w, "vendor"), { recursive: true });
+    writeFileSync(join(w, "vendor", "tracked.js"), "vendored\n");
+    g(w, "add", "-A"); g(w, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "vendor it");
+    writeFileSync(join(w, "vendor", "new-fix.js"), "the new part\n");
+    writeFileSync(join(w, "vendor", "tracked.js"), "the edited part\n");
+    writeFileSync(join(w, "fix.js"), "the rest\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: ["fix.js", "vendor/new-fix.js", "vendor/tracked.js"] });
+    check(r.ok && r.committed, "a repair adding a file inside a copied tree commits", JSON.stringify(r).slice(0, 200));
+    check(r.files.includes("vendor/new-fix.js"), "and the ADDED file is in it", r.files.join(", "));
+    check(r.files.includes("vendor/tracked.js"), "control: so is the edited tracked one", r.files.join(", "));
+  }
+
+  {
+    // A path git would ignore, declared anyway. `--force` is what makes the
+    // worker's declaration outrank the ignore rule.
+    const w = mkWorktree("declared-but-ignored");
+    writeFileSync(join(w, ".gitignore"), "generated/\n");
+    mkdirSync(join(w, "generated"), { recursive: true });
+    writeFileSync(join(w, "generated", "out.js"), "a generated file the fix needs\n");
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: [".gitignore", "generated/out.js"] });
+    check(r.ok && r.committed, "a declared path inside an ignored directory commits", JSON.stringify(r).slice(0, 200));
+    check(r.files.includes("generated/out.js"), "because the declaration outranks the ignore rule", r.files.join(", "));
+  }
+
+  {
+    // Declared but never changed. This is the direction that used to lose work:
+    // publishing the rest as a complete repair while the omitted part went in the
+    // bin with the checkout.
+    const w = mkWorktree("declared-but-unchanged");
+    const before = g(w, "rev-parse", "HEAD");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+
+    // A path that does not exist is refused by `git add` itself. Worth asserting,
+    // but it is NOT what the declared-vs-staged check is for -- my first fixture
+    // here used exactly that and passed on git's error while the check itself was
+    // stubbed out.
+    const gone = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                                 declared: ["fix.js", "never-existed.js"] });
+    check(gone.ok === false, "a declared file that does not exist is refused", JSON.stringify(gone).slice(0, 180));
+
+    // THIS is the case the check exists for: `seed.js` is tracked and unchanged,
+    // so `git add` accepts it happily and stages nothing. Declaring a file you
+    // did not change means the report and the tree disagree, and publishing the
+    // rest as a complete repair is how the disagreement gets buried.
+    const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                              declared: ["fix.js", "seed.js"] });
+    check(r.ok === false, "a declared file that exists but is unchanged refuses the commit", JSON.stringify(r));
+    check(/seed\.js/.test(r.why ?? ""), "and names it", String(r.why));
+    check(g(w, "rev-parse", "f") === before, "control: nothing was committed", before.slice(0, 8));
+    check(g(w, "diff", "--cached", "--name-only") === "", "and the index is left clean for the human who gets this", g(w, "diff", "--cached", "--name-only"));
+  }
+
+  {
+    // Declarations reeve refuses to act on at all. git rejects an escaping
+    // pathspec itself, but the refusal a worker sees should be reeve's and name
+    // the rule, and `.git` is worth refusing here rather than by `add` declining.
+    const w = mkWorktree("hostile-declarations");
+    writeFileSync(join(w, "fix.js"), "the fix\n");
+    for (const [what, path] of [["an absolute path", "/etc/passwd"],
+                                ["a climb out of the checkout", "../../etc/passwd"],
+                                ["git's own state", ".git/config"],
+                                ["a nested climb", "src/../../outside"]]) {
+      const r = commitRunWork({ repoRoot: cFounder, path: w, branch: "f", message: "fix(ci): x",
+                                declared: ["fix.js", path] });
+      check(r.ok === false, `a declared path that is ${what} is refused`, `${path}: ${JSON.stringify(r)}`);
+    }
+    check(g(w, "status", "--porcelain") === "?? fix.js", "control: and the checkout is untouched by any of them", g(w, "status", "--porcelain"));
   }
 
   rmSync(cRoot, { recursive: true, force: true });

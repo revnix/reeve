@@ -522,14 +522,16 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
 //
 // The absent and malformed report cases are the same rule read the other way: a
 // run that says nothing has not said it fixed anything.
-for (const [what, report] of [
-  ["an undeclared scratch file", { fixed: true, cause: "c", change: "ch", filesTouched: ["fix.js"] }],
-  ["no report at all", null],
-  ["a report with no `fixed`", { cause: "c", change: "ch", filesTouched: ["fix.js", "repro.js"] }],
-  // An unusable `filesTouched` reached `commitRunWork` as null and turned the
-  // declaration check OFF, so the undeclared file went with the fix.
-  ["no filesTouched at all", { fixed: true, cause: "c", change: "ch" }],
-  ["a filesTouched that is not an array", { fixed: true, cause: "c", change: "ch", filesTouched: "fix.js" }],
+for (const [what, report, commits] of [
+  // The declared part DOES commit here: staging from the declaration means the
+  // undeclared file is never staged, and what refuses is the uncommitted-work
+  // gate on exactly what is left. Nothing publishes either way.
+  ["an undeclared scratch file", { fixed: true, cause: "c", change: "ch", filesTouched: ["fix.js"] }, true],
+  ["no report at all", null, false],
+  ["a report with no `fixed`", { cause: "c", change: "ch", filesTouched: ["fix.js", "repro.js"] }, false],
+  // An unusable `filesTouched` is refused before any staging happens at all.
+  ["no filesTouched at all", { fixed: true, cause: "c", change: "ch" }, false],
+  ["a filesTouched that is not an array", { fixed: true, cause: "c", change: "ch", filesTouched: "fix.js" }, false],
 ]) {
   const dirU2 = mkdtempSync(join(tmpdir(), "reeve-e2e-undeclared-"));
   const wtU2 = mkdtempSync(join(dirU2, "wt-"));
@@ -560,7 +562,9 @@ for (const [what, report] of [
     : null;
 
   check(publishedU2 === 0, `${what}: nothing is published`, `published=${publishedU2} esc=${escU2}`);
-  check(movedU2 === pinnedU2, "and nothing was committed either", `${pinnedU2.slice(0, 8)} vs ${String(movedU2 ?? "(checkout gone)").slice(0, 8)}`);
+  check(commits ? movedU2 !== pinnedU2 : movedU2 === pinnedU2,
+    commits ? "the declared part is committed, and held back rather than shipped" : "and nothing was committed either",
+    `${pinnedU2.slice(0, 8)} vs ${String(movedU2 ?? "(checkout gone)").slice(0, 8)}`);
   check(!!keptAt && existsSync(join(keptAt, "repro.js")), "the work is kept for a human", String(keptAt));
   ctxU2.db.close();
   rmSync(dirU2, { recursive: true, force: true });

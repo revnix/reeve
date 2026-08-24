@@ -44,8 +44,8 @@ import { GIT_NEUTRALISE, GIT_NEUTRALISE_FOUNDER, REFUSING_HOOK, recordConfig, re
 import { writeFileSync, chmodSync } from "node:fs";
 
 /** Every daemon git command in a worker-controlled directory carries the neutralisers. */
-function git(cwd, args) {
-  return run(cwd, GIT_NEUTRALISE, args, gitEnv());
+function git(cwd, args, opts) {
+  return run(cwd, GIT_NEUTRALISE, args, gitEnv(), opts);
 }
 
 /**
@@ -75,13 +75,20 @@ function founderGit(cwd, args) {
   return run(cwd, GIT_NEUTRALISE_FOUNDER, args, founderGitEnv());
 }
 
-function run(cwd, neutralise, args, env) {
+function run(cwd, neutralise, args, env, { raw = false, input = undefined } = {}) {
   try {
     // 64 MiB, because the default 1 MiB is not enough for a repository-sized
     // answer: `changedFiles` raised it after about 1,800 long paths overflowed
     // it, and a helper that fails on SIZE turns a valid repair into a refusal.
-    return { ok: true, out: execFileSync("git", ["-C", cwd, ...neutralise, ...args],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024, env }).trim() };
+    //
+    // `raw` for NUL-delimited output, which is DATA and not text: leading and
+    // trailing whitespace are legal in a git filename, and trimming ` leading`
+    // to `leading` made a correctly declared repair unrecognisable. Only callers
+    // reading a textual value want the trim.
+    const out = execFileSync("git", ["-C", cwd, ...neutralise, ...args],
+      { encoding: "utf8", stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+        maxBuffer: 64 * 1024 * 1024, env, input });
+    return { ok: true, out: raw ? out : out.trim() };
   // `reason` picks git's own fatal line rather than the last thing it printed,
   // which is usually progress narration and sends the reader somewhere else.
   } catch (e) { return { ok: false, out: "", err: reason(e.stderr || e.message) }; }
@@ -513,12 +520,28 @@ export function founderIdentity(repoRoot) {
  * earlier in the same sequence: the party that decides what may ship is the party
  * that writes it. The worker is now unable to touch git's state at all.
  *
- * Everything the worker left is staged, ignored files excepted, and nothing is
- * judged here. The diff gate runs AFTER this, against the ref that gets pushed,
- * so a stray file is refused by the gate that exists for exactly that -- rather
- * than by a guess made here about which of a worker's files it meant to leave.
+ * What gets staged is exactly what the worker declared in `filesTouched`, and
+ * nothing is JUDGED here. The diff gate runs after this, against the ref that
+ * gets pushed, so what may ship is still decided where it was always decided.
  */
-export function commitRunWork({ repoRoot, path, branch, message, exclude = [], secrets = [], declared = null }) {
+/**
+ * Why reeve will not stage this declared path, or null if it will.
+ *
+ * git rejects an escaping pathspec itself, but the refusal a worker sees should
+ * be reeve's and should name the rule, and `.git` is worth refusing here rather
+ * than relying on `add` to decline it. Nothing is normalised away beyond a
+ * leading `./`: leading and trailing whitespace are legal in a git filename.
+ */
+function badDeclaredPath(f) {
+  if (typeof f !== "string" || !f.length) return `${JSON.stringify(f)} is not a filename`;
+  const rel = f.replace(/^\.\//, "");
+  if (rel.startsWith("/")) return `${rel} is absolute`;
+  if (rel.split("/").includes("..")) return `${rel} climbs out of the checkout`;
+  if (rel === ".git" || rel.startsWith(".git/")) return `${rel} is git's own state`;
+  return null;
+}
+
+export function commitRunWork({ repoRoot, path, branch, message, secrets = [], declared = [] }) {
   if (!String(message ?? "").trim()) return { ok: false, why: "no commit message was given" };
 
   // The message is built from the worker's report, which is model output that has
@@ -551,65 +574,62 @@ export function commitRunWork({ repoRoot, path, branch, message, exclude = [], s
   if (on.out !== branch)
     return { ok: true, committed: false, files: [], why: `not committing: the checkout is on ${on.out || "a detached head"}, not ${branch}` };
 
-  // Dependency trees are copied in by `prepareRunCheckout` BEFORE the worker
-  // starts, so their CONTENT is not the worker's work. A repository that does not
-  // ignore its own `node_modules` or `.venv` would otherwise have the whole tree
-  // staged into the repair: published wholesale where the lane is broad, and
-  // refusing every valid repair where it is narrow.
+  // reeve stages EXACTLY what the worker declared, and nothing else.
   //
-  // But a copied tree can hold TRACKED files -- a vendored directory under
-  // version control -- and a worker editing one of those is doing real work.
-  // Excluding the whole path dropped that edit from the commit AND hid it from
-  // the uncommitted check, publishing the rest as a complete fix. So the staging
-  // is in two steps: everything outside the copied trees, then tracked changes
-  // INSIDE them. What is never staged is untracked content under a copied tree,
-  // which is exactly what preparation put there.
-  const spec = exclude.map(e => `:(exclude)${e}`);
-  const added = git(path, ["add", "--all", "--", ".", ...spec]);
-  if (!added.ok) return { ok: false, why: `could not stage the work: ${added.err}` };
-  if (exclude.length) {
-    // Only for trees that actually HOLD tracked files: `git add --update` fails
-    // outright when no pathspec matches, which is the ordinary case for a
-    // `node_modules` nothing has ever tracked.
-    const known = git(path, ["ls-files", "-z", "--", ...exclude]);
-    if (!known.ok) return { ok: false, why: `could not read the copied trees: ${known.err}` };
-    if (known.out) {
-      const tracked = git(path, ["add", "--update", "--", ...exclude]);
-      if (!tracked.ok) return { ok: false, why: `could not stage changes inside a copied dependency tree: ${tracked.err}` };
-    }
-  }
+  // The previous design staged by heuristic -- `git add --all` minus the
+  // dependency trees preparation had copied in -- and produced three separate
+  // defects in three review rounds: a tree excluded from staging still made the
+  // checkout dirty; a TRACKED file inside such a tree had its edit silently
+  // dropped; and a NEW file inside one was dropped while the rest published as if
+  // complete. Each fix was another exclusion rule, which is the shape that says
+  // the design is wrong rather than the instances.
+  //
+  // Only the worker can say which of its files were the repair and which were a
+  // reproduction script, so the declaration is the INSTRUCTION here rather than a
+  // cross-check applied afterwards. That removes every special case at once: a
+  // path inside a copied tree stages because it was declared, and a scratch file
+  // does not because it was not.
+  const bad = declared.map(badDeclaredPath).filter(Boolean);
+  if (bad.length) return { ok: false, why: `the worker declared ${bad.length} path(s) reeve will not stage: ${bad.slice(0, 5).join("; ")}` };
+  const wanted = [...new Set(declared.map(f => f.replace(/^\.\//, "")))];
+  // Nothing declared is not an error: the gates below judge whatever the branch
+  // already holds, and a worker that committed nothing has changed nothing.
+  if (!wanted.length) return { ok: true, why: null, committed: false, files: [] };
 
-  // `-z`, because git QUOTES a path it considers unusual: `kéy.txt` comes back as
-  // `"k\303\251y.txt"` from `--name-only`, which matches nothing the worker
-  // reported and would quarantine a perfectly good repair. NUL-terminated output
-  // is the raw filename, and it is what `changedFiles` already reads.
-  const staged = git(path, ["diff", "--cached", "--name-only", "-z"]);
+  // `--force`, because a declared path may sit inside an ignored or copied tree,
+  // and the worker saying it is part of the repair outranks the ignore rule. The
+  // diff gate still judges the result.
+  //
+  // Through stdin rather than argv: a repository-sized repair overruns ARG_MAX,
+  // and `--pathspec-from-file=-` with `--pathspec-file-nul` is git's own answer
+  // for a list of arbitrary length holding arbitrary bytes.
+  const added = git(path, ["add", "--force", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                    { input: wanted.join("\0") + "\0" });
+  if (!added.ok) return { ok: false, why: `could not stage the declared work: ${added.err}` };
+
+  // `-z` and RAW, because git quotes a path it considers unusual -- `kéy.txt`
+  // comes back as `"k\303\251y.txt"` from `--name-only` -- and because trimming
+  // the output would eat a leading space that is part of the filename.
+  const staged = git(path, ["diff", "--cached", "--name-only", "-z"], { raw: true });
   if (!staged.ok) return { ok: false, why: `could not read what was staged: ${staged.err}` };
   const files = staged.out ? staged.out.split("\0").filter(Boolean) : [];
-  // A worker that committed its own work, or changed nothing, leaves nothing to
-  // stage. Not an error: the gates below judge whatever the branch now holds.
-  if (!files.length) return { ok: true, why: null, committed: false, files: [] };
 
-  // What the worker SAID it changed has to account for what is there. The diff
-  // gate judges paths and territory, never intent, so an ordinary scratch file
-  // inside the lane -- a reproduction script, a debug dump -- passes it and would
-  // be published as part of the repair. Refusing on the disagreement is the only
-  // check that can tell those apart, because only the worker knows which of its
-  // files were the fix.
-  if (declared !== null) {
-    // Only a leading `./` or `/` comes off. NOT `.trim()`: leading and trailing
-    // whitespace are legal in a git filename, and `"a "` trimmed to `"a"` matches
-    // nothing the NUL-delimited staged list holds, quarantining a valid repair.
-    const said = new Set(declared
-      .filter(f => typeof f === "string")
-      .map(f => f.replace(/^\.\//, "").replace(/^\/+/, "")));
-    const undeclared = files.filter(f => !said.has(f));
-    if (undeclared.length) {
-      // Nothing is staged when this fires: the index is reset so the checkout is
-      // handed to a human exactly as the worker left it.
-      git(path, ["reset", "--quiet", "HEAD", "--"]);
-      return { ok: false, why: `the checkout holds ${undeclared.length} change(s) the worker did not report: ${undeclared.slice(0, 5).join(", ")}` };
-    }
+  // BOTH directions, and the index is reset on either so a human gets the
+  // checkout exactly as the worker left it.
+  //
+  // Declared-but-unstaged is the one that used to lose work: a declared path with
+  // no change means the worker mis-reported or something dropped it, and
+  // publishing the remainder as a complete repair is how the omitted part goes in
+  // the bin with the checkout. Staged-but-undeclared cannot happen now by
+  // construction, and is asserted rather than assumed.
+  const have = new Set(files), said = new Set(wanted);
+  const missing = wanted.filter(f => !have.has(f));
+  const extra = files.filter(f => !said.has(f));
+  if (missing.length || extra.length) {
+    git(path, ["reset", "--quiet", "HEAD", "--"]);
+    return { ok: false, why: missing.length
+      ? `the worker reported ${missing.length} file(s) that are not changed in the checkout: ${missing.slice(0, 5).join(", ")}`
+      : `staging produced ${extra.length} file(s) the worker did not report: ${extra.slice(0, 5).join(", ")}` };
   }
 
   const id = founderIdentity(repoRoot);

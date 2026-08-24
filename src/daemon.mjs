@@ -138,7 +138,7 @@ function attemptsFor(db, nwo, pr, fp, logPath) {
  * untrusted CI logs, so it goes through `printable` like every other worker
  * string that reaches a terminal.
  */
-function repairMessage(report, decision) {
+export function repairMessage(report, decision) {
   const clean = s => printable(String(s ?? "")).replace(/\s+/g, " ").trim();
   const change = clean(report?.change);
   const cause = clean(report?.cause);
@@ -147,9 +147,17 @@ function repairMessage(report, decision) {
   // trailing period. Truncation falls back to a word boundary, because a subject
   // cut mid-word reads as corruption rather than as brevity.
   const said = (change || "repair the failing check").replace(/\.+$/, "");
-  const full = `fix(${scope}): ${said.charAt(0).toLowerCase()}${said.slice(1)}`;
-  const subject = full.length <= 72 ? full
-    : full.slice(0, 72).replace(/\s+\S*$/, "");
+  const prefix = `fix(${scope}): `;
+  const body = `${said.charAt(0).toLowerCase()}${said.slice(1)}`;
+  const room = 72 - prefix.length;
+  // A word boundary when there is one, a hard cut when there is not. Trimming to
+  // the last space deleted the ENTIRE description when the first token was longer
+  // than the room available -- measured, a 100-character first word produced
+  // exactly `fix(ci):`, which is uninformative history and not a valid
+  // Conventional Commit either, since the description is required.
+  const cut = body.length <= room ? body
+    : (body.slice(0, room).replace(/\s+\S*$/, "") || body.slice(0, room));
+  const subject = prefix + cut;
   return cause ? `${subject}\n\n${cause}` : subject;
 }
 
@@ -1265,9 +1273,6 @@ export async function tick(ctx) {
                                 : (ctx.commitWork ?? commitRunWork)({
           repoRoot: repoCheckout, path: worktree, branch: e.headRef,
           message: repairMessage(r.report, decision),
-          // What reeve itself copied in before the worker started is not the
-          // worker's work, and must not be staged as part of the repair.
-          exclude: copiedDeps,
           secrets: [{ label: "reeve's worker authentication token", value: workerToken }],
           // The diff gate judges paths and territory, never intent, so a
           // reproduction script inside the lane passes it. reeve commits what the

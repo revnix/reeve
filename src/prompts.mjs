@@ -10,6 +10,79 @@
 // protocol containing instructions that contradicted each other and a path to a
 // checkout 47 commits stale.
 
+import { projectRunners, commandDenied, deniedCommands } from "./sandbox.mjs";
+
+/**
+ * The commands this prompt presents to a worker as runnable, in the order it
+ * names them. Every one is drawn from the profile the grant is built from, never
+ * written in by hand.
+ *
+ * Exported so a test can hold the prose against the real grant. Until 2026-08-23
+ * rule 0 promised `pnpm test` to every worker regardless of profile; a worker
+ * granted `npm` spent a turn discovering otherwise, and that was the sixth
+ * measured instance of the prompt claiming what the sandbox refuses.
+ */
+export function claimedCommands(profile) {
+  // Every declared command the prompt names, at any state, plus the runners. An
+  // advisory or broken command is granted by `sandboxFor` and named in rule 0's
+  // inventory, so leaving it out here made the two disagree about what the prompt
+  // presents -- which is the drift this export exists to let a test catch.
+  return [...new Set([...runnableCommands(profile, { anyState: true }), ...namedRunners(profile)])];
+}
+
+/** `git` first because it is granted for every action, then the language's own
+ * runners. Two is enough to make the point without listing the whole grant. */
+function namedRunners(profile) {
+  // `git` is granted for every action -- unless the profile forbids it, in which
+  // case naming it tells the worker to use a command the sandbox refuses, which
+  // is the contradiction this whole derivation exists to close.
+  const always = commandDenied("git", profile) ? [] : ["git"];
+  return [...always, ...[...projectRunners(profile)].slice(0, 2)];
+}
+
+/** The project's own verification command, as the grant sees it: the runner and
+ * its first argument, which is exactly the shape `sandboxFor` allows. */
+function exampleCommand(profile) {
+  return runnableCommands(profile)[0] ?? null;
+}
+
+/** EVERY declared command that survives the deny rules, deduplicated and in
+ * declaration order. The fallback below has to name all of them: `sandboxFor`
+ * grants one per declared command, so describing only the first tells a worker
+ * that a command HOW TO VERIFY goes on to recommend is not available. */
+function runnableCommands(profile, { anyState = false } = {}) {
+  const out = [];
+  for (const u of profile?.units ?? []) {
+    for (const c of Object.values(u.commands ?? {})) {
+      // `sandboxFor` grants a declared command whatever its state, so the GRANT
+      // inventory has to include an advisory or broken one -- rule 0 claiming to
+      // list everything granted while omitting `Bash(custom lint:*)` is the same
+      // prose-versus-data drift this file exists to close. The EXAMPLE still
+      // prefers a present command, because that is about usefulness.
+      if (!anyState && c?.state !== "present") continue;
+      if (!c?.cmd) continue;
+      const full = c.cmd.trim();
+      const head = full.split(/\s+/).slice(0, 2).join(" ");
+      // A command of nothing but whitespace is truthy, so it passes validation and
+      // trims to "". Returning it would print an empty backtick pair as the
+      // permitted example, and the nullish fallback in `invariants` would not
+      // catch it. `sandboxFor` already skips these.
+      if (!head) continue;
+      // Declared and granted is not the same as runnable: `npm publish` is in
+      // NEVER, and deny beats allow. Offering one of those as the example is the
+      // very contradiction this derivation exists to close.
+      //
+      // Both forms, because a deny rule can be LONGER than the head that gets
+      // granted: `forbiddenCommands: ["npm run release"]` leaves the head
+      // `npm run` looking clean while the command the worker is actually told to
+      // run below is refused.
+      if (commandDenied(head, profile) || commandDenied(full, profile)) continue;
+      if (!out.includes(head)) out.push(head);
+    }
+  }
+  return out;
+}
+
 /**
  * Invariants every worker gets, whatever its task.
  *
@@ -19,6 +92,13 @@
  */
 function invariants(profile) {
   const risk = profile.risk ?? {};
+  const named = namedRunners(profile);
+  // Unconditional in `sandboxFor`, but a profile may forbid it by absolute path.
+  const interpreter = commandDenied(process.execPath, profile) ? null : process.execPath;
+  const runnableList = runnableCommands(profile, { anyState: true });
+  const denials = deniedCommands(profile);
+  const runnable = exampleCommand(profile) ?? named[0] ?? null;
+  const nameList = named.map(r => `\`${r}\``).join(", ");
   const lines = [
     "RULES, in order of precedence:",
 
@@ -28,11 +108,57 @@ function invariants(profile) {
     // worker reads that as "I am not allowed to run tests" rather than "say it
     // differently". This is about the shape of the request, not about restraint.
     "0. Run ONE command per tool call. Do not chain with && or ; , do not pipe, and do",
-    "   not redirect. `pnpm test` is permitted; `pnpm test 2>&1 | tail -20` is refused",
-    "   by the sandbox as a different command. If output is long, read the file instead.",
-    "   Use plain command names — `node`, `git`, `pnpm` — never an absolute path to a",
-    "   binary and never `env` or `sh` as a wrapper. The permissions are written",
-    "   against the names, so a path or a wrapper reads as something else entirely.",
+    "   not redirect.",
+    // A profile can forbid `git` and every read-only utility and declare no units,
+    // which leaves nothing runnable at all. Naming an example then printed
+    // `undefined …` as permitted and an empty list of command names -- the same
+    // contradiction, reached from the other end. Say nothing rather than something
+    // untrue.
+    ...(runnable ? [
+      // Deliberately about MATCHING rather than about permission. Saying
+      // "`git …` is permitted" promises every suffix, and `git push` is denied;
+      // a more specific deny can always sit under a granted prefix.
+      `   Permission is decided by matching a command from its START, so \`${runnable} …\``,
+      `   is what the grant is written against, while \`${runnable} … 2>&1 | tail -20\` is`,
+      "   a different command and is refused. A more specific rule can still deny a",
+      "   particular form.",
+    ] : []),
+    // OUTSIDE the branch above: these hold whatever is granted, so a profile with
+    // nothing runnable still needs them. NAMED, not gestured at -- this used to say
+    // "the rules below say which" while rendering only the profile's own forbidden
+    // list, so a worker could read `git remote -v` as a qualified allowance and
+    // spend a turn discovering it is in NEVER.
+    `   Refused whatever else is granted: ${denials.join(", ")}.`,
+    "   If output is long, read the file instead.",
+    ...(nameList ? [
+      `   Use plain command names — ${nameList} — never an absolute path to a`,
+      "   binary and never `env` or `sh` as a wrapper. The permissions are written",
+      "   against the names, so a path or a wrapper reads as something else entirely.",
+      // A DECLARED command may itself be `sh test.sh`, `env npm test` or
+      // `/usr/bin/make test`, and the grant is written against that exact head --
+      // so the prohibition above would forbid the very command HOW TO VERIFY goes
+      // on to recommend. The exemption is what makes the two consistent.
+      "   The project's own commands below are the exception: they are granted",
+      "   exactly as written, wrapper or path included, so run those verbatim.",
+    ] : [
+      // `sandboxFor` grants `Bash(<process.execPath>:*)` unconditionally, and a
+      // declared command as `Bash(<runner> <first arg>:*)`, so a profile that
+      // forbids every plain NAME has still not been left with nothing -- and
+      // telling it so would send it away from the shell it does have. The
+      // plain-names rule above cannot apply here, because these grants are a path
+      // and a two-word head.
+      // The interpreter grant is unconditional in `sandboxFor`, but the profile
+      // schema accepts any non-empty string in `forbiddenCommands` -- including
+      // this absolute path -- and deny beats allow. Advertising it then names a
+      // command the sandbox refuses, which is the defect this file exists to stop.
+      ...(runnableList.length || interpreter
+            ? [`   The shell commands granted here are ${[...runnableList.map(c => `\`${c} …\``),
+                                                          ...(interpreter ? [`the interpreter itself at \`${interpreter}\``] : [])]
+                                                          .join(", ")}.`,
+               "   Use those exactly as written: the rule about plain names does not apply",
+               "   to them, because these grants are written against whole commands and a path."]
+            : ["   You have no shell commands granted at all: work from the files alone."]),
+    ]),
     "   A `for` loop is a compound command too, and will be refused. To run the",
     "   suite, use the project's own command below rather than inventing a loop",
     "   over test files — a worker did exactly that and lost the run to it.",
@@ -67,16 +193,35 @@ function verification(profile) {
   for (const unit of profile.units ?? []) {
     const cmds = Object.entries(unit.commands ?? {})
       .filter(([, c]) => c.state === "present")
+      // A command of only whitespace is truthy, so it passes profile validation
+      // and `commandDenied("")` accepts it -- and this section printed an intent
+      // with nothing beside it. `sandboxFor` skips the empty head entirely, so
+      // there is no grant behind it either. Same non-empty test `runnableCommands`
+      // applies.
+      .filter(([, c]) => String(c?.cmd ?? "").trim().length > 0)
+      // A command the sandbox refuses is not a way to verify anything. The rules
+      // above already forbid it BY NAME, so printing it here as how to check the
+      // work makes one prompt say both things.
+      .filter(([, c]) => !commandDenied(String(c?.cmd ?? "").trim(), profile))
       .map(([intent, c]) => `  ${intent.padEnd(10)} ${c.cmd}`);
     if (!cmds.length) continue;
-    out.push(`In ${unit.root === "." ? "the repository root" : unit.root}:`, ...cmds);
+    // `root` is optional, and an absent one printed "In undefined:".
+    out.push(`In ${!unit.root || unit.root === "." ? "the repository root" : unit.root}:`, ...cmds);
     // An advisory command reports success regardless, so a green from it is not evidence.
     const advisory = Object.entries(unit.commands ?? {}).filter(([, c]) => c.state === "advisory").map(([i]) => i);
     if (advisory.length) out.push(`  (${advisory.join(", ")} are advisory here: they report success regardless, so a pass from them is not evidence)`);
     const broken = Object.entries(unit.commands ?? {}).filter(([, c]) => c.state === "broken").map(([i]) => i);
     if (broken.length) out.push(`  (${broken.join(", ")} are declared but broken here: do not rely on them)`);
   }
-  return out.length ? out.join("\n") : "This project declares no verification commands. Say so in your report rather than inventing one.";
+  if (out.length) return out.join("\n");
+  // Declared-but-refused is materially different from never declared, and the
+  // worker is asked to report which. Saying "declares none" would have it report
+  // something false about the project.
+  const declared = (profile.units ?? []).some(u =>
+    Object.values(u.commands ?? {}).some(c => c?.state === "present" && String(c.cmd ?? "").trim()));
+  return declared
+    ? "This project's declared verification commands are all refused by this sandbox, so you cannot run them. Say THAT in your report — the project has them; you were not permitted to use them."
+    : "This project declares no verification commands. Say so in your report rather than inventing one.";
 }
 
 /**

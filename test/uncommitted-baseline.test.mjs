@@ -125,20 +125,39 @@ const baseline = Object.fromEntries(copied.map(rel => [rel, "SAME"]));
   // The bound is imported rather than copied. A test that hardcodes 20000 keeps
   // passing after the ceiling is raised, which is the moment the limit starts
   // mattering again.
-  const long = "vendor/" + "n".repeat(96) + "/";
+  // A realistic deep dependency path rather than a padded one. pnpm's store
+  // routinely produces names this long, and picking a length because it happens
+  // to breach a particular kernel's limit would be a tuned constant that quietly
+  // stops breaching it on the next runner image.
   const many = {};
-  for (let i = 0; i < MAX_COPIED_UNTRACKED; i++) many[`${long}dep-${i}.js`] = "SAME";
+  for (let i = 0; i < MAX_COPIED_UNTRACKED; i++)
+    many[`node_modules/.pnpm/@scope+some-plugin-transform-runtime@7.24.0_@scope+core@7.24.0/`
+       + `node_modules/@scope/some-plugin-transform-runtime/dist/esm/chunks/vendor-${i}.js`] = "SAME";
   const argv = Object.keys(many);
 
-  // Control: the fixture is genuinely past what a spawn can carry. Without this,
-  // a green below could mean the fix works OR that the paths were short enough
-  // that nothing was ever at risk -- and those read identically.
-  let blew = null;
+  // Whether the defect is REACHABLE here is a property of the platform, not of
+  // the code, so it is probed rather than assumed -- and the answer is printed
+  // either way. macOS caps argv at 1 MiB and Windows caps a command line at
+  // 32,767 characters, so a ceiling-sized list breaks there with room to spare;
+  // Linux allows about a quarter of the stack limit, which on some runners is
+  // enough to carry this whole list. An earlier version asserted the failure
+  // outright, passed on macOS and turned CI red on Ubuntu for exactly that
+  // reason.
+  //
+  // This is NOT a skip. The behavioural assertions below run everywhere and mean
+  // the same thing everywhere; what changes is only whether this platform can
+  // also demonstrate the old failure. Saying which of the two happened is the
+  // point -- a silent skip would let "not exercised here" read as "verified".
+  let reachable = null;
   try {
-    execFileSync("git", ["-C", root, "ls-files", "-z", "--", ...argv],
-                 { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
-  } catch (e) { blew = e.code ?? e.message; }
-  check(blew !== null, "control: naming every baseline path in argv really does fail the spawn", String(blew));
+    execFileSync(process.execPath, ["-e", "process.exit(0)", ...argv], { stdio: "ignore" });
+    reachable = false;
+  } catch (e) { reachable = e.code === "E2BIG" || /E2BIG|too long/i.test(String(e.message)); }
+  check(reachable !== null, "control: the platform was probed for whether argv can carry the ceiling",
+    "the probe neither returned nor threw recognisably");
+  console.log(reachable
+    ? "      (this platform CANNOT carry the ceiling in argv, so the case below is the regression)"
+    : "      (this platform CAN carry the ceiling in argv; macOS and Windows cannot, and the fix is for them)");
 
   const left = uncommittedFiles(root, many, { digest });
   check(left !== null, "a baseline at the accepted ceiling is decided, not quarantined",

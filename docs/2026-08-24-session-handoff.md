@@ -29,6 +29,12 @@ this file outside §0, without pointing at §0.
 | open, a peer's | #23 (hub post-merge) — `nextly-integrations-28` owns it |
 | first real dispatch on nextly | **still has not happened** — 0 rows in `run` |
 | the tracker | **stale**: no record of 22–24 Aug at all |
+| the guardian daemon | **running** under launchd |
+| the builder daemon | not running |
+| capability 1 — watch, judge, escalate | **ON** |
+| capability 2 — repair red CI | built; **off**, which is `--execute` above |
+| capability 3 — work review threads | half-built; §6 has what it needs |
+| capability 4 — refuse an unsafe merge | **off**; needs a shadow week and the R-01 flip |
 
 ---
 
@@ -37,18 +43,21 @@ this file outside §0, without pointing at §0.
 Two programmes sharing a codebase. **The guardian** watches pull requests, judges
 them, escalates, and repairs red CI by dispatching a sandboxed worker. **The
 builder** takes a task and builds it across a phase machine. They are separate
-daemons with separate stores. The guardian is what runs today.
+daemons with separate stores. Which of them is running is a §0 fact.
 
 ---
 
 ## 2. The guardian's four capabilities
 
-| # | capability | state |
+Whether each of these is on is a §0 fact and is not repeated here. This table
+says what each capability IS; §0 says where it stands.
+
+| # | capability | what it does |
 |---|---|---|
-| 1 | Watch, judge, escalate | **ON**, running |
-| 2 | Repair red CI | built; switched off (§0) |
-| 3 | Work review threads | half-built, see §6 |
-| 4 | Refuse an unsafe merge | off — needs a shadow week and the R-01 ruleset flip |
+| 1 | Watch, judge, escalate | reads every open pull request, judges it, and raises what needs a person |
+| 2 | Repair red CI | dispatches a sandboxed worker at a red check, gates the diff, and publishes the fix |
+| 3 | Work review threads | answers and resolves review findings without a person relaying them |
+| 4 | Refuse an unsafe merge | stands between a pull request and `main` as a required check |
 
 ---
 

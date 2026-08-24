@@ -42,9 +42,14 @@ const HANDOFF = newest("-session-handoff.md");
 const prompt = readFileSync(join(docs, PROMPT), "utf8");
 const handoff = readFileSync(join(docs, HANDOFF), "utf8");
 
-// Present-tense claims about state. Deliberately NOT a SHA match: the prompt
-// legitimately cites commits for WHEN a thing landed, which is history and does
-// not go stale.
+// A SUPPLEMENTARY net, and it is important to be honest about which. Matching
+// phrasings can only ever catch phrasings someone has already written: nine
+// review rounds found nine this list did not have, and every one of them was
+// found by a reader, not by this test. Deciding whether a sentence is volatile
+// is not something a regex can do, so the checks that carry real weight are the
+// two DERIVED ones further down -- one reads §0's own values, the other reads
+// document structure -- and neither can lag the prose. This list stays because a
+// cheap net that catches the obvious cases is still worth its two milliseconds.
 const STATE_CLAIMS = [
   /\bis open\b/i, /\bstill open\b/i, /\bcurrently open\b/i, /\bremaining work\b/i,
   /\bis armed\b/i, /\bis disarmed\b/i, /\bawaiting review\b/i, /\bnot yet merged\b/i,
@@ -98,6 +103,51 @@ const offendersIn = text => {
   check(offenders.length === 0,
     `${HANDOFF} states no current facts OUTSIDE §0`,
     offenders.slice(0, 4).join("\n        "));
+}
+
+// --- DERIVED: the prompt names no PR and no commit ---------------------------
+//
+// Decidable, and it cannot lag the prose. A pull-request number and a commit hash
+// are the two facts that expire fastest and the two that read as authoritative
+// when they are stale, so the prompt carries neither and points at §0 instead.
+// The handoff is deliberately NOT held to this: outside §0 it cites both as
+// HISTORY ("merged in #19"), which never goes stale, and firing on correct text
+// is how a guard gets weakened until it catches nothing.
+{
+  const lines = prompt.split("\n");
+  const hits = [];
+  for (let i = 0; i < lines.length; i++) {
+    // A hash needs at least one digit, or ordinary words made only of a-f
+    // ("defaced") match and the check starts crying wolf.
+    const m = /(?<![\w#])#\d+\b/.exec(lines[i]) ?? /\b(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}\b/.exec(lines[i]);
+    if (m) hits.push(`${i + 1}: ${m[0]}  in  ${lines[i].trim().slice(0, 70)}`);
+  }
+  check(hits.length === 0, `${PROMPT} names no pull request and no commit`,
+    hits.slice(0, 4).join("\n        "));
+  // Control: the matcher can see what it is looking for. Without this a green
+  // means "no PR numbers" and "the regex is broken" equally well.
+  check(/(?<![\w#])#\d+\b/.test("see #19 for the fix"), "control: the PR matcher matches a PR number", "");
+  check(/\b(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}\b/.test("landed in 1385071"), "control: the commit matcher matches a hash", "");
+  check(!/\b(?=[0-9a-f]*[0-9])[0-9a-f]{7,40}\b/.test("a defaced facade"), "control: and does not match ordinary words", "");
+}
+
+// --- DERIVED: no table outside §0 has a column that can only hold state -------
+//
+// The other decidable one, and it caught the shape the phrase list could not: §2
+// tabulated the four capabilities with a `state` column, which is a copy of §0 by
+// construction no matter how the cells are worded. A column headed state or
+// status IS a state claim, whatever prose fills it, so the structure is checked
+// rather than the words.
+{
+  const tablesOutsideZero = text => text.split("\n")
+    .filter(l => /^\s*\|/.test(l) && /\|\s*(state|status|where it stands)\s*\|/i.test(l));
+  const offenders = [...tablesOutsideZero(handoff.replace(/^## 0\. STATE[\s\S]*?(?=^## )/m, "")),
+                     ...tablesOutsideZero(prompt)];
+  check(offenders.length === 0, "no table outside §0 has a state column",
+    offenders.slice(0, 3).join("\n        "));
+  // Control: the matcher recognises the header it is looking for.
+  check(tablesOutsideZero("| # | capability | state |").length === 1,
+    "control: a state column is recognised when one is present", "");
 }
 
 // --- and it says so, so a reader knows the rule -------------------------------

@@ -14,7 +14,10 @@
 // absent from most ticks, and absence within a tick is what the escalation layer
 // reads as resolved -- the defect already fixed twice in this codebase.
 import { selfAudit, BROKEN, DEGRADED } from "../src/selfaudit.mjs";
-import { everyStore, snapshotAll } from "../src/backup.mjs";
+import { everyStore, snapshotAll, snapshot } from "../src/backup.mjs";
+// The hub half of the audit needs a real hub and a real hub snapshot.
+import { openHub } from "../src/build/hubdb.mjs";
+import { hubPathFor } from "../src/paths.mjs";
 import { open } from "../src/db/ops.mjs";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -302,6 +305,52 @@ check(healthy.length === 0, "control: a healthy reeve produces no findings", JSO
   check(audit < announce,
     "and the announce runs after the audit — or its findings are reduced before they exist",
     `audit@${audit} announce@${announce}`);
+}
+
+// ── a hub that DISAPPEARS is reported, and one that never existed is not ───
+// `existsSync(hub)` guarded the only hub finding, so deleting `hub.db` after the
+// builder had been initialised produced NOTHING from the audit that runs on
+// every guardian tick -- and `everyStore` enumerates only files that exist, so
+// the same tick snapshotted every repository store and said nothing about the
+// missing authority database. The CLI half was closed (`backup --hub` refuses
+// without a hub result); this is the automatic half.
+//
+// The discriminator is the EVIDENCE: a retained hub snapshot. Absence of
+// snapshots means the builder has genuinely never run, which is not a fault --
+// reporting it would be the same absence-read-as-a-fault the `projectsKnown`
+// default exists to avoid, in the other direction.
+{
+  const h = mkdtempSync(join(tmpdir(), "reeve-hubgone-"));
+  mkdirSync(join(h, "state"), { recursive: true });
+  const root = join(h, "backups");
+
+  // NEVER EXISTED: no hub, no snapshots. Silence is correct here.
+  const never = selfAudit(null, { nwo: "o/r", home: h, backupRoot: root });
+  check(!never.some(f => f.id === "hub.missing"),
+    "a hub that has never been created raises nothing, because the builder simply has not run",
+    JSON.stringify(never.map(f => f.id)));
+
+  // EXISTED, then gone: a snapshot on disk is the proof.
+  openHub(hubPathFor(h)).close();
+  const snap = snapshot(openHub(hubPathFor(h)), root, "hub");
+  check(snap.ok, "fixture: a hub snapshot was taken", JSON.stringify(snap));
+  rmSync(hubPathFor(h), { force: true });
+  const gone = selfAudit(null, { nwo: "o/r", home: h, backupRoot: root });
+  const f = gone.find(x => x.id === "hub.missing");
+  check(f != null, "a hub that existed and is gone IS reported", JSON.stringify(gone.map(x => x.id)));
+  check(f != null && f.level === BROKEN,
+    "and as BROKEN, because the authority database is the one thing the builder cannot proceed without",
+    f?.level);
+  check(f != null && String(f.detail).includes(hubPathFor(h)) && /restore --hub/.test(String(f.detail)),
+    "and it names the path and the way back", String(f?.detail));
+
+  // CONTROL: put the hub back and the finding clears, so the assertion above is
+  // about the hub being absent rather than about this home always failing.
+  openHub(hubPathFor(h)).close();
+  const back = selfAudit(null, { nwo: "o/r", home: h, backupRoot: root });
+  check(!back.some(x => x.id === "hub.missing"),
+    "control: and it clears when the hub is restored", JSON.stringify(back.map(x => x.id)));
+  rmSync(h, { recursive: true, force: true });
 }
 
 db.close();

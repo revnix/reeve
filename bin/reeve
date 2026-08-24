@@ -97,7 +97,19 @@ const registryProjects = (home) => {
     // `owner/repo`, because that is the only form `nwo_snapshot` ever holds and
     // the only form H-4 can match a gate-state row against. A name that cannot
     // match is not a name.
-    const NWO = /^[\w.-]+\/[\w.-]+$/;
+    // A SEGMENT MUST BE MORE THAN DOTS. `[\w.-]+` accepts `.`, `..`, `../..` and
+    // `owner/..`, none of which can ever equal an `nwo_snapshot` -- so a registry
+    // carrying one still set `projectsKnown`, and `hubFindings` went on
+    // suppressing every real gate-state row against a name that matches nothing.
+    // That is the unsafe-authority hiding this validation exists to stop,
+    // reached through a name that is syntactically a name and semantically not.
+    //
+    // GitHub's own rule for the repository half is the same one: a segment may
+    // hold letters, digits, `-`, `_` and `.`, and may not be `.` or `..`.
+    // The first lookahead ends at the SLASH, not at the end of the string:
+    // `(?!\\.+$)` on the owner asks whether the WHOLE REMAINDER is dots, so
+    // `./repo` sailed through it. Measured, on the first attempt at this rule.
+    const NWO = /^(?!\.+\/)[\w.-]+\/(?!\.+$)[\w.-]+$/;
     const bad = Object.entries(reg)
       .filter(([, v]) => !v || typeof v !== "object" || Array.isArray(v) ||
                          typeof v.nwo !== "string" || !NWO.test(v.nwo))

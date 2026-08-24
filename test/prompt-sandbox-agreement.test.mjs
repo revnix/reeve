@@ -11,6 +11,12 @@
 import { promptFor, claimedCommands } from "../src/prompts.mjs";
 import { sandboxFor, commandDenied, commandDenied as commandDeniedIn } from "../src/sandbox.mjs";
 
+// Does this line FORBID the thing it names, rather than offer it? Rule 6 echoes
+// the profile's forbidden list and rule 0 names the built-in denials, so a
+// command can appear legitimately in prose that refuses it. Three copies of this
+// test drifted apart in turn, each missing a word the prompt had started using.
+const forbids = line => /never|do not|cannot|not able|forbidden|irreversible|refused/i.test(line);
+
 let fail = 0;
 const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
@@ -46,7 +52,7 @@ for (const action of ["FIX_CI", "FIX_FINDINGS"]) {
   // earlier in the sequence, and this test did not have the verb for it.
   for (const [verb, rule] of [["push", "Bash(git push"], ["merge", "gh pr merge"],
                               ["commit", "Bash(git commit"], ["add", "Bash(git add"]]) {
-    const told = instructions.some(l => new RegExp(`\\b${verb}\\b`, "i").test(l) && !/do not|never|cannot|not able/i.test(l));
+    const told = instructions.some(l => new RegExp(`\\b${verb}\\b`, "i").test(l) && !forbids(l));
     check(!(told && deny.includes(rule)),
       `${action}: never INSTRUCTED to ${verb}, which the sandbox denies`,
       instructions.filter(l => new RegExp(verb, "i").test(l)).join(" | ").slice(0, 160));
@@ -64,7 +70,7 @@ for (const action of ["FIX_CI", "FIX_FINDINGS"]) {
     for (const line of p.split("\n").filter(l => l.includes(c)))
       // `refused` belongs here: rule 0 now NAMES the built-in denials rather than
       // gesturing at "the rules below", and that sentence is a forbidding one.
-      check(/never|do not|forbidden|irreversible|refused/i.test(line),
+      check(forbids(line),
         `${action}: "${c}" is only ever mentioned as forbidden`, line.trim());
 }
 
@@ -265,7 +271,7 @@ for (const [name, prof] of Object.entries(PROFILES)) {
     // It may appear ONLY in a sentence that forbids it -- rule 6 echoes the
     // profile's own list -- never in one that offers it. Same rule the forbidden
     // commands already get above.
-    const offers = prompt.split("\n").filter(l => l.includes(process.execPath) && !/NEVER run|never|do not|refused/i.test(l));
+    const offers = prompt.split("\n").filter(l => l.includes(process.execPath) && !forbids(l));
     check(offers.length === 0, "not even the interpreter: the path is only ever mentioned as forbidden",
           offers.join(" | ").slice(0, 160));
     check(/no shell commands granted at all/.test(prompt), "and says so plainly", "");
@@ -288,7 +294,7 @@ for (const [name, prof] of Object.entries(PROFILES)) {
     // It may appear in the sentence that FORBIDS it -- rule 6 echoes the profile's
     // own list -- but never in one that offers it. Same distinction the forbidden
     // commands and the interpreter path already get.
-    const offered = prompt.split("\n").filter(l => /git clean/.test(l) && !/NEVER run|never|do not|cannot/i.test(l));
+    const offered = prompt.split("\n").filter(l => /git clean/.test(l) && !forbids(l));
     check(offered.length === 0, `${name}: the worker is not told to run git clean when it is forbidden`,
           offered.join(" | ").slice(0, 160));
   }

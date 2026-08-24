@@ -894,8 +894,10 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // A supplied `--tail` answers the loss question, so it is not damage the
       // operator needs to confirm; it is the recovery they have already performed.
       const historyLost = !opened.hasEvents && suppliedTail == null;
-      const damaged = missing.length > 0 || !opened.hasEvents;
-      const partial = missing.length > 0 || historyLost;
+      // `let`, not `const`: the holder scan below can discover a table the probe
+      // called readable, and both of these have to reflect that.
+      let damaged = missing.length > 0 || !opened.hasEvents;
+      let partial = missing.length > 0 || historyLost;
       // RAW DatabaseSync, not openHub. openHub applies forward migrations, and
       // migrating a database is a write -- so opening that way would upgrade a
       // hub that a builder or a CLI is actively using, before this command has
@@ -923,10 +925,21 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // hub, so a hub that has lost that table cannot carry its own exclusion --
       // and it moves to the same canonical sibling the unreadable path uses, so
       // two restores of one damaged hub still contend for a single row.
-      const lockTarget = partial && missing.includes("maintenance_lock")
-        ? (lockDb = openHub(dbPath + ".restore-lock"))
-        : live;
-      const got = acquireMaintenanceLock(lockTarget, { pid, lstart, isAlive });
+      // AND THE ATTEMPT ITSELF DECIDES, not only the probe. A probe is a
+      // DIFFERENT QUERY from the one that follows it, and a different query can
+      // succeed where the real one throws. If taking the lock in the hub fails
+      // for any reason the probe did not see, the lock moves to the sibling
+      // rather than escaping to the outer catch -- where `--force` cannot reach
+      // it, which is the whole failure being repaired.
+      const sibling = () => (lockDb ??= openHub(dbPath + ".restore-lock"));
+      let lockTarget = missing.includes("maintenance_lock") ? sibling() : live;
+      let got;
+      try { got = acquireMaintenanceLock(lockTarget, { pid, lstart, isAlive }); }
+      catch {
+        if (!missing.includes("maintenance_lock")) missing.push("maintenance_lock");
+        lockTarget = sibling();
+        got = acquireMaintenanceLock(lockTarget, { pid, lstart, isAlive });
+      }
       if (!got.ok) return { ok: false, why: `another restore is running (pid ${got.holder.pid})`, holders: [got.holder] };
       locked = true;
 
@@ -953,16 +966,36 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // `singleton_lease`, and replacing the file underneath it is the failure
       // this scan exists to prevent -- losing one table is no reason to stop
       // asking the other three.
+      // AND THE READ THAT MATTERS IS THE READ THAT DECIDES.
+      //
+      // `SELECT … LIMIT 1` touches the FIRST leaf; `.all()` walks every one. So a
+      // lease table spanning several pages with damage in a later leaf passed the
+      // probe and then threw during enumeration, and that throw escaped to the
+      // outer catch as `could not restore` -- past every recovery path, from the
+      // command that exists to recover it. Probing harder is the same shape one
+      // size up; the fix is to let the real query report its own failure.
+      //
+      // A table that throws HERE joins `missing`, which is re-read below: the
+      // refusal names it, `force` becomes required for it, and the file is
+      // quarantined -- the degradation that already exists, reached by the read
+      // that actually found the damage.
       const holders = [];
-      if (!missing.includes("singleton_lease"))
-        for (const r of live.prepare("SELECT * FROM singleton_lease").all())
-          if (isAlive(r.pid, r.lstart)) holders.push({ what: "builder", pid: r.pid, lstart: r.lstart, command: r.command });
-      if (!missing.includes("writer_lease"))
-        for (const r of liveWriters(live, { isAlive }))
-          holders.push({ what: "cli", pid: r.pid, lstart: r.lstart, command: r.command });
-      if (!missing.includes("provider_lease"))
-        for (const r of live.prepare("SELECT * FROM provider_lease WHERE status='held'").all())
-          if (isAlive(r.pid, r.lstart)) holders.push({ what: r.owner, pid: r.pid, lstart: r.lstart, command: r.run_ref });
+      const scan = (table, fn) => {
+        if (missing.includes(table)) return [];
+        try { return fn(); }
+        catch { missing.push(table); return []; }
+      };
+      for (const r of scan("singleton_lease", () => live.prepare("SELECT * FROM singleton_lease").all()))
+        if (isAlive(r.pid, r.lstart)) holders.push({ what: "builder", pid: r.pid, lstart: r.lstart, command: r.command });
+      for (const r of scan("writer_lease", () => liveWriters(live, { isAlive })))
+        holders.push({ what: "cli", pid: r.pid, lstart: r.lstart, command: r.command });
+      for (const r of scan("provider_lease", () => live.prepare("SELECT * FROM provider_lease WHERE status='held'").all()))
+        if (isAlive(r.pid, r.lstart)) holders.push({ what: r.owner, pid: r.pid, lstart: r.lstart, command: r.run_ref });
+      // RE-DERIVED, because `scan` may have just discovered damage the probe did
+      // not. Computed before the lock so it could choose one; recomputed here so
+      // the refusal, the force rule and the quarantine all see what was found.
+      partial = missing.length > 0 || historyLost;
+      damaged = missing.length > 0 || !opened.hasEvents;
 
       // `force` overrides the operator-judgement half of this check, never the
       // safety half. A live builder or CLI writer holds a descriptor to the file

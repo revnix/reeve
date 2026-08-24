@@ -1908,6 +1908,66 @@ function writeAuthority(db, project) {
   rmSync(cHome, { recursive: true, force: true });
 }
 
+// ── the read that MATTERS is the read that decides ────────────────────────
+// `SELECT … LIMIT 1` touches the FIRST leaf; `.all()` walks every one. So a lease
+// table spanning several pages with damage in a LATER leaf passed the probe and
+// then threw during enumeration — and that throw escaped to the outer catch as
+// `could not restore`, past every recovery path, from the command that exists to
+// recover it.
+//
+// Probing harder is the same shape one size up. A probe is a DIFFERENT QUERY
+// from the one that follows it, and a different query can succeed where the real
+// one throws. So each lease read reports its own failure and the table joins
+// `missing` at that point.
+{
+  const lHome = mkdtempSync(join(tmpdir(), "reeve-leaf-"));
+  mkdirSync(join(lHome, "state"), { recursive: true });
+  const src = openHub(join(lHome, "state", "src.db"));
+  const snapL = snapshot(src, join(lHome, "backups"), "hub");
+  src.close();
+
+  const t = join(lHome, "state", "multileaf.db");
+  const d = openHub(t);
+  // EVERY row 'held', so the holder scan's `WHERE status='held'` must walk the
+  // whole table. With them all 'queued' the scan answers from an index without
+  // touching the damaged leaf, and the fixture proves nothing — measured.
+  const ins = d.prepare(`INSERT INTO provider_lease(owner,repo_id,run_ref,pid,lstart,status,requested_at,expires_at)
+                         VALUES('guardian',?,?,1,'L','held',unixepoch(),unixepoch()+9)`);
+  for (let i = 0; i < 400; i++) ins.run(i, "run-" + "x".repeat(180) + i);
+  d.close();
+
+  const meta = new DatabaseSync(t, { readOnly: true });
+  const pages = meta.prepare("SELECT pageno FROM dbstat WHERE name='provider_lease' ORDER BY pageno").all();
+  const pageSize = meta.prepare("PRAGMA page_size").get().page_size;
+  meta.close();
+  check(pages.length > 2, "fixture: provider_lease spans several b-tree pages", `${pages.length} pages`);
+  // A LATE leaf, never the root — the root case is the one already covered above.
+  const buf = readFileSync(t);
+  const victim = pages[pages.length - 1].pageno;
+  buf.fill(0x5a, (victim - 1) * pageSize, victim * pageSize);
+  writeFileSync(t, buf);
+
+  // The fixture's decisive property, asserted as TWO facts: the probe passes and
+  // the real query throws. Without both this is just another corrupt table.
+  const probe = new DatabaseSync(t, { readOnly: true });
+  let limit1 = false, full = false;
+  try { probe.prepare("SELECT * FROM provider_lease LIMIT 1").get(); limit1 = true; } catch { /* recorded below */ }
+  try { probe.prepare("SELECT * FROM provider_lease WHERE status='held'").all(); full = true; } catch { /* recorded below */ }
+  probe.close();
+  check(limit1, "fixture: a LIMIT 1 probe still succeeds on it", `${limit1}`);
+  check(!full, "fixture: while the query the holder scan actually runs throws", `${full}`);
+
+  const r = restoreHub(snapL.path, t, { isAlive: () => false, pid: process.pid, lstart: "me", force: true });
+  check(r.ok, "a table that throws only on the FULL scan is recovered, not abandoned",
+    JSON.stringify(r).slice(0, 200));
+  check(!/could not restore/.test(String(r.why ?? "")),
+    "and not through the outer catch, which is where --force could not reach", String(r.why));
+  check(/\.damaged-/.test(String(r.quarantined)),
+    "and the file is quarantined, because the scan found damage the probe did not",
+    String(r.quarantined));
+  rmSync(lHome, { recursive: true, force: true });
+}
+
 rmSync(home, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

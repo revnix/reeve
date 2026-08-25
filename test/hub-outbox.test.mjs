@@ -43,7 +43,7 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
                       source_kind, source_key, repo_path, profile_path, profile_hash,
                       default_branch, visibility, registry_version, created_at, updated_at)
      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,unixepoch(),unixepoch())`)
-    .run(id, "proj", 1, "o/r", "t", phase, generation, "founder", `k:${id}`,
+    .run(id, "p", 1, "o/r", "t", phase, generation, "founder", `k:${id}`,
          "/repo", "/profile.json", "hash", "main", "private", 1);
   for (let i = 0; i < events; i++)
     db.prepare(

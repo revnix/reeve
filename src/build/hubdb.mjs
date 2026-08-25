@@ -11,8 +11,8 @@
 // versioned instead: a numbered, forward-only list, each step in its own
 // transaction, and a store recorded above this binary's version does not open.
 import { DatabaseSync } from "node:sqlite";
-import { readFileSync, mkdirSync, existsSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
+import { dirname, join, basename } from "node:path";
 import { canonical } from "../db/ops.mjs";
 // `migrationPlan` hashes each migration's `up` so the freeze test has a stable,
 // INERT representation of what migration 1 is. Exporting MIGRATIONS itself would
@@ -112,6 +112,13 @@ export function isOperational(e) {
   // through the damage branch told a concurrent `build run` that its lock tables
   // had failed and sent it at another forced restore, when the correct answer is
   // to wait for the one already running.
+  // REEVE'S OWN DAMAGE VERDICT, which carries no errcode because no SQLite call
+  // failed -- `quick_check` ANSWERED, and the answer was that the file is broken.
+  // Without this the rule below reads it as "not a storage error, therefore not
+  // damage" and every recovery path treats a corrupt hub as a healthy one that
+  // was merely busy. The marker is explicit rather than a fabricated errcode: an
+  // invented 11 would be a lie about where the verdict came from.
+  if (e?.hubDamaged) return false;
   if (e?.errcode === undefined) return true;
   // Access and contention: the file is untouched and the situation is what
   // failed. CANTOPEN is the one this list was missing -- a healthy hub the CLI
@@ -130,7 +137,33 @@ export function isOperational(e) {
       || e.errcode === 14;    // SQLITE_CANTOPEN
 }
 
-export function openHub(path) {
+/**
+ * The newest snapshot an operator could restore, named WITHOUT importing
+ * `backup.mjs`.
+ *
+ * `backup.mjs` imports this module, so importing `latestSnapshot` back would be
+ * a cycle. This is the cheap half of that function -- list and sort -- and it
+ * deliberately validates nothing: the refusal below is the safety property, and
+ * naming a file is DX on top of it. A wrong guess about the layout degrades the
+ * MESSAGE and never the refusal, so it says what it could not find rather than
+ * inventing a path.
+ *
+ * The layout is the CLI's own default (`join(HOME, "backups")`, `bin/reeve:496`)
+ * and `hubPathFor`'s `<home>/state/hub.db`, so the hub's snapshots live in
+ * `<home>/backups/hub`.
+ */
+function newestHubSnapshot(path) {
+  try {
+    const home = dirname(dirname(path));
+    const dir = join(home, "backups", basename(path, ".db"));
+    const newest = readdirSync(dir)
+      .filter(f => /^\d+\.db$/.test(f))
+      .sort((a, b) => Number(b.split(".")[0]) - Number(a.split(".")[0]))[0];
+    return newest ? join(dir, newest) : null;
+  } catch { return null; }
+}
+
+export function openHub(path, { skipIntegrity = false } = {}) {
   // state/ may not exist yet: on a fresh REEVE_HOME no guardian store has
   // created it, and DatabaseSync will not create a missing parent. Without this
   // the very first hub-writing command fails before migration 1 can run.
@@ -209,6 +242,55 @@ export function openHub(path) {
           `  recover  stop any running builder or reeve CLI and re-run; check the permissions on ` +
           `${path} and its directory. Do NOT restore over it -- there is no evidence it is broken.`,
       { cause: e });
+  }
+
+  // AND THE FILE ITSELF IS CHECKED, not merely opened.
+  //
+  // SQLite opens a database with damage in an index or an unrelated table
+  // perfectly happily, and every probe above can succeed against exactly that
+  // file -- so a refusal built on "the open threw" hands the caller a corrupt hub
+  // and calls it healthy. The guard above catches damage in the pages it happens
+  // to touch; this catches the rest.
+  //
+  // `quick_check(1)`, not `integrity_check`. This runs on EVERY command and every
+  // tick, and the full check is measured at ~1.1 ms/MB -- 52 ms on a 47 MB hub,
+  // per open. `quick_check` skips the index cross-references, which is the
+  // expensive half, and still refuses the page-level damage that matters here.
+  // The deep check stays where it already is: `snapshotAll`, `restoreHub` and
+  // `builder doctor`, each of which runs once and on purpose. Moving a full scan
+  // onto the hot path to fix this would be the same mistake as the earlier
+  // `latestSnapshot` repair, in the other direction.
+  //
+  // `1` is the row limit, not a depth: it stops after the first problem, which
+  // is all a refusal needs.
+  //
+  // ONE CALLER IS EXEMPT, and it is the one whose job is to replace the file.
+  // `restoreHub` opens the hub to take the maintenance lock IN it -- that is the
+  // only exclusion a bootstrapping builder honours -- and then quarantines it and
+  // installs a snapshot. Refusing there would make `restore --hub --force`
+  // unable to recover exactly the hubs it exists for: measured, adding this check
+  // turned five of that command's own recovery assertions red, including "names
+  // the table it could not read" and "force carries it through". The check is for
+  // callers about to USE the hub; the restore is about to REPLACE it, and it
+  // validates the SNAPSHOT it installs rather than the wreck it is removing.
+  if (!skipIntegrity) {
+    let verdict;
+    try { verdict = Object.values(db.prepare("PRAGMA quick_check(1)").get() ?? {})[0]; }
+    catch (e) { verdict = `the check itself failed: ${e.message}`; }
+    if (verdict !== "ok") {
+      db.close();
+      const newest = newestHubSnapshot(path);
+      throw Object.assign(new Error(
+        `the hub at ${path} is damaged (${verdict}).\n` +
+        (newest
+          ? `  recover  reeve restore --hub --force --from ${newest}\n` +
+            `           pass --tail from a durable export-events --hub to carry history forward`
+          : `  recover  no snapshot was found under ${join(dirname(dirname(path)), "backups", basename(path, ".db"))}; ` +
+            `if one exists elsewhere, pass it with --from`)),
+        // The marker `isOperational` reads. This verdict is reeve's, not
+        // SQLite's, so it has no errcode to classify by.
+        { hubDamaged: true });
+    }
   }
 
   // `schema_version` was created and first read INSIDE the guard above, so it

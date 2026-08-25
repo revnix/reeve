@@ -250,9 +250,37 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       `docs/superpowers/plans/2026-08-23-s2b-phase-machine.md`:
       `src/build/{phases,transition,outbox,registry,gatestate,loop}.mjs`, the
       `buildTick` call in `bin/reeve`'s `build run`, and the crash, recovery and
-      corruption drills. **Measured 2026-08-25: suite 77 files, 0 failures**,
-      `escape.test.mjs` excluded as always. No builder worker is dispatched and
-      no GitHub call is made from any code path.
+      corruption drills. **Measured 2026-08-25: suite 77 files, 0 failures,
+      3755 assertions**, `escape.test.mjs` excluded as always. No builder worker
+      is dispatched and no GitHub call is made from any code path.
+
+      **Round 1 of review: 8 findings (5×P1), all genuine, all fixed at
+      `347f804`.** Four of them were one shape — a decision made twice, in two
+      places, that had drifted. `admitTask` and `regrant-territory` each kept
+      their own territory logic and disagreed three ways at once, so a resume
+      could be granted paths a live lease already covered by ancestry or under
+      the other claim kind; `src/build/territory.mjs` now owns the predicate, the
+      scan, the grant, and the two constants both files had copied.
+
+      The two that could not have been found by reading: **`founder.infeasible`
+      required a prose reason and `write-pr-hold` read that same field as a
+      closed enum**, so the more carefully a founder explained themselves the
+      more certainly the terminal transition threw and rolled back; and
+      **`recoverEffects` called its reconciler inside `BEGIN IMMEDIATE`**, where
+      an async reconciler's Promise made `verdict.settled` `undefined` — the
+      system's one defence against re-performing an action that already happened
+      answered "could not tell" for every async reconciler ever passed to it, and
+      answered it silently.
+
+      **The durable finding is about FIXTURE SHAPE.** `registryProjects` returns
+      `{name, nwo}` and nothing else, so in the real `build run` path every
+      registered project hit `buildTick`'s no-id guard and was skipped on every
+      heartbeat: the wiring test passed, the behaviour tests passed, and not one
+      gate-state row was ever written for a real project — because every fixture
+      handed the tick a `repoId` production never supplies. A fixture richer than
+      production cannot exhibit the defect, however many assertions it carries.
+      `build run` was also discarding the tick's return value, which is the half
+      that would have made the silence visible.
 
       The §14 S2 Verify clause is checked item by item: the transition matrix
       (588 cells, all total), the GATE → ESCALATED edge, the CANCELLING

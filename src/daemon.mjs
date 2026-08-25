@@ -753,13 +753,22 @@ function effectsFor({ nwo, e, decision, profile }) {
   // tick reports comments queued, later ticks deduplicate the same head, and a
   // reviewer whose approval is REQUIRED is never summoned and never mentioned.
   // The pull request then waits on a round nobody asked for.
-  const unsummonable = reviewers.filter(r => r.blocking && !r.trigger).map(r => r.login);
+  // `kind === "blocking"`, which is how a profile actually says it -- the schema
+  // validator, the verdict and the review derivation all read it that way. I wrote
+  // `r.blocking`, a property no profile has, so this list was ALWAYS empty and the
+  // escalation it feeds could never fire. The validator warns about this exact
+  // reviewer at schema.mjs:379, which is the case this is meant to carry further.
+  const unsummonable = reviewers.filter(r => r.kind === "blocking" && !r.trigger).map(r => r.login);
   const effects = reviewers.filter(r => r.trigger).map(r => ({
-    idemKey: `review-request:${nwo}:${e.pr}:${e.head}:${r.login}`,
-    // What this request replaces: the same reviewer, the same pull request, any
-    // earlier head. Deliberately NOT keyed on the head, since the whole point is
-    // to catch the rows a head change left behind.
-    supersedes: `review-request:${nwo}:${e.pr}:`,
+    // The REVIEWER precedes the head in the key, and that ordering is the whole
+    // mechanism. With the head first, no prefix can name one reviewer's requests,
+    // so the supersede below matched every reviewer on the pull request -- and
+    // since the effects are enqueued in a loop, the second reviewer's supersede
+    // deleted the first reviewer's row that had just been created. Only the last
+    // reviewer would ever have been summoned.
+    idemKey: `review-request:${nwo}:${e.pr}:${r.login}:${e.head}`,
+    // What this replaces: THIS reviewer, this pull request, any earlier head.
+    supersedes: `review-request:${nwo}:${e.pr}:${r.login}:`,
     kind: "gh.pr.comment",
     args: { nwo, pr: e.pr, body: r.trigger },
   }));
@@ -1751,6 +1760,18 @@ export async function tick(ctx) {
       // to do, which also made the comment above about an idle tick costing one
       // query untrue. Rows recoverable from a dead drainer count as work, or a
       // crashed delivery waits for a tick that happens to have new work in it.
+      // Dead letters FIRST, and outside every branch below.
+      //
+      // Nested inside "there is work due" it disappeared exactly when it mattered:
+      // once the last due row is dead-lettered, `due` is 0, the query is skipped,
+      // and `announceable` sees a standing escalation absent on a complete tick and
+      // CLEARS it -- so the permanent loss announces itself once and is then
+      // retracted. The same held while authentication failed, and across a restart.
+      // A terminal row is a fact about the store, not about this tick's work.
+      for (const d of db.prepare(`SELECT kind, count(*) n FROM outbox
+                                  WHERE status='dead_letter' GROUP BY kind`).all())
+        escalations.set(`${d.n} ${d.kind} effect(s) reeve could not perform and will not retry — they need a person`, 1);
+
       const due = db.prepare(`SELECT count(*) n FROM outbox
                               WHERE (status='pending' AND not_before<=unixepoch())
                                  OR (status='inflight' AND lease_expires_at<unixepoch())`).get().n;
@@ -1776,8 +1797,10 @@ export async function tick(ctx) {
         // Counted from the store rather than from this pass, because recovery can
         // dead-letter a row in a tick that performed nothing, and because a
         // restart must not make the backlog disappear.
-        const dead = db.prepare(`SELECT kind, count(*) n FROM outbox WHERE status='dead_letter' GROUP BY kind`).all();
-        for (const d of dead)
+        // Re-read after the drain, because this pass may have dead-lettered a row
+        // that the count above was taken before.
+        for (const d of db.prepare(`SELECT kind, count(*) n FROM outbox
+                                    WHERE status='dead_letter' GROUP BY kind`).all())
           escalations.set(`${d.n} ${d.kind} effect(s) reeve could not perform and will not retry — they need a person`, 1);
       }
       }

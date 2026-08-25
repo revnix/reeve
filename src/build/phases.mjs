@@ -110,6 +110,29 @@ const holdReasonRefusal = (evidence) => {
 // implements is refused rather than persisted and dispatched under.
 const DEPTHS = Object.freeze(["trivial", "standard", "deep"]);
 
+/**
+ * The COMPLETE section 1.5 admission snapshot.
+ *
+ * Exported because ADMISSION needs the same list. `admitTask` wrote
+ * `specRepoId`, `gateDefinitionHash` and `founderUserId` straight through, and
+ * all three columns are nullable -- so a snapshot whose lookups returned null
+ * was accepted, and the task acquired its territory and entered FILED unable to
+ * create or gate its spec PR, or to authenticate the founder comment overrides
+ * section 5 authorises against that immutable identity. Regeneration already
+ * refused exactly that shape; the list lived inside its branch, so admission
+ * could not consult it.
+ *
+ * A partial snapshot is the failure that looks like success: the columns it does
+ * carry are correct.
+ */
+export const SNAPSHOT_FIELDS = Object.freeze(
+  ["repoId", "nwo", "repoPath", "profilePath", "profileHash",
+   "defaultBranch", "visibility", "specRepoId",
+   "gateDefinitionHash", "registryVersion", "founderUserId"]);
+
+export const missingSnapshotFields = (snapshot) =>
+  SNAPSHOT_FIELDS.filter(f => snapshot?.[f] == null);
+
 const go = (to, { generation, bumps = false, compensations = [], sliceCursor = null,
                   escalate = null, persistDepth = null }) =>
   ({ ok: true, to, generation, bumps, sliceCursor, escalate, persistDepth,
@@ -431,13 +454,25 @@ export function nextPhase(state, evidence) {
   // Which way it goes is not the machine's guess -- the loop supplies
   // `moreSlices` from the durable slice cursor and DESIGN's slice list.
   if (phase === "SLICE_MERGED") {
-    if (kind === "slice.next")
+    if (kind === "slice.next") {
+      // AN EXPLICIT BOOLEAN, because the two answers are not symmetric. `false`
+      // means "the slice list was read and there are none left"; `undefined`
+      // means the loop could not read the durable design artifact or the slice
+      // cursor at all -- and a truthiness test spends the second as the first,
+      // sending the task to FINALIZING and then DONE with every remaining
+      // planned slice unimplemented. Absence is the one answer that must not
+      // decide this, so it is refused rather than defaulted.
+      if (typeof evidence.moreSlices !== "boolean")
+        return refuse(
+          "slice.next must state moreSlices as a boolean; it decides whether any planned slice " +
+          "remains, and a missing value would finish the task rather than admit it is unknown");
       return evidence.moreSlices
         // The cursor is durable and nothing else writes it, so a transition back
         // to IMPLEMENTING that leaves it alone re-runs the slice that just
         // merged -- reopening or reconciling a PR that is already in.
         ? go("IMPLEMENTING", { generation, sliceCursor: sliceCursor + 1 })
         : go("FINALIZING", { generation });
+    }
     if (kind === "slice.merged")
       return refuse("SLICE_MERGED is entered BY slice.merged; advancing needs slice.next");
   }
@@ -466,10 +501,7 @@ export function nextPhase(state, evidence) {
     // the list because comment-based depth overrides are authorised against that
     // immutable identity (section 5), so a task without it cannot authenticate
     // the very evidence this branch exists to handle.
-    const SNAPSHOT_FIELDS = ["repoId", "nwo", "repoPath", "profilePath", "profileHash",
-                             "defaultBranch", "visibility", "specRepoId",
-                             "gateDefinitionHash", "registryVersion", "founderUserId"];
-    const missing = SNAPSHOT_FIELDS.filter(f => evidence.snapshot?.[f] == null);
+    const missing = missingSnapshotFields(evidence.snapshot);
     if (missing.length)
       return refuse(`regenerate needs a resolved registry snapshot; missing ${missing.join(", ")}. ` +
                     `Resolve it before the transaction, as section 2.2 requires`);
@@ -499,13 +531,31 @@ export function nextPhase(state, evidence) {
       return refuse("a phase report must name the phase it came from; an unattributed success advances nothing");
     if (evidence.phase !== phase)
       return refuse(`a ${evidence.phase} report cannot advance a task in ${phase}`);
-    if (phase === "SIZING" && evidence.depth === "trivial")
-      // The skip has to be EMITTED, not described. A plain transition to DESIGN
-      // leaves no durable explanation for the absent research artifact, and the
-      // gap is indistinguishable from a research phase that was lost -- which is
-      // the reading that matters months later, when someone asks why this task
-      // has no research to show.
-      return go("DESIGN", { generation, compensations: ["record-research-skip"] });
+    // SIZING SELECTS THE DEPTH, so SIZING is where it becomes durable.
+    //
+    // The classifier's decision drives budgets, fan-out and what artifacts are
+    // expected of every later phase, and `task.depth` is the only place any of
+    // them can read it. Nothing wrote it on this path: `persistDepth` travelled
+    // on the founder-override edges alone, so an ordinarily sized task kept
+    // `depth = NULL` and no later phase could reproduce -- or even name -- the
+    // decision it was working under. The skip-RESEARCH case made that sharpest:
+    // the depth was consulted to skip a whole phase and then discarded.
+    if (phase === "SIZING") {
+      if (!DEPTHS.includes(evidence.depth))
+        return refuse(
+          `a SIZING report must name the depth it selected, one of ${DEPTHS.join(", ")}; ` +
+          `every later budget and artifact expectation is derived from it and task.depth is ` +
+          `the only record of what was chosen`);
+      if (evidence.depth === "trivial")
+        // The skip has to be EMITTED, not described. A plain transition to DESIGN
+        // leaves no durable explanation for the absent research artifact, and the
+        // gap is indistinguishable from a research phase that was lost -- which is
+        // the reading that matters months later, when someone asks why this task
+        // has no research to show.
+        return go("DESIGN", { generation, persistDepth: evidence.depth,
+                              compensations: ["record-research-skip"] });
+      return go(ADVANCE.SIZING, { generation, persistDepth: evidence.depth });
+    }
     if (phase === "VERDICT_WAIT")
       return refuse("VERDICT_WAIT advances only on the reconciler's slice.merged witness, never on a phase report");
     if (phase === "FINALIZING")

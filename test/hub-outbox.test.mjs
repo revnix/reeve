@@ -774,6 +774,61 @@ const NOW = 1_800_000_000;
   db.close();
 }
 
+// ── merging is gated on the MERGE switch, not on publishing ────────────────
+// `builder.capabilities.mergeBuilderPr` is declared in the profile schema and
+// defaults to false INDEPENDENTLY of `publishPr` -- and nothing read it. Every
+// project-repository effect, `gh.pr.merge` included, was classified under
+// `publishPr`, so a founder who enabled publishing enabled merging with it, and
+// a merge row already pending when merge authority was withdrawn was still
+// leased and delivered. A switch that governs nothing is worse than no switch:
+// it is a control an operator believes they have set.
+{
+  const db = openHub(join(dir, "o15.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:merge", kind: "gh.pr.merge",
+                                      taskId: "bt:1", generation: 1, fence: 1,
+                                      args: { repo_id: 1, pr: 7 } }));
+  // Publishing ON, merging OFF -- which is the DEFAULT pairing, not an exotic one.
+  const publishOnly = { ...allOn, "builder.capabilities.mergeBuilderPr": false };
+  const refused = leaseEffect(db, { worker: "w", capabilities: publishOnly, now: NOW });
+  check(refused === null, "a merge is not leased while the merge switch is off",
+    JSON.stringify(refused));
+  const row = db.prepare("SELECT status, last_error FROM outbox WHERE idempotency_key='bt:1:g1:merge'").get();
+  check(row.status === "refused", "it is refused as configuration rather than left pending",
+    JSON.stringify(row));
+  check(/mergeBuilderPr/.test(row.last_error ?? ""),
+    "and it names the switch the operator actually has to turn on", JSON.stringify(row));
+  db.close();
+}
+
+// CONTROL, both directions, or "merge is gated" has become "merge never runs"
+// and "publishing is gated" has quietly stopped being true.
+{
+  const db = openHub(join(dir, "o16.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:merge2", kind: "gh.pr.merge",
+                                      taskId: "bt:1", generation: 1, fence: 1,
+                                      args: { repo_id: 1, pr: 8 } }));
+  const leased = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  check(leased?.kind === "gh.pr.merge",
+    "control: with the merge switch on, the merge is leased", JSON.stringify(leased));
+  db.close();
+
+  const db2 = openHub(join(dir, "o17.db"));
+  seed(db2, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db2, () => enqueueEffect(db2, { idempotencyKey: "bt:1:g1:comment", kind: "gh.pr.comment",
+                                        taskId: "bt:1", generation: 1, fence: 1,
+                                        args: { repo_id: 1, pr: 9 } }));
+  // Merging ON, publishing OFF: an ordinary project-repo effect must STILL be
+  // governed by publishPr, or the merge carve-out has widened past the one kind.
+  const mergeOnly = { ...allOn, "builder.capabilities.publishPr": false };
+  check(leaseEffect(db2, { worker: "w", capabilities: mergeOnly, now: NOW }) === null,
+    "control: an ordinary project-repo effect is still governed by publishPr");
+  check(/publishPr/.test(db2.prepare("SELECT last_error FROM outbox WHERE idempotency_key='bt:1:g1:comment'").get().last_error ?? ""),
+    "control: and names publishPr, not the merge switch");
+  db2.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

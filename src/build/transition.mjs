@@ -170,12 +170,30 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
     // The close, and the comment that explains it. Enqueued, never performed:
     // the executor revalidates the fence inside its lease transaction.
     case "close-prs": {
-      for (const pr of db.prepare(
-        `SELECT repo_id, pr FROM impl_pr WHERE task = ? AND merged_sha IS NULL`).all(taskId)) {
+      const open = db.prepare(
+        `SELECT repo_id, pr FROM impl_pr WHERE task = ? AND merged_sha IS NULL`).all(taskId);
+      // AND THE SPEC PR, but only when the task is being ABANDONED.
+      //
+      // A cancellation or an infeasibility after SPEC_PR_OPEN can leave
+      // `spec_repo_id`/`spec_pr` set with no `impl_pr` row at all, so this
+      // compensation enqueued nothing and the task reached CANCELLED or
+      // INFEASIBLE with its spec PR still open against a task that no longer
+      // exists. The DDL is explicit that the spec PR is fixed for the task's
+      // life and a redesign pushes a NEW HEAD to it -- so a resume or a
+      // regenerate must leave it alone, and only the two terminal edges close
+      // it. Keyed on the transition, not on whether a row happens to be there.
+      if (evidence?.kind === "founder.cancel" || evidence?.kind === "founder.infeasible") {
+        const spec = db.prepare(
+          `SELECT spec_repo_id, spec_pr FROM task WHERE id = ?`).get(taskId);
+        if (spec?.spec_repo_id != null && spec?.spec_pr != null)
+          open.push({ repo_id: spec.spec_repo_id, pr: spec.spec_pr, spec: true });
+      }
+      for (const pr of open) {
         enqueue("gh.pr.comment", `${taskId}:g${generation}:pr${pr.pr}:close-notice`,
-                { repo_id: pr.repo_id, pr: pr.pr, reason: evidence?.kind ?? null });
+                { repo_id: pr.repo_id, pr: pr.pr, reason: evidence?.kind ?? null,
+                  ...(pr.spec ? { repo: "spec" } : {}) });
         enqueue("gh.pr.close", `${taskId}:g${generation}:pr${pr.pr}:close`,
-                { repo_id: pr.repo_id, pr: pr.pr });
+                { repo_id: pr.repo_id, pr: pr.pr, ...(pr.spec ? { repo: "spec" } : {}) });
       }
       return;
     }
@@ -207,7 +225,7 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       // path filed under the other claim kind found no row on the exact key,
       // inserted under a different primary key, and both tasks resumed holding
       // paths `overlaps()` calls mutually exclusive.
-      const held = liveLeases(db, task.project, at);
+      const held = liveLeases(db, task.project);
       for (const claim of db.prepare(
         `SELECT kind, path, pinned FROM task_territory WHERE task = ?`).all(taskId)) {
         const holder = firstConflict(claim, held, taskId);
@@ -581,10 +599,12 @@ function applyTransitionTx(db, { taskId, expectedPhase, expectedGeneration, evid
            AND to_generation=? ORDER BY seq DESC LIMIT 1`).get(taskId, expectedGeneration)?.seq;
       if (finalizingSeq == null)
         return refuseDurably("there is no FINALIZING entry for this generation to scope the completion check to");
+      // LIVE rows always block: a pending or inflight effect has not happened yet,
+      // and no later row can speak for it.
       const bad = db.prepare(
         `SELECT status, count(*) c FROM outbox
           WHERE task_id=? AND task_generation=? AND fence >= ?
-            AND status IN ('pending','inflight','failed','dead_letter','refused')
+            AND status IN ('pending','inflight')
           GROUP BY status`).all(taskId, expectedGeneration, finalizingSeq);
       // `voided` is counted SEPARATELY, and PER ROW. It is the one status that
       // can be forgiven -- a voided effect no longer matters if the resume
@@ -597,18 +617,37 @@ function applyTransitionTx(db, { taskId, expectedPhase, expectedGeneration, evid
       // `d.id > v.id` is what makes "replacement" mean "afterwards": without it
       // any HISTORICAL done row with the same key forgives the void, and a plain
       // resume deliberately re-enqueues a completed effect beside its history.
-      const unreplacedVoided = db.prepare(
-        `SELECT count(*) c FROM outbox v
+      // AND THE UNHAPPY SETTLED ONES, forgiven only by a LATER success on the same
+      // key. `voided` was the only status treated this way, and the reasoning
+      // applies identically to the other three: a `refused` row is what a
+      // capability being off looks like, and re-enabling it re-enqueues the
+      // effect under the live-key policy. That replacement reaching `done` left
+      // the original counted for ever, so `finalize.settled` could never move the
+      // task to DONE -- a task permanently unable to finish because a switch had
+      // once been off. Same for a `failed` or `dead_lettered` delivery that a
+      // later attempt completed.
+      //
+      // Forgiveness is per EFFECT, not per group. Asking "is there any voided key
+      // with a done replacement" drops the whole group on a single yes, so a task
+      // with five abandoned completion effects and one replacement commits DONE
+      // with four never performed.
+      //
+      // `d.id > v.id` is what makes "replacement" mean "afterwards": without it
+      // any HISTORICAL done row with the same key forgives it, and a plain resume
+      // deliberately re-enqueues a completed effect beside its history.
+      const unreplaced = db.prepare(
+        `SELECT v.status, count(*) c FROM outbox v
           WHERE v.task_id = ? AND v.task_generation = ? AND v.fence >= ?
-            AND v.status = 'voided'
+            AND v.status IN ('voided','failed','dead_letter','refused')
             AND NOT EXISTS (SELECT 1 FROM outbox d
                              WHERE d.task_id         = v.task_id
                                AND d.task_generation = v.task_generation
                                AND d.idempotency_key = v.idempotency_key
                                AND d.status          = 'done'
-                               AND d.id              > v.id)`)
-        .get(taskId, expectedGeneration, finalizingSeq).c;
-      if (unreplacedVoided) bad.push({ status: "voided", c: unreplacedVoided });
+                               AND d.id              > v.id)
+          GROUP BY v.status`)
+        .all(taskId, expectedGeneration, finalizingSeq);
+      for (const row of unreplaced) bad.push(row);
       if (bad.length)
         return refuseDurably(`finalization is not complete: ` + bad.map(r => `${r.c} ${r.status}`).join(", ") +
                              `; DONE is terminal and cannot be revisited`);

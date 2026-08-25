@@ -282,9 +282,23 @@ export function checkpoint(db, { runId, step, seq, state, actor = "lane" }) {
     // every step, indefinitely, under the stop contract this function advertises.
     if (row.cancel_requested) return refuse("cancelled");
 
-    db.prepare(`UPDATE run SET step=?, cursor=json_patch(cursor, ?), heartbeat_at=unixepoch(),
-                lease_expires_at=unixepoch()+? WHERE id=?`)
-      .run(step, canonical(state), LEASE_SECONDS, runId);
+    // The claim is taken with the guard IN the statement, and its result decides
+    // whether anything else is written.
+    //
+    // The reads above classify the refusal; they cannot be the guard. `BEGIN
+    // IMMEDIATE` stops competing writers, it does not stop the clock -- so a
+    // process descheduled near the deadline could pass the JavaScript check and
+    // then renew an already-lapsed lease, which is the revival this whole function
+    // exists to prevent, reintroduced by the fix for it. SQLite evaluates the
+    // predicate at execution, so putting it here closes the window that the two
+    // statements would otherwise leave open between them.
+    const held = db.prepare(`UPDATE run SET step=?, cursor=json_patch(cursor, ?), heartbeat_at=unixepoch(),
+                lease_expires_at=unixepoch()+?
+                WHERE id=? AND status IN (${LEASE_HOLDING_STATES.map(() => "?").join(",")})
+                  AND lease_expires_at > unixepoch()
+                RETURNING id`).get(step, canonical(state), LEASE_SECONDS, runId, ...LEASE_HOLDING_STATES);
+    // Nothing was written when this misses, so there is nothing to undo.
+    if (!held) return refuse("lease-expired");
     db.prepare(`INSERT INTO checkpoint(run_id,step,seq,state,at)
                 VALUES(?,?,?,?,unixepoch())
                 ON CONFLICT(run_id,step) DO UPDATE SET state=excluded.state, at=excluded.at`)

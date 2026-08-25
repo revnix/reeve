@@ -170,6 +170,22 @@ export function openHub(path, { skipIntegrity = false } = {}) {
   mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path, { timeout: 10000 });
 
+  // CLOSED EXACTLY ONCE, from whichever path exits first.
+  //
+  // Seven places in this function close the handle and two of them already
+  // carried an ad-hoc try/catch, which was the warning. A third then fell
+  // through: the corruption branch closed, converted the exception into a
+  // verdict, and the common damage branch closed AGAIN. `DatabaseSync.close()`
+  // throws `database is not open` on a closed handle, so that error REPLACED the
+  // hubDamaged verdict and its recovery guidance -- and it carries no errcode,
+  // which `isOperational` reads as "not a storage error", so a genuinely corrupt
+  // hub was classified as merely operational. The exact misclassification the
+  // three-answer split was added to prevent, reintroduced by the split itself.
+  //
+  // Guarded here rather than by ordering, because ordering is what failed.
+  let closed = false;
+  const closeHub = () => { if (closed) return; closed = true; db.close(); };
+
   // AN UNREADABLE FILE IS REFUSED HERE, ONCE, FOR EVERY CALLER.
   //
   // Opening a corrupt database SUCCEEDS -- SQLite reads nothing until it is
@@ -200,7 +216,7 @@ export function openHub(path, { skipIntegrity = false } = {}) {
              ) STRICT`);
     db.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get();
   } catch (e) {
-    try { db.close(); } catch { /* the throw below is the answer either way */ }
+    closeHub();
     // WHICH FAILURE, not merely that one happened. These pragmas WRITE, so they
     // fail for reasons that have nothing to do with the file being damaged:
     //
@@ -289,7 +305,7 @@ export function openHub(path, { skipIntegrity = false } = {}) {
     catch (e) { checkFailed = e; }
 
     if (checkFailed) {
-      db.close();
+      closeHub();
       // A CHECK THAT THREW *CORRUPTION* HAS ANSWERED. SQLITE_CORRUPT and
       // SQLITE_NOTADB out of `quick_check` are not "could not tell": they are the
       // file saying so through a different door, and calling that unknown would
@@ -315,7 +331,7 @@ export function openHub(path, { skipIntegrity = false } = {}) {
     }
 
     if (verdict !== "ok") {
-      db.close();
+      closeHub();
       const newest = newestHubSnapshot(path);
       throw Object.assign(new Error(
         // `quick_check(1)` stops at the FIRST problem, which is what makes it
@@ -355,7 +371,7 @@ export function openHub(path, { skipIntegrity = false } = {}) {
     const gaps = [];
     for (let v = 1; v <= seen; v++) if (!rows.includes(v)) gaps.push(v);
     if (gaps.length) {
-      db.close();
+      closeHub();
       throw new Error(
         `hub store at ${path} records schema version ${seen} but is missing migration(s) ` +
         `${gaps.join(", ")}. The history has holes, so the store's real shape is unknown and the ` +
@@ -363,7 +379,7 @@ export function openHub(path, { skipIntegrity = false } = {}) {
     }
   }
   if (seen > HUB_SCHEMA_VERSION) {
-    db.close();
+    closeHub();
     throw new Error(
       `hub store at ${path} is schema version ${seen}; this binary knows ${HUB_SCHEMA_VERSION}. ` +
       `Migrations are forward-only: run the newer binary, or restore a snapshot taken at ${HUB_SCHEMA_VERSION}.`);
@@ -381,7 +397,7 @@ export function openHub(path, { skipIntegrity = false } = {}) {
     try {
       const now = db.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get().v;
       if (now > HUB_SCHEMA_VERSION) {
-        db.exec("ROLLBACK"); db.close();
+        db.exec("ROLLBACK"); closeHub();
         throw new Error(
           `hub store at ${path} is schema version ${now}; this binary knows ${HUB_SCHEMA_VERSION}. ` +
           `It was migrated by a newer reeve while this one was opening it.`);
@@ -428,7 +444,7 @@ export function openHub(path, { skipIntegrity = false } = {}) {
       db.exec("COMMIT");
     } catch (e) {
       try { db.exec("ROLLBACK"); } catch {}
-      try { db.close(); } catch {}
+      closeHub();
       // The version-race error is RETHROWN verbatim. Wrapping it as "migration N
       // failed" is wrong twice: no migration was attempted, and the wrapper hides
       // the two version numbers an operator needs to know which binary to run.

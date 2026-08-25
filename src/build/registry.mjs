@@ -24,6 +24,9 @@ import { assertWritable } from "./locks.mjs";
 // territory.mjs for why admission and regrant may not each keep their own.
 import { overlaps, liveLeases, firstConflict,
          conflictRefusal, grantLease } from "./territory.mjs";
+// The admission snapshot's required fields, shared with the regenerate edge that
+// already refused an incomplete one. See phases.mjs.
+import { missingSnapshotFields } from "./phases.mjs";
 // Re-exported because callers and tests import the predicate from here.
 export { overlaps };
 // `isSameProcess` is deliberately NOT imported. It lives in `supervisor.mjs`,
@@ -203,6 +206,18 @@ export function admitTask(db, snapshot, filing, { isAlive = () => true } = {}) {
       if (seen) return { ok: true, taskId: seen.id, replayed: true };
     }
 
+    // BEFORE ANYTHING IS WRITTEN. An incomplete snapshot used to reach the
+    // INSERT: every one of these columns is nullable, so SQLite accepted the
+    // malformed task, and it had already taken its territory and entered FILED
+    // by the time anyone could notice it could not gate a spec PR or
+    // authenticate a founder override.
+    const missing = missingSnapshotFields(snapshot);
+    if (missing.length)
+      return { ok: false,
+               refusal: `the registry snapshot is incomplete; missing ${missing.join(", ")}. ` +
+                        `Resolve it before admission, as section 2.2 requires: a task cannot gate ` +
+                        `its spec PR or authenticate a founder override without these` };
+
     const claims = filing.claims ?? [];
     if (!claims.length)
       return { ok: false, refusal: `a filing must declare its territory; pass --territory` };
@@ -214,7 +229,7 @@ export function admitTask(db, snapshot, filing, { isAlive = () => true } = {}) {
     // serialise against each other -- a deadlock between projects that share
     // nothing, reported as a territory conflict.
     const at = db.prepare("SELECT unixepoch() n").get().n;
-    const held = liveLeases(db, filing.project, at);
+    const held = liveLeases(db, filing.project);
     for (const claim of claims) {
       const lease = firstConflict(claim, held, filing.id);
       if (lease) return { ok: false, refusal: conflictRefusal(claim, lease) };

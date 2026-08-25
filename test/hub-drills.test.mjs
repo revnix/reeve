@@ -3,7 +3,7 @@
 // The crash drill kills a real child process mid-transition. That matters:
 // SQLite's atomicity is the thing being relied on, and a same-process test with
 // a mocked failure proves only that the MOCK rolled back.
-import { openHub, hubTx } from "../src/build/hubdb.mjs";
+import { openHub, hubTx, isOperational, faultKind } from "../src/build/hubdb.mjs";
 import { applyTransition } from "../src/build/transition.mjs";
 import { enqueueEffect, leaseEffect, settleEffect, recoverEffects } from "../src/build/outbox.mjs";
 import { snapshotAll, latestSnapshot } from "../src/backup.mjs";
@@ -410,6 +410,75 @@ for (let i = 0; i < 500; i++) {
   check(/checkFailed\.errcode === 11 \|\| checkFailed\.errcode === 26/.test(src),
     "and a check that threw SQLITE_CORRUPT or SQLITE_NOTADB is treated as an answer",
     "checked");
+
+  // ── the handle is closed ONCE, from whichever path exits first ─────────────
+  //
+  // The corruption fall-through above closes and then falls into the common
+  // damage branch, which closed AGAIN. `DatabaseSync.close()` throws on a closed
+  // handle, and that error REPLACES the damage verdict -- so the refusal an
+  // operator sees is `database is not open` with no recovery guidance, and
+  // because it carries no errcode `isOperational` reads it as "not a storage
+  // error, therefore not damage". A corrupt hub classified as merely busy: the
+  // exact misclassification this whole section exists to prevent, reintroduced
+  // by the fix for it.
+  check(/const closeHub = \(\) => \{ if \(closed\) return; closed = true; db\.close\(\); \};/.test(src),
+    "openHub closes through one idempotent guard", "checked");
+  {
+    // Every close inside `openHub` goes through it -- counted, because seven
+    // sites and one guard is a property of the whole function, not of the site
+    // that happened to be edited. Two of the seven already carried an ad-hoc
+    // try/catch, which was the warning that ordering was load-bearing.
+    const fn = src.slice(src.indexOf("export function openHub("));
+    const body = fn.slice(0, fn.indexOf("\n}\n"));
+    const raw = (body.match(/db\.close\(\)/g) ?? []).length;
+    check(raw === 1, "and every close inside it goes through that guard, not db.close() directly",
+      `${raw} direct db.close() call(s) remain; expected exactly 1 (the guard's own)`);
+    check((body.match(/closeHub\(\)/g) ?? []).length >= 7,
+      "control: the guard really is used by the paths that were closing directly",
+      String((body.match(/closeHub\(\)/g) ?? []).length));
+  }
+  // WHY IT MATTERS, asserted rather than described: the error a double close
+  // produces is exactly the shape `isOperational` mistakes for a healthy hub.
+  {
+    const scratch = new DatabaseSync(join(home, "state", "doubleclose.db"));
+    scratch.close();
+    let second = null;
+    try { scratch.close(); } catch (e) { second = e; }
+    check(second !== null && /not open/i.test(second.message),
+      "fixture: closing a closed handle throws, which is what made the fall-through fatal",
+      String(second?.message));
+    check(second?.errcode === undefined && isOperational(second) === true,
+      "and that error is classified OPERATIONAL, so a damaged hub would read as merely busy",
+      `errcode=${second?.errcode} isOperational=${isOperational(second)}`);
+  }
+  // CONTROL: a hub corrupted where the pragmas themselves fail is still refused
+  // as damage, with the marker and the guidance intact.
+  {
+    const cp = join(home, "state", "schemacorrupt.db");
+    openHub(cp).close();
+    const fd = openSync(cp, "r+");
+    writeSync(fd, Buffer.alloc(24, 0xff), 0, 24, 100);   // the schema b-tree header
+    closeSync(fd);
+    let err = null;
+    try { openHub(cp).close(); } catch (e) { err = e; }
+    check(err !== null && /cannot be read|is damaged/.test(err.message),
+      "control: a corrupt hub is still refused AS DAMAGE, not as a closed handle",
+      String(err?.message).split("\n")[0]);
+    check(/restore --hub/.test(err?.message ?? ""),
+      "control: and it carries the recovery a damaged hub earns",
+      String(err?.message).split("\n")[1]);
+    // THE CAUSE, not the wrapper. This refusal comes from the PRAGMA guard,
+    // which has a real SQLite error behind it and wraps it as `cause` -- so the
+    // classification lives there, and `restoreHub` unwraps it before asking
+    // (`const cause = (e?.errcode === undefined && e?.cause) ? e.cause : e`).
+    // The `hubDamaged` marker exists only on the `quick_check` verdict, which
+    // has NO SQLite error behind it and would otherwise be unclassifiable. The
+    // two are not a divergence, and adding the marker here to make them look
+    // alike would be inventing a provenance this refusal does not have.
+    check(err?.cause?.errcode === 11 && faultKind(err.cause) === "damage",
+      "control: the cause classifies as damage, which is what recovery unwraps and reads",
+      `errcode=${err?.cause?.errcode} kind=${err?.cause ? faultKind(err.cause) : "n/a"}`);
+  }
   // CONTROL: with the holder gone the same hub opens, so the refusal was about
   // the lock and not about the file.
   let reopened = true;

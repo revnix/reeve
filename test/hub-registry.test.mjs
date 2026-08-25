@@ -9,6 +9,7 @@
 import { openHub } from "../src/build/hubdb.mjs";
 import { resolveSnapshot, admitTask, resolveClaims, normalizeClaim, overlaps } from "../src/build/registry.mjs";
 import { replayHub } from "../src/build/replay.mjs";
+import { SNAPSHOT_FIELDS } from "../src/build/phases.mjs";
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { dirname, resolve, basename, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -463,38 +464,62 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
     "and nothing is inserted, so a refused filing leaves no half-task behind");
   db.close();
 }
-// ── an EXPIRED lease on the same path is not a conflict ─────────────────────
-// The conflict scan deliberately excludes dead leases, so admission proceeded --
-// and then a plain INSERT hit `territory_lease`'s primary key and threw, taking
-// the whole filing with it. Reachable after any daemon outage or missed renewal,
-// and it surfaced as an uncaught database error rather than as a decision.
+// ── a lease is dead when its TASK is, not when its clock says so ───────────
+// hub.sql: "a task is a row, not a process, so dead is a state question... never
+// merely because it looks old". The scan asked `expires_at > now` instead, and
+// nothing in this system renews a territory lease -- the only writes are the
+// grant and release-territory's delete. So every active task's lease became
+// invisible one hour after it was granted and its paths were handed to the next
+// filing, while the original task was still editing them.
 {
   const db = openHub(join(dir, "r5.db"));
   const first = admitTask(db, snap, { id: "bt:old", project: "p", title: "t",
                                       claims: [normalizeClaim("packages/x")] });
   check(first.ok === true, "a task is admitted and holds its territory", JSON.stringify(first));
-  // Expire it in place: the row survives, which is the situation.
+  // The clock runs out while the task is very much alive.
   db.prepare("UPDATE territory_lease SET expires_at = 1 WHERE task = 'bt:old'").run();
-  check(db.prepare("SELECT count(*) c FROM territory_lease WHERE path='packages/x'").get().c === 1,
-    "the dead row is still in the table, which is what makes this reachable");
 
+  // CAUGHT, because the failure this covers is defence-in-depth: if the SCAN
+  // stops excluding the row, `grantLease`'s read-back still refuses and THROWS,
+  // which ends the file rather than failing one assertion. A crash is a red, but
+  // it is a red that takes every later block with it and prints no name.
+  let stolen = null, stoleThrew = null;
+  try {
+    stolen = admitTask(db, snap, { id: "bt:live", project: "p", title: "t",
+                                   claims: [normalizeClaim("packages/x")] });
+  } catch (e) { stoleThrew = e; }
+  check(stoleThrew === null,
+    "the scan refuses it as a conflict rather than letting the grant throw",
+    String(stoleThrew?.message));
+  check(stolen?.ok === false,
+    "an EXPIRED lease held by a LIVE task still excludes a new filing", JSON.stringify(stolen));
+  check(String(stolen?.refusal).includes("bt:old"),
+    "and the refusal names the task that still holds it", String(stolen.refusal));
+  check(db.prepare("SELECT task FROM territory_lease WHERE path='packages/x'").get().task === "bt:old",
+    "and the live task keeps its lease");
+
+  // NOW the task ends. A terminal task's lease is dead, whatever the clock says
+  // -- and the row can survive its task when release-territory never ran, which
+  // is what used to abort the whole next filing on the primary key.
+  db.prepare("UPDATE task SET phase = 'CANCELLED' WHERE id = 'bt:old'").run();
   let threw = null, next = null;
   try {
     next = admitTask(db, snap, { id: "bt:new", project: "p", title: "t",
                                  claims: [normalizeClaim("packages/x")] });
   } catch (e) { threw = e; }
-  check(threw === null, "admitting over an expired lease does not throw", String(threw?.message));
+  check(threw === null, "admitting over a TERMINAL task's leftover row does not throw",
+    String(threw?.message));
   check(next?.ok === true, "and the filing is admitted", JSON.stringify(next));
   const row = db.prepare("SELECT task, expires_at FROM territory_lease WHERE path='packages/x'").get();
   check(row?.task === "bt:new", "the lease now belongs to the new task", JSON.stringify(row));
   check(row?.expires_at > 1, "with a live expiry rather than the dead one", JSON.stringify(row));
 
-  // CONTROL: a LIVE lease on the same path is still refused, or "replaces an
-  // expired row" has quietly become "replaces any row".
-  const stolen = admitTask(db, snap, { id: "bt:thief", project: "p", title: "t",
-                                       claims: [normalizeClaim("packages/x")] });
-  check(stolen.ok === false, "control: a LIVE lease on the same path is still refused",
-    JSON.stringify(stolen));
+  // CONTROL: a lease held by a live task on the same path is still refused, or
+  // "replaces a dead task's row" has become "replaces any row".
+  const thief = admitTask(db, snap, { id: "bt:thief", project: "p", title: "t",
+                                      claims: [normalizeClaim("packages/x")] });
+  check(thief.ok === false, "control: a LIVE lease on the same path is still refused",
+    JSON.stringify(thief));
   check(db.prepare("SELECT task FROM territory_lease WHERE path='packages/x'").get().task === "bt:new",
     "control: and the live holder still holds it");
   db.close();
@@ -511,10 +536,16 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
                         claims: [normalizeClaim("packages/x")] });
   check(db.prepare("SELECT pinned_until FROM territory_lease WHERE path='packages/x'").get().pinned_until === null,
     "an unpinned filing leaves the pin empty");
-  db.prepare("UPDATE territory_lease SET expires_at = 1 WHERE task = 'bt:unpinned'").run();
-  const pinned = admitTask(db, snap, { id: "bt:pinned", project: "p", title: "t",
-                                       pinTerritory: true, claims: [normalizeClaim("packages/x")] });
-  check(pinned.ok === true, "a pinned filing replaces the expired row", JSON.stringify(pinned));
+  db.prepare("UPDATE task SET phase = 'DONE' WHERE id = 'bt:unpinned'").run();
+  // Caught for the same reason as the block above: a replacement rule that stops
+  // recognising a terminal task's row refuses inside `grantLease`, which throws.
+  let pinned = null, pinThrew = null;
+  try {
+    pinned = admitTask(db, snap, { id: "bt:pinned", project: "p", title: "t",
+                                   pinTerritory: true, claims: [normalizeClaim("packages/x")] });
+  } catch (e) { pinThrew = e; }
+  check(pinThrew === null, "replacing a terminal task's row does not throw", String(pinThrew?.message));
+  check(pinned?.ok === true, "a pinned filing replaces a terminal task's row", JSON.stringify(pinned));
   const row = db.prepare("SELECT task, pinned_until FROM territory_lease WHERE path='packages/x'").get();
   check(row.task === "bt:pinned", "the replacement transferred the task", JSON.stringify(row));
   check(row.pinned_until !== null && row.pinned_until > 1,
@@ -522,13 +553,65 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
 
   // CONTROL, the other direction: a replacement by an UNPINNED claim must clear
   // an inherited pin rather than leaving the old one standing.
-  db.prepare("UPDATE territory_lease SET expires_at = 1 WHERE task = 'bt:pinned'").run();
-  admitTask(db, snap, { id: "bt:plain", project: "p", title: "t",
-                        claims: [normalizeClaim("packages/x")] });
+  db.prepare("UPDATE task SET phase = 'DONE' WHERE id = 'bt:pinned'").run();
+  let plainThrew = null;
+  try {
+    admitTask(db, snap, { id: "bt:plain", project: "p", title: "t",
+                          claims: [normalizeClaim("packages/x")] });
+  } catch (e) { plainThrew = e; }
+  check(plainThrew === null, "control: and neither does the unpinned replacement",
+    String(plainThrew?.message));
   const after = db.prepare("SELECT task, pinned_until FROM territory_lease WHERE path='packages/x'").get();
   check(after.task === "bt:plain" && after.pinned_until === null,
     "control: replacing a pinned row with an unpinned claim clears the pin", JSON.stringify(after));
   db.close();
+}
+
+// ── an incomplete snapshot is refused BEFORE anything is written ───────────
+// `specRepoId`, `gateDefinitionHash` and `founderUserId` are all nullable
+// columns, so a snapshot whose lookups returned null was inserted without
+// complaint -- and the task had already taken its territory and entered FILED by
+// the time anyone could notice it could not gate its spec PR or authenticate the
+// founder comment overrides section 5 authorises against that immutable id.
+// Regeneration already refused exactly this shape; the field list lived inside
+// its branch, where admission could not consult it.
+{
+  const db = openHub(join(dir, "r7.db"));
+  for (const field of ["specRepoId", "gateDefinitionHash", "founderUserId", "repoId", "profileHash"]) {
+    const partial = { ...snap, [field]: null };
+    const r = admitTask(db, partial, { id: `bt:${field}`, project: "p", title: "t",
+                                       claims: [normalizeClaim(`packages/${field}`)] });
+    check(r.ok === false, `a snapshot missing ${field} is refused`, JSON.stringify(r));
+    check(String(r.refusal).includes(field), `and the refusal names ${field}`, String(r.refusal));
+    check(db.prepare("SELECT count(*) c FROM task WHERE id=?").get(`bt:${field}`).c === 0,
+      `and no task row was written for the ${field} case`);
+    check(db.prepare("SELECT count(*) c FROM territory_lease WHERE path=?").get(`packages/${field}`).c === 0,
+      `and NO TERRITORY was taken -- the half-admitted task is what made this expensive`);
+  }
+  // CONTROL: the complete snapshot still admits, or "validates" has become
+  // "refuses".
+  const ok = admitTask(db, snap, { id: "bt:complete", project: "p", title: "t",
+                                   claims: [normalizeClaim("packages/complete")] });
+  check(ok.ok === true, "control: a complete snapshot is admitted", JSON.stringify(ok));
+  db.close();
+}
+
+// The list is SHARED with the regenerate edge, not copied beside it. Two lists
+// drift, and the drift is silent: whichever edge is not exercised admits the
+// field the other refuses.
+{
+  const fromPhases = new Set(SNAPSHOT_FIELDS);
+  check(fromPhases.size === 11, "the snapshot contract names eleven fields",
+    String(fromPhases.size));
+  for (const f of ["repoId", "nwo", "specRepoId", "gateDefinitionHash", "founderUserId"])
+    check(fromPhases.has(f), `control: ${f} is in the shared contract`);
+  const reg = readFileSync(new URL("../src/build/registry.mjs", import.meta.url), "utf8");
+  check(/missingSnapshotFields/.test(reg),
+    "and admission consults it rather than keeping its own", "checked");
+  const ph = readFileSync(new URL("../src/build/phases.mjs", import.meta.url), "utf8");
+  check((ph.match(/"gateDefinitionHash"/g) ?? []).length === 1,
+    "control: the field list exists in exactly one place",
+    String((ph.match(/"gateDefinitionHash"/g) ?? []).length));
 }
 
 rmSync(dir, { recursive: true, force: true });

@@ -135,6 +135,16 @@ export function enqueueEffect(db, { idempotencyKey, kind, taskId, generation, fe
 const NEVER_GATED = Object.freeze(["notify", "gate.clean_notice", "ledger.claim", "ledger.release"]);
 const capabilityFor = (row) => {
   if (NEVER_GATED.includes(row.kind)) return null;
+  // MERGING HAS ITS OWN SWITCH, and it is default-off INDEPENDENTLY of
+  // `publishPr`. Classifying `gh.pr.merge` as an ordinary project-repo effect
+  // made `mergeBuilderPr` govern nothing at all: the profile declares it, the
+  // validator accepts it, and no code ever read it -- so a founder who turned
+  // publishing on had merging on too, and a merge row already pending when merge
+  // authority was withdrawn would still be leased and delivered. Withdrawing a
+  // capability has to stop the effects that were already decided under it, which
+  // is the entire reason the lease revalidates capabilities rather than trusting
+  // enqueue time.
+  if (row.kind === "gh.pr.merge") return "builder.capabilities.mergeBuilderPr";
   let args = {};
   try { args = JSON.parse(row.args); } catch { args = {}; }
   return args?.repo === "spec"

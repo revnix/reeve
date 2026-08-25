@@ -72,7 +72,10 @@ const EVIDENCE = [
   // spine entirely and still pass.
   const EXPECTED = [
     ["FILED",        { kind: "phase.succeeded", phase: "FILED" },              "SIZING"],
-    ["SIZING",       { kind: "phase.succeeded", phase: "SIZING" },             "RESEARCH"],
+    // The depth is part of the edge now, not decoration: SIZING SELECTS it and
+    // is the only place that makes it durable, so a report that does not name
+    // one is refused rather than advancing a task whose depth stays NULL.
+    ["SIZING",       { kind: "phase.succeeded", phase: "SIZING", depth: "standard" }, "RESEARCH"],
     ["SIZING",       { kind: "phase.succeeded", phase: "SIZING", depth: "trivial" }, "DESIGN"],
     ["RESEARCH",     { kind: "phase.succeeded", phase: "RESEARCH" },           "DESIGN"],
     ["DESIGN",       { kind: "phase.succeeded", phase: "DESIGN" },             "SPEC_DRAFT"],
@@ -361,6 +364,71 @@ const EVIDENCE = [
   // A retry that has NOT exhausted its budget is not a transition at all.
   const retry = nextPhase({ phase: "RESEARCH", generation: 1 }, { kind: "phase.failed", retriesExhausted: false });
   check(!retry.ok, "control: a failed attempt with retries left does not transition; it is a new attempt");
+}
+
+// ── absence is not "no more slices" ────────────────────────────────────────
+// `moreSlices` decides whether any planned implementation slice remains. A
+// truthiness test spends `undefined` -- the loop could not read the durable
+// design artifact or the slice cursor -- as `false`, which is the verified
+// no-more-slices answer, so the task goes to FINALIZING and then DONE with every
+// remaining slice unimplemented. The two answers are not symmetric and must not
+// share a branch.
+{
+  const at = (evidence, state = {}) =>
+    nextPhase({ phase: "SLICE_MERGED", generation: 1, sliceCursor: 3, ...state }, evidence);
+
+  const missing = at({ kind: "slice.next" });
+  check(missing.ok === false, "slice.next with no moreSlices is refused", JSON.stringify(missing));
+  check(/moreSlices/.test(missing.refusal ?? ""),
+    "and the refusal names the field it needed", String(missing.refusal));
+
+  for (const bad of [undefined, null, "false", "true", 0, 1, ""]) {
+    const r = at({ kind: "slice.next", moreSlices: bad });
+    check(r.ok === false, `a non-boolean moreSlices (${JSON.stringify(bad)}) is refused`,
+      JSON.stringify(r));
+  }
+
+  // CONTROLS, both directions, or "refuses absence" has become "refuses".
+  const more = at({ kind: "slice.next", moreSlices: true });
+  check(more.ok === true && more.to === "IMPLEMENTING" && more.sliceCursor === 4,
+    "control: an explicit true returns to IMPLEMENTING and advances the cursor",
+    JSON.stringify(more));
+  const done = at({ kind: "slice.next", moreSlices: false });
+  check(done.ok === true && done.to === "FINALIZING",
+    "control: an explicit false -- the VERIFIED no-more-slices answer -- finalizes",
+    JSON.stringify(done));
+}
+
+// ── SIZING makes the depth it selected durable ─────────────────────────────
+// The classifier's decision drives budgets, fan-out and artifact expectations,
+// and `task.depth` is the only place any later phase can read it. `persistDepth`
+// travelled on the founder-override edges alone, so an ordinarily sized task
+// kept depth = NULL -- and the skip-RESEARCH edge was the sharpest case, reading
+// the depth to skip an entire phase and then discarding it.
+{
+  const size = (depth) =>
+    nextPhase({ phase: "SIZING", generation: 1 },
+              depth === undefined ? { kind: "phase.succeeded", phase: "SIZING" }
+                                  : { kind: "phase.succeeded", phase: "SIZING", depth });
+
+  const bare = size(undefined);
+  check(bare.ok === false, "a SIZING report with no depth is refused", JSON.stringify(bare));
+  check(/depth/.test(bare.refusal ?? ""), "and says what it needed", String(bare.refusal));
+  check(size("enormous").ok === false, "an unknown depth is refused",
+    JSON.stringify(size("enormous")));
+
+  for (const d of ["standard", "deep"]) {
+    const r = size(d);
+    check(r.ok === true && r.to === "RESEARCH" && r.persistDepth === d,
+      `an ordinary ${d} sizing advances to RESEARCH AND carries the depth`, JSON.stringify(r));
+  }
+  const trivial = size("trivial");
+  check(trivial.ok === true && trivial.to === "DESIGN" && trivial.persistDepth === "trivial",
+    "and the RESEARCH-skipping edge carries it too, having just consulted it",
+    JSON.stringify(trivial));
+  check((trivial.compensations ?? []).includes("record-research-skip"),
+    "control: the skip is still emitted rather than merely described",
+    JSON.stringify(trivial.compensations));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

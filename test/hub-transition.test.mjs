@@ -278,6 +278,112 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
   db.close();
 }
 
+// ── an abandoned task does not leave its SPEC PR open ──────────────────────
+// Cancellation or infeasibility after SPEC_PR_OPEN can leave spec_repo_id and
+// spec_pr set with no impl_pr row at all, so `close-prs` enqueued nothing and the
+// task reached its terminal state with the spec PR still open against work that
+// no longer exists.
+{
+  const db = openHub(join(dir, "t17.db"));
+  seed(db, { id: "bt:1", phase: "SPEC_PR_OPEN", generation: 1 });
+  db.exec(`UPDATE task SET spec_repo_id = 9, spec_pr = 42 WHERE id = 'bt:1'`);
+  check(db.prepare("SELECT count(*) c FROM impl_pr WHERE task='bt:1'").get().c === 0,
+    "fixture: there is no implementation PR, which is what made this reachable");
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "SPEC_PR_OPEN", expectedGeneration: 1,
+    evidence: { kind: "founder.cancel" }, op: "phase.cancelled" });
+  check(r.applied === true, "the cancellation applies", JSON.stringify(r));
+  const closes = db.prepare(
+    "SELECT idempotency_key, args FROM outbox WHERE task_id='bt:1' AND kind='gh.pr.close'").all();
+  check(closes.length === 1, "the spec PR is enqueued for closing", JSON.stringify(closes));
+  check(JSON.parse(closes[0]?.args ?? "{}").pr === 42,
+    "and it is the task's own spec PR", closes[0]?.args);
+  check(db.prepare("SELECT count(*) c FROM outbox WHERE task_id='bt:1' AND kind='gh.pr.comment'").get().c === 1,
+    "with the comment that explains it");
+  db.close();
+}
+
+// CONTROL: a REDESIGN must leave the spec PR alone. hub.sql is explicit that the
+// spec PR is fixed for the task's life and a redesign pushes a NEW HEAD to it,
+// so closing it there would destroy the thread the redesign is continuing.
+{
+  const db = openHub(join(dir, "t18.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING', spec_repo_id=9, spec_pr=42 WHERE id='bt:1'`);
+  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1',1,0,1,7,'sha',unixepoch())`);
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: true }, op: "phase.resumed" });
+  check(r.applied === true, "control: the redesign resume applies", JSON.stringify(r));
+  const prs = db.prepare(
+    "SELECT args FROM outbox WHERE task_id='bt:1' AND kind='gh.pr.close'").all()
+    .map(r => JSON.parse(r.args).pr);
+  check(!prs.includes(42), "control: a redesign does NOT close the spec PR", JSON.stringify(prs));
+  check(prs.includes(7), "control: it still closes the implementation PR", JSON.stringify(prs));
+  db.close();
+}
+
+// ── a superseded effect stops blocking DONE ────────────────────────────────
+// `voided` was the only status a later success could forgive. A `refused` row is
+// what a capability being OFF looks like, and turning it back on re-enqueues the
+// effect -- so the replacement reached `done` while the original was counted for
+// ever, and finalize.settled could never move the task to DONE. A task
+// permanently unable to finish because a switch had once been off.
+{
+  const db = openHub(join(dir, "t19.db"));
+  seed(db, { id: "bt:1", phase: "FINALIZING", generation: 1 });
+  const seq = db.prepare(
+    `INSERT INTO phase_event(task, at, op, from_phase, to_phase, from_generation, to_generation, detail)
+     VALUES('bt:1', unixepoch(), 'phase.advanced', 'SLICE_MERGED', 'FINALIZING', 1, 1, '{}')
+     RETURNING seq`).get().seq;
+  const mk = (key, status) => db.prepare(
+    `INSERT INTO outbox(idempotency_key, kind, task_id, task_generation, fence, cancellable, args,
+                        status, attempts, max_attempts, not_before, lease_expires_at, lease_token,
+                        created_at, updated_at)
+     VALUES(?, 'gh.pr.comment', 'bt:1', 1, ?, 1, '{}', ?, 1, 8, 0, 0, 0, unixepoch(), unixepoch())
+     RETURNING id`).get(key, seq, status).id;
+
+  for (const st of ["refused", "failed", "dead_letter"]) {
+    const key = `bt:1:g1:${st}`;
+    mk(key, st);
+    const blocked = applyTransition(db, { taskId: "bt:1", expectedPhase: "FINALIZING", expectedGeneration: 1,
+      evidence: { kind: "finalize.settled", outstanding: 0 }, op: "phase.finalized" });
+    check(blocked.applied === false && /not complete/.test(blocked.refusal ?? ""),
+      `an unreplaced ${st} effect still blocks DONE`, JSON.stringify(blocked));
+    // The replacement, enqueued AFTER it and settled.
+    mk(key, "done");
+  }
+  const done = applyTransition(db, { taskId: "bt:1", expectedPhase: "FINALIZING", expectedGeneration: 1,
+    evidence: { kind: "finalize.settled", outstanding: 0 }, op: "phase.finalized" });
+  check(done.applied === true && done.to === "DONE",
+    "once each is replaced by a LATER done on the same key, the task finalizes",
+    JSON.stringify(done));
+  db.close();
+}
+
+// CONTROL: a done row that PREDATES the unhappy one forgives nothing, or
+// "replacement" has stopped meaning "afterwards".
+{
+  const db = openHub(join(dir, "t20.db"));
+  seed(db, { id: "bt:1", phase: "FINALIZING", generation: 1 });
+  const seq = db.prepare(
+    `INSERT INTO phase_event(task, at, op, from_phase, to_phase, from_generation, to_generation, detail)
+     VALUES('bt:1', unixepoch(), 'phase.advanced', 'SLICE_MERGED', 'FINALIZING', 1, 1, '{}')
+     RETURNING seq`).get().seq;
+  const mk = (key, status) => db.prepare(
+    `INSERT INTO outbox(idempotency_key, kind, task_id, task_generation, fence, cancellable, args,
+                        status, attempts, max_attempts, not_before, lease_expires_at, lease_token,
+                        created_at, updated_at)
+     VALUES(?, 'gh.pr.comment', 'bt:1', 1, ?, 1, '{}', ?, 1, 8, 0, 0, 0, unixepoch(), unixepoch())`)
+    .run(key, seq, status);
+  mk("bt:1:g1:hist", "done");        // the history
+  mk("bt:1:g1:hist", "refused");     // and the later refusal
+  const blocked = applyTransition(db, { taskId: "bt:1", expectedPhase: "FINALIZING", expectedGeneration: 1,
+    evidence: { kind: "finalize.settled", outstanding: 0 }, op: "phase.finalized" });
+  check(blocked.applied === false,
+    "control: an EARLIER done does not forgive a later refusal", JSON.stringify(blocked));
+  db.close();
+}
+
 // ── TWO open PRs, so the per-PR scope is visible ────────────────────────────
 // `write-pr-hold` loops over a task's open PRs and upserts on the OPEN row for
 // each. Every fixture for it seeds one `impl_pr`, and with one PR a hold keyed on

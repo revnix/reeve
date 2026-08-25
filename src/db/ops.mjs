@@ -154,6 +154,11 @@ export function claim(db, { lane, actor = lane, territory = null, pid = process.
 // ------------------------------------------------------------- heartbeat
 // Returns false when the lease was lost (reaped) or cancellation was requested:
 // the caller must then stop, because another run may already own the task.
+/** The statuses in which a run can still be holding its lease. Shared by
+ * `heartbeat` and `checkpoint` deliberately: two copies of this list would drift,
+ * and the drift would show up as the two disagreeing about who owns a run. */
+const LEASE_HOLDING_STATES = ['leased','running','blocked_on_ci','blocked_on_review','awaiting_founder'];
+
 export function heartbeat(db, { runId, actor = "lane" }) {
   return tx(db, () => {
     // An expired lease is not renewed by a late heartbeat: a daemon that stalled
@@ -162,13 +167,13 @@ export function heartbeat(db, { runId, actor = "lane" }) {
     // under a lease that had lapsed.
     const r = db.prepare(`
       UPDATE run SET heartbeat_at=unixepoch(), lease_expires_at=unixepoch()+?
-      WHERE id=? AND status IN ('leased','running','blocked_on_ci','blocked_on_review','awaiting_founder')
+      WHERE id=? AND status IN (${LEASE_HOLDING_STATES.map(() => "?").join(",")})
         AND lease_expires_at > unixepoch()
-      RETURNING task_id`).get(LEASE_SECONDS, runId);
+      RETURNING task_id`).get(LEASE_SECONDS, runId, ...LEASE_HOLDING_STATES);
     if (!r) {
       const row = db.prepare(`SELECT status, lease_expires_at FROM run WHERE id=?`).get(runId);
       const expired = row && row.lease_expires_at <= Math.floor(Date.now() / 1000)
-        && ['leased','running','blocked_on_ci','blocked_on_review','awaiting_founder'].includes(row.status);
+        && LEASE_HOLDING_STATES.includes(row.status);
       return { alive: false, reason: expired ? "lease-expired" : "lease-lost" };
     }
     const c = db.prepare(`SELECT cancel_requested FROM task_exec WHERE task_id=?`).get(r.task_id);
@@ -221,16 +226,85 @@ export function reap(db, { actor = "daemon", isAlive = () => false } = {}) {
 }
 
 // --------------------------------------------------------------- checkpoint
+/**
+ * Record progress within a run — only while the run still holds its lease.
+ *
+ * Returns `{ ok: false, reason }` and writes NOTHING when it does not. Callers
+ * carry the same contract as `heartbeat`: a false here means another run may
+ * already own this task, and the caller has to stop.
+ *
+ * The guard is the same one `heartbeat` states three functions above, and it is
+ * here because this function used to walk straight around it. `heartbeat`
+ * deliberately refuses to renew a lapsed lease -- "reviving it here would let that
+ * worker finish and publish under a lease that had lapsed" -- and `checkpoint`
+ * then set `lease_expires_at` forward with no status and no expiry check at all.
+ * Measured 2026-08-24: a run 60 seconds past its deadline was refused by
+ * `heartbeat`, checkpointed once, and `heartbeat` reported it alive again.
+ *
+ * That made a documented boundary decorative, and the run's own step and cursor
+ * were written into a record `reap` may already have abandoned and handed on.
+ *
+ * The shape is the one the outbox fence closes, one layer up: matching on `id`
+ * asked "does this row exist", when the fact needed was "do I still own it". An id
+ * is not an identity while a row can be re-leased.
+ */
 export function checkpoint(db, { runId, step, seq, state, actor = "lane" }) {
   return tx(db, () => {
+    // Every reason to refuse is decided BEFORE anything is written.
+    //
+    // The first version claimed first and then checked, on the reasoning that a
+    // claim and a check taken apart could disagree. Inside one IMMEDIATE
+    // transaction they cannot, so the ordering bought nothing and cost the
+    // property that matters: the claiming UPDATE also sets `step`, json-patches
+    // `cursor` and refreshes `heartbeat_at`, so a REFUSED checkpoint still left
+    // progress behind. `resume` would then read a step the run never successfully
+    // recorded and carry on from work a cancelled worker did not do. Putting
+    // `lease_expires_at` back covered one field of four, and `cursor` is not
+    // trivially reversible once patched at all -- which is the tell that restoring
+    // was the wrong shape and not-writing was the right one.
+    const row = db.prepare(`SELECT r.status, r.lease_expires_at, x.cancel_requested
+                            FROM run r LEFT JOIN task_exec x ON x.task_id = r.task_id
+                            WHERE r.id=?`).get(runId);
+    const refuse = reason => {
+      emit(db, { actor, op: "run.checkpoint.refused", run_id: runId, payload: { step, seq, reason } });
+      return { ok: false, reason };
+    };
+    if (!row) return refuse("no-such-run");
+    // Classified the way `heartbeat` classifies. A run `reap` has ABANDONED keeps
+    // its old `lease_expires_at`, so reading the timestamp alone reports that the
+    // lease merely timed out -- when in fact ownership was taken and the task
+    // handed to another run. Expiry is the reason only while the status is one a
+    // holder could still hold.
+    if (!LEASE_HOLDING_STATES.includes(row.status)) return refuse("lease-lost");
+    if (row.lease_expires_at <= Math.floor(Date.now() / 1000)) return refuse("lease-expired");
+    // `heartbeat` reports `cancelled` for this, and a checkpoint that returned ok
+    // would let a worker told to stop keep checkpointing -- renewing its lease on
+    // every step, indefinitely, under the stop contract this function advertises.
+    if (row.cancel_requested) return refuse("cancelled");
+
+    // The claim is taken with the guard IN the statement, and its result decides
+    // whether anything else is written.
+    //
+    // The reads above classify the refusal; they cannot be the guard. `BEGIN
+    // IMMEDIATE` stops competing writers, it does not stop the clock -- so a
+    // process descheduled near the deadline could pass the JavaScript check and
+    // then renew an already-lapsed lease, which is the revival this whole function
+    // exists to prevent, reintroduced by the fix for it. SQLite evaluates the
+    // predicate at execution, so putting it here closes the window that the two
+    // statements would otherwise leave open between them.
+    const held = db.prepare(`UPDATE run SET step=?, cursor=json_patch(cursor, ?), heartbeat_at=unixepoch(),
+                lease_expires_at=unixepoch()+?
+                WHERE id=? AND status IN (${LEASE_HOLDING_STATES.map(() => "?").join(",")})
+                  AND lease_expires_at > unixepoch()
+                RETURNING id`).get(step, canonical(state), LEASE_SECONDS, runId, ...LEASE_HOLDING_STATES);
+    // Nothing was written when this misses, so there is nothing to undo.
+    if (!held) return refuse("lease-expired");
     db.prepare(`INSERT INTO checkpoint(run_id,step,seq,state,at)
                 VALUES(?,?,?,?,unixepoch())
                 ON CONFLICT(run_id,step) DO UPDATE SET state=excluded.state, at=excluded.at`)
       .run(runId, step, seq, canonical(state));
-    db.prepare(`UPDATE run SET step=?, cursor=json_patch(cursor, ?), heartbeat_at=unixepoch(),
-                lease_expires_at=unixepoch()+? WHERE id=?`)
-      .run(step, canonical(state), LEASE_SECONDS, runId);
     emit(db, { actor, op: "run.checkpoint", run_id: runId, payload: { step, seq } });
+    return { ok: true };
   });
 }
 

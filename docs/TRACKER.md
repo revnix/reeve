@@ -332,6 +332,28 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       absence was spent as an answer: `slice.next` treated a missing `moreSlices`
       as "no slices remain", finishing tasks with planned work unimplemented.
 
+      **Round 3: 6 findings (2×P1), all genuine, all fixed at `6d1a2ef`.** Four
+      were follow-ups on round 2's own repairs. The two that matter: awaiting the
+      reconciler outside any `try` meant ONE throwing row aborted the whole pass,
+      and the scan is `ORDER BY id`, so a single malformed row at the front
+      stopped the outbox recovering on every pass for ever; and `gate.capReached`
+      emitted `write-pr-hold` for a task that by definition has a spec PR and no
+      implementation PR, so the compensation ran and wrote nothing — the task sat
+      ESCALATED with its spec PR still mergeable. Also: the repo-id lookup keyed
+      on `nwo_snapshot` while its own comment said that column is only ever a
+      snapshot, so a rename made it return null for an id the hub was holding.
+
+      **FOUNDER DECISIONS, 2026-08-25:**
+      - **#30 merge:** ask again when Codex returns a clean pass at the current
+        head. No conditional or pre-authorised grant. Every merge stays explicit.
+      - **S2-C shape: SPLIT into 3-4 PRs**, overriding the plan's single-PR
+        structure. Rationale: #30 ran 3 rounds and 22 findings at 6,700 lines and
+        findings-per-round did not decay (8, then 6). The daemon-touching part
+        lands alone and last.
+      - **While a verdict is pending:** audit the S2-C plan against the code as it
+        now stands rather than idling — on S2-B, executing the plan found 6
+        defects that ~490 review findings over 16 rounds had missed.
+
       **A control I wrote failed and was wrong, which is worth recording too.** It
       asserted `hubDamaged` on the pragma-guard path; the marker belongs only to
       the `quick_check` verdict, which has no SQLite error behind it, and

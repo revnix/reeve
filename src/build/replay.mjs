@@ -51,6 +51,12 @@ export const NON_REPLAYED_KINDS = Object.freeze([
   // RESEARCH was skipped, not lost. The reason is durable in hub_event as
   // history; there is no row it projects into.
   "research.skipped",
+  // `repo_gate_state` has a LIVE WRITER: the builder tick re-derives it every
+  // pass, and `tables.mjs` declares it `replayed: false`. Restoring an older
+  // reading would put a staler gate state in front of clause U4 than the one the
+  // loop is about to write. The event is the record of what reeve saw and when;
+  // the row is a projection that rebuilds itself.
+  "repo_gate_state.refreshed",
   // The singleton lease is PROCESS-scoped: `singleton_lease` is cleared by
   // `restoreHub` along with every other row naming a pid, because no process
   // from before the restore still holds anything. Replaying a grant would

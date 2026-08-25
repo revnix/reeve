@@ -693,7 +693,7 @@ function openPrs(nwo, limit = 20) {   // bounded; the caller LOGS when the bound
  * Record what a tick decided, so the dashboard and `reeve why` can answer without
  * re-deriving anything, and so a restart knows how long a clause has been UNKNOWN.
  */
-function record(db, { pr, head, verdict, decision, effects = [] }) {
+function record(db, { pr, head, verdict, decision, effects = [], retire = new Map() }) {
   try {
     // ONE transaction, and that is the outbox's whole reason for existing. The
     // decision and the side effect it implies have to become durable together or
@@ -712,6 +712,16 @@ function record(db, { pr, head, verdict, decision, effects = [] }) {
       // `enqueue` returns null for a key it already holds, which is success: the
       // effect is durable, it was simply made durable by an earlier tick.
       let queued = 0, known = 0, dropped = 0;
+      // Reconcile BEFORE enqueuing, and against the whole desired set rather than
+      // one key at a time.
+      //
+      // Doing it per-effect meant cleanup only happened while creating a
+      // replacement -- so when the desired set became EMPTY it never ran at all,
+      // and a request for a reviewer since removed from the profile would still be
+      // posted, while a dead letter for one would escalate forever. `retire`
+      // carries the desired set even when it is empty, which is the case that
+      // needed it.
+      for (const [prefix, keep] of retire) dropped += supersedeEffects(db, { prefix, keep });
       for (const eff of effects) {
         // Withdraw what this one supersedes, in the SAME transaction. A transient
         // failure leaves a row pending on a backoff; if the pull request gets a new
@@ -722,7 +732,6 @@ function record(db, { pr, head, verdict, decision, effects = [] }) {
         //
         // The prefix stops before the head, so it matches this reviewer's requests
         // on this pull request at ANY head, and `keep` spares the one just made.
-        if (eff.supersedes) dropped += supersedeEffects(db, { prefix: eff.supersedes, keep: eff.idemKey });
         (enqueue(db, eff) !== null ? queued++ : known++);
       }
       return { ok: true, queued, known, dropped };
@@ -744,8 +753,16 @@ function record(db, { pr, head, verdict, decision, effects = [] }) {
  * The key is per HEAD on purpose: a new head is a new round and must ask again,
  * while a repeated tick at one head must not.
  */
+/** The identity of one reviewer's request at one head, in ONE place.
+ *
+ * Written twice it would drift, and the drift would appear as a request being
+ * retired the moment after it was created -- the reconciliation would compute a
+ * key the enqueue did not use, find the new row unaccounted for, and delete it. */
+const keyFor = (nwo, e, r) =>
+  `review-request:${nwo}:${e.pr}:${r.login}:${e.head}:${sha256(r.trigger).slice(0, 12)}`;
+
 function effectsFor({ nwo, e, decision, profile }) {
-  if (decision.action !== "REQUEST_REVIEW" || !reviewActionsOn(profile)) return { effects: [], unsummonable: [] };
+  if (!reviewActionsOn(profile)) return { effects: [], unsummonable: [], retire: new Map() };
   const reviewers = profile.reviewers ?? [];
   // A BLOCKING reviewer with no trigger is the dangerous shape, and it is quiet by
   // construction: the profile validator only warns, the filter drops them, and if
@@ -778,9 +795,9 @@ function effectsFor({ nwo, e, decision, profile }) {
     //
     // The supersedes prefix stops before the head, so a corrected trigger at the
     // SAME head withdraws the obsolete request as well as replacing it.
-    idemKey: `review-request:${nwo}:${e.pr}:${r.login}:${e.head}:${sha256(r.trigger).slice(0, 12)}`,
+    idemKey: keyFor(nwo, e, r),
     // What this replaces: THIS reviewer, this pull request, any earlier head.
-    supersedes: `review-request:${nwo}:${e.pr}:${r.login}:`,
+
     kind: "gh.pr.comment",
     // `head` travels with the effect so the handler can refuse a request that has
     // been overtaken. Withdrawing superseded PENDING rows covers the ordinary
@@ -790,7 +807,30 @@ function effectsFor({ nwo, e, decision, profile }) {
     // thing that can close it is the delivery itself declining to post.
     args: { nwo, pr: e.pr, body: r.trigger, head: e.head },
   }));
-  return { effects, unsummonable };
+  // What SHOULD be queued for this pull request, computed from the profile and the
+  // current head — deliberately independent of what this tick decided.
+  //
+  // The decision answers "ask now?". This answers "what is still wanted?", and
+  // they are different questions. A request stays wanted while its reviewer is
+  // configured with that trigger and the head has not moved; it stops being wanted
+  // when the reviewer is removed, the trigger is corrected, or the head changes —
+  // none of which is a decision.
+  //
+  // Keyed by the reviewer's prefix so one reviewer's requests can be reconciled
+  // without touching another's.
+  const retire = new Map();
+  for (const r of reviewers.filter(x => x.trigger)) {
+    const prefix = `review-request:${nwo}:${e.pr}:${r.login}:`;
+    retire.set(prefix, new Set([keyFor(nwo, e, r)]));
+  }
+  // A reviewer no longer in the profile leaves rows nothing above will name, so the
+  // pull-request-wide prefix is reconciled too, sparing every key still wanted.
+  retire.set(`review-request:${nwo}:${e.pr}:`, new Set(effects.map(x => x.idemKey)));
+
+  // Only the REQUEST_REVIEW decision enqueues. Everything else still reconciles:
+  // a stale request must not be posted just because this tick decided to WAIT.
+  const asking = decision.action === "REQUEST_REVIEW";
+  return { effects: asking ? effects : [], unsummonable: asking ? unsummonable : [], retire };
 }
 
 /** How long has this PR been sitting in UNKNOWN? Read from the event log, not memory. */
@@ -900,7 +940,30 @@ if (ctx.drain !== false) {
             escalations.set(`${d.n} ${d.kind} effect(s) reeve could not perform and will not retry — they need a person`, 1);
         }
         }
-      } catch (err) { log(logPath, `  outbox: drain failed — ${err.message}`); }
+      } catch (err) {
+        log(logPath, `  outbox: drain failed — ${err.message}`);
+        // Escalated, not merely logged, and for the same reason the `!auth.ok`
+        // branch is: nothing on this path leases a row, so nothing spends an
+        // attempt, reaches a retry budget or becomes a dead letter. The queue just
+        // stops.
+        //
+        // This catch is reachable in a way the `ok:false` branch is not:
+        // `authenticate` can THROW rather than return -- `apiAsApp` uses an
+        // uncaught `fetch`, so a DNS, TLS or connection failure arrives here. And
+        // silence would be worse than a missing alert: on an otherwise complete
+        // tick, a standing authentication escalation that this tick did not
+        // re-raise is CLEARED, so a persistent outage would announce itself once
+        // and then quietly retire its own alarm.
+        //
+        // Counted from the store rather than carried from above, because the
+        // throw may have happened before `due` was read.
+        try {
+          const stuck = db.prepare(`SELECT count(*) n FROM outbox
+                                    WHERE (status='pending' AND not_before<=unixepoch())
+                                       OR (status='inflight' AND lease_expires_at<unixepoch())`).get().n;
+          if (stuck) escalations.set(`${stuck} queued effect(s) cannot be performed: the drain is failing — ${err.message}`, 1);
+        } catch { /* a store that cannot be read must not take the tick down */ }
+      }
     }
   };
 
@@ -1120,12 +1183,12 @@ if (ctx.drain !== false) {
     // worker containment. A review request withheld because a sandbox could not be
     // proved closed is a pull request left without the round it needed, for a
     // reason that has nothing to do with it.
-    const { effects, unsummonable } = effectsFor({ nwo, e, decision, profile });
+    const { effects, unsummonable, retire } = effectsFor({ nwo, e, decision, profile });
     for (const login of unsummonable) {
       log(logPath, `  #${pr}: ${login} BLOCKS this pull request and declares no trigger comment — reeve cannot summon them`);
       escalations.set(`${login} blocks merges but declares no trigger comment, so reeve cannot request their review`, 1);
     }
-    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects });
+    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire });
     if (effects.length && !decided.ok)
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
     else if (decided.queued)

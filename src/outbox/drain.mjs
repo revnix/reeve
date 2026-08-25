@@ -120,7 +120,23 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
     // attempt counted for work never begun, and would sit inflight until its lease
     // expired -- so the budget has to be spent deciding not to start, never
     // deciding to stop partway.
-    if (now() - startedAt >= budgetMs) { outOfTime = true; break; }
+    // The budget bounds the PASS, so it has to bound the delivery inside it too.
+    // Checking only before leasing left the first slow delivery free to spend its
+    // whole lease -- around 250s against an advertised 60s budget -- and the pass
+    // was over by the time the check came round again. A bound that the work
+    // inside it does not see is not a bound.
+    const leftInPass = budgetMs - (now() - startedAt);
+    // Not merely "any time left". A row leased with a sliver remaining is a row
+    // whose attempt is spent on a call that cannot finish, and it then sits
+    // inflight until its lease expires.
+    //
+    // The floor is the settle reserve of the BUDGET, not of the lease. I wrote it
+    // against the lease first: at the defaults that is 50s of a 60s budget, so the
+    // pass would have refused to start a second delivery ever. Same constant, and
+    // it has to be applied to the quantity being spent -- reserving a fraction of
+    // a number the budget has no relation to reserves the wrong thing.
+    const floorMs = Math.max(1, budgetMs * SETTLE_RESERVE);
+    if (leftInPass < floorMs) { outOfTime = true; break; }
     const job = leaseOutbox(db, { worker, leaseSeconds, kinds });
     if (!job) break;
 
@@ -135,7 +151,12 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
       // call even by accident, and cannot make TWO calls that each fit the lease
       // while the pair does not. There is one `api`, it is already bounded, and the
       // bound shrinks as the delivery spends it.
-      const deadlineAt = Date.now() + Math.max(1, leaseSeconds * (1 - SETTLE_RESERVE)) * 1000;
+      // The SMALLER of what the lease allows and what the pass has left. The lease
+      // protects the row from a second drainer; the pass protects the tick from
+      // this one. A delivery has to respect both, and neither implies the other.
+      const byLease = Date.now() + Math.max(1, leaseSeconds * (1 - SETTLE_RESERVE)) * 1000;
+      const byPass = startedAt === undefined ? byLease : Date.now() + leftInPass;
+      const deadlineAt = Math.min(byLease, byPass);
       const bounded = (a, opts = {}) => {
         const left = remainingMs(deadlineAt);
         if (left <= 0) return { ok: false, out: "", err: "the delivery deadline passed before this call started", timedOut: true };

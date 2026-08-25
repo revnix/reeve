@@ -106,6 +106,50 @@ const check = (ok, name, detail) => {
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- a request nobody wants any more is retired, even with no replacement ------
+{
+  // Cleanup used to happen while enqueuing a replacement, so it could only spare
+  // the row being created -- and when the desired set became EMPTY, nothing was
+  // enqueued, the loop never ran, and the obsolete row was left to fire. A
+  // reviewer removed from the profile would still be summoned; a dead letter for
+  // one would go on escalating forever.
+  //
+  // Reconciling against the whole desired SET makes the operation "what is queued
+  // versus what is wanted", which is the shape that works when the answer is
+  // nothing at all.
+  const dir = mkdtempSync(join(tmpdir(), "reeve-retire-"));
+  const db = open(join(dir, "state.db"));
+  const key = login => `review-request:o/r:11:${login}:head1:abcdef123456`;
+  const put = login => tx(db, () => enqueue(db, {
+    idemKey: key(login), kind: "gh.pr.comment", args: { nwo: "o/r", pr: 11, body: `@${login} review` },
+  }));
+  const statusOf = k => db.prepare(`SELECT status FROM outbox WHERE idem_key=?`).get(k)?.status ?? null;
+
+  put("codex");
+  put("coderabbit");
+  db.prepare(`UPDATE outbox SET status='dead_letter' WHERE idem_key=?`).run(key("coderabbit"));
+  check(statusOf(key("codex")) === "pending" && statusOf(key("coderabbit")) === "dead_letter",
+    "control: one pending and one dead-lettered request stand", "");
+
+  // The desired set is now EMPTY -- both reviewers removed from the profile. The
+  // old per-effect loop would not have run at all.
+  const dropped = tx(db, () => supersedeEffects(db, { prefix: "review-request:o/r:11:", keep: new Set() }));
+  check(dropped === 2, "an empty desired set retires everything queued for that pull request", String(dropped));
+  check(statusOf(key("codex")) === null && statusOf(key("coderabbit")) === null,
+    "including the dead letter, which would otherwise escalate forever", "");
+
+  // And a NON-empty set spares exactly what is wanted, so the widening did not
+  // simply become "delete everything".
+  put("codex");
+  put("coderabbit");
+  const n = tx(db, () => supersedeEffects(db, { prefix: "review-request:o/r:11:", keep: new Set([key("codex")]) }));
+  check(n === 1 && statusOf(key("codex")) === "pending" && statusOf(key("coderabbit")) === null,
+    "control: a non-empty set spares exactly the keys still wanted", `dropped ${n}`);
+
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- correcting a trigger at the same head is a new request -------------------
 {
   // An operator fixes a trigger the bot accepted syntactically and then ignored.

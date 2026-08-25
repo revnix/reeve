@@ -244,6 +244,43 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       **The durable finding is about plan SIZE**: a plan needing four rounds and
       still finding sixteen defects at the fourth is one document doing three
       documents' work.
+- [ ] **S2-B, the phase machine and its effects — BUILT, PR #30 open
+      (2026-08-25).** Branch `feat/s2b-phase-machine`, based on `b4bec5d`
+      (S2-A's merge plus its four correction PRs). All seven tasks of
+      `docs/superpowers/plans/2026-08-23-s2b-phase-machine.md`:
+      `src/build/{phases,transition,outbox,registry,gatestate,loop}.mjs`, the
+      `buildTick` call in `bin/reeve`'s `build run`, and the crash, recovery and
+      corruption drills. **Measured 2026-08-25: suite 77 files, 0 failures**,
+      `escape.test.mjs` excluded as always. No builder worker is dispatched and
+      no GitHub call is made from any code path.
+
+      The §14 S2 Verify clause is checked item by item: the transition matrix
+      (588 cells, all total), the GATE → ESCALATED edge, the CANCELLING
+      exclusion, the CAS lost-race no-op, the generation fence in both the
+      transition and the outbox lease, and the crash, recovery, corruption and
+      duplicate-delivery drills. The three guardian-side items — provider lease,
+      hub connection allowlist, and the verdict reading `pr_hold` — belong to
+      PR-C and are deliberately absent.
+
+      **`openHub` now runs `PRAGMA quick_check(1)`** on every open and refuses on
+      any answer but `ok`, naming the newest usable snapshot. `quick_check`
+      rather than `integrity_check` because this is on every command and every
+      tick (~1.1 ms/MB measured; 52 ms on a 47 MB hub). Two interactions the
+      plan did not anticipate: the refusal carries no errcode, so `isOperational`
+      needed an explicit marker or every recovery path would read a corrupt hub
+      as merely busy; and `restoreHub` is EXEMPT, because it opens a damaged hub
+      on purpose to take the lock inside it — without the exemption five of that
+      command's own recovery assertions went red.
+
+      **Six plan defects found by executing rather than reviewing**, each fixed
+      in the commit that carries it: `phases.mjs`'s source reads an
+      undestructured `sliceCursor`; the plan claims the matrix asserts CLAIMING
+      is off the spine and it does not; Task 15 imports a module Task 16 creates;
+      two of Task 15's fixtures share a database and collide on the task key;
+      Task 15's compensation table and its test disagree on `regrant-territory`'s
+      shape; and every event kind Task 15 says it adds to `replay.mjs` was
+      already there.
+
 - [ ] **S2-A, the hub store — BUILT, PR open (2026-08-24).** Branch
       `feat/s2-hub-store`, based on `bc17a06`. All 13 tasks of
       `docs/superpowers/plans/2026-08-23-s2a-hub-store.md` implemented:

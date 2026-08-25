@@ -1444,6 +1444,9 @@ switch (cmd) {
     };
     for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => stop(sig));
 
+    // What the last tick could not refresh, so a CHANGE is reported and a steady
+    // state is not repeated every heartbeat.
+    let lastSkipped = null;
     while (running) {
       // A heartbeat that fails means the row is no longer ours -- a takeover, or
       // a restore that replaced the file. Authority is gone, so the loop stops
@@ -1470,7 +1473,21 @@ switch (cmd) {
       // the next pass may well succeed, so the failure is reported and the loop
       // continues. `refreshGateState` already turns a fetcher's throw into a row.
       try {
-        await buildTick({ hub: db, projects: registryProjects(HOME).projects ?? [] });
+        const tick = await buildTick({ hub: db, projects: registryProjects(HOME).projects ?? [] });
+        // AND THE TICK'S OWN REPORT IS READ. `buildTick` returns what it could
+        // not refresh precisely because a pass that refreshed nothing is
+        // indistinguishable from one that refreshed everything -- and this
+        // caller threw the answer away, so a tick that skipped every project on
+        // every heartbeat looked exactly like a healthy one from outside.
+        const note = tick.skipped.length ? tick.skipped.join(", ") : "";
+        if (note !== lastSkipped) {
+          if (note) console.error(
+            `build run: no gate state for ${note} -- no repository id yet; ` +
+            `it is resolved from the hub once a task has been filed for the project`);
+          else if (lastSkipped !== null)
+            console.log("build run: every registry project now has a repository id");
+          lastSkipped = note;
+        }
       } catch (e) {
         console.error(`build run: tick failed (${e.message}); the lease is still held, continuing`);
       }

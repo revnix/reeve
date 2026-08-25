@@ -23,6 +23,11 @@ import { assertWritable } from "./locks.mjs";
 import { nextPhase, HELD, HOLD_ESCALATION, holdReasonFor } from "./phases.mjs";
 import { isSameProcess } from "../supervisor.mjs";       // build/ is one level down
 import { enqueueEffect, voidPendingIn } from "./outbox.mjs";
+// ONE claim model, shared with admission. A resume that decided territory its
+// own way granted paths a live lease already covered by ancestry; see
+// territory.mjs.
+import { LEASE_COLS, liveLeases, firstConflict, grantLease }
+  from "./territory.mjs";
 
 // "Open" means the PR exists and is NOT YET MERGED, and both halves are
 // corrections that pull in opposite directions.
@@ -77,12 +82,10 @@ export class CompensationRefused extends Error {
 
 const PR_HOLD_COLS = `id, task, repo_id, pr, head_sha, reason, detail, created_at, cleared_at`;
 const HOLD_REASON_COLS = `id, task, reason, detail, at, cleared_at`;
-const LEASE_COLS = `project, kind, path, task, expires_at, pinned_until`;
 const DRAIN_COLS = `task, outbox_id, recorded_at, settled_at, forced, last_known`;
 
 // A territory lease lasts as long as the task holds it; the loop renews. The
 // value is a bound, not a schedule, so it lives here rather than in a profile.
-const LEASE_SECONDS = 3600;
 
 /**
  * Apply ONE compensation, inside the caller's transaction.
@@ -117,9 +120,31 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
     // is where the PR's current head lives; taking it from the caller would let
     // a value read before BEGIN IMMEDIATE be written as the hold's witness.
     case "write-pr-hold": {
-      const reason = evidence?.reason ? holdReasonFor(evidence.reason) : "escalated";
-      const detail = evidence?.reason === "blocked_other"
-        ? (evidence.escalation ?? evidence.detail ?? null) : (evidence?.detail ?? null);
+      // THE HOLD REASON COMES FROM THE TRANSITION, not from the shape of a field
+      // that means different things in different transitions.
+      //
+      // `pr_hold.reason` is a closed CHECK. Only the `hold` transition carries a
+      // member of that enum in `evidence.reason`; `founder.infeasible` REQUIRES
+      // `evidence.reason` and requires it to be a free-form explanation of why
+      // work stopped, which is the whole point of a terminal state that has to
+      // be explainable afterwards. Reading it as an enum meant a perfectly
+      // ordinary `dependency cannot be licensed` threw inside `holdReasonFor`
+      // and rolled back the entire terminal transition -- the task stayed where
+      // it was, and the more carefully the founder explained themselves the more
+      // certainly it failed.
+      //
+      // So the enum is derived from the kind, and the explanation is kept in
+      // `detail`, which is the column that exists to hold free text.
+      const fromHold = evidence?.kind === "hold";
+      const reason = fromHold ? holdReasonFor(evidence.reason)
+                   : evidence?.kind === "founder.cancel" ? "cancel"
+                   : "escalated";
+      const detail = fromHold
+        ? (evidence.reason === "blocked_other"
+            ? (evidence.escalation ?? evidence.detail ?? null) : (evidence.detail ?? null))
+        // The founder's words, preserved. `founder.infeasible` mandates them and
+        // there is no later phase in which to record them.
+        : (evidence?.detail ?? evidence?.reason ?? null);
       for (const pr of db.prepare(
         `SELECT repo_id, pr, head_sha FROM impl_pr WHERE task = ? AND merged_sha IS NULL`).all(taskId)) {
         const open = db.prepare(
@@ -177,26 +202,24 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
     // beside another task editing the same paths.
     case "regrant-territory": {
       const at = db.prepare("SELECT unixepoch() n").get().n;
+      // THE SAME SCAN ADMISSION RUNS, not an exact-path lookup. A held task
+      // resuming beside a live lease on an ancestor, a descendant, or the same
+      // path filed under the other claim kind found no row on the exact key,
+      // inserted under a different primary key, and both tasks resumed holding
+      // paths `overlaps()` calls mutually exclusive.
+      const held = liveLeases(db, task.project, at);
       for (const claim of db.prepare(
         `SELECT kind, path, pinned FROM task_territory WHERE task = ?`).all(taskId)) {
-        const holder = db.prepare(
-          `SELECT task, expires_at FROM territory_lease
-            WHERE project = ? AND kind = ? AND path = ? AND task <> ? AND expires_at > ?`)
-          .get(task.project, claim.kind, claim.path, taskId, at);
+        const holder = firstConflict(claim, held, taskId);
         if (holder)
           throw new CompensationRefused(
-            `territory ${claim.kind} ${claim.path} is held by ${holder.task} until ${holder.expires_at}; ` +
+            `territory ${claim.kind} ${claim.path || "(repository root)"} overlaps ` +
+            `${holder.kind} ${holder.path || "(repository root)"}, held by ${holder.task} ` +
+            `until ${holder.expires_at}; ` +
             `the resume is refused rather than granting two tasks the same paths`);
-        db.prepare(
-          `INSERT INTO territory_lease(project, kind, path, task, expires_at, pinned_until)
-           VALUES(?,?,?,?,?,?)
-           ON CONFLICT(project, kind, path) DO UPDATE SET task=excluded.task, expires_at=excluded.expires_at`)
-          .run(task.project, claim.kind, claim.path, taskId, at + LEASE_SECONDS,
-               claim.pinned ? at + LEASE_SECONDS : null);
-        hubEvent(db, { kind: "territory_lease.granted", task: taskId,
-          payload: db.prepare(`SELECT ${LEASE_COLS} FROM territory_lease
-                               WHERE project=? AND kind=? AND path=?`)
-            .get(task.project, claim.kind, claim.path) });
+        const granted = grantLease(db, { project: task.project, claim, taskId, at,
+                                         pinned: !!claim.pinned });
+        hubEvent(db, { kind: "territory_lease.granted", task: taskId, payload: granted });
       }
       return;
     }

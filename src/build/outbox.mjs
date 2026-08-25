@@ -257,15 +257,48 @@ export function settleEffect(db, { id, worker, leaseToken, ok, result = null,
  * requests -- so the reconciler is asked first, and only an effect it cannot
  * observe goes back into the queue.
  */
-export function recoverEffects(db, { reconcile, now = null, isAlive = isSameProcess } = {}) {
+export async function recoverEffects(db, { reconcile, now = null, isAlive = isSameProcess } = {}) {
+  // REFUSED BEFORE ANY OBSERVATION, not only before the write. A restore holding
+  // the maintenance lock must stop this call at the door: reaching the reconciler
+  // first would send it to GitHub, git remotes and receipts on behalf of a hub
+  // that is about to be replaced, and those are real external reads made under a
+  // state that no longer exists by the time the verdict lands.
+  hubTx(db, () => assertWritable(db, { isAlive, inTx: true }));
+
+  // ── 1. READ. No transaction, so no lock is held while the world is consulted.
+  const at = now ?? db.prepare("SELECT unixepoch() n").get().n;
+  const expired = db.prepare(
+    `SELECT ${ROW} FROM outbox WHERE status='inflight' AND lease_expires_at <= ? ORDER BY id`).all(at);
+  if (!expired.length) return { settled: 0, returned: 0, dead: 0, stale: 0 };
+
+  // ── 2. ASK, OUTSIDE the write transaction, and AWAIT the answer.
+  //
+  // Two defects lived here, and the second hid inside the first. A reconciler
+  // that checks GitHub, a git remote, a notification receipt or ledger truth was
+  // being called inside `BEGIN IMMEDIATE`, so the hub's SOLE writer was held for
+  // the length of a network call -- every transition, lease and settle in the
+  // process queued behind an HTTP timeout. And an ASYNC reconciler was worse
+  // than slow: its Promise is an object, `verdict?.settled` on it is `undefined`,
+  // so every effect was read as unobservable and returned to the queue. The
+  // system's one defence against re-delivering an action that already happened
+  // answered "could not tell" for every asynchronous reconciler ever passed to
+  // it, and did so silently.
+  const verdicts = [];
+  for (const row of expired)
+    verdicts.push([row, reconcile ? await reconcile(row) : { settled: false }]);
+
+  // ── 3. APPLY, under a short write transaction, each row CAS'd on the state it
+  // was read in. The lease may have been handed on, settled or voided while the
+  // reconciler was out; a verdict about a row that has moved is stale, and
+  // applying it would overwrite whoever holds it now.
   return hubTx(db, () => {
     assertWritable(db, { isAlive, inTx: true });
-    const at = now ?? db.prepare("SELECT unixepoch() n").get().n;
-    const expired = db.prepare(
-      `SELECT ${ROW} FROM outbox WHERE status='inflight' AND lease_expires_at <= ? ORDER BY id`).all(at);
-    let settled = 0, returned = 0;
-    for (const row of expired) {
-      const verdict = reconcile ? reconcile(row) : { settled: false };
+    let settled = 0, returned = 0, dead = 0, stale = 0;
+    for (const [row, verdict] of verdicts) {
+      const cur = db.prepare("SELECT status, worker, lease_token FROM outbox WHERE id = ?").get(row.id);
+      if (!cur || cur.status !== "inflight" || cur.worker !== row.worker
+          || cur.lease_token !== row.lease_token) { stale++; continue; }
+
       if (verdict?.settled) {
         db.prepare(
           `UPDATE outbox SET status=?, worker=NULL, result=?, last_error=?, updated_at=unixepoch()
@@ -276,16 +309,27 @@ export function recoverEffects(db, { reconcile, now = null, isAlive = isSameProc
         emitRow(db, "outbox.settled", row.id);
         settleDrainFor(db, row.id);
         settled++;
-      } else {
-        // Back to the queue, and its attempt already counted at lease time.
-        db.prepare(
-          `UPDATE outbox SET status='pending', worker=NULL, lease_expires_at=0, updated_at=unixepoch()
-            WHERE id=?`).run(row.id);
-        emitRow(db, "outbox.settled", row.id);
-        returned++;
+        continue;
       }
+
+      // THE RETRY BOUND APPLIES HERE TOO. `settleEffect` dead-letters an effect
+      // whose attempts are spent; this path returned it to `pending` regardless,
+      // and `leaseEffect` does not filter exhausted rows -- so an effect nobody
+      // could observe was leased, expired and requeued for ever, performing an
+      // externally ambiguous action every round. The bound is on the ROW, so
+      // every path that writes `pending` has to honour it.
+      const spent = row.attempts >= row.max_attempts;
+      db.prepare(
+        `UPDATE outbox SET status=?, worker=NULL, lease_expires_at=0,
+                           last_error=COALESCE(?, last_error), updated_at=unixepoch()
+          WHERE id=?`)
+        .run(spent ? "dead_letter" : "pending",
+             spent ? `unobserved after ${row.attempts} of ${row.max_attempts} attempts` : null,
+             row.id);
+      emitRow(db, "outbox.settled", row.id);
+      if (spent) { settleDrainFor(db, row.id); dead++; } else returned++;
     }
-    return { settled, returned };
+    return { settled, returned, dead, stale };
   });
 }
 

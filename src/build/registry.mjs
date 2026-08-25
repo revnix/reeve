@@ -20,6 +20,12 @@
 // a claim about discipline.
 import { hubTx, hubEvent } from "./hubdb.mjs";
 import { assertWritable } from "./locks.mjs";
+// ONE claim model, shared with `applyTransition`'s resume path. See
+// territory.mjs for why admission and regrant may not each keep their own.
+import { overlaps, liveLeases, firstConflict,
+         conflictRefusal, grantLease } from "./territory.mjs";
+// Re-exported because callers and tests import the predicate from here.
+export { overlaps };
 // `isSameProcess` is deliberately NOT imported. It lives in `supervisor.mjs`,
 // which pulls in node:child_process and node:fs -- so importing it would give
 // this module's graph exactly the capability `admitTask` is required not to
@@ -27,7 +33,6 @@ import { assertWritable } from "./locks.mjs";
 // is a process capability, so the caller that has one passes it in.
 
 // A territory lease lasts while the task holds it; the loop renews.
-const LEASE_SECONDS = 3600;
 
 // The constructs section 10.1 refuses. Globs and negations are refused rather
 // than expanded because a claim is compared by SEGMENT against other claims, and
@@ -94,12 +99,6 @@ export function normalizeClaim(raw, { kind = "prefix" } = {}) {
  * directory, and no filesystem offers both. Granting both hands out territory
  * that is structurally impossible to occupy.
  */
-export function overlaps(a, b) {
-  const p = a?.path ?? "", q = b?.path ?? "";
-  // The repository root contains everything, including itself.
-  if (p === "" || q === "") return true;
-  return p === q || p.startsWith(q + "/") || q.startsWith(p + "/");
-}
 
 /**
  * The filesystem-aware half, run before the transaction opens.
@@ -178,7 +177,6 @@ export async function resolveSnapshot(registry, project, claims, io) {
   };
 }
 
-const LEASE_COLS = `project, kind, path, task, expires_at, pinned_until`;
 
 /**
  * One BEGIN IMMEDIATE. No I/O. Every value it writes was resolved before it.
@@ -216,16 +214,11 @@ export function admitTask(db, snapshot, filing, { isAlive = () => true } = {}) {
     // serialise against each other -- a deadlock between projects that share
     // nothing, reported as a territory conflict.
     const at = db.prepare("SELECT unixepoch() n").get().n;
-    const held = db.prepare(
-      `SELECT ${LEASE_COLS} FROM territory_lease WHERE project = ? AND expires_at > ?`)
-      .all(filing.project, at);
-    for (const claim of claims)
-      for (const lease of held)
-        if (lease.task !== filing.id && overlaps(claim, lease))
-          return { ok: false,
-            refusal: `territory ${claim.kind} ${claim.path || "(repository root)"} overlaps ` +
-                     `${lease.kind} ${lease.path || "(repository root)"}, held by ${lease.task}; ` +
-                     `the filing is refused rather than granting two tasks the same paths` };
+    const held = liveLeases(db, filing.project, at);
+    for (const claim of claims) {
+      const lease = firstConflict(claim, held, filing.id);
+      if (lease) return { ok: false, refusal: conflictRefusal(claim, lease) };
+    }
 
     db.prepare(
       `INSERT INTO task(id, project, repo_id, nwo_snapshot, title, body, phase, generation,
@@ -268,18 +261,17 @@ export function admitTask(db, snapshot, filing, { isAlive = () => true } = {}) {
           `SELECT task, kind, path, pinned FROM task_territory WHERE task=? AND kind=? AND path=?`)
           .get(filing.id, claim.kind, claim.path) });
 
-      db.prepare(
-        `INSERT INTO territory_lease(project, kind, path, task, expires_at, pinned_until)
-         VALUES(?,?,?,?,?,?)`)
-        .run(filing.project, claim.kind, claim.path, filing.id, at + LEASE_SECONDS,
-             filing.pinTerritory ? at + LEASE_SECONDS : null);
+      // AN EXPIRED ROW FOR THE SAME PATH IS NOT A CONFLICT, and a plain INSERT
+      // treated it as one -- the scan above deliberately excludes dead leases,
+      // so admission proceeded and the primary key aborted the whole filing.
+      // Reachable after any daemon outage or missed renewal, and it surfaced as
+      // an uncaught database error rather than a reasoned refusal.
+      const granted = grantLease(db, { project: filing.project, claim, taskId: filing.id,
+                                       at, pinned: !!filing.pinTerritory });
       // And the GRANT's event: `territory_lease` is in COMPARISON_SET, so an
       // ungranted event means a post-snapshot admission loses its lease at
       // replay and the task runs with territory nothing records it holding.
-      hubEvent(db, { kind: "territory_lease.granted", task: filing.id,
-        payload: db.prepare(`SELECT ${LEASE_COLS} FROM territory_lease
-                             WHERE project=? AND kind=? AND path=?`)
-          .get(filing.project, claim.kind, claim.path) });
+      hubEvent(db, { kind: "territory_lease.granted", task: filing.id, payload: granted });
     }
 
     return { ok: true, taskId: filing.id };

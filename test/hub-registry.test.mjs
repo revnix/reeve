@@ -463,6 +463,74 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
     "and nothing is inserted, so a refused filing leaves no half-task behind");
   db.close();
 }
+// ── an EXPIRED lease on the same path is not a conflict ─────────────────────
+// The conflict scan deliberately excludes dead leases, so admission proceeded --
+// and then a plain INSERT hit `territory_lease`'s primary key and threw, taking
+// the whole filing with it. Reachable after any daemon outage or missed renewal,
+// and it surfaced as an uncaught database error rather than as a decision.
+{
+  const db = openHub(join(dir, "r5.db"));
+  const first = admitTask(db, snap, { id: "bt:old", project: "p", title: "t",
+                                      claims: [normalizeClaim("packages/x")] });
+  check(first.ok === true, "a task is admitted and holds its territory", JSON.stringify(first));
+  // Expire it in place: the row survives, which is the situation.
+  db.prepare("UPDATE territory_lease SET expires_at = 1 WHERE task = 'bt:old'").run();
+  check(db.prepare("SELECT count(*) c FROM territory_lease WHERE path='packages/x'").get().c === 1,
+    "the dead row is still in the table, which is what makes this reachable");
+
+  let threw = null, next = null;
+  try {
+    next = admitTask(db, snap, { id: "bt:new", project: "p", title: "t",
+                                 claims: [normalizeClaim("packages/x")] });
+  } catch (e) { threw = e; }
+  check(threw === null, "admitting over an expired lease does not throw", String(threw?.message));
+  check(next?.ok === true, "and the filing is admitted", JSON.stringify(next));
+  const row = db.prepare("SELECT task, expires_at FROM territory_lease WHERE path='packages/x'").get();
+  check(row?.task === "bt:new", "the lease now belongs to the new task", JSON.stringify(row));
+  check(row?.expires_at > 1, "with a live expiry rather than the dead one", JSON.stringify(row));
+
+  // CONTROL: a LIVE lease on the same path is still refused, or "replaces an
+  // expired row" has quietly become "replaces any row".
+  const stolen = admitTask(db, snap, { id: "bt:thief", project: "p", title: "t",
+                                       claims: [normalizeClaim("packages/x")] });
+  check(stolen.ok === false, "control: a LIVE lease on the same path is still refused",
+    JSON.stringify(stolen));
+  check(db.prepare("SELECT task FROM territory_lease WHERE path='packages/x'").get().task === "bt:new",
+    "control: and the live holder still holds it");
+  db.close();
+}
+
+// ── the pin travels with the replacement ────────────────────────────────────
+// `territory_lease.pinned_until` is the ONLY home of the pin. A replacement that
+// refreshed `task` and `expires_at` but not the pin left the previous holder's
+// value in place -- so an unpinned row stayed unpinned under a pinned claim, and
+// anything reading that column acted on a value no live claim asked for.
+{
+  const db = openHub(join(dir, "r6.db"));
+  admitTask(db, snap, { id: "bt:unpinned", project: "p", title: "t",
+                        claims: [normalizeClaim("packages/x")] });
+  check(db.prepare("SELECT pinned_until FROM territory_lease WHERE path='packages/x'").get().pinned_until === null,
+    "an unpinned filing leaves the pin empty");
+  db.prepare("UPDATE territory_lease SET expires_at = 1 WHERE task = 'bt:unpinned'").run();
+  const pinned = admitTask(db, snap, { id: "bt:pinned", project: "p", title: "t",
+                                       pinTerritory: true, claims: [normalizeClaim("packages/x")] });
+  check(pinned.ok === true, "a pinned filing replaces the expired row", JSON.stringify(pinned));
+  const row = db.prepare("SELECT task, pinned_until FROM territory_lease WHERE path='packages/x'").get();
+  check(row.task === "bt:pinned", "the replacement transferred the task", JSON.stringify(row));
+  check(row.pinned_until !== null && row.pinned_until > 1,
+    "AND the pin, which the replacement previously dropped", JSON.stringify(row));
+
+  // CONTROL, the other direction: a replacement by an UNPINNED claim must clear
+  // an inherited pin rather than leaving the old one standing.
+  db.prepare("UPDATE territory_lease SET expires_at = 1 WHERE task = 'bt:pinned'").run();
+  admitTask(db, snap, { id: "bt:plain", project: "p", title: "t",
+                        claims: [normalizeClaim("packages/x")] });
+  const after = db.prepare("SELECT task, pinned_until FROM territory_lease WHERE path='packages/x'").get();
+  check(after.task === "bt:plain" && after.pinned_until === null,
+    "control: replacing a pinned row with an unpinned claim clears the pin", JSON.stringify(after));
+  db.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

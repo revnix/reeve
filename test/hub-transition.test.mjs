@@ -226,6 +226,108 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
   db.close();
 }
 
+// ── a terminal transition's EXPLANATION is not a hold-reason enum ───────────
+// `founder.infeasible` requires `evidence.reason` and requires it to be prose:
+// a terminal state with no durable explanation cannot be explained afterwards.
+// `write-pr-hold` read that same field as a member of `pr_hold.reason`'s closed
+// CHECK, so an ordinary sentence threw inside `holdReasonFor` and rolled the
+// whole terminal transition back. The more carefully the founder explained
+// themselves, the more certainly the transition failed.
+{
+  const db = openHub(join(dir, "t12.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1',1,0,1,77,'deadbee',unixepoch())`);
+  const words = "the upstream dependency cannot be licensed for redistribution";
+  // CAUGHT, not called bare. The defect this covers THROWS out of the whole
+  // transition, so an uncaught call ends the file and takes every later block
+  // with it -- a crash where the evidence should have been one named failure.
+  let threw = null, r = null;
+  try {
+    r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+      evidence: { kind: "founder.infeasible", reason: words }, op: "phase.infeasible" });
+  } catch (e) { threw = e; }
+  check(threw === null, "a free-form infeasible reason does not throw out of the transition",
+    String(threw?.message));
+  check(r?.applied === true && r?.to === "INFEASIBLE",
+    "and the terminal transition applies", JSON.stringify(r));
+  const hold = db.prepare("SELECT reason, detail, head_sha FROM pr_hold WHERE task='bt:1'").get();
+  check(hold?.reason === "escalated",
+    "the hold's reason is derived from the transition, so it satisfies the CHECK",
+    JSON.stringify(hold));
+  check(hold?.detail === words,
+    "and the founder's words are kept in detail rather than discarded", JSON.stringify(hold));
+  check(hold?.head_sha === "deadbee",
+    "with the head read from the projection inside the transaction", JSON.stringify(hold));
+  db.close();
+}
+
+// CONTROL: the `hold` transition still writes its own enum member, or the
+// derivation has replaced a real reason with a blanket "escalated".
+{
+  const db = openHub(join(dir, "t13.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1',1,0,1,78,'cafe123',unixepoch())`);
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "hold", reason: "ownership_lost" }, op: "phase.held" });
+  check(r.applied === true, "control: a hold transition applies", JSON.stringify(r));
+  check(db.prepare("SELECT reason FROM pr_hold WHERE task='bt:1'").get()?.reason === "ownership_lost",
+    "control: and its hold carries the reason the machine validated",
+    JSON.stringify(db.prepare("SELECT reason, detail FROM pr_hold WHERE task='bt:1'").get()));
+  db.close();
+}
+
+// ── the resume runs ADMISSION'S scan, not an exact-path lookup ──────────────
+// A held task resuming while another task holds a live lease on an ancestor, a
+// descendant, or the same path under the other claim kind found no row on the
+// exact `(project, kind, path)` key. The regrant then inserted under a DIFFERENT
+// primary key and succeeded, so both tasks resumed holding paths `overlaps()`
+// calls mutually exclusive -- the one outcome the whole territory model exists
+// to prevent, reached by the check being narrower than the predicate.
+{
+  const db = openHub(join(dir, "t2c.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  seed(db, { id: "bt:2", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',0)`);
+  // A DESCENDANT, filed under the OTHER kind: same bytes, different primary key.
+  db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at)
+           VALUES('p','file','packages/x/a.ts','bt:2',unixepoch()+3600)`);
+  const blocked = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(!blocked.applied, "a resume overlapping a live lease by ancestry is refused",
+    JSON.stringify(blocked));
+  check(/packages\/x\/a\.ts/.test(JSON.stringify(blocked)),
+    "and the refusal names the lease it actually overlaps", JSON.stringify(blocked));
+  check(db.prepare("SELECT count(*) c FROM territory_lease").get().c === 1,
+    "no second lease was granted over the same bytes",
+    JSON.stringify(db.prepare("SELECT * FROM territory_lease").all()));
+  check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "BLOCKED",
+    "and the whole transaction rolled back");
+  db.close();
+}
+
+// CONTROL: a live lease in the same project that does NOT overlap must still let
+// the resume through, or the scan has become "refuse whenever anything is held".
+{
+  const db = openHub(join(dir, "t2d.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  seed(db, { id: "bt:2", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',0)`);
+  db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at)
+           VALUES('p','prefix','packages/y','bt:2',unixepoch()+3600)`);
+  const ok = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(ok.applied === true, "control: a non-overlapping live lease does not block the resume",
+    JSON.stringify(ok));
+  check(db.prepare("SELECT task FROM territory_lease WHERE path='packages/x'").get()?.task === "bt:1",
+    "control: and the resuming task got its own lease",
+    JSON.stringify(db.prepare("SELECT * FROM territory_lease").all()));
+  db.close();
+}
+
 // ── a plain resume clears every hold it entered with ─────────────────────────
 // Its OWN fixture. The previous version ran this against the database that had
 // just proved `bt:2` holds a LIVE overlapping lease, and then expected the same

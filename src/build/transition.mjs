@@ -145,8 +145,36 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
         // The founder's words, preserved. `founder.infeasible` mandates them and
         // there is no later phase in which to record them.
         : (evidence?.detail ?? evidence?.reason ?? null);
-      for (const pr of db.prepare(
-        `SELECT repo_id, pr, head_sha FROM impl_pr WHERE task = ? AND merged_sha IS NULL`).all(taskId)) {
+      // EVERY OPEN BUILDER PR, which for a task that has not started implementing
+      // means its SPEC PR.
+      //
+      // `pr_hold` exists so the guardian's verdict finds a row and renders BLOCK,
+      // making the PR unmergeable while the task is stopped -- and hub.sql says
+      // that applies "on CANCELLING, ESCALATED and BLOCKED". This loop read
+      // `impl_pr` alone, so `gate.capReached` -- which by definition happens at
+      // GATE, with a spec PR open and no implementation PR yet -- wrote no hold at
+      // all. The task sat ESCALATED with its spec PR still mergeable, which is the
+      // exact outcome a fail-closed stop exists to prevent, and the compensation
+      // that was supposed to prevent it did nothing.
+      //
+      // Keyed on the transition rather than on which rows happen to exist:
+      // `depth.override` and `founder.regenerate` re-render the spec and push a
+      // NEW HEAD to that same PR, so holding it there would block the work they
+      // are dispatching.
+      const HOLDS_SPEC = ["founder.cancel", "founder.infeasible", "hold", "gate.capReached"];
+      const holdable = db.prepare(
+        `SELECT repo_id, pr, head_sha FROM impl_pr WHERE task = ? AND merged_sha IS NULL`).all(taskId);
+      if (HOLDS_SPEC.includes(evidence?.kind)) {
+        const spec = db.prepare(
+          `SELECT spec_repo_id, spec_pr, spec_head FROM task WHERE id = ?`).get(taskId);
+        // `spec_head` is the hold's witness, and `pr_hold.head_sha` is NOT NULL:
+        // a spec PR with no recorded head cannot support a hold, and admitting
+        // one would abort the transition on a constraint at the moment a task is
+        // being escalated.
+        if (spec?.spec_repo_id != null && spec?.spec_pr != null && spec?.spec_head)
+          holdable.push({ repo_id: spec.spec_repo_id, pr: spec.spec_pr, head_sha: spec.spec_head });
+      }
+      for (const pr of holdable) {
         const open = db.prepare(
           `SELECT id FROM pr_hold WHERE repo_id = ? AND pr = ? AND cleared_at IS NULL`)
           .get(pr.repo_id, pr.pr);

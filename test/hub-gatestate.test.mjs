@@ -326,6 +326,93 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
     (branch.match(/[^\n]*buildTick\s*\([^\n]*/) ?? ["(not found)"])[0]);
   check(/tick\.skipped/.test(branch),
     "and reads what the tick could not refresh");
+  // AND A BROKEN REGISTRY IS NOT AN EMPTY ONE. `registryProjects` returns
+  // `{ projects: [], error }` for a file that is unreadable, invalid JSON, or
+  // carries a malformed entry, and reading only `.projects` turned all three into
+  // a clean pass over nothing -- neither a failure nor a skipped project, while
+  // every existing gate-state row aged into staleness.
+  check(/registry\.error/.test(branch),
+    "the build route reads the registry's ERROR, not only its projects",
+    (branch.match(/[^\n]*registry\.error[^\n]*/) ?? ["(not found)"])[0]);
+  check(/registryProjects\(HOME\)[\s\S]{0,200}registry\.error/.test(branch),
+    "and reads it from the same call, so a broken file cannot arrive as an empty one",
+    "checked");
+
+  // ── a RENAMED repository is still resolved ────────────────────────────────
+  // The first version keyed on `nwo_snapshot` while its own comment said a
+  // repository can be renamed and that column is only ever a snapshot. So the
+  // moment a repository was renamed or transferred, projects.json supplied the
+  // new name, every existing task still carried the old one, and the lookup
+  // returned null for a repository whose numeric id the hub was holding all
+  // along -- skipped on every heartbeat until some new task happened to be
+  // admitted under the new name. `task.project` IS the registry key, written at
+  // admission from the same entry this lookup resolves, and it does not move.
+  {
+    const db4 = openHub(join(dir, "g-renamed.db"));
+    const base = { repoPath: "/p", profilePath: "/f", profileHash: "h", defaultBranch: "main",
+                   visibility: "private", specRepoId: 9, gateDefinitionHash: "g",
+                   registryVersion: 3, founderUserId: 4242 };
+    admitTask(db4, { ...base, repoId: 77, nwo: "o/old-name" },
+      { id: "bt:renamed", project: "nextly", title: "t", claims: [normalizeClaim("packages/a")] });
+    // The registry now carries the NEW name for the same project key.
+    const tick = await buildTick({ hub: db4, projects: [{ name: "nextly", nwo: "o/new-name" }] });
+    check(tick.refreshed === 1 && tick.skipped.length === 0,
+      "a renamed repository is still resolved and refreshed", JSON.stringify(tick));
+    check(db4.prepare("SELECT repo_id FROM repo_gate_state").get()?.repo_id === 77,
+      "and keyed on the numeric id the hub already held, which the rename did not change",
+      JSON.stringify(db4.prepare("SELECT repo_id, nwo_snapshot FROM repo_gate_state").get()));
+    // CONTROL: a DIFFERENT project key is still unresolvable, or "resolves by
+    // project" has become "resolves anything".
+    const other = await buildTick({ hub: db4, projects: [{ name: "not-a-project", nwo: "o/old-name" }] });
+    check(other.refreshed === 0 && other.skipped.includes("not-a-project"),
+      "control: an unknown project key is still skipped", JSON.stringify(other));
+    db4.close();
+  }
+
+  // ── the daemon tick answers the liveness question itself ──────────────────
+  // `refreshGateState` defaults `isAlive` to `() => true`, which is right for a
+  // pure unit test and wrong for `build run`: a maintenance lock left by a
+  // CRASHED restore then reads as live for ever, every refresh throws, the daemon
+  // catches the tick failure and continues, and no gate-state row is written
+  // again until some unrelated writer reaps it. The tick runs on the machine that
+  // holds the lock, so it is exactly the caller that can answer.
+  check(/isAlive = isSameProcess/.test(readFileSync(new URL("../src/build/loop.mjs", import.meta.url), "utf8")),
+    "buildTick defaults isAlive to the real process predicate, not to true", "checked");
+  {
+    const db5 = openHub(join(dir, "g-deadlock.db"));
+    const base = { repoPath: "/p", profilePath: "/f", profileHash: "h", defaultBranch: "main",
+                   visibility: "private", specRepoId: 9, gateDefinitionHash: "g",
+                   registryVersion: 3, founderUserId: 4242 };
+    admitTask(db5, { ...base, repoId: 55, nwo: "o/r" },
+      { id: "bt:lock", project: "nextly", title: "t", claims: [normalizeClaim("packages/a")] });
+    // A restore that DIED: the row is there, its process is not. `lstart` is what
+    // distinguishes a dead pid from a recycled one, so a value no process can
+    // have is the honest fixture.
+    const putLock = () => db5.prepare(
+      `INSERT OR REPLACE INTO maintenance_lock(name, pid, lstart, acquired_at)
+       VALUES('restore', 999999, 'not-a-real-start', unixepoch())`).run();
+
+    // With the DEFAULT that shipped -- everything is alive -- the lock stands and
+    // the refresh throws, which is the state the daemon sat in for ever.
+    putLock();
+    let stuck = null;
+    try { await buildTick({ hub: db5, projects: [{ name: "nextly", nwo: "o/r" }], isAlive: () => true }); }
+    catch (e) { stuck = e.message; }
+    check(stuck !== null && /restore|maintenance/i.test(stuck),
+      "fixture: treating every lock as live makes the refresh throw", String(stuck));
+
+    // With the real predicate the dead lock is reaped and the tick proceeds.
+    putLock();
+    let threw = null, tick = null;
+    try { tick = await buildTick({ hub: db5, projects: [{ name: "nextly", nwo: "o/r" }] }); }
+    catch (e) { threw = e; }
+    check(threw === null, "a lock left by a CRASHED restore does not stop the tick",
+      String(threw?.message));
+    check(tick?.refreshed === 1, "and the gate-state row is refreshed", JSON.stringify(tick));
+    check(db5.prepare("SELECT count(*) c FROM maintenance_lock").get().c === 0,
+      "control: the dead lock was reaped rather than merely ignored");
+    db5.close();
+  }
 
   // ── a MIXED list in ONE pass ───────────────────────────────────────────────
   // The two blocks above call `buildTick` once per project, so `refreshed` and

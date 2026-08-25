@@ -1,0 +1,444 @@
+// Every transition is exactly one BEGIN IMMEDIATE that CAS-updates the
+// projection, appends its phase_event and hub_event, records the artifact sha
+// that justified it, and enqueues side effects rather than performing them.
+//
+// The CAS predicate includes the GENERATION, not just the phase. Without it a
+// stale attempt from generation 3 can act on a task that a --redesign moved
+// into generation 4: the phase would still match, the update would succeed, and
+// the task would be advanced by work done under a contract nobody approved.
+import { openHub, hubTx } from "../src/build/hubdb.mjs";
+import { applyTransition, applyCompensation, COMPENSATIONS } from "../src/build/transition.mjs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+let fail = 0;
+const check = (ok, name, detail) => {
+  console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+  if (!ok) { fail++; if (detail !== undefined) console.log(`        ${detail}`); }
+};
+const dir = mkdtempSync(join(tmpdir(), "reeve-transition-"));
+
+// A task, plus a RUN of phase_event rows. `outbox.fence` references
+// phase_event(seq), so a fixture with no events fails on the foreign key rather
+// than on anything these blocks are about -- and the lost-race block measures a
+// DELTA against this count rather than against zero.
+// `project` is 'p' because the territory fixtures below insert leases under that
+// key, and `regrant-territory`'s intersection check is scoped by project -- a
+// seed using any other value makes every conflict check match nothing, so the
+// live-lease block's resume succeeds and its three assertions fail for a reason
+// that has nothing to do with territory.
+const seed = (db, { id, phase, generation = 1, events = 12 }) => {
+  db.prepare(
+    `INSERT INTO task(id, project, repo_id, nwo_snapshot, title, phase, generation,
+                      source_kind, source_key, repo_path, profile_path, profile_hash,
+                      default_branch, visibility, registry_version, created_at, updated_at)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,unixepoch(),unixepoch())`)
+    .run(id, "p", 1, "o/r", "t", phase, generation, "founder", `k:${id}`,
+         "/repo", "/profile.json", "hash", "main", "private", 1);
+  for (let i = 0; i < events; i++)
+    db.prepare(
+      `INSERT INTO phase_event(task, at, op, from_phase, to_phase, from_generation, to_generation, detail)
+       VALUES(?, unixepoch(), 'phase.advanced', ?, ?, ?, ?, '{}')`)
+      .run(id, phase, phase, generation, generation);
+};
+// ── the ordinary case ────────────────────────────────────────────────────────
+{
+  const db = openHub(join(dir, "t1.db")); seed(db, { id: "bt:1", phase: "RESEARCH", generation: 2 });
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "RESEARCH", expectedGeneration: 2,
+    evidence: { kind: "phase.succeeded", phase: "RESEARCH" }, artifactSha: "sha-research", op: "phase.advanced" });
+  check(r.applied === true && r.to === "DESIGN", "a legal transition advances the task", JSON.stringify(r));
+  check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "DESIGN", "and the projection moved");
+  const ev = db.prepare("SELECT * FROM phase_event WHERE task='bt:1' ORDER BY seq DESC LIMIT 1").get();
+  check(ev.from_phase === "RESEARCH" && ev.to_phase === "DESIGN" && ev.from_generation === 2 && ev.to_generation === 2,
+    "the phase_event records both phases and both generations", JSON.stringify(ev));
+  check(ev.artifact_sha === "sha-research", "and the artifact sha that justified it", String(ev.artifact_sha));
+  check(r.seq === ev.seq, "and its seq is returned as the fence for this transition's effects");
+  // TWO row images now: task.transitioned and phase_event.appended. The
+  // assertion said one and the implementation emits both, so it contradicted the
+  // plan it appears in.
+  const kinds = db.prepare("SELECT kind FROM hub_event WHERE task='bt:1' ORDER BY seq").all().map(r => r.kind);
+  // Order matches the implementation: phase_event.appended is emitted at the
+  // insert, task.transitioned after the projection is read back. The reversed
+  // expectation would have failed against correct code -- the worst kind of
+  // failing test, because it argues for changing the implementation.
+  check(JSON.stringify(kinds) === '["phase_event.appended","task.transitioned"]',
+    "the transition appends BOTH row images in the same transaction, in emit order", kinds.join(","));
+  db.close();
+}
+
+// ── the lost race is a NO-OP, not an error ───────────────────────────────────
+{
+  const db = openHub(join(dir, "t2.db")); seed(db, { id: "bt:1", phase: "DESIGN", generation: 2 });
+  // Captured HERE, from THIS database, immediately before the stale call. `seed`
+  // mints a run of phase_event rows, so the count is not zero, and reading a
+  // baseline declared in another block would be both out of scope and about a
+  // different file.
+  const eventsBefore = db.prepare("SELECT count(*) c FROM phase_event").get().c;
+  let threw = null;
+  let r; try {
+    r = applyTransition(db, { taskId: "bt:1", expectedPhase: "RESEARCH", expectedGeneration: 2,
+      evidence: { kind: "phase.succeeded", phase: "RESEARCH" }, artifactSha: "x", op: "phase.advanced" });
+  } catch (e) { threw = e.message; }
+  check(threw === null, "a concurrent actor winning the race does not throw", String(threw));
+  check(r?.applied === false && r.reason === "lost-race", "it is reported as a lost race", JSON.stringify(r));
+  // The baseline belongs to THIS block and THIS database. It was previously read
+  // from a `const` declared inside the preceding block -- out of scope here, and
+  // counting a different file besides -- so the assertion below reached a
+  // ReferenceError instead of checking anything.
+  check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "DESIGN", "the projection is untouched");
+  // A DELTA, not an absolute count: `seed` mints a run of phase_event rows so
+  // that outbox fences have events to reference, and an assertion written as
+  // `=== 0` reads those and fails against a correct implementation. Measuring
+  // the change is also the right shape regardless of what the fixture seeds --
+  // the claim is "this call appended nothing", not "the table is empty".
+  check(db.prepare("SELECT count(*) c FROM phase_event").get().c === eventsBefore,
+    "and no event is appended for work that did not happen",
+    `${eventsBefore} -> ${db.prepare("SELECT count(*) c FROM phase_event").get().c}`);
+  db.close();
+}
+
+// ── the generation fence ─────────────────────────────────────────────────────
+// THE assertion of this task. A phase-only CAS passes every test above.
+{
+  const db = openHub(join(dir, "t3.db")); seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 4 });
+  const stale = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 3,
+    evidence: { kind: "phase.succeeded", phase: "IMPLEMENTING" }, artifactSha: "x", op: "phase.advanced" });
+  check(stale.applied === false && stale.reason === "lost-race",
+    "an attempt from generation 3 cannot act on a task now in generation 4", JSON.stringify(stale));
+  check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "IMPLEMENTING", "the redesigned task did not move");
+
+  const current = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 4,
+    evidence: { kind: "phase.succeeded", phase: "IMPLEMENTING" }, artifactSha: "x", op: "phase.advanced" });
+  check(current.applied === true, "control: the SAME call at generation 4 succeeds, so the predicate is the generation and not a blanket refusal");
+  db.close();
+}
+
+// ── compensations on the way into a hold ─────────────────────────────────────
+{
+  const db = openHub(join(dir, "t4.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  // WITH a head sha. `write-pr-hold` persists `pr_hold.head_sha`, and a fixture
+  // that supplies no witness anywhere -- not on impl_pr, not as an inbox row, not
+  // on the evidence -- leaves a correct implementation with nothing to build the
+  // asserted row from: it either violates its own NOT NULL or invents a value,
+  // and the test cannot tell those apart from success. `impl_pr` is where the
+  // projection keeps the PR's current head, so it is where the compensation
+  // reads it, INSIDE the transaction rather than from the caller.
+  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1',1,0,1,7,'${"c".repeat(40)}',unixepoch())`);
+  db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at) VALUES('p','prefix','packages/x','bt:1',unixepoch()+120)`);
+  db.exec(`INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,cancellable,args,created_at,updated_at)
+           VALUES('k1','gh.pr.comment','bt:1',1,1,1,'{}',unixepoch(),unixepoch())`);
+  db.exec(`INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,cancellable,args,created_at,updated_at)
+           VALUES('k2','git.push.branch','bt:1',1,1,0,'{}',unixepoch(),unixepoch())`);
+
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "hold", reason: "over_budget" }, op: "task.blocked" });
+  check(r.applied && r.to === "BLOCKED", "an over-budget slice blocks", JSON.stringify(r));
+  check(db.prepare("SELECT status FROM outbox WHERE idempotency_key='k1'").get().status === "voided",
+    "the pending CANCELLABLE row is voided");
+  check(db.prepare("SELECT status FROM outbox WHERE idempotency_key='k2'").get().status === "pending",
+    "and a NON-cancellable row is left alone: voiding a push mid-transport is not a compensation");
+  check(db.prepare("SELECT count(*) c FROM pr_hold WHERE task='bt:1' AND cleared_at IS NULL").get().c === 1,
+    "one pr_hold row is written for the open builder PR");
+  check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task='bt:1'").get().c === 0,
+    "and the territory lease is released in the same transaction");
+  check(db.prepare("SELECT held_from FROM task WHERE id='bt:1'").get().held_from === "IMPLEMENTING",
+    "held_from records where resume goes back to");
+
+  // A second hold must STACK, not transition and not write a second open hold.
+  const again = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "hold", reason: "ownership_lost" }, op: "task.blocked" });
+  check(again.applied === false && again.reason === "stacked", "a hold on an already-held task stacks", JSON.stringify(again));
+  check(db.prepare("SELECT count(*) c FROM pr_hold WHERE repo_id=1 AND pr=7 AND cleared_at IS NULL").get().c === 1,
+    "and there is still exactly ONE open hold, so one_open_hold stays satisfiable");
+  check(db.prepare("SELECT reason FROM pr_hold WHERE repo_id=1 AND pr=7 AND cleared_at IS NULL").get().reason === "ownership_lost",
+    "the existing hold's reason is updated to the newest one");
+  check(db.prepare("SELECT count(*) c FROM hold_reason WHERE task='bt:1' AND cleared_at IS NULL").get().c === 2,
+    "and both reasons are listed, so resume can clear them all");
+  check(db.prepare("SELECT held_from FROM task WHERE id='bt:1'").get().held_from === "IMPLEMENTING",
+    "held_from is NOT rewritten by the second hold");
+  db.close();
+}
+
+// ── resume clears every hold in one transaction ──────────────────────────────
+{
+  // Executable setup, not a prose comment. The block previously opened with
+  // `/* seed a BLOCKED task ... */` and then used `db`, which the standard
+  // harness does not supply -- so the file stopped at `ReferenceError: db is not
+  // defined` before exercising any resume compensation.
+  const db = openHub(join(dir, "t7.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  for (const reason of ["over_budget", "ownership_lost"])
+    db.prepare(`INSERT INTO hold_reason(task,reason,at) VALUES('bt:1',?,unixepoch())`).run(reason);
+  db.prepare(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at)
+              VALUES('bt:1',1,7,?,'blocked_other',unixepoch())`).run("a".repeat(40));
+  // `bt:1` needs a CLAIM of its own, or `regrant-territory` has nothing to
+  // grant and an implementation whose regrant branch is empty passes this block
+  // while the task returns to IMPLEMENTING holding no lease at all -- which
+  // makes the expired `bt:0` lease beside it irrelevant to what is tested.
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned)
+           VALUES('bt:1','prefix','packages/x',0)`);
+  // The lease's task must EXIST -- territory_lease references task(id) and
+  // openHub enables foreign keys, so a lease owned by an unseeded `bt:0` fails
+  // at setup and the block never reaches regrant-territory at all.
+  seed(db, { id: "bt:0", phase: "CANCELLED", generation: 1 });
+  db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at)
+           VALUES('p','prefix','packages/x','bt:0',unixepoch()-1)`);   // expired: regrant must succeed
+  const resumed = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(resumed.applied, "the resume applies", JSON.stringify(resumed));
+  // ASSERTED, not described. This block previously proved only that the resume
+  // did not throw, so an empty `regrant-territory` branch passed it while the
+  // task returned to IMPLEMENTING holding no lease at all.
+  check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task='bt:1'").get().c === 1,
+    "the resume re-granted the task's own territory",
+    JSON.stringify(db.prepare("SELECT * FROM territory_lease").all()));
+  db.close();
+}
+
+// ── and a LIVE overlapping lease rolls the whole resume back ─────────────────
+// The other direction, and the one an unconditional `regrant-territory` fails.
+// §10.2's intersection check is re-run INSIDE the transaction precisely because
+// the machine's `territoryConflict` evidence is the caller's earlier read; only
+// a check under BEGIN IMMEDIATE excludes a filing that landed in between.
+{
+  // t2b, not t2: the lost-race block above already seeded `bt:1` into t2.
+  const db = openHub(join(dir, "t2b.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  seed(db, { id: "bt:2", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',0)`);
+  // Another task holds it, and its lease is LIVE -- not expired, so the regrant
+  // must lose rather than reap.
+  db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at)
+           VALUES('p','prefix','packages/x','bt:2',unixepoch()+3600)`);
+  const blocked = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(!blocked.applied, "a resume whose territory is now held by a live task does not apply",
+    JSON.stringify(blocked));
+  check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "BLOCKED",
+    "and the WHOLE transaction rolled back: the task is still BLOCKED");
+  check(db.prepare("SELECT task FROM territory_lease WHERE path='packages/x'").get().task === "bt:2",
+    "control: the other task still holds the lease, so the regrant did not overwrite it");
+  db.close();
+}
+
+// ── a plain resume clears every hold it entered with ─────────────────────────
+// Its OWN fixture. The previous version ran this against the database that had
+// just proved `bt:2` holds a LIVE overlapping lease, and then expected the same
+// resume to succeed without expiring or deleting that lease -- so it demanded
+// two opposite answers from one authoritative check. It also asserted on
+// `hold_reason` and `pr_hold` rows that block never seeded.
+{
+  const db = openHub(join(dir, "t4b.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',0)`);
+  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1',1,0,1,7,'${"c".repeat(40)}',unixepoch())`);
+  db.exec(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at)
+           VALUES('bt:1',1,7,'${"c".repeat(40)}','over_budget',unixepoch())`);
+  for (const reason of ["over_budget", "harness_touched"])
+    db.exec(`INSERT INTO hold_reason(task,reason,at) VALUES('bt:1','${reason}',unixepoch())`);
+  check(db.prepare("SELECT count(*) c FROM hold_reason WHERE cleared_at IS NULL").get().c === 2,
+    "fixture: the task is BLOCKED with two open hold reasons and one open pr_hold");
+
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "task.resumed" });
+  check(r.applied && r.to === "IMPLEMENTING" && r.generation === 1,
+    "a plain resume re-enters held_from with the generation unchanged", JSON.stringify(r));
+  check(db.prepare("SELECT count(*) c FROM pr_hold WHERE cleared_at IS NULL").get().c === 0, "and clears the pr_hold");
+  check(db.prepare("SELECT count(*) c FROM hold_reason WHERE cleared_at IS NULL").get().c === 0, "and every stacked reason");
+  check(db.prepare("SELECT resume_seq FROM task WHERE id='bt:1'").get().resume_seq === 1,
+    "and increments resume_seq, so a re-minted spec round gets a distinct idempotency key");
+  db.close();
+}
+
+// ── the force-cancel drain window, either side of the boundary ───────────────
+// The clock and the threshold arrive through the interface: this module has no
+// clock, and the hub does not store the profile. Both boundaries are exercised,
+// because a comparison written `>` instead of `>=` passes any test that only
+// probes one side of it.
+{
+  const db = openHub(join(dir, "t5.db"));
+  seed(db, { id: "bt:1", phase: "CANCELLING", generation: 1 });
+  const ENTERED = 1_800_000_000, MINUTES = 30;
+  db.prepare(`INSERT INTO phase_event(seq,task,at,op,from_phase,to_phase,detail)
+              VALUES(100,'bt:1',?,'task.cancelling','IMPLEMENTING','CANCELLING','{}')`).run(ENTERED);
+  const force = (now) => applyTransition(db, { taskId: "bt:1", expectedPhase: "CANCELLING", expectedGeneration: 1,
+    evidence: { kind: "founder.cancelForce", drainEligible: true }, op: "task.cancelled",
+    now, drainMinutes: MINUTES });
+
+  const early = force(ENTERED + MINUTES * 60 - 1);
+  check(early.applied === false && /29m of its 30m/.test(early.refusal ?? ""),
+    "one second short of the window, --force is refused and says how far in it is", JSON.stringify(early));
+  const onTime = force(ENTERED + MINUTES * 60);
+  check(onTime.applied === true && onTime.to === "CANCELLED",
+    "and exactly at the window it is allowed: the boundary is inclusive", JSON.stringify(onTime));
+
+  // A caller that supplies no threshold is refused rather than defaulted. An
+  // invented window is the one thing this guard exists to prevent.
+  const db2 = openHub(join(dir, "t6.db"));
+  seed(db2, { id: "bt:1", phase: "CANCELLING", generation: 1 });
+  db2.prepare(`INSERT INTO phase_event(seq,task,at,op,from_phase,to_phase,detail)
+               VALUES(100,'bt:1',?,'task.cancelling','IMPLEMENTING','CANCELLING','{}')`).run(ENTERED);
+  const noThreshold = applyTransition(db2, { taskId: "bt:1", expectedPhase: "CANCELLING", expectedGeneration: 1,
+    evidence: { kind: "founder.cancelForce", drainEligible: true }, op: "task.cancelled",
+    now: ENTERED + 86400 });
+  check(noThreshold.applied === false && /drainMinutes/.test(noThreshold.refusal ?? ""),
+    "a --force with no configured threshold is refused, not defaulted", JSON.stringify(noThreshold));
+  db.close(); db2.close();
+}
+
+// ── FINALIZING -> DONE forgives voided effects ONE BY ONE ────────────────────
+// The forgiveness rule is per EFFECT: a voided row stops mattering when the
+// resume re-enqueued that same idempotency key and the replacement reached
+// `done`. Asking "is there ANY replacement" and dropping the whole voided group
+// on a single yes is how a task commits DONE -- terminal, no edges out -- with
+// its ledger write-back never performed.
+//
+// The fixture is the smallest one that can tell the two apart: TWO voided
+// completion effects, exactly ONE replaced. A group-level check sees one
+// replacement and forgives both; a correlated check forgives one and refuses.
+{
+  // t7b, not t7: the resume block above already opened t7 and seeded `bt:1`,
+  // and `task` is UNIQUE on (source_kind, source_key) -- so reopening it aborts
+  // at the fixture before this block tests anything. The same collision the
+  // outbox task caught between o5 and o6, in a task that did not get the fix.
+  const db = openHub(join(dir, "t7b.db"));
+  seed(db, { id: "bt:1", phase: "FINALIZING", generation: 1 });
+  // The completion check scopes itself to the FINALIZING entry for this
+  // generation and refuses outright without one, so the fixture supplies it.
+  db.prepare(`INSERT INTO phase_event(seq,task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+              VALUES(200,'bt:1',unixepoch(),'phase.advanced','SLICE_MERGED','FINALIZING',1,1,'{}')`).run();
+  const put = (key, status) => db.prepare(
+    `INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,status,args,created_at,updated_at)
+     VALUES(?,'gh.pr.comment','bt:1',1,200,?,'{}',unixepoch(),unixepoch())`).run(key, status);
+  put("bt:1:g1:ledger-writeback", "voided");
+  put("bt:1:g1:pr-close",         "voided");
+  put("bt:1:g1:pr-close",         "done");     // ONE replacement, for ONE of the two
+  const settle = () => applyTransition(db, { taskId: "bt:1", expectedPhase: "FINALIZING",
+    expectedGeneration: 1, evidence: { kind: "finalize.settled", outstanding: 0 }, op: "phase.advanced" });
+
+  const partial = settle();
+  check(partial.applied === false && /1 voided/.test(String(partial.refusal)),
+    "one replaced voided effect does not forgive the other, and the count reported is the UNREPLACED one",
+    JSON.stringify(partial));
+  check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "FINALIZING",
+    "and the task is still FINALIZING, because DONE cannot be revisited once entered");
+
+  // CONTROL: replace the second one too and the SAME call commits. Without it a
+  // completion check that refuses whenever any voided row exists -- the obvious
+  // over-fix -- satisfies both assertions above.
+  put("bt:1:g1:ledger-writeback", "done");
+  const complete = settle();
+  check(complete.applied === true && complete.to === "DONE",
+    "control: with EVERY voided effect replaced, the same transition commits",
+    JSON.stringify(complete));
+  db.close();
+}
+
+// ── a replacement must POSTDATE the void it forgives ─────────────────────────
+// The correlation on `idempotency_key` alone matches any historical `done` row.
+// This is the plain-resume sequence, which the design deliberately permits: an
+// effect completes, the resume re-enqueues the same key beside its history, and
+// a hold then voids the NEW row. The old completion satisfies a key-only
+// subquery, so FINALIZING commits DONE while the delivery that actually
+// mattered was abandoned. `d.id > v.id` is what makes "replacement" mean
+// "afterwards" -- `outbox.id` is INTEGER PRIMARY KEY and therefore monotonic.
+{
+  const db = openHub(join(dir, "t8.db"));
+  seed(db, { id: "bt:1", phase: "FINALIZING", generation: 1 });
+  db.prepare(`INSERT INTO phase_event(seq,task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+              VALUES(200,'bt:1',unixepoch(),'phase.advanced','SLICE_MERGED','FINALIZING',1,1,'{}')`).run();
+  const put = (key, status) => db.prepare(
+    `INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,status,args,created_at,updated_at)
+     VALUES(?,'gh.pr.comment','bt:1',1,200,?,'{}',unixepoch(),unixepoch())`).run(key, status);
+  const settle = () => applyTransition(db, { taskId: "bt:1", expectedPhase: "FINALIZING",
+    expectedGeneration: 1, evidence: { kind: "finalize.settled", outstanding: 0 }, op: "phase.advanced" });
+
+  put("bt:1:g1:comment", "done");        // the ORIGINAL delivery -- lower id
+  put("bt:1:g1:comment", "voided");      // re-enqueued, then voided -- HIGHER id
+  const stale = settle();
+  check(stale.applied === false && /1 voided/.test(String(stale.refusal)),
+    "a done row that PREDATES the void does not forgive it: a replacement has to postdate what it replaces",
+    JSON.stringify(stale));
+
+  // CONTROL: enqueue the replacement AFTER the void and the same call commits.
+  // Without it, an over-fix that never forgives a voided row at all -- which
+  // would deadlock every legitimate resume in FINALIZING -- passes the line
+  // above.
+  put("bt:1:g1:comment", "done");
+  const after = settle();
+  check(after.applied === true && after.to === "DONE",
+    "control: a replacement enqueued AFTER the void does forgive it", JSON.stringify(after));
+  db.close();
+}
+// ── record-drain runs LAST, so it sees what the cancel itself enqueued ──────
+// It snapshots what is OUTSTANDING, so anything that enqueues has to run before
+// it. Ordered ahead of `close-prs` it captures only rows that were already
+// inflight and misses the close and comment effects the cancellation just
+// created -- so `drainRemaining` reads zero and the task can reach CANCELLED
+// with its own compensations still pending, which is the one thing the drain
+// exists to prevent.
+{
+  const db = openHub(join(dir, "t10.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1',1,0,1,7,'${"c".repeat(40)}',unixepoch())`);
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "founder.cancel" }, op: "task.cancelling" });
+  check(r.applied && r.to === "CANCELLING", "the cancel applies", JSON.stringify(r).slice(0, 160));
+
+  // The close and the comment are enqueued BY the cancellation's own
+  // compensations, so they exist only if `close-prs` ran before `record-drain`.
+  const enqueued = db.prepare(
+    "SELECT id, kind FROM outbox WHERE task_id='bt:1' AND status='pending'").all();
+  check(enqueued.some(e => e.kind === "gh.pr.close"),
+    "fixture: the cancellation enqueued its own PR-close effect",
+    JSON.stringify(enqueued.map(e => e.kind)));
+  const drained = db.prepare("SELECT outbox_id FROM task_drain WHERE task='bt:1'").all().map(d => d.outbox_id);
+  const missing = enqueued.filter(e => !drained.includes(e.id)).map(e => e.kind);
+  check(missing.length === 0,
+    "record-drain captured every effect the cancellation enqueued, so it ran last",
+    `not drained: ${missing.join(", ") || "(none)"}`);
+  check(db.prepare(
+    "SELECT count(*) c FROM task_drain WHERE task='bt:1' AND settled_at IS NULL").get().c === enqueued.length,
+    "so drainRemaining counts them all and CANCELLED is not yet legitimate",
+    `${db.prepare("SELECT count(*) c FROM task_drain WHERE task='bt:1' AND settled_at IS NULL").get().c} vs ${enqueued.length}`);
+  db.close();
+}
+
+// ── a compensation this module cannot apply is LOUD ─────────────────────────
+// A name the machine can emit and the transaction cannot apply either throws or
+// silently does nothing -- and silence looks exactly like success, which is how
+// `regrant-territory` was emitted for a round with no branch to run it.
+{
+  const db = openHub(join(dir, "t11.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  let threw = null;
+  try {
+    hubTx(db, () => applyCompensation(db, { c: "not-a-compensation", taskId: "bt:1",
+                                            generation: 1, seq: null, evidence: {} }));
+  } catch (e) { threw = e; }
+  check(threw !== null, "an unknown compensation throws rather than doing nothing", String(threw));
+  check(/not-a-compensation/.test(String(threw?.message)),
+    "and names the one it could not apply", String(threw?.message).slice(0, 120));
+  check(COMPENSATIONS.length === 14,
+    "control: the closed set is the fourteen the machine can emit", `${COMPENSATIONS.length}`);
+  // CONTROL: a REAL name does not throw, so the assertion above is about the
+  // unknown name and not about the switch refusing everything.
+  let ok = true;
+  try { hubTx(db, () => applyCompensation(db, { c: "void-pending", taskId: "bt:1",
+                                                generation: 1, seq: null, evidence: {} })); }
+  catch { ok = false; }
+  check(ok, "control: a name from the closed set applies without throwing");
+  db.close();
+}
+
+rmSync(dir, { recursive: true, force: true });
+console.log(fail ? `\nfailed=${fail}` : "\nall green");
+process.exit(fail ? 1 : 0);

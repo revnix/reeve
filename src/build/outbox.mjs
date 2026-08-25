@@ -290,17 +290,30 @@ export function recoverEffects(db, { reconcile, now = null, isAlive = isSameProc
 export function voidPending(db, taskId, { isAlive = isSameProcess } = {}) {
   return hubTx(db, () => {
     assertWritable(db, { isAlive, inTx: true });
-    const doomed = db.prepare(
-      `SELECT id FROM outbox WHERE task_id = ? AND cancellable = 1 AND status = 'pending'`)
-      .all(taskId).map(r => r.id);
-    for (const id of doomed) {
-      db.prepare(`UPDATE outbox SET status='voided', worker=NULL, updated_at=unixepoch() WHERE id=?`).run(id);
-      // ONE PER ROW, never one for the batch. Replay is a primary-key upsert on
-      // `id`, so a single batch event restores one row and leaves every other
-      // voided effect at its old `pending` status -- to be performed again.
-      emitRow(db, "outbox.voided", id);
-      settleDrainFor(db, id);
-    }
-    return { voided: doomed.length };
+    return voidPendingIn(db, taskId);
   });
+}
+
+/**
+ * The same voiding, WITHOUT opening a transaction.
+ *
+ * `applyCompensation` runs inside the transition's own `BEGIN IMMEDIATE`, and
+ * `void-pending` is the first compensation it applies -- so calling the wrapper
+ * above from there attempts a second transaction and throws before a single row
+ * is voided. The caller that already holds the write lock uses this; everyone
+ * else uses `voidPending`. One body either way, so the two cannot drift.
+ */
+export function voidPendingIn(db, taskId) {
+  const doomed = db.prepare(
+    `SELECT id FROM outbox WHERE task_id = ? AND cancellable = 1 AND status = 'pending'`)
+    .all(taskId).map(r => r.id);
+  for (const id of doomed) {
+    db.prepare(`UPDATE outbox SET status='voided', worker=NULL, updated_at=unixepoch() WHERE id=?`).run(id);
+    // ONE PER ROW, never one for the batch. Replay is a primary-key upsert on
+    // `id`, so a single batch event restores one row and leaves every other
+    // voided effect at its old `pending` status -- to be performed again.
+    emitRow(db, "outbox.voided", id);
+    settleDrainFor(db, id);
+  }
+  return { voided: doomed.length };
 }

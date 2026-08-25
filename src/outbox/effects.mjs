@@ -57,8 +57,15 @@ export function ghPrComment(args, { api, idemKey, actor = null }) {
   // evidence is not evidence of absence, and the cost of a stale comment is much
   // lower than the cost of dropping a review request on a transient read failure.
   if (head) {
-    const now = api(["-X", "GET", `repos/${nwo}/pulls/${pr}`, "--jq", ".head.sha"]);
-    const current = now.ok ? String(now.out || "").trim() : null;
+    // State AND head, in one read. A closed or merged pull request normally KEEPS
+    // its head, so a head check alone lets a request through to a pull request the
+    // watcher already treats as finished -- asking for a review of something
+    // nobody is going to review, or failing terminally and raising a dead letter
+    // that names a pull request that is done.
+    const now = api(["-X", "GET", `repos/${nwo}/pulls/${pr}`, "--jq", "[.state, .head.sha] | @tsv"]);
+    const [state, current] = now.ok ? String(now.out || "").trim().split("\t") : [null, null];
+    if (state && state !== "open")
+      return { ok: true, result: { posted: false, superseded: true, reason: `the pull request is ${state}` } };
     if (current && current !== head)
       return { ok: true, result: { posted: false, superseded: true, decidedFor: head, now: current } };
   }

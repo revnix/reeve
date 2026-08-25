@@ -50,6 +50,39 @@ let db = open(path);
   // The rule above is inert unless the daemon PASSES `waiting`: the parameter
 // defaults to null, and null filters nothing. A guard that quietly stops applying
 // because its input narrowed is the shape this codebase keeps being bitten by.
+// --- a tick that could not look at anything retires nothing -------------------
+{
+  // A tick whose pull-request listing failed still drains the outbox, and a drain
+  // can raise a permanent loss that has to be announced. But that tick LOOKED at
+  // nothing, so it must not also retire standing causes: an escalation is not
+  // resolved because reeve could not check it. Asserted rather than reasoned,
+  // because the degraded path passes empty sets and the clearing rule reads them.
+  const dir = mkdtempSync(join(tmpdir(), "reeve-degraded-"));
+  const db = open(join(dir, "s.db"));
+
+  // A standing cause of each shape: one naming a pull request, one shared.
+  announceable(db, new Map([["#7: needs a human", 1], ["a shared cause", 1]]),
+               { covered: new Set([7]), waiting: new Set(), finished: new Set(), complete: true });
+  const before = db.prepare("SELECT count(*) n FROM escalation").get().n;
+  check(before === 2, "control: two causes are standing", String(before));
+
+  // The degraded call, exactly as the tick makes it: nothing covered, not complete.
+  const { fresh, cleared } = announceable(db, new Map(),
+    { covered: new Set(), waiting: new Set(), finished: new Set(), complete: false });
+  check(cleared.length === 0, "a tick that looked at nothing clears nothing", JSON.stringify(cleared));
+  check(db.prepare("SELECT count(*) n FROM escalation").get().n === 2,
+    "and both causes still stand", "");
+  check(fresh.length === 0, "control: and it announced nothing new either", JSON.stringify(fresh));
+
+  // Control: the SAME causes do clear on a tick that did look, so the assertion
+  // above is about the degraded scope and not about clearing being broken.
+  const done = announceable(db, new Map(), { covered: new Set([7]), waiting: new Set(), finished: new Set(), complete: true });
+  check(done.cleared.length === 2, "control: a complete tick retires them both", JSON.stringify(done.cleared));
+
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 {
   const src = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
   const call = (src.match(/announceable\(db, escalations,[\s\S]{0,200}?\}\)/) ?? [null])[0];

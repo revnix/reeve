@@ -8,7 +8,7 @@
 // Two things have to hold: the gate is OFF unless a profile says otherwise, and a
 // repeated tick at one head must not ask twice while a NEW head must ask again.
 import { reviewActionsOn } from "../src/daemon.mjs";
-import { open, tx, enqueue, supersedeEffects } from "../src/db/ops.mjs";
+import { open, tx, enqueue, supersedeEffects, sha256 } from "../src/db/ops.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -106,6 +106,40 @@ const check = (ok, name, detail) => {
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- correcting a trigger at the same head is a new request -------------------
+{
+  // An operator fixes a trigger the bot accepted syntactically and then ignored.
+  // Without the trigger's CONTENT in the identity the key is unchanged, so the
+  // existing done or dead-lettered row wins the conflict, the corrected body is
+  // never enqueued, and that reviewer cannot be summoned at all until some other
+  // commit happens to move the head -- an unrelated event that may never come.
+  //
+  // The key is built here the way the daemon builds it, so the property is
+  // asserted rather than the daemon's private string.
+  const dir = mkdtempSync(join(tmpdir(), "reeve-trig-"));
+  const db = open(join(dir, "state.db"));
+  const keyFor = trigger => `review-request:o/r:9:codex:head1:${sha256(trigger).slice(0, 12)}`;
+  const ask = trigger => tx(db, () => enqueue(db, {
+    idemKey: keyFor(trigger), kind: "gh.pr.comment", args: { nwo: "o/r", pr: 9, body: trigger },
+  }));
+
+  const wrong = ask("@codex plz review");
+  check(wrong !== null, "control: the first trigger enqueues", String(wrong));
+  const again = ask("@codex plz review");
+  check(again === null, "control: and asking with the SAME trigger enqueues nothing", String(again));
+
+  const fixed = ask("@codex review");
+  check(fixed !== null, "a corrected trigger at the same head is a NEW request", String(fixed));
+  check(keyFor("@codex plz review") !== keyFor("@codex review"),
+    "because the trigger's content is part of the identity", "");
+  const bodies = db.prepare(`SELECT args FROM outbox`).all().map(r => JSON.parse(r.args).body).sort();
+  check(bodies.length === 2 && bodies.includes("@codex review"),
+    "and the corrected body is actually queued, not swallowed by the conflict", JSON.stringify(bodies));
+
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- a new head withdraws the request the old head left pending ---------------
 {
   // The sequence: delivery fails transiently, the row waits on a backoff, and the
@@ -146,6 +180,24 @@ const check = (ok, name, detail) => {
   check(statusOf(key("live", "codex")) === "inflight", "an inflight request is left alone, not deleted under its drainer",
     String(statusOf(key("live", "codex"))));
   check(n2 >= 1, "control: but the pending one beside it was still withdrawn", String(n2));
+
+  // --- a DEAD LETTER for an overtaken head is retired too ---------------------
+  //
+  // A dead letter is permanent and is counted into a standing escalation every
+  // tick. So an old head's request that failed terminally goes on demanding a
+  // person's attention after the reviewer has been successfully summoned for the
+  // current head -- naming work that must no longer be performed. It is not merely
+  // late; it is obsolete.
+  put("dead", "codex");
+  db.prepare(`UPDATE outbox SET status='dead_letter' WHERE idem_key=?`).run(key("dead", "codex"));
+  check(statusOf(key("dead", "codex")) === "dead_letter", "control: a terminal row from an old head", "");
+  const n3 = tx(db, () => supersedeEffects(db, { prefix: "review-request:o/r:7:", keep: key("newest", "codex") }));
+  check(statusOf(key("dead", "codex")) === null,
+    "a dead letter for an overtaken head is retired, not left nagging forever", String(n3));
+  // Control: an INFLIGHT row is still spared, so the widening did not simply
+  // start deleting everything that matched the prefix.
+  check(statusOf(key("live", "codex")) === "inflight",
+    "control: and an inflight row is still spared", String(statusOf(key("live", "codex"))));
 
   // The withdrawal is on the record. A row that vanishes with no event is a
   // review request that disappeared for reasons nobody can reconstruct.

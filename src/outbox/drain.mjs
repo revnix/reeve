@@ -79,10 +79,27 @@ const deadline = seconds => {
  */
 const SETTLE_RESERVE = 1 / 6;   // of the lease, kept back so the settle can happen
 
+/**
+ * How long the whole PASS may take, whatever it finds.
+ *
+ * `max` bounds how many effects a pass performs. It does not bound how long the
+ * pass takes, and those are different guarantees -- ten deliveries each given a
+ * fresh deadline can spend the sum of ten deadlines, around forty minutes at the
+ * defaults. This runs inside a tick that also evaluates pull requests, publishes
+ * verdicts, heartbeats workers and raises alerts, and none of that happens while a
+ * drain grinds through failing effects. An outbox in trouble would stop the
+ * guardian doing everything else it exists for.
+ *
+ * A pass that runs out of budget stops leasing. What is left stays pending and the
+ * next tick continues, which is the same contract as running out of rows.
+ */
+const PASS_BUDGET_MS = 60_000;
+
 const remainingMs = (deadlineAt) => deadlineAt - Date.now();
 
 export async function drainOutbox({ db, log = () => {}, handlers, api, actor = null,
-                                    worker = "drainer", max = 10, leaseSeconds = 300 }) {
+                                    worker = "drainer", max = 10, leaseSeconds = 300,
+                                    budgetMs = PASS_BUDGET_MS, now = () => Date.now() }) {
   const kinds = Object.keys(handlers ?? {});
   // Recovery FIRST, so a row whose drainer died is a candidate in this pass rather
   // than the next one. It returns expired inflight rows to pending; it does not
@@ -96,7 +113,14 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
     log(`  outbox: ${d.kind} #${d.id} DEAD-LETTERED — ${d.attempts} lease(s) and never once settled; its drainer is crashing`);
 
   const done = [];
+  const startedAt = now();
+  let outOfTime = false;
   for (let i = 0; i < max; i++) {
+    // Checked BEFORE leasing. A row leased and then abandoned would have its
+    // attempt counted for work never begun, and would sit inflight until its lease
+    // expired -- so the budget has to be spent deciding not to start, never
+    // deciding to stop partway.
+    if (now() - startedAt >= budgetMs) { outOfTime = true; break; }
     const job = leaseOutbox(db, { worker, leaseSeconds, kinds });
     if (!job) break;
 
@@ -146,9 +170,15 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
   // perform is the failure this line exists to make visible, and it is invisible
   // by construction: the rows are pending, the drainer is healthy, and the only
   // symptom is a comment that never appeared.
+  // Said out loud. A pass that stopped early looks exactly like a pass that had
+  // nothing to do, and the difference matters: one means the queue is empty, the
+  // other means it is moving slower than it fills.
+  if (outOfTime)
+    log(`  outbox: pass budget of ${Math.round(budgetMs / 1000)}s spent after ${done.length} effect(s); the rest wait for the next tick`);
+
   const stranded = pendingWithNoHandler(db, kinds);
   if (stranded.length)
     log(`  outbox: ${stranded.map(s => `${s.n} ${s.kind}`).join(", ")} pending with no handler in this build`);
 
-  return { recovered: recovered.length, done, stranded };
+  return { recovered: recovered.length, done, stranded, outOfTime };
 }

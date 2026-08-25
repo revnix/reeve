@@ -766,7 +766,19 @@ function effectsFor({ nwo, e, decision, profile }) {
     // since the effects are enqueued in a loop, the second reviewer's supersede
     // deleted the first reviewer's row that had just been created. Only the last
     // reviewer would ever have been summoned.
-    idemKey: `review-request:${nwo}:${e.pr}:${r.login}:${e.head}`,
+    // The trigger's CONTENT is part of the identity, not just who and where.
+    //
+    // Without it, correcting a trigger an operator got wrong -- a comment the bot
+    // accepted syntactically and then ignored -- produces the same key, so the
+    // existing done or dead-lettered row wins the conflict and the corrected body
+    // is never enqueued. That reviewer then cannot be summoned at all until some
+    // other commit happens to move the head, which is an unrelated event that may
+    // never come. A key that ignores what is being SENT cannot tell "already sent
+    // this" from "already sent something else to the same place".
+    //
+    // The supersedes prefix stops before the head, so a corrected trigger at the
+    // SAME head withdraws the obsolete request as well as replacing it.
+    idemKey: `review-request:${nwo}:${e.pr}:${r.login}:${e.head}:${sha256(r.trigger).slice(0, 12)}`,
     // What this replaces: THIS reviewer, this pull request, any earlier head.
     supersedes: `review-request:${nwo}:${e.pr}:${r.login}:`,
     kind: "gh.pr.comment",
@@ -857,6 +869,13 @@ if (ctx.drain !== false) {
         const auth = await (ctx.authenticate ?? authenticate)(nwo);
         if (!auth.ok) {
           log(logPath, `  outbox: ${due} effect(s) waiting; cannot authenticate — ${auth.why}`);
+          // Escalated, not merely logged. No row is leased on this path, so nothing
+          // spends an attempt, nothing reaches its retry budget and nothing becomes
+          // a dead letter -- the queue simply stops, silently, and a blocking review
+          // request can wait forever without anything reaching the notification
+          // channel. Missing credentials and an uninstalled App both land here, and
+          // neither fixes itself.
+          escalations.set(`${due} queued effect(s) cannot be performed: reeve cannot authenticate — ${auth.why}`, 1);
         } else {
           const api = (args, opts) => apiAsInstallation(auth.token, args, opts);
           // `auth.actor` is the login reeve's own comments carry. A handler needs it
@@ -885,6 +904,40 @@ if (ctx.drain !== false) {
     }
   };
 
+  // Turning escalations into announcements, as a function BOTH exits call.
+  //
+  // A tick that cannot list pull requests still drains, and a drain can recover a
+  // row or newly dead-letter one -- a permanent loss. That reached `escalations`
+  // and then hit an immediate `return`, so it was logged and never announced, for
+  // as long as listing stayed broken. The one thing that must not depend on
+  // reading the repository is telling a person the queue has lost something.
+  //
+  // `complete: false` on the degraded path is the honest reading: nothing was
+  // covered, so a standing escalation must not be cleared merely because this
+  // tick did not see the pull request that raised it.
+  const announce = (scope = {}) => {
+    const { fresh, cleared } = announceable(db, escalations, {
+      covered: scope.covered ?? new Set(),
+      waiting: scope.waiting ?? new Set(),
+      finished: scope.finished ?? new Set(),
+      complete: scope.complete ?? false,
+    });
+    for (const { why, count } of fresh) log(logPath, `NEEDS YOU: ${why}${count > 1 ? ` (${count} PRs)` : ""}`);
+    for (const why of cleared) log(logPath, `CLEARED: ${why}`);
+    const alert = buildAlert({ nwo, escalations: fresh });
+    if (alert) {
+      const sent = (ctx.notify ?? notify)({ profile, alert });
+      log(logPath, sent.ok ? `pushed ${fresh.length} escalation(s) to ${profile.notify?.topic}`
+                           : `did NOT push: ${sent.why}`);
+      try {
+        db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+          .run(now(), "daemon", sent.ok ? "notify.sent" : "notify.failed", `repo:${nwo}`,
+               JSON.stringify({ count: fresh.length, why: sent.why ?? null }));
+      } catch { /* a store that cannot record must not stop the tick */ }
+    }
+    return { fresh, cleared };
+  };
+
   const prs = (ctx.openPrs ?? openPrs)(nwo, profile.watch?.maxOpenPrs ?? 20);
   if (prs === null) {
     // Could not ask is not none. Returning an empty list here would look exactly
@@ -894,6 +947,10 @@ if (ctx.drain !== false) {
     // could read the repository, and an inflight row whose drainer died is
     // recovered here or waits for a tick that happens to succeed.
     await drainDueEffects();
+    // Announce what that drain raised. A dead letter is permanent, and "we could
+    // not list pull requests" must not also mean "nobody is told the queue lost
+    // something".
+    announce();
     return { decisions, escalations, halted: false, unreadable: true };
   }
   // A cap that does not say it capped reads as "covered everything". The portfolio
@@ -1827,8 +1884,8 @@ if (ctx.drain !== false) {
   // stop reading pull requests.
   await drainDueEffects();
 
-  const { fresh, cleared } = announceable(db, escalations,
-    { covered: evaluated, waiting, finished, complete: evaluated.size === prs.length });
+  const { fresh, cleared } = announce({ covered: evaluated, waiting, finished,
+                                        complete: evaluated.size === prs.length });
 
   if (ctx.reviewIngest !== false) {
     const sk = streak(db, nwo, now());
@@ -1844,28 +1901,6 @@ if (ctx.drain !== false) {
 
   noteTick(db);
 
-  for (const { why, count } of fresh) log(logPath, `NEEDS YOU: ${why}${count > 1 ? ` (${count} PRs)` : ""}`);
-  for (const why of cleared) log(logPath, `CLEARED: ${why}`);
-
-  // Only what ARRIVED goes to a phone. `fresh` is already the deduplicated set,
-  // so a standing cause is pushed once rather than every two and a half minutes --
-  // which is how a channel gets muted and stops being a channel.
-  const alert = buildAlert({ nwo, escalations: fresh });
-  if (alert) {
-    const sent = (ctx.notify ?? notify)({ profile, alert });
-    // Logged either way. A push channel nobody knows is broken is the same as no
-    // push channel, so a decline is never swallowed.
-    log(logPath, sent.ok ? `pushed ${fresh.length} escalation(s) to ${profile.notify?.topic}`
-                         : `did NOT push: ${sent.why}`);
-    // Recorded as well as logged: the self-audit reads this to notice a channel
-    // that has been refusing for days, and a log line does not survive a restart
-    // as something queryable.
-    try {
-      db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
-        .run(now(), "daemon", sent.ok ? "notify.sent" : "notify.failed", `repo:${nwo}`,
-             JSON.stringify({ count: fresh.length, why: sent.why ?? null }));
-    } catch { /* recording a push must never fail a tick */ }
-  }
   return { decisions, escalations, halted: false };
 }
 

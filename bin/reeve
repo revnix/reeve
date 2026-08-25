@@ -1473,7 +1473,16 @@ switch (cmd) {
       // the next pass may well succeed, so the failure is reported and the loop
       // continues. `refreshGateState` already turns a fetcher's throw into a row.
       try {
-        const tick = await buildTick({ hub: db, projects: registryProjects(HOME).projects ?? [] });
+        // A BROKEN REGISTRY IS NOT AN EMPTY ONE. `registryProjects` returns
+        // `{ projects: [], error }` for a file that is unreadable, invalid JSON,
+        // or carries a malformed entry -- and reading only `.projects` turned all
+        // three into a clean pass over nothing. The daemon then reported neither
+        // a failure nor a skipped project while every existing gate-state row
+        // aged into staleness, which clause U4 reads as UNKNOWN: fail-closed, but
+        // silently, from the one component that could have said why.
+        const registry = registryProjects(HOME);
+        if (registry.error) throw new Error(registry.error);
+        const tick = await buildTick({ hub: db, projects: registry.projects ?? [] });
         // AND THE TICK'S OWN REPORT IS READ. `buildTick` returns what it could
         // not refresh precisely because a pass that refreshed nothing is
         // indistinguishable from one that refreshed everything -- and this

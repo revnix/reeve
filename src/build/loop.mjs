@@ -8,27 +8,44 @@
 // project. The phase work that fills it out is S4's, and no task in S2
 // dispatches a builder worker.
 import { refreshGateState } from "./gatestate.mjs";
+// REAL LIVENESS FOR THE DAEMON PATH. `refreshGateState` defaults `isAlive` to
+// `() => true`, which is right for a pure unit test and wrong for `build run`: a
+// maintenance lock left behind by a crashed restore then reads as live for ever,
+// every refresh throws, the daemon catches the tick failure and continues, and no
+// gate-state row is written again until some unrelated writer happens to reap it.
+// The tick is a long-running process on the machine that holds the lock, so it is
+// exactly the caller that CAN answer the question.
+import { isSameProcess } from "../supervisor.mjs";
 
 /**
  * The numeric repository id the hub already knows for a project.
  *
  * `task.repo_id` is written at admission from the snapshot `resolveSnapshot`
  * took through the API client, so it is a value GitHub gave us rather than one
- * derived from a name -- which matters, because a repository can be renamed and
- * `nwo_snapshot` is only ever a snapshot. The most recently updated task wins
- * for the same reason: if a project's id ever changed, the newest admission is
- * the one that saw the current repository.
+ * derived from a name.
+ *
+ * MATCHED ON THE REGISTRY PROJECT KEY, not on the nwo. The first version keyed
+ * on `nwo_snapshot` while its own comment said a repository can be renamed and
+ * that column is only ever a snapshot -- so the moment a repository was renamed
+ * or transferred, `projects.json` supplied the new name, every existing task
+ * still carried the old one, and the lookup returned null for a repository whose
+ * numeric id the hub was holding all along. The project key is what does not
+ * move: `task.project` IS the registry key, written at admission from the same
+ * `projects.json` entry this lookup is resolving.
+ *
+ * The most recently updated task wins, so if an id ever did change, the newest
+ * admission is the one that saw the current repository.
  *
  * Returns null rather than throwing for a project the hub has never admitted a
  * task for. That is a real state in S2 -- a registered project with no work yet
  * -- and it is not an error.
  */
 export function repoIdFromHub(hub, project) {
-  if (!hub || !project?.nwo) return null;
+  if (!hub || !project?.name) return null;
   try {
     return hub.prepare(
-      `SELECT repo_id FROM task WHERE nwo_snapshot = ? ORDER BY updated_at DESC, id DESC LIMIT 1`)
-      .get(project.nwo)?.repo_id ?? null;
+      `SELECT repo_id FROM task WHERE project = ? ORDER BY updated_at DESC, id DESC LIMIT 1`)
+      .get(project.name)?.repo_id ?? null;
   } catch { return null; }
 }
 
@@ -43,7 +60,7 @@ export function repoIdFromHub(hub, project) {
  */
 export async function buildTick(ctx = {}) {
   const { hub, projects = [], fetchGateState = () => null,
-          resolveRepoId = repoIdFromHub } = ctx;
+          resolveRepoId = repoIdFromHub, isAlive = isSameProcess } = ctx;
   const skipped = [];
   const rows = [];
   for (const project of projects) {
@@ -71,7 +88,7 @@ export async function buildTick(ctx = {}) {
     // repository must not stop the others being refreshed -- and
     // `refreshGateState` already turns a throw into an `unknown` row carrying
     // why, so there is nothing here to catch that it does not.
-    rows.push(await refreshGateState(hub, { ...project, repoId }, fetchGateState));
+    rows.push(await refreshGateState(hub, { ...project, repoId }, fetchGateState, { isAlive }));
   }
   // `skipped` is RETURNED rather than swallowed. A tick that silently refreshed
   // nothing is indistinguishable from one that refreshed everything, and the

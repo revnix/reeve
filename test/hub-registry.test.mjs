@@ -614,6 +614,41 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
     String((ph.match(/"gateDefinitionHash"/g) ?? []).length));
 }
 
+// ── a filing's claims are a SET ────────────────────────────────────────────
+// `task_territory`'s primary key is (task, kind, path) and normalisation
+// collapses aliases, so `packages/x` and `packages/./x` arrive as the same claim.
+// A filing that named a path twice inserted the same row twice and the whole
+// admission rolled back on an uncaught SQLite constraint error -- neither a task
+// nor a reasoned refusal, from the ordinary mistake of repeating yourself.
+{
+  const db = openHub(join(dir, "r8.db"));
+  let threw = null, r = null;
+  try {
+    r = admitTask(db, snap, { id: "bt:dup", project: "p", title: "t",
+      claims: [normalizeClaim("packages/x"), normalizeClaim("packages/./x"),
+               normalizeClaim("packages/y")] });
+  } catch (e) { threw = e; }
+  check(threw === null, "a filing that repeats a claim does not throw", String(threw?.message));
+  check(r?.ok === true, "and is admitted", JSON.stringify(r));
+  const paths = db.prepare("SELECT path FROM task_territory WHERE task='bt:dup' ORDER BY path").all()
+    .map(x => x.path);
+  check(JSON.stringify(paths) === '["packages/x","packages/y"]',
+    "with the alias collapsed rather than inserted twice", JSON.stringify(paths));
+  check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task='bt:dup'").get().c === 2,
+    "and one lease per DISTINCT claim");
+
+  // CONTROL: repeating yourself is not a conflict with yourself -- the scan
+  // compares this filing against OTHER tasks, never against itself.
+  check(String(r?.refusal ?? "") === "", "control: no self-conflict was reported",
+    String(r?.refusal));
+  // CONTROL: the same path claimed by ANOTHER task is still a conflict.
+  const other = admitTask(db, snap, { id: "bt:other", project: "p", title: "t",
+                                      claims: [normalizeClaim("packages/x")] });
+  check(other.ok === false, "control: another task claiming it is still refused",
+    JSON.stringify(other));
+  db.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

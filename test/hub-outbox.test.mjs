@@ -829,6 +829,67 @@ const NOW = 1_800_000_000;
   db2.close();
 }
 
+// ── one reconciler failure does not stop the pass ──────────────────────────
+// The reconciler consults the outside world, which is the part of this system
+// most entitled to fail. A throw aborted the loop before the apply transaction,
+// so verdicts already obtained were discarded and every later expired row was
+// skipped -- and the scan is ORDER BY id, so one permanently malformed row at
+// the front stopped the whole outbox recovering on every pass, for ever.
+{
+  const db = openHub(join(dir, "o18.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const leased = {};
+  for (const k of ["a", "b", "c"]) {
+    hubTx(db, () => enqueueEffect(db, { idempotencyKey: `bt:1:g1:${k}`, kind: "gh.pr.comment",
+                                        taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+    leased[k] = leaseEffect(db, { worker: `w${k}`, capabilities: allOn, now: NOW });
+  }
+  db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1`);
+
+  // CAUGHT, because the defect this covers PROPAGATES: without per-row isolation
+  // the reconciler's throw comes straight out of recoverEffects and ends the
+  // file, which is a red that prints no name and takes every later block with it.
+  const asked = [];
+  let r = null, passThrew = null;
+  try {
+    r = await recoverEffects(db, { reconcile: (row) => {
+      const k = row.idempotency_key.split(":").pop();
+      asked.push(k);
+      if (k === "a") throw new Error("the API is unreachable");
+      return { settled: true, ok: true, result: { pr: 1 } };
+    }});
+  } catch (e) { passThrew = e; }
+  check(passThrew === null, "a reconciler that throws does not abort the pass",
+    String(passThrew?.message));
+  r ??= { settled: -1, returned: -1 };
+  check(asked.length === 3, "every expired row is still offered to the reconciler",
+    JSON.stringify(asked));
+  check(r.settled === 2, "the rows that COULD be observed are settled", JSON.stringify(r));
+  check(r.returned === 1, "and the one that failed is returned to the queue, not lost",
+    JSON.stringify(r));
+  const failed = db.prepare("SELECT status, last_error FROM outbox WHERE id=?").get(leased.a.id);
+  check(failed.status === "pending", "the failed row is pending, since nothing was established",
+    JSON.stringify(failed));
+  check(/unreachable/.test(failed.last_error ?? ""),
+    "and last_error says WHY it could not be told, rather than cycling silently",
+    JSON.stringify(failed));
+  check(db.prepare("SELECT status FROM outbox WHERE id=?").get(leased.c.id).status === "done",
+    "control: a row AFTER the failing one was still reconciled");
+
+  // CONTROL: an async rejection is the same shape, since a real reconciler is
+  // async and a rejected promise is how it actually fails.
+  db.exec(`UPDATE outbox SET status='inflight', worker='wZ', lease_expires_at=unixepoch()-1
+           WHERE id = ${leased.c.id}`);
+  let r2 = null, rejThrew = null;
+  try { r2 = await recoverEffects(db, { reconcile: async () => { throw new Error("rejected"); } }); }
+  catch (e) { rejThrew = e; }
+  check(rejThrew === null, "control: a rejected async reconciler does not abort the pass either",
+    String(rejThrew?.message));
+  check(r2?.returned === 1 && r2?.settled === 0,
+    "control: a REJECTED async reconciler is handled the same way", JSON.stringify(r2));
+  db.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

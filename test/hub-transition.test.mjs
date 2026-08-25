@@ -278,6 +278,53 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
   db.close();
 }
 
+// ── a cap-reached task's SPEC PR gets a durable hold ───────────────────────
+// `gate.capReached` happens at GATE by definition: a spec PR is open and no
+// implementation PR exists yet. `write-pr-hold` iterated `impl_pr` alone, so the
+// compensation ran and wrote nothing -- the task sat ESCALATED with its spec PR
+// still mergeable, which is the exact outcome a fail-closed stop exists to
+// prevent, defeated by the compensation meant to prevent it.
+{
+  const db = openHub(join(dir, "t21.db"));
+  seed(db, { id: "bt:1", phase: "GATE", generation: 1 });
+  db.exec(`UPDATE task SET spec_repo_id=9, spec_pr=5, spec_head='specsha' WHERE id='bt:1'`);
+  check(db.prepare("SELECT count(*) c FROM impl_pr WHERE task='bt:1'").get().c === 0,
+    "fixture: there is no implementation PR, which is what made this reachable");
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "GATE", expectedGeneration: 1,
+    evidence: { kind: "gate.capReached" }, op: "phase.escalated" });
+  check(r.applied === true && r.to === "ESCALATED", "the cap escalates the task", JSON.stringify(r));
+  const hold = db.prepare("SELECT repo_id, pr, head_sha, reason FROM pr_hold WHERE task='bt:1'").get();
+  check(hold != null, "and the spec PR is held", JSON.stringify(hold));
+  check(hold?.pr === 5 && hold?.repo_id === 9, "on the task's own spec PR", JSON.stringify(hold));
+  check(hold?.head_sha === "specsha",
+    "witnessed by the spec head, which pr_hold.head_sha requires", JSON.stringify(hold));
+  db.close();
+}
+
+// CONTROL: a regenerate must NOT hold the spec PR -- it re-renders the spec and
+// pushes a new head to that same PR, so a hold would block the work it is
+// dispatching.
+{
+  const db = openHub(join(dir, "t22.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`UPDATE task SET spec_repo_id=9, spec_pr=5, spec_head='specsha' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1',1,0,1,11,'implsha',unixepoch())`);
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "founder.regenerate",
+                snapshot: { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
+                            profileHash: "h", defaultBranch: "main", visibility: "private",
+                            specRepoId: 9, gateDefinitionHash: "g", registryVersion: 3,
+                            founderUserId: 4242 } },
+    op: "phase.regenerated" });
+  check(r.applied === true, "control: the regenerate applies", JSON.stringify(r));
+  const held = db.prepare("SELECT pr FROM pr_hold WHERE task='bt:1'").all().map(h => h.pr);
+  check(held.includes(11), "control: it holds the implementation PR", JSON.stringify(held));
+  check(!held.includes(5), "control: and NOT the spec PR it is about to push to",
+    JSON.stringify(held));
+  db.close();
+}
+
 // ── an abandoned task does not leave its SPEC PR open ──────────────────────
 // Cancellation or infeasibility after SPEC_PR_OPEN can leave spec_repo_id and
 // spec_pr set with no impl_pr row at all, so `close-prs` enqueued nothing and the

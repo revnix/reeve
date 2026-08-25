@@ -307,9 +307,25 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
   // system's one defence against re-delivering an action that already happened
   // answered "could not tell" for every asynchronous reconciler ever passed to
   // it, and did so silently.
+  // PER ROW, and a failure is that ROW's answer rather than the pass's.
+  //
+  // One reconciler throwing aborted the whole loop before the apply
+  // transaction, so verdicts already obtained were discarded and every later
+  // expired row was skipped -- and since the scan is `ORDER BY id`, a single
+  // permanently malformed or unsupported row at the front stopped the entire
+  // outbox from recovering, on every pass, for ever. The reconciler consults the
+  // outside world, which is the part of this system most entitled to fail.
+  //
+  // A failure is "could not tell", which is what an unsettled verdict already
+  // means, so the row goes back to the queue exactly as an unobservable one does
+  // -- and its reason is carried so `last_error` says why rather than leaving a
+  // row that quietly cycles.
   const verdicts = [];
-  for (const row of expired)
-    verdicts.push([row, reconcile ? await reconcile(row) : { settled: false }]);
+  for (const row of expired) {
+    if (!reconcile) { verdicts.push([row, { settled: false }]); continue; }
+    try { verdicts.push([row, await reconcile(row)]); }
+    catch (e) { verdicts.push([row, { settled: false, reconcileError: e?.message ?? String(e) }]); }
+  }
 
   // ── 3. APPLY, under a short write transaction, each row CAS'd on the state it
   // was read in. The lease may have been handed on, settled or voided while the
@@ -348,7 +364,9 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
                            last_error=COALESCE(?, last_error), updated_at=unixepoch()
           WHERE id=?`)
         .run(spent ? "dead_letter" : "pending",
-             spent ? `unobserved after ${row.attempts} of ${row.max_attempts} attempts` : null,
+             spent ? `unobserved after ${row.attempts} of ${row.max_attempts} attempts` +
+                     (verdict?.reconcileError ? `; last reconcile failed: ${verdict.reconcileError}` : "")
+                   : (verdict?.reconcileError ? `reconcile failed: ${verdict.reconcileError}` : null),
              row.id);
       emitRow(db, "outbox.settled", row.id);
       if (spent) { settleDrainFor(db, row.id); dead++; } else returned++;

@@ -218,11 +218,27 @@ export function admitTask(db, snapshot, filing, { isAlive = () => true } = {}) {
                         `Resolve it before admission, as section 2.2 requires: a task cannot gate ` +
                         `its spec PR or authenticate a founder override without these` };
 
-    const claims = filing.claims ?? [];
-    if (!claims.length)
+    const declared = filing.claims ?? [];
+    if (!declared.length)
       return { ok: false, refusal: `a filing must declare its territory; pass --territory` };
-    for (const c of claims)
+    for (const c of declared)
       if (c?.refusal) return { ok: false, refusal: c.refusal };
+
+    // A FILING'S CLAIMS ARE A SET. `task_territory`'s primary key is
+    // `(task, kind, path)` and normalisation collapses aliases -- `packages/x`
+    // and `packages/./x` arrive as the same `(kind, path)` -- so a filing that
+    // named a path twice inserted the same row twice and the whole admission
+    // rolled back on an uncaught constraint error rather than producing a task or
+    // a reasoned refusal. Repeating yourself is not a conflict with yourself, so
+    // this collapses rather than refuses; the conflict scan below compares this
+    // filing against OTHER tasks and never against itself.
+    const seen = new Set();
+    const claims = declared.filter(c => {
+      const key = `${c.kind}\u0000${c.path}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
 
     // THE FULL INTERSECTION CHECK, scoped BY PROJECT. Without the project
     // predicate two unrelated repositories that both contain `packages/x`

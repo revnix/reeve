@@ -9,7 +9,7 @@
 //
 // Measured before the fix: a run 60 seconds past its deadline was refused by
 // `heartbeat`, checkpointed once, and `heartbeat` reported it alive again.
-import { open, tx, checkpoint, heartbeat, reap, LEASE_SECONDS } from "../src/db/ops.mjs";
+import { open, tx, checkpoint, heartbeat, reap, resume, LEASE_SECONDS } from "../src/db/ops.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -86,6 +86,40 @@ const makeRun = (id, expiresAt, status = "running") => tx(db, () => {
   check(JSON.parse(ev.payload).reason === "lease-lost",
     "and the audit record says the same thing the caller was told", ev.payload);
   check(steps("reaped") === 0, "and leaves no record of progress it did not make", String(steps("reaped")));
+}
+
+// --- a REFUSED checkpoint leaves no progress behind ---------------------------
+{
+  // The half a restore-the-lease fix missed. The claiming UPDATE also sets `step`,
+  // json-patches `cursor` and refreshes `heartbeat_at`, so a refused checkpoint
+  // could still leave progress recorded -- and `resume` would then read a step the
+  // run never successfully recorded and carry on from work that was never done.
+  // Putting `lease_expires_at` back covered one field of four, and `cursor` is not
+  // trivially reversible once patched, which is the tell that not-writing was the
+  // right shape and restoring was not.
+  makeRun("refused", now() + 300);
+  checkpoint(db, { runId: "refused", step: "first", seq: 1, state: { a: 1 } });
+  const before = runRow("refused");
+  const beforeMore = db.prepare(`SELECT cursor, heartbeat_at FROM run WHERE id='refused'`).get();
+  check(before.step === "first", "control: a live run recorded its first step", JSON.stringify(before));
+
+  tx(db, () => db.prepare(`INSERT INTO task_exec(task_id,cancel_requested) VALUES('task-refused',1)
+                           ON CONFLICT(task_id) DO UPDATE SET cancel_requested=1`).run());
+  const r = checkpoint(db, { runId: "refused", step: "second", seq: 2, state: { b: 2 } });
+  check(r?.ok === false && r.reason === "cancelled", "a cancelled run's checkpoint is refused", JSON.stringify(r));
+
+  const after = runRow("refused");
+  const afterMore = db.prepare(`SELECT cursor, heartbeat_at FROM run WHERE id='refused'`).get();
+  check(after.step === "first", "and the run's step did NOT move to the refused one", after.step);
+  check(afterMore.cursor === beforeMore.cursor, "nor was the cursor patched with its state", afterMore.cursor);
+  check(after.lease_expires_at === before.lease_expires_at, "nor was the lease renewed",
+    `${before.lease_expires_at} -> ${after.lease_expires_at}`);
+  check(afterMore.heartbeat_at === beforeMore.heartbeat_at, "nor the heartbeat refreshed",
+    `${beforeMore.heartbeat_at} -> ${afterMore.heartbeat_at}`);
+  check(steps("refused") === 1, "and no checkpoint row was written for it", String(steps("refused")));
+  // The property that matters downstream, asserted rather than inferred.
+  const res = resume(db, "refused");
+  check(!res.done.includes("second"), "so resume never sees a step the run did not record", JSON.stringify(res.done));
 }
 
 // --- a run that never existed -------------------------------------------------

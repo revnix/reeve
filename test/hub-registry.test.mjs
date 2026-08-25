@@ -649,6 +649,57 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   db.close();
 }
 
+// ── a backslash is refused, on every platform ──────────────────────────────
+// reeve has to run on macOS, Windows and Ubuntu, and the two families disagree
+// about what a backslash MEANS: on POSIX it is an ordinary character in a
+// filename, on Windows it is a separator. So `packages\\x` is one segment on one
+// platform and two on another, `overlaps()` compares it as disjoint from
+// `packages/x`, and the same directory can be granted to two tasks at once.
+// Refused rather than rewritten, because rewriting it to a slash would silently
+// change which file a POSIX claim addressed.
+{
+  for (const raw of ["packages\\x", "packages\\x\\y", "a\\b/c"]) {
+    const c = normalizeClaim(raw);
+    check(c.refusal != null, `a claim containing a backslash is refused (${raw})`, JSON.stringify(c));
+    check(/backslash/i.test(c.refusal ?? ""), "and says what is wrong with it", String(c.refusal));
+  }
+  // CONTROL: the slash-separated form is still accepted, or "refuses
+  // backslashes" has become "refuses paths".
+  const ok = normalizeClaim("packages/x/y");
+  check(ok.refusal == null && ok.path === "packages/x/y",
+    "control: the slash form every platform agrees on is accepted", JSON.stringify(ok));
+}
+
+// ── the index probe is a PRECONDITION, not an enhancement ──────────────────
+// `io.lsTree?.()` made a missing capability read as "nothing is tracked", so
+// every ENOENT became "does not exist yet" and the walk stopped -- accepting an
+// uninitialised submodule, which is EXACTLY the case that has no worktree entry
+// and IS a mode-160000 gitlink. The refusal was defeated by the absence of the
+// probe that detects it, and an adapter that simply omitted it looked like a
+// repository with no submodules at all.
+{
+  const enoent = () => { const e = new Error("ENOENT"); e.code = "ENOENT"; throw e; };
+  const noProbe = { lstat: enoent };                       // no lsTree at all
+  const r = resolveClaims([normalizeClaim("vendor/thing")], "/repo", noProbe);
+  check(r.refusal != null, "resolving without an index probe is refused", JSON.stringify(r));
+  check(/lsTree|index probe/i.test(r.refusal ?? ""),
+    "and names the capability it needed", String(r.refusal));
+
+  // CONTROL: with the probe present and reporting a gitlink, the submodule
+  // refusal still fires -- the check it protects still works.
+  const gitlink = { lstat: enoent, lsTree: () => ({ mode: "160000" }) };
+  const sub = resolveClaims([normalizeClaim("vendor/thing")], "/repo", gitlink);
+  check(/submodule/.test(sub.refusal ?? ""),
+    "control: with the probe, a gitlink is still refused as a submodule", JSON.stringify(sub));
+
+  // CONTROL: with the probe present and nothing tracked, an ordinary
+  // not-yet-existing path is still admitted -- the commonest filing there is.
+  const clean = { lstat: enoent, lsTree: () => null };
+  const fresh = resolveClaims([normalizeClaim("packages/new")], "/repo", clean);
+  check(fresh.ok === true && !fresh.refusal,
+    "control: a path that does not exist yet is still a valid claim", JSON.stringify(fresh));
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

@@ -431,5 +431,44 @@ const EVIDENCE = [
     JSON.stringify(trivial.compensations));
 }
 
+// ── a resume waits for the hold's own drain ────────────────────────────────
+// Entering BLOCKED or ESCALATED runs `record-drain`, which snapshots the effects
+// still in flight -- a push, a PR operation, a merge -- and those settle under
+// the UNCHANGED generation, because a hold does not bump it. An immediate resume
+// clears the holds and puts the task back to work beside them: two writers on
+// one branch, and a merge that lands for a task that has since been redesigned.
+// `drainRemaining` already answers this question for CANCELLING; the resume
+// branch simply never read it, so the drain protected the cancellation path and
+// not the one a founder actually reaches for.
+{
+  const resume = (extra = {}, state = {}) =>
+    nextPhase({ phase: "BLOCKED", generation: 1, heldFrom: "IMPLEMENTING", ...state },
+              { kind: "founder.resume", redesign: false, ...extra });
+
+  const draining = resume({}, { drainRemaining: 2 });
+  check(draining.ok === false, "a resume with effects still draining is refused",
+    JSON.stringify(draining));
+  check(/drain/i.test(draining.refusal ?? ""), "and says so", String(draining.refusal));
+
+  const redesign = nextPhase({ phase: "BLOCKED", generation: 1, heldFrom: "IMPLEMENTING",
+                              drainRemaining: 2 },
+                             { kind: "founder.resume", redesign: true });
+  check(redesign.ok === false, "a REDESIGN resume is refused for the same reason",
+    JSON.stringify(redesign));
+
+  // CONTROL: with the drain settled, both resumes go through -- or "waits for
+  // the drain" has become "never resumes".
+  const plain = resume({}, { drainRemaining: 0 });
+  check(plain.ok === true, "control: a settled drain resumes", JSON.stringify(plain));
+  const rd = nextPhase({ phase: "BLOCKED", generation: 1, heldFrom: "IMPLEMENTING",
+                         drainRemaining: 0 },
+                       { kind: "founder.resume", redesign: true });
+  check(rd.ok === true, "control: and so does a redesign resume", JSON.stringify(rd));
+  // CONTROL: the default is zero, so a caller that never held anything is not
+  // refused for a drain it never had.
+  check(resume().ok === true, "control: no drainRemaining supplied means nothing draining",
+    JSON.stringify(resume()));
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

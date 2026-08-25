@@ -278,6 +278,136 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
   db.close();
 }
 
+// ── a task held BEFORE implementing still gets a hold ──────────────────────
+// `write-pr-hold` learned to hold the spec PR, but `hasOpenBuilderPr` is the
+// predicate that decides whether the machine EMITS that compensation, and it
+// counted `impl_pr` alone. So the commonest pre-implementation hold -- a task
+// stopped in SPEC_PR_OPEN or GATE -- emitted no hold at all and left its spec PR
+// mergeable for as long as it stayed BLOCKED. The repair to the compensation was
+// invisible because the gate in front of it had not moved.
+{
+  const db = openHub(join(dir, "t23.db"));
+  seed(db, { id: "bt:1", phase: "SPEC_PR_OPEN", generation: 1 });
+  db.exec(`UPDATE task SET spec_repo_id=9, spec_pr=42, spec_head='specsha' WHERE id='bt:1'`);
+  check(db.prepare("SELECT count(*) c FROM impl_pr WHERE task='bt:1'").get().c === 0,
+    "fixture: no implementation PR exists, which is the whole point");
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "SPEC_PR_OPEN", expectedGeneration: 1,
+    evidence: { kind: "hold", reason: "over_budget" }, op: "phase.held" });
+  check(r.applied === true && r.to === "BLOCKED", "the hold applies", JSON.stringify(r));
+  const hold = db.prepare("SELECT pr, repo_id, reason FROM pr_hold WHERE task='bt:1'").get();
+  check(hold != null, "and the spec PR is held", JSON.stringify(hold));
+  check(hold?.pr === 42 && hold?.repo_id === 9, "on the task's own spec PR", JSON.stringify(hold));
+  check(hold?.reason === "over_budget",
+    "carrying the reason the machine validated", JSON.stringify(hold));
+  db.close();
+}
+
+// CONTROL: a task with NO spec PR and no implementation PR writes no hold, or
+// the predicate has become "always true" and every hold writes a phantom row.
+{
+  const db = openHub(join(dir, "t24.db"));
+  seed(db, { id: "bt:1", phase: "SPEC_DRAFT", generation: 1 });
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "SPEC_DRAFT", expectedGeneration: 1,
+    evidence: { kind: "hold", reason: "over_budget" }, op: "phase.held" });
+  check(r.applied === true, "control: a hold with no PR at all still applies", JSON.stringify(r));
+  check(db.prepare("SELECT count(*) c FROM pr_hold WHERE task='bt:1'").get().c === 0,
+    "control: and writes no hold, because there is nothing to hold");
+  db.close();
+}
+
+// ── the pin expires ────────────────────────────────────────────────────────
+// hub.sql calls `territory_lease.pinned_until` "the ONLY home of the pin", and
+// `task_territory.pinned` is what the FILING asked for -- a durable bit nothing
+// ever clears. Reading the bit meant `release-territory` was omitted on every
+// hold of a task that was EVER pinned; and since a lease is live while its task
+// is non-terminal, that expired pin then blocked every overlapping filing for
+// ever rather than until its deadline. A pin is a promise with an end.
+{
+  const db = openHub(join(dir, "t25.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',1)`);
+  // The claim is pinned; the LEASE's pin has run out.
+  db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at,pinned_until)
+           VALUES('p','prefix','packages/x','bt:1',unixepoch()+3600, unixepoch()-1)`);
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "hold", reason: "over_budget" }, op: "phase.held" });
+  check(r.applied === true, "a hold on a task whose pin expired applies", JSON.stringify(r));
+  check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task='bt:1'").get().c === 0,
+    "and the territory IS released, because the pin is over",
+    JSON.stringify(db.prepare("SELECT * FROM territory_lease").all()));
+  db.close();
+}
+
+// CONTROL: a LIVE pin still holds the territory across the hold, or "the pin
+// expires" has become "the pin does nothing".
+{
+  const db = openHub(join(dir, "t26.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',1)`);
+  db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at,pinned_until)
+           VALUES('p','prefix','packages/x','bt:1',unixepoch()+3600, unixepoch()+3600)`);
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "hold", reason: "over_budget" }, op: "phase.held" });
+  check(r.applied === true, "control: the hold applies", JSON.stringify(r));
+  check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task='bt:1'").get().c === 1,
+    "control: a LIVE pin keeps the territory across the hold");
+  db.close();
+}
+
+// ── two PRs with the same number in different repositories ─────────────────
+// A pull-request number is unique only within its repository, and the close set
+// now spans two. Keys built from the task, generation and PR number alone
+// collided, `enqueueEffect` returned the second as a duplicate, and the drain
+// never saw it -- so the task could reach CANCELLED with one PR permanently
+// open while the drain that exists to prove otherwise agreed everything settled.
+{
+  const db = openHub(join(dir, "t27.db"));
+  seed(db, { id: "bt:1", phase: "IMPL_PR_OPEN", generation: 1 });
+  db.exec(`UPDATE task SET spec_repo_id=9, spec_pr=5, spec_head='specsha' WHERE id='bt:1'`);
+  // THE SAME NUMBER, in a different repository.
+  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1',1,0,1,5,'implsha',unixepoch())`);
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPL_PR_OPEN", expectedGeneration: 1,
+    evidence: { kind: "founder.cancel" }, op: "phase.cancelled" });
+  check(r.applied === true, "the cancellation applies", JSON.stringify(r));
+  const closes = db.prepare(
+    `SELECT args FROM outbox WHERE task_id='bt:1' AND kind='gh.pr.close'`).all()
+    .map(x => JSON.parse(x.args).repo_id).sort();
+  check(closes.length === 2, "BOTH PRs are enqueued for closing, not one",
+    JSON.stringify(closes));
+  check(JSON.stringify(closes) === "[1,9]",
+    "one per repository, so neither was swallowed as a duplicate", JSON.stringify(closes));
+  const comments = db.prepare(
+    `SELECT count(*) c FROM outbox WHERE task_id='bt:1' AND kind='gh.pr.comment'`).get().c;
+  check(comments === 2, "and each gets its own explaining comment", String(comments));
+  db.close();
+}
+
+// ── a depth override keeps its own hold reason ─────────────────────────────
+// `depth_post_approval` is a member of pr_hold's CHECK and of HOLD_ESCALATION,
+// the machine emits it, and `record-hold-reason` writes it to the task -- so
+// classifying the PR's hold as the generic `escalated` made the hold and its own
+// task disagree about why the work stopped, in the row a guardian reads to
+// explain the block.
+{
+  const db = openHub(join(dir, "t28.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1',1,0,1,3,'sha',unixepoch())`);
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "depth.override", depth: "deep" }, op: "phase.held" });
+  check(r.applied === true, "a post-approval depth override applies", JSON.stringify(r));
+  const hold = db.prepare("SELECT reason FROM pr_hold WHERE task='bt:1'").get();
+  check(hold?.reason === "depth_post_approval",
+    "and its hold carries the depth-specific reason, not the generic one",
+    JSON.stringify(hold));
+  const onTask = db.prepare("SELECT reason FROM hold_reason WHERE task='bt:1' ORDER BY id DESC LIMIT 1").get();
+  check(onTask == null || onTask.reason === hold?.reason,
+    "so the hold and the task agree about why the work stopped",
+    JSON.stringify({ hold: hold?.reason, task: onTask?.reason }));
+  db.close();
+}
+
 // ── a cap-reached task's SPEC PR gets a durable hold ───────────────────────
 // `gate.capReached` happens at GATE by definition: a spec PR is open and no
 // implementation PR exists yet. `write-pr-hold` iterated `impl_pr` alone, so the

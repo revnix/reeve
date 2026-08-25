@@ -227,6 +227,22 @@ function trackedAmong(worktree, wanted) {
  * GitHub writes on someone else's pull request, and the founder turns it on
  * deliberately after the shadow week rather than inheriting it from a merge.
  */
+/**
+ * The escalation CAUSE for dead-lettered effects of one kind.
+ *
+ * A function, and it takes no count, because the count is not part of the cause.
+ * `announceable` treats the key as identity and the map value as the count: a
+ * changed value re-announces the SAME cause, while a changed key is a new cause
+ * and leaves the old one standing until something clears it.
+ *
+ * Written with the number interpolated, every count was a different cause -- two
+ * reads in one pass produced two keys instead of one updated one, so a single
+ * notification could carry contradictory totals and the next tick would retire the
+ * stale one as though it had been resolved.
+ */
+export const deadLetterCause = kind =>
+  `${kind} effect(s) reeve could not perform and will not retry — they need a person`;
+
 export const reviewActionsOn = profile => profile?.watch?.reviewActions === true;
 
 export function uncommittedFiles(worktree, copiedBaseline = {}, { digest = digestOf } = {}) {
@@ -761,8 +777,13 @@ function record(db, { pr, head, verdict, decision, effects = [], retire = new Ma
 const keyFor = (nwo, e, r) =>
   `review-request:${nwo}:${e.pr}:${r.login}:${e.head}:${sha256(r.trigger).slice(0, 12)}`;
 
-function effectsFor({ nwo, e, decision, profile }) {
-  if (!reviewActionsOn(profile)) return { effects: [], unsummonable: [], retire: new Map() };
+export function effectsFor({ nwo, e, decision, profile, execute }) {
+  // BOTH gates, and they answer different questions. `--execute` is "may reeve act
+  // at all"; `watch.reviewActions` is "may it act on review threads". An
+  // observational run must not queue a visible GitHub write any more than it may
+  // perform one -- a queue outlives the run that made it, so producing while
+  // disarmed only moves the acting to whichever run drains it next.
+  if (!execute || !reviewActionsOn(profile)) return { effects: [], unsummonable: [], retire: new Map() };
   const reviewers = profile.reviewers ?? [];
   // A BLOCKING reviewer with no trigger is the dangerous shape, and it is quiet by
   // construction: the profile validator only warns, the filter drops them, and if
@@ -880,8 +901,25 @@ export async function tick(ctx) {
   // otherwise leave review requests undelivered indefinitely while everything
   // needed to deliver them was healthy. So this is a function both exits call,
   // rather than a block only the successful path reaches.
+  const deadLetters = () => db.prepare(`SELECT kind, count(*) n FROM outbox
+                                       WHERE status='dead_letter' GROUP BY kind`).all();
+
   const drainDueEffects = async () => {
-if (ctx.drain !== false) {
+    // `--execute` gates DELIVERY as well as dispatch, and that is the CLI's own
+    // definition of the flag: act, rather than observe. Posting a comment on
+    // someone's pull request is acting -- it is visible, it is not undoable, and a
+    // run started to watch must not do it.
+    //
+    // Two gates, not one, and they answer different questions. `--execute` is "may
+    // reeve act at all"; `watch.reviewActions` is "may it act on review threads".
+    // A queue persisted by an earlier armed run is exactly the case that makes the
+    // first one necessary: without it, an observational run started afterwards
+    // would drain that queue and post.
+    //
+    // The dead-letter escalation below still runs. Refusing to ACT is not a reason
+    // to stop SAYING what is stuck -- an observational run is the one most likely
+    // to be looked at by a person.
+    if (execute && ctx.drain !== false) {
       try {
         // The QUEUE is read before the credential. Authenticating first meant an
         // installation lookup and a fresh token mint on every ordinary tick --
@@ -897,9 +935,16 @@ if (ctx.drain !== false) {
         // CLEARS it -- so the permanent loss announces itself once and is then
         // retracted. The same held while authentication failed, and across a restart.
         // A terminal row is a fact about the store, not about this tick's work.
-        for (const d of db.prepare(`SELECT kind, count(*) n FROM outbox
-                                    WHERE status='dead_letter' GROUP BY kind`).all())
-          escalations.set(`${d.n} ${d.kind} effect(s) reeve could not perform and will not retry — they need a person`, 1);
+        // The KEY is the cause; the COUNT is the value. `announceable` reads them
+        // that way -- the key is identity, and a changed value is what makes a
+        // known cause worth re-announcing.
+        //
+        // Putting the number in the string made every count a different cause. Two
+        // reads in one pass produced two keys rather than one updated one, so a
+        // single notification could carry contradictory totals, and the next tick
+        // would clear the stale one as though it had been resolved. This is also
+        // why it is read ONCE, after the drain, rather than before and after.
+
 
         const due = db.prepare(`SELECT count(*) n FROM outbox
                                 WHERE (status='pending' AND not_before<=unixepoch())
@@ -933,11 +978,7 @@ if (ctx.drain !== false) {
           // Counted from the store rather than from this pass, because recovery can
           // dead-letter a row in a tick that performed nothing, and because a
           // restart must not make the backlog disappear.
-          // Re-read after the drain, because this pass may have dead-lettered a row
-          // that the count above was taken before.
-          for (const d of db.prepare(`SELECT kind, count(*) n FROM outbox
-                                      WHERE status='dead_letter' GROUP BY kind`).all())
-            escalations.set(`${d.n} ${d.kind} effect(s) reeve could not perform and will not retry — they need a person`, 1);
+          /* the dead-letter escalation is raised once, below, after every branch */
         }
         }
       } catch (err) {
@@ -965,6 +1006,16 @@ if (ctx.drain !== false) {
         } catch { /* a store that cannot be read must not take the tick down */ }
       }
     }
+    // OUTSIDE the execute gate, deliberately. A terminal row is a fact about the
+    // store, not about whether this run is allowed to act -- and an observational
+    // run is the one most likely to have a person reading it. Raised after every
+    // branch for the same reason: if it were raised only where work happened it
+    // would vanish on the tick after the last row died, and `announceable` would
+    // then clear it as resolved.
+    try {
+      for (const d of deadLetters())
+        escalations.set(deadLetterCause(d.kind), d.n);
+    } catch { /* an unreadable store is reported by the audit, not by crashing here */ }
   };
 
   // Turning escalations into announcements, as a function BOTH exits call.
@@ -1183,7 +1234,7 @@ if (ctx.drain !== false) {
     // worker containment. A review request withheld because a sandbox could not be
     // proved closed is a pull request left without the round it needed, for a
     // reason that has nothing to do with it.
-    const { effects, unsummonable, retire } = effectsFor({ nwo, e, decision, profile });
+    const { effects, unsummonable, retire } = effectsFor({ nwo, e, decision, profile, execute });
     for (const login of unsummonable) {
       log(logPath, `  #${pr}: ${login} BLOCKS this pull request and declares no trigger comment — reeve cannot summon them`);
       escalations.set(`${login} blocks merges but declares no trigger comment, so reeve cannot request their review`, 1);
@@ -1198,7 +1249,7 @@ if (ctx.drain !== false) {
       log(logPath, `  #${pr}: REQUEST_REVIEW — already requested at this head`);
     // A decision that WANTED effects and produced none names the reason, because
     // a profile with no trigger declared looks identical to one already asked.
-    if (decision.action === "REQUEST_REVIEW" && reviewActionsOn(profile) && !effects.length)
+    if (decision.action === "REQUEST_REVIEW" && execute && reviewActionsOn(profile) && !effects.length)
       log(logPath, `  #${pr}: REQUEST_REVIEW — no reviewer in this profile declares a trigger`);
     if (decision.action === ACTIONS.WAIT) waiting.add(pr);
     // Carried on the entry rather than left in this block's scope: the dispatch
@@ -1238,7 +1289,7 @@ if (ctx.drain !== false) {
   // count towards the worker gates -- otherwise an open containment blocks a
   // comment that no worker was ever going to post.
   const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action)
-                                    && !(d.decision.action === "REQUEST_REVIEW" && reviewActionsOn(profile)));
+                                    && !(d.decision.action === "REQUEST_REVIEW" && execute && reviewActionsOn(profile)));
   let containment = ctx.containment ?? null;
   if (execute && wanted.length && !containment) containment = await measuredContainment(ctx, profile, nwo, logPath);
   if (execute && wanted.length && containment.credentialRead !== "closed") {
@@ -1258,7 +1309,10 @@ if (ctx.drain !== false) {
     for (const { e, decision, cause, fp } of decisions) {
       // Already handled at decision time, in the same transaction as the decision.
       // Nothing to dispatch: reeve posts it.
-      if (decision.action === "REQUEST_REVIEW" && reviewActionsOn(profile)) continue;
+      // The same condition the producer uses. If they disagree, a disarmed run
+      // skips the dispatch for an action it never queued -- so the request is
+      // neither made by reeve nor handed to a worker, and nothing says so.
+      if (decision.action === "REQUEST_REVIEW" && execute && reviewActionsOn(profile)) continue;
       if (UNBUILT_ACTIONS[decision.action]) {
         log(logPath, `  #${e.pr}: NOT dispatching ${decision.action} — ${UNBUILT_ACTIONS[decision.action]}`);
         escalations.set(`#${e.pr}: ${decision.action.toLowerCase().replace("_", " ")} needs a GitHub effect reeve does not yet perform`, 1);

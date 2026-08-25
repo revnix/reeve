@@ -160,6 +160,22 @@ const statusOf = key => db.prepare(`SELECT status, attempts, result, last_error 
   }
   const before = status2("loop");
   check(before.attempts === 3, "control: the row has spent its whole budget on leases", JSON.stringify(before));
+
+  // ONE more pass first, and it is not generosity. The final allowed lease can
+  // POST the comment and crash before settling: at that point attempts equals the
+  // budget, and dead-lettering records a delivered effect as one reeve "could not
+  // perform" -- and escalates it -- while GitHub already contains it. The handler's
+  // marker pre-check is the only thing that can tell those apart, and it needs a
+  // lease to run.
+  const recon = recoverOutbox(db2);
+  check(status2("loop").status === "pending",
+    "a row at its budget gets ONE reconciliation pass before terminal failure", JSON.stringify(status2("loop")));
+  check((recon.deadLettered ?? []).length === 0, "and is not dead-lettered yet", JSON.stringify(recon.deadLettered));
+
+  // That pass is spent, and now it terminates.
+  const j4 = leaseOutbox(db2, { worker: "crasher", leaseSeconds: -5, kinds: ["gh.pr.comment"] });
+  check(j4 !== undefined && status2("loop").attempts === 4,
+    "control: the reconciliation lease happened and went past the budget", JSON.stringify(status2("loop")));
   const rec = recoverOutbox(db2);
   const after = status2("loop");
   check(after.status === "dead_letter", "a row recovered past its budget is dead-lettered, not handed out again",

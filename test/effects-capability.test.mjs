@@ -1,0 +1,111 @@
+// What an effect handler is allowed to REACH, enforced by walking its imports.
+//
+// `effects.mjs` claims, in its own docblock, that nothing in it reaches for a
+// credential on its own — the drainer authenticates once and passes the caller in.
+// That is a capability boundary, and today it holds by construction: the file
+// imports nothing at all. Which is exactly the condition under which someone adds
+// `import { authenticate } from "../github/app.mjs"` for convenience, the claim
+// silently stops being true, and every existing test still passes because they
+// inject a fake `api` and never notice the module could have made its own.
+//
+// So the property is checked rather than asserted in prose. The walk is
+// TRANSITIVE: a boundary that only inspects direct imports is defeated by one
+// level of indirection, which is the ordinary way it gets defeated.
+import { readFileSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join, resolve, relative } from "node:path";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const src = join(here, "..", "src");
+
+let fail = 0;
+const check = (ok, name, detail) => {
+  console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+  if (!ok) { if (detail) console.log("        " + detail); fail++; }
+};
+
+/**
+ * Every specifier a file pulls in, by any of the four routes.
+ *
+ * `export ... from` and a dynamic `import()` are imports as surely as a static one
+ * is, and `require` reaches CommonJS. A walk that reads only `import ... from` is
+ * a boundary with three doors left open.
+ */
+const specifiersIn = text => {
+  const out = [];
+  for (const re of [
+    /^\s*import\s[\s\S]*?from\s*["']([^"']+)["']/gm,   // import x from "y"
+    /^\s*import\s*["']([^"']+)["']/gm,                 // import "y" (side effect)
+    /^\s*export\s[\s\S]*?from\s*["']([^"']+)["']/gm,   // export ... from "y"
+    /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,          // await import("y")
+    /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g,         // require("y")
+  ]) for (const m of text.matchAll(re)) out.push(m[1]);
+  return out;
+};
+
+/** Everything `entry` can reach, transitively, as a set of specifiers. */
+const reachableFrom = entry => {
+  const seen = new Set(), reached = new Set();
+  const walk = file => {
+    const abs = resolve(file);
+    if (seen.has(abs) || !existsSync(abs)) return;
+    seen.add(abs);
+    for (const spec of specifiersIn(readFileSync(abs, "utf8"))) {
+      reached.add(spec);
+      if (spec.startsWith(".")) walk(join(dirname(abs), spec));
+    }
+  };
+  walk(entry);
+  return { reached, files: seen };
+};
+
+// --- the walker can see what it is looking for --------------------------------
+{
+  // Controls first, and against a REAL file rather than a string, because a
+  // matcher that finds nothing and a boundary that is clean read identically.
+  const { reached, files } = reachableFrom(join(src, "outbox", "drain.mjs"));
+  check(reached.has("../db/ops.mjs"), "control: the walk sees a direct import", [...reached].join(", "));
+  check(reached.has("node:sqlite") || reached.has("node:fs"),
+    "control: and follows it TRANSITIVELY into what that file imports", [...reached].join(", "));
+  check(files.size >= 3, "control: so it visited more than the entry file", `${files.size} file(s)`);
+
+  for (const [route, text, want] of [
+    ["export ... from", 'export { a } from "./x.mjs";', "./x.mjs"],
+    ["dynamic import", 'const m = await import("./y.mjs");', "./y.mjs"],
+    ["require", 'const z = require("./z.mjs");', "./z.mjs"],
+    ["side-effect import", 'import "./w.mjs";', "./w.mjs"],
+  ]) check(specifiersIn(text).includes(want), `control: the matcher sees a ${route}`, specifiersIn(text).join(","));
+}
+
+// --- the boundary itself ------------------------------------------------------
+{
+  const { reached } = reachableFrom(join(src, "outbox", "effects.mjs"));
+
+  // A credential, by any route. `github/app.mjs` is what loads the App key and
+  // mints tokens; the node modules are what would let a handler go around it.
+  const forbidden = [...reached].filter(s =>
+    /github\/app\.mjs$/.test(s) || /^node:(child_process|fs|net|http|https|tls|dns)$/.test(s));
+  check(forbidden.length === 0,
+    "an effect handler can reach neither a credential nor a way to make its own network call",
+    `reaches ${forbidden.join(", ")}`);
+
+  // And the positive half: the claim is that it takes its caller as an argument.
+  // Without this, a handler that simply stopped working would also pass above.
+  const text = readFileSync(join(src, "outbox", "effects.mjs"), "utf8");
+  check(/\{\s*api\b/.test(text), "because the caller is handed to it, not fetched by it",
+    "no `api` parameter found");
+}
+
+// --- and the drainer holds the weaker version of the same line ----------------
+{
+  // The drainer legitimately touches the database — that is its job — but it
+  // still must not authenticate. Whoever holds the credential passes it in, so
+  // there is one place a token is minted and one place to audit.
+  const { reached } = reachableFrom(join(src, "outbox", "drain.mjs"));
+  const auth = [...reached].filter(s => /github\/app\.mjs$/.test(s));
+  check(auth.length === 0, "the drainer does not authenticate either; it is handed the caller",
+    `reaches ${auth.join(", ")}`);
+}
+
+console.log(fail ? `\nfailed=${fail}` : "\nall green");
+process.exit(fail ? 1 : 0);

@@ -28,7 +28,7 @@ import { measureContainment, revalidateContainment, probeKeychain, isolationTopo
 import { canaryIdFor, netListener, instrumentHash } from "./canary.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects } from "./db/ops.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
 import { drainOutbox } from "./outbox/drain.mjs";
 import { HANDLERS } from "./outbox/effects.mjs";
@@ -711,9 +711,21 @@ function record(db, { pr, head, verdict, decision, effects = [] }) {
         }));
       // `enqueue` returns null for a key it already holds, which is success: the
       // effect is durable, it was simply made durable by an earlier tick.
-      let queued = 0, known = 0;
-      for (const eff of effects) (enqueue(db, eff) !== null ? queued++ : known++);
-      return { ok: true, queued, known };
+      let queued = 0, known = 0, dropped = 0;
+      for (const eff of effects) {
+        // Withdraw what this one supersedes, in the SAME transaction. A transient
+        // failure leaves a row pending on a backoff; if the pull request gets a new
+        // commit before that retry comes due, the new head enqueues its own effect
+        // and both are pending. They carry different markers, so neither
+        // idempotency check can see the other, and the reviewer is asked twice for
+        // what is now the same head.
+        //
+        // The prefix stops before the head, so it matches this reviewer's requests
+        // on this pull request at ANY head, and `keep` spares the one just made.
+        if (eff.supersedes) dropped += supersedeEffects(db, { prefix: eff.supersedes, keep: eff.idemKey });
+        (enqueue(db, eff) !== null ? queued++ : known++);
+      }
+      return { ok: true, queued, known, dropped };
     });
   } catch (err) {
     // A store that cannot record must not stop the loop -- but it must not report
@@ -744,6 +756,10 @@ function effectsFor({ nwo, e, decision, profile }) {
   const unsummonable = reviewers.filter(r => r.blocking && !r.trigger).map(r => r.login);
   const effects = reviewers.filter(r => r.trigger).map(r => ({
     idemKey: `review-request:${nwo}:${e.pr}:${e.head}:${r.login}`,
+    // What this request replaces: the same reviewer, the same pull request, any
+    // earlier head. Deliberately NOT keyed on the head, since the whole point is
+    // to catch the rows a head change left behind.
+    supersedes: `review-request:${nwo}:${e.pr}:`,
     kind: "gh.pr.comment",
     args: { nwo, pr: e.pr, body: r.trigger },
   }));
@@ -974,7 +990,8 @@ export async function tick(ctx) {
     if (effects.length && !decided.ok)
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
     else if (decided.queued)
-      log(logPath, `  #${pr}: REQUEST_REVIEW — queued ${decided.queued} trigger comment(s) for reeve to post`);
+      log(logPath, `  #${pr}: REQUEST_REVIEW — queued ${decided.queued} trigger comment(s) for reeve to post`
+                 + (decided.dropped ? `, withdrawing ${decided.dropped} for a head that has moved on` : ""));
     else if (effects.length)
       log(logPath, `  #${pr}: REQUEST_REVIEW — already requested at this head`);
     // A decision that WANTED effects and produced none names the reason, because
@@ -1744,7 +1761,11 @@ export async function tick(ctx) {
         log(logPath, `  outbox: ${due} effect(s) waiting; cannot authenticate — ${auth.why}`);
       } else {
         const api = (args, opts) => apiAsInstallation(auth.token, args, opts);
-        const r = await drainOutbox({ db, log: m => log(logPath, m), handlers: ctx.handlers ?? HANDLERS, api });
+        // `auth.actor` is the login reeve's own comments carry. A handler needs it
+        // to tell its own writing from a contributor's; null means GitHub did not
+        // say, and a handler must read that as "cannot tell" rather than "matches".
+        const r = await drainOutbox({ db, log: m => log(logPath, m), handlers: ctx.handlers ?? HANDLERS,
+                                      api, actor: auth.actor ?? null });
         const posted = r.done.filter(d => d.verdict === "done").length;
         if (posted) log(logPath, `  outbox: performed ${posted} effect(s)`);
         // A dead letter is PERMANENT: no later drain leases the row again, so the

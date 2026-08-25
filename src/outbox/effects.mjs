@@ -35,44 +35,48 @@ export const markerFor = idemKey => `<!-- reeve:effect:${idemKey} -->`;
  * repost, which is a duplicate comment rather than a lost one -- the failure the
  * cheaper direction produces is worse.
  */
-export function ghPrComment(args, { api, idemKey, attempt = 1 }) {
+export function ghPrComment(args, { api, idemKey, actor = null }) {
   const { nwo, pr, body } = args;
   if (!nwo || !pr || !body) return { ok: false, retryable: false, error: `gh.pr.comment needs nwo, pr and body; got ${JSON.stringify(args)}` };
   const marker = markerFor(idemKey);
 
-  // Only a RETRY can find anything. `attempt` is the lease count for this row, so
-  // 1 means nothing has ever been delivered for it and there is no marker to look
-  // for. Reading anyway would put a paginated list call on every ordinary
-  // delivery to answer a question whose answer is known.
-  if ((attempt ?? 1) > 1) {
-    // `--paginate`, and it is not optional. The default order for issue comments
-    // is OLDEST FIRST, so a fixed `page=1` reads the oldest hundred -- on any
-    // busy pull request that is the page least likely to hold a comment posted
-    // seconds ago, which made the at-most-once claim false exactly where
-    // duplicates are most visible. Fetching every page is the only read that
-    // answers "is my marker here" rather than "is it in this arbitrary slice".
-    //
-    // Filtered by `--jq` at the source, and that is what makes paginating safe.
-    // Every page still crosses a subprocess pipe, and a long discussion's full
-    // JSON exceeds the default buffer -- at which point the read FAILS for a
-    // request that succeeded, this falls through, and the duplicate it exists to
-    // prevent is posted. Asking gh for matching ids instead means the output is a
-    // handful of digits however long the thread is, so the buffer stops being a
-    // variable in the answer at all.
+  // The pre-check runs on EVERY attempt, not only on a retry.
+  //
+  // Gating it on the attempt count was an optimisation and it was wrong. A local
+  // counter cannot prove that no external delivery exists: restore the database
+  // from a snapshot taken before a delivery and the comment is still on GitHub
+  // while the row comes back with `attempts = 0`, so a "first" attempt posts the
+  // same trigger again. The state that would have to remember is precisely the
+  // state a restore rolls back. Only GitHub knows what is on GitHub.
+  //
+  // It is affordable because the read is filtered at the source: `--jq` returns
+  // matching ids and nothing else, so the output is a handful of digits however
+  // long the thread is, and the discussion's length stops being a variable in the
+  // answer. `--paginate` because issue comments come OLDEST FIRST, so a fixed
+  // first page is the page least likely to hold a comment posted seconds ago.
+  //
+  // The AUTHOR is checked, not just the marker. The key is derived from public
+  // values -- repository, pull request, head, reviewer login -- so anyone who can
+  // comment can construct it. Without an author test, a contributor could post the
+  // marker during a transient failure and the retry would settle `done` without
+  // ever requesting the review: a required reviewer silently never summoned. The
+  // check is done in the `--jq` so a forged comment never even reaches this code.
+  //
+  // A null actor means GitHub did not tell us what reeve writes as. That is
+  // "cannot tell", not "matches", so the suppression is skipped entirely and the
+  // comment is posted: a duplicate comment is a nuisance, an unrequested review is
+  // a pull request that waits forever.
+  if (actor) {
     const seen = api(["--paginate", "-X", "GET", `repos/${nwo}/issues/${pr}/comments`,
                       "-F", "per_page=100",
-                      "--jq", `.[] | select(.body | contains("${marker}")) | .id`]);
+                      "--jq", `.[] | select(.user.login == "${actor}") | select(.body | contains("${marker}")) | .id`]);
     if (seen.ok) {
-      // Ids, one per line, and usually none. The LAST is taken for the same reason
-      // the old code took the last match: if a duplicate was somehow posted, the
-      // most recent is the one a reader sees.
       const ids = String(seen.out || "").split("\n").map(s => s.trim()).filter(Boolean);
-      if (ids.length) return { ok: true, result: { commentId: Number(ids[ids.length - 1]), reposted: false, alreadyThere: true } };
+      if (ids.length) return { ok: true, result: { commentId: Number(ids[ids.length - 1]), alreadyThere: true } };
     }
     // A failed read falls THROUGH and posts. Absence of evidence is not evidence
-    // of absence, and a lost review request costs more than a duplicated comment.
-    // Said explicitly because the failure modes that land here -- a timeout, a
-    // truncated buffer, a rate limit -- all LOOK like "no marker found".
+    // of absence, and every failure that lands here -- a timeout, a truncated
+    // buffer, a rate limit -- LOOKS exactly like "no marker found".
   }
 
   const r = api(["-X", "POST", `repos/${nwo}/issues/${pr}/comments`,

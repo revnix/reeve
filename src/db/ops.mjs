@@ -350,6 +350,35 @@ export function enqueue(db, { idemKey, kind, runId = null, args, notBefore = 0 }
  * the tries the budget allows. The two counters move together on this path and
  * apart on others, which is exactly why they are two columns.
  */
+/**
+ * Withdraw pending effects that a newer one has made obsolete.
+ *
+ * A transient failure leaves a row pending with a backoff. If the pull request
+ * gets a new commit before that retry comes due, the new head enqueues its own
+ * effect under a different key -- and both are now pending. They carry different
+ * markers, so the idempotency pre-check cannot see one from the other, and the
+ * reviewer is asked twice for what is now the same head.
+ *
+ * The old row is DELETED rather than settled. There is no status meaning "was
+ * never going to happen": `done` would claim a comment that was never posted, and
+ * `dead_letter` means a person must look at it, which turns an ordinary
+ * supersession into an alarm. The event is emitted so the withdrawal is still on
+ * the record.
+ *
+ * Only PENDING rows. An inflight one may already be mid-delivery, and deleting a
+ * row a drainer holds would leave it settling into nothing.
+ */
+export function supersedeEffects(db, { prefix, keep }) {
+  const rows = db.prepare(`SELECT id, idem_key, kind FROM outbox
+                           WHERE status='pending' AND idem_key LIKE ? AND idem_key <> ?`).all(prefix + "%", keep);
+  for (const r of rows) {
+    db.prepare(`DELETE FROM outbox WHERE id=? AND status='pending'`).run(r.id);
+    emit(db, { actor: "daemon", op: "outbox.superseded",
+               payload: { id: r.id, kind: r.kind, key: r.idem_key, supersededBy: keep } });
+  }
+  return rows.length;
+}
+
 export function leaseOutbox(db, { worker, leaseSeconds = 300, kinds = null }) {
   // A drainer leases only the kinds it can PERFORM. Without the filter it takes a
   // row it has no handler for and must then decide what to do with it, and both

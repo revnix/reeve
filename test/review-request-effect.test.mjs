@@ -66,6 +66,46 @@ const check = (ok, name, detail) => {
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- every reviewer is summoned, not only the last ----------------------------
+{
+  // The key had the head before the login, so no prefix could name one reviewer's
+  // requests and `supersedes` matched every reviewer on the pull request. The
+  // effects are enqueued in a loop, so the second reviewer's supersede deleted the
+  // first reviewer's row that had just been created -- and only the last reviewer
+  // was ever summoned. Two reviewers is the smallest fixture that can show it;
+  // with one, the bug is invisible.
+  const dir = mkdtempSync(join(tmpdir(), "reeve-multi-"));
+  const db = open(join(dir, "state.db"));
+  const effects = [
+    { login: "codex", key: "review-request:o/r:9:codex:HEAD1" },
+    { login: "coderabbit", key: "review-request:o/r:9:coderabbit:HEAD1" },
+  ];
+  tx(db, () => {
+    for (const e of effects) {
+      supersedeEffects(db, { prefix: `review-request:o/r:9:${e.login}:`, keep: e.key });
+      enqueue(db, { idemKey: e.key, kind: "gh.pr.comment", args: { nwo: "o/r", pr: 9, body: `@${e.login} review` } });
+    }
+  });
+  const pending = db.prepare(`SELECT idem_key FROM outbox WHERE status='pending' ORDER BY idem_key`).all().map(r => r.idem_key);
+  check(pending.length === 2, "both reviewers' requests survive being enqueued together", JSON.stringify(pending));
+  for (const e of effects)
+    check(pending.includes(e.key), `${e.login} is still queued after the others were processed`, JSON.stringify(pending));
+
+  // And a new head still supersedes each reviewer's own earlier request, without
+  // touching the other's. Without this the assertion above passes on a supersede
+  // that has simply stopped working.
+  tx(db, () => {
+    supersedeEffects(db, { prefix: "review-request:o/r:9:codex:", keep: "review-request:o/r:9:codex:HEAD2" });
+    enqueue(db, { idemKey: "review-request:o/r:9:codex:HEAD2", kind: "gh.pr.comment", args: {} });
+  });
+  const after = db.prepare(`SELECT idem_key FROM outbox WHERE status='pending' ORDER BY idem_key`).all().map(r => r.idem_key);
+  check(!after.includes("review-request:o/r:9:codex:HEAD1"), "control: a new head does supersede that reviewer's old request", JSON.stringify(after));
+  check(after.includes("review-request:o/r:9:coderabbit:HEAD1"), "and leaves the OTHER reviewer's request alone", JSON.stringify(after));
+
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- a new head withdraws the request the old head left pending ---------------
 {
   // The sequence: delivery fails transiently, the row waits on a backoff, and the

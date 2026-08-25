@@ -343,6 +343,24 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       on `nwo_snapshot` while its own comment said that column is only ever a
       snapshot, so a rename made it return null for an id the hub was holding.
 
+      **Round 4: 8 findings (3×P1), all genuine, all fixed at `4176f22`.** Four
+      were follow-ups on rounds 2-3. The one worth remembering: `write-pr-hold`
+      learned to hold the spec PR in round 3, and `hasOpenBuilderPr` — the
+      predicate deciding whether the machine EMITS that compensation — still
+      counted `impl_pr` alone. **The repair was correct and unreachable**, because
+      the gate in front of it had not moved. A fix is not landed until something
+      calls it.
+
+      **And an interaction that was individually defensible and jointly wrong.**
+      Round 2 made a lease live while its TASK is non-terminal rather than while
+      its clock runs. Round 4 found `hasLivePin` reading `task_territory.pinned`
+      — the durable bit recording what the filing asked for, which nothing
+      clears — instead of `territory_lease.pinned_until`. Separately each is
+      arguable; together, an omitted `release-territory` stopped being a lease
+      that expires in an hour and became one that blocks every overlapping filing
+      FOR EVER. Worth stating as a rule: when a change widens what counts as
+      live, re-audit every predicate that decides what counts as released.
+
       **FOUNDER DECISIONS, 2026-08-25:**
       - **#30 merge:** ask again when Codex returns a clean pass at the current
         head. No conditional or pre-authorised grant. Every merge stays explicit.

@@ -299,6 +299,45 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       cannot leave a task holding part of its territory while believing it holds
       all of it.
 
+      **Round 2 of review: 8 findings (5×P1), all genuine, all fixed at
+      `0827932`.** One was MINE, from round 1, and it is the shape worth keeping:
+      the three-answer `quick_check` split closed the handle on its corruption
+      branch and then fell through into the common damage branch, which closed it
+      again. `DatabaseSync.close()` throws on a closed handle, that error
+      replaced the `hubDamaged` verdict, and — carrying no errcode —
+      `isOperational` classified it as operational. **A corrupt hub reported as
+      merely busy: the exact misclassification the split was added to prevent,
+      reintroduced by the split.** Seven sites in `openHub` closed that handle and
+      two already carried an ad-hoc `try/catch`, which was the warning that
+      ordering was load-bearing. One idempotent `closeHub()` now.
+
+      **The durable finding is about WHAT A PREDICATE IS MEASURING.** The
+      territory conflict scan asked `expires_at > now`, and nothing in this system
+      renews a territory lease — searched: the only writes are the grant and
+      `release-territory`'s delete. So every active task's lease went invisible an
+      hour after it was granted and its paths were handed to the next filing,
+      while the task was still editing them. `hub.sql` states the opposite
+      invariant directly above the table: *"a task is a row, not a process, so
+      dead is a state question... never merely because it looks old."* The clock
+      was measuring nothing but the age of the row. This also **superseded round
+      1's fix in the same file**, which had made an expired row REPLACEABLE — right
+      about the primary-key abort, wrong about when a replacement is allowed.
+
+      Two more where a switch or a field governed nothing:
+      `builder.capabilities.mergeBuilderPr` was declared, defaulted false
+      independently of `publishPr`, and read by no code — every merge was gated on
+      publishing. `persistDepth` travelled on the founder-override edges alone, so
+      an ordinarily sized task kept `depth = NULL` and the RESEARCH-skipping edge
+      read the depth to skip a whole phase and then discarded it. And one where
+      absence was spent as an answer: `slice.next` treated a missing `moreSlices`
+      as "no slices remain", finishing tasks with planned work unimplemented.
+
+      **A control I wrote failed and was wrong, which is worth recording too.** It
+      asserted `hubDamaged` on the pragma-guard path; the marker belongs only to
+      the `quick_check` verdict, which has no SQLite error behind it, and
+      `restoreHub` unwraps `cause` before classifying. Roughly one in ten needs
+      reframing — including one's own.
+
       The §14 S2 Verify clause is checked item by item: the transition matrix
       (588 cells, all total), the GATE → ESCALATED edge, the CANCELLING
       exclusion, the CAS lost-race no-op, the generation fence in both the

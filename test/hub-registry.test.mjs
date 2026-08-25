@@ -685,6 +685,18 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   check(/lsTree|index probe/i.test(r.refusal ?? ""),
     "and names the capability it needed", String(r.refusal));
 
+  // A SYMLINK THE INDEX RECORDS, one mode along from the submodule. The `lstat`
+  // check catches a symlink PRESENT in the worktree; a sparse checkout or a
+  // local deletion leaves it ENOENT there while git still records mode 120000.
+  // The claim was admitted, and the moment an ordinary checkout recreates the
+  // link, work under that path traverses outside the repository -- the boundary
+  // this resolver exists to hold, defeated by the file not being on disk yet.
+  const idxLink = { lstat: enoent, lsTree: () => ({ mode: "120000" }) };
+  const linked = resolveClaims([normalizeClaim("link/inside")], "/repo", idxLink);
+  check(linked.refusal != null, "a claim under an index-recorded symlink is refused",
+    JSON.stringify(linked));
+  check(/symlink/.test(linked.refusal ?? ""), "and says it is a symlink", String(linked.refusal));
+
   // CONTROL: with the probe present and reporting a gitlink, the submodule
   // refusal still fires -- the check it protects still works.
   const gitlink = { lstat: enoent, lsTree: () => ({ mode: "160000" }) };

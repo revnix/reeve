@@ -8,7 +8,7 @@
 // the task would be advanced by work done under a contract nobody approved.
 import { openHub, hubTx } from "../src/build/hubdb.mjs";
 import { applyTransition, applyCompensation, COMPENSATIONS } from "../src/build/transition.mjs";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -275,6 +275,99 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
   check(db.prepare("SELECT reason FROM pr_hold WHERE task='bt:1'").get()?.reason === "ownership_lost",
     "control: and its hold carries the reason the machine validated",
     JSON.stringify(db.prepare("SELECT reason, detail FROM pr_hold WHERE task='bt:1'").get()));
+  db.close();
+}
+
+// ── a held task's pin EXPIRES, with no reaper to enforce it ────────────────
+// Entering BLOCKED releases territory unless the claim is pinned, so a pinned
+// held task keeps its lease -- and that decision is taken ONCE, at the
+// transition. Nothing revisits it when `pinned_until` later passes, and there is
+// no reaper: searched, and none exists. So a pin whose whole purpose is to be
+// time-bounded went on blocking every overlapping filing until a founder
+// intervened. Asking the pin at READ time is what makes the deadline mean
+// anything without a reaper.
+{
+  const db = openHub(join(dir, "t29.db"));
+  seed(db, { id: "bt:held", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:held'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:held','prefix','packages/x',1)`);
+  // Held, pinned, and the pin has run out. The lease row is still there because
+  // the hold deliberately kept it.
+  db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at,pinned_until)
+           VALUES('p','prefix','packages/x','bt:held',unixepoch()+3600, unixepoch()-1)`);
+
+  seed(db, { id: "bt:next", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:next'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:next','prefix','packages/x',0)`);
+  const r = applyTransition(db, { taskId: "bt:next", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(r.applied === true,
+    "a held task's EXPIRED pin no longer blocks another task's territory", JSON.stringify(r));
+  check(db.prepare("SELECT task FROM territory_lease WHERE path='packages/x'").get()?.task === "bt:next",
+    "and the lease passes to the task that can use it",
+    JSON.stringify(db.prepare("SELECT * FROM territory_lease").all()));
+  db.close();
+}
+
+// CONTROL: a held task whose pin is still LIVE keeps its territory, or "the pin
+// expires" has become "a hold releases everything".
+{
+  const db = openHub(join(dir, "t30.db"));
+  seed(db, { id: "bt:held", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:held'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:held','prefix','packages/x',1)`);
+  db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at,pinned_until)
+           VALUES('p','prefix','packages/x','bt:held',unixepoch()+3600, unixepoch()+3600)`);
+  seed(db, { id: "bt:next", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:next'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:next','prefix','packages/x',0)`);
+  const r = applyTransition(db, { taskId: "bt:next", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(r.applied === false, "control: a LIVE pin still blocks another task", JSON.stringify(r));
+  check(db.prepare("SELECT task FROM territory_lease WHERE path='packages/x'").get()?.task === "bt:held",
+    "control: and the held task keeps it");
+  db.close();
+}
+
+// ── the hold explains itself on the pull request ───────────────────────────
+// `pr_hold` is the row a GUARDIAN reads to render BLOCK. It says nothing to the
+// people on the pull request, who see work simply stop -- and a later resume
+// posts a `resumed` comment with no matching hold comment before it, a thread
+// that announces the end of something it never announced the start of.
+{
+  const db = openHub(join(dir, "t31.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1',1,0,1,7,'sha',unixepoch())`);
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "hold", reason: "ownership_lost" }, op: "phase.held" });
+  check(r.applied === true && r.to === "BLOCKED", "the hold applies", JSON.stringify(r));
+  const c = db.prepare(
+    `SELECT args FROM outbox WHERE task_id='bt:1' AND kind='gh.pr.comment'`).all()
+    .map(x => JSON.parse(x.args));
+  check(c.length === 1, "a comment explaining the hold is enqueued", JSON.stringify(c));
+  check(c[0]?.note === "held" && c[0]?.pr === 7,
+    "on the open PR, marked as a hold", JSON.stringify(c[0]));
+  check(c[0]?.reason === "ownership_lost",
+    "carrying the reason, so the thread says WHY work stopped", JSON.stringify(c[0]));
+  // The durable hold is still written: the comment is in addition to it, never
+  // instead of it.
+  check(db.prepare("SELECT count(*) c FROM pr_hold WHERE task='bt:1'").get().c === 1,
+    "control: and the guardian-facing pr_hold row is still written");
+  db.close();
+}
+
+// CONTROL: a task with no open PR enqueues no hold comment -- there is nobody to
+// tell, and a comment on nothing is an effect that can only fail.
+{
+  const db = openHub(join(dir, "t32.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "hold", reason: "ownership_lost" }, op: "phase.held" });
+  check(r.applied === true, "control: the hold still applies with no PR", JSON.stringify(r));
+  check(db.prepare(
+    `SELECT count(*) c FROM outbox WHERE task_id='bt:1' AND kind='gh.pr.comment'`).get().c === 0,
+    "control: and no hold comment is enqueued");
   db.close();
 }
 
@@ -893,8 +986,43 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
   check(threw !== null, "an unknown compensation throws rather than doing nothing", String(threw));
   check(/not-a-compensation/.test(String(threw?.message)),
     "and names the one it could not apply", String(threw?.message).slice(0, 120));
-  check(COMPENSATIONS.length === 14,
-    "control: the closed set is the fourteen the machine can emit", `${COMPENSATIONS.length}`);
+  // DERIVED FROM THE MACHINE, not counted by hand. A hardcoded 14 has to be
+  // maintained by whoever adds an edge, and the failure it produces -- a number
+  // that no longer matches -- says nothing about WHICH name is missing or
+  // surplus. Both directions matter and neither is a count: a name the machine
+  // can emit but this module cannot apply throws mid-transition and rolls it
+  // back; a name in the list that no edge emits is dead code that reads as
+  // coverage.
+  {
+    const machine = readFileSync(new URL("../src/build/phases.mjs", import.meta.url), "utf8");
+    const emitted = new Set();
+    // Every `compensations: [ ... ]` array in the machine, in both the `go` and
+    // the `refuse` shapes, and the string literals inside them.
+    for (const m of machine.matchAll(/compensations:\s*\[([\s\S]*?)\]\s*\}/g))
+      // ARRAY ELEMENTS ONLY. A bare string scan also captured the `"ledger"` in
+      // `...(sourceKind === "ledger" ? [...] : [])` -- a ternary CONDITION inside
+      // the array, not a name the machine emits -- and reported it as a
+      // compensation this module cannot apply. The element position is what
+      // distinguishes the two: preceded by `[` or `,`, followed by `,` or `]`.
+      for (const q of m[1].matchAll(/(?<=[[,]\s*)"([a-z][a-z0-9-]*)"(?=\s*[,\]])/g))
+        emitted.add(q[1]);
+    check(emitted.size > 0, "fixture: the machine's compensation names were found to compare against",
+      `${emitted.size} name(s)`);
+    const unappliable = [...emitted].filter(c => !COMPENSATIONS.includes(c));
+    check(unappliable.length === 0,
+      "every compensation the machine can emit is one this module can apply",
+      unappliable.join(", "));
+    // The reverse direction, asked in the way that cannot misparse. Scoping a
+    // regex to each `compensations: [...]` block is fragile -- nested arrays from
+    // the conditional spreads end the non-greedy match early, and four live names
+    // were reported dead. A name's PRESENCE as a quoted literal in the machine is
+    // not fragile, and it still catches the thing this direction is for: an entry
+    // no edge can produce, which reads as coverage and is never exercised.
+    const dead = COMPENSATIONS.filter(c => !machine.includes(`"${c}"`));
+    check(dead.length === 0,
+      "and every name in the closed set appears in the machine that emits it",
+      dead.join(", "));
+  }
   // CONTROL: a REAL name does not throw, so the assertion above is about the
   // unknown name and not about the switch refusing everything.
   let ok = true;

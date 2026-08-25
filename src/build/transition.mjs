@@ -83,7 +83,8 @@ const hasLivePin = (db, taskId) => db.prepare(
 // worse -- silently does nothing and looks like it worked.
 const COMPENSATIONS = Object.freeze([
   "void-pending", "write-pr-hold", "close-prs", "release-territory",
-  "regrant-territory", "clear-holds", "annotate-resumed", "record-hold-reason",
+  "regrant-territory", "clear-holds", "annotate-held", "annotate-resumed",
+  "record-hold-reason",
   "adopt-snapshot", "release-ledger-claim", "terminate-worker",
   "record-research-skip", "record-drain", "force-drain",
 ]);
@@ -337,6 +338,23 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
     }
 
     // The compensating comment for a hold comment left behind on an open PR.
+    // The hold's explanation, for the people on the pull request. `write-pr-hold`
+    // writes the row a GUARDIAN reads; this is what a human sees. Keyed on the
+    // generation and the hold reason, so a re-hold under a NEW cause posts again
+    // while a replayed transition does not.
+    case "annotate-held": {
+      for (const pr of db.prepare(
+        `SELECT repo_id, pr FROM impl_pr WHERE task = ? AND merged_sha IS NULL`).all(taskId))
+        enqueue("gh.pr.comment",
+                `${taskId}:g${generation}:pr${pr.pr}:held:${evidence?.reason ?? "held"}`,
+                { repo_id: pr.repo_id, pr: pr.pr, note: "held",
+                  reason: evidence?.reason ?? null,
+                  detail: evidence?.reason === "blocked_other"
+                    ? (evidence.escalation ?? evidence.detail ?? null)
+                    : (evidence?.detail ?? null) });
+      return;
+    }
+
     case "annotate-resumed": {
       for (const pr of db.prepare(
         `SELECT repo_id, pr FROM impl_pr WHERE task = ? AND merged_sha IS NULL`).all(taskId))

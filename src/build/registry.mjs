@@ -155,6 +155,16 @@ export function resolveClaims(claims, repoPath, io) {
       const tracked = io.lsTree(repoPath, partial) ?? null;
       if (tracked?.mode === "160000")
         return { refusal: `${partial} is a submodule; its contents belong to another repository` };
+      // AND A SYMLINK THE INDEX RECORDS, which is the same reasoning one mode
+      // along. The `lstat` check above catches a symlink present in the worktree;
+      // a sparse checkout or a local deletion leaves it ENOENT there while git
+      // still records it as mode 120000 (`git ls-tree HEAD link` reports
+      // `120000 blob`). The claim was then admitted, and the moment an ordinary
+      // checkout recreates the link, work under that path traverses outside the
+      // repository -- the boundary this resolver exists to hold, defeated by the
+      // file simply not being on disk yet.
+      if (tracked?.mode === "120000")
+        return { refusal: `${partial} is a symlink recorded in the index; a claim may not traverse one` };
 
       // Only NOW is it safe to stop. A path in neither the worktree nor the
       // index can be neither a symlink nor a submodule, so nothing below it can

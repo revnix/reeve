@@ -15,11 +15,22 @@
 // Imports only the phase machine's TERMINAL set, which itself imports nothing.
 // It is given a `db` and never reaches for one, which is what lets both callers
 // use it inside their own `BEGIN IMMEDIATE` without nesting a transaction.
-import { TERMINAL } from "./phases.mjs";
+import { TERMINAL, HELD } from "./phases.mjs";
 
 // The terminal phases, as a SQL list. A lease belonging to a task in one of
 // these is dead; every other lease is live, whatever its clock says.
 const TERMINAL_SQL = TERMINAL.map(p => `'${p}'`).join(",");
+// The held phases. A held task's lease lives exactly as long as its PIN.
+const HELD_SQL = HELD.map(p => `'${p}'`).join(",");
+
+// hub.sql's reaper rule, as one predicate both the scan and the grant apply:
+// "deletes a territory lease only when its task is terminal, or held with no
+// live pin". Written once, because the scan and the replacement asking the same
+// question differently is how this file's last three defects happened.
+const LEASE_IS_LIVE = `
+  t.phase NOT IN (${TERMINAL_SQL})
+  AND (t.phase NOT IN (${HELD_SQL})
+       OR (l.pinned_until IS NOT NULL AND l.pinned_until > unixepoch()))`;
 
 // The columns of a lease row, in the order every event payload carries them.
 export const LEASE_COLS = `project, kind, path, task, expires_at, pinned_until`;
@@ -59,6 +70,15 @@ export function overlaps(a, b) {
  * records when the grant was made. It is not a liveness test and must not become
  * one again while no writer advances it.
  *
+ * A HELD TASK IS THE EXCEPTION, and hub.sql names it: dead when "terminal, or
+ * held with no live pin". Entering BLOCKED or ESCALATED releases territory
+ * UNLESS the claim is pinned, so a pinned held task keeps its lease -- and that
+ * decision is taken once, at the transition. Nothing revisits it when
+ * `pinned_until` later passes, and there is no reaper: searched, and none
+ * exists. So a pin whose whole purpose is to be time-bounded went on blocking
+ * every overlapping filing until a founder intervened. Asking the pin at READ
+ * time is what makes the deadline mean anything without a reaper to enforce it.
+ *
  * SCOPED BY PROJECT. Without the project predicate two unrelated repositories
  * that both contain `packages/x` serialise against each other -- a deadlock
  * between projects that share nothing, reported as a territory conflict.
@@ -68,7 +88,7 @@ export const liveLeases = (db, project) =>
     `SELECT l.project, l.kind, l.path, l.task, l.expires_at, l.pinned_until
        FROM territory_lease l
        JOIN task t ON t.id = l.task
-      WHERE l.project = ? AND t.phase NOT IN (${TERMINAL_SQL})`)
+      WHERE l.project = ? AND ${LEASE_IS_LIVE}`)
     .all(project);
 
 /**
@@ -116,9 +136,12 @@ export function grantLease(db, { project, claim, taskId, at, pinned = false,
        expires_at = excluded.expires_at,
        pinned_until = excluded.pinned_until
      WHERE territory_lease.task = excluded.task
-        OR NOT EXISTS (SELECT 1 FROM task t
+        OR NOT EXISTS (SELECT 1 FROM task t, territory_lease l
                         WHERE t.id = territory_lease.task
-                          AND t.phase NOT IN (${TERMINAL_SQL}))`)
+                          AND l.project = territory_lease.project
+                          AND l.kind    = territory_lease.kind
+                          AND l.path    = territory_lease.path
+                          AND ${LEASE_IS_LIVE})`)
     .run(project, claim.kind, claim.path, taskId, until, pinned ? until : null);
 
   const row = db.prepare(

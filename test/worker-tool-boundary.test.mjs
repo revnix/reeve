@@ -15,7 +15,7 @@
 // So: the list is stated, the worker is told, and this asserts all three layers.
 import { sandboxFor, NEVER_TOOLS } from "../src/sandbox.mjs";
 import { workerArgs } from "../src/supervisor.mjs";
-import { promptFor } from "../src/prompts.mjs";
+import { promptFor, NO_NETWORK } from "../src/prompts.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -105,7 +105,33 @@ const sb = sandboxFor({ action: "FIX_CI", profile, worktree: root, tmp: join(roo
   const text = typeof spec === "string" ? spec : (spec?.prompt ?? JSON.stringify(spec));
   for (const tool of ["WebFetch", "Task", "SendMessage"])
     check(text.includes(tool), `the prompt names ${tool} as withheld`, "");
-  check(/no network/i.test(text), "and says plainly that there is no network", "");
+  // Third attempt at this one, and the previous two were both wrong in the same
+  // direction -- they asserted something weaker than they claimed.
+  //
+  // I first deleted it as redundant with the tool-name checks. It is not: the tool
+  // names cover WebFetch and WebSearch and say nothing about `curl`, `git fetch` or
+  // a package installer, which the sandbox also refuses and which is the larger
+  // share of what a worker reaches for.
+  //
+  // I then restored it as `/network/i` and wrote that this "fails the contradiction
+  // that matters". It does not -- "network access is available" contains the word
+  // and passes. That comment asserted a property the code did not have, which is
+  // worse than the weak check, because it stops anyone looking again.
+  //
+  // So the denial is ONE definition in prompts.mjs and this reads it. The test
+  // binds to the fact rather than to the wording: rewrite the lines and this still
+  // passes, delete them and it fails.
+  for (const line of NO_NETWORK)
+    check(text.includes(line), `the worker's rules carry the network denial: ${line.trim().slice(0, 48)}…`, "");
+  check(NO_NETWORK.some(l => /shell|curl|git fetch|installer/i.test(l)),
+    "and that denial names the SHELL route, not only the two tools",
+    "the definition mentions no shell-level route");
+
+  // The contradiction case, bounded rather than closed. A test cannot decide
+  // whether some other sentence contradicts these; what it can do is refuse the
+  // obvious affirmative grants. Stated as a limit, not as a guarantee.
+  const affirms = /network (access )?(is|are)? ?(available|permitted|allowed|granted|enabled)/i.exec(text);
+  check(!affirms, "and nothing in the rules affirmatively grants network access", String(affirms?.[0]));
   // The prompt renders FROM the grant. If it were typed out separately the two
   // would drift, which is the defect this file has produced six times.
   const named = NEVER_TOOLS.filter(t => !text.includes(t));

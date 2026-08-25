@@ -210,12 +210,22 @@ export function leaseEffect(db, { worker, leaseSeconds = 300, capabilities = {},
       // A switch the founder has not turned on is CONFIGURATION, not a fault: it
       // burns no attempt and raises no escalation, and it is terminal, because
       // retrying a decision the operator made is not recovery.
+      // FAIL CLOSED ON ABSENCE, not only on an explicit false. Every builder
+      // capability in the profile schema defaults to FALSE, so an omitted entry
+      // means "off" everywhere else in the system -- and here `undefined === false`
+      // is false, so a partially populated map, or the `capabilities = {}` this
+      // function defaults to, authorised the effect. That is a real push, PR
+      // operation or merge performed because a key was missing from an object,
+      // and it silently undid the merge switch added earlier in this branch.
+      // The switch has to be present AND true.
       const cap = capabilityFor(row);
-      if (cap && capabilities[cap] === false) {
+      if (cap && capabilities[cap] !== true) {
         db.prepare(
           `UPDATE outbox SET status='refused', worker=NULL,
                              last_error=?, updated_at=unixepoch() WHERE id=?`)
-          .run(`${cap} is off`, row.id);
+          .run(capabilities[cap] === undefined
+                 ? `${cap} is not set; every builder capability defaults to off`
+                 : `${cap} is off`, row.id);
         emitRow(db, "outbox.settled", row.id);
         settleDrainFor(db, row.id);
         continue;

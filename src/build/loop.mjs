@@ -36,17 +36,24 @@ import { isSameProcess } from "../supervisor.mjs";
  * The most recently updated task wins, so if an id ever did change, the newest
  * admission is the one that saw the current repository.
  *
- * Returns null rather than throwing for a project the hub has never admitted a
- * task for. That is a real state in S2 -- a registered project with no work yet
- * -- and it is not an error.
+ * Returns null for a project the hub has never admitted a task for. That is a
+ * real state in S2 -- a registered project with no work yet -- and it is not an
+ * error.
+ *
+ * A QUERY FAILURE IS NOT THAT STATE, and the catch that swallowed it said the
+ * two were the same. A structurally damaged hub -- a version-1 file whose `task`
+ * table is gone, which still passes `quick_check` because the pages it does have
+ * are intact -- reported "no repository id" on every tick, so gate state aged
+ * into staleness while the tick reported a clean pass over a skipped project.
+ * The one failure a diagnostic must never render as a benign absence. It
+ * propagates, and `build run` already turns a throwing tick into a reported
+ * failure that keeps the lease.
  */
 export function repoIdFromHub(hub, project) {
   if (!hub || !project?.name) return null;
-  try {
-    return hub.prepare(
-      `SELECT repo_id FROM task WHERE project = ? ORDER BY updated_at DESC, id DESC LIMIT 1`)
-      .get(project.name)?.repo_id ?? null;
-  } catch { return null; }
+  return hub.prepare(
+    `SELECT repo_id FROM task WHERE project = ? ORDER BY updated_at DESC, id DESC LIMIT 1`)
+    .get(project.name)?.repo_id ?? null;
 }
 
 /**

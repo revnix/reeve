@@ -470,5 +470,30 @@ const EVIDENCE = [
     JSON.stringify(resume()));
 }
 
+// ── an EMPTY escalation identity is no identity ────────────────────────────
+// The downstream raise is `if (decision.escalate)`, so an empty or
+// whitespace-only string is falsy there and no escalation is raised at all --
+// the task enters BLOCKED with no founder-visible identity, which is precisely
+// what this validator exists to refuse. A null check alone was one shape short
+// of its own stated purpose.
+{
+  const hold = (escalation) =>
+    nextPhase({ phase: "IMPLEMENTING", generation: 1 },
+              { kind: "hold", reason: "blocked_other", escalation });
+  for (const bad of [undefined, null, "", "   ", "\t\n"]) {
+    const r = hold(bad);
+    check(r.ok === false, `a blocked_other hold with ${JSON.stringify(bad)} as its identity is refused`,
+      JSON.stringify(r));
+    check(/identity/.test(r.refusal ?? ""), "and says an identity is what it needed",
+      String(r.refusal));
+  }
+  // CONTROL: a real identity is accepted AND survives to the escalation, or
+  // "refuses empty" has become "refuses blocked_other".
+  const ok = hold("bt:1:dependency-upgrade");
+  check(ok.ok === true, "control: a real identity is accepted", JSON.stringify(ok));
+  check(ok.escalate === "bt:1:dependency-upgrade",
+    "control: and is what the transition escalates under", String(ok.escalate));
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

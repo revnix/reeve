@@ -366,6 +366,25 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
     const other = await buildTick({ hub: db4, projects: [{ name: "not-a-project", nwo: "o/old-name" }] });
     check(other.refreshed === 0 && other.skipped.includes("not-a-project"),
       "control: an unknown project key is still skipped", JSON.stringify(other));
+
+    // AND A QUERY FAILURE IS NOT "NEVER ADMITTED". A catch that returned null
+    // said the two were the same, so a structurally damaged hub -- a file whose
+    // `task` table is gone, which still passes `quick_check` because the pages it
+    // does have are intact -- reported "no repository id" on every tick while
+    // gate state aged into staleness. The one failure a diagnostic must never
+    // render as a benign absence.
+    // Foreign keys OFF for the drop only: `repo_gate_state` and friends reference
+    // `task`, so the drop itself would fail the constraint rather than producing
+    // the damaged-hub state this asserts about.
+    db4.exec("PRAGMA foreign_keys = OFF");
+    db4.exec("DROP TABLE task");
+    let broke = null;
+    try { await buildTick({ hub: db4, projects: [{ name: "nextly", nwo: "o/r" }] }); }
+    catch (e) { broke = e; }
+    check(broke !== null, "a hub whose task table is missing makes the tick FAIL",
+      String(broke?.message));
+    check(/task/.test(broke?.message ?? ""), "naming what could not be read",
+      String(broke?.message));
     db4.close();
   }
 

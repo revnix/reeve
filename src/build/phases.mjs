@@ -100,7 +100,12 @@ const holdReasonRefusal = (evidence) => {
            `it must be one of ${Object.keys(HOLD_ESCALATION).join(", ")}`;
   // `blocked_other` is the catch-all the DDL gives a `detail` column for; the
   // caller that knows the cause supplies the identity.
-  if (evidence.reason === "blocked_other" && (evidence.escalation ?? null) === null)
+  // NONEMPTY, not merely non-null. The downstream raise is `if
+  // (decision.escalate)`, so an empty or whitespace-only string is falsy there
+  // and no escalation is raised at all -- the task enters BLOCKED with no
+  // founder-visible identity, which is precisely what this validator exists to
+  // refuse. A null check alone was one shape short of its own stated purpose.
+  if (evidence.reason === "blocked_other" && String(evidence.escalation ?? "").trim() === "")
     return "a blocked_other hold must carry the escalation identity for its cause; " +
            "a hold with no identity reaches no founder";
   return null;
@@ -351,7 +356,18 @@ export function nextPhase(state, evidence) {
       compensations: [...(hasLiveRun ? ["terminate-worker"] : []),
                       "record-hold-reason","void-pending",
                       ...(pinnedTerritory ? [] : ["release-territory"]),
-                      ...(hasOpenPr ? ["write-pr-hold"] : []), "record-drain"] });
+                      // The durable hold AND the human-readable one. `pr_hold` is
+                      // what the guardian reads to render BLOCK; it says nothing
+                      // to the people on the pull request, who see work simply
+                      // stop. A later resume then posts a `resumed` comment with
+                      // no matching hold comment before it -- a thread that
+                      // announces the end of something it never announced the
+                      // start of. Only the HOLD paths: cancel and infeasible
+                      // close their PRs and already post a close notice, so a
+                      // hold comment there would explain a stop that is really
+                      // an ending.
+                      ...(hasOpenPr ? ["write-pr-hold","annotate-held"] : []),
+                      "record-drain"] });
   }
 
   // A worker phase whose bounded retries are exhausted. ESCALATED voids
@@ -461,7 +477,18 @@ export function nextPhase(state, evidence) {
       compensations: [...(hasLiveRun ? ["terminate-worker"] : []),
                       "record-hold-reason","void-pending",
                       ...(pinnedTerritory ? [] : ["release-territory"]),
-                      ...(hasOpenPr ? ["write-pr-hold"] : []), "record-drain"] });
+                      // The durable hold AND the human-readable one. `pr_hold` is
+                      // what the guardian reads to render BLOCK; it says nothing
+                      // to the people on the pull request, who see work simply
+                      // stop. A later resume then posts a `resumed` comment with
+                      // no matching hold comment before it -- a thread that
+                      // announces the end of something it never announced the
+                      // start of. Only the HOLD paths: cancel and infeasible
+                      // close their PRs and already post a close notice, so a
+                      // hold comment there would explain a stop that is really
+                      // an ending.
+                      ...(hasOpenPr ? ["write-pr-hold","annotate-held"] : []),
+                      "record-drain"] });
   }
 
   // SLICE_MERGED must exit, or a task that merged its first slice sits there

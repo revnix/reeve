@@ -945,6 +945,43 @@ const NOW = 1_800_000_000;
   db.close();
 }
 
+// ── an ABSENT capability is off, not on ────────────────────────────────────
+// Every builder capability in the profile schema defaults to FALSE, so an
+// omitted entry means "off" everywhere else in the system. Here `undefined ===
+// false` is false, so a partially populated map -- or the `capabilities = {}`
+// this function DEFAULTS to -- authorised the effect. A real push, PR operation
+// or merge performed because a key was missing from an object, and it silently
+// undid the merge switch added earlier in this same branch.
+{
+  const db = openHub(join(dir, "o21.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const mk = (key, kind, args = {}) => hubTx(db, () => enqueueEffect(db,
+    { idempotencyKey: key, kind, taskId: "bt:1", generation: 1, fence: 1, args }));
+
+  // THE DEFAULT ARGUMENT, which is the shape a forgetful caller actually passes.
+  mk("bt:1:g1:bare", "gh.pr.merge", { repo_id: 1, pr: 1 });
+  check(leaseEffect(db, { worker: "w" }) === null,
+    "leaseEffect with no capabilities at all leases nothing");
+  const bare = db.prepare("SELECT status, last_error FROM outbox WHERE idempotency_key='bt:1:g1:bare'").get();
+  check(bare.status === "refused", "the effect is refused as configuration", JSON.stringify(bare));
+  check(/not set|defaults to off/.test(bare.last_error ?? ""),
+    "and says the switch was never set, rather than implying it was turned off",
+    JSON.stringify(bare));
+
+  // A PARTIAL map: publishing set, merging simply absent.
+  mk("bt:1:g1:partial", "gh.pr.merge", { repo_id: 1, pr: 2 });
+  const partial = { "builder.capabilities.publishPr": true };
+  check(leaseEffect(db, { worker: "w", capabilities: partial }) === null,
+    "an absent merge switch does not authorise a merge");
+
+  // CONTROL: explicitly true still leases, or "fail closed" has become "never run".
+  mk("bt:1:g1:on", "gh.pr.merge", { repo_id: 1, pr: 3 });
+  const leased = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  check(leased?.idempotency_key === "bt:1:g1:on",
+    "control: an explicitly enabled switch still leases", JSON.stringify(leased));
+  db.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

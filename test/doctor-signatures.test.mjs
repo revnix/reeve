@@ -59,8 +59,25 @@ for (const cond of [undefined, { include: ["~ALL"] }, { include: ["~ALL"], exclu
                       bypass_actors: [{ actor_type: "OrganizationAdmin", bypass_mode: "always" }] });
   const r = checkMergeAuthority("o/r", { api: apiFor(both) });
   const sig = r.lines.filter(l => /signed commits/.test(l)).join(" | ");
-  check(/inside the bypass/.test(sig), "a signature rule beside an always-bypass is reported as conditional", sig);
-  check(/OrganizationAdmin/.test(sig), "and names the actor the caveat depends on", sig);
+
+  // Asserted as a DIFFERENCE rather than as a phrase. The property is that a
+  // bypass changes the prediction from certain to conditional; "inside the
+  // bypass" is one wording of that and pinning it means the assertion goes red
+  // when someone improves the sentence, which is the opposite of what a guard
+  // should do. The same ruleset without a bypass is rendered here and the two are
+  // compared, so any wording that actually distinguishes the cases passes.
+  const flat = base({ rules: [{ type: "required_status_checks" }, { type: "required_signatures" }],
+                      bypass_actors: [] });
+  const plain = checkMergeAuthority("o/r", { api: apiFor(flat) })
+    .lines.filter(l => /signed commits/.test(l)).join(" | ");
+  check(sig !== plain, "a bypass changes what the signature line says at all", `${sig}\n        vs ${plain}`);
+  // No length comparison. It looked like a property and is not: a correct rewrite
+  // can make the conditional form SHORTER -- replacing the flat prediction instead
+  // of appending to it -- and would be rejected for its character count while
+  // distinguishing the cases perfectly. That is the same phrasing sensitivity this
+  // block was rewritten to remove, wearing a numeric disguise.
+  check(/OrganizationAdmin/.test(sig) && !/OrganizationAdmin/.test(plain),
+    "and what it adds is the actor, which the flat form never names", sig);
 }
 
 // Naming the CLASS is not naming the actor. Two entries of the same type render
@@ -106,8 +123,11 @@ for (const cond of [undefined, { include: ["~ALL"] }, { include: ["~ALL"], exclu
                           bypass_actors: [] });
   const r = checkMergeAuthority("o/r", { api: apiFor(noBypass) });
   const sig = r.lines.filter(l => /signed commits/.test(l)).join(" | ");
-  check(/will be refused at the push/.test(sig) && !/inside the bypass/.test(sig),
-    "control: with no bypass the refusal is stated flatly", sig);
+  // The converse, and still not a phrase match: with nobody able to bypass, no
+  // bypass actor may be named at all. That is the property; how the certainty is
+  // worded is not this test's business.
+  check(sig.length > 0 && !/OrganizationAdmin|Team:|Integration:/.test(sig),
+    "control: with no bypass, the line names no bypass actor", sig);
 }
 
 // The bypass remedy is still there when a bypass is what broke it.

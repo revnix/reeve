@@ -231,15 +231,51 @@ db.close();
   const r = await drainOutbox({ db: db4, handlers, max: 10, budgetMs: 1000, now: () => clock });
 
   check(r.outOfTime === true, "a pass that runs out of time says so", JSON.stringify({ outOfTime: r.outOfTime, done: r.done.length }));
-  check(r.done.length === 3, "and stops after the budget rather than after `max`", `${r.done.length} of 6`);
+  // A RANGE, not an exact count. The exact number depends on the reserve fraction,
+  // and pinning it makes this test fail whenever that is tuned -- which is the
+  // brittleness the budget exists to avoid, moved into its own test. What matters
+  // is that it did some work and stopped short of all of it.
+  check(r.done.length > 0 && r.done.length < 6,
+    "and stops after the budget rather than after `max`", `${r.done.length} of 6`);
   const left = db4.prepare(`SELECT count(*) n FROM outbox WHERE status='pending'`).get().n;
-  check(left === 3, "leaving the rest pending for the next tick, exactly as running out of rows does", String(left));
+  check(left === 6 - r.done.length,
+    "leaving the rest pending for the next tick, exactly as running out of rows does", String(left));
   // Control: the same six drain fully when the budget is not the binding
   // constraint, so the assertion above is about the budget and not about the
   // drainer having stopped working.
-  const r2 = await drainOutbox({ db: db4, handlers, max: 10, budgetMs: 10_000, now: () => clock });
-  check(r2.done.length === 3 && r2.outOfTime === false,
-    "control: with room, the remainder drains and the pass does not report a cutoff", JSON.stringify(r2.done.length));
+  // --- and the budget bounds the delivery INSIDE it, not just the gap between --
+  //
+  // Checking only before leasing left the first slow delivery free to spend its
+  // whole lease. A bound the work inside it cannot see is not a bound: the pass
+  // was over by the time the check came round again.
+  {
+    let seen = null;
+    const slow = { "gh.pr.comment": (a, { api }) => { api(["-X", "GET", "x"]); return { ok: true }; } };
+    const spy = (a, opts) => { seen = opts?.timeoutMs ?? null; return { ok: true, out: "" }; };
+    const d5 = mkdtempSync(join(tmpdir(), "reeve-inner-"));
+    const db5 = open(join(d5, "s.db"));
+    tx(db5, () => enqueue(db5, { idemKey: "inner", kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "b" } }));
+    // A generous lease and a small budget: the lease would allow 250s, the budget
+    // allows 2s, and the delivery must be given the SMALLER.
+    await drainOutbox({ db: db5, handlers: slow, api: spy, max: 1, leaseSeconds: 300, budgetMs: 2000 });
+    check(seen !== null && seen <= 2000,
+      "a delivery is bounded by what the PASS has left, not only by its lease", `timeoutMs=${seen}`);
+    // Control: with a budget larger than the lease allows, the lease is what binds
+    // — so the assertion above is about the minimum and not about the budget
+    // having simply replaced the lease.
+    tx(db5, () => enqueue(db5, { idemKey: "inner2", kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "b" } }));
+    await drainOutbox({ db: db5, handlers: slow, api: spy, max: 1, leaseSeconds: 10, budgetMs: 600_000 });
+    check(seen !== null && seen <= 10_000,
+      "control: and by its lease when that is the smaller of the two", `timeoutMs=${seen}`);
+    db5.close();
+    rmSync(d5, { recursive: true, force: true });
+  }
+
+  const before2 = db4.prepare(`SELECT count(*) n FROM outbox WHERE status='pending'`).get().n;
+  const r2 = await drainOutbox({ db: db4, handlers, max: 10, budgetMs: 100_000, now: () => clock });
+  check(r2.done.length === before2 && r2.outOfTime === false,
+    "control: with room, the remainder drains and the pass does not report a cutoff",
+    `${r2.done.length} of ${before2}, outOfTime=${r2.outOfTime}`);
 
   db4.close();
   rmSync(d4, { recursive: true, force: true });

@@ -369,6 +369,16 @@ export function enqueue(db, { idemKey, kind, runId = null, args, notBefore = 0 }
  * row a drainer holds would leave it settling into nothing.
  */
 export function supersedeEffects(db, { prefix, keep }) {
+  // `keep` is a SET of keys, not one key. Cleanup used to happen while enqueuing a
+  // replacement, so it could only ever spare the row being created -- and when the
+  // desired set became EMPTY, nothing was enqueued, the loop never ran, and the
+  // obsolete rows were left to fire. A reviewer removed from the profile would
+  // still be summoned; a dead letter for one would still escalate forever.
+  //
+  // Taking the whole desired set makes the operation "reconcile what is queued
+  // against what is wanted" rather than "make room for this one", which is the
+  // shape that works when what is wanted is nothing at all.
+  const spare = keep instanceof Set ? keep : new Set(keep === undefined ? [] : [keep]);
   // PENDING and DEAD_LETTER, and the second is not an afterthought. A dead letter
   // is permanent and is counted into a standing escalation every tick -- so an
   // old head's request that failed terminally goes on demanding a person's
@@ -379,11 +389,12 @@ export function supersedeEffects(db, { prefix, keep }) {
   // it holds would leave it settling into nothing.
   const rows = db.prepare(`SELECT id, idem_key, kind, status FROM outbox
                            WHERE status IN ('pending','dead_letter')
-                             AND idem_key LIKE ? AND idem_key <> ?`).all(prefix + "%", keep);
+                             AND idem_key LIKE ?`).all(prefix + "%")
+                 .filter(r => !spare.has(r.idem_key));
   for (const r of rows) {
     db.prepare(`DELETE FROM outbox WHERE id=? AND status IN ('pending','dead_letter')`).run(r.id);
     emit(db, { actor: "daemon", op: "outbox.superseded",
-               payload: { id: r.id, kind: r.kind, was: r.status, key: r.idem_key, supersededBy: keep } });
+               payload: { id: r.id, kind: r.kind, was: r.status, key: r.idem_key, kept: [...spare] } });
   }
   return rows.length;
 }

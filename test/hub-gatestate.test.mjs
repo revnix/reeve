@@ -326,6 +326,44 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
     (branch.match(/[^\n]*buildTick\s*\([^\n]*/) ?? ["(not found)"])[0]);
   check(/tick\.skipped/.test(branch),
     "and reads what the tick could not refresh");
+
+  // ── a MIXED list in ONE pass ───────────────────────────────────────────────
+  // The two blocks above call `buildTick` once per project, so `refreshed` and
+  // `skipped` are never both populated by the same pass -- and a loop that
+  // `continue`s, one that `return`s, and one that throws away everything after
+  // the first skip all satisfy single-project calls identically. The rule is
+  // per-project, so the fixture has to hold projects that must be scored
+  // differently, with the unresolvable one in the MIDDLE.
+  {
+    const db3 = openHub(join(dir, "g-mixed.db"));
+    const base = { repoPath: "/p", profilePath: "/f", profileHash: "h", defaultBranch: "main",
+                   visibility: "private", specRepoId: 9, gateDefinitionHash: "g",
+                   registryVersion: 3, founderUserId: 4242 };
+    admitTask(db3, { ...base, repoId: 11, nwo: "o/one" },
+      { id: "bt:one", project: "one", title: "t", claims: [normalizeClaim("packages/a")] });
+    admitTask(db3, { ...base, repoId: 33, nwo: "o/three" },
+      { id: "bt:three", project: "three", title: "t", claims: [normalizeClaim("packages/c")] });
+
+    const tick = await buildTick({ hub: db3, projects: [
+      { name: "one",   nwo: "o/one" },
+      { name: "two",   nwo: "o/never" },     // the hub has never seen this one
+      { name: "three", nwo: "o/three" },
+    ]});
+    check(tick.refreshed === 2 && tick.skipped.length === 1,
+      "one pass both refreshes and skips, and counts each separately", JSON.stringify(tick));
+    check(tick.skipped[0] === "two",
+      "the unresolvable project is the one named", JSON.stringify(tick.skipped));
+    const ids = db3.prepare("SELECT repo_id FROM repo_gate_state ORDER BY repo_id").all().map(r => r.repo_id);
+    check(JSON.stringify(ids) === "[11,33]",
+      "and BOTH resolvable projects got their own row: the skip in the middle did not end the pass",
+      JSON.stringify(ids));
+    // Each row is keyed on ITS project's id, not on whichever was resolved last.
+    const rows = db3.prepare("SELECT repo_id, nwo_snapshot FROM repo_gate_state ORDER BY repo_id").all();
+    check(rows[0].nwo_snapshot === "o/one" && rows[1].nwo_snapshot === "o/three",
+      "each row carries its own project's nwo, so the ids were not crossed",
+      JSON.stringify(rows));
+    db3.close();
+  }
   db.close();
 }
 

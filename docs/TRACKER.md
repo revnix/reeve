@@ -361,6 +361,30 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       FOR EVER. Worth stating as a rule: when a change widens what counts as
       live, re-audit every predicate that decides what counts as released.
 
+      **Round 5: 6 findings (3×P1), all genuine, all fixed at `3769d4c`.** The
+      one to remember: `leaseEffect` tested `capabilities[cap] === false`, and
+      every builder capability defaults to FALSE — so an OMITTED key read as
+      enabled, and the `capabilities = {}` default authorised a real push, PR
+      operation or merge. **It silently undid the merge switch added two rounds
+      earlier without touching that code.** Fail-closed means present AND true.
+
+      Also: a pin ends with no reaper to end it. Round 4 fixed which column
+      `hasLivePin` reads AT THE TRANSITION; nothing revisited the decision when
+      `pinned_until` later passed, and a repo-wide search finds no reaper. The
+      rule was already written in hub.sql — dead when "terminal, or held with no
+      live pin" — and is now ONE predicate both the scan and the replacement
+      apply, because those two asking the same question differently is how this
+      file's last three defects happened.
+
+      **TWO INSTRUMENT DEFECTS found this round, both mine.** The closed
+      compensation set was asserted by a hardcoded count of fourteen — a number
+      maintained by hand whose failure names no cause; it now derives both
+      directions from the machine. And a per-file harness line read `$?` AFTER a
+      command substitution (`echo "$(basename $f): exit=$?"`), so it reported
+      basename's status rather than the test's: **a crashing test file would have
+      read as a clean exit.** Caught only because an assertion count dropped by
+      31 and I chased the number instead of the green.
+
       **FOUNDER DECISIONS, 2026-08-25:**
       - **#30 merge:** ask again when Codex returns a clean pass at the current
         head. No conditional or pre-authorised grant. Every merge stays explicit.

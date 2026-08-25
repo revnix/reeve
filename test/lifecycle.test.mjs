@@ -66,7 +66,17 @@ tx(db,()=>db.prepare(`INSERT INTO task_exec(task_id,cancel_requested) VALUES('ta
 const hb = heartbeat(db,{runId:"run-4"});
 ok("heartbeat reports cancellation", hb.alive===false && hb.reason==="cancelled");
 
-// 8. checkpoint + resume
+// 8. checkpoint honours the cancellation step 7 just requested
+// This block used to checkpoint straight through it. A worker told to stop could
+// keep checkpointing -- and each one RENEWS the lease, so it could hold the task
+// indefinitely under the stop contract checkpoint advertises.
+const cancelled = checkpoint(db,{runId:"run-4",step:"branch",seq:1,state:{branch:"fix/x"}});
+ok("checkpoint refuses a cancelled run, as heartbeat does", cancelled?.ok===false && cancelled.reason==="cancelled");
+ok("and records no step for it", db.prepare("SELECT count(*) c FROM checkpoint WHERE run_id='run-4'").get().c===0);
+
+// 8b. checkpoint + resume, on a run that is not cancelled
+tx(db,()=>db.prepare("UPDATE task_exec SET cancel_requested=0 WHERE task_id='task:b'").run());
+ok("control: the run holds its lease again", heartbeat(db,{runId:"run-4"}).alive===true);
 checkpoint(db,{runId:"run-4",step:"branch",seq:1,state:{branch:"fix/x"}});
 checkpoint(db,{runId:"run-4",step:"push",seq:2,state:{head_sha:"abc123"}});
 const res = resume(db,"run-4");

@@ -51,23 +51,28 @@ export function ghPrComment(args, { api, idemKey, attempt = 1 }) {
     // seconds ago, which made the at-most-once claim false exactly where
     // duplicates are most visible. Fetching every page is the only read that
     // answers "is my marker here" rather than "is it in this arbitrary slice".
+    //
+    // Filtered by `--jq` at the source, and that is what makes paginating safe.
+    // Every page still crosses a subprocess pipe, and a long discussion's full
+    // JSON exceeds the default buffer -- at which point the read FAILS for a
+    // request that succeeded, this falls through, and the duplicate it exists to
+    // prevent is posted. Asking gh for matching ids instead means the output is a
+    // handful of digits however long the thread is, so the buffer stops being a
+    // variable in the answer at all.
     const seen = api(["--paginate", "-X", "GET", `repos/${nwo}/issues/${pr}/comments`,
-                      "-F", "per_page=100"]);
+                      "-F", "per_page=100",
+                      "--jq", `.[] | select(.body | contains("${marker}")) | .id`]);
     if (seen.ok) {
-      let already = null;
-      // `--paginate` concatenates JSON arrays, so the output may be several
-      // arrays rather than one. Parsed leniently for that reason.
-      for (const chunk of String(seen.out || "").split(/(?<=\])\s*(?=\[)/)) {
-        try {
-          for (const c of JSON.parse(chunk || "[]"))
-            if (typeof c?.body === "string" && c.body.includes(marker)) already = c.id;
-        } catch { /* an unreadable page is not evidence of absence */ }
-      }
-      if (already !== null) return { ok: true, result: { commentId: already, reposted: false, alreadyThere: true } };
+      // Ids, one per line, and usually none. The LAST is taken for the same reason
+      // the old code took the last match: if a duplicate was somehow posted, the
+      // most recent is the one a reader sees.
+      const ids = String(seen.out || "").split("\n").map(s => s.trim()).filter(Boolean);
+      if (ids.length) return { ok: true, result: { commentId: Number(ids[ids.length - 1]), reposted: false, alreadyThere: true } };
     }
-    // A failed or unreadable read falls THROUGH and posts. Absence of evidence is
-    // not evidence of absence, and a lost review request costs more than a
-    // duplicated comment.
+    // A failed read falls THROUGH and posts. Absence of evidence is not evidence
+    // of absence, and a lost review request costs more than a duplicated comment.
+    // Said explicitly because the failure modes that land here -- a timeout, a
+    // truncated buffer, a rate limit -- all LOOK like "no marker found".
   }
 
   const r = api(["-X", "POST", `repos/${nwo}/issues/${pr}/comments`,

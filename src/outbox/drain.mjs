@@ -52,13 +52,30 @@ const deadline = seconds => {
  * comment is already on the pull request, because a fence orders writes to the
  * DATABASE and has no authority over GitHub.
  *
- * So the handler is given a deadline strictly inside the lease and is abandoned at
- * it. Two thirds leaves room for the settle that follows. This bounds the window
- * rather than closing it: a POST that has already reached GitHub when the deadline
- * fires still lands. What it removes is the case where a drainer sits in a hung
- * request for minutes while its claim quietly expires around it.
+ * **This race is what the SUBPROCESS timeout closes, not this one.** The real
+ * handler chain is synchronous: `apiAsInstallation` uses `execFileSync`, so while
+ * a call is in flight nothing else in this process runs -- no timer fires and no
+ * promise settles. The race below cannot even create its timer until the handler
+ * has returned. An earlier version of this comment claimed the race bounded
+ * delivery; it did not, and the test that "proved" it used an async handler that
+ * never resolved, which is a shape the production path cannot take. That fixture
+ * could not exhibit the defect it was written for.
+ *
+ * What actually bounds a hung GitHub call is `timeoutMs` on the subprocess, which
+ * kills `gh` and returns. What this race still buys is the ASYNC case -- a handler
+ * that awaits something and never settles -- so it stays, described honestly:
+ * defence for one shape, and not the shape that matters most.
  */
 const HANDLER_DEADLINE = 2 / 3;
+
+/**
+ * How long a single GitHub call may run, given the lease it must finish inside.
+ *
+ * Half the lease, so a slow pre-check and the POST that follows it both fit with
+ * room for the settle. Passed to the handler and on to the subprocess, because a
+ * bound the caller cannot enforce is not a bound.
+ */
+const callTimeoutMs = leaseSeconds => Math.max(5, Math.floor(leaseSeconds / 2)) * 1000;
 
 export async function drainOutbox({ db, log = () => {}, handlers, api,
                                     worker = "drainer", max = 10, leaseSeconds = 300 }) {
@@ -86,8 +103,12 @@ export async function drainOutbox({ db, log = () => {}, handlers, api,
       // `attempt` reaches the handler because idempotency depends on it: only a
       // retry can find a previous delivery, and a first attempt that looked would
       // be paying for an answer it already has.
+      // The timeout travels WITH the caller, so a handler cannot make an unbounded
+      // call even by accident: there is one `api` and it is already bounded.
+      const timeoutMs = callTimeoutMs(leaseSeconds);
+      const bounded = (a, opts = {}) => api(a, { timeoutMs, ...opts });
       const deliver = Promise.resolve(
-        handlers[job.kind](args, { api, idemKey: job.idem_key, attempt: job.attempts, log }));
+        handlers[job.kind](args, { api: bounded, idemKey: job.idem_key, attempt: job.attempts, log }));
       const clock = deadline(leaseSeconds * HANDLER_DEADLINE);
       try { outcome = await Promise.race([deliver, clock]); }
       finally { clock.cancel(); }   // the loser's timer must not outlive the race

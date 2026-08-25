@@ -45,6 +45,16 @@ const REFUSED = [
   [/^!/,        "a negation"],
   [/[{}]/,      "a brace expansion"],
   [/[\[\]]/,    "a character class"],
+  // REFUSED RATHER THAN CONVERTED, because the two platforms disagree about what
+  // it MEANS. reeve has to run on macOS, Windows and Ubuntu; on POSIX a backslash
+  // is an ordinary character in a filename, on Windows it is a separator. So
+  // `packages\x` is one segment on one platform and two on another, `overlaps()`
+  // compares the strings as disjoint from `packages/x`, and the same directory
+  // can be granted to two tasks at once. Rewriting it to a slash would silently
+  // change which file a POSIX claim addressed; refusing asks the caller which
+  // they meant. Git's own path representation is slash-separated everywhere,
+  // which is the form a claim has to be written in.
+  [/\\/,        "a backslash (paths are slash-separated on every platform, as git records them)"],
 ];
 
 /**
@@ -131,7 +141,18 @@ export function resolveClaims(claims, repoPath, io) {
       // the task territory inside a DIFFERENT repository, whose changed files
       // the superproject's diff cannot inspect: the gitlink refusal defeated by
       // the very case it exists for.
-      const tracked = io.lsTree?.(repoPath, partial) ?? null;
+      // REQUIRED, not optional. `io.lsTree?.()` made a missing capability read as
+      // "nothing is tracked", so every ENOENT became "does not exist yet" and the
+      // walk stopped -- accepting an uninitialised submodule, which is exactly
+      // the case that has no worktree entry and IS a mode-160000 gitlink. The
+      // refusal was defeated by the absence of the probe that detects it, and an
+      // adapter that simply did not provide it looked like a repository with no
+      // submodules. A capability this check depends on is a precondition, not an
+      // enhancement.
+      if (typeof io?.lsTree !== "function")
+        return { refusal: `territory cannot be resolved without an index probe; ` +
+                          `the submodule check needs io.lsTree(repoPath, path) and it was not supplied` };
+      const tracked = io.lsTree(repoPath, partial) ?? null;
       if (tracked?.mode === "160000")
         return { refusal: `${partial} is a submodule; its contents belong to another repository` };
 

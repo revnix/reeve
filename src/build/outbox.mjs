@@ -20,6 +20,11 @@
 import { hubTx, hubEvent, canonicalHub } from "./hubdb.mjs";
 import { assertWritable } from "./locks.mjs";
 import { isSameProcess } from "../supervisor.mjs";
+// ONE backoff policy for the whole system. `src/db/ops.mjs` already owns it and
+// `src/build/locks.mjs` already imports from there, so a second curve defined
+// here would be two answers to one question -- and the one this file needed was
+// the one that already existed.
+import { backoffSeconds } from "../db/ops.mjs";
 
 /**
  * The kinds whose IDEMPOTENCY KEY identifies the effect exactly enough that a
@@ -259,10 +264,21 @@ export function settleEffect(db, { id, worker, leaseToken, ok, result = null,
     else if (retryable && row.attempts < row.max_attempts) status = "pending";
     else status = row.attempts >= row.max_attempts ? "dead_letter" : "failed";
 
+    // A RETRY IS SCHEDULED, NOT MERELY ALLOWED. Returning the row to `pending`
+    // without advancing `not_before` left it due immediately, and `leaseEffect`
+    // takes every pending row whose schedule is due -- so the executor leased the
+    // same failing delivery again on the very next iteration and burned all eight
+    // attempts in a tight burst against whatever was failing. The backoff was
+    // promised by the column and never written to it. `not_before` is only
+    // advanced when the row is going back to the queue; a terminal status leaves
+    // the schedule alone, because nothing will read it again.
+    const notBefore = status === "pending" ? backoffSeconds(row.attempts + 1) : null;
     db.prepare(
-      `UPDATE outbox SET status=?, worker=NULL, result=?, last_error=?, updated_at=unixepoch()
+      `UPDATE outbox SET status=?, worker=NULL, result=?, last_error=?,
+                         not_before=CASE WHEN ? IS NULL THEN not_before ELSE unixepoch() + ? END,
+                         updated_at=unixepoch()
         WHERE id=?`)
-      .run(status, result === null ? null : canonicalHub(result), error, id);
+      .run(status, result === null ? null : canonicalHub(result), error, notBefore, notBefore, id);
     emitRow(db, "outbox.settled", id);
     // Only a TERMINAL status clears the drain; `settleDrainFor` enforces that
     // itself, so a retryable failure that returned the row to `pending` leaves

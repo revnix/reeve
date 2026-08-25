@@ -44,11 +44,39 @@ import { LEASE_COLS, liveLeases, firstConflict, grantLease }
 // this true forever. Terminal transitions then scheduled holds, comments and
 // close effects against a PR that merged weeks ago -- and a cancellation that
 // cannot drain is a task that cannot reach a terminal phase.
-const hasOpenBuilderPr = (db, taskId) => db.prepare(
-  `SELECT count(*) c FROM impl_pr WHERE task = ? AND merged_sha IS NULL`).get(taskId).c > 0;
+const hasOpenBuilderPr = (db, taskId) => {
+  if (db.prepare(`SELECT count(*) c FROM impl_pr WHERE task = ? AND merged_sha IS NULL`)
+        .get(taskId).c > 0) return true;
+  // AND THE SPEC PR, which is the ONLY open PR a task has before it starts
+  // implementing. `write-pr-hold` learned to hold it, but this predicate is what
+  // decides whether the machine emits that compensation at all -- so a task held
+  // in SPEC_PR_OPEN or GATE, the commonest pre-implementation hold there is,
+  // emitted no hold and left its spec PR mergeable for as long as it stayed
+  // BLOCKED. The fix to the compensation was invisible because the gate in front
+  // of it had not moved.
+  //
+  // `approved_spec_head IS NULL` is the "not yet approved" condition. NOTHING
+  // WRITES THAT COLUMN YET -- it is declared in hub.sql for the gate stage that
+  // will -- so today it is always NULL and this reads as "the task has a spec
+  // PR". That is the fail-closed direction: it holds a PR that may already be
+  // approved rather than missing one that is open, and it narrows correctly the
+  // moment the writer exists, instead of needing to be found and changed then.
+  const spec = db.prepare(
+    `SELECT spec_pr, approved_spec_head FROM task WHERE id = ?`).get(taskId);
+  return spec?.spec_pr != null && spec.approved_spec_head == null;
+};
 
+// THE LEASE'S DEADLINE, not the claim's intent. hub.sql calls
+// `territory_lease.pinned_until` "the ONLY home of the pin", and
+// `task_territory.pinned` is what the FILING asked for -- a durable bit that
+// nothing ever clears. Reading the bit meant `release-territory` was omitted on
+// every hold of a task that was EVER pinned, and since a lease is live while its
+// task is non-terminal, the expired pin then blocked every overlapping filing
+// for ever rather than until its deadline. A pin is a promise with an end.
 const hasLivePin = (db, taskId) => db.prepare(
-  `SELECT count(*) c FROM task_territory WHERE task = ? AND pinned = 1`).get(taskId).c > 0;
+  `SELECT count(*) c FROM territory_lease
+    WHERE task = ? AND pinned_until IS NOT NULL AND pinned_until > unixepoch()`)
+  .get(taskId).c > 0;
 
 // The compensations `nextPhase` may emit. A name the machine can produce and
 // this module cannot apply either throws and rolls the transition back, or --
@@ -136,8 +164,14 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       // So the enum is derived from the kind, and the explanation is kept in
       // `detail`, which is the column that exists to hold free text.
       const fromHold = evidence?.kind === "hold";
+      // `depth_post_approval` is a member of pr_hold's CHECK and of
+      // HOLD_ESCALATION, the machine emits it, and `record-hold-reason` writes it
+      // to the task -- so classifying the PR's hold as the generic `escalated`
+      // made the hold and its own task disagree about why the work stopped, in
+      // the row a guardian reads to explain the block.
       const reason = fromHold ? holdReasonFor(evidence.reason)
-                   : evidence?.kind === "founder.cancel" ? "cancel"
+                   : evidence?.kind === "founder.cancel"  ? "cancel"
+                   : evidence?.kind === "depth.override"  ? "depth_post_approval"
                    : "escalated";
       const detail = fromHold
         ? (evidence.reason === "blocked_other"
@@ -216,11 +250,18 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
         if (spec?.spec_repo_id != null && spec?.spec_pr != null)
           open.push({ repo_id: spec.spec_repo_id, pr: spec.spec_pr, spec: true });
       }
+      // THE REPOSITORY IS PART OF THE KEY. A pull-request number is unique only
+      // within its repository, and this list now spans two of them -- so a spec
+      // PR and an implementation PR that happen to share a number produced the
+      // same idempotency key, `enqueueEffect` returned the second as a duplicate,
+      // and `record-drain` never saw it. The task then reached CANCELLED or
+      // INFEASIBLE with one of its PRs permanently open, and the drain that
+      // exists to prove otherwise agreed that everything had settled.
       for (const pr of open) {
-        enqueue("gh.pr.comment", `${taskId}:g${generation}:pr${pr.pr}:close-notice`,
+        enqueue("gh.pr.comment", `${taskId}:g${generation}:r${pr.repo_id}:pr${pr.pr}:close-notice`,
                 { repo_id: pr.repo_id, pr: pr.pr, reason: evidence?.kind ?? null,
                   ...(pr.spec ? { repo: "spec" } : {}) });
-        enqueue("gh.pr.close", `${taskId}:g${generation}:pr${pr.pr}:close`,
+        enqueue("gh.pr.close", `${taskId}:g${generation}:r${pr.repo_id}:pr${pr.pr}:close`,
                 { repo_id: pr.repo_id, pr: pr.pr, ...(pr.spec ? { repo: "spec" } : {}) });
       }
       return;

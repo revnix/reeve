@@ -256,6 +256,22 @@ export function nextPhase(state, evidence) {
       if (evidence.territoryConflict)
         return refuse(`territory now conflicts with ${evidence.territoryConflict}; ` +
                       `resume is refused until the founder settles who owns it`);
+      // AND THE DRAIN THE HOLD LEFT BEHIND. Entering BLOCKED or ESCALATED runs
+      // `record-drain`, which snapshots the effects that were still in flight --
+      // a push, a PR operation, a merge -- and those settle under the UNCHANGED
+      // generation, because a hold does not bump it. An immediate resume clears
+      // the holds and puts the task back to work beside them: two writers on one
+      // branch, and a merge that lands for a task that has since been redesigned.
+      //
+      // `drainRemaining` is already computed for CANCELLING, which refuses
+      // CANCELLED until it reaches zero. The same count answers the same question
+      // here and this branch simply never read it, so the drain protected the
+      // cancellation path and not the resume path -- the one a founder actually
+      // reaches for, and reaches for quickly.
+      if (drainRemaining > 0)
+        return refuse(`${drainRemaining} effect(s) from the hold are still draining; ` +
+                      `they settle under this generation and would run beside the resumed task. ` +
+                      `Resume once they reconcile, or cancel if they never will`);
       // Section 3.4 requires TWO preconditions on resume, not one. A task held
       // because ownership was lost is precisely the case where the second
       // matters: territory can be free while a human still owns the ledger node,

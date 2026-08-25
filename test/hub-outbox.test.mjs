@@ -890,6 +890,61 @@ const NOW = 1_800_000_000;
   db.close();
 }
 
+// ── a retryable failure is SCHEDULED, not merely allowed ───────────────────
+// Returning the row to `pending` without advancing `not_before` left it due
+// immediately, and `leaseEffect` takes every pending row whose schedule is due
+// -- so the executor leased the same failing delivery again on the very next
+// iteration and burned all eight attempts in a tight burst against whatever was
+// failing. The backoff was promised by the column and never written to it.
+{
+  const db = openHub(join(dir, "o19.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:retry", kind: "gh.pr.comment",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+  const leased = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  const before = db.prepare("SELECT not_before FROM outbox WHERE id=?").get(leased.id).not_before;
+
+  const r = settleEffect(db, { id: leased.id, worker: "w", leaseToken: leased.lease_token,
+                               ok: false, retryable: true, error: "502 from GitHub" });
+  check(r.status === "pending", "a retryable failure returns to the queue", JSON.stringify(r));
+  const row = db.prepare("SELECT status, not_before, attempts FROM outbox WHERE id=?").get(leased.id);
+  const now = db.prepare("SELECT unixepoch() n").get().n;
+  check(row.not_before > now, "and is scheduled in the FUTURE, not due immediately",
+    JSON.stringify({ ...row, now }));
+  check(row.not_before > before, "which is later than the schedule it had", `${before} -> ${row.not_before}`);
+
+  // AND THE LEASE HONOURS IT. Advancing the column is only half the property:
+  // the executor must actually decline the row, or the backoff is a number
+  // nobody reads. The clock here is the DATABASE's, not the file's fixed `NOW`
+  // -- that constant sits far in the future, so it sails past any real backoff
+  // and the probe would report success without ever exercising the schedule.
+  check(leaseEffect(db, { worker: "w2", capabilities: allOn, now }) === null,
+    "so the executor cannot lease it again on the next pass");
+  // CONTROL: at its scheduled time it IS leasable, or "backs off" has become
+  // "never runs again".
+  const due = leaseEffect(db, { worker: "w2", capabilities: allOn, now: row.not_before });
+  check(due?.id === leased.id, "control: once the backoff elapses it is leased again",
+    JSON.stringify(due));
+  db.close();
+}
+
+// CONTROL: a TERMINAL settle leaves the schedule alone -- nothing will read it
+// again, and moving it would be a write with no meaning.
+{
+  const db = openHub(join(dir, "o20.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:done", kind: "gh.pr.comment",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+  const leased = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  const before = db.prepare("SELECT not_before FROM outbox WHERE id=?").get(leased.id).not_before;
+  settleEffect(db, { id: leased.id, worker: "w", leaseToken: leased.lease_token,
+                     ok: true, result: { pr: 1 } });
+  const row = db.prepare("SELECT status, not_before FROM outbox WHERE id=?").get(leased.id);
+  check(row.status === "done" && row.not_before === before,
+    "control: a successful settle does not move not_before", JSON.stringify({ before, ...row }));
+  db.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

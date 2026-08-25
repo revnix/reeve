@@ -310,6 +310,53 @@ db.close();
     "an unknown actor posts rather than trusting a marker it cannot attribute", JSON.stringify(blind.result));
 }
 
+// --- a request the head has outrun is not posted ------------------------------
+{
+  // Withdrawing superseded PENDING rows leaves one window open on purpose: an
+  // INFLIGHT row is not deleted, because deleting one its drainer holds would
+  // leave it settling into nothing. So a head that moves mid-delivery can only be
+  // caught by the delivery declining. A trigger comment names no revision, so
+  // posting one decided for an old head requests a review of the NEW head -- and
+  // the tick that saw the new head enqueues its own, differently marked, and asks
+  // again.
+  let posted = 0, headReads = 0;
+  const mk = current => args => {
+    if (args.includes(`repos/o/r/pulls/1`)) { headReads++; return { ok: true, out: current }; }
+    if (args.includes("GET")) return { ok: true, out: "" };
+    posted++; return { ok: true, out: JSON.stringify({ id: 1 }) };
+  };
+  const args = { nwo: "o/r", pr: 1, body: "@codex review", head: "aaa" };
+
+  const stale = ghPrComment(args, { api: mk("bbb"), idemKey: "k-stale", actor: "x[bot]" });
+  check(stale.ok && posted === 0, "a request decided for an old head is not posted", JSON.stringify(stale));
+  check(stale.result.superseded === true, "and says it was overtaken rather than delivered", JSON.stringify(stale.result));
+  check(headReads === 1, "control: it actually asked what the head is", String(headReads));
+
+  // Control: the SAME call at the head it was decided for does post. Without it,
+  // the assertion above passes on a handler that has stopped posting anything.
+  const fresh = ghPrComment(args, { api: mk("aaa"), idemKey: "k-fresh", actor: "x[bot]" });
+  check(fresh.ok && posted === 1, "control: at its own head the same request posts", JSON.stringify(fresh.result));
+
+  // An UNREADABLE head does not discard. Absence of evidence is not evidence of
+  // absence, and a stale comment costs far less than a review request dropped on a
+  // transient read failure.
+  const blindApi = a => {
+    if (a.includes(`repos/o/r/pulls/1`)) return { ok: false, err: "HTTP 502" };
+    if (a.includes("GET")) return { ok: true, out: "" };
+    posted++; return { ok: true, out: JSON.stringify({ id: 2 }) };
+  };
+  const at = posted;
+  const blind = ghPrComment(args, { api: blindApi, idemKey: "k-blind", actor: "x[bot]" });
+  check(blind.ok && posted === at + 1, "an unreadable head posts rather than dropping the request",
+    JSON.stringify(blind.result));
+
+  // And an effect with no head at all is unaffected, so other kinds of comment
+  // do not silently acquire a revision check they were never given one for.
+  const at2 = posted;
+  const noHead = ghPrComment({ nwo: "o/r", pr: 1, body: "hello" }, { api: mk("zzz"), idemKey: "k-nohead", actor: "x[bot]" });
+  check(noHead.ok && posted === at2 + 1, "an effect carrying no head is posted as before", JSON.stringify(noHead.result));
+}
+
 // --- an unreadable list is not read as absence, nor as presence ---------------
 {
   const posted = [];

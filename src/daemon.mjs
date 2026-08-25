@@ -770,7 +770,13 @@ function effectsFor({ nwo, e, decision, profile }) {
     // What this replaces: THIS reviewer, this pull request, any earlier head.
     supersedes: `review-request:${nwo}:${e.pr}:${r.login}:`,
     kind: "gh.pr.comment",
-    args: { nwo, pr: e.pr, body: r.trigger },
+    // `head` travels with the effect so the handler can refuse a request that has
+    // been overtaken. Withdrawing superseded PENDING rows covers the ordinary
+    // case; it deliberately leaves INFLIGHT rows alone, because deleting one its
+    // drainer holds would leave it settling into nothing. That leaves exactly one
+    // window -- a head that moves while a delivery is in flight -- and the only
+    // thing that can close it is the delivery itself declining to post.
+    args: { nwo, pr: e.pr, body: r.trigger, head: e.head },
   }));
   return { effects, unsummonable };
 }
@@ -816,11 +822,78 @@ export async function tick(ctx) {
     return { decisions, escalations, halted: true };
   }
 
+  // Carrying out queued effects does not depend on being able to LIST pull
+  // requests, and the two use different credentials -- `openPrs` uses the ambient
+  // `gh` login, the outbox uses the GitHub App. A broken ambient credential would
+  // otherwise leave review requests undelivered indefinitely while everything
+  // needed to deliver them was healthy. So this is a function both exits call,
+  // rather than a block only the successful path reaches.
+  const drainDueEffects = async () => {
+if (ctx.drain !== false) {
+      try {
+        // The QUEUE is read before the credential. Authenticating first meant an
+        // installation lookup and a fresh token mint on every ordinary tick --
+        // roughly a thousand a day per repository -- to discover there was nothing
+        // to do, which also made the comment above about an idle tick costing one
+        // query untrue. Rows recoverable from a dead drainer count as work, or a
+        // crashed delivery waits for a tick that happens to have new work in it.
+        // Dead letters FIRST, and outside every branch below.
+        //
+        // Nested inside "there is work due" it disappeared exactly when it mattered:
+        // once the last due row is dead-lettered, `due` is 0, the query is skipped,
+        // and `announceable` sees a standing escalation absent on a complete tick and
+        // CLEARS it -- so the permanent loss announces itself once and is then
+        // retracted. The same held while authentication failed, and across a restart.
+        // A terminal row is a fact about the store, not about this tick's work.
+        for (const d of db.prepare(`SELECT kind, count(*) n FROM outbox
+                                    WHERE status='dead_letter' GROUP BY kind`).all())
+          escalations.set(`${d.n} ${d.kind} effect(s) reeve could not perform and will not retry — they need a person`, 1);
+
+        const due = db.prepare(`SELECT count(*) n FROM outbox
+                                WHERE (status='pending' AND not_before<=unixepoch())
+                                   OR (status='inflight' AND lease_expires_at<unixepoch())`).get().n;
+        if (!due) { /* nothing to carry; do not mint a token to find that out */ }
+        else {
+        const auth = await (ctx.authenticate ?? authenticate)(nwo);
+        if (!auth.ok) {
+          log(logPath, `  outbox: ${due} effect(s) waiting; cannot authenticate — ${auth.why}`);
+        } else {
+          const api = (args, opts) => apiAsInstallation(auth.token, args, opts);
+          // `auth.actor` is the login reeve's own comments carry. A handler needs it
+          // to tell its own writing from a contributor's; null means GitHub did not
+          // say, and a handler must read that as "cannot tell" rather than "matches".
+          const r = await drainOutbox({ db, log: m => log(logPath, m), handlers: ctx.handlers ?? HANDLERS,
+                                        api, actor: auth.actor ?? null });
+          const posted = r.done.filter(d => d.verdict === "done").length;
+          if (posted) log(logPath, `  outbox: performed ${posted} effect(s)`);
+          // A dead letter is PERMANENT: no later drain leases the row again, so the
+          // effect is not late, it is gone. It had only a log line to say so, and a
+          // log line is not a channel -- nothing reads dead-lettered rows, so the
+          // one signal that a review request was lost forever scrolled past.
+          //
+          // Counted from the store rather than from this pass, because recovery can
+          // dead-letter a row in a tick that performed nothing, and because a
+          // restart must not make the backlog disappear.
+          // Re-read after the drain, because this pass may have dead-lettered a row
+          // that the count above was taken before.
+          for (const d of db.prepare(`SELECT kind, count(*) n FROM outbox
+                                      WHERE status='dead_letter' GROUP BY kind`).all())
+            escalations.set(`${d.n} ${d.kind} effect(s) reeve could not perform and will not retry — they need a person`, 1);
+        }
+        }
+      } catch (err) { log(logPath, `  outbox: drain failed — ${err.message}`); }
+    }
+  };
+
   const prs = (ctx.openPrs ?? openPrs)(nwo, profile.watch?.maxOpenPrs ?? 20);
   if (prs === null) {
     // Could not ask is not none. Returning an empty list here would look exactly
     // like a quiet, healthy fleet.
     log(logPath, `tick: could not list PRs for ${nwo} — skipping this pass rather than assuming zero`);
+    // Still drain. An effect already made durable is owed whether or not this tick
+    // could read the repository, and an inflight row whose drainer died is
+    // recovered here or waits for a tick that happens to succeed.
+    await drainDueEffects();
     return { decisions, escalations, halted: false, unreadable: true };
   }
   // A cap that does not say it capped reads as "covered everything". The portfolio
@@ -1752,61 +1825,7 @@ export async function tick(ctx) {
   // A drain failure never fails the tick. Watching, judging and escalating do not
   // depend on it, and a queue that cannot move is a reason to say so rather than to
   // stop reading pull requests.
-  if (ctx.drain !== false) {
-    try {
-      // The QUEUE is read before the credential. Authenticating first meant an
-      // installation lookup and a fresh token mint on every ordinary tick --
-      // roughly a thousand a day per repository -- to discover there was nothing
-      // to do, which also made the comment above about an idle tick costing one
-      // query untrue. Rows recoverable from a dead drainer count as work, or a
-      // crashed delivery waits for a tick that happens to have new work in it.
-      // Dead letters FIRST, and outside every branch below.
-      //
-      // Nested inside "there is work due" it disappeared exactly when it mattered:
-      // once the last due row is dead-lettered, `due` is 0, the query is skipped,
-      // and `announceable` sees a standing escalation absent on a complete tick and
-      // CLEARS it -- so the permanent loss announces itself once and is then
-      // retracted. The same held while authentication failed, and across a restart.
-      // A terminal row is a fact about the store, not about this tick's work.
-      for (const d of db.prepare(`SELECT kind, count(*) n FROM outbox
-                                  WHERE status='dead_letter' GROUP BY kind`).all())
-        escalations.set(`${d.n} ${d.kind} effect(s) reeve could not perform and will not retry — they need a person`, 1);
-
-      const due = db.prepare(`SELECT count(*) n FROM outbox
-                              WHERE (status='pending' AND not_before<=unixepoch())
-                                 OR (status='inflight' AND lease_expires_at<unixepoch())`).get().n;
-      if (!due) { /* nothing to carry; do not mint a token to find that out */ }
-      else {
-      const auth = await (ctx.authenticate ?? authenticate)(nwo);
-      if (!auth.ok) {
-        log(logPath, `  outbox: ${due} effect(s) waiting; cannot authenticate — ${auth.why}`);
-      } else {
-        const api = (args, opts) => apiAsInstallation(auth.token, args, opts);
-        // `auth.actor` is the login reeve's own comments carry. A handler needs it
-        // to tell its own writing from a contributor's; null means GitHub did not
-        // say, and a handler must read that as "cannot tell" rather than "matches".
-        const r = await drainOutbox({ db, log: m => log(logPath, m), handlers: ctx.handlers ?? HANDLERS,
-                                      api, actor: auth.actor ?? null });
-        const posted = r.done.filter(d => d.verdict === "done").length;
-        if (posted) log(logPath, `  outbox: performed ${posted} effect(s)`);
-        // A dead letter is PERMANENT: no later drain leases the row again, so the
-        // effect is not late, it is gone. It had only a log line to say so, and a
-        // log line is not a channel -- nothing reads dead-lettered rows, so the
-        // one signal that a review request was lost forever scrolled past.
-        //
-        // Counted from the store rather than from this pass, because recovery can
-        // dead-letter a row in a tick that performed nothing, and because a
-        // restart must not make the backlog disappear.
-        // Re-read after the drain, because this pass may have dead-lettered a row
-        // that the count above was taken before.
-        for (const d of db.prepare(`SELECT kind, count(*) n FROM outbox
-                                    WHERE status='dead_letter' GROUP BY kind`).all())
-          escalations.set(`${d.n} ${d.kind} effect(s) reeve could not perform and will not retry — they need a person`, 1);
-      }
-      }
-    } catch (err) { log(logPath, `  outbox: drain failed — ${err.message}`); }
-  }
-
+  await drainDueEffects();
 
   const { fresh, cleared } = announceable(db, escalations,
     { covered: evaluated, waiting, finished, complete: evaluated.size === prs.length });

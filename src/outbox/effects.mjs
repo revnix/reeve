@@ -36,9 +36,32 @@ export const markerFor = idemKey => `<!-- reeve:effect:${idemKey} -->`;
  * cheaper direction produces is worse.
  */
 export function ghPrComment(args, { api, idemKey, actor = null }) {
-  const { nwo, pr, body } = args;
+  const { nwo, pr, body, head = null } = args;
   if (!nwo || !pr || !body) return { ok: false, retryable: false, error: `gh.pr.comment needs nwo, pr and body; got ${JSON.stringify(args)}` };
   const marker = markerFor(idemKey);
+
+  // Has the request been overtaken while it was in flight?
+  //
+  // A trigger comment names no revision -- it asks for a review of whatever is
+  // current -- so posting one decided for an old head requests a review of the NEW
+  // head, and the tick that noticed the new head enqueues its own differently
+  // marked effect and asks again. Two requests, neither idempotency check able to
+  // see the other, because they are genuinely different effects.
+  //
+  // Resolved as `ok` rather than as a failure: not posting IS the correct outcome
+  // for this effect, so it is finished, not broken. A retry would ask the same
+  // question and get the same answer, and a dead letter would summon a person to
+  // look at a head that simply moved on.
+  //
+  // An unreadable head does NOT discard. The whole file's rule: absence of
+  // evidence is not evidence of absence, and the cost of a stale comment is much
+  // lower than the cost of dropping a review request on a transient read failure.
+  if (head) {
+    const now = api(["-X", "GET", `repos/${nwo}/pulls/${pr}`, "--jq", ".head.sha"]);
+    const current = now.ok ? String(now.out || "").trim() : null;
+    if (current && current !== head)
+      return { ok: true, result: { posted: false, superseded: true, decidedFor: head, now: current } };
+  }
 
   // The pre-check runs on EVERY attempt, not only on a retry.
   //

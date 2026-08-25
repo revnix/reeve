@@ -22,7 +22,8 @@ import { assertWritable } from "./locks.mjs";
 import { isSameProcess } from "../supervisor.mjs";
 
 /**
- * The kinds whose IDEMPOTENCY KEY is itself proof the effect happened.
+ * The kinds whose IDEMPOTENCY KEY identifies the effect exactly enough that a
+ * completed one must never be re-derived.
  *
  * A spec push is round-keyed and an implementation push and a merge are
  * sha-keyed (section 3.2), so re-deriving the bytes after a crash produces a
@@ -107,8 +108,21 @@ export function enqueueEffect(db, { idempotencyKey, kind, taskId, generation, fe
   // log. An event here would replay as a mutation that never happened.
   if (live) return { id: live.id, status: "duplicate" };
 
-  // The key IS the proof, for these kinds only. A completed round- or sha-keyed
+  // The key is the proof, for these kinds only. A completed round- or sha-keyed
   // effect must not be performed again under a re-derived payload.
+  //
+  // AND WHAT IT DOES NOT SURVIVE, said out loud so the next reader does not take
+  // this for more than it is: the proof consulted here is THIS HUB'S OWN ROW, and
+  // a restore rolls that row back. Install a snapshot taken before a push or a
+  // merge settled and the external act still exists while the record of it does
+  // not -- so this check passes and the effect is admitted a second time. The
+  // state that would have to remember is precisely the state a restore
+  // rewinds, so no local counter or status can close it; only asking GitHub can.
+  // Nothing in S2 performs an effect, so there is no live re-delivery today. The
+  // executor that does must re-verify a KEY_KIND against external truth before
+  // its first delivery rather than trusting an absent row, and `recoverEffects`
+  // is not that check -- it reconciles rows already `inflight`, and a restored
+  // row comes back `pending`.
   if (KEY_KINDS.includes(kind)) {
     const done = db.prepare(
       `SELECT id FROM outbox WHERE idempotency_key = ? AND status = 'done' ORDER BY id DESC LIMIT 1`)

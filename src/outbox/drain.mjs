@@ -77,7 +77,7 @@ const HANDLER_DEADLINE = 2 / 3;
  */
 const callTimeoutMs = leaseSeconds => Math.max(5, Math.floor(leaseSeconds / 2)) * 1000;
 
-export async function drainOutbox({ db, log = () => {}, handlers, api,
+export async function drainOutbox({ db, log = () => {}, handlers, api, actor = null,
                                     worker = "drainer", max = 10, leaseSeconds = 300 }) {
   const kinds = Object.keys(handlers ?? {});
   // Recovery FIRST, so a row whose drainer died is a candidate in this pass rather
@@ -108,7 +108,7 @@ export async function drainOutbox({ db, log = () => {}, handlers, api,
       const timeoutMs = callTimeoutMs(leaseSeconds);
       const bounded = (a, opts = {}) => api(a, { timeoutMs, ...opts });
       const deliver = Promise.resolve(
-        handlers[job.kind](args, { api: bounded, idemKey: job.idem_key, attempt: job.attempts, log }));
+        handlers[job.kind](args, { api: bounded, idemKey: job.idem_key, actor, log }));
       const clock = deadline(leaseSeconds * HANDLER_DEADLINE);
       try { outcome = await Promise.race([deliver, clock]); }
       finally { clock.cancel(); }   // the loser's timer must not outlive the race

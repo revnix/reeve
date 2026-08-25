@@ -223,46 +223,91 @@ db.close();
   // reason a fixed `page=1` was wrong -- on a busy pull request the first page is
   // the page least likely to hold a comment posted seconds ago. Here the fake
   // pads the history so a single unpaginated page could not reach the marker.
-  const history = Array.from({ length: 150 }, (_, i) => ({ id: i, body: `old ${i}` }));
+  const history = Array.from({ length: 150 }, (_, i) => ({ id: i, user: "someone", body: `old ${i}` }));
   // Models `--jq` filtering at the source, which is what production now does: gh
   // returns matching IDS, one per line, not the discussion. That is the whole
   // point -- a long thread's full JSON exceeds the subprocess buffer, the read
   // fails, and a failed read falls through and posts the duplicate it exists to
   // prevent. Filtering at the source removes the thread's length from the answer.
+  const ME = "reeve-merge-policy[bot]";
+  // Models `--jq` filtering at the source, including the AUTHOR test. gh returns
+  // matching ids and nothing else -- that is what keeps a long thread from
+  // overrunning the subprocess buffer, and what keeps a forged marker from ever
+  // reaching the handler.
   const api = args => {
     if (args.includes("GET")) {
       lists++;
       if (args.includes("--paginate")) paginated++;
       const jq = args[args.indexOf("--jq") + 1] ?? "";
-      const want = /contains\("([^"]+)"\)/.exec(jq)?.[1] ?? null;
-      const all = [...history, ...posted.map((b, i) => ({ id: 1000 + i, body: b }))];
+      const wantBody = /contains\("([^"]+)"\)/.exec(jq)?.[1] ?? null;
+      const wantUser = /\.user\.login == "([^"]+)"/.exec(jq)?.[1] ?? null;
+      const all = [...history, ...posted];
       const pages = args.includes("--paginate") ? all : all.slice(0, 100);
-      const ids = want === null ? [] : pages.filter(c => c.body.includes(want)).map(c => c.id);
+      const ids = wantBody === null ? [] : pages
+        .filter(c => (wantUser === null || c.user === wantUser) && c.body.includes(wantBody))
+        .map(c => c.id);
       return { ok: true, out: ids.join("\n") };
     }
-    posted.push(args[args.indexOf("-f") + 1].replace(/^body=/, ""));
+    posted.push({ id: 1000 + posted.length, user: ME, body: args[args.indexOf("-f") + 1].replace(/^body=/, "") });
     return { ok: true, out: JSON.stringify({ id: 1000 + posted.length - 1 }) };
   };
   const args = { nwo: "o/r", pr: 1, body: "@codex review" };
 
-  const first = ghPrComment(args, { api, idemKey: key, attempt: 1 });
+  const first = ghPrComment(args, { api, idemKey: key, actor: ME });
   check(first.ok && posted.length === 1, "the first delivery posts the comment", JSON.stringify(first));
-  check(posted[0].includes(markerFor(key)), "carrying an invisible key that identifies it", posted[0]);
-  // A first attempt cannot find a previous delivery, so looking for one is a
-  // paginated list call bought to answer a question already answered.
-  check(lists === 0, "and a FIRST attempt does not read the comment list at all", `${lists} list call(s)`);
+  check(posted[0].body.includes(markerFor(key)), "carrying an invisible key that identifies it", posted[0].body);
+  // The pre-check runs on the FIRST attempt too. Gating it on the attempt count
+  // was an optimisation that could not survive a restore: roll the database back
+  // to before a delivery and the comment is still on GitHub while the row returns
+  // with attempts=0, so a "first" attempt posts the same trigger again. Only
+  // GitHub knows what is on GitHub.
+  check(lists === 1, "and the first attempt DID check GitHub, because a local counter cannot know about a restore",
+    `${lists} list call(s)`);
 
-  const second = ghPrComment(args, { api, idemKey: key, attempt: 2 });
+  const second = ghPrComment(args, { api, idemKey: key, actor: ME });
   check(second.ok, "a retry after a crash still reports success", JSON.stringify(second));
   check(posted.length === 1, "and does NOT post a second comment", `posted ${posted.length}`);
   check(second.result.alreadyThere === true, "because it recognised its own earlier one", JSON.stringify(second.result));
-  check(paginated === 1, "having read EVERY page, not the arbitrary first one",
+  check(paginated === lists && lists >= 2, "having read EVERY page, not the arbitrary first one",
     `${paginated} of ${lists} list call(s) paginated`);
 
   // Control: a DIFFERENT key must still post. Without this the assertion above
   // passes equally well on a handler that has simply stopped posting anything.
-  const other = ghPrComment(args, { api, idemKey: "review-request:o/r:1:def:codex", attempt: 2 });
+  const other = ghPrComment(args, { api, idemKey: "review-request:o/r:1:def:codex", actor: ME });
   check(other.ok && posted.length === 2, "control: a different effect still posts", `posted ${posted.length}`);
+
+  // --- a marker someone ELSE wrote is not evidence that reeve delivered --------
+  //
+  // The key is built from public values: repository, pull request, head, reviewer
+  // login. Anyone who can comment can construct it. Without an author test, a
+  // contributor could post the marker during a transient failure and the retry
+  // would settle `done` without ever requesting the review -- a required reviewer
+  // silently never summoned, which is worse than a duplicate comment because
+  // nothing looks wrong.
+  const forgedKey = "review-request:o/r:1:xyz:codex";
+  history.push({ id: 500, user: "a-contributor", body: `nice work ${markerFor(forgedKey)}` });
+  const before = posted.length;
+  const forged = ghPrComment(args, { api, idemKey: forgedKey, actor: ME });
+  check(forged.ok && posted.length === before + 1,
+    "a marker posted by someone else does not suppress the delivery", JSON.stringify(forged));
+  check(forged.result.alreadyThere === false, "and is not mistaken for reeve's own", JSON.stringify(forged.result));
+
+  // Control: the same marker from REEVE does suppress it, so the assertion above
+  // is about the author and not about the marker having stopped working.
+  const mineKey = "review-request:o/r:1:pqr:codex";
+  posted.push({ id: 900, user: ME, body: `x ${markerFor(mineKey)}` });
+  const at = posted.length;
+  const own = ghPrComment(args, { api, idemKey: mineKey, actor: ME });
+  check(own.ok && posted.length === at && own.result.alreadyThere === true,
+    "control: the same marker from reeve DOES suppress it", JSON.stringify(own.result));
+
+  // And with no actor known, suppression is skipped entirely: "cannot tell" is not
+  // "matches". A duplicate comment is a nuisance; an unrequested review is a pull
+  // request that waits forever.
+  const at2 = posted.length;
+  const blind = ghPrComment(args, { api, idemKey: mineKey, actor: null });
+  check(blind.ok && posted.length === at2 + 1,
+    "an unknown actor posts rather than trusting a marker it cannot attribute", JSON.stringify(blind.result));
 }
 
 // --- an unreadable list is not read as absence, nor as presence ---------------

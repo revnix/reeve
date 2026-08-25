@@ -72,7 +72,12 @@ export async function findInstallation(jwt, nwo) {
   const r = await apiAsApp(jwt, `repos/${owner}/${repo}/installation`);
   if (!r.ok) return { ok: false, why: `HTTP ${r.status}: ${r.err.split("\n")[0]}` };
   const inst = JSON.parse(r.out);
-  return { ok: true, id: inst.id, account: inst.account?.login, permissions: inst.permissions, repositorySelection: inst.repository_selection };
+  // `app_slug` is carried because it is the only way to know what reeve's own
+  // comments are AUTHORED as: a GitHub App writes as `<app_slug>[bot]`, and a
+  // caller that needs to tell its own writing from a contributor's has no other
+  // handle on it.
+  return { ok: true, id: inst.id, account: inst.account?.login, appSlug: inst.app_slug,
+           permissions: inst.permissions, repositorySelection: inst.repository_selection };
 }
 
 /** An installation token: one hour, scoped to the repos the App is installed on. */
@@ -133,7 +138,10 @@ export async function authenticate(nwo, name = "merge-policy") {
   const tok = await mintInstallationToken(jwt, inst.id);
   if (!tok.ok) return { ok: false, why: tok.why };
   return { ok: true, token: tok.token, expiresAt: tok.expiresAt, installationId: inst.id,
-           account: inst.account, permissions: tok.permissions, repositorySelection: inst.repositorySelection };
+           account: inst.account, permissions: tok.permissions, repositorySelection: inst.repositorySelection,
+           // The login reeve's own comments carry. Null when GitHub did not say,
+           // and a caller must treat null as "cannot tell" rather than as a match.
+           actor: inst.appSlug ? `${inst.appSlug}[bot]` : null };
 }
 
 /**

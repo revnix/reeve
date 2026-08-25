@@ -250,44 +250,41 @@ export function reap(db, { actor = "daemon", isAlive = () => false } = {}) {
  */
 export function checkpoint(db, { runId, step, seq, state, actor = "lane" }) {
   return tx(db, () => {
-    // The claim is taken FIRST, so nothing is written on a run this caller has
-    // lost. Doing it the other way round leaves the checkpoint row behind as a
-    // record of progress by a holder that no longer held anything.
-    // Read BEFORE the claim, so a refusal below can put it back exactly as it was.
-    const heldUntil = db.prepare(`SELECT lease_expires_at FROM run WHERE id=?`).get(runId)?.lease_expires_at ?? 0;
-    const held = db.prepare(`
-      UPDATE run SET step=?, cursor=json_patch(cursor, ?), heartbeat_at=unixepoch(),
-             lease_expires_at=unixepoch()+?
-      WHERE id=? AND status IN (${LEASE_HOLDING_STATES.map(() => "?").join(",")})
-        AND lease_expires_at > unixepoch()
-      RETURNING id`).get(step, canonical(state), LEASE_SECONDS, runId, ...LEASE_HOLDING_STATES);
-    if (!held) {
-      const row = db.prepare(`SELECT status, lease_expires_at FROM run WHERE id=?`).get(runId);
-      // Classified the way `heartbeat` classifies, and for its reason. A run that
-      // `reap` has already ABANDONED keeps its old `lease_expires_at`, so reading
-      // the timestamp alone reports "lease-expired" -- telling a caller its lease
-      // merely timed out, when ownership was taken and the task handed to another
-      // run. Expiry is the reason only while the status is one a holder could hold.
-      const reason = !row ? "no-such-run"
-        : (LEASE_HOLDING_STATES.includes(row.status)
-           && row.lease_expires_at <= Math.floor(Date.now() / 1000)) ? "lease-expired"
-        : "lease-lost";
+    // Every reason to refuse is decided BEFORE anything is written.
+    //
+    // The first version claimed first and then checked, on the reasoning that a
+    // claim and a check taken apart could disagree. Inside one IMMEDIATE
+    // transaction they cannot, so the ordering bought nothing and cost the
+    // property that matters: the claiming UPDATE also sets `step`, json-patches
+    // `cursor` and refreshes `heartbeat_at`, so a REFUSED checkpoint still left
+    // progress behind. `resume` would then read a step the run never successfully
+    // recorded and carry on from work a cancelled worker did not do. Putting
+    // `lease_expires_at` back covered one field of four, and `cursor` is not
+    // trivially reversible once patched at all -- which is the tell that restoring
+    // was the wrong shape and not-writing was the right one.
+    const row = db.prepare(`SELECT r.status, r.lease_expires_at, x.cancel_requested
+                            FROM run r LEFT JOIN task_exec x ON x.task_id = r.task_id
+                            WHERE r.id=?`).get(runId);
+    const refuse = reason => {
       emit(db, { actor, op: "run.checkpoint.refused", run_id: runId, payload: { step, seq, reason } });
       return { ok: false, reason };
-    }
-    // Cancellation, read INSIDE the transaction that took the claim. `heartbeat`
-    // reports `cancelled` for this state; a checkpoint returning ok would let a
-    // worker that has been told to stop keep checkpointing -- renewing its lease
-    // on every step, indefinitely, under the stop contract this function now
-    // advertises. The claim is already held at this point, so the lease is put
-    // back where it was rather than left extended by a call that is refusing.
-    const cancel = db.prepare(`SELECT cancel_requested FROM task_exec
-                               WHERE task_id=(SELECT task_id FROM run WHERE id=?)`).get(runId);
-    if (cancel?.cancel_requested) {
-      db.prepare(`UPDATE run SET lease_expires_at=? WHERE id=?`).run(heldUntil, runId);
-      emit(db, { actor, op: "run.checkpoint.refused", run_id: runId, payload: { step, seq, reason: "cancelled" } });
-      return { ok: false, reason: "cancelled" };
-    }
+    };
+    if (!row) return refuse("no-such-run");
+    // Classified the way `heartbeat` classifies. A run `reap` has ABANDONED keeps
+    // its old `lease_expires_at`, so reading the timestamp alone reports that the
+    // lease merely timed out -- when in fact ownership was taken and the task
+    // handed to another run. Expiry is the reason only while the status is one a
+    // holder could still hold.
+    if (!LEASE_HOLDING_STATES.includes(row.status)) return refuse("lease-lost");
+    if (row.lease_expires_at <= Math.floor(Date.now() / 1000)) return refuse("lease-expired");
+    // `heartbeat` reports `cancelled` for this, and a checkpoint that returned ok
+    // would let a worker told to stop keep checkpointing -- renewing its lease on
+    // every step, indefinitely, under the stop contract this function advertises.
+    if (row.cancel_requested) return refuse("cancelled");
+
+    db.prepare(`UPDATE run SET step=?, cursor=json_patch(cursor, ?), heartbeat_at=unixepoch(),
+                lease_expires_at=unixepoch()+? WHERE id=?`)
+      .run(step, canonical(state), LEASE_SECONDS, runId);
     db.prepare(`INSERT INTO checkpoint(run_id,step,seq,state,at)
                 VALUES(?,?,?,?,unixepoch())
                 ON CONFLICT(run_id,step) DO UPDATE SET state=excluded.state, at=excluded.at`)

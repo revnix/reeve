@@ -7,7 +7,7 @@
 //
 // Two things have to hold: the gate is OFF unless a profile says otherwise, and a
 // repeated tick at one head must not ask twice while a NEW head must ask again.
-import { reviewActionsOn } from "../src/daemon.mjs";
+import { reviewActionsOn, effectsFor } from "../src/daemon.mjs";
 import { open, tx, enqueue, supersedeEffects, sha256 } from "../src/db/ops.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -104,6 +104,30 @@ const check = (ok, name, detail) => {
 
   db.close();
   rmSync(dir, { recursive: true, force: true });
+}
+
+// --- an observational run neither queues nor delivers -------------------------
+{
+  // `--execute` is the CLI's own definition of "act rather than observe", and
+  // posting a comment on someone's pull request is acting: visible, not undoable,
+  // and exactly what a run started to WATCH must not do.
+  //
+  // Two gates, answering different questions. `--execute` is "may reeve act at
+  // all"; `watch.reviewActions` is "may it act on review threads". Both are
+  // needed, and the reason the first one is not redundant is that a queue outlives
+  // the run that made it -- producing while disarmed only moves the acting to
+  // whichever run drains it next.
+  const armed = { watch: { reviewActions: true }, reviewers: [{ login: "codex", trigger: "@codex review" }] };
+  for (const [label, profile, execute, want] of [
+    ["disarmed, review actions on",  armed,                            false, 0],
+    ["armed, review actions off",    { watch: {}, reviewers: armed.reviewers }, true, 0],
+    ["armed, review actions on",     armed,                            true,  1],
+  ]) {
+    const r = effectsFor({ nwo: "o/r", e: { pr: 3, head: "h" }, decision: { action: "REQUEST_REVIEW" }, profile, execute });
+    check(r.effects.length === want, `${label}: ${want} effect(s) queued`, `${r.effects.length}`);
+  }
+  // The third row is the control: without it the first two pass equally well on a
+  // producer that has stopped producing anything at all.
 }
 
 // --- a request nobody wants any more is retired, even with no replacement ------

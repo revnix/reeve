@@ -491,10 +491,22 @@ export function settleOutbox(db, { id, leaseToken, ok, result, error, retryable 
  */
 export function recoverOutbox(db) {
   return tx(db, () => {
+    // `>` and not `>=`, which buys exactly one reconciliation pass.
+    //
+    // The final allowed lease can post the comment and then crash before settling.
+    // At that point `attempts` equals `max_attempts`, so dead-lettering here
+    // records a delivered effect as one reeve "could not perform" -- and escalates
+    // it -- while GitHub already contains it. The handler's marker pre-check is the
+    // only thing that can tell the difference, and it needs a lease to run.
+    //
+    // So an exhausted row goes back to pending once. Its next lease bumps
+    // `attempts` past the budget, the pre-check either finds the marker and settles
+    // `done` without posting, or it does not and `settleOutbox` dead-letters on the
+    // budget it has now exceeded. One extra pass, and it still terminates.
     const dead = db.prepare(`
       UPDATE outbox SET status='dead_letter', lease_expires_at=0, updated_at=unixepoch(),
              last_error=coalesce(last_error,'') || ' | recovered past max_attempts without ever settling'
-      WHERE status='inflight' AND lease_expires_at < unixepoch() AND attempts >= max_attempts
+      WHERE status='inflight' AND lease_expires_at < unixepoch() AND attempts > max_attempts
       RETURNING id, kind, attempts`).all();
     for (const d of dead)
       emit(db, { actor: "drainer", op: "outbox.dead_letter",

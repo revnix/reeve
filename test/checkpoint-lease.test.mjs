@@ -73,6 +73,18 @@ const makeRun = (id, expiresAt, status = "running") => tx(db, () => {
   check(runRow("reaped").status === "abandoned", "control: and marked abandoned", runRow("reaped").status);
   const r = checkpoint(db, { runId: "reaped", step: "publish", seq: 1, state: {} });
   check(r?.ok === false, "an abandoned run cannot checkpoint", JSON.stringify(r));
+  // The REASON, not just the refusal. `reap` leaves the old `lease_expires_at` in
+  // place, so reading the timestamp alone reports "lease-expired" -- which tells a
+  // caller its lease merely timed out, when in fact ownership was taken and the
+  // task handed to another run. Those are different facts and a caller may
+  // reasonably act on them differently. `heartbeat` has always distinguished them;
+  // this did not until it was pointed out, and my first version of this test
+  // asserted only that it refused, which is why the gap survived the fix.
+  check(r?.reason === "lease-lost",
+    "and says ownership was LOST, not merely expired", JSON.stringify(r));
+  const ev = db.prepare(`SELECT payload FROM event WHERE op='run.checkpoint.refused' ORDER BY seq DESC LIMIT 1`).get();
+  check(JSON.parse(ev.payload).reason === "lease-lost",
+    "and the audit record says the same thing the caller was told", ev.payload);
   check(steps("reaped") === 0, "and leaves no record of progress it did not make", String(steps("reaped")));
 }
 

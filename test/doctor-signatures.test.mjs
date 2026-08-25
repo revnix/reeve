@@ -71,9 +71,13 @@ for (const cond of [undefined, { include: ["~ALL"] }, { include: ["~ALL"], exclu
   const plain = checkMergeAuthority("o/r", { api: apiFor(flat) })
     .lines.filter(l => /signed commits/.test(l)).join(" | ");
   check(sig !== plain, "a bypass changes what the signature line says at all", `${sig}\n        vs ${plain}`);
-  check(sig.length > plain.length, "and says MORE, because it carries the caveat", `${sig.length} vs ${plain.length}`);
+  // No length comparison. It looked like a property and is not: a correct rewrite
+  // can make the conditional form SHORTER -- replacing the flat prediction instead
+  // of appending to it -- and would be rejected for its character count while
+  // distinguishing the cases perfectly. That is the same phrasing sensitivity this
+  // block was rewritten to remove, wearing a numeric disguise.
   check(/OrganizationAdmin/.test(sig) && !/OrganizationAdmin/.test(plain),
-    "and the extra part is the actor the caveat depends on", sig);
+    "and what it adds is the actor, which the flat form never names", sig);
 }
 
 // Naming the CLASS is not naming the actor. Two entries of the same type render

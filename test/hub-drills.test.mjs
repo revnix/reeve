@@ -9,7 +9,8 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects } from "../src
 import { snapshotAll, latestSnapshot } from "../src/backup.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { spawn } from "node:child_process";
-import { openSync, writeSync, closeSync, mkdirSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { openSync, writeSync, closeSync, mkdirSync, writeFileSync, mkdtempSync, rmSync,
+         readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -272,7 +273,7 @@ for (let i = 0; i < 500; i++) {
   // straight back to pending. Returning it to pending would perform the effect
   // a second time whenever the first one had actually landed.
   let asked = null;
-  recoverEffects(db, { reconcile: (row) => { asked = row.kind; return { settled: true, ok: true, result: { pr: 7 } }; } });
+  await recoverEffects(db, { reconcile: (row) => { asked = row.kind; return { settled: true, ok: true, result: { pr: 7 } }; } });
   check(asked === "gh.pr.create", "an expired inflight row is handed to its reconciler", String(asked));
   check(db.prepare("SELECT status FROM outbox WHERE id=?").get(leased.id).status === "done",
     "and settled from external truth");
@@ -281,7 +282,7 @@ for (let i = 0; i < 500; i++) {
   hubTx(db2, () => enqueueEffect(db2, { idempotencyKey: "k", kind: "gh.pr.create", taskId: "bt:1", generation: 1, fence: 1, args: {} }));
   const l2 = leaseEffect(db2, { worker: "w", capabilities: allOn });
   db2.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${l2.id}`);
-  recoverEffects(db2, { reconcile: () => ({ settled: false }) });
+  await recoverEffects(db2, { reconcile: () => ({ settled: false }) });
   check(db2.prepare("SELECT status FROM outbox WHERE id=?").get(l2.id).status === "pending",
     "control: a reconciler that cannot decide returns the row to pending, so it is retried rather than lost");
 }
@@ -344,6 +345,76 @@ for (let i = 0; i < 500; i++) {
   const newest = latestSnapshot(root, "hub");
   check(newest && (why ?? "").includes(newest),
     "and the refusal names the newest usable snapshot by path", `${why}\n        newest=${newest}`);
+}
+
+// A CHECK THAT COULD NOT RUN IS NOT A VERDICT ON THE FILE.
+//
+// "not ok" and "could not tell" are different facts with different remedies:
+// one is restore-from-backup, the other is find out why the check would not run.
+// Collapsing them sends an operator to replace a database that may be perfectly
+// intact — which is the strongest claim this file makes, and it must not be made
+// on a guess.
+{
+  const p = join(home, "state", "unreadable.db");
+  openHub(p).close();
+  // A DIFFERENT process holding an exclusive DELETE-mode transaction: in that
+  // mode it blocks readers, so `quick_check` cannot run. The file is untouched.
+  const holder = new DatabaseSync(p);
+  holder.exec("PRAGMA journal_mode = DELETE");
+  holder.exec("BEGIN EXCLUSIVE");
+  let why = null;
+  try { openHub(p).close(); } catch (e) { why = e.message; }
+  try { holder.exec("ROLLBACK"); } catch {}
+  holder.close();
+  check(why !== null, "a hub whose check cannot run is refused", String(why));
+  check(!/is damaged/.test(why ?? ""),
+    "and is NOT called damaged, because nothing established that", String(why).split("\n")[0]);
+  check(/Do NOT restore/.test(why ?? ""),
+    "and the remedy is explicitly NOT to replace the file",
+    String(why).split("\n").slice(0, 3).join(" | "));
+  // WHICH GUARD ANSWERS, stated rather than assumed. A locked hub never reaches
+  // `quick_check` at all: `openHub`'s pragma guard runs first and its own
+  // BUSY/READONLY split already answers correctly. So this block proves the
+  // PROPERTY end to end — a hub that cannot be examined is never called damaged
+  // and never gets restore advice — while the third answer inside the check
+  // itself is asserted structurally below, because nothing here can make
+  // `quick_check` fail for a reason the pragmas did not already catch.
+  const src = readFileSync(new URL("../src/build/hubdb.mjs", import.meta.url), "utf8");
+  check(/let verdict = null, checkFailed = null;/.test(src),
+    "the check separates its three answers rather than folding a failed check into a verdict",
+    "checked");
+  check(/could not be checked[\s\S]{0,200}NOT a verdict on the file/.test(src),
+    "and a check that could not RUN says so, without the damage marker",
+    "checked");
+  // CONTROL, read by SLICING the branch rather than by guessing a distance: a
+  // character window would pass merely because the marker sits far away, which
+  // is a property of the layout and not of the branch.
+  const branch = src.slice(src.indexOf("if (checkFailed) {"), src.indexOf('if (verdict !== "ok")'));
+  // The MARKER, not the word: the branch's own comment says out loud that it is
+  // not marked, so a bare word search reads its explanation as its behaviour.
+  check(branch.length > 200 && !/hubDamaged: true/.test(branch),
+    "control: the could-not-check branch never sets the damage marker",
+    `branch=${branch.length} chars`);
+  check((src.match(/hubDamaged: true/g) ?? []).length === 1,
+    "control: exactly one place in the file claims damage",
+    String((src.match(/hubDamaged: true/g) ?? []).length));
+  // AND THE THIRD ANSWER IS CLASSIFIED, not merely worded. `isOperational` is
+  // what every recovery path consults, and it reads an errcode -- so a refusal
+  // that left the code behind on `cause` would be classified by the accident of
+  // the wrapper having none of its own rather than by the evidence.
+  check(/errcode: checkFailed\.errcode/.test(src),
+    "the could-not-check refusal carries the SQLite errcode, so it is classified on evidence",
+    "checked");
+  // A check that threw CORRUPTION is a verdict, not an absence of one: calling
+  // it unknown leaves an operator with no remedy for a genuinely broken hub.
+  check(/checkFailed\.errcode === 11 \|\| checkFailed\.errcode === 26/.test(src),
+    "and a check that threw SQLITE_CORRUPT or SQLITE_NOTADB is treated as an answer",
+    "checked");
+  // CONTROL: with the holder gone the same hub opens, so the refusal was about
+  // the lock and not about the file.
+  let reopened = true;
+  try { openHub(p).close(); } catch { reopened = false; }
+  check(reopened, "control: once the lock is released the same hub opens normally", String(reopened));
 }
 rmSync(dir, { recursive: true, force: true });
 rmSync(home, { recursive: true, force: true });

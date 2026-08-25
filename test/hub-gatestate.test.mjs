@@ -273,6 +273,59 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
   // including one that imports the symbol and never calls it.
   check(!/\bbuildTick\s*\(/.test('import { buildTick } from "../src/build/loop.mjs";'),
     "control: the scan does not match an import that never calls it");
+
+  // ── the tick refreshes the shape PRODUCTION actually passes it ─────────────
+  //
+  // Every assertion above hands `buildTick` a project with `repoId` already on
+  // it. `registryProjects` returns `{name, nwo}` and nothing else, so in the real
+  // `build run` path every registered project reached the no-id guard and was
+  // skipped on every heartbeat: the wiring was proved, the behaviour was proved,
+  // and not one gate-state row was ever written for a real project. A fixture
+  // richer than production cannot exhibit that, however many assertions it
+  // carries.
+  //
+  // So the id is resolved from the hub, and this block passes the production
+  // shape verbatim.
+  check(/\{ name, nwo: p\.nwo \}/.test(cli),
+    "fixture: registryProjects really does yield only a name and an nwo",
+    (cli.match(/Object\.entries\(reg\)[^\n]*/) ?? ["(not found)"])[0]);
+  {
+    const db2 = openHub(join(dir, "g-prod.db"));
+    // The snapshot `resolveSnapshot` would have taken through the API client;
+    // `repoId` is the value the hub records at admission and the one this block
+    // expects the tick to find without being handed it.
+    const admitted = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f", profileHash: "h",
+                       defaultBranch: "main", visibility: "private", specRepoId: 9,
+                       gateDefinitionHash: "g", registryVersion: 3, founderUserId: 4242 };
+    admitTask(db2, admitted, { id: "bt:prod", project: "nextly", title: "t",
+                           claims: [normalizeClaim("packages/x")] });
+    const tick = await buildTick({ hub: db2, projects: [{ name: "nextly", nwo: "o/r" }] });
+    check(tick.refreshed === 1 && tick.skipped.length === 0,
+      "a registry-shaped project is refreshed, not skipped", JSON.stringify(tick));
+    const row = db2.prepare("SELECT repo_id, nwo_snapshot FROM repo_gate_state").get();
+    check(row?.repo_id === admitted.repoId,
+      "and the row is keyed on the id the hub recorded at admission, not an invented one",
+      JSON.stringify(row));
+
+    // CONTROL: a project the hub has never admitted a task for still has no id,
+    // and skipping it remains the honest answer -- or "resolves the id" has
+    // become "invents one".
+    const unknown = await buildTick({ hub: db2, projects: [{ name: "other", nwo: "o/never" }] });
+    check(unknown.refreshed === 0 && unknown.skipped.includes("other"),
+      "control: a project the hub has never seen is still skipped", JSON.stringify(unknown));
+    check(db2.prepare("SELECT count(*) c FROM repo_gate_state").get().c === 1,
+      "control: and no row was fabricated for it");
+    db2.close();
+  }
+  // AND THE PRODUCTION CALLER READS THE SKIP LIST. `buildTick` returns it
+  // because a pass that refreshed nothing is indistinguishable from one that
+  // refreshed everything -- and `build run` discarded the whole result, so a
+  // tick skipping every project looked healthy from outside.
+  check(/=\s*await buildTick\s*\(/.test(branch),
+    "the build route keeps the tick's result rather than discarding it",
+    (branch.match(/[^\n]*buildTick\s*\([^\n]*/) ?? ["(not found)"])[0]);
+  check(/tick\.skipped/.test(branch),
+    "and reads what the tick could not refresh");
   db.close();
 }
 
@@ -378,7 +431,6 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
   // at the lock and not at the lease fence -- a call that never reaches the write
   // proves nothing about whether the write is guarded.
   refused("settleEffect", () => settleEffect(db, { id: 1, ok: true, result: {} }));
-  refused("recoverEffects", () => recoverEffects(db, { reconcile: () => ({ settled: false }) }));
   refused("voidPending", () => voidPending(db, "bt:1"));
   refused("admitTask", () => admitTask(db, snap, { id: "bt:9", project: "p", title: "t",
     claims: [normalizeClaim("packages/z")] }));
@@ -390,6 +442,17 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
   catch (e) { asyncThrew = e.message; }
   check(asyncThrew !== null && /restore|maintenance/i.test(asyncThrew),
     "refreshGateState refuses while a restore holds the lock", String(asyncThrew));
+
+  // `recoverEffects` joined the async ones when its reconciler moved OUTSIDE the
+  // write transaction. It refuses BEFORE consulting anything, which is the part
+  // that matters here: a restore must not send a reconciler to GitHub on behalf
+  // of a hub that is about to be replaced.
+  let recovered = null, recoverThrew = null, asked = 0;
+  try { recovered = await recoverEffects(db, { reconcile: () => { asked++; return { settled: false }; } }); }
+  catch (e) { recoverThrew = e.message; }
+  check(recoverThrew !== null && /restore|maintenance/i.test(recoverThrew),
+    "recoverEffects refuses while a restore holds the lock", String(recoverThrew ?? recovered));
+  check(asked === 0, "and refuses before asking the reconciler anything", String(asked));
 
   // CONTROL: release the lock and one of them must succeed. Without it, a
   // writer that throws for an unrelated reason -- a missing table, a bad

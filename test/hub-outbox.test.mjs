@@ -10,6 +10,7 @@
 //      different bytes and would otherwise push a second time for one round.
 //   3. Every row carries a fence, revalidated inside the lease transaction.
 import { openHub, hubTx } from "../src/build/hubdb.mjs";
+import { DatabaseSync } from "node:sqlite";
 import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
          voidPending, KEY_KINDS } from "../src/build/outbox.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -304,7 +305,7 @@ const NOW = 1_800_000_000;
     // an executor that simply leaves it pending forever.
     db.exec(`UPDATE outbox SET status='inflight', lease_expires_at = unixepoch() - 1
              WHERE idempotency_key = '${key}' AND status = 'pending'`);
-    recoverEffects(db, { reconcile: (row) =>
+    await recoverEffects(db, { reconcile: (row) =>
       world.includes(row.idempotency_key)
         ? { settled: true, ok: true, result: { reconciled: true } }
         : { settled: false } });
@@ -335,7 +336,7 @@ const NOW = 1_800_000_000;
   // The reconciler may only OBSERVE. It never appends to `world`; if the outbox
   // needs a second external action to make progress, this drill cannot supply one.
   let observed = 0;
-  recoverEffects(db, { reconcile: (row) => {
+  await recoverEffects(db, { reconcile: (row) => {
     observed++;
     return world.includes(row.idempotency_key)
       ? { settled: true, ok: true, result: { reconciled: true } }
@@ -542,7 +543,7 @@ const NOW = 1_800_000_000;
   check(A?.worker === "wA", "fixture: worker A holds the lease", JSON.stringify(A));
   // A stalls past expiry and the reconciler returns the row to pending.
   db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${A.id}`);
-  recoverEffects(db, { reconcile: () => ({ settled: false }) });
+  await recoverEffects(db, { reconcile: () => ({ settled: false }) });
   const B = leaseEffect(db, { worker: "wB", capabilities: allOn, now: NOW });
   check(B?.id === A.id && B.worker === "wB",
     "fixture: the same row is re-leased to worker B", JSON.stringify(B));
@@ -590,6 +591,137 @@ const NOW = 1_800_000_000;
     "control: an unscheduled row beside it is leased immediately");
   db.close();
 }
+// ── an ASYNC reconciler is awaited, not read as "could not tell" ────────────
+// A real reconciler checks GitHub, a git remote, a receipt or ledger truth --
+// all asynchronous. Its Promise is an object, so `verdict.settled` on it is
+// `undefined`, and every effect was read as unobservable and returned to the
+// queue. The one defence against re-performing an action that already happened
+// answered "could not tell" for every async reconciler ever passed to it, and
+// answered it silently.
+{
+  const db = openHub(join(dir, "o10.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:async", kind: "gh.pr.comment",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+  const leased = leaseEffect(db, { worker: "wA", capabilities: allOn, now: NOW });
+  db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${leased.id}`);
+
+  const r = await recoverEffects(db, { reconcile: async (row) => {
+    await new Promise(res => setTimeout(res, 1));
+    return { settled: true, ok: true, result: { pr: 11 } };
+  }});
+  check(r.settled === 1 && r.returned === 0,
+    "an async reconciler's verdict is awaited and applied", JSON.stringify(r));
+  check(db.prepare("SELECT status FROM outbox WHERE id=?").get(leased.id).status === "done",
+    "so the effect is settled from external truth rather than re-queued",
+    db.prepare("SELECT status FROM outbox WHERE id=?").get(leased.id).status);
+  db.close();
+}
+
+// ── the reconciler is asked while NO write transaction is held ──────────────
+// It was being called inside `BEGIN IMMEDIATE`, so the hub's SOLE writer was
+// held for the length of a network call and every other transition, lease and
+// settle in the process queued behind an HTTP timeout. Probed rather than
+// described: a second connection tries to open its own immediate transaction
+// from inside the reconciler, which can only succeed if no writer is held.
+{
+  const db = openHub(join(dir, "o11.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:nolock", kind: "gh.pr.comment",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+  const leased = leaseEffect(db, { worker: "wA", capabilities: allOn, now: NOW });
+  db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${leased.id}`);
+
+  let couldWrite = null, why = null;
+  await recoverEffects(db, { reconcile: () => {
+    const other = new DatabaseSync(join(dir, "o11.db"));
+    try { other.exec("BEGIN IMMEDIATE"); other.exec("ROLLBACK"); couldWrite = true; }
+    catch (e) { couldWrite = false; why = e.message; }
+    finally { other.close(); }
+    return { settled: false };
+  }});
+  check(couldWrite === true,
+    "no write transaction is held while the reconciler consults the world", String(why));
+
+  // CONTROL: the same probe INSIDE a transaction must fail, or the probe cannot
+  // tell the two situations apart and its green above means nothing.
+  let inTx = null;
+  hubTx(db, () => {
+    const other = new DatabaseSync(join(dir, "o11.db"));
+    try { other.exec("BEGIN IMMEDIATE"); other.exec("ROLLBACK"); inTx = true; }
+    catch { inTx = false; }
+    finally { other.close(); }
+  });
+  check(inTx === false, "control: the same probe inside a transaction is refused", String(inTx));
+  db.close();
+}
+
+// ── an effect whose attempts are spent does not re-enter the queue ──────────
+// `settleEffect` dead-letters a row whose attempts are exhausted; this path
+// returned it to `pending` regardless, and `leaseEffect` does not filter
+// exhausted rows. So an effect nobody could observe was leased, expired and
+// requeued for ever -- performing an externally ambiguous action every round,
+// which is exactly what the retry bound exists to stop.
+{
+  const db = openHub(join(dir, "o12.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:spent", kind: "gh.pr.comment",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+  const leased = leaseEffect(db, { worker: "wA", capabilities: allOn, now: NOW });
+  db.exec(`UPDATE outbox SET attempts = max_attempts, lease_expires_at = unixepoch() - 1
+           WHERE id = ${leased.id}`);
+
+  const r = await recoverEffects(db, { reconcile: () => ({ settled: false }) });
+  check(r.dead === 1 && r.returned === 0, "an exhausted unobservable effect is dead-lettered",
+    JSON.stringify(r));
+  const row = db.prepare("SELECT status, last_error FROM outbox WHERE id=?").get(leased.id);
+  check(row.status === "dead_letter", "and its status says so", JSON.stringify(row));
+  check(/attempts/.test(row.last_error ?? ""),
+    "with a last_error that says why it stopped", JSON.stringify(row));
+  check(leaseEffect(db, { worker: "wB", capabilities: allOn, now: NOW }) === null,
+    "so nothing can lease it again");
+
+  // CONTROL: one attempt short of the bound still returns to the queue, or
+  // "stops at the limit" has become "stops".
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:short", kind: "gh.pr.comment",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+  const two = leaseEffect(db, { worker: "wB", capabilities: allOn, now: NOW });
+  db.exec(`UPDATE outbox SET attempts = max_attempts - 1, lease_expires_at = unixepoch() - 1
+           WHERE id = ${two.id}`);
+  const r2 = await recoverEffects(db, { reconcile: () => ({ settled: false }) });
+  check(r2.returned === 1 && r2.dead === 0,
+    "control: one attempt short of the bound, the effect is returned to the queue",
+    JSON.stringify(r2));
+  db.close();
+}
+
+// ── a verdict about a row that MOVED is not applied ─────────────────────────
+// The reconciler now runs outside the write transaction, so the row can be
+// re-leased, settled or voided while it is out. Applying a verdict about the
+// state it was READ in would overwrite whoever holds the row now -- the same
+// stale-worker failure `settleEffect` already fences, arriving by a new door.
+{
+  const db = openHub(join(dir, "o13.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:moved", kind: "gh.pr.comment",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+  const A = leaseEffect(db, { worker: "wA", capabilities: allOn, now: NOW });
+  db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${A.id}`);
+
+  const r = await recoverEffects(db, { reconcile: () => {
+    // Somebody else re-leases the row while the reconciler is out.
+    db.exec(`UPDATE outbox SET worker='wB', lease_token=lease_token+1,
+             lease_expires_at=unixepoch()+300 WHERE id = ${A.id}`);
+    return { settled: true, ok: true, result: { pr: 99 } };
+  }});
+  check(r.stale === 1 && r.settled === 0,
+    "a verdict about a row that has since been re-leased is dropped as stale", JSON.stringify(r));
+  const row = db.prepare("SELECT status, worker, result FROM outbox WHERE id=?").get(A.id);
+  check(row.status === "inflight" && row.worker === "wB",
+    "and the new holder's delivery is untouched", JSON.stringify(row));
+  db.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

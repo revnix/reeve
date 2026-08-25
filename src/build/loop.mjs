@@ -10,6 +10,29 @@
 import { refreshGateState } from "./gatestate.mjs";
 
 /**
+ * The numeric repository id the hub already knows for a project.
+ *
+ * `task.repo_id` is written at admission from the snapshot `resolveSnapshot`
+ * took through the API client, so it is a value GitHub gave us rather than one
+ * derived from a name -- which matters, because a repository can be renamed and
+ * `nwo_snapshot` is only ever a snapshot. The most recently updated task wins
+ * for the same reason: if a project's id ever changed, the newest admission is
+ * the one that saw the current repository.
+ *
+ * Returns null rather than throwing for a project the hub has never admitted a
+ * task for. That is a real state in S2 -- a registered project with no work yet
+ * -- and it is not an error.
+ */
+export function repoIdFromHub(hub, project) {
+  if (!hub || !project?.nwo) return null;
+  try {
+    return hub.prepare(
+      `SELECT repo_id FROM task WHERE nwo_snapshot = ? ORDER BY updated_at DESC, id DESC LIMIT 1`)
+      .get(project.nwo)?.repo_id ?? null;
+  } catch { return null; }
+}
+
+/**
  * One pass of the builder loop.
  *
  * `fetchGateState` defaults to a function returning null, which
@@ -19,22 +42,36 @@ import { refreshGateState } from "./gatestate.mjs";
  * real tick, where no live GitHub client is wired.
  */
 export async function buildTick(ctx = {}) {
-  const { hub, projects = [], fetchGateState = () => null } = ctx;
+  const { hub, projects = [], fetchGateState = () => null,
+          resolveRepoId = repoIdFromHub } = ctx;
   const skipped = [];
   const rows = [];
   for (const project of projects) {
     // NO REPO ID, NO ROW. `repo_gate_state` is keyed on the numeric repository
-    // id and the column is NOT NULL, and the registry file records only a name
-    // and an `owner/repo`. The id is resolved by the API client S8 supplies, so
-    // in S2 a registry entry legitimately has none -- and skipping it is the
-    // honest answer: there is no row to key, and inventing one would put a
-    // fabricated identity in front of the clause that reads it.
-    if (project?.repoId == null) { skipped.push(project?.name ?? "(unnamed)"); continue; }
+    // id and the column is NOT NULL, while the registry file records only a name
+    // and an `owner/repo` -- so the id has to come from somewhere before this
+    // tick can write anything at all.
+    //
+    // AND IT DID NOT. `registryProjects` returns exactly `{name, nwo}`, so in the
+    // real `build run` path every registered project arrived here with no
+    // `repoId` and was skipped on every single iteration: the wiring existed, the
+    // tick ran, and not one gate-state row was ever written for a real project.
+    // A guard whose condition is unconditionally true in production is not a
+    // guard, it is an off switch.
+    //
+    // So the hub is asked first. It is the honest local authority: it holds the
+    // numeric id for every project it has admitted a task for, recorded at
+    // admission from the API client's own snapshot. A project it has never seen
+    // still has no id, and skipping THAT is the right answer -- there is no row
+    // to key, and inventing one would put a fabricated identity in front of the
+    // clause that reads it.
+    const repoId = project?.repoId ?? resolveRepoId(hub, project);
+    if (repoId == null) { skipped.push(project?.name ?? "(unnamed)"); continue; }
     // One project's failure is not the tick's. A fetcher that throws for one
     // repository must not stop the others being refreshed -- and
     // `refreshGateState` already turns a throw into an `unknown` row carrying
     // why, so there is nothing here to catch that it does not.
-    rows.push(await refreshGateState(hub, project, fetchGateState));
+    rows.push(await refreshGateState(hub, { ...project, repoId }, fetchGateState));
   }
   // `skipped` is RETURNED rather than swallowed. A tick that silently refreshed
   // nothing is indistinguishable from one that refreshed everything, and the

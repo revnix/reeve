@@ -87,15 +87,38 @@ export async function mintInstallationToken(jwt, installationId) {
  * Everything the fleet does on GitHub goes through here, as the App.
  * The token is passed by environment and never written to disk or logged.
  */
-export function apiAsInstallation(token, args) {
+export function apiAsInstallation(token, args, { timeoutMs = 60_000, maxBuffer = 64 * 1024 * 1024 } = {}) {
   try {
     const out = execFileSync("gh", ["api", ...args], {
       encoding: "utf8",
       env: { ...process.env, GH_TOKEN: token, GITHUB_TOKEN: token },
       stdio: ["ignore", "pipe", "pipe"],
+      // BOUNDED, and both bounds are load-bearing.
+      //
+      // This call is SYNCHRONOUS, so while it runs nothing else in the process
+      // does -- no timer fires, no promise settles, no lease is renewed. A caller
+      // that thinks it has wrapped this in a deadline has wrapped nothing: the
+      // deadline's timer cannot be created until this returns. A hung `gh` is
+      // therefore not a slow call, it is a stopped daemon, and the only thing that
+      // can end it is the subprocess timeout.
+      //
+      // The buffer matters for the same class of reason. The default is 1 MiB, and
+      // a paginated read of a long discussion exceeds it -- at which point this
+      // returns a FAILURE for a request that actually succeeded, and a caller that
+      // reads a failed read as "not found" acts on the wrong answer.
+      timeout: timeoutMs,
+      maxBuffer,
     });
     return { ok: true, out: out.trim() };
-  } catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
+  } catch (e) {
+    // A timeout kill is reported as itself. Otherwise it arrives as an empty
+    // stderr and reads like an ordinary refusal, which is the one thing it is not.
+    if (e?.killed || e?.signal === "SIGTERM")
+      return { ok: false, out: "", err: `gh api exceeded ${timeoutMs}ms and was killed`, timedOut: true };
+    if (e?.code === "ENOBUFS")
+      return { ok: false, out: "", err: `gh api output exceeded ${maxBuffer} bytes`, truncated: true };
+    return { ok: false, out: "", err: String(e.stderr || e.message).trim() };
+  }
 }
 
 /** One call: credentials to a usable installation token. */

@@ -23,6 +23,26 @@ const put = (key, kind = "gh.pr.comment", args = { nwo: "o/r", pr: 1, body: "ple
   tx(db, () => enqueue(db, { idemKey: key, kind, args }));
 const statusOf = key => db.prepare(`SELECT status, attempts, result, last_error FROM outbox WHERE idem_key=?`).get(key);
 
+// --- an effect cannot be enqueued outside a transaction ----------------------
+{
+  // The invariant the table exists for, and it used to be a comment: "must be
+  // called inside the same tx as the state change that decided it". A rule that
+  // lives in every caller lives in none of them, and a bare `enqueue(db, …)` is an
+  // ordinary-looking line that produces exactly the failure the outbox prevents.
+  let threw = null;
+  try { enqueue(db, { idemKey: "bare", kind: "gh.pr.comment", args: {} }); }
+  catch (e) { threw = e.message; }
+  check(threw !== null && /transaction/i.test(threw),
+    "enqueuing outside a transaction throws rather than succeeding", String(threw));
+  check(db.prepare(`SELECT count(*) n FROM outbox WHERE idem_key='bare'`).get().n === 0,
+    "and nothing is written", "");
+  // Control: the same call INSIDE one works, or the assertion above would pass on
+  // an enqueue that had simply stopped functioning.
+  const id = tx(db, () => enqueue(db, { idemKey: "wrapped", kind: "gh.pr.comment", args: {} }));
+  check(id !== null && id !== undefined, "control: inside a transaction it enqueues normally", String(id));
+  db.prepare(`DELETE FROM outbox WHERE idem_key='wrapped'`).run();
+}
+
 // --- the happy path, and it is performed exactly once -------------------------
 {
   put("a");
@@ -204,13 +224,21 @@ db.close();
   // the page least likely to hold a comment posted seconds ago. Here the fake
   // pads the history so a single unpaginated page could not reach the marker.
   const history = Array.from({ length: 150 }, (_, i) => ({ id: i, body: `old ${i}` }));
+  // Models `--jq` filtering at the source, which is what production now does: gh
+  // returns matching IDS, one per line, not the discussion. That is the whole
+  // point -- a long thread's full JSON exceeds the subprocess buffer, the read
+  // fails, and a failed read falls through and posts the duplicate it exists to
+  // prevent. Filtering at the source removes the thread's length from the answer.
   const api = args => {
     if (args.includes("GET")) {
       lists++;
       if (args.includes("--paginate")) paginated++;
+      const jq = args[args.indexOf("--jq") + 1] ?? "";
+      const want = /contains\("([^"]+)"\)/.exec(jq)?.[1] ?? null;
       const all = [...history, ...posted.map((b, i) => ({ id: 1000 + i, body: b }))];
-      // Unpaginated reads return only the first hundred, as the real API does.
-      return { ok: true, out: JSON.stringify(args.includes("--paginate") ? all : all.slice(0, 100)) };
+      const pages = args.includes("--paginate") ? all : all.slice(0, 100);
+      const ids = want === null ? [] : pages.filter(c => c.body.includes(want)).map(c => c.id);
+      return { ok: true, out: ids.join("\n") };
     }
     posted.push(args[args.indexOf("-f") + 1].replace(/^body=/, ""));
     return { ok: true, out: JSON.stringify({ id: 1000 + posted.length - 1 }) };
@@ -246,6 +274,17 @@ db.close();
   const r = ghPrComment({ nwo: "o/r", pr: 1, body: "b" }, { api, idemKey: "k", attempt: 2 });
   check(r.ok && posted.length === 1, "a failed pre-check falls through and posts, rather than assuming delivered",
     JSON.stringify(r));
+  // Named, because every failure that lands here LOOKS like "no marker found": a
+  // timeout, a truncated buffer, a rate limit. Reading any of them as absence is
+  // how the check meant to prevent a duplicate causes one.
+  for (const err of [{ ok: false, err: "gh api exceeded 30000ms and was killed", timedOut: true },
+                     { ok: false, err: "gh api output exceeded 1048576 bytes", truncated: true }]) {
+    const before = posted.length;
+    const q = ghPrComment({ nwo: "o/r", pr: 1, body: "b" },
+                          { api: a => (a.includes("GET") ? err : (posted.push("y"), { ok: true, out: "{}" })), idemKey: "k2", attempt: 2 });
+    check(q.ok && posted.length === before + 1,
+      `a ${err.timedOut ? "timed-out" : "truncated"} pre-check posts rather than assuming delivered`, JSON.stringify(q));
+  }
 }
 
 // --- which GitHub failures are worth retrying --------------------------------

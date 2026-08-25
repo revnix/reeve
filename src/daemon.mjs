@@ -733,12 +733,21 @@ function record(db, { pr, head, verdict, decision, effects = [] }) {
  * while a repeated tick at one head must not.
  */
 function effectsFor({ nwo, e, decision, profile }) {
-  if (decision.action !== "REQUEST_REVIEW" || !reviewActionsOn(profile)) return [];
-  return (profile.reviewers ?? []).filter(r => r.trigger).map(r => ({
+  if (decision.action !== "REQUEST_REVIEW" || !reviewActionsOn(profile)) return { effects: [], unsummonable: [] };
+  const reviewers = profile.reviewers ?? [];
+  // A BLOCKING reviewer with no trigger is the dangerous shape, and it is quiet by
+  // construction: the profile validator only warns, the filter drops them, and if
+  // any other reviewer does have a trigger the effect list is non-empty -- so the
+  // tick reports comments queued, later ticks deduplicate the same head, and a
+  // reviewer whose approval is REQUIRED is never summoned and never mentioned.
+  // The pull request then waits on a round nobody asked for.
+  const unsummonable = reviewers.filter(r => r.blocking && !r.trigger).map(r => r.login);
+  const effects = reviewers.filter(r => r.trigger).map(r => ({
     idemKey: `review-request:${nwo}:${e.pr}:${e.head}:${r.login}`,
     kind: "gh.pr.comment",
     args: { nwo, pr: e.pr, body: r.trigger },
   }));
+  return { effects, unsummonable };
 }
 
 /** How long has this PR been sitting in UNKNOWN? Read from the event log, not memory. */
@@ -956,7 +965,11 @@ export async function tick(ctx) {
     // worker containment. A review request withheld because a sandbox could not be
     // proved closed is a pull request left without the round it needed, for a
     // reason that has nothing to do with it.
-    const effects = effectsFor({ nwo, e, decision, profile });
+    const { effects, unsummonable } = effectsFor({ nwo, e, decision, profile });
+    for (const login of unsummonable) {
+      log(logPath, `  #${pr}: ${login} BLOCKS this pull request and declares no trigger comment — reeve cannot summon them`);
+      escalations.set(`${login} blocks merges but declares no trigger comment, so reeve cannot request their review`, 1);
+    }
     const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects });
     if (effects.length && !decided.ok)
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
@@ -1701,23 +1714,11 @@ export async function tick(ctx) {
   // needs a positive answer about the PR itself or it stands forever.
   const finished = finishedSubjects(db, nwo, new Set(prs), ctx);
   for (const pr of finished) log(logPath, `  #${pr}: is merged or closed — retiring what it was escalating`);
-  const { fresh, cleared } = announceable(db, escalations,
-    { covered: evaluated, waiting, finished, complete: evaluated.size === prs.length });
-
-  if (ctx.reviewIngest !== false) {
-    const sk = streak(db, nwo, now());
-    log(logPath, `shadow: ${sk.days} consecutive day(s) agreeing over ${sk.comparisons} comparison(s)` +
-                 (sk.firstDivergence ? ` — last divergence ${sk.firstDivergence.day}` : ""));
-  }
-
-  // Repo-wide, so once per tick rather than once per pull request.
-  if (ctx.reviewIngest !== false) {
-    try { (ctx.deriveSupply ?? deriveSupply)(db, nwo, profile, { at: now() }); }
-    catch (err) { log(logPath, `supply derive failed — ${err.message}`); }
-  }
-
-  // Drain AFTER the decisions, so an effect enqueued in this tick goes out in this
-  // tick rather than waiting for the next one. Unconditional: with nothing
+  // Drain AFTER the decisions and BEFORE the announcement. After, so an effect
+  // enqueued in this tick goes out in this tick. Before, because a dead letter it
+  // raises must reach the same tick's escalations -- `announceable` reads the map
+  // once, so anything added later is written to a set nobody looks at again, and
+  // the permanent loss of a review request would be announced by nothing. Unconditional: with nothing
   // enqueued it leases nothing and costs one query, and gating it as well as the
   // producers would mean the path that performs the writes had never run by the
   // time the flag was first flipped.
@@ -1742,13 +1743,40 @@ export async function tick(ctx) {
       if (!auth.ok) {
         log(logPath, `  outbox: ${due} effect(s) waiting; cannot authenticate — ${auth.why}`);
       } else {
-        const api = args => apiAsInstallation(auth.token, args);
+        const api = (args, opts) => apiAsInstallation(auth.token, args, opts);
         const r = await drainOutbox({ db, log: m => log(logPath, m), handlers: ctx.handlers ?? HANDLERS, api });
         const posted = r.done.filter(d => d.verdict === "done").length;
         if (posted) log(logPath, `  outbox: performed ${posted} effect(s)`);
+        // A dead letter is PERMANENT: no later drain leases the row again, so the
+        // effect is not late, it is gone. It had only a log line to say so, and a
+        // log line is not a channel -- nothing reads dead-lettered rows, so the
+        // one signal that a review request was lost forever scrolled past.
+        //
+        // Counted from the store rather than from this pass, because recovery can
+        // dead-letter a row in a tick that performed nothing, and because a
+        // restart must not make the backlog disappear.
+        const dead = db.prepare(`SELECT kind, count(*) n FROM outbox WHERE status='dead_letter' GROUP BY kind`).all();
+        for (const d of dead)
+          escalations.set(`${d.n} ${d.kind} effect(s) reeve could not perform and will not retry — they need a person`, 1);
       }
       }
     } catch (err) { log(logPath, `  outbox: drain failed — ${err.message}`); }
+  }
+
+
+  const { fresh, cleared } = announceable(db, escalations,
+    { covered: evaluated, waiting, finished, complete: evaluated.size === prs.length });
+
+  if (ctx.reviewIngest !== false) {
+    const sk = streak(db, nwo, now());
+    log(logPath, `shadow: ${sk.days} consecutive day(s) agreeing over ${sk.comparisons} comparison(s)` +
+                 (sk.firstDivergence ? ` — last divergence ${sk.firstDivergence.day}` : ""));
+  }
+
+  // Repo-wide, so once per tick rather than once per pull request.
+  if (ctx.reviewIngest !== false) {
+    try { (ctx.deriveSupply ?? deriveSupply)(db, nwo, profile, { at: now() }); }
+    catch (err) { log(logPath, `supply derive failed — ${err.message}`); }
   }
 
   noteTick(db);

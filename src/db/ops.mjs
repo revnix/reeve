@@ -317,7 +317,19 @@ export function resume(db, runId) {
 
 // ------------------------------------------------------------------ outbox
 export function enqueue(db, { idemKey, kind, runId = null, args, notBefore = 0 }) {
-  // MUST be called inside the same tx as the state change that decided it.
+  // The outbox's whole invariant, ENFORCED rather than requested.
+  //
+  // "Must be called inside the same transaction as the state change that decided
+  // it" was a comment, which means the rule lived in every caller and in none of
+  // them. A bare `enqueue(db, …)` is a perfectly ordinary-looking line that
+  // silently produces the failure the table exists to prevent: a decision durable
+  // without its effect, or an effect durable without its decision.
+  //
+  // A guard that lives in the caller is not a guard. This cannot prove the
+  // transaction is the RIGHT one -- that a state change is in it too -- but it
+  // closes the case that needs no mistake to reach, only forgetting.
+  if (!db.isTransaction)
+    throw new Error("enqueue: an effect must be enqueued inside the transaction that decided it, or a crash between the two loses one of them");
   const r = db.prepare(`
     INSERT INTO outbox(idem_key,kind,run_id,args,not_before,created_at,updated_at)
     VALUES(?,?,?,?,?,unixepoch(),unixepoch())

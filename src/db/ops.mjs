@@ -369,12 +369,21 @@ export function enqueue(db, { idemKey, kind, runId = null, args, notBefore = 0 }
  * row a drainer holds would leave it settling into nothing.
  */
 export function supersedeEffects(db, { prefix, keep }) {
-  const rows = db.prepare(`SELECT id, idem_key, kind FROM outbox
-                           WHERE status='pending' AND idem_key LIKE ? AND idem_key <> ?`).all(prefix + "%", keep);
+  // PENDING and DEAD_LETTER, and the second is not an afterthought. A dead letter
+  // is permanent and is counted into a standing escalation every tick -- so an
+  // old head's request that failed terminally goes on demanding a person's
+  // attention after the reviewer has been successfully summoned for the current
+  // head. The work it names is not merely late, it must no longer be performed.
+  //
+  // INFLIGHT is still excluded: a drainer may be mid-delivery, and deleting a row
+  // it holds would leave it settling into nothing.
+  const rows = db.prepare(`SELECT id, idem_key, kind, status FROM outbox
+                           WHERE status IN ('pending','dead_letter')
+                             AND idem_key LIKE ? AND idem_key <> ?`).all(prefix + "%", keep);
   for (const r of rows) {
-    db.prepare(`DELETE FROM outbox WHERE id=? AND status='pending'`).run(r.id);
+    db.prepare(`DELETE FROM outbox WHERE id=? AND status IN ('pending','dead_letter')`).run(r.id);
     emit(db, { actor: "daemon", op: "outbox.superseded",
-               payload: { id: r.id, kind: r.kind, key: r.idem_key, supersededBy: keep } });
+               payload: { id: r.id, kind: r.kind, was: r.status, key: r.idem_key, supersededBy: keep } });
   }
   return rows.length;
 }

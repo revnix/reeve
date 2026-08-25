@@ -212,6 +212,39 @@ const statusOf = key => db.prepare(`SELECT status, attempts, result, last_error 
 
 db.close();
 
+// --- one budget for the whole pass, not one per effect ------------------------
+{
+  // `max` bounds how many effects a pass performs. It does not bound how LONG the
+  // pass takes, and those are different guarantees: ten deliveries each given a
+  // fresh deadline can spend the sum of ten deadlines. This runs inside a tick
+  // that also evaluates pull requests, publishes verdicts and raises alerts, so an
+  // outbox in trouble would stop the guardian doing everything else it exists for.
+  const d4 = mkdtempSync(join(tmpdir(), "reeve-budget-"));
+  const db4 = open(join(d4, "s.db"));
+  for (let i = 0; i < 6; i++)
+    tx(db4, () => enqueue(db4, { idemKey: `b${i}`, kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "b" } }));
+
+  // A fake clock, so the assertion is about the budget rather than about how fast
+  // this machine happens to be. Each delivery "takes" 400ms of it.
+  let clock = 0;
+  const handlers = { "gh.pr.comment": () => { clock += 400; return { ok: true }; } };
+  const r = await drainOutbox({ db: db4, handlers, max: 10, budgetMs: 1000, now: () => clock });
+
+  check(r.outOfTime === true, "a pass that runs out of time says so", JSON.stringify({ outOfTime: r.outOfTime, done: r.done.length }));
+  check(r.done.length === 3, "and stops after the budget rather than after `max`", `${r.done.length} of 6`);
+  const left = db4.prepare(`SELECT count(*) n FROM outbox WHERE status='pending'`).get().n;
+  check(left === 3, "leaving the rest pending for the next tick, exactly as running out of rows does", String(left));
+  // Control: the same six drain fully when the budget is not the binding
+  // constraint, so the assertion above is about the budget and not about the
+  // drainer having stopped working.
+  const r2 = await drainOutbox({ db: db4, handlers, max: 10, budgetMs: 10_000, now: () => clock });
+  check(r2.done.length === 3 && r2.outOfTime === false,
+    "control: with room, the remainder drains and the pass does not report a cutoff", JSON.stringify(r2.done.length));
+
+  db4.close();
+  rmSync(d4, { recursive: true, force: true });
+}
+
 // --- the comment handler is at-most-once across a crash ----------------------
 {
   // The window the fence cannot close: the API call succeeded and the drainer died
@@ -320,8 +353,8 @@ db.close();
   // the tick that saw the new head enqueues its own, differently marked, and asks
   // again.
   let posted = 0, headReads = 0;
-  const mk = current => args => {
-    if (args.includes(`repos/o/r/pulls/1`)) { headReads++; return { ok: true, out: current }; }
+  const mk = (current, state = "open") => args => {
+    if (args.includes(`repos/o/r/pulls/1`)) { headReads++; return { ok: true, out: `${state}\t${current}` }; }
     if (args.includes("GET")) return { ok: true, out: "" };
     posted++; return { ok: true, out: JSON.stringify({ id: 1 }) };
   };
@@ -336,6 +369,18 @@ db.close();
   // the assertion above passes on a handler that has stopped posting anything.
   const fresh = ghPrComment(args, { api: mk("aaa"), idemKey: "k-fresh", actor: "x[bot]" });
   check(fresh.ok && posted === 1, "control: at its own head the same request posts", JSON.stringify(fresh.result));
+
+  // A pull request that has CLOSED is not asked for a review either. It normally
+  // keeps its head, so a head check alone lets the request through to something
+  // the watcher already treats as finished -- asking for a review nobody will do,
+  // or failing terminally and raising a dead letter naming a pull request that is
+  // over.
+  const at0 = posted;
+  const closed = ghPrComment(args, { api: mk("aaa", "closed"), idemKey: "k-closed", actor: "x[bot]" });
+  check(closed.ok && posted === at0, "a request to a CLOSED pull request is not posted", JSON.stringify(closed.result));
+  check(/closed/.test(String(closed.result.reason)), "and says which state stopped it", JSON.stringify(closed.result));
+  const merged = ghPrComment(args, { api: mk("aaa", "merged"), idemKey: "k-merged", actor: "x[bot]" });
+  check(merged.ok && posted === at0, "nor to a merged one", JSON.stringify(merged.result));
 
   // An UNREADABLE head does not discard. Absence of evidence is not evidence of
   // absence, and a stale comment costs far less than a review request dropped on a

@@ -46,6 +46,7 @@ import { resolveHome } from "../src/home.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { openHub, HUB_SCHEMA_VERSION, completedVersion, faultKind } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
+import { buildTick } from "../src/build/loop.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
 import { HEARTBEAT_SECONDS } from "../src/db/ops.mjs";
 
@@ -1455,8 +1456,25 @@ switch (cmd) {
         console.error("build run: lost the singleton lease; another process holds it. Stopping.");
         process.exit(1);
       }
-      // refreshGateState lands with S2-B (its Task 18); until then the loop body
-      // is the heartbeat alone. `sleep` is not a global -- spelled out here.
+      // THE TICK. It lives in `build/loop.mjs` rather than here so the wiring can
+      // be tested without spawning a daemon -- this is a heartbeat loop, and
+      // invoking it from a test starts one.
+      //
+      // No fetcher is wired in S2, and that is deliberate rather than unfinished:
+      // `buildTick` defaults to one returning null, which writes an `unknown`
+      // gate-state row carrying why. "reeve has not looked" is the honest reading,
+      // and it is what clause U4 must see rather than a default that resembles a
+      // pass. S8 supplies the real rulesets client.
+      //
+      // A tick that throws must not kill the daemon: the lease is still held and
+      // the next pass may well succeed, so the failure is reported and the loop
+      // continues. `refreshGateState` already turns a fetcher's throw into a row.
+      try {
+        await buildTick({ hub: db, projects: registryProjects(HOME).projects ?? [] });
+      } catch (e) {
+        console.error(`build run: tick failed (${e.message}); the lease is still held, continuing`);
+      }
+      // `sleep` is not a global -- spelled out here.
       await new Promise(r => setTimeout(r, HEARTBEAT_SECONDS * 1000));
     }
     break;

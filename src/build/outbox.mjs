@@ -87,7 +87,16 @@ export function settleDrainFor(db, outboxId) {
  * intent is durable in the same commit as the decision that produced it.
  */
 export function enqueueEffect(db, { idempotencyKey, kind, taskId, generation, fence,
-                                    cancellable = true, args, notBefore = 0 }) {
+                                    cancellable = true, args, notBefore = 0,
+                                    isAlive = isSameProcess }) {
+  // IT TOO. This function opens no transaction of its own -- it runs inside the
+  // caller's -- and it was left out of the exclusion rule on the grounds that
+  // `applyTransition` checks before calling it. That reasoning covers one caller.
+  // It is a hub WRITER, the rule is "every hub writer calls it", and a rule with
+  // a remembered exception is a rule honoured by whoever remembered it: a bare
+  // `hubTx(db, () => enqueueEffect(...))` is a legitimate call shape, and it
+  // admitted an effect while a restore was replacing the file underneath it.
+  assertWritable(db, { isAlive, inTx: true });
   // LIVE rows only. The partial unique index is over `pending` and `inflight`,
   // and that is deliberate: a hold voids the original, and the resume must be
   // able to re-enqueue the same key beside its own history.

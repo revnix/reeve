@@ -282,6 +282,23 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       `build run` was also discarding the tick's return value, which is the half
       that would have made the silence visible.
 
+      **And the same lesson a second way, from the peer lane.** Every fixture
+      written for those eight fixes was ONE element over a loop applying a scoped
+      rule: one expired effect, one `impl_pr`, one territory claim, one project
+      per `buildTick` call. With one element, a rule scoped per-row, per-PR,
+      per-claim or per-project is indistinguishable from one scoped to the batch,
+      to the task, or to nothing — and from one that stops at the first item. All
+      four were rewritten multi-element with the odd item in the MIDDLE, and
+      three scope bugs were then stubbed to check the new coverage: `continue` →
+      `break` in the tick loop, the retry bound read from the first row rather
+      than each row, and the `pr_hold` lookup keyed by task instead of
+      `(repo_id, pr)`. **All three were caught, and every failure was a new
+      assertion — the one-element tests stayed green under all three.** The
+      three-claim block also established something no one-claim fixture could:
+      a conflict on the third claim rolls the first two grants back, so a resume
+      cannot leave a task holding part of its territory while believing it holds
+      all of it.
+
       The §14 S2 Verify clause is checked item by item: the transition matrix
       (588 cells, all total), the GATE → ESCALATED edge, the CANCELLING
       exclusion, the CAS lost-race no-op, the generation fence in both the

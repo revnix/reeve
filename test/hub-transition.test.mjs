@@ -278,6 +278,87 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
   db.close();
 }
 
+// ── TWO open PRs, so the per-PR scope is visible ────────────────────────────
+// `write-pr-hold` loops over a task's open PRs and upserts on the OPEN row for
+// each. Every fixture for it seeds one `impl_pr`, and with one PR a hold keyed on
+// the task, on the repository, or on nothing at all behaves identically: the
+// second write is what reveals which key the upsert is actually using. A
+// one-element fixture cannot show whether a scope is right.
+{
+  const db = openHub(join(dir, "t14.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1',1,0,1,101,'sha-a',unixepoch()),
+                 ('bt:1',1,1,1,102,'sha-b',unixepoch())`);
+  const words = "the vendor withdrew the API we were building against";
+  let threw = null, r = null;
+  try {
+    r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+      evidence: { kind: "founder.infeasible", reason: words }, op: "phase.infeasible" });
+  } catch (e) { threw = e; }
+  check(threw === null && r?.applied === true, "the terminal transition applies with two open PRs",
+    String(threw?.message ?? JSON.stringify(r)));
+  const holds = db.prepare("SELECT pr, reason, detail, head_sha FROM pr_hold WHERE task='bt:1' ORDER BY pr").all();
+  check(holds.length === 2, "BOTH open PRs are held, not just the last one written",
+    JSON.stringify(holds));
+  check(holds.every(h => h.reason === "escalated" && h.detail === words),
+    "each carries the derived reason and the founder's words", JSON.stringify(holds));
+  check(holds[0]?.head_sha === "sha-a" && holds[1]?.head_sha === "sha-b",
+    "and each witnesses its OWN head, so the second did not overwrite the first",
+    JSON.stringify(holds));
+  db.close();
+}
+
+// ── THREE claims, one of which conflicts ────────────────────────────────────
+// `regrant-territory` loops over a task's claims and grants each. With one claim
+// the loop is not a loop, so nothing shows that a conflict found on the third
+// claim undoes the first two -- and a partial grant is the worst outcome
+// available here: a task resumes holding some of its territory and believes it
+// holds all of it.
+{
+  const db = openHub(join(dir, "t15.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  seed(db, { id: "bt:2", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned)
+           VALUES('bt:1','prefix','packages/a',0),
+                 ('bt:1','prefix','packages/b',0),
+                 ('bt:1','prefix','packages/c',0)`);
+  // The conflict is on the LAST claim, so the first two are granted before it is
+  // reached. Only the transaction rolling back can remove them.
+  db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at)
+           VALUES('p','file','packages/c/x.ts','bt:2',unixepoch()+3600)`);
+  const blocked = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(!blocked.applied, "a conflict on the third claim refuses the whole resume",
+    JSON.stringify(blocked));
+  check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task='bt:1'").get().c === 0,
+    "and NO claim is left granted: the first two rolled back with it",
+    JSON.stringify(db.prepare("SELECT * FROM territory_lease").all()));
+  db.close();
+}
+
+// CONTROL: three claims with nothing in the way are ALL granted, or "refuses on
+// conflict" has become "grants at most the first".
+{
+  const db = openHub(join(dir, "t16.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned)
+           VALUES('bt:1','prefix','packages/a',0),
+                 ('bt:1','prefix','packages/b',1),
+                 ('bt:1','file','packages/c/x.ts',0)`);
+  const ok = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(ok.applied === true, "control: an unobstructed resume applies", JSON.stringify(ok));
+  const rows = db.prepare("SELECT kind, path, pinned_until FROM territory_lease WHERE task='bt:1' ORDER BY path").all();
+  check(rows.length === 3, "control: all three claims are granted", JSON.stringify(rows));
+  check(rows[0].pinned_until === null && rows[1].pinned_until !== null && rows[2].pinned_until === null,
+    "control: and the pin lands on the pinned claim ONLY, not on the batch",
+    JSON.stringify(rows));
+  db.close();
+}
+
 // ── the resume runs ADMISSION'S scan, not an exact-path lookup ──────────────
 // A held task resuming while another task holds a live lease on an ancestor, a
 // descendant, or the same path under the other claim kind found no row on the

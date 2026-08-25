@@ -722,6 +722,58 @@ const NOW = 1_800_000_000;
   db.close();
 }
 
+// ── FOUR expired effects in ONE pass, each taking a different outcome ───────
+// Every block above hands `recoverEffects` exactly one expired row, and with one
+// row none of its per-row rules can be seen to be per-row: a bound applied to
+// the batch, a CAS that skips the whole loop, or a settle that writes the wrong
+// id all pass a one-element fixture identically. The rules are scoped to a ROW,
+// so the fixture has to contain rows that must be scored differently.
+{
+  const db = openHub(join(dir, "o14.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const leased = {};
+  for (const k of ["a", "b", "c", "d"]) {
+    hubTx(db, () => enqueueEffect(db, { idempotencyKey: `bt:1:g1:${k}`, kind: "gh.pr.comment",
+                                        taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+    leased[k] = leaseEffect(db, { worker: `w${k}`, capabilities: allOn, now: NOW });
+  }
+  check(Object.values(leased).every(Boolean) && new Set(Object.values(leased).map(r => r.id)).size === 4,
+    "fixture: four distinct effects are leased", JSON.stringify(Object.values(leased).map(r => r?.id)));
+  // `c` has spent its attempts; the other three have not.
+  db.exec(`UPDATE outbox SET attempts = max_attempts WHERE id = ${leased.c.id}`);
+  db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1`);
+
+  const asked = [];
+  const r = await recoverEffects(db, { reconcile: (row) => {
+    const k = row.idempotency_key.split(":").pop();
+    asked.push(k);
+    // `d` is re-leased by somebody else while the reconciler is out, so its
+    // verdict must be dropped even though the reconciler is certain about it.
+    if (k === "d") {
+      db.exec(`UPDATE outbox SET worker='wX', lease_token=lease_token+1,
+               lease_expires_at=unixepoch()+300 WHERE id = ${leased.d.id}`);
+      return { settled: true, ok: true, result: { pr: 1 } };
+    }
+    return k === "a" ? { settled: true, ok: true, result: { pr: 2 } } : { settled: false };
+  }});
+
+  check(asked.length === 4, "every expired row is handed to the reconciler exactly once",
+    JSON.stringify(asked));
+  check(r.settled === 1 && r.returned === 1 && r.dead === 1 && r.stale === 1,
+    "and the four outcomes are counted separately in one pass", JSON.stringify(r));
+  const status = k => db.prepare("SELECT status, worker FROM outbox WHERE id=?").get(leased[k].id);
+  check(status("a").status === "done", "the observed one is settled", JSON.stringify(status("a")));
+  check(status("b").status === "pending",
+    "the unobservable one with attempts left is re-queued", JSON.stringify(status("b")));
+  check(status("c").status === "dead_letter",
+    "the exhausted one is dead-lettered, and its neighbours' attempts did not exempt it",
+    JSON.stringify(status("c")));
+  check(status("d").status === "inflight" && status("d").worker === "wX",
+    "and the re-leased one keeps its NEW holder: a stale verdict beside three live ones is still dropped",
+    JSON.stringify(status("d")));
+  db.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

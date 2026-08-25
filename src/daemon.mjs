@@ -28,7 +28,10 @@ import { measureContainment, revalidateContainment, probeKeychain, isolationTopo
 import { canaryIdFor, netListener, instrumentHash } from "./canary.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256 } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects } from "./db/ops.mjs";
+import { authenticate, apiAsInstallation } from "./github/app.mjs";
+import { drainOutbox } from "./outbox/drain.mjs";
+import { HANDLERS } from "./outbox/effects.mjs";
 import { writeDash } from "./dash.mjs";
 import { snapshot, snapshotAll } from "./backup.mjs";
 import { selfAudit } from "./selfaudit.mjs";
@@ -215,6 +218,32 @@ function trackedAmong(worktree, wanted) {
     try { unlinkSync(tmp); } catch {}
   }
 }
+
+/**
+ * Is reeve allowed to act on review threads at all?
+ *
+ * One reader, so the flag cannot be half-observed. It is OFF unless a profile says
+ * otherwise, and that default is the point: this whole path performs real, visible
+ * GitHub writes on someone else's pull request, and the founder turns it on
+ * deliberately after the shadow week rather than inheriting it from a merge.
+ */
+/**
+ * The escalation CAUSE for dead-lettered effects of one kind.
+ *
+ * A function, and it takes no count, because the count is not part of the cause.
+ * `announceable` treats the key as identity and the map value as the count: a
+ * changed value re-announces the SAME cause, while a changed key is a new cause
+ * and leaves the old one standing until something clears it.
+ *
+ * Written with the number interpolated, every count was a different cause -- two
+ * reads in one pass produced two keys instead of one updated one, so a single
+ * notification could carry contradictory totals and the next tick would retire the
+ * stale one as though it had been resolved.
+ */
+export const deadLetterCause = kind =>
+  `${kind} effect(s) reeve could not perform and will not retry — they need a person`;
+
+export const reviewActionsOn = profile => profile?.watch?.reviewActions === true;
 
 export function uncommittedFiles(worktree, copiedBaseline = {}, { digest = digestOf } = {}) {
   try {
@@ -680,15 +709,149 @@ function openPrs(nwo, limit = 20) {   // bounded; the caller LOGS when the bound
  * Record what a tick decided, so the dashboard and `reeve why` can answer without
  * re-deriving anything, and so a restart knows how long a clause has been UNKNOWN.
  */
-function record(db, { pr, head, verdict, decision }) {
+function record(db, { pr, head, verdict, decision, effects = [], retire = new Map() }) {
   try {
-    db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
-      .run(now(), "daemon", "pr.decided", `pr:${pr}`, JSON.stringify({
-        head, state: verdict.state, summary: verdict.summary,
-        action: decision.action, why: decision.why,
-        clauses: verdict.clauses.map(c => ({ id: c.id, state: c.state })),
-      }));
-  } catch { /* a store that cannot record must not stop the loop */ }
+    // ONE transaction, and that is the outbox's whole reason for existing. The
+    // decision and the side effect it implies have to become durable together or
+    // neither: a crash between them leaves a store saying a review round was
+    // requested and a pull request where nothing was said, and re-deriving on the
+    // next tick is not a repair -- the head, the profile, the PR's state or an
+    // UNKNOWN timeout can all have moved, so the next tick may legitimately decide
+    // something else and the effect is simply lost.
+    return tx(db, () => {
+      db.prepare(`INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)`)
+        .run(now(), "daemon", "pr.decided", `pr:${pr}`, JSON.stringify({
+          head, state: verdict.state, summary: verdict.summary,
+          action: decision.action, why: decision.why,
+          clauses: verdict.clauses.map(c => ({ id: c.id, state: c.state })),
+        }));
+      // `enqueue` returns null for a key it already holds, which is success: the
+      // effect is durable, it was simply made durable by an earlier tick.
+      let queued = 0, known = 0, dropped = 0;
+      // Reconcile BEFORE enqueuing, and against the whole desired set rather than
+      // one key at a time.
+      //
+      // Doing it per-effect meant cleanup only happened while creating a
+      // replacement -- so when the desired set became EMPTY it never ran at all,
+      // and a request for a reviewer since removed from the profile would still be
+      // posted, while a dead letter for one would escalate forever. `retire`
+      // carries the desired set even when it is empty, which is the case that
+      // needed it.
+      for (const [prefix, keep] of retire) dropped += supersedeEffects(db, { prefix, keep });
+      for (const eff of effects) {
+        // Withdraw what this one supersedes, in the SAME transaction. A transient
+        // failure leaves a row pending on a backoff; if the pull request gets a new
+        // commit before that retry comes due, the new head enqueues its own effect
+        // and both are pending. They carry different markers, so neither
+        // idempotency check can see the other, and the reviewer is asked twice for
+        // what is now the same head.
+        //
+        // The prefix stops before the head, so it matches this reviewer's requests
+        // on this pull request at ANY head, and `keep` spares the one just made.
+        (enqueue(db, eff) !== null ? queued++ : known++);
+      }
+      return { ok: true, queued, known, dropped };
+    });
+  } catch (err) {
+    // A store that cannot record must not stop the loop -- but it must not report
+    // an effect as queued either. The caller says so out loud.
+    return { ok: false, queued: 0, known: 0, why: err.message };
+  }
+}
+
+/**
+ * The GitHub effects a decision implies, ready to be made durable WITH it.
+ *
+ * Built here rather than at dispatch, because dispatch is about workers and these
+ * are not worker tasks. Returns an empty list for every action that has no such
+ * effect, so the caller has one shape to handle.
+ *
+ * The key is per HEAD on purpose: a new head is a new round and must ask again,
+ * while a repeated tick at one head must not.
+ */
+/** The identity of one reviewer's request at one head, in ONE place.
+ *
+ * Written twice it would drift, and the drift would appear as a request being
+ * retired the moment after it was created -- the reconciliation would compute a
+ * key the enqueue did not use, find the new row unaccounted for, and delete it. */
+const keyFor = (nwo, e, r) =>
+  `review-request:${nwo}:${e.pr}:${r.login}:${e.head}:${sha256(r.trigger).slice(0, 12)}`;
+
+export function effectsFor({ nwo, e, decision, profile, execute }) {
+  // BOTH gates, and they answer different questions. `--execute` is "may reeve act
+  // at all"; `watch.reviewActions` is "may it act on review threads". An
+  // observational run must not queue a visible GitHub write any more than it may
+  // perform one -- a queue outlives the run that made it, so producing while
+  // disarmed only moves the acting to whichever run drains it next.
+  if (!execute || !reviewActionsOn(profile)) return { effects: [], unsummonable: [], retire: new Map() };
+  const reviewers = profile.reviewers ?? [];
+  // A BLOCKING reviewer with no trigger is the dangerous shape, and it is quiet by
+  // construction: the profile validator only warns, the filter drops them, and if
+  // any other reviewer does have a trigger the effect list is non-empty -- so the
+  // tick reports comments queued, later ticks deduplicate the same head, and a
+  // reviewer whose approval is REQUIRED is never summoned and never mentioned.
+  // The pull request then waits on a round nobody asked for.
+  // `kind === "blocking"`, which is how a profile actually says it -- the schema
+  // validator, the verdict and the review derivation all read it that way. I wrote
+  // `r.blocking`, a property no profile has, so this list was ALWAYS empty and the
+  // escalation it feeds could never fire. The validator warns about this exact
+  // reviewer at schema.mjs:379, which is the case this is meant to carry further.
+  const unsummonable = reviewers.filter(r => r.kind === "blocking" && !r.trigger).map(r => r.login);
+  const effects = reviewers.filter(r => r.trigger).map(r => ({
+    // The REVIEWER precedes the head in the key, and that ordering is the whole
+    // mechanism. With the head first, no prefix can name one reviewer's requests,
+    // so the supersede below matched every reviewer on the pull request -- and
+    // since the effects are enqueued in a loop, the second reviewer's supersede
+    // deleted the first reviewer's row that had just been created. Only the last
+    // reviewer would ever have been summoned.
+    // The trigger's CONTENT is part of the identity, not just who and where.
+    //
+    // Without it, correcting a trigger an operator got wrong -- a comment the bot
+    // accepted syntactically and then ignored -- produces the same key, so the
+    // existing done or dead-lettered row wins the conflict and the corrected body
+    // is never enqueued. That reviewer then cannot be summoned at all until some
+    // other commit happens to move the head, which is an unrelated event that may
+    // never come. A key that ignores what is being SENT cannot tell "already sent
+    // this" from "already sent something else to the same place".
+    //
+    // The supersedes prefix stops before the head, so a corrected trigger at the
+    // SAME head withdraws the obsolete request as well as replacing it.
+    idemKey: keyFor(nwo, e, r),
+    // What this replaces: THIS reviewer, this pull request, any earlier head.
+
+    kind: "gh.pr.comment",
+    // `head` travels with the effect so the handler can refuse a request that has
+    // been overtaken. Withdrawing superseded PENDING rows covers the ordinary
+    // case; it deliberately leaves INFLIGHT rows alone, because deleting one its
+    // drainer holds would leave it settling into nothing. That leaves exactly one
+    // window -- a head that moves while a delivery is in flight -- and the only
+    // thing that can close it is the delivery itself declining to post.
+    args: { nwo, pr: e.pr, body: r.trigger, head: e.head },
+  }));
+  // What SHOULD be queued for this pull request, computed from the profile and the
+  // current head — deliberately independent of what this tick decided.
+  //
+  // The decision answers "ask now?". This answers "what is still wanted?", and
+  // they are different questions. A request stays wanted while its reviewer is
+  // configured with that trigger and the head has not moved; it stops being wanted
+  // when the reviewer is removed, the trigger is corrected, or the head changes —
+  // none of which is a decision.
+  //
+  // Keyed by the reviewer's prefix so one reviewer's requests can be reconciled
+  // without touching another's.
+  const retire = new Map();
+  for (const r of reviewers.filter(x => x.trigger)) {
+    const prefix = `review-request:${nwo}:${e.pr}:${r.login}:`;
+    retire.set(prefix, new Set([keyFor(nwo, e, r)]));
+  }
+  // A reviewer no longer in the profile leaves rows nothing above will name, so the
+  // pull-request-wide prefix is reconciled too, sparing every key still wanted.
+  retire.set(`review-request:${nwo}:${e.pr}:`, new Set(effects.map(x => x.idemKey)));
+
+  // Only the REQUEST_REVIEW decision enqueues. Everything else still reconciles:
+  // a stale request must not be posted just because this tick decided to WAIT.
+  const asking = decision.action === "REQUEST_REVIEW";
+  return { effects: asking ? effects : [], unsummonable: asking ? unsummonable : [], retire };
 }
 
 /** How long has this PR been sitting in UNKNOWN? Read from the event log, not memory. */
@@ -732,11 +895,176 @@ export async function tick(ctx) {
     return { decisions, escalations, halted: true };
   }
 
+  // Carrying out queued effects does not depend on being able to LIST pull
+  // requests, and the two use different credentials -- `openPrs` uses the ambient
+  // `gh` login, the outbox uses the GitHub App. A broken ambient credential would
+  // otherwise leave review requests undelivered indefinitely while everything
+  // needed to deliver them was healthy. So this is a function both exits call,
+  // rather than a block only the successful path reaches.
+  const deadLetters = () => db.prepare(`SELECT kind, count(*) n FROM outbox
+                                       WHERE status='dead_letter' GROUP BY kind`).all();
+
+  const drainDueEffects = async () => {
+    // `--execute` gates DELIVERY as well as dispatch, and that is the CLI's own
+    // definition of the flag: act, rather than observe. Posting a comment on
+    // someone's pull request is acting -- it is visible, it is not undoable, and a
+    // run started to watch must not do it.
+    //
+    // Two gates, not one, and they answer different questions. `--execute` is "may
+    // reeve act at all"; `watch.reviewActions` is "may it act on review threads".
+    // A queue persisted by an earlier armed run is exactly the case that makes the
+    // first one necessary: without it, an observational run started afterwards
+    // would drain that queue and post.
+    //
+    // The dead-letter escalation below still runs. Refusing to ACT is not a reason
+    // to stop SAYING what is stuck -- an observational run is the one most likely
+    // to be looked at by a person.
+    if (execute && ctx.drain !== false) {
+      try {
+        // The QUEUE is read before the credential. Authenticating first meant an
+        // installation lookup and a fresh token mint on every ordinary tick --
+        // roughly a thousand a day per repository -- to discover there was nothing
+        // to do, which also made the comment above about an idle tick costing one
+        // query untrue. Rows recoverable from a dead drainer count as work, or a
+        // crashed delivery waits for a tick that happens to have new work in it.
+        // Dead letters FIRST, and outside every branch below.
+        //
+        // Nested inside "there is work due" it disappeared exactly when it mattered:
+        // once the last due row is dead-lettered, `due` is 0, the query is skipped,
+        // and `announceable` sees a standing escalation absent on a complete tick and
+        // CLEARS it -- so the permanent loss announces itself once and is then
+        // retracted. The same held while authentication failed, and across a restart.
+        // A terminal row is a fact about the store, not about this tick's work.
+        // The KEY is the cause; the COUNT is the value. `announceable` reads them
+        // that way -- the key is identity, and a changed value is what makes a
+        // known cause worth re-announcing.
+        //
+        // Putting the number in the string made every count a different cause. Two
+        // reads in one pass produced two keys rather than one updated one, so a
+        // single notification could carry contradictory totals, and the next tick
+        // would clear the stale one as though it had been resolved. This is also
+        // why it is read ONCE, after the drain, rather than before and after.
+
+
+        const due = db.prepare(`SELECT count(*) n FROM outbox
+                                WHERE (status='pending' AND not_before<=unixepoch())
+                                   OR (status='inflight' AND lease_expires_at<unixepoch())`).get().n;
+        if (!due) { /* nothing to carry; do not mint a token to find that out */ }
+        else {
+        const auth = await (ctx.authenticate ?? authenticate)(nwo);
+        if (!auth.ok) {
+          log(logPath, `  outbox: ${due} effect(s) waiting; cannot authenticate — ${auth.why}`);
+          // Escalated, not merely logged. No row is leased on this path, so nothing
+          // spends an attempt, nothing reaches its retry budget and nothing becomes
+          // a dead letter -- the queue simply stops, silently, and a blocking review
+          // request can wait forever without anything reaching the notification
+          // channel. Missing credentials and an uninstalled App both land here, and
+          // neither fixes itself.
+          escalations.set(`${due} queued effect(s) cannot be performed: reeve cannot authenticate — ${auth.why}`, 1);
+        } else {
+          const api = (args, opts) => apiAsInstallation(auth.token, args, opts);
+          // `auth.actor` is the login reeve's own comments carry. A handler needs it
+          // to tell its own writing from a contributor's; null means GitHub did not
+          // say, and a handler must read that as "cannot tell" rather than "matches".
+          const r = await drainOutbox({ db, log: m => log(logPath, m), handlers: ctx.handlers ?? HANDLERS,
+                                        api, actor: auth.actor ?? null });
+          const posted = r.done.filter(d => d.verdict === "done").length;
+          if (posted) log(logPath, `  outbox: performed ${posted} effect(s)`);
+          // A dead letter is PERMANENT: no later drain leases the row again, so the
+          // effect is not late, it is gone. It had only a log line to say so, and a
+          // log line is not a channel -- nothing reads dead-lettered rows, so the
+          // one signal that a review request was lost forever scrolled past.
+          //
+          // Counted from the store rather than from this pass, because recovery can
+          // dead-letter a row in a tick that performed nothing, and because a
+          // restart must not make the backlog disappear.
+          /* the dead-letter escalation is raised once, below, after every branch */
+        }
+        }
+      } catch (err) {
+        log(logPath, `  outbox: drain failed — ${err.message}`);
+        // Escalated, not merely logged, and for the same reason the `!auth.ok`
+        // branch is: nothing on this path leases a row, so nothing spends an
+        // attempt, reaches a retry budget or becomes a dead letter. The queue just
+        // stops.
+        //
+        // This catch is reachable in a way the `ok:false` branch is not:
+        // `authenticate` can THROW rather than return -- `apiAsApp` uses an
+        // uncaught `fetch`, so a DNS, TLS or connection failure arrives here. And
+        // silence would be worse than a missing alert: on an otherwise complete
+        // tick, a standing authentication escalation that this tick did not
+        // re-raise is CLEARED, so a persistent outage would announce itself once
+        // and then quietly retire its own alarm.
+        //
+        // Counted from the store rather than carried from above, because the
+        // throw may have happened before `due` was read.
+        try {
+          const stuck = db.prepare(`SELECT count(*) n FROM outbox
+                                    WHERE (status='pending' AND not_before<=unixepoch())
+                                       OR (status='inflight' AND lease_expires_at<unixepoch())`).get().n;
+          if (stuck) escalations.set(`${stuck} queued effect(s) cannot be performed: the drain is failing — ${err.message}`, 1);
+        } catch { /* a store that cannot be read must not take the tick down */ }
+      }
+    }
+    // OUTSIDE the execute gate, deliberately. A terminal row is a fact about the
+    // store, not about whether this run is allowed to act -- and an observational
+    // run is the one most likely to have a person reading it. Raised after every
+    // branch for the same reason: if it were raised only where work happened it
+    // would vanish on the tick after the last row died, and `announceable` would
+    // then clear it as resolved.
+    try {
+      for (const d of deadLetters())
+        escalations.set(deadLetterCause(d.kind), d.n);
+    } catch { /* an unreadable store is reported by the audit, not by crashing here */ }
+  };
+
+  // Turning escalations into announcements, as a function BOTH exits call.
+  //
+  // A tick that cannot list pull requests still drains, and a drain can recover a
+  // row or newly dead-letter one -- a permanent loss. That reached `escalations`
+  // and then hit an immediate `return`, so it was logged and never announced, for
+  // as long as listing stayed broken. The one thing that must not depend on
+  // reading the repository is telling a person the queue has lost something.
+  //
+  // `complete: false` on the degraded path is the honest reading: nothing was
+  // covered, so a standing escalation must not be cleared merely because this
+  // tick did not see the pull request that raised it.
+  const announce = (scope = {}) => {
+    const { fresh, cleared } = announceable(db, escalations, {
+      covered: scope.covered ?? new Set(),
+      waiting: scope.waiting ?? new Set(),
+      finished: scope.finished ?? new Set(),
+      complete: scope.complete ?? false,
+    });
+    for (const { why, count } of fresh) log(logPath, `NEEDS YOU: ${why}${count > 1 ? ` (${count} PRs)` : ""}`);
+    for (const why of cleared) log(logPath, `CLEARED: ${why}`);
+    const alert = buildAlert({ nwo, escalations: fresh });
+    if (alert) {
+      const sent = (ctx.notify ?? notify)({ profile, alert });
+      log(logPath, sent.ok ? `pushed ${fresh.length} escalation(s) to ${profile.notify?.topic}`
+                           : `did NOT push: ${sent.why}`);
+      try {
+        db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
+          .run(now(), "daemon", sent.ok ? "notify.sent" : "notify.failed", `repo:${nwo}`,
+               JSON.stringify({ count: fresh.length, why: sent.why ?? null }));
+      } catch { /* a store that cannot record must not stop the tick */ }
+    }
+    return { fresh, cleared };
+  };
+
   const prs = (ctx.openPrs ?? openPrs)(nwo, profile.watch?.maxOpenPrs ?? 20);
   if (prs === null) {
     // Could not ask is not none. Returning an empty list here would look exactly
     // like a quiet, healthy fleet.
     log(logPath, `tick: could not list PRs for ${nwo} — skipping this pass rather than assuming zero`);
+    // Still drain. An effect already made durable is owed whether or not this tick
+    // could read the repository, and an inflight row whose drainer died is
+    // recovered here or waits for a tick that happens to succeed.
+    await drainDueEffects();
+    // Announce what that drain raised. A dead letter is permanent, and "we could
+    // not list pull requests" must not also mean "nobody is told the queue lost
+    // something".
+    announce();
     return { decisions, escalations, halted: false, unreadable: true };
   }
   // A cap that does not say it capped reads as "covered everything". The portfolio
@@ -901,7 +1229,28 @@ export async function tick(ctx) {
       fixAttempts: fp ? new Map([[fp, attemptsFor(db, nwo, pr, fp, logPath)]]) : new Map(),
     });
 
-    record(db, { pr, head: e.head, verdict: e.verdict, decision });
+    // Posting a comment launches no worker and hands no credential to one, so it
+    // is decided and made durable HERE -- not below, where dispatch is gated on
+    // worker containment. A review request withheld because a sandbox could not be
+    // proved closed is a pull request left without the round it needed, for a
+    // reason that has nothing to do with it.
+    const { effects, unsummonable, retire } = effectsFor({ nwo, e, decision, profile, execute });
+    for (const login of unsummonable) {
+      log(logPath, `  #${pr}: ${login} BLOCKS this pull request and declares no trigger comment — reeve cannot summon them`);
+      escalations.set(`${login} blocks merges but declares no trigger comment, so reeve cannot request their review`, 1);
+    }
+    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire });
+    if (effects.length && !decided.ok)
+      log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
+    else if (decided.queued)
+      log(logPath, `  #${pr}: REQUEST_REVIEW — queued ${decided.queued} trigger comment(s) for reeve to post`
+                 + (decided.dropped ? `, withdrawing ${decided.dropped} for a head that has moved on` : ""));
+    else if (effects.length)
+      log(logPath, `  #${pr}: REQUEST_REVIEW — already requested at this head`);
+    // A decision that WANTED effects and produced none names the reason, because
+    // a profile with no trigger declared looks identical to one already asked.
+    if (decision.action === "REQUEST_REVIEW" && execute && reviewActionsOn(profile) && !effects.length)
+      log(logPath, `  #${pr}: REQUEST_REVIEW — no reviewer in this profile declares a trigger`);
     if (decision.action === ACTIONS.WAIT) waiting.add(pr);
     // Carried on the entry rather than left in this block's scope: the dispatch
     // loop below is a SEPARATE block, and reaching for these there threw a
@@ -936,7 +1285,11 @@ export async function tick(ctx) {
   // is open, and the founder is told once, by identity. The verdict is
   // injectable for tests only; the default measures, and measures only when a
   // worker task actually wants dispatching, so a quiet tick runs no canary.
-  const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action));
+  // A REQUEST_REVIEW reeve performs itself is not a worker task, so it must not
+  // count towards the worker gates -- otherwise an open containment blocks a
+  // comment that no worker was ever going to post.
+  const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action)
+                                    && !(d.decision.action === "REQUEST_REVIEW" && execute && reviewActionsOn(profile)));
   let containment = ctx.containment ?? null;
   if (execute && wanted.length && !containment) containment = await measuredContainment(ctx, profile, nwo, logPath);
   if (execute && wanted.length && containment.credentialRead !== "closed") {
@@ -954,6 +1307,12 @@ export async function tick(ctx) {
 
     const PREP_BACKOFF = (ctx.prepBackoff ??= new Map());   // pr -> { until, failures }
     for (const { e, decision, cause, fp } of decisions) {
+      // Already handled at decision time, in the same transaction as the decision.
+      // Nothing to dispatch: reeve posts it.
+      // The same condition the producer uses. If they disagree, a disarmed run
+      // skips the dispatch for an action it never queued -- so the request is
+      // neither made by reeve nor handed to a worker, and nothing says so.
+      if (decision.action === "REQUEST_REVIEW" && execute && reviewActionsOn(profile)) continue;
       if (UNBUILT_ACTIONS[decision.action]) {
         log(logPath, `  #${e.pr}: NOT dispatching ${decision.action} — ${UNBUILT_ACTIONS[decision.action]}`);
         escalations.set(`#${e.pr}: ${decision.action.toLowerCase().replace("_", " ")} needs a GitHub effect reeve does not yet perform`, 1);
@@ -1628,8 +1987,22 @@ export async function tick(ctx) {
   // needs a positive answer about the PR itself or it stands forever.
   const finished = finishedSubjects(db, nwo, new Set(prs), ctx);
   for (const pr of finished) log(logPath, `  #${pr}: is merged or closed — retiring what it was escalating`);
-  const { fresh, cleared } = announceable(db, escalations,
-    { covered: evaluated, waiting, finished, complete: evaluated.size === prs.length });
+  // Drain AFTER the decisions and BEFORE the announcement. After, so an effect
+  // enqueued in this tick goes out in this tick. Before, because a dead letter it
+  // raises must reach the same tick's escalations -- `announceable` reads the map
+  // once, so anything added later is written to a set nobody looks at again, and
+  // the permanent loss of a review request would be announced by nothing. Unconditional: with nothing
+  // enqueued it leases nothing and costs one query, and gating it as well as the
+  // producers would mean the path that performs the writes had never run by the
+  // time the flag was first flipped.
+  //
+  // A drain failure never fails the tick. Watching, judging and escalating do not
+  // depend on it, and a queue that cannot move is a reason to say so rather than to
+  // stop reading pull requests.
+  await drainDueEffects();
+
+  const { fresh, cleared } = announce({ covered: evaluated, waiting, finished,
+                                        complete: evaluated.size === prs.length });
 
   if (ctx.reviewIngest !== false) {
     const sk = streak(db, nwo, now());
@@ -1645,28 +2018,6 @@ export async function tick(ctx) {
 
   noteTick(db);
 
-  for (const { why, count } of fresh) log(logPath, `NEEDS YOU: ${why}${count > 1 ? ` (${count} PRs)` : ""}`);
-  for (const why of cleared) log(logPath, `CLEARED: ${why}`);
-
-  // Only what ARRIVED goes to a phone. `fresh` is already the deduplicated set,
-  // so a standing cause is pushed once rather than every two and a half minutes --
-  // which is how a channel gets muted and stops being a channel.
-  const alert = buildAlert({ nwo, escalations: fresh });
-  if (alert) {
-    const sent = (ctx.notify ?? notify)({ profile, alert });
-    // Logged either way. A push channel nobody knows is broken is the same as no
-    // push channel, so a decline is never swallowed.
-    log(logPath, sent.ok ? `pushed ${fresh.length} escalation(s) to ${profile.notify?.topic}`
-                         : `did NOT push: ${sent.why}`);
-    // Recorded as well as logged: the self-audit reads this to notice a channel
-    // that has been refusing for days, and a log line does not survive a restart
-    // as something queryable.
-    try {
-      db.prepare("INSERT INTO event(at,actor,op,subject,payload) VALUES(?,?,?,?,?)")
-        .run(now(), "daemon", sent.ok ? "notify.sent" : "notify.failed", `repo:${nwo}`,
-             JSON.stringify({ count: fresh.length, why: sent.why ?? null }));
-    } catch { /* recording a push must never fail a tick */ }
-  }
   return { decisions, escalations, halted: false };
 }
 

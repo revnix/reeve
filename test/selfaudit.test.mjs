@@ -293,7 +293,12 @@ check(healthy.length === 0, "control: a healthy reeve produces no findings", JSO
   };
   const backup   = at("if (ctx.backupRoot !== false) {");
   const audit    = at("if (ctx.selfAudit !== false) {");
-  const announce = at("const { fresh, cleared } = announceable(db, escalations,");
+  // The CALL in the ordinary path, not the definition. `announceable` is invoked
+  // from a helper now, because a tick that cannot list pull requests still has to
+  // announce what its drain found -- and a helper is necessarily defined before
+  // both of its callers. Measuring the definition made the order read backwards
+  // while the runtime order was unchanged.
+  const announce = at("const { fresh, cleared } = announce({ covered:");
 
   check(Number.isFinite(backup) && Number.isFinite(audit) && Number.isFinite(announce),
     "control: found all three steps in the tick",

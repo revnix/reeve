@@ -122,6 +122,39 @@ const makeRun = (id, expiresAt, status = "running") => tx(db, () => {
   check(!res.done.includes("second"), "so resume never sees a step the run did not record", JSON.stringify(res.done));
 }
 
+// --- a REFUSED checkpoint writes nothing at all ------------------------------
+{
+  // Not just "no checkpoint row". The claiming UPDATE also set `step`,
+  // json-patched `cursor` and refreshed `heartbeat_at`, so an earlier version
+  // refused the call and left progress behind -- and `resume` would then read a
+  // step the run never successfully recorded and carry on from work a cancelled
+  // worker did not do. Putting `lease_expires_at` back covered one field of four,
+  // and `cursor` is not trivially reversible once patched, which is the tell that
+  // restoring was the wrong shape and not-writing was the right one.
+  makeRun("frozen", now() + 300);
+  const before = db.prepare(`SELECT status, step, cursor, heartbeat_at, lease_expires_at FROM run WHERE id='frozen'`).get();
+  tx(db, () => db.prepare(`INSERT INTO task_exec(task_id,cancel_requested) VALUES('task-frozen',1)
+                           ON CONFLICT(task_id) DO UPDATE SET cancel_requested=1`).run());
+
+  const r = checkpoint(db, { runId: "frozen", step: "publish", seq: 1, state: { pushed: true } });
+  check(r?.ok === false && r.reason === "cancelled", "a cancelled run's checkpoint is refused", JSON.stringify(r));
+
+  const after = db.prepare(`SELECT status, step, cursor, heartbeat_at, lease_expires_at FROM run WHERE id='frozen'`).get();
+  for (const field of ["step", "cursor", "heartbeat_at", "lease_expires_at", "status"])
+    check(after[field] === before[field], `and ${field} is exactly as it was`,
+      `${JSON.stringify(before[field])} -> ${JSON.stringify(after[field])}`);
+  check(steps("frozen") === 0, "and no checkpoint row was written", String(steps("frozen")));
+
+  // Control: the fixture really could have moved. The same call on the same run,
+  // with the cancellation lifted, changes every one of those fields -- so the
+  // assertions above are about the refusal and not about a run that was inert.
+  tx(db, () => db.prepare(`UPDATE task_exec SET cancel_requested=0 WHERE task_id='task-frozen'`).run());
+  const ok2 = checkpoint(db, { runId: "frozen", step: "publish", seq: 1, state: { pushed: true } });
+  const moved = db.prepare(`SELECT step, cursor FROM run WHERE id='frozen'`).get();
+  check(ok2?.ok === true && moved.step === "publish" && moved.cursor !== before.cursor,
+    "control: with the cancellation lifted the same call DOES move them", JSON.stringify(moved));
+}
+
 // --- a run that never existed -------------------------------------------------
 {
   const r = checkpoint(db, { runId: "ghost", step: "x", seq: 1, state: {} });

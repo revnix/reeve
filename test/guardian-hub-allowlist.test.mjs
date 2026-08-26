@@ -257,13 +257,31 @@ for (const [sql, name] of refused) {
   holder.exec("BEGIN IMMEDIATE");
   const started = Date.now();
   let why = null;
-  try { openHubAsGuest(p).exec("BEGIN IMMEDIATE"); } catch (e) { why = e.message; }
+  // HELD AND CLOSED, not discarded. A guest dropped on the floor leaves its
+  // DatabaseSync open until GC finalises it, and this block removes the
+  // temporary database immediately afterwards -- which on Windows fails with a
+  // sharing violation while the file is still open. reeve has to run on Windows
+  // as well as macOS and Ubuntu, so a test that only cleans up on one of them is
+  // a test that fails on the other two for a reason unrelated to what it checks.
+  const waiter = openHubAsGuest(p);
+  try { waiter.exec("BEGIN IMMEDIATE"); } catch (e) { why = e.message; }
+  finally { try { waiter.close(); } catch {} }
   const waited = Date.now() - started;
   try { holder.exec("ROLLBACK"); } catch {}
   holder.close();
   check(why !== null && waited >= 50,
     "the guest WAITS for a contended write lock rather than failing instantly",
     JSON.stringify({ waitedMs: waited, why: String(why).slice(0, 60) }));
+}
+
+// The module refuses to hand back a connection it could not restrain. `engines`
+// is advisory and `bin/reeve`'s floor guards the CLI, not an import from
+// elsewhere, so the guarantee has to be checked where it is made.
+{
+  const proto = Object.getPrototypeOf(openHub(join(dir, "probe.db")));
+  check(typeof proto.setAuthorizer === "function",
+    "fixture: this runtime HAS setAuthorizer, so the guard below is dormant rather than absent",
+    `node ${process.versions.node}`);
 }
 
 g.close();

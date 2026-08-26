@@ -12,7 +12,7 @@
 import { openHub, hubTx } from "../src/build/hubdb.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
-         voidPending, KEY_KINDS } from "../src/build/outbox.mjs";
+         voidPending, KEY_KINDS, isStopOwned } from "../src/build/outbox.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1334,6 +1334,150 @@ const REASK_MAX = 3600;
   check(blocked === null,
     "a later comment waits behind a retained one: silence, not a contradicting status line",
     JSON.stringify(blocked));
+  db.close();
+}
+
+// ── an unobservable STOPPED effect is retained, not declared dead ───────────
+// Fencing means "this will not happen". A reconciler that THREW has not
+// established that -- and an effect already INFLIGHT when its task stopped is
+// exactly the case where the action may already have landed. Fencing it on a
+// failed look settles its drain, and the task then reaches a terminal phase with
+// an untracked pull request open behind it: the one thing the drain exists to
+// prevent.
+{
+  const db = openHub(join(dir, "o32.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:amb", kind: "gh.pr.create",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: { repo_id: 7, pr: 1 } }));
+  const leased = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  check(leased != null, "fixture: the effect is INFLIGHT -- it may already have landed");
+  // The stop, as a real transition, so the fence has a moment to point at.
+  db.exec(`UPDATE task SET phase='CANCELLING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+           VALUES('bt:1',unixepoch(),'phase.cancelling','IMPLEMENTING','CANCELLING',1,1,'{}')`);
+  db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${leased.id}`);
+
+  const r = await recoverEffects(db, { reconcile: () => { throw new Error("GitHub is unreachable"); } });
+  check(r.unobserved === 1 && r.stale === 0,
+    "a stopped task's effect whose reconciler THREW is retained, not fenced", JSON.stringify(r));
+  const row = db.prepare("SELECT status FROM outbox WHERE id=?").get(leased.id);
+  check(row.status === "inflight", "the row is still inflight, so it will be looked at again",
+    JSON.stringify(row));
+  const drain = db.prepare("SELECT settled_at FROM task_drain WHERE outbox_id=?").get(leased.id);
+  check(!drain || drain.settled_at === null,
+    "and its drain is NOT settled, so the task cannot reach a terminal phase behind it",
+    JSON.stringify(drain));
+  // AND IT IS STILL NOT DELIVERED. Retention must not become a way back into
+  // the queue for an effect the stop was meant to abandon.
+  check(leaseEffect(db, { worker: "w2", capabilities: allOn,
+                          now: db.prepare("SELECT unixepoch() n").get().n + 100000 }) === null,
+    "control: retaining it does not make it deliverable again");
+
+  // CONTROL: a reconciler that CAN look and reports it did not happen fences it,
+  // or "retain" has become "never fence a stopped effect".
+  //
+  // The row has to be made DUE again first: retention pushed its deadline out,
+  // and a sweep that finds nothing expired reconciles nothing -- so without this
+  // the control would assert against an empty pass and report the retained
+  // status as though the reconciler had spoken.
+  db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${leased.id}`);
+  const r2 = await recoverEffects(db, { reconcile: () => ({ settled: false }) });
+  check(db.prepare("SELECT status FROM outbox WHERE id=?").get(leased.id).status === "fenced",
+    "control: once a reconciler LOOKS and finds nothing, the stopped effect is fenced",
+    JSON.stringify(r2));
+  db.close();
+}
+
+// ── the re-ask deadline is measured from when it is WRITTEN ─────────────────
+// `at` is sampled before the reconcilers run, and a pass is a sequence of network
+// round trips. A slow batch leaves `at` further in the past than the interval
+// being scheduled, so `at + wait` lands BEHIND now and the next sweep re-asks
+// immediately -- for ever, because the elapsed measure the interval doubles from
+// is the gap since the last COMPLETION, which floors at the minimum.
+{
+  const db = openHub(join(dir, "o33.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:slow", kind: "gh.pr.comment",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: { repo_id: 7, pr: 3 } }));
+  const leased = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  // Expired under the INJECTED clock below, not merely under the real one: the
+  // scan selects `lease_expires_at <= at`, so a row expired only against real
+  // time is invisible to a pass whose clock is a day earlier -- and the block
+  // would then assert against a sweep that reconciled nothing at all.
+  db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 86500 WHERE id = ${leased.id}`);
+
+  // A LONG PASS, simulated by the clock rather than by sleeping through it.
+  //
+  // The scan clock is sampled before the reconcilers run, so "the pass took
+  // longer than the interval" IS "`at` is far behind the moment the deadline is
+  // written". Injecting an old `now` reproduces that exactly and deterministically;
+  // sleeping would need to exceed the 30s floor to show anything, which is not a
+  // test anyone will run.
+  const longAgo = db.prepare("SELECT unixepoch() - 86400 n").get().n;
+  await recoverEffects(db, { now: longAgo,
+    reconcile: () => { throw new Error("timed out"); } });
+  const after = db.prepare("SELECT lease_expires_at FROM outbox WHERE id=?").get(leased.id);
+  const nowAfter = db.prepare("SELECT unixepoch() n").get().n;
+  check(after.lease_expires_at > nowAfter,
+    "the new deadline is in the FUTURE even though the pass took longer than the interval",
+    JSON.stringify({ deadline: after.lease_expires_at, now: nowAfter }));
+  // The sharp end: the next sweep must not find it due again straight away.
+  const asked = [];
+  await recoverEffects(db, { reconcile: (r) => { asked.push(r.id); return { settled: false }; } });
+  check(asked.length === 0,
+    "so the next sweep does not re-ask it immediately, which is what a past deadline caused",
+    JSON.stringify(asked));
+  db.close();
+}
+
+// ── a task can stop TWICE, and the first stop's own effect is still its own ──
+// "At or after the LATEST stop" is correct only while a task has stopped once. A
+// task held, resumed while its hold comment was still unsettled, and held again
+// has two stops -- and the first hold's comment, whose fence IS the first stop,
+// sorts before the second one. It was then reclassified as work the task had
+// been doing, which fences a previous stop's own explanation.
+{
+  const db = openHub(join(dir, "o31.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const ev = (from, to, op) => db.prepare(
+    `INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+     VALUES('bt:1',unixepoch(),?,?,?,1,1,'{}') RETURNING seq`).get(op, from, to).seq;
+
+  // WORK, enqueued under an ACTIVE event. The odd one out sits between the two
+  // stop-owned rows below, so a predicate that ignores the event entirely cannot
+  // pass by accident.
+  const work = hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:work",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 1, fence: 1, args: { repo_id: 7, pr: 5 } }));
+
+  // STOP ONE, and the comment that explains it.
+  const stop1 = ev("IMPLEMENTING", "BLOCKED", "phase.held");
+  const held1 = hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:held1",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 1, fence: stop1, args: { repo_id: 7, pr: 12 } }));
+  // The resume, then STOP TWO -- the second hold that makes "the latest stop"
+  // the wrong question.
+  ev("BLOCKED", "IMPLEMENTING", "phase.resumed");
+  const stop2 = ev("IMPLEMENTING", "BLOCKED", "phase.held");
+  const held2 = hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:held2",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 1, fence: stop2, args: { repo_id: 7, pr: 12 } }));
+  db.exec(`UPDATE task SET phase='BLOCKED' WHERE id='bt:1'`);
+  check(stop1 < stop2, "fixture: the first stop really does sort before the second",
+    JSON.stringify({ stop1, stop2 }));
+
+  check(isStopOwned(db, "bt:1", stop1) === true,
+    "the FIRST stop's own effect is still recognised as the stop's, not as work",
+    JSON.stringify({ stop1 }));
+  check(isStopOwned(db, "bt:1", stop2) === true, "control: so is the second stop's");
+  check(isStopOwned(db, "bt:1", 1) === false,
+    "control: and an effect enqueued under an ACTIVE event is NOT stop-owned");
+
+  // The consequence at the door that matters: the first hold's explanation is
+  // still deliverable after a second hold, and the work is not.
+  const first = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  check(first?.idempotency_key === "bt:1:g1:held1",
+    "so the first hold's comment is delivered rather than fenced",
+    JSON.stringify({ got: first?.idempotency_key, work: work.id, held1: held1.id, held2: held2.id }));
+  check(db.prepare("SELECT status FROM outbox WHERE idempotency_key='bt:1:g1:work'").get().status === "fenced",
+    "control: and the WORK the stop halted is fenced, so this is not 'deliver everything'");
   db.close();
 }
 

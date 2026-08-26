@@ -331,6 +331,40 @@ const ALIVE = () => true, DEAD = () => false;
   db.close();
 }
 
+// ── a cooldown starting AFTER the request withdraws the mark ───────────────
+// Admission already refuses to REQUEST preemption while cooling. A cooldown that
+// begins after the request was made is the same fact arriving in the other
+// order, and the mark outlived it: a builder reaching a phase boundary during
+// the cooldown would surrender capacity that then sits idle until the throttle
+// lifts. A queued guardian under a cooldown is not waiting for a slot.
+{
+  const db = openHub(join(dir, "p19.db"));
+  db.exec(`INSERT INTO provider_state(provider,concurrency_limit,guardian_reserved)
+           VALUES('claude',1,0)
+           ON CONFLICT(provider) DO UPDATE SET concurrency_limit=1, guardian_reserved=0`);
+  claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE, now: 1000 });
+  claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 2, lstart: "G", isAlive: ALIVE, now: 1001 });
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE preempt_requested=1").get().c === 1,
+    "fixture: the guardian queues while capacity is full, and marks the builder");
+
+  // THEN the 429 arrives.
+  noteRateLimit(db, { signature: "rate_limit_exceeded", now: 1010, cooldownSeconds: 300 });
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE preempt_requested=1").get().c === 0,
+    "the mark is withdrawn: the guardian could not use a freed slot anyway",
+    JSON.stringify(db.prepare("SELECT owner,run_ref,status,preempt_requested FROM provider_lease").all()));
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE status='queued'").get().c === 1,
+    "control: the guardian is still queued, so it was the cooldown that withdrew it and not a lost request");
+
+  // CONTROL: once the cooldown lifts, a still-starved guardian asks again and
+  // the mark comes back -- or "withdraw while cooling" has become "never
+  // preempt after any 429".
+  claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 2, lstart: "G", isAlive: ALIVE, now: 1400 });
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE preempt_requested=1").get().c === 1,
+    "control: after the cooldown a still-starved guardian requests preemption again",
+    JSON.stringify(db.prepare("SELECT owner,run_ref,status,preempt_requested FROM provider_lease").all()));
+  db.close();
+}
+
 // ── the queue is served in ORDER ────────────────────────────────────────────
 // Admitting whichever guardian asks next lets a newer request from another
 // watched repository take the slot an older one is waiting for, and a steady

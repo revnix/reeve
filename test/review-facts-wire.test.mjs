@@ -61,6 +61,12 @@ const review = (id, who, body, head, at) => ({
   content_hash: hash(String(id) + body),
 });
 
+// The LIVE thread read this evaluation already holds. The projection is checked
+// against it, because the daemon evaluates before it folds: a reviewer opening a
+// thread on the SAME head leaves the projection fresh by every clock and a tick
+// out of date in content, and the head check cannot see that.
+const liveOf = (total, unresolved) => ({ readable: true, total, unresolved, seen: total });
+
 const dir = mkdtempSync(join(tmpdir(), "reeve-wire-"));
 const db = open(join(dir, "s.db"));
 noteHead(db, NWO, 1, HEAD_A, T);
@@ -87,14 +93,25 @@ const ev = rounds => {
 
 // --- the facts arrive, and they are the derived ones --------------------------
 {
-  const f = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A, at: T + 100 });
+  const f = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A, at: T + 100, live: liveOf(2, 2) });
   check(f.projection.readable === true, "the projection is readable at this head", JSON.stringify(f.projection));
-  check(f.unspilledCritical === 1,
-    "the evaluation receives a real critical count, where it used to receive null",
-    String(f.unspilledCritical));
   check(Array.isArray(f.threadDetails) && f.threadDetails.length === 2,
-    "and the thread details a worker is dispatched with, where it used to receive nothing",
+    "the evaluation receives the thread details a worker is dispatched with, where it used to receive nothing",
     JSON.stringify(f.threadDetails?.length));
+  check(f.rounds === 1,
+    "and the DERIVED round count, which `judged.size` cannot produce past one for a single reviewer",
+    String(f.rounds));
+  // The count is deliberately still UNKNOWN, and for a written reason rather than
+  // by the accident of a hard-coded null. The fold classifies severity for THREAD
+  // rows only, so a P0 stated in a review body with no inline thread is invisible
+  // -- and a zero missing a body-only critical would spill a P0, which is the one
+  // outcome the standing ruling forbids outright.
+  check(f.unspilledCritical === null,
+    "but the critical COUNT stays unknown while a body-only finding could be missing from it",
+    JSON.stringify(f.unspilledCritical));
+  check(/body/.test(String(f.projection.countUnknown)),
+    "and it says WHY, so the next stage has a stated precondition rather than a mystery",
+    JSON.stringify(f.projection));
   const d = f.threadDetails[0];
   check(d.id && d.severity && d.path,
     "control: each detail carries what a follow-up issue or a fix would need",
@@ -105,7 +122,7 @@ const ev = rounds => {
 {
   // With a critical open, SPILL must not fire -- the standing ruling is that
   // criticals escalate and are never moved to a follow-up.
-  const withCritical = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A, at: T + 100 });
+  const withCritical = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A, at: T + 100, live: liveOf(2, 2) });
   const d1 = nextAction(ev({ n: 6, softCap: 5, hardCap: 10, unspilledCritical: withCritical.unspilledCritical }), PROFILE);
   check(d1.action !== ACTIONS.SPILL,
     "with a critical open, the wired count still refuses to spill", JSON.stringify(d1));
@@ -127,13 +144,25 @@ const ev = rounds => {
   ingest(db, NWO, 1, [thread("PRRT_1", "codex", "**![P1 Badge](x)** a critical thing", true)], { at: T + 600 });
   ingest(db, NWO, 1, [review(2, "codex", "| _🟡 Minor_ | one nit left", HEAD_A, T + 700)], { at: T + 700 });
   derivePr(db, NWO, 1, PROFILE, { at: T + 800, head: HEAD_A });
-  const cleared = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A, at: T + 900 });
-  check(cleared.unspilledCritical === 0,
-    "control: the critical really is gone, as a KNOWN zero rather than an unknown",
+  const cleared = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A, at: T + 900, live: liveOf(2, 1) });
+  check(cleared.unspilledCritical === null,
+    "control: and it stays unknown even once the fold really has no criticals left",
     JSON.stringify({ c: cleared.unspilledCritical, readable: cleared.projection.readable }));
-  const d2 = nextAction(ev({ n: 6, softCap: 5, hardCap: 10, unspilledCritical: cleared.unspilledCritical }), PROFILE);
+
+  // With the precondition MET -- a fold that has derived body findings -- the same
+  // chain reaches SPILL. This is the one thing the flag gates, driven through an
+  // injected projection that declares itself complete, so the day the fold learns
+  // to classify bodies the behaviour here is what the product does.
+  const complete = reviewFacts({
+    db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A, at: T + 900, live: liveOf(2, 1),
+    io: { reviewState: () => ({ readable: true, bodyFindingsDerived: true, total: 2, open: 1,
+                                resolved: 1, unspilledCritical: 0, rounds: 6, threads: [] }) } });
+  check(complete.unspilledCritical === 0,
+    "with body findings derived, the count becomes a KNOWN zero", JSON.stringify(complete.unspilledCritical));
+  const d2 = nextAction(ev({ n: 6, softCap: 5, hardCap: 10, unspilledCritical: complete.unspilledCritical }), PROFILE);
   check(d2.action === ACTIONS.SPILL,
-    "and SPILL becomes reachable from real data for the first time", JSON.stringify(d2));
+    "and SPILL becomes reachable, which no input to the product could previously produce",
+    JSON.stringify(d2));
 }
 
 // --- every way of not knowing stays UNKNOWN, never zero -----------------------
@@ -142,9 +171,9 @@ const ev = rounds => {
   // property. Each of these used to be a way for a caller to end up with the
   // convenient number rather than the honest one.
   const cases = [
-    ["no state database at all", () => reviewFacts({ db: null, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A, at: T + 100 })],
-    ["a projection derived for a DIFFERENT head", () => reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_B, at: T + 100 })],
-    ["a pull request never derived", () => reviewFacts({ db, nwo: NWO, pr: 999, profile: PROFILE, head: HEAD_A, at: T + 100 })],
+    ["no state database at all", () => reviewFacts({ db: null, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A, at: T + 100, live: liveOf(2, 2) })],
+    ["a projection derived for a DIFFERENT head", () => reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_B, at: T + 100, live: liveOf(2, 2) })],
+    ["a pull request never derived", () => reviewFacts({ db, nwo: NWO, pr: 999, profile: PROFILE, head: HEAD_A, at: T + 100, live: liveOf(0, 0) })],
     ["a store that THROWS rather than answering", () => reviewFacts({
       db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A, at: T + 100,
       io: { reviewState: () => { throw new Error("database is locked"); } } })],
@@ -164,10 +193,56 @@ const ev = rounds => {
   // and a caller has to be able to tell them apart. A single nullable number
   // cannot carry both, which is why the details are null rather than [].
   const f = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A, at: T + 800,
-                          io: { reviewState: () => ({ readable: true, unspilledCritical: 0, threads: [] }) } });
+                          live: liveOf(0, 0),
+                          io: { reviewState: () => ({ readable: true, bodyFindingsDerived: true, total: 0,
+                                                      open: 0, resolved: 0, unspilledCritical: 0,
+                                                      rounds: 3, threads: [] }) } });
   check(f.unspilledCritical === 0 && Array.isArray(f.threadDetails) && f.threadDetails.length === 0,
     "a readable projection with nothing open is an empty LIST and a known zero",
     JSON.stringify(f));
+}
+
+// --- a projection that DISAGREES with the live read is not usable -------------
+{
+  // The staleness the head check cannot see, and the reason it cannot.
+  //
+  // The daemon evaluates a pull request before it observes, ingests and folds, so
+  // the projection read during evaluation came from the PREVIOUS tick. When a
+  // reviewer opens a thread on the SAME head -- the ordinary case -- the head
+  // matches, every clock says fresh, and the content is a tick out of date. A
+  // newly filed critical would sit behind a zero.
+  //
+  // The live read the evaluation already holds is the cross-check, through the
+  // same `compare` the review shadow has been running against this projection for
+  // days. The shadow was measuring exactly this while the decision path ignored it.
+  const agreeing = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A,
+                                 at: T + 900, live: liveOf(2, 1) });
+  check(agreeing.projection.readable === true,
+    "control: a projection that agrees with the live read is usable", JSON.stringify(agreeing.projection));
+
+  // One more thread exists live than the projection knows about: exactly what a
+  // reviewer filing a finding between the fold and this tick looks like.
+  const behind = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A,
+                               at: T + 900, live: liveOf(3, 2) });
+  check(behind.projection.readable === false && behind.unspilledCritical === null,
+    "a projection the live read has moved past is UNKNOWN, however fresh its clock",
+    JSON.stringify(behind.projection));
+  check(/disagrees/.test(String(behind.projection.why)),
+    "and says so, rather than reporting an absence", JSON.stringify(behind.projection.why));
+
+  // Same head, same thread count, different resolution: the shape a bot
+  // self-resolving a thread produces, which is a claim rather than evidence.
+  const resolvedDiff = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A,
+                                     at: T + 900, live: liveOf(2, 2) });
+  check(resolvedDiff.projection.readable === false,
+    "and so is one whose resolved count the live read contradicts", JSON.stringify(resolvedDiff.projection));
+
+  // A live read that could not answer is not agreement. It is another way of not
+  // knowing, and the honest answer to not knowing is the same as everywhere else.
+  const blind = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A,
+                              at: T + 900, live: { readable: false, why: "truncated" } });
+  check(blind.projection.readable === false && blind.unspilledCritical === null,
+    "an unreadable live read is not agreement either", JSON.stringify(blind.projection));
 }
 
 // --- and the EVALUATION is actually wired to it ------------------------------
@@ -190,6 +265,10 @@ const ev = rounds => {
     "evaluatePr takes its critical count from the projection, not from a literal", "");
   check(/threadDetails:\s*facts\.threadDetails/.test(body),
     "and hands on the thread details a dispatched worker is given", "");
+  check(/n:\s*facts\.rounds\s*\?\?/.test(body),
+    "and prefers the DERIVED round count, without which every cap decision is unreachable", "");
+  check(/live:\s*threads/.test(body),
+    "and hands the live read in, so the projection can be checked against it", "");
   check(!/unspilledCritical:\s*(null|0)\b/.test(body),
     "and no literal count survives anywhere in it",
     (body.match(/unspilledCritical:.*/g) ?? []).join(" | "));

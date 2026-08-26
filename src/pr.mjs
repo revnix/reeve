@@ -11,6 +11,7 @@ import { loadSettlement, saveSettlement } from "./db/ops.mjs";
 import { rootCause } from "./ci-rootcause.mjs";
 import { computeVerdict, renderVerdict, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
 import { reviewState } from "./review/derive.mjs";
+import { compare } from "./review/shadow.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
 import { execFileSync } from "node:child_process";
 
@@ -146,8 +147,9 @@ export function readReviewerStates(nwo, pr, head, reviewers, io = null) {
  * is stale, incomplete, differently classified or derived for another revision --
  * all of them null.
  */
-export function reviewFacts({ db, nwo, pr, profile, head, at = Math.floor(Date.now() / 1000), io = {} }) {
-  const unknown = why => ({ unspilledCritical: null, threadDetails: null,
+export function reviewFacts({ db, nwo, pr, profile, head, live = null,
+                             at = Math.floor(Date.now() / 1000), io = {} }) {
+  const unknown = why => ({ unspilledCritical: null, rounds: null, threadDetails: null,
                             projection: { readable: false, why } });
   if (!db) return unknown("no state database");
   let st;
@@ -161,8 +163,52 @@ export function reviewFacts({ db, nwo, pr, profile, head, at = Math.floor(Date.n
   try { st = (io.reviewState ?? reviewState)(db, nwo, pr, profile, { head, at }); }
   catch (e) { return unknown(`projection could not be read — ${e.message}`); }
   if (!st?.readable) return unknown(st?.why ?? "not derived");
-  return { unspilledCritical: st.unspilledCritical, threadDetails: st.threads,
-           projection: { readable: true } };
+
+  // AGREEMENT WITH THE LIVE READ, and the head check is not a substitute for it.
+  //
+  // The daemon evaluates a pull request BEFORE it observes, ingests and folds, so
+  // the projection read here was derived from the previous tick's observation.
+  // When review activity changes without the head changing -- a reviewer opens a
+  // new thread on the same revision, which is the ordinary case -- the head check
+  // passes, the projection is fresh by every clock, and its content is a tick out
+  // of date. A newly filed critical would then sit behind `unspilledCritical: 0`.
+  //
+  // The live thread read this evaluation already holds is the cross-check, and
+  // `compare` is the same function the review shadow has been running against
+  // this projection for days. The shadow was measuring exactly this and the
+  // decision path was not consulting it.
+  //
+  // An unreadable live read is not agreement. It is another way of not knowing,
+  // and the honest answer to not knowing is the same as everywhere else here.
+  const agreement = (io.compare ?? compare)(live, { ...st, readable: true });
+  if (!agreement.comparable) return unknown(`no live read to check the projection against: ${agreement.why}`);
+  if (!agreement.agree) return unknown(`the projection disagrees with the live read: ${agreement.why}`);
+
+  // The ROUND COUNT comes from the projection too, and dropping it made the rest
+  // pointless. `judged.size` counts distinct heads across the LATEST state per
+  // reviewer, so a single-reviewer pull request stays at one however many rounds
+  // it has had -- and with a soft cap of five, no decision gated on the cap could
+  // ever be reached. Carrying the count without carrying the criticals, or the
+  // other way round, wires up half a rule.
+  // The COUNT and the DETAILS are separated here, because they are trusted for
+  // different things and one of them is not ready.
+  //
+  // The details are strictly better than what they replace: FIX_FINDINGS and
+  // SPILL were handed an empty array and told those were the findings. Any real
+  // list beats that, and being short of a body-only finding cannot make a worker
+  // do something unsafe -- it can only give it less to work on.
+  //
+  // The count is different. A known zero is what licenses SPILL, and a zero that
+  // may be missing a critical stated in a review body would spill a P0 -- the one
+  // outcome the standing ruling forbids outright. So until the fold derives body
+  // findings, this stays UNKNOWN, and it stays unknown for a REASON that is
+  // written down rather than by the accident of a hard-coded null.
+  const complete = st.bodyFindingsDerived === true;
+  return { unspilledCritical: complete ? st.unspilledCritical : null,
+           rounds: st.rounds, threadDetails: st.threads,
+           projection: complete
+             ? { readable: true }
+             : { readable: true, countUnknown: "review-body findings are not derived yet, so a zero could be missing a body-only critical" } };
 }
 
 export function evaluatePr({ nwo, pr, profile, db = null, io = {} }) {
@@ -241,9 +287,13 @@ export function evaluatePr({ nwo, pr, profile, db = null, io = {} }) {
   // absent, stale, incomplete, classified by another version, or derived for a
   // different revision -- and null flows through to a watcher that refuses to
   // spill on anything but a known zero. The unsafe direction stays impossible.
-  const facts = reviewFacts({ db, nwo, pr, profile, head: pin.sha, io });
+  const facts = reviewFacts({ db, nwo, pr, profile, head: pin.sha, live: threads, io });
 
-  const rounds = { n: judged.size, softCap: profile.rounds?.softCap ?? 5,
+  // The DERIVED round count when there is one. `judged.size` counts distinct heads
+  // across the latest state per reviewer, so a single-reviewer pull request stays
+  // at one however many rounds it has had -- and every decision gated on the soft
+  // cap was therefore unreachable for the commonest shape there is.
+  const rounds = { n: facts.rounds ?? judged.size, softCap: profile.rounds?.softCap ?? 5,
                    // A number when the projection is readable AT THIS HEAD, and null
                    // otherwise. Claiming "no criticals open" is a fact reeve may only
                    // state when it has it -- the alternative licenses spilling a P0.

@@ -333,6 +333,20 @@ export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() /
 
   return {
     readable: true,
+    // Whether the count below can be COMPLETE, which today it cannot.
+    //
+    // The fold classifies severity for `review_thread` rows only. A substantive
+    // review BODY is classified into a round outcome and its individual findings
+    // are never projected -- so a P0 stated in a body with no matching inline
+    // thread is invisible here. Every other reader of this number tolerates that;
+    // one does not. A known zero is what licenses SPILL, and spilling a critical
+    // is the single thing the standing ruling forbids outright, so a zero that
+    // might be missing a body-only critical is worse than no answer at all.
+    //
+    // Reported rather than assumed by callers, and false until the fold derives
+    // body findings. A caller that only wants to SHOW the open threads may use
+    // them regardless; a caller about to spend the number on a decision must not.
+    bodyFindingsDerived: false,
     total: threads.length, open: open.length,
     // What GitHub itself calls resolved, which is a DIFFERENT question from
     // cleared and is the one a live read can be compared against.

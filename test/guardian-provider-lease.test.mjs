@@ -389,10 +389,29 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
   ]) check(isBuilderPr(meta) === want, `${label}: isBuilderPr is ${want}`, JSON.stringify(meta));
 
   // The App name is READ from where it already lives rather than restated here.
+  // THE FUNCTION BODY, not the file. `/POLICY_APP/.test(src)` passes on the
+  // import line and on any comment mentioning it, so it survives the classifier
+  // being changed to stop using it -- verified: the stub that widened this to
+  // every `[bot]` login left this assertion green. Same "a call, not a mention"
+  // lesson as the version gate, unapplied one file over.
   const src = readFileSync(new URL("../src/pr.mjs", import.meta.url), "utf8");
-  check(/POLICY_APP/.test(src) && !/"merge-policy\[bot\]"/.test(src),
-    "and the App's name is read from POLICY_APP, not restated in the classifier",
-    (src.match(/.*merge-policy.*/g) ?? []).join(" | "));
+  const fn = src.slice(src.indexOf("export function isBuilderPr"),
+                       src.indexOf("export function prAnchor"));
+  // COMMENTS STRIPPED, because the body EXPLAINS that it reads `POLICY_APP` --
+  // and a bare test over the body passes on that explanation alone. Verified:
+  // the stub that widened this to every `[bot]` login left the un-stripped
+  // version green while the behavioural cases went red. Third time this shape
+  // has appeared in this PR, each a level finer than the last: the file, then
+  // the function, now the code within it.
+  const code = fn.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/.*$/gm, " ");
+  check(code.length > 0 && /isBuilderPr/.test(code),
+    "control: the classifier's code was located with its comments removed", `${code.length} chars`);
+  check(/POLICY_APP/.test(code),
+    "the App's identity is READ from POLICY_APP in the classifier's code, not merely described",
+    code.slice(0, 300));
+  check(!/["`']merge-policy/.test(code),
+    "and never restated as a literal there",
+    (code.match(/.*merge-policy.*/g) ?? ["none"]).join(" | "));
 }
 
 // ── a release survives a hub that is momentarily unreachable ──────────────

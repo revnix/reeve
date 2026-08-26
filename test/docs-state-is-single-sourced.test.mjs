@@ -115,7 +115,13 @@ const unlink = s => s
   .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")     // [text](target)
   .replace(/\[([^\]]*)\]\[[^\]]*\]/g, "$1");   // [text][ref]
 const sentencesOf = s => unlink(s).split(SENTENCE);
-const defersToZero = s => /§0/.test(s.replace(/\(§0\)/g, ""));
+// A PARENTHETICAL `(§0)` defers. It used to be stripped before this test, from a
+// design where the exemption was block-scoped and a passing citation could excuse
+// a whole paragraph. Under clause scoping that concern is gone -- the pointer
+// only ever excuses the clause it sits in -- and the strip had become a direct
+// contradiction: `(§0)` is exactly the form this rule now asks authors to write,
+// and it was the one form that did not count.
+const defersToZero = s => /§0/.test(s);
 
 const offendersIn = text => {
   const out = [];
@@ -261,7 +267,22 @@ const offendersIn = text => {
   // Mechanical: an R-number is unambiguous, and every claim about one is a claim
   // about what doctor currently reports. History carries a date and is excused
   // like anything else, so this needs no opinion about tense.
-  const SUBJECT_PATTERNS = [[/\bR-\d+\b/, "an R-rule outcome"]];
+  const SUBJECT_PATTERNS = [
+    [/\bR-\d+\b/, "an R-rule outcome"],
+    // A BARE COMMIT HASH is a §0 fact whoever it belongs to, and naming its
+    // subject is not always possible: "The running daemon is at abcdef1" is a
+    // claim about what the process loaded, and the only word tying it to §0.1 is
+    // `daemon` -- which these documents use constantly to say what reeve IS.
+    // Policing the hash instead needs no subject at all, and the handoff carries
+    // none outside §0 today, so it costs nothing. History cites pull requests,
+    // which never go stale, and those are untouched.
+    // At least one DIGIT. `deadbeef`, `facade`, `decade` and `access` are valid
+    // hex and ordinary English, and rejecting a sentence for containing one would
+    // be the kind of false alarm that gets a guard switched off. A real short sha
+    // without a single digit is about one in a thousand, which is a residual I can
+    // name rather than a hole I have not noticed.
+    [/(?<![\w/#-])(?=[0-9a-f]{7,40}(?![\w/-]))[a-f]*[0-9][0-9a-f]*/, "a bare commit hash"],
+  ];
 
   // A row's VALUE is owned by §0 as surely as its label, and a restatement never
   // contains the label -- which is how the founder's merge rule came to be copied
@@ -291,7 +312,15 @@ const offendersIn = text => {
   // "R-01 has been broken since 2026-08-22." Mechanical -- the word before the
   // date -- so it needs no view about tense.
   const ONGOING = new RegExp(`\\b(since|as of|from)\\s+(?:${DATE.source})`, "i");
-  const DATED = s => DATE.test(s) && !ONGOING.test(s);
+  // A NOW-WORD beside a date is two time references that disagree, and the date
+  // must not win. "R-01 was broken on 2026-08-22 and remains broken today" is
+  // dated history welded to a live claim, and excusing the whole thing on the
+  // date let the most confident form of a stale outcome through. Mechanical --
+  // a closed list of words that mean "at the time of reading" -- so it needs no
+  // view about tense, only the observation that a past date cannot make a
+  // present-tense claim historical.
+  const NOW_WORD = /\b(today|now|currently|still|at present|as things stand|remains?|these days)\b/i;
+  const DATED = s => DATE.test(s) && !ONGOING.test(s) && !NOW_WORD.test(s);
   // A HEADING or a bold LABEL names its subject; it does not assert anything about
   // it. Both are markdown structure rather than grammar, so recognising them
   // needs no opinion about English: a line beginning `#`, or a sentence wholly
@@ -317,15 +346,28 @@ const offendersIn = text => {
     const tail = /[a-z0-9]$/i.test(s) ? "\\b" : "";
     return new RegExp(`${lead}${esc}${tail}`, cased ? "" : "i").test(sentence);
   };
-  const isHeading = s => /^\s*#/.test(s);
-  const isLabel = s => /^\s*\*\*[^*]+\*\*[.:,;]?\s*$/.test(s);
-  // `isLabel` is deliberately NOT here. Label handling lives in the scan, where
-  // it can see whether anything FOLLOWS the label -- a lead-in is exempt, a bold
-  // sentence standing alone is the assertion. Leaving it in this chain too meant
-  // the scan's careful version was never reached: "**doctor reports degraded.**"
-  // fell through to the blanket exemption one line later. Two places deciding one
-  // thing, and the looser of them won.
-  const excused = s => defersToZero(s) || DATED(s) || isHeading(s);
+  // NO STRUCTURAL EXEMPTIONS. Not for headings, not for bold labels, not for
+  // table rows.
+  //
+  // I added all three to avoid editing prose, and review found a hole in each in
+  // the round after it landed: a bold assertion at the END of a block counted as
+  // a "lead-in" because something else in the block came first; a state claim
+  // written as a heading vanished with the heading line; a state column under the
+  // word "outcome" escaped both this scan and the rule that polices state
+  // columns. Every fix made an exemption narrower and the next round found the
+  // next shape -- which is the pattern "defer or date" was chosen to END, and I
+  // had reintroduced it one softening at a time.
+  //
+  // The rule is the rule now. A heading or a label naming something §0 owns says
+  // "(§0)" like any other text: a handful of one-time edits, against an unbounded
+  // stream of exemption holes.
+  //
+  // CLAUSES, because a date excuses the clause it belongs to and not the sentence
+  // around it. "R-01 was broken on 2026-08-22 and remains broken today" is two
+  // claims -- one dated and finished, one live and naked -- and judging the
+  // sentence whole let the date carry the live half.
+  const clausesOf = s => s.split(/;|\s+—\s+|,\s+(?:and|but|although|though|while)\s+/i);
+  const excused = s => defersToZero(s) || DATED(s);
 
   const offenders = [];
   for (const [label, text] of [[HANDOFF, handoff.replace(/^## 0\. STATE[\s\S]*?(?=^## )/m, "")], [PROMPT, prompt]])
@@ -337,12 +379,7 @@ const offendersIn = text => {
       // The heading LINE, not the block. Markdown does not require a blank line
       // after a heading, so "## Doctor state" followed straight by a paragraph is
       // one block -- and skipping the block skipped the paragraph with it.
-      // TABLE ROWS are structure, and they are policed by a rule of their own --
-      // "no table outside §0 has a state column", a few blocks below. A row saying
-      // what capability 4 DOES is a definition, and running the sentence scan over
-      // it would demand a §0 pointer inside a table cell for no reader's benefit.
-      const body = b.lines.filter(l => !isHeading(l) && !/^\s*\|/.test(l));
-      if (!body.length) continue;
+      const body = b.lines;
       // A LABEL carries its subject forward.
       //
       // "**R-01.** It is broken right now." is two sentences: the first is a label
@@ -352,22 +389,17 @@ const offendersIn = text => {
       // the label's subject into the sentences that follow it needs no grammar at
       // all, and covers the same case.
       let carried = [];
-      const sentences = sentencesOf(body.join(" "));
+      const sentences = sentencesOf(body.join(" ")).flatMap(clausesOf);
       for (const sentence of sentences) {
         const lower = sentence.toLowerCase();
         const here = subjects.filter(s => namesSubject(sentence, s))
           .concat(SUBJECT_PATTERNS.filter(([re]) => re.test(sentence)).map(([, n]) => n));
-        // A LABEL is a lead-in: bold text INTRODUCING the prose that follows it in
-        // the same block. A bold sentence standing alone is not introducing
-        // anything, it is the assertion -- "**doctor reports degraded.**" was
-        // being waved through as a label. Judged by whether anything follows it,
-        // which is structure rather than grammar.
-        if (isLabel(sentence) && sentences.length > 1) { carried = here; continue; }
         if (excused(sentence)) { carried = []; continue; }
-        const named = here.concat(carried.map(s => `${s} (from the label above)`))
+        const named = here.concat(carried.map(s => `${s} (carried from earlier in the block)`))
           .concat(rowValues
             .filter(([, ws]) => ws.filter(w => new RegExp(`\\b${w}\\b`).test(lower)).length >= 4)
             .map(([l]) => `${l} (restated, not named)`));
+        carried = here.length ? here : carried;
         if (named.length)
           offenders.push(`${label}:${b.nums[0]} names "${named[0]}" and neither defers nor dates — ${sentence.trim().slice(0, 70)}`);
       }
@@ -396,15 +428,30 @@ const offendersIn = text => {
      "R-01 requires a status check so a broken build cannot merge.", false],
     ["another ongoing form", "doctor has reported degraded as of 2026-08-22.", false],
     ["an undated count", "The last two PRs of the programme.", false],
-    ["a section heading", "## 3. The durable-effect programme", true],
-    ["a bold label — excused by the SCAN, not by this chain", "**R-01, the merge authority.**", false],
+    // Structure buys nothing now. A heading and a label are text like any other,
+    // and each of these was an exemption that review found a hole in.
+    ["a section heading naming a subject", "## 3. The durable-effect programme", false],
+    ["the same heading, deferring", "## 3. The durable-effect programme (§0)", true],
+    ["a bold label naming a subject", "**R-01, the merge authority.**", false],
+    ["a bold label that defers", "**R-01** (§0), the merge authority.", true],
+    ["a dated commit hash, which is history", "The daemon ran abcdef1 on 2026-08-24.", true],
+    ["dated history welded to a live clause", "R-01 was broken on 2026-08-22 and remains broken today.", false],
 
   ]) check(excused(sample) === want, `control: "defer or date" ${want ? "excuses" : "catches"} ${what}`, sample);
 
   check(fromLabelTokens.length >= 2, "control: §0's row labels yielded reusable terms",
     fromLabelTokens.join(" / "));
-  check(SUBJECT_PATTERNS.every(([re]) => re.test("R-01 is broken.")),
-    "control: and an R-number is recognised as a subject §0 owns", "");
+  // These are SUBJECT patterns, not exemptions, so they are exercised directly.
+  // Routing them through `excused` was testing the wrong function -- the same
+  // mistake as an earlier control here that passed for a second reason.
+  const asSubject = s => SUBJECT_PATTERNS.filter(([re]) => re.test(s)).map(([, n]) => n);
+  for (const [what, sample, want] of [
+    ["an R-number", "R-01 is broken.", "an R-rule outcome"],
+    ["a bare commit hash", "The running daemon is at abcdef1.", "a bare commit hash"],
+    ["a pull request number, which never goes stale", "Merged in #19.", null],
+    ["an ordinary word that merely looks hexish", "The deadbeef case is documented.", null],
+  ]) check(want ? asSubject(sample).includes(want) : asSubject(sample).length === 0,
+           `control: ${want ? "recognised" : "spared"} — ${what}`, `${sample} -> ${asSubject(sample).join(", ") || "none"}`);
 
   // And the two ways a sentence can hide from the scan, which are about markdown
   // rather than about grammar and are therefore still worth checking.

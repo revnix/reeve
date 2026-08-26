@@ -429,8 +429,20 @@ export function nextPhase(state, evidence) {
     // out of attempts and a worker that is still trying look identical from
     // outside. `<id>` stays a placeholder because applyTransition substitutes the
     // task id; `<phase>` cannot, because only the machine knows it.
+    // AN ESCALATION IS A STOP, so it gets the same durable pre-stop accounting
+    // every other stop gets. Without `void-pending` a cancellable effect from
+    // before the escalation stays deliverable, and `stillDeliverable` only
+    // fences it while the task is still ESCALATED -- so whether the external
+    // action happened came down to whether an executor reached the row before
+    // the founder resumed. And without `record-drain` there is no record of what
+    // was INFLIGHT when it stopped, which `void-pending` cannot reach and which
+    // a resume must not run beside. `record-drain` LAST, so it snapshots the
+    // compensations too.
     return go("ESCALATED", { generation, escalate: `bt:<id>:phase:failed:${phase}`,
-      compensations: [...(hasOpenPr ? ["write-pr-hold"] : []), ...(pinnedTerritory ? [] : ["release-territory"])] });
+      compensations: ["void-pending",
+                      ...(hasOpenPr ? ["write-pr-hold"] : []),
+                      ...(pinnedTerritory ? [] : ["release-territory"]),
+                      "record-drain"] });
   }
 
   // CLAIMING leaves on a claim-specific witness, never the generic spine. The
@@ -463,9 +475,12 @@ export function nextPhase(state, evidence) {
     // the rounds were spent on -- so this edge holds it like every other path
     // into a held state. The cap is a founder-held stop, and section 11.7 names
     // the identity for it: fail-closed must never mean fail-quiet.
+    // The same durable accounting as every other stop, for the same reason.
     if (kind === "gate.capReached")  return go("ESCALATED", { generation,
       escalate: `bt:<id>:gate:revision-loop`,
-      compensations: ["write-pr-hold", ...(pinnedTerritory ? [] : ["release-territory"])] });
+      compensations: ["void-pending", "write-pr-hold",
+                      ...(pinnedTerritory ? [] : ["release-territory"]),
+                      "record-drain"] });
     // depth.override from GATE is handled by the shared block below, so the two
     // cannot drift apart.
   }

@@ -336,13 +336,38 @@ const EVIDENCE = [
   check(!bogus.ok && /unknown hold reason/.test(bogus.refusal ?? ""),
     "control: a reason outside pr_hold's CHECK set is refused", JSON.stringify(bogus));
 
-  // ESCALATED voids nothing; BLOCKED voids pending rows. Both release territory.
+  // BOTH held phases stop DURABLY. This assertion used to read "ESCALATED voids
+  // NOTHING: the phase merely stopped, and its effects stand", and that is no
+  // longer coherent with the rest of the machine.
+  //
+  // `HELD` is `["BLOCKED","ESCALATED"]` -- the taxonomy already calls an
+  // escalation a stop -- and `stillDeliverable` fences a stopped task's
+  // cancellable effects on exactly that basis. So an ESCALATED task that voided
+  // nothing was fenced while it stayed ESCALATED and delivered the same row if
+  // the founder resumed first: whether an external action happened came down to
+  // whether an executor reached it before the resume did. A task escalated for a
+  // human to look at must not go on pushing and commenting while it waits for
+  // that judgement, and "it depends who gets there first" is not a policy.
+  //
+  // So an escalation gets the same durable pre-stop accounting as a hold:
+  // `void-pending` for what is queued, and `record-drain` for what was already
+  // in flight, which `void-pending` cannot reach and which a resume must not run
+  // beside.
   const blocked = nextPhase({ phase: "IMPLEMENTING", generation: 1, hasOpenPr: true }, { kind: "hold", reason: "over_budget" });
   check(blocked.ok && blocked.to === "BLOCKED" && blocked.compensations.includes("void-pending"),
     "BLOCKED voids pending cancellable rows", JSON.stringify(blocked));
   const esc = nextPhase({ phase: "IMPLEMENTING", generation: 1, hasOpenPr: true }, { kind: "phase.failed", retriesExhausted: true });
-  check(esc.ok && esc.to === "ESCALATED" && !esc.compensations.includes("void-pending"),
-    "ESCALATED voids NOTHING: the phase merely stopped, and its effects stand", JSON.stringify(esc));
+  check(esc.ok && esc.to === "ESCALATED" && esc.compensations.includes("void-pending"),
+    "ESCALATED voids them too: it is a HELD phase, so it is a stop", JSON.stringify(esc));
+  check(esc.compensations.includes("record-drain")
+        && esc.compensations[esc.compensations.length - 1] === "record-drain",
+    "and records the in-flight set LAST, so the snapshot includes its own compensations",
+    JSON.stringify(esc.compensations));
+  // The other escalation path, which is a different branch and was missed once.
+  const cap = nextPhase({ phase: "GATE", generation: 1, hasOpenPr: true }, { kind: "gate.capReached" });
+  check(cap.ok && cap.to === "ESCALATED" && cap.compensations.includes("void-pending")
+        && cap.compensations[cap.compensations.length - 1] === "record-drain",
+    "control: the revision-loop escalation stops just as durably", JSON.stringify(cap));
 
   // A trivial filing skips RESEARCH, and the skip is recorded rather than merely
   // implied by a missing artifact.

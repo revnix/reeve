@@ -16,6 +16,7 @@
 // So the invariant is enforced rather than intended: a present-tense claim about
 // state may appear in the resume prompt only as a POINTER to §0.
 import { readFileSync, readdirSync } from "node:fs";
+import { newestDoc } from "./newest-doc.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -32,13 +33,11 @@ const check = (ok, name, detail) => {
 // the superseded documents and leaves the live ones unprotected the moment a new
 // handoff is written -- which is the same half-an-invariant failure this test was
 // widened to fix. Dates sort lexically here, so newest is last.
-const newest = suffix => {
-  const found = readdirSync(docs).filter(f => f.endsWith(suffix)).sort();
-  if (!found.length) throw new Error(`no docs/*${suffix} at all`);
-  return found[found.length - 1];
-};
-const PROMPT = newest("-resume-prompt.md");
-const HANDOFF = newest("-session-handoff.md");
+// Resolved by the SHARED helper, so this test and the agreement test cannot end
+// up reading different documents -- which they would have the moment a same-day
+// revision existed, since each had grown its own version of "newest".
+const PROMPT = newestDoc(docs, "resume-prompt");
+const HANDOFF = newestDoc(docs, "session-handoff");
 const prompt = readFileSync(join(docs, PROMPT), "utf8");
 const handoff = readFileSync(join(docs, HANDOFF), "utf8");
 
@@ -325,7 +324,14 @@ const offendersIn = text => {
   // A BOUNDED range is history: "from 2026-08-22 to 2026-08-24" has both ends, so
   // the state it describes has finished. Only an OPEN start reaches today.
   const BOUNDED = new RegExp(`\\bfrom\\s+(?:${DATE.source})\\s+(?:to|through|until)\\s+(?:${DATE.source})`, "i");
-  const ONGOING = s => new RegExp(`\\b(since|as of|from)\\s+(?:${DATE.source})`, "i").test(s) && !BOUNDED.test(s);
+  // Bounded ranges are REMOVED before looking for an open one, rather than used to
+  // suppress the search. "has been broken since 2026-08-22 following an outage
+  // from 2026-08-20 to 2026-08-21" carries both: a live claim and a finished one.
+  // Treating any bounded range as proof that nothing is ongoing let the second
+  // excuse the first, which is the same mistake as a date excusing a whole
+  // sentence -- an exemption earned by one part of the text, spent by another.
+  const ONGOING = s => new RegExp(`\\b(since|as of|from)\\s+(?:${DATE.source})`, "i")
+    .test(s.replace(new RegExp(BOUNDED.source, "gi"), " "));
   // A NOW-WORD beside a date is two time references that disagree, and the date
   // must not win. "R-01 was broken on 2026-08-22 and remains broken today" is
   // dated history welded to a live claim, and excusing the whole thing on the
@@ -334,7 +340,8 @@ const offendersIn = text => {
   // view about tense, only the observation that a past date cannot make a
   // present-tense claim historical.
   const NOW_WORD = /\b(today|now|currently|still|at present|as things stand|remains?|these days)\b/i;
-  const DATED = s => DATE.test(s) && !ONGOING(s) && !NOW_WORD.test(s);
+  // A date excuses a SIMPLE sentence. A compound one has to defer.
+  const DATED = s => DATE.test(s) && !ONGOING(s) && !NOW_WORD.test(s) && !COMPOUND.test(s);
   // A HEADING or a bold LABEL names its subject; it does not assert anything about
   // it. Both are markdown structure rather than grammar, so recognising them
   // needs no opinion about English: a line beginning `#`, or a sentence wholly
@@ -380,22 +387,29 @@ const offendersIn = text => {
   // around it. "R-01 was broken on 2026-08-22 and remains broken today" is two
   // claims -- one dated and finished, one live and naked -- and judging the
   // sentence whole let the date carry the live half.
-  // Clauses, WITH the joiner that produced each one.
+  // NO CLAUSE SPLITTING. It is grammar, and grammar is what this rule replaced.
   //
-  // A clause joined by "and" or "but" shares the subject of the clause before it
-  // -- "R-01 was broken on 2026-08-22 and is broken again" is one subject and two
-  // claims, and the second names nothing of its own. Losing the joiner meant the
-  // dated half excused itself and the live half was invisible. Returned as
-  // [text, joinedByConjunction] pairs so the scan can tell the difference between
-  // a new sentence and a continuation of the one before.
-  const CLAUSE_SPLIT = /(;|\s+—\s+|,?\s+(?:and|but|although|though|while)\s+)/i;
-  const clausesOf = s => {
-    const parts = s.split(CLAUSE_SPLIT);
-    const out = [[parts[0] ?? "", false]];
-    for (let i = 1; i < parts.length; i += 2)
-      out.push([parts[i + 1] ?? "", /\b(and|but|although|though|while)\b/i.test(parts[i])]);
-    return out;
-  };
+  // I added it to close one real hole -- "R-01 was broken on 2026-08-22 and
+  // remains broken today", where a date excused a live claim welded to history --
+  // and it produced four findings of its own in the next round. A bounded range
+  // in one half suppressed an ongoing claim in the other. A chain of coordinated
+  // predicates lost the subject after the first joiner. Every conjunction was
+  // read as a back-reference, even where the next clause had its own subject. And
+  // a COMPOUND SUBJECT -- "R-01 and R-03 are §0 facts" -- was split into a
+  // fragment that names a rule and a fragment that carries the pointer.
+  //
+  // Every one of those is a question about English sentence structure, which is
+  // exactly what "defer or date" exists to avoid asking. So the machinery is gone
+  // and one mechanical rule replaces it, below: a COMPOUND sentence cannot be
+  // excused by a date alone.
+  //
+  // That is principled rather than expedient. A date excuses a sentence because
+  // the sentence is history; history is a simple past statement, and a sentence
+  // that joins two claims is where the ambiguity lives. An author with a compound
+  // historical sentence writes two sentences or adds a pointer, and always knows
+  // which. The cost lands on prose that mixes history with rationale, which the
+  // founder already accepted for rule rationale.
+  const COMPOUND = /;|\s+—\s+|,?\s+(?:and|but|although|though|while)\s+/i;
   const excused = s => defersToZero(s) || DATED(s);
 
   const offenders = [];
@@ -432,9 +446,9 @@ const offendersIn = text => {
           offenders.push(`${label}:${b.nums[0]} restates "${restated[0]}" and neither defers nor dates — ${sentence.trim().slice(0, 70)}`);
       }
 
+      const sentences = sentencesOf(body.join(" "));
       let carried = [];
-      const sentences = sentencesOf(body.join(" ")).flatMap(clausesOf);
-      for (const [sentence, joined] of sentences) {
+      for (const sentence of sentences) {
         const lower = sentence.toLowerCase();
         const here = subjects.filter(s => namesSubject(sentence, s))
           .concat(SUBJECT_PATTERNS.filter(([re]) => re.test(sentence)).map(([, n]) => n));
@@ -457,11 +471,11 @@ const offendersIn = text => {
         // moved twice. That taught the harder half:" inherited `main` into a
         // sentence about a lesson. A pronoun that can refer to a proposition
         // cannot be used to carry a subject.
-        const refersBack = joined || /^\s*(it|they|both)\b/i.test(sentence);
+        const refersBack = /^\s*(it|they|both)\b/i.test(sentence);
         const inherited = here.length === 0 && refersBack ? carried : [];
         carried = here;
         if (excused(sentence)) continue;
-        const named = here.concat(inherited.map(s => `${s} (carried from the clause before)`));
+        const named = here.concat(inherited.map(s => `${s} (carried from the sentence before)`));
         if (named.length)
           offenders.push(`${label}:${b.nums[0]} names "${named[0]}" and neither defers nor dates — ${sentence.trim().slice(0, 70)}`);
       }

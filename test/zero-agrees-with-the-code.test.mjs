@@ -15,7 +15,8 @@
 // and only if that stage was built. The row claims a set; the tree shows a set;
 // the test fails if they differ. Raising or lowering a claim stays a considered
 // act, because the test asserts agreement rather than any particular answer.
-import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
+import { newestDoc } from "./newest-doc.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -28,23 +29,12 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
 
-// The newest handoff, by filename sort — the same rule the single-source test
-// uses, so the two cannot end up reading different documents.
 const docs = join(root, "docs");
-// The NEWEST handoff, including a same-day revision. This repository already uses
-// `-2`, `-3` suffixes for a document revised within a day, and matching only the
-// unsuffixed name meant a revision could disagree with the tree while this test
-// went on certifying the older file — an obsolete §0 passing on the strength of a
-// document nobody reads. Sorted by date first, then by suffix numerically, so
-// `-10` cannot sort before `-2`.
-const rank = f => {
-  const m = /^(\d{4}-\d\d-\d\d)-session-handoff(?:-(\d+))?\.md$/.exec(f);
-  return m ? [m[1], Number(m[2] ?? 1)] : null;
-};
-const newest = readdirSync(docs).filter(f => rank(f))
-  .sort((a, b) => { const [da, na] = rank(a), [db_, nb] = rank(b);
-                    return da === db_ ? na - nb : (da < db_ ? -1 : 1); })
-  .pop();
+
+// The SHARED resolver, so this test and the single-source guard cannot inspect
+// different documents. Each had grown its own idea of "newest" and they had
+// already diverged on same-day revisions.
+const newest = newestDoc(docs, "session-handoff");
 check(Boolean(newest), "control: a handoff was found to read", String(newest));
 const handoff = readFileSync(join(docs, newest), "utf8");
 
@@ -85,7 +75,14 @@ const landedClause = /([^.]*\bhave landed\b[^.]*)\./i.exec(row)?.[1] ?? row;
 // programme is finished would fail the comparison against a tree that agrees.
 // Number words are read, and `all` expands to every stage with a witness defined.
 const WORDS = { one: 1, two: 2, three: 3, four: 4 };
-const claimed = /\ball\b/i.test(landedClause)
+// `all` only when it is an AFFIRMATIVE all-stages claim. "Not all stages have
+// landed" and "All but stage 3 have landed" both contain the word and both mean
+// the opposite of what expanding it would assert -- one would report a false
+// disagreement, the other could certify prose that says the programme is
+// unfinished.
+const ALL_LANDED = /\ball\b(?![^.]*\bbut\b)/i.test(landedClause)
+  && !/\b(not|no|none|neither)\b[^.]*\ball\b|\ball\b[^.]*\b(not|except|but)\b/i.test(landedClause);
+const claimed = ALL_LANDED
   ? new Set(WITNESSES.map(([n]) => n))
   : new Set([...landedClause.matchAll(/\b([1-4]|one|two|three|four)\b/gi)]
       .map(m => WORDS[m[1].toLowerCase()] ?? Number(m[1])));

@@ -268,6 +268,45 @@ CREATE TABLE IF NOT EXISTS review_thread (
   PRIMARY KEY (nwo, pr, thread_id)) STRICT;
 CREATE INDEX IF NOT EXISTS thread_pr ON review_thread(nwo, pr, is_cleared, severity);
 
+-- A finding stated in a review's BODY, with no inline thread of its own.
+--
+-- A SEPARATE table from review_thread on purpose, not a flag on it. The two
+-- populations answer different questions and only one of them has a GitHub
+-- object behind it: a thread can be replied to and resolved, a body finding
+-- cannot. Sharing a table would put a synthetic id one careless filter away from
+-- a resolve mutation that can only fail, and would break the live cross-check
+-- besides -- `compare` measures the projection's thread counts against a live
+-- THREAD read, so a body finding counted as a thread is a permanent disagreement
+-- that would turn the whole review path UNKNOWN.
+--
+-- `is_cleared` here carries a WEAKER rule than the one on a thread, and the
+-- difference is the founder's decision of 2026-08-27. A thread clears when it is
+-- resolved AND a later substantive round by the same reviewer covered this head.
+-- A body finding has no resolve to observe, so only the second half survives: the
+-- reviewer looked at this same revision again. If the problem is still there the
+-- reviewer restates it and it returns as a new finding.
+CREATE TABLE IF NOT EXISTS review_body_finding (
+  nwo        TEXT NOT NULL,
+  pr         INTEGER NOT NULL,
+  -- `<review external_id>#<ordinal>`. Stable across re-derivation because the
+  -- fold reads the LATEST generation of each review, so an edited body re-derives
+  -- under the same external_id rather than accumulating.
+  finding_id TEXT NOT NULL,
+  reviewer   TEXT NOT NULL,
+  severity   TEXT NOT NULL CHECK (severity IN
+               ('critical','major','minor','nit','unknown')),
+  is_cleared INTEGER NOT NULL DEFAULT 0,
+  excerpt    TEXT NOT NULL,
+  event_at   INTEGER,
+  -- The revision the filing round was bound to. Recorded so a later reader can
+  -- tell a finding filed against this head from one carried over from an older
+  -- one, without re-deriving.
+  head_full  TEXT,
+  classifier_version TEXT NOT NULL,
+  PRIMARY KEY (nwo, pr, finding_id)) STRICT;
+CREATE INDEX IF NOT EXISTS body_finding_pr
+  ON review_body_finding(nwo, pr, is_cleared, severity);
+
 -- Per-reviewer availability as a BAND, not a rate. Measured: 15/15 refusals in
 -- one 7-hour window, then ~30 straight answers over 29 hours.
 CREATE TABLE IF NOT EXISTS reviewer_supply (
@@ -302,6 +341,16 @@ CREATE TABLE IF NOT EXISTS projection_meta (
   -- with no head in hand. Both are UNKNOWN and neither is usable, which is the
   -- same fail-closed reading as the four staleness reasons beside it.
   head       TEXT,
+  -- Could the body-finding derivation have been COMPLETE for this pull request?
+  --
+  -- Stored with the projection rather than computed by a reader, for the same
+  -- reason `head` is: it is a property of how these rows were derived, and a
+  -- reader recomputing it from today's profile would answer about a fold that
+  -- never ran. 0 means at least one reviewer posted a substantive review body
+  -- and the profile does not say how that reviewer's bodies carry findings, so
+  -- the critical count below may be missing one. Default 0 -- a projection
+  -- written before this column existed derived no body findings at all.
+  body_derived INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (nwo, scope)) STRICT;
 
 -- ------------------------------------------------------------ review shadow

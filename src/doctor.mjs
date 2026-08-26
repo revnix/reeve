@@ -420,6 +420,9 @@ function checkDetectors(db, profile) {
       return texts.filter(t => rx.test(t)).length;
     };
     const named = [["refusal", rev.refusal], ["clean", rev.clean], ["commitPattern", rev.commitPattern],
+                   // `false` is a declaration, not a pattern, and falls out at the
+                   // `!pattern` guard below like any other absent one.
+                   ["bodyFindings", rev.bodyFindings],
                    ...(rev.severityMarkers ?? []).map(([pat], i) => [`severityMarkers[${i}]`, pat])];
     for (const [name, pattern] of named) {
       if (!pattern) continue;
@@ -427,6 +430,13 @@ function checkDetectors(db, profile) {
       if (n === -1) broken.push(`${rev.login}.${name} does not compile`);
       else if (n === 0) idle.push(`${rev.login}.${name}`);
     }
+
+    // An UNDECLARED reviewer is worth saying out loud, because its consequence is
+    // silent: the fold marks the whole pull request's body-finding count as
+    // possibly short, and the critical count stops being usable for every pull
+    // request this reviewer touches -- not just the ones where it wrote a body.
+    if (!(typeof rev.bodyFindings === "string" || rev.bodyFindings === false))
+      lines.push(`${rev.login.padEnd(26)} bodyFindings undeclared — the critical count cannot be complete`);
 
     const markers = rev.severityMarkers ?? [];
     if (markers.length && found.length) {

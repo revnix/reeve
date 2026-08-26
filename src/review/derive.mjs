@@ -43,7 +43,7 @@ export function classifierVersion(profile) {
   const detectors = (profile?.reviewers ?? []).map(r => ({
     login: r.login, kind: r.kind, refusal: r.refusal, clean: r.clean,
     cleanReaction: r.cleanReaction, commitPattern: r.commitPattern,
-    severityMarkers: r.severityMarkers,
+    severityMarkers: r.severityMarkers, bodyFindings: r.bodyFindings,
   }));
   return createHash("sha256")
     .update(code).update(JSON.stringify(detectors))
@@ -64,6 +64,35 @@ export function severityOf(body, markers = []) {
     catch { /* an uncompilable marker is refused at profile validation */ }
   }
   return "unknown";
+}
+
+/**
+ * Split one review BODY into the individual findings it states.
+ *
+ * `start` matches where each finding BEGINS; the finding runs from there to the
+ * next match, or to the end. Prose before the first match is not a finding --
+ * codex opens with a summary paragraph and CodeRabbit's whole body is one -- so
+ * a body with no match yields nothing rather than yielding itself.
+ *
+ * Returns [] for a reviewer with no declaration. That is not "this reviewer has
+ * no findings": the caller records separately that the count could be short, and
+ * conflating the two is exactly what would let a body-only P0 through as a zero.
+ *
+ * Zero-length matches are dropped. `matchAll` advances past them rather than
+ * looping, so they cost nothing here, but a pattern that can match empty would
+ * otherwise mint one finding per character. Profile validation refuses such a
+ * pattern outright; this is the second half of the same guard, because the fold
+ * also runs against stored history whose profile is long gone.
+ */
+export function bodyFindingsOf(body, start) {
+  if (typeof start !== "string" || !start) return [];
+  const text = String(body ?? "");
+  let re;
+  try { re = new RegExp(start, "gi"); } catch { return []; }
+  const at = [...text.matchAll(re)].filter(m => m[0].length > 0).map(m => m.index);
+  return at
+    .map((i, k) => text.slice(i, k + 1 < at.length ? at[k + 1] : text.length).trim())
+    .filter(Boolean);
 }
 
 /** Reviewer config by normalised login, or null when unrostered. */
@@ -168,7 +197,12 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
      WHERE i.pr_number = ?
      ORDER BY i.event_at, i.id`).all(pr, pr);
 
-  const rounds = [], threads = [];
+  const rounds = [], threads = [], bodyFindings = [];
+  // Which reviewers wrote a review body at all, and whether every one of them had
+  // declared how their bodies carry findings. Both are needed: the count is only
+  // trustworthy when nobody wrote a body reeve could not read.
+  const bodyAuthors = new Set();
+  let bodyComplete = true;
   for (const r of rows) {
     const o = { kind: r.kind, payload: JSON.parse(r.payload) };
     const rev = roster.get(r.source) ?? null;
@@ -189,7 +223,40 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     }
 
     const c = classifyObservation(o, rev, resolve);
-    if (c) rounds.push({ reviewer: r.source, source_id: r.external_id, event_at: r.event_at ?? at, ...c });
+    if (!c) continue;
+    // The round's ORDINAL, taken before the push so it indexes the round itself.
+    // Body findings clear by ordinal rather than by timestamp because the round
+    // that files a finding shares its instant exactly -- they are the same
+    // observation -- and `>` on equal seconds is a coin toss decided by whichever
+    // GitHub timestamp happens to round which way.
+    const ord = rounds.length;
+    rounds.push({ reviewer: r.source, source_id: r.external_id, event_at: r.event_at ?? at, ...c });
+
+    // A substantive review BODY is the only place a body finding can come from.
+    // `classifyObservation` already returned null for a 0-byte review -- the
+    // carrier GitHub mints for every inline reply -- so reaching here with
+    // kind 'review' IS the definition of one.
+    if (r.kind !== "review") continue;
+    bodyAuthors.add(r.source);
+    // COMPLETENESS is decided per pull request against what was actually posted,
+    // not against the roster. A profile can be fully configured and still miss a
+    // body finding from a human reviewer nobody rostered, and a roster check
+    // would report complete for exactly that pull request. Asking "did everyone
+    // who actually wrote a review body declare how their bodies work" is the
+    // question the count depends on, and it fails closed on a stranger.
+    if (!(typeof rev?.bodyFindings === "string" || rev?.bodyFindings === false)) bodyComplete = false;
+    for (const [n, text] of bodyFindingsOf(o.payload?.body, rev?.bodyFindings).entries()) {
+      bodyFindings.push({
+        finding_id: `${r.external_id}#${n}`, reviewer: r.source,
+        // Severity is read from the FINDING, never the whole body. Markers are
+        // first-match-wins, so classifying the body would give every finding in
+        // it the severity of whichever appeared first -- a P0 below a P3 would
+        // be filed as a nit.
+        severity: severityOf(text, rev?.severityMarkers ?? []),
+        excerpt: text.slice(0, 400), event_at: r.event_at ?? at,
+        head_full: c.head_full ?? null, ord,
+      });
+    }
   }
 
   // A thread is CLEARED only when a LATER substantive round by the SAME reviewer,
@@ -211,10 +278,29 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     t.is_cleared = t.is_resolved && t.resolved_at != null && clearedBy(t.reviewer, t.resolved_at) ? 1 : 0;
   }
 
+  // A BODY finding carries only the second half of that rule, and the founder
+  // ruled on 2026-08-27 that this is what clearing one means: the same reviewer
+  // reviewed this same revision again, whatever it said that time.
+  //
+  // The first half cannot exist here. There is no thread, so there is nothing to
+  // resolve and no resolve to observe, and a rule requiring one would leave every
+  // body finding open forever -- which does not fail closed, it fails STUCK, and
+  // a pull request nothing can ever clear is not a safety property.
+  //
+  // The weakness is named rather than hidden: a reviewer whose second pass was
+  // cut short clears the finding by not repeating it. What limits the damage is
+  // that the reviewer is looking at the same code, so a problem still there is
+  // restated and returns as a new finding.
+  const roundClearsAfter = (reviewer, ord) => rounds.some(
+    (x, i) => i > ord && x.reviewer === reviewer &&
+              (x.outcome === "findings" || x.outcome === "clean") && covers(x));
+  for (const f of bodyFindings) f.is_cleared = roundClearsAfter(f.reviewer, f.ord) ? 1 : 0;
+
   db.exec("BEGIN IMMEDIATE");
   try {
     db.prepare("DELETE FROM review_round WHERE nwo=? AND pr=?").run(nwo, pr);
     db.prepare("DELETE FROM review_thread WHERE nwo=? AND pr=?").run(nwo, pr);
+    db.prepare("DELETE FROM review_body_finding WHERE nwo=? AND pr=?").run(nwo, pr);
     const ir = db.prepare(`INSERT INTO review_round
       (nwo,pr,reviewer,source_id,outcome,head_full,head10,event_at,classifier_version)
       VALUES (?,?,?,?,?,?,?,?,?)`);
@@ -225,20 +311,26 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     for (const t of threads) it.run(nwo, pr, t.thread_id, t.reviewer, t.path, t.line, t.severity,
       t.is_resolved, t.is_outdated, t.resolved_by, t.resolved_at, t.is_cleared, t.excerpt, t.event_at, version);
+    const ib = db.prepare(`INSERT INTO review_body_finding
+      (nwo,pr,finding_id,reviewer,severity,is_cleared,excerpt,event_at,head_full,classifier_version)
+      VALUES (?,?,?,?,?,?,?,?,?,?)`);
+    for (const f of bodyFindings) ib.run(nwo, pr, f.finding_id, f.reviewer, f.severity,
+      f.is_cleared, f.excerpt, f.event_at, f.head_full, version);
     // The head is stored WITH the projection, in the same transaction as the rows
     // it explains. Clearing was computed against it, so a projection and the head
     // it describes are one fact and must not be able to drift apart.
-    db.prepare(`INSERT INTO projection_meta (nwo,scope,classifier_version,derived_at,complete,head)
-                VALUES (?,?,?,?,?,?)
+    db.prepare(`INSERT INTO projection_meta (nwo,scope,classifier_version,derived_at,complete,head,body_derived)
+                VALUES (?,?,?,?,?,?,?)
                 ON CONFLICT(nwo,scope) DO UPDATE SET
                   classifier_version=excluded.classifier_version,
                   derived_at=excluded.derived_at, complete=excluded.complete,
-                  head=excluded.head`)
-      .run(nwo, `pr:${pr}`, version, at, complete ? 1 : 0, head ?? null);
+                  head=excluded.head, body_derived=excluded.body_derived`)
+      .run(nwo, `pr:${pr}`, version, at, complete ? 1 : 0, head ?? null, bodyComplete ? 1 : 0);
     db.exec("COMMIT");
   } catch (e) { try { db.exec("ROLLBACK"); } catch {} throw e; }
 
-  return { rounds: rounds.length, threads: threads.length, version };
+  return { rounds: rounds.length, threads: threads.length,
+           bodyFindings: bodyFindings.length, bodyComplete, bodyAuthors: [...bodyAuthors], version };
 }
 
 /**
@@ -322,6 +414,9 @@ export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() /
   const threads = db.prepare("SELECT * FROM review_thread WHERE nwo=? AND pr=?").all(nwo, pr);
   const open = threads.filter(t => !t.is_cleared);
   const blocking = open.filter(t => BLOCKING_SEVERITIES.has(t.severity));
+  const body = db.prepare("SELECT * FROM review_body_finding WHERE nwo=? AND pr=?").all(nwo, pr);
+  const bodyOpen = body.filter(f => !f.is_cleared);
+  const bodyBlocking = bodyOpen.filter(f => BLOCKING_SEVERITIES.has(f.severity));
   const rounds = db.prepare(
     `SELECT reviewer, COUNT(DISTINCT head10) n FROM review_round
       WHERE nwo=? AND pr=? AND outcome IN ('findings','clean') AND head10 IS NOT NULL
@@ -343,19 +438,39 @@ export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() /
     // is the single thing the standing ruling forbids outright, so a zero that
     // might be missing a body-only critical is worse than no answer at all.
     //
-    // Reported rather than assumed by callers, and false until the fold derives
-    // body findings. A caller that only wants to SHOW the open threads may use
-    // them regardless; a caller about to spend the number on a decision must not.
-    bodyFindingsDerived: false,
+    // Reported rather than assumed by callers. A caller that only wants to SHOW
+    // the open findings may use them regardless; a caller about to spend the
+    // number on a decision must not.
+    bodyFindingsDerived: !!meta.body_derived,
+    // THREAD counts, and they stay thread-only however many body findings there
+    // are. `compare` measures these three against a live read of GitHub's review
+    // threads, so a body finding counted here is a disagreement that can never
+    // resolve -- and a permanent disagreement turns every downstream answer
+    // UNKNOWN, which would take the whole review path dark to add a number.
     total: threads.length, open: open.length,
     // What GitHub itself calls resolved, which is a DIFFERENT question from
     // cleared and is the one a live read can be compared against.
     resolved: threads.filter(t => t.is_resolved).length,
     // Severity counts every reviewer, rostered or not, blocking or advisory: a
     // P0 is a P0 whoever filed it, and blocking-ness gates coverage not severity.
-    unspilledCritical: blocking.length,
+    unspilledCritical: blocking.length + bodyBlocking.length,
+    // The body population, reported on its own as well as folded into the count
+    // above, so a reader can tell WHICH kind of finding is holding a pull request.
+    bodyTotal: body.length, bodyOpen: bodyOpen.length,
     rounds: n,
-    threads: open.map(t => ({ id: t.thread_id, reviewer: t.reviewer, path: t.path,
-                              line: t.line, severity: t.severity, excerpt: t.excerpt })),
+    // ONE list, because everything downstream of it -- what blocks a merge, what
+    // a worker is sent at -- treats both kinds the same way. `anchor` is what
+    // stops them being treated the same where they differ: a thread can be
+    // replied to and resolved, a body finding has no GitHub object at all, and a
+    // worker told to resolve one would be given an instruction that cannot
+    // succeed.
+    threads: [
+      ...open.map(t => ({ id: t.thread_id, reviewer: t.reviewer, path: t.path,
+                          line: t.line, severity: t.severity, excerpt: t.excerpt,
+                          anchor: "thread" })),
+      ...bodyOpen.map(f => ({ id: f.finding_id, reviewer: f.reviewer, path: null,
+                              line: null, severity: f.severity, excerpt: f.excerpt,
+                              anchor: "body" })),
+    ],
   };
 }

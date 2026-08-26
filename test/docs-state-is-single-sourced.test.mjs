@@ -295,20 +295,46 @@ const offendersIn = text => {
   // earlier version rejected both, because it fired on `is` or `requires` within
   // forty characters and spared only the single verb its control happened to pick.
   // What makes a sentence a copy of doctor's answer is the OUTCOME word.
-  const RULE_OUTCOME = /\b(broken|degraded|failing|passing|clean|currently|today|right now|no required|not required|bypass(?:es|ed)?)\b/i;
+  const RULE_OUTCOME = /\b(broken|degraded|failing|passing|clean|currently|today|right now|no required|not required|bypass(?:es|ed)?)\b/i
+  const NEGATIVE_CHECK = /\brequires? (no|none|nothing|zero)\b|\bno (required )?status check\b/i;
+  // PAST TENSE is what makes a sentence history, and the verb list is where that
+  // is decided -- there is no separate exemption, on purpose.
+  //
+  // "R-01 was broken on 2026-08-22" is exactly what this document should keep: it
+  // says why a rule changed, and a session that cannot read it repeats the
+  // investigation. An earlier version rejected it, because it accepted `was` and
+  // `were` beside the present-tense verbs and then found `broken` anywhere in the
+  // sentence. Dropping those two verbs fixes it at the source.
+  //
+  // I first fixed it by ADDING a historical exemption -- dates, `previously`,
+  // `at the time` -- and stubbing showed it was inert: removing it changed no
+  // result, because the verb list had already settled the question. It was also
+  // strictly worse than nothing, since it would have spared a live claim that
+  // happened to mention a date. Tolerance added is detection subtracted, and an
+  // exemption that never fires still widens what gets through.
   const statesRuleOutcome = s => /\bR-\d+\b/.test(s)
-    && /\bR-\d+\b[^.]{0,60}?\b(is|are|was|were|lets|allows|requires|carries|exempts|declares|reports?|remains?)\b/i.test(s)
-    && RULE_OUTCOME.test(s);
+    && /\bR-\d+\b[^.]{0,60}?\b(is|are|lets|allows|requires|carries|exempts|declares|reports?|remains?)\b/i.test(s)
+    && (RULE_OUTCOME.test(s) || NEGATIVE_CHECK.test(s));
 
   // `countsRemainingWork` matches a remaining-work CONSTRUCTION, with the
   // qualifier attached to the count rather than merely somewhere in the sentence.
   // Two independent sentence-wide tests rejected "the four PRs are still the
   // programme size", which states a fixed size and is exactly what the
   // neighbouring control claims to spare.
+  // An ORDINAL is not by itself a claim about what remains. "The first two PRs
+  // landed on 24 Aug" is durable history and the earlier version rejected it,
+  // because `first` and `next` were accepted unconditionally -- which pressures an
+  // author to delete valid context to get a green run. So an ordinal count has to
+  // appear in a construction that actually SAYS the items remain.
+  const REMAINS = /\b(remain(s|ing)?|left|outstanding|still to (land|come|do)|to go|not yet)\b/i;
   const countsRemainingWork = s =>
-    /\b(last|first|remaining|final|next)\s+(one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(s)
-    || /\b(one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\s+(remain|are left|still|left)\b/i.test(s)
-    || /\b(prs?|pull requests?|stages?)\s+(remaining|left)\b/i.test(s);
+    // "the last two PRs of the programme" -- `last` alone is a remaining-work word
+    // in a way `first` is not: nothing calls finished work "the last two".
+    /\b(last|remaining|final)\s+(one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(s)
+    // any count, when the sentence says they remain
+    || (/\b(first|next|last|one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(s)
+        && REMAINS.test(s))
+    || /\b(prs?|pull requests?|stages?)\s+(remaining|left|outstanding)\b/i.test(s);
 
   const offenders = [];
   for (const [label, text] of [[HANDOFF, handoff.replace(/^## 0\. STATE[\s\S]*?(?=^## )/m, "")], [PROMPT, prompt]])
@@ -379,6 +405,12 @@ const offendersIn = text => {
     ["a rule's requirement, which does not expire", "R-01 requires a status check to exist.", false],
     ["the programme's own size, which does not change", "§3.2 lists all four PRs of the plan.", false],
     ["a fixed size stated with an unrelated qualifier", "The four PRs are still the programme size.", false],
+    ["a negative status-check claim", "R-01 requires no status check.", true],
+    ["dated history, which this document exists to keep", "R-01 was broken on 2026-08-22.", false],
+    ["past-tense history with no date", "R-03 was previously degraded.", false],
+    ["a LIVE claim that happens to mention a date", "R-01 is currently broken, as on 2026-08-22.", true],
+    ["an ordinal in durable history", "The first two PRs landed on 24 Aug.", false],
+    ["an ordinal that DOES say work remains", "The first two PRs are still outstanding.", true],
   ]) check((statesRuleOutcome(sample) || countsRemainingWork(sample)) === want,
            `control: the state-claim rules ${want ? "catch" : "spare"} ${what}`, sample);
 

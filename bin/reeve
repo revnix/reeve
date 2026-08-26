@@ -100,12 +100,28 @@ const die = (msg) => { console.error(msg); process.exit(1); };
 const guardianHubAccess = () => {
   let handle = null, ident = null;
   const identOf = (p) => { try { const st = statSync(p); return `${st.dev}:${st.ino}`; } catch { return null; } };
+  // A POSITIVELY READ VERSION, not `completedVersion`. That helper catches every
+  // open and query failure and answers 0, so a corrupt, locked or unreadable hub
+  // was indistinguishable from an unmigrated one -- and this function then took
+  // the benign path and returned `{hub:null, why:null}` BEFORE reaching the
+  // three-way logic below it. The daemon dispatched unscheduled, omitted holds,
+  // and said nothing. Using an error-collapsing predicate as the readiness gate
+  // undid the very distinction this function was rewritten to make.
+  const versionOf = (p) => {
+    try {
+      const q = new DatabaseSync(p, { readOnly: true });
+      try { return { ok: true, version: q.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get().v }; }
+      finally { q.close(); }
+    } catch (err) { return { ok: false, why: err.message }; }
+  };
   return () => {
     const p = hubPathFor(HOME);
-    if (!existsSync(p) || completedVersion(p) < 1) {
-      if (handle) { try { handle.close(); } catch {} handle = null; ident = null; }
-      return { hub: null, why: null };
-    }
+    const drop = () => { if (handle) { try { handle.close(); } catch {} handle = null; ident = null; } };
+    if (!existsSync(p)) { drop(); return { hub: null, why: null }; }
+    const v = versionOf(p);
+    // Could not read is not "not migrated".
+    if (!v.ok) { drop(); return { hub: null, why: `the hub at ${p} could not be read: ${v.why}` }; }
+    if (v.version < 1) { drop(); return { hub: null, why: null }; }
     const now = identOf(p);
     if (handle && now && now === ident) return { hub: handle, why: null };
     if (handle) { try { handle.close(); } catch {} handle = null; ident = null; }
@@ -137,12 +153,23 @@ const guardianHubAccess = () => {
 const repoIdOnce = async (project) => {
   if (!project) return null;
   const p = hubPathFor(HOME);
-  if (!existsSync(p) || completedVersion(p) < 1) return null;
+  if (!existsSync(p)) return null;
   let db = null;
   try {
-    db = openHub(p);
+    // READ-ONLY, AND DELIBERATELY NOT `openHub`. `openHub` MIGRATES: it applies
+    // every pending migration before answering anything. This path holds no
+    // builder singleton lease, so a newer guardian restarting beside an older
+    // running builder would have upgraded the schema underneath that builder --
+    // exactly the ordering `build run` avoids by taking its lease on a raw
+    // handle first. A lookup must never be a schema change.
+    //
+    // A hub too old to have `task` yet simply throws here and the id stays
+    // unknown, which is the honest answer: the guardian fails closed and says so
+    // rather than migrating someone else's database to find out.
+    db = new DatabaseSync(p, { readOnly: true });
     return await resolveRepoId(db, project);
-  } finally { try { db?.close(); } catch {} }
+  } catch { return null; }
+  finally { try { db?.close(); } catch {} }
 };
 
 const registryProjects = (home) => {

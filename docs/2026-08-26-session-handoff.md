@@ -74,7 +74,8 @@ this can tell you that its absence is deliberate.
 | the tracker | current to 2026-08-24; §6 says what belongs in it after that |
 | capability 1 — watch, judge, escalate | the one that is meant to be on |
 | capability 2 — repair red CI | built, and gated behind `--execute` above |
-| capability 3 — work review threads | being built now; §3 is the whole plan and where it has got to |
+| capability 3 — work review threads | being built now; §3 is the plan, and the row below is where it has got to |
+| the durable-effect stages | 1 and 2 landed; 3 is open; 4 not started. §3.2 says what each one IS — this row is the only place that says which have landed |
 | capability 4 — refuse an unsafe merge | not started; needs a shadow week and the R-01 ruleset flip |
 | the builder daemon | not something this programme runs; S2 is a peer's lane, see §7 |
 | the founder's merge rule | merge on CI green AND zero open threads. Reaffirmed 2026-08-25 over my recommendation to wait for a verdict |
@@ -298,10 +299,13 @@ These cost hours. They are the reason to read this file rather than re-derive it
 
 ## 6. Unfinished work, and what each piece needs
 
-**The durable-effect programme.** §3.2 lists its stages and §0 says which of them
-have landed, including whether any remain — a count here would be a second copy of
-that, and so would a sentence asserting the programme is unfinished, which is the
-same claim with the number removed. What is durable is the shape: the stage that
+**The durable-effect programme.** §3.2 says what each stage IS; §0.2's
+durable-effect row says which have landed, and it is the only place that does.
+That pointer was wrong until now: §0 carried no per-stage state at all, so a
+resumed session was sent to a source that could not answer, and the §0.1 commands
+report a git tip and open pull requests rather than plan stages. A count here
+would be a second copy of that row, and so would a sentence asserting the
+programme is unfinished, which is the same claim with the number removed. What is durable is the shape: the stage that
 matters most makes `FIX_FINDINGS` able to ACT on a review finding rather than
 merely notice one, by giving it the thread details it is dispatched with.
 
@@ -318,8 +322,16 @@ founder's account, about fifteen minutes.
 **R-03, the merge shape.** What the rule MEANS: a gate that assumes squash merges
 reasons about ancestry differently from one that expects merge commits, so the
 repository's declared shape and its actual history have to agree. Whether they do
-today is §0.1's doctor line. Not investigated either way — a gate written against
-a false premise passes for the wrong reason.
+today is §0.1's doctor line.
+
+It HAS been looked at once, and saying otherwise was wrong: `docs/2026-08-22-
+session-handoff-2.md` records the investigation and its result — four merge
+commits in the last twenty while the gate declared squash. Superseding that
+document replaces its outcome, which is volatile; it cannot make the investigation
+un-happen, and a session told nothing was ever looked at will look again. What
+remains undone is the consequence rather than the enquiry: nothing has been
+decided about which shape the repository should declare, and a gate written
+against a false premise passes for the wrong reason.
 
 **The wrong-worker experiment.** It published correctly on 2026-08-24 — 61s,
 $0.42, 16 turns, 0 denials — against a toy fixture, and it has never been run

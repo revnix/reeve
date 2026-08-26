@@ -14,7 +14,7 @@
 //     it WOULD do. Shipping a loop that acts before its decisions have been
 //     watched is how an unattended run becomes an incident.
 
-import { evaluatePr, publishVerdict } from "./pr.mjs";
+import { evaluatePr, publishVerdict, prAnchor } from "./pr.mjs";
 import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
@@ -1250,28 +1250,53 @@ export async function tick(ctx) {
   // Evaluated is not the same as settled. A PR whose decision this tick is WAIT
   // was looked at and found to be IN FLIGHT, which says nothing about whether the
   // human-needed condition behind its escalation still holds.
+  // How the anchor is obtained, decided ONCE for the whole loop.
+  //
+  // In production it is `prAnchor` -- one small read that pins the revision
+  // before anything is folded or judged against it.
+  //
+  // A test that injects `evaluate` gets its anchor from that double instead, so
+  // the ORDER under test is the real one: fold first, evaluate second. The
+  // alternative was to make every such test inject a second seam, and a double
+  // that has to be kept in step with another double is how a suite starts
+  // agreeing with itself rather than with the product. Calling the double twice
+  // costs nothing -- it is a pure function of its inputs, which is exactly what
+  // production's separate `prAnchor` read is not, and why production pins once
+  // and hands the result on.
+  const anchorFor = ctx.prAnchor
+    ?? (ctx.evaluate
+        ? ({ nwo: n, pr: p }) => {
+            const probe = ctx.evaluate({ nwo: n, pr: p, profile, db });
+            return probe.ok
+              ? { ok: true, head: probe.head, headRef: probe.headRef, updatedAt: probe.updatedAt }
+              : probe;
+          }
+        : prAnchor);
+
   const waiting = new Set();
   for (const pr of prs) {
     if (halted(ctx.haltMarker)) { log(logPath, "HALTED mid-tick"); return { decisions, escalations, halted: true }; }
 
-    const e = (ctx.evaluate ?? evaluatePr)({ nwo, pr, profile, db });
-    if (!e.ok) { log(logPath, `  #${pr}: could not evaluate — ${e.why}`); continue; }
-
-    // GitHub is authoritative for PR facts; this is also what releases a lease
-    // when a PR merges.
-    evaluated.add(pr);
-    const rec = reconcilePr(db, { nwo, pr, profile });
-    if (rec.ok && rec.released) log(logPath, `  #${pr}: released ${rec.released} lease(s) — PR merged`);
-
-    // Review ingest, in SHADOW: it writes and nothing reads. Landing raw
-    // observations now means the derivation that comes next has history to fold
-    // rather than starting from whatever it happens to see on its first tick.
+    // THE HEAD IS PINNED FIRST, and the fold runs before the evaluation.
     //
-    // Skipped unless the PR moved, because re-polling a quiet PR costs API quota
-    // for rows the content key would reject anyway. `updatedAt` is GitHub's, so a
-    // change reeve has not seen yet still triggers a read.
-    if (ctx.reviewIngest !== false && e.ok) {
-      noteHead(db, nwo, pr, e.head);
+    // The order used to be evaluate, then observe, ingest and derive -- so every
+    // decision read a projection built from the PREVIOUS tick, and two P1s came
+    // out of that one fact. The head check could not see it, because a reviewer
+    // acting on the SAME revision leaves the head matching while the content
+    // moves; and a count cross-check could not see it either, because a thread
+    // EDITED in place changes no total. Comparing aggregates catches things
+    // appearing and disappearing, never things changing.
+    //
+    // A third check would have detected one more instance of an ordering that can
+    // simply be corrected, at a cost paid on every tick for every pull request.
+    // This removes the class instead. The anchor is pinned once and handed to
+    // both, so the fold and the evaluation cannot disagree about which revision
+    // they describe -- which pinning twice would have permitted.
+    const anchor = anchorFor({ nwo, pr });
+    if (!anchor.ok) { log(logPath, `  #${pr}: could not read — ${anchor.why}`); continue; }
+
+    if (ctx.reviewIngest !== false) {
+      noteHead(db, nwo, pr, anchor.head);
       // `updatedAt` is NOT a complete change signal for review state. MEASURED
       // 2026-08-22 on revnix/reeve #4: resolving a thread, and unresolving one,
       // leave `pull_request.updated_at` byte-identical. So on a pull request
@@ -1288,7 +1313,7 @@ export async function tick(ctx) {
       // quiet pull request costs one observation per window, not one per tick.
       const staleAfter = (profile?.watch?.staleSeconds ?? 900) * 1000;
       const last = ctx.lastIngest?.get?.(pr) ?? null;
-      const moved = !last || last.updatedAt !== e.updatedAt || (now() * 1000) - last.at >= staleAfter;
+      const moved = !last || last.updatedAt !== anchor.updatedAt || (now() * 1000) - last.at >= staleAfter;
       // Whether this tick's ingest changed anything, which decides below whether
       // the live read taken back in evaluate() still describes the same moment
       // as the projection.
@@ -1312,7 +1337,7 @@ export async function tick(ctx) {
           }
           // Only a COMPLETE read updates the watermark. Skipping a PR on the
           // strength of a partial read is how a gap becomes permanent.
-          if (!seen.incomplete) (ctx.lastIngest ??= new Map()).set(pr, { updatedAt: e.updatedAt, at: now() * 1000 });
+          if (!seen.incomplete) (ctx.lastIngest ??= new Map()).set(pr, { updatedAt: anchor.updatedAt, at: now() * 1000 });
           // And whether it was whole is carried to the fold. Positively named and
           // fail-closed: a pull request reeve has never wholly observed is NOT
           // complete, so it answers UNKNOWN rather than confidently from a
@@ -1327,7 +1352,7 @@ export async function tick(ctx) {
       // answer -- it un-clears everything until a reviewer speaks at the new head.
       try {
         const d = (ctx.derivePr ?? derivePr)(db, nwo, pr, profile,
-          { at: now(), head: e.head, complete: ctx.ingestComplete?.get?.(pr) === true });
+          { at: now(), head: anchor.head, complete: ctx.ingestComplete?.get?.(pr) === true });
         const st = (ctx.reviewState ?? reviewState)(db, nwo, pr, profile, { at: now() });
         if (st.readable && (st.open || st.unspilledCritical)) {
           log(logPath, `  #${pr}: review ${st.open}/${st.total} open, ` +
@@ -1375,6 +1400,28 @@ export async function tick(ctx) {
         log(logPath, `  #${pr}: derive failed — ${err.message}`);
       }
     }
+
+
+    // AFTER the fold, and handed the anchor the fold used. `foldPrecedesEvaluation`
+    // is what releases the thread details to the decision: they were withheld
+    // precisely because this order was the other way round.
+    const e = (ctx.evaluate ?? evaluatePr)({ nwo, pr, profile, db, anchor,
+                                             io: { foldPrecedesEvaluation: true } });
+    if (!e.ok) { log(logPath, `  #${pr}: could not evaluate — ${e.why}`); continue; }
+
+    // GitHub is authoritative for PR facts; this is also what releases a lease
+    // when a PR merges.
+    evaluated.add(pr);
+    const rec = reconcilePr(db, { nwo, pr, profile });
+    if (rec.ok && rec.released) log(logPath, `  #${pr}: released ${rec.released} lease(s) — PR merged`);
+
+    // Review ingest, in SHADOW: it writes and nothing reads. Landing raw
+    // observations now means the derivation that comes next has history to fold
+    // rather than starting from whatever it happens to see on its first tick.
+    //
+    // Skipped unless the PR moved, because re-polling a quiet PR costs API quota
+    // for rows the content key would reject anyway. `updatedAt` is GitHub's, so a
+    // change reeve has not seen yet still triggers a read.
 
     // The root cause is resolved BEFORE the decision, not after it. The watcher's
     // retry cap reads `h.fingerprint`, and the daemon never supplied one -- so the

@@ -116,6 +116,40 @@ const stillDeliverable = (db, row) => {
   return stoppedAt === null ? true : row.fence >= stoppedAt;
 };
 
+/**
+ * The conversation an effect speaks into, or null if it does not speak.
+ *
+ * `(repo_id, pr)` is the identity, because that pair is `task_pr`'s primary key:
+ * a pull request number is unique inside its repository and nowhere else. It is
+ * read from `args` rather than from a column because that is where the enqueue
+ * already puts it, and inventing a second home for the same fact is how the two
+ * PR shapes drifted apart before migration 2 merged them.
+ */
+const COMMENT_KIND = "gh.pr.comment";
+const conversationOf = (row) => {
+  if (row.kind !== COMMENT_KIND) return null;
+  let a;
+  try { a = JSON.parse(row.args); } catch { return null; }
+  return (a?.repo_id == null || a?.pr == null) ? null : `${a.repo_id}:${a.pr}`;
+};
+
+/**
+ * Is an EARLIER comment on the same pull request still unsettled?
+ *
+ * `id` is the enqueue order, and only `pending` and `inflight` rows are still
+ * going to be delivered -- a fenced, voided or dead-lettered predecessor never
+ * arrives, so it must not hold the queue for ever.
+ */
+const blockedByEarlierComment = (db, row) => {
+  const conv = conversationOf(row);
+  if (!conv) return false;
+  return db.prepare(
+    `SELECT id, kind, args FROM outbox
+      WHERE kind = ? AND status IN ('pending','inflight') AND id < ? ORDER BY id`)
+    .all(COMMENT_KIND, row.id)
+    .some(earlier => conversationOf(earlier) === conv);
+};
+
 const TERMINAL_OUTBOX = Object.freeze(
   ["done", "failed", "dead_letter", "voided", "fenced", "refused", "superseded", "forced"]);
 
@@ -295,6 +329,31 @@ export function leaseEffect(db, { worker, leaseSeconds = 300, capabilities = {},
         continue;
       }
 
+      // ONE CONVERSATION, ONE ORDER. Comments on a pull request are a running
+      // commentary on the task's status, and the LAST one to arrive is the one a
+      // reader believes -- so their order is part of their meaning in a way a
+      // push's is not.
+      //
+      // Nothing made them ordered. A hold enqueues "held" and a resume enqueues
+      // "resumed"; the resume neither waits for the first nor voids it -- and it
+      // must not, because a founder's resume blocking on a comment is how
+      // hold-then-resume deadlocked once already. So both sat deliverable at
+      // once: `stillDeliverable` re-admits the older row the moment the task is
+      // ACTIVE again, two executors lease them independently, and the transports
+      // race. "held" landing second leaves an ACTIVE task whose pull request says
+      // it is stopped, with nothing to correct it until the next transition.
+      //
+      // Ordering is a DELIVERY property, so it belongs here rather than in a
+      // guard on the resume: an older unsettled comment for the same pull request
+      // means this one is not due yet. Skipped, not fenced -- the row keeps its
+      // place and the next pass reconsiders it.
+      //
+      // Fail-closed, and deliberately: if that older row is stuck `inflight`
+      // because its reconciler cannot reach GitHub, later comments on that pull
+      // request wait behind it. Silence is recoverable; a status line that
+      // contradicts the task is not.
+      if (blockedByEarlierComment(db, row)) continue;
+
       // A switch the founder has not turned on is CONFIGURATION, not a fault: it
       // burns no attempt and raises no escalation, and it is terminal, because
       // retrying a decision the operator made is not recovery.
@@ -392,6 +451,22 @@ export function settleEffect(db, { id, worker, leaseToken, ok, result = null,
   });
 }
 
+// How long before a row whose reconciler FAILED is asked again.
+//
+// It has to escalate, or an unreachable reconciler is polled at a fixed rate for
+// as long as the outage lasts. `backoffSeconds` cannot be used as it stands:
+// its curve is driven by `attempts`, which counts DELIVERIES and by design does
+// not move on this path -- so it would return the same interval for ever.
+//
+// So the previous interval is read from the CLOCK instead of a counter: the gap
+// since the row was last touched IS the last wait, and doubling it walks the
+// same curve up to the same ceiling without storing anything. A durable
+// reconcile-attempt column is the fuller answer and needs a migration; this is
+// the half that does not, and it is bounded either way.
+const REASK_MIN = 30, REASK_MAX = 3600;
+const reaskSeconds = (at, row) =>
+  Math.min(REASK_MAX, Math.max(REASK_MIN, 2 * Math.max(0, at - row.updated_at)));
+
 /**
  * Reconcile deliveries whose lease expired, against EXTERNAL TRUTH.
  *
@@ -413,7 +488,7 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
   const at = now ?? db.prepare("SELECT unixepoch() n").get().n;
   const expired = db.prepare(
     `SELECT ${ROW} FROM outbox WHERE status='inflight' AND lease_expires_at <= ? ORDER BY id`).all(at);
-  if (!expired.length) return { settled: 0, returned: 0, dead: 0, stale: 0 };
+  if (!expired.length) return { settled: 0, returned: 0, dead: 0, stale: 0, unobserved: 0 };
 
   // ── 2. ASK, OUTSIDE the write transaction, and AWAIT the answer.
   //
@@ -453,7 +528,7 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
   // applying it would overwrite whoever holds it now.
   return hubTx(db, () => {
     assertWritable(db, { isAlive, inTx: true });
-    let settled = 0, returned = 0, dead = 0, stale = 0;
+    let settled = 0, returned = 0, dead = 0, stale = 0, unobserved = 0;
     for (const [row, verdict] of verdicts) {
       const cur = db.prepare("SELECT status, worker, lease_token FROM outbox WHERE id = ?").get(row.id);
       if (!cur || cur.status !== "inflight" || cur.worker !== row.worker
@@ -504,15 +579,36 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
       // reachable with a push or a merge outstanding, which is the single thing
       // the drain exists to prevent.
       //
-      // So a reconcile that ERRORED never spends the budget. The row goes back
-      // with a backoff and is asked again. It is unbounded on purpose: the
-      // alternative is discarding a possibly-delivered effect, and a task whose
-      // drain will not settle is FAIL-CLOSED and visible in `task why`, while a
-      // dead-lettered one is fail-open and silent. A separate durable reconcile
-      // budget is the right long-term shape and needs a column; this is the half
-      // that does not need one, and the comment is here so the next reader knows
-      // which half is missing.
-      const spent = !verdict?.reconcileError && row.attempts >= row.max_attempts;
+      // So a reconcile that ERRORED never spends the budget. It is unbounded on
+      // purpose: the alternative is discarding a possibly-delivered effect, and a
+      // task whose drain will not settle is FAIL-CLOSED and visible in
+      // `task why`, while a dead-lettered one is fail-open and silent.
+      //
+      // BUT NOT BACK INTO THE DELIVERY QUEUE. `pending` is not a holding area,
+      // it is the queue `leaseEffect` takes from -- and that scan filters on the
+      // schedule alone, never on the attempt limit. So a row kept for further
+      // OBSERVATION was leased for another DELIVERY the moment its backoff
+      // expired, and a prolonged reconciler outage turned into an unbounded run
+      // of duplicate pushes, merges and PR operations: exactly the harm not
+      // spending the budget was meant to avoid, arrived at by the other road.
+      //
+      // Retention has to be a state the deliverer cannot see. `inflight` already
+      // is one: `leaseEffect` reads `pending` only, the reconcile sweep reads
+      // expired `inflight` rows, and `outbox_live_key` keeps the idempotency key
+      // reserved while the effect's fate is unknown -- which is right, because it
+      // may have landed. So the row simply stays where it is, with its lease
+      // deadline pushed out, and the next sweep ASKS AGAIN rather than acts. The
+      // CAS on (worker, lease_token) still matches, because neither changes here.
+      if (verdict?.reconcileError) {
+        db.prepare(
+          `UPDATE outbox SET lease_expires_at=?, last_error=?, updated_at=unixepoch()
+            WHERE id=?`)
+          .run(at + reaskSeconds(at, row), `reconcile failed: ${verdict.reconcileError}`, row.id);
+        emitRow(db, "outbox.unobserved", row.id);
+        unobserved++;
+        continue;
+      }
+      const spent = row.attempts >= row.max_attempts;
       // BACKED OFF LIKE ANY OTHER RETRY. A row returned here is due immediately,
       // and `leaseEffect` takes every pending row whose schedule is due -- so an
       // effect requeued because the external service was UNREACHABLE was leased
@@ -527,14 +623,12 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
                            last_error=COALESCE(?, last_error), updated_at=unixepoch()
           WHERE id=?`)
         .run(spent ? "dead_letter" : "pending", backoff, backoff,
-             spent ? `unobserved after ${row.attempts} of ${row.max_attempts} attempts` +
-                     (verdict?.reconcileError ? `; last reconcile failed: ${verdict.reconcileError}` : "")
-                   : (verdict?.reconcileError ? `reconcile failed: ${verdict.reconcileError}` : null),
+             spent ? `unobserved after ${row.attempts} of ${row.max_attempts} attempts` : null,
              row.id);
       emitRow(db, "outbox.settled", row.id);
       if (spent) { settleDrainFor(db, row.id); dead++; } else returned++;
     }
-    return { settled, returned, dead, stale };
+    return { settled, returned, dead, stale, unobserved };
   });
 }
 

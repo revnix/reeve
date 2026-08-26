@@ -1467,6 +1467,70 @@ rmSync(dir, { recursive: true, force: true });
   db.close();
 }
 
+// ── an expired pin does not come back after one more hold ──────────────────
+// The two halves of a pin were kept in places with different lifetimes: the
+// INTENT in `task_territory.pinned`, which is durable, and the DEADLINE in
+// `territory_lease.pinned_until`, which `release-territory` deletes. So carrying
+// the original deadline across a resume held only until the next hold -- a hold
+// releases territory precisely when no pin is live, the row went with it, and
+// the resume after that found no row, read the still-set intent bit, and minted
+// a fresh `now + LEASE_SECONDS`. One extra hold/resume cycle and a time-boxed
+// pin was live again, past the deadline the founder actually set.
+{
+  const db = openHub(join(dir, "t52.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',1)`);
+  const expired = db.prepare("SELECT unixepoch()-1 t").get().t;
+  db.prepare(`INSERT INTO territory_lease(project,kind,path,task,expires_at,pinned_until)
+              VALUES('p','prefix','packages/x','bt:1',unixepoch()+3600,?)`).run(expired);
+
+  // HOLD. The pin is spent, so the territory is released and the lease row --
+  // the only home of the deadline -- goes with it.
+  const held = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING",
+    expectedGeneration: 1, evidence: { kind: "hold", reason: "over_budget" }, op: "phase.held" });
+  check(held.applied === true, "fixture: the hold applies", JSON.stringify(held));
+  check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task='bt:1'").get().c === 0,
+    "fixture: and the lease carrying the expired deadline is gone");
+  check(db.prepare("SELECT pinned FROM task_territory WHERE task='bt:1'").get().pinned === 0,
+    "the spent pin is recorded where the INTENT lives, which outlives the lease",
+    JSON.stringify(db.prepare("SELECT * FROM task_territory").all()));
+
+  // RESUME. With no lease row, the intent bit is the only thing left to read.
+  const back = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED",
+    expectedGeneration: 1, evidence: { kind: "founder.resume", redesign: false },
+    op: "phase.resumed" });
+  check(back.applied === true, "fixture: the resume applies", JSON.stringify(back));
+  const after = db.prepare("SELECT pinned_until FROM territory_lease WHERE task='bt:1'").get();
+  check(after != null, "fixture: the resume regrants the territory", JSON.stringify(after));
+  check(after.pinned_until === null,
+    "and the expired pin does NOT come back live after the extra hold/resume cycle",
+    JSON.stringify({ was: expired, now: after.pinned_until,
+                     unixepoch: db.prepare("SELECT unixepoch() n").get().n }));
+  db.close();
+}
+
+// CONTROL: a hold that releases territory whose pin was NEVER set leaves the
+// intent bit alone -- the clear is about a deadline that ended, not about every
+// release.
+{
+  const db = openHub(join(dir, "t53.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/a',1)`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/b',0)`);
+  // The ODD ONE IN THE MIDDLE would be a single row here, so both are present:
+  // an unpinned lease released beside a pinned claim on a DIFFERENT path.
+  db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at,pinned_until)
+           VALUES('p','prefix','packages/b','bt:1',unixepoch()+3600,NULL)`);
+  applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "hold", reason: "over_budget" }, op: "phase.held" });
+  const rows = Object.fromEntries(db.prepare(
+    "SELECT path, pinned FROM task_territory WHERE task='bt:1'").all().map(r => [r.path, r.pinned]));
+  check(rows["packages/a"] === 1 && rows["packages/b"] === 0,
+    "control: releasing a lease that carried no pin clears no intent bit",
+    JSON.stringify(rows));
+  db.close();
+}
+
 // ── each hold occurrence is externally distinguishable ─────────────────────
 // A task resumed and then held again for the SAME reason in the SAME generation
 // produced an identical comment key. The outbox admits the second row beside the

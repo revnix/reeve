@@ -61,6 +61,10 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 // runs, so one declared below the blocks that read it throws on the first lease.
 const NOW = 1_800_000_000;
 
+// The re-ask ceiling, restated here rather than imported: a test that shares the
+// constant with the code under test cannot notice the constant changing.
+const REASK_MAX = 3600;
+
 
 // ── fence revalidation ───────────────────────────────────────────────────────
 {
@@ -872,14 +876,41 @@ const NOW = 1_800_000_000;
   check(asked.length === 3, "every expired row is still offered to the reconciler",
     JSON.stringify(asked));
   check(r.settled === 2, "the rows that COULD be observed are settled", JSON.stringify(r));
-  check(r.returned === 1, "and the one that failed is returned to the queue, not lost",
+  check(r.unobserved === 1, "and the one that failed is RETAINED, not lost",
     JSON.stringify(r));
-  const failed = db.prepare("SELECT status, last_error FROM outbox WHERE id=?").get(leased.a.id);
-  check(failed.status === "pending", "the failed row is pending, since nothing was established",
+  check(r.returned === 0, "and it is not counted as returned to the delivery queue",
+    JSON.stringify(r));
+  const failed = db.prepare(
+    "SELECT status, last_error, lease_expires_at, worker, attempts FROM outbox WHERE id=?")
+    .get(leased.a.id);
+  // THE POINT OF THE FIX. `pending` is the queue `leaseEffect` takes from, and
+  // that scan never checks the attempt limit -- so a row parked there for further
+  // OBSERVATION was handed out for another DELIVERY as soon as its backoff
+  // expired. Retention has to be a state the deliverer cannot see.
+  check(failed.status === "inflight", "the failed row is RETAINED inflight, out of the delivery queue",
+    JSON.stringify(failed));
+  check(failed.worker === "wa", "and its lease identity is untouched, so the CAS still matches",
+    JSON.stringify(failed));
+  check(failed.lease_expires_at > db.prepare("SELECT unixepoch() n").get().n,
+    "and its lease deadline is pushed out, so the next sweep ASKS rather than acts",
     JSON.stringify(failed));
   check(/unreachable/.test(failed.last_error ?? ""),
     "and last_error says WHY it could not be told, rather than cycling silently",
     JSON.stringify(failed));
+  // THE DEFECT ITSELF, asserted rather than inferred: no delivery follows.
+  const attemptsBefore = failed.attempts;
+  // FAR PAST EVERY SCHEDULE. Leasing at `lease_expires_at + 1` proved nothing:
+  // the old contract set that column to 0, so the probe asked at epoch 1 and was
+  // refused by the backoff rather than by the fix. The question is whether the
+  // row is EVER handed out again, so ask when no schedule could still hold it.
+  const wellPast = db.prepare("SELECT unixepoch() n").get().n + REASK_MAX * 2;
+  const stolen = leaseEffect(db, { worker: "wLater", capabilities: allOn, now: wellPast });
+  check(stolen === null || stolen.id !== leased.a.id,
+    "a row kept for observation is NEVER leased for delivery again",
+    JSON.stringify(stolen));
+  check(db.prepare("SELECT attempts FROM outbox WHERE id=?").get(leased.a.id).attempts
+          === attemptsBefore,
+    "and no delivery attempt is spent on it");
   check(db.prepare("SELECT status FROM outbox WHERE id=?").get(leased.c.id).status === "done",
     "control: a row AFTER the failing one was still reconciled");
 
@@ -892,7 +923,7 @@ const NOW = 1_800_000_000;
   catch (e) { rejThrew = e; }
   check(rejThrew === null, "control: a rejected async reconciler does not abort the pass either",
     String(rejThrew?.message));
-  check(r2?.returned === 1 && r2?.settled === 0,
+  check(r2?.unobserved === 1 && r2?.settled === 0,
     "control: a REJECTED async reconciler is handled the same way", JSON.stringify(r2));
   db.close();
 }
@@ -1066,17 +1097,33 @@ const NOW = 1_800_000_000;
   db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${leased.id}`);
 
   const r = await recoverEffects(db, { reconcile: () => { throw new Error("service unreachable"); } });
-  check(r.returned === 1, "the unobservable effect is returned to the queue", JSON.stringify(r));
-  const row = db.prepare("SELECT status, not_before, last_error FROM outbox WHERE id=?").get(leased.id);
+  check(r.unobserved === 1, "the unobservable effect is RETAINED for another look",
+    JSON.stringify(r));
+  const row = db.prepare(
+    "SELECT status, not_before, lease_expires_at, last_error FROM outbox WHERE id=?").get(leased.id);
   const now = db.prepare("SELECT unixepoch() n").get().n;
-  check(row.status === "pending", "as pending", JSON.stringify(row));
-  check(row.not_before > now, "and scheduled in the FUTURE, not due immediately",
+  check(row.status === "inflight", "as inflight, which is the state the deliverer cannot see",
+    JSON.stringify(row));
+  check(row.lease_expires_at > now, "and its next LOOK is scheduled in the future",
     JSON.stringify({ ...row, now }));
   check(leaseEffect(db, { worker: "w2", capabilities: allOn, now }) === null,
     "so the executor does not go straight back at the service that just failed");
-  // CONTROL: at its scheduled time it IS leasable again.
-  check(leaseEffect(db, { worker: "w2", capabilities: allOn, now: row.not_before })?.id === leased.id,
-    "control: once the backoff elapses it is leased again");
+  // CONTROL, and it is the whole difference: at its scheduled time the row is
+  // offered to the RECONCILER again, never to the delivery queue. The old
+  // contract put it back as `pending`, where the next due scan POSTed it afresh.
+  check(leaseEffect(db, { worker: "w2", capabilities: allOn, now: row.lease_expires_at + 1 }) === null,
+    "control: not even once its schedule elapses is it leased for delivery");
+  const reasked = [];
+  await recoverEffects(db, { now: row.lease_expires_at - 1,
+                             reconcile: (x) => { reasked.push(["early", x.id]); return { settled: false }; } });
+  check(reasked.length === 0, "and it is not re-asked BEFORE its schedule either",
+    JSON.stringify(reasked));
+  await recoverEffects(db, { now: row.lease_expires_at,
+                             reconcile: (x) => { reasked.push(["due", x.id]); return { settled: true, ok: true }; } });
+  check(reasked.length === 1 && reasked[0][1] === leased.id,
+    "control: once its schedule elapses the RECONCILER is asked again", JSON.stringify(reasked));
+  check(db.prepare("SELECT status FROM outbox WHERE id=?").get(leased.id).status === "done",
+    "and a reconciler that can finally look settles it");
   db.close();
 }
 
@@ -1098,11 +1145,17 @@ const NOW = 1_800_000_000;
   // spending it dead-letters a row that MAY have landed and settles its drain,
   // so CANCELLED becomes reachable with a push outstanding.
   const errored = await recoverEffects(db, { reconcile: () => { throw new Error("still unreachable"); } });
-  check(errored.dead === 0 && errored.returned === 1,
-    "an exhausted row whose reconciler ERRORED is returned, not dead-lettered",
+  check(errored.dead === 0 && errored.unobserved === 1,
+    "an exhausted row whose reconciler ERRORED is retained, not dead-lettered",
     JSON.stringify(errored));
-  check(db.prepare("SELECT status FROM outbox WHERE id=?").get(leased.id).status === "pending",
+  check(db.prepare("SELECT status FROM outbox WHERE id=?").get(leased.id).status === "inflight",
     "so it will be asked again rather than discarded as if it never happened");
+  // AND NOT DELIVERED AGAIN EITHER. This row is already at `max_attempts`, and
+  // the queue scan does not filter on that -- so the old contract's `pending`
+  // handed an exhausted, externally ambiguous effect straight back out.
+  check(leaseEffect(db, { worker: "wX", capabilities: allOn,
+                          now: db.prepare("SELECT unixepoch() n").get().n + REASK_MAX + 1 }) === null,
+    "and an exhausted retained row is never leased for delivery, however long it waits");
 
   // CONTROL: a reconciler that LOOKED and found nothing IS definitive -- the
   // effect did not happen -- so the delivery budget applies and the row dies.
@@ -1183,6 +1236,105 @@ const NOW = 1_800_000_000;
   check(leaseEffect(db2, { worker: "w", capabilities: allOn, now: NOW })?.idempotency_key === "bt:1:g1:push",
     "control: a NON-cancellable effect is still delivered after the task stops");
   db.close(); db2.close();
+}
+
+// ── one conversation, one order ────────────────────────────────────────────
+// Comments on a pull request are a running commentary on the task's status, and
+// the LAST one to arrive is the one a reader believes. Nothing made them
+// ordered: a hold enqueues "held" and a resume enqueues "resumed", the resume
+// neither waits for the first nor voids it, and `stillDeliverable` re-admits the
+// older row the moment the task is ACTIVE again. Two executors then lease them
+// independently and the transports race -- "held" landing second leaves an
+// ACTIVE task whose pull request says it is stopped.
+{
+  const db = openHub(join(dir, "o28.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const say = (key, args) => hubTx(db, () => enqueueEffect(db,
+    { idempotencyKey: key, kind: "gh.pr.comment", taskId: "bt:1",
+      generation: 1, fence: 1, args }));
+
+  // THE ODD ONE IN THE MIDDLE: the row that must NOT be blocked sits between two
+  // rows on the conversation that is blocked, so a scope that ignores the
+  // conversation entirely cannot pass by accident.
+  say("bt:1:g1:held",    { repo_id: 7, pr: 12, note: "held" });
+  say("bt:1:g1:other",   { repo_id: 7, pr: 99, note: "held" });
+  say("bt:1:g1:resumed", { repo_id: 7, pr: 12, note: "resumed" });
+
+  const first = leaseEffect(db, { worker: "w1", capabilities: allOn, now: NOW });
+  check(first?.idempotency_key === "bt:1:g1:held",
+    "the earliest comment on a pull request is leased first", JSON.stringify(first));
+
+  const second = leaseEffect(db, { worker: "w2", capabilities: allOn, now: NOW });
+  check(second?.idempotency_key === "bt:1:g1:other",
+    "control: a comment on a DIFFERENT pull request is not held up by it",
+    JSON.stringify(second));
+
+  const third = leaseEffect(db, { worker: "w3", capabilities: allOn, now: NOW });
+  check(third === null,
+    "and the later comment on the SAME pull request is not leased while the first is unsettled",
+    JSON.stringify(third));
+
+  // SKIPPED, NOT FENCED: the row keeps its place and its status.
+  const waiting = db.prepare("SELECT status, attempts FROM outbox WHERE idempotency_key='bt:1:g1:resumed'").get();
+  check(waiting.status === "pending" && waiting.attempts === 0,
+    "the waiting comment is skipped, not fenced -- it still has its turn coming",
+    JSON.stringify(waiting));
+
+  // CONTROL: once the first SETTLES, the second is leasable.
+  settleEffect(db, { id: first.id, worker: "w1", leaseToken: first.lease_token,
+                     ok: true, result: { commented: true } });
+  const after = leaseEffect(db, { worker: "w4", capabilities: allOn, now: NOW });
+  check(after?.idempotency_key === "bt:1:g1:resumed",
+    "control: once the earlier comment settles, the later one goes out",
+    JSON.stringify(after));
+  db.close();
+}
+
+// CONTROL: a predecessor that will NEVER arrive must not hold the conversation
+// for ever. Only `pending` and `inflight` rows are still going to be delivered.
+{
+  const db = openHub(join(dir, "o29.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const say = (key, args) => hubTx(db, () => enqueueEffect(db,
+    { idempotencyKey: key, kind: "gh.pr.comment", taskId: "bt:1",
+      generation: 1, fence: 1, args }));
+  say("bt:1:g1:doomed", { repo_id: 7, pr: 12, note: "held" });
+  say("bt:1:g1:next",   { repo_id: 7, pr: 12, note: "resumed" });
+  db.exec(`UPDATE outbox SET status='voided' WHERE idempotency_key='bt:1:g1:doomed'`);
+  const got = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  check(got?.idempotency_key === "bt:1:g1:next",
+    "control: a voided predecessor does not block the conversation for ever",
+    JSON.stringify(got));
+  db.close();
+}
+
+// THE INTERACTION OF THE TWO FIXES, pinned as deliberate rather than left to be
+// rediscovered. A comment whose reconciler cannot reach GitHub is now retained
+// `inflight` instead of being requeued -- and an unsettled predecessor holds its
+// conversation. So later comments on that pull request wait for as long as the
+// outage lasts. That is the intended trade: silence on a thread is recoverable,
+// and a status line that contradicts the task is not. The drain keeps the task
+// out of a terminal phase meanwhile, so it is visible rather than silent.
+{
+  const db = openHub(join(dir, "o30.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const say = (key, args) => hubTx(db, () => enqueueEffect(db,
+    { idempotencyKey: key, kind: "gh.pr.comment", taskId: "bt:1",
+      generation: 1, fence: 1, args }));
+  say("bt:1:g1:stuck", { repo_id: 7, pr: 12, note: "held" });
+  say("bt:1:g1:after", { repo_id: 7, pr: 12, note: "resumed" });
+  const first = leaseEffect(db, { worker: "w1", capabilities: allOn, now: NOW });
+  check(first?.idempotency_key === "bt:1:g1:stuck", "fixture: the first comment is leased");
+  db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${first.id}`);
+  const r = await recoverEffects(db, { reconcile: () => { throw new Error("GitHub is unreachable"); } });
+  check(r.unobserved === 1, "fixture: its reconciler cannot look, so the row is retained",
+    JSON.stringify(r));
+  const blocked = leaseEffect(db, { worker: "w2", capabilities: allOn,
+                                    now: db.prepare("SELECT unixepoch() n").get().n + REASK_MAX * 2 });
+  check(blocked === null,
+    "a later comment waits behind a retained one: silence, not a contradicting status line",
+    JSON.stringify(blocked));
+  db.close();
 }
 
 rmSync(dir, { recursive: true, force: true });

@@ -225,12 +225,16 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
     for (const t of threads) it.run(nwo, pr, t.thread_id, t.reviewer, t.path, t.line, t.severity,
       t.is_resolved, t.is_outdated, t.resolved_by, t.resolved_at, t.is_cleared, t.excerpt, t.event_at, version);
-    db.prepare(`INSERT INTO projection_meta (nwo,scope,classifier_version,derived_at,complete)
-                VALUES (?,?,?,?,?)
+    // The head is stored WITH the projection, in the same transaction as the rows
+    // it explains. Clearing was computed against it, so a projection and the head
+    // it describes are one fact and must not be able to drift apart.
+    db.prepare(`INSERT INTO projection_meta (nwo,scope,classifier_version,derived_at,complete,head)
+                VALUES (?,?,?,?,?,?)
                 ON CONFLICT(nwo,scope) DO UPDATE SET
                   classifier_version=excluded.classifier_version,
-                  derived_at=excluded.derived_at, complete=excluded.complete`)
-      .run(nwo, `pr:${pr}`, version, at, complete ? 1 : 0);
+                  derived_at=excluded.derived_at, complete=excluded.complete,
+                  head=excluded.head`)
+      .run(nwo, `pr:${pr}`, version, at, complete ? 1 : 0, head ?? null);
     db.exec("COMMIT");
   } catch (e) { try { db.exec("ROLLBACK"); } catch {} throw e; }
 
@@ -286,17 +290,34 @@ export function staleScopes(db, nwo, profile) {
 }
 
 /** What the gate reads: one snapshot, already derived. */
-export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() / 1000) } = {}) {
+export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() / 1000), head = null } = {}) {
   const version = classifierVersion(profile);
   const meta = db.prepare("SELECT * FROM projection_meta WHERE nwo=? AND scope=?").get(nwo, `pr:${pr}`);
   const stale = profile?.watch?.staleSeconds ?? 900;
-  // Three ways to have no honest answer, and all of them are UNKNOWN rather than
-  // an empty one: never derived, derived by something else, or derived too long
-  // ago to still describe the pull request.
+  // Ways to have no honest answer, and every one of them is UNKNOWN rather than
+  // an empty one: never derived, derived by something else, derived from an
+  // incomplete read, derived too long ago, or derived for a DIFFERENT REVISION.
   if (!meta) return { readable: false, why: "no projection for this pull request" };
   if (meta.classifier_version !== version) return { readable: false, why: "projection predates the current classifier" };
   if (!meta.complete) return { readable: false, why: "the observation behind this projection was incomplete" };
   if (at - meta.derived_at > stale) return { readable: false, why: `projection is older than ${stale}s` };
+  // The revision check, and it is the one a caller is most likely to skip because
+  // the projection looks perfectly fresh without it.
+  //
+  // Clearing is computed against a head: the same threads under a different head
+  // give a different answer to "what is still open". A projection derived for the
+  // previous head is not stale by the clock and is still wrong, and the two facts
+  // it feeds -- how many criticals are open, and which threads they are -- are
+  // exactly the ones that license spilling a finding or sending a worker at it.
+  //
+  // Asked only when the caller names a head. A caller that does not care about a
+  // revision (the shadow log) keeps the old behaviour; a caller that is going to
+  // DECIDE something passes one, and gets UNKNOWN rather than a confident answer
+  // about the wrong commit.
+  if (head) {
+    if (!meta.head) return { readable: false, why: "the projection does not record which head it was derived for" };
+    if (meta.head !== head) return { readable: false, why: `projection was derived for ${String(meta.head).slice(0, 10)}, not ${String(head).slice(0, 10)}` };
+  }
 
   const threads = db.prepare("SELECT * FROM review_thread WHERE nwo=? AND pr=?").all(nwo, pr);
   const open = threads.filter(t => !t.is_cleared);

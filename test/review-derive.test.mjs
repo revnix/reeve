@@ -148,6 +148,47 @@ ingest(db, NWO, 1, [
   check(st.rounds === 1, "one blocking reviewer answered once at one head", String(st.rounds));
 }
 
+// --- a projection answers only about the head it was derived FOR --------------
+{
+  // The check a caller is most likely to skip, because a projection derived for
+  // the previous head looks perfectly fresh by every other measure.
+  //
+  // Clearing is head-dependent: `derivePr` decides `is_cleared` by asking whether
+  // a round covers THIS head, so the same threads under a different head give a
+  // different answer to "what is still open". The two facts that answer feeds --
+  // how many criticals are open, and which threads they are -- are exactly the
+  // ones that license spilling a finding or sending a worker at it.
+  derivePr(db, NWO, 1, PROFILE, { at: T, head: HEAD_A });
+
+  const atA = reviewState(db, NWO, 1, PROFILE, { at: T, head: HEAD_A });
+  check(atA.readable === true, "a projection derived for this head is readable", JSON.stringify(atA.why ?? ""));
+  check(atA.unspilledCritical === 2 && atA.threads.length === 3,
+    "control: and carries the counts and the threads a decision needs",
+    JSON.stringify({ c: atA.unspilledCritical, n: atA.threads?.length }));
+
+  const atB = reviewState(db, NWO, 1, PROFILE, { at: T, head: HEAD_B });
+  check(atB.readable === false,
+    "the same projection is UNREADABLE for a different head, however fresh it is",
+    JSON.stringify(atB));
+  check(/derived for/.test(String(atB.why)) && atB.unspilledCritical === undefined,
+    "and reports no counts at all, rather than counts about the wrong revision",
+    JSON.stringify(atB));
+
+  // A caller that names no head keeps the old behaviour. The shadow log compares
+  // against a live read taken in the same tick and has no revision to assert.
+  check(reviewState(db, NWO, 1, PROFILE, { at: T }).readable === true,
+    "control: a caller that names no head is unaffected", "");
+
+  // A projection written before the column existed records no head. That is
+  // "we do not know which revision", which is unusable rather than a match.
+  db.prepare("UPDATE projection_meta SET head=NULL WHERE nwo=? AND scope=?").run(NWO, "pr:1");
+  const noHead = reviewState(db, NWO, 1, PROFILE, { at: T, head: HEAD_A });
+  check(noHead.readable === false,
+    "a projection that records no head is unreadable, not assumed to match",
+    JSON.stringify(noHead));
+  derivePr(db, NWO, 1, PROFILE, { at: T, head: HEAD_A });   // restore for later blocks
+}
+
 // ── resolution is a claim ────────────────────────────────────────────────────
 {
   // crab resolves its OWN thread. Nothing else changes.

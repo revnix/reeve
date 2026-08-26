@@ -69,7 +69,8 @@ const hasLivePin = (db, taskId) => db.prepare(
 // worse -- silently does nothing and looks like it worked.
 const COMPENSATIONS = Object.freeze([
   "void-pending", "write-pr-hold", "close-prs", "release-territory",
-  "regrant-territory", "clear-holds", "annotate-held", "annotate-resumed",
+  "regrant-territory", "clear-holds", "clear-holds-except-closing",
+  "annotate-held", "annotate-resumed",
   "record-hold-reason",
   "adopt-snapshot", "release-ledger-claim", "terminate-worker",
   "record-research-skip", "record-drain", "force-drain",
@@ -280,8 +281,28 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
             `${holder.kind} ${holder.path || "(repository root)"}, held by ${holder.task} ` +
             `until ${holder.expires_at}; ` +
             `the resume is refused rather than granting two tasks the same paths`);
+        // THE ORIGINAL DEADLINE, not a fresh one. `task_territory.pinned` is a
+        // durable bit saying the filing ASKED for a pin; the deadline lived on
+        // the lease. Deriving a new `now + LEASE_SECONDS` from that bit renews a
+        // pin the founder time-boxed every time the task resumes -- and if it is
+        // held again inside the renewed window it keeps blocking overlapping
+        // filings past the expiry that was actually requested. A pin that
+        // renews itself on resume is not a deadline.
+        //
+        // An EXPIRED pin regrants unpinned: the promise was kept and it ended.
+        // THE ROW, not the column. A missing `pinned_until` is ambiguous on its
+        // own: it means "this lease was never pinned" AND "there is no lease
+        // here at all", and those want opposite answers. A held task whose
+        // territory was RELEASED has no row, so its resume is making a FRESH
+        // promise and takes a fresh deadline; a row that still exists carries
+        // whatever deadline it has, including none.
+        const prior = db.prepare(
+          `SELECT pinned_until FROM territory_lease
+            WHERE project=? AND kind=? AND path=? AND task=?`)
+          .get(task.project, claim.kind, claim.path, taskId);
+        const priorPin = prior ? (prior.pinned_until ?? null) : undefined;
         const granted = grantLease(db, { project: task.project, claim, taskId, at,
-                                         pinned: !!claim.pinned });
+                                         pinned: !!claim.pinned, pinnedUntil: priorPin });
         hubEvent(db, { kind: "territory_lease.granted", task: taskId, payload: granted });
       }
       return;
@@ -292,9 +313,24 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
     // key -- without the event a snapshot holding open reasons plus a later
     // resume replays into an active task whose reasons are still open, and
     // `task why` reports a cause that was cleared before the restore.
+    // A redesign and a regenerate ABANDON their implementation PRs, and the
+    // close is enqueued rather than performed. Clearing those holds here leaves
+    // an open PR with nothing making it unmergeable in the window before the
+    // close lands -- and if the close is delayed, retried, or refused because
+    // `publishPr` is off, that window has no end. The hold is the only thing
+    // that stops superseded work being merged, so it outlives the decision to
+    // close the PR and is cleared by the close settling, not by the resume.
+    //
+    // The SPEC PR's hold is cleared: it is reused rather than abandoned, and the
+    // transition is about to push a new head to it.
+    case "clear-holds-except-closing":
     case "clear-holds": {
+      const keepHeld = c === "clear-holds-except-closing"
+        ? new Set(openPrs(db, taskId, { kind: "impl" }).map(p => `${p.repo_id}:${p.pr}`))
+        : new Set();
       for (const h of db.prepare(
-        `SELECT id FROM pr_hold WHERE task = ? AND cleared_at IS NULL`).all(taskId)) {
+        `SELECT id, repo_id, pr FROM pr_hold WHERE task = ? AND cleared_at IS NULL`).all(taskId)) {
+        if (keepHeld.has(`${h.repo_id}:${h.pr}`)) continue;
         db.prepare(`UPDATE pr_hold SET cleared_at = unixepoch() WHERE id = ?`).run(h.id);
         // `pr_hold.cleared` rather than `pr_hold.created`: both are declared in
         // HANDLERS against the same table and the same key, so replay treats
@@ -303,6 +339,8 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
         hubEvent(db, { kind: "pr_hold.cleared", task: taskId,
           payload: db.prepare(`SELECT ${PR_HOLD_COLS} FROM pr_hold WHERE id = ?`).get(h.id) });
       }
+      // The task-level reasons clear either way: the task IS resuming, whatever
+      // happens to the pull requests it is abandoning.
       for (const r of db.prepare(
         `SELECT id FROM hold_reason WHERE task = ? AND cleared_at IS NULL`).all(taskId)) {
         db.prepare(`UPDATE hold_reason SET cleared_at = unixepoch() WHERE id = ?`).run(r.id);
@@ -325,7 +363,15 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       // only within one.
       for (const pr of openPrs(db, taskId))
         enqueue("gh.pr.comment",
-                `${taskId}:g${generation}:r${pr.repo_id}:pr${pr.pr}:held:${evidence?.reason ?? "held"}`,
+                // `resume_seq` makes each HOLD OCCURRENCE distinct. Without it a
+                // task resumed and then held again for the same reason in the
+                // same generation produced the identical key, and the comment
+                // reconciler identifies delivery by that marker -- so it can
+                // settle the second hold against the FIRST hold's comment,
+                // leaving the thread with a "resumed" note and no explanation
+                // for the hold that followed it.
+                `${taskId}:g${generation}:r${task.resume_seq}:repo${pr.repo_id}:pr${pr.pr}` +
+                `:held:${evidence?.reason ?? "held"}`,
                 { repo_id: pr.repo_id, pr: pr.pr, note: "held",
                   ...(pr.kind === "spec" ? { repo: "spec" } : {}),
                   reason: evidence?.reason ?? null,
@@ -336,7 +382,19 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
     }
 
     case "annotate-resumed": {
-      for (const pr of openPrs(db, taskId))
+      // NOT THE PRs THIS TRANSITION IS ABOUT TO CLOSE. A redesign resume and a
+      // regenerate both run `annotate-resumed` BEFORE `close-prs`, so after the
+      // all-PR refactor this posted "resumed" to an implementation PR seconds
+      // before closing it -- a thread that announces work restarting on a pull
+      // request being abandoned. Those PRs get the close notice, which is the
+      // comment that actually explains what happened to them.
+      //
+      // The spec PR is the exception on exactly these paths: it is REUSED, the
+      // transition pushes a new head to it, and it is the one place a "resumed"
+      // note is true.
+      const closing = evidence?.kind === "founder.regenerate"
+                   || (evidence?.kind === "founder.resume" && evidence?.redesign === true);
+      for (const pr of (closing ? openPrs(db, taskId, { kind: "spec" }) : openPrs(db, taskId)))
         enqueue("gh.pr.comment",
                 `${taskId}:g${generation}:r${task.resume_seq}:repo${pr.repo_id}:pr${pr.pr}:resumed`,
                 { repo_id: pr.repo_id, pr: pr.pr, note: "resumed",
@@ -555,7 +613,24 @@ function applyTransitionTx(db, { taskId, expectedPhase, expectedGeneration, evid
       phase: expectedPhase, generation: expectedGeneration, heldFrom: task.held_from,
       sliceCursor: task.slice_cursor, hasOpenPr: hasOpenBuilderPr(db, taskId),
       pinnedTerritory: hasLivePin(db, taskId),
+      // TWO QUESTIONS, NOT ONE. `drainRemaining` is everything still outstanding
+      // and is what CANCELLING reads: a task cannot claim to be CANCELLED until
+      // its own close and notice have actually happened, so the stop's own
+      // compensations belong in that count.
       drainRemaining: db.prepare("SELECT count(*) c FROM task_drain WHERE task=? AND settled_at IS NULL").get(taskId).c,
+      // A RESUME asks something different: is any of the work the task was DOING
+      // still in flight? The hold's own explanatory comment is not that. Counting
+      // it made every hold-then-resume refuse until an executor delivered a
+      // comment -- and in S2 nothing delivers anything, so the refusal had no
+      // end. Scoped by the `fence` of the event that stopped the task: at or
+      // after it is the stop's own doing, before it is the work.
+      drainBeforeStop: db.prepare(
+        `SELECT count(*) c FROM task_drain d
+           JOIN outbox o ON o.id = d.outbox_id
+          WHERE d.task = ? AND d.settled_at IS NULL
+            AND o.fence < COALESCE((SELECT max(seq) FROM phase_event
+                                     WHERE task = ? AND to_phase NOT IN (${["BLOCKED","ESCALATED","CANCELLING","DONE","CANCELLED","LOST","INFEASIBLE"].map(p=>`'${p}'`).join(",")})), o.fence + 1)`)
+        .get(taskId, taskId).c,
     }, evidence);
 
     const WORKER_PHASES = ["SIZING","RESEARCH","DESIGN","SPEC_DRAFT","IMPLEMENTING"];

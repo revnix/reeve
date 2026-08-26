@@ -1300,5 +1300,207 @@ rmSync(dir, { recursive: true, force: true });
   db.close(); db2.close();
 }
 
+// ── an abandoned PR stays held until its close is confirmed ────────────────
+// A redesign cleared EVERY hold and then merely ENQUEUED the close, so between
+// the two an abandoned implementation PR is open with nothing making it
+// unmergeable. If the close is delayed, retried, or refused because `publishPr`
+// is off, that window has no end: the PR's next guardian verdict goes green and
+// a human or a stale client can merge work from a superseded design.
+{
+  const db = openHub(join(dir, "t43.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING', spec_repo_id=9 WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',0)`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','spec',NULL,NULL,9,42,'specsha',unixepoch()),
+                 ('bt:1','impl',1,0,1,7,'implsha',unixepoch())`);
+  // Both are held, as a hold would have left them.
+  db.exec(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at)
+           VALUES('bt:1',9,42,'specsha','over_budget',unixepoch()),
+                 ('bt:1',1,7,'implsha','over_budget',unixepoch())`);
+
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: true }, op: "phase.resumed" });
+  check(r.applied === true && r.to === "DESIGN", "the redesign resume applies", JSON.stringify(r));
+
+  const open = db.prepare(
+    "SELECT repo_id, pr FROM pr_hold WHERE task='bt:1' AND cleared_at IS NULL").all();
+  check(open.length === 1 && open[0].pr === 7,
+    "the ABANDONED implementation PR is still held while its close is only enqueued",
+    JSON.stringify(open));
+  check(db.prepare(
+    "SELECT cleared_at FROM pr_hold WHERE task='bt:1' AND pr=42").get().cleared_at !== null,
+    "and the REUSED spec PR's hold is cleared, because it is workable again");
+  // The close really is only enqueued, which is what makes the window exist.
+  check(db.prepare(
+    "SELECT count(*) c FROM outbox WHERE task_id='bt:1' AND kind='gh.pr.close'").get().c >= 1,
+    "fixture: the close is an enqueued effect, not a performed one");
+  db.close();
+}
+
+// CONTROL: a PLAIN resume clears every hold. Nothing is being abandoned there --
+// the task returns to the same PRs and the same design.
+{
+  const db = openHub(join(dir, "t44.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',0)`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,7,'implsha',unixepoch())`);
+  db.exec(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at)
+           VALUES('bt:1',1,7,'implsha','over_budget',unixepoch())`);
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(r.applied === true, "control: the plain resume applies", JSON.stringify(r));
+  check(db.prepare(
+    "SELECT count(*) c FROM pr_hold WHERE task='bt:1' AND cleared_at IS NULL").get().c === 0,
+    "control: and it clears every hold, because it abandons nothing");
+  db.close();
+}
+
+// ── a resume does not comment a PR it is about to close ────────────────────
+// `annotate-resumed` runs BEFORE `close-prs`, so after the all-PR refactor this
+// posted "resumed" to an implementation PR seconds before closing it: a thread
+// announcing work restarting on a pull request being abandoned. The spec PR is
+// the exception -- it is reused and the transition pushes a new head to it.
+{
+  const db = openHub(join(dir, "t45.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING', spec_repo_id=9 WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',0)`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','spec',NULL,NULL,9,42,'specsha',unixepoch()),
+                 ('bt:1','impl',1,0,1,7,'implsha',unixepoch())`);
+  applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: true }, op: "phase.resumed" });
+  const resumed = db.prepare(
+    `SELECT args FROM outbox WHERE task_id='bt:1' AND kind='gh.pr.comment'`).all()
+    .map(x => JSON.parse(x.args)).filter(a => a.note === "resumed").map(a => a.pr);
+  check(resumed.length === 1 && resumed[0] === 42,
+    "only the REUSED spec PR is told the task resumed", JSON.stringify(resumed));
+  check(!resumed.includes(7),
+    "the implementation PR being abandoned gets no resume note", JSON.stringify(resumed));
+  db.close();
+}
+
+// CONTROL: a plain resume comments BOTH, because it abandons neither.
+{
+  const db = openHub(join(dir, "t46.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING', spec_repo_id=9 WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',0)`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','spec',NULL,NULL,9,42,'specsha',unixepoch()),
+                 ('bt:1','impl',1,0,1,7,'implsha',unixepoch())`);
+  applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  const resumed = db.prepare(
+    `SELECT args FROM outbox WHERE task_id='bt:1' AND kind='gh.pr.comment'`).all()
+    .map(x => JSON.parse(x.args)).filter(a => a.note === "resumed").map(a => a.pr).sort((x, y) => x - y);
+  check(JSON.stringify(resumed) === "[7,42]",
+    "control: a plain resume tells both PRs, because it abandons neither",
+    JSON.stringify(resumed));
+  db.close();
+}
+
+// ── a pin is a deadline, not a renewable lease ─────────────────────────────
+// `task_territory.pinned` is a durable bit saying the filing ASKED for a pin;
+// the deadline lives on the lease. Deriving a fresh `now + LEASE_SECONDS` from
+// that bit renews the pin every time the task resumes, so a founder's
+// time-boxed pin never expires -- and if the task is held again inside the
+// renewed window it keeps blocking overlapping filings past the expiry that was
+// actually requested.
+{
+  const db = openHub(join(dir, "t47.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',1)`);
+  // A pinned lease the task KEPT across its hold, with a deadline still in force.
+  const deadline = db.prepare("SELECT unixepoch()+600 t").get().t;
+  db.prepare(`INSERT INTO territory_lease(project,kind,path,task,expires_at,pinned_until)
+              VALUES('p','prefix','packages/x','bt:1',unixepoch()+3600,?)`).run(deadline);
+
+  applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  const after = db.prepare("SELECT pinned_until, expires_at FROM territory_lease WHERE task='bt:1'").get();
+  check(after.pinned_until === deadline,
+    "the resume carries the ORIGINAL pin deadline rather than minting a new one",
+    JSON.stringify({ was: deadline, now: after.pinned_until }));
+  check(after.expires_at > deadline,
+    "control: the LEASE is renewed by the resume -- it is the PIN that is not",
+    JSON.stringify(after));
+  db.close();
+}
+
+// CONTROL: an EXPIRED pin regrants UNPINNED. The promise was kept and it ended;
+// renewing it here is the defect in its other direction.
+{
+  const db = openHub(join(dir, "t48.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',1)`);
+  db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at,pinned_until)
+           VALUES('p','prefix','packages/x','bt:1',unixepoch()+3600, unixepoch()-1)`);
+  applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  const after = db.prepare("SELECT pinned_until FROM territory_lease WHERE task='bt:1'").get();
+  check(after.pinned_until !== null && after.pinned_until < db.prepare("SELECT unixepoch() n").get().n,
+    "control: an expired pin stays expired rather than being renewed by the resume",
+    JSON.stringify(after));
+  db.close();
+}
+
+// CONTROL: a FIRST grant still takes a fresh deadline. A held task whose
+// territory was RELEASED has no lease row, so its resume is making a NEW
+// promise -- "no prior pin" and "no prior row" are different facts.
+{
+  const db = openHub(join(dir, "t49.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',1)`);
+  applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  const after = db.prepare("SELECT pinned_until FROM territory_lease WHERE task='bt:1'").get();
+  check(after?.pinned_until != null && after.pinned_until > db.prepare("SELECT unixepoch() n").get().n,
+    "control: with no prior lease, the resume makes a fresh pin",
+    JSON.stringify(after));
+  db.close();
+}
+
+// ── each hold occurrence is externally distinguishable ─────────────────────
+// A task resumed and then held again for the SAME reason in the SAME generation
+// produced an identical comment key. The outbox admits the second row beside the
+// completed one, but the comment reconciler identifies delivery by that marker
+// and can settle it against the FIRST hold's comment -- leaving the thread with
+// a "resumed" note and no explanation for the hold that followed it.
+{
+  const db = openHub(join(dir, "t50.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,7,'implsha',unixepoch())`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',0)`);
+  const keys = () => db.prepare(
+    `SELECT idempotency_key FROM outbox WHERE task_id='bt:1' AND kind='gh.pr.comment'`)
+    .all().map(r => r.idempotency_key).filter(k => /:held:/.test(k));
+
+  applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "hold", reason: "over_budget" }, op: "phase.held" });
+  const first = keys();
+  applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "hold", reason: "over_budget" }, op: "phase.held" });
+  const both = keys();
+  check(both.length === 2, "a second hold for the same reason enqueues its own comment",
+    JSON.stringify(both));
+  check(new Set(both).size === 2,
+    "with a DISTINCT key, so a reconciler cannot settle it against the first hold's comment",
+    JSON.stringify(both));
+  check(both.includes(first[0]),
+    "control: the first hold's key is still there, unchanged",
+    JSON.stringify({ first, both }));
+  db.close();
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

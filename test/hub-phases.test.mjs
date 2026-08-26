@@ -445,20 +445,20 @@ const EVIDENCE = [
     nextPhase({ phase: "BLOCKED", generation: 1, heldFrom: "IMPLEMENTING", ...state },
               { kind: "founder.resume", redesign: false, ...extra });
 
-  const draining = resume({}, { drainRemaining: 2 });
+  const draining = resume({}, { drainRemaining: 2, drainBeforeStop: 2 });
   check(draining.ok === false, "a resume with effects still draining is refused",
     JSON.stringify(draining));
   check(/drain/i.test(draining.refusal ?? ""), "and says so", String(draining.refusal));
 
   const redesign = nextPhase({ phase: "BLOCKED", generation: 1, heldFrom: "IMPLEMENTING",
-                              drainRemaining: 2 },
+                              drainRemaining: 2, drainBeforeStop: 2 },
                              { kind: "founder.resume", redesign: true });
   check(redesign.ok === false, "a REDESIGN resume is refused for the same reason",
     JSON.stringify(redesign));
 
   // CONTROL: with the drain settled, both resumes go through -- or "waits for
   // the drain" has become "never resumes".
-  const plain = resume({}, { drainRemaining: 0 });
+  const plain = resume({}, { drainRemaining: 0, drainBeforeStop: 0 });
   check(plain.ok === true, "control: a settled drain resumes", JSON.stringify(plain));
   const rd = nextPhase({ phase: "BLOCKED", generation: 1, heldFrom: "IMPLEMENTING",
                          drainRemaining: 0 },

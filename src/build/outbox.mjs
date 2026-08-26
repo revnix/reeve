@@ -20,6 +20,7 @@
 import { hubTx, hubEvent, canonicalHub } from "./hubdb.mjs";
 import { assertWritable } from "./locks.mjs";
 import { isSameProcess } from "../supervisor.mjs";
+import { ACTIVE } from "./phases.mjs";
 // ONE backoff policy for the whole system. `src/db/ops.mjs` already owns it and
 // `src/build/locks.mjs` already imports from there, so a second curve defined
 // here would be two answers to one question -- and the one this file needed was
@@ -64,6 +65,57 @@ export const KEY_KINDS = Object.freeze(["git.push.branch", "gh.pr.merge"]);
 // drain row only when its effect reaches one of these: a retryable failure
 // returns the row to `pending`, and marking its drain settled there would let a
 // task reach CANCELLED with the effect still queued to run again.
+/**
+ * May this effect still be DELIVERED?
+ *
+ * The generation fence answers a different question. A redesign bumps the
+ * generation, so an effect decided under the old contract is fenced -- but a
+ * HOLD, a CANCELLATION, an infeasibility and a lost claim all leave the
+ * generation ALONE, deliberately: they stop the task without redefining its
+ * contract. So `leaseEffect`'s generation check passes for an effect enqueued
+ * before the stop, and a task the founder has stopped could still push, comment
+ * or merge.
+ *
+ * `void-pending` was supposed to cover this and cannot reach the whole set: it
+ * marks `pending` rows, and an effect INFLIGHT when the stop commits is not one.
+ * When its worker reports a retryable failure the row went back to `pending` and
+ * became deliverable again -- so the gap was not a missed row, it was a row that
+ * came back.
+ *
+ * CANCELLABLE ONLY, which is the column's existing meaning: a push mid-transport
+ * is `cancellable = 0` because the bytes may already be on the wire, and
+ * abandoning it is not a compensation. Those still finish. Everything the task
+ * could safely abandon stops being deliverable the moment the task stops.
+ *
+ * ACTIVE is the whole of it -- HELD, DRAINING and TERMINAL are every other
+ * phase -- so this cannot drift as phases are added.
+ */
+const stillDeliverable = (db, row) => {
+  if (!row.cancellable) return true;
+  if (!row.task_id) return true;                 // not a task's effect
+  const t = db.prepare("SELECT phase FROM task WHERE id = ?").get(row.task_id);
+  if (!t) return true;                           // no task row: the FK decides, not this
+  if (ACTIVE.includes(t.phase)) return true;
+
+  // THE STOP'S OWN EFFECTS ARE NOT WHAT IT STOPS.
+  //
+  // A hold enqueues the comment that EXPLAINS the hold; a cancellation enqueues
+  // the close and its notice. Those are the compensations of the very transition
+  // that stopped the task, and suppressing them would silence the explanation
+  // the stop exists to give -- the first version of this predicate did exactly
+  // that, and it was found by the hold-then-resume test rather than by reading.
+  //
+  // `fence` is the phase_event seq that enqueued the row, and the stop's own
+  // compensations carry the stopping transition's seq. So an effect enqueued AT
+  // OR AFTER the moment the task stopped belongs to the stop; anything earlier
+  // is work the task was doing, and that is what must not continue.
+  const stoppedAt = db.prepare(
+    `SELECT max(seq) s FROM phase_event
+      WHERE task = ? AND to_phase NOT IN (${ACTIVE.map(p => `'${p}'`).join(",")})`)
+    .get(row.task_id)?.s ?? null;
+  return stoppedAt === null ? true : row.fence >= stoppedAt;
+};
+
 const TERMINAL_OUTBOX = Object.freeze(
   ["done", "failed", "dead_letter", "voided", "fenced", "refused", "superseded", "forced"]);
 
@@ -228,6 +280,21 @@ export function leaseEffect(db, { worker, leaseSeconds = 300, capabilities = {},
         continue;
       }
 
+      // A TASK THAT HAS STOPPED DELIVERS NOTHING IT COULD ABANDON. The
+      // generation fence above cannot answer this: a hold, a cancellation, an
+      // infeasibility and a lost claim all leave the generation alone, so an
+      // effect enqueued before the stop still matches it.
+      if (!stillDeliverable(db, row)) {
+        db.prepare(
+          `UPDATE outbox SET status='fenced', worker=NULL,
+                             last_error=?, updated_at=unixepoch() WHERE id=?`)
+          .run("the task is no longer active; a cancellable effect is not delivered after it stops",
+               row.id);
+        emitRow(db, "outbox.fenced", row.id);
+        settleDrainFor(db, row.id);
+        continue;
+      }
+
       // A switch the founder has not turned on is CONFIGURATION, not a fault: it
       // burns no attempt and raises no escalation, and it is terminal, because
       // retrying a decision the operator made is not recovery.
@@ -292,6 +359,12 @@ export function settleEffect(db, { id, worker, leaseToken, ok, result = null,
 
     let status;
     if (ok) status = "done";
+    // NOT BACK INTO THE QUEUE FOR A STOPPED TASK. `void-pending` marks `pending`
+    // rows and cannot reach one that was INFLIGHT when the stop committed -- so
+    // the gap was never a missed row, it was a row that came BACK. Fenced here
+    // rather than left pending for `leaseEffect` to catch, because a pending row
+    // keeps its task's drain outstanding and `fenced` is terminal for a drain.
+    else if (retryable && !stillDeliverable(db, row)) status = "fenced";
     else if (retryable && row.attempts < row.max_attempts) status = "pending";
     else status = row.attempts >= row.max_attempts ? "dead_letter" : "failed";
 
@@ -405,7 +478,41 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
       // could observe was leased, expired and requeued for ever, performing an
       // externally ambiguous action every round. The bound is on the ROW, so
       // every path that writes `pending` has to honour it.
-      const spent = row.attempts >= row.max_attempts;
+      // A STOPPED TASK'S EFFECT IS FENCED HERE TOO, for the same reason as the
+      // settle path: this is the other way a row leaves `inflight`.
+      if (!stillDeliverable(db, row)) {
+        db.prepare(
+          `UPDATE outbox SET status='fenced', worker=NULL, lease_expires_at=0,
+                             last_error=?, updated_at=unixepoch() WHERE id=?`)
+          .run("the task is no longer active; a cancellable effect is not delivered after it stops",
+               row.id);
+        emitRow(db, "outbox.fenced", row.id);
+        settleDrainFor(db, row.id);
+        stale++;                      // counted, not silently dropped
+        continue;
+      }
+
+      // THE DELIVERY BUDGET DOES NOT RATION THE READ THAT COULD SAVE US.
+      //
+      // `attempts` counts DELIVERIES -- each one a POST that could duplicate an
+      // external act. A reconciler that could not LOOK has performed no delivery
+      // and can only ever conclude "still cannot tell", so charging it to that
+      // budget makes the safe act as scarce as the dangerous one. Spending it
+      // dead-letters the row and settles its drain, and the task then proceeds
+      // as though nothing happened -- while the effect may have landed on one of
+      // those attempts and nobody will ever look again. CANCELLED becomes
+      // reachable with a push or a merge outstanding, which is the single thing
+      // the drain exists to prevent.
+      //
+      // So a reconcile that ERRORED never spends the budget. The row goes back
+      // with a backoff and is asked again. It is unbounded on purpose: the
+      // alternative is discarding a possibly-delivered effect, and a task whose
+      // drain will not settle is FAIL-CLOSED and visible in `task why`, while a
+      // dead-lettered one is fail-open and silent. A separate durable reconcile
+      // budget is the right long-term shape and needs a column; this is the half
+      // that does not need one, and the comment is here so the next reader knows
+      // which half is missing.
+      const spent = !verdict?.reconcileError && row.attempts >= row.max_attempts;
       // BACKED OFF LIKE ANY OTHER RETRY. A row returned here is due immediately,
       // and `leaseEffect` takes every pending row whose schedule is due -- so an
       // effect requeued because the external service was UNREACHABLE was leased

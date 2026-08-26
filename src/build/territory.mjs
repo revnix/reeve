@@ -122,8 +122,18 @@ export const conflictRefusal = (claim, lease) =>
  * that holds when a scan is skipped, reordered, or added to later.
  */
 export function grantLease(db, { project, claim, taskId, at, pinned = false,
-                                 seconds = LEASE_SECONDS }) {
+                                 pinnedUntil = undefined, seconds = LEASE_SECONDS }) {
   const until = at + seconds;
+  // THE PIN'S DEADLINE IS NOT THE LEASE'S. A lease is renewed by working; a pin
+  // is a promise with an END, and deriving it from `at + seconds` on every grant
+  // renews it every time the holder resumes -- so a time-boxed pin never
+  // expires. `pinnedUntil` lets a caller carry the ORIGINAL deadline forward.
+  // Omitted, it behaves as before and takes the lease's expiry, which is right
+  // for a FIRST grant: that is the moment the promise is made.
+  //
+  // An explicit null means "pinned no longer", which is how an expired pin
+  // regrants unpinned rather than being silently renewed.
+  const pinUntil = pinned ? (pinnedUntil === undefined ? until : pinnedUntil) : null;
   // EVERY column the insert would have set, `pinned_until` included. Leaving it
   // out let a replacement keep the previous holder's pin -- or its absence --
   // while that column is the only home of the pin, so a reaper reading it acted
@@ -142,7 +152,7 @@ export function grantLease(db, { project, claim, taskId, at, pinned = false,
                           AND l.kind    = territory_lease.kind
                           AND l.path    = territory_lease.path
                           AND ${LEASE_IS_LIVE})`)
-    .run(project, claim.kind, claim.path, taskId, until, pinned ? until : null);
+    .run(project, claim.kind, claim.path, taskId, until, pinUntil);
 
   const row = db.prepare(
     `SELECT ${LEASE_COLS} FROM territory_lease WHERE project=? AND kind=? AND path=?`)

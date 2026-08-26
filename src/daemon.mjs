@@ -929,6 +929,24 @@ export async function tick(ctx) {
   if (logPath !== ctx.logPath) ctx = { ...ctx, logPath };
   const decisions = [];
   const escalations = new Map();
+  /**
+   * Raise a cause. The count is the VALUE and can never be part of the key.
+   *
+   * `announceable` treats a changed key as a new cause and a changed value as the
+   * same cause with a new shape, so a volatile number interpolated into the key
+   * turns one standing outage into a stream of alerts, each of which retires the
+   * last as though it had been resolved. `deadLetterCause` was written to fix
+   * exactly that, and three sites drifted back afterwards -- two with a queue
+   * depth in the key, one setting a shared key to 1 per pull request so the last
+   * iteration overwrote the rest and the notification never said how many were
+   * affected.
+   *
+   * Correcting the third instance of a shape is not the fix; removing the way to
+   * write it is. `set` is not called directly any more: every raise goes through
+   * here, accumulates rather than overwrites, and takes the count as an argument
+   * so that putting it in the key requires deliberately going around this.
+   */
+  const raise = (cause, n = 1) => escalations.set(cause, (escalations.get(cause) ?? 0) + n);
 
   if (halted(ctx.haltMarker)) {
     log(logPath, `HALTED: ${ctx.haltMarker} exists — no work will be started`);
@@ -1063,9 +1081,21 @@ export async function tick(ctx) {
         // why it is read ONCE, after the drain, rather than before and after.
 
 
-        const due = db.prepare(`SELECT count(*) n FROM outbox
-                                WHERE (status='pending' AND not_before<=unixepoch())
-                                   OR (status='inflight' AND lease_expires_at<unixepoch())`).get().n;
+        // Counted over the kinds this build can actually DRAIN.
+        //
+        // Unfiltered, a due row whose kind has no handler here -- or one gated off
+        // by `reviewActions` -- made the daemon mint a token for work the drainer
+        // deliberately will not lease. Harmless when authentication works, and
+        // actively misleading when it does not: the tick then reports that
+        // credentials are blocking an effect that no credential would have moved,
+        // and never reaches the drainer's accurate "pending with no handler" line.
+        // The same filter the drainer leases by, so the two cannot disagree about
+        // what is drainable.
+        const kinds = Object.keys(permitted);
+        const due = kinds.length ? db.prepare(`SELECT count(*) n FROM outbox
+                                WHERE kind IN (${kinds.map(() => "?").join(",")})
+                                  AND ((status='pending' AND not_before<=unixepoch())
+                                    OR (status='inflight' AND lease_expires_at<unixepoch()))`).get(...kinds).n : 0;
         if (!due) { /* nothing to carry; do not mint a token to find that out */ }
         else {
         const auth = await (ctx.authenticate ?? authenticate)(nwo);
@@ -1077,7 +1107,10 @@ export async function tick(ctx) {
           // request can wait forever without anything reaching the notification
           // channel. Missing credentials and an uninstalled App both land here, and
           // neither fixes itself.
-          escalations.set(`${due} queued effect(s) cannot be performed: reeve cannot authenticate — ${auth.why}`, 1);
+          // The DEPTH is the count, not part of the cause. With it interpolated,
+          // every change in the queue while an outage persisted was a brand new
+          // cause: another notification, and the previous one retired as resolved.
+          raise(`queued effect(s) cannot be performed: reeve cannot authenticate — ${auth.why}`, due);
         } else {
           const api = (args, opts) => apiAsInstallation(auth.token, args, opts);
           // `auth.actor` is the login reeve's own comments carry. A handler needs it
@@ -1116,10 +1149,14 @@ export async function tick(ctx) {
         // Counted from the store rather than carried from above, because the
         // throw may have happened before `due` was read.
         try {
-          const stuck = db.prepare(`SELECT count(*) n FROM outbox
-                                    WHERE (status='pending' AND not_before<=unixepoch())
-                                       OR (status='inflight' AND lease_expires_at<unixepoch())`).get().n;
-          if (stuck) escalations.set(`${stuck} queued effect(s) cannot be performed: the drain is failing — ${err.message}`, 1);
+          // Filtered like `due` above, and for the same reason: a row this build
+          // cannot perform is not evidence that the drain is failing.
+          const kinds = Object.keys(permitted);
+          const stuck = kinds.length ? db.prepare(`SELECT count(*) n FROM outbox
+                                    WHERE kind IN (${kinds.map(() => "?").join(",")})
+                                      AND ((status='pending' AND not_before<=unixepoch())
+                                        OR (status='inflight' AND lease_expires_at<unixepoch()))`).get(...kinds).n : 0;
+          if (stuck) raise(`queued effect(s) cannot be performed: the drain is failing — ${err.message}`, stuck);
         } catch { /* a store that cannot be read must not take the tick down */ }
       }
     }
@@ -1147,7 +1184,7 @@ export async function tick(ctx) {
     // then clear it as resolved.
     try {
       for (const d of deadLetters())
-        escalations.set(deadLetterCause(d.kind), d.prs);
+        raise(deadLetterCause(d.kind), d.prs);
     } catch { /* an unreadable store is reported by the audit, not by crashing here */ }
   };
 
@@ -1370,7 +1407,11 @@ export async function tick(ctx) {
     const { effects, unsummonable, retire } = effectsFor({ nwo, e, decision, profile, execute });
     for (const login of unsummonable) {
       log(logPath, `  #${pr}: ${login} BLOCKS this pull request and declares no trigger comment — reeve cannot summon them`);
-      escalations.set(`${login} blocks merges but declares no trigger comment, so reeve cannot request their review`, 1);
+      // ACCUMULATED. The key is shared by design -- one reviewer misconfigured
+      // once, however many pull requests they block -- so setting it to 1 per pull
+      // request meant the last iteration overwrote the rest, the alert never said
+      // how many were affected, and it never re-announced when that number grew.
+      raise(`${login} blocks merges but declares no trigger comment, so reeve cannot request their review`);
     }
     const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire });
     if (effects.length && !decided.ok) {
@@ -1379,7 +1420,7 @@ export async function tick(ctx) {
       // dispatched for the action, no row exists to spend an attempt or become a
       // dead letter, and the pull request simply waits. A locked, read-only or
       // full database is a state that does not fix itself.
-      escalations.set(`#${pr}: reeve could not record the review request it decided to make — ${decided.why}`, 1);
+      raise(`#${pr}: reeve could not record the review request it decided to make — ${decided.why}`);
     }
     else if (decided.queued)
       log(logPath, `  #${pr}: REQUEST_REVIEW — queued ${decided.queued} trigger comment(s) for reeve to post`
@@ -1405,7 +1446,7 @@ export async function tick(ctx) {
 
     // A shared cause is one problem, not N. Four PRs blocked on a red base is a
     // single escalation, or the phone becomes noise and gets muted.
-    if (decision.shared) escalations.set(decision.why, (escalations.get(decision.why) ?? 0) + 1);
+    if (decision.shared) raise(decision.why);
     else if (decision.action === ACTIONS.ESCALATE) {
       // "The same failure survived a second fix" assumes a fix was attempted. When
       // the previous worker declined -- because the change belonged to a human --
@@ -1413,7 +1454,7 @@ export async function tick(ctx) {
       // bad fix that was never made. The reason it gave is carried on the ledger
       // row for exactly this moment.
       const note = fp ? fixAttemptNote(db, nwo, pr, fp) : null;
-      escalations.set(note ? `#${pr}: needs a human — ${note}` : `#${pr}: ${decision.why}`, 1);
+      raise(note ? `#${pr}: needs a human — ${note}` : `#${pr}: ${decision.why}`);
     }
   }
 
@@ -1433,7 +1474,7 @@ export async function tick(ctx) {
   if (execute && wanted.length && !containment) containment = await measuredContainment(ctx, profile, nwo, logPath);
   if (execute && wanted.length && containment.credentialRead !== "closed") {
     log(logPath, `execute: NOT dispatching ${wanted.length} worker task(s) — worker containment is open: ${containment.why}`);
-    escalations.set("guardian:containment:open", 1);
+    raise("guardian:containment:open");
   }
 
   if (execute && wanted.length && containment.credentialRead === "closed") {
@@ -1454,14 +1495,14 @@ export async function tick(ctx) {
       if (decision.action === "REQUEST_REVIEW" && execute && reviewActionsOn(profile)) continue;
       if (UNBUILT_ACTIONS[decision.action]) {
         log(logPath, `  #${e.pr}: NOT dispatching ${decision.action} — ${UNBUILT_ACTIONS[decision.action]}`);
-        escalations.set(`#${e.pr}: ${decision.action.toLowerCase().replace("_", " ")} needs a GitHub effect reeve does not yet perform`, 1);
+        raise(`#${e.pr}: ${decision.action.toLowerCase().replace("_", " ")} needs a GitHub effect reeve does not yet perform`);
         continue;
       }
       const prepKey = e.pr;
       const backoff = PREP_BACKOFF.get(prepKey);
       if (backoff && backoff.until > Date.now() && WORKER_ACTIONS.includes(decision.action)) {
         log(logPath, `  #${e.pr}: NOT dispatching — worker preparation failed ${backoff.failures} time(s); backing off until ${new Date(backoff.until).toISOString()}`);
-        escalations.set(`#${e.pr}: the worker could not be prepared; reeve is backing off`, 1);
+        raise(`#${e.pr}: the worker could not be prepared; reeve is backing off`);
         continue;
       }
       if (started >= cap.canStart) { log(logPath, `  capacity reached; ${decisions.length - started} decision(s) deferred to the next tick`); break; }
@@ -1482,7 +1523,7 @@ export async function tick(ctx) {
         // identity; the run ids and job names go to the log.
         const flake = flakeAssessment(nwo, cause, ctx.flakeProbe);
         if (flake.allFlaky) {
-          escalations.set(`#${e.pr}: every failing check is a demonstrated flake — reeve will not pay a fixer for randomness`, 1);
+          raise(`#${e.pr}: every failing check is a demonstrated flake — reeve will not pay a fixer for randomness`);
           log(logPath, `  #${e.pr}: NOT dispatching — demonstrated flake: ${flake.flaky.map(p => `${p.job} (run ${p.runId})`).join(", ")}`);
           continue;
         }
@@ -1516,7 +1557,7 @@ export async function tick(ctx) {
       const repoCheckout = profile.identity?.checkout ?? null;
       if (!checkoutRoot || !repoCheckout) {
         const why = !checkoutRoot ? "no identity.worktreeRoot in the profile" : "no identity.checkout in the profile — a checkout is made FROM a clone";
-        escalations.set(`#${e.pr}: cannot dispatch — ${why}`, 1);
+        raise(`#${e.pr}: cannot dispatch — ${why}`);
         log(logPath, `  #${e.pr}: NOT dispatching — ${why}`);
         continue;
       }
@@ -1697,7 +1738,7 @@ export async function tick(ctx) {
         });
         if (!reval.ok) {
           log(logPath, `  #${e.pr}: NOT dispatching — ${reval.why}`);
-          escalations.set("guardian:containment:changed", 1);
+          raise("guardian:containment:changed");
           // The attempt is NOT refunded here: this is an UNBOUND outcome, and the
           // finally block below refunds every pre-execution outcome once. Doing
           // it in both places took a cause from two attempts to zero and handed
@@ -1730,7 +1771,7 @@ export async function tick(ctx) {
         if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
         const prev = PREP_BACKOFF.get(prepKey)?.failures ?? 0;
         PREP_BACKOFF.set(prepKey, { failures: prev + 1, until: Date.now() + Math.min(PREP_BACKOFF_CAP_MS, PREP_BACKOFF_BASE_MS * 2 ** prev) });
-        escalations.set(`#${e.pr}: the worker could not be prepared; reeve is backing off`, 1);
+        raise(`#${e.pr}: the worker could not be prepared; reeve is backing off`);
       } finally {
         clearInterval(beat);
         // Classified FIRST, before anything is recorded: a binding refused
@@ -1753,7 +1794,7 @@ export async function tick(ctx) {
           if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
           const prev = PREP_BACKOFF.get(prepKey)?.failures ?? 0;
           PREP_BACKOFF.set(prepKey, { failures: prev + 1, until: Date.now() + Math.min(PREP_BACKOFF_CAP_MS, PREP_BACKOFF_BASE_MS * 2 ** prev) });
-          escalations.set(`#${e.pr}: the worker could not be prepared; reeve is backing off`, 1);
+          raise(`#${e.pr}: the worker could not be prepared; reeve is backing off`);
         }
         // The flag, not the reason string: a recorder that fails for the same
         // cause rewrites the reason, and a backoff inferred from it vanished.
@@ -1840,8 +1881,8 @@ export async function tick(ctx) {
       const cfg = (ctx.verifyConfig ?? verifyConfig)(worktree);
       if (!cfg.ok) {
         log(logPath, `  #${e.pr}: NOT reading or publishing this checkout — ${cfg.why}`);
-        escalations.set(`#${e.pr}: the worker changed its checkout's git configuration; the checkout is preserved at ${worktree} for inspection`, 1);
-        escalations.set("guardian:checkout:config-tampered", 1);
+        raise(`#${e.pr}: the worker changed its checkout's git configuration; the checkout is preserved at ${worktree} for inspection`);
+        raise("guardian:checkout:config-tampered");
         continue;
       }
 
@@ -1861,7 +1902,7 @@ export async function tick(ctx) {
             : branchAt === null ? `left ${e.headRef} unreadable`
             : `committed on ${e.headRef} without finishing`;
           log(logPath, `  #${e.pr}: the worker ${why} — ${rel.quarantined ? `preserved at ${rel.path}` : "released"}`);
-          escalations.set(`#${e.pr}: an unfinished candidate fix was preserved rather than published — ${left?.length ? left.slice(0, 3).join(", ") : `commits on ${e.headRef}`}`, 1);
+          raise(`#${e.pr}: an unfinished candidate fix was preserved rather than published — ${left?.length ? left.slice(0, 3).join(", ") : `commits on ${e.headRef}`}`);
         } else {
           releaseRunCheckout(worktree, { workFetched: true });
         }
@@ -1920,7 +1961,7 @@ export async function tick(ctx) {
         if (!landed.ok) {
           const rel = releaseRunCheckout(worktree, { workFetched: false });
           log(logPath, `  #${e.pr}: NOT published — reeve could not commit the work: ${landed.why}${rel.quarantined ? `; preserved at ${rel.path}` : ""}`);
-          escalations.set(`#${e.pr}: a finished fix was NOT published — reeve could not commit it: ${landed.why}`, 1);
+          raise(`#${e.pr}: a finished fix was NOT published — reeve could not commit it: ${landed.why}`);
           continue;
         }
         if (landed.committed) log(logPath, `  #${e.pr}: committed ${landed.files.length} file(s) the worker left in the checkout`);
@@ -1939,8 +1980,8 @@ export async function tick(ctx) {
             : `the worker finished with ${stillDirty.length} uncommitted change(s), which a push cannot carry`;
           const rel = releaseRunCheckout(worktree, { workFetched: false });
           log(logPath, `  #${e.pr}: NOT published — ${why}${rel.quarantined ? `; preserved at ${rel.path}` : ""}`);
-          escalations.set(`#${e.pr}: a finished fix was NOT published — ${why}` +
-                          `${stillDirty?.length ? ` (${stillDirty.slice(0, 3).join(", ")})` : ""}`, 1);
+          raise(`#${e.pr}: a finished fix was NOT published — ${why}` +
+                `${stillDirty?.length ? ` (${stillDirty.slice(0, 3).join(", ")})` : ""}`);
           continue;
         }
         // Against the ref that will actually be PUSHED, not against HEAD.
@@ -1955,7 +1996,7 @@ export async function tick(ctx) {
         if (!atRef) {
           const rel = releaseRunCheckout(worktree, { workFetched: false });
           log(logPath, `  #${e.pr}: NOT published — ${e.headRef} cannot be read in the checkout${rel.quarantined ? `; preserved at ${rel.path}` : ""}`);
-          escalations.set(`#${e.pr}: a finished fix was NOT published — reeve could not read ${e.headRef} in the worker's checkout`, 1);
+          raise(`#${e.pr}: a finished fix was NOT published — reeve could not read ${e.headRef} in the worker's checkout`);
           continue;
         }
         const changed = changedFiles(worktree, e.head, publishRef);
@@ -1969,9 +2010,9 @@ export async function tick(ctx) {
           // one outcome the rules asked for. Its own reason is the only witness
           // to why it stopped, so it is the one a human is given.
           const blocker = statedBlocker(r.report);
-          escalations.set(blocker
+          raise(blocker
             ? `#${e.pr}: needs a human — ${blocker}`
-            : `#${e.pr}: a fix was produced but refused publication — ${gate.why}`, 1);
+            : `#${e.pr}: a fix was produced but refused publication — ${gate.why}`);
         } else {
           // Before reeve puts its name on it: the worker had a working token in
           // its environment and every runtime needed to read it. A filename gate
@@ -1980,8 +2021,8 @@ export async function tick(ctx) {
           if (leak) {
             const rel = releaseRunCheckout(worktree, { workFetched: false });
             log(logPath, `  #${e.pr}: NOT published — ${leak.why}${rel.quarantined ? `; preserved at ${rel.path}` : ""}`);
-            escalations.set(`#${e.pr}: a fix was refused publication because ${leak.why}; rotate the token with \`claude setup-token\``, 1);
-            escalations.set("guardian:worker:credential-in-diff", 1);
+            raise(`#${e.pr}: a fix was refused publication because ${leak.why}; rotate the token with \`claude setup-token\``);
+            raise("guardian:worker:credential-in-diff");
             continue;
           }
           // reeve publishes, not the worker: the actor and the only claim that
@@ -1990,13 +2031,13 @@ export async function tick(ctx) {
                                                                branch: e.headRef, expectedRemote: e.head });
           if (!pushed.ok) {
             log(logPath, `  #${e.pr}: NOT published — ${pushed.why}`);
-            escalations.set(`#${e.pr}: a fix was produced but could not be published — ${pushed.why}`, 1);
+            raise(`#${e.pr}: a fix was produced but could not be published — ${pushed.why}`);
           } else {
             log(logPath, `  #${e.pr}: published ${changed.length} file(s)` + (refused.length ? ` (${refused.length} call(s) refused along the way)` : ""));
             // Published, and still escalated: CI at the new head is the check that
             // matters, and a fix nothing ran the tests over should be watched.
             if (couldNotVerify)
-              escalations.set(`#${e.pr}: a fix was published but the worker could not run the project's checks — watch CI at the new head`, 1);
+              raise(`#${e.pr}: a fix was published but the worker could not run the project's checks — watch CI at the new head`);
             // Only ever release what pushed cleanly. Anything else quarantines,
             // because a directory holding work nobody has a copy of is not spare
             // disk space.
@@ -2010,7 +2051,7 @@ export async function tick(ctx) {
 
       // A worker whose tools were denied wrote a plausible answer it could not
       // support. Treating that as progress is the fail-open this exists to close.
-      if (r.outcome === OUTCOMES.RATE_LIMITED) { escalations.set("the provider is rate limiting; work is paused", 1); break; }
+      if (r.outcome === OUTCOMES.RATE_LIMITED) { raise("the provider is rate limiting; work is paused"); break; }
     }
   }
 
@@ -2089,7 +2130,7 @@ export async function tick(ctx) {
     // already cleared it. Between backup attempts there is nothing to recreate
     // the finding, and absence within a tick is what the layer below reads as
     // resolved.
-    for (const line of (ctx.backupFailures ?? new Map()).values()) escalations.set(line, 1);
+    for (const line of (ctx.backupFailures ?? new Map()).values()) raise(line);
   }
 
   // AFTER the backup, deliberately. Running it first meant the audit reported a
@@ -2113,7 +2154,7 @@ export async function tick(ctx) {
       home: ctx.home ?? dirname(logPath ?? join(resolveHome(), "x")),
     })) {
       log(logPath, `self: ${f.level} ${f.why}${f.detail ? ` — ${f.detail}` : ""}`);
-      escalations.set(f.why, f.count ?? 1);
+      raise(f.why, f.count ?? 1);
     }
   }
 

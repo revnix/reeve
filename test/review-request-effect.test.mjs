@@ -9,7 +9,7 @@
 // repeated tick at one head must not ask twice while a NEW head must ask again.
 import { reviewActionsOn, effectsFor, deadLetterCause, finishedSubjects } from "../src/daemon.mjs";
 import { open, tx, enqueue, supersedeEffects, sha256 } from "../src/db/ops.mjs";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -382,6 +382,49 @@ const check = (ok, name, detail) => {
 
   db2.close();
   rmSync(d, { recursive: true, force: true });
+}
+
+// --- a count belongs in the VALUE, and there is now one way to raise ---------
+{
+  // Third instance of one shape, so the fix is to remove the way to write it.
+  //
+  // `announceable` reads a changed KEY as a new cause and a changed VALUE as the
+  // same cause with a new shape. Put a volatile number in the key and one standing
+  // outage becomes a stream of alerts, each retiring the last as though it had
+  // been resolved. `deadLetterCause` exists because that happened; two sites then
+  // interpolated a queue depth into the key anyway, and a third set a shared key
+  // to 1 per pull request so the last iteration overwrote the rest.
+  //
+  // Correcting the third instance is not the fix. `escalations.set` is not called
+  // directly anywhere in the daemon any more: every raise goes through a helper
+  // that accumulates and takes the count as a separate argument, so writing the
+  // count into the key means deliberately going around it. Asserted MECHANICALLY,
+  // over the source, because that is what the rule actually is -- one identifier,
+  // one call site.
+  const daemon = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
+  const direct = daemon.split("\n")
+    .map((line, i) => [i + 1, line])
+    .filter(([, line]) => line.includes("escalations.set(") && !line.includes("const raise ="));
+  check(direct.length === 0,
+    "nothing raises an escalation except the helper that keeps the count out of the key",
+    direct.map(([n, l]) => `${n}: ${l.trim()}`).join(" | "));
+  check(/const raise = \(cause, n = 1\) =>/.test(daemon),
+    "control: and the helper is present, so the check above is not vacuous", "");
+  // Control: the scan can see a direct call when there IS one. Without this a
+  // renamed map would read as compliance.
+  check(["escalations.set(x, 1);"].filter(l => l.includes("escalations.set(")).length === 1,
+    "control: the scan recognises a direct call", "");
+
+  // And the behaviour the rule protects: the same cause, raised for two pull
+  // requests, is ONE escalation carrying two -- not two escalations, and not one
+  // that says 1.
+  const seen = new Map();
+  const raise = (cause, n = 1) => seen.set(cause, (seen.get(cause) ?? 0) + n);
+  raise("codex blocks merges but declares no trigger comment");
+  raise("codex blocks merges but declares no trigger comment");
+  check(seen.size === 1 && seen.get("codex blocks merges but declares no trigger comment") === 2,
+    "two pull requests blocked by one misconfigured reviewer raise one cause counting two",
+    JSON.stringify([...seen]));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

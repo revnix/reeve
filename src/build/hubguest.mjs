@@ -178,6 +178,17 @@ function refuseBadTransactions(sql) {
  * flag on the handle: the handle simply does not have the other methods.
  */
 export function openHubAsGuest(path) {
+  // THE MODULE CHECKS ITS OWN PRECONDITION, rather than trusting a floor
+  // declared somewhere else. `engines` is advisory -- npm warns and installs
+  // anyway unless the operator opted into engine-strict -- and `bin/reeve`'s
+  // runtime check protects the CLI, not an import from anywhere else. This
+  // module's whole promise is that the connection it returns is restrained, so
+  // it must not return one it could not restrain. Fail closed and say why.
+  if (typeof DatabaseSync.prototype.setAuthorizer !== "function")
+    throw new Error(
+      `node ${process.versions.node} has no DatabaseSync.setAuthorizer (added in 24.10.0), so the ` +
+      `guardian's hub connection cannot be restricted; refusing to open an unrestricted one`);
+
   // THE SAME BUSY TIMEOUT AS EVERY OTHER HUB CONNECTION. `openHub` opens with
   // `{ timeout: 10000 }`; a guest on SQLite's default of zero fails instantly
   // with SQLITE_BUSY the moment a builder or a restore holds the write lock for

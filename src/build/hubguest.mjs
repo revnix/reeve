@@ -47,9 +47,15 @@ const OP = new Map([
 // "may a SELECT run at all" check -- the tables it touches arrive separately as
 // READs, which is what makes a join, a subquery and a UNION all visible.
 // FUNCTION covers `unixepoch()` and `count()`, without which nothing here runs.
+// The only SQL functions the scheduler's statements use. SQLite's built-in set
+// varies by build and release, so authorising the ACTION rather than the NAME
+// silently widens this surface every time the runtime gains a function -- and
+// the point of a default-deny allowlist is that new capability arrives refused
+// rather than granted.
+const FUNCTIONS_OK = new Set(["count", "unixepoch", "max", "coalesce"]);
+
 const TABLELESS_OK = new Set([
   constants.SQLITE_SELECT,
-  constants.SQLITE_FUNCTION,
   constants.SQLITE_RECURSIVE,
   // Shape is enforced by the scanner below, because the authorizer cannot see
   // it: measured on node v24.17.0, every flavour of BEGIN -- IMMEDIATE,
@@ -74,12 +80,24 @@ export function stripSql(sql) {
   let out = "";
   for (let i = 0; i < sql.length; ) {
     const c = sql[i], d = sql[i + 1];
-    if (c === "'" || c === '"') {
+    // EVERY QUOTING FORM SQLITE HAS, not just the two that look like strings.
+    //
+    // SQLite also quotes IDENTIFIERS with backticks and with square brackets, and
+    // a comment marker inside one of those is no more a comment than one inside a
+    // string. Handling only ' and " left a real bypass of the single thing this
+    // module exists to prevent: `SELECT count(*) AS ` + "`--`" + ` FROM
+    // provider_state; BEGIN EXCLUSIVE` had everything after the marker stripped,
+    // so the scanner saw one harmless statement, and `exec` then ran both and
+    // opened an EXCLUSIVE transaction -- blocking the builder and every restore.
+    // Verified by reproducing it before the fix.
+    if (c === "'" || c === '"' || c === "`" || c === "[") {
+      const close = c === "[" ? "]" : c;
       // A doubled quote inside a literal is an escaped quote, not the end of it.
+      // Brackets do not nest and have no escape, so the first ] closes them.
       out += " "; i++;
       while (i < sql.length) {
-        if (sql[i] === c && sql[i + 1] === c) { out += "  "; i += 2; continue; }
-        if (sql[i] === c) { out += " "; i++; break; }
+        if (close !== "]" && sql[i] === close && sql[i + 1] === close) { out += "  "; i += 2; continue; }
+        if (sql[i] === close) { out += " "; i++; break; }
         out += sql[i] === "\n" ? "\n" : " "; i++;
       }
       continue;
@@ -160,9 +178,28 @@ function refuseBadTransactions(sql) {
  * flag on the handle: the handle simply does not have the other methods.
  */
 export function openHubAsGuest(path) {
-  const db = new DatabaseSync(path);
-  db.setAuthorizer((action, arg1) => {
+  // THE SAME BUSY TIMEOUT AS EVERY OTHER HUB CONNECTION. `openHub` opens with
+  // `{ timeout: 10000 }`; a guest on SQLite's default of zero fails instantly
+  // with SQLITE_BUSY the moment a builder or a restore holds the write lock for
+  // an instant. The guardian treats a scheduler exception as FAIL-OPEN and
+  // dispatches unscheduled, so routine write contention would quietly defeat the
+  // global quota this connection exists to enforce.
+  //
+  // Set BEFORE the authorizer is installed, because the authorizer denies PRAGMA
+  // -- correctly, since a guest must not reach the schema sideways. The
+  // constructor option and the pragma say the same thing; both are set because
+  // `openHub` sets both and a guest that behaved differently under contention
+  // would be a second answer to the same question.
+  const db = new DatabaseSync(path, { timeout: 10000 });
+  db.exec("PRAGMA busy_timeout = 10000");
+  db.setAuthorizer((action, arg1, arg2) => {
     if (TABLELESS_OK.has(action)) return constants.SQLITE_OK;
+    // THE NAME IS arg2 FOR SQLITE_FUNCTION, measured rather than assumed: SQLite
+    // passes NULL as the third C argument for this action and the function name
+    // as the fourth, so arg1 is null here and reading it denied `count` -- which
+    // is the first function every one of these statements uses.
+    if (action === constants.SQLITE_FUNCTION)
+      return FUNCTIONS_OK.has(String(arg2).toLowerCase()) ? constants.SQLITE_OK : constants.SQLITE_DENY;
     const op = OP.get(action);
     if (!op) return constants.SQLITE_DENY;          // DROP, ATTACH, PRAGMA, everything else
     return (ALLOWED[arg1] ?? []).includes(op) ? constants.SQLITE_OK : constants.SQLITE_DENY;

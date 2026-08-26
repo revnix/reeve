@@ -105,18 +105,30 @@ const refused = [
 // TypeError on the RAW handle too, so "it threw" is satisfied by the very thing
 // this is meant to exclude -- six of these seven passed against an unwrapped
 // DatabaseSync. The question is whether the method is reachable at all.
-for (const m of ["setAuthorizer", "applyChangeset", "deserialize", "loadExtension", "enableLoadExtension",
-                 "createSession", "serialize"]) {
+const SEALED = ["setAuthorizer", "applyChangeset", "deserialize", "loadExtension",
+                "enableLoadExtension", "createSession", "serialize"];
+for (const m of SEALED) {
   check(typeof g[m] !== "function",
     `refused: the non-statement API ${m}() is not present on the guest`,
     `typeof g.${m} === ${typeof g[m]}`);
 }
 // CONTROL: the raw handle DOES have them, so the assertions above are about the
 // facade rather than about node:sqlite having dropped the methods.
+//
+// DERIVED FROM THIS BUILD, not asserted against a fixed name. `serialize` is
+// absent on some Node 24.x that satisfy the package's `>=24` engine, so naming
+// it made a correctly sealed facade fail the suite on a supported runtime -- a
+// control that reports a defect in the thing it is controlling for. The property
+// is "the facade hides what the raw handle has", and which methods the raw
+// handle has is the build's business.
 {
   const raw = openHub(join(dir, "raw.db"));
-  check(typeof raw.setAuthorizer === "function" && typeof raw.serialize === "function",
-    "control: an ordinary hub connection does expose them");
+  const rawHas = SEALED.filter(m => typeof raw[m] === "function");
+  check(rawHas.length > 0,
+    "control: an ordinary hub connection exposes some of them, so the facade is hiding something real",
+    JSON.stringify({ rawHas }));
+  check(typeof raw.setAuthorizer === "function",
+    "control: including setAuthorizer, which this module depends on and every supported build has");
   raw.close();
 }
 // And the facade's surface is exactly what it means to be: anything added here
@@ -140,6 +152,16 @@ for (const [sql, name] of [
   ["SELECT '--'; BEGIN EXCLUSIVE", "an exclusive BEGIN behind a line-comment marker in a LITERAL"],
   ["SELECT '/*'; BEGIN EXCLUSIVE", "an exclusive BEGIN behind a block-comment marker in a LITERAL"],
   ["SAVEPOINT sp", "a savepoint"],
+  // QUOTED IDENTIFIERS, which are not string literals and were not handled. A
+  // comment marker inside one is no more a comment than one inside a string, and
+  // this exact statement was ACCEPTED before the fix -- it opened an exclusive
+  // transaction, blocking the builder and every restore.
+  ["SELECT count(*) AS `--` FROM provider_state; BEGIN EXCLUSIVE",
+   "an exclusive BEGIN behind a comment marker in a BACKTICK identifier"],
+  ["SELECT count(*) AS [--] FROM provider_state; BEGIN EXCLUSIVE",
+   "an exclusive BEGIN behind a comment marker in a BRACKET identifier"],
+  ["SELECT count(*) AS `x;y` FROM provider_state; BEGIN EXCLUSIVE",
+   "an exclusive BEGIN behind a semicolon in a backtick identifier"],
 ]) {
   for (const via of ["prepare", "exec"]) {
     let why = null; try { g[via](sql); } catch (e) { why = e.message; }
@@ -164,9 +186,21 @@ for (const [sql, name] of [
   ["UPDATE provider_state SET last_signature = 'x--y' WHERE provider='claude'", "a comment marker inside a literal"],
   ["SELECT * FROM provider_lease WHERE run_ref = 'it''s'", "a doubled-quote escape"],
   ["SELECT count(*) c FROM provider_state -- trailing comment", "a genuine trailing comment"],
+  ["SELECT count(*) AS `total` FROM provider_state", "a backtick-quoted identifier"],
+  ["SELECT count(*) AS [total] FROM provider_state", "a bracket-quoted identifier"],
 ]) {
   let ok = true, why = null; try { g.prepare(sql); } catch (e) { ok = false; why = e.message; }
   check(ok, `control: ordinary SQL with ${name} is still permitted`, `${sql} :: ${why}`);
+}
+
+// The function surface is an allowlist too. SQLite's built-in set varies by
+// build, so authorising the ACTION rather than the NAME widens this quietly
+// every time the runtime gains a function.
+{
+  let denied = null; try { g.prepare("SELECT fts3_tokenizer('simple')"); } catch (e) { denied = e.message; }
+  check(denied !== null, "a function outside the scheduler's set is refused", String(denied));
+  let ok = true; try { g.prepare("SELECT count(*), unixepoch() FROM provider_state"); } catch { ok = false; }
+  check(ok, "control: the ones its own statements use are permitted");
 }
 
 // The stripper on its own, because the two literal cases above pass for the
@@ -207,6 +241,29 @@ for (const [sql, name] of refused) {
   let ok = true; try { owner.prepare("SELECT * FROM task"); } catch { ok = false; }
   check(ok, "control: an ordinary hub connection reads task normally");
   owner.close();
+}
+
+// The guest waits for the write lock like every other hub connection. On
+// SQLite's default of zero it fails instantly with SQLITE_BUSY the moment a
+// builder or a restore holds the lock for an instant -- and the guardian treats
+// a scheduler exception as fail-open, so routine contention would dispatch
+// unscheduled and defeat the quota this connection exists to enforce.
+{
+  // PRAGMA is denied to a guest by design, so the timeout cannot be read back
+  // through this connection. It is asserted through BEHAVIOUR instead, which is
+  // the property that matters anyway: a competing writer holds the lock and the
+  // guest WAITS rather than failing at once.
+  const holder = openHub(p);
+  holder.exec("BEGIN IMMEDIATE");
+  const started = Date.now();
+  let why = null;
+  try { openHubAsGuest(p).exec("BEGIN IMMEDIATE"); } catch (e) { why = e.message; }
+  const waited = Date.now() - started;
+  try { holder.exec("ROLLBACK"); } catch {}
+  holder.close();
+  check(why !== null && waited >= 50,
+    "the guest WAITS for a contended write lock rather than failing instantly",
+    JSON.stringify({ waitedMs: waited, why: String(why).slice(0, 60) }));
 }
 
 g.close();

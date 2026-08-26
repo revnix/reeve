@@ -30,6 +30,11 @@ const ADDED_COLUMNS = [
   // correct -- an unleased row has no holder to fence out. `RESHAPED` is for a
   // changed UNIQUE constraint and refuses a non-empty table; this is neither.
   ["outbox", "lease_token", "INTEGER NOT NULL DEFAULT 0"],
+  // The reconciliation budget, kept apart from the delivery budget. Additive and
+  // defaulted like the fence: an existing row starts at 0 reconciliations, which
+  // is exactly true of every row written before the column existed.
+  ["outbox", "reconcile_attempts", "INTEGER NOT NULL DEFAULT 0"],
+  ["outbox", "max_reconcile", "INTEGER NOT NULL DEFAULT 3"],
 ];
 
 function addMissingColumns(db) {
@@ -427,13 +432,27 @@ export function leaseOutbox(db, { worker, leaseSeconds = 300, kinds = null }) {
   // untouched and visible -- `pendingWithNoHandler` counts exactly those.
   if (Array.isArray(kinds) && kinds.length === 0) return undefined;
   const filter = Array.isArray(kinds) ? ` AND kind IN (${kinds.map(() => "?").join(",")})` : "";
+  // The lease bumps whichever counter the row's PHASE names, and the phase is read
+  // from the row as it stood BEFORE this statement. SQLite evaluates every
+  // assignment's right-hand side against the original row, so both CASEs see the
+  // same pre-lease `attempts` and exactly one of them can be 1.
+  //
+  // Deciding the phase from the returned `attempts` instead would be wrong by one:
+  // a row leased at `max_attempts - 1` comes back with `attempts = max_attempts`,
+  // and a caller testing `attempts >= max_attempts` would refuse to deliver on the
+  // very attempt the budget had just granted. `reconcile_attempts > 0` cannot be
+  // ambiguous that way -- it is only ever bumped in the reconciling phase.
   return tx(db, () => db.prepare(`
-    UPDATE outbox SET status='inflight', attempts=attempts+1, lease_token=lease_token+1,
+    UPDATE outbox SET status='inflight', lease_token=lease_token+1,
+           attempts = attempts + (CASE WHEN attempts >= max_attempts THEN 0 ELSE 1 END),
+           reconcile_attempts = reconcile_attempts
+                              + (CASE WHEN attempts >= max_attempts THEN 1 ELSE 0 END),
            lease_expires_at=unixepoch()+?, updated_at=unixepoch()
     WHERE id = (SELECT id FROM outbox
                 WHERE status='pending' AND not_before<=unixepoch()${filter}
                 ORDER BY id LIMIT 1)
-    RETURNING id, idem_key, kind, run_id, args, attempts, max_attempts, lease_token`)
+    RETURNING id, idem_key, kind, run_id, args, attempts, max_attempts,
+              reconcile_attempts, max_reconcile, lease_token`)
     .get(leaseSeconds, ...(Array.isArray(kinds) ? kinds : [])));
 }
 
@@ -468,7 +487,8 @@ export function settleOutbox(db, { id, leaseToken, ok, result, error, retryable 
   if (!Number.isInteger(leaseToken))
     throw new Error("settleOutbox: leaseToken is required; an unfenced settle can overwrite another drainer's live delivery");
   return tx(db, () => {
-    const row = db.prepare(`SELECT attempts, max_attempts, kind, lease_token, status FROM outbox WHERE id=?`).get(id);
+    const row = db.prepare(`SELECT attempts, max_attempts, reconcile_attempts, max_reconcile,
+                                   kind, lease_token, status FROM outbox WHERE id=?`).get(id);
     // A row that is gone, or one whose fence has moved on, is not this caller's to
     // settle. Reported rather than thrown: a drainer losing a race is an ordinary
     // event, and the loser's job is to stop touching the row, not to crash.
@@ -482,13 +502,29 @@ export function settleOutbox(db, { id, leaseToken, ok, result, error, retryable 
       emit(db, { actor, op: "outbox.done", payload: { id, kind: row.kind } });
       return "done";
     }
-    const dead = !retryable || row.attempts >= row.max_attempts;
+    // A retryable failure in the DELIVERY phase never ends here, however many
+    // attempts it has spent. Spending the delivery budget moves the row on to
+    // reconciliation; it does not condemn it.
+    //
+    // It used to. `attempts >= max_attempts` meant the final POST reaching GitHub
+    // and losing only its response -- a `gh` timeout after the comment was created
+    // -- was recorded as an effect reeve could not perform, and escalated, while
+    // the comment sat on the pull request. Nothing was ever going to look again,
+    // because looking is what the reconciling phase is for and the row never
+    // reached it. Only the reconciliation budget is a reason to give up on a
+    // retryable failure, because only reconciliation has already asked GitHub what
+    // happened and been unable to find out.
+    const reconciling = row.reconcile_attempts > 0;
+    const dead = !retryable || (reconciling && row.reconcile_attempts >= row.max_reconcile);
     db.prepare(`UPDATE outbox SET status=?, last_error=?, not_before=unixepoch()+?,
                 lease_expires_at=0, updated_at=unixepoch() WHERE id=? AND lease_token=?`)
       .run(dead ? "dead_letter" : "pending", String(error).slice(0, 2000),
-           dead ? 0 : backoffSeconds(row.attempts), id, leaseToken);
+           dead ? 0 : backoffSeconds(reconciling ? row.reconcile_attempts : row.attempts),
+           id, leaseToken);
     emit(db, { actor, op: dead ? "outbox.dead_letter" : "outbox.retry",
-               payload: { id, kind: row.kind, attempts: row.attempts } });
+               payload: { id, kind: row.kind, attempts: row.attempts,
+                          reconcileAttempts: row.reconcile_attempts,
+                          phase: reconciling ? "reconcile" : "deliver" } });
     return dead ? "dead_letter" : "retry";
   });
 }
@@ -510,26 +546,31 @@ export function settleOutbox(db, { id, leaseToken, ok, result, error, retryable 
  */
 export function recoverOutbox(db) {
   return tx(db, () => {
-    // `>` and not `>=`, which buys exactly one reconciliation pass.
+    // Judged on the RECONCILIATION budget, never on the delivery one.
     //
-    // The final allowed lease can post the comment and then crash before settling.
-    // At that point `attempts` equals `max_attempts`, so dead-lettering here
-    // records a delivered effect as one reeve "could not perform" -- and escalates
-    // it -- while GitHub already contains it. The handler's marker pre-check is the
-    // only thing that can tell the difference, and it needs a lease to run.
+    // The final allowed delivery can post the comment and then crash before
+    // settling. Dead-lettering on `attempts` at that point records a delivered
+    // effect as one reeve "could not perform" -- and escalates it -- while GitHub
+    // already contains the comment. The handler's marker pre-check is the only
+    // thing that can tell the difference, and it needs a lease to run.
     //
-    // So an exhausted row goes back to pending once. Its next lease bumps
-    // `attempts` past the budget, the pre-check either finds the marker and settles
-    // `done` without posting, or it does not and `settleOutbox` dead-letters on the
-    // budget it has now exceeded. One extra pass, and it still terminates.
+    // A single extra lease was the first answer to that and it was one short: the
+    // reconciling lease can itself crash, after confirming the marker and before
+    // settling, and the next recovery then condemned a confirmed delivery on an
+    // unrelated process failure. So reconciliation has a budget of its own and is
+    // retried like anything else. It still terminates -- `reconcile_attempts` only
+    // rises, and no lease is granted once it reaches `max_reconcile` -- and it is
+    // bounded work in any case, because a reconciling lease reads and never posts.
     const dead = db.prepare(`
       UPDATE outbox SET status='dead_letter', lease_expires_at=0, updated_at=unixepoch(),
-             last_error=coalesce(last_error,'') || ' | recovered past max_attempts without ever settling'
-      WHERE status='inflight' AND lease_expires_at < unixepoch() AND attempts > max_attempts
-      RETURNING id, kind, attempts`).all();
+             last_error=coalesce(last_error,'') || ' | recovered with the reconciliation budget spent and no delivery ever confirmed'
+      WHERE status='inflight' AND lease_expires_at < unixepoch()
+        AND reconcile_attempts >= max_reconcile
+      RETURNING id, kind, attempts, reconcile_attempts`).all();
     for (const d of dead)
       emit(db, { actor: "drainer", op: "outbox.dead_letter",
-                 payload: { id: d.id, kind: d.kind, attempts: d.attempts, why: "crash-loop" } });
+                 payload: { id: d.id, kind: d.kind, attempts: d.attempts,
+                            reconcileAttempts: d.reconcile_attempts, why: "crash-loop" } });
     const back = db.prepare(`
       UPDATE outbox SET status='pending', updated_at=unixepoch()
       WHERE status='inflight' AND lease_expires_at < unixepoch() RETURNING id`).all();

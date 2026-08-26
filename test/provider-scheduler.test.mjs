@@ -29,17 +29,46 @@ const ALIVE = () => true, DEAD = () => false;
   const g = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 1, lstart: "A", isAlive: ALIVE });
   check(g.ok, "a guardian claim is admitted", JSON.stringify(g));
 
+  // THE RESERVATION IS TWO BOUNDS, NOT ONE. This assertion used to read "a
+  // builder claim is refused when held leases reach limit minus
+  // guardian_reserved (2-1=1)", which tested the TOTAL against the BUILDER's
+  // ceiling -- so a guardian admitted first put the total at 1 and the builder
+  // was refused although the unreserved slot was free, while the reverse order
+  // admitted both. Same two requests, same limits, different answer depending on
+  // who asked first, and a slot idle whenever guardians arrived first.
   const b = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 2, lstart: "B", isAlive: ALIVE });
-  check(!b.ok && b.reason === "at-limit",
-    "a builder claim is refused when held leases reach limit minus guardian_reserved (2-1=1)", JSON.stringify(b));
+  check(b.ok, "a builder still gets the UNRESERVED slot while the guardian holds the reserved one",
+    JSON.stringify(b));
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE status='held'").get().c === 2,
+    "so both fit under a limit of 2 with 1 reserved");
+
+  // The ceiling is on BUILDER-OWNED leases, so a second builder is refused.
+  const b2 = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:2", pid: 3, lstart: "C", isAlive: ALIVE });
+  check(!b2.ok && b2.reason === "at-limit",
+    "and a SECOND builder is refused: the builder ceiling is limit minus reserved", JSON.stringify(b2));
+
+  // ORDER INDEPENDENCE, asserted directly rather than inferred from two blocks
+  // that happen to agree. The same requests in the opposite order must reach the
+  // same state, or usable capacity depends on who asked first.
+  {
+    const rev = openHub(join(dir, "p1o.db"));
+    const rb = claimProvider(rev, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 2, lstart: "B", isAlive: ALIVE });
+    const rg = claimProvider(rev, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 1, lstart: "A", isAlive: ALIVE });
+    check(rb.ok && rg.ok, "control: builder-then-guardian admits both as well", JSON.stringify({ rb, rg }));
+    check(rev.prepare("SELECT count(*) c FROM provider_lease WHERE status='held'").get().c === 2,
+      "control: and reaches the same held count either way round");
+    rev.close();
+  }
 
   // THE CLAIM HANDS BACK WHAT THE RELEASE NEEDS. `claimProvider` returns the
   // identity alongside the id precisely so a caller never has to release by an
   // integer a restore can renumber, and passing the whole result is the shape
   // production should copy.
   releaseProvider(db, g);
-  const b2 = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 2, lstart: "B", isAlive: ALIVE });
-  check(b2.ok, "control: once the guardian releases, the builder is admitted");
+  const after = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:2", pid: 3, lstart: "C", isAlive: ALIVE });
+  check(!after.ok,
+    "control: releasing the GUARDIAN does not raise the builder ceiling -- a reservation is not a total",
+    JSON.stringify(after));
   db.close();
 }
 
@@ -510,6 +539,25 @@ const ALIVE = () => true, DEAD = () => false;
   noteRateLimit(db, { signature: "longer", now: 1020, cooldownSeconds: 900 });
   check(db.prepare("SELECT cooldown_until FROM provider_state WHERE provider='claude'").get().cooldown_until === 1920,
     "control: a longer cooldown DOES extend it");
+
+  // AND THE METADATA MOVES FORWARD ONLY. Observations can commit out of order --
+  // one daemon retrying an event stamped earlier than one another daemon has
+  // already written -- and an unconditional assignment walks the timestamp
+  // backwards and names an older throttle as the most recent. The cooldown stays
+  // correct either way; the diagnostic that says WHAT threw last would lie.
+  noteRateLimit(db, { signature: "late-arriving-older", now: 1005, cooldownSeconds: 60 });
+  const st2 = db.prepare("SELECT last_429_at, last_signature FROM provider_state WHERE provider='claude'").get();
+  check(st2.last_429_at === 1020 && st2.last_signature === "longer",
+    "an observation that commits LATE but is stamped earlier does not become the latest",
+    JSON.stringify(st2));
+  // CONTROL: a genuinely newer one still takes over, or "forward only" has
+  // become "never update".
+  noteRateLimit(db, { signature: "newest", now: 1030, cooldownSeconds: 60 });
+  const st3 = db.prepare("SELECT last_429_at, last_signature FROM provider_state WHERE provider='claude'").get();
+  check(st3.last_429_at === 1030 && st3.last_signature === "newest",
+    "control: and a genuinely newer observation does", JSON.stringify(st3));
+  check(db.prepare("SELECT cooldown_until FROM provider_state WHERE provider='claude'").get().cooldown_until === 1920,
+    "control: while neither of them shortened the standing cooldown");
   db.close();
 }
 

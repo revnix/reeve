@@ -167,15 +167,63 @@ const offendersIn = text => {
     // A label carrying an em-dash gloss ("capability 1 — watch, judge, escalate")
     // is policed by its stem, which is the part prose actually reuses.
     .map(s => s.split(" — ")[0].trim());
+  // §0.1's COMMANDS are subjects too, and leaving them out was a real gap.
+  //
+  // The rule §0 states is that a fact a command can answer must not be written
+  // down. The guard only policed §0.2's table, so §0.2's subjects were enforced
+  // and §0.1's were not -- and a sentence asserting yesterday's `doctor` outcome
+  // sat outside §0 through a passing run of this very test. The half of §0 that
+  // matters MORE was the unpoliced half.
+  //
+  // Derived from the block rather than listed here, so adding a command to §0.1
+  // starts policing it with no second place to remember. Only tokens long enough
+  // to be distinctive: `git`, `gh`, `ps` and `grep` appear in correct prose
+  // everywhere, and a guard that fires on right text is weakened until it catches
+  // nothing.
+  const commands = [...new Set(
+    (/```bash\n([\s\S]*?)```/.exec(zero)?.[1] ?? "")
+      .split("\n")
+      // A TRAILING comment is still a comment. Splitting the whole line pulled
+      // prose out of `grep ... # the review shadow streak` and started policing
+      // the word "review", which fires on correct text in both documents.
+      .map(l => l.split("#")[0].trim())
+      .filter(Boolean)
+      // The executable and its subcommand only. Arguments are paths, flags and
+      // repository names, none of which is the name of a question.
+      .flatMap(l => l.split(/\s+/).slice(0, 2))
+      .map(w => w.replace(/^\.?\/?(?:bin\/)?/, "").replace(/[^\w-]/g, ""))
+      .filter(w => w.length >= 6 && /^[a-z][\w-]*$/.test(w)))];
+  check(commands.length >= 2, "control: §0.1's command block yielded commands to police",
+    commands.join(" / "));
+
   check(subjects.length >= 4, "control: §0's table yielded subjects to police",
     `${subjects.length}: ${subjects.join(" / ")}`);
 
+  // A claim about a COMMAND is judged per SENTENCE, not per block.
+  //
+  // The block-scoped exemption is right for a table subject: a paragraph that
+  // defers to §0 is discussing the subject, not restating it. It is wrong here,
+  // and measurably so. The sentence this whole widening exists to catch --
+  // "doctor reports the repository declares squash while 8 of the last 20 commits
+  // are merge commits" -- sat in a paragraph that already ended with "see §0.1",
+  // so a block-scoped test waved it through, and I confirmed that by putting the
+  // sentence back and watching the guard stay green. A paragraph can defer to §0
+  // and still copy an answer out of it, so the deferral has to be in the same
+  // breath as the claim.
+  const CLAIM = c => new RegExp(
+    `\\b${c}\\b[^.]{0,40}\\b(reports?|said|says?|shows?|returns?|answers?|reported|broken|degraded|clean|zero|empty)\\b`, "i");
   const offenders = [];
   for (const [label, text] of [[HANDOFF, handoff.replace(/^## 0\. STATE[\s\S]*?(?=^## )/m, "")], [PROMPT, prompt]])
     for (const b of blocksOf(text)) {
       const joined = b.lines.join(" ");
+      for (const sentence of joined.split(/(?<=[.!?])\s+/)) {
+        if (/§0/.test(sentence.replace(/\(§0\)/g, ""))) continue;
+        const named = commands.filter(c => CLAIM(c).test(sentence));
+        if (named.length) offenders.push(`${label}:${b.nums[0]} claims a "${named[0]}" outcome — ${sentence.trim().slice(0, 70)}`);
+      }
       if (/§0/.test(joined.replace(/\(§0\)/g, ""))) continue;
-      const named = subjects.filter(s => joined.toLowerCase().includes(s.toLowerCase()));
+      const lower = joined.toLowerCase();
+      const named = subjects.filter(s => lower.includes(s.toLowerCase()));
       if (named.length) offenders.push(`${label}:${b.nums[0]} names "${named[0]}" — ${joined.trim().slice(0, 70)}`);
     }
   check(offenders.length === 0, "no block outside §0 names a §0 subject without deferring to it",

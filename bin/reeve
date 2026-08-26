@@ -156,9 +156,17 @@ const registryProjects = (home) => {
 // profile describing it -- the two halves of one project's configuration read
 // from different roots, which is unusable for a test and wrong for an operator.
 
-const [major] = process.versions.node.split(".").map(Number);
-if (major < 24) {
-  console.error(`reeve: node ${process.versions.node} — node:sqlite is only unflagged and unwarned from 24. Use 24 or newer.`);
+// 24.10, not 24. `node:sqlite` is unflagged and unwarned from 24 -- which is
+// what this floor used to say -- but `DatabaseSync.setAuthorizer` arrived in
+// 24.10.0, and the guardian's hub connection is built on it. On 24.0 through
+// 24.9, which the old `>=24` engine range admitted, opening that connection
+// throws a TypeError before it can return anything. A floor that admits a
+// runtime the code cannot run on is not a floor.
+const [major, minor] = process.versions.node.split(".").map(Number);
+if (major < 24 || (major === 24 && minor < 10)) {
+  console.error(`reeve: node ${process.versions.node} — node:sqlite is unflagged from 24, and ` +
+                `DatabaseSync.setAuthorizer (which the guardian's hub connection needs) from 24.10. ` +
+                `Use 24.10 or newer.`);
   process.exit(1);
 }
 

@@ -244,6 +244,49 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       **The durable finding is about plan SIZE**: a plan needing four rounds and
       still finding sixteen defects at the fourth is one document doing three
       documents' work.
+- [ ] **S2-C PR-C2, the guardian's hub guest — BUILT (2026-08-26).** Branch
+      `feat/s2c-hub-guest`, stacked on **PR-C1** rather than on main, because
+      Task 23a's test imports `claimProvider` to assert a real admission
+      completes through the guest connection. Task **23a only**:
+      `src/build/hubguest.mjs` and `test/guardian-hub-allowlist.test.mjs`.
+      **Creates two files and modifies none.** Task 23b — the structural control
+      that no privileged `openHub(` remains in `bin/reeve` or `src/daemon.mjs` —
+      is deliberately NOT here: the plan's own split puts it after Task 22,
+      because the assertion needs the wiring to exist first.
+
+      Section 13 says the guardian's hub surface is exactly two touches. This
+      makes that provable rather than argued: the connection refuses anything
+      outside the allowlist. `maintenance_lock` is included and is not a third
+      surface — it is the precondition on the two the guardian already has, since
+      every hub writer checks the lock before writing.
+
+      **The plan's claims about `node:sqlite` were measured, not trusted**, and
+      all held: 17 methods on `DatabaseSync`, `setAuthorizer` present, denials in
+      exactly two shapes (`not authorized` and `access to X.Y is prohibited`),
+      and the authorizer sees through joins, subqueries, unions and semicolons.
+      It reports `"BEGIN"` for **every** transaction flavour, so shape is caught
+      by a text scanner that understands comments and string literals.
+
+      **Two defects found by executing rather than reading:**
+      - `prepare` compiles only the FIRST statement, so
+        `SELECT * FROM provider_lease; SELECT * FROM task` reached a forbidden
+        table through a door the authorizer never sees.
+      - A denied multi-statement `exec` had already run what came before it:
+        `BEGIN IMMEDIATE; DELETE FROM approval` opened a write transaction, was
+        refused on the delete, and left the guest holding the hub's write lock
+        with nothing to release it.
+
+      One rule closed both: **the guest takes exactly one statement per call.**
+      Nothing the scheduler issues needs more.
+
+      Three stub loops, four checks each. The regex-instead-of-tokenizer stub
+      failed the refusals AND the control that ordinary SQL with `'a;b'` still
+      works — the under-fix and the over-fix caught by one block. The
+      raw-handle stub also exposed a fault in this test: six of seven API
+      assertions had passed against an unwrapped `DatabaseSync`, because calling
+      those methods with no arguments throws a TypeError anyway. They assert
+      ABSENCE now, with a control that a real connection does expose them.
+
 - [ ] **S2-C PR-C1, the provider admission rule — BUILT (2026-08-26).** Branch
       `feat/s2c-provider-admission`, based on `0fd2f9a` (S2-B's merge). Task 21
       of `docs/superpowers/plans/2026-08-23-s2c-provider-scheduler.md`:

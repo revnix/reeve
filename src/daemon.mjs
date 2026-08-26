@@ -1576,7 +1576,7 @@ export async function tick(ctx) {
     // that publishes an action-required merge-policy result. A builder-store
     // fault would then block every pull request in the repository over a table
     // that has no row for any of them.
-    const builderPr = isBuilderPr({ headRef: anchor?.headRef, authorIsApp: anchor?.authorIsApp });
+    const builderPr = isBuilderPr({ headRef: anchor?.headRef, authorLogin: anchor?.authorLogin });
     // AND THE FAILURE REASON TRAVELS. Passing a bare `null` when the hub could
     // not be opened made `computeVerdict` omit the clause entirely -- which reads
     // as "not asked" and lets the same tick publish a passing verdict or choose
@@ -2183,15 +2183,30 @@ export async function tick(ctx) {
             // The full identity, because `bindProviderLease` refuses anything
             // less: an id-only call matches nothing and returns a silent
             // `{ ok: true, bound: 0 }` wearing a success.
+            // A GATE, NOT AN OBSERVER -- and the first revision had this exactly
+            // backwards. `onSpawn` is called BEFORE `runWorker` releases the
+            // child's execution gate: a throw here means `withhold()`,
+            // `killGroup(SIGKILL)` and an UNBOUND outcome, which is the same
+            // treatment `bindRun` already gets one line above. The comment in
+            // `supervisor.mjs` states the rule: a worker whose binding could not
+            // be written is one a restart can neither adopt nor kill with
+            // confidence, so it does not get to run at all.
+            //
+            // Logging and continuing left the lease attached to the guardian's
+            // own always-alive pid -- so a guardian that died during a detached
+            // run left a row the reaper would collect while the worker was still
+            // spending the window. The whole point of rebinding.
+            //
+            // EXACTLY ONE ROW. `bindProviderLease` returns `{ ok: true, bound: 0 }`
+            // when its predicate matches nothing, which is a silent no-op wearing
+            // a success, and zero rebound is indistinguishable in effect from not
+            // having called it.
             if (prLease) {
-              try {
-                const b = (ctx.providerBind ?? bindProviderLease)(hub, { ...prLease, pid, lstart, isAlive: isSameProcess });
-                if (b?.ok === false) log(logPath, `  #${e.pr}: provider lease not rebound to the worker — ${b.reason}`);
-              } catch (err) {
-                // Never take the spawn down with it: the worker is already
-                // running, and an unbound lease expires on its own.
-                log(logPath, `  #${e.pr}: provider lease could not be rebound — ${err.message}`);
-              }
+              const b = (ctx.providerBind ?? bindProviderLease)(hub, { ...prLease, pid, lstart, isAlive: isSameProcess });
+              if (b?.ok === false)
+                throw new Error(`the provider lease could not be rebound to the worker: ${b.reason}`);
+              if (b?.bound !== 1)
+                throw new Error(`the provider lease rebind matched ${b?.bound ?? "no"} row(s); the lease would stay on the guardian`);
             }
           },
         });

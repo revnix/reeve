@@ -10,6 +10,9 @@ import { pinHead, readChecks, classify, settle, inheritedOrCaused, readTimeline,
 import { loadSettlement, saveSettlement } from "./db/ops.mjs";
 import { rootCause } from "./ci-rootcause.mjs";
 import { computeVerdict, renderVerdict, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
+// The builder App's name has one home already; the classifier reads it rather
+// than restating it.
+import { POLICY_APP } from "./github/reconciler.mjs";
 import { reviewState } from "./review/derive.mjs";
 import { compare } from "./review/shadow.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
@@ -289,11 +292,23 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
  * request green and mergeable. That is the exact failure the hold clause exists
  * to prevent.
  *
+ * The second signal is the App's LOGIN and not "is a bot": widening it to every
+ * bot account is the opposite error, and pulls every dependency and review bot
+ * into a table that has no row for any of them.
+ *
  * A SEGMENT PREFIX, not a string one. `mpx/not-ours` starts with `mp` and is
  * nobody's builder branch; matching on the string would claim it.
  */
-export function isBuilderPr({ headRef = null, authorIsApp = false } = {}) {
-  if (authorIsApp) return true;
+export function isBuilderPr({ headRef = null, authorLogin = null } = {}) {
+  // THE APP, not any bot. `user.type` is `Bot` for dependency bots, review bots
+  // and every other integration in the repository, so testing it marked every
+  // automated pull request as the builder's -- and during a hub or repository-id
+  // fault those PRs would take an UNKNOWN hold clause and an action-required
+  // policy result over `pr_hold` rows that can never exist for them. The
+  // identity is the App's login, and `POLICY_APP` is where that name already
+  // lives.
+  if (typeof authorLogin === "string" &&
+      authorLogin.toLowerCase() === `${POLICY_APP}[bot]`.toLowerCase()) return true;
   return typeof headRef === "string" && /^mp\//.test(headRef);
 }
 
@@ -301,17 +316,17 @@ export function prAnchor({ nwo, pr }) {
   // updated_at rides along so ingest can skip a pull request that has not moved.
   // It is GitHub's timestamp, so a change reeve has not seen yet still triggers a
   // read -- unlike a local clock, which would skip whatever it slept through.
-  // `.user.type` rides along for the builder classification below. Appended
+  // `.user.login` rides along for the builder classification below. Appended
   // rather than inserted: the destructuring below is positional, so a new field
   // in the middle silently shifts every one after it.
-  const meta = ghJson([`repos/${nwo}/pulls/${pr}`, "--jq", "[.head.ref,.base.ref,.state,.title,.updated_at,.user.type]|@tsv"]);
+  const meta = ghJson([`repos/${nwo}/pulls/${pr}`, "--jq", "[.head.ref,.base.ref,.state,.title,.updated_at,.user.login]|@tsv"]);
   if (!meta.ok) return { ok: false, why: meta.err.split("\n")[0] };
-  const [headRef, baseRef, state, title, updatedAt, authorType] = meta.out.split("\t");
+  const [headRef, baseRef, state, title, updatedAt, authorLogin] = meta.out.split("\t");
 
   const pin = pinHead(nwo, headRef);
   if (!pin.ok) return { ok: false, why: `could not pin head: ${pin.why}` };
   return { ok: true, headRef, baseRef, state, title, updatedAt, head: pin.sha, pin,
-           authorIsApp: authorType === "Bot" };
+           authorLogin };
 }
 
 export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}, hold = null }) {

@@ -1,3 +1,11 @@
+// NOT IN THE REVIEW ROTATION. Founder's decision, 2026-08-26: this file stays in
+// CI and keeps working, but it is not sent for another adversarial review round.
+// It reached ten rounds and forty-nine findings, and the last four were caused by
+// the previous round's fix — each change opens a new surface in English rather
+// than closing one in the code. It catches thirteen defect classes and spares
+// five kinds of durable prose, which is the point at which more review buys
+// edge cases in grammar at the cost of the capability reeve actually runs.
+//
 // The handoff's §0 is the only place that states current facts. This test is what
 // makes that true tomorrow rather than only today.
 //

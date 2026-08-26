@@ -78,6 +78,7 @@ this can tell you that its absence is deliberate.
 | the durable-effect stages | **1, 2 and 4 have landed. 3 has not.** §3.2 says what each one IS — this row is the only place that says which have landed. Stage 4 arrived out of order: wiring the projection gave `FIX_FINDINGS` its real thread list, so the stage defined as "thread details into FIX_FINDINGS" was complete before SPILL's own delivery was built |
 | the second project | `rextaihq/rext-backend` — **not started.** No profile, no store, nothing watching it |
 | the ntfy read user | **not created.** Needs shell on 95.217.11.127, which is the founder's |
+| the docs guard's review status | **out of the review rotation** since 2026-08-26. It stays in CI; it is not sent for further adversarial rounds. Ten rounds, forty-nine findings, and the last round's four came from the round before's fix |
 | the R-03 merge shape | **undecided.** The enquiry was done on 2026-08-22 (§6); choosing what this repository declares is the founder's, and has not been made |
 | capability 4 — refuse an unsafe merge | not started; needs a shadow week and the R-01 ruleset flip |
 | the builder daemon | not something this programme runs; S2 is a peer's lane, see §7 |

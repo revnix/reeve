@@ -23,7 +23,7 @@ import { assertWritable } from "./locks.mjs";
 // ONE claim model, shared with `applyTransition`'s resume path. See
 // territory.mjs for why admission and regrant may not each keep their own.
 import { overlaps, liveLeases, firstConflict,
-         conflictRefusal, grantLease } from "./territory.mjs";
+         conflictRefusal, grantLease, TERRITORY_COLS } from "./territory.mjs";
 // The admission snapshot's required fields, shared with the regenerate edge that
 // already refused an incomplete one. See phases.mjs.
 import { missingSnapshotFields } from "./phases.mjs";
@@ -340,7 +340,7 @@ export function admitTask(db, snapshot, filing, { isAlive = () => true } = {}) {
       // no territory to rebuild a lease from or to validate its diff against.
       hubEvent(db, { kind: "task_territory.claimed", task: filing.id,
         payload: db.prepare(
-          `SELECT task, kind, path, pinned FROM task_territory WHERE task=? AND kind=? AND path=?`)
+          `SELECT ${TERRITORY_COLS} FROM task_territory WHERE task=? AND kind=? AND path=?`)
           .get(filing.id, claim.kind, claim.path) });
 
       // AN EXPIRED ROW FOR THE SAME PATH IS NOT A CONFLICT, and a plain INSERT

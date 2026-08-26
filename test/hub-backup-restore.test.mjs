@@ -287,6 +287,10 @@ import { restoreHub } from "../src/backup.mjs";
 // suite threw before destroying or restoring anything.
 import { replayHub, replayableKinds, COMPARISON_SET } from "../src/build/replay.mjs";
 import { hubTx, hubEvent } from "../src/build/hubdb.mjs";
+// The legacy-tail pin block below needs the real grant, not a hand-built row:
+// the defect is about what a grant reads back, so a fixture that writes the
+// table directly never reaches it.
+import { grantLease } from "../src/build/territory.mjs";
 import { copyFileSync, openSync, writeSync, closeSync } from "node:fs";
 import { acquireSingleton, withWriterLease, acquireMaintenanceLock } from "../src/build/locks.mjs";
 import { createHash } from "node:crypto";
@@ -3067,6 +3071,99 @@ rmSync(home, { recursive: true, force: true });
   check(row?.repo_id === 1 && row?.pr === 7 && row?.slice === 0,
     "carrying its repository, number and slice", JSON.stringify(row));
   db.close();
+  rmSync(d, { recursive: true, force: true });
+}
+
+// ── a LEGACY tail does not resurrect a time-boxed pin ──────────────────────
+// `restoreHub` opens the staging database FIRST, which runs the migrations, and
+// replays the tail only afterwards. Migration 3 carries every pin's deadline
+// from its lease onto its claim -- so a task pinned after the snapshot was taken
+// arrives once that has already happened.
+//
+// A tail written by a v2 binary is the case that bites. Its
+// `task_territory.claimed` image predates the column and carries no
+// `pinned_until`; the `territory_lease.granted` image that follows holds the
+// deadline and never copies it across. The restore therefore ends in exactly the
+// state migration 3 exists to remove, having already run -- and the next regrant
+// reads "no deadline", treats itself as the first grant, and mints a fresh one
+// over a pin the founder had time-boxed.
+{
+  const d = mkdtempSync(join(tmpdir(), "reeve-legacy-pin-"));
+  const hp = join(d, "hub.db");
+  const bak = join(d, "backups");
+  const db = openHub(hp);
+  db.exec(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,generation,source_kind,source_key,
+             repo_path,profile_path,profile_hash,default_branch,visibility,registry_version,created_at,updated_at)
+           VALUES('bt:pin','p',1,'o/r','pinned','IMPLEMENTING',1,'founder','k','/p','/f','h','main','private',1,
+                  unixepoch(),unixepoch())`);
+  const snapSeqBefore = db.prepare("SELECT COALESCE(max(seq),0) s FROM hub_event").get().s;
+  mkdirSync(bak, { recursive: true });
+  const snap = join(bak, "1.db");
+  db.exec(`VACUUM INTO '${snap.replace(/'/g, "''")}'`);
+
+  // The pin is taken AFTER the snapshot, so it exists only in the tail.
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:pin','prefix','packages/x',1)`);
+  const at = db.prepare("SELECT unixepoch() n").get().n;
+  hubEvent(db, { kind: "task_territory.claimed", task: "bt:pin",
+    payload: db.prepare("SELECT task, kind, path, pinned, pinned_until FROM task_territory WHERE task='bt:pin'").get() });
+  // EVENTED THE WAY THE REAL WRITERS DO IT. `grantLease` does not emit the lease
+  // image itself -- `registry.mjs` and `transition.mjs` do, from its return value
+  // -- so a fixture that only calls it produces a tail with no lease in it and
+  // proves nothing about a lease the replay restores.
+  const granted = grantLease(db, { project: "p", claim: { kind: "prefix", path: "packages/x" },
+                                   taskId: "bt:pin", at, pinned: true });
+  hubEvent(db, { kind: "territory_lease.granted", task: "bt:pin", payload: granted });
+  const deadline = db.prepare("SELECT pinned_until FROM task_territory WHERE task='bt:pin'").get().pinned_until;
+  check(deadline != null, "fixture: the pin has a deadline before the hub is destroyed", String(deadline));
+
+  const events = db.prepare("SELECT seq,at,kind,task,payload FROM hub_event WHERE seq > ? ORDER BY seq")
+                   .all(snapSeqBefore);
+  // AGED DOWN TO A v2 BINARY'S OUTPUT: the only difference is the key that
+  // binary could not have written, because the column did not exist yet.
+  let stripped = 0;
+  for (const e of events) {
+    if (e.kind !== "task_territory.claimed") continue;
+    const img = JSON.parse(e.payload);
+    if (!("pinned_until" in img)) continue;
+    delete img.pinned_until;
+    e.payload = JSON.stringify(img);
+    stripped++;
+  }
+  // Without this the fixture is a v3 tail, the claim image carries the deadline,
+  // and the assertion below passes with the reconciliation removed -- proving
+  // nothing at all.
+  check(stripped > 0, "fixture: the tail's claim image really has no pinned_until in it",
+    `stripped ${stripped}`);
+  const lease = events.filter(e => e.kind === "territory_lease.granted")
+                      .map(e => JSON.parse(e.payload)).find(x => x.pinned_until != null);
+  check(lease != null, "fixture: the LEASE image still carries the deadline, which is the only copy left",
+    JSON.stringify(lease));
+
+  writeTail(join(d, "tail.jsonl"), events);
+  db.close();
+  rmSync(hp, { force: true });
+  for (const x of ["-wal", "-shm"]) rmSync(hp + x, { force: true });
+
+  const r = restoreHub(snap, hp, { isAlive: () => false, pid: process.pid, lstart: "L",
+                                   tail: readTail(join(d, "tail.jsonl")) });
+  check(r.ok === true, "the legacy tail restores", JSON.stringify(r));
+
+  const back = openHub(hp);
+  const got = back.prepare("SELECT pinned_until FROM task_territory WHERE task='bt:pin'").get();
+  check(got?.pinned_until === deadline,
+    "the restored pin keeps the deadline it was given, rather than losing it to the replay",
+    JSON.stringify({ got: got?.pinned_until, want: deadline }));
+
+  // AND THE CONSEQUENCE, not just the column. A NULL deadline is only a defect
+  // because the next grant mints a new one over it, so the assertion that
+  // matters is that regranting does not move the deadline.
+  grantLease(back, { project: "p", claim: { kind: "prefix", path: "packages/x" },
+                     taskId: "bt:pin", at: at + 1, pinned: true });
+  const after = back.prepare("SELECT pinned_until FROM task_territory WHERE task='bt:pin'").get();
+  check(after?.pinned_until === deadline,
+    "and a regrant reads that deadline back instead of resurrecting the pin with a fresh one",
+    JSON.stringify({ after: after?.pinned_until, want: deadline }));
+  back.close();
   rmSync(d, { recursive: true, force: true });
 }
 

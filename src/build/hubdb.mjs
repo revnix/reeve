@@ -23,12 +23,48 @@ import { createHash } from "node:crypto";
 // read it; two spellings of the same path is how they drift.
 const SCHEMA_PATH = new URL("./hub.sql", import.meta.url);
 
-export const HUB_SCHEMA_VERSION = 2;
+export const HUB_SCHEMA_VERSION = 3;
 
 /**
  * Forward-only. Each entry runs exactly once, in order, in its own transaction,
  * and records itself. Never edit a merged entry -- add the next number.
  */
+/**
+ * Move a pin's deadline from the LEASE onto the CLAIM, wherever that has not
+ * happened yet.
+ *
+ * A pin is one promise, and its deadline now lives on `task_territory` beside
+ * the intent. Anything still carrying the deadline only on `territory_lease`
+ * says "pinned" with no end once the lease goes, so the next grant reads "no
+ * deadline", treats itself as the first grant, and mints a fresh one --
+ * resurrecting a promise that was deliberately time-boxed.
+ *
+ * TWO CALLERS, ONE STATEMENT, and the second caller is why this is a function.
+ * Migration 3 runs it over whatever the store already holds. But `restoreHub`
+ * opens the staging database -- which runs the migration -- and only THEN
+ * replays the tail, so a task pinned after the snapshot arrives afterwards. A
+ * tail written by a v2 binary carries a `task_territory.claimed` image with no
+ * `pinned_until` in it, and the `territory_lease.granted` image that follows
+ * holds the deadline without ever copying it across. The restore therefore ends
+ * in exactly the state the migration exists to remove, having already run.
+ * Restore reconciles again after replay.
+ *
+ * Idempotent and safe to repeat: it touches only a pinned claim with no
+ * deadline whose lease has one, so a v3 tail -- whose claim image already
+ * carries the value -- matches nothing.
+ */
+export function backfillPinDeadlines(db) {
+  db.exec(`
+    UPDATE task_territory AS t
+       SET pinned_until = (SELECT l.pinned_until FROM territory_lease l
+                            WHERE l.task = t.task AND l.kind = t.kind AND l.path = t.path)
+     WHERE t.pinned = 1
+       AND t.pinned_until IS NULL
+       AND EXISTS (SELECT 1 FROM territory_lease l
+                    WHERE l.task = t.task AND l.kind = t.kind AND l.path = t.path
+                      AND l.pinned_until IS NOT NULL)`);
+}
+
 const MIGRATIONS = [
   { version: 1, up: (db) => db.exec(readFileSync(SCHEMA_PATH, "utf8")) },
   // ---------------------------------------------------------------- 2
@@ -99,6 +135,48 @@ const MIGRATIONS = [
       db.exec("DROP TABLE IF EXISTS impl_pr");
       if (hasColumn("task", "spec_pr"))   db.exec("ALTER TABLE task DROP COLUMN spec_pr");
       if (hasColumn("task", "spec_head")) db.exec("ALTER TABLE task DROP COLUMN spec_head");
+    } },
+  // ---------------------------------------------------------------- 3
+  // TWO FACTS THAT WERE SPLIT ACROSS PLACES WITH DIFFERENT LIFETIMES.
+  //
+  // Both defects below were found twice each -- once, patched at the site, and
+  // then again through a second door the site fix did not cover. That is the
+  // signal that the site was never the defect.
+  //
+  // 1. A PIN IS ONE PROMISE STORED AS TWO FACTS. `task_territory.pinned` records
+  //    that the filing ASKED for a pin and is durable; the deadline lived on
+  //    `territory_lease.pinned_until`, which dies with the lease row. So every
+  //    path that removes a lease loses the deadline and leaves the intent, and
+  //    the next resume reads "pinned" with no deadline and mints a fresh one --
+  //    resurrecting a pin the founder time-boxed. Found first through
+  //    `release-territory`, then again through `grantLease` REPLACING a
+  //    non-live holder's row, which never goes near the release path at all.
+  //    Putting the deadline beside the intent makes the two inseparable, and
+  //    both site patches are deleted.
+  //
+  // 2. A LEASE HAS NO INCARNATION. `restoreHub` clears `provider_lease` in the
+  //    restored file (src/backup.mjs), so SQLite restarts its integer keys and a
+  //    re-claim of the same run gets an identical (owner, repo_id, run_ref) AND
+  //    an identical id. Nothing distinguishes the new claim from the old, so a
+  //    pre-restore mutation replayed afterwards -- which the retry-on-maintenance
+  //    loop is exactly the caller to do -- deletes a live lease or corrupts its
+  //    liveness data. `outbox.lease_token` already solves this shape in this
+  //    codebase; `provider_lease` gets the same treatment.
+  { version: 3, up: (db) => {
+      // RE-RUNNABLE for the same reason migration 2 is: a store whose
+      // `schema_version` rows are lost while its tables survive replays every
+      // migration, and `ALTER TABLE ... ADD COLUMN` has no IF NOT EXISTS.
+      const hasColumn = (t, c) => db.prepare(
+        `SELECT count(*) c FROM pragma_table_info(?) WHERE name = ?`).get(t, c).c > 0;
+
+      if (!hasColumn("task_territory", "pinned_until"))
+        db.exec("ALTER TABLE task_territory ADD COLUMN pinned_until INTEGER");
+      // CARRIED FROM THE LEASE, so a hub mid-flight keeps the deadlines it has
+      // rather than silently re-minting them. Only live leases have one to give.
+      backfillPinDeadlines(db);
+
+      if (!hasColumn("provider_lease", "token"))
+        db.exec("ALTER TABLE provider_lease ADD COLUMN token TEXT");
     } },
 ];
 
@@ -599,7 +677,62 @@ const V1 = Object.freeze([
 // COUNT is unchanged and only the name moves. Built from V1 rather than restated,
 // which is what stops the two drifting.
 const V2 = Object.freeze([...V1.filter(t => t !== "impl_pr"), "task_pr"].sort());
-export const TABLES_AT = Object.freeze({ 1: V1, 2: V2 });
+// Migration 3 adds COLUMNS only -- `task_territory.pinned_until` and
+// `provider_lease.token` -- so the table inventory is V2's, unchanged. Aliased
+// rather than restated for the same reason V2 is built from V1: two lists that
+// must agree are two lists that can disagree.
+const V3 = V2;
+export const TABLES_AT = Object.freeze({ 1: V1, 2: V2, 3: V3 });
+
+/**
+ * The COLUMNS a version requires beyond its table set.
+ *
+ * A table-name inventory cannot describe migration 3, which adds no tables --
+ * so a snapshot recording version 3 while missing the new columns passed
+ * validation, including the deep one: `integrity_check` proves the FILE is
+ * structurally sound, and the version check proved the TABLES were present, and
+ * neither asks what shape those tables are. `openHub` then reads version 3 as
+ * completed, skips the migration, and the first pin or provider query fails with
+ * `no such column` -- after that snapshot had already been chosen for recovery,
+ * which is the worst possible moment to discover it.
+ *
+ * Empty for versions 1 and 2 by construction: their table lists already imply
+ * their columns, because those migrations created the tables.
+ */
+export const COLUMNS_AT = Object.freeze({
+  3: Object.freeze({
+    task_territory: Object.freeze({ pinned_until: "INTEGER" }),
+    provider_lease: Object.freeze({ token: "TEXT" }),
+  }),
+});
+
+/**
+ * How a store's columns fail this version's requirements, one string each.
+ * Empty means it satisfies them.
+ *
+ * NAMES ARE NOT ENOUGH, and the difference is not academic. Every hub table is
+ * STRICT, so a column of the wrong declared type does not coerce -- it refuses
+ * the write. A snapshot carrying `provider_lease.token INTEGER` has the column,
+ * passes a name-only inventory, is selected for recovery, and then fails the
+ * first `claimProvider` with `cannot store TEXT value in INTEGER column`. That
+ * is the same failure mode as the missing column this function was written for,
+ * arriving at the same worst moment, so it is the same check.
+ */
+export function columnDefectsAt(db, version) {
+  const want = COLUMNS_AT[version];
+  if (!want) return [];
+  const bad = [];
+  for (const [table, cols] of Object.entries(want)) {
+    const have = new Map(db.prepare(`SELECT name, type FROM pragma_table_info(?)`).all(table)
+                           .map(r => [r.name, String(r.type ?? "").toUpperCase()]));
+    for (const [c, type] of Object.entries(cols)) {
+      if (!have.has(c)) { bad.push(`${table}.${c} is missing`); continue; }
+      const got = have.get(c);
+      if (got !== type.toUpperCase()) bad.push(`${table}.${c} is ${got || "untyped"}, want ${type}`);
+    }
+  }
+  return bad;
+}
 
 /**
  * The CURRENT schema's tables: what snapshot validation compares a

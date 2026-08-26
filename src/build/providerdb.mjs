@@ -40,7 +40,24 @@ export const nowSeconds = (db) => db.prepare("SELECT unixepoch() n").get().n;
 
 export const LEASE_COLS =
   `id, owner, repo_id, run_ref, pid, lstart, priority, budget_usd, status,
-   requested_at, started_at, heartbeat_at, expires_at, preempt_requested`;
+   requested_at, started_at, heartbeat_at, expires_at, preempt_requested, token`;
+
+/**
+ * A claim's INCARNATION, and the reason an identity is not enough.
+ *
+ * `restoreHub` clears provider_lease in the restored file, so SQLite restarts
+ * its integer keys: after a restore, a re-claim of the same run gets an
+ * identical (owner, repo_id, run_ref) AND an identical id. Nothing in the row
+ * told the new claim apart from the old one, so a pre-restore mutation replayed
+ * afterwards -- which the retry-on-maintenance loop is exactly the caller to do
+ * -- deleted a live lease or overwrote its liveness data.
+ *
+ * Random rather than a counter, because a counter would have to survive the very
+ * event this exists to detect. outbox.lease_token solves the same problem the
+ * same way; this is that pattern applied to the second table that needed it.
+ */
+export const newToken = () =>
+  `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 
 /**
  * The scheduler's view of the provider, with the documented defaults applied.
@@ -120,13 +137,13 @@ export const clearPreemption = (db) => db.prepare(
   `UPDATE provider_lease SET preempt_requested = 0 WHERE preempt_requested = 1`).run();
 
 export const insertLease = (db, { owner, repoId, runRef, pid, lstart, priority,
-                                  budgetUsd, status, at, expiresAt }) => db.prepare(
+                                  budgetUsd, status, at, expiresAt, token }) => db.prepare(
   `INSERT INTO provider_lease(owner, repo_id, run_ref, pid, lstart, priority, budget_usd,
-                              status, requested_at, started_at, heartbeat_at, expires_at)
-   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-   RETURNING id`)
+                              status, requested_at, started_at, heartbeat_at, expires_at, token)
+   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+   RETURNING id, token`)
   .get(owner, repoId, runRef, pid, lstart, priority, budgetUsd, status, at,
-       status === "held" ? at : null, status === "held" ? at : null, expiresAt);
+       status === "held" ? at : null, status === "held" ? at : null, expiresAt, token);
 
 // A queued request records WHO is waiting, so a re-ask by a restarted daemon has
 // to update that -- otherwise the row still names a dead process and the reaper
@@ -171,25 +188,39 @@ export const promoteToHeld = (db, { id, pid, lstart, at, expiresAt }) => db.prep
 //
 // So the id is a fast path, never an identity. Where a caller supplies both, both
 // must match; where it supplies only the identity, that alone selects the row.
-const identityWhere = (id) =>
-  `owner = ? AND repo_id = ? AND run_ref = ?` + (id == null ? "" : ` AND id = ?`);
-const identityArgs = (id, owner, repoId, runRef) =>
-  id == null ? [owner, repoId, runRef] : [owner, repoId, runRef, id];
+// THE TOKEN IS PART OF EVERY FENCE. The identity says WHICH RUN; the token says
+// WHICH ATTEMPT AT IT. Without the second, a mutation held across a restore
+// matches a row that merely inherited the same name and number.
+// THE TOKEN IS NOT OPTIONAL, and a missing one is refused rather than dropped.
+//
+// Building the predicate without it when it is absent means a tokenless call
+// silently gets the PRE-MIGRATION fence -- identity and id, both of which a
+// restore reproduces exactly. A guard that degrades to the thing it replaced,
+// quietly, on the input it was added for, is not a guard. Callers have the token:
+// `claimProvider` returns it beside the id for exactly this.
+const identityWhere = (id, token) => {
+  if (token == null)
+    throw new Error("a fenced provider mutation requires the claim's token; refusing the weaker predicate");
+  return `owner = ? AND repo_id = ? AND run_ref = ? AND token = ?`
+       + (id == null ? "" : ` AND id = ?`);
+};
+const identityArgs = (id, token, owner, repoId, runRef) =>
+  [owner, repoId, runRef, token, ...(id == null ? [] : [id])];
 
-export const bindLease = (db, { id = null, owner, repoId, runRef, pid, lstart, at }) => db.prepare(
+export const bindLease = (db, { id = null, token = null, owner, repoId, runRef, pid, lstart, at }) => db.prepare(
   `UPDATE provider_lease SET pid = ?, lstart = ?, started_at = COALESCE(started_at, ?),
                              heartbeat_at = ?
-    WHERE ${identityWhere(id)}`)
-  .run(pid, lstart, at, at, ...identityArgs(id, owner, repoId, runRef));
+    WHERE ${identityWhere(id, token)}`)
+  .run(pid, lstart, at, at, ...identityArgs(id, token, owner, repoId, runRef));
 
-export const touchLease = (db, { id = null, owner, repoId, runRef, at, expiresAt }) => db.prepare(
+export const touchLease = (db, { id = null, token = null, owner, repoId, runRef, at, expiresAt }) => db.prepare(
   `UPDATE provider_lease SET heartbeat_at = ?, expires_at = ?
-    WHERE ${identityWhere(id)}`)
-  .run(at, expiresAt, ...identityArgs(id, owner, repoId, runRef));
+    WHERE ${identityWhere(id, token)}`)
+  .run(at, expiresAt, ...identityArgs(id, token, owner, repoId, runRef));
 
-export const deleteLease = (db, { id = null, owner, repoId, runRef }) => db.prepare(
-  `DELETE FROM provider_lease WHERE ${identityWhere(id)}`)
-  .run(...identityArgs(id, owner, repoId, runRef));
+export const deleteLease = (db, { id = null, token = null, owner, repoId, runRef }) => db.prepare(
+  `DELETE FROM provider_lease WHERE ${identityWhere(id, token)}`)
+  .run(...identityArgs(id, token, owner, repoId, runRef));
 
 export const deleteLeaseById = (db, id) => db.prepare(
   `DELETE FROM provider_lease WHERE id = ?`).run(id);

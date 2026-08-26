@@ -1,0 +1,203 @@
+// providerdb -- every statement the provider scheduler runs.
+//
+// The hub owns its own SQL, exactly as `hubdb.mjs` owns the phase machine's and
+// `src/db/ops.mjs` owns the guardian's. `src/provider.mjs` sits above this file
+// and holds the POLICY -- the admission rule, the reservation arithmetic, the
+// cooldown comparison -- and calls in here for every read and write.
+//
+// The split is not tidiness. `src/provider.mjs` is imported by BOTH daemons, and
+// it sits at the top level because of that, which puts it outside the two
+// directories allowed to contain raw SQL. Keeping the statements here means the
+// guardian imports a policy function rather than a query builder, and the
+// statement allowlist that fences the guardian's hub connection is checking a
+// surface with exactly one definition.
+//
+// NOTHING HERE WRITES `hub_event`, and that is a constraint rather than an
+// omission. `provider_lease` and `provider_state` are process-scoped: `restoreHub`
+// clears them and they are not in the replay comparison set, so there is no
+// image for a replay to restore. More concretely, the guardian's hub connection
+// is authorised for exactly these two tables, so an `INSERT INTO hub_event` from
+// a provider transaction is DENIED -- every real guardian claim and release
+// would fail on the one statement that looked like good hygiene.
+import { assertWritable } from "./locks.mjs";
+
+// The fallback used when `provider_state` has no row yet.
+//
+// A fresh hub genuinely has none -- the doctor's H-5 check exists for that
+// state -- so every read here has to carry the default rather than assuming a
+// seeded row. One slot of the two is reserved for the guardian: the guardian is
+// the watchman, the builder is the thing being restrained, and the asymmetry is
+// the point of the table.
+export const DEFAULT_LIMIT = 2, DEFAULT_RESERVED = 1;
+export const PROVIDER = "claude";
+
+export const LEASE_COLS =
+  `id, owner, repo_id, run_ref, pid, lstart, priority, budget_usd, status,
+   requested_at, started_at, heartbeat_at, expires_at, preempt_requested`;
+
+/**
+ * The scheduler's view of the provider, with the documented defaults applied.
+ *
+ * Returned as a plain object rather than a row so callers cannot accidentally
+ * depend on the row being absent -- "no row" and "the default limits" are the
+ * same fact to every reader above this line.
+ */
+export function providerState(db, { provider = PROVIDER } = {}) {
+  const row = db.prepare(
+    `SELECT provider, concurrency_limit, guardian_reserved, cooldown_until,
+            last_429_at, last_signature, measured_at
+       FROM provider_state WHERE provider = ?`).get(provider);
+  return {
+    provider,
+    limit: row?.concurrency_limit ?? DEFAULT_LIMIT,
+    reserved: row?.guardian_reserved ?? DEFAULT_RESERVED,
+    cooldownUntil: row?.cooldown_until ?? null,
+    lastSignature: row?.last_signature ?? null,
+    seeded: row != null,
+  };
+}
+
+export const heldCount = (db) => db.prepare(
+  `SELECT count(*) c FROM provider_lease WHERE status = 'held'`).get().c;
+
+export const heldCountBy = (db, owner) => db.prepare(
+  `SELECT count(*) c FROM provider_lease WHERE status = 'held' AND owner = ?`).get(owner).c;
+
+export const queuedGuardianCount = (db) => db.prepare(
+  `SELECT count(*) c FROM provider_lease WHERE status = 'queued' AND owner = 'guardian'`).get().c;
+
+/**
+ * Every `queued` guardian request for ONE repository.
+ *
+ * It exists as a function rather than as a query in the daemon because the sweep
+ * that uses it runs in `src/daemon.mjs`, where raw SQL is not allowed to live: a
+ * `SELECT ... FROM provider_lease` embedded there is a second definition of the
+ * guest's SQL surface, and it drifts from this one the first time the allowlist
+ * or the schema changes.
+ */
+export const queuedGuardianRequests = (db, { repoId }) => db.prepare(
+  `SELECT ${LEASE_COLS} FROM provider_lease
+    WHERE status = 'queued' AND owner = 'guardian' AND repo_id = ?
+    ORDER BY requested_at, id`).all(repoId);
+
+export const liveRequest = (db, { owner, repoId, runRef }) => db.prepare(
+  `SELECT ${LEASE_COLS} FROM provider_lease
+    WHERE owner = ? AND repo_id = ? AND run_ref = ? AND status IN ('queued','held')`)
+  .get(owner, repoId, runRef);
+
+export const leaseById = (db, id) => db.prepare(
+  `SELECT ${LEASE_COLS} FROM provider_lease WHERE id = ?`).get(id);
+
+/**
+ * The YOUNGEST live builder lease -- the one a queued guardian asks to preempt.
+ *
+ * Youngest, not oldest: the newest builder has done the least work, so releasing
+ * it at its next phase boundary discards the least. `requested_at` is integer
+ * seconds and several claims can share one, so `id` breaks the tie -- without it
+ * "the youngest" has no defined answer inside a single second and the choice
+ * falls to whichever row the scan happened to reach first.
+ */
+export const youngestHeldBuilder = (db) => db.prepare(
+  `SELECT ${LEASE_COLS} FROM provider_lease
+    WHERE status = 'held' AND owner = 'builder'
+    ORDER BY requested_at DESC, id DESC LIMIT 1`).get();
+
+export const requestPreemption = (db, id) => db.prepare(
+  `UPDATE provider_lease SET preempt_requested = 1 WHERE id = ?`).run(id);
+
+export const insertLease = (db, { owner, repoId, runRef, pid, lstart, priority,
+                                  budgetUsd, status, at, expiresAt }) => db.prepare(
+  `INSERT INTO provider_lease(owner, repo_id, run_ref, pid, lstart, priority, budget_usd,
+                              status, requested_at, started_at, heartbeat_at, expires_at)
+   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+   RETURNING id`)
+  .get(owner, repoId, runRef, pid, lstart, priority, budgetUsd, status, at,
+       status === "held" ? at : null, status === "held" ? at : null, expiresAt);
+
+export const promoteToHeld = (db, { id, at, expiresAt }) => db.prepare(
+  `UPDATE provider_lease
+      SET status = 'held', started_at = ?, heartbeat_at = ?, expires_at = ?
+    WHERE id = ? AND status = 'queued'`).run(at, at, expiresAt, id);
+
+// THE IDENTITY IS PART OF THE KEY, on every mutation that names a row by id.
+//
+// A restore replaces the database, clears `provider_lease` and lets SQLite
+// renumber it, so an integer key can come back pointing at somebody else's
+// request. Two silent failures follow from trusting it. If a restore lands
+// between a claim and the spawn, a rebind keyed on the id alone overwrites the
+// NEW holder's pid and lstart with the spawned worker's, and the reaper -- whose
+// whole basis is pid-and-lstart death -- can never match either row again. If it
+// lands while an old worker still runs, that worker's heartbeat keeps renewing an
+// unrelated reused row and prevents its reaping for as long as the worker lives.
+//
+// So the id is a fast path, never an identity. Where a caller supplies both, both
+// must match; where it supplies only the identity, that alone selects the row.
+const identityWhere = (id) =>
+  `owner = ? AND repo_id = ? AND run_ref = ?` + (id == null ? "" : ` AND id = ?`);
+const identityArgs = (id, owner, repoId, runRef) =>
+  id == null ? [owner, repoId, runRef] : [owner, repoId, runRef, id];
+
+export const bindLease = (db, { id = null, owner, repoId, runRef, pid, lstart, at }) => db.prepare(
+  `UPDATE provider_lease SET pid = ?, lstart = ?, started_at = COALESCE(started_at, ?),
+                             heartbeat_at = ?
+    WHERE ${identityWhere(id)}`)
+  .run(pid, lstart, at, at, ...identityArgs(id, owner, repoId, runRef));
+
+export const touchLease = (db, { id = null, owner, repoId, runRef, at, expiresAt }) => db.prepare(
+  `UPDATE provider_lease SET heartbeat_at = ?, expires_at = ?
+    WHERE ${identityWhere(id)}`)
+  .run(at, expiresAt, ...identityArgs(id, owner, repoId, runRef));
+
+export const deleteLease = (db, { id = null, owner, repoId, runRef }) => db.prepare(
+  `DELETE FROM provider_lease WHERE ${identityWhere(id)}`)
+  .run(...identityArgs(id, owner, repoId, runRef));
+
+export const deleteLeaseById = (db, id) => db.prepare(
+  `DELETE FROM provider_lease WHERE id = ?`).run(id);
+
+export const deleteQueued = (db, { owner, repoId, runRef }) => db.prepare(
+  `DELETE FROM provider_lease
+    WHERE owner = ? AND repo_id = ? AND run_ref = ? AND status = 'queued'`)
+  .run(owner, repoId, runRef);
+
+// EXPIRED AND ONLY EXPIRED. Liveness is asked about these by the caller, because
+// `isAlive` is a process question and this file answers only database ones.
+export const expiredLeases = (db, at) => db.prepare(
+  `SELECT ${LEASE_COLS} FROM provider_lease WHERE expires_at <= ? ORDER BY id`).all(at);
+
+export const recordRateLimit = (db, { provider = PROVIDER, signature, at, until,
+                                      limit = DEFAULT_LIMIT, reserved = DEFAULT_RESERVED }) => db.prepare(
+  `INSERT INTO provider_state(provider, concurrency_limit, guardian_reserved,
+                              cooldown_until, last_429_at, last_signature)
+   VALUES(?,?,?,?,?,?)
+   ON CONFLICT(provider) DO UPDATE SET
+     cooldown_until = excluded.cooldown_until,
+     last_429_at    = excluded.last_429_at,
+     last_signature = excluded.last_signature`)
+  .run(provider, limit, reserved, until, at, signature);
+
+/**
+ * Open the scheduler's write transaction.
+ *
+ * `assertWritable` runs FIRST, inside the transaction, on every mutation without
+ * exception. Without it a guardian can take a lease and launch a worker after
+ * `restoreHub` has acquired `maintenance_lock` and finished its holder scan --
+ * reopening the writer race the lock exists to close, from the one code path
+ * allowed to write the hub without holding a writer lease.
+ *
+ * It runs before any argument validation, so a caller that is missing an
+ * identity during a restore is told about the restore. The restore is the
+ * bigger fact, and it is the one that will still be true a second later.
+ */
+export function providerTx(db, { isAlive, at = null }, fn) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    assertWritable(db, { isAlive, inTx: true, ...(at == null ? {} : { at }) });
+    const r = fn();
+    db.exec("COMMIT");
+    return r;
+  } catch (e) {
+    try { db.exec("ROLLBACK"); } catch {}
+    throw e;
+  }
+}

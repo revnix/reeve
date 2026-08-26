@@ -1,7 +1,8 @@
 // The verdict decides merges, so every case here is a measured incident.
 // The governing rule: UNKNOWN never merges. Every fail-open defect found in the
 // previous system was an UNKNOWN rendered as a PASS.
-import { computeVerdict, coversHead, publishArgs, PASS, BLOCK, UNKNOWN } from "../src/verdict.mjs";
+import { computeVerdict, coversHead, publishArgs, CLAUSE_IDS, PASS, BLOCK, UNKNOWN } from "../src/verdict.mjs";
+import { readFileSync } from "node:fs";
 
 let fail = 0;
 const check = (name, got, want) => {
@@ -188,6 +189,58 @@ check("a too-short prefix does not cover", coversHead(HEAD.slice(0, 6), HEAD), f
   const v = computeVerdict({ ...good(), ledgerBlockers: null });
   check("UNKNOWN is not a success check run", publishArgs(v, { nwo: "o/r", asApp: true }).body.conclusion, "action_required");
   check("UNKNOWN is not a success status", publishArgs(v, { nwo: "o/r", asApp: false }).body.state, "pending");
+}
+
+// ── the builder hold clause ────────────────────────────────────────────────
+{
+  const v = computeVerdict({ ...good(), hold: { readable: true, held: false } });
+  check("a clear hold is a PASS clause", v.clauses.find(c => c.id === "hold")?.state, PASS);
+  check("and does not disturb the verdict", v.state, PASS);
+}
+{
+  const v = computeVerdict({ ...good(),
+    hold: { readable: true, held: true, reason: "ownership_lost", detail: "the task no longer owns this path" } });
+  const c = v.clauses.find(x => x.id === "hold");
+  check("an open hold BLOCKS", c?.state, BLOCK);
+  check("and carries the reason and the detail, not just the reason", c?.detail,
+    "ownership_lost: the task no longer owns this path");
+  check("so the whole verdict blocks", v.state, BLOCK);
+}
+{
+  // ABSENT IS NOT UNREADABLE. This is the fail-open the guest connection exists
+  // to prevent: an unreachable hub must never read as "nothing is held".
+  const v = computeVerdict({ ...good(), hold: { readable: false, why: "no hub connection" } });
+  check("an unreadable hold is UNKNOWN, never a pass", v.clauses.find(c => c.id === "hold")?.state, UNKNOWN);
+  check("and UNKNOWN does not merge", v.state, UNKNOWN);
+}
+{
+  // A guardian with no hub was never ASKED about holds, so it has no opinion.
+  // An UNKNOWN clause here would drag every verdict it renders to UNKNOWN for a
+  // question nobody put to it.
+  const v = computeVerdict(good());
+  check("no reading supplied means no clause at all", v.clauses.some(c => c.id === "hold"), false);
+  check("and the verdict is unaffected", v.state, PASS);
+}
+
+// ── CLAUSE_IDS agrees with what computeVerdict actually emits ─────────────
+// The list is consumed by three test matrices that assert TOTALITY over it. A
+// restated set drifts, and a matrix claiming totality over a stale copy is how a
+// clause ships with no branch while its test reports full coverage. So the list
+// is compared against the source rather than trusted -- in BOTH directions,
+// because an id declared but never emitted is just as wrong as one emitted and
+// never declared, and only one of those is caught by running the code.
+{
+  const src = readFileSync(new URL("../src/verdict.mjs", import.meta.url), "utf8");
+  const body = src.slice(src.indexOf("export function computeVerdict"));
+  const emitted = [...new Set([...body.matchAll(/\badd\("([a-z_]+)"/g)].map(m => m[1]))].sort();
+  const declared = [...CLAUSE_IDS].sort();
+  // Fixture: a regex that matched nothing would make both sides trivially agree
+  // on the empty set and pass while comparing nothing at all.
+  check("fixture: the source really emits clauses this test can read", emitted.length > 0, true);
+  check("every id computeVerdict emits is declared in CLAUSE_IDS",
+    emitted.filter(id => !declared.includes(id)).join(",") || "none", "none");
+  check("and every id CLAUSE_IDS declares is one computeVerdict emits",
+    declared.filter(id => !emitted.includes(id)).join(",") || "none", "none");
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

@@ -1411,6 +1411,46 @@ const REASK_MAX = 3600;
   db.close();
 }
 
+// ── NO reconciler is a failed observation, not a verdict ────────────────────
+// `recoverEffects` supports being called without a reconciler, and that path
+// produced a bare `{ settled: false }`. An unsettled verdict means "could not
+// tell", but without the failure flag it fell through to the stop fence -- so an
+// effect that was INFLIGHT when its task stopped was terminally fenced and its
+// drain settled, on the strength of an observation nobody made. The absence of
+// an observer is the strongest reason to keep looking.
+{
+  const db = openHub(join(dir, "o38.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:noobs", kind: "gh.pr.create",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: { repo_id: 7, pr: 1 } }));
+  const leased = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  check(leased != null, "fixture: the effect is INFLIGHT -- it may already have landed");
+  // The stop, as a real transition, so the fence has a moment to point at.
+  db.exec(`UPDATE task SET phase='CANCELLING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+           VALUES('bt:1',unixepoch(),'phase.cancelling','IMPLEMENTING','CANCELLING',1,1,'{}')`);
+  db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${leased.id}`);
+
+  const r = await recoverEffects(db, {});          // no reconciler at all
+  check(r.unobserved === 1,
+    "a pass with NO reconciler retains the row rather than fencing it", JSON.stringify(r));
+  check(db.prepare("SELECT status FROM outbox WHERE id=?").get(leased.id).status === "inflight",
+    "so the ambiguous effect is still there to be looked at",
+    JSON.stringify(db.prepare("SELECT status FROM outbox WHERE id=?").get(leased.id)));
+  const drain = db.prepare("SELECT settled_at FROM task_drain WHERE outbox_id=?").get(leased.id);
+  check(!drain || drain.settled_at === null,
+    "and its drain is NOT settled, so the task cannot reach a terminal phase behind it",
+    JSON.stringify(drain));
+
+  // CONTROL: a reconciler that LOOKS and reports it did not happen still fences
+  // it -- otherwise "retain when unobserved" has become "never fence".
+  db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${leased.id}`);
+  await recoverEffects(db, { reconcile: () => ({ settled: false }) });
+  check(db.prepare("SELECT status FROM outbox WHERE id=?").get(leased.id).status === "fenced",
+    "control: once something actually LOOKS and finds nothing, the stopped effect is fenced");
+  db.close();
+}
+
 // ── a reconciler that threw WITHOUT a message still threw ───────────────────
 // The marker that decides control flow must not be the same value as the
 // human-readable detail, because detail is allowed to be missing. `new Error()`

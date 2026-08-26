@@ -204,6 +204,111 @@ const ALIVE = () => true, DEAD = () => false;
   db.close();
 }
 
+// ── a held claim does not authorise a different claimant ────────────────────
+// Answering "you already hold this" to ANY caller naming the same
+// (owner, repoId, runRef) hands out an admission nobody counted: two guardian
+// daemons on one repository, or a daemon that restarted while its detached
+// worker survived, both proceed while a single lease exists. The later bind then
+// overwrites the row's process identity and one worker becomes invisible to both
+// admission and reaping.
+{
+  const db = openHub(join(dir, "p9.db"));
+  const mine = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 10, lstart: "L10", isAlive: ALIVE });
+  check(mine.ok, "fixture: the first daemon is admitted", JSON.stringify(mine));
+
+  const again = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 10, lstart: "L10", isAlive: ALIVE });
+  check(again.ok && again.id === mine.id,
+    "control: the SAME process re-asking gets the same lease, not a second one", JSON.stringify(again));
+
+  const other = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 11, lstart: "L11", isAlive: ALIVE });
+  check(!other.ok && other.reason === "held-elsewhere",
+    "a DIFFERENT process asking for the same run is refused, not handed the lease",
+    JSON.stringify(other));
+
+  // IDENTITY IS pid AND lstart. A pid is reused; lstart is what separates this
+  // process from whatever inherited its number.
+  const reused = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 10, lstart: "L-DIFFERENT", isAlive: ALIVE });
+  check(!reused.ok && reused.reason === "held-elsewhere",
+    "and a REUSED pid with a different start time is a different process",
+    JSON.stringify(reused));
+  check(db.prepare("SELECT count(*) c FROM provider_lease").get().c === 1,
+    "control: still exactly one lease, so no refusal quietly created a second");
+  db.close();
+}
+
+// ── a preemption request is withdrawn once it is satisfied ──────────────────
+// The flag asks a builder for capacity on behalf of a WAITING guardian. Left set
+// after that guardian is admitted, the marked builder still surrenders its slot
+// at its next phase boundary, suspending running work to leave a slot idle that
+// nobody is waiting for.
+{
+  const db = openHub(join(dir, "p10.db"));
+  db.exec(`INSERT INTO provider_state(provider,concurrency_limit,guardian_reserved)
+           VALUES('claude',2,0)
+           ON CONFLICT(provider) DO UPDATE SET concurrency_limit=2, guardian_reserved=0`);
+  const b1 = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE, now: 1000 });
+  const b2 = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:2", pid: 2, lstart: "B", isAlive: ALIVE, now: 1001 });
+  check(b1.ok && b2.ok, "fixture: both slots are builder-held");
+  const g = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 3, lstart: "G", isAlive: ALIVE, now: 1002 });
+  check(!g.ok && g.reason === "queued", "fixture: the guardian queues", JSON.stringify(g));
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE preempt_requested=1").get().c === 1,
+    "fixture: and one builder is asked to yield");
+
+  // ANOTHER builder releases, so the guardian is served without the marked one
+  // ever having to give anything up.
+  releaseProvider(db, b1);
+  const served = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 3, lstart: "G", isAlive: ALIVE, now: 1003 });
+  check(served.ok, "fixture: the queued guardian is admitted into the freed slot", JSON.stringify(served));
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE preempt_requested=1").get().c === 0,
+    "the preemption request is withdrawn once the guardian it was for is served",
+    JSON.stringify(db.prepare("SELECT owner,run_ref,preempt_requested FROM provider_lease").all()));
+  db.close();
+}
+
+// CONTROL: cancelling the queued guardian withdraws it too -- the flag is keyed
+// on somebody waiting, not on how the waiting ended.
+{
+  const db = openHub(join(dir, "p11.db"));
+  db.exec(`INSERT INTO provider_state(provider,concurrency_limit,guardian_reserved)
+           VALUES('claude',1,0)
+           ON CONFLICT(provider) DO UPDATE SET concurrency_limit=1, guardian_reserved=0`);
+  claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE, now: 1000 });
+  claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 2, lstart: "G", isAlive: ALIVE, now: 1001 });
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE preempt_requested=1").get().c === 1,
+    "fixture: the builder is marked");
+  cancelQueued(db, { owner: "guardian", repoId: 1, runRef: "pr:1" });
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE preempt_requested=1").get().c === 0,
+    "control: cancelling the request withdraws the mark as well",
+    JSON.stringify(db.prepare("SELECT owner,run_ref,preempt_requested FROM provider_lease").all()));
+  db.close();
+}
+
+// ── a cooldown is a floor, never shortened by a later observation ───────────
+// `provider_state` is one row shared by every daemon on the host, and their
+// profiles need not agree. A 300-second cooldown followed ten seconds later by a
+// 30-second one would cut the remaining wait to 40 and admit claims while the
+// first backoff was still live.
+{
+  const db = openHub(join(dir, "p12.db"));
+  noteRateLimit(db, { signature: "long", now: 1000, cooldownSeconds: 300 });
+  noteRateLimit(db, { signature: "short", now: 1010, cooldownSeconds: 30 });
+  const st = db.prepare("SELECT cooldown_until, last_signature FROM provider_state WHERE provider='claude'").get();
+  check(st.cooldown_until === 1300,
+    "the longer cooldown stands: a second observation is not evidence it got milder",
+    JSON.stringify(st));
+  check(st.last_signature === "short",
+    "control: but the LATEST signature is still recorded -- what threw last is a different question",
+    JSON.stringify(st));
+  check(!claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE, now: 1100 }).ok,
+    "control: and the builder is still refused inside the original window");
+
+  // CONTROL: a LONGER one does extend it, or "never shorten" has become "never change".
+  noteRateLimit(db, { signature: "longer", now: 1020, cooldownSeconds: 900 });
+  check(db.prepare("SELECT cooldown_until FROM provider_state WHERE provider='claude'").get().cooldown_until === 1920,
+    "control: a longer cooldown DOES extend it");
+  db.close();
+}
+
 // ── releasing by an id alone is refused ─────────────────────────────────────
 // The id is a fast path, never an identity. A restore clears `provider_lease`
 // and SQLite reuses the integer, so a cleanup running in a `finally` after that

@@ -61,10 +61,12 @@ expected one.
    `original_commit_id` against the head; `headRefOid` is the MERGED head and
    answers a different question.
 
-   **Merge rule, and it is mine, not yours to soften:** merge when CI is green AND
-   zero threads are open. I reaffirmed that after being told a verdict often lands
-   after the state reads clean. Tell me if a review is in flight at the moment you
-   merge — do not present the snapshot as settled — but merge.
+   **The merge rule is mine and it is stated in §0, which is the only place it is
+   stated.** Read it there and apply it as written; it is not yours to soften, and
+   it is not this prompt's to restate — a copy here would go on instructing you
+   after I had changed it, and the merge it authorised would be one my current
+   policy forbids. Whatever else you do, tell me if a review is in flight at the
+   moment you act, rather than presenting the snapshot as settled.
 
    **If a PR passes ten review rounds without the findings tapering, stop and
    bring me the shape rather than the next fix.** That happened once, we split the

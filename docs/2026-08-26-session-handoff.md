@@ -366,9 +366,9 @@ The order that follows from that:
 
 1. **The durable-effect programme finished** (§3), because it is what makes reeve
    able to close a loop rather than only report on one.
-2. **A real dispatch on a real repository**, because the publish path is carried by
-   tests and one toy fixture. In this project a dispatch once found what roughly
-   640 green tests missed.
+2. **A real dispatch on a real repository** — see §0 for what has actually been
+   proven so far, which is the whole reason this ranks second. In this project a
+   dispatch once found what roughly 640 green tests missed.
 3. **R-01**, because refusing an unsafe merge means standing as a required status
    check, and a ruleset with no required checks has nowhere to stand.
 4. **The merge-refusal capability** (§2, fourth row), after a shadow week.

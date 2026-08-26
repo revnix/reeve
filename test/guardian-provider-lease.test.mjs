@@ -913,6 +913,18 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
   check(/readOnly:\s*true/.test(resolver) && !/openHub\(/.test(resolver),
     "the repository-id read uses a read-only connection, never the migrating opener",
     resolver.slice(0, 400));
+  // AND IT WAITS. On SQLite's default of zero this fails the instant a migration
+  // or restore holds the lock, and the caller then waits REPO_ID_RETRY_SECONDS
+  // before asking again -- ten minutes of fail-closed dispatch bought by a
+  // moment's contention. Every hub connection takes the same budget.
+  check(/timeout:\s*HUB_BUSY_TIMEOUT_MS/.test(resolver),
+    "and waits the shared hub contention budget rather than SQLite's zero",
+    resolver.slice(0, 400));
+  // No hub connection in the CLI restates the number the constant holds.
+  const literals = (cli.match(/new DatabaseSync\([^)]*timeout:\s*\d+/g) ?? []);
+  check(literals.length === 0,
+    "and no hub connection in the CLI restates the timeout as a literal",
+    literals.join(" | "));
   check(/finally\s*\{[^}]*close/.test(resolver),
     "and closes it on every path out", resolver.slice(0, 400));
 

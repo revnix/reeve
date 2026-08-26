@@ -310,12 +310,21 @@ function newestHubSnapshot(path) {
   } catch { return null; }
 }
 
+// ONE HOME FOR THE CONTENTION BUDGET.
+//
+// Every hub connection has to wait the same amount for the write lock, and the
+// number had grown four copies across two files. A guest that waited a
+// different amount from `openHub` is a second answer to the same question, and
+// the copies drift silently because nothing compares them. Exported so the
+// guardian's restricted connection reads it rather than repeating it.
+export const HUB_BUSY_TIMEOUT_MS = 10000;
+
 export function openHub(path, { skipIntegrity = false } = {}) {
   // state/ may not exist yet: on a fresh REEVE_HOME no guardian store has
   // created it, and DatabaseSync will not create a missing parent. Without this
   // the very first hub-writing command fails before migration 1 can run.
   mkdirSync(dirname(path), { recursive: true });
-  const db = new DatabaseSync(path, { timeout: 10000 });
+  const db = new DatabaseSync(path, { timeout: HUB_BUSY_TIMEOUT_MS });
 
   // CLOSED EXACTLY ONCE, from whichever path exits first.
   //
@@ -350,7 +359,7 @@ export function openHub(path, { skipIntegrity = false } = {}) {
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA synchronous = FULL");   // authority-bearing and low-volume; NORMAL is not inherited
     db.exec("PRAGMA foreign_keys = ON");
-    db.exec("PRAGMA busy_timeout = 10000");
+    db.exec(`PRAGMA busy_timeout = ${HUB_BUSY_TIMEOUT_MS}`);
     // AND THE SCHEMA PROBE, inside the same guard. Corruption confined to the
     // `schema_version` PAGE rather than the header lets all four pragmas
     // succeed, so the first version read threw outside this catch and `build

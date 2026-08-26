@@ -43,9 +43,12 @@ publishes after checking what git says changed.
 
 ## Requirements
 
-- **Node ≥ 24.** `node:sqlite` still emits an experimental warning on 22.x and the
-  state layer is the authority. On this machine `node` on `PATH` is v22, so use
-  the absolute path: `~/.nvm/versions/node/v24.17.0/bin/node`.
+- **Node ≥ 24.10.0.** `node:sqlite` still emits an experimental warning on 22.x
+  and the state layer is the authority, and `DatabaseSync.setAuthorizer` -- which
+  the guardian's restricted hub connection refuses to open without -- arrived in
+  24.10.0. `package.json` enforces the same floor. On this machine `node` on
+  `PATH` is v22, so use the absolute path:
+  `~/.nvm/versions/node/v24.17.0/bin/node`.
 - `git` and the `gh` CLI, authenticated.
 - `claude` on `PATH` for dispatch (not needed to observe).
 

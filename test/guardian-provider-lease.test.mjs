@@ -15,6 +15,8 @@ import { open } from "../src/db/ops.mjs";
 import { openHub } from "../src/build/hubdb.mjs";
 import { openHubAsGuest } from "../src/build/hubguest.mjs";
 import { resolveRepoId } from "../src/build/repoid.mjs";
+import { COLUMNS_AT, SCHEDULER_MIN_HUB_VERSION } from "../src/build/hubdb.mjs";
+import { isBuilderPr } from "../src/pr.mjs";
 import { CLAUSE_IDS } from "../src/verdict.mjs";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -223,7 +225,7 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
     // classified as a stranger's PR and never reaches the hub at all.
     prAnchor: () => ({ ok: true, headRef: "mp/bt-1-s0", baseRef: "main", state: "open",
                        title: "t", updatedAt: "2026-08-26T00:00:00Z", head: "b".repeat(40),
-                       pin: { ok: true, sha: "b".repeat(40) }, authorIsApp: false }),
+                       pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
     evaluate: (a) => { seen = a; return EVAL; },
     publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
     oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
@@ -268,7 +270,7 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
     openPrs: () => [42],
     prAnchor: () => ({ ok: true, headRef: "mp/bt-1-s0", baseRef: "main", state: "open",
                        title: "t", updatedAt: "x", head: "b".repeat(40),
-                       pin: { ok: true, sha: "b".repeat(40) }, authorIsApp: false }),
+                       pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
     evaluate: (a) => { seen = a; return EVAL; },
     publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
     oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
@@ -299,11 +301,12 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
 // return PASS -- or, when the table is unreadable, an UNKNOWN that blocks every
 // pull request in the repository over rows none of them have.
 {
-  for (const [label, headRef, authorIsApp, wantAsked] of [
-    ["a builder branch",   "mp/bt-1-s0",       false, true],
-    ["an App author",      "feature/ordinary", true,  true],
-    ["a lookalike branch", "mpx/not-ours",     false, false],
-    ["a stranger's PR",    "feature/ordinary", false, false],
+  for (const [label, headRef, authorLogin, wantAsked] of [
+    ["a builder branch",   "mp/bt-1-s0",       "someone",           true],
+    ["the builder App",    "feature/ordinary", "merge-policy[bot]", true],
+    ["a lookalike branch", "mpx/not-ours",     "someone",           false],
+    ["a stranger's PR",    "feature/ordinary", "someone",           false],
+    ["dependabot",         "dependabot/x",     "dependabot[bot]",   false],
   ]) {
     let seen;
     const dir = mkdtempSync(join(tmpdir(), "reeve-prov-cls-"));
@@ -326,7 +329,7 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
       repoId: 7, lstart: "boot-1",
       openPrs: () => [42],
       prAnchor: () => ({ ok: true, headRef, baseRef: "main", state: "open", title: "t",
-                         updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorIsApp }),
+                         updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorLogin }),
       evaluate: (a) => { seen = a; return EVAL; },
       publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
       oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
@@ -339,6 +342,57 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
       `${label}: the hold is ${wantAsked ? "read" : "NOT read"}`, JSON.stringify(seen?.hold));
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+// ── the scheduler's schema floor is the column it actually needs ──────────
+// "The hub opened" is not "the scheduler can be used". Every claim names
+// `provider_lease.token`, which migration 3 adds -- so against an older hub each
+// claim throws and the guardian's fail-open path runs model work outside the
+// shared limit, beside an older builder still using its own.
+{
+  const need = COLUMNS_AT[SCHEDULER_MIN_HUB_VERSION] ?? {};
+  check(need.provider_lease?.token != null,
+    "the scheduler's floor is the version that introduces provider_lease.token",
+    JSON.stringify({ floor: SCHEDULER_MIN_HUB_VERSION, declares: Object.keys(need) }));
+  // Both directions: no EARLIER version may already declare it, or the floor is
+  // higher than it needs to be and refuses hubs that would have worked.
+  const earlier = Object.entries(COLUMNS_AT)
+    .filter(([v]) => Number(v) < SCHEDULER_MIN_HUB_VERSION)
+    .filter(([, cols]) => cols.provider_lease?.token != null)
+    .map(([v]) => v);
+  check(earlier.length === 0,
+    "and no earlier version declares it, so the floor is not higher than it needs to be",
+    earlier.join(","));
+
+  // The BEHAVIOUR of the floor -- that an older hub is refused, with a reason,
+  // and that a current one still opens -- lives in
+  // `test/guardian-hub-access.test.mjs`, where it can actually be exercised. A
+  // structural echo of it here would be a second statement of one fact, and the
+  // weaker of the two.
+}
+
+// ── the classifier matches the APP, not every bot ─────────────────────────
+// `user.type` is `Bot` for dependency bots, review bots and every other
+// integration. Testing it pulled all of them into a table that has no row for
+// any of them -- so during a hub fault they would take an UNKNOWN hold clause
+// and an action-required policy result.
+{
+  for (const [label, meta, want] of [
+    ["a builder branch",   { headRef: "mp/bt-1-s0" }, true],
+    ["the builder App",    { headRef: "feature/ordinary", authorLogin: "merge-policy[bot]" }, true],
+    ["both at once",       { headRef: "mp/bt-2-s0", authorLogin: "merge-policy[bot]" }, true],
+    ["dependabot",         { headRef: "dependabot/npm_and_yarn/x", authorLogin: "dependabot[bot]" }, false],
+    ["a review bot",       { headRef: "feature/ordinary", authorLogin: "coderabbitai[bot]" }, false],
+    ["a human",            { headRef: "feature/ordinary", authorLogin: "mobeenabdullah" }, false],
+    // The control that keeps `mp/` a SEGMENT prefix rather than a string one.
+    ["a lookalike branch", { headRef: "mpx/not-ours", authorLogin: "someone" }, false],
+  ]) check(isBuilderPr(meta) === want, `${label}: isBuilderPr is ${want}`, JSON.stringify(meta));
+
+  // The App name is READ from where it already lives rather than restated here.
+  const src = readFileSync(new URL("../src/pr.mjs", import.meta.url), "utf8");
+  check(/POLICY_APP/.test(src) && !/"merge-policy\[bot\]"/.test(src),
+    "and the App's name is read from POLICY_APP, not restated in the classifier",
+    (src.match(/.*merge-policy.*/g) ?? []).join(" | "));
 }
 
 // ── A-9: a maintenance refusal is retried, never swallowed ────────────────
@@ -410,13 +464,12 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
     "the guardian's tick context is handed a hub getter",
     (cli.match(/hub:.*/) ?? []).slice(0, 2).join(" | "));
 
-  // The CONNECTION the tick holds is the guest one. Sliced to the getter alone,
-  // because the founder's decision puts exactly one privileged read on the
-  // guardian path and it is not this.
-  const getter = cli.slice(cli.indexOf("const guardianHubAccess"), cli.indexOf("// The numeric repository id"));
-  check(/openHubAsGuest\(/.test(getter) && !/[^s]openHub\(/.test(getter),
-    "and that connection is opened as a GUEST, never with the privileged opener",
-    getter.slice(0, 200));
+  // The connection itself is built by `src/build/hubaccess.mjs`, which is tested
+  // behaviourally. What must hold HERE is only the wiring: that the guardian's
+  // context is handed that getter and not something assembled inline.
+  check(/hubAccess\(hubPathFor\(HOME\)\)/.test(cli),
+    "and it comes from the extracted, tested hub accessor",
+    (cli.match(/const guardianHubAccess.*/) ?? [""])[0]);
 
   // THE REPOSITORY-ID READ IS READ-ONLY AND DOES NOT MIGRATE. `openHub` applies
   // every pending migration before answering, and this path holds no builder
@@ -430,15 +483,9 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
   check(/finally\s*\{[^}]*close/.test(resolver),
     "and closes it on every path out", resolver.slice(0, 400));
 
-  // The readiness gate is a POSITIVELY READ version. `completedVersion` catches
-  // every open and query failure and answers 0, so using it here made a corrupt
-  // hub take the benign absent-hub path before the three-way logic could run.
-  // A CALL, not a mention: the getter's own comment explains why it does not use
-  // `completedVersion`, and a bare substring test reads that explanation as the
-  // defect it warns about.
-  check(/versionOf\s*\(/.test(getter) && !/completedVersion\s*\(/.test(getter),
-    "the hub getter reads the version itself rather than through the error-collapsing helper",
-    (getter.match(/.*completedVersion\s*\(.*/g) ?? ["no call"]).join(" | "));
+  // That the readiness gate reads the version ITSELF rather than through
+  // `completedVersion` -- which catches every failure and answers 0 -- is now a
+  // behavioural assertion over a corrupt file in the hub-access suite.
 
   const daemon = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
   check(!/\bopenHub\b/.test(daemon),

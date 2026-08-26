@@ -288,6 +288,20 @@ CREATE TABLE IF NOT EXISTS projection_meta (
   classifier_version TEXT NOT NULL,
   derived_at INTEGER NOT NULL,
   complete   INTEGER NOT NULL,               -- 0 = a fetch failed or was truncated
+  -- The head this projection was derived FOR, and it is not decoration.
+  --
+  -- Clearing is head-dependent: `derivePr` decides `is_cleared` by asking whether
+  -- a round covers THIS head, so the same threads under a different head give a
+  -- different answer to "what is still open". A reader that takes the projection
+  -- without checking the head is judging the current revision by the previous
+  -- one's clearing -- and the two facts it feeds, how many criticals are open and
+  -- which threads they are, are exactly the ones that license spilling a finding
+  -- or dispatching a worker at it.
+  --
+  -- NULL means a projection written before this column existed, or one derived
+  -- with no head in hand. Both are UNKNOWN and neither is usable, which is the
+  -- same fail-closed reading as the four staleness reasons beside it.
+  head       TEXT,
   PRIMARY KEY (nwo, scope)) STRICT;
 
 -- ------------------------------------------------------------ review shadow

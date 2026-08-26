@@ -1652,7 +1652,14 @@ rmSync(dir, { recursive: true, force: true });
 
   // CONTROL: once the close is DONE the hold is clearable, or "keep it held" has
   // become "hold for ever" and no redesigned task can ever tidy up after itself.
-  db.prepare("UPDATE outbox SET status='done' WHERE kind='gh.pr.close' AND task_id='bt:1'").run();
+  // ONLY THE REPLACEMENT, which is what ordinary settlement does. Marking every
+  // historical close row `done` hid the defect this control exists to catch: the
+  // ORIGINAL voided row never becomes done, so a per-ROW test of "is anything
+  // outstanding" keeps answering yes for ever.
+  check(db.prepare(
+    "SELECT count(*) c FROM outbox WHERE kind='gh.pr.close' AND task_id='bt:1' AND status='voided'").get().c === 1,
+    "fixture: the voided original is still on record beside its replacement");
+  db.prepare("UPDATE outbox SET status='done' WHERE kind='gh.pr.close' AND task_id='bt:1' AND status='pending'").run();
   const cur = db.prepare("SELECT phase, generation FROM task WHERE id='bt:1'").get();
   applyTransition(db, { taskId: "bt:1", expectedPhase: cur.phase, expectedGeneration: cur.generation,
     evidence: { kind: "hold", reason: "over_budget" }, op: "phase.held" });
@@ -1661,7 +1668,16 @@ rmSync(dir, { recursive: true, force: true });
     evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
   check(db.prepare(
     "SELECT count(*) c FROM pr_hold WHERE task='bt:1' AND cleared_at IS NULL").get().c === 0,
-    "control: with the close landed, a resume clears it");
+    "control: with the close landed, a resume clears it",
+    JSON.stringify(db.prepare("SELECT status,idempotency_key FROM outbox WHERE kind='gh.pr.close'").all()));
+  // AND NOTHING NEW IS ENQUEUED. A successful close satisfies the obligation
+  // whichever row carried it; asking per ROW instead of per PULL REQUEST made
+  // every later resume enqueue another one, repeating an external operation a
+  // successor had already completed.
+  check(db.prepare(
+    "SELECT count(*) c FROM outbox WHERE kind='gh.pr.close' AND task_id='bt:1' AND status='pending'").get().c === 0,
+    "control: and no further close is enqueued once one has landed",
+    JSON.stringify(db.prepare("SELECT status,idempotency_key FROM outbox WHERE kind='gh.pr.close'").all()));
   db.close();
 }
 

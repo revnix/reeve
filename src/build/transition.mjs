@@ -391,20 +391,38 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       // close is precisely the one that must stay held and visible. Fail-closed:
       // the hold outlives the decision to close, and only the close landing
       // clears it.
-      for (const p of db.prepare(
+      // PER PULL REQUEST, not per row. The obligation is "this PR gets closed",
+      // and a hold voids the close while the next resume enqueues a replacement
+      // -- so a PR accumulates close rows, and asking "is any row not done" keeps
+      // answering yes for ever because the ORIGINAL voided row never becomes
+      // done. The hold then never cleared and every resume enqueued another
+      // close, repeating an external operation a successor had already
+      // completed. Any successful close satisfies the obligation, whichever row
+      // carried it.
+      const byPr = new Map();
+      for (const row of db.prepare(
         `SELECT o.args, o.status, o.kind, o.idempotency_key FROM outbox o
-          WHERE o.task_id = ? AND o.kind = 'gh.pr.close' AND o.status <> 'done'
+          WHERE o.task_id = ? AND o.kind = 'gh.pr.close'
           ORDER BY o.id`).all(taskId)) {
-        let a; try { a = JSON.parse(p.args); } catch { continue; }
-        if (a?.repo_id != null && a?.pr != null) keepHeld.add(`${a.repo_id}:${a.pr}`);
-        // AND RE-ESTABLISHED IF A HOLD VOIDED IT. A row that is neither done nor
-        // still going to happen is an obligation that has been dropped: the
-        // pull request stays held, correctly, but nothing is left to ever close
-        // it. Re-enqueued with its ORIGINAL key and args -- the same logical act,
-        // and `enqueueEffect`'s key is unique over LIVE rows only, so the dead
-        // row does not refuse it.
-        if (!LIVE_OUTBOX.includes(p.status))
-          enqueue(p.kind, p.idempotency_key, a);
+        let a; try { a = JSON.parse(row.args); } catch { continue; }
+        if (a?.repo_id == null || a?.pr == null) continue;
+        const key = `${a.repo_id}:${a.pr}`;
+        const seen = byPr.get(key) ?? { done: false, live: false, last: null, args: a };
+        if (row.status === "done") seen.done = true;
+        else if (LIVE_OUTBOX.includes(row.status)) seen.live = true;
+        else seen.last = row;                       // dropped: voided, fenced, dead-lettered
+        byPr.set(key, seen);
+      }
+      for (const [key, seen] of byPr) {
+        if (seen.done) continue;                    // the PR is closed; the hold may clear
+        keepHeld.add(key);
+        // AND RE-ESTABLISHED IF A HOLD VOIDED IT. A PR with no successful close
+        // and nothing still going to happen is an obligation that was dropped:
+        // it stays held, correctly, but nothing is left to ever close it.
+        // Re-enqueued with its ORIGINAL key and args -- the same logical act, and
+        // `enqueueEffect`'s key is unique over LIVE rows only, so the dead row
+        // does not refuse it.
+        if (!seen.live && seen.last) enqueue(seen.last.kind, seen.last.idempotency_key, seen.args);
       }
       for (const h of db.prepare(
         `SELECT id, repo_id, pr FROM pr_hold WHERE task = ? AND cleared_at IS NULL`).all(taskId)) {

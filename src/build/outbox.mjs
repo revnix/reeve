@@ -175,11 +175,20 @@ const blockedByEarlierComment = (db, row) => {
   // Matched against the task's CURRENT generation rather than against this row's,
   // because the question is whether the predecessor can still act at all, not
   // whether the two agree with each other.
+  //
+  // AND ONLY WHILE IT IS STILL PENDING. The fence lives in `leaseEffect`, so a
+  // row that is already `inflight` has PASSED it: a worker holds it, the settle
+  // path does not re-check the generation, and it will land. Exempting it lets a
+  // new-generation comment be leased beside it and arrive first, after which the
+  // older one lands last and leaves the pull request showing a status the task
+  // left two generations ago. A condemned row is only harmless while the thing
+  // that condemns it can still reach it.
   return db.prepare(
     `SELECT o.id, o.kind, o.args FROM outbox o
        LEFT JOIN task t ON t.id = o.task_id
       WHERE o.kind = ? AND o.status IN ('pending','inflight') AND o.id < ?
-        AND (o.task_id IS NULL OR t.id IS NULL OR o.task_generation = t.generation)
+        AND (o.status = 'inflight'
+             OR o.task_id IS NULL OR t.id IS NULL OR o.task_generation = t.generation)
       ORDER BY o.id`)
     .all(COMMENT_KIND, row.id)
     .some(earlier => conversationOf(earlier) === conv);
@@ -554,7 +563,14 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
   for (const row of expired) {
     if (!reconcile) { verdicts.push([row, { settled: false }]); continue; }
     try { verdicts.push([row, await reconcile(row)]); }
-    catch (e) { verdicts.push([row, { settled: false, reconcileError: e?.message ?? String(e) }]); }
+    // A SEPARATE FLAG, not the message. `new Error()` has an empty message, and
+    // an empty string is falsy -- so a reconciler that threw one was read as an
+    // authoritative "not settled", and the ambiguous effect went back to the
+    // queue or was dead-lettered. The marker that decides control flow must not
+    // be the same value as the human-readable detail, because detail is allowed
+    // to be missing.
+    catch (e) { verdicts.push([row, { settled: false, reconcileFailed: true,
+                                      reconcileError: errText(e) ?? "the reconciler threw without a message" }]); }
   }
 
   // ── 3. APPLY, under a short write transaction, each row CAS'd on the state it
@@ -620,7 +636,7 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
       // unobservable stopped effect is held for another look rather than being
       // declared dead, and the fence below still catches it the moment a
       // reconciler can actually LOOK and reports it did not happen.
-      if (verdict?.reconcileError) {
+      if (verdict?.reconcileFailed) {
         const wait = reaskSeconds(applyAt, row);
         db.prepare(
           `UPDATE outbox SET lease_expires_at=?, last_error=?, updated_at=unixepoch()

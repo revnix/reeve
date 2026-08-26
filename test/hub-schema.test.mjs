@@ -174,7 +174,7 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hub-"));
   const db = openHub(join(dir, "f2.db"));
   const tables = new Set(db.prepare(
     "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().map(r => r.name));
-  for (const t of ["gate_request","approval","notice_receipt","impl_pr","attested_push","guardian_receipt","ownership_check","harness_acceptance"])
+  for (const t of ["gate_request","approval","notice_receipt","task_pr","attested_push","guardian_receipt","ownership_check","harness_acceptance"])
     check(tables.has(t), `openHub creates ${t}`);
 
   db.exec(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,source_kind,source_key,
@@ -217,9 +217,9 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hub-"));
   // impl_pr binds a PR to a slice, and UNIQUE(repo_id, pr) is what the receipt
   // importer joins on. Two slices claiming one PR would make that join
   // ambiguous and a merge would be attributed to the wrong slice.
-  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at) VALUES('bt:1',1,0,1,7,'h0',unixepoch())`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at) VALUES('bt:1','impl',1,0,1,7,'h0',unixepoch())`);
   let dup = true;
-  try { db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at) VALUES('bt:1',1,1,1,7,'h1',unixepoch())`); }
+  try { db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at) VALUES('bt:1','impl',1,1,1,7,'h1',unixepoch())`); }
   catch { dup = false; }
   check(!dup, "two slices cannot bind the same (repo_id, pr)");
 
@@ -431,5 +431,78 @@ import { hubEvent, migrationPlan } from "../src/build/hubdb.mjs";
 }
 
 rmSync(dir, { recursive: true, force: true });
+// ── migration 2 carries a REAL v1 hub forward ──────────────────────────────
+// An upgrade that runs on a fresh database proves only that its SQL parses. The
+// question a migration exists to answer is whether the rows that were already
+// there arrive on the other side -- and this one moves two shapes into one, so
+// there are two ways for it to lose something silently.
+{
+  const dir2 = mkdtempSync(join(tmpdir(), "reeve-upgrade-"));
+  const p2 = join(dir2, "hub.db");
+
+  // A GENUINE v1 store: migration 1's own SQL, marked version 1, then seeded in
+  // BOTH of the shapes v1 had.
+  const v1 = new DatabaseSync(p2);
+  v1.exec("PRAGMA journal_mode = WAL"); v1.exec("PRAGMA foreign_keys = ON");
+  v1.exec(`CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY,
+             applied_at INTEGER NOT NULL) STRICT`);
+  v1.exec(readFileSync(new URL("../src/build/hub.sql", import.meta.url), "utf8"));
+  v1.exec("INSERT INTO schema_version(version, applied_at) VALUES(1, unixepoch())");
+  v1.exec(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,generation,source_kind,
+                            source_key,repo_path,profile_path,profile_hash,default_branch,
+                            visibility,registry_version,spec_repo_id,spec_pr,spec_head,
+                            created_at,updated_at)
+           VALUES('bt:1','p',1,'o/r','t','GATE',1,'founder','k1','/r','/p','h','main','private',1,
+                  9,42,'specsha',unixepoch(),unixepoch())`);
+  v1.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at,merged_sha)
+           VALUES('bt:1',1,0,1,7,'implsha',unixepoch(),NULL),
+                 ('bt:1',1,1,1,8,'implsha2',unixepoch(),'merged')`);
+  v1.close();
+
+  const up = openHub(p2);
+  check(up.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v === HUB_SCHEMA_VERSION,
+    "a v1 hub is carried to this binary's schema version",
+    String(up.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v));
+
+  const rows = up.prepare(
+    "SELECT kind, generation, slice, repo_id, pr, head_sha, merged_sha FROM task_pr ORDER BY repo_id, pr").all();
+  check(rows.length === 3, "every PR of BOTH old shapes arrives", JSON.stringify(rows));
+  const impl = rows.filter(r => r.kind === "impl");
+  check(impl.length === 2 && impl[0].generation === 1 && impl[0].slice === 0,
+    "implementation PRs keep their generation and slice", JSON.stringify(impl));
+  check(impl.some(r => r.merged_sha === "merged"),
+    "and a MERGED one stays merged, so history is not resurrected as open",
+    JSON.stringify(impl.map(r => r.merged_sha)));
+  const spec = rows.find(r => r.kind === "spec");
+  check(spec?.repo_id === 9 && spec?.pr === 42 && spec?.head_sha === "specsha",
+    "the spec PR arrives as a row, with its repository, number and head",
+    JSON.stringify(spec));
+  check(spec?.generation === null && spec?.slice === null,
+    "carrying no generation or slice, which the CHECK requires of it", JSON.stringify(spec));
+  check(up.prepare("SELECT count(*) c FROM task_pr WHERE task='bt:1' AND merged_sha IS NULL").get().c === 2,
+    "and 'what is open' is now ONE query returning both kinds");
+  check(up.prepare("SELECT count(*) c FROM pragma_table_info('task') WHERE name IN ('spec_pr','spec_head')").get().c === 0,
+    "the old columns are gone, so no site can read the shape that caused this");
+  check(up.prepare("SELECT count(*) c FROM pragma_table_info('task') WHERE name='spec_repo_id'").get().c === 1,
+    "control: spec_repo_id STAYS -- it is which repository holds specs, a project fact, not a PR");
+
+  // RE-RUNNABLE. `openHub` rolls an interrupted migration back, but a store whose
+  // schema_version rows are lost while its tables survive replays every migration
+  // over tables that already exist. Migration 1 survives that by construction;
+  // this asserts migration 2 does too, and `ALTER TABLE ... DROP COLUMN` has no
+  // IF EXISTS to lean on.
+  up.exec("DELETE FROM schema_version");
+  up.close();
+  let again = null, reopened = null;
+  try { reopened = openHub(p2); } catch (e) { again = e; }
+  check(again === null, "replaying migration 2 over an already-migrated store does not throw",
+    String(again?.message));
+  check(reopened?.prepare("SELECT count(*) c FROM task_pr").get().c === 3,
+    "and loses nothing when it does",
+    String(reopened?.prepare("SELECT count(*) c FROM task_pr").get().c));
+  reopened?.close();
+  rmSync(dir2, { recursive: true, force: true });
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

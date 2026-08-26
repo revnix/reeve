@@ -23,7 +23,7 @@ import { createHash } from "node:crypto";
 // read it; two spellings of the same path is how they drift.
 const SCHEMA_PATH = new URL("./hub.sql", import.meta.url);
 
-export const HUB_SCHEMA_VERSION = 1;
+export const HUB_SCHEMA_VERSION = 2;
 
 /**
  * Forward-only. Each entry runs exactly once, in order, in its own transaction,
@@ -31,6 +31,75 @@ export const HUB_SCHEMA_VERSION = 1;
  */
 const MIGRATIONS = [
   { version: 1, up: (db) => db.exec(readFileSync(SCHEMA_PATH, "utf8")) },
+  // ---------------------------------------------------------------- 2
+  // ONE SHAPE FOR EVERY PULL REQUEST A TASK OWNS.
+  //
+  // Migration 1 put implementation PRs in a table and the spec PR in three
+  // columns on `task`, so every question of the form "what is open for this
+  // task" had to be asked twice and the two answers merged by hand. Five places
+  // ask it. Three learned about the spec PR one review round at a time, and
+  // four consecutive rounds produced eight findings of that single shape --
+  // rising, not falling. The sites were not the defect: asking one question in
+  // two shapes was.
+  //
+  // A NEW MIGRATION rather than an edit to hub.sql, which is frozen by design
+  // and by a recorded hash. Migration 1 has no deployed instance today, so
+  // editing it would have worked and taught the wrong habit; a schema whose
+  // history can be rewritten cannot be reasoned about the first time it cannot.
+  { version: 2, up: (db) => {
+      // RE-RUNNABLE, exactly as migration 1 is. `openHub` wraps each migration in
+      // BEGIN IMMEDIATE, so an interrupted one rolls back -- but a hub whose
+      // `schema_version` rows are lost while its TABLES survive reports version 0
+      // and replays every migration over a store that already has them. Migration
+      // 1 survives that because it is `CREATE TABLE IF NOT EXISTS` throughout;
+      // this one has to earn the same property, and `ALTER TABLE ... DROP COLUMN`
+      // has no IF EXISTS to lean on. The suite already had a fixture for this
+      // state and it is the one that caught it.
+      const hasTable = (t) => db.prepare(
+        `SELECT count(*) c FROM sqlite_master WHERE type='table' AND name = ?`).get(t).c > 0;
+      const hasColumn = (t, c) => db.prepare(
+        `SELECT count(*) c FROM pragma_table_info(?) WHERE name = ?`).get(t, c).c > 0;
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS task_pr (
+          task       TEXT    NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+          kind       TEXT    NOT NULL CHECK (kind IN ('spec','impl')),
+          generation INTEGER,
+          slice      INTEGER,
+          repo_id    INTEGER NOT NULL,
+          pr         INTEGER NOT NULL,
+          head_sha   TEXT    NOT NULL,
+          created_at INTEGER NOT NULL,
+          merged_sha TEXT,
+          PRIMARY KEY (repo_id, pr),
+          CHECK ((kind = 'impl' AND generation IS NOT NULL AND slice IS NOT NULL)
+              OR (kind = 'spec' AND generation IS NULL     AND slice IS NULL))
+        ) STRICT, WITHOUT ROWID;
+        CREATE UNIQUE INDEX IF NOT EXISTS one_spec_pr ON task_pr(task) WHERE kind = 'spec';
+        CREATE UNIQUE INDEX IF NOT EXISTS impl_pr_slice
+          ON task_pr(task, generation, slice) WHERE kind = 'impl';
+        CREATE INDEX IF NOT EXISTS task_pr_open ON task_pr(task) WHERE merged_sha IS NULL;
+      `);
+
+      // Each carry is guarded by the shape it reads FROM, so a second run over an
+      // already-migrated store finds nothing to do rather than failing.
+      if (hasTable("impl_pr"))
+        db.exec(`INSERT OR IGNORE INTO task_pr(task, kind, generation, slice, repo_id, pr,
+                                               head_sha, created_at, merged_sha)
+                   SELECT task, 'impl', generation, slice, repo_id, pr, head_sha, created_at, merged_sha
+                     FROM impl_pr`);
+      if (hasColumn("task", "spec_pr"))
+        db.exec(`INSERT OR IGNORE INTO task_pr(task, kind, generation, slice, repo_id, pr,
+                                               head_sha, created_at)
+                   SELECT id, 'spec', NULL, NULL, spec_repo_id, spec_pr,
+                          COALESCE(${hasColumn("task", "spec_head") ? "spec_head" : "NULL"}, ''), created_at
+                     FROM task
+                    WHERE spec_repo_id IS NOT NULL AND spec_pr IS NOT NULL`);
+
+      db.exec("DROP TABLE IF EXISTS impl_pr");
+      if (hasColumn("task", "spec_pr"))   db.exec("ALTER TABLE task DROP COLUMN spec_pr");
+      if (hasColumn("task", "spec_head")) db.exec("ALTER TABLE task DROP COLUMN spec_head");
+    } },
 ];
 
 /**
@@ -474,7 +543,7 @@ export const canonicalHub = canonical;
  *
  * This function deliberately does not open a transaction. Every
  * authority-bearing write appends one of these in the same tx that performs
- * it -- an approval, a gate request, a notice receipt, an impl_pr, an attested
+ * it -- an approval, a gate request, a notice receipt, a task_pr, an attested
  * push, a guardian receipt, a harness acceptance, a gate run, a pr_hold create
  * or clear, a hold reason, a project authority grant, a merge decision, a
  * territory or singleton lease grant or release, and every outbox enqueue,
@@ -526,7 +595,11 @@ const V1 = Object.freeze([
   ...[...readFileSync(SCHEMA_PATH, "utf8")
         .matchAll(/CREATE TABLE IF NOT EXISTS ([a-z_]+)\s*\(/g)].map(m => m[1]),
 ]);
-export const TABLES_AT = Object.freeze({ 1: V1 });
+// Migration 2 replaces `impl_pr` with `task_pr`: one table out, one in, so the
+// COUNT is unchanged and only the name moves. Built from V1 rather than restated,
+// which is what stops the two drifting.
+const V2 = Object.freeze([...V1.filter(t => t !== "impl_pr"), "task_pr"].sort());
+export const TABLES_AT = Object.freeze({ 1: V1, 2: V2 });
 
 /**
  * The CURRENT schema's tables: what snapshot validation compares a

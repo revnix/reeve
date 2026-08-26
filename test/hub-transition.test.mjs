@@ -125,8 +125,8 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
   // and the test cannot tell those apart from success. `impl_pr` is where the
   // projection keeps the PR's current head, so it is where the compensation
   // reads it, INSIDE the transaction rather than from the caller.
-  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
-           VALUES('bt:1',1,0,1,7,'${"c".repeat(40)}',unixepoch())`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,7,'${"c".repeat(40)}',unixepoch())`);
   db.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at) VALUES('p','prefix','packages/x','bt:1',unixepoch()+120)`);
   db.exec(`INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,cancellable,args,created_at,updated_at)
            VALUES('k1','gh.pr.comment','bt:1',1,1,1,'{}',unixepoch(),unixepoch())`);
@@ -236,8 +236,8 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 {
   const db = openHub(join(dir, "t12.db"));
   seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
-  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
-           VALUES('bt:1',1,0,1,77,'deadbee',unixepoch())`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,77,'deadbee',unixepoch())`);
   const words = "the upstream dependency cannot be licensed for redistribution";
   // CAUGHT, not called bare. The defect this covers THROWS out of the whole
   // transition, so an uncaught call ends the file and takes every later block
@@ -267,8 +267,8 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 {
   const db = openHub(join(dir, "t13.db"));
   seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
-  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
-           VALUES('bt:1',1,0,1,78,'cafe123',unixepoch())`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,78,'cafe123',unixepoch())`);
   const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
     evidence: { kind: "hold", reason: "ownership_lost" }, op: "phase.held" });
   check(r.applied === true, "control: a hold transition applies", JSON.stringify(r));
@@ -337,8 +337,8 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 {
   const db = openHub(join(dir, "t31.db"));
   seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
-  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
-           VALUES('bt:1',1,0,1,7,'sha',unixepoch())`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,7,'sha',unixepoch())`);
   const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
     evidence: { kind: "hold", reason: "ownership_lost" }, op: "phase.held" });
   check(r.applied === true && r.to === "BLOCKED", "the hold applies", JSON.stringify(r));
@@ -381,8 +381,10 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 {
   const db = openHub(join(dir, "t23.db"));
   seed(db, { id: "bt:1", phase: "SPEC_PR_OPEN", generation: 1 });
-  db.exec(`UPDATE task SET spec_repo_id=9, spec_pr=42, spec_head='specsha' WHERE id='bt:1'`);
-  check(db.prepare("SELECT count(*) c FROM impl_pr WHERE task='bt:1'").get().c === 0,
+  db.exec(`UPDATE task SET spec_repo_id=9 WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','spec',NULL,NULL,9,42,'specsha',unixepoch())`);
+  check(db.prepare("SELECT count(*) c FROM task_pr WHERE kind='impl' AND task='bt:1'").get().c === 0,
     "fixture: no implementation PR exists, which is the whole point");
   const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "SPEC_PR_OPEN", expectedGeneration: 1,
     evidence: { kind: "hold", reason: "over_budget" }, op: "phase.held" });
@@ -456,10 +458,12 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 {
   const db = openHub(join(dir, "t27.db"));
   seed(db, { id: "bt:1", phase: "IMPL_PR_OPEN", generation: 1 });
-  db.exec(`UPDATE task SET spec_repo_id=9, spec_pr=5, spec_head='specsha' WHERE id='bt:1'`);
+  db.exec(`UPDATE task SET spec_repo_id=9 WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','spec',NULL,NULL,9,5,'specsha',unixepoch())`);
   // THE SAME NUMBER, in a different repository.
-  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
-           VALUES('bt:1',1,0,1,5,'implsha',unixepoch())`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,5,'implsha',unixepoch())`);
   const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPL_PR_OPEN", expectedGeneration: 1,
     evidence: { kind: "founder.cancel" }, op: "phase.cancelled" });
   check(r.applied === true, "the cancellation applies", JSON.stringify(r));
@@ -485,8 +489,8 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 {
   const db = openHub(join(dir, "t28.db"));
   seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
-  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
-           VALUES('bt:1',1,0,1,3,'sha',unixepoch())`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,3,'sha',unixepoch())`);
   const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
     evidence: { kind: "depth.override", depth: "deep" }, op: "phase.held" });
   check(r.applied === true, "a post-approval depth override applies", JSON.stringify(r));
@@ -510,8 +514,10 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 {
   const db = openHub(join(dir, "t21.db"));
   seed(db, { id: "bt:1", phase: "GATE", generation: 1 });
-  db.exec(`UPDATE task SET spec_repo_id=9, spec_pr=5, spec_head='specsha' WHERE id='bt:1'`);
-  check(db.prepare("SELECT count(*) c FROM impl_pr WHERE task='bt:1'").get().c === 0,
+  db.exec(`UPDATE task SET spec_repo_id=9 WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','spec',NULL,NULL,9,5,'specsha',unixepoch())`);
+  check(db.prepare("SELECT count(*) c FROM task_pr WHERE kind='impl' AND task='bt:1'").get().c === 0,
     "fixture: there is no implementation PR, which is what made this reachable");
   const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "GATE", expectedGeneration: 1,
     evidence: { kind: "gate.capReached" }, op: "phase.escalated" });
@@ -530,9 +536,11 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 {
   const db = openHub(join(dir, "t22.db"));
   seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
-  db.exec(`UPDATE task SET spec_repo_id=9, spec_pr=5, spec_head='specsha' WHERE id='bt:1'`);
-  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
-           VALUES('bt:1',1,0,1,11,'implsha',unixepoch())`);
+  db.exec(`UPDATE task SET spec_repo_id=9 WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','spec',NULL,NULL,9,5,'specsha',unixepoch())`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,11,'implsha',unixepoch())`);
   const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
     evidence: { kind: "founder.regenerate",
                 snapshot: { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
@@ -556,8 +564,10 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 {
   const db = openHub(join(dir, "t17.db"));
   seed(db, { id: "bt:1", phase: "SPEC_PR_OPEN", generation: 1 });
-  db.exec(`UPDATE task SET spec_repo_id = 9, spec_pr = 42 WHERE id = 'bt:1'`);
-  check(db.prepare("SELECT count(*) c FROM impl_pr WHERE task='bt:1'").get().c === 0,
+  db.exec(`UPDATE task SET spec_repo_id = 9 WHERE id = 'bt:1'`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','spec',NULL,NULL,9,42,'specsha',unixepoch())`);
+  check(db.prepare("SELECT count(*) c FROM task_pr WHERE kind='impl' AND task='bt:1'").get().c === 0,
     "fixture: there is no implementation PR, which is what made this reachable");
   const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "SPEC_PR_OPEN", expectedGeneration: 1,
     evidence: { kind: "founder.cancel" }, op: "phase.cancelled" });
@@ -578,9 +588,11 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 {
   const db = openHub(join(dir, "t18.db"));
   seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
-  db.exec(`UPDATE task SET held_from='IMPLEMENTING', spec_repo_id=9, spec_pr=42 WHERE id='bt:1'`);
-  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
-           VALUES('bt:1',1,0,1,7,'sha',unixepoch())`);
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING', spec_repo_id=9 WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','spec',NULL,NULL,9,42,'specsha',unixepoch())`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,7,'sha',unixepoch())`);
   const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
     evidence: { kind: "founder.resume", redesign: true }, op: "phase.resumed" });
   check(r.applied === true, "control: the redesign resume applies", JSON.stringify(r));
@@ -663,9 +675,9 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 {
   const db = openHub(join(dir, "t14.db"));
   seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
-  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
-           VALUES('bt:1',1,0,1,101,'sha-a',unixepoch()),
-                 ('bt:1',1,1,1,102,'sha-b',unixepoch())`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,101,'sha-a',unixepoch()),
+                 ('bt:1','impl',1,1,1,102,'sha-b',unixepoch())`);
   const words = "the vendor withdrew the API we were building against";
   let threw = null, r = null;
   try {
@@ -796,8 +808,8 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
   seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
   db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
   db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',0)`);
-  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
-           VALUES('bt:1',1,0,1,7,'${"c".repeat(40)}',unixepoch())`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,7,'${"c".repeat(40)}',unixepoch())`);
   db.exec(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at)
            VALUES('bt:1',1,7,'${"c".repeat(40)}','over_budget',unixepoch())`);
   for (const reason of ["over_budget", "harness_touched"])
@@ -946,8 +958,8 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 {
   const db = openHub(join(dir, "t10.db"));
   seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
-  db.exec(`INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at)
-           VALUES('bt:1',1,0,1,7,'${"c".repeat(40)}',unixepoch())`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,7,'${"c".repeat(40)}',unixepoch())`);
   const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
     evidence: { kind: "founder.cancel" }, op: "task.cancelling" });
   check(r.applied && r.to === "CANCELLING", "the cancel applies", JSON.stringify(r).slice(0, 160));
@@ -1034,5 +1046,39 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 }
 
 rmSync(dir, { recursive: true, force: true });
+// ── ONE way to ask what a task has open ────────────────────────────────────
+// The whole point of folding the spec PR into `task_pr` was that "what is open
+// for this task" stopped being a question with two answers. A shared helper
+// nobody is REQUIRED to use is a convention, and conventions are exactly what
+// the eight findings of that shape were: five sites each merging two shapes by
+// hand, three of them taught about the spec PR one review round at a time.
+//
+// So the guard is not "a helper exists", it is "nothing else queries the table".
+{
+  const SRC = new URL("../src/build/", import.meta.url);
+  const files = ["transition.mjs", "registry.mjs", "phases.mjs", "loop.mjs",
+                 "outbox.mjs", "territory.mjs", "gatestate.mjs", "replay.mjs"];
+  const offenders = files.filter(f =>
+    /\bFROM\s+task_pr\b|\bINTO\s+task_pr\b|\bUPDATE\s+task_pr\b/i
+      .test(readFileSync(new URL(f, SRC), "utf8")));
+  check(offenders.length === 0,
+    "no module outside prs.mjs queries task_pr directly",
+    offenders.join(", "));
+  // CONTROL: the scan can actually SEE such a query, or it is asserting an
+  // absence it could never have found -- which is how a guard reads as green
+  // over the thing it was written to catch.
+  const owner = readFileSync(new URL("prs.mjs", SRC), "utf8");
+  check(/\bFROM\s+task_pr\b/.test(owner),
+    "control: the scan finds the query where it IS allowed to live", "prs.mjs");
+  // AND THE CALLERS GO THROUGH IT. An empty offender list is also what a
+  // transition applier that had stopped reading PRs at all would produce.
+  const applier = readFileSync(new URL("transition.mjs", SRC), "utf8");
+  check(/openPrs\(/.test(applier),
+    "control: the applier reaches the table through openPrs", "checked");
+  check((applier.match(/openPrs\(/g) ?? []).length >= 4,
+    "and every path that needs it does -- hold, close, and both annotations",
+    String((applier.match(/openPrs\(/g) ?? []).length));
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

@@ -20,7 +20,7 @@ import { assertWritable } from "./locks.mjs";
 // `HOLD_ESCALATION` and `holdReasonFor` are exported BY phases.mjs and imported
 // here: the stacked-hold branch indexes the first and calls the second, and a
 // second copy of either would be a second closed set to drift from the DDL.
-import { nextPhase, HELD, isSliceReport, HOLD_ESCALATION, holdReasonFor } from "./phases.mjs";
+import { nextPhase, HELD, isSliceReport, HOLD_ESCALATION, holdReasonFor, ACTIVE } from "./phases.mjs";
 import { isSameProcess } from "../supervisor.mjs";       // build/ is one level down
 import { enqueueEffect, voidPendingIn } from "./outbox.mjs";
 // ONE claim model, shared with admission. A resume that decided territory its
@@ -69,7 +69,8 @@ const hasLivePin = (db, taskId) => db.prepare(
 // worse -- silently does nothing and looks like it worked.
 const COMPENSATIONS = Object.freeze([
   "void-pending", "write-pr-hold", "close-prs", "release-territory",
-  "regrant-territory", "clear-holds", "annotate-held", "annotate-resumed",
+  "regrant-territory", "clear-holds", "clear-holds-except-closing",
+  "annotate-held", "annotate-resumed",
   "record-hold-reason",
   "adopt-snapshot", "release-ledger-claim", "terminate-worker",
   "record-research-skip", "record-drain", "force-drain",
@@ -93,6 +94,42 @@ const COMPENSATIONS = Object.freeze([
  */
 export class CompensationRefused extends Error {
   constructor(message) { super(message); this.name = "CompensationRefused"; }
+}
+
+// The outbox statuses from which a delivery may still follow. Anything else is
+// an obligation that has been dropped, whatever the reason.
+const LIVE_OUTBOX = Object.freeze(["pending", "inflight"]);
+
+/**
+ * The pull requests this task still owes a close, and the state of each.
+ *
+ * ONE definition, because two readers ask it and they were answering it
+ * differently. `clear-holds` asks it to decide which holds outlive the resume;
+ * `annotate-resumed` asks it to decide which pull requests must NOT be told that
+ * work has restarted. The second used to derive its own answer from the CURRENT
+ * transition's evidence -- so a close CARRIED FORWARD from a redesign several
+ * transitions ago was invisible to it, and an ordinary resume cheerfully posted
+ * "resumed" to a pull request it was in the middle of abandoning.
+ *
+ * Keyed on the pull request and decided by its LATEST close attempt, because
+ * close rows accumulate: a hold voids one and the next resume enqueues another,
+ * so "was there ever a done" is a question about history rather than about what
+ * is owed now.
+ */
+function closeObligations(db, taskId) {
+  const byPr = new Map();
+  for (const row of db.prepare(
+    `SELECT o.args, o.status, o.kind, o.idempotency_key FROM outbox o
+      WHERE o.task_id = ? AND o.kind = 'gh.pr.close'
+      ORDER BY o.id`).all(taskId)) {
+    let a; try { a = JSON.parse(row.args); } catch { continue; }
+    if (a?.repo_id == null || a?.pr == null) continue;
+    byPr.set(`${a.repo_id}:${a.pr}`, { row, args: a });
+  }
+  // Settled ones are not obligations: the pull request is closed and nothing is
+  // owed, so its hold may clear and nobody needs telling about it.
+  for (const [key, { row }] of byPr) if (row.status === "done") byPr.delete(key);
+  return byPr;
 }
 
 const PR_HOLD_COLS = `id, task, repo_id, pr, head_sha, reason, detail, created_at, cleared_at`;
@@ -233,6 +270,20 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       // and `record-drain` never saw it. The task then reached CANCELLED or
       // INFEASIBLE with one of its PRs permanently open, and the drain that
       // exists to prove otherwise agreed that everything had settled.
+      // THE CLOSE STAYS CANCELLABLE, deliberately, and the hold is what carries
+      // the obligation instead.
+      //
+      // Making it non-cancellable was the obvious repair and it is wrong: the row
+      // then survives into `record-drain`, and the next resume is refused while
+      // it is outstanding -- so a task could not resume until GitHub was
+      // reachable, which is the very failure this branch removed from the hold
+      // comment two rounds ago. A safety property must not be bought with a
+      // liveness one.
+      //
+      // So the PR's hold outlives every resume until its close actually lands
+      // (see `clear-holds`), which closes the mergeable window on its own, and a
+      // resume RE-ENQUEUES a close that a hold voided. Voided and re-enqueued is
+      // a cycle that converges; open and unheld is not.
       for (const pr of open) {
         enqueue("gh.pr.comment", `${taskId}:g${generation}:r${pr.repo_id}:pr${pr.pr}:close-notice`,
                 { repo_id: pr.repo_id, pr: pr.pr, reason: evidence?.kind ?? null,
@@ -247,8 +298,39 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
     // -- the claims are the task's, the lease is the grant -- so a release with
     // no event is undone by replay and the territory is held by a ghost.
     case "release-territory": {
+      const at = db.prepare("SELECT unixepoch() n").get().n;
       const held = db.prepare(`SELECT ${LEASE_COLS} FROM territory_lease WHERE task = ?`).all(taskId);
       for (const lease of held) {
+        // AN EXPIRED PIN IS SPENT, AND THAT HAS TO OUTLIVE THE LEASE.
+        //
+        // The two halves of a pin were kept in places with different lifetimes:
+        // the INTENT in `task_territory.pinned`, which is durable, and the
+        // DEADLINE in `territory_lease.pinned_until`, which this delete destroys.
+        // So carrying the original deadline across a resume -- the fix that made
+        // a pin a deadline rather than a renewable lease -- held only until the
+        // next hold. A hold releases territory precisely when no pin is live, the
+        // row went with it, and the resume after that found no row, read the
+        // still-set intent bit, and minted `now + LEASE_SECONDS`. One extra
+        // hold/resume cycle and the expired pin was live again, blocking
+        // overlapping filings past the deadline the founder actually set.
+        //
+        // Recording the end where the intent lives is what makes them one fact.
+        // An intent bit with no live pin at release time is spent by
+        // construction: the hold paths emit this compensation only when
+        // `pinnedTerritory` is false, and a terminal task does not resume.
+        //
+        // AND THE CLEAR IS EVENTED, because `task_territory` is a replayed
+        // projection like the lease is. An unrecorded write is undone by the
+        // next restore, which would put the intent bit back and hand the same
+        // resurrection back to the resume that follows it.
+        if (lease.pinned_until !== null && lease.pinned_until <= at) {
+          const claim = db.prepare(
+            `UPDATE task_territory SET pinned = 0
+              WHERE task = ? AND kind = ? AND path = ?
+              RETURNING task, kind, path, pinned`)
+            .get(taskId, lease.kind, lease.path);
+          if (claim) hubEvent(db, { kind: "task_territory.claimed", task: taskId, payload: claim });
+        }
         db.prepare(`DELETE FROM territory_lease WHERE project=? AND kind=? AND path=?`)
           .run(lease.project, lease.kind, lease.path);
         hubEvent(db, { kind: "territory_lease.released", task: taskId, payload: lease });
@@ -280,8 +362,28 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
             `${holder.kind} ${holder.path || "(repository root)"}, held by ${holder.task} ` +
             `until ${holder.expires_at}; ` +
             `the resume is refused rather than granting two tasks the same paths`);
+        // THE ORIGINAL DEADLINE, not a fresh one. `task_territory.pinned` is a
+        // durable bit saying the filing ASKED for a pin; the deadline lived on
+        // the lease. Deriving a new `now + LEASE_SECONDS` from that bit renews a
+        // pin the founder time-boxed every time the task resumes -- and if it is
+        // held again inside the renewed window it keeps blocking overlapping
+        // filings past the expiry that was actually requested. A pin that
+        // renews itself on resume is not a deadline.
+        //
+        // An EXPIRED pin regrants unpinned: the promise was kept and it ended.
+        // THE ROW, not the column. A missing `pinned_until` is ambiguous on its
+        // own: it means "this lease was never pinned" AND "there is no lease
+        // here at all", and those want opposite answers. A held task whose
+        // territory was RELEASED has no row, so its resume is making a FRESH
+        // promise and takes a fresh deadline; a row that still exists carries
+        // whatever deadline it has, including none.
+        const prior = db.prepare(
+          `SELECT pinned_until FROM territory_lease
+            WHERE project=? AND kind=? AND path=? AND task=?`)
+          .get(task.project, claim.kind, claim.path, taskId);
+        const priorPin = prior ? (prior.pinned_until ?? null) : undefined;
         const granted = grantLease(db, { project: task.project, claim, taskId, at,
-                                         pinned: !!claim.pinned });
+                                         pinned: !!claim.pinned, pinnedUntil: priorPin });
         hubEvent(db, { kind: "territory_lease.granted", task: taskId, payload: granted });
       }
       return;
@@ -292,9 +394,65 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
     // key -- without the event a snapshot holding open reasons plus a later
     // resume replays into an active task whose reasons are still open, and
     // `task why` reports a cause that was cleared before the restore.
+    // A redesign and a regenerate ABANDON their implementation PRs, and the
+    // close is enqueued rather than performed. Clearing those holds here leaves
+    // an open PR with nothing making it unmergeable in the window before the
+    // close lands -- and if the close is delayed, retried, or refused because
+    // `publishPr` is off, that window has no end. The hold is the only thing
+    // that stops superseded work being merged, so it outlives the decision to
+    // close the PR and is cleared by the close settling, not by the resume.
+    //
+    // The SPEC PR's hold is cleared: it is reused rather than abandoned, and the
+    // transition is about to push a new head to it.
+    case "clear-holds-except-closing":
     case "clear-holds": {
+      const keepHeld = c === "clear-holds-except-closing"
+        ? new Set(openPrs(db, taskId, { kind: "impl" }).map(p => `${p.repo_id}:${p.pr}`))
+        : new Set();
+      // AND NEITHER VARIANT CLEARS A HOLD WHOSE CLOSE HAS NOT LANDED.
+      //
+      // Retaining the hold on the strength of the CURRENT transition's type was
+      // the defect: the obligation belongs to the pull request, not to whichever
+      // resume happens to be running. A redesign retained the hold and enqueued
+      // the close; a later ordinary resume, several transitions away, knew
+      // nothing about either and cleared it.
+      //
+      // The obligation is read from the outbox, where it durably is. Anything
+      // short of `done` keeps the hold -- including a close that was dead-
+      // lettered or fenced, because a superseded pull request nothing will ever
+      // close is precisely the one that must stay held and visible. Fail-closed:
+      // the hold outlives the decision to close, and only the close landing
+      // clears it.
+      // PER PULL REQUEST, not per row. The obligation is "this PR gets closed",
+      // and a hold voids the close while the next resume enqueues a replacement
+      // -- so a PR accumulates close rows, and asking "is any row not done" keeps
+      // answering yes for ever because the ORIGINAL voided row never becomes
+      // done. The hold then never cleared and every resume enqueued another
+      // close, repeating an external operation a successor had already
+      // completed. Any successful close satisfies the obligation, whichever row
+      // carried it.
+      // THE LATEST ATTEMPT DECIDES, not "was there ever a success".
+      //
+      // Collecting the flags separately let an OLD `done` forgive a NEWER dropped
+      // close: a pull request closed, reopened, and re-closed by an attempt that
+      // was then voided still looked satisfied, so the hold cleared and the
+      // reopened superseded PR became mergeable again. History is not the
+      // question -- the state of the most recent obligation is. Rows arrive in
+      // `id` order, which is enqueue order, so the last one for a PR is that
+      // obligation and its status is the answer.
+      for (const [key, { row, args }] of closeObligations(db, taskId)) {
+        keepHeld.add(key);
+        // AND RE-ESTABLISHED IF A HOLD VOIDED IT. A PR with no successful close
+        // and nothing still going to happen is an obligation that was dropped:
+        // it stays held, correctly, but nothing is left to ever close it.
+        // Re-enqueued with its ORIGINAL key and args -- the same logical act, and
+        // `enqueueEffect`'s key is unique over LIVE rows only, so the dead row
+        // does not refuse it.
+        if (!LIVE_OUTBOX.includes(row.status)) enqueue(row.kind, row.idempotency_key, args);
+      }
       for (const h of db.prepare(
-        `SELECT id FROM pr_hold WHERE task = ? AND cleared_at IS NULL`).all(taskId)) {
+        `SELECT id, repo_id, pr FROM pr_hold WHERE task = ? AND cleared_at IS NULL`).all(taskId)) {
+        if (keepHeld.has(`${h.repo_id}:${h.pr}`)) continue;
         db.prepare(`UPDATE pr_hold SET cleared_at = unixepoch() WHERE id = ?`).run(h.id);
         // `pr_hold.cleared` rather than `pr_hold.created`: both are declared in
         // HANDLERS against the same table and the same key, so replay treats
@@ -303,6 +461,8 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
         hubEvent(db, { kind: "pr_hold.cleared", task: taskId,
           payload: db.prepare(`SELECT ${PR_HOLD_COLS} FROM pr_hold WHERE id = ?`).get(h.id) });
       }
+      // The task-level reasons clear either way: the task IS resuming, whatever
+      // happens to the pull requests it is abandoning.
       for (const r of db.prepare(
         `SELECT id FROM hold_reason WHERE task = ? AND cleared_at IS NULL`).all(taskId)) {
         db.prepare(`UPDATE hold_reason SET cleared_at = unixepoch() WHERE id = ?`).run(r.id);
@@ -325,7 +485,15 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       // only within one.
       for (const pr of openPrs(db, taskId))
         enqueue("gh.pr.comment",
-                `${taskId}:g${generation}:r${pr.repo_id}:pr${pr.pr}:held:${evidence?.reason ?? "held"}`,
+                // `resume_seq` makes each HOLD OCCURRENCE distinct. Without it a
+                // task resumed and then held again for the same reason in the
+                // same generation produced the identical key, and the comment
+                // reconciler identifies delivery by that marker -- so it can
+                // settle the second hold against the FIRST hold's comment,
+                // leaving the thread with a "resumed" note and no explanation
+                // for the hold that followed it.
+                `${taskId}:g${generation}:r${task.resume_seq}:repo${pr.repo_id}:pr${pr.pr}` +
+                `:held:${evidence?.reason ?? "held"}`,
                 { repo_id: pr.repo_id, pr: pr.pr, note: "held",
                   ...(pr.kind === "spec" ? { repo: "spec" } : {}),
                   reason: evidence?.reason ?? null,
@@ -336,7 +504,30 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
     }
 
     case "annotate-resumed": {
-      for (const pr of openPrs(db, taskId))
+      // NOT THE PRs THIS TRANSITION IS ABOUT TO CLOSE. A redesign resume and a
+      // regenerate both run `annotate-resumed` BEFORE `close-prs`, so after the
+      // all-PR refactor this posted "resumed" to an implementation PR seconds
+      // before closing it -- a thread that announces work restarting on a pull
+      // request being abandoned. Those PRs get the close notice, which is the
+      // comment that actually explains what happened to them.
+      //
+      // The spec PR is the exception on exactly these paths: it is REUSED, the
+      // transition pushes a new head to it, and it is the one place a "resumed"
+      // note is true.
+      // AND NOT THE ONES IT IS STILL ABANDONING FROM AN EARLIER TRANSITION.
+      //
+      // `closing` reads the CURRENT evidence, which only knows about a redesign
+      // happening right now. A close carried forward -- voided by a hold and
+      // re-enqueued by `clear-holds` in this very transition -- is invisible to
+      // it, so an ordinary resume announced that work had restarted on a pull
+      // request it was in the middle of abandoning. Same misleading sequence the
+      // direct redesign path already avoids, reached by the longer route.
+      const closing = evidence?.kind === "founder.regenerate"
+                   || (evidence?.kind === "founder.resume" && evidence?.redesign === true);
+      const owed = closeObligations(db, taskId);
+      const speaking = (closing ? openPrs(db, taskId, { kind: "spec" }) : openPrs(db, taskId))
+        .filter(pr => !owed.has(`${pr.repo_id}:${pr.pr}`));
+      for (const pr of speaking)
         enqueue("gh.pr.comment",
                 `${taskId}:g${generation}:r${task.resume_seq}:repo${pr.repo_id}:pr${pr.pr}:resumed`,
                 { repo_id: pr.repo_id, pr: pr.pr, note: "resumed",
@@ -555,7 +746,36 @@ function applyTransitionTx(db, { taskId, expectedPhase, expectedGeneration, evid
       phase: expectedPhase, generation: expectedGeneration, heldFrom: task.held_from,
       sliceCursor: task.slice_cursor, hasOpenPr: hasOpenBuilderPr(db, taskId),
       pinnedTerritory: hasLivePin(db, taskId),
+      // TWO QUESTIONS, NOT ONE. `drainRemaining` is everything still outstanding
+      // and is what CANCELLING reads: a task cannot claim to be CANCELLED until
+      // its own close and notice have actually happened, so the stop's own
+      // compensations belong in that count.
       drainRemaining: db.prepare("SELECT count(*) c FROM task_drain WHERE task=? AND settled_at IS NULL").get(taskId).c,
+      // A RESUME asks something different: is any of the work the task was DOING
+      // still in flight? The hold's own explanatory comment is not that. Counting
+      // it made every hold-then-resume refuse until an executor delivered a
+      // comment -- and in S2 nothing delivers anything, so the refusal had no
+      // end. Scoped by the `fence` of the event that stopped the task: at or
+      // after it is the stop's own doing, before it is the work.
+      // THE EXACT TEST: was this effect enqueued BY a stop? `fence` is the
+      // `phase_event.seq` that authorised the row, so the event itself answers
+      // it -- and a hardcoded list of stopped phases here was a second copy of a
+      // classification `phases.mjs` already owns, free to drift from it.
+      //
+      // Comparing against the LATEST stop was correct only while a task had
+      // stopped once. Held, resumed while the hold comment was still unsettled,
+      // held again: the first hold's own comment has the FIRST stop's fence,
+      // which sorts before the second stop, so it was recounted as work the task
+      // was doing and every later resume was refused -- indefinitely, if that
+      // comment is waiting on a reconciler that cannot reach GitHub.
+      drainBeforeStop: db.prepare(
+        `SELECT count(*) c FROM task_drain d
+           JOIN outbox o ON o.id = d.outbox_id
+          WHERE d.task = ? AND d.settled_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM phase_event e
+                             WHERE e.task = d.task AND e.seq = o.fence
+                               AND e.to_phase NOT IN (${ACTIVE.map(p => `'${p}'`).join(",")}))`)
+        .get(taskId).c,
     }, evidence);
 
     const WORKER_PHASES = ["SIZING","RESEARCH","DESIGN","SPEC_DRAFT","IMPLEMENTING"];

@@ -159,6 +159,12 @@ const HANDLERS = {
   "outbox.settled":           { table: "outbox", key: ["id"] },
   "outbox.voided":            { table: "outbox", key: ["id"] },
   "outbox.fenced":            { table: "outbox", key: ["id"] },
+  // A row whose reconciler could not LOOK stays `inflight` with its lease
+  // deadline pushed out, so the sweep asks again instead of the queue acting
+  // again. It is a row image like the others and replay must not lose it:
+  // without this binding a restore rewinds the deadline and the reconciler is
+  // hammered at the interval it had already escalated away from.
+  "outbox.unobserved":        { table: "outbox", key: ["id"] },
   "territory_lease.granted":  { table: "territory_lease", key: ["project","kind","path"] },
   "territory_lease.released": { table: "territory_lease", key: ["project","kind","path"], delete: true },
 };

@@ -20,6 +20,7 @@
 import { hubTx, hubEvent, canonicalHub } from "./hubdb.mjs";
 import { assertWritable } from "./locks.mjs";
 import { isSameProcess } from "../supervisor.mjs";
+import { ACTIVE } from "./phases.mjs";
 // ONE backoff policy for the whole system. `src/db/ops.mjs` already owns it and
 // `src/build/locks.mjs` already imports from there, so a second curve defined
 // here would be two answers to one question -- and the one this file needed was
@@ -64,6 +65,135 @@ export const KEY_KINDS = Object.freeze(["git.push.branch", "gh.pr.merge"]);
 // drain row only when its effect reaches one of these: a retryable failure
 // returns the row to `pending`, and marking its drain settled there would let a
 // task reach CANCELLED with the effect still queued to run again.
+/**
+ * May this effect still be DELIVERED?
+ *
+ * The generation fence answers a different question. A redesign bumps the
+ * generation, so an effect decided under the old contract is fenced -- but a
+ * HOLD, a CANCELLATION, an infeasibility and a lost claim all leave the
+ * generation ALONE, deliberately: they stop the task without redefining its
+ * contract. So `leaseEffect`'s generation check passes for an effect enqueued
+ * before the stop, and a task the founder has stopped could still push, comment
+ * or merge.
+ *
+ * `void-pending` was supposed to cover this and cannot reach the whole set: it
+ * marks `pending` rows, and an effect INFLIGHT when the stop commits is not one.
+ * When its worker reports a retryable failure the row went back to `pending` and
+ * became deliverable again -- so the gap was not a missed row, it was a row that
+ * came back.
+ *
+ * CANCELLABLE ONLY, which is the column's existing meaning: a push mid-transport
+ * is `cancellable = 0` because the bytes may already be on the wire, and
+ * abandoning it is not a compensation. Those still finish. Everything the task
+ * could safely abandon stops being deliverable the moment the task stops.
+ *
+ * ACTIVE is the whole of it -- HELD, DRAINING and TERMINAL are every other
+ * phase -- so this cannot drift as phases are added.
+ */
+const stillDeliverable = (db, row) => {
+  if (!row.cancellable) return true;
+  if (!row.task_id) return true;                 // not a task's effect
+  const t = db.prepare("SELECT phase FROM task WHERE id = ?").get(row.task_id);
+  if (!t) return true;                           // no task row: the FK decides, not this
+  if (ACTIVE.includes(t.phase)) return true;
+
+  // THE STOP'S OWN EFFECTS ARE NOT WHAT IT STOPS.
+  //
+  // A hold enqueues the comment that EXPLAINS the hold; a cancellation enqueues
+  // the close and its notice. Those are the compensations of the very transition
+  // that stopped the task, and suppressing them would silence the explanation
+  // the stop exists to give -- the first version of this predicate did exactly
+  // that, and it was found by the hold-then-resume test rather than by reading.
+  //
+  // `fence` is the phase_event seq that enqueued the row, and the stop's own
+  // compensations carry the stopping transition's seq. So an effect enqueued AT
+  // OR AFTER the moment the task stopped belongs to the stop; anything earlier
+  // is work the task was doing, and that is what must not continue.
+  return isStopOwned(db, row.task_id, row.fence);
+};
+
+/**
+ * Was this effect enqueued BY a stop, rather than by the work the stop halted?
+ *
+ * `fence` is the `phase_event.seq` that authorised the row, so the question has
+ * an exact answer: look at that event and ask whether it was itself a stopping
+ * transition. Anything else is work the task was doing.
+ *
+ * THE EXACT TEST, not "at or after the latest stop". Comparing against
+ * `max(seq)` is right only while a task has stopped once. A task held, resumed
+ * while its hold comment was still unsettled, and held again has TWO stops -- and
+ * the first hold's own comment, whose fence is the first stop, sorts before the
+ * second one. It was then reclassified as work the task was doing, which fences
+ * a previous stop's explanation on one path and refuses every subsequent resume
+ * on the other. A predicate that is correct only for the first occurrence of the
+ * thing it describes is not a predicate.
+ */
+export const isStopOwned = (db, taskId, fence) => {
+  if (taskId == null) return false;
+  return db.prepare(
+    `SELECT count(*) c FROM phase_event
+      WHERE task = ? AND seq = ? AND to_phase NOT IN (${ACTIVE.map(p => `'${p}'`).join(",")})`)
+    .get(taskId, fence).c > 0;
+};
+
+/**
+ * The conversation an effect speaks into, or null if it does not speak.
+ *
+ * `(repo_id, pr)` is the identity, because that pair is `task_pr`'s primary key:
+ * a pull request number is unique inside its repository and nowhere else. It is
+ * read from `args` rather than from a column because that is where the enqueue
+ * already puts it, and inventing a second home for the same fact is how the two
+ * PR shapes drifted apart before migration 2 merged them.
+ */
+const COMMENT_KIND = "gh.pr.comment";
+const conversationOf = (row) => {
+  if (row.kind !== COMMENT_KIND) return null;
+  let a;
+  try { a = JSON.parse(row.args); } catch { return null; }
+  return (a?.repo_id == null || a?.pr == null) ? null : `${a.repo_id}:${a.pr}`;
+};
+
+/**
+ * Is an EARLIER comment on the same pull request still unsettled?
+ *
+ * `id` is the enqueue order, and only `pending` and `inflight` rows are still
+ * going to be delivered -- a fenced, voided or dead-lettered predecessor never
+ * arrives, so it must not hold the queue for ever.
+ */
+const blockedByEarlierComment = (db, row) => {
+  const conv = conversationOf(row);
+  if (!conv) return false;
+  // A PREDECESSOR THE GENERATION FENCE HAS ALREADY CONDEMNED IS NOT ONE.
+  //
+  // `founder.regenerate` bumps the generation without voiding pending rows, so
+  // an old-generation comment sitting on a backoff is certain to settle `fenced`
+  // -- but not until its `not_before` arrives, because the due scan cannot see
+  // it before then. Waiting behind it delays the regenerated task's own status
+  // and close-notice comments by up to the backoff ceiling, for an ordering risk
+  // that cannot exist: the row it is ordered against will never be delivered.
+  //
+  // Matched against the task's CURRENT generation rather than against this row's,
+  // because the question is whether the predecessor can still act at all, not
+  // whether the two agree with each other.
+  //
+  // AND ONLY WHILE IT IS STILL PENDING. The fence lives in `leaseEffect`, so a
+  // row that is already `inflight` has PASSED it: a worker holds it, the settle
+  // path does not re-check the generation, and it will land. Exempting it lets a
+  // new-generation comment be leased beside it and arrive first, after which the
+  // older one lands last and leaves the pull request showing a status the task
+  // left two generations ago. A condemned row is only harmless while the thing
+  // that condemns it can still reach it.
+  return db.prepare(
+    `SELECT o.id, o.kind, o.args FROM outbox o
+       LEFT JOIN task t ON t.id = o.task_id
+      WHERE o.kind = ? AND o.status IN ('pending','inflight') AND o.id < ?
+        AND (o.status = 'inflight'
+             OR o.task_id IS NULL OR t.id IS NULL OR o.task_generation = t.generation)
+      ORDER BY o.id`)
+    .all(COMMENT_KIND, row.id)
+    .some(earlier => conversationOf(earlier) === conv);
+};
+
 const TERMINAL_OUTBOX = Object.freeze(
   ["done", "failed", "dead_letter", "voided", "fenced", "refused", "superseded", "forced"]);
 
@@ -228,6 +358,46 @@ export function leaseEffect(db, { worker, leaseSeconds = 300, capabilities = {},
         continue;
       }
 
+      // A TASK THAT HAS STOPPED DELIVERS NOTHING IT COULD ABANDON. The
+      // generation fence above cannot answer this: a hold, a cancellation, an
+      // infeasibility and a lost claim all leave the generation alone, so an
+      // effect enqueued before the stop still matches it.
+      if (!stillDeliverable(db, row)) {
+        db.prepare(
+          `UPDATE outbox SET status='fenced', worker=NULL,
+                             last_error=?, updated_at=unixepoch() WHERE id=?`)
+          .run("the task is no longer active; a cancellable effect is not delivered after it stops",
+               row.id);
+        emitRow(db, "outbox.fenced", row.id);
+        settleDrainFor(db, row.id);
+        continue;
+      }
+
+      // ONE CONVERSATION, ONE ORDER. Comments on a pull request are a running
+      // commentary on the task's status, and the LAST one to arrive is the one a
+      // reader believes -- so their order is part of their meaning in a way a
+      // push's is not.
+      //
+      // Nothing made them ordered. A hold enqueues "held" and a resume enqueues
+      // "resumed"; the resume neither waits for the first nor voids it -- and it
+      // must not, because a founder's resume blocking on a comment is how
+      // hold-then-resume deadlocked once already. So both sat deliverable at
+      // once: `stillDeliverable` re-admits the older row the moment the task is
+      // ACTIVE again, two executors lease them independently, and the transports
+      // race. "held" landing second leaves an ACTIVE task whose pull request says
+      // it is stopped, with nothing to correct it until the next transition.
+      //
+      // Ordering is a DELIVERY property, so it belongs here rather than in a
+      // guard on the resume: an older unsettled comment for the same pull request
+      // means this one is not due yet. Skipped, not fenced -- the row keeps its
+      // place and the next pass reconsiders it.
+      //
+      // Fail-closed, and deliberately: if that older row is stuck `inflight`
+      // because its reconciler cannot reach GitHub, later comments on that pull
+      // request wait behind it. Silence is recoverable; a status line that
+      // contradicts the task is not.
+      if (blockedByEarlierComment(db, row)) continue;
+
       // A switch the founder has not turned on is CONFIGURATION, not a fault: it
       // burns no attempt and raises no escalation, and it is terminal, because
       // retrying a decision the operator made is not recovery.
@@ -292,6 +462,12 @@ export function settleEffect(db, { id, worker, leaseToken, ok, result = null,
 
     let status;
     if (ok) status = "done";
+    // NOT BACK INTO THE QUEUE FOR A STOPPED TASK. `void-pending` marks `pending`
+    // rows and cannot reach one that was INFLIGHT when the stop committed -- so
+    // the gap was never a missed row, it was a row that came BACK. Fenced here
+    // rather than left pending for `leaseEffect` to catch, because a pending row
+    // keeps its task's drain outstanding and `fenced` is terminal for a drain.
+    else if (retryable && !stillDeliverable(db, row)) status = "fenced";
     else if (retryable && row.attempts < row.max_attempts) status = "pending";
     else status = row.attempts >= row.max_attempts ? "dead_letter" : "failed";
 
@@ -319,6 +495,22 @@ export function settleEffect(db, { id, worker, leaseToken, ok, result = null,
   });
 }
 
+// How long before a row whose reconciler FAILED is asked again.
+//
+// It has to escalate, or an unreachable reconciler is polled at a fixed rate for
+// as long as the outage lasts. `backoffSeconds` cannot be used as it stands:
+// its curve is driven by `attempts`, which counts DELIVERIES and by design does
+// not move on this path -- so it would return the same interval for ever.
+//
+// So the previous interval is read from the CLOCK instead of a counter: the gap
+// since the row was last touched IS the last wait, and doubling it walks the
+// same curve up to the same ceiling without storing anything. A durable
+// reconcile-attempt column is the fuller answer and needs a migration; this is
+// the half that does not, and it is bounded either way.
+const REASK_MIN = 30, REASK_MAX = 3600;
+const reaskSeconds = (at, row) =>
+  Math.min(REASK_MAX, Math.max(REASK_MIN, 2 * Math.max(0, at - row.updated_at)));
+
 /**
  * Reconcile deliveries whose lease expired, against EXTERNAL TRUTH.
  *
@@ -340,7 +532,7 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
   const at = now ?? db.prepare("SELECT unixepoch() n").get().n;
   const expired = db.prepare(
     `SELECT ${ROW} FROM outbox WHERE status='inflight' AND lease_expires_at <= ? ORDER BY id`).all(at);
-  if (!expired.length) return { settled: 0, returned: 0, dead: 0, stale: 0 };
+  if (!expired.length) return { settled: 0, returned: 0, dead: 0, stale: 0, unobserved: 0 };
 
   // ── 2. ASK, OUTSIDE the write transaction, and AWAIT the answer.
   //
@@ -371,7 +563,14 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
   for (const row of expired) {
     if (!reconcile) { verdicts.push([row, { settled: false }]); continue; }
     try { verdicts.push([row, await reconcile(row)]); }
-    catch (e) { verdicts.push([row, { settled: false, reconcileError: e?.message ?? String(e) }]); }
+    // A SEPARATE FLAG, not the message. `new Error()` has an empty message, and
+    // an empty string is falsy -- so a reconciler that threw one was read as an
+    // authoritative "not settled", and the ambiguous effect went back to the
+    // queue or was dead-lettered. The marker that decides control flow must not
+    // be the same value as the human-readable detail, because detail is allowed
+    // to be missing.
+    catch (e) { verdicts.push([row, { settled: false, reconcileFailed: true,
+                                      reconcileError: errText(e) ?? "the reconciler threw without a message" }]); }
   }
 
   // ── 3. APPLY, under a short write transaction, each row CAS'd on the state it
@@ -380,7 +579,24 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
   // applying it would overwrite whoever holds it now.
   return hubTx(db, () => {
     assertWritable(db, { isAlive, inTx: true });
-    let settled = 0, returned = 0, dead = 0, stale = 0;
+    // A CLOCK READ HERE, not the one taken before the reconcilers ran.
+    //
+    // `at` was sampled before any external call, and the reconcile pass is a
+    // sequence of network round trips: a slow batch, or one long timeout, can
+    // leave `at` further in the past than the interval being scheduled, so
+    // `at + wait` lands BEHIND now and the next sweep re-asks immediately. Worse,
+    // it does so for ever -- `updated_at` records completion, so the elapsed
+    // measure the next interval doubles from is the gap since completion rather
+    // than the gap the row actually waited, which floors at the minimum and never
+    // escalates. A deadline has to be measured from when it is written.
+    // ALWAYS RE-READ, even when the caller injected a clock for the scan. `now`
+    // says which rows are DUE -- a read-side question, asked before the network.
+    // When that deadline is written is a different moment, and letting one
+    // override stand for both is what made this defect untestable: a fixture
+    // that pins `now` pins the apply clock to it too, so the stale-clock bug and
+    // the fix produce identical output and the stub goes green.
+    const applyAt = db.prepare("SELECT unixepoch() n").get().n;
+    let settled = 0, returned = 0, dead = 0, stale = 0, unobserved = 0;
     for (const [row, verdict] of verdicts) {
       const cur = db.prepare("SELECT status, worker, lease_token FROM outbox WHERE id = ?").get(row.id);
       if (!cur || cur.status !== "inflight" || cur.worker !== row.worker
@@ -405,6 +621,78 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
       // could observe was leased, expired and requeued for ever, performing an
       // externally ambiguous action every round. The bound is on the ROW, so
       // every path that writes `pending` has to honour it.
+      // BEFORE THE STOP FENCE, and the order is the whole point.
+      //
+      // Fencing means "this will not happen". A reconciler that THREW has not
+      // established that. An effect that was already `inflight` when its task
+      // stopped is the one case where the action may ALREADY have landed -- that
+      // is what inflight means -- so fencing it on the strength of a failed look
+      // settles its drain, and the task then reaches CANCELLED or resumes with an
+      // untracked pull request open behind it. That is the single thing the drain
+      // exists to prevent, and the previous ordering walked straight into it.
+      //
+      // Retention is safe here precisely because it does not redeliver: the row
+      // stays `inflight`, and `leaseEffect` reads `pending` only. So an
+      // unobservable stopped effect is held for another look rather than being
+      // declared dead, and the fence below still catches it the moment a
+      // reconciler can actually LOOK and reports it did not happen.
+      if (verdict?.reconcileFailed) {
+        const wait = reaskSeconds(applyAt, row);
+        db.prepare(
+          `UPDATE outbox SET lease_expires_at=?, last_error=?, updated_at=unixepoch()
+            WHERE id=?`)
+          .run(applyAt + wait, `reconcile failed: ${verdict.reconcileError}`, row.id);
+        emitRow(db, "outbox.unobserved", row.id);
+        unobserved++;
+        continue;
+      }
+
+      // A STOPPED TASK'S EFFECT IS FENCED HERE TOO, for the same reason as the
+      // settle path: this is the other way a row leaves `inflight`.
+      if (!stillDeliverable(db, row)) {
+        db.prepare(
+          `UPDATE outbox SET status='fenced', worker=NULL, lease_expires_at=0,
+                             last_error=?, updated_at=unixepoch() WHERE id=?`)
+          .run("the task is no longer active; a cancellable effect is not delivered after it stops",
+               row.id);
+        emitRow(db, "outbox.fenced", row.id);
+        settleDrainFor(db, row.id);
+        stale++;                      // counted, not silently dropped
+        continue;
+      }
+
+      // THE DELIVERY BUDGET DOES NOT RATION THE READ THAT COULD SAVE US.
+      //
+      // `attempts` counts DELIVERIES -- each one a POST that could duplicate an
+      // external act. A reconciler that could not LOOK has performed no delivery
+      // and can only ever conclude "still cannot tell", so charging it to that
+      // budget makes the safe act as scarce as the dangerous one. Spending it
+      // dead-letters the row and settles its drain, and the task then proceeds
+      // as though nothing happened -- while the effect may have landed on one of
+      // those attempts and nobody will ever look again. CANCELLED becomes
+      // reachable with a push or a merge outstanding, which is the single thing
+      // the drain exists to prevent.
+      //
+      // So a reconcile that ERRORED never spends the budget. It is unbounded on
+      // purpose: the alternative is discarding a possibly-delivered effect, and a
+      // task whose drain will not settle is FAIL-CLOSED and visible in
+      // `task why`, while a dead-lettered one is fail-open and silent.
+      //
+      // BUT NOT BACK INTO THE DELIVERY QUEUE. `pending` is not a holding area,
+      // it is the queue `leaseEffect` takes from -- and that scan filters on the
+      // schedule alone, never on the attempt limit. So a row kept for further
+      // OBSERVATION was leased for another DELIVERY the moment its backoff
+      // expired, and a prolonged reconciler outage turned into an unbounded run
+      // of duplicate pushes, merges and PR operations: exactly the harm not
+      // spending the budget was meant to avoid, arrived at by the other road.
+      //
+      // Retention has to be a state the deliverer cannot see. `inflight` already
+      // is one: `leaseEffect` reads `pending` only, the reconcile sweep reads
+      // expired `inflight` rows, and `outbox_live_key` keeps the idempotency key
+      // reserved while the effect's fate is unknown -- which is right, because it
+      // may have landed. So the row simply stays where it is, with its lease
+      // deadline pushed out, and the next sweep ASKS AGAIN rather than acts. The
+      // CAS on (worker, lease_token) still matches, because neither changes here.
       const spent = row.attempts >= row.max_attempts;
       // BACKED OFF LIKE ANY OTHER RETRY. A row returned here is due immediately,
       // and `leaseEffect` takes every pending row whose schedule is due -- so an
@@ -420,14 +708,12 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
                            last_error=COALESCE(?, last_error), updated_at=unixepoch()
           WHERE id=?`)
         .run(spent ? "dead_letter" : "pending", backoff, backoff,
-             spent ? `unobserved after ${row.attempts} of ${row.max_attempts} attempts` +
-                     (verdict?.reconcileError ? `; last reconcile failed: ${verdict.reconcileError}` : "")
-                   : (verdict?.reconcileError ? `reconcile failed: ${verdict.reconcileError}` : null),
+             spent ? `unobserved after ${row.attempts} of ${row.max_attempts} attempts` : null,
              row.id);
       emitRow(db, "outbox.settled", row.id);
       if (spent) { settleDrainFor(db, row.id); dead++; } else returned++;
     }
-    return { settled, returned, dead, stale };
+    return { settled, returned, dead, stale, unobserved };
   });
 }
 

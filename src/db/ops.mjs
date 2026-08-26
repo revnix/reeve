@@ -30,6 +30,11 @@ const ADDED_COLUMNS = [
   // correct -- an unleased row has no holder to fence out. `RESHAPED` is for a
   // changed UNIQUE constraint and refuses a non-empty table; this is neither.
   ["outbox", "lease_token", "INTEGER NOT NULL DEFAULT 0"],
+  // The reconciliation budget, kept apart from the delivery budget. Additive and
+  // defaulted like the fence: an existing row starts at 0 reconciliations, which
+  // is exactly true of every row written before the column existed.
+  ["outbox", "reconcile_attempts", "INTEGER NOT NULL DEFAULT 0"],
+  ["outbox", "max_reconcile", "INTEGER NOT NULL DEFAULT 3"],
 ];
 
 function addMissingColumns(db) {
@@ -317,7 +322,19 @@ export function resume(db, runId) {
 
 // ------------------------------------------------------------------ outbox
 export function enqueue(db, { idemKey, kind, runId = null, args, notBefore = 0 }) {
-  // MUST be called inside the same tx as the state change that decided it.
+  // The outbox's whole invariant, ENFORCED rather than requested.
+  //
+  // "Must be called inside the same transaction as the state change that decided
+  // it" was a comment, which means the rule lived in every caller and in none of
+  // them. A bare `enqueue(db, …)` is a perfectly ordinary-looking line that
+  // silently produces the failure the table exists to prevent: a decision durable
+  // without its effect, or an effect durable without its decision.
+  //
+  // A guard that lives in the caller is not a guard. This cannot prove the
+  // transaction is the RIGHT one -- that a state change is in it too -- but it
+  // closes the case that needs no mistake to reach, only forgetting.
+  if (!db.isTransaction)
+    throw new Error("enqueue: an effect must be enqueued inside the transaction that decided it, or a crash between the two loses one of them");
   const r = db.prepare(`
     INSERT INTO outbox(idem_key,kind,run_id,args,not_before,created_at,updated_at)
     VALUES(?,?,?,?,?,unixepoch(),unixepoch())
@@ -338,14 +355,120 @@ export function enqueue(db, { idemKey, kind, runId = null, args, notBefore = 0 }
  * the tries the budget allows. The two counters move together on this path and
  * apart on others, which is exactly why they are two columns.
  */
-export function leaseOutbox(db, { worker, leaseSeconds = 300 }) {
+/**
+ * Withdraw pending effects that a newer one has made obsolete.
+ *
+ * A transient failure leaves a row pending with a backoff. If the pull request
+ * gets a new commit before that retry comes due, the new head enqueues its own
+ * effect under a different key -- and both are now pending. They carry different
+ * markers, so the idempotency pre-check cannot see one from the other, and the
+ * reviewer is asked twice for what is now the same head.
+ *
+ * The old row is DELETED rather than settled. There is no status meaning "was
+ * never going to happen": `done` would claim a comment that was never posted, and
+ * `dead_letter` means a person must look at it, which turns an ordinary
+ * supersession into an alarm. The event is emitted so the withdrawal is still on
+ * the record.
+ *
+ * Only PENDING rows. An inflight one may already be mid-delivery, and deleting a
+ * row a drainer holds would leave it settling into nothing.
+ */
+export function supersedeEffects(db, { prefix, keep }) {
+  // `keep` is a SET of keys, not one key. Cleanup used to happen while enqueuing a
+  // replacement, so it could only ever spare the row being created -- and when the
+  // desired set became EMPTY, nothing was enqueued, the loop never ran, and the
+  // obsolete rows were left to fire. A reviewer removed from the profile would
+  // still be summoned; a dead letter for one would still escalate forever.
+  //
+  // Taking the whole desired set makes the operation "reconcile what is queued
+  // against what is wanted" rather than "make room for this one", which is the
+  // shape that works when what is wanted is nothing at all.
+  // Inside a transaction, for the same reason `enqueue` demands one -- and this
+  // needs it more, not less. It performs several deletes and an event insert per
+  // delete, and those describe ONE reconciliation: a crash partway leaves some
+  // obsolete effects removed without their audit events while others stay queued,
+  // and a reader cannot then tell a partial reconciliation from a complete one.
+  //
+  // It must also commit with the decision that produced it. Reconciling in its own
+  // transaction means a crash between the two leaves the queue reconciled against
+  // a decision that was never recorded.
+  //
+  // A guard that lives in the caller is not a guard: `enqueue` learned that in the
+  // same file, and this function was written afterwards without it.
+  if (!db.isTransaction)
+    throw new Error("supersedeEffects: reconciliation must run inside the transaction that decided it, or a crash leaves it half applied");
+  const spare = keep instanceof Set ? keep : new Set(keep === undefined ? [] : [keep]);
+  // PENDING and DEAD_LETTER, and the second is not an afterthought. A dead letter
+  // is permanent and is counted into a standing escalation every tick -- so an
+  // old head's request that failed terminally goes on demanding a person's
+  // attention after the reviewer has been successfully summoned for the current
+  // head. The work it names is not merely late, it must no longer be performed.
+  //
+  // INFLIGHT is still excluded: a drainer may be mid-delivery, and deleting a row
+  // it holds would leave it settling into nothing.
+  // `_` and `%` are LIKE wildcards, and a repository name may legitimately contain
+  // an underscore -- `my_repo` would also match `myXrepo`, so a prefix could reach
+  // into another repository's rows and delete them. Escaped explicitly rather than
+  // hoping the input never contains one.
+  const esc = prefix.replace(/[\\%_]/g, c => "\\" + c);
+  const rows = db.prepare(`SELECT id, idem_key, kind, status FROM outbox
+                           WHERE status IN ('pending','dead_letter')
+                             AND idem_key LIKE ? ESCAPE '\\'`).all(esc + "%")
+                 .filter(r => !spare.has(r.idem_key));
+  for (const r of rows) {
+    db.prepare(`DELETE FROM outbox WHERE id=? AND status IN ('pending','dead_letter')`).run(r.id);
+    emit(db, { actor: "daemon", op: "outbox.superseded",
+               payload: { id: r.id, kind: r.kind, was: r.status, key: r.idem_key, kept: [...spare] } });
+  }
+  return rows.length;
+}
+
+export function leaseOutbox(db, { worker, leaseSeconds = 300, kinds = null }) {
+  // A drainer leases only the kinds it can PERFORM. Without the filter it takes a
+  // row it has no handler for and must then decide what to do with it, and both
+  // available answers are wrong: dead-lettering discards an effect a later build
+  // would have delivered, and settling it back to pending burns an attempt each
+  // time around until the budget dead-letters it anyway. Not leasing it leaves it
+  // untouched and visible -- `pendingWithNoHandler` counts exactly those.
+  if (Array.isArray(kinds) && kinds.length === 0) return undefined;
+  const filter = Array.isArray(kinds) ? ` AND kind IN (${kinds.map(() => "?").join(",")})` : "";
+  // The lease bumps whichever counter the row's PHASE names, and the phase is read
+  // from the row as it stood BEFORE this statement. SQLite evaluates every
+  // assignment's right-hand side against the original row, so both CASEs see the
+  // same pre-lease `attempts` and exactly one of them can be 1.
+  //
+  // Deciding the phase from the returned `attempts` instead would be wrong by one:
+  // a row leased at `max_attempts - 1` comes back with `attempts = max_attempts`,
+  // and a caller testing `attempts >= max_attempts` would refuse to deliver on the
+  // very attempt the budget had just granted. `reconcile_attempts > 0` cannot be
+  // ambiguous that way -- it is only ever bumped in the reconciling phase.
   return tx(db, () => db.prepare(`
-    UPDATE outbox SET status='inflight', attempts=attempts+1, lease_token=lease_token+1,
+    UPDATE outbox SET status='inflight', lease_token=lease_token+1,
+           attempts = attempts + (CASE WHEN attempts >= max_attempts THEN 0 ELSE 1 END),
+           reconcile_attempts = reconcile_attempts
+                              + (CASE WHEN attempts >= max_attempts THEN 1 ELSE 0 END),
            lease_expires_at=unixepoch()+?, updated_at=unixepoch()
     WHERE id = (SELECT id FROM outbox
-                WHERE status='pending' AND not_before<=unixepoch()
+                WHERE status='pending' AND not_before<=unixepoch()${filter}
                 ORDER BY id LIMIT 1)
-    RETURNING id, idem_key, kind, run_id, args, attempts, max_attempts, lease_token`).get(leaseSeconds));
+    RETURNING id, idem_key, kind, run_id, args, attempts, max_attempts,
+              reconcile_attempts, max_reconcile, lease_token`)
+    .get(leaseSeconds, ...(Array.isArray(kinds) ? kinds : [])));
+}
+
+/**
+ * Effects waiting for a handler that does not exist in this build.
+ *
+ * Read rather than inferred. A row nothing can perform sits pending forever and
+ * looks exactly like an idle queue, so the count is surfaced instead of being left
+ * for someone to notice a missing comment.
+ */
+export function pendingWithNoHandler(db, kinds) {
+  if (!Array.isArray(kinds) || !kinds.length)
+    return db.prepare(`SELECT kind, count(*) n FROM outbox WHERE status='pending' GROUP BY kind`).all();
+  return db.prepare(`SELECT kind, count(*) n FROM outbox
+                     WHERE status='pending' AND kind NOT IN (${kinds.map(() => "?").join(",")})
+                     GROUP BY kind`).all(...kinds);
 }
 
 /**
@@ -360,11 +483,13 @@ export function leaseOutbox(db, { worker, leaseSeconds = 300 }) {
  * and the failure it produces -- an unfenced settle -- is the exact defect this
  * argument exists to prevent, so it must not be possible to reach it by omission.
  */
-export function settleOutbox(db, { id, leaseToken, ok, result, error, retryable = true, actor = "drainer" }) {
+export function settleOutbox(db, { id, leaseToken, ok, result, error, retryable = true,
+                                   unstarted = false, actor = "drainer" }) {
   if (!Number.isInteger(leaseToken))
     throw new Error("settleOutbox: leaseToken is required; an unfenced settle can overwrite another drainer's live delivery");
   return tx(db, () => {
-    const row = db.prepare(`SELECT attempts, max_attempts, kind, lease_token, status FROM outbox WHERE id=?`).get(id);
+    const row = db.prepare(`SELECT attempts, max_attempts, reconcile_attempts, max_reconcile,
+                                   kind, lease_token, status FROM outbox WHERE id=?`).get(id);
     // A row that is gone, or one whose fence has moved on, is not this caller's to
     // settle. Reported rather than thrown: a drainer losing a race is an ordinary
     // event, and the loser's job is to stop touching the row, not to crash.
@@ -378,22 +503,109 @@ export function settleOutbox(db, { id, leaseToken, ok, result, error, retryable 
       emit(db, { actor, op: "outbox.done", payload: { id, kind: row.kind } });
       return "done";
     }
-    const dead = !retryable || row.attempts >= row.max_attempts;
+    // A retryable failure in the DELIVERY phase never ends here, however many
+    // attempts it has spent. Spending the delivery budget moves the row on to
+    // reconciliation; it does not condemn it.
+    //
+    // It used to. `attempts >= max_attempts` meant the final POST reaching GitHub
+    // and losing only its response -- a `gh` timeout after the comment was created
+    // -- was recorded as an effect reeve could not perform, and escalated, while
+    // the comment sat on the pull request. Nothing was ever going to look again,
+    // because looking is what the reconciling phase is for and the row never
+    // reached it. Only the reconciliation budget is a reason to give up on a
+    // retryable failure, because only reconciliation has already asked GitHub what
+    // happened and been unable to find out.
+    const reconciling = row.reconcile_attempts > 0;
+
+    // A lease that never reached the handler REFUNDS the budget it charged.
+    //
+    // The fence and the budget are separate facts and this is where the
+    // difference bites. The lease really happened, so `lease_token` stays bumped
+    // and a stalled holder is still fenced out. But no attempt was made, and
+    // charging one for work never begun is not merely untidy: on the LAST
+    // permitted delivery it moves the row into reconciliation without a single
+    // POST ever having been sent, and reconciliation then correctly finds no
+    // marker and dead-letters an effect that was never delivered. A review
+    // request silently never made, escalated as one reeve could not perform.
+    //
+    // I first wrote this as "the attempt is spent and stays spent", reasoning
+    // that un-bumping would deny a lease that really happened. That conflated the
+    // two counters the schema keeps apart on purpose: the fence counts leases,
+    // the budget counts attempts, and this is a lease that was not an attempt.
+    if (unstarted) {
+      db.prepare(`UPDATE outbox SET status='pending', last_error=?, not_before=unixepoch()+?,
+                  attempts = attempts - (CASE WHEN ? THEN 0 ELSE 1 END),
+                  reconcile_attempts = reconcile_attempts - (CASE WHEN ? THEN 1 ELSE 0 END),
+                  lease_expires_at=0, updated_at=unixepoch() WHERE id=? AND lease_token=?`)
+        .run(String(error).slice(0, 2000), backoffSeconds(0),
+             reconciling ? 1 : 0, reconciling ? 1 : 0, id, leaseToken);
+      emit(db, { actor, op: "outbox.unstarted",
+                 payload: { id, kind: row.kind, phase: reconciling ? "reconcile" : "deliver" } });
+      return "unstarted";
+    }
+
+    const dead = !retryable || (reconciling && row.reconcile_attempts >= row.max_reconcile);
     db.prepare(`UPDATE outbox SET status=?, last_error=?, not_before=unixepoch()+?,
                 lease_expires_at=0, updated_at=unixepoch() WHERE id=? AND lease_token=?`)
       .run(dead ? "dead_letter" : "pending", String(error).slice(0, 2000),
-           dead ? 0 : backoffSeconds(row.attempts), id, leaseToken);
+           dead ? 0 : backoffSeconds(reconciling ? row.reconcile_attempts : row.attempts),
+           id, leaseToken);
     emit(db, { actor, op: dead ? "outbox.dead_letter" : "outbox.retry",
-               payload: { id, kind: row.kind, attempts: row.attempts } });
+               payload: { id, kind: row.kind, attempts: row.attempts,
+                          reconcileAttempts: row.reconcile_attempts,
+                          phase: reconciling ? "reconcile" : "deliver" } });
     return dead ? "dead_letter" : "retry";
   });
 }
 
-// recover outbox rows whose drainer died mid-flight
+/**
+ * Return rows whose drainer died mid-flight — and dead-letter the ones that have
+ * exhausted their budget on the way.
+ *
+ * The budget is checked in `settleOutbox`, which a hard crash never reaches. So a
+ * process that dies after leasing and before settling bumps `attempts` every time
+ * and is handed back every time: an effect that crashes its drainer could be
+ * retried forever, and `max_attempts` would never once be consulted. Recovery is
+ * the only place that failure mode passes through, so it is where the budget has
+ * to be enforced.
+ *
+ * Returns the rows made pending. A dead-lettered one is NOT among them — it is not
+ * a candidate any more — and is reported separately so a queue that stopped moving
+ * says why rather than going quiet.
+ */
 export function recoverOutbox(db) {
-  return tx(db, () => db.prepare(`
-    UPDATE outbox SET status='pending', updated_at=unixepoch()
-    WHERE status='inflight' AND lease_expires_at < unixepoch() RETURNING id`).all());
+  return tx(db, () => {
+    // Judged on the RECONCILIATION budget, never on the delivery one.
+    //
+    // The final allowed delivery can post the comment and then crash before
+    // settling. Dead-lettering on `attempts` at that point records a delivered
+    // effect as one reeve "could not perform" -- and escalates it -- while GitHub
+    // already contains the comment. The handler's marker pre-check is the only
+    // thing that can tell the difference, and it needs a lease to run.
+    //
+    // A single extra lease was the first answer to that and it was one short: the
+    // reconciling lease can itself crash, after confirming the marker and before
+    // settling, and the next recovery then condemned a confirmed delivery on an
+    // unrelated process failure. So reconciliation has a budget of its own and is
+    // retried like anything else. It still terminates -- `reconcile_attempts` only
+    // rises, and no lease is granted once it reaches `max_reconcile` -- and it is
+    // bounded work in any case, because a reconciling lease reads and never posts.
+    const dead = db.prepare(`
+      UPDATE outbox SET status='dead_letter', lease_expires_at=0, updated_at=unixepoch(),
+             last_error=coalesce(last_error,'') || ' | recovered with the reconciliation budget spent and no delivery ever confirmed'
+      WHERE status='inflight' AND lease_expires_at < unixepoch()
+        AND reconcile_attempts >= max_reconcile
+      RETURNING id, kind, attempts, reconcile_attempts`).all();
+    for (const d of dead)
+      emit(db, { actor: "drainer", op: "outbox.dead_letter",
+                 payload: { id: d.id, kind: d.kind, attempts: d.attempts,
+                            reconcileAttempts: d.reconcile_attempts, why: "crash-loop" } });
+    const back = db.prepare(`
+      UPDATE outbox SET status='pending', updated_at=unixepoch()
+      WHERE status='inflight' AND lease_expires_at < unixepoch() RETURNING id`).all();
+    back.deadLettered = dead;
+    return back;
+  });
 }
 
 // ------------------------------------------------------------------ export

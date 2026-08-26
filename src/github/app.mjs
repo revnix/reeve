@@ -72,7 +72,12 @@ export async function findInstallation(jwt, nwo) {
   const r = await apiAsApp(jwt, `repos/${owner}/${repo}/installation`);
   if (!r.ok) return { ok: false, why: `HTTP ${r.status}: ${r.err.split("\n")[0]}` };
   const inst = JSON.parse(r.out);
-  return { ok: true, id: inst.id, account: inst.account?.login, permissions: inst.permissions, repositorySelection: inst.repository_selection };
+  // `app_slug` is carried because it is the only way to know what reeve's own
+  // comments are AUTHORED as: a GitHub App writes as `<app_slug>[bot]`, and a
+  // caller that needs to tell its own writing from a contributor's has no other
+  // handle on it.
+  return { ok: true, id: inst.id, account: inst.account?.login, appSlug: inst.app_slug,
+           permissions: inst.permissions, repositorySelection: inst.repository_selection };
 }
 
 /** An installation token: one hour, scoped to the repos the App is installed on. */
@@ -87,15 +92,47 @@ export async function mintInstallationToken(jwt, installationId) {
  * Everything the fleet does on GitHub goes through here, as the App.
  * The token is passed by environment and never written to disk or logged.
  */
-export function apiAsInstallation(token, args) {
+export function apiAsInstallation(token, args, { timeoutMs = 60_000, maxBuffer = 64 * 1024 * 1024 } = {}) {
   try {
     const out = execFileSync("gh", ["api", ...args], {
       encoding: "utf8",
       env: { ...process.env, GH_TOKEN: token, GITHUB_TOKEN: token },
       stdio: ["ignore", "pipe", "pipe"],
+      // BOUNDED, and both bounds are load-bearing.
+      //
+      // This call is SYNCHRONOUS, so while it runs nothing else in the process
+      // does -- no timer fires, no promise settles, no lease is renewed. A caller
+      // that thinks it has wrapped this in a deadline has wrapped nothing: the
+      // deadline's timer cannot be created until this returns. A hung `gh` is
+      // therefore not a slow call, it is a stopped daemon, and the only thing that
+      // can end it is the subprocess timeout.
+      //
+      // The buffer matters for the same class of reason. The default is 1 MiB, and
+      // a paginated read of a long discussion exceeds it -- at which point this
+      // returns a FAILURE for a request that actually succeeded, and a caller that
+      // reads a failed read as "not found" acts on the wrong answer.
+      timeout: timeoutMs,
+      maxBuffer,
     });
     return { ok: true, out: out.trim() };
-  } catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
+  } catch (e) {
+    // `code`, and only `code`. Measured on node v24.17.0, both failures set
+    // `signal === "SIGTERM"` and leave `killed` undefined:
+    //
+    //   maxBuffer overflow -> code=ENOBUFS  signal=SIGTERM  killed=undefined
+    //   timeout            -> code=ETIMEDOUT signal=SIGTERM killed=undefined
+    //
+    // So a signal test cannot separate them and reported every overflow as a
+    // timeout, making the truncation branch unreachable for the failure it names
+    // -- and `killed` never fired at all. These two need telling apart because a
+    // caller acts on them differently: a timeout is transient and worth retrying,
+    // an overflow means the request SUCCEEDED and the answer did not fit.
+    if (e?.code === "ETIMEDOUT")
+      return { ok: false, out: "", err: `gh api exceeded ${timeoutMs}ms and was killed`, timedOut: true };
+    if (e?.code === "ENOBUFS")
+      return { ok: false, out: "", err: `gh api output exceeded ${maxBuffer} bytes`, truncated: true };
+    return { ok: false, out: "", err: String(e.stderr || e.message).trim() };
+  }
 }
 
 /** One call: credentials to a usable installation token. */
@@ -110,7 +147,10 @@ export async function authenticate(nwo, name = "merge-policy") {
   const tok = await mintInstallationToken(jwt, inst.id);
   if (!tok.ok) return { ok: false, why: tok.why };
   return { ok: true, token: tok.token, expiresAt: tok.expiresAt, installationId: inst.id,
-           account: inst.account, permissions: tok.permissions, repositorySelection: inst.repositorySelection };
+           account: inst.account, permissions: tok.permissions, repositorySelection: inst.repositorySelection,
+           // The login reeve's own comments carry. Null when GitHub did not say,
+           // and a caller must treat null as "cannot tell" rather than as a match.
+           actor: inst.appSlug ? `${inst.appSlug}[bot]` : null };
 }
 
 /**

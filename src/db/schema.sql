@@ -136,6 +136,28 @@ CREATE TABLE IF NOT EXISTS outbox (
   lease_token  INTEGER NOT NULL DEFAULT 0,
   attempts     INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 8,
+  -- A THIRD counter, for the same reason there is a second one.
+  --
+  -- Delivery and reconciliation are different acts with different costs. A
+  -- delivery POSTs and must be strictly bounded, because every attempt can create
+  -- another comment. A reconciliation only READS -- it asks GitHub whether a
+  -- delivery already landed -- and can conclude nothing worse than "still cannot
+  -- tell". Charging both to `attempts` made the reconciliation budget exactly one,
+  -- expressed as the difference between `>` here and `>=` there, and that budget
+  -- was too small twice over:
+  --
+  --   · the final allowed POST reached GitHub and the response was lost, so the
+  --     handler reported a retryable failure and the settle path dead-lettered a
+  --     comment that exists;
+  --   · the single reconciliation lease crashed before settling, and the next
+  --     recovery dead-lettered a delivery a second look would have confirmed.
+  --
+  -- Both are one row being told a delivered effect needs a person. So the phase is
+  -- explicit and each phase has its own budget. A row is RECONCILING once
+  -- `reconcile_attempts > 0`; the lease bumps whichever counter the phase names,
+  -- and the total number of leases is still bounded, at max_attempts + max_reconcile.
+  reconcile_attempts INTEGER NOT NULL DEFAULT 0,
+  max_reconcile      INTEGER NOT NULL DEFAULT 3,
   not_before   INTEGER NOT NULL DEFAULT 0,
   lease_expires_at INTEGER NOT NULL DEFAULT 0,
   result       TEXT,                          -- JSON: pr number, sha, comment id…

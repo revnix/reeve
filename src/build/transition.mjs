@@ -248,8 +248,39 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
     // -- the claims are the task's, the lease is the grant -- so a release with
     // no event is undone by replay and the territory is held by a ghost.
     case "release-territory": {
+      const at = db.prepare("SELECT unixepoch() n").get().n;
       const held = db.prepare(`SELECT ${LEASE_COLS} FROM territory_lease WHERE task = ?`).all(taskId);
       for (const lease of held) {
+        // AN EXPIRED PIN IS SPENT, AND THAT HAS TO OUTLIVE THE LEASE.
+        //
+        // The two halves of a pin were kept in places with different lifetimes:
+        // the INTENT in `task_territory.pinned`, which is durable, and the
+        // DEADLINE in `territory_lease.pinned_until`, which this delete destroys.
+        // So carrying the original deadline across a resume -- the fix that made
+        // a pin a deadline rather than a renewable lease -- held only until the
+        // next hold. A hold releases territory precisely when no pin is live, the
+        // row went with it, and the resume after that found no row, read the
+        // still-set intent bit, and minted `now + LEASE_SECONDS`. One extra
+        // hold/resume cycle and the expired pin was live again, blocking
+        // overlapping filings past the deadline the founder actually set.
+        //
+        // Recording the end where the intent lives is what makes them one fact.
+        // An intent bit with no live pin at release time is spent by
+        // construction: the hold paths emit this compensation only when
+        // `pinnedTerritory` is false, and a terminal task does not resume.
+        //
+        // AND THE CLEAR IS EVENTED, because `task_territory` is a replayed
+        // projection like the lease is. An unrecorded write is undone by the
+        // next restore, which would put the intent bit back and hand the same
+        // resurrection back to the resume that follows it.
+        if (lease.pinned_until !== null && lease.pinned_until <= at) {
+          const claim = db.prepare(
+            `UPDATE task_territory SET pinned = 0
+              WHERE task = ? AND kind = ? AND path = ?
+              RETURNING task, kind, path, pinned`)
+            .get(taskId, lease.kind, lease.path);
+          if (claim) hubEvent(db, { kind: "task_territory.claimed", task: taskId, payload: claim });
+        }
         db.prepare(`DELETE FROM territory_lease WHERE project=? AND kind=? AND path=?`)
           .run(lease.project, lease.kind, lease.path);
         hubEvent(db, { kind: "territory_lease.released", task: taskId, payload: lease });

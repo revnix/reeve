@@ -327,10 +327,22 @@ const offendersIn = text => {
   // author to delete valid context to get a green run. So an ordinal count has to
   // appear in a construction that actually SAYS the items remain.
   const REMAINS = /\b(remain(s|ing)?|left|outstanding|still to (land|come|do)|to go|not yet)\b/i;
+  // COMPLETION puts a count in the past, which is history and not a claim about
+  // what is left. I argued that `last` was safe unconditionally, on the reasoning
+  // that nothing calls finished work "the last two" -- and "the last two PRs
+  // landed on 24 Aug" is precisely that. The reasoning was wrong, and the rule now
+  // turns on tense, exactly as the rule-outcome matcher above does.
+  //
+  // This exemption is load-bearing rather than decorative, which is the thing to
+  // check before keeping one: removing it turns both of the sentences below back
+  // into offenders, and there is a stub that proves it. An exemption that never
+  // fires would be a widened surface waiting for the input that reaches it.
+  const COMPLETED = /\b(landed|merged|shipped|completed|closed|went in|finished|are done|were done)\b/i;
   const countsRemainingWork = s =>
-    // "the last two PRs of the programme" -- `last` alone is a remaining-work word
-    // in a way `first` is not: nothing calls finished work "the last two".
-    /\b(last|remaining|final)\s+(one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(s)
+    // "The last two PRs of the durable-effect programme." -- a bare heading
+    // naming outstanding work, with no verb to place it in time.
+    (/\b(last|remaining|final)\s+(one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(s)
+     && !COMPLETED.test(s))
     // any count, when the sentence says they remain
     || (/\b(first|next|last|one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(s)
         && REMAINS.test(s))
@@ -411,6 +423,9 @@ const offendersIn = text => {
     ["a LIVE claim that happens to mention a date", "R-01 is currently broken, as on 2026-08-22.", true],
     ["an ordinal in durable history", "The first two PRs landed on 24 Aug.", false],
     ["an ordinal that DOES say work remains", "The first two PRs are still outstanding.", true],
+    ["a LAST-count in durable history", "The last two PRs landed on 24 Aug.", false],
+    ["a FINAL-count in durable history", "The final two stages landed together.", false],
+    ["a bare heading naming outstanding work", "The last two PRs of the durable-effect programme.", true],
   ]) check((statesRuleOutcome(sample) || countsRemainingWork(sample)) === want,
            `control: the state-claim rules ${want ? "catch" : "spare"} ${what}`, sample);
 

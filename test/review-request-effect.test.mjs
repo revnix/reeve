@@ -7,7 +7,7 @@
 //
 // Two things have to hold: the gate is OFF unless a profile says otherwise, and a
 // repeated tick at one head must not ask twice while a NEW head must ask again.
-import { reviewActionsOn, effectsFor } from "../src/daemon.mjs";
+import { reviewActionsOn, effectsFor, deadLetterCause } from "../src/daemon.mjs";
 import { open, tx, enqueue, supersedeEffects, sha256 } from "../src/db/ops.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -128,6 +128,57 @@ const check = (ok, name, detail) => {
   }
   // The third row is the control: without it the first two pass equally well on a
   // producer that has stopped producing anything at all.
+}
+
+// --- the dead-letter alert counts PULL REQUESTS, which is the unit it prints ---
+{
+  // `announceable` renders any count above one as "(N PRs)". Two failed reviewer
+  // triggers on ONE pull request are two rows and one pull request, and passing
+  // the row count claimed two repositories' worth of trouble where there was one.
+  //
+  // The cause itself must stay stable across the change, since the key is identity
+  // and the count is the value.
+  check(deadLetterCause("gh.pr.comment") === deadLetterCause("gh.pr.comment"),
+    "control: the cause is stable", deadLetterCause("gh.pr.comment"));
+  check(!/\d/.test(deadLetterCause("gh.pr.comment")), "and carries no number", "");
+}
+
+// --- a queued request the profile no longer asks for is withdrawn -------------
+{
+  // `effectsFor` reconciles a pull request while it is being EVALUATED. A row can
+  // outlive that: authentication failed, or delivery backed off, and by the next
+  // tick the reviewer is gone or the trigger corrected. On a tick that cannot list
+  // pull requests there is no evaluation at all — so nothing reconciles and the
+  // drain posts the obsolete trigger, because the handler checks the pull
+  // request's state and head and neither knows anything about the profile.
+  //
+  // The key carries reviewer and trigger-hash, so this half needs no pull request.
+  const dir = mkdtempSync(join(tmpdir(), "reeve-unconf-"));
+  const db = open(join(dir, "s.db"));
+  const k = (pr, login, trigger) => `review-request:o/r:${pr}:${login}:head1:${sha256(trigger).slice(0, 12)}`;
+  const put = key => tx(db, () => enqueue(db, { idemKey: key, kind: "gh.pr.comment", args: {} }));
+  const alive = key => db.prepare(`SELECT count(*) n FROM outbox WHERE idem_key=?`).get(key).n === 1;
+
+  const keep    = k(5, "codex", "@codex review");        // still configured
+  const gone    = k(5, "oldbot", "@oldbot review");      // reviewer removed
+  const stale   = k(6, "codex", "@codex plz review");    // trigger corrected
+  for (const key of [keep, gone, stale]) put(key);
+
+  // The reconciliation the daemon performs, reproduced here from the same inputs:
+  // the profile's configured (login, trigger-hash) pairs.
+  const wanted = new Set([`codex:${sha256("@codex review").slice(0, 12)}`]);
+  for (const r of db.prepare(`SELECT idem_key FROM outbox WHERE idem_key LIKE 'review-request:%'`).all()) {
+    const m = /^review-request:[^:]+\/[^:]+:\d+:([^:]+):[^:]+:([0-9a-f]+)$/.exec(r.idem_key);
+    if (!m || wanted.has(`${m[1]}:${m[2]}`)) continue;
+    tx(db, () => supersedeEffects(db, { prefix: r.idem_key, keep: new Set() }));
+  }
+
+  check(alive(keep), "a request the profile still asks for survives", "");
+  check(!alive(gone), "a request for a reviewer since REMOVED is withdrawn", "");
+  check(!alive(stale), "and one whose trigger was CORRECTED, at any head", "");
+
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
 }
 
 // --- a request nobody wants any more is retired, even with no replacement ------

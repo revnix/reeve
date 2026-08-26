@@ -24,7 +24,8 @@ import {
   providerTx, providerState, heldCount, heldCountBy, queuedGuardianCount,
   queuedGuardianRequests, liveRequest, youngestHeldBuilder, requestPreemption,
   insertLease, promoteToHeld, bindLease, touchLease, deleteLease, deleteLeaseById,
-  deleteQueued, expiredLeases, recordRateLimit, DEFAULT_LIMIT, DEFAULT_RESERVED,
+  deleteQueued, expiredLeases, recordRateLimit, clearPreemption,
+  DEFAULT_LIMIT, DEFAULT_RESERVED,
 } from "./build/providerdb.mjs";
 
 // How long a lease survives without a heartbeat. A held lease is renewed by the
@@ -114,16 +115,47 @@ export function claimProvider(db, { owner, repoId, runRef, pid, lstart, priority
     const state = providerState(db);
     const cooling = state.cooldownUntil != null && state.cooldownUntil > at;
     const existing = liveRequest(db, { owner, repoId, runRef });
-    // ALREADY HOLDING. A re-ask for a run that is already admitted is the same
-    // answer, not a second slot -- and the unique index would refuse the insert
-    // anyway, turning an idempotent call into a thrown constraint.
-    if (existing?.status === "held")
-      return { ok: true, id: existing.id, owner, repoId, runRef };
+    // ALREADY HOLDING -- BUT ONLY FOR THE PROCESS THAT HOLDS IT.
+    //
+    // A re-ask for a run this caller already has admitted is the same answer,
+    // not a second slot, and the live-request unique index would refuse the
+    // insert anyway. But answering that to ANY caller naming the same
+    // (owner, repoId, runRef) hands out an admission nobody counted: two
+    // guardian daemons watching one repository, or a daemon that restarted while
+    // its detached worker survived, both proceed to spawn while a single lease
+    // exists. The later bind then overwrites the row's process identity, so one
+    // of the two workers is invisible to both admission and reaping -- it holds
+    // no slot the scheduler knows about and no reaper can ever free it.
+    //
+    // Identity is pid AND lstart, never pid alone: pids are reused, and lstart is
+    // what distinguishes this process from whatever inherited its number.
+    if (existing?.status === "held") {
+      if (existing.pid === pid && existing.lstart === lstart)
+        return { ok: true, id: existing.id, owner, repoId, runRef };
+      // Not an at-limit and not a queue: the run itself is already in flight
+      // somewhere, and the answer is neither "wait" nor "try later" but "this is
+      // not yours". A caller that treats every refusal as "do not dispatch"
+      // behaves correctly on it either way.
+      return refuse("held-elsewhere", { id: existing.id });
+    }
+
+    // A PREEMPTION REQUEST IS WITHDRAWN ONCE IT HAS BEEN SATISFIED.
+    //
+    // The flag asks a builder for capacity on behalf of a WAITING guardian. Left
+    // set after that guardian is admitted -- or after its request is cancelled --
+    // the marked builder still surrenders its slot at its next phase boundary,
+    // suspending running work to leave a slot that nobody is waiting for idle.
+    // Keyed on the queue being empty rather than on this particular guardian,
+    // because any remaining queued guardian still needs the capacity.
+    const withdrawIfServed = () => {
+      if (queuedGuardianCount(db) === 0) clearPreemption(db);
+    };
 
     const granted = () => {
       const expiresAt = at + LEASE_SECONDS;
       if (existing) {
         promoteToHeld(db, { id: existing.id, at, expiresAt });
+        withdrawIfServed();
         return { ok: true, id: existing.id, owner, repoId, runRef };
       }
       const row = insertLease(db, { owner, repoId, runRef, pid, lstart, priority,
@@ -257,7 +289,12 @@ export function cancelQueued(db, { owner, repoId, runRef,
                                    isAlive = isSameProcess, now = null } = {}) {
   return guarded(db, { isAlive, now }, () => {
     if (owner == null || repoId == null || runRef == null) return refuse("no-identity");
-    return { ok: true, cancelled: deleteQueued(db, { owner, repoId, runRef }).changes };
+    const cancelled = deleteQueued(db, { owner, repoId, runRef }).changes;
+    // The same withdrawal as on admission: a cancelled guardian request is one
+    // nobody is waiting behind either, and the marked builder must not go on
+    // yielding for it.
+    if (queuedGuardianCount(db) === 0) clearPreemption(db);
+    return { ok: true, cancelled };
   });
 }
 

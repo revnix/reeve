@@ -105,6 +105,13 @@ export const youngestHeldBuilder = (db) => db.prepare(
 export const requestPreemption = (db, id) => db.prepare(
   `UPDATE provider_lease SET preempt_requested = 1 WHERE id = ?`).run(id);
 
+// The flag is a REQUEST for capacity, so it has to be withdrawn when the
+// capacity is no longer wanted. Left set, the marked builder still surrenders
+// its slot at its next phase boundary for a guardian that has already been
+// served, suspending running work to leave a slot idle.
+export const clearPreemption = (db) => db.prepare(
+  `UPDATE provider_lease SET preempt_requested = 0 WHERE preempt_requested = 1`).run();
+
 export const insertLease = (db, { owner, repoId, runRef, pid, lstart, priority,
                                   budgetUsd, status, at, expiresAt }) => db.prepare(
   `INSERT INTO provider_lease(owner, repo_id, run_ref, pid, lstart, priority, budget_usd,
@@ -171,7 +178,18 @@ export const recordRateLimit = (db, { provider = PROVIDER, signature, at, until,
                               cooldown_until, last_429_at, last_signature)
    VALUES(?,?,?,?,?,?)
    ON CONFLICT(provider) DO UPDATE SET
-     cooldown_until = excluded.cooldown_until,
+     -- THE LONGEST WAIT WINS. provider_state is one row shared by every daemon
+     -- on the host, and their profiles need not agree: a 300-second cooldown
+     -- followed ten seconds later by a 30-second one would otherwise cut the
+     -- remaining wait to 40 and admit claims while the first backoff was still
+     -- live. A cooldown is a floor, and a second observation of the same
+     -- throttling cannot be evidence that it has become less severe.
+     cooldown_until = CASE
+       WHEN provider_state.cooldown_until IS NULL
+         OR provider_state.cooldown_until < excluded.cooldown_until
+       THEN excluded.cooldown_until ELSE provider_state.cooldown_until END,
+     -- The metadata is always the LATEST, because "what threw last" is a
+     -- different question from "how long to wait".
      last_429_at    = excluded.last_429_at,
      last_signature = excluded.last_signature`)
   .run(provider, limit, reserved, until, at, signature);

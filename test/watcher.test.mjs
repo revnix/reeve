@@ -169,27 +169,32 @@ check("an unrecognised merge state escalates with the state named",
   check("and says it is unclassified", /unclassified/.test(g.why), true);
 }
 
-// ── this file's clause list is the verdict's clause list ────────────────────
+// ── a swap that swaps nothing ──────────────────────────────────────────────
 //
-// Two statements of one fact, and the failure mode is silent: a `swap` for a
-// clause the list does not know about replaces nothing, so the fixture stays
-// all-pass and the test PASSES while measuring nothing at all. Compared here in
-// both directions, because a list that is merely a superset would hide a removal
-// just as well as a subset hides an addition.
+// `swap(id, …)` replaces a clause in the fixture. When the fixture's clause list
+// does not know that id, it replaces NOTHING: the fixture stays all-pass, the
+// decision is MERGE, and the assertion beneath it reports whatever an all-pass
+// verdict does. That is worse than a stale list that under-covers, because the
+// green is not merely uninformative -- it is actively wrong, and the test passes
+// while inert. It happened here: adding `cleared` left three assertions
+// measuring nothing until this was noticed.
+//
+// So the fixture is checked for reaching the mechanism, which is the general form
+// of the defect. It is deliberately NOT a second canonical clause list: the
+// builder lane is landing `CLAUSE_IDS`, exported from verdict.mjs and compared
+// against what `computeVerdict` emits, and two canonical lists would be exactly
+// the defect this file is guarding against, arriving as its fix. When that lands,
+// `CLAUSES` here becomes the import and this check stays, because it answers a
+// different question: not "is the list right" but "did the fixture bite".
+// One check, not two. The obvious first one -- "every id this file swaps is one
+// the fixture contains" -- is CIRCULAR: `allPass()` is built FROM `CLAUSES`, so
+// it compares a list against something derived from itself and cannot fail.
+// Stubbing an unknown id into the list left it green, which is how I know.
 {
-  const emitted = computeVerdict({
-    head: "b".repeat(40),
-    checks: { verdict: "GREEN", settled: true, failing: [] },
-    base: { verdict: "GREEN" },
-    reviewers: [], rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 },
-    threads: { unresolved: 0, total: 0, readable: true },
-    cleared: { readable: true, uncleared: 0, reviewers: [] },
-    ledgerBlockers: 0, mergeState: "CLEAN",
-  }).clauses.map(c => c.id);
-  const missing = emitted.filter(id => !CLAUSES.includes(id));
-  const extra = CLAUSES.filter(id => !emitted.includes(id));
-  check("this file's clause list matches what computeVerdict emits",
-    `${missing.join(",")}|${extra.join(",")}`, "|");
+  const before = nextAction(ev(allPass()), P).action;
+  const changed = CLAUSES.filter(id => nextAction(ev(swap(id, "BLOCK", "x")), P).action === before);
+  check("and blocking any one of them changes the decision, so no swap is inert",
+    changed.join(",") || "none", "none");
 }
 
 // ── a thread nobody came back to is work, not a gap ─────────────────────────

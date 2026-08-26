@@ -182,14 +182,21 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       // `depth.override` and `founder.regenerate` re-render the spec and push a
       // NEW HEAD to that same PR, so holding it there would block the work they
       // are dispatching.
-      // WHICH KINDS, keyed on the transition rather than on which rows exist.
-      // `depth.override` and `founder.regenerate` re-render the spec and push a
-      // NEW HEAD to that same PR, so holding it there blocks the work they are
-      // dispatching; every other path that stops a task holds everything open.
-      const HOLDS_SPEC = ["founder.cancel", "founder.infeasible", "hold", "gate.capReached"];
-      const holdable = HOLDS_SPEC.includes(evidence?.kind)
-        ? openPrs(db, taskId)
-        : openPrs(db, taskId, { kind: "impl" });
+      // A DENYLIST, not an allowlist, because the allowlist was wrong by omission
+      // twice. It named four kinds that hold the spec PR and left out
+      // `phase.failed` -- so a revision-loop task back in SPEC_DRAFT whose worker
+      // exhausted its retries escalated with its spec PR still mergeable, which
+      // is the same defect `gate.capReached` was added to fix, reached by a
+      // different edge. An allowlist has to be extended for every new transition
+      // and fails OPEN when someone forgets; this fails closed.
+      //
+      // The only reason not to hold a spec PR is that the transition is about to
+      // push a NEW HEAD to it: a depth override and a regenerate both re-render
+      // the spec, and holding it would block the work they are dispatching.
+      const KEEPS_SPEC_OPEN = ["depth.override", "founder.regenerate"];
+      const holdable = KEEPS_SPEC_OPEN.includes(evidence?.kind)
+        ? openPrs(db, taskId, { kind: "impl" })
+        : openPrs(db, taskId);
       for (const pr of holdable) {
         const open = db.prepare(
           `SELECT id FROM pr_hold WHERE repo_id = ? AND pr = ? AND cleared_at IS NULL`)
@@ -384,6 +391,24 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
     // network first.
     case "adopt-snapshot": {
       if (!snapshot) throw new Error("adopt-snapshot without a resolved snapshot");
+      // THE SPEC PR'S REPOSITORY IS PART OF ITS IDENTITY. A regenerate that
+      // adopts a snapshot naming a DIFFERENT spec repository used to move
+      // `task.spec_repo_id` while the spec PR kept its number and head -- so
+      // every later gate, hold, annotation and close read that number as a PR in
+      // the new repository, and a PR number is unique only within one. That is
+      // not a stale value, it is a live handle on somebody else's pull request.
+      //
+      // Refused rather than silently rebound: creating a replacement spec PR is a
+      // real action with a real head, and inventing one inside a compensation
+      // would be the same class of guess.
+      {
+        const spec = openPrs(db, taskId, { kind: "spec" })[0] ?? null;
+        if (spec && snapshot.specRepoId != null && spec.repo_id !== snapshot.specRepoId)
+          throw new CompensationRefused(
+            `the task's spec PR is #${spec.pr} in repository ${spec.repo_id}, and the new snapshot ` +
+            `names ${snapshot.specRepoId}; a regenerate cannot move a spec PR between repositories. ` +
+            `Close the existing spec PR first, or regenerate against the repository it lives in`);
+      }
       db.prepare(
         `UPDATE task SET repo_id=?, nwo_snapshot=?, repo_path=?, profile_path=?, profile_hash=?,
                          default_branch=?, visibility=?, spec_repo_id=?, gate_definition_hash=?,
@@ -492,11 +517,21 @@ function applyTransitionTx(db, { taskId, expectedPhase, expectedGeneration, evid
   // Declared ABOVE the transaction: as a `const` inside `hubTx` it sits in the
   // temporal dead zone when the refusal branch calls it, so an accepted
   // SIZING/RESEARCH/DESIGN override throws on the one path that needs it most.
-  const persistDepth = (db, taskId, depth) => {
+  // WHICH FACT, not just which value. `persistDepth` now runs on EVERY successful
+  // SIZING -- that was the point of recording the classifier's choice at all --
+  // and it appended `sizing.overridden` unconditionally, so the durable history
+  // claimed the ordinary selection was a founder override. `task why` and every
+  // event consumer then misattribute how the depth was chosen, which is a lie in
+  // the audit trail rather than a missing entry: worse, because it reads as an
+  // answer. The kind is the caller's, and `sizing.overridden` is reserved for
+  // actual `depth.override` evidence.
+  const persistDepth = (db, taskId, depth, kind) => {
     db.prepare("UPDATE task SET depth=?, updated_at=unixepoch() WHERE id=?").run(depth, taskId);
-    hubEvent(db, { kind: "sizing.overridden", task: taskId,
+    hubEvent(db, { kind, task: taskId,
       payload: db.prepare("SELECT id, depth, generation, updated_at FROM task WHERE id = ?").get(taskId) });
   };
+  const depthEventFor = (evidence) =>
+    evidence?.kind === "depth.override" ? "sizing.overridden" : "sizing.recorded";
 
   return hubTx(db, () => {
     // Every hub writer checks the restore exclusion first, inside its own
@@ -600,7 +635,7 @@ function applyTransitionTx(db, { taskId, expectedPhase, expectedGeneration, evid
       // rejected command leaves the caller to report failure to the founder, or
       // to retry an override that has already been applied.
       if (decision.persistDepth && evidence?.kind === "depth.override") {
-        persistDepth(db, taskId, decision.persistDepth);
+        persistDepth(db, taskId, decision.persistDepth, depthEventFor(evidence));
         for (const c of decision.compensations ?? [])
           applyCompensation(db, { c, taskId, generation: expectedGeneration, seq: null, evidence,
                                   snapshot: evidence?.snapshot });
@@ -610,7 +645,7 @@ function applyTransitionTx(db, { taskId, expectedPhase, expectedGeneration, evid
         return { applied: false, reason: "accepted-no-transition", depth: decision.persistDepth,
                  why: decision.refusal };
       }
-      if (decision.persistDepth) persistDepth(db, taskId, decision.persistDepth);
+      if (decision.persistDepth) persistDepth(db, taskId, decision.persistDepth, depthEventFor(evidence));
       for (const c of decision.compensations ?? [])
         applyCompensation(db, { c, taskId, generation: expectedGeneration, seq: null, evidence,
                                 snapshot: evidence?.snapshot });
@@ -714,18 +749,37 @@ function applyTransitionTx(db, { taskId, expectedPhase, expectedGeneration, evid
                              `; DONE is terminal and cannot be revisited`);
     }
 
+    // AND THE SLICE, when the caller named one.
+    //
+    // Phase and generation are not enough for the implementation loop, because it
+    // RETURNS to the same phases: a task at slice 1 is in IMPLEMENTING under the
+    // same generation it was in for slice 0. So a delayed report from slice 0 --
+    // a duplicate `slice.merged` witness is the case that matters -- still
+    // matched this CAS and was applied to slice 1, moving it to SLICE_MERGED.
+    // `slice.next` then advanced again, or entered FINALIZING, with that slice
+    // never merged and nothing recording the gap. The generation fence exists for
+    // exactly this shape one level up; the cursor is its equivalent within a
+    // generation, and it is already durable on the row.
+    //
+    // Only when `slice` is supplied: the phases that are not slice-scoped pass
+    // null and must not be fenced on a cursor their reports say nothing about.
+    const fenceSlice = slice !== null && slice !== undefined;
     const upd = db.prepare(
       `UPDATE task SET phase=?, generation=?, updated_at=unixepoch(),
                        held_from=?, blocked_reason=?, terminal_reason=?,
                        slice_cursor=COALESCE(?, slice_cursor)
-       WHERE id=? AND phase=? AND generation=?`)
+       WHERE id=? AND phase=? AND generation=?` +
+      (fenceSlice ? ` AND slice_cursor=?` : ``))
       .run(decision.to, decision.generation,
            HELD.includes(decision.to) ? expectedPhase : (decision.to === "CANCELLING" ? task.held_from : null),
            HELD.includes(decision.to) ? holdReason : null,
            TERMINAL_WITH_REASON.includes(decision.to) ? (evidence.reason ?? null) : task.terminal_reason,
            decision.sliceCursor,          // null leaves it alone; slice.next advances it
-           taskId, expectedPhase, expectedGeneration);
-    if (upd.changes === 0) return { applied: false, reason: "lost-race" };
+           taskId, expectedPhase, expectedGeneration,
+           ...(fenceSlice ? [slice] : []));
+    if (upd.changes === 0)
+      return { applied: false,
+               reason: fenceSlice && task.slice_cursor !== slice ? "stale-slice" : "lost-race" };
 
     const { seq } = db.prepare(
       `INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,slice,artifact_sha,detail)
@@ -778,7 +832,7 @@ function applyTransitionTx(db, { taskId, expectedPhase, expectedGeneration, evid
     for (const e of effects)
       enqueueEffect(db, { ...e, taskId, generation: decision.generation, fence: seq });
 
-    if (decision.persistDepth) persistDepth(db, taskId, decision.persistDepth);
+    if (decision.persistDepth) persistDepth(db, taskId, decision.persistDepth, depthEventFor(evidence));
 
     // Phase 3. `void-pending` is SKIPPED here: it ran in phase 1, and running it
     // again would void the effects phase 2 just enqueued -- the exact failure the

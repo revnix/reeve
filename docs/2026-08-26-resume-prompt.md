@@ -20,8 +20,8 @@ at all, deliberately.
 
 That is not tidiness. Three volatile facts were once restated in about twenty
 places, and seven review rounds in a row found a correction applied to one copy
-and left standing in the others. Then `main` moved twice in one afternoon while
-the file said otherwise, which taught the harder half: a fact a command can answer
+and left standing in the others. Then `main` moved twice in one afternoon on 2026-08-24
+while the file said otherwise, which taught the harder half: a fact a command can answer
 should not be written down at all. `test/docs-state-is-single-sourced.test.mjs`
 now fails if a present-tense state claim, or a block naming a §0 subject, appears
 in either document outside §0 without deferring to it.
@@ -34,11 +34,11 @@ Run §0.1's command block. Every one of those lines matters, but two especially:
     from launchd's CACHED plist — so the file can say `--execute` while the
     running process does not. That happened once and I nearly reported it as done. If the process and
     §0 disagree about arming, find out which changed before doing anything else.
-    The same gap applies to CODE: a running daemon holds the modules it loaded at
-    startup, so the checkout's `HEAD` is not what it runs. The daemon writes its
-    own commit into the log when it starts, and §0.1 greps for that line. Never
-    substitute `git log -1 HEAD` for it — that reports a fix as deployed when the
-    restart it needed has not happened.
+    The same gap applies to CODE, and §0.1 has a line for it: a running daemon
+    holds the modules it loaded at startup, so the checkout's `HEAD` is not what
+    it runs. The daemon writes its own commit into the log when it starts, and
+    §0.1 greps for that line — never substitute `git log -1 HEAD` for it, which
+    reports a fix as deployed when the restart it needed has not happened.
 
   · §0.1's sqlite line must use `-readonly` and the PER-REPO path, because
     `sqlite3` opens a missing file by CREATING it — so a wrong path answers "zero

@@ -1380,6 +1380,72 @@ const REASK_MAX = 3600;
   db.close(); db2.close();
 }
 
+// CONTROL on the exemption above: an INFLIGHT old-generation predecessor still
+// blocks. The generation fence lives in `leaseEffect`, so a row already inflight
+// has PASSED it -- a worker holds it, the settle path does not re-check the
+// generation, and it WILL land. Exempting it lets a new-generation comment be
+// leased beside it and arrive first, leaving the pull request showing a status
+// the task left two generations ago.
+{
+  const db = openHub(join(dir, "o36.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:transporting",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 1, fence: 1, args: { repo_id: 7, pr: 12 } }));
+  const inflight = leaseEffect(db, { worker: "w1", capabilities: allOn, now: NOW });
+  check(inflight != null, "fixture: the old-generation comment is INFLIGHT, past the fence");
+
+  db.exec(`UPDATE task SET generation = 2 WHERE id = 'bt:1'`);
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g2:status",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 2, fence: 1, args: { repo_id: 7, pr: 12 } }));
+
+  check(leaseEffect(db, { worker: "w2", capabilities: allOn, now: NOW }) === null,
+    "an inflight predecessor keeps blocking even though its generation is stale",
+    JSON.stringify(db.prepare("SELECT idempotency_key,status,task_generation FROM outbox").all()));
+
+  // CONTROL: once it settles, the newer one goes out -- so this is "wait for it",
+  // not "never deliver behind a stale generation".
+  settleEffect(db, { id: inflight.id, worker: "w1", leaseToken: inflight.lease_token,
+                     ok: true, result: { commented: true } });
+  check(leaseEffect(db, { worker: "w3", capabilities: allOn, now: NOW })?.idempotency_key === "bt:1:g2:status",
+    "control: and once it settles the newer comment is leased");
+  db.close();
+}
+
+// ── a reconciler that threw WITHOUT a message still threw ───────────────────
+// The marker that decides control flow must not be the same value as the
+// human-readable detail, because detail is allowed to be missing. `new Error()`
+// has an empty message, an empty string is falsy, and the ambiguous effect was
+// read as an authoritative "not settled" -- returned to the queue or
+// dead-lettered on the strength of an observation that never happened.
+{
+  const db = openHub(join(dir, "o37.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:silent", kind: "gh.pr.create",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: { repo_id: 7, pr: 1 } }));
+  const leased = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${leased.id}`);
+
+  const r = await recoverEffects(db, { reconcile: () => { throw new Error(); } });
+  check(r.unobserved === 1,
+    "a reconciler throwing an EMPTY error is a failed observation, not a verdict",
+    JSON.stringify(r));
+  const row = db.prepare("SELECT status, last_error FROM outbox WHERE id=?").get(leased.id);
+  check(row.status === "inflight", "so the ambiguous effect is retained", JSON.stringify(row));
+  check((row.last_error ?? "").length > "reconcile failed: ".length,
+    "and last_error still says something, rather than trailing off",
+    JSON.stringify(row));
+
+  // CONTROL: a reconciler that RETURNS unsettled is still a real verdict and
+  // still spends the budget path -- or "empty means failure" has become
+  // "everything means failure".
+  db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${leased.id}`);
+  const r2 = await recoverEffects(db, { reconcile: () => ({ settled: false }) });
+  check(r2.unobserved === 0 && r2.returned === 1,
+    "control: a reconciler that LOOKED and returned unsettled is not treated as a failure",
+    JSON.stringify(r2));
+  db.close();
+}
+
 // ── an unobservable STOPPED effect is retained, not declared dead ───────────
 // Fencing means "this will not happen". A reconciler that THREW has not
 // established that -- and an effect already INFLIGHT when its task stopped is

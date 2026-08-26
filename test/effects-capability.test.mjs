@@ -83,14 +83,27 @@ const reachableFrom = entry => {
 
   // A credential, by any route. `github/app.mjs` is what loads the App key and
   // mints tokens; the node modules are what would let a handler go around it.
-  // SUBPATHS too. `^node:fs$` does not match `node:fs/promises`, which is the same
-  // capability through a door the pattern left open -- and an exact-match list is
-  // exactly the shape that looks complete while being one character short.
-  const forbidden = [...reached].filter(s =>
-    /github\/app\.mjs$/.test(s) || /^node:(child_process|fs|net|http|https|tls|dns|worker_threads|vm)(\/|$)/.test(s));
+  // An ALLOWLIST, not a denylist, and that change is the whole point.
+  //
+  // The denylist was wrong in principle and demonstrably wrong in practice: it
+  // named `net`, `http`, `https`, `dns` and missed `node:http2` and `node:dgram`,
+  // both of which reach the network perfectly well. Enumerating the ways out is a
+  // race against the platform's module list that the platform wins -- every new
+  // capability node ships is a hole until someone remembers to add it here.
+  //
+  // Naming what a handler MAY reach inverts that. The list is currently empty,
+  // which is the honest answer: these handlers take everything they need as
+  // arguments. Anything a future handler genuinely needs gets added here
+  // deliberately, by someone who has to justify it in a diff.
+  const ALLOWED = [];
+  const forbidden = [...reached].filter(s => !ALLOWED.includes(s));
   check(forbidden.length === 0,
-    "an effect handler can reach neither a credential nor a way to make its own network call",
+    "an effect handler reaches nothing that is not explicitly permitted",
     `reaches ${forbidden.join(", ")}`);
+  // Control: the allowlist is doing work rather than being vacuously satisfied by
+  // a walk that finds nothing. If `reached` were empty for a broken reason, this
+  // would still pass -- so the walk itself is exercised against a file that does
+  // import things, above.
 
   // GLOBALS, which need no import at all and which the walk therefore cannot see.
   // `fetch` is the one that matters: a handler calling it directly makes its own

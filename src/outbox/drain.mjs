@@ -30,13 +30,18 @@ import { leaseOutbox, settleOutbox, recoverOutbox, pendingWithNoHandler } from "
  * abandoned. Measured -- the first version did exactly that and the test warned
  * about an unsettled await rather than failing.
  */
-const deadline = seconds => {
+const deadline = ms => {
   let timer;
   const promise = new Promise(resolve => {
+    // MILLISECONDS, and no one-second floor. Taking seconds and flooring at 1
+    // rounded every sub-second deadline up to a full second, so a pass with 100ms
+    // left would not abandon a hung handler for ten times its own budget. The
+    // floor was protecting against a zero delay; 1ms does that without inventing
+    // nine hundred more.
     timer = setTimeout(() => resolve({
       ok: false, retryable: true,
-      error: `the handler did not finish within ${Math.round(seconds)}s, which is inside its lease; abandoned before the claim could lapse mid-delivery`,
-    }), Math.max(1, seconds) * 1000);
+      error: `the handler did not finish within ${Math.round(ms)}ms, which is inside its lease; abandoned before the claim could lapse mid-delivery`,
+    }), Math.max(1, ms));
   });
   promise.cancel = () => clearTimeout(timer);
   return promise;
@@ -172,11 +177,30 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
         // lease -- reopening the duplicate-delivery race this wrapper exists to
         // close. Clamped rather than simply overridden, so a handler asking for
         // LESS still gets less.
-        return api(a, { ...opts, timeoutMs: Math.min(left, opts.timeoutMs ?? left) });
+        // A POSITIVE INTEGER, and both halves of that are load-bearing. Measured on
+        // node v24.17.0:
+        //
+        //   timeout: 8333.333 -> ERR_OUT_OF_RANGE, thrown before the call runs
+        //   timeout: 0        -> no bound at all; a 1.5s child ran to completion
+        //
+        // `left` is fractional whenever the lease binds (`leaseSeconds: 10` gives
+        // 8333.333ms), so every GitHub call would have failed without running --
+        // and a handler asking for 0 would have removed the bound entirely, which
+        // is the one thing the clamp exists to make impossible.
+        const asked = opts.timeoutMs;
+        const want = Number.isFinite(asked) && asked > 0 ? Math.min(left, asked) : left;
+        return api(a, { ...opts, timeoutMs: Math.max(1, Math.floor(want)) });
       };
       const deliver = Promise.resolve(
-        handlers[job.kind](args, { api: bounded, idemKey: job.idem_key, actor, log }));
-      const clock = deadline(Math.max(1, remainingMs(deadlineAt) / 1000));
+        handlers[job.kind](args, { api: bounded, idemKey: job.idem_key, actor, log,
+          // The over-budget lease exists to RECONCILE, never to deliver. Recovery
+          // hands an exhausted row back once so the marker pre-check can find a
+          // delivery whose settle was lost to a crash -- but if the check finds
+          // nothing, posting would deliver on attempt max+1, past the budget the
+          // extra pass was granted in spite of. A handler that cannot confirm a
+          // prior delivery must decline instead.
+          reconcileOnly: job.attempts > job.max_attempts }));
+      const clock = deadline(remainingMs(deadlineAt));
       try { outcome = await Promise.race([deliver, clock]); }
       finally { clock.cancel(); }   // the loser's timer must not outlive the race
     } catch (e) {
@@ -209,9 +233,19 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
   if (outOfTime)
     log(`  outbox: pass budget of ${Math.round(budgetMs / 1000)}s spent after ${done.length} effect(s); the rest wait for the next tick`);
 
+  // EVERY pass, not only the one that created them. A process that exits after
+  // `settleOutbox` commits `dead_letter` and before the line below leaves a row
+  // nothing ever mentions again: it is not leaseable, `pendingWithNoHandler` does
+  // not include it, and a terminal effect is precisely the one that needs a person.
+  // Read from the store so a crash cannot lose the notification.
+  const standing = db.prepare(`SELECT kind, count(*) n FROM outbox
+                               WHERE status='dead_letter' GROUP BY kind`).all();
+  if (standing.length)
+    log(`  outbox: ${standing.map(s => `${s.n} ${s.kind}`).join(", ")} DEAD-LETTERED and waiting for a person`);
+
   const stranded = pendingWithNoHandler(db, kinds);
   if (stranded.length)
     log(`  outbox: ${stranded.map(s => `${s.n} ${s.kind}`).join(", ")} pending with no handler in this build`);
 
-  return { recovered: recovered.length, done, stranded, outOfTime };
+  return { recovered: recovered.length, done, stranded, outOfTime, deadLettered: standing };
 }

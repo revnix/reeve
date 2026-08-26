@@ -35,7 +35,7 @@ export const markerFor = idemKey => `<!-- reeve:effect:${idemKey} -->`;
  * repost, which is a duplicate comment rather than a lost one -- the failure the
  * cheaper direction produces is worse.
  */
-export function ghPrComment(args, { api, idemKey, actor = null }) {
+export function ghPrComment(args, { api, idemKey, actor = null, reconcileOnly = false }) {
   const { nwo, pr, body, head = null } = args;
   if (!nwo || !pr || !body) return { ok: false, retryable: false, error: `gh.pr.comment needs nwo, pr and body; got ${JSON.stringify(args)}` };
   const marker = markerFor(idemKey);
@@ -108,6 +108,17 @@ export function ghPrComment(args, { api, idemKey, actor = null }) {
     // of absence, and every failure that lands here -- a timeout, a truncated
     // buffer, a rate limit -- LOOKS exactly like "no marker found".
   }
+
+  // A reconciliation pass may confirm a delivery. It may not make one.
+  //
+  // This is the lease recovery grants past `max_attempts` so the marker check can
+  // find a comment whose settle was lost to a crash. Reaching here means no such
+  // comment was found -- so posting would deliver on an attempt the budget had
+  // already refused, which is the opposite of what the extra pass was for.
+  // Terminal, because another pass would ask the same question.
+  if (reconcileOnly)
+    return { ok: false, retryable: false,
+             error: "the retry budget is spent and no earlier delivery could be confirmed; not posting" };
 
   const r = api(["-X", "POST", `repos/${nwo}/issues/${pr}/comments`,
                  "-f", `body=${body}\n\n${marker}`]);

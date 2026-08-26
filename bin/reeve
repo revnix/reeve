@@ -46,7 +46,7 @@ import { resolveHome } from "../src/home.mjs";
 // builder migrates a store it is about to be refused from. Task 9 adds the same
 // import for the export/restore routes; whichever lands first owns it.
 import { DatabaseSync } from "node:sqlite";
-import { openHub, HUB_SCHEMA_VERSION, completedVersion, faultKind } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION, HUB_BUSY_TIMEOUT_MS, completedVersion, faultKind } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
 import { buildTick } from "../src/build/loop.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
@@ -135,7 +135,17 @@ const repoIdOnce = async (project) => {
     // A hub too old to have `task` yet simply throws here and the id stays
     // unknown, which is the honest answer: the guardian fails closed and says so
     // rather than migrating someone else's database to find out.
-    db = new DatabaseSync(p, { readOnly: true });
+    // THE SHARED CONTENTION BUDGET, like every other hub connection. On
+    // SQLite's default of zero this fails the instant a migration or a restore
+    // holds the lock -- and the caller then records the attempt and waits
+    // REPO_ID_RETRY_SECONDS before asking again, so a moment's contention costs
+    // ten minutes of fail-closed dispatch and UNKNOWN holds.
+    //
+    // This is the second read-only hub connection this change opened and the
+    // second to be missed: the constant was extracted in #40 precisely so there
+    // would be one answer, and a new connection is exactly where the old answer
+    // gets re-invented.
+    db = new DatabaseSync(p, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS });
     return await resolveRepoId(db, project, { fetchRepoId: repoIdFromGitHub });
   } catch (err) {
     // ONLY THE ABSENT CASE IS BENIGN. A hub too old to have `task` yet is
@@ -1271,7 +1281,10 @@ switch (cmd) {
         ? openHub(hubPathFor(HOME))
         : (raw = sub === "status"
             ? new DatabaseSync(hubPathFor(HOME), { readOnly: true })
-            : new DatabaseSync(hubPathFor(HOME), { timeout: 10000 }));
+            // The constant, not the number it happens to equal. #40 exported it
+            // so the hub's contention budget had one home; this literal is what
+            // that change left behind in the same file.
+            : new DatabaseSync(hubPathFor(HOME), { timeout: HUB_BUSY_TIMEOUT_MS }));
       // The first read is what proves the file answers at all. On the raw path
       // nothing has touched it yet, so this is where a corrupt store surfaces.
       // Its VALUE is kept: `build status` re-read the same version a few lines

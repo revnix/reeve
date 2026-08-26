@@ -244,6 +244,90 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       **The durable finding is about plan SIZE**: a plan needing four rounds and
       still finding sixteen defects at the fourth is one document doing three
       documents' work.
+- [ ] **S2-C PR-C4, the guardian claims and the hold clause — BUILT
+      (2026-08-26).** Branch `feat/s2c-guardian-provider`, based on `8e5135a`
+      (PR-C2's merge). Tasks **23b + 22 + 24 in ONE PR**, on the founder's
+      decision: they are one change and its proof. This is the only PR in S2
+      that changes what the running guardian DOES.
+
+      **Task 23b** — the guardian's verdict reads `pr_hold`. That table has had
+      a writer since S2-B and its declared reader was never built, so a task the
+      builder deliberately parked looked to the guardian like any other pull
+      request. The clause is read FIRST, before anything that could act: read
+      after `ci`, a held PR with red checks returns FIX_CI and the guardian
+      dispatches a fixer at the task the hold exists to protect; read later
+      still, it reaches the unclassified escalation, which carries `gap: true`,
+      so every ordinary held PR reports an implementation gap on a loop with the
+      merge correctly blocked and the reason a lie.
+
+      Absent and unreadable are kept apart the whole way down. `openHold`
+      answers three ways and an unreadable hub renders UNKNOWN, never PASS — a
+      boolean would make an unreachable hub read as nothing-is-held, which is
+      the fail-open the guest connection exists to stop. A caller supplying no
+      reading gets no clause at all, so a guardian with no hub is not dragged to
+      UNKNOWN over a question nobody asked it.
+
+      **The clause set had ELEVEN homes** — `verdict.mjs` and ten test files,
+      three of which assert TOTALITY over their own private copy. `CLAUSE_IDS`
+      is declared once and compared against what `computeVerdict` actually
+      emits, **in both directions**: an id declared and never emitted is as
+      wrong as one emitted and never declared, and only the second is caught by
+      running the code. The count was printed before the listing, which is why
+      it was eleven and not the four a truncated search showed.
+
+      **Task 22** — a provider lease at BOTH dispatch sites, the containment
+      canary and each worker. Fail OPEN on an unreadable scheduler and CLOSED on
+      an unscopeable one, which are not the same case: a broken hub must not
+      stop the guardian working, but it escalates, because silent unscheduled
+      dispatch is indistinguishable from scheduled dispatch. A null repository
+      id DOES stop it — `provider_lease.repo_id` spans the live-request unique
+      index and SQLite does not deduplicate keys containing a NULL, so a lease
+      scoped to nothing is invisible to the index and the limit never binds.
+
+      The claim precedes `startRun`, which spends a fixer's attempt two lines
+      later: a dispatch refused for capacity AFTER the run exists burns the one
+      retry the design allows on work that never ran. The release lives in the
+      `finally` every dispatched run already passes through — one release path
+      rather than one per outcome, which is how the outcome nobody thought of
+      ends up holding a lease until expiry.
+
+      **A-9 is wired and tested**: a release refused because a restore holds the
+      hub is inspected and retried next tick, never swallowed. The retry stores
+      the IDENTITY and never the id — a restore clears `provider_lease` and
+      SQLite reuses the integer, so an id-keyed retry deletes whatever inherited
+      that key.
+
+      **A-11 was unsatisfiable as written** and is scoped to the guardian, as
+      the audit said: both `openHub(` sites in `bin/reeve` are inside the
+      `build` command, which legitimately holds the whole schema. What is
+      asserted instead is that the guardian's connection is the guest one and
+      that `src/daemon.mjs` cannot reach the privileged opener at all.
+
+      **The repo-id resolver moved** to `src/build/repoid.mjs`. A-12 claimed it
+      had zero occurrences on main; it had two, in `src/build/loop.mjs`. C4 is
+      the change that makes it shared, so this is the cheapest moment to put it
+      in the right place — a resolver two lanes call that lives in one lane's
+      tick file is a shared module nobody decided on. Identity unchanged per the
+      founder's A-2 ruling: one resolver, keyed on the project, hub first.
+
+      **Task 24** — the §14 acceptance observation is recorded at
+      `docs/measured/2026-08-26-guardian-claims-provider.md`: a guardian lease
+      held during dispatch and zero rows after, on the real `tick` path with a
+      fixture `spawnWorker`, over the RESTRICTED connection rather than a
+      privileged one. Running it found a defect in the plan's own fixture —
+      `checks.caused` takes check NAMES, and the plan supplied `{name}` objects,
+      so the first run escalated with "could not name it" before any provider
+      claim and reported the acceptance failed for a reason that had nothing to
+      do with what it measures.
+
+      **The durable finding is the truncated search.** Three times in one day I
+      piped a search whose result I then reasoned about as a set through `head`
+      or `tail` — an anchor sweep that reported one call site of two, a clause
+      count that said four of eleven, and a test run that showed 7 assertions of
+      24. A truncated listing and a complete one are indistinguishable in the
+      terminal. The rule now: no `head` on a search whose result is a
+      population, and where output could be long, the count goes first.
+
 - [ ] **S2-C PR-C2, the guardian's hub guest — BUILT (2026-08-26).** Branch
       `feat/s2c-hub-guest`, stacked on **PR-C1** rather than on main, because
       Task 23a's test imports `claimProvider` to assert a real admission

@@ -22,7 +22,7 @@ export PATH="$HOME/.nvm/versions/node/v24.17.0/bin:$PATH"   # node 24 is a floor
 cd ~/Work/Products/reeve && git fetch -q origin
 
 git log --oneline -1 origin/main                     # what `main` is
-git log --oneline -1 HEAD                            # what the CHECKOUT is; NOT what runs
+git log --oneline -1 HEAD                            # what `HEAD` is; NOT what runs
 
 # What the DAEMON runs, which is a different fact. A running process holds the
 # modules it loaded at startup, so fast-forwarding the checkout moves the tree and
@@ -74,7 +74,11 @@ this can tell you that its absence is deliberate.
 | the tracker | current to 2026-08-24; §6 says what belongs in it after that |
 | capability 1 — watch, judge, escalate | the one that is meant to be on |
 | capability 2 — repair red CI | built, and gated behind `--execute` above |
-| capability 3 — work review threads | being built now; §3 is the whole plan and where it has got to |
+| capability 3 — work review threads | being built now; §3 is the plan, and the row below is where it has got to |
+| the durable-effect stages | **1, 2 and 4 have landed. 3 has not.** §3.2 says what each one IS — this row is the only place that says which have landed. Stage 4 arrived out of order: wiring the projection gave `FIX_FINDINGS` its real thread list, so the stage defined as "thread details into FIX_FINDINGS" was complete before SPILL's own delivery was built |
+| the second project | `rextaihq/rext-backend` — **not started.** No profile, no store, nothing watching it |
+| the ntfy read user | **not created.** Needs shell on 95.217.11.127, which is the founder's |
+| the R-03 merge shape | **undecided.** The enquiry was done on 2026-08-22 (§6); choosing what this repository declares is the founder's, and has not been made |
 | capability 4 — refuse an unsafe merge | not started; needs a shadow week and the R-01 ruleset flip |
 | the builder daemon | not something this programme runs; S2 is a peer's lane, see §7 |
 | the founder's merge rule | merge on CI green AND zero open threads. Reaffirmed 2026-08-25 over my recommendation to wait for a verdict |
@@ -111,11 +115,11 @@ each capability IS; §0 says where it stands.
 | 1 | Watch, judge, escalate | reads every open pull request, judges it, and raises what needs a person |
 | 2 | Repair red CI | dispatches a sandboxed worker at a red check, gates the diff, and publishes the fix |
 | 3 | Work review threads | answers and resolves review findings without a person relaying them |
-| 4 | Refuse an unsafe merge | stands between a pull request and `main` as a required check |
+| 4 | Refuse an unsafe merge | stands between a pull request and the default branch as a required check |
 
 ---
 
-## 3. The durable-effect programme
+## 3. The durable-effect programme (§0 for where it stands)
 
 The third of the four capabilities in §2. Where it has got to is a §0 fact; this
 section is the design and the reasoning behind it.
@@ -144,7 +148,7 @@ Where each has got to is a §0 fact. This says what each one IS.
 | 1 | the fencing token — a settle that cannot overwrite another drainer's live delivery |
 | 2 | the drainer, the handler, and `REQUEST_REVIEW` as its first real producer |
 | 3 | `SPILL` onto the same path |
-| 4 | real thread details into `FIX_FINDINGS`, which reads an empty list until this lands |
+| 4 | real thread details into `FIX_FINDINGS` |
 
 PR 2 was opened as one change, reached **ten review rounds and thirty-two
 findings without tapering**, and was split into two on the founder's decision. The
@@ -205,7 +209,7 @@ because re-deriving them costs more than reading them.
 
 ### 3.4 The gates, and why there are two
 
-`--execute` is "may reeve act at all". `watch.reviewActions` is "may it act on
+`--execute` (§0) is "may reeve act at all". `watch.reviewActions` is "may it act on
 review threads". **Both are required to queue an effect AND to deliver one.**
 
 Gating only production is not enough: a queue outlives the run that made it, so
@@ -298,34 +302,61 @@ These cost hours. They are the reason to read this file rather than re-derive it
 
 ## 6. Unfinished work, and what each piece needs
 
-**The last two PRs of the durable-effect programme.** §3.2 has the plan and §0
-says where it has got to. The fourth is what makes `FIX_FINDINGS` able to act on a
-review finding rather than merely notice one — it reads `e.threadDetails`, which
-is written by nothing.
+**The durable-effect programme** (§0). §3.2 says what each stage IS while §0.2's
+durable-effect row says which have landed, and that row is the only place saying so.
+That pointer was wrong until now: §0 carried no per-stage state at all, so a
+resumed session was sent to a source that could not answer, and the §0.1 commands
+report a git tip and open pull requests rather than plan stages. A count here
+would be a second copy of that row, and so would a sentence asserting the
+programme is unfinished, which is the same claim with the number removed. What is durable is the shape (§0 for where it stands): the stage that matters most
+makes `FIX_FINDINGS` able to ACT on a review finding rather than merely notice
+one, by giving it the thread details it is dispatched with.
 
 **Bring `docs/TRACKER.md` up to date.** §0 says how current it is. What is owed:
 the PR split and why, the two halves, and this session's findings.
 
-**R-01, the merge authority.** What the rule MEANS: reeve's fourth capability
-stands between a pull request and `main` as a required status check, so it needs
+**R-01** (§0), the merge authority. What the rule MEANS (§0): reeve's fourth capability
+stands between a pull request and the default branch as a required status check, so it needs
 a ruleset that actually requires one and does not exempt the people most likely to
 merge. Whether it does today is §0.1's doctor line, not a sentence here.
 Instructions were written and sent to the founder on 2026-08-24; they need the
 founder's account, about fifteen minutes.
 
-**R-03, the merge shape.** What the rule MEANS: a gate that assumes squash merges
+**R-03** (§0), the merge shape. What the rule MEANS: a gate that assumes squash merges
 reasons about ancestry differently from one that expects merge commits, so the
 repository's declared shape and its actual history have to agree. Whether they do
-today is §0.1's doctor line. Not investigated either way — a gate written against
-a false premise passes for the wrong reason.
+today is §0.1's doctor line.
 
-**The wrong-worker experiment could be re-run.** It published correctly on
-2026-08-24 — 61s, $0.42, 16 turns, 0 denials — against a toy fixture. The harness
-is `<scratchpad>/wrong-worker/{build-fixture.sh,run.mjs}`. It has never been run
+It HAS been looked at once, and saying otherwise was wrong. The investigation and
+its result are recorded in [the 22 August handoff](2026-08-22-session-handoff-2.md)
+— four merge commits in the last twenty while the gate declared squash.
+Superseding a document replaces its outcome, which is volatile; it cannot make the
+investigation un-happen, and a session told nothing was ever looked at will look
+again.
+
+What is durable is the requirement rather than its status: someone has to decide
+which shape this repository declares, because a gate written against a false
+premise passes for the wrong reason. Whether that decision has been taken is a §0
+fact, not one for this section.
+
+**The wrong-worker experiment.** It published correctly on 2026-08-24 — 61s,
+$0.42, 16 turns, 0 denials — against a toy fixture, and it has never been run
 against a real repository.
 
-**Also open:** ntfy read user (needs shell on 95.217.11.127); second project
-(`rextaihq/rext-backend`).
+**Its original harness was LOST**, and that is the durable fact worth carrying: it
+was written into a session's scratchpad, that scratchpad was discarded with the
+session, and an earlier draft of this section went on naming `build-fixture.sh` and
+`run.mjs` by a placeholder path afterwards. Whether a harness exists in the tree
+today is a question `ls tools/` answers, and this section deliberately does not
+answer it.
+
+The lesson is the one that put `tools/watch-prs.sh` in the repository, arriving a
+day too late for this: a tool a document tells someone to run has to live where the
+document lives. Rebuilding is perhaps an hour, and it goes in `tools/`.
+
+**Also open:** the ntfy read user and the second project, both §0.2 rows now,
+because both are person-owned states that a session would otherwise have to infer
+from an unticked line here.
 
 ---
 
@@ -364,13 +395,13 @@ question: **can reeve be armed and left alone?**
 
 The order that follows from that:
 
-1. **The durable-effect programme finished** (§3), because it is what makes reeve
+1. **The durable-effect programme finished** (§3, with §0 for where it stands), because it is what makes reeve
    able to close a loop rather than only report on one.
 2. **A real dispatch on a real repository** — see §0 for what has actually been
    proven so far, which is the whole reason this ranks second. In this project a
    dispatch once found what roughly 640 green tests missed.
-3. **R-01**, because refusing an unsafe merge means standing as a required status
-   check, and a ruleset with no required checks has nowhere to stand.
+3. **R-01** (§0 for its state), because refusing an unsafe merge means standing
+   as a required status check, and a ruleset with no required checks has nowhere
 4. **The merge-refusal capability** (§2, fourth row), after a shadow week.
 
 Re-arming is the founder's decision at every step, and §0 records that the current

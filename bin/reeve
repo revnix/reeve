@@ -1645,7 +1645,22 @@ switch (cmd) {
     // daemon started would otherwise leave the guardian fail-closed on every
     // dispatch until someone restarted it.
     ctx.resolveRepoId = () => repoIdOnce(ctx.project);
-    ctx.repoId = await repoIdOnce(ctx.project);
+    // GUARDED, because this one is OUTSIDE the tick. Narrowing `repoIdOnce`'s
+    // catch so operational failures propagate was right for the retry path
+    // inside `tick`, which logs them and raises `guardian:hub:unreadable` -- and
+    // it made THIS call, which has no such catch, able to kill `reeve run` at
+    // startup over a transient lock. A fix that makes an error visible must not
+    // make it fatal somewhere the error was previously impossible.
+    //
+    // Left null on failure: the tick re-asks on its own cadence through the same
+    // resolver, and until it succeeds the guardian fails closed and says so.
+    try {
+      ctx.repoId = await repoIdOnce(ctx.project);
+    } catch (err) {
+      console.error(`reeve run: the repository id could not be resolved at startup (${err.message}); ` +
+                    `continuing, and the tick will retry.`);
+      ctx.repoId = null;
+    }
     // Honour the FLAG as well as the command. The help has always documented
     // `run --tick` as "one pass and exit" while only the separate `tick` command
     // did that, so `reeve run --tick` started the long-running daemon -- the

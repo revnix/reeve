@@ -99,6 +99,31 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubaccess-"));
   check(hubAccess(q)().hub != null, "control: the current version still opens");
 }
 
+// ── a version is a CLAIM; the columns are the evidence ────────────────────
+// A store can record the current version and have lost `provider_lease.token`.
+// The version gate accepts it, the guest opens, and the first claim throws --
+// and a throwing scheduler dispatches UNSCHEDULED. Same lesson as
+// `columnDefectsAt`: a version-only probe cannot see a column that is absent,
+// just as a name-only inventory could not see one that was wrong.
+{
+  const p = join(dir, "hollow.db");
+  openHub(p).close();
+  const w = new DatabaseSync(p);
+  w.exec("ALTER TABLE provider_lease DROP COLUMN token");
+  w.close();
+  const a = hubAccess(p)();
+  check(a.hub === null,
+    "a hub whose version is current but whose scheduler column is gone does NOT open", JSON.stringify(a));
+  check(/token/.test(a.why ?? ""),
+    "and the refusal names the column that is missing", String(a.why));
+
+  // CONTROL: the same store with the column intact opens, so this is a shape
+  // check and not "refuse everything with a provider_lease".
+  const q = join(dir, "hollow-control.db");
+  openHub(q).close();
+  check(hubAccess(q)().hub != null, "control: an intact store at the same version still opens");
+}
+
 // ── an existing hub that cannot be READ is a fault, not an absence ────────
 {
   const p = join(dir, "corrupt.db");

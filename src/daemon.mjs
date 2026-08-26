@@ -1868,6 +1868,18 @@ export async function tick(ctx) {
     try {
       containment = await measuredContainment(ctx, profile, nwo, logPath);
     } finally {
+      // THE CANARY IS A PAID MODEL CALL, so its rate limit is the provider's
+      // state and not this measurement's private business. `sandboxCanary`
+      // preserves the worker's outcome in `evidence.outcome`, and a failed
+      // canary is never a cache hit -- so without this the next tick claims
+      // another slot and spends another request into the same exhausted window,
+      // while builders stay eligible against the same untouched `provider_state`.
+      // The cooldown goes in BEFORE the slot goes back, exactly as on the worker
+      // path.
+      if (containment?.canary?.evidence?.outcome === OUTCOMES.RATE_LIMITED) {
+        noteCooldownWithRetry(`cooldown:canary:${nwo}`,
+          { signature: profile.watch?.model ?? "claude", cooldownSeconds: RATE_LIMIT_COOLDOWN_SECONDS });
+      }
       // RELEASED WHATEVER HAPPENED. The canary can throw, and a lease left
       // behind by a throw is counted against the limit until it expires -- five
       // minutes of the guardian throttling itself over one failed measurement.

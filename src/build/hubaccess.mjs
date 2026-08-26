@@ -8,7 +8,7 @@
 import { existsSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { openHubAsGuest } from "./hubguest.mjs";
-import { SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION } from "./hubdb.mjs";
+import { SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION, COLUMNS_AT, columnDefectsAt } from "./hubdb.mjs";
 
 /**
  * A getter over the hub at `hubPath`, answering three ways. See the notes below.
@@ -46,20 +46,44 @@ export function hubAccess(hubPath) {
   // three-way logic below it. The daemon dispatched unscheduled, omitted holds,
   // and said nothing. Using an error-collapsing predicate as the readiness gate
   // undid the very distinction this function was rewritten to make.
-  const versionOf = (p) => {
+  // Opens a read-only probe and hands it to `read`, closing it afterwards
+  // whatever happens. One connection answers both the version and the column
+  // questions: they are two readings of the same store at the same moment, and
+  // taking them through separate handles is two moments again.
+  const probeRead = (p, read) => {
+    let q = null;
     try {
-      const q = new DatabaseSync(p, { readOnly: true });
-      try { return { ok: true, version: q.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get().v }; }
-      finally { q.close(); }
+      q = new DatabaseSync(p, { readOnly: true });
+      return { ok: true, value: read(q) };
     } catch (err) { return { ok: false, why: err.message }; }
+    finally { try { q?.close(); } catch {} }
   };
   return () => {
     const p = hubPath;
     const drop = () => { if (handle) { try { handle.close(); } catch {} handle = null; ident = null; } };
     if (!existsSync(p)) { drop(); return { hub: null, why: null }; }
-    const v = versionOf(p);
+    // ONE PROBE, BOTH READINGS. The version and the column shape are two facts
+    // about the same store at the same moment; taking them through separate
+    // handles would be two moments, and a restore between them would have the
+    // gate answering about a file that no longer exists.
+    // ONE PROBE, BOTH READINGS, BOTH TAKEN INSIDE IT. The version and the column
+    // shape are two facts about the same store at the same moment, so they share
+    // a handle -- and the values are computed here rather than returned as a
+    // closure, because `probeRead` closes the connection on the way out and a
+    // closure over it would run against a closed handle. (It did; the control
+    // that a healthy hub still opens is what caught it.)
+    const v = probeRead(p, q => {
+      const version = q.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get().v;
+      const defects = [];
+      for (const n of Object.keys(COLUMNS_AT).map(Number).filter(x => x <= version).sort((a, b) => a - b)) {
+        try { defects.push(...columnDefectsAt(q, n)); }
+        catch (err) { defects.push(`version ${n}: ${err.message}`); }
+      }
+      return { version, defects };
+    });
     // Could not read is not "not migrated".
     if (!v.ok) { drop(); return { hub: null, why: `the hub at ${p} could not be read: ${v.why}` }; }
+    const version = v.value.version;
     // "The hub opened" and "the scheduler can be used" are DIFFERENT questions.
     //
     // Below version 1 there is no hub at all: an ordinary state, and the tick
@@ -71,7 +95,7 @@ export function hubAccess(hubPath) {
     // guardian's fail-open path runs model work outside the shared limit --
     // beside an older builder that is still using its own. That is an
     // incompatibility and it says so, rather than passing as an absent hub.
-    if (v.version < 1) { drop(); return { hub: null, why: null }; }
+    if (version < 1) { drop(); return { hub: null, why: null }; }
     // AND AN UPPER BOUND. `openHub` refuses a forward schema in three places --
     // migrations are forward-only, and a store a newer binary has migrated is
     // one this binary cannot reason about. The guest had only a floor, so a
@@ -81,16 +105,37 @@ export function hubAccess(hubPath) {
     // takes the documented fail-open path: model work dispatched outside the
     // shared limit, which is the one outcome the whole connection exists to
     // prevent. Refusing is the same answer the privileged opener already gives.
-    if (v.version > HUB_SCHEMA_VERSION) {
+    if (version > HUB_SCHEMA_VERSION) {
       drop();
-      return { hub: null, why: `the hub at ${p} is at schema version ${v.version}; this binary knows ` +
+      return { hub: null, why: `the hub at ${p} is at schema version ${version}; this binary knows ` +
                               `${HUB_SCHEMA_VERSION}. Migrations are forward-only: run the newer binary.` };
     }
-    if (v.version < SCHEDULER_MIN_HUB_VERSION) {
+    if (version < SCHEDULER_MIN_HUB_VERSION) {
       drop();
-      return { hub: null, why: `the hub at ${p} is at schema version ${v.version}; the provider scheduler needs ` +
+      return { hub: null, why: `the hub at ${p} is at schema version ${version}; the provider scheduler needs ` +
                               `${SCHEDULER_MIN_HUB_VERSION}. Run the builder once to migrate it.` };
     }
+    // A VERSION IS A CLAIM; THE COLUMNS ARE THE EVIDENCE.
+    //
+    // A store can record version 3 and have lost `provider_lease.token` -- a
+    // damaged table, a hand-edited database, a restore from something that was
+    // never quite a hub. The version gate above accepts it, `openHubAsGuest`
+    // succeeds, and the first `claimProvider` throws; both dispatch paths answer
+    // a throwing scheduler by running model work UNSCHEDULED, which is the one
+    // outcome this connection exists to prevent.
+    //
+    // This is the same lesson `columnDefectsAt` was written for one PR ago -- a
+    // name-only inventory cannot see a column that is present and wrong, and a
+    // version-only probe cannot see one that is absent. It is reused rather than
+    // restated: every declared requirement at or below the store's version, so a
+    // future migration's columns are covered the day they are declared.
+    const defects = v.value.defects;
+    if (defects.length) {
+      drop();
+      return { hub: null, why: `the hub at ${p} records version ${version} but its scheduler tables do not match it: ` +
+                              `${defects.slice(0, 4).join("; ")}` };
+    }
+
     const now = identOf(p);
     if (handle && now && now === ident) return { hub: handle, why: null };
     if (handle) { try { handle.close(); } catch {} handle = null; ident = null; }

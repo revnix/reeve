@@ -246,15 +246,27 @@ export function providerTx(db, { isAlive, at = null }, fn) {
     const r = fn();
     // THE INVARIANT, ENFORCED HERE RATHER THAN AT EACH SITE THAT CAN BREAK IT.
     //
-    // A preemption request exists only while a guardian is WAITING for capacity.
-    // Three separate paths empty that queue -- a promotion, a cancellation, and
-    // the reaper deleting an expired queued row whose daemon died -- and the
-    // first two were taught to withdraw the mark one review round at a time
-    // while the third was missed. A rule that every future mutation has to
-    // remember is a rule that will be forgotten again, so it is asserted on the
-    // way out of every provider transaction instead. Setting the flag stays a
-    // policy decision in provider.mjs; only its withdrawal is bookkeeping.
-    if (queuedGuardianCount(db) === 0) clearPreemption(db);
+    // A preemption request exists only while a guardian is waiting for capacity
+    // AND COULD ACTUALLY USE IT. Three separate paths empty that queue -- a
+    // promotion, a cancellation, and the reaper deleting an expired queued row
+    // whose daemon died -- and the first two were taught to withdraw the mark one
+    // review round at a time while the third was missed. A rule that every future
+    // mutation has to remember is a rule that will be forgotten again, so it is
+    // asserted on the way out of every provider transaction instead. Setting the
+    // flag stays a policy decision in provider.mjs; only its withdrawal is
+    // bookkeeping.
+    //
+    // A LIVE COOLDOWN WITHDRAWS IT TOO. A queued guardian is not waiting for a
+    // SLOT while the provider is throttled -- it is waiting for the throttle to
+    // lift -- so a builder that reaches a phase boundary during the cooldown
+    // would surrender capacity that then sits idle until it does. Admission
+    // already refuses to REQUEST preemption while cooling; a cooldown that starts
+    // after the request was made is the same fact arriving in the other order,
+    // and a guardian still starved when the cooldown lifts asks again.
+    const st = providerState(db);
+    const clockNow = at ?? nowSeconds(db);
+    const cooling = st.cooldownUntil != null && st.cooldownUntil > clockNow;
+    if (cooling || queuedGuardianCount(db) === 0) clearPreemption(db);
     db.exec("COMMIT");
     return r;
   } catch (e) {

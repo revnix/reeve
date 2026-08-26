@@ -8,6 +8,13 @@
 // one the first time the allowlist or the schema changes.
 
 /**
+ * The columns this module's query names. Part of the guardian's required shape:
+ * a hub whose `pr_hold` has lost one of these does not throw until the first
+ * held pull request is evaluated, which is the worst moment to find out.
+ */
+export const HOLD_COLUMNS = Object.freeze(["repo_id", "pr", "cleared_at", "reason", "detail", "head_sha"]);
+
+/**
  * The open hold on one pull request, if any.
  *
  * THREE ANSWERS, NOT TWO. "no hold" and "reeve could not look" are different

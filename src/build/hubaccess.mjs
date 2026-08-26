@@ -7,8 +7,10 @@
 // asserted and untested at the same time.
 import { existsSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { openHubAsGuest } from "./hubguest.mjs";
-import { SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION, COLUMNS_AT, TABLES_AT, columnDefectsAt } from "./hubdb.mjs";
+import { openHubAsGuest, ALLOWED } from "./hubguest.mjs";
+import { SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION, HUB_BUSY_TIMEOUT_MS } from "./hubdb.mjs";
+import { SCHEDULER_COLUMNS } from "./providerdb.mjs";
+import { HOLD_COLUMNS } from "./holds.mjs";
 
 /**
  * A getter over the hub at `hubPath`, answering three ways. See the notes below.
@@ -53,7 +55,14 @@ export function hubAccess(hubPath) {
   const probeRead = (p, read) => {
     let q = null;
     try {
-      q = new DatabaseSync(p, { readOnly: true });
+      // THE SAME CONTENTION BUDGET AS EVERY OTHER HUB CONNECTION. On SQLite's
+      // default of zero this probe fails the instant a builder or a restore
+      // holds the lock for a moment -- and its failure is read as "the scheduler
+      // is unreadable", which dispatches a worker UNSCHEDULED. A ten-second wait
+      // is what `openHub` and `openHubAsGuest` both take; a probe that decides
+      // whether the quota applies must not be the one connection that refuses to
+      // wait.
+      q = new DatabaseSync(p, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS });
       return { ok: true, value: read(q) };
     } catch (err) { return { ok: false, why: err.message }; }
     finally { try { q?.close(); } catch {} }
@@ -75,24 +84,33 @@ export function hubAccess(hubPath) {
     const v = probeRead(p, q => {
       const version = q.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get().v;
       const defects = [];
-      // THE TABLES FIRST, AND THIS WAS THE HALF THAT WAS MISSING. `COLUMNS_AT`
-      // describes only what migrations ADD to tables that already exist -- its
-      // sole entry is migration 3's two columns -- so a current-version hub that
-      // has lost a version-1 table like `provider_state` produced no defects at
-      // all. The guest opened, and `claimProvider` threw on its first
-      // `SELECT ... FROM provider_state` straight into the fail-open path.
+      // THE GUARDIAN'S OWN SURFACE, and neither of the two inventories I reached
+      // for first is that.
       //
-      // `TABLES_AT` is the inventory that answers this, and it already exists.
-      // Consulting one inventory and not the other is how a shape check ends up
-      // covering exactly the last migration and nothing before it.
+      // `COLUMNS_AT` describes only what later migrations ADD, so a hub missing
+      // a column created in migration 1 -- `provider_state.cooldown_until` --
+      // passed, and `claimProvider` threw into the fail-open path. `TABLES_AT`
+      // is the whole hub, so losing an unrelated builder projection like
+      // `approval` reported the SCHEDULER unusable, and the resulting null hub
+      // dispatched an ordinary pull request unscheduled. Too narrow and too wide
+      // are the same mistake: reading an inventory as an answer to a question it
+      // was not built for.
+      //
+      // The surface is `ALLOWED` -- the guest connection's own allowlist, which
+      // is where "what the guardian may touch" is already defined -- and the
+      // columns are the ones the scheduler's SQL names. One home each.
       const present = new Set(q.prepare(
         `SELECT name FROM sqlite_master WHERE type = 'table'`).all().map(r => r.name));
-      for (const t of TABLES_AT[version] ?? [])
-        if (!present.has(t)) defects.push(`${t} is missing`);
-      for (const n of Object.keys(COLUMNS_AT).map(Number).filter(x => x <= version).sort((a, b) => a - b)) {
-        try { defects.push(...columnDefectsAt(q, n)); }
-        catch (err) { defects.push(`version ${n}: ${err.message}`); }
+      const needCols = { ...SCHEDULER_COLUMNS, pr_hold: HOLD_COLUMNS };
+      for (const t of Object.keys(ALLOWED)) {
+        if (!present.has(t)) { defects.push(`${t} is missing`); continue; }
+        const have = new Set(q.prepare(`SELECT name FROM pragma_table_info(?)`).all(t).map(r => r.name));
+        for (const c of needCols[t] ?? []) if (!have.has(c)) defects.push(`${t}.${c} is missing`);
       }
+      // `COLUMNS_AT` is deliberately NOT consulted here any more:
+      // `task_territory.pinned_until` is the builder's, not the guardian's, and
+      // `provider_lease.token` is already named by `LEASE_COLS` above. Snapshot
+      // validation still uses it -- that question IS about the whole hub.
       return { version, defects };
     });
     // Could not read is not "not migrated".

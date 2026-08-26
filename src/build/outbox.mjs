@@ -561,7 +561,19 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
   // row that quietly cycles.
   const verdicts = [];
   for (const row of expired) {
-    if (!reconcile) { verdicts.push([row, { settled: false }]); continue; }
+    // NO RECONCILER IS A FAILED OBSERVATION, not a verdict of "it did not
+    // happen". Nobody looked -- which is exactly the state the retention path
+    // exists for. Without the flag this fell through to the stop fence, so an
+    // effect that was INFLIGHT when its task stopped was terminally fenced and
+    // its drain settled, and the task could then reach a terminal phase or
+    // resume with an ambiguous pull request creation, close or merge already
+    // landed behind it. The absence of an observer is the strongest reason to
+    // keep looking, not a licence to stop.
+    if (!reconcile) {
+      verdicts.push([row, { settled: false, reconcileFailed: true,
+                            reconcileError: "no reconciler was supplied; nothing observed this effect" }]);
+      continue;
+    }
     try { verdicts.push([row, await reconcile(row)]); }
     // A SEPARATE FLAG, not the message. `new Error()` has an empty message, and
     // an empty string is falsy -- so a reconciler that threw one was read as an

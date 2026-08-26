@@ -31,7 +31,20 @@ const check = (ok, name, detail) => {
 // The newest handoff, by filename sort — the same rule the single-source test
 // uses, so the two cannot end up reading different documents.
 const docs = join(root, "docs");
-const newest = readdirSync(docs).filter(f => /^\d{4}-\d\d-\d\d-session-handoff\.md$/.test(f)).sort().pop();
+// The NEWEST handoff, including a same-day revision. This repository already uses
+// `-2`, `-3` suffixes for a document revised within a day, and matching only the
+// unsuffixed name meant a revision could disagree with the tree while this test
+// went on certifying the older file — an obsolete §0 passing on the strength of a
+// document nobody reads. Sorted by date first, then by suffix numerically, so
+// `-10` cannot sort before `-2`.
+const rank = f => {
+  const m = /^(\d{4}-\d\d-\d\d)-session-handoff(?:-(\d+))?\.md$/.exec(f);
+  return m ? [m[1], Number(m[2] ?? 1)] : null;
+};
+const newest = readdirSync(docs).filter(f => rank(f))
+  .sort((a, b) => { const [da, na] = rank(a), [db_, nb] = rank(b);
+                    return da === db_ ? na - nb : (da < db_ ? -1 : 1); })
+  .pop();
 check(Boolean(newest), "control: a handoff was found to read", String(newest));
 const handoff = readFileSync(join(docs, newest), "utf8");
 
@@ -42,7 +55,12 @@ const handoff = readFileSync(join(docs, newest), "utf8");
 const WITNESSES = [
   [1, "the fencing token", "src/db/schema.sql", /\blease_token\b/],
   [2, "the drainer and its first producer", "src/outbox/drain.mjs", /export async function drainOutbox\b/],
-  [3, "SPILL onto the durable path", "src/outbox/effects.mjs", /["']gh\.issue\.create["']/],
+  // Stage 3 is SPILL reaching the durable path, so the witness is the PRODUCER --
+  // the decision enqueuing the effect — and not the handler's name. A kind
+  // constant or a handler added ahead of the wiring would otherwise make the tree
+  // claim a stage §0 correctly says has not landed, and the comparison would
+  // pressure someone into an inaccurate progress update.
+  [3, "SPILL onto the durable path", "src/daemon.mjs", /SPILL[\s\S]{0,400}?gh\.issue\.create/],
   [4, "real thread details into FIX_FINDINGS", "src/daemon.mjs", /threads:\s*e\.threadDetails\b/],
 ];
 
@@ -62,7 +80,15 @@ check(built.size >= 1, "control: at least one stage's witness matched, so the pa
 const row = /^\|\s*the durable-effect stages\s*\|([^|]*)\|/m.exec(handoff)?.[1] ?? "";
 check(row.length > 0, "control: §0 has a durable-effect stages row to compare against", row.slice(0, 80));
 const landedClause = /([^.]*\bhave landed\b[^.]*)\./i.exec(row)?.[1] ?? row;
-const claimed = new Set([...landedClause.matchAll(/\b([1-4])\b/g)].map(m => Number(m[1])));
+// "All four stages have landed" is the natural way to write the final state, and
+// a digit-only parser reads it as claiming NOTHING -- so the row that says the
+// programme is finished would fail the comparison against a tree that agrees.
+// Number words are read, and `all` expands to every stage with a witness defined.
+const WORDS = { one: 1, two: 2, three: 3, four: 4 };
+const claimed = /\ball\b/i.test(landedClause)
+  ? new Set(WITNESSES.map(([n]) => n))
+  : new Set([...landedClause.matchAll(/\b([1-4]|one|two|three|four)\b/gi)]
+      .map(m => WORDS[m[1].toLowerCase()] ?? Number(m[1])));
 check(claimed.size >= 1, "control: and the row names at least one stage", landedClause.trim().slice(0, 80));
 
 // THE COMPARISON. Neither side is authoritative here on purpose: if they differ,

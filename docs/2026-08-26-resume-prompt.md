@@ -147,9 +147,11 @@ and concede plainly when they are right.
 
 ## What needs me, so you do not wait on it silently
 
-§6 has these in full. In short: R-01, the ruleset that lets admins bypass every
-rule and requires no status check; whether to re-arm; the second project; and the
-ntfy read user.
+§6 has these in full, and says what each MEANS rather than what any command
+reported yesterday: R-01, the merge-authority ruleset; whether to re-arm; the
+second project; and the ntfy read user. For R-01's current shape, run §0.1's
+doctor line — a summary here would prime you to read real drift as the finding you
+were told to expect.
 
 Work autonomously, tell me when you need something, and do not claim anything is
 verified that you have not run.

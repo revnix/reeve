@@ -249,7 +249,15 @@ export function admitTask(db, snapshot, filing, { isAlive = () => true } = {}) {
                         `Resolve it before admission, as section 2.2 requires: a task cannot gate ` +
                         `its spec PR or authenticate a founder override without these` };
 
-    const declared = filing.claims ?? [];
+    // THE CLAIMS THAT WERE CHECKED, not a second list that looks like them.
+    // `resolveSnapshot` performs the symlink and gitlink walk on the claims it
+    // was given and returns them as `snapshot.claims`; admission then granted
+    // `filing.claims` instead. Two lists that are equal in every current caller
+    // is not the same as one list, and the failure is silent in the direction
+    // that matters: a harmless path is checked before the transaction while an
+    // unchecked symlink, submodule or overlapping alias receives the durable
+    // claim and the lease.
+    const declared = snapshot?.claims ?? filing.claims ?? [];
     if (!declared.length)
       return { ok: false, refusal: `a filing must declare its territory; pass --territory` };
     for (const c of declared)

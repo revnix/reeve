@@ -982,6 +982,67 @@ const NOW = 1_800_000_000;
   db.close();
 }
 
+// ── an Error OBJECT is stored as its message ───────────────────────────────
+// node:sqlite's behaviour here depends on ARITY, and the difference matters. A
+// single object argument is read as a NAMED-parameter bag, so an Error passed
+// alone binds nothing and the column takes NULL. Every statement in outbox.mjs
+// binds POSITIONALLY with several arguments, and in that shape an Error is not a
+// bindable type: `run` THROWS.
+//
+// So the failure an executor actually hits is not a lost diagnostic. It is a
+// settle that throws, a transaction that rolls back, and an effect left
+// `inflight` with its result discarded -- the delivery happened, the hub does not
+// know, and the row waits for its lease to expire. Both shapes are asserted
+// below, because a fixture that reproduced only the first would have proved the
+// conversion against a failure this code cannot have.
+{
+  const db = openHub(join(dir, "o22.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const mk = (k) => { hubTx(db, () => enqueueEffect(db, { idempotencyKey: k, kind: "gh.pr.comment",
+      taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+    return leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW }); };
+
+  // FIXTURE FIRST, in BOTH arities, or this asserts a conversion against a
+  // failure the real call site cannot produce.
+  {
+    const probe = new DatabaseSync(":memory:");
+    probe.exec("CREATE TABLE one(a TEXT)");
+    probe.exec("CREATE TABLE many(a TEXT, b TEXT, c TEXT)");
+    probe.prepare("INSERT INTO one(a) VALUES(?)").run(new Error("boom"));
+    check(probe.prepare("SELECT a FROM one").get().a === null,
+      "fixture: a LONE Error argument is read as a named-parameter bag and binds NULL");
+    let threw = null;
+    try { probe.prepare("INSERT INTO many(a,b,c) VALUES(?,?,?)").run("s", null, new Error("boom")); }
+    catch (e) { threw = e; }
+    check(threw !== null,
+      "fixture: but POSITIONALLY, among several arguments, it THROWS -- which is the shape settleEffect uses",
+      String(threw?.code ?? threw?.message));
+    probe.close();
+  }
+
+  const a = mk("bt:1:g1:objerr");
+  settleEffect(db, { id: a.id, worker: "w", leaseToken: a.lease_token,
+                     ok: false, retryable: true, error: new Error("502 from GitHub") });
+  check(db.prepare("SELECT last_error FROM outbox WHERE id=?").get(a.id).last_error === "502 from GitHub",
+    "an Error object settles cleanly and is stored as its message",
+    JSON.stringify(db.prepare("SELECT last_error FROM outbox WHERE id=?").get(a.id)));
+
+  // CONTROL: a plain string still arrives unchanged, so the conversion has not
+  // started rewriting what callers already got right.
+  const b = mk("bt:1:g1:strerr");
+  settleEffect(db, { id: b.id, worker: "w", leaseToken: b.lease_token,
+                     ok: false, retryable: true, error: "plain string reason" });
+  check(db.prepare("SELECT last_error FROM outbox WHERE id=?").get(b.id).last_error === "plain string reason",
+    "control: a string is stored unchanged");
+
+  // CONTROL: null stays null -- a success has no error and must not acquire one.
+  const c = mk("bt:1:g1:noerr");
+  settleEffect(db, { id: c.id, worker: "w", leaseToken: c.lease_token, ok: true, result: { pr: 1 } });
+  check(db.prepare("SELECT last_error FROM outbox WHERE id=?").get(c.id).last_error === null,
+    "control: a successful settle records no error");
+  db.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

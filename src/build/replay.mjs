@@ -89,6 +89,11 @@ const HANDLERS = {
   // image left it. S2-B's depth override writes this on both the accepted-and-
   // moved and the accepted-but-refused paths.
   "sizing.overridden":        { table: "task", key: ["id"] },
+  // The SAME row image, a DIFFERENT fact. `sizing.recorded` is the classifier
+  // choosing a depth; `sizing.overridden` is the founder replacing it. Replay
+  // treats them identically -- same table, same key -- and a reader asking how
+  // the depth was chosen gets an answer instead of a guess.
+  "sizing.recorded":          { table: "task", key: ["id"] },
   // The transition LOG, not just the projection. Without it every transition
   // after the snapshot vanishes from history: `task why` and dash's
   // age-in-state lose the record, and restored outbox rows keep fence values

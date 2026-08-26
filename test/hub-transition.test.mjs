@@ -1080,5 +1080,160 @@ rmSync(dir, { recursive: true, force: true });
     String((applier.match(/openPrs\(/g) ?? []).length));
 }
 
+// ── a stale slice report cannot advance a later slice ──────────────────────
+// Phase and generation are not enough for the implementation loop, because it
+// RETURNS to the same phases: a task at slice 1 is in IMPLEMENTING under the same
+// generation it was in for slice 0. So a delayed report from slice 0 -- a
+// duplicate `slice.merged` witness is the case that matters -- matched the CAS
+// and was applied to slice 1, moving it to SLICE_MERGED. `slice.next` then
+// advanced again, or entered FINALIZING, with that slice never merged.
+{
+  const db = openHub(join(dir, "t33.db"));
+  seed(db, { id: "bt:1", phase: "VERDICT_WAIT", generation: 1 });
+  db.exec(`UPDATE task SET slice_cursor = 1 WHERE id='bt:1'`);   // the task has moved on
+
+  const stale = applyTransition(db, { taskId: "bt:1", expectedPhase: "VERDICT_WAIT",
+    expectedGeneration: 1, slice: 0,          // a report about the PREVIOUS slice
+    evidence: { kind: "slice.merged", mergedSha: "abc", mergedAt: 1 }, op: "phase.merged" });
+  check(stale.applied === false, "a report naming an earlier slice does not apply",
+    JSON.stringify(stale));
+  check(stale.reason === "stale-slice",
+    "and says WHY -- a stale slice, not a lost race, which is a different repair",
+    String(stale.reason));
+  check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "VERDICT_WAIT",
+    "and the task has not moved");
+
+  // CONTROL: the report for the CURRENT slice applies, or the fence has become a
+  // wall and the implementation loop can never advance at all.
+  const fresh = applyTransition(db, { taskId: "bt:1", expectedPhase: "VERDICT_WAIT",
+    expectedGeneration: 1, slice: 1,
+    evidence: { kind: "slice.merged", mergedSha: "abc", mergedAt: 1 }, op: "phase.merged" });
+  check(fresh.applied === true && fresh.to === "SLICE_MERGED",
+    "control: the report for the CURRENT slice applies", JSON.stringify(fresh));
+  db.close();
+}
+
+// CONTROL: a transition that names NO slice is not fenced on the cursor. Most
+// phases are not slice-scoped and their reports say nothing about it, so
+// requiring a match would refuse every one of them.
+{
+  const db = openHub(join(dir, "t34.db"));
+  seed(db, { id: "bt:1", phase: "RESEARCH", generation: 1 });
+  db.exec(`UPDATE task SET slice_cursor = 3 WHERE id='bt:1'`);
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "RESEARCH", expectedGeneration: 1,
+    evidence: { kind: "phase.succeeded", phase: "RESEARCH" }, artifactSha: "sha-research",
+    op: "phase.advanced" });
+  check(r.applied === true,
+    "control: a phase that names no slice advances whatever the cursor says",
+    JSON.stringify(r));
+  db.close();
+}
+
+// ── an ordinary sizing is not recorded as an override ──────────────────────
+// `persistDepth` runs on EVERY successful SIZING now, and it appended
+// `sizing.overridden` unconditionally -- so the durable history claimed the
+// classifier's ordinary selection was a founder override. That is a lie in the
+// audit trail rather than a gap in it, which is worse: it reads as an answer.
+{
+  const db = openHub(join(dir, "t35.db"));
+  seed(db, { id: "bt:1", phase: "SIZING", generation: 1 });
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "SIZING", expectedGeneration: 1,
+    evidence: { kind: "phase.succeeded", phase: "SIZING", depth: "deep" }, artifactSha: "sha-sizing",
+    op: "phase.advanced" });
+  check(r.applied === true, "an ordinary sizing applies", JSON.stringify(r));
+  check(db.prepare("SELECT depth FROM task WHERE id='bt:1'").get().depth === "deep",
+    "and the depth is durable");
+  const kinds = db.prepare(
+    "SELECT kind FROM hub_event WHERE task='bt:1' AND kind LIKE 'sizing.%'").all().map(k => k.kind);
+  check(kinds.includes("sizing.recorded"), "recorded as the classifier's choice", JSON.stringify(kinds));
+  check(!kinds.includes("sizing.overridden"),
+    "and NOT as an override, which no founder made", JSON.stringify(kinds));
+  db.close();
+}
+
+// CONTROL: a real override still records itself as one, or the distinction has
+// collapsed the other way and `task why` can no longer see a founder's decision.
+{
+  const db = openHub(join(dir, "t36.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "depth.override", depth: "deep" }, op: "phase.held" });
+  check(r.applied === true, "control: the override applies", JSON.stringify(r));
+  const kinds = db.prepare(
+    "SELECT kind FROM hub_event WHERE task='bt:1' AND kind LIKE 'sizing.%'").all().map(k => k.kind);
+  check(kinds.includes("sizing.overridden"),
+    "control: a real override IS recorded as one", JSON.stringify(kinds));
+  db.close();
+}
+
+// ── a spec-draft retry exhaustion holds its spec PR ────────────────────────
+// The allowlist named four kinds and left out `phase.failed`, so a revision-loop
+// task back in SPEC_DRAFT whose worker exhausted its retries escalated with its
+// spec PR still mergeable -- the same defect `gate.capReached` was added to fix,
+// reached by a different edge. It is a denylist now: the only reason NOT to hold
+// a spec PR is that the transition is about to push a new head to it.
+{
+  const db = openHub(join(dir, "t37.db"));
+  seed(db, { id: "bt:1", phase: "SPEC_DRAFT", generation: 1 });
+  db.exec(`UPDATE task SET spec_repo_id=9 WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','spec',NULL,NULL,9,42,'specsha',unixepoch())`);
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "SPEC_DRAFT", expectedGeneration: 1,
+    evidence: { kind: "phase.failed", retriesExhausted: true }, op: "phase.escalated" });
+  check(r.applied === true && r.to === "ESCALATED", "the exhausted retry escalates", JSON.stringify(r));
+  const hold = db.prepare("SELECT pr, repo_id FROM pr_hold WHERE task='bt:1'").get();
+  check(hold?.pr === 42 && hold?.repo_id === 9,
+    "and the spec PR is held, so it is not mergeable while the task is stopped",
+    JSON.stringify(hold));
+  db.close();
+}
+
+// CONTROL: a regenerate still leaves the spec PR unheld -- it is about to push a
+// new head to it, and holding it would block the work it is dispatching.
+{
+  const db = openHub(join(dir, "t38.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`UPDATE task SET spec_repo_id=9 WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','spec',NULL,NULL,9,42,'specsha',unixepoch()),
+                 ('bt:1','impl',1,0,1,7,'implsha',unixepoch())`);
+  const snapshot = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f", profileHash: "h",
+                     defaultBranch: "main", visibility: "private", specRepoId: 9,
+                     gateDefinitionHash: "g", registryVersion: 3, founderUserId: 4242 };
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "founder.regenerate", snapshot }, op: "phase.regenerated" });
+  check(r.applied === true, "control: the regenerate applies", JSON.stringify(r));
+  const held = db.prepare("SELECT pr FROM pr_hold WHERE task='bt:1'").all().map(h => h.pr);
+  check(held.includes(7) && !held.includes(42),
+    "control: it holds the implementation PR and NOT the spec PR", JSON.stringify(held));
+  db.close();
+}
+
+// ── a regenerate cannot move a spec PR between repositories ────────────────
+// A PR number is unique only within its repository. Moving `spec_repo_id` while
+// the spec PR keeps its number is not a stale value -- it is a live handle on
+// somebody else's pull request, and every later gate, hold, annotation and close
+// would act on it.
+{
+  const db = openHub(join(dir, "t39.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`UPDATE task SET spec_repo_id=9 WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','spec',NULL,NULL,9,42,'specsha',unixepoch())`);
+  const moved = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f", profileHash: "h",
+                  defaultBranch: "main", visibility: "private", specRepoId: 77,   // a DIFFERENT repo
+                  gateDefinitionHash: "g", registryVersion: 3, founderUserId: 4242 };
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 1,
+    evidence: { kind: "founder.regenerate", snapshot: moved }, op: "phase.regenerated" });
+  check(r.applied === false, "a regenerate that moves the spec repository is refused",
+    JSON.stringify(r));
+  check(/spec PR/.test(JSON.stringify(r)), "and says why", JSON.stringify(r).slice(0, 200));
+  check(db.prepare("SELECT spec_repo_id FROM task WHERE id='bt:1'").get().spec_repo_id === 9,
+    "and the whole transaction rolled back: the task still names its own repository");
+  check(db.prepare("SELECT repo_id FROM task_pr WHERE task='bt:1' AND kind='spec'").get().repo_id === 9,
+    "control: and the spec PR still belongs to the repository it was opened in");
+  db.close();
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

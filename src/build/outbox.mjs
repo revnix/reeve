@@ -26,6 +26,27 @@ import { isSameProcess } from "../supervisor.mjs";
 // the one that already existed.
 import { backoffSeconds } from "../db/ops.mjs";
 
+// MEASURED, and it does NOT do what it first appears to.
+//
+// node:sqlite's behaviour depends on ARITY. A single object argument is read as
+// a named-parameter bag, so an Error passed alone binds nothing and the column
+// takes NULL -- which is what a one-parameter probe shows, and what the review
+// finding described. Every statement here binds POSITIONALLY with several
+// arguments, and in that shape an Error is not a bindable type: `run` throws
+// ERR_INVALID_ARG_TYPE.
+//
+// So the real failure is louder and worse than a lost message. An executor
+// passing the caught error -- the natural failure-call shape -- makes
+// `settleEffect` THROW, `hubTx` rolls the settle back, and the effect stays
+// `inflight` with its result discarded. The delivery happened, the hub does not
+// know, and the row waits for its lease to expire so it can be reconciled or
+// re-delivered. The conversion is the fix either way; the reason it matters is
+// not the one it looked like.
+const errText = (e) =>
+  e == null ? null
+  : typeof e === "string" ? e
+  : (e instanceof Error ? (e.message || String(e)) : String(e));
+
 /**
  * The kinds whose IDEMPOTENCY KEY identifies the effect exactly enough that a
  * completed one must never be re-derived.
@@ -288,7 +309,7 @@ export function settleEffect(db, { id, worker, leaseToken, ok, result = null,
                          not_before=CASE WHEN ? IS NULL THEN not_before ELSE unixepoch() + ? END,
                          updated_at=unixepoch()
         WHERE id=?`)
-      .run(status, result === null ? null : canonicalHub(result), error, notBefore, notBefore, id);
+      .run(status, result === null ? null : canonicalHub(result), errText(error), notBefore, notBefore, id);
     emitRow(db, "outbox.settled", id);
     // Only a TERMINAL status clears the drain; `settleDrainFor` enforces that
     // itself, so a retryable failure that returned the row to `pending` leaves
@@ -371,7 +392,7 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
             WHERE id=?`)
           .run(verdict.ok === false ? "failed" : "done",
                verdict.result == null ? null : canonicalHub(verdict.result),
-               verdict.error ?? null, row.id);
+               errText(verdict.error), row.id);
         emitRow(db, "outbox.settled", row.id);
         settleDrainFor(db, row.id);
         settled++;

@@ -712,6 +712,41 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
     "control: a path that does not exist yet is still a valid claim", JSON.stringify(fresh));
 }
 
+// ── admission grants the claims that were CHECKED ──────────────────────────
+// `resolveSnapshot` performs the symlink and gitlink walk on the claims it is
+// given and returns them as `snapshot.claims`; admission then granted
+// `filing.claims` instead. Two lists that happen to be equal in every current
+// caller is not the same as one list, and the failure is silent in the direction
+// that matters -- a harmless path is checked before the transaction while an
+// unchecked one receives the durable claim and the lease.
+{
+  const db = openHub(join(dir, "r9.db"));
+  // The two lists DISAGREE, which is the whole point: no current caller does
+  // this, and that is exactly why nothing caught it.
+  const checked = [normalizeClaim("packages/checked")];
+  const unchecked = [normalizeClaim("packages/unchecked")];
+  const r = admitTask(db, { ...snap, claims: checked },
+    { id: "bt:bound", project: "p", title: "t", claims: unchecked });
+  check(r.ok === true, "the filing is admitted", JSON.stringify(r));
+  const paths = db.prepare("SELECT path FROM task_territory WHERE task='bt:bound'").all().map(x => x.path);
+  check(JSON.stringify(paths) === '["packages/checked"]',
+    "and the territory granted is the list resolveSnapshot WALKED, not the one beside it",
+    JSON.stringify(paths));
+  const leased = db.prepare("SELECT path FROM territory_lease WHERE task='bt:bound'").all().map(x => x.path);
+  check(JSON.stringify(leased) === '["packages/checked"]',
+    "and so is the lease", JSON.stringify(leased));
+
+  // CONTROL: a snapshot carrying no claims still falls back to the filing's, so
+  // this does not break the callers that never set the field.
+  const fallback = admitTask(db, snap,
+    { id: "bt:fallback", project: "p", title: "t", claims: [normalizeClaim("packages/fb")] });
+  check(fallback.ok === true, "control: a snapshot with no claims falls back to the filing's",
+    JSON.stringify(fallback));
+  check(db.prepare("SELECT count(*) c FROM task_territory WHERE task='bt:fallback' AND path='packages/fb'").get().c === 1,
+    "control: and grants them");
+  db.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

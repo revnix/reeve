@@ -126,18 +126,36 @@ const reachableFrom = entry => {
   // things that can be named, and this makes "cannot be named" fail rather than
   // pass. It is the same move as the allowlist itself: stop enumerating the ways
   // out, and require every way IN to be legible.
+  // A BACKTICK counts as opaque, and exempting it was the hole.
+  //
+  // The first version of this pattern excused backticks along with the two quote
+  // characters, on the reasoning that a template literal with no interpolation is
+  // just a string. It is -- but `specifiersIn` above matches only single and
+  // double quotes, so `await import(\`node:fs\`)` was invisible to the WALK while
+  // being waved through here. Two readers with different ideas of what counts as a
+  // literal is precisely the gap an allowlist cannot survive.
+  //
+  // So there is one rule and no interpolation question to get wrong: a specifier
+  // this boundary can act on is a plain quoted string. A template literal buys
+  // nothing over one and costs an agreement between two matchers, so it is
+  // refused. That is a rule about legibility, not about danger.
+  const OPAQUE = /\b(?:import|require)\s*\(\s*(?!["'])/;
   const opaque = [];
   for (const f of reachableFrom(join(src, "outbox", "effects.mjs")).files) {
     const code = codeOf(readFileSync(f, "utf8"));
-    if (/\b(?:import|require)\s*\(\s*(?!["'`])/.test(code)) opaque.push(relative(src, f));
+    if (OPAQUE.test(code)) opaque.push(relative(src, f));
   }
   check(opaque.length === 0,
-    "and pulls nothing in by a specifier that cannot be read before it runs",
-    `dynamic, non-literal import in ${opaque.join(", ")}`);
-  check(/\b(?:import|require)\s*\(\s*(?!["'`])/.test("const m = await import(name);"),
-    "control: the opaque-import detector recognises a computed specifier", "");
-  check(!/\b(?:import|require)\s*\(\s*(?!["'`])/.test('const m = await import("./x.mjs");'),
-    "control: and does not fire on a literal one, which the walk can follow", "");
+    "and pulls nothing in by a specifier this boundary cannot read before it runs",
+    `dynamic or template-literal import in ${opaque.join(", ")}`);
+  for (const [what, sample] of [
+    ["a computed specifier", "const m = await import(name);"],
+    ["a template literal", "const m = await import(`node:fs`);"],
+    ["an INTERPOLATED template literal", "const m = await import(`node:${x}`);"],
+    ["a computed require", "const z = require(pick());"],
+  ]) check(OPAQUE.test(sample), `control: the opaque-import detector recognises ${what}`, sample);
+  for (const sample of ['const m = await import("./x.mjs");', "const z = require('./y.mjs');"])
+    check(!OPAQUE.test(sample), "control: and does not fire on a plain quoted one, which the walk can follow", sample);
 
   // GLOBALS, which need no import at all and which the walk therefore cannot see.
   // `fetch` is the one that matters: a handler calling it directly makes its own

@@ -324,10 +324,14 @@ const statusOf = key => db.prepare(`SELECT status, attempts, result, last_error 
                                args: { nwo: "o/r", pr: 2, body: "b" } }));
   db4.prepare(`UPDATE outbox SET status='done' WHERE idem_key='slow-lease'`).run();
   let calls = 0;
-  // One reading inside the budget, and every later one past it. The pass therefore
-  // clears its pre-lease check, takes a row, and only then finds the time gone.
+  // TWO readings inside the budget, then every later one past it, and the count is
+  // load-bearing. The drainer reads the clock to set `startedAt` and again for the
+  // pre-lease check, so a single inside reading makes the pass give up BEFORE
+  // leasing anything -- and the assertions below then pass over a row nothing ever
+  // touched. That is exactly what the first version of this fixture did, and the
+  // fence check is what exposed it: lease_token was still 0.
   let n = 0;
-  const jumping = () => (n++ === 0 ? 2_000_000 : 2_000_000 + BUDGET * 10);
+  const jumping = () => (n++ < 2 ? 2_000_000 : 2_000_000 + BUDGET * 10);
   const res = await drainOutbox({ db: db4, handlers: { "gh.pr.comment": () => { calls++; return { ok: true }; } },
                                   api, max: 1, budgetMs: BUDGET, now: jumping });
   const late = db4.prepare(`SELECT status FROM outbox WHERE idem_key='too-late'`).get();
@@ -335,6 +339,41 @@ const statusOf = key => db.prepare(`SELECT status, attempts, result, last_error 
   check(late.status === "pending",
     "and is returned to pending rather than left inflight until its lease expires", JSON.stringify(late));
   check(res.outOfTime === true, "and the pass says out loud that the budget is what stopped it", JSON.stringify(res));
+
+  // The budget it charged is REFUNDED, and the fence it bumped is not.
+  //
+  // Charging an attempt for work never begun is not merely untidy. On the last
+  // permitted delivery it moves the row into reconciliation with no POST ever
+  // sent, and reconciliation then correctly finds no marker and dead-letters an
+  // effect that was never delivered: a review request silently never made, and
+  // escalated as one reeve could not perform.
+  const counters = db4.prepare(`SELECT attempts, reconcile_attempts, lease_token FROM outbox WHERE idem_key='too-late'`).get();
+  check(counters.attempts === 0,
+    "the delivery budget is refunded, because a lease that never ran is not an attempt",
+    JSON.stringify(counters));
+  check(counters.lease_token === 1,
+    "control: while the FENCE stays bumped, because the lease really did happen",
+    JSON.stringify(counters));
+
+  // End to end, on the attempt that matters. A row on its LAST permitted delivery
+  // must survive an unstarted pass and still get its delivery.
+  tx(db4, () => enqueue(db4, { idemKey: "last-chance", kind: "gh.pr.comment",
+                              args: { nwo: "o/r", pr: 3, body: "b" } }));
+  db4.prepare(`UPDATE outbox SET max_attempts=1, status='done' WHERE idem_key='too-late'`).run();
+  let m = 0;
+  const jumping2 = () => (m++ < 2 ? 3_000_000 : 3_000_000 + BUDGET * 10);
+  await drainOutbox({ db: db4, handlers: { "gh.pr.comment": () => ({ ok: true }) },
+                      api, max: 1, budgetMs: BUDGET, now: jumping2 });
+  const stalled = db4.prepare(`SELECT status, attempts, reconcile_attempts FROM outbox WHERE idem_key='last-chance'`).get();
+  check(stalled.attempts === 0 && stalled.reconcile_attempts === 0,
+    "a row on its last permitted delivery is not pushed into reconciliation by a pass it never ran in",
+    JSON.stringify(stalled));
+  db4.prepare(`UPDATE outbox SET not_before=0 WHERE idem_key='last-chance'`).run();
+  let delivered = 0;
+  await drainOutbox({ db: db4, handlers: { "gh.pr.comment": () => { delivered++; return { ok: true }; } },
+                      api, max: 1, budgetMs: BUDGET });
+  check(delivered === 1 && db4.prepare(`SELECT status FROM outbox WHERE idem_key='last-chance'`).get().status === "done",
+    "and still gets the delivery its budget had always permitted", `${delivered} delivery(ies)`);
 
   db4.close();
   rmSync(d4, { recursive: true, force: true });
@@ -683,7 +722,7 @@ db.close();
   rmSync(d7, { recursive: true, force: true });
 }
 
-// --- the comment handler is at-most-once across a crash ----------------------
+// --- the comment handler DEDUPLICATES across a crash, as far as a read allows --
 {
   // The window the fence cannot close: the API call succeeded and the drainer died
   // before settling. Recovery re-leases the row and the retry must NOT post twice.
@@ -779,6 +818,27 @@ db.close();
   const blind = ghPrComment(args, { api, idemKey: mineKey, actor: null });
   check(blind.ok && posted.length === at2 + 1,
     "an unknown actor posts rather than trusting a marker it cannot attribute", JSON.stringify(blind.result));
+
+  // THE PROPERTY THE CONTRACT IS NAMED FOR. The marker makes a duplicate unlikely;
+  // it cannot make one impossible, because the check is a network read and a
+  // network read can fail. A timeout, a truncated buffer and a rate limit all
+  // arrive here looking exactly like "no marker found", and this posts anyway.
+  //
+  // Asserted rather than merely conceded in a comment, because the docblock now
+  // calls delivery at-least-once and an implementer will build on that word. It
+  // has to be demonstrably the weaker claim, not the modest phrasing of a stronger
+  // one -- the repository's own audit ruled that an outbox must never advertise
+  // exactly-once, and this is what the honest name costs.
+  const at3 = posted.length;
+  const flaky = (a, opts) => (a.includes("POST") ? api(a, opts)
+    : { ok: false, err: "get https://api.github.com: TLS handshake timeout", timedOut: true });
+  const again = ghPrComment(args, { api: flaky, idemKey: mineKey, actor: ME });
+  check(again.ok && posted.length === at3 + 1,
+    "a marker read that FAILS posts a second copy, which is why delivery is at-least-once",
+    JSON.stringify(again.result));
+  check(posted.filter(c => String(c.body).includes(markerFor(mineKey))).length >= 2,
+    "control: and the duplicate really is the same effect, not a different one",
+    String(posted.filter(c => String(c.body).includes(markerFor(mineKey))).length));
 }
 
 // --- a request the head has outrun is not posted ------------------------------

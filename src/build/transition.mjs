@@ -20,7 +20,7 @@ import { assertWritable } from "./locks.mjs";
 // `HOLD_ESCALATION` and `holdReasonFor` are exported BY phases.mjs and imported
 // here: the stacked-hold branch indexes the first and calls the second, and a
 // second copy of either would be a second closed set to drift from the DDL.
-import { nextPhase, HELD, isSliceReport, HOLD_ESCALATION, holdReasonFor } from "./phases.mjs";
+import { nextPhase, HELD, isSliceReport, HOLD_ESCALATION, holdReasonFor, ACTIVE } from "./phases.mjs";
 import { isSameProcess } from "../supervisor.mjs";       // build/ is one level down
 import { enqueueEffect, voidPendingIn } from "./outbox.mjs";
 // ONE claim model, shared with admission. A resume that decided territory its
@@ -655,13 +655,25 @@ function applyTransitionTx(db, { taskId, expectedPhase, expectedGeneration, evid
       // comment -- and in S2 nothing delivers anything, so the refusal had no
       // end. Scoped by the `fence` of the event that stopped the task: at or
       // after it is the stop's own doing, before it is the work.
+      // THE EXACT TEST: was this effect enqueued BY a stop? `fence` is the
+      // `phase_event.seq` that authorised the row, so the event itself answers
+      // it -- and a hardcoded list of stopped phases here was a second copy of a
+      // classification `phases.mjs` already owns, free to drift from it.
+      //
+      // Comparing against the LATEST stop was correct only while a task had
+      // stopped once. Held, resumed while the hold comment was still unsettled,
+      // held again: the first hold's own comment has the FIRST stop's fence,
+      // which sorts before the second stop, so it was recounted as work the task
+      // was doing and every later resume was refused -- indefinitely, if that
+      // comment is waiting on a reconciler that cannot reach GitHub.
       drainBeforeStop: db.prepare(
         `SELECT count(*) c FROM task_drain d
            JOIN outbox o ON o.id = d.outbox_id
           WHERE d.task = ? AND d.settled_at IS NULL
-            AND o.fence < COALESCE((SELECT max(seq) FROM phase_event
-                                     WHERE task = ? AND to_phase NOT IN (${["BLOCKED","ESCALATED","CANCELLING","DONE","CANCELLED","LOST","INFEASIBLE"].map(p=>`'${p}'`).join(",")})), o.fence + 1)`)
-        .get(taskId, taskId).c,
+            AND NOT EXISTS (SELECT 1 FROM phase_event e
+                             WHERE e.task = d.task AND e.seq = o.fence
+                               AND e.to_phase NOT IN (${ACTIVE.map(p => `'${p}'`).join(",")}))`)
+        .get(taskId).c,
     }, evidence);
 
     const WORKER_PHASES = ["SIZING","RESEARCH","DESIGN","SPEC_DRAFT","IMPLEMENTING"];

@@ -1531,6 +1531,68 @@ rmSync(dir, { recursive: true, force: true });
   db.close();
 }
 
+// ── the second resume is not refused by the FIRST hold's own comment ───────
+// A resume asks whether the WORK the task was doing is still in flight; a hold's
+// own explanatory comment is not that. Scoping by "at or after the LATEST stop"
+// answers it correctly only for a task that has stopped once. Held, resumed while
+// that comment was still unsettled, held again: the first hold's comment carries
+// the FIRST stop's fence, which sorts before the second stop, so it was recounted
+// as work -- and every resume after that was refused, with no end at all if the
+// comment is waiting on a reconciler that cannot reach GitHub.
+{
+  const db = openHub(join(dir, "t54.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const ev = (from, to, op) => db.prepare(
+    `INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+     VALUES('bt:1',unixepoch(),?,?,?,1,1,'{}') RETURNING seq`).get(op, from, to).seq;
+  const draining = (key, fence) => {
+    const id = db.prepare(
+      `INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,cancellable,args,
+                          status,created_at,updated_at)
+       VALUES(?,'gh.pr.comment','bt:1',1,?,1,'{}','pending',unixepoch(),unixepoch())
+       RETURNING id`).get(key, fence).id;
+    db.prepare(`INSERT INTO task_drain(task,outbox_id,recorded_at) VALUES('bt:1',?,unixepoch())`).run(id);
+    return id;
+  };
+
+  const stop1 = ev("IMPLEMENTING", "BLOCKED", "phase.held");
+  draining("bt:1:g1:held1", stop1);                 // the first hold's OWN comment
+  ev("BLOCKED", "IMPLEMENTING", "phase.resumed");
+  const stop2 = ev("IMPLEMENTING", "BLOCKED", "phase.held");
+  draining("bt:1:g1:held2", stop2);                 // and the second's
+  db.exec(`UPDATE task SET phase='BLOCKED', held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  check(stop1 < stop2, "fixture: the first stop sorts before the second",
+    JSON.stringify({ stop1, stop2 }));
+  check(db.prepare("SELECT count(*) c FROM task_drain WHERE task='bt:1' AND settled_at IS NULL").get().c === 2,
+    "fixture: both hold comments are still draining");
+
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(r.applied === true,
+    "the resume applies: neither stop's own comment is work the task was doing",
+    JSON.stringify(r));
+
+  // CONTROL: a drain row enqueued under an ACTIVE event IS work, and still
+  // refuses the resume -- or the fix has become "never count anything".
+  const db2 = openHub(join(dir, "t55.db"));
+  seed(db2, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const workId = db2.prepare(
+    `INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,cancellable,args,
+                        status,created_at,updated_at)
+     VALUES('bt:1:g1:work','git.push.branch','bt:1',1,1,1,'{}','pending',unixepoch(),unixepoch())
+     RETURNING id`).get().id;
+  db2.prepare(`INSERT INTO task_drain(task,outbox_id,recorded_at) VALUES('bt:1',?,unixepoch())`).run(workId);
+  db2.prepare(
+    `INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+     VALUES('bt:1',unixepoch(),'phase.held','IMPLEMENTING','BLOCKED',1,1,'{}')`).run();
+  db2.exec(`UPDATE task SET phase='BLOCKED', held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  const r2 = applyTransition(db2, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(r2.applied === false && /draining/.test(r2.refusal ?? ""),
+    "control: a push the task was making DOES still refuse the resume", JSON.stringify(r2));
+  db.close(); db2.close();
+}
+
 // ── each hold occurrence is externally distinguishable ─────────────────────
 // A task resumed and then held again for the SAME reason in the SAME generation
 // produced an identical comment key. The outbox admits the second row beside the

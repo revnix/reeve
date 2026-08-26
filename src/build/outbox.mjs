@@ -109,11 +109,31 @@ const stillDeliverable = (db, row) => {
   // compensations carry the stopping transition's seq. So an effect enqueued AT
   // OR AFTER the moment the task stopped belongs to the stop; anything earlier
   // is work the task was doing, and that is what must not continue.
-  const stoppedAt = db.prepare(
-    `SELECT max(seq) s FROM phase_event
-      WHERE task = ? AND to_phase NOT IN (${ACTIVE.map(p => `'${p}'`).join(",")})`)
-    .get(row.task_id)?.s ?? null;
-  return stoppedAt === null ? true : row.fence >= stoppedAt;
+  return isStopOwned(db, row.task_id, row.fence);
+};
+
+/**
+ * Was this effect enqueued BY a stop, rather than by the work the stop halted?
+ *
+ * `fence` is the `phase_event.seq` that authorised the row, so the question has
+ * an exact answer: look at that event and ask whether it was itself a stopping
+ * transition. Anything else is work the task was doing.
+ *
+ * THE EXACT TEST, not "at or after the latest stop". Comparing against
+ * `max(seq)` is right only while a task has stopped once. A task held, resumed
+ * while its hold comment was still unsettled, and held again has TWO stops -- and
+ * the first hold's own comment, whose fence is the first stop, sorts before the
+ * second one. It was then reclassified as work the task was doing, which fences
+ * a previous stop's explanation on one path and refuses every subsequent resume
+ * on the other. A predicate that is correct only for the first occurrence of the
+ * thing it describes is not a predicate.
+ */
+export const isStopOwned = (db, taskId, fence) => {
+  if (taskId == null) return false;
+  return db.prepare(
+    `SELECT count(*) c FROM phase_event
+      WHERE task = ? AND seq = ? AND to_phase NOT IN (${ACTIVE.map(p => `'${p}'`).join(",")})`)
+    .get(taskId, fence).c > 0;
 };
 
 /**
@@ -528,6 +548,23 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
   // applying it would overwrite whoever holds it now.
   return hubTx(db, () => {
     assertWritable(db, { isAlive, inTx: true });
+    // A CLOCK READ HERE, not the one taken before the reconcilers ran.
+    //
+    // `at` was sampled before any external call, and the reconcile pass is a
+    // sequence of network round trips: a slow batch, or one long timeout, can
+    // leave `at` further in the past than the interval being scheduled, so
+    // `at + wait` lands BEHIND now and the next sweep re-asks immediately. Worse,
+    // it does so for ever -- `updated_at` records completion, so the elapsed
+    // measure the next interval doubles from is the gap since completion rather
+    // than the gap the row actually waited, which floors at the minimum and never
+    // escalates. A deadline has to be measured from when it is written.
+    // ALWAYS RE-READ, even when the caller injected a clock for the scan. `now`
+    // says which rows are DUE -- a read-side question, asked before the network.
+    // When that deadline is written is a different moment, and letting one
+    // override stand for both is what made this defect untestable: a fixture
+    // that pins `now` pins the apply clock to it too, so the stale-clock bug and
+    // the fix produce identical output and the stub goes green.
+    const applyAt = db.prepare("SELECT unixepoch() n").get().n;
     let settled = 0, returned = 0, dead = 0, stale = 0, unobserved = 0;
     for (const [row, verdict] of verdicts) {
       const cur = db.prepare("SELECT status, worker, lease_token FROM outbox WHERE id = ?").get(row.id);
@@ -553,6 +590,32 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
       // could observe was leased, expired and requeued for ever, performing an
       // externally ambiguous action every round. The bound is on the ROW, so
       // every path that writes `pending` has to honour it.
+      // BEFORE THE STOP FENCE, and the order is the whole point.
+      //
+      // Fencing means "this will not happen". A reconciler that THREW has not
+      // established that. An effect that was already `inflight` when its task
+      // stopped is the one case where the action may ALREADY have landed -- that
+      // is what inflight means -- so fencing it on the strength of a failed look
+      // settles its drain, and the task then reaches CANCELLED or resumes with an
+      // untracked pull request open behind it. That is the single thing the drain
+      // exists to prevent, and the previous ordering walked straight into it.
+      //
+      // Retention is safe here precisely because it does not redeliver: the row
+      // stays `inflight`, and `leaseEffect` reads `pending` only. So an
+      // unobservable stopped effect is held for another look rather than being
+      // declared dead, and the fence below still catches it the moment a
+      // reconciler can actually LOOK and reports it did not happen.
+      if (verdict?.reconcileError) {
+        const wait = reaskSeconds(applyAt, row);
+        db.prepare(
+          `UPDATE outbox SET lease_expires_at=?, last_error=?, updated_at=unixepoch()
+            WHERE id=?`)
+          .run(applyAt + wait, `reconcile failed: ${verdict.reconcileError}`, row.id);
+        emitRow(db, "outbox.unobserved", row.id);
+        unobserved++;
+        continue;
+      }
+
       // A STOPPED TASK'S EFFECT IS FENCED HERE TOO, for the same reason as the
       // settle path: this is the other way a row leaves `inflight`.
       if (!stillDeliverable(db, row)) {
@@ -599,15 +662,6 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
       // may have landed. So the row simply stays where it is, with its lease
       // deadline pushed out, and the next sweep ASKS AGAIN rather than acts. The
       // CAS on (worker, lease_token) still matches, because neither changes here.
-      if (verdict?.reconcileError) {
-        db.prepare(
-          `UPDATE outbox SET lease_expires_at=?, last_error=?, updated_at=unixepoch()
-            WHERE id=?`)
-          .run(at + reaskSeconds(at, row), `reconcile failed: ${verdict.reconcileError}`, row.id);
-        emitRow(db, "outbox.unobserved", row.id);
-        unobserved++;
-        continue;
-      }
       const spent = row.attempts >= row.max_attempts;
       // BACKED OFF LIKE ANY OTHER RETRY. A row returned here is due immediately,
       // and `leaseEffect` takes every pending row whose schedule is due -- so an

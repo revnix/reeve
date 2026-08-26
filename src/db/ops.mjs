@@ -378,6 +378,20 @@ export function supersedeEffects(db, { prefix, keep }) {
   // Taking the whole desired set makes the operation "reconcile what is queued
   // against what is wanted" rather than "make room for this one", which is the
   // shape that works when what is wanted is nothing at all.
+  // Inside a transaction, for the same reason `enqueue` demands one -- and this
+  // needs it more, not less. It performs several deletes and an event insert per
+  // delete, and those describe ONE reconciliation: a crash partway leaves some
+  // obsolete effects removed without their audit events while others stay queued,
+  // and a reader cannot then tell a partial reconciliation from a complete one.
+  //
+  // It must also commit with the decision that produced it. Reconciling in its own
+  // transaction means a crash between the two leaves the queue reconciled against
+  // a decision that was never recorded.
+  //
+  // A guard that lives in the caller is not a guard: `enqueue` learned that in the
+  // same file, and this function was written afterwards without it.
+  if (!db.isTransaction)
+    throw new Error("supersedeEffects: reconciliation must run inside the transaction that decided it, or a crash leaves it half applied");
   const spare = keep instanceof Set ? keep : new Set(keep === undefined ? [] : [keep]);
   // PENDING and DEAD_LETTER, and the second is not an afterthought. A dead letter
   // is permanent and is counted into a standing escalation every tick -- so an

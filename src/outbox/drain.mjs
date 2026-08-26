@@ -105,6 +105,12 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
   // than the next one. It returns expired inflight rows to pending; it does not
   // touch the fence, because the next lease bumps it and that is what makes the
   // dead holder's settle stale.
+  // BEFORE recovery, not after. Recovery updates every expired inflight row and
+  // emits an event per crash-loop dead letter; with a troubled queue that is real
+  // work, and starting the clock afterwards meant it cost nothing against the
+  // budget and the pass then still got its full sixty seconds. A whole-pass bound
+  // that excludes part of the pass is not a whole-pass bound.
+  const startedAt = now();
   const recovered = recoverOutbox(db);
   if (recovered.length) log(`  outbox: recovered ${recovered.length} row(s) from a drainer that did not finish`);
   // Said separately, because a crash-loop is a different problem from a crash and
@@ -113,7 +119,6 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
     log(`  outbox: ${d.kind} #${d.id} DEAD-LETTERED — ${d.attempts} lease(s) and never once settled; its drainer is crashing`);
 
   const done = [];
-  const startedAt = now();
   let outOfTime = false;
   for (let i = 0; i < max; i++) {
     // Checked BEFORE leasing. A row leased and then abandoned would have its
@@ -160,7 +165,14 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
       const bounded = (a, opts = {}) => {
         const left = remainingMs(deadlineAt);
         if (left <= 0) return { ok: false, out: "", err: "the delivery deadline passed before this call started", timedOut: true };
-        return api(a, { timeoutMs: left, ...opts });
+        // The bound goes LAST, so a handler cannot spread its own over it. The
+        // spread order was the other way round: a handler passing a conventional
+        // per-call timeout replaced the remaining deadline with its own, and the
+        // synchronous `gh` call could then outrun both the pass budget and the
+        // lease -- reopening the duplicate-delivery race this wrapper exists to
+        // close. Clamped rather than simply overridden, so a handler asking for
+        // LESS still gets less.
+        return api(a, { ...opts, timeoutMs: Math.min(left, opts.timeoutMs ?? left) });
       };
       const deliver = Promise.resolve(
         handlers[job.kind](args, { api: bounded, idemKey: job.idem_key, actor, log }));

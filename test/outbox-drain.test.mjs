@@ -4,9 +4,10 @@
 // transaction. That buys nothing unless something carries the effect out exactly
 // once, survives its own crash, refuses a kind it cannot perform, and says so when
 // a queue is stuck. Each of those is asserted here against the real functions.
-import { open, tx, enqueue, leaseOutbox, recoverOutbox } from "../src/db/ops.mjs";
+import { open, tx, enqueue, leaseOutbox, recoverOutbox, supersedeEffects } from "../src/db/ops.mjs";
 import { drainOutbox } from "../src/outbox/drain.mjs";
 import { ghPrComment, markerFor, retryableFrom, HANDLERS } from "../src/outbox/effects.mjs";
+import { apiAsInstallation } from "../src/github/app.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +23,30 @@ const db = open(join(dir, "state.db"));
 const put = (key, kind = "gh.pr.comment", args = { nwo: "o/r", pr: 1, body: "please review" }) =>
   tx(db, () => enqueue(db, { idemKey: key, kind, args }));
 const statusOf = key => db.prepare(`SELECT status, attempts, result, last_error FROM outbox WHERE idem_key=?`).get(key);
+
+// --- ENOBUFS and a timeout are told apart ------------------------------------
+{
+  // Measured on node v24.17.0, both failures set `signal === "SIGTERM"` and leave
+  // `killed` undefined:
+  //
+  //   maxBuffer overflow -> code=ENOBUFS   signal=SIGTERM  killed=undefined
+  //   timeout            -> code=ETIMEDOUT signal=SIGTERM  killed=undefined
+  //
+  // So the signal cannot separate them, and a `killed` test never fires at all.
+  // They have to be told apart because a caller acts on them differently: a
+  // timeout is transient and worth retrying, while an overflow means the request
+  // SUCCEEDED and the answer did not fit -- and this handler reads a failed read
+  // as "no marker found" and posts the duplicate it exists to prevent.
+  const big = apiAsInstallation("t", ["--version"], { maxBuffer: 4 });
+  check(big.ok === false, "control: a four-byte buffer really does fail", JSON.stringify(big));
+  check(big.truncated === true && !big.timedOut,
+    "an output that did not fit is reported as truncation, not as a timeout", JSON.stringify(big));
+
+  const slow = apiAsInstallation("t", ["--version"], { timeoutMs: 1 });
+  check(slow.ok === false, "control: a one-millisecond timeout really does fail", JSON.stringify(slow));
+  check(slow.timedOut === true && !slow.truncated,
+    "and a timeout is reported as a timeout", JSON.stringify(slow));
+}
 
 // --- an effect cannot be enqueued outside a transaction ----------------------
 {
@@ -41,6 +66,20 @@ const statusOf = key => db.prepare(`SELECT status, attempts, result, last_error 
   const id = tx(db, () => enqueue(db, { idemKey: "wrapped", kind: "gh.pr.comment", args: {} }));
   check(id !== null && id !== undefined, "control: inside a transaction it enqueues normally", String(id));
   db.prepare(`DELETE FROM outbox WHERE idem_key='wrapped'`).run();
+
+  // And reconciliation demands one for a stronger reason than enqueue does: it
+  // performs several deletes and an event insert per delete, and those describe
+  // ONE reconciliation. A crash partway leaves some obsolete effects removed
+  // without their audit events while others stay queued, and a reader cannot then
+  // tell a partial reconciliation from a complete one. It must also commit WITH
+  // the decision that produced it, or a crash between the two leaves the queue
+  // reconciled against a decision that was never recorded.
+  let threw2 = null;
+  try { supersedeEffects(db, { prefix: "x:", keep: new Set() }); } catch (e) { threw2 = e.message; }
+  check(threw2 !== null && /transaction/i.test(threw2),
+    "reconciling outside a transaction throws rather than half-applying", String(threw2));
+  const inTx = tx(db, () => supersedeEffects(db, { prefix: "x:", keep: new Set() }));
+  check(inTx === 0, "control: inside one it runs normally", String(inTx));
 }
 
 // --- the happy path, and it is performed exactly once -------------------------
@@ -295,6 +334,63 @@ db.close();
 
   db4.close();
   rmSync(d4, { recursive: true, force: true });
+}
+
+// --- a handler cannot widen its own deadline ---------------------------------
+{
+  // `api(a, { timeoutMs: left, ...opts })` put the handler's options LAST, so a
+  // handler passing a conventional per-call timeout replaced the remaining
+  // deadline with its own -- and the synchronous `gh` call could then outrun both
+  // the pass budget and the lease, reopening the duplicate-delivery race the
+  // wrapper exists to close.
+  const d6 = mkdtempSync(join(tmpdir(), "reeve-clamp-"));
+  const db6 = open(join(d6, "s.db"));
+  const seen = [];
+  const spy = (a, opts) => { seen.push(opts?.timeoutMs ?? null); return { ok: true, out: "" }; };
+  // A handler that asks for ten minutes, inside a two-second budget.
+  const greedy = { "gh.pr.comment": (a, { api }) => { api(["-X", "GET", "x"], { timeoutMs: 600_000 }); return { ok: true }; } };
+  tx(db6, () => enqueue(db6, { idemKey: "greedy", kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "b" } }));
+  await drainOutbox({ db: db6, handlers: greedy, api: spy, max: 1, leaseSeconds: 300, budgetMs: 2000 });
+  check(seen[0] !== null && seen[0] <= 2000,
+    "a handler asking for more time than the pass has does not get it", `timeoutMs=${seen[0]}`);
+
+  // Control: a handler asking for LESS still gets less, so this is a clamp and not
+  // an override -- a wrapper that simply ignored the handler would pass the check
+  // above while taking away a legitimate, tighter bound.
+  const modest = { "gh.pr.comment": (a, { api }) => { api(["-X", "GET", "x"], { timeoutMs: 50 }); return { ok: true }; } };
+  tx(db6, () => enqueue(db6, { idemKey: "modest", kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "b" } }));
+  await drainOutbox({ db: db6, handlers: modest, api: spy, max: 1, leaseSeconds: 300, budgetMs: 60_000 });
+  check(seen[1] === 50, "control: and one asking for less keeps its own tighter bound", `timeoutMs=${seen[1]}`);
+
+  db6.close();
+  rmSync(d6, { recursive: true, force: true });
+}
+
+// --- the pass budget covers recovery, not only delivery -----------------------
+{
+  // Recovery updates every expired inflight row and emits an event per crash-loop
+  // dead letter. With a troubled queue that is real work, and starting the clock
+  // afterwards meant it cost nothing against the budget -- the pass then still got
+  // its full sixty seconds. A whole-pass bound that excludes part of the pass is
+  // not a whole-pass bound.
+  const d7 = mkdtempSync(join(tmpdir(), "reeve-recovclock-"));
+  const db7 = open(join(d7, "s.db"));
+  tx(db7, () => enqueue(db7, { idemKey: "r1", kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "b" } }));
+  // A clock that jumps during recovery, standing in for a slow one.
+  let clock = 0, recovered = false;
+  const now = () => { if (!recovered) return clock; return clock; };
+  const handlers = { "gh.pr.comment": () => ({ ok: true }) };
+  // Lease it and let it expire, so recovery has work to do.
+  leaseOutbox(db7, { worker: "dead", leaseSeconds: -5, kinds: ["gh.pr.comment"] });
+  // The budget is already spent by the time recovery finishes.
+  clock = 0;
+  const r = await drainOutbox({ db: db7, handlers, max: 5, budgetMs: 1000,
+                                now: () => { const v = clock; clock += 2000; return v; } });
+  check(r.recovered >= 1, "control: recovery had work to do", String(r.recovered));
+  check(r.done.length === 0 && r.outOfTime === true,
+    "time spent recovering counts against the pass budget", JSON.stringify({ done: r.done.length, outOfTime: r.outOfTime }));
+  db7.close();
+  rmSync(d7, { recursive: true, force: true });
 }
 
 // --- the comment handler is at-most-once across a crash ----------------------

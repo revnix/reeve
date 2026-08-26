@@ -115,11 +115,11 @@ each capability IS; §0 says where it stands.
 | 1 | Watch, judge, escalate | reads every open pull request, judges it, and raises what needs a person |
 | 2 | Repair red CI | dispatches a sandboxed worker at a red check, gates the diff, and publishes the fix |
 | 3 | Work review threads | answers and resolves review findings without a person relaying them |
-| 4 | Refuse an unsafe merge | stands between a pull request and `main` as a required check |
+| 4 | Refuse an unsafe merge | stands between a pull request and the default branch as a required check |
 
 ---
 
-## 3. The durable-effect programme
+## 3. The durable-effect programme (§0 for where it stands)
 
 The third of the four capabilities in §2. Where it has got to is a §0 fact; this
 section is the design and the reasoning behind it.
@@ -148,7 +148,7 @@ Where each has got to is a §0 fact. This says what each one IS.
 | 1 | the fencing token — a settle that cannot overwrite another drainer's live delivery |
 | 2 | the drainer, the handler, and `REQUEST_REVIEW` as its first real producer |
 | 3 | `SPILL` onto the same path |
-| 4 | real thread details into `FIX_FINDINGS`, which reads an empty list until this lands |
+| 4 | real thread details into `FIX_FINDINGS` |
 
 PR 2 was opened as one change, reached **ten review rounds and thirty-two
 findings without tapering**, and was split into two on the founder's decision. The
@@ -209,7 +209,7 @@ because re-deriving them costs more than reading them.
 
 ### 3.4 The gates, and why there are two
 
-`--execute` is "may reeve act at all" — §0 says how it is currently set. `watch.reviewActions` is "may it act on
+`--execute` (§0) is "may reeve act at all". `watch.reviewActions` is "may it act on
 review threads". **Both are required to queue an effect AND to deliver one.**
 
 Gating only production is not enough: a queue outlives the run that made it, so
@@ -302,8 +302,8 @@ These cost hours. They are the reason to read this file rather than re-derive it
 
 ## 6. Unfinished work, and what each piece needs
 
-**The durable-effect programme.** §3.2 says what each stage IS; §0.2's
-durable-effect row says which have landed, and it is the only place that does.
+**The durable-effect programme** (§0). §3.2 says what each stage IS while §0.2's
+durable-effect row says which have landed, and that row is the only place saying so.
 That pointer was wrong until now: §0 carried no per-stage state at all, so a
 resumed session was sent to a source that could not answer, and the §0.1 commands
 report a git tip and open pull requests rather than plan stages. A count here
@@ -315,14 +315,14 @@ one, by giving it the thread details it is dispatched with.
 **Bring `docs/TRACKER.md` up to date.** §0 says how current it is. What is owed:
 the PR split and why, the two halves, and this session's findings.
 
-**R-01, the merge authority.** What the rule MEANS, with §0 for its state: reeve's fourth capability
-stands between a pull request and `main` as a required status check, so it needs
+**R-01** (§0), the merge authority. What the rule MEANS (§0): reeve's fourth capability
+stands between a pull request and the default branch as a required status check, so it needs
 a ruleset that actually requires one and does not exempt the people most likely to
 merge. Whether it does today is §0.1's doctor line, not a sentence here.
 Instructions were written and sent to the founder on 2026-08-24; they need the
 founder's account, about fifteen minutes.
 
-**R-03, the merge shape.** What the rule MEANS, with §0 for its state: a gate that assumes squash merges
+**R-03** (§0), the merge shape. What the rule MEANS: a gate that assumes squash merges
 reasons about ancestry differently from one that expects merge commits, so the
 repository's declared shape and its actual history have to agree. Whether they do
 today is §0.1's doctor line.
@@ -354,7 +354,7 @@ The lesson is the one that put `tools/watch-prs.sh` in the repository, arriving 
 day too late for this: a tool a document tells someone to run has to live where the
 document lives. Rebuilding is perhaps an hour, and it goes in `tools/`.
 
-**Also open:** the ntfy read user and the second project — both §0.2 rows now,
+**Also open:** the ntfy read user and the second project, both §0.2 rows now,
 because both are person-owned states that a session would otherwise have to infer
 from an unticked line here.
 

@@ -135,22 +135,30 @@ const ALIVE = () => true, DEAD = () => false;
   check(db.prepare("SELECT count(*) c FROM provider_lease WHERE owner='guardian' AND status='queued'").get().c === 1,
     "re-asking for the SAME run does not add a second queued row");
 
+  // THE MARK IS CHECKED WHILE THE GUARDIAN IS ACTUALLY STARVED -- that is, before
+  // anything frees a slot. A preemption request exists only while a queued
+  // guardian is blocked by CAPACITY, so releasing a builder below the limit
+  // withdraws it: the guardian can simply take the free slot on its next poll,
+  // and a victim left marked through that interval would yield as well and
+  // suspend a second worker for nothing.
+  const flaggedWhileStarved = db.prepare(
+    "SELECT run_ref FROM provider_lease WHERE owner='builder' AND preempt_requested=1").all();
+  check(flaggedWhileStarved.length === 1,
+    "exactly one builder lease is marked for preemption", JSON.stringify(flaggedWhileStarved));
+  // The YOUNGEST, per the plan: bt:2 and bt:3 were claimed after bt:1, so bt:3
+  // is the newest live builder.
+  check(flaggedWhileStarved[0]?.run_ref === "bt:3",
+    "and it is the YOUNGEST builder, not whichever row the query happened to reach first",
+    JSON.stringify(flaggedWhileStarved));
+
   releaseProvider(db, a);
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE preempt_requested=1").get().c === 0,
+    "and an unrelated release withdraws the mark, because the guardian is no longer starved",
+    JSON.stringify(db.prepare("SELECT owner,run_ref,status,preempt_requested FROM provider_lease").all()));
+
   const e = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:4", pid: 5, lstart: "E", isAlive: ALIVE });
   check(!e.ok && e.reason === "queued",
     "and the freed slot is not taken by the next builder while a guardian is queued", JSON.stringify(e));
-  // The preemption WRITE, asserted in the one fixture that can produce it: a
-  // queued guardian with every slot builder-held. Without this an implementation
-  // that never sets the flag passes the entire scheduler suite, and the
-  // phase-boundary reader has no signal to release capacity for the guardian.
-  const flagged = db.prepare(
-    "SELECT run_ref FROM provider_lease WHERE owner='builder' AND preempt_requested=1").all();
-  check(flagged.length === 1, "exactly one builder lease is marked for preemption", JSON.stringify(flagged));
-  // The YOUNGEST: bt:2 and bt:3 were claimed after bt:1, and bt:1's slot was
-  // released above, so bt:3 is the newest live builder.
-  check(flagged[0]?.run_ref === "bt:3",
-    "and it is the YOUNGEST builder, not whichever row the query happened to reach first",
-    JSON.stringify(flagged));
   // Marked, NOT revoked. Preemption happens at a phase boundary; killing here is
   // the behaviour this flag exists to avoid.
   check(db.prepare("SELECT count(*) c FROM provider_lease WHERE owner='builder' AND status='held'").get().c === 2,

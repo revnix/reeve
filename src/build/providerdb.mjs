@@ -274,10 +274,20 @@ export function providerTx(db, { isAlive, at = null }, fn) {
     // already refuses to REQUEST preemption while cooling; a cooldown that starts
     // after the request was made is the same fact arriving in the other order,
     // and a guardian still starved when the cooldown lifts asks again.
+    // Stated once, positively: A PREEMPTION REQUEST EXISTS ONLY WHILE A QUEUED
+    // GUARDIAN IS BLOCKED BY CAPACITY. Everything else is a way of not being
+    // blocked by capacity, and each was learned separately until the rule was
+    // put here -- nobody queued (a promotion, a cancellation, the reaper taking
+    // an expired row), throttled rather than starved (a cooldown), and now
+    // simply not starved any more: a slot freed by an UNRELATED release, which
+    // the queued guardian has not polled for yet. Left marked through that
+    // interval, the victim reaches its phase boundary and yields as well,
+    // suspending a second worker to leave capacity idle that was already free.
     const st = providerState(db);
     const clockNow = at ?? nowSeconds(db);
     const cooling = st.cooldownUntil != null && st.cooldownUntil > clockNow;
-    if (cooling || queuedGuardianCount(db) === 0) clearPreemption(db);
+    const starved = queuedGuardianCount(db) > 0 && !cooling && heldCount(db) >= st.limit;
+    if (!starved) clearPreemption(db);
     db.exec("COMMIT");
     return r;
   } catch (e) {

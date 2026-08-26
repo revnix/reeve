@@ -1260,6 +1260,7 @@ export async function tick(ctx) {
   // cause, and raising it per operation would turn a standing failure into a
   // stream of alerts that each retire the last.
   let hubFaultSaid = false;
+  let projectFaultSaid = false;
   const hubOr = (onFault) => {
     const a = hubNow();
     if (a.why && !hubFaultSaid) {
@@ -1290,6 +1291,16 @@ export async function tick(ctx) {
   // `builder.provider.repoIdRetryMinutes`, which the profile schema does not
   // declare, so an operator who tuned the knob it advertised made `reeve run`
   // fail validation instead.
+  // A REGISTRY THAT COULD NOT BE PARSED IS NOT A MISSING PROJECT. `bin/reeve`
+  // rejects the whole registry when any single entry is malformed, so an
+  // unrelated bad entry leaves this repository with no project, no repository
+  // id, every dispatch fail-closed and every builder-PR hold UNKNOWN. Failing
+  // closed is right; doing it silently is not.
+  if (ctx.projectError && !projectFaultSaid) {
+    projectFaultSaid = true;
+    log(logPath, `registry: ${ctx.projectError}`);
+    raise("the project registry could not be read; this repository has no resolvable identity");
+  }
   if (ctx.repoId == null && ctx.resolveRepoId) {
     const at = Math.floor(Date.now() / 1000);
     if (at - (ctx._repoIdTriedAt ?? 0) >= REPO_ID_RETRY_SECONDS) {
@@ -1318,8 +1329,25 @@ export async function tick(ctx) {
   const releaseWithRetry = (key, identity) => {
     // FRESH, not the tick's opening snapshot: a release is the operation most
     // likely to run long after the hub was first opened.
-    const h = hubOr(() => null);
-    if (!h) return;
+    const a = hubNow();
+    // RETAINED, NOT DROPPED. This early return handled the exception path and
+    // the maintenance refusal and then threw the identity away on the third
+    // route out -- a hub that is momentarily unreadable between the claim and
+    // the cleanup. A pre-bind lease is still attached to the guardian's own
+    // always-alive pid, so even past its expiry the liveness-aware reaper keeps
+    // it and the slot is lost for good.
+    //
+    // Only a hub that is genuinely ABSENT drops it: there is no scheduler, so
+    // there is no lease and nothing to give back.
+    if (!a.hub) {
+      if (a.why) {
+        pendingReleases.set(key, identity);
+        if (!hubFaultSaid) { hubFaultSaid = true; log(logPath, `hub: ${a.why}`); raise("guardian:hub:unreadable"); }
+        log(logPath, `provider: release deferred — the hub could not be reached; retrying next tick (${key})`);
+      }
+      return;
+    }
+    const h = a.hub;
     let r;
     // A THROW IS NOT A REFUSAL, and only the refusal was handled. On the worker
     // path this runs at the top of the `finally`, so an exception here skips the
@@ -1705,6 +1733,12 @@ export async function tick(ctx) {
   const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action)
                                     && !(d.decision.action === "REQUEST_REVIEW" && execute && reviewActionsOn(profile)));
 
+  // Whether this tick will ask for a canary lease at all. Declared ONCE and read
+  // by both the queued sweep below and the canary block further down: two
+  // statements of the same condition drift, and the sweep cancelling a request
+  // the next few lines are about to make is the shape that drift takes here.
+  const willAttemptCanary = Boolean(execute && wanted.length && !(ctx.containment ?? null));
+
   // ── the scheduler's own housekeeping, before anything asks it for a slot ──
   //
   // REAP FIRST. `claimProvider` counts held rows and does not reap, and nothing
@@ -1749,7 +1783,15 @@ export async function tick(ctx) {
     const h = hubOr(() => null);
     if (h) {
       try {
-        const intended = new Set([`canary:${nwo}`,
+        // THE CANARY ONLY IF THIS TICK WILL ATTEMPT IT. Treating its run ref as
+        // intended unconditionally meant a queued canary request survived every
+        // later tick that had no worker decisions -- never claimed, never
+        // cancelled, and owned by the live guardian so the reaper preserves it,
+        // while `queuedGuardianCount` blocks every builder admission behind it.
+        // The same predicate the canary block uses, not a second one that agrees
+        // today.
+        const intended = new Set([
+          ...(willAttemptCanary ? [`canary:${nwo}`] : []),
           ...wanted.map(d => `${nwo}#${d.e.pr}:${d.decision.action}`)]);
         for (const row of (ctx.queuedRequests ?? queuedGuardianRequests)(h, { repoId })) {
           if (intended.has(row.run_ref)) continue;
@@ -1774,7 +1816,7 @@ export async function tick(ctx) {
   // scheduler cannot see.
   let skipDispatch = false;
   let canaryLease = null;
-  if (execute && wanted.length && !containment && hub) {
+  if (willAttemptCanary && hub) {
     if (repoId == null) {
       // FAIL CLOSED, unlike an unreadable hub below. A missing repository id is
       // not "the scheduler is down"; it is "this lease cannot be scoped to

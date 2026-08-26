@@ -395,6 +395,139 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
     (src.match(/.*merge-policy.*/g) ?? []).join(" | "));
 }
 
+// ── a release survives a hub that is momentarily unreachable ──────────────
+// The exception path and the maintenance refusal were both retried, and the
+// third route out -- a hub unreadable between the claim and the cleanup -- threw
+// the identity away. A pre-bind lease sits on the guardian's always-alive pid,
+// so even past expiry the liveness-aware reaper keeps it and the slot is gone
+// for good.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-drop-"));
+  const hubPath = join(dir, "hub.db");
+  openHub(hubPath).close();
+  const guest = openHubAsGuest(hubPath);
+  const retry = new Map();
+  let reachable = true;
+  const ctx = {
+    nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+    execute: true, shadow: true, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-drop-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+    },
+    // Reachable while the claim happens, unreadable by the time cleanup runs --
+    // which is exactly the window this guards.
+    hub: () => (reachable ? { hub: guest, why: null } : { hub: null, why: "the hub could not be read just now" }),
+    repoId: 7, lstart: "boot-1",
+    providerRetry: retry,
+    providerClaim: () => ({ ok: true, id: 1, token: "t" }),
+    providerBind: () => ({ ok: true, bound: 1 }),
+    providerRelease: () => ({ ok: true }),
+    openPrs: () => [42],
+    prAnchor: () => ({ ok: true, headRef: "mp/bt-1-s0", baseRef: "main", state: "open", title: "t",
+                       updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
+    evaluate: () => EVAL,
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    spawnWorker: async () => { reachable = false; return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; },
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+  };
+  const r = await tick(ctx); ctx.db.close();
+  check(retry.size > 0,
+    "a release whose hub is unreachable is RETAINED for the next tick, not dropped",
+    JSON.stringify([...retry.keys()]));
+  const kept = [...retry.values()][0];
+  check(kept?.owner === "guardian" && kept?.repoId === 7 && kept?.runRef != null,
+    "and what is kept is the identity", JSON.stringify(kept));
+  check(/hub:unreadable/.test([...(r.escalations?.keys?.() ?? [])].join(" ")),
+    "and the unreachable hub escalates", [...(r.escalations?.keys?.() ?? [])].join(" | "));
+  try { guest.close(); } catch {}
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── the canary's queued request is cancelled when no canary will run ──────
+// Treating `canary:<nwo>` as intended unconditionally left a queued canary
+// request alive through every later tick with no worker decisions: never
+// claimed, never cancelled, owned by the live guardian so the reaper keeps it,
+// and blocking every builder admission behind it.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-sweep-"));
+  const cancelled = [];
+  const base = (decisionsWanted) => ({
+    nwo: "o/r", db: open(join(dir, `s${cancelled.length}.db`)), logPath: join(dir, "log.txt"),
+    execute: true, shadow: true, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-sweep-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+    },
+    hub: () => ({ hub: {}, why: null }), repoId: 7, lstart: "boot-1",
+    // A queued canary request is already sitting in the scheduler.
+    queuedRequests: () => [{ run_ref: "canary:o/r" }],
+    cancelQueued: (db, a) => { cancelled.push(a.runRef); return { ok: true, cancelled: 1 }; },
+    reapProvider: () => ({ ok: true, reaped: 0 }),
+    providerClaim: () => ({ ok: true, id: 1, token: "t" }),
+    providerBind: () => ({ ok: true, bound: 1 }),
+    providerRelease: () => ({ ok: true }),
+    openPrs: () => (decisionsWanted ? [42] : []),
+    prAnchor: () => ({ ok: true, headRef: "mp/bt-1-s0", baseRef: "main", state: "open", title: "t",
+                       updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
+    evaluate: () => EVAL,
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }),
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+  });
+
+  // No open pull requests, so nothing is wanted and no canary will be attempted.
+  const a = base(false); await tick(a); a.db.close();
+  check(cancelled.includes("canary:o/r"),
+    "a queued canary request is cancelled on a tick that will not run one",
+    JSON.stringify(cancelled));
+
+  // CONTROL: a tick that WILL attempt the canary must NOT cancel its request, or
+  // the sweep withdraws the very thing the next few lines are about to ask for.
+  //
+  // `containment` is deliberately NOT injected here -- injecting it is what makes
+  // `willAttemptCanary` false, which is correct behaviour and was why the first
+  // version of this control failed. With `worker.isolation` at its default the
+  // cheap gates in `measuredContainment` answer without ever running a canary
+  // process, so this stays deterministic and host-independent.
+  cancelled.length = 0;
+  const b = base(true);
+  delete b.containment;
+  b.profile.worker = { isolation: "none" };
+  await tick(b); b.db.close();
+  check(!cancelled.includes("canary:o/r"),
+    "control: a tick that WILL run the canary leaves its request alone",
+    JSON.stringify(cancelled));
+  // And the discrimination itself: a run ref this tick did not decide on IS
+  // cancelled, in the same sweep that spared the canary.
+  cancelled.length = 0;
+  const c = base(true);
+  delete c.containment;
+  c.profile.worker = { isolation: "none" };
+  c.queuedRequests = () => [{ run_ref: "o/r#99:FIX_CI" }];
+  await tick(c); c.db.close();
+  check(cancelled.includes("o/r#99:FIX_CI"),
+    "a queued request for a PR this tick never decided on is cancelled",
+    JSON.stringify(cancelled));
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // ── A-9: a maintenance refusal is retried, never swallowed ────────────────
 // `assertWritable` refuses every hub write while a restore holds the lock. A
 // release dropped there leaves the lease held until it expires, counted against

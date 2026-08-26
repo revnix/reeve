@@ -8,7 +8,7 @@
 import { existsSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { openHubAsGuest } from "./hubguest.mjs";
-import { SCHEDULER_MIN_HUB_VERSION } from "./hubdb.mjs";
+import { SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION } from "./hubdb.mjs";
 
 /**
  * A getter over the hub at `hubPath`, answering three ways. See the notes below.
@@ -72,6 +72,20 @@ export function hubAccess(hubPath) {
     // beside an older builder that is still using its own. That is an
     // incompatibility and it says so, rather than passing as an absent hub.
     if (v.version < 1) { drop(); return { hub: null, why: null }; }
+    // AND AN UPPER BOUND. `openHub` refuses a forward schema in three places --
+    // migrations are forward-only, and a store a newer binary has migrated is
+    // one this binary cannot reason about. The guest had only a floor, so a
+    // newer builder migrating the shared hub left this guardian issuing
+    // scheduler mutations against a layout it does not know. The moment a future
+    // migration changes those statements they throw, and a throwing scheduler
+    // takes the documented fail-open path: model work dispatched outside the
+    // shared limit, which is the one outcome the whole connection exists to
+    // prevent. Refusing is the same answer the privileged opener already gives.
+    if (v.version > HUB_SCHEMA_VERSION) {
+      drop();
+      return { hub: null, why: `the hub at ${p} is at schema version ${v.version}; this binary knows ` +
+                              `${HUB_SCHEMA_VERSION}. Migrations are forward-only: run the newer binary.` };
+    }
     if (v.version < SCHEDULER_MIN_HUB_VERSION) {
       drop();
       return { hub: null, why: `the hub at ${p} is at schema version ${v.version}; the provider scheduler needs ` +

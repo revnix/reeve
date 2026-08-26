@@ -114,7 +114,17 @@ const repoIdOnce = async (project) => {
     // rather than migrating someone else's database to find out.
     db = new DatabaseSync(p, { readOnly: true });
     return await resolveRepoId(db, project);
-  } catch { return null; }
+  } catch (err) {
+    // ONLY THE ABSENT CASE IS BENIGN. A hub too old to have `task` yet is
+    // genuinely "no id known", which is an ordinary state. A `task` table that
+    // exists and cannot be read is an operational fault, and collapsing the two
+    // defeated `resolveRepoId`'s three-outcome contract: the daemon's own catch
+    // never saw it, nothing reported the hub unreadable, and the guardian sat
+    // fail-closed under the misleading "the repository numeric id is unknown"
+    // with only the ten-minute absence cadence to retry it.
+    if (/no such table/i.test(err.message)) return null;
+    throw err;
+  }
   finally { try { db?.close(); } catch {} }
 };
 
@@ -1574,6 +1584,14 @@ switch (cmd) {
     // nobody. (Codex #4g-[2].)
     const dbPath = resolve(opt("db") ?? stateFor(nwo));
     if (!existsSync(dbPath)) { console.error(`reeve run: no state database at ${dbPath}`); process.exit(1); }
+    // Resolved before the context so the REASON survives. A project that is
+    // simply not registered is `{ project: null, why: null }` -- an ordinary
+    // state. A registry that could not be parsed is a fault that says so.
+    const registry = registryProjects(HOME);
+    const guardianProject = {
+      project: (registry.projects ?? []).find(p => p.nwo === nwo) ?? null,
+      why: (registry.projects ?? []).some(p => p.nwo === nwo) ? null : (registry.error ?? null),
+    };
     const ctx = {
       nwo, profile, db: open(dbPath),
       // The database's own path: the worker must not be able to read the event
@@ -1611,7 +1629,15 @@ switch (cmd) {
       // resolver is keyed on. A rename changes `nwo` and never the id, so the
       // project key is the stable half; a repository absent from the registry
       // has no project and the guardian dispatches unscheduled.
-      project: (registryProjects(HOME).projects ?? []).find(p => p.nwo === nwo) ?? null,
+      project: guardianProject.project,
+      // WHY there is no project, when there is a reason. `registryProjects`
+      // rejects the WHOLE registry if any single entry is malformed -- by
+      // design, because a partially-read registry silently narrows what doctor
+      // reports on. But converting that global diagnostic into a bare
+      // `project: null` here meant one unrelated bad entry left this repository
+      // unable to resolve its numeric id: every provider dispatch fail-closed
+      // and every builder-PR hold UNKNOWN, with nothing saying why.
+      projectError: guardianProject.why,
     };
     // RESOLVED HERE, not in the tick, because the tick's connection cannot read
     // it. Re-resolved on the tick's own cadence through this same closure when

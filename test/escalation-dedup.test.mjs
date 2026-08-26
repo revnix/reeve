@@ -7,7 +7,7 @@
 // It must also survive a restart: KeepAlive restarts the daemon, and in-memory
 // dedup would re-announce everything each time.
 import { open } from "../src/db/ops.mjs";
-import { announceable } from "../src/daemon.mjs";
+import { announceable, deadLetterCause } from "../src/daemon.mjs";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,6 +50,70 @@ let db = open(path);
   // The rule above is inert unless the daemon PASSES `waiting`: the parameter
 // defaults to null, and null filters nothing. A guard that quietly stops applying
 // because its input narrowed is the shape this codebase keeps being bitten by.
+// --- a dead-letter cause keeps its identity when the count changes ------------
+{
+  // `announceable` reads the KEY as identity and the map VALUE as the count. With
+  // the number interpolated into the string, every count was a different cause:
+  // two reads in one pass produced two keys rather than one updated one, so a
+  // single notification could carry contradictory totals, and the next tick would
+  // retire the stale one as though it had been resolved.
+  check(deadLetterCause("gh.pr.comment") === deadLetterCause("gh.pr.comment"),
+    "control: the cause is stable for one kind", deadLetterCause("gh.pr.comment"));
+  check(!/\d/.test(deadLetterCause("gh.pr.comment")),
+    "and carries no count, because the count is the VALUE and not the identity",
+    deadLetterCause("gh.pr.comment"));
+  check(deadLetterCause("gh.pr.comment") !== deadLetterCause("gh.thread.resolve"),
+    "control: but two kinds are still two causes", "");
+
+  // The behaviour it buys: a changed count re-announces ONE cause rather than
+  // leaving a stale sibling behind.
+  const dir = mkdtempSync(join(tmpdir(), "reeve-dlkey-"));
+  const db = open(join(dir, "s.db"));
+  const cause = deadLetterCause("gh.pr.comment");
+  announceable(db, new Map([[cause, 1]]), { covered: new Set(), complete: true });
+  const second = announceable(db, new Map([[cause, 3]]), { covered: new Set(), complete: true });
+  check(db.prepare("SELECT count(*) n FROM escalation").get().n === 1,
+    "a changed count updates the one cause rather than adding a second", "");
+  check(second.fresh.length === 1 && second.fresh[0].count === 3,
+    "and is re-announced with the new count", JSON.stringify(second.fresh));
+  check(second.cleared.length === 0, "with nothing spuriously cleared", JSON.stringify(second.cleared));
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- a tick that could not look at anything retires nothing -------------------
+{
+  // A tick whose pull-request listing failed still drains the outbox, and a drain
+  // can raise a permanent loss that has to be announced. But that tick LOOKED at
+  // nothing, so it must not also retire standing causes: an escalation is not
+  // resolved because reeve could not check it. Asserted rather than reasoned,
+  // because the degraded path passes empty sets and the clearing rule reads them.
+  const dir = mkdtempSync(join(tmpdir(), "reeve-degraded-"));
+  const db = open(join(dir, "s.db"));
+
+  // A standing cause of each shape: one naming a pull request, one shared.
+  announceable(db, new Map([["#7: needs a human", 1], ["a shared cause", 1]]),
+               { covered: new Set([7]), waiting: new Set(), finished: new Set(), complete: true });
+  const before = db.prepare("SELECT count(*) n FROM escalation").get().n;
+  check(before === 2, "control: two causes are standing", String(before));
+
+  // The degraded call, exactly as the tick makes it: nothing covered, not complete.
+  const { fresh, cleared } = announceable(db, new Map(),
+    { covered: new Set(), waiting: new Set(), finished: new Set(), complete: false });
+  check(cleared.length === 0, "a tick that looked at nothing clears nothing", JSON.stringify(cleared));
+  check(db.prepare("SELECT count(*) n FROM escalation").get().n === 2,
+    "and both causes still stand", "");
+  check(fresh.length === 0, "control: and it announced nothing new either", JSON.stringify(fresh));
+
+  // Control: the SAME causes do clear on a tick that did look, so the assertion
+  // above is about the degraded scope and not about clearing being broken.
+  const done = announceable(db, new Map(), { covered: new Set([7]), waiting: new Set(), finished: new Set(), complete: true });
+  check(done.cleared.length === 2, "control: a complete tick retires them both", JSON.stringify(done.cleared));
+
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 {
   const src = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
   const call = (src.match(/announceable\(db, escalations,[\s\S]{0,200}?\}\)/) ?? [null])[0];

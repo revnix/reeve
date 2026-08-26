@@ -293,8 +293,17 @@ export function bindProviderLease(db, { id = null, token = null, owner = null, r
 /**
  * Renew a held lease while its worker works.
  *
- * The expiry is taken from the HEARTBEAT's clock, not the claim's, which is the
- * only thing that makes a long run survive its own lease.
+ * The expiry is taken from the HEARTBEAT's clock, not the claim's.
+ *
+ * NOT the only thing that makes a long run survive its own lease -- that claim
+ * was here and was false. `heldCount` counts a held row whatever its expiry, and
+ * `reapProviderLeases` spares an expired lease whose holder is still alive, so a
+ * run outliving `LEASE_SECONDS` is admitted and reaped correctly with no
+ * heartbeat at all. What this actually buys is that `expires_at` keeps
+ * describing reality: without it a 20-minute worker spends 15 minutes holding an
+ * expired lease, and every query that reads expiry -- `expiredLeases` is one --
+ * is then one liveness misread away from acting on a lease that is perfectly
+ * healthy.
  */
 export function heartbeatProvider(db, { id = null, token = null, owner = null, repoId = null, runRef = null,
                                         isAlive = isSameProcess, now = null } = {}) {

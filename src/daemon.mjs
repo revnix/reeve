@@ -26,7 +26,7 @@ import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
 import { canaryIdFor, netListener, instrumentHash } from "./canary.mjs";
-import { claimProvider, releaseProvider, bindProviderLease, noteRateLimit,
+import { claimProvider, releaseProvider, bindProviderLease, noteRateLimit, heartbeatProvider,
          reapProviderLeases, cancelQueued, queuedGuardianRequests } from "./provider.mjs";
 import { openHold } from "./build/holds.mjs";
 import { resolveRepoId } from "./build/repoid.mjs";
@@ -2094,6 +2094,28 @@ export async function tick(ctx) {
           const hb = (ctx.heartbeat ?? heartbeat)(db, { runId: run.runId });
           if (!hb.alive) revoked = hb.reason ?? "lease not alive";
         } catch (err) { revoked = `heartbeat write failed: ${err.message}`; }
+        // AND THE PROVIDER LEASE, on the same beat.
+        //
+        // `LEASE_SECONDS` is 300 and `watch.workerBudgetMinutes` defaults to 20,
+        // so without this every worker spends three quarters of its run holding
+        // a lease that expired, and `expires_at` means nothing for exactly the
+        // runs it was meant to bound. Nothing over-admits today -- `heldCount`
+        // counts held rows whatever their expiry, and the reaper spares one
+        // whose holder is alive -- so this is not a live defect; it is a column
+        // that has stopped describing reality, and `expiredLeases` is one
+        // liveness misread away from acting on it.
+        //
+        // Renewed by IDENTITY, which is why this works before and after the
+        // spawn rebinds the row from the guardian's pid to the worker's.
+        //
+        // Failure is logged, never fatal: the run is under way, and a lease that
+        // stops being renewed still ends when the process does.
+        if (prLease) {
+          try {
+            const h = hubOr(() => null);
+            if (h) (ctx.providerHeartbeat ?? heartbeatProvider)(h, { ...prLease, isAlive: isSameProcess });
+          } catch (err) { log(logPath, `  #${e.pr}: provider lease not renewed — ${err.message}`); }
+        }
       }, ctx.heartbeatMs ?? HEARTBEAT_MS);
       // The deterministic boundary, built from the profile rather than described
       // to the model. Measured against the CLI first: a scoped allowlist refuses

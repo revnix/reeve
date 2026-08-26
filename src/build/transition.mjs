@@ -399,6 +399,15 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       // close, repeating an external operation a successor had already
       // completed. Any successful close satisfies the obligation, whichever row
       // carried it.
+      // THE LATEST ATTEMPT DECIDES, not "was there ever a success".
+      //
+      // Collecting the flags separately let an OLD `done` forgive a NEWER dropped
+      // close: a pull request closed, reopened, and re-closed by an attempt that
+      // was then voided still looked satisfied, so the hold cleared and the
+      // reopened superseded PR became mergeable again. History is not the
+      // question -- the state of the most recent obligation is. Rows arrive in
+      // `id` order, which is enqueue order, so the last one for a PR is that
+      // obligation and its status is the answer.
       const byPr = new Map();
       for (const row of db.prepare(
         `SELECT o.args, o.status, o.kind, o.idempotency_key FROM outbox o
@@ -406,15 +415,10 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
           ORDER BY o.id`).all(taskId)) {
         let a; try { a = JSON.parse(row.args); } catch { continue; }
         if (a?.repo_id == null || a?.pr == null) continue;
-        const key = `${a.repo_id}:${a.pr}`;
-        const seen = byPr.get(key) ?? { done: false, live: false, last: null, args: a };
-        if (row.status === "done") seen.done = true;
-        else if (LIVE_OUTBOX.includes(row.status)) seen.live = true;
-        else seen.last = row;                       // dropped: voided, fenced, dead-lettered
-        byPr.set(key, seen);
+        byPr.set(`${a.repo_id}:${a.pr}`, { row, args: a });
       }
-      for (const [key, seen] of byPr) {
-        if (seen.done) continue;                    // the PR is closed; the hold may clear
+      for (const [key, { row, args }] of byPr) {
+        if (row.status === "done") continue;        // the PR is closed; the hold may clear
         keepHeld.add(key);
         // AND RE-ESTABLISHED IF A HOLD VOIDED IT. A PR with no successful close
         // and nothing still going to happen is an obligation that was dropped:
@@ -422,7 +426,7 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
         // Re-enqueued with its ORIGINAL key and args -- the same logical act, and
         // `enqueueEffect`'s key is unique over LIVE rows only, so the dead row
         // does not refuse it.
-        if (!seen.live && seen.last) enqueue(seen.last.kind, seen.last.idempotency_key, seen.args);
+        if (!LIVE_OUTBOX.includes(row.status)) enqueue(row.kind, row.idempotency_key, args);
       }
       for (const h of db.prepare(
         `SELECT id, repo_id, pr FROM pr_hold WHERE task = ? AND cleared_at IS NULL`).all(taskId)) {

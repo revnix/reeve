@@ -1681,6 +1681,68 @@ rmSync(dir, { recursive: true, force: true });
   db.close();
 }
 
+// ── an OLD success does not forgive a NEWER dropped close ──────────────────
+// Asking "was there ever a done close" is a question about history, not about
+// the obligation. A pull request closed, REOPENED, and re-closed by an attempt
+// that was then voided still looked satisfied -- so the hold cleared and the
+// reopened superseded PR became mergeable again, which is the window the hold
+// exists to close.
+{
+  const db = openHub(join(dir, "t59.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,7,'${"c".repeat(40)}',unixepoch())`);
+  db.exec(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at)
+           VALUES('bt:1',1,7,'${"c".repeat(40)}','over_budget',unixepoch())`);
+  const close = (key, status) => db.prepare(
+    `INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,cancellable,args,
+                        status,created_at,updated_at)
+     VALUES(?,'gh.pr.close','bt:1',1,1,1,'{"repo_id":1,"pr":7}',?,unixepoch(),unixepoch())`)
+    .run(key, status);
+  // The PR was closed once, REOPENED, and the newer close was voided by a hold.
+  close("bt:1:g1:r1:pr7:close", "done");
+  close("bt:1:g1:r1:pr7:close:again", "voided");
+
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(r.applied === true, "fixture: the resume applies", JSON.stringify(r));
+  check(db.prepare(
+    "SELECT count(*) c FROM pr_hold WHERE task='bt:1' AND cleared_at IS NULL").get().c === 1,
+    "the hold STAYS: an older success does not satisfy a newer dropped close",
+    JSON.stringify(db.prepare("SELECT repo_id,pr,cleared_at FROM pr_hold WHERE task='bt:1'").all()));
+  check(db.prepare(
+    "SELECT count(*) c FROM outbox WHERE kind='gh.pr.close' AND status='pending'").get().c === 1,
+    "and the newer obligation is re-enqueued",
+    JSON.stringify(db.prepare("SELECT status,idempotency_key FROM outbox WHERE kind='gh.pr.close'").all()));
+  db.close();
+}
+
+// CONTROL: the ordinary ordering still clears. A voided attempt followed by a
+// successful one is satisfied -- otherwise "the latest decides" has become
+// "any failure holds for ever" and no redesigned task can tidy up after itself.
+{
+  const db = openHub(join(dir, "t60.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at)
+           VALUES('bt:1',1,7,'${"c".repeat(40)}','over_budget',unixepoch())`);
+  const close = (key, status) => db.prepare(
+    `INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,cancellable,args,
+                        status,created_at,updated_at)
+     VALUES(?,'gh.pr.close','bt:1',1,1,1,'{"repo_id":1,"pr":7}',?,unixepoch(),unixepoch())`)
+    .run(key, status);
+  close("bt:1:g1:r1:pr7:close", "voided");
+  close("bt:1:g1:r1:pr7:close:again", "done");
+  applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(db.prepare(
+    "SELECT count(*) c FROM pr_hold WHERE task='bt:1' AND cleared_at IS NULL").get().c === 0,
+    "control: a voided attempt followed by a successful one DOES clear the hold",
+    JSON.stringify(db.prepare("SELECT status,idempotency_key FROM outbox WHERE kind='gh.pr.close'").all()));
+  db.close();
+}
+
 // ── a pin does not survive its lease being REPLACED either ─────────────────
 // The clear on `release-territory` covered one way a lease row disappears. The
 // other is replacement: `grantLease`'s upsert takes over a row whose holder is no

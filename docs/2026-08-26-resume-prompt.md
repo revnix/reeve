@@ -20,8 +20,8 @@ at all, deliberately.
 
 That is not tidiness. Three volatile facts were once restated in about twenty
 places, and seven review rounds in a row found a correction applied to one copy
-and left standing in the others. Then `main` moved twice in one afternoon on 2026-08-24
-while the file said otherwise, which taught the harder half: a fact a command can answer
+and left standing in the others. Then, on 2026-08-24, `main` moved twice in one afternoon against a file that said
+otherwise. That taught the harder half: a fact a command can answer
 should not be written down at all. `test/docs-state-is-single-sourced.test.mjs`
 now fails if a present-tense state claim, or a block naming a §0 subject, appears
 in either document outside §0 without deferring to it.
@@ -40,13 +40,13 @@ Run §0.1's command block. Every one of those lines matters, but two especially:
     §0.1 greps for that line. Never substitute `git log -1 HEAD` (§0) for it: that
     reports a fix as deployed when the restart it needed has not happened.
 
-  · §0.1's sqlite line must use `-readonly` and the PER-REPO path, because
-    `sqlite3` opens a missing file by CREATING it — so a wrong path answers "zero
+  · §0.1's sqlite line must use `-readonly` and the PER-REPO path: `sqlite3`
+    opens a missing file by CREATING it (§0.1) — so a wrong path answers "zero
     rows" for a database it just made. That mistake produced a confident zero on
     2026-08-24.
 
-§0.1 runs doctor; whatever it reports is the answer. §6 says what R-01 and R-03
-MEAN and leaves every outcome of theirs to §0,
+§0.1 runs doctor; whatever it reports is the answer. §6 says what the two merge
+rules MEAN; §0 holds every outcome of theirs,
 because a resumed session told to expect a finding will read real drift as the
 expected one.
 
@@ -149,9 +149,10 @@ and concede plainly when they are right.
 ## What needs me, so you do not wait on it silently
 
 §6 has these in full and §0 holds every current state for them, so what follows
-names only what each one IS (§0 for all four): the R-01 merge-authority ruleset,
-whether to re-arm, the second project, and the ntfy read user. A summary of their
-status here would prime you to read real drift as the finding you were told to expect.
+names only what each one IS, with §0 as the source throughout: the
+merge-authority ruleset, whether to re-arm, the second project, the ntfy read
+user. A summary of their status here would prime you to read real drift as the
+finding you were told to expect.
 
 Work autonomously, tell me when you need something, and do not claim anything is
 verified that you have not run.

@@ -1,3 +1,11 @@
+// NOT IN THE REVIEW ROTATION. Founder's decision, 2026-08-26: this file stays in
+// CI and keeps working, but it is not sent for another adversarial review round.
+// It reached ten rounds and forty-nine findings, and the last four were caused by
+// the previous round's fix — each change opens a new surface in English rather
+// than closing one in the code. It catches thirteen defect classes and spares
+// five kinds of durable prose, which is the point at which more review buys
+// edge cases in grammar at the cost of the capability reeve actually runs.
+//
 // The handoff's §0 is the only place that states current facts. This test is what
 // makes that true tomorrow rather than only today.
 //
@@ -16,6 +24,7 @@
 // So the invariant is enforced rather than intended: a present-tense claim about
 // state may appear in the resume prompt only as a POINTER to §0.
 import { readFileSync, readdirSync } from "node:fs";
+import { newestDoc } from "./newest-doc.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -32,13 +41,11 @@ const check = (ok, name, detail) => {
 // the superseded documents and leaves the live ones unprotected the moment a new
 // handoff is written -- which is the same half-an-invariant failure this test was
 // widened to fix. Dates sort lexically here, so newest is last.
-const newest = suffix => {
-  const found = readdirSync(docs).filter(f => f.endsWith(suffix)).sort();
-  if (!found.length) throw new Error(`no docs/*${suffix} at all`);
-  return found[found.length - 1];
-};
-const PROMPT = newest("-resume-prompt.md");
-const HANDOFF = newest("-session-handoff.md");
+// Resolved by the SHARED helper, so this test and the agreement test cannot end
+// up reading different documents -- which they would have the moment a same-day
+// revision existed, since each had grown its own version of "newest".
+const PROMPT = newestDoc(docs, "resume-prompt");
+const HANDOFF = newestDoc(docs, "session-handoff");
 const prompt = readFileSync(join(docs, PROMPT), "utf8");
 const handoff = readFileSync(join(docs, HANDOFF), "utf8");
 
@@ -210,9 +217,14 @@ const offendersIn = text => {
   // about grammar, and it is settled by looking at §0 rather than at a sentence.
   const fromRows = [...zero.matchAll(/^\|\s*([^|]+?)\s*\|/gm)]
     .map(m => m[1].replace(/`/g, "").trim())
+    // A LONG label is distinctive as a phrase, whatever its words. "the ntfy read
+    // user" has no word of six characters and could not possibly fire on ordinary
+    // prose -- the length filter exists to stop a single common word becoming a
+    // subject, and it was rejecting whole phrases for the same reason.
     .filter(s => s && !/^-+$/.test(s)
-                 && s.split(/\s+/).length >= 2
-                 && s.split(/[\s,]+/).some(w => w.length >= 6))
+                 && (s.split(/\s+/).length >= 4
+                     || (s.split(/\s+/).length >= 2
+                         && s.split(/[\s,]+/).some(w => w.length >= 6))))
     .map(s => s.split(" — ")[0].trim());
   // A row's distinctive TOKENS, not only its whole label.
   //
@@ -252,7 +264,13 @@ const offendersIn = text => {
     // not, which is a fact about the block's own formatting rather than a guess.
     .filter(l => !/^\s/.test(l))
     .map(l => l.split("#")[0].trim()).filter(Boolean)
+    // A SETUP builtin is not a state-reading command, and an OPTION is not a
+    // subject. `export PATH=...` contributed `export`, and `sqlite3 -readonly`
+    // contributed `readonly`, so ordinary prose using either word was rejected
+    // for naming a fact §0 does not own.
+    .filter(l => !/^(?:export|cd|set|source|unset|alias)\b/.test(l))
     .flatMap(l => l.split(/\s+/).slice(0, 2))
+    .filter(w => !w.startsWith("-"))
     // A QUOTED token is an argument, never a command name. `grep "daemon
     // starting"` contributed `daemon`, which then matched every sentence in §1
     // describing what the daemon IS -- durable prose that has no business
@@ -268,7 +286,7 @@ const offendersIn = text => {
   // about what doctor currently reports. History carries a date and is excused
   // like anything else, so this needs no opinion about tense.
   const SUBJECT_PATTERNS = [
-    [/\bR-\d+\b/, "an R-rule outcome"],
+    [/\bR-\d+\b/i, "an R-rule outcome"],
     // A BARE COMMIT HASH is a §0 fact whoever it belongs to, and naming its
     // subject is not always possible: "The running daemon is at abcdef1" is a
     // claim about what the process loaded, and the only word tying it to §0.1 is
@@ -311,7 +329,17 @@ const offendersIn = text => {
   // excuse the most confident form of the thing this rule exists to stop:
   // "R-01 has been broken since 2026-08-22." Mechanical -- the word before the
   // date -- so it needs no view about tense.
-  const ONGOING = new RegExp(`\\b(since|as of|from)\\s+(?:${DATE.source})`, "i");
+  // A BOUNDED range is history: "from 2026-08-22 to 2026-08-24" has both ends, so
+  // the state it describes has finished. Only an OPEN start reaches today.
+  const BOUNDED = new RegExp(`\\bfrom\\s+(?:${DATE.source})\\s+(?:to|through|until)\\s+(?:${DATE.source})`, "i");
+  // Bounded ranges are REMOVED before looking for an open one, rather than used to
+  // suppress the search. "has been broken since 2026-08-22 following an outage
+  // from 2026-08-20 to 2026-08-21" carries both: a live claim and a finished one.
+  // Treating any bounded range as proof that nothing is ongoing let the second
+  // excuse the first, which is the same mistake as a date excusing a whole
+  // sentence -- an exemption earned by one part of the text, spent by another.
+  const ONGOING = s => new RegExp(`\\b(since|as of|from)\\s+(?:${DATE.source})`, "i")
+    .test(s.replace(new RegExp(BOUNDED.source, "gi"), " "));
   // A NOW-WORD beside a date is two time references that disagree, and the date
   // must not win. "R-01 was broken on 2026-08-22 and remains broken today" is
   // dated history welded to a live claim, and excusing the whole thing on the
@@ -320,7 +348,8 @@ const offendersIn = text => {
   // view about tense, only the observation that a past date cannot make a
   // present-tense claim historical.
   const NOW_WORD = /\b(today|now|currently|still|at present|as things stand|remains?|these days)\b/i;
-  const DATED = s => DATE.test(s) && !ONGOING.test(s) && !NOW_WORD.test(s);
+  // A date excuses a SIMPLE sentence. A compound one has to defer.
+  const DATED = s => DATE.test(s) && !ONGOING(s) && !NOW_WORD.test(s) && !COMPOUND.test(s);
   // A HEADING or a bold LABEL names its subject; it does not assert anything about
   // it. Both are markdown structure rather than grammar, so recognising them
   // needs no opinion about English: a line beginning `#`, or a sentence wholly
@@ -366,7 +395,37 @@ const offendersIn = text => {
   // around it. "R-01 was broken on 2026-08-22 and remains broken today" is two
   // claims -- one dated and finished, one live and naked -- and judging the
   // sentence whole let the date carry the live half.
-  const clausesOf = s => s.split(/;|\s+—\s+|,\s+(?:and|but|although|though|while)\s+/i);
+  // NO CLAUSE SPLITTING. It is grammar, and grammar is what this rule replaced.
+  //
+  // I added it to close one real hole -- "R-01 was broken on 2026-08-22 and
+  // remains broken today", where a date excused a live claim welded to history --
+  // and it produced four findings of its own in the next round. A bounded range
+  // in one half suppressed an ongoing claim in the other. A chain of coordinated
+  // predicates lost the subject after the first joiner. Every conjunction was
+  // read as a back-reference, even where the next clause had its own subject. And
+  // a COMPOUND SUBJECT -- "R-01 and R-03 are §0 facts" -- was split into a
+  // fragment that names a rule and a fragment that carries the pointer.
+  //
+  // Every one of those is a question about English sentence structure, which is
+  // exactly what "defer or date" exists to avoid asking. So the machinery is gone
+  // and one mechanical rule replaces it, below: a COMPOUND sentence cannot be
+  // excused by a date alone.
+  //
+  // That is principled rather than expedient. A date excuses a sentence because
+  // the sentence is history; history is a simple past statement, and a sentence
+  // that joins two claims is where the ambiguity lives. An author with a compound
+  // historical sentence writes two sentences or adds a pointer, and always knows
+  // which. The cost lands on prose that mixes history with rationale, which the
+  // founder already accepted for rule rationale.
+  const COMPOUND = /;|\s+—\s+|,?\s+(?:and|but|or|nor|yet|although|though|while)\s+/i;
+  // KNOWN LIMIT, recorded rather than fixed. A §0 pointer belonging to one half of
+  // a coordinated sentence excuses the other half: "R-01 is broken, but R-03 is a
+  // §0 fact" passes. Closing it means telling subject coordination from clause
+  // coordination -- "R-01 and R-03 are §0 facts" must still be spared -- and that
+  // is the grammar question this rule exists to avoid. The date escape does not
+  // have the hole, because a compound sentence cannot use it at all; the deferral
+  // escape cannot take the same treatment without rejecting the compound-subject
+  // form that is the natural way to write a pointer for two rules at once.
   const excused = s => defersToZero(s) || DATED(s);
 
   const offenders = [];
@@ -388,18 +447,56 @@ const offendersIn = text => {
       // pronoun is grammar, and grammar is what was removed here -- but carrying
       // the label's subject into the sentences that follow it needs no grammar at
       // all, and covers the same case.
+      // A RESTATEMENT is judged per SENTENCE, not per clause, because that is the
+      // unit it spans. "Merge as soon as CI is green and zero threads remain open"
+      // reuses the merge rule's words across a conjunction, and clause splitting
+      // -- added for dates, where a narrower unit is exactly right -- cut it below
+      // the overlap threshold and it stopped being caught. Two rules, two units.
+      for (const sentence of sentencesOf(body.join(" "))) {
+        if (excused(sentence)) continue;
+        const lower = sentence.toLowerCase();
+        const restated = rowValues
+          .filter(([, ws]) => ws.filter(w => new RegExp(`\\b${w}\\b`).test(lower)).length >= 4)
+          .map(([l]) => `${l} (restated, not named)`);
+        if (restated.length)
+          offenders.push(`${label}:${b.nums[0]} restates "${restated[0]}" and neither defers nor dates — ${sentence.trim().slice(0, 70)}`);
+      }
+
+      const sentences = sentencesOf(body.join(" "));
       let carried = [];
-      const sentences = sentencesOf(body.join(" ")).flatMap(clausesOf);
       for (const sentence of sentences) {
         const lower = sentence.toLowerCase();
         const here = subjects.filter(s => namesSubject(sentence, s))
           .concat(SUBJECT_PATTERNS.filter(([re]) => re.test(sentence)).map(([, n]) => n));
-        if (excused(sentence)) { carried = []; continue; }
-        const named = here.concat(carried.map(s => `${s} (carried from earlier in the block)`))
-          .concat(rowValues
-            .filter(([, ws]) => ws.filter(w => new RegExp(`\\b${w}\\b`).test(lower)).length >= 4)
-            .map(([l]) => `${l} (restated, not named)`));
-        carried = here.length ? here : carried;
+        // An excused clause that NAMES a subject still carries it. "**R-01** (§0).
+        // It is broken." was passing: the label deferred, `carried` was cleared,
+        // and the pronoun that followed named nothing -- so adding the required
+        // pointer to a label disabled the pronoun protection this loop exists for.
+        // Carried for exactly ONE clause, which is what the pronoun case needs and
+        // no more. Persisting it across the block made `--execute` condemn a later
+        // sentence about `watch.reviewActions` -- a different subject entirely.
+        // A subject reaches the clause that follows it and then stops.
+        // Carried only into a clause that REFERS BACK -- one that opens with a
+        // pronoun and names nothing of its own. "**R-01** (§0). It is broken."
+        // is the case this exists for. Carrying into any following clause was
+        // far too much: it made `--execute` condemn the next sentence, which is
+        // about `watch.reviewActions` and a different subject entirely.
+        // `it`, `they`, `both` — pronouns standing for a NAMED THING. `this` and
+        // `that` were in this list and had to come out: they routinely stand for
+        // the whole preceding statement rather than its subject, so "Then `main`
+        // moved twice. That taught the harder half:" inherited `main` into a
+        // sentence about a lesson. A pronoun that can refer to a proposition
+        // cannot be used to carry a subject.
+        const refersBack = /^\s*(it|they|both)\b/i.test(sentence);
+        // The subject survives a RUN of back-references. Assigning `carried = here`
+        // unconditionally cleared it after the first pronoun, so the second
+        // sentence of "**R-01** (§0). It was broken on 2026-08-22. It is broken
+        // again." named nothing and inherited nothing. A pronoun does not
+        // introduce a subject; it spends the one already in hand and leaves it.
+        const inherited = here.length === 0 && refersBack ? carried : [];
+        carried = here.length ? here : (refersBack ? carried : []);
+        if (excused(sentence)) continue;
+        const named = here.concat(inherited.map(s => `${s} (carried from the sentence before)`));
         if (named.length)
           offenders.push(`${label}:${b.nums[0]} names "${named[0]}" and neither defers nor dates — ${sentence.trim().slice(0, 70)}`);
       }

@@ -1337,6 +1337,49 @@ const REASK_MAX = 3600;
   db.close();
 }
 
+// ── a predecessor the generation fence has condemned is not a predecessor ──
+// `founder.regenerate` bumps the generation without voiding pending rows, so an
+// old-generation comment sitting on a backoff is certain to settle `fenced` --
+// but not until its `not_before` arrives, because the due scan cannot see it
+// before then. Ordering the regenerated task's own comments behind it delays
+// them by up to the backoff ceiling, against a row that will never be delivered.
+{
+  const db = openHub(join(dir, "o34.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  const old = hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:stale",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 1, fence: 1, args: { repo_id: 7, pr: 12 } }));
+  // On a backoff, which is what makes it invisible to the scan that would fence
+  // it. Scheduled against NOW, not against `unixepoch()`: NOW is a synthetic
+  // constant well ahead of real time, so `unixepoch() + 3600` is still in its
+  // past and the row would be DUE -- a fixture that cannot exhibit the thing it
+  // is named for.
+  db.exec(`UPDATE outbox SET not_before = ${NOW + 3600} WHERE id = ${old.id}`);
+  // The regenerate: a new generation, and the old row left exactly where it was.
+  db.exec(`UPDATE task SET generation = 2 WHERE id = 'bt:1'`);
+  const fresh = hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g2:status",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 2, fence: 1, args: { repo_id: 7, pr: 12 } }));
+  check(db.prepare("SELECT status FROM outbox WHERE id=?").get(old.id).status === "pending",
+    "fixture: the stale comment is still pending, not yet fenced");
+
+  const got = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  check(got?.id === fresh.id,
+    "the regenerated task's comment goes out rather than queueing behind a condemned one",
+    JSON.stringify({ got: got?.idempotency_key, old: old.id, fresh: fresh.id }));
+
+  // CONTROL: a SAME-generation predecessor still blocks, or the ordering rule
+  // has been deleted rather than narrowed.
+  const db2 = openHub(join(dir, "o35.db"));
+  seed(db2, { id: "bt:1", phase: "IMPLEMENTING", generation: 2 });
+  const first = hubTx(db2, () => enqueueEffect(db2, { idempotencyKey: "bt:1:g2:a",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 2, fence: 1, args: { repo_id: 7, pr: 12 } }));
+  db2.exec(`UPDATE outbox SET not_before = ${NOW + 3600} WHERE id = ${first.id}`);
+  hubTx(db2, () => enqueueEffect(db2, { idempotencyKey: "bt:1:g2:b",
+    kind: "gh.pr.comment", taskId: "bt:1", generation: 2, fence: 1, args: { repo_id: 7, pr: 12 } }));
+  check(leaseEffect(db2, { worker: "w", capabilities: allOn, now: NOW }) === null,
+    "control: a live predecessor on the same conversation still holds the later comment back");
+  db.close(); db2.close();
+}
+
 // ── an unobservable STOPPED effect is retained, not declared dead ───────────
 // Fencing means "this will not happen". A reconciler that THREW has not
 // established that -- and an effect already INFLIGHT when its task stopped is

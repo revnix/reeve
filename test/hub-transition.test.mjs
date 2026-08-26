@@ -8,6 +8,7 @@
 // the task would be advanced by work done under a contract nobody approved.
 import { openHub, hubTx } from "../src/build/hubdb.mjs";
 import { applyTransition, applyCompensation, COMPENSATIONS } from "../src/build/transition.mjs";
+import { grantLease } from "../src/build/territory.mjs";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1590,6 +1591,132 @@ rmSync(dir, { recursive: true, force: true });
     evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
   check(r2.applied === false && /draining/.test(r2.refusal ?? ""),
     "control: a push the task was making DOES still refuse the resume", JSON.stringify(r2));
+  db.close(); db2.close();
+}
+
+// ── an abandoned PR stays held until its close actually lands ──────────────
+// The redesign retains the hold and enqueues the close, but every hold path runs
+// `void-pending` -- so a task held again before that close settled had it voided,
+// and a later ORDINARY resume selects plain `clear-holds`, which knew nothing
+// about either and cleared the hold. The superseded pull request was then open,
+// unheld and mergeable: the exact window the hold exists to close.
+{
+  const db = openHub(join(dir, "t56.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,7,'${"c".repeat(40)}',unixepoch())`);
+  db.exec(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at)
+           VALUES('bt:1',1,7,'${"c".repeat(40)}','over_budget',unixepoch())`);
+
+  // 1. THE REDESIGN. Retains the hold, enqueues the close.
+  const redesign = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED",
+    expectedGeneration: 1, evidence: { kind: "founder.resume", redesign: true },
+    op: "phase.resumed" });
+  check(redesign.applied === true, "fixture: the redesign resume applies", JSON.stringify(redesign));
+  const close = db.prepare(
+    "SELECT id, status, cancellable FROM outbox WHERE kind='gh.pr.close' AND task_id='bt:1'").get();
+  check(close != null, "fixture: the close is enqueued", JSON.stringify(close));
+  // It stays CANCELLABLE on purpose: a close that survives into `record-drain`
+  // refuses the next resume until GitHub is reachable, which trades a safety
+  // property for a liveness one. The HOLD carries the obligation instead.
+  check(close.cancellable === 1,
+    "the close is cancellable -- the hold, not the effect, is what outlives the resume",
+    JSON.stringify(close));
+
+  // 2. HELD AGAIN before the close settles. `void-pending` runs on every hold.
+  const gen = db.prepare("SELECT generation, phase FROM task WHERE id='bt:1'").get();
+  const held = applyTransition(db, { taskId: "bt:1", expectedPhase: gen.phase,
+    expectedGeneration: gen.generation, evidence: { kind: "hold", reason: "over_budget" },
+    op: "phase.held" });
+  check(held.applied === true, "fixture: the second hold applies", JSON.stringify(held));
+  check(db.prepare("SELECT status FROM outbox WHERE id=?").get(close.id).status === "voided",
+    "fixture: the hold voids the queued close, which is what left the PR with nothing to close it",
+    JSON.stringify(db.prepare("SELECT status FROM outbox WHERE id=?").get(close.id)));
+
+  // 3. AN ORDINARY RESUME, several transitions from the redesign that decided it.
+  const back = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED",
+    expectedGeneration: db.prepare("SELECT generation FROM task WHERE id='bt:1'").get().generation,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(back.applied === true, "fixture: the ordinary resume applies", JSON.stringify(back));
+  check(db.prepare(
+    "SELECT count(*) c FROM pr_hold WHERE task='bt:1' AND cleared_at IS NULL").get().c === 1,
+    "and the hold is STILL held, because its close has not landed",
+    JSON.stringify(db.prepare("SELECT repo_id,pr,reason,cleared_at FROM pr_hold WHERE task='bt:1'").all()));
+  // AND THE OBLIGATION IS BACK. Held and never closed is safe but stuck; the
+  // resume re-enqueues the close the hold dropped, so the cycle converges.
+  const revived = db.prepare(
+    "SELECT count(*) c FROM outbox WHERE kind='gh.pr.close' AND task_id='bt:1' AND status='pending'").get().c;
+  check(revived === 1, "and the resume RE-ENQUEUES the close the hold voided",
+    JSON.stringify(db.prepare("SELECT id,status,idempotency_key FROM outbox WHERE kind='gh.pr.close'").all()));
+
+  // CONTROL: once the close is DONE the hold is clearable, or "keep it held" has
+  // become "hold for ever" and no redesigned task can ever tidy up after itself.
+  db.prepare("UPDATE outbox SET status='done' WHERE kind='gh.pr.close' AND task_id='bt:1'").run();
+  const cur = db.prepare("SELECT phase, generation FROM task WHERE id='bt:1'").get();
+  applyTransition(db, { taskId: "bt:1", expectedPhase: cur.phase, expectedGeneration: cur.generation,
+    evidence: { kind: "hold", reason: "over_budget" }, op: "phase.held" });
+  applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED",
+    expectedGeneration: db.prepare("SELECT generation FROM task WHERE id='bt:1'").get().generation,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(db.prepare(
+    "SELECT count(*) c FROM pr_hold WHERE task='bt:1' AND cleared_at IS NULL").get().c === 0,
+    "control: with the close landed, a resume clears it");
+  db.close();
+}
+
+// ── a pin does not survive its lease being REPLACED either ─────────────────
+// The clear on `release-territory` covered one way a lease row disappears. The
+// other is replacement: `grantLease`'s upsert takes over a row whose holder is no
+// longer live -- which a held task with an expired pin is -- and that overwrite
+// destroys the deadline while `task_territory.pinned` survives. The original
+// task's resume then finds no row, reads the intent, and mints a fresh pin,
+// having never gone near `release-territory`.
+{
+  const db = openHub(join(dir, "t57.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  seed(db, { id: "bt:2", phase: "IMPLEMENTING", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',1)`);
+  const expired = db.prepare("SELECT unixepoch()-1 t").get().t;
+  db.prepare(`INSERT INTO territory_lease(project,kind,path,task,expires_at,pinned_until)
+              VALUES('p','prefix','packages/x','bt:1',unixepoch()+3600,?)`).run(expired);
+
+  // ANOTHER TASK TAKES THE TERRITORY. No release runs; the row is overwritten.
+  const at = db.prepare("SELECT unixepoch() n").get().n;
+  grantLease(db, { project: "p", claim: { kind: "prefix", path: "packages/x" },
+                   taskId: "bt:2", at, pinned: false });
+  check(db.prepare("SELECT task FROM territory_lease WHERE path='packages/x'").get().task === "bt:2",
+    "fixture: the second task now holds the territory");
+  check(db.prepare("SELECT pinned FROM task_territory WHERE task='bt:1'").get().pinned === 0,
+    "the spent pin is recorded even though no release ever ran",
+    JSON.stringify(db.prepare("SELECT * FROM task_territory").all()));
+
+  // And the original task's resume does not resurrect it.
+  db.exec(`DELETE FROM territory_lease WHERE task='bt:2'`);
+  applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  const after = db.prepare("SELECT pinned_until FROM territory_lease WHERE task='bt:1'").get();
+  check(after != null && after.pinned_until === null,
+    "so the resume regrants UNPINNED after a replacement, as it does after a release",
+    JSON.stringify(after));
+
+  // CONTROL: a LIVE pin is not cleared by a replacement, because a live pin also
+  // stops the replacement happening at all.
+  const db2 = openHub(join(dir, "t58.db"));
+  seed(db2, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  seed(db2, { id: "bt:2", phase: "IMPLEMENTING", generation: 1 });
+  db2.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',1)`);
+  db2.exec(`INSERT INTO territory_lease(project,kind,path,task,expires_at,pinned_until)
+            VALUES('p','prefix','packages/x','bt:1',unixepoch()+3600, unixepoch()+3600)`);
+  let threw = null;
+  try {
+    grantLease(db2, { project: "p", claim: { kind: "prefix", path: "packages/x" },
+                      taskId: "bt:2", at: db2.prepare("SELECT unixepoch() n").get().n, pinned: false });
+  } catch (e) { threw = e; }
+  check(threw !== null, "control: a LIVE pin refuses the replacement outright", String(threw?.message).slice(0, 80));
+  check(db2.prepare("SELECT pinned FROM task_territory WHERE task='bt:1'").get().pinned === 1,
+    "control: and its intent bit is untouched");
   db.close(); db2.close();
 }
 

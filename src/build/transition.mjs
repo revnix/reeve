@@ -96,6 +96,10 @@ export class CompensationRefused extends Error {
   constructor(message) { super(message); this.name = "CompensationRefused"; }
 }
 
+// The outbox statuses from which a delivery may still follow. Anything else is
+// an obligation that has been dropped, whatever the reason.
+const LIVE_OUTBOX = Object.freeze(["pending", "inflight"]);
+
 const PR_HOLD_COLS = `id, task, repo_id, pr, head_sha, reason, detail, created_at, cleared_at`;
 const HOLD_REASON_COLS = `id, task, reason, detail, at, cleared_at`;
 const DRAIN_COLS = `task, outbox_id, recorded_at, settled_at, forced, last_known`;
@@ -234,6 +238,20 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       // and `record-drain` never saw it. The task then reached CANCELLED or
       // INFEASIBLE with one of its PRs permanently open, and the drain that
       // exists to prove otherwise agreed that everything had settled.
+      // THE CLOSE STAYS CANCELLABLE, deliberately, and the hold is what carries
+      // the obligation instead.
+      //
+      // Making it non-cancellable was the obvious repair and it is wrong: the row
+      // then survives into `record-drain`, and the next resume is refused while
+      // it is outstanding -- so a task could not resume until GitHub was
+      // reachable, which is the very failure this branch removed from the hold
+      // comment two rounds ago. A safety property must not be bought with a
+      // liveness one.
+      //
+      // So the PR's hold outlives every resume until its close actually lands
+      // (see `clear-holds`), which closes the mergeable window on its own, and a
+      // resume RE-ENQUEUES a close that a hold voided. Voided and re-enqueued is
+      // a cycle that converges; open and unheld is not.
       for (const pr of open) {
         enqueue("gh.pr.comment", `${taskId}:g${generation}:r${pr.repo_id}:pr${pr.pr}:close-notice`,
                 { repo_id: pr.repo_id, pr: pr.pr, reason: evidence?.kind ?? null,
@@ -359,6 +377,35 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       const keepHeld = c === "clear-holds-except-closing"
         ? new Set(openPrs(db, taskId, { kind: "impl" }).map(p => `${p.repo_id}:${p.pr}`))
         : new Set();
+      // AND NEITHER VARIANT CLEARS A HOLD WHOSE CLOSE HAS NOT LANDED.
+      //
+      // Retaining the hold on the strength of the CURRENT transition's type was
+      // the defect: the obligation belongs to the pull request, not to whichever
+      // resume happens to be running. A redesign retained the hold and enqueued
+      // the close; a later ordinary resume, several transitions away, knew
+      // nothing about either and cleared it.
+      //
+      // The obligation is read from the outbox, where it durably is. Anything
+      // short of `done` keeps the hold -- including a close that was dead-
+      // lettered or fenced, because a superseded pull request nothing will ever
+      // close is precisely the one that must stay held and visible. Fail-closed:
+      // the hold outlives the decision to close, and only the close landing
+      // clears it.
+      for (const p of db.prepare(
+        `SELECT o.args, o.status, o.kind, o.idempotency_key FROM outbox o
+          WHERE o.task_id = ? AND o.kind = 'gh.pr.close' AND o.status <> 'done'
+          ORDER BY o.id`).all(taskId)) {
+        let a; try { a = JSON.parse(p.args); } catch { continue; }
+        if (a?.repo_id != null && a?.pr != null) keepHeld.add(`${a.repo_id}:${a.pr}`);
+        // AND RE-ESTABLISHED IF A HOLD VOIDED IT. A row that is neither done nor
+        // still going to happen is an obligation that has been dropped: the
+        // pull request stays held, correctly, but nothing is left to ever close
+        // it. Re-enqueued with its ORIGINAL key and args -- the same logical act,
+        // and `enqueueEffect`'s key is unique over LIVE rows only, so the dead
+        // row does not refuse it.
+        if (!LIVE_OUTBOX.includes(p.status))
+          enqueue(p.kind, p.idempotency_key, a);
+      }
       for (const h of db.prepare(
         `SELECT id, repo_id, pr FROM pr_hold WHERE task = ? AND cleared_at IS NULL`).all(taskId)) {
         if (keepHeld.has(`${h.repo_id}:${h.pr}`)) continue;

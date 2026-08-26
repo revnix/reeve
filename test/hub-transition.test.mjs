@@ -1480,8 +1480,11 @@ rmSync(dir, { recursive: true, force: true });
 {
   const db = openHub(join(dir, "t52.db"));
   seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
-  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',1)`);
   const expired = db.prepare("SELECT unixepoch()-1 t").get().t;
+  // The claim carries its own deadline: that is where a pin's END lives now, so
+  // a fixture that put it only on the lease would be modelling the old split.
+  db.prepare(`INSERT INTO task_territory(task,kind,path,pinned,pinned_until)
+              VALUES('bt:1','prefix','packages/x',1,?)`).run(expired);
   db.prepare(`INSERT INTO territory_lease(project,kind,path,task,expires_at,pinned_until)
               VALUES('p','prefix','packages/x','bt:1',unixepoch()+3600,?)`).run(expired);
 
@@ -1492,8 +1495,10 @@ rmSync(dir, { recursive: true, force: true });
   check(held.applied === true, "fixture: the hold applies", JSON.stringify(held));
   check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task='bt:1'").get().c === 0,
     "fixture: and the lease carrying the expired deadline is gone");
-  check(db.prepare("SELECT pinned FROM task_territory WHERE task='bt:1'").get().pinned === 0,
-    "the spent pin is recorded where the INTENT lives, which outlives the lease",
+  // THE DEADLINE OUTLIVES THE LEASE because it is stored beside the intent, so
+  // there is nothing for the release to "record": the fact was never split.
+  check(db.prepare("SELECT pinned_until FROM task_territory WHERE task='bt:1'").get().pinned_until === expired,
+    "the pin's deadline survives the release, on the claim where it lives",
     JSON.stringify(db.prepare("SELECT * FROM task_territory").all()));
 
   // RESUME. With no lease row, the intent bit is the only thing left to read.
@@ -1503,10 +1508,12 @@ rmSync(dir, { recursive: true, force: true });
   check(back.applied === true, "fixture: the resume applies", JSON.stringify(back));
   const after = db.prepare("SELECT pinned_until FROM territory_lease WHERE task='bt:1'").get();
   check(after != null, "fixture: the resume regrants the territory", JSON.stringify(after));
-  check(after.pinned_until === null,
+  // NOT LIVE is the property that matters, and it now holds because the resume
+  // reads back the ORIGINAL deadline rather than finding no row and minting one.
+  const nowSec = db.prepare("SELECT unixepoch() n").get().n;
+  check(after.pinned_until === expired && after.pinned_until <= nowSec,
     "and the expired pin does NOT come back live after the extra hold/resume cycle",
-    JSON.stringify({ was: expired, now: after.pinned_until,
-                     unixepoch: db.prepare("SELECT unixepoch() n").get().n }));
+    JSON.stringify({ was: expired, now: after.pinned_until, unixepoch: nowSec }));
   db.close();
 }
 
@@ -1801,8 +1808,11 @@ rmSync(dir, { recursive: true, force: true });
   seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
   seed(db, { id: "bt:2", phase: "IMPLEMENTING", generation: 1 });
   db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
-  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',1)`);
   const expired = db.prepare("SELECT unixepoch()-1 t").get().t;
+  // The claim carries its own deadline: that is where a pin's END lives now, so
+  // a fixture that put it only on the lease would be modelling the old split.
+  db.prepare(`INSERT INTO task_territory(task,kind,path,pinned,pinned_until)
+              VALUES('bt:1','prefix','packages/x',1,?)`).run(expired);
   db.prepare(`INSERT INTO territory_lease(project,kind,path,task,expires_at,pinned_until)
               VALUES('p','prefix','packages/x','bt:1',unixepoch()+3600,?)`).run(expired);
 
@@ -1812,8 +1822,8 @@ rmSync(dir, { recursive: true, force: true });
                    taskId: "bt:2", at, pinned: false });
   check(db.prepare("SELECT task FROM territory_lease WHERE path='packages/x'").get().task === "bt:2",
     "fixture: the second task now holds the territory");
-  check(db.prepare("SELECT pinned FROM task_territory WHERE task='bt:1'").get().pinned === 0,
-    "the spent pin is recorded even though no release ever ran",
+  check(db.prepare("SELECT pinned_until FROM task_territory WHERE task='bt:1'").get().pinned_until === expired,
+    "the deadline survives a REPLACEMENT too, because it never lived on the lease",
     JSON.stringify(db.prepare("SELECT * FROM task_territory").all()));
 
   // And the original task's resume does not resurrect it.
@@ -1821,9 +1831,10 @@ rmSync(dir, { recursive: true, force: true });
   applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
     evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
   const after = db.prepare("SELECT pinned_until FROM territory_lease WHERE task='bt:1'").get();
-  check(after != null && after.pinned_until === null,
-    "so the resume regrants UNPINNED after a replacement, as it does after a release",
-    JSON.stringify(after));
+  const nowSec2 = db.prepare("SELECT unixepoch() n").get().n;
+  check(after != null && after.pinned_until === expired && after.pinned_until <= nowSec2,
+    "so the resume regrants a DEAD pin after a replacement, as it does after a release",
+    JSON.stringify({ after, unixepoch: nowSec2 }));
 
   // CONTROL: a LIVE pin is not cleared by a replacement, because a live pin also
   // stops the replacement happening at all.

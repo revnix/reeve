@@ -23,7 +23,7 @@ import { createHash } from "node:crypto";
 // read it; two spellings of the same path is how they drift.
 const SCHEMA_PATH = new URL("./hub.sql", import.meta.url);
 
-export const HUB_SCHEMA_VERSION = 2;
+export const HUB_SCHEMA_VERSION = 3;
 
 /**
  * Forward-only. Each entry runs exactly once, in order, in its own transaction,
@@ -99,6 +99,56 @@ const MIGRATIONS = [
       db.exec("DROP TABLE IF EXISTS impl_pr");
       if (hasColumn("task", "spec_pr"))   db.exec("ALTER TABLE task DROP COLUMN spec_pr");
       if (hasColumn("task", "spec_head")) db.exec("ALTER TABLE task DROP COLUMN spec_head");
+    } },
+  // ---------------------------------------------------------------- 3
+  // TWO FACTS THAT WERE SPLIT ACROSS PLACES WITH DIFFERENT LIFETIMES.
+  //
+  // Both defects below were found twice each -- once, patched at the site, and
+  // then again through a second door the site fix did not cover. That is the
+  // signal that the site was never the defect.
+  //
+  // 1. A PIN IS ONE PROMISE STORED AS TWO FACTS. `task_territory.pinned` records
+  //    that the filing ASKED for a pin and is durable; the deadline lived on
+  //    `territory_lease.pinned_until`, which dies with the lease row. So every
+  //    path that removes a lease loses the deadline and leaves the intent, and
+  //    the next resume reads "pinned" with no deadline and mints a fresh one --
+  //    resurrecting a pin the founder time-boxed. Found first through
+  //    `release-territory`, then again through `grantLease` REPLACING a
+  //    non-live holder's row, which never goes near the release path at all.
+  //    Putting the deadline beside the intent makes the two inseparable, and
+  //    both site patches are deleted.
+  //
+  // 2. A LEASE HAS NO INCARNATION. `restoreHub` clears `provider_lease` in the
+  //    restored file (src/backup.mjs), so SQLite restarts its integer keys and a
+  //    re-claim of the same run gets an identical (owner, repo_id, run_ref) AND
+  //    an identical id. Nothing distinguishes the new claim from the old, so a
+  //    pre-restore mutation replayed afterwards -- which the retry-on-maintenance
+  //    loop is exactly the caller to do -- deletes a live lease or corrupts its
+  //    liveness data. `outbox.lease_token` already solves this shape in this
+  //    codebase; `provider_lease` gets the same treatment.
+  { version: 3, up: (db) => {
+      // RE-RUNNABLE for the same reason migration 2 is: a store whose
+      // `schema_version` rows are lost while its tables survive replays every
+      // migration, and `ALTER TABLE ... ADD COLUMN` has no IF NOT EXISTS.
+      const hasColumn = (t, c) => db.prepare(
+        `SELECT count(*) c FROM pragma_table_info(?) WHERE name = ?`).get(t, c).c > 0;
+
+      if (!hasColumn("task_territory", "pinned_until"))
+        db.exec("ALTER TABLE task_territory ADD COLUMN pinned_until INTEGER");
+      // CARRIED FROM THE LEASE, so a hub mid-flight keeps the deadlines it has
+      // rather than silently re-minting them. Only live leases have one to give.
+      db.exec(`
+        UPDATE task_territory AS t
+           SET pinned_until = (SELECT l.pinned_until FROM territory_lease l
+                                WHERE l.task = t.task AND l.kind = t.kind AND l.path = t.path)
+         WHERE t.pinned = 1
+           AND t.pinned_until IS NULL
+           AND EXISTS (SELECT 1 FROM territory_lease l
+                        WHERE l.task = t.task AND l.kind = t.kind AND l.path = t.path
+                          AND l.pinned_until IS NOT NULL)`);
+
+      if (!hasColumn("provider_lease", "token"))
+        db.exec("ALTER TABLE provider_lease ADD COLUMN token TEXT");
     } },
 ];
 
@@ -599,7 +649,12 @@ const V1 = Object.freeze([
 // COUNT is unchanged and only the name moves. Built from V1 rather than restated,
 // which is what stops the two drifting.
 const V2 = Object.freeze([...V1.filter(t => t !== "impl_pr"), "task_pr"].sort());
-export const TABLES_AT = Object.freeze({ 1: V1, 2: V2 });
+// Migration 3 adds COLUMNS only -- `task_territory.pinned_until` and
+// `provider_lease.token` -- so the table inventory is V2's, unchanged. Aliased
+// rather than restated for the same reason V2 is built from V1: two lists that
+// must agree are two lists that can disagree.
+const V3 = V2;
+export const TABLES_AT = Object.freeze({ 1: V1, 2: V2, 3: V3 });
 
 /**
  * The CURRENT schema's tables: what snapshot validation compares a

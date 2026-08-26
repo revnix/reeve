@@ -128,45 +128,36 @@ export const conflictRefusal = (claim, lease) =>
 export function grantLease(db, { project, claim, taskId, at, pinned = false,
                                  pinnedUntil = undefined, seconds = LEASE_SECONDS }) {
   const until = at + seconds;
-  // THE PIN'S DEADLINE IS NOT THE LEASE'S. A lease is renewed by working; a pin
-  // is a promise with an END, and deriving it from `at + seconds` on every grant
-  // renews it every time the holder resumes -- so a time-boxed pin never
-  // expires. `pinnedUntil` lets a caller carry the ORIGINAL deadline forward.
-  // Omitted, it behaves as before and takes the lease's expiry, which is right
-  // for a FIRST grant: that is the moment the promise is made.
+  // THE PIN'S DEADLINE LIVES WITH ITS INTENT, on `task_territory`, and this reads
+  // it from there rather than being told.
   //
-  // An explicit null means "pinned no longer", which is how an expired pin
-  // regrants unpinned rather than being silently renewed.
-  const pinUntil = pinned ? (pinnedUntil === undefined ? until : pinnedUntil) : null;
+  // A pin is one promise. While its intent was durable on the claim and its
+  // deadline lived on the LEASE, every path that removed a lease lost half of it
+  // -- and the surviving half said "pinned" with no end, so the next grant minted
+  // a fresh deadline and resurrected a promise the founder had time-boxed. That
+  // was found twice: once through `release-territory` deleting the row, and again
+  // through this very upsert REPLACING a non-live holder's row, which never goes
+  // near the release path. Two doors onto one defect is the signal that the
+  // doors were never the defect.
+  //
+  // So the claim owns the deadline. The FIRST grant stamps it -- that is the
+  // moment the promise is made -- and every later grant reads back what is
+  // stored, including when it has passed. Nothing can lose one half without the
+  // other, because there are no longer two halves.
+  const claimRow = pinned ? db.prepare(
+    `SELECT pinned_until FROM task_territory WHERE task=? AND kind=? AND path=?`)
+    .get(taskId, claim.kind, claim.path) : null;
+  let pinUntil = null;
+  if (pinned) {
+    pinUntil = claimRow?.pinned_until ?? (pinnedUntil === undefined ? until : pinnedUntil);
+    if (claimRow && claimRow.pinned_until == null)
+      db.prepare(`UPDATE task_territory SET pinned_until = ? WHERE task=? AND kind=? AND path=?`)
+        .run(pinUntil, taskId, claim.kind, claim.path);
+  }
   // EVERY column the insert would have set, `pinned_until` included. Leaving it
   // out let a replacement keep the previous holder's pin -- or its absence --
   // while that column is the only home of the pin, so a reaper reading it acted
   // on a value no live claim asked for.
-  // THE SECOND DOOR ONTO THE SAME DEFECT, and it is a replacement rather than a
-  // release. The upsert below takes over a row whose holder is no longer LIVE --
-  // which a held task with an expired pin is -- and that overwrite destroys the
-  // previous holder's `pinned_until`. Its `task_territory.pinned` bit survives,
-  // so when THAT task resumes it finds no row, reads the intent, and mints a
-  // fresh deadline: the expired pin, live again, by a path that never touches
-  // `release-territory` and so never reaches the clear there.
-  //
-  // The real repair is to keep the deadline beside the intent, where their
-  // lifetimes cannot diverge. That is a schema change and belongs in its own
-  // pull request; until it lands, the spent intent is cleared here too, so both
-  // ways a lease row can disappear record the same fact.
-  const previous = db.prepare(
-    `SELECT task, pinned_until FROM territory_lease WHERE project=? AND kind=? AND path=?`)
-    .get(project, claim.kind, claim.path);
-  if (previous && previous.task !== taskId
-      && previous.pinned_until !== null && previous.pinned_until <= at) {
-    const spent = db.prepare(
-      `UPDATE task_territory SET pinned = 0
-        WHERE task = ? AND kind = ? AND path = ? AND pinned = 1
-        RETURNING task, kind, path, pinned`)
-      .get(previous.task, claim.kind, claim.path);
-    if (spent) hubEvent(db, { kind: "task_territory.claimed", task: previous.task, payload: spent });
-  }
-
   db.prepare(
     `INSERT INTO territory_lease(project, kind, path, task, expires_at, pinned_until)
      VALUES(?,?,?,?,?,?)

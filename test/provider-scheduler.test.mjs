@@ -203,6 +203,50 @@ const ALIVE = () => true, DEAD = () => false;
   db.close();
 }
 
+// ── nor is a re-used identity: a claim has an INCARNATION ───────────────────
+// `restoreHub` clears provider_lease in the restored file, so SQLite restarts
+// its integer keys. A re-claim of the same run afterwards therefore gets an
+// identical (owner, repo_id, run_ref) AND an identical id -- so the full-identity
+// fence, which was the previous answer, still cannot tell the new claim from the
+// old. A pre-restore mutation replayed afterwards deletes a live lease or
+// corrupts its liveness data, and the retry-on-maintenance loop is exactly the
+// caller that holds one across a restore.
+{
+  const db = openHub(join(dir, "p20.db"));
+  const before = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:9", pid: 5, lstart: "L5", isAlive: ALIVE });
+  check(before.ok && typeof before.token === "string" && before.token.length > 0,
+    "a claim returns an incarnation token beside its id", JSON.stringify(before));
+
+  // WHAT A RESTORE DOES: the table is cleared in the restored file.
+  db.exec("DELETE FROM provider_lease");
+  const after = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:9", pid: 6, lstart: "L6", isAlive: ALIVE });
+  check(after.ok && after.id === before.id,
+    "fixture: the re-claim inherits the SAME id, which is the whole hazard",
+    JSON.stringify({ before: before.id, after: after.id }));
+  check(after.token !== before.token,
+    "but not the same token: the incarnation is what changed", JSON.stringify({ b: before.token, a: after.token }));
+
+  // The three fenced mutations, each replayed with the PRE-RESTORE claim.
+  const staleRelease = releaseProvider(db, before);
+  check(staleRelease.released === 0,
+    "a pre-restore release deletes nothing, though its id and identity both match",
+    JSON.stringify(staleRelease));
+  check(bindProviderLease(db, { ...before, pid: 99, lstart: "GHOST" }).bound === 0,
+    "a pre-restore bind changes nothing");
+  check(heartbeatProvider(db, before).beat === 0, "and a pre-restore heartbeat renews nothing");
+
+  const row = db.prepare("SELECT pid, lstart, token FROM provider_lease WHERE id=?").get(after.id);
+  check(row != null && row.pid === 6 && row.lstart === "L6" && row.token === after.token,
+    "so the live claim is untouched, and still reapable by its own identity",
+    JSON.stringify(row));
+
+  // CONTROL: the CURRENT incarnation's own mutations still work, or the fence
+  // has become a blanket refusal and no lease can ever be released.
+  check(heartbeatProvider(db, after).beat === 1, "control: the current claim's heartbeat applies");
+  check(releaseProvider(db, after).released === 1, "control: and its release deletes exactly one row");
+  db.close();
+}
+
 // ── a renumbered id is not an identity ───────────────────────────────────────
 // A restore replaces the database, clears `provider_lease` and lets SQLite
 // renumber it, so an integer key can come back pointing at somebody else's

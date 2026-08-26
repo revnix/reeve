@@ -50,7 +50,13 @@ const WITNESSES = [
   // constant or a handler added ahead of the wiring would otherwise make the tree
   // claim a stage §0 correctly says has not landed, and the comparison would
   // pressure someone into an inaccurate progress update.
-  [3, "SPILL onto the durable path", "src/daemon.mjs", /SPILL[\s\S]{0,400}?gh\.issue\.create/],
+  // The witness is an effect DECLARATION -- `kind: "gh.issue.create"` -- which is
+  // the shape a producer takes when it enqueues one, and is how the existing
+  // review-request effect is written. Requiring the two tokens within four
+  // hundred characters was far too loose: a comment, an uncalled helper or a
+  // nearby handler declaration would all have satisfied it, and the witness would
+  // have claimed a stage §0 correctly denies.
+  [3, "SPILL onto the durable path", "src/daemon.mjs", /kind:\s*["']gh\.issue\.create["']/],
   [4, "real thread details into FIX_FINDINGS", "src/daemon.mjs", /threads:\s*e\.threadDetails\b/],
 ];
 

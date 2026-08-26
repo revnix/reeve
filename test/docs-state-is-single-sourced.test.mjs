@@ -417,7 +417,15 @@ const offendersIn = text => {
   // historical sentence writes two sentences or adds a pointer, and always knows
   // which. The cost lands on prose that mixes history with rationale, which the
   // founder already accepted for rule rationale.
-  const COMPOUND = /;|\s+—\s+|,?\s+(?:and|but|although|though|while)\s+/i;
+  const COMPOUND = /;|\s+—\s+|,?\s+(?:and|but|or|nor|yet|although|though|while)\s+/i;
+  // KNOWN LIMIT, recorded rather than fixed. A §0 pointer belonging to one half of
+  // a coordinated sentence excuses the other half: "R-01 is broken, but R-03 is a
+  // §0 fact" passes. Closing it means telling subject coordination from clause
+  // coordination -- "R-01 and R-03 are §0 facts" must still be spared -- and that
+  // is the grammar question this rule exists to avoid. The date escape does not
+  // have the hole, because a compound sentence cannot use it at all; the deferral
+  // escape cannot take the same treatment without rejecting the compound-subject
+  // form that is the natural way to write a pointer for two rules at once.
   const excused = s => defersToZero(s) || DATED(s);
 
   const offenders = [];
@@ -480,8 +488,13 @@ const offendersIn = text => {
         // sentence about a lesson. A pronoun that can refer to a proposition
         // cannot be used to carry a subject.
         const refersBack = /^\s*(it|they|both)\b/i.test(sentence);
+        // The subject survives a RUN of back-references. Assigning `carried = here`
+        // unconditionally cleared it after the first pronoun, so the second
+        // sentence of "**R-01** (§0). It was broken on 2026-08-22. It is broken
+        // again." named nothing and inherited nothing. A pronoun does not
+        // introduce a subject; it spends the one already in hand and leaves it.
         const inherited = here.length === 0 && refersBack ? carried : [];
-        carried = here;
+        carried = here.length ? here : (refersBack ? carried : []);
         if (excused(sentence)) continue;
         const named = here.concat(inherited.map(s => `${s} (carried from the sentence before)`));
         if (named.length)

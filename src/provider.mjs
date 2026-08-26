@@ -198,11 +198,22 @@ export function claimProvider(db, { owner, repoId, runRef, pid, lstart, priority
     // rather than being refused, and it is checked BEFORE capacity: a freed slot
     // must not be taken by the next builder to ask while a guardian is waiting.
     if (queuedGuardianCount(db) > 0) return refuse("queued");
-    // And only then the reservation. The builder's ceiling is the limit MINUS
-    // the guardian's reserved slots; the guardian's is the whole limit. Capping
-    // both owners at the reduced number would let one builder holding the single
-    // unreserved slot block the guardian out of the reserved one.
-    if (heldCount(db) >= state.limit - state.reserved) return refuse("at-limit");
+    // And only then the reservation, which is TWO bounds and not one.
+    //
+    // The builder's ceiling is on BUILDER-OWNED leases; the overall limit is on
+    // everything. Testing the total against `limit - reserved` conflates them and
+    // makes usable capacity depend on arrival order: under the documented 2/1, a
+    // guardian admitted first put the total at 1 and the builder was then refused
+    // although the unreserved slot was free -- while the reverse order admitted
+    // both. Same two requests, same limits, different answer depending on who
+    // asked first, and a slot left idle whenever guardians arrive first.
+    //
+    // The reservation still holds, and holds better: capping builders at
+    // `limit - reserved` means at least `reserved` slots can never be
+    // builder-held, so the guardian's slot is kept by construction rather than
+    // by arithmetic that happens to work when the order is convenient.
+    if (heldCountBy(db, "builder") >= state.limit - state.reserved) return refuse("at-limit");
+    if (heldCount(db) >= state.limit) return refuse("at-limit");
     return granted();
   });
 }

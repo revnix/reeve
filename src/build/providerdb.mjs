@@ -220,10 +220,21 @@ export const recordRateLimit = (db, { provider = PROVIDER, signature, at, until,
        WHEN provider_state.cooldown_until IS NULL
          OR provider_state.cooldown_until < excluded.cooldown_until
        THEN excluded.cooldown_until ELSE provider_state.cooldown_until END,
-     -- The metadata is always the LATEST, because "what threw last" is a
-     -- different question from "how long to wait".
-     last_429_at    = excluded.last_429_at,
-     last_signature = excluded.last_signature`)
+     -- The metadata is the latest by TIMESTAMP, not by arrival. Observations can
+     -- commit out of order -- one daemon retrying an event stamped 1000 after
+     -- another has already written one stamped 1100 -- and an unconditional
+     -- assignment then walks last_429_at backwards and replaces the newest
+     -- signature with an older one. The cooldown stays correct either way, but
+     -- the diagnostic that tells a founder WHAT threw last would name the wrong
+     -- event, which is worse than saying nothing.
+     last_429_at    = CASE
+       WHEN provider_state.last_429_at IS NULL
+         OR provider_state.last_429_at <= excluded.last_429_at
+       THEN excluded.last_429_at ELSE provider_state.last_429_at END,
+     last_signature = CASE
+       WHEN provider_state.last_429_at IS NULL
+         OR provider_state.last_429_at <= excluded.last_429_at
+       THEN excluded.last_signature ELSE provider_state.last_signature END`)
   .run(provider, limit, reserved, until, at, signature);
 
 /**

@@ -12,6 +12,9 @@
 // tick while the limit never binds.
 import { tick } from "../src/daemon.mjs";
 import { open } from "../src/db/ops.mjs";
+import { openHub } from "../src/build/hubdb.mjs";
+import { openHubAsGuest } from "../src/build/hubguest.mjs";
+import { resolveRepoId } from "../src/build/repoid.mjs";
 import { CLAUSE_IDS } from "../src/verdict.mjs";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -38,13 +41,22 @@ const EVAL = {
 /**
  * One tick with the scheduler injected at the daemon's seams.
  *
- * `hub` is a marker object, not a database: the daemon only ever hands it to
- * `providerClaim` / `providerRelease`, both of which are injected here. A real
- * hub would test `provider.mjs`, which has its own suite; what is under test
- * here is whether the DAEMON asks, and what it does with each answer.
+ * `hub` DEFAULTS TO A REAL GUEST CONNECTION, and that is not incidental. The
+ * first version of this fixture passed a plain `{}` marker on the grounds that
+ * the daemon only ever hands it to injected seams. That was true of the seams
+ * and false of the daemon: it also handed the hub to the repository-id resolver,
+ * which reads `task` -- a table the guest allowlist REFUSES. Against a marker
+ * object nothing threw and every assertion passed; against the real connection
+ * every production tick threw and fail-closed on every dispatch.
+ *
+ * A fixture that cannot exhibit the defect reports the code healthy. The default
+ * is now the connection production actually uses.
  */
-const run = async ({ hub = {}, repoId = 7, claim, release, containmentThrows = false } = {}) => {
+const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false } = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "reeve-prov-"));
+  const hubPath = join(dir, "hub.db");
+  openHub(hubPath).close();
+  const guest = hub === undefined ? openHubAsGuest(hubPath) : hub;
   const claims = [], releases = [], spawned = [];
   const ctx = {
     nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
@@ -59,7 +71,7 @@ const run = async ({ hub = {}, repoId = 7, claim, release, containmentThrows = f
       ci: { provider: "github-actions", requiredChecks: [] },
       watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
     },
-    hub, repoId, lstart: "boot-1",
+    hub: () => ({ hub: guest, why: null }), repoId, lstart: "boot-1",
     providerClaim: (db, a) => { claims.push(a); return (claim ?? (() => ({ ok: true, id: claims.length })))(a); },
     providerRelease: (db, a) => { releases.push(a); return (release ?? (() => ({ ok: true })))(a); },
     openPrs: () => [42],
@@ -75,6 +87,7 @@ const run = async ({ hub = {}, repoId = 7, claim, release, containmentThrows = f
                 esc: [...(r.escalations?.keys?.() ?? [])].join(" | "),
                 log: readFileSync(join(dir, "log.txt"), "utf8") };
   ctx.db.close();
+  try { guest?.close?.(); } catch {}
   rmSync(dir, { recursive: true, force: true });
   return out;
 };
@@ -131,6 +144,98 @@ const run = async ({ hub = {}, repoId = 7, claim, release, containmentThrows = f
   check(ok.spawned.length === 1, "control: the same tick with a known id dispatches");
 }
 
+// ── the repository id is NOT resolved through the guest connection ────────
+// This is the defect the marker-object fixture could not see. `repoIdFromHub`
+// reads `task`; the guest allowlist refuses it. A daemon that asks the guest for
+// a repository id therefore throws on every production tick, leaves `repoId`
+// null, and fail-closes every dispatch.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-guest-"));
+  const hubPath = join(dir, "hub.db");
+  openHub(hubPath).close();
+  const guest = openHubAsGuest(hubPath);
+
+  // The control that names the boundary: the guest genuinely cannot read `task`.
+  // Without this the assertion below could pass because the table is empty.
+  let why = null;
+  try { guest.prepare("SELECT repo_id FROM task LIMIT 1"); } catch (err) { why = err.message; }
+  check(why != null && /not authorized|prohibited|not permitted/i.test(why),
+    "control: the guest connection REFUSES the table the resolver reads", String(why));
+
+  // And the daemon must never put it in that position. `resolveRepoId` is a
+  // privileged read by construction, so the tick has to be handed a number.
+  const daemon = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
+  check(!/resolveRepoId\s*\(\s*(ctx\.)?hub/.test(daemon),
+    "the daemon never hands its hub connection to the repository-id resolver",
+    (daemon.match(/.*resolveRepoId.*/g) ?? []).join(" | "));
+
+  // A tick against the real guest reaches dispatch rather than throwing.
+  const s2 = await run({ repoId: 7 });
+  check(s2.spawned.length === 1,
+    "and a tick holding the real guest connection still dispatches", s2.esc);
+  check(!/hub:unreadable/.test(s2.esc),
+    "without reporting the hub unreadable", s2.esc);
+  try { guest.close(); } catch {}
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── the hold reading is WIRED, not merely implemented ─────────────────────
+// `openHold` was imported and never called: every unit test passed against a
+// hold supplied by hand, the clause worked, and no production tick ever produced
+// one -- so a pull request the builder had parked still reached FIX_CI. Proving
+// a mechanism works is not proving it is reachable.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-hold-"));
+  const hubPath = join(dir, "hub.db");
+  const owner = openHub(hubPath);
+  owner.exec(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,generation,source_kind,source_key,
+                repo_path,profile_path,profile_hash,default_branch,visibility,registry_version,created_at,updated_at)
+              VALUES('bt:h','p',7,'o/r','t','IMPLEMENTING',1,'founder','k','/p','/f','h','main','private',1,
+                     unixepoch(),unixepoch())`);
+  owner.exec(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,detail,created_at)
+              VALUES('bt:h',7,42,'${"b".repeat(40)}','ownership_lost','the task no longer owns this path',unixepoch())`);
+  owner.close();
+  const guest = openHubAsGuest(hubPath);
+
+  // The verdict handed to `nextAction` is recomputed by the daemon from what
+  // `evaluate` returns, so the hold has to arrive through the DAEMON's own read.
+  // `evaluate` here deliberately reports no hold at all.
+  let seen;
+  const dir2 = mkdtempSync(join(tmpdir(), "reeve-prov-hold-st-"));
+  const ctx = {
+    nwo: "o/r", db: open(join(dir2, "s.db")), logPath: join(dir2, "log.txt"),
+    execute: false, shadow: false, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir2, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-hold-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+    },
+    hub: () => ({ hub: guest, why: null }), repoId: 7, lstart: "boot-1",
+    openPrs: () => [42],
+    evaluate: (a) => { seen = a; return EVAL; },
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+    prepareCheckout: () => ({ ok: true, path: dir2, why: null, deps: { ok: true, cow: false } }),
+  };
+  await tick(ctx);
+  ctx.db.close();
+  check(seen?.hold != null, "evaluatePr is handed a hold reading by the tick", JSON.stringify(seen?.hold));
+  check(seen?.hold?.readable === true && seen?.hold?.held === true,
+    "and it is the row the builder actually wrote, read through the GUEST connection",
+    JSON.stringify(seen?.hold));
+  check(seen?.hold?.reason === "ownership_lost",
+    "carrying the reason the guardian renders", JSON.stringify(seen?.hold));
+  try { guest.close(); } catch {}
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir2, { recursive: true, force: true });
+}
+
 // ── A-9: a maintenance refusal is retried, never swallowed ────────────────
 // `assertWritable` refuses every hub write while a restore holds the lock. A
 // release dropped there leaves the lease held until it expires, counted against
@@ -138,6 +243,9 @@ const run = async ({ hub = {}, repoId = 7, claim, release, containmentThrows = f
 // over a restore that took one second.
 {
   const dir = mkdtempSync(join(tmpdir(), "reeve-prov-retry-"));
+  const retryHubPath = join(dir, "hub.db");
+  openHub(retryHubPath).close();
+  const retryGuest = openHubAsGuest(retryHubPath);
   const shared = {};                       // ctx.providerRetry lives across ticks
   let refuse = true;
   const releases = [];
@@ -154,7 +262,7 @@ const run = async ({ hub = {}, repoId = 7, claim, release, containmentThrows = f
       ci: { provider: "github-actions", requiredChecks: [] },
       watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
     },
-    hub: {}, repoId: 7, lstart: "boot-1",
+    hub: () => ({ hub: retryGuest, why: null }), repoId: 7, lstart: "boot-1",
     providerRetry: shared.map ??= new Map(),
     providerClaim: () => ({ ok: true, id: 1 }),
     providerRelease: (db, a) => { releases.push({ ...a, refused: refuse }); return refuse ? { ok: false, reason: "maintenance" } : { ok: true }; },
@@ -181,6 +289,7 @@ const run = async ({ hub = {}, repoId = 7, claim, release, containmentThrows = f
   check(releases.length > before, "the next tick retries it", `${before} -> ${releases.length}`);
   check(shared.map.size === 0, "and a successful retry clears it, so it is not retried forever",
     JSON.stringify([...shared.map.keys()]));
+  try { retryGuest.close(); } catch {}
   rmSync(dir, { recursive: true, force: true });
 }
 
@@ -192,12 +301,33 @@ const run = async ({ hub = {}, repoId = 7, claim, release, containmentThrows = f
 // guardian's connection is the restricted one.
 {
   const cli = readFileSync(new URL("../bin/reeve", import.meta.url), "utf8");
-  check(/hub:\s*guardianHub\(\)/.test(cli),
-    "the guardian's tick context is handed a hub",
+  check(/hub:\s*guardianHubAccess\(\)/.test(cli),
+    "the guardian's tick context is handed a hub getter",
     (cli.match(/hub:.*/) ?? []).slice(0, 2).join(" | "));
-  const helper = cli.slice(cli.indexOf("const guardianHub"), cli.indexOf("const registryProjects"));
-  check(/openHubAsGuest\(/.test(helper) && !/[^s]openHub\(/.test(helper),
-    "and it is opened as a GUEST, never with the privileged opener", helper.slice(0, 300));
+
+  // The CONNECTION the tick holds is the guest one. Sliced to the getter alone,
+  // because the founder's decision puts exactly one privileged read on the
+  // guardian path and it is not this.
+  const getter = cli.slice(cli.indexOf("const guardianHubAccess"), cli.indexOf("// The numeric repository id"));
+  check(/openHubAsGuest\(/.test(getter) && !/[^s]openHub\(/.test(getter),
+    "and that connection is opened as a GUEST, never with the privileged opener",
+    getter.slice(0, 200));
+
+  // THE ONE PRIVILEGED READ, bounded rather than forbidden. Section 13 keeps the
+  // guardian off `task`, and the repository id lives there -- so `bin/reeve`
+  // answers it with a handle held for one statement. Asserting it does not exist
+  // would be asserting something false; what must hold is that it is confined to
+  // this helper and closed on every path out.
+  const resolver = cli.slice(cli.indexOf("const repoIdOnce"), cli.indexOf("const registryProjects"));
+  check(/openHub\(/.test(resolver) && /finally\s*\{[^}]*close/.test(resolver),
+    "the one privileged read on the guardian path is closed in a finally",
+    resolver.slice(0, 300));
+  const cliNoResolver = cli.replace(resolver, "");
+  const guardianBlock = cliNoResolver.slice(cliNoResolver.indexOf("const guardianHubAccess"));
+  check(!/[^s]openHub\(/.test(guardianBlock.slice(0, guardianBlock.indexOf("if (cmd === \"build\"") + 1 || 4000)),
+    "and no OTHER privileged open appears beside the guardian's wiring",
+    (guardianBlock.slice(0, 4000).match(/.*[^s]openHub\(.*/g) ?? []).join(" | "));
+
   const daemon = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
   check(!/\bopenHub\b/.test(daemon),
     "and the guardian's own module cannot reach the privileged opener at all",

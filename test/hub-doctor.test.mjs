@@ -6,7 +6,7 @@
 // It also must not write repo_gate_state. A reporter that can write what it
 // reports can agree with itself, and the row exists precisely so that clause U4
 // reads something the LOOP established.
-import { openHub, isOperational, faultKind } from "../src/build/hubdb.mjs";
+import { openHub, isOperational, faultKind, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
 import { hubFindings, renderHub } from "../src/doctor.mjs";
 // The self-audit block at the end of this task needs all of these. The standard
 // harness supplies only check, dir, join, tmpdir, mkdtempSync and rmSync.
@@ -726,7 +726,12 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     let leaseThrows = false;
     try { probe.prepare("SELECT * FROM singleton_lease WHERE name='builder'").get(); } catch { leaseThrows = true; }
     probe.close();
-    check(version === 1, "fixture: the localized state still answers the version query", `version ${version}`);
+    // Against the BINARY's current version, not a literal. This pinned 1 and broke
+    // the moment migration 2 landed -- a fixture asserting the schema had not
+    // moved, in a file about something else entirely.
+    check(version === HUB_SCHEMA_VERSION,
+      "fixture: the localized state still answers the version query",
+      `version ${version} of ${HUB_SCHEMA_VERSION}`);
     check(leaseThrows, "fixture: and throws on the lease read that comes after it", `${leaseThrows}`);
   }
 
@@ -923,7 +928,11 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   mkdirSync(join(nHome, "state"), { recursive: true });
   const d = openHub(hubPathFor(nHome));
   d.exec("DROP TABLE singleton_lease");
-  d.prepare("INSERT INTO schema_version(version, applied_at) VALUES(2, unixepoch())").run();
+  // ONE PAST the binary's own version, derived. A literal 2 was "newer" only
+  // while the binary was at 1; migration 2 made it a duplicate of a row that
+  // already existed, and the fixture aborted instead of building the case.
+  d.prepare("INSERT INTO schema_version(version, applied_at) VALUES(?, unixepoch())")
+   .run(HUB_SCHEMA_VERSION + 1);
   d.close();
 
   // The fixture's two halves: it really is marked newer, and the table this
@@ -933,14 +942,16 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
     const v = q.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
     const listed = q.prepare("SELECT count(*) c FROM sqlite_master WHERE name='singleton_lease'").get().c;
     q.close();
-    check(v === 2, "fixture: the hub records a version this binary does not know", `${v}`);
+    check(v === HUB_SCHEMA_VERSION + 1,
+      "fixture: the hub records a version this binary does not know",
+      `${v} vs this binary's ${HUB_SCHEMA_VERSION}`);
     check(listed === 0, "fixture: and the table build status reads is gone", `${listed}`);
   }
 
   const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), "build", "status"],
     { encoding: "utf8", env: { ...process.env, REEVE_HOME: nHome }, timeout: 30_000 });
   const out = (r.stdout ?? "") + (r.stderr ?? "");
-  check(/schema version 2/.test(out) && /Upgrade reeve/.test(out),
+  check(new RegExp(`schema version ${HUB_SCHEMA_VERSION + 1}`).test(out) && /Upgrade reeve/.test(out),
     "a newer hub is answered with upgrade reeve", out.slice(0, 200));
   check(!/cannot be read/.test(out),
     "and is NOT called unreadable, which it is not", out.slice(0, 200));

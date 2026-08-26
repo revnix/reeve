@@ -25,7 +25,7 @@ import { hubTx } from "./hubdb.mjs";
 // dropped every imported receipt passed the recovery acceptance test -- and
 // those receipts are what clause B1 reads to decide a push was attested.
 export const COMPARISON_SET = [
-  "task", "task_territory", "task_drain", "phase_event", "phase_run", "approval", "gate_request", "notice_receipt", "impl_pr", "attested_push",
+  "task", "task_territory", "task_drain", "phase_event", "phase_run", "approval", "gate_request", "notice_receipt", "task_pr", "attested_push",
   "harness_acceptance", "gate_run", "pr_hold", "hold_reason", "project_authority",
   "outbox", "territory_lease", "merge_decision", "guardian_receipt",
   // `escalation` joined the set when `escalation.raised` became replayable: a
@@ -120,7 +120,10 @@ const HANDLERS = {
   "approval.recorded":        { table: "approval", key: ["spec_repo_id","spec_pr","head_sha","actor_id","source_id"] },
   "gate_request.minted":      { table: "gate_request", key: ["spec_repo_id","spec_pr","head_sha"] },
   "notice_receipt.recorded":  { table: "notice_receipt", key: ["task","head_sha","clean_source_id"] },
-  "impl_pr.bound":            { table: "impl_pr", key: ["task","generation","slice"] },
+  // Keyed on the PR's OWN identity, which is what the table's primary key became
+  // when the spec PR joined it: `(task, generation, slice)` cannot address a spec
+  // row, whose generation and slice are NULL by CHECK.
+  "task_pr.bound":            { table: "task_pr", key: ["repo_id","pr"] },
   "attested_push.appended":   { table: "attested_push", key: ["task","generation","slice","sha"] },
   "guardian_receipt.imported":{ table: "guardian_receipt", key: ["repo_id","guardian_event_seq"] },
   "harness_acceptance.recorded": { table: "harness_acceptance", key: ["task","generation","slice","diff_hash"] },

@@ -28,6 +28,9 @@ import { enqueueEffect, voidPendingIn } from "./outbox.mjs";
 // territory.mjs.
 import { LEASE_COLS, liveLeases, firstConflict, grantLease }
   from "./territory.mjs";
+// ONE way to ask what a task has open. See prs.mjs for why this is a module and
+// not five hand-merged queries.
+import { openPrs, hasOpenPr as anyOpenPr } from "./prs.mjs";
 
 // "Open" means the PR exists and is NOT YET MERGED, and both halves are
 // corrections that pull in opposite directions.
@@ -44,27 +47,10 @@ import { LEASE_COLS, liveLeases, firstConflict, grantLease }
 // this true forever. Terminal transitions then scheduled holds, comments and
 // close effects against a PR that merged weeks ago -- and a cancellation that
 // cannot drain is a task that cannot reach a terminal phase.
-const hasOpenBuilderPr = (db, taskId) => {
-  if (db.prepare(`SELECT count(*) c FROM impl_pr WHERE task = ? AND merged_sha IS NULL`)
-        .get(taskId).c > 0) return true;
-  // AND THE SPEC PR, which is the ONLY open PR a task has before it starts
-  // implementing. `write-pr-hold` learned to hold it, but this predicate is what
-  // decides whether the machine emits that compensation at all -- so a task held
-  // in SPEC_PR_OPEN or GATE, the commonest pre-implementation hold there is,
-  // emitted no hold and left its spec PR mergeable for as long as it stayed
-  // BLOCKED. The fix to the compensation was invisible because the gate in front
-  // of it had not moved.
-  //
-  // `approved_spec_head IS NULL` is the "not yet approved" condition. NOTHING
-  // WRITES THAT COLUMN YET -- it is declared in hub.sql for the gate stage that
-  // will -- so today it is always NULL and this reads as "the task has a spec
-  // PR". That is the fail-closed direction: it holds a PR that may already be
-  // approved rather than missing one that is open, and it narrows correctly the
-  // moment the writer exists, instead of needing to be found and changed then.
-  const spec = db.prepare(
-    `SELECT spec_pr, approved_spec_head FROM task WHERE id = ?`).get(taskId);
-  return spec?.spec_pr != null && spec.approved_spec_head == null;
-};
+// Both kinds, because `task_pr` holds both. This used to count implementation
+// rows and then ask `task` for the spec PR separately, which is the merge that
+// three review rounds each taught to one more site.
+const hasOpenBuilderPr = anyOpenPr;
 
 // THE LEASE'S DEADLINE, not the claim's intent. hub.sql calls
 // `territory_lease.pinned_until` "the ONLY home of the pin", and
@@ -196,19 +182,14 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       // `depth.override` and `founder.regenerate` re-render the spec and push a
       // NEW HEAD to that same PR, so holding it there would block the work they
       // are dispatching.
+      // WHICH KINDS, keyed on the transition rather than on which rows exist.
+      // `depth.override` and `founder.regenerate` re-render the spec and push a
+      // NEW HEAD to that same PR, so holding it there blocks the work they are
+      // dispatching; every other path that stops a task holds everything open.
       const HOLDS_SPEC = ["founder.cancel", "founder.infeasible", "hold", "gate.capReached"];
-      const holdable = db.prepare(
-        `SELECT repo_id, pr, head_sha FROM impl_pr WHERE task = ? AND merged_sha IS NULL`).all(taskId);
-      if (HOLDS_SPEC.includes(evidence?.kind)) {
-        const spec = db.prepare(
-          `SELECT spec_repo_id, spec_pr, spec_head FROM task WHERE id = ?`).get(taskId);
-        // `spec_head` is the hold's witness, and `pr_hold.head_sha` is NOT NULL:
-        // a spec PR with no recorded head cannot support a hold, and admitting
-        // one would abort the transition on a constraint at the moment a task is
-        // being escalated.
-        if (spec?.spec_repo_id != null && spec?.spec_pr != null && spec?.spec_head)
-          holdable.push({ repo_id: spec.spec_repo_id, pr: spec.spec_pr, head_sha: spec.spec_head });
-      }
+      const holdable = HOLDS_SPEC.includes(evidence?.kind)
+        ? openPrs(db, taskId)
+        : openPrs(db, taskId, { kind: "impl" });
       for (const pr of holdable) {
         const open = db.prepare(
           `SELECT id FROM pr_hold WHERE repo_id = ? AND pr = ? AND cleared_at IS NULL`)
@@ -233,24 +214,11 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
     // The close, and the comment that explains it. Enqueued, never performed:
     // the executor revalidates the fence inside its lease transaction.
     case "close-prs": {
-      const open = db.prepare(
-        `SELECT repo_id, pr FROM impl_pr WHERE task = ? AND merged_sha IS NULL`).all(taskId);
-      // AND THE SPEC PR, but only when the task is being ABANDONED.
-      //
-      // A cancellation or an infeasibility after SPEC_PR_OPEN can leave
-      // `spec_repo_id`/`spec_pr` set with no `impl_pr` row at all, so this
-      // compensation enqueued nothing and the task reached CANCELLED or
-      // INFEASIBLE with its spec PR still open against a task that no longer
-      // exists. The DDL is explicit that the spec PR is fixed for the task's
-      // life and a redesign pushes a NEW HEAD to it -- so a resume or a
-      // regenerate must leave it alone, and only the two terminal edges close
-      // it. Keyed on the transition, not on whether a row happens to be there.
-      if (evidence?.kind === "founder.cancel" || evidence?.kind === "founder.infeasible") {
-        const spec = db.prepare(
-          `SELECT spec_repo_id, spec_pr FROM task WHERE id = ?`).get(taskId);
-        if (spec?.spec_repo_id != null && spec?.spec_pr != null)
-          open.push({ repo_id: spec.spec_repo_id, pr: spec.spec_pr, spec: true });
-      }
+      // Terminal abandonment closes BOTH kinds; a redesign or a regenerate closes
+      // only the implementation PRs, because the spec PR is fixed for the task's
+      // life and they are about to push a new head to it.
+      const abandoning = evidence?.kind === "founder.cancel" || evidence?.kind === "founder.infeasible";
+      const open = abandoning ? openPrs(db, taskId) : openPrs(db, taskId, { kind: "impl" });
       // THE REPOSITORY IS PART OF THE KEY. A pull-request number is unique only
       // within its repository, and this list now spans two of them -- so a spec
       // PR and an implementation PR that happen to share a number produced the
@@ -261,9 +229,9 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       for (const pr of open) {
         enqueue("gh.pr.comment", `${taskId}:g${generation}:r${pr.repo_id}:pr${pr.pr}:close-notice`,
                 { repo_id: pr.repo_id, pr: pr.pr, reason: evidence?.kind ?? null,
-                  ...(pr.spec ? { repo: "spec" } : {}) });
+                  ...(pr.kind === "spec" ? { repo: "spec" } : {}) });
         enqueue("gh.pr.close", `${taskId}:g${generation}:r${pr.repo_id}:pr${pr.pr}:close`,
-                { repo_id: pr.repo_id, pr: pr.pr, ...(pr.spec ? { repo: "spec" } : {}) });
+                { repo_id: pr.repo_id, pr: pr.pr, ...(pr.kind === "spec" ? { repo: "spec" } : {}) });
       }
       return;
     }
@@ -343,11 +311,16 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
     // generation and the hold reason, so a re-hold under a NEW cause posts again
     // while a replayed transition does not.
     case "annotate-held": {
-      for (const pr of db.prepare(
-        `SELECT repo_id, pr FROM impl_pr WHERE task = ? AND merged_sha IS NULL`).all(taskId))
+      // BOTH KINDS. A task held at SPEC_PR_OPEN or GATE has only a spec PR, and
+      // these annotations read implementation rows alone -- so the one PR its
+      // participants were watching said nothing at all. The key carries the
+      // repository for the same reason the close keys do: a number is unique
+      // only within one.
+      for (const pr of openPrs(db, taskId))
         enqueue("gh.pr.comment",
-                `${taskId}:g${generation}:pr${pr.pr}:held:${evidence?.reason ?? "held"}`,
+                `${taskId}:g${generation}:r${pr.repo_id}:pr${pr.pr}:held:${evidence?.reason ?? "held"}`,
                 { repo_id: pr.repo_id, pr: pr.pr, note: "held",
+                  ...(pr.kind === "spec" ? { repo: "spec" } : {}),
                   reason: evidence?.reason ?? null,
                   detail: evidence?.reason === "blocked_other"
                     ? (evidence.escalation ?? evidence.detail ?? null)
@@ -356,10 +329,11 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
     }
 
     case "annotate-resumed": {
-      for (const pr of db.prepare(
-        `SELECT repo_id, pr FROM impl_pr WHERE task = ? AND merged_sha IS NULL`).all(taskId))
-        enqueue("gh.pr.comment", `${taskId}:g${generation}:r${task.resume_seq}:pr${pr.pr}:resumed`,
-                { repo_id: pr.repo_id, pr: pr.pr, note: "resumed" });
+      for (const pr of openPrs(db, taskId))
+        enqueue("gh.pr.comment",
+                `${taskId}:g${generation}:r${task.resume_seq}:repo${pr.repo_id}:pr${pr.pr}:resumed`,
+                { repo_id: pr.repo_id, pr: pr.pr, note: "resumed",
+                  ...(pr.kind === "spec" ? { repo: "spec" } : {}) });
       return;
     }
 

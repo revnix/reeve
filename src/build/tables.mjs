@@ -27,7 +27,7 @@ export const TABLE_OWNERS = {
   gate_request:    { writer: "gate.mjs per round",          reader: "revision cap, why",                  replayed: true,  section: "7.3"  },
   approval:        { writer: "gate.mjs from the inbox",     reader: "merge clauses B4/U2, why",           replayed: true,  section: "7.3"  },
   notice_receipt:  { writer: "gate.mjs on notice settle",   reader: "the silence clock",                  replayed: true,  section: "7.3"  },
-  impl_pr:         { writer: "chain.mjs (pr-create settle)", reader: "receipt importer, merge.mjs",       replayed: true,  section: "8.5"  },
+  task_pr:         { writer: "chain.mjs (pr-create settle)", reader: "receipt importer, merge.mjs, every hold/close/annotate path", replayed: true, section: "8.5" },
   attested_push:   { writer: "chain.mjs",                   reader: "merge clause B1",                    replayed: true,  section: "8.5"  },
   guardian_receipt:{ writer: "chain.mjs receipt importer",  reader: "clause B1 via attested_push",        replayed: true,  section: "8.5"  },
   ownership_check: { writer: "the VERDICT_WAIT poller",     reader: "merge clause B6, pre-flight",        replayed: false,  section: "2.5"  },
@@ -71,7 +71,7 @@ export const PROSE_TABLES = [
   // this list feeds was described as complete: 31 of 32, and the one absent was
   // the table the CANCELLING drain depends on.
   "task", "task_territory", "task_drain", "phase_event", "hold_reason", "hub_event", "phase_run", "gate_run",
-  "gate_request", "approval", "notice_receipt", "impl_pr", "attested_push", "guardian_receipt",
+  "gate_request", "approval", "notice_receipt", "task_pr", "attested_push", "guardian_receipt",
   "ownership_check", "harness_acceptance", "pr_hold", "project_authority", "repo_gate_state",
   "inbox", "outbox", "merge_decision", "singleton_lease", "writer_lease", "maintenance_lock",
   "directory_lease", "territory_lease", "provider_lease", "provider_state", "intake_event",

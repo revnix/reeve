@@ -5,7 +5,7 @@
 // The lease lives in the DATABASE rather than in an OS lock, because the
 // service manager's instance and a founder's terminal instance do not share a
 // lock namespace on every platform, and the platform matrix has to fail closed.
-import { openHub } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton,
          withWriterLease, acquireMaintenanceLock, assertWritable } from "../src/build/locks.mjs";
 // mkdirSync and readdirSync are the race barrier's; without them the test throws
@@ -292,9 +292,12 @@ function db_rows(p) { const d = openHub(p); const c = d.prepare("SELECT count(*)
   const tablesAfter = after.prepare("SELECT count(*) c FROM sqlite_master WHERE type='table'").get().c;
   const versionAfter = after.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
   after.close();
-  check(versionAfter === 1,
+  // The BINARY's version, not a literal. This pinned 1 and broke the moment
+  // migration 2 landed -- the assertion is that the store was carried all the way
+  // forward, and "all the way" moves with the binary.
+  check(versionAfter === HUB_SCHEMA_VERSION,
     "and it COMPLETES the interrupted migration rather than refusing the store",
-    `version ${versionBefore} -> ${versionAfter}`);
+    `version ${versionBefore} -> ${versionAfter}, binary at ${HUB_SCHEMA_VERSION}`);
   check(tablesAfter > tablesBefore,
     "control: the store really was incomplete before, so the recovery is observable",
     `${tablesBefore} -> ${tablesAfter} tables`);

@@ -3033,5 +3033,42 @@ function writeAuthority(db, project) {
 }
 
 rmSync(home, { recursive: true, force: true });
+// ── a schema-1 durable tail still replays after migration 2 ────────────────
+// The tail is HISTORY and cannot be migrated in place: a v1 export records
+// implementation PRs as `impl_pr.bound`, and removing that kind when the table
+// was renamed made every such event UNKNOWN. Restoring a v1 snapshot with a tail
+// exported before the upgrade would then refuse recovery, and the PRs created
+// after that snapshot could not be carried forward at all.
+{
+  const d = mkdtempSync(join(tmpdir(), "reeve-legacy-tail-"));
+  const p2 = join(d, "hub.db");
+  const db = openHub(p2);                       // migrations 1 and 2
+  db.prepare(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,generation,source_kind,
+                               source_key,repo_path,profile_path,profile_hash,default_branch,
+                               visibility,registry_version,created_at,updated_at)
+              VALUES('bt:1','p',1,'o/r','t','IMPLEMENTING',1,'founder','k1','/r','/p','h','main',
+                     'private',1,unixepoch(),unixepoch())`).run();
+
+  // A v1 EVENT, exactly as a schema-1 binary wrote it: the old kind, the old
+  // row image, no `kind` column because v1's table had none.
+  hubTx(db, () => hubEvent(db, { kind: "impl_pr.bound", task: "bt:1",
+    payload: { task: "bt:1", generation: 1, slice: 0, repo_id: 1, pr: 7,
+               head_sha: "implsha", created_at: 1, merged_sha: null } }));
+
+  const tail = db.prepare("SELECT seq, at, kind, task, payload FROM hub_event ORDER BY seq").all();
+  db.exec("DELETE FROM task_pr");               // as a restore-from-snapshot would leave it
+  const out = replayHub(db, tail.filter(e => e.kind === "impl_pr.bound"));
+  check(out.skipped === 0,
+    "a v1 impl_pr.bound event is not skipped as unknown", JSON.stringify(out));
+  const row = db.prepare("SELECT kind, generation, slice, repo_id, pr, head_sha FROM task_pr").get();
+  check(row != null, "it replays into the table that replaced impl_pr", JSON.stringify(row));
+  check(row?.kind === "impl",
+    "translated to an implementation row, which is what it always was", JSON.stringify(row));
+  check(row?.repo_id === 1 && row?.pr === 7 && row?.slice === 0,
+    "carrying its repository, number and slice", JSON.stringify(row));
+  db.close();
+  rmSync(d, { recursive: true, force: true });
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

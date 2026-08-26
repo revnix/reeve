@@ -20,7 +20,7 @@ import { assertWritable } from "./locks.mjs";
 // `HOLD_ESCALATION` and `holdReasonFor` are exported BY phases.mjs and imported
 // here: the stacked-hold branch indexes the first and calls the second, and a
 // second copy of either would be a second closed set to drift from the DDL.
-import { nextPhase, HELD, HOLD_ESCALATION, holdReasonFor } from "./phases.mjs";
+import { nextPhase, HELD, isSliceReport, HOLD_ESCALATION, holdReasonFor } from "./phases.mjs";
 import { isSameProcess } from "../supervisor.mjs";       // build/ is one level down
 import { enqueueEffect, voidPendingIn } from "./outbox.mjs";
 // ONE claim model, shared with admission. A resume that decided territory its
@@ -761,9 +761,24 @@ function applyTransitionTx(db, { taskId, expectedPhase, expectedGeneration, evid
     // exactly this shape one level up; the cursor is its equivalent within a
     // generation, and it is already durable on the row.
     //
-    // Only when `slice` is supplied: the phases that are not slice-scoped pass
-    // null and must not be fenced on a cursor their reports say nothing about.
-    const fenceSlice = slice !== null && slice !== undefined;
+    // REQUIRED, not optional. The first version fenced only when the caller
+    // happened to pass a slice, which makes the guard opt-in: a caller that omits
+    // it -- and the parameter DEFAULTS to null -- gets exactly the behaviour the
+    // fence was added to prevent, silently. A guard a caller can switch off by
+    // forgetting is a guard that protects the callers who did not need it.
+    //
+    // So the PHASE AND THE EVIDENCE decide, not the caller. `isSliceReport` is
+    // the three reports that advance the slice pipeline, from the four phases the
+    // loop returns to. A hold, a cancel or a depth override from IMPLEMENTING is
+    // about the TASK and has no slice to name; demanding one from them would
+    // refuse ordinary transitions, which is how a first version of this fence
+    // failed nine assertions that had nothing to do with slices.
+    const fenceSlice = isSliceReport(expectedPhase, evidence?.kind);
+    if (fenceSlice && (slice === null || slice === undefined))
+      return refuseDurably(
+        `${expectedPhase} is slice-scoped: the transition must name the slice it reports on, ` +
+        `because the task returns to this phase for every slice and the phase alone cannot ` +
+        `tell one report from another`);
     const upd = db.prepare(
       `UPDATE task SET phase=?, generation=?, updated_at=unixepoch(),
                        held_from=?, blocked_reason=?, terminal_reason=?,

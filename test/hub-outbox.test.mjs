@@ -1043,6 +1043,54 @@ const NOW = 1_800_000_000;
   db.close();
 }
 
+// ── a reconcile failure is backed off like any other retry ─────────────────
+// A row returned here is due immediately, and `leaseEffect` takes every pending
+// row whose schedule is due -- so an effect requeued because the external service
+// was UNREACHABLE was leased again on the next pass and the externally ambiguous
+// action attempted straight back at the service that just failed. settleEffect
+// learned this a round earlier and this path did not: two ways out of inflight,
+// one of them honouring the schedule.
+{
+  const db = openHub(join(dir, "o23.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:rerr", kind: "gh.pr.comment",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+  const leased = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  db.exec(`UPDATE outbox SET lease_expires_at = unixepoch() - 1 WHERE id = ${leased.id}`);
+
+  const r = await recoverEffects(db, { reconcile: () => { throw new Error("service unreachable"); } });
+  check(r.returned === 1, "the unobservable effect is returned to the queue", JSON.stringify(r));
+  const row = db.prepare("SELECT status, not_before, last_error FROM outbox WHERE id=?").get(leased.id);
+  const now = db.prepare("SELECT unixepoch() n").get().n;
+  check(row.status === "pending", "as pending", JSON.stringify(row));
+  check(row.not_before > now, "and scheduled in the FUTURE, not due immediately",
+    JSON.stringify({ ...row, now }));
+  check(leaseEffect(db, { worker: "w2", capabilities: allOn, now }) === null,
+    "so the executor does not go straight back at the service that just failed");
+  // CONTROL: at its scheduled time it IS leasable again.
+  check(leaseEffect(db, { worker: "w2", capabilities: allOn, now: row.not_before })?.id === leased.id,
+    "control: once the backoff elapses it is leased again");
+  db.close();
+}
+
+// CONTROL: an EXHAUSTED row is dead-lettered, and its schedule is left alone --
+// nothing will read it again, so moving it would be a write with no meaning.
+{
+  const db = openHub(join(dir, "o24.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:rspent", kind: "gh.pr.comment",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+  const leased = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  const before = db.prepare("SELECT not_before FROM outbox WHERE id=?").get(leased.id).not_before;
+  db.exec(`UPDATE outbox SET attempts = max_attempts, lease_expires_at = unixepoch() - 1
+           WHERE id = ${leased.id}`);
+  const r = await recoverEffects(db, { reconcile: () => { throw new Error("still unreachable"); } });
+  check(r.dead === 1, "control: an exhausted row is dead-lettered", JSON.stringify(r));
+  check(db.prepare("SELECT not_before FROM outbox WHERE id=?").get(leased.id).not_before === before,
+    "control: and its schedule is untouched");
+  db.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

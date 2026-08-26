@@ -121,6 +121,22 @@ export const insertLease = (db, { owner, repoId, runRef, pid, lstart, priority,
   .get(owner, repoId, runRef, pid, lstart, priority, budgetUsd, status, at,
        status === "held" ? at : null, status === "held" ? at : null, expiresAt);
 
+// A queued request records WHO is waiting, so a re-ask by a restarted daemon has
+// to update that -- otherwise the row still names a dead process and the reaper
+// deletes a queue entry somebody is actively polling for. A queued row holds no
+// slot, so this transfers no capacity; it only keeps the claimant current.
+export const renewQueued = (db, { id, pid, lstart, at, expiresAt }) => db.prepare(
+  `UPDATE provider_lease SET pid = ?, lstart = ?, expires_at = ?, heartbeat_at = ?
+    WHERE id = ? AND status = 'queued'`).run(pid, lstart, expiresAt, at, id);
+
+// The oldest guardian still waiting. `requested_at` is integer seconds and two
+// requests can share one, so `id` breaks the tie -- without it "first in the
+// queue" has no defined answer inside a single second.
+export const oldestQueuedGuardian = (db) => db.prepare(
+  `SELECT ${LEASE_COLS} FROM provider_lease
+    WHERE status = 'queued' AND owner = 'guardian'
+    ORDER BY requested_at, id LIMIT 1`).get();
+
 export const promoteToHeld = (db, { id, at, expiresAt }) => db.prepare(
   `UPDATE provider_lease
       SET status = 'held', started_at = ?, heartbeat_at = ?, expires_at = ?
@@ -212,6 +228,17 @@ export function providerTx(db, { isAlive, at = null }, fn) {
   try {
     assertWritable(db, { isAlive, inTx: true, ...(at == null ? {} : { at }) });
     const r = fn();
+    // THE INVARIANT, ENFORCED HERE RATHER THAN AT EACH SITE THAT CAN BREAK IT.
+    //
+    // A preemption request exists only while a guardian is WAITING for capacity.
+    // Three separate paths empty that queue -- a promotion, a cancellation, and
+    // the reaper deleting an expired queued row whose daemon died -- and the
+    // first two were taught to withdraw the mark one review round at a time
+    // while the third was missed. A rule that every future mutation has to
+    // remember is a rule that will be forgotten again, so it is asserted on the
+    // way out of every provider transaction instead. Setting the flag stays a
+    // policy decision in provider.mjs; only its withdrawal is bookkeeping.
+    if (queuedGuardianCount(db) === 0) clearPreemption(db);
     db.exec("COMMIT");
     return r;
   } catch (e) {

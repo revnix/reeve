@@ -23,8 +23,9 @@ import { isSameProcess } from "./supervisor.mjs";
 import {
   providerTx, providerState, heldCount, heldCountBy, queuedGuardianCount,
   queuedGuardianRequests, liveRequest, youngestHeldBuilder, requestPreemption,
-  insertLease, promoteToHeld, bindLease, touchLease, deleteLease, deleteLeaseById,
-  deleteQueued, expiredLeases, recordRateLimit, clearPreemption,
+  insertLease, promoteToHeld, renewQueued, oldestQueuedGuardian,
+  bindLease, touchLease, deleteLease, deleteLeaseById,
+  deleteQueued, expiredLeases, recordRateLimit,
   DEFAULT_LIMIT, DEFAULT_RESERVED,
 } from "./build/providerdb.mjs";
 
@@ -139,23 +140,10 @@ export function claimProvider(db, { owner, repoId, runRef, pid, lstart, priority
       return refuse("held-elsewhere", { id: existing.id });
     }
 
-    // A PREEMPTION REQUEST IS WITHDRAWN ONCE IT HAS BEEN SATISFIED.
-    //
-    // The flag asks a builder for capacity on behalf of a WAITING guardian. Left
-    // set after that guardian is admitted -- or after its request is cancelled --
-    // the marked builder still surrenders its slot at its next phase boundary,
-    // suspending running work to leave a slot that nobody is waiting for idle.
-    // Keyed on the queue being empty rather than on this particular guardian,
-    // because any remaining queued guardian still needs the capacity.
-    const withdrawIfServed = () => {
-      if (queuedGuardianCount(db) === 0) clearPreemption(db);
-    };
-
     const granted = () => {
       const expiresAt = at + LEASE_SECONDS;
       if (existing) {
         promoteToHeld(db, { id: existing.id, at, expiresAt });
-        withdrawIfServed();
         return { ok: true, id: existing.id, owner, repoId, runRef };
       }
       const row = insertLease(db, { owner, repoId, runRef, pid, lstart, priority,
@@ -164,14 +152,35 @@ export function claimProvider(db, { owner, repoId, runRef, pid, lstart, priority
     };
 
     if (owner === "guardian") {
-      if (!cooling && heldCount(db) < state.limit) return granted();
+      // AND THE QUEUE IS SERVED IN ORDER. Admitting whichever guardian asks next
+      // lets a newer request from another watched repository take the slot an
+      // older one is waiting for, and a steady stream of new guardian work
+      // starves it indefinitely -- while the API's whole promise for a queued
+      // request is that it will be served in turn.
+      const oldest = oldestQueuedGuardian(db);
+      const ourTurn = !oldest || (existing != null && oldest.id === existing.id);
+      if (!cooling && ourTurn && heldCount(db) < state.limit) return granted();
       // QUEUED, NOT DROPPED -- including under a cooldown. The queued row is what
       // holds the next slot for the watchman; dropping the request during a
       // cooldown would let the builder take the slot the moment the cooldown
       // lifted, which is the priority inverted at exactly the busiest moment.
-      const id = existing?.id ?? insertLease(db, {
-        owner, repoId, runRef, pid, lstart, priority, budgetUsd,
-        status: "queued", at, expiresAt: at + LEASE_SECONDS }).id;
+      // A RE-ASK REFRESHES THE QUEUED ROW, it does not merely find it.
+      //
+      // Reusing the id and leaving the old pid, lstart and expiry behind means a
+      // guardian that RESTARTED while queued is represented by its dead
+      // predecessor: once the original expiry passes, `reapProviderLeases` sees a
+      // dead holder and deletes the queue entry while the replacement daemon is
+      // still polling for it -- and a builder takes the next opening ahead of a
+      // guardian that never stopped asking. A queued row holds no slot, so
+      // refreshing its claimant transfers nothing; it records who is waiting now.
+      let id;
+      if (existing) {
+        id = existing.id;
+        renewQueued(db, { id, pid, lstart, at, expiresAt: at + LEASE_SECONDS });
+      } else {
+        id = insertLease(db, { owner, repoId, runRef, pid, lstart, priority, budgetUsd,
+                               status: "queued", at, expiresAt: at + LEASE_SECONDS }).id;
+      }
       // NOT WHILE COOLING. A guardian queued behind a cooldown is not waiting
       // for a SLOT, so asking a builder to surrender one suspends running work
       // to produce capacity that then sits idle until the cooldown lifts. The
@@ -251,8 +260,13 @@ export function releaseProvider(db, { id = null, owner = null, repoId = null,
 export function bindProviderLease(db, { id = null, owner = null, repoId = null, runRef = null,
                                         pid, lstart, isAlive = isSameProcess, now = null } = {}) {
   return guarded(db, { isAlive, now }, () => {
-    if (id == null && !(owner != null && repoId != null && runRef != null))
-      return refuse("no-identity");
+    // THE FULL IDENTITY, REQUIRED. The predicate this builds always names owner,
+    // repo_id and run_ref, so an id-only call matched nothing and returned
+    // `{ ok: true, bound: 0 }` -- a silent no-op wearing a success. The lease
+    // then stays bound to the long-lived daemon that claimed it, liveness is
+    // asked about a process that is always alive, and a detached worker that
+    // dies takes its slot with it until expiry.
+    if (owner == null || repoId == null || runRef == null) return refuse("no-identity");
     if (pid == null || lstart == null) return refuse("no-identity");
     const at = now ?? unix(db);
     const bound = bindLease(db, { id, owner, repoId, runRef, pid, lstart, at }).changes;
@@ -269,8 +283,10 @@ export function bindProviderLease(db, { id = null, owner = null, repoId = null, 
 export function heartbeatProvider(db, { id = null, owner = null, repoId = null, runRef = null,
                                         isAlive = isSameProcess, now = null } = {}) {
   return guarded(db, { isAlive, now }, () => {
-    if (id == null && !(owner != null && repoId != null && runRef != null))
-      return refuse("no-identity");
+    // The same requirement, for the same reason: an id-only heartbeat matched
+    // nothing and reported a successful renewal of a lease it never touched, so
+    // the row expired under a worker that was still running.
+    if (owner == null || repoId == null || runRef == null) return refuse("no-identity");
     const at = now ?? unix(db);
     const beat = touchLease(db, { id, owner, repoId, runRef, at,
                                   expiresAt: at + LEASE_SECONDS }).changes;
@@ -289,12 +305,11 @@ export function cancelQueued(db, { owner, repoId, runRef,
                                    isAlive = isSameProcess, now = null } = {}) {
   return guarded(db, { isAlive, now }, () => {
     if (owner == null || repoId == null || runRef == null) return refuse("no-identity");
-    const cancelled = deleteQueued(db, { owner, repoId, runRef }).changes;
-    // The same withdrawal as on admission: a cancelled guardian request is one
-    // nobody is waiting behind either, and the marked builder must not go on
-    // yielding for it.
-    if (queuedGuardianCount(db) === 0) clearPreemption(db);
-    return { ok: true, cancelled };
+    // The withdrawal of any satisfied preemption request is `providerTx`'s job
+    // now, on the way out of EVERY provider transaction -- this path, the
+    // promotion, and the reaper alike. Three sites learning the same rule one
+    // round at a time is the sign the rule was in the wrong place.
+    return { ok: true, cancelled: deleteQueued(db, { owner, repoId, runRef }).changes };
   });
 }
 

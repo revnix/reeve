@@ -11,6 +11,7 @@ import { openHubAsGuest, ALLOWED } from "./hubguest.mjs";
 import { SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION, HUB_BUSY_TIMEOUT_MS } from "./hubdb.mjs";
 import { SCHEDULER_COLUMNS } from "./providerdb.mjs";
 import { HOLD_COLUMNS } from "./holds.mjs";
+import { LOCK_COLUMNS } from "./locks.mjs";
 
 /**
  * A getter over the hub at `hubPath`, answering three ways. See the notes below.
@@ -101,7 +102,7 @@ export function hubAccess(hubPath) {
       // columns are the ones the scheduler's SQL names. One home each.
       const present = new Set(q.prepare(
         `SELECT name FROM sqlite_master WHERE type = 'table'`).all().map(r => r.name));
-      const needCols = { ...SCHEDULER_COLUMNS, pr_hold: HOLD_COLUMNS };
+      const needCols = { ...SCHEDULER_COLUMNS, pr_hold: HOLD_COLUMNS, maintenance_lock: LOCK_COLUMNS };
       for (const t of Object.keys(ALLOWED)) {
         if (!present.has(t)) { defects.push(`${t} is missing`); continue; }
         const have = new Set(q.prepare(`SELECT name FROM pragma_table_info(?)`).all(t).map(r => r.name));

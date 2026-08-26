@@ -1403,19 +1403,34 @@ export async function tick(ctx) {
   // a result to inspect, and it is the same shape as the one two lines above.
   const pendingCooldowns = (ctx.cooldownRetry ??= new Map());
   const noteCooldownWithRetry = (key, note) => {
+    // THE WINDOW STARTED WHEN THE 429 WAS SEEN, not when we managed to record it.
+    //
+    // A deferred note that only carries a DURATION restarts the whole cooldown
+    // at retry time, so an outage longer than the cooldown recovers and then
+    // imposes a fresh ten-minute block on every builder and guardian admission
+    // for a window that had already passed. The absolute expiry is stamped at
+    // observation and carried; the retry asks for whatever is left of it.
+    const nowSec = Math.floor(Date.now() / 1000);
+    const stamped = note.expiresAt != null ? note : { ...note, expiresAt: nowSec + (note.cooldownSeconds ?? 0) };
+    const left = stamped.expiresAt - nowSec;
+    // Already elapsed while we could not write it. Recording a zero or negative
+    // cooldown would be recording a fact that has stopped being true.
+    if (left <= 0) { pendingCooldowns.delete(key); return; }
+    const send = { signature: stamped.signature, cooldownSeconds: left };
+
     const h = hubOr(() => null);
-    if (!h) { pendingCooldowns.set(key, note); return; }
+    if (!h) { pendingCooldowns.set(key, stamped); return; }
     let r;
     try {
-      r = (ctx.noteRateLimit ?? noteRateLimit)(h, { ...note, isAlive: isSameProcess });
+      r = (ctx.noteRateLimit ?? noteRateLimit)(h, { ...send, isAlive: isSameProcess });
     } catch (err) {
-      pendingCooldowns.set(key, note);
+      pendingCooldowns.set(key, stamped);
       log(logPath, `provider: could not record the rate limit — ${err.message}; retrying next tick`);
       raise("the provider scheduler is unreadable; dispatching unscheduled");
       return;
     }
     if (r?.ok === false && r.reason === "maintenance") {
-      pendingCooldowns.set(key, note);
+      pendingCooldowns.set(key, stamped);
       log(logPath, `provider: cooldown deferred — a restore holds the hub; retrying next tick (${key})`);
     } else {
       pendingCooldowns.delete(key);
@@ -1797,7 +1812,13 @@ export async function tick(ctx) {
   //
   // Expiry AND liveness together: a row past `expires_at` whose holder is still
   // running is a long job, not an abandoned one.
-  if (execute && wanted.length) {
+  // NOT gated on `wanted.length`. A guardian that died holding a lease leaves a
+  // row only its successor can clear, and a successor with nothing to dispatch
+  // this tick is exactly the state a restart lands in -- so gating housekeeping
+  // on local demand meant the rows that most need reaping were reaped least. The
+  // builder never calls the reaper at all, so a held row would count against
+  // capacity for ever and a queued one would block every builder admission.
+  if (execute) {
     const h = hubOr(() => null);
     if (h) {
       try {
@@ -1917,17 +1938,25 @@ export async function tick(ctx) {
       ...ctx,
       canaryBeforeSpawn: async () => {
         const h = claimHub();
-        // FAIL CLOSED on an unscopeable lease. A lease keyed on a null repo_id
-        // is invisible to the live-request index, so the guardian would insert a
-        // fresh live request every tick and the limit would never bind.
+        // NO HUB IS NO SCHEDULER, and that answer comes FIRST.
+        //
+        // Asking for the repository id before asking whether a scheduler exists
+        // turned the documented fail-open case into a total outage: with an
+        // unreadable hub the id lookup also fails, so the canary was refused and
+        // `skipDispatch` set, and the guardian did nothing at all -- over a lease
+        // that could not have been written to the unavailable hub anyway. The
+        // worker path already had this order; the canary did not, and two paths
+        // disagreeing about the same question is the defect.
+        if (!h) return { ok: true };
+        // FAIL CLOSED on an unscopeable lease, once a scheduler is known to
+        // exist. A lease keyed on a null repo_id is invisible to the
+        // live-request index, so the guardian would insert a fresh live request
+        // every tick and the limit would never bind.
         if (repoId == null) {
           raise("the repository numeric id is unknown; provider leases cannot be scoped");
           skipDispatch = true;
           return { ok: false, why: "the repository id is unknown" };
         }
-        // No hub is no scheduler: unscheduled, as the founder's decision says,
-        // and the tick still measures.
-        if (!h) return { ok: true };
         let got;
         // FAIL OPEN on an unreadable scheduler. An exception outside a catch
         // would abort the tick instead of letting the guardian proceed.

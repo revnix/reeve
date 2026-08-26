@@ -10,6 +10,7 @@ import { hubAccess } from "../src/build/hubaccess.mjs";
 import { openHub, SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
 import { SCHEDULER_COLUMNS } from "../src/build/providerdb.mjs";
 import { HOLD_COLUMNS } from "../src/build/holds.mjs";
+import { LOCK_COLUMNS } from "../src/build/locks.mjs";
 import { mkdtempSync, rmSync, writeFileSync, renameSync, copyFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
@@ -173,6 +174,42 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubaccess-"));
   rd.hub?.close?.();
 }
 
+// ── the MAINTENANCE LOCK is part of the guardian's surface too ────────────
+// Every provider mutation calls `assertWritable`, which reads `name`, `pid` and
+// `lstart`. A hub missing `name` makes every claim throw into the unscheduled
+// fail-open path. Missing `pid` or `lstart` is quieter and worse:
+// `isAlive(undefined, undefined)` answers false, so a LIVE restore's lock reads
+// as dead and is reaped, and a mutation proceeds against a hub being replaced
+// underneath it.
+{
+  // REBUILT WITHOUT THE COLUMN rather than altered: `name` is the primary key
+  // and SQLite refuses to drop it, and a table that exists in the wrong shape is
+  // the case being modelled anyway.
+  const without = {
+    name:   "CREATE TABLE maintenance_lock (pid INTEGER, lstart TEXT)",
+    pid:    "CREATE TABLE maintenance_lock (name TEXT PRIMARY KEY, lstart TEXT)",
+    lstart: "CREATE TABLE maintenance_lock (name TEXT PRIMARY KEY, pid INTEGER)",
+  };
+  for (const [col, ddl] of Object.entries(without)) {
+    const p = join(dir, `lock-${col}.db`);
+    openHub(p).close();
+    const w = new DatabaseSync(p);
+    w.exec("DROP TABLE maintenance_lock");
+    w.exec(ddl);
+    w.close();
+    const a = hubAccess(p)();
+    check(a.hub === null && new RegExp(col).test(a.why ?? ""),
+      `a hub missing maintenance_lock.${col} does not open, and the refusal names it`,
+      JSON.stringify(a));
+  }
+  // CONTROL: intact, and it opens.
+  const ok = join(dir, "lock-control.db");
+  openHub(ok).close();
+  const r = hubAccess(ok)();
+  check(r.hub != null, "control: an intact lock table still opens");
+  r.hub?.close?.();
+}
+
 // ── the declared shape matches a freshly migrated hub ─────────────────────
 // `SCHEDULER_COLUMNS.provider_state` is written out rather than derived, so it
 // can drift from the schema. A declaration demanding a column that does not
@@ -181,7 +218,7 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubaccess-"));
   const p = join(dir, "drift.db");
   const db = openHub(p);
   const drift = [];
-  for (const [t, cols] of Object.entries({ ...SCHEDULER_COLUMNS, pr_hold: HOLD_COLUMNS })) {
+  for (const [t, cols] of Object.entries({ ...SCHEDULER_COLUMNS, pr_hold: HOLD_COLUMNS, maintenance_lock: LOCK_COLUMNS })) {
     const have = new Set(db.prepare("SELECT name FROM pragma_table_info(?)").all(t).map(r => r.name));
     for (const c of cols) if (!have.has(c)) drift.push(`${t}.${c}`);
   }

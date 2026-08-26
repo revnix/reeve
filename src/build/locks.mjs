@@ -139,6 +139,17 @@ export function releaseMaintenanceLock(db, { pid, lstart }) {
  * BEGIN). It is not an optional safety switch -- the check runs identically
  * either way; only the transaction it runs in differs.
  */
+/**
+ * The columns `assertWritable` reads. Part of the guardian's required surface.
+ *
+ * A hub missing `name` makes every provider mutation throw -- into the daemon's
+ * unscheduled fail-open path. Missing `pid` or `lstart` is worse and quieter:
+ * `isAlive(undefined, undefined)` answers false, so a LIVE restore's lock reads
+ * as dead, is reaped, and a concurrent mutation proceeds against a hub that is
+ * being replaced underneath it.
+ */
+export const LOCK_COLUMNS = Object.freeze(["name", "pid", "lstart"]);
+
 export function assertWritable(db, { isAlive, at = now(), inTx = false }) {
   const row = db.prepare("SELECT * FROM maintenance_lock WHERE name='restore'").get();
   if (!row) return;

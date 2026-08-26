@@ -22,6 +22,11 @@ import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+// The daemon's constant, restated here only as an upper bound for an
+// assertion -- the test asserts `<=`, so a change to the real value cannot make
+// this pass wrongly.
+const RATE_LIMIT_COOLDOWN_SECONDS_FOR_TEST = 600;
+
 let fail = 0;
 const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
@@ -910,6 +915,166 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
     "a queued request for a PR this tick could not read is KEPT", JSON.stringify(cancelled));
   check(cancelled.includes("o/r#99:FIX_CI"),
     "control: one for a PR this tick never saw at all is still cancelled", JSON.stringify(cancelled));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── housekeeping runs even when this repository wants nothing ─────────────
+// A guardian that died holding a lease leaves a row only its successor can
+// clear, and a successor with nothing to dispatch is exactly the state a restart
+// lands in. Gating the reaper on local demand reaped least in the case that
+// needed it most, and the builder never calls it at all.
+{
+  const mk = (openPrs) => {
+    const dir = mkdtempSync(join(tmpdir(), "reeve-prov-reap-"));
+    const reaped = [];
+    return { dir, reaped, ctx: {
+      nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+      execute: true, shadow: true, running: 0,
+      containment: { credentialRead: "closed", why: "test" },
+      keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+      capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+      profile: {
+        identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-reap-cl-")) },
+        authority: { policy: "propose_and_merge" },
+        rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+        ci: { provider: "github-actions", requiredChecks: [] },
+        watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+      },
+      hub: () => ({ hub: {}, why: null }), repoId: 7, lstart: "boot-1",
+      reapProvider: () => { reaped.push(1); return { ok: true, reaped: 0 }; },
+      queuedRequests: () => [],
+      providerClaim: () => ({ ok: true, id: 1, token: "t" }),
+      providerBind: () => ({ ok: true, bound: 1 }),
+      providerRelease: () => ({ ok: true }),
+      openPrs: () => openPrs,
+      prAnchor: () => ({ ok: true, headRef: "mp/bt-1-s0", baseRef: "main", state: "open", title: "t",
+                         updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
+      evaluate: () => EVAL,
+      publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+      spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }),
+      oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+      resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+      prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+    } };
+  };
+  const quiet = mk([]);                     // nothing open: no worker decisions at all
+  await tick(quiet.ctx); quiet.ctx.db.close();
+  check(quiet.reaped.length > 0,
+    "a tick with no worker decisions still reaps abandoned leases", String(quiet.reaped.length));
+
+  const busy = mk([42]);
+  await tick(busy.ctx); busy.ctx.db.close();
+  check(busy.reaped.length > 0, "control: and so does a tick that does have work", String(busy.reaped.length));
+  rmSync(quiet.dir, { recursive: true, force: true });
+  rmSync(busy.dir, { recursive: true, force: true });
+}
+
+// ── no hub is no scheduler, and that is decided BEFORE the repository id ──
+// Asking for the id first turned the documented fail-open case into a total
+// outage: an unreadable hub fails the id lookup too, so the canary was refused
+// and skipDispatch set, over a lease that could not have been written anyway.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-nohub-"));
+  const spawned = [];
+  let permitted = null;
+  const ctx = {
+    nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+    execute: true, shadow: true, running: 0,
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    platform: "darwin", isolationReady: () => true,
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-nohub-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+      worker: { isolation: "scratch-home" },
+    },
+    // No hub AND no repository id: the state a guardian restarts into when the
+    // hub cannot be read.
+    hub: () => ({ hub: null, why: null }), repoId: null, lstart: "boot-1",
+    canary: async ({ beforeSpawn }) => {
+      permitted = await beforeSpawn();
+      return permitted.ok ? { ok: true, id: "c1", why: null, evidence: { outcome: "ok" } }
+                          : { ok: false, id: "c1", why: permitted.why, skipped: true, evidence: {} };
+    },
+    openPrs: () => [42],
+    prAnchor: () => ({ ok: true, headRef: "mp/bt-1-s0", baseRef: "main", state: "open", title: "t",
+                       updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
+    evaluate: () => EVAL,
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    spawnWorker: async a => { spawned.push(a); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; },
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+  };
+  await tick(ctx); ctx.db.close();
+  check(permitted?.ok === true,
+    "with no hub the canary is permitted rather than refused for a missing id", JSON.stringify(permitted));
+  check(spawned.length === 1,
+    "and the guardian still dispatches, unscheduled, as the fail-open decision says",
+    JSON.stringify(spawned.length));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── a deferred cooldown expires when it was MEANT to ──────────────────────
+// A pending note carrying only a duration restarts the whole window at retry
+// time, so an outage longer than the cooldown recovers and then imposes a fresh
+// block for a window that had already passed.
+{
+  const pending = new Map();
+  const notes = [];
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-cool-"));
+  const mk = (reachable) => ({
+    nwo: "o/r", db: open(join(dir, `s${notes.length}.db`)), logPath: join(dir, "log.txt"),
+    execute: true, shadow: true, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-cool-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5, model: "claude-x" },
+    },
+    hub: () => (reachable ? { hub: {}, why: null } : { hub: null, why: "unreadable" }),
+    repoId: 7, lstart: "boot-1", cooldownRetry: pending,
+    noteRateLimit: (db, a) => { notes.push(a); return { ok: true, until: 1 }; },
+    providerClaim: () => ({ ok: true, id: 1, token: "t" }),
+    providerBind: () => ({ ok: true, bound: 1 }),
+    providerRelease: () => ({ ok: true }),
+    reapProvider: () => ({ ok: true, reaped: 0 }),
+    queuedRequests: () => [],
+    openPrs: () => [42],
+    prAnchor: () => ({ ok: true, headRef: "mp/bt-1-s0", baseRef: "main", state: "open", title: "t",
+                       updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
+    evaluate: () => EVAL,
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    spawnWorker: async () => ({ outcome: "rate_limited", why: "429", ms: 1, cost: 0, sessionId: "s" }),
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+  });
+
+  // The hub is unreachable when the 429 lands, so the note is deferred.
+  const a = mk(false); await tick(a); a.db.close();
+  const held = [...pending.values()][0];
+  check(pending.size === 1, "a cooldown that could not be written is deferred", JSON.stringify([...pending.keys()]));
+  check(typeof held?.expiresAt === "number",
+    "and it carries an ABSOLUTE expiry, not just a duration", JSON.stringify(held));
+  check(held.expiresAt > Math.floor(Date.now() / 1000),
+    "stamped from when the throttling was observed", JSON.stringify({ expiresAt: held.expiresAt }));
+
+  // Retried once the hub is back: the window that is asked for is what REMAINS.
+  const before = notes.length;
+  const b = mk(true); await tick(b); b.db.close();
+  check(notes.length > before, "the next reachable tick records it", `${before} -> ${notes.length}`);
+  const sent = notes[notes.length - 1];
+  check(sent.cooldownSeconds <= RATE_LIMIT_COOLDOWN_SECONDS_FOR_TEST,
+    "and asks for no MORE than the original window, never a fresh one",
+    JSON.stringify({ asked: sent.cooldownSeconds, original: RATE_LIMIT_COOLDOWN_SECONDS_FOR_TEST }));
   rmSync(dir, { recursive: true, force: true });
 }
 

@@ -1,5 +1,9 @@
 # Session handoff — 2026-08-24
 
+> **SUPERSEDED by `docs/2026-08-26-session-handoff.md` (2026-08-26).** Kept as history.
+> Its state claims were true when written and are not maintained. The
+> single-source test does not scan this file.
+
 Supersedes `docs/2026-08-23-session-handoff.md`, which stays readable as history.
 
 Everything here is either **measured** (with a date and the file that records it)

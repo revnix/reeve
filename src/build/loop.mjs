@@ -16,45 +16,13 @@ import { refreshGateState } from "./gatestate.mjs";
 // The tick is a long-running process on the machine that holds the lock, so it is
 // exactly the caller that CAN answer the question.
 import { isSameProcess } from "../supervisor.mjs";
+// MOVED OUT, because C4 is the change that makes it shared. The guardian needs
+// the same repository id this tick needs, and a resolver used by two lanes that
+// lives in one lane's tick file is a shared module by accident -- nobody decides
+// it and nobody documents it. The identity rule is unchanged: one resolver,
+// keyed on the project.
+import { resolveRepoId as resolveRepoIdShared } from "./repoid.mjs";
 
-/**
- * The numeric repository id the hub already knows for a project.
- *
- * `task.repo_id` is written at admission from the snapshot `resolveSnapshot`
- * took through the API client, so it is a value GitHub gave us rather than one
- * derived from a name.
- *
- * MATCHED ON THE REGISTRY PROJECT KEY, not on the nwo. The first version keyed
- * on `nwo_snapshot` while its own comment said a repository can be renamed and
- * that column is only ever a snapshot -- so the moment a repository was renamed
- * or transferred, `projects.json` supplied the new name, every existing task
- * still carried the old one, and the lookup returned null for a repository whose
- * numeric id the hub was holding all along. The project key is what does not
- * move: `task.project` IS the registry key, written at admission from the same
- * `projects.json` entry this lookup is resolving.
- *
- * The most recently updated task wins, so if an id ever did change, the newest
- * admission is the one that saw the current repository.
- *
- * Returns null for a project the hub has never admitted a task for. That is a
- * real state in S2 -- a registered project with no work yet -- and it is not an
- * error.
- *
- * A QUERY FAILURE IS NOT THAT STATE, and the catch that swallowed it said the
- * two were the same. A structurally damaged hub -- a version-1 file whose `task`
- * table is gone, which still passes `quick_check` because the pages it does have
- * are intact -- reported "no repository id" on every tick, so gate state aged
- * into staleness while the tick reported a clean pass over a skipped project.
- * The one failure a diagnostic must never render as a benign absence. It
- * propagates, and `build run` already turns a throwing tick into a reported
- * failure that keeps the lease.
- */
-export function repoIdFromHub(hub, project) {
-  if (!hub || !project?.name) return null;
-  return hub.prepare(
-    `SELECT repo_id FROM task WHERE project = ? ORDER BY updated_at DESC, id DESC LIMIT 1`)
-    .get(project.name)?.repo_id ?? null;
-}
 
 /**
  * One pass of the builder loop.
@@ -67,7 +35,7 @@ export function repoIdFromHub(hub, project) {
  */
 export async function buildTick(ctx = {}) {
   const { hub, projects = [], fetchGateState = () => null,
-          resolveRepoId = repoIdFromHub, isAlive = isSameProcess } = ctx;
+          resolveRepoId = resolveRepoIdShared, isAlive = isSameProcess } = ctx;
   const skipped = [];
   const rows = [];
   for (const project of projects) {
@@ -89,7 +57,11 @@ export async function buildTick(ctx = {}) {
     // still has no id, and skipping THAT is the right answer -- there is no row
     // to key, and inventing one would put a fabricated identity in front of the
     // clause that reads it.
-    const repoId = project?.repoId ?? resolveRepoId(hub, project);
+    // AWAITED, so the builder and the guardian run the SAME policy rather than
+    // two that agree today. The builder wires no GitHub client, so the fallback
+    // is simply unavailable here and the answer is the hub's or none -- but it
+    // is the same function deciding that, not a second one that happens to.
+    const repoId = project?.repoId ?? await resolveRepoId(hub, project);
     if (repoId == null) { skipped.push(project?.name ?? "(unnamed)"); continue; }
     // One project's failure is not the tick's. A fetcher that throws for one
     // repository must not stop the others being refreshed -- and

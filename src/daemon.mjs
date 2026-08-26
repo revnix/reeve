@@ -17,7 +17,7 @@
 import { evaluatePr, publishVerdict, prAnchor } from "./pr.mjs";
 import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
-import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
+import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, isSameProcess, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE, gitEnv } from "./gitguard.mjs";
@@ -26,6 +26,9 @@ import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
 import { canaryIdFor, netListener, instrumentHash } from "./canary.mjs";
+import { claimProvider, releaseProvider } from "./provider.mjs";
+import { openHold } from "./build/holds.mjs";
+import { resolveRepoId } from "./build/repoid.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects } from "./db/ops.mjs";
@@ -1506,6 +1509,62 @@ export async function tick(ctx) {
     }
   }
 
+  // ── the provider scheduler ────────────────────────────────────────────────
+  //
+  // Model quota is global and this tick spends it in TWO shapes -- the
+  // containment canary, once, and a worker per decision -- so both take a lease.
+  // A dispatch site without one is capacity the scheduler cannot see, which is
+  // the whole failure the scheduler exists to prevent.
+  //
+  // HOISTED, because the canary below and the per-decision loop further down
+  // both need it and resolving twice is two answers to one question.
+  //
+  // AT MOST ONE LOOKUP PER INTERVAL. The fallback is a network call and a
+  // project with no admitted task has no id to find, so an unresolvable
+  // repository would otherwise ask GitHub on every tick forever.
+  if (ctx.hub && ctx.repoId == null && ctx.project) {
+    const every = (profile.builder?.provider?.repoIdRetryMinutes ?? 10) * 60;
+    const at = Math.floor(Date.now() / 1000);
+    if (at - (ctx._repoIdTriedAt ?? 0) >= every) {
+      ctx._repoIdTriedAt = at;
+      // A THROW HERE IS A DAMAGED HUB, not a missing id, and the two must not
+      // collapse: `resolveRepoId` propagates query failures precisely so a
+      // structurally broken store cannot read as "this project has no work yet".
+      try {
+        ctx.repoId = await resolveRepoId(ctx.hub, ctx.project, { fetchRepoId: ctx.fetchRepoId ?? null });
+      } catch (err) {
+        log(logPath, `provider: the hub could not be read for a repository id — ${err.message}`);
+        raise("guardian:hub:unreadable");
+      }
+    }
+  }
+  const repoId = ctx.repoId ?? null;
+
+  // Releases refused because a restore holds `maintenance_lock`, carried to the
+  // next tick. A refusal is a REAL outcome to inspect and retry, never something
+  // to swallow: a `catch {}` here leaves a lease held until expiry while the
+  // scheduler counts it against the limit, so the guardian throttles itself for
+  // five minutes over a restore that took one second.
+  //
+  // The IDENTITY is stored and never the id. A restore clears `provider_lease`
+  // and SQLite reuses the integer key, so an id-keyed retry deletes whatever
+  // inherited it -- an unrelated live lease, and the limit is breached by the
+  // very bookkeeping meant to protect it.
+  const pendingReleases = (ctx.providerRetry ??= new Map());
+  const releaseWithRetry = (key, identity) => {
+    if (!ctx.hub) return;
+    const r = (ctx.providerRelease ?? releaseProvider)(ctx.hub, { ...identity, isAlive: isSameProcess });
+    if (r?.ok === false && r.reason === "maintenance") {
+      pendingReleases.set(key, identity);
+      log(logPath, `provider: release deferred — a restore holds the hub; retrying next tick (${key})`);
+    } else {
+      pendingReleases.delete(key);
+    }
+  };
+  if (ctx.hub && pendingReleases.size) {
+    for (const [key, identity] of [...pendingReleases]) releaseWithRetry(key, identity);
+  }
+
   // A worker that can read the founder's credentials is not dispatched, whatever
   // --execute says. Containment is MEASURED, on this host, under this CLI and
   // this sandbox block (containment.mjs): the sandbox canary must have passed
@@ -1519,13 +1578,71 @@ export async function tick(ctx) {
   const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action)
                                     && !(d.decision.action === "REQUEST_REVIEW" && execute && reviewActionsOn(profile)));
   let containment = ctx.containment ?? null;
-  if (execute && wanted.length && !containment) containment = await measuredContainment(ctx, profile, nwo, logPath);
-  if (execute && wanted.length && containment.credentialRead !== "closed") {
+
+  // THE CANARY IS A DISPATCH. It runs a real model under a real sandbox and
+  // spends real quota, once per tick, so it takes its own lease exactly as a
+  // worker does. Leaving it unleased would let every guardian on the machine run
+  // one unscheduled model call per tick, which is precisely the capacity the
+  // scheduler cannot see.
+  let skipDispatch = false;
+  let canaryLease = null;
+  if (execute && wanted.length && !containment && ctx.hub) {
+    if (repoId == null) {
+      // FAIL CLOSED, unlike an unreadable hub below. A missing repository id is
+      // not "the scheduler is down"; it is "this lease cannot be scoped to
+      // anything", and a lease keyed on a null repo_id is invisible to the live
+      // request index -- so the guardian would insert a fresh live request on
+      // every tick and the limit would never bind.
+      raise("the repository numeric id is unknown; provider leases cannot be scoped");
+      log(logPath, "execute: NOT running the containment canary — the repository id is unknown");
+      // Suppress the DISPATCH, finish the TICK. An early return would skip the
+      // epilogue that sends this very escalation, which is a fail-closed path
+      // silencing its own alarm.
+      skipDispatch = true;
+    } else {
+      let got;
+      // FAIL OPEN on an unreadable scheduler, and the try is what makes that
+      // true. `claimProvider` runs against a handle that can throw, and an
+      // exception outside a catch aborts the tick instead of letting the
+      // guardian proceed unscheduled -- inverting the founder's decision at the
+      // one site a stubbed-containment fixture never reaches.
+      try {
+        got = (ctx.providerClaim ?? claimProvider)(ctx.hub, {
+          owner: "guardian", repoId, runRef: `canary:${nwo}`,
+          pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
+      } catch (err) {
+        raise("the provider scheduler is unreadable; dispatching unscheduled");
+        log(logPath, `execute: provider unreadable, running the containment canary unscheduled: ${err.message}`);
+        got = { ok: true, id: null };          // unscheduled, not blocked
+      }
+      if (!got.ok) {
+        // NO RETURN. `queued`, `cooldown` and `at-limit` are ORDINARY outcomes,
+        // and returning here would skip the tick's whole epilogue -- self-audit,
+        // escalation reconciliation and notification, supply derivation, and
+        // noteTick -- on exactly the ticks most likely to need all of them.
+        log(logPath, `execute: NOT running the containment canary — provider ${got.reason}`);
+        skipDispatch = true;
+      } else if (got.id != null) {
+        canaryLease = { owner: "guardian", repoId, runRef: `canary:${nwo}`, id: got.id, token: got.token ?? null };
+      }
+    }
+  }
+  if (execute && wanted.length && !containment && !skipDispatch) {
+    try {
+      containment = await measuredContainment(ctx, profile, nwo, logPath);
+    } finally {
+      // RELEASED WHATEVER HAPPENED. The canary can throw, and a lease left
+      // behind by a throw is counted against the limit until it expires -- five
+      // minutes of the guardian throttling itself over one failed measurement.
+      if (canaryLease) releaseWithRetry(`canary:${nwo}`, canaryLease);
+    }
+  }
+  if (execute && wanted.length && !skipDispatch && containment.credentialRead !== "closed") {
     log(logPath, `execute: NOT dispatching ${wanted.length} worker task(s) — worker containment is open: ${containment.why}`);
     raise("guardian:containment:open");
   }
 
-  if (execute && wanted.length && containment.credentialRead === "closed") {
+  if (execute && wanted.length && !skipDispatch && containment.credentialRead === "closed") {
     // Injectable: the real reading is the machine's load average, which is right
     // for production and wrong for a test — a busy host makes canStart 0 and the
     // suite reports "no worker dispatched" about the laptop rather than the code.
@@ -1610,6 +1727,46 @@ export async function tick(ctx) {
         continue;
       }
 
+      // A PROVIDER LEASE BEFORE A DURABLE RUN, in that order and not the other
+      // way round. `startRun` spends a fixer's attempt two lines below it, so a
+      // dispatch refused for capacity AFTER the run exists burns the single
+      // retry the design allows on work that never ran.
+      let prLease = null;
+      const prRunRef = `${nwo}#${e.pr}:${decision.action}`;
+      if (ctx.hub) {
+        if (repoId == null) {
+          // FAIL CLOSED, the same as the canary: a lease that cannot be scoped
+          // is invisible to the live-request index, so the guardian would insert
+          // a fresh request every tick and the limit would never bind.
+          log(logPath, `  #${e.pr}: NOT dispatching — the repository id is unknown, so a provider lease cannot be scoped`);
+          raise("the repository numeric id is unknown; provider leases cannot be scoped");
+          continue;
+        }
+        let got;
+        // FAIL OPEN on an unreadable scheduler. The founder's decision is that a
+        // broken scheduler must not stop the guardian working -- but it must say
+        // so, because dispatching unscheduled is exactly what the limit exists
+        // to prevent and a silent version of it is indistinguishable from a
+        // working one.
+        try {
+          got = (ctx.providerClaim ?? claimProvider)(ctx.hub, {
+            owner: "guardian", repoId, runRef: prRunRef,
+            pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
+        } catch (err) {
+          raise("the provider scheduler is unreadable; dispatching unscheduled");
+          log(logPath, `  #${e.pr}: provider unreadable, dispatching unscheduled: ${err.message}`);
+          got = { ok: true, id: null };
+        }
+        if (!got.ok) {
+          // ORDINARY OUTCOMES. `queued`, `cooldown` and `at-limit` are the
+          // scheduler working, not failing: this PR waits for the next tick and
+          // the others in this loop still get their turn.
+          log(logPath, `  #${e.pr}: NOT dispatching — provider ${got.reason}${got.until ? ` until ${got.until}` : ""}`);
+          continue;
+        }
+        if (got.id != null) prLease = { owner: "guardian", repoId, runRef: prRunRef, id: got.id, token: got.token ?? null };
+      }
+
       // A durable run is the ONLY way a worker may start. The exclusive right to
       // act on this PR is taken FIRST, so a restarted daemon cannot re-dispatch
       // work already in flight -- the log shows exactly that happening, the same
@@ -1622,6 +1779,10 @@ export async function tick(ctx) {
       if (!run.ok) {
         // Refusing to act is the only safe answer when the transition cannot be
         // recorded: an unrecorded worker is one nothing can reason about later.
+        // The lease taken above is given back here: nothing is going to run
+        // under it, and holding it until expiry throttles the guardian for five
+        // minutes over a store that refused one row.
+        if (prLease) releaseWithRetry(prRunRef, prLease);
         log(logPath, `  #${e.pr}: NOT dispatching — ${run.why}`);
         continue;
       }
@@ -1822,6 +1983,15 @@ export async function tick(ctx) {
         raise(`#${e.pr}: the worker could not be prepared; reeve is backing off`);
       } finally {
         clearInterval(beat);
+        // THE PROVIDER LEASE GOES BACK HERE, and this is the only place it does
+        // for a dispatched run. Every exit from this block passes through --
+        // success, worker failure, a throw during preparation -- so there is one
+        // release path rather than one per outcome, which is how the outcome
+        // nobody thought of ends up holding a lease until it expires.
+        //
+        // A release refused because a restore holds the hub is RETRIED, not
+        // swallowed: `releaseWithRetry` carries the identity to the next tick.
+        if (prLease) { releaseWithRetry(prRunRef, prLease); prLease = null; }
         // Classified FIRST, before anything is recorded: a binding refused
         // because a cancel landed first is a cancellation, not a preparation
         // failure, and the audit trail must say so (run.finish, cancelled),

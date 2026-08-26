@@ -7,6 +7,7 @@
 import { runDoctor, render, checkAppIdentity, hubFindings, renderHub } from "../src/doctor.mjs";
 import { open } from "../src/db/ops.mjs";
 import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor, hubPathFor } from "../src/paths.mjs";
+import { openHubAsGuest } from "../src/build/hubguest.mjs";
 import { snapshot, restore, latestSnapshot, exportEvents,
          snapshotAll, restoreHub, validateSnapshot } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
@@ -72,6 +73,25 @@ const die = (msg) => { console.error(msg); process.exit(1); };
 // (§1.5, and measured -- resolving one needs the App client, which
 // `builder doctor` deliberately does not use). So H-4 matches projects to
 // `repo_gate_state` rows by `nwo_snapshot`, which both sides have.
+// The guardian's hub handle, or null.
+//
+// RESTRICTED BY CONSTRUCTION. `openHubAsGuest` returns a facade whose authorizer
+// refuses every table outside the guardian's declared surface, and which does not
+// carry the methods that could switch that authorizer off. The privileged
+// `openHub` appears in this file only under `build`, which is the builder's own
+// command and legitimately holds the whole schema.
+//
+// A hub that is absent or has never been migrated is NOT an error here. A
+// guardian can run on a machine with no builder, and `tick` reads a missing
+// `ctx.hub` as "there is no scheduler", which dispatches unscheduled rather than
+// refusing to work.
+const guardianHub = () => {
+  try {
+    if (!existsSync(hubPathFor(HOME)) || completedVersion(hubPathFor(HOME)) < 1) return null;
+    return openHubAsGuest(hubPathFor(HOME));
+  } catch { return null; }
+};
+
 const registryProjects = (home) => {
   const path = join(home, "projects.json");
   try {
@@ -1545,6 +1565,24 @@ switch (cmd) {
       // The sandbox canary's result is written here and read by `reeve doctor`
       // from the same place, independent of any --log directory.
       canaryStateDir: HOME,
+      // THE GUARDIAN'S OWN START TIME, read once. `provider_lease` is reaped by
+      // `isAlive(pid, lstart)`, and a lease whose holder has no start time can
+      // never be recognised as dead: a pid alone is reused.
+      lstart: readStart(process.pid),
+      // THE RESTRICTED CONNECTION, never `openHub`. The guardian's hub surface is
+      // the provider scheduler and `pr_hold`, and a comment saying so is checked
+      // by whoever remembers -- this is checked by the connection. `openHub`
+      // would hand the guardian the whole schema and every migration right.
+      //
+      // Absent rather than open when there is no hub: a guardian on a machine
+      // with no builder has nothing to schedule against, and `tick` treats a
+      // missing `ctx.hub` as "unscheduled" rather than failing.
+      hub: guardianHub(),
+      // The registry entry for THIS repository, which is what the repository-id
+      // resolver is keyed on. A rename changes `nwo` and never the id, so the
+      // project key is the stable half; a repository absent from the registry
+      // has no project and the guardian dispatches unscheduled.
+      project: (registryProjects(HOME).projects ?? []).find(p => p.nwo === nwo) ?? null,
     };
     // Honour the FLAG as well as the command. The help has always documented
     // `run --tick` as "one pass and exit" while only the separate `tick` command

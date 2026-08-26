@@ -165,6 +165,9 @@ export function nextAction(e, p, h = {}) {
 
   const threads = clause(v, "threads");
   const findings = clause(v, "findings");
+  // `cleared` deliberately does NOT join these two, and getting that wrong was a
+  // real defect. See its own branch below, after the stale-review one.
+  const cleared = clause(v, "cleared");
   if (threads?.state === "BLOCK" || findings?.state === "BLOCK") {
     const R = e.rounds ?? {};
     // `?? 0` here would read an UNKNOWN critical count as "no criticals" and spill
@@ -182,6 +185,32 @@ export function nextAction(e, p, h = {}) {
     const R = e.rounds ?? {};
     if ((R.n ?? 0) < (R.hardCap ?? 10)) return act(ACTIONS.REQUEST_REVIEW, review.detail, { round: (R.n ?? 0) + 1, stale: true });
     return act(ACTIONS.ESCALATE, ESCALATIONS.CAP_WITH_CRITICAL, { detail: review.detail });
+  }
+
+  // 6b. A thread the blocking reviewer has not come back to. AFTER the stale
+  //     review above, and the action is to ask them rather than to fix anything.
+  //
+  //     Putting this in the findings branch was wrong twice over. After a push,
+  //     `derivePr` marks previously cleared threads uncleared until the reviewer
+  //     covers the new head -- so every push dispatched a worker at findings that
+  //     were uncleared only because nobody had looked at the new revision yet,
+  //     when the one thing that could clear them is the review this skipped past.
+  //
+  //     And where the reviewer HAS covered this head, a thread going uncleared
+  //     means it was resolved AFTER their round -- the bot dismissing its own
+  //     finding, which is the case this clause exists for. The answer there is the
+  //     same: ask the reviewer to come back and confirm. Nothing about either case
+  //     says "send a worker to change code".
+  //
+  //     Not dispatching also closes a narrower window: a reviewer's round landing
+  //     between the fold and this decision leaves the count a tick stale, and a
+  //     stale count that costs a review request is self-correcting where one that
+  //     costs a worker is not.
+  if (cleared?.state === "BLOCK") {
+    const R = e.rounds ?? {};
+    if ((R.n ?? 0) < (R.hardCap ?? 10))
+      return act(ACTIONS.REQUEST_REVIEW, cleared.detail, { round: (R.n ?? 0) + 1, uncleared: true });
+    return act(ACTIONS.ESCALATE, ESCALATIONS.CAP_WITH_CRITICAL, { detail: cleared.detail });
   }
 
   if (v.state === "PASS") {

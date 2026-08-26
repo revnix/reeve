@@ -1,6 +1,7 @@
 // The decision function must be TOTAL: every reachable verdict maps to exactly one
 // action, and no state falls through to a silent WAIT.
 import { nextAction, ACTIONS, ESCALATIONS } from "../src/watcher.mjs";
+import { computeVerdict } from "../src/verdict.mjs";
 
 let fail = 0;
 const check = (n, got, want) => { const ok = got === want;
@@ -12,13 +13,18 @@ const check = (n, got, want) => { const ok = got === want;
 const P = { rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
             authority: { policy: "propose_and_merge" }, watch: { reviewActions: true } };
 const cl = (id, state, detail = "") => ({ id, state, detail });
+// The clause set, kept in step with the verdict's own by a check below rather
+// than by memory. A hardcoded list here silently stopped reaching the mechanism
+// the moment a clause was added: `swap("cleared", ...)` replaced nothing, the
+// fixture stayed all-pass, and the test reported MERGE instead of failing.
+const CLAUSES = ["ci", "base", "review", "rounds", "threads", "cleared", "findings", "mergeable"];
 const ev = (clauses, extra = {}) => ({
   pr: 1, state: "open",
   verdict: { state: clauses.some(c => c.state === "BLOCK") ? "BLOCK" : clauses.some(c => c.state === "UNKNOWN") ? "UNKNOWN" : "PASS", clauses, summary: "x" },
   rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 },
   checks: {}, ...extra,
 });
-const allPass = () => ["ci", "base", "review", "rounds", "threads", "findings", "mergeable"].map(id => cl(id, "PASS"));
+const allPass = () => CLAUSES.map(id => cl(id, "PASS"));
 const swap = (id, state, detail) => allPass().map(c => (c.id === id ? cl(id, state, detail) : c));
 
 // ── terminal shapes ───────────────────────────────────────────────────────
@@ -162,6 +168,99 @@ check("an unrecognised merge state escalates with the state named",
   check("an unknown blocking clause still reports a gap", g.gap, true);
   check("and says it is unclassified", /unclassified/.test(g.why), true);
 }
+
+// ── a swap that swaps nothing ──────────────────────────────────────────────
+//
+// `swap(id, …)` replaces a clause in the fixture. When the fixture's clause list
+// does not know that id, it replaces NOTHING: the fixture stays all-pass, the
+// decision is MERGE, and the assertion beneath it reports whatever an all-pass
+// verdict does. That is worse than a stale list that under-covers, because the
+// green is not merely uninformative -- it is actively wrong, and the test passes
+// while inert. It happened here: adding `cleared` left three assertions
+// measuring nothing until this was noticed.
+//
+// So the fixture is checked for reaching the mechanism, which is the general form
+// of the defect. It is deliberately NOT a second canonical clause list: the
+// builder lane is landing `CLAUSE_IDS`, exported from verdict.mjs and compared
+// against what `computeVerdict` emits, and two canonical lists would be exactly
+// the defect this file is guarding against, arriving as its fix. When that lands,
+// `CLAUSES` here becomes the import and this check stays, because it answers a
+// different question: not "is the list right" but "did the fixture bite".
+// One check, not two. The obvious first one -- "every id this file swaps is one
+// the fixture contains" -- is CIRCULAR: `allPass()` is built FROM `CLAUSES`, so
+// it compares a list against something derived from itself and cannot fail.
+// Stubbing an unknown id into the list left it green, which is how I know.
+{
+  const before = nextAction(ev(allPass()), P).action;
+  const changed = CLAUSES.filter(id => nextAction(ev(swap(id, "BLOCK", "x")), P).action === before);
+  check("and blocking any one of them changes the decision, so no swap is inert",
+    changed.join(",") || "none", "none");
+}
+
+// ── a thread nobody came back to is work, not a gap ─────────────────────────
+//
+// `nextAction` is total by construction: a BLOCK matching no branch falls to
+// "unclassified verdict … gap: true". That totality only helps if new clauses are
+// actually classified, so adding one without a branch turns a real finding into
+// an escalation about the decision function itself.
+check("an uncleared thread ASKS THE REVIEWER, rather than dispatching a fixer",
+  nextAction(ev(swap("cleared", "BLOCK", "1 thread(s) that codex has not come back to")), P).action,
+  ACTIONS.REQUEST_REVIEW);
+// After a push, threads go uncleared because nobody has reviewed the new head
+// yet, and the review clause blocks for the same reason. The reviewer's return is
+// the only thing that clears them, so the stale review must be asked for FIRST --
+// dispatching a fixer here sends a worker at findings whose only problem is that
+// nobody has looked at them.
+{
+  const both = allPass().map(c => c.id === "cleared" ? cl("cleared", "BLOCK", "uncleared")
+                                : c.id === "review" ? cl("review", "BLOCK", "reviewed an older revision") : c);
+  const d = nextAction(ev(both), P);
+  check("a push that unclears threads asks for the review, not a fix", d.action, ACTIONS.REQUEST_REVIEW);
+  check("and says which, so the two cases are distinguishable", /older revision/.test(d.why ?? ""), true);
+}
+// THE REGRESSION THIS ORDERING CAUSED, asserted directly. Past the soft cap with
+// an unbuilt critical count, a real finding must still reach a fixer: the
+// watcher handles UNKNOWN before BLOCK findings, so an UNKNOWN rounds clause
+// stopped every repair rather than stopping a spill.
+{
+  const past = { rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "not-derived" } };
+  check("past the cap with an unbuilt critical count, a finding still dispatches a fixer",
+    nextAction(ev(swap("findings", "BLOCK", "2 open"), past), P).action, ACTIONS.FIX_FINDINGS);
+
+  // END TO END, through computeVerdict rather than a hand-built clause list.
+  //
+  // The check above hands `nextAction` clauses directly, so it cannot see the
+  // verdict deciding what state `rounds` is in -- and that decision is the P1.
+  // Collapsing the transient/permanent split left this file GREEN while the
+  // composition was broken, which is the seam-versus-mounted trap: the watcher
+  // was fine, the verdict was fine in isolation, and together they waited
+  // forever. Only a test that runs both catches it.
+  const composed = computeVerdict({
+    head: "c".repeat(40),
+    checks: { verdict: "GREEN", settled: true, failing: [] },
+    base: { verdict: "GREEN" },
+    reviewers: [{ login: "codex", kind: "blocking", state: "CLEAN", reviewedHead: "c".repeat(10) }],
+    rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "not-derived" },
+    threads: { unresolved: 2, total: 4, readable: true },
+    cleared: { readable: true, uncleared: 0, reviewers: [] },
+    ledgerBlockers: 0, mergeState: "CLEAN",
+  });
+  const d = nextAction({ pr: 1, state: "open", verdict: composed, checks: {},
+                         rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null } }, P);
+  check("and the same holds through computeVerdict, which is where the state is decided",
+    d.action, ACTIONS.FIX_FINDINGS);
+}
+// Past the hard cap it stops asking and fetches a person.
+check("past the hard cap an uncleared thread escalates rather than asking again",
+  nextAction(ev(swap("cleared", "BLOCK", "uncleared"), { rounds: { n: 10, softCap: 5, hardCap: 10, unspilledCritical: 0 } }), P).action,
+  ACTIONS.ESCALATE);
+// And it must not steal the dispatch when a real finding is open.
+check("control: a genuine finding still dispatches a fixer",
+  nextAction(ev(swap("findings", "BLOCK", "2 open")), P).action, ACTIONS.FIX_FINDINGS);
+check("control: and it is NOT reported as an unclassified verdict",
+  /unclassified/.test(nextAction(ev(swap("cleared", "BLOCK", "x")), P).why ?? ""), false);
+check("an unreadable projection waits rather than passing",
+  nextAction(ev(swap("cleared", "UNKNOWN", "cannot say")), P).action, ACTIONS.WAIT);
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

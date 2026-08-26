@@ -7,6 +7,7 @@
 // absence is never read as success anywhere else in this system either.
 import { hubPathFor, statePathFor } from "../src/paths.mjs";
 import { openHub, hubTx, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
+import { validateSnapshot } from "../src/backup.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -428,6 +429,32 @@ import { hubEvent, migrationPlan } from "../src/build/hubdb.mjs";
   check(upNow === frozen.up_sha256,
     "and so is its up() implementation, which is the other half of what migration 1 IS",
     `${upNow} vs ${frozen.up_sha256}`);
+}
+
+// ── a version-3 snapshot without its columns is NOT usable ─────────────────
+// Migration 3 adds no tables, so a table-name inventory cannot describe it. A
+// snapshot recording version 3 while missing the new columns satisfies every
+// other check -- integrity_check proves the file is structurally sound, the
+// inventory proves the tables are present -- and `openHub` would then read the
+// migration as completed, skip it, and fail with `no such column` on the first
+// pin or provider query, after the snapshot had been chosen for recovery.
+{
+  const bad = join(dir, "v3-no-cols.db");
+  const db = openHub(bad);
+  // Exactly the shape the finding describes: version 3 recorded, columns gone.
+  db.exec("ALTER TABLE task_territory DROP COLUMN pinned_until");
+  db.close();
+  const v = validateSnapshot(bad, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true });
+  check(v.ok === false && /column/i.test(v.why ?? ""),
+    "a version-3 snapshot missing a migration-3 column is refused, with the column named",
+    JSON.stringify(v));
+
+  // CONTROL: an intact one at the same version passes, or "refuse version 3" has
+  // become "refuse everything" and no hub could ever be restored.
+  const good = join(dir, "v3-intact.db");
+  openHub(good).close();
+  const ok = validateSnapshot(good, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true });
+  check(ok.ok === true, "control: an intact version-3 snapshot is usable", JSON.stringify(ok));
 }
 
 rmSync(dir, { recursive: true, force: true });

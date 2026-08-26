@@ -191,12 +191,21 @@ export const promoteToHeld = (db, { id, pid, lstart, at, expiresAt }) => db.prep
 // THE TOKEN IS PART OF EVERY FENCE. The identity says WHICH RUN; the token says
 // WHICH ATTEMPT AT IT. Without the second, a mutation held across a restore
 // matches a row that merely inherited the same name and number.
-const identityWhere = (id, token) =>
-  `owner = ? AND repo_id = ? AND run_ref = ?`
-  + (id == null ? "" : ` AND id = ?`)
-  + (token == null ? "" : ` AND token = ?`);
+// THE TOKEN IS NOT OPTIONAL, and a missing one is refused rather than dropped.
+//
+// Building the predicate without it when it is absent means a tokenless call
+// silently gets the PRE-MIGRATION fence -- identity and id, both of which a
+// restore reproduces exactly. A guard that degrades to the thing it replaced,
+// quietly, on the input it was added for, is not a guard. Callers have the token:
+// `claimProvider` returns it beside the id for exactly this.
+const identityWhere = (id, token) => {
+  if (token == null)
+    throw new Error("a fenced provider mutation requires the claim's token; refusing the weaker predicate");
+  return `owner = ? AND repo_id = ? AND run_ref = ? AND token = ?`
+       + (id == null ? "" : ` AND id = ?`);
+};
 const identityArgs = (id, token, owner, repoId, runRef) =>
-  [owner, repoId, runRef, ...(id == null ? [] : [id]), ...(token == null ? [] : [token])];
+  [owner, repoId, runRef, token, ...(id == null ? [] : [id])];
 
 export const bindLease = (db, { id = null, token = null, owner, repoId, runRef, pid, lstart, at }) => db.prepare(
   `UPDATE provider_lease SET pid = ?, lstart = ?, started_at = COALESCE(started_at, ?),

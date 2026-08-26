@@ -37,6 +37,18 @@ const LEASE_IS_LIVE = `
        OR (l.pinned_until IS NOT NULL AND l.pinned_until > unixepoch()))`;
 
 // The columns of a lease row, in the order every event payload carries them.
+/**
+ * The claim's row image, named once because two writers append it.
+ *
+ * `registry.mjs` emits it when a filing claims territory; `grantLease` emits it
+ * again when the first grant stamps the pin's deadline. Both are replayed
+ * projections keyed on (task, kind, path), and a column left out of either list
+ * is a column replay reconstructs as NULL -- which for `pinned_until` means a
+ * restored tail forgets when a pin ends and the next regrant treats it as a
+ * first grant. One list, so the two cannot disagree.
+ */
+export const TERRITORY_COLS = `task, kind, path, pinned, pinned_until`;
+
 export const LEASE_COLS = `project, kind, path, task, expires_at, pinned_until`;
 
 // One hour. Long enough that an ordinary phase does not have to renew mid-step,
@@ -150,9 +162,21 @@ export function grantLease(db, { project, claim, taskId, at, pinned = false,
   let pinUntil = null;
   if (pinned) {
     pinUntil = claimRow?.pinned_until ?? (pinnedUntil === undefined ? until : pinnedUntil);
-    if (claimRow && claimRow.pinned_until == null)
+    if (claimRow && claimRow.pinned_until == null) {
       db.prepare(`UPDATE task_territory SET pinned_until = ? WHERE task=? AND kind=? AND path=?`)
         .run(pinUntil, taskId, claim.kind, claim.path);
+      // EVENTED, because `task_territory` is a replayed projection and this is a
+      // write to it. `registry.mjs` emits the claim's image at FILING time --
+      // before any grant exists, so `pinned_until` is NULL in that image -- and
+      // without this second emit a replayed tail reconstructs the deadline as
+      // NULL. The next regrant then reads "no deadline", treats it as a first
+      // grant, and mints a new one: the resurrection this migration exists to
+      // remove, arriving through replay instead of through a lease delete.
+      hubEvent(db, { kind: "task_territory.claimed", task: taskId,
+        payload: db.prepare(
+          `SELECT ${TERRITORY_COLS} FROM task_territory WHERE task=? AND kind=? AND path=?`)
+          .get(taskId, claim.kind, claim.path) });
+    }
   }
   // EVERY column the insert would have set, `pinned_until` included. Leaving it
   // out let a replacement keep the previous holder's pin -- or its absence --

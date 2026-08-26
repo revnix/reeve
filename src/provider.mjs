@@ -248,6 +248,10 @@ export function releaseProvider(db, { id = null, token = null, owner = null, rep
     // appears in review rather than being reached by omission.
     if (!hasIdentity && !force) return refuse("no-identity");
     if (!hasIdentity && id == null) return refuse("no-identity");
+    // A release with an identity must carry the token too. `force` remains the
+    // one named way past the fence, and it deletes by id alone -- typed at the
+    // call site so it shows up in review rather than being reached by omission.
+    if (hasIdentity && !force && token == null) return refuse("no-identity");
     const released = (!hasIdentity || (force && id != null))
       ? deleteLeaseById(db, id).changes
       : deleteLease(db, { id, token, owner, repoId, runRef }).changes;
@@ -278,6 +282,7 @@ export function bindProviderLease(db, { id = null, token = null, owner = null, r
     // asked about a process that is always alive, and a detached worker that
     // dies takes its slot with it until expiry.
     if (owner == null || repoId == null || runRef == null) return refuse("no-identity");
+    if (token == null) return refuse("no-identity");
     if (pid == null || lstart == null) return refuse("no-identity");
     const at = now ?? nowSeconds(db);
     const bound = bindLease(db, { id, token, owner, repoId, runRef, pid, lstart, at }).changes;
@@ -296,8 +301,11 @@ export function heartbeatProvider(db, { id = null, token = null, owner = null, r
   return guarded(db, { isAlive, now }, () => {
     // The same requirement, for the same reason: an id-only heartbeat matched
     // nothing and reported a successful renewal of a lease it never touched, so
-    // the row expired under a worker that was still running.
+    // the row expired under a worker that was still running. The token is
+    // required too -- a restore reproduces the identity exactly, so identity
+    // alone renews whatever inherited the name.
     if (owner == null || repoId == null || runRef == null) return refuse("no-identity");
+    if (token == null) return refuse("no-identity");
     const at = now ?? nowSeconds(db);
     const beat = touchLease(db, { id, token, owner, repoId, runRef, at,
                                   expiresAt: at + LEASE_SECONDS }).changes;

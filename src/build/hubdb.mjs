@@ -657,6 +657,43 @@ const V3 = V2;
 export const TABLES_AT = Object.freeze({ 1: V1, 2: V2, 3: V3 });
 
 /**
+ * The COLUMNS a version requires beyond its table set.
+ *
+ * A table-name inventory cannot describe migration 3, which adds no tables --
+ * so a snapshot recording version 3 while missing the new columns passed
+ * validation, including the deep one: `integrity_check` proves the FILE is
+ * structurally sound, and the version check proved the TABLES were present, and
+ * neither asks what shape those tables are. `openHub` then reads version 3 as
+ * completed, skips the migration, and the first pin or provider query fails with
+ * `no such column` -- after that snapshot had already been chosen for recovery,
+ * which is the worst possible moment to discover it.
+ *
+ * Empty for versions 1 and 2 by construction: their table lists already imply
+ * their columns, because those migrations created the tables.
+ */
+export const COLUMNS_AT = Object.freeze({
+  3: Object.freeze({
+    task_territory: ["pinned_until"],
+    provider_lease: ["token"],
+  }),
+});
+
+/**
+ * Which required columns a store is missing at a given version, as
+ * `table.column` strings. Empty means it has them all.
+ */
+export function missingColumnsAt(db, version) {
+  const want = COLUMNS_AT[version];
+  if (!want) return [];
+  const gone = [];
+  for (const [table, cols] of Object.entries(want)) {
+    const have = new Set(db.prepare(`SELECT name FROM pragma_table_info(?)`).all(table).map(r => r.name));
+    for (const c of cols) if (!have.has(c)) gone.push(`${table}.${c}`);
+  }
+  return gone;
+}
+
+/**
  * The CURRENT schema's tables: what snapshot validation compares a
  * same-version snapshot against, and what Task 11 compares the live database to.
  *

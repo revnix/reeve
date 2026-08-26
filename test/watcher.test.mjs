@@ -1,6 +1,7 @@
 // The decision function must be TOTAL: every reachable verdict maps to exactly one
 // action, and no state falls through to a silent WAIT.
 import { nextAction, ACTIONS, ESCALATIONS } from "../src/watcher.mjs";
+import { computeVerdict } from "../src/verdict.mjs";
 
 let fail = 0;
 const check = (n, got, want) => { const ok = got === want;
@@ -12,13 +13,18 @@ const check = (n, got, want) => { const ok = got === want;
 const P = { rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
             authority: { policy: "propose_and_merge" }, watch: { reviewActions: true } };
 const cl = (id, state, detail = "") => ({ id, state, detail });
+// The clause set, kept in step with the verdict's own by a check below rather
+// than by memory. A hardcoded list here silently stopped reaching the mechanism
+// the moment a clause was added: `swap("cleared", ...)` replaced nothing, the
+// fixture stayed all-pass, and the test reported MERGE instead of failing.
+const CLAUSES = ["ci", "base", "review", "rounds", "threads", "cleared", "findings", "mergeable"];
 const ev = (clauses, extra = {}) => ({
   pr: 1, state: "open",
   verdict: { state: clauses.some(c => c.state === "BLOCK") ? "BLOCK" : clauses.some(c => c.state === "UNKNOWN") ? "UNKNOWN" : "PASS", clauses, summary: "x" },
   rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 },
   checks: {}, ...extra,
 });
-const allPass = () => ["ci", "base", "review", "rounds", "threads", "findings", "mergeable"].map(id => cl(id, "PASS"));
+const allPass = () => CLAUSES.map(id => cl(id, "PASS"));
 const swap = (id, state, detail) => allPass().map(c => (c.id === id ? cl(id, state, detail) : c));
 
 // ── terminal shapes ───────────────────────────────────────────────────────
@@ -162,6 +168,43 @@ check("an unrecognised merge state escalates with the state named",
   check("an unknown blocking clause still reports a gap", g.gap, true);
   check("and says it is unclassified", /unclassified/.test(g.why), true);
 }
+
+// ── this file's clause list is the verdict's clause list ────────────────────
+//
+// Two statements of one fact, and the failure mode is silent: a `swap` for a
+// clause the list does not know about replaces nothing, so the fixture stays
+// all-pass and the test PASSES while measuring nothing at all. Compared here in
+// both directions, because a list that is merely a superset would hide a removal
+// just as well as a subset hides an addition.
+{
+  const emitted = computeVerdict({
+    head: "b".repeat(40),
+    checks: { verdict: "GREEN", settled: true, failing: [] },
+    base: { verdict: "GREEN" },
+    reviewers: [], rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 },
+    threads: { unresolved: 0, total: 0, readable: true },
+    cleared: { readable: true, uncleared: 0, reviewers: [] },
+    ledgerBlockers: 0, mergeState: "CLEAN",
+  }).clauses.map(c => c.id);
+  const missing = emitted.filter(id => !CLAUSES.includes(id));
+  const extra = CLAUSES.filter(id => !emitted.includes(id));
+  check("this file's clause list matches what computeVerdict emits",
+    `${missing.join(",")}|${extra.join(",")}`, "|");
+}
+
+// ── a thread nobody came back to is work, not a gap ─────────────────────────
+//
+// `nextAction` is total by construction: a BLOCK matching no branch falls to
+// "unclassified verdict … gap: true". That totality only helps if new clauses are
+// actually classified, so adding one without a branch turns a real finding into
+// an escalation about the decision function itself.
+check("an uncleared thread dispatches a fixer, not a gap",
+  nextAction(ev(swap("cleared", "BLOCK", "1 thread(s) that codex has not come back to")), P).action,
+  ACTIONS.FIX_FINDINGS);
+check("control: and it is NOT reported as an unclassified verdict",
+  /unclassified/.test(nextAction(ev(swap("cleared", "BLOCK", "x")), P).why ?? ""), false);
+check("an unreadable projection waits rather than passing",
+  nextAction(ev(swap("cleared", "UNKNOWN", "cannot say")), P).action, ACTIONS.WAIT);
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

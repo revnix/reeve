@@ -165,15 +165,22 @@ export function nextAction(e, p, h = {}) {
 
   const threads = clause(v, "threads");
   const findings = clause(v, "findings");
-  if (threads?.state === "BLOCK" || findings?.state === "BLOCK") {
+  // `cleared` joins these two rather than getting a branch of its own: a thread a
+  // reviewer has not come back to is a finding that needs work, which is the same
+  // answer. Adding a BLOCK clause with no branch would fall through to the
+  // "unclassified verdict" escalation at the end -- total by construction, and
+  // that totality is only useful if new clauses are actually classified.
+  const cleared = clause(v, "cleared");
+  if (threads?.state === "BLOCK" || findings?.state === "BLOCK" || cleared?.state === "BLOCK") {
     const R = e.rounds ?? {};
     // `?? 0` here would read an UNKNOWN critical count as "no criticals" and spill
     // on it, which is the standing ruling inverted. Only a known zero may spill.
     if ((R.n ?? 0) >= (R.softCap ?? 5) && R.unspilledCritical === 0)
       return act(ACTIONS.SPILL, `past the soft cap with only non-critical findings open`, { round: R.n });
-    const blocking = [threads, findings].filter(c => c?.state === "BLOCK");
+    const blocking = [threads, findings, cleared].filter(c => c?.state === "BLOCK");
     return act(ACTIONS.FIX_FINDINGS, blocking.map(c => c.detail).filter(Boolean).join("; ") || "findings block this PR",
-               { threads: threads?.state === "BLOCK", findings: findings?.state === "BLOCK" });
+               { threads: threads?.state === "BLOCK", findings: findings?.state === "BLOCK",
+                 uncleared: cleared?.state === "BLOCK" });
   }
 
   // 6. A stale verdict: reviewed, but not this revision.

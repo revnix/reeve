@@ -269,11 +269,52 @@ const offendersIn = text => {
   // stayed green until this changed.
   const SENTENCE = /(?<=[.!?][*_`"')\]]*)\s+/;
 
+  // ...and markdown LINKS, which the character class above cannot express.
+  //
+  // `[doctor reports degraded.](details) See §0.1` puts a whole URL between the
+  // stop and the whitespace, so nothing splits, the combined string carries the
+  // §0 pointer, and the claim is exempt in full -- the same failure the emphasis
+  // case had, reached through syntax no widening of that class can cover. Link
+  // syntax is removed before splitting instead, leaving the visible text, which
+  // is what a reader reads and what these rules are about.
+  const unlink = s => s.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
+  const sentencesOf = s => unlink(s).split(SENTENCE);
+
+  // THE PREDICATES, defined ONCE and called by both the scan and its controls.
+  //
+  // They were inline regexes, duplicated into the control loop as separate
+  // literal copies. That is a control on the wrong side of a boundary: weaken or
+  // replace the production matcher and the controls keep compiling their own
+  // copies and stay green, so the check that exists to prove the guard still runs
+  // could not see the guard stop running. The clean documents supply no positive
+  // match of their own, so nothing else would have noticed either.
+  //
+  // `statesRuleOutcome` requires a STATE-BEARING predicate, not every definitional
+  // use of a verb. "R-01 is the merge-authority check" and "R-01 requires a status
+  // check" are what §6 is FOR -- durable statements of what a rule means -- and an
+  // earlier version rejected both, because it fired on `is` or `requires` within
+  // forty characters and spared only the single verb its control happened to pick.
+  // What makes a sentence a copy of doctor's answer is the OUTCOME word.
+  const RULE_OUTCOME = /\b(broken|degraded|failing|passing|clean|currently|today|right now|no required|not required|bypass(?:es|ed)?)\b/i;
+  const statesRuleOutcome = s => /\bR-\d+\b/.test(s)
+    && /\bR-\d+\b[^.]{0,60}?\b(is|are|was|were|lets|allows|requires|carries|exempts|declares|reports?|remains?)\b/i.test(s)
+    && RULE_OUTCOME.test(s);
+
+  // `countsRemainingWork` matches a remaining-work CONSTRUCTION, with the
+  // qualifier attached to the count rather than merely somewhere in the sentence.
+  // Two independent sentence-wide tests rejected "the four PRs are still the
+  // programme size", which states a fixed size and is exactly what the
+  // neighbouring control claims to spare.
+  const countsRemainingWork = s =>
+    /\b(last|first|remaining|final|next)\s+(one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(s)
+    || /\b(one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\s+(remain|are left|still|left)\b/i.test(s)
+    || /\b(prs?|pull requests?|stages?)\s+(remaining|left)\b/i.test(s);
+
   const offenders = [];
   for (const [label, text] of [[HANDOFF, handoff.replace(/^## 0\. STATE[\s\S]*?(?=^## )/m, "")], [PROMPT, prompt]])
     for (const b of blocksOf(text)) {
       const joined = b.lines.join(" ");
-      for (const sentence of joined.split(SENTENCE)) {
+      for (const sentence of sentencesOf(joined)) {
         if (/§0/.test(sentence.replace(/\(§0\)/g, ""))) continue;
         const lowerS = sentence.toLowerCase();
         const named = [...commands, ...subjectsInComments].filter(c => CLAIM(c).test(sentence))
@@ -295,7 +336,7 @@ const offendersIn = text => {
       // The rule is the same one the other two halves already use: the deferral
       // has to be in the same breath as the claim. A sentence that says "see §0"
       // is exempt; the sentence next to it is not.
-      for (const sentence of joined.split(SENTENCE)) {
+      for (const sentence of sentencesOf(joined)) {
         if (/§0/.test(sentence.replace(/\(§0\)/g, ""))) continue;
         const lower = sentence.toLowerCase();
         const named = subjects.filter(s => lower.includes(s.toLowerCase()));
@@ -309,14 +350,13 @@ const offendersIn = text => {
         // currently reports is doctor's answer. A sentence that says an R-number
         // "is" or "lets" or "requires" something has copied that answer, and the
         // copy primes a reader to treat real drift as the finding they expected.
-        if (/\bR-\d+\b[^.]{0,40}\b(is|are|lets|allows|requires|carries|exempts|declares|reports?)\b/i.test(sentence))
+        if (statesRuleOutcome(sentence))
           offenders.push(`${label}:${b.nums[0]} states an R-rule's OUTCOME — ${sentence.trim().slice(0, 70)}`);
 
         // A COUNT OF REMAINING WORK. "The last two PRs" is true until one lands
         // and then silently sequences a session onto work that is done. §0 says
         // which stages remain; a number here is a second copy of that.
-        if (/\b(last|first|remaining|final|next)?\s*(one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(sentence)
-            && /\b(last|remaining|final|next|more|left|still)\b/i.test(sentence))
+        if (countsRemainingWork(sentence))
           offenders.push(`${label}:${b.nums[0]} counts REMAINING work — ${sentence.trim().slice(0, 70)}`);
       }
     }
@@ -325,17 +365,28 @@ const offendersIn = text => {
 
   // Controls, because both rules above are regexes over prose and a regex that
   // stopped matching would read exactly like documents that stopped offending.
+  // Both directions, and the SPARING half matters more: these documents are
+  // required to explain what each rule means and how large the programme is, so a
+  // matcher that rejects durable statements does not merely annoy -- it pushes the
+  // explanation out of the document that exists to carry it.
   for (const [what, sample, want] of [
-    ["an R-rule outcome", "R-01 is the ruleset that lets admins bypass every rule.", true],
+    ["an R-rule outcome", "R-01 is currently broken and lets admins bypass every rule.", true],
+    ["an R-rule outcome in other words", "R-01 reports degraded today.", true],
     ["a remaining-work count", "The last two PRs of the programme remain.", true],
+    ["a remaining-work count phrased the other way round", "Two stages still remain.", true],
     ["a rule's MEANING, which is durable", "R-01 means reeve must stand as a required check.", false],
+    ["a rule DEFINED with an ordinary verb", "R-01 is the merge-authority check.", false],
+    ["a rule's requirement, which does not expire", "R-01 requires a status check to exist.", false],
     ["the programme's own size, which does not change", "§3.2 lists all four PRs of the plan.", false],
-  ]) {
-    const hit = /\bR-\d+\b[^.]{0,40}\b(is|are|lets|allows|requires|carries|exempts|declares|reports?)\b/i.test(sample)
-      || (/\b(last|first|remaining|final|next)?\s*(one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(sample)
-          && /\b(last|remaining|final|next|more|left|still)\b/i.test(sample));
-    check(hit === want, `control: the state-claim rules ${want ? "catch" : "spare"} ${what}`, sample);
-  }
+    ["a fixed size stated with an unrelated qualifier", "The four PRs are still the programme size.", false],
+  ]) check((statesRuleOutcome(sample) || countsRemainingWork(sample)) === want,
+           `control: the state-claim rules ${want ? "catch" : "spare"} ${what}`, sample);
+
+  // A sentence ending inside a LINK still splits, so a claim cannot hide behind
+  // URL syntax the way it hid behind bold.
+  check(sentencesOf("[doctor reports degraded.](d/e.md) See §0.1").length === 2,
+    "control: a sentence ending inside a markdown link is still two sentences",
+    JSON.stringify(sentencesOf("[doctor reports degraded.](d/e.md) See §0.1")));
 }
 
 // --- DERIVED: the prompt names no PR and no commit ---------------------------

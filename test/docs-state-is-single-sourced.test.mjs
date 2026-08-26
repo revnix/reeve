@@ -170,306 +170,181 @@ const offendersIn = text => {
 // would fire on correct prose everywhere, and a guard that fires on right text is
 // weakened until it catches nothing.
 {
+  // DEFER OR DATE. One rule, and it cannot be wrong about English.
+  //
+  // This check used to try to understand grammar: whether a verb was past tense,
+  // whether an outcome word described the rule or the build, whether a count was
+  // history or work remaining. It took five review rounds and eighteen findings
+  // and the counts went 6, 5, 1, 6 -- every round found another sentence shape
+  // judged wrongly, and every fix traded a false alarm for a missed case or the
+  // reverse. English has no end of shapes, so that instrument has no end of
+  // rounds. The founder's call was to stop grinding it and change the instrument.
+  //
+  // What is left is mechanical. A sentence that names something §0 owns must
+  // either point at §0, or carry a DATE. Nothing here inspects tense, mood or
+  // predicate structure. A date is unambiguous where past tense is not, and both
+  // ways of satisfying the rule are things an author can see and add:
+  //
+  //   "R-01 was broken on 2026-08-22."          -> dated, so it is history. Fine.
+  //   "Whether R-01 is broken is a §0 fact."     -> defers. Fine.
+  //   "R-01 is broken."                          -> neither. That is the defect.
+  //
+  // The cost is real and is the trade the founder chose: some historical prose
+  // now carries a date it would not otherwise need. That is cheap, visible, and
+  // never wrong -- which the grammar rules could not manage.
   const zero = /^## 0\. STATE[\s\S]*?(?=^## )/m.exec(handoff)?.[0] ?? "";
-  const subjects = [...zero.matchAll(/^\|\s*([^|]+?)\s*\|/gm)]
+
+  // The subjects, derived from §0 so there is no second list to maintain.
+  //
+  // §0.2's row labels, and the backticked terms in §0.1's comments -- which is
+  // where §0.1 already says what each command answers. A label needs more than
+  // one word and one distinctive word: `main` alone appears in correct prose
+  // everywhere, and a guard that fires on right text is weakened until it catches
+  // nothing. That much judgement stays, because it is about naming rather than
+  // about grammar, and it is settled by looking at §0 rather than at a sentence.
+  const fromRows = [...zero.matchAll(/^\|\s*([^|]+?)\s*\|/gm)]
     .map(m => m[1].replace(/`/g, "").trim())
-    // A label is usable as a search term when it has more than one word AND at
-    // least one word distinctive enough not to appear everywhere. The first
-    // version used a character count, which is a proxy for that and a bad one:
-    // "the tracker" is eleven characters, fell under it, and the twelfth copy --
-    // "the tracker has no record of 22-24 Aug at all" -- walked straight through.
-    // Length was never the property that mattered; having a word worth searching
-    // for was.
     .filter(s => s && !/^-+$/.test(s)
                  && s.split(/\s+/).length >= 2
                  && s.split(/[\s,]+/).some(w => w.length >= 6))
-    // A label carrying an em-dash gloss ("capability 1 — watch, judge, escalate")
-    // is policed by its stem, which is the part prose actually reuses.
     .map(s => s.split(" — ")[0].trim());
-  // §0.1's COMMANDS are subjects too, and leaving them out was a real gap.
+  // A row's distinctive TOKENS, not only its whole label.
   //
-  // The rule §0 states is that a fact a command can answer must not be written
-  // down. The guard only policed §0.2's table, so §0.2's subjects were enforced
-  // and §0.1's were not -- and a sentence asserting yesterday's `doctor` outcome
-  // sat outside §0 through a passing run of this very test. The half of §0 that
-  // matters MORE was the unpoliced half.
-  //
-  // Derived from the block rather than listed here, so adding a command to §0.1
-  // starts policing it with no second place to remember. Only tokens long enough
-  // to be distinctive: `git`, `gh`, `ps` and `grep` appear in correct prose
-  // everywhere, and a guard that fires on right text is weakened until it catches
-  // nothing.
-  const commands = [...new Set(
-    (/```bash\n([\s\S]*?)```/.exec(zero)?.[1] ?? "")
-      .split("\n")
-      // A TRAILING comment is still a comment. Splitting the whole line pulled
-      // prose out of `grep ... # the review shadow streak` and started policing
-      // the word "review", which fires on correct text in both documents.
-      .map(l => l.split("#")[0].trim())
-      .filter(Boolean)
-      // The executable and its subcommand only. Arguments are paths, flags and
-      // repository names, none of which is the name of a question.
-      .flatMap(l => l.split(/\s+/).slice(0, 2))
-      .map(w => w.replace(/^\.?\/?(?:bin\/)?/, "").replace(/[^\w-]/g, ""))
-      .filter(w => w.length >= 6 && /^[a-z][\w-]*$/.test(w)))];
+  // Matching the label as one string is too literal to be useful: the row reads
+  // "the durable-effect stages" and the prose says "the durable-effect programme",
+  // the row reads "`--execute` is OFF on purpose" and the prose says "the
+  // --execute flag". Both name the same owned fact and neither contains the
+  // label. Backticked terms and hyphenated compounds are the parts prose actually
+  // reuses, and they are distinctive enough not to fire on ordinary text.
+  const fromLabelTokens = [...new Set([...zero.matchAll(/^\|\s*([^|]+?)\s*\|/gm)]
+    .flatMap(m => [...m[1].matchAll(/`([^`]+)`/g)].map(b => b[1])
+      .concat(m[1].split(/\s+/).filter(w => /^[a-z][a-z]+-[a-z-]+$/i.test(w))))
+    .map(s => s.trim()).filter(s => s.length >= 6))];
+  const bash = /```bash\n([\s\S]*?)```/.exec(zero)?.[1] ?? "";
+  // The backticked terms in §0.1's COMMENTS, which is where §0.1 already says
+  // what each command answers.
+  const fromComments = [...bash.matchAll(/#[^\n]*/g)]
+    .flatMap(m => [...m[0].matchAll(/`([^`]+)`/g)].map(b => b[1]))
+    .map(s => s.trim()).filter(s => s.length >= 6);
+  // And the COMMAND NAMES themselves. Dropping these was a regression I nearly
+  // shipped: the simplification passed on clean documents, and the stub loop then
+  // showed it caught NONE of the four defects the old rules had caught -- a
+  // sentence stating a `doctor` outcome walked straight through. Simplifying the
+  // DECISION is the change the founder asked for; narrowing what the decision is
+  // made ABOUT was an accident of the same edit.
+  const fromCommands = [...new Set(bash.split("\n")
+    .map(l => l.split("#")[0].trim()).filter(Boolean)
+    .flatMap(l => l.split(/\s+/).slice(0, 2))
+    // A QUOTED token is an argument, never a command name. `grep "daemon
+    // starting"` contributed `daemon`, which then matched every sentence in §1
+    // describing what the daemon IS -- durable prose that has no business
+    // deferring to §0. The rule fired on right text, which is how a guard gets
+    // weakened until someone turns it off.
+    .filter(w => !/^["']/.test(w))
+    .map(w => w.replace(/^\.?\/?(?:bin\/)?/, "").replace(/[^\w-]/g, ""))
+    .filter(w => w.length >= 6 && /^[a-z][\w-]*$/.test(w)))];
+  const subjects = [...new Set([...fromRows, ...fromLabelTokens, ...fromComments, ...fromCommands])];
 
-  // The SHORT commands need their subject, because their name is not usable.
-  //
-  // `git`, `gh` and `ps` are three, two and two characters and appear in correct
-  // prose everywhere, so the length filter above drops them -- which left the
-  // measurements they perform completely unpoliced while this test claimed to
-  // cover §0.1. Demonstrated rather than argued: "the current main tip contains
-  // the outbox repair" outside §0 passed a green run of this file.
-  //
-  // §0.1 already names each subject, in backticks, in the comment on its own
-  // line. That is the thing to read: a command added with a comment is policed by
-  // what the comment says it answers, and there is no second list to maintain.
-  const subjectsInComments = [...new Set(
-    [...(/```bash\n([\s\S]*?)```/.exec(zero)?.[1] ?? "").matchAll(/#[^\n]*/g)]
-      .flatMap(m => [...m[0].matchAll(/`([^`]+)`/g)].map(b => b[1]))
-      .map(s => s.trim().toLowerCase())
-      .filter(s => s && s.length >= 3))];
+  // The RULE IDENTIFIERS, which §0.1's doctor line owns and no row names.
+  // Mechanical: an R-number is unambiguous, and every claim about one is a claim
+  // about what doctor currently reports. History carries a date and is excused
+  // like anything else, so this needs no opinion about tense.
+  const SUBJECT_PATTERNS = [[/\bR-\d+\b/, "an R-rule outcome"]];
 
-  check(commands.length >= 2, "control: §0.1's command block yielded commands to police",
-    commands.join(" / "));
-  check(subjectsInComments.length >= 2,
-    "control: and its comments yielded the subjects its short commands measure",
-    subjectsInComments.join(" / "));
-
-  // A row's VALUE is as volatile as its label, and it was not policed at all.
-  //
-  // The label check catches "the founder's merge rule says X". It does not catch a
-  // paragraph that never names the rule and simply RESTATES it -- which is what the
-  // resume prompt did with the merge condition, through green runs of this file.
-  // §0 says change these here and nowhere else; a copy that avoids the label is
-  // still a copy, and it is the one that goes stale silently because nothing links
-  // it back.
-  //
-  // Matched by distinctive-word OVERLAP rather than as a substring, because a
-  // restatement is never a substring: "merge on CI green AND zero open threads"
-  // became "merge when CI is green AND zero threads are open". Four words from one
-  // row, in one sentence, is a restatement rather than a coincidence -- three
-  // fired on ordinary prose when I tried it.
+  // A row's VALUE is owned by §0 as surely as its label, and a restatement never
+  // contains the label -- which is how the founder's merge rule came to be copied
+  // into the prompt in different words. Matched by distinctive-word OVERLAP,
+  // because a restatement is never a substring. Four words from one row in one
+  // sentence is a restatement; three fired on ordinary prose when I tried it.
   const STOP = new Set(["that","this","with","from","have","been","were","will","when","then",
                         "over","into","only","also","which","after","before","their","there",
                         "would","could","should","about","while","every","because","rather"]);
-  const rowWords = [...zero.matchAll(/^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*$/gm)]
+  const rowValues = [...zero.matchAll(/^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*$/gm)]
     .map(m => [m[1].replace(/`/g, "").trim(),
                [...new Set(m[2].toLowerCase().replace(/[^a-z0-9\s-]/g, " ").split(/\s+/)
                  .filter(w => w.length >= 4 && !STOP.has(w)))]])
     .filter(([, ws]) => ws.length >= 5);
-  check(rowWords.length >= 3, "control: §0's rows yielded VALUES to police, not only labels",
-    rowWords.map(([l, w]) => `${l}(${w.length})`).join(" "));
 
-  check(subjects.length >= 4, "control: §0's table yielded subjects to police",
+  check(subjects.length >= 8, "control: §0 yielded the subjects it owns",
     `${subjects.length}: ${subjects.join(" / ")}`);
+  check(rowValues.length >= 3, "control: and the row VALUES a restatement would copy",
+    rowValues.map(([l, w]) => `${l}(${w.length})`).join(" "));
 
-  // A claim about a COMMAND is judged per SENTENCE, not per block.
-  //
-  // The block-scoped exemption is right for a table subject: a paragraph that
-  // defers to §0 is discussing the subject, not restating it. It is wrong here,
-  // and measurably so. The sentence this whole widening exists to catch --
-  // "doctor reports the repository declares squash while 8 of the last 20 commits
-  // are merge commits" -- sat in a paragraph that already ended with "see §0.1",
-  // so a block-scoped test waved it through, and I confirmed that by putting the
-  // sentence back and watching the guard stay green. A paragraph can defer to §0
-  // and still copy an answer out of it, so the deferral has to be in the same
-  // breath as the claim.
-  const esc = s => s.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
-  const CLAIM = c => new RegExp(
-    `\\b${esc(c)}\\b[^.]{0,40}\\b(reports?|said|says?|shows?|returns?|answers?|reported|contains?|sits at|is at|points at|tip|broken|degraded|clean|zero|empty)\\b`, "i");
-  // Sentence boundaries have to survive MARKDOWN, or the whole rule is inert.
-  //
-  // `/(?<=[.!?])\s+/` requires whitespace immediately after the stop, and these
-  // documents write emphasis: "**The last two PRs of the programme.** §3.2 says…"
-  // puts `**` between the two. Nothing split there, the paragraph stayed one
-  // "sentence", it contained a §0 pointer, and it was exempt in full -- so the
-  // rule written to catch exactly that line did not catch it. Measured: the stub
-  // stayed green until this changed.
-
-  // ...and markdown LINKS, which the character class above cannot express.
-  //
-  // `[doctor reports degraded.](details) See §0.1` puts a whole URL between the
-  // stop and the whitespace, so nothing splits, the combined string carries the
-  // §0 pointer, and the claim is exempt in full -- the same failure the emphasis
-  // case had, reached through syntax no widening of that class can cover. Link
-  // syntax is removed before splitting instead, leaving the visible text, which
-  // is what a reader reads and what these rules are about.
-
-  // THE PREDICATES, defined ONCE and called by both the scan and its controls.
-  //
-  // They were inline regexes, duplicated into the control loop as separate
-  // literal copies. That is a control on the wrong side of a boundary: weaken or
-  // replace the production matcher and the controls keep compiling their own
-  // copies and stay green, so the check that exists to prove the guard still runs
-  // could not see the guard stop running. The clean documents supply no positive
-  // match of their own, so nothing else would have noticed either.
-  //
-  // `statesRuleOutcome` requires a STATE-BEARING predicate, not every definitional
-  // use of a verb. "R-01 is the merge-authority check" and "R-01 requires a status
-  // check" are what §6 is FOR -- durable statements of what a rule means -- and an
-  // earlier version rejected both, because it fired on `is` or `requires` within
-  // forty characters and spared only the single verb its control happened to pick.
-  // What makes a sentence a copy of doctor's answer is the OUTCOME word.
-  const RULE_OUTCOME = /\b(broken|degraded|failing|passing|clean|currently|today|right now|no required|not required|bypass(?:es|ed)?)\b/i
-  const NEGATIVE_CHECK = /\brequires? (no|none|nothing|zero)\b|\bno (required )?status check\b/i;
-  // PAST TENSE is what makes a sentence history, and the verb list is where that
-  // is decided -- there is no separate exemption, on purpose.
-  //
-  // "R-01 was broken on 2026-08-22" is exactly what this document should keep: it
-  // says why a rule changed, and a session that cannot read it repeats the
-  // investigation. An earlier version rejected it, because it accepted `was` and
-  // `were` beside the present-tense verbs and then found `broken` anywhere in the
-  // sentence. Dropping those two verbs fixes it at the source.
-  //
-  // I first fixed it by ADDING a historical exemption -- dates, `previously`,
-  // `at the time` -- and stubbing showed it was inert: removing it changed no
-  // result, because the verb list had already settled the question. It was also
-  // strictly worse than nothing, since it would have spared a live claim that
-  // happened to mention a date. Tolerance added is detection subtracted, and an
-  // exemption that never fires still widens what gets through.
-  // The outcome has to be the PREDICATE'S COMPLEMENT, not merely somewhere in the
-  // sentence. "R-01 requires a status check so a broken build cannot merge" is
-  // ordinary rule rationale -- `broken` describes the build -- and a sentence-wide
-  // test rejected it, which pushes exactly the explanation §6 exists to carry out
-  // of the document. Fifteen characters is the room for "is CURRENTLY broken" and
-  // "reports degraded TODAY", and not enough for a noun phrase to intervene.
-  const OUTCOME_NEAR = new RegExp(
-    `\\bR-\\d+\\b[^.]{0,60}?\\b(is|are|lets|allows|requires|carries|exempts|declares|reports?|remains?)\\b`
-    + `[^.]{0,15}?${RULE_OUTCOME.source}`, "i");
-  const statesRuleOutcome = s => /\bR-\d+\b/.test(s) && (OUTCOME_NEAR.test(s) || NEGATIVE_CHECK.test(s));
-
-  // `countsRemainingWork` matches a remaining-work CONSTRUCTION, with the
-  // qualifier attached to the count rather than merely somewhere in the sentence.
-  // Two independent sentence-wide tests rejected "the four PRs are still the
-  // programme size", which states a fixed size and is exactly what the
-  // neighbouring control claims to spare.
-  // An ORDINAL is not by itself a claim about what remains. "The first two PRs
-  // landed on 24 Aug" is durable history and the earlier version rejected it,
-  // because `first` and `next` were accepted unconditionally -- which pressures an
-  // author to delete valid context to get a green run. So an ordinal count has to
-  // appear in a construction that actually SAYS the items remain.
-  const REMAINS = /\b(remain(s|ing)?|left|outstanding|still to (land|come|do)|to go|not yet|are open|is open|still open)\b/i;
-  // COMPLETION puts a count in the past, which is history and not a claim about
-  // what is left. I argued that `last` was safe unconditionally, on the reasoning
-  // that nothing calls finished work "the last two" -- and "the last two PRs
-  // landed on 24 Aug" is precisely that. The reasoning was wrong, and the rule now
-  // turns on tense, exactly as the rule-outcome matcher above does.
-  //
-  // This exemption is load-bearing rather than decorative, which is the thing to
-  // check before keeping one: removing it turns both of the sentences below back
-  // into offenders, and there is a stub that proves it. An exemption that never
-  // fires would be a widened surface waiting for the input that reaches it.
-  // Completion has to attach to the COUNTED WORK. Exempting any sentence that
-  // contains a completion verb anywhere let a live claim through: "The final two
-  // PRs are open, although setup completed yesterday" is remaining work, and
-  // `completed` -- about the setup -- disabled the rule.
-  const COMPLETED_COUNT = /\b(last|final|remaining|first|one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b[^.]{0,20}?\b(landed|merged|shipped|completed|closed|went in|finished)\b/i;
-  const countsRemainingWork = s =>
-    // "The last two PRs of the durable-effect programme." -- a bare heading
-    // naming outstanding work, with no verb to place it in time.
-    (/\b(last|remaining|final)\s+(one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(s)
-     && !COMPLETED_COUNT.test(s))
-    // any count, when the sentence says they remain
-    || (/\b(first|next|last|one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(s)
-        && REMAINS.test(s))
-    || /\b(prs?|pull requests?|stages?)\s+(remaining|left|outstanding)\b/i.test(s);
+  // A DATE, in any form these documents actually use. Mechanical, and the only
+  // thing standing in for "this is history".
+  const DATED = /\b20\d\d-\d\d-\d\d\b|\b\d{1,2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\b|\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}\b/;
+  // A HEADING or a bold LABEL names its subject; it does not assert anything about
+  // it. Both are markdown structure rather than grammar, so recognising them
+  // needs no opinion about English: a line beginning `#`, or a sentence wholly
+  // wrapped in emphasis. Requiring "## 3. The durable-effect programme (§0)"
+  // would be noise for no reader's benefit, and a rule that fires on right text
+  // is weakened until someone turns it off.
+  const isHeading = s => /^\s*#/.test(s);
+  const isLabel = s => /^\s*\*\*[^*]+\*\*[.:,;]?\s*$/.test(s);
+  const excused = s => defersToZero(s) || DATED.test(s) || isHeading(s) || isLabel(s);
 
   const offenders = [];
   for (const [label, text] of [[HANDOFF, handoff.replace(/^## 0\. STATE[\s\S]*?(?=^## )/m, "")], [PROMPT, prompt]])
     for (const b of blocksOf(text)) {
-      const joined = b.lines.join(" ");
-      for (const sentence of sentencesOf(joined)) {
-        if (defersToZero(sentence)) continue;
-        const lowerS = sentence.toLowerCase();
-        const named = [...commands, ...subjectsInComments].filter(c => CLAIM(c).test(sentence))
-          .concat(rowWords
-            .filter(([, ws]) => ws.filter(w => new RegExp(`\\b${w}\\b`).test(lowerS)).length >= 4)
-            .map(([label]) => `${label} (restated, not named)`));
-        if (named.length) offenders.push(`${label}:${b.nums[0]} claims a "${named[0]}" outcome — ${sentence.trim().slice(0, 70)}`);
-      }
-      // Row LABELS are judged per sentence too, and that is the third time the
-      // block-scoped exemption has been the defect rather than the rule.
+      // A HEADING is judged as a block, not as sentences. "## 3. The
+      // durable-effect programme" splits at "3." into two, and the half carrying
+      // the subject no longer looks like a heading -- so the exemption has to be
+      // taken where the structure is still visible.
+      if (isHeading(b.lines[0])) continue;
+      // A LABEL carries its subject forward.
       //
-      // A block that mentions §0 anywhere was exempt in full. That is generous in
-      // exactly the wrong direction: the paragraphs most likely to restate a
-      // volatile fact are the ones ALREADY discussing it, so they are the ones
-      // carrying a §0 pointer. Three findings came from that one allowance -- a
-      // doctor outcome, a restated merge rule, and a progress count -- each in a
-      // block whose later sentence deferred correctly.
-      //
-      // The rule is the same one the other two halves already use: the deferral
-      // has to be in the same breath as the claim. A sentence that says "see §0"
-      // is exempt; the sentence next to it is not.
-      for (const sentence of sentencesOf(joined)) {
-        if (defersToZero(sentence)) continue;
+      // "**R-01.** It is broken right now." is two sentences: the first is a label
+      // and exempt, the second says "It" and names nothing. Neither offends, and
+      // together they state exactly what this rule exists to stop. Resolving a
+      // pronoun is grammar, and grammar is what was removed here -- but carrying
+      // the label's subject into the sentences that follow it needs no grammar at
+      // all, and covers the same case.
+      let carried = [];
+      for (const sentence of sentencesOf(b.lines.join(" "))) {
         const lower = sentence.toLowerCase();
-        const named = subjects.filter(s => lower.includes(s.toLowerCase()));
-        if (named.length) offenders.push(`${label}:${b.nums[0]} names "${named[0]}" — ${sentence.trim().slice(0, 70)}`);
-
-        // Two shapes that recurred and that nothing above could see. Both were
-        // found in review AFTER a fix that did not cover them, which is the whole
-        // reason they are rules and not resolutions to be careful.
-
-        // A RULE'S OUTCOME. §6 explains what R-01 and R-03 mean; what either
-        // currently reports is doctor's answer. A sentence that says an R-number
-        // "is" or "lets" or "requires" something has copied that answer, and the
-        // copy primes a reader to treat real drift as the finding they expected.
-        if (statesRuleOutcome(sentence))
-          offenders.push(`${label}:${b.nums[0]} states an R-rule's OUTCOME — ${sentence.trim().slice(0, 70)}`);
-
-        // A COUNT OF REMAINING WORK. "The last two PRs" is true until one lands
-        // and then silently sequences a session onto work that is done. §0 says
-        // which stages remain; a number here is a second copy of that.
-        if (countsRemainingWork(sentence))
-          offenders.push(`${label}:${b.nums[0]} counts REMAINING work — ${sentence.trim().slice(0, 70)}`);
+        const here = subjects.filter(s => lower.includes(s.toLowerCase()))
+          .concat(SUBJECT_PATTERNS.filter(([re]) => re.test(sentence)).map(([, n]) => n));
+        if (isLabel(sentence)) { carried = here; continue; }
+        if (excused(sentence)) { carried = []; continue; }
+        const named = here.concat(carried.map(s => `${s} (from the label above)`))
+          .concat(rowValues
+            .filter(([, ws]) => ws.filter(w => new RegExp(`\\b${w}\\b`).test(lower)).length >= 4)
+            .map(([l]) => `${l} (restated, not named)`));
+        if (named.length)
+          offenders.push(`${label}:${b.nums[0]} names "${named[0]}" and neither defers nor dates — ${sentence.trim().slice(0, 70)}`);
       }
     }
-  check(offenders.length === 0, "no block outside §0 names a §0 subject without deferring to it",
-    offenders.slice(0, 4).join("\n        "));
+  check(offenders.length === 0,
+    "every sentence naming something §0 owns either defers to §0 or carries a date",
+    offenders.slice(0, 5).join("\n        "));
 
-  // Controls, because both rules above are regexes over prose and a regex that
-  // stopped matching would read exactly like documents that stopped offending.
-  // Both directions, and the SPARING half matters more: these documents are
-  // required to explain what each rule means and how large the programme is, so a
-  // matcher that rejects durable statements does not merely annoy -- it pushes the
-  // explanation out of the document that exists to carry it.
+  // Controls. Both ways of satisfying the rule, and the shape that satisfies
+  // neither -- driven through the same `excused` the scan uses, not a copy of it.
   for (const [what, sample, want] of [
-    ["an R-rule outcome", "R-01 is currently broken and lets admins bypass every rule.", true],
-    ["an R-rule outcome in other words", "R-01 reports degraded today.", true],
-    ["a remaining-work count", "The last two PRs of the programme remain.", true],
-    ["a remaining-work count phrased the other way round", "Two stages still remain.", true],
-    ["a rule's MEANING, which is durable", "R-01 means reeve must stand as a required check.", false],
-    ["a rule DEFINED with an ordinary verb", "R-01 is the merge-authority check.", false],
-    ["a rule's requirement, which does not expire", "R-01 requires a status check to exist.", false],
-    ["the programme's own size, which does not change", "§3.2 lists all four PRs of the plan.", false],
-    ["a fixed size stated with an unrelated qualifier", "The four PRs are still the programme size.", false],
-    ["a negative status-check claim", "R-01 requires no status check.", true],
-    ["dated history, which this document exists to keep", "R-01 was broken on 2026-08-22.", false],
-    ["past-tense history with no date", "R-03 was previously degraded.", false],
-    ["a LIVE claim that happens to mention a date", "R-01 is currently broken, as on 2026-08-22.", true],
-    ["an ordinal in durable history", "The first two PRs landed on 24 Aug.", false],
-    ["an ordinal that DOES say work remains", "The first two PRs are still outstanding.", true],
-    ["a LAST-count in durable history", "The last two PRs landed on 24 Aug.", false],
-    ["a FINAL-count in durable history", "The final two stages landed together.", false],
-    ["a bare heading naming outstanding work", "The last two PRs of the durable-effect programme.", true],
-    ["rule rationale mentioning a broken BUILD", "R-01 requires a status check so a broken build cannot merge.", false],
-    ["a live count beside an unrelated completion", "The final two PRs are open, although setup completed yesterday.", true],
-    // Isolates the BINDING. The case above is also caught by the remaining-work
-    // predicate ("are open"), so it passes whether or not completion is tied to
-    // the count -- it proves the rule and not the binding. This one has no
-    // remaining predicate at all, so only the binding can catch it, and the stub
-    // that unbinds completion turns it green.
-    ["a live count whose only completion word is unrelated",
-     "The final two PRs of the programme, although setup completed yesterday.", true],
-  ]) check((statesRuleOutcome(sample) || countsRemainingWork(sample)) === want,
-           `control: the state-claim rules ${want ? "catch" : "spare"} ${what}`, sample);
+    ["a bare state claim", "R-01 is broken.", false],
+    ["one that defers to §0", "Whether R-01 is broken is a §0 fact.", true],
+    ["one carrying an ISO date", "R-01 was broken on 2026-08-22.", true],
+    ["one carrying a written date", "R-01 was broken on 22 Aug.", true],
+    ["a dated count", "The last two PRs landed on 24 Aug.", true],
+    ["an undated count", "The last two PRs of the programme.", false],
+    ["a section heading", "## 3. The durable-effect programme", true],
+    ["a bold label", "**R-01, the merge authority.**", true],
 
-  // A sentence ending inside a LINK still splits, so a claim cannot hide behind
-  // URL syntax the way it hid behind bold.
+  ]) check(excused(sample) === want, `control: "defer or date" ${want ? "excuses" : "catches"} ${what}`, sample);
+
+  check(fromLabelTokens.length >= 2, "control: §0's row labels yielded reusable terms",
+    fromLabelTokens.join(" / "));
+  check(SUBJECT_PATTERNS.every(([re]) => re.test("R-01 is broken.")),
+    "control: and an R-number is recognised as a subject §0 owns", "");
+
+  // And the two ways a sentence can hide from the scan, which are about markdown
+  // rather than about grammar and are therefore still worth checking.
   check(sentencesOf("[doctor reports degraded.](d/e.md) See §0.1").length === 2,
-    "control: a sentence ending inside a markdown link is still two sentences",
-    JSON.stringify(sentencesOf("[doctor reports degraded.](d/e.md) See §0.1")));
+    "control: a sentence ending inside an inline link is still two sentences", "");
+  check(sentencesOf("[doctor reports degraded.][ref] See §0.1").length === 2,
+    "control: and so is one inside a reference-style link", "");
+  check(sentencesOf("**The last two PRs.** See §0.").length === 2,
+    "control: and one ending in emphasis", "");
 }
 
 // --- DERIVED: the prompt names no PR and no commit ---------------------------

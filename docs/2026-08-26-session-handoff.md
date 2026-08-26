@@ -207,7 +207,7 @@ because re-deriving them costs more than reading them.
 
 ### 3.4 The gates, and why there are two
 
-`--execute` is "may reeve act at all". `watch.reviewActions` is "may it act on
+`--execute` is "may reeve act at all" — §0 says how it is currently set. `watch.reviewActions` is "may it act on
 review threads". **Both are required to queue an effect AND to deliver one.**
 
 Gating only production is not enough: a queue outlives the run that made it, so
@@ -313,14 +313,14 @@ merely notice one, by giving it the thread details it is dispatched with.
 **Bring `docs/TRACKER.md` up to date.** §0 says how current it is. What is owed:
 the PR split and why, the two halves, and this session's findings.
 
-**R-01, the merge authority.** What the rule MEANS: reeve's fourth capability
+**R-01, the merge authority.** What the rule MEANS, with §0 for its state: reeve's fourth capability
 stands between a pull request and `main` as a required status check, so it needs
 a ruleset that actually requires one and does not exempt the people most likely to
 merge. Whether it does today is §0.1's doctor line, not a sentence here.
 Instructions were written and sent to the founder on 2026-08-24; they need the
 founder's account, about fifteen minutes.
 
-**R-03, the merge shape.** What the rule MEANS: a gate that assumes squash merges
+**R-03, the merge shape.** What the rule MEANS, with §0 for its state: a gate that assumes squash merges
 reasons about ancestry differently from one that expects merge commits, so the
 repository's declared shape and its actual history have to agree. Whether they do
 today is §0.1's doctor line.
@@ -392,13 +392,13 @@ question: **can reeve be armed and left alone?**
 
 The order that follows from that:
 
-1. **The durable-effect programme finished** (§3), because it is what makes reeve
+1. **The durable-effect programme finished** (§3, with §0 for where it stands), because it is what makes reeve
    able to close a loop rather than only report on one.
 2. **A real dispatch on a real repository** — see §0 for what has actually been
    proven so far, which is the whole reason this ranks second. In this project a
    dispatch once found what roughly 640 green tests missed.
-3. **R-01**, because refusing an unsafe merge means standing as a required status
-   check, and a ruleset with no required checks has nowhere to stand.
+3. **R-01** (§0 for its state), because refusing an unsafe merge means standing
+   as a required status check, and a ruleset with no required checks has nowhere
 4. **The merge-refusal capability** (§2, fourth row), after a shadow week.
 
 Re-arming is the founder's decision at every step, and §0 records that the current

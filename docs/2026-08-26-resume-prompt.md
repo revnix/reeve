@@ -30,9 +30,9 @@ in either document outside §0 without deferring to it.
 
 Run §0.1's command block. Every one of those lines matters, but two especially:
 
-  · The `ps` line is not optional. `launchctl kickstart` restarts from launchd's
-    CACHED plist, so the file can say `--execute` while the running process does
-    not. That happened once and I nearly reported it as done. If the process and
+  · The `ps` line in §0.1 is not optional, because `launchctl kickstart` restarts
+    from launchd's CACHED plist — so the file can say `--execute` while the
+    running process does not. That happened once and I nearly reported it as done. If the process and
     §0 disagree about arming, find out which changed before doing anything else.
     The same gap applies to CODE: a running daemon holds the modules it loaded at
     startup, so the checkout's `HEAD` is not what it runs. The daemon writes its
@@ -40,12 +40,13 @@ Run §0.1's command block. Every one of those lines matters, but two especially:
     substitute `git log -1 HEAD` for it — that reports a fix as deployed when the
     restart it needed has not happened.
 
-  · The sqlite line must use `-readonly` and the PER-REPO path. `sqlite3` opens a
-    missing file by CREATING it, so a wrong path answers "zero rows" for a
-    database it just made. That exact mistake produced a confident zero once.
+  · §0.1's sqlite line must use `-readonly` and the PER-REPO path, because
+    `sqlite3` opens a missing file by CREATING it — so a wrong path answers "zero
+    rows" for a database it just made. That mistake produced a confident zero on
+    2026-08-24.
 
 §0.1 runs doctor; whatever it reports is the answer. §6 says what R-01 and R-03
-MEAN and which of them need me, and deliberately records no outcome for either,
+MEAN and which of them need me, and leaves every outcome to §0,
 because a resumed session told to expect a finding will read real drift as the
 expected one.
 
@@ -147,11 +148,11 @@ and concede plainly when they are right.
 
 ## What needs me, so you do not wait on it silently
 
-§6 has these in full, and says what each MEANS rather than what any command
-reported yesterday: R-01, the merge-authority ruleset; whether to re-arm; the
-second project; and the ntfy read user. For R-01's current shape, run §0.1's
-doctor line — a summary here would prime you to read real drift as the finding you
-were told to expect.
+§6 has these in full and §0 holds every current state for them, so what follows is
+only what each one IS: R-01, the merge-authority ruleset; whether to re-arm; the
+second project; and the ntfy read user. Every current state for them is a §0
+fact — a summary here would prime you to read real drift as the finding you were
+told to expect.
 
 Work autonomously, tell me when you need something, and do not claim anything is
 verified that you have not run.

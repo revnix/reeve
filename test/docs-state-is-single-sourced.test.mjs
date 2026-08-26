@@ -102,15 +102,40 @@ const blocksOf = text => {
   return blocks;
 };
 
+// Sentence machinery, at module scope because EVERY matcher needs it.
+//
+// A sentence ends at a stop, but these documents put emphasis and links between
+// that stop and the next space -- "**...programme.** §3.2 says", or
+// "[doctor reports degraded.](d.md) See §0.1" -- so a naive split leaves the
+// paragraph whole, the §0 pointer in it exempts the lot, and the claim beside the
+// pointer walks through. Both markdown link forms are removed first, leaving the
+// visible text, which is what a reader reads and what these rules are about.
+const SENTENCE = /(?<=[.!?][*_`"')\]]*)\s+/;
+const unlink = s => s
+  .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")     // [text](target)
+  .replace(/\[([^\]]*)\]\[[^\]]*\]/g, "$1");   // [text][ref]
+const sentencesOf = s => unlink(s).split(SENTENCE);
+// A PARENTHETICAL `(§0)` defers. It used to be stripped before this test, from a
+// design where the exemption was block-scoped and a passing citation could excuse
+// a whole paragraph. Under clause scoping that concern is gone -- the pointer
+// only ever excuses the clause it sits in -- and the strip had become a direct
+// contradiction: `(§0)` is exactly the form this rule now asks authors to write,
+// and it was the one form that did not count.
+const defersToZero = s => /§0/.test(s);
+
 const offendersIn = text => {
   const out = [];
   for (const b of blocksOf(text)) {
-    const joined = b.lines.join(" ");
-    const defers = /§0/.test(joined.replace(/\(§0\)/g, ""));
-    if (defers) continue;
-    b.lines.forEach((line, k) => {
-      if (STATE_CLAIMS.some(re => re.test(line))) out.push(`${b.nums[k]}: ${line.trim().slice(0, 88)}`);
-    });
+    // PER SENTENCE, like every other matcher in this file. This one was left
+    // block-scoped when the others were fixed, and a claim beside a pointer went
+    // straight through it -- "The work is still open. See §0 for details." was
+    // green. Declaring a class swept is not sweeping it: the fix has to be
+    // applied at every site, and this is the site that was missed.
+    for (const sentence of sentencesOf(b.lines.join(" "))) {
+      if (defersToZero(sentence)) continue;
+      if (STATE_CLAIMS.some(re => re.test(sentence)))
+        out.push(`${b.nums[0]}: ${sentence.trim().slice(0, 88)}`);
+    }
   }
   return out;
 };
@@ -151,134 +176,291 @@ const offendersIn = text => {
 // would fire on correct prose everywhere, and a guard that fires on right text is
 // weakened until it catches nothing.
 {
+  // DEFER OR DATE. One rule, and it cannot be wrong about English.
+  //
+  // This check used to try to understand grammar: whether a verb was past tense,
+  // whether an outcome word described the rule or the build, whether a count was
+  // history or work remaining. It took five review rounds and eighteen findings
+  // and the counts went 6, 5, 1, 6 -- every round found another sentence shape
+  // judged wrongly, and every fix traded a false alarm for a missed case or the
+  // reverse. English has no end of shapes, so that instrument has no end of
+  // rounds. The founder's call was to stop grinding it and change the instrument.
+  //
+  // What is left is mechanical. A sentence that names something §0 owns must
+  // either point at §0, or carry a DATE. Nothing here inspects tense, mood or
+  // predicate structure. A date is unambiguous where past tense is not, and both
+  // ways of satisfying the rule are things an author can see and add:
+  //
+  //   "R-01 was broken on 2026-08-22."          -> dated, so it is history. Fine.
+  //   "Whether R-01 is broken is a §0 fact."     -> defers. Fine.
+  //   "R-01 is broken."                          -> neither. That is the defect.
+  //
+  // The cost is real and is the trade the founder chose: some historical prose
+  // now carries a date it would not otherwise need. That is cheap, visible, and
+  // never wrong -- which the grammar rules could not manage.
   const zero = /^## 0\. STATE[\s\S]*?(?=^## )/m.exec(handoff)?.[0] ?? "";
-  const subjects = [...zero.matchAll(/^\|\s*([^|]+?)\s*\|/gm)]
+
+  // The subjects, derived from §0 so there is no second list to maintain.
+  //
+  // §0.2's row labels, and the backticked terms in §0.1's comments -- which is
+  // where §0.1 already says what each command answers. A label needs more than
+  // one word and one distinctive word: `main` alone appears in correct prose
+  // everywhere, and a guard that fires on right text is weakened until it catches
+  // nothing. That much judgement stays, because it is about naming rather than
+  // about grammar, and it is settled by looking at §0 rather than at a sentence.
+  const fromRows = [...zero.matchAll(/^\|\s*([^|]+?)\s*\|/gm)]
     .map(m => m[1].replace(/`/g, "").trim())
-    // A label is usable as a search term when it has more than one word AND at
-    // least one word distinctive enough not to appear everywhere. The first
-    // version used a character count, which is a proxy for that and a bad one:
-    // "the tracker" is eleven characters, fell under it, and the twelfth copy --
-    // "the tracker has no record of 22-24 Aug at all" -- walked straight through.
-    // Length was never the property that mattered; having a word worth searching
-    // for was.
     .filter(s => s && !/^-+$/.test(s)
                  && s.split(/\s+/).length >= 2
                  && s.split(/[\s,]+/).some(w => w.length >= 6))
-    // A label carrying an em-dash gloss ("capability 1 — watch, judge, escalate")
-    // is policed by its stem, which is the part prose actually reuses.
     .map(s => s.split(" — ")[0].trim());
-  // §0.1's COMMANDS are subjects too, and leaving them out was a real gap.
+  // A row's distinctive TOKENS, not only its whole label.
   //
-  // The rule §0 states is that a fact a command can answer must not be written
-  // down. The guard only policed §0.2's table, so §0.2's subjects were enforced
-  // and §0.1's were not -- and a sentence asserting yesterday's `doctor` outcome
-  // sat outside §0 through a passing run of this very test. The half of §0 that
-  // matters MORE was the unpoliced half.
-  //
-  // Derived from the block rather than listed here, so adding a command to §0.1
-  // starts policing it with no second place to remember. Only tokens long enough
-  // to be distinctive: `git`, `gh`, `ps` and `grep` appear in correct prose
-  // everywhere, and a guard that fires on right text is weakened until it catches
-  // nothing.
-  const commands = [...new Set(
-    (/```bash\n([\s\S]*?)```/.exec(zero)?.[1] ?? "")
-      .split("\n")
-      // A TRAILING comment is still a comment. Splitting the whole line pulled
-      // prose out of `grep ... # the review shadow streak` and started policing
-      // the word "review", which fires on correct text in both documents.
-      .map(l => l.split("#")[0].trim())
-      .filter(Boolean)
-      // The executable and its subcommand only. Arguments are paths, flags and
-      // repository names, none of which is the name of a question.
-      .flatMap(l => l.split(/\s+/).slice(0, 2))
-      .map(w => w.replace(/^\.?\/?(?:bin\/)?/, "").replace(/[^\w-]/g, ""))
-      .filter(w => w.length >= 6 && /^[a-z][\w-]*$/.test(w)))];
+  // Matching the label as one string is too literal to be useful: the row reads
+  // "the durable-effect stages" and the prose says "the durable-effect programme",
+  // the row reads "`--execute` is OFF on purpose" and the prose says "the
+  // --execute flag". Both name the same owned fact and neither contains the
+  // label. Backticked terms and hyphenated compounds are the parts prose actually
+  // reuses, and they are distinctive enough not to fire on ordinary text.
+  const fromLabelTokens = [...new Set([...zero.matchAll(/^\|\s*([^|]+?)\s*\|/gm)]
+    .flatMap(m => [...m[1].matchAll(/`([^`]+)`/g)].map(b => b[1])
+      .concat(m[1].split(/\s+/).filter(w => /^[a-z][a-z]+-[a-z-]+$/i.test(w))))
+    .map(s => s.trim()).filter(s => s.length >= 6))];
+  const bash = /```bash\n([\s\S]*?)```/.exec(zero)?.[1] ?? "";
+  // The backticked terms in §0.1's COMMENTS, which is where §0.1 already says
+  // what each command answers.
+  // NO LENGTH FILTER here, and that was a real hole. A term is in a §0.1 comment
+  // and in backticks because §0.1 is naming it as the thing that command answers
+  // -- `main`, `HEAD`, `run`. Dropping them for being short meant "HEAD points at
+  // 1234567." passed, which is exactly a fact §0.1 exists to measure. The length
+  // filter is for terms INFERRED from a label, where a common word would fire on
+  // ordinary prose; these are declared, so there is nothing to infer.
+  const fromComments = [...bash.matchAll(/#[^\n]*/g)]
+    .flatMap(m => [...m[0].matchAll(/`([^`]+)`/g)].map(b => b[1]))
+    .map(s => s.trim()).filter(Boolean);
+  // And the COMMAND NAMES themselves. Dropping these was a regression I nearly
+  // shipped: the simplification passed on clean documents, and the stub loop then
+  // showed it caught NONE of the four defects the old rules had caught -- a
+  // sentence stating a `doctor` outcome walked straight through. Simplifying the
+  // DECISION is the change the founder asked for; narrowing what the decision is
+  // made ABOUT was an accident of the same edit.
+  const fromCommands = [...new Set(bash.split("\n")
+    // A CONTINUATION line is not a command. The sqlite query wraps, and its
+    // second line begins `(select count(*) ...` -- so `select` became a
+    // "command name" and any durable sentence containing the word Select was
+    // rejected. Continuations and quoted bodies are indented; command starts are
+    // not, which is a fact about the block's own formatting rather than a guess.
+    .filter(l => !/^\s/.test(l))
+    .map(l => l.split("#")[0].trim()).filter(Boolean)
+    .flatMap(l => l.split(/\s+/).slice(0, 2))
+    // A QUOTED token is an argument, never a command name. `grep "daemon
+    // starting"` contributed `daemon`, which then matched every sentence in §1
+    // describing what the daemon IS -- durable prose that has no business
+    // deferring to §0. The rule fired on right text, which is how a guard gets
+    // weakened until someone turns it off.
+    .filter(w => !/^["']/.test(w))
+    .map(w => w.replace(/^\.?\/?(?:bin\/)?/, "").replace(/[^\w-]/g, ""))
+    .filter(w => w.length >= 6 && /^[a-z][\w-]*$/.test(w)))];
+  const subjects = [...new Set([...fromRows, ...fromLabelTokens, ...fromComments, ...fromCommands])];
 
-  // The SHORT commands need their subject, because their name is not usable.
-  //
-  // `git`, `gh` and `ps` are three, two and two characters and appear in correct
-  // prose everywhere, so the length filter above drops them -- which left the
-  // measurements they perform completely unpoliced while this test claimed to
-  // cover §0.1. Demonstrated rather than argued: "the current main tip contains
-  // the outbox repair" outside §0 passed a green run of this file.
-  //
-  // §0.1 already names each subject, in backticks, in the comment on its own
-  // line. That is the thing to read: a command added with a comment is policed by
-  // what the comment says it answers, and there is no second list to maintain.
-  const subjectsInComments = [...new Set(
-    [...(/```bash\n([\s\S]*?)```/.exec(zero)?.[1] ?? "").matchAll(/#[^\n]*/g)]
-      .flatMap(m => [...m[0].matchAll(/`([^`]+)`/g)].map(b => b[1]))
-      .map(s => s.trim().toLowerCase())
-      .filter(s => s && s.length >= 3))];
+  // The RULE IDENTIFIERS, which §0.1's doctor line owns and no row names.
+  // Mechanical: an R-number is unambiguous, and every claim about one is a claim
+  // about what doctor currently reports. History carries a date and is excused
+  // like anything else, so this needs no opinion about tense.
+  const SUBJECT_PATTERNS = [
+    [/\bR-\d+\b/, "an R-rule outcome"],
+    // A BARE COMMIT HASH is a §0 fact whoever it belongs to, and naming its
+    // subject is not always possible: "The running daemon is at abcdef1" is a
+    // claim about what the process loaded, and the only word tying it to §0.1 is
+    // `daemon` -- which these documents use constantly to say what reeve IS.
+    // Policing the hash instead needs no subject at all, and the handoff carries
+    // none outside §0 today, so it costs nothing. History cites pull requests,
+    // which never go stale, and those are untouched.
+    // At least one DIGIT. `deadbeef`, `facade`, `decade` and `access` are valid
+    // hex and ordinary English, and rejecting a sentence for containing one would
+    // be the kind of false alarm that gets a guard switched off. A real short sha
+    // without a single digit is about one in a thousand, which is a residual I can
+    // name rather than a hole I have not noticed.
+    [/(?<![\w/#-])(?=[0-9a-f]{7,40}(?![\w/-]))[a-f]*[0-9][0-9a-f]*/, "a bare commit hash"],
+  ];
 
-  check(commands.length >= 2, "control: §0.1's command block yielded commands to police",
-    commands.join(" / "));
-  check(subjectsInComments.length >= 2,
-    "control: and its comments yielded the subjects its short commands measure",
-    subjectsInComments.join(" / "));
-
-  // A row's VALUE is as volatile as its label, and it was not policed at all.
-  //
-  // The label check catches "the founder's merge rule says X". It does not catch a
-  // paragraph that never names the rule and simply RESTATES it -- which is what the
-  // resume prompt did with the merge condition, through green runs of this file.
-  // §0 says change these here and nowhere else; a copy that avoids the label is
-  // still a copy, and it is the one that goes stale silently because nothing links
-  // it back.
-  //
-  // Matched by distinctive-word OVERLAP rather than as a substring, because a
-  // restatement is never a substring: "merge on CI green AND zero open threads"
-  // became "merge when CI is green AND zero threads are open". Four words from one
-  // row, in one sentence, is a restatement rather than a coincidence -- three
-  // fired on ordinary prose when I tried it.
+  // A row's VALUE is owned by §0 as surely as its label, and a restatement never
+  // contains the label -- which is how the founder's merge rule came to be copied
+  // into the prompt in different words. Matched by distinctive-word OVERLAP,
+  // because a restatement is never a substring. Four words from one row in one
+  // sentence is a restatement; three fired on ordinary prose when I tried it.
   const STOP = new Set(["that","this","with","from","have","been","were","will","when","then",
                         "over","into","only","also","which","after","before","their","there",
                         "would","could","should","about","while","every","because","rather"]);
-  const rowWords = [...zero.matchAll(/^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*$/gm)]
+  const rowValues = [...zero.matchAll(/^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*$/gm)]
     .map(m => [m[1].replace(/`/g, "").trim(),
                [...new Set(m[2].toLowerCase().replace(/[^a-z0-9\s-]/g, " ").split(/\s+/)
                  .filter(w => w.length >= 4 && !STOP.has(w)))]])
     .filter(([, ws]) => ws.length >= 5);
-  check(rowWords.length >= 3, "control: §0's rows yielded VALUES to police, not only labels",
-    rowWords.map(([l, w]) => `${l}(${w.length})`).join(" "));
 
-  check(subjects.length >= 4, "control: §0's table yielded subjects to police",
+  check(subjects.length >= 8, "control: §0 yielded the subjects it owns",
     `${subjects.length}: ${subjects.join(" / ")}`);
+  check(rowValues.length >= 3, "control: and the row VALUES a restatement would copy",
+    rowValues.map(([l, w]) => `${l}(${w.length})`).join(" "));
 
-  // A claim about a COMMAND is judged per SENTENCE, not per block.
+  // A DATE, in any form these documents actually use. Mechanical, and the only
+  // thing standing in for "this is history".
+  const DATE = /\b20\d\d-\d\d-\d\d\b|\b\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\b|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}\b/;
+  // "SINCE <date>" is not history. It is a claim that reaches today with a
+  // starting point attached, and a date escape that took it at face value would
+  // excuse the most confident form of the thing this rule exists to stop:
+  // "R-01 has been broken since 2026-08-22." Mechanical -- the word before the
+  // date -- so it needs no view about tense.
+  const ONGOING = new RegExp(`\\b(since|as of|from)\\s+(?:${DATE.source})`, "i");
+  // A NOW-WORD beside a date is two time references that disagree, and the date
+  // must not win. "R-01 was broken on 2026-08-22 and remains broken today" is
+  // dated history welded to a live claim, and excusing the whole thing on the
+  // date let the most confident form of a stale outcome through. Mechanical --
+  // a closed list of words that mean "at the time of reading" -- so it needs no
+  // view about tense, only the observation that a past date cannot make a
+  // present-tense claim historical.
+  const NOW_WORD = /\b(today|now|currently|still|at present|as things stand|remains?|these days)\b/i;
+  const DATED = s => DATE.test(s) && !ONGOING.test(s) && !NOW_WORD.test(s);
+  // A HEADING or a bold LABEL names its subject; it does not assert anything about
+  // it. Both are markdown structure rather than grammar, so recognising them
+  // needs no opinion about English: a line beginning `#`, or a sentence wholly
+  // wrapped in emphasis. Requiring "## 3. The durable-effect programme (§0)"
+  // would be noise for no reader's benefit, and a rule that fires on right text
+  // is weakened until someone turns it off.
+  // WORD BOUNDARIES, not substrings. `main` is a subject and `remaining` contains
+  // it, so a substring test rejected a sentence about a drainer's remaining
+  // budget for naming the default branch. This had to arrive WITH the change that
+  // stopped dropping short declared subjects: keeping `main` under a substring
+  // test would have fired on ordinary prose everywhere, which is how a guard gets
+  // switched off rather than fixed.
+  const namesSubject = (sentence, s) => {
+    // CASE MATTERS when the subject carries a capital. `HEAD` is a git ref and
+    // `head` is an ordinary English word these documents use constantly -- "the
+    // head, the profile", "the MERGED head" -- so a case-insensitive match
+    // rejected four sentences that had nothing to do with the ref. A subject
+    // written in lower case (`main`, `doctor`) is matched either way, because
+    // nothing is lost by it.
+    const cased = /[A-Z]/.test(s);
+    const esc = s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const lead = /^[a-z0-9]/i.test(s) ? "\\b" : "";
+    const tail = /[a-z0-9]$/i.test(s) ? "\\b" : "";
+    return new RegExp(`${lead}${esc}${tail}`, cased ? "" : "i").test(sentence);
+  };
+  // NO STRUCTURAL EXEMPTIONS. Not for headings, not for bold labels, not for
+  // table rows.
   //
-  // The block-scoped exemption is right for a table subject: a paragraph that
-  // defers to §0 is discussing the subject, not restating it. It is wrong here,
-  // and measurably so. The sentence this whole widening exists to catch --
-  // "doctor reports the repository declares squash while 8 of the last 20 commits
-  // are merge commits" -- sat in a paragraph that already ended with "see §0.1",
-  // so a block-scoped test waved it through, and I confirmed that by putting the
-  // sentence back and watching the guard stay green. A paragraph can defer to §0
-  // and still copy an answer out of it, so the deferral has to be in the same
-  // breath as the claim.
-  const esc = s => s.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
-  const CLAIM = c => new RegExp(
-    `\\b${esc(c)}\\b[^.]{0,40}\\b(reports?|said|says?|shows?|returns?|answers?|reported|contains?|sits at|is at|points at|tip|broken|degraded|clean|zero|empty)\\b`, "i");
+  // I added all three to avoid editing prose, and review found a hole in each in
+  // the round after it landed: a bold assertion at the END of a block counted as
+  // a "lead-in" because something else in the block came first; a state claim
+  // written as a heading vanished with the heading line; a state column under the
+  // word "outcome" escaped both this scan and the rule that polices state
+  // columns. Every fix made an exemption narrower and the next round found the
+  // next shape -- which is the pattern "defer or date" was chosen to END, and I
+  // had reintroduced it one softening at a time.
+  //
+  // The rule is the rule now. A heading or a label naming something §0 owns says
+  // "(§0)" like any other text: a handful of one-time edits, against an unbounded
+  // stream of exemption holes.
+  //
+  // CLAUSES, because a date excuses the clause it belongs to and not the sentence
+  // around it. "R-01 was broken on 2026-08-22 and remains broken today" is two
+  // claims -- one dated and finished, one live and naked -- and judging the
+  // sentence whole let the date carry the live half.
+  const clausesOf = s => s.split(/;|\s+—\s+|,\s+(?:and|but|although|though|while)\s+/i);
+  const excused = s => defersToZero(s) || DATED(s);
+
   const offenders = [];
   for (const [label, text] of [[HANDOFF, handoff.replace(/^## 0\. STATE[\s\S]*?(?=^## )/m, "")], [PROMPT, prompt]])
     for (const b of blocksOf(text)) {
-      const joined = b.lines.join(" ");
-      for (const sentence of joined.split(/(?<=[.!?])\s+/)) {
-        if (/§0/.test(sentence.replace(/\(§0\)/g, ""))) continue;
-        const lowerS = sentence.toLowerCase();
-        const named = [...commands, ...subjectsInComments].filter(c => CLAIM(c).test(sentence))
-          .concat(rowWords
-            .filter(([, ws]) => ws.filter(w => new RegExp(`\\b${w}\\b`).test(lowerS)).length >= 4)
-            .map(([label]) => `${label} (restated, not named)`));
-        if (named.length) offenders.push(`${label}:${b.nums[0]} claims a "${named[0]}" outcome — ${sentence.trim().slice(0, 70)}`);
+      // A HEADING is judged as a block, not as sentences. "## 3. The
+      // durable-effect programme" splits at "3." into two, and the half carrying
+      // the subject no longer looks like a heading -- so the exemption has to be
+      // taken where the structure is still visible.
+      // The heading LINE, not the block. Markdown does not require a blank line
+      // after a heading, so "## Doctor state" followed straight by a paragraph is
+      // one block -- and skipping the block skipped the paragraph with it.
+      const body = b.lines;
+      // A LABEL carries its subject forward.
+      //
+      // "**R-01.** It is broken right now." is two sentences: the first is a label
+      // and exempt, the second says "It" and names nothing. Neither offends, and
+      // together they state exactly what this rule exists to stop. Resolving a
+      // pronoun is grammar, and grammar is what was removed here -- but carrying
+      // the label's subject into the sentences that follow it needs no grammar at
+      // all, and covers the same case.
+      let carried = [];
+      const sentences = sentencesOf(body.join(" ")).flatMap(clausesOf);
+      for (const sentence of sentences) {
+        const lower = sentence.toLowerCase();
+        const here = subjects.filter(s => namesSubject(sentence, s))
+          .concat(SUBJECT_PATTERNS.filter(([re]) => re.test(sentence)).map(([, n]) => n));
+        if (excused(sentence)) { carried = []; continue; }
+        const named = here.concat(carried.map(s => `${s} (carried from earlier in the block)`))
+          .concat(rowValues
+            .filter(([, ws]) => ws.filter(w => new RegExp(`\\b${w}\\b`).test(lower)).length >= 4)
+            .map(([l]) => `${l} (restated, not named)`));
+        carried = here.length ? here : carried;
+        if (named.length)
+          offenders.push(`${label}:${b.nums[0]} names "${named[0]}" and neither defers nor dates — ${sentence.trim().slice(0, 70)}`);
       }
-      if (/§0/.test(joined.replace(/\(§0\)/g, ""))) continue;
-      const lower = joined.toLowerCase();
-      const named = subjects.filter(s => lower.includes(s.toLowerCase()));
-      if (named.length) offenders.push(`${label}:${b.nums[0]} names "${named[0]}" — ${joined.trim().slice(0, 70)}`);
     }
-  check(offenders.length === 0, "no block outside §0 names a §0 subject without deferring to it",
-    offenders.slice(0, 4).join("\n        "));
+  check(offenders.length === 0,
+    "every sentence naming something §0 owns either defers to §0 or carries a date",
+    offenders.slice(0, 5).join("\n        "));
+
+  // Controls. Both ways of satisfying the rule, and the shape that satisfies
+  // neither -- driven through the same `excused` the scan uses, not a copy of it.
+  for (const [what, sample, want] of [
+    ["a bare state claim", "R-01 is broken.", false],
+    ["one that defers to §0", "Whether R-01 is broken is a §0 fact.", true],
+    ["one carrying an ISO date", "R-01 was broken on 2026-08-22.", true],
+    ["one carrying a written date", "R-01 was broken on 22 Aug.", true],
+    ["a dated count", "The last two PRs landed on 24 Aug.", true],
+    ["an ONGOING claim wearing a date", "R-01 has been broken since 2026-08-22.", false],
+    // THE TRADE, stated rather than discovered again. Rationale that names an
+    // R-rule is not excused: "R-01 requires a status check so a broken build
+    // cannot merge" has to say "(§0 for its state)" or carry a date. The previous
+    // design tried to tell rationale from a live claim by reading the sentence,
+    // and that is what cost five rounds. Asking the author for four words is the
+    // price of a rule that can never be wrong about English, and it is the price
+    // the founder chose.
+    ["rationale that names a rule, which must still defer",
+     "R-01 requires a status check so a broken build cannot merge.", false],
+    ["another ongoing form", "doctor has reported degraded as of 2026-08-22.", false],
+    ["an undated count", "The last two PRs of the programme.", false],
+    // Structure buys nothing now. A heading and a label are text like any other,
+    // and each of these was an exemption that review found a hole in.
+    ["a section heading naming a subject", "## 3. The durable-effect programme", false],
+    ["the same heading, deferring", "## 3. The durable-effect programme (§0)", true],
+    ["a bold label naming a subject", "**R-01, the merge authority.**", false],
+    ["a bold label that defers", "**R-01** (§0), the merge authority.", true],
+    ["a dated commit hash, which is history", "The daemon ran abcdef1 on 2026-08-24.", true],
+    ["dated history welded to a live clause", "R-01 was broken on 2026-08-22 and remains broken today.", false],
+
+  ]) check(excused(sample) === want, `control: "defer or date" ${want ? "excuses" : "catches"} ${what}`, sample);
+
+  check(fromLabelTokens.length >= 2, "control: §0's row labels yielded reusable terms",
+    fromLabelTokens.join(" / "));
+  // These are SUBJECT patterns, not exemptions, so they are exercised directly.
+  // Routing them through `excused` was testing the wrong function -- the same
+  // mistake as an earlier control here that passed for a second reason.
+  const asSubject = s => SUBJECT_PATTERNS.filter(([re]) => re.test(s)).map(([, n]) => n);
+  for (const [what, sample, want] of [
+    ["an R-number", "R-01 is broken.", "an R-rule outcome"],
+    ["a bare commit hash", "The running daemon is at abcdef1.", "a bare commit hash"],
+    ["a pull request number, which never goes stale", "Merged in #19.", null],
+    ["an ordinary word that merely looks hexish", "The deadbeef case is documented.", null],
+  ]) check(want ? asSubject(sample).includes(want) : asSubject(sample).length === 0,
+           `control: ${want ? "recognised" : "spared"} — ${what}`, `${sample} -> ${asSubject(sample).join(", ") || "none"}`);
+
+  // And the two ways a sentence can hide from the scan, which are about markdown
+  // rather than about grammar and are therefore still worth checking.
+  check(sentencesOf("[doctor reports degraded.](d/e.md) See §0.1").length === 2,
+    "control: a sentence ending inside an inline link is still two sentences", "");
+  check(sentencesOf("[doctor reports degraded.][ref] See §0.1").length === 2,
+    "control: and so is one inside a reference-style link", "");
+  check(sentencesOf("**The last two PRs.** See §0.").length === 2,
+    "control: and one ending in emphasis", "");
 }
 
 // --- DERIVED: the prompt names no PR and no commit ---------------------------

@@ -385,6 +385,40 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       read as a clean exit.** Caught only because an assertion count dropped by
       31 and I chased the number instead of the green.
 
+      **Round 6: 7 findings (4×P1), all fixed at `83bf001`.** FOUR of the seven
+      were one shape, and rounds 2, 3, 4 and 6 had now produced EIGHT of it —
+      rising, not falling. Measured rather than patched again: five places ask
+      "what is open for this task", three learned about the spec PR one review
+      round at a time, and the two that had not were this round's report.
+
+      **THE FIX WAS THE SHAPE, NOT THE SITES.** Implementation PRs were rows;
+      the spec PR was three columns on `task`. **Migration 2** folds both into
+      `task_pr`, keyed on `(repo_id, pr)` — a PR number is unique within its
+      repository and nowhere else, which is also round 4's duplicate-key
+      collision. Partial unique indexes now ENFORCE what were sentences in
+      comments: one spec PR per task, one impl PR per slice. `src/build/prs.mjs`
+      owns the only query, and a test asserts no other module reaches the table —
+      verified to fail when a direct query is reintroduced.
+
+      **A new migration, not an edit to hub.sql.** Its freeze test exists for this
+      reason, and migration 1 having no deployed instance would have made the
+      wrong habit free: a schema whose history can be rewritten cannot be reasoned
+      about the first time it cannot. Migration 2 is re-runnable, which the
+      suite's own interrupted-migration fixture caught.
+
+      **Eleven test assertions pinned the schema version or table count as a
+      literal** and failed on a schema change rather than on what they tested.
+      They derive from `HUB_SCHEMA_VERSION`/`HUB_TABLES` now, and a new test
+      carries a genuine v1 hub forward with both old shapes seeded.
+
+      **AND A FINDING WHOSE MECHANISM WAS WRONG.** Codex reported that node:sqlite
+      binds an Error as NULL. Measured: it depends on ARITY. A lone object
+      argument is read as a named-parameter bag (→ NULL); positionally among
+      several arguments — the shape every statement here uses — it THROWS. So the
+      real failure is a settle that rolls back and leaves the effect inflight, not
+      a lost message. My first fixture reproduced only the arity this code cannot
+      have, written while fixing a finding about that call.
+
       **FOUNDER DECISIONS, 2026-08-25:**
       - **#30 merge:** ask again when Codex returns a clean pass at the current
         head. No conditional or pre-authorised grant. Every merge stays explicit.

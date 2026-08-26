@@ -146,6 +146,39 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
 }
 
 // ── verdicts ──────────────────────────────────────────────────────────────────
+// ── the caller is ASKED before anything is spent, and may refuse ──────────
+// The guardian's provider lease is taken in `beforeSpawn` rather than around
+// this function, because whether a canary runs depends on the cheap platform
+// gates and on a cache hit under an exact key -- and a caller that predicts that
+// from outside gets it wrong in both directions. Asking here makes the claim
+// coincide with the spend by construction, so the ordering below IS the
+// guarantee.
+{
+  let asked = 0, ran = 0;
+  const countingRunner = (...args) => { ran++; return runnerThat()(...args); };
+
+  const refused = await sandboxCanary({ ...base, runner: countingRunner,
+    beforeSpawn: async () => { asked++; return { ok: false, why: "provider at-limit" }; } });
+  check(asked === 1, "the canary asks its caller before spending", String(asked));
+  check(ran === 0, "and a refusal means the runner is never called at all", String(ran));
+  check(refused.ok === false && refused.skipped === true,
+    "the result is a SKIP, not a failure: nothing ran, so nothing was measured", JSON.stringify({ ok: refused.ok, skipped: refused.skipped }));
+  check(/at-limit/.test(refused.why ?? ""), "and it carries the caller's reason", String(refused.why));
+
+  // CONTROL, or "never runs" would pass by breaking the canary outright.
+  asked = 0; ran = 0;
+  const allowed = await sandboxCanary({ ...base, runner: countingRunner,
+    beforeSpawn: async () => { asked++; return { ok: true }; } });
+  check(asked === 1 && ran === 1, "control: a permitted canary asks once and runs once", JSON.stringify({ asked, ran }));
+  check(allowed.ok === true, "control: and still passes", allowed.why);
+
+  // DEFAULT PERMITS. Every existing caller passes no hook, and a canary that
+  // refused by default would silently stop measuring containment everywhere.
+  ran = 0;
+  const bare = await sandboxCanary({ ...base, runner: countingRunner });
+  check(ran === 1 && bare.ok === true, "control: with no hook at all the canary runs as before", JSON.stringify({ ran, ok: bare.ok }));
+}
+
 {
   const r = await sandboxCanary({ ...base, runner: runnerThat() });
   check(r.ok === true && r.why === null, "every denial held and both controls succeeded: ok", r.why);

@@ -466,6 +466,16 @@ export async function sandboxCanary({
   // guardian's pid, and a guardian that dies while the canary runs leaves a
   // lease whose holder looks dead while the model call is still being paid for.
   onSpawn = () => {},
+  // Asked immediately before the paid model call, and able to REFUSE it.
+  //
+  // The caller's provider lease belongs here rather than around this function:
+  // whether a canary actually runs depends on the cheap platform gates and on a
+  // cache hit under an exact key with `ok: true`, and a caller that tries to
+  // predict that from outside gets it wrong in both directions -- claiming for a
+  // call that will not happen, or skipping the claim for one that will and
+  // spending unmetered. Asking here makes the claim coincide with the spend by
+  // construction.
+  beforeSpawn = async () => ({ ok: true }),
   validate = validateSettings, keepOnFailure = true,
   // The network positive control: a daemon-local listener (netListener above)
   // the sandboxed curl tries to reach. `{ url, selfReachable, wasHit }`. The
@@ -564,6 +574,16 @@ export async function sandboxCanary({
   // run, or a sandboxed curl that fails to reach it proves nothing. Confirmed
   // again after the run, so a hit at any point counts.
   const selfBefore = netProbe ? await Promise.resolve(netProbe.selfReachable?.() ?? null) : null;
+
+  // REFUSED BEFORE ANYTHING IS SPENT. A refusal is not a canary failure: nothing
+  // ran, so nothing was measured, and the verdict stays open for want of
+  // evidence rather than because evidence was gathered and was bad.
+  const permit = await beforeSpawn();
+  if (permit?.ok === false) {
+    evidence.outcome = "not-run";
+    evidence.why = permit.why ?? "the canary was not permitted to run";
+    return { ok: false, id, why: `not run: ${evidence.why}`, skipped: true, evidence };
+  }
 
   let r;
   try {

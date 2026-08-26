@@ -901,10 +901,66 @@ export async function tick(ctx) {
   // otherwise leave review requests undelivered indefinitely while everything
   // needed to deliver them was healthy. So this is a function both exits call,
   // rather than a block only the successful path reaches.
-  const deadLetters = () => db.prepare(`SELECT kind, count(*) n FROM outbox
-                                       WHERE status='dead_letter' GROUP BY kind`).all();
+  // Counted in PULL REQUESTS, not in rows, because that is the unit the
+  // announcement renders: `announceable` prints any count above one as "(N PRs)".
+  // Two failed reviewer triggers on ONE pull request are two rows and one PR, and
+  // reporting the row count claimed two repositories' worth of trouble where
+  // there was one.
+  //
+  // The identity comes from the key rather than the args, because a row whose args
+  // cannot be parsed still belongs to a pull request and still needs counting.
+  const deadLetters = () => {
+    const rows = db.prepare(`SELECT kind, idem_key FROM outbox WHERE status='dead_letter'`).all();
+    const byKind = new Map();
+    for (const r of rows) {
+      // `review-request:<owner>/<repo>:<pr>:...` -- anything else counts as its own
+      // subject rather than being silently merged with another.
+      const pr = /^[^:]+:[^:]+\/[^:]+:(\d+):/.exec(r.idem_key)?.[1] ?? r.idem_key;
+      if (!byKind.has(r.kind)) byKind.set(r.kind, new Set());
+      byKind.get(r.kind).add(pr);
+    }
+    return [...byKind].map(([kind, prs]) => ({ kind, prs: prs.size, rows: rows.filter(r => r.kind === kind).length }));
+  };
 
-  const drainDueEffects = async () => {
+  /**
+   * Retire queued review requests the CURRENT profile no longer wants.
+   *
+   * `effectsFor` reconciles per pull request while that pull request is being
+   * evaluated. A row can outlive that: authentication failed, or a delivery backed
+   * off, and by the next tick the operator has removed the reviewer or corrected
+   * the trigger. On the degraded path there is no evaluation at all, so nothing
+   * reconciles and the drain posts the obsolete trigger -- the handler checks the
+   * pull request's state and head, neither of which knows anything about the
+   * profile.
+   *
+   * This is the half that needs no pull request: a request whose REVIEWER is gone,
+   * or whose TRIGGER no longer matches any configured one, is unwanted whatever
+   * head it was for. The head-specific half stays in `effectsFor`, because only an
+   * evaluated pull request knows its head.
+   */
+  const retireUnconfigured = () => {
+    if (!reviewActionsOn(profile)) return 0;
+    const wanted = new Set((profile.reviewers ?? []).filter(r => r.trigger)
+      .map(r => `${r.login}:${sha256(r.trigger).slice(0, 12)}`));
+    const rows = db.prepare(`SELECT id, idem_key FROM outbox
+                             WHERE status IN ('pending','dead_letter') AND idem_key LIKE 'review-request:%'`).all();
+    let dropped = 0;
+    for (const r of rows) {
+      // review-request:<nwo>:<pr>:<login>:<head>:<trigger-hash>
+      const m = /^review-request:[^:]+\/[^:]+:\d+:([^:]+):[^:]+:([0-9a-f]+)$/.exec(r.idem_key);
+      if (!m) continue;                                  // an unfamiliar shape is not ours to retire
+      if (wanted.has(`${m[1]}:${m[2]}`)) continue;
+      dropped += tx(db, () => supersedeEffects(db, { prefix: r.idem_key, keep: new Set() }));
+    }
+    if (dropped) log(logPath, `  outbox: withdrew ${dropped} review request(s) the profile no longer asks for`);
+    return dropped;
+  };
+
+  // `finished` is passed IN rather than captured. It is declared far below this
+  // closure, so the degraded exit -- which runs early -- would hit its temporal
+  // dead zone and throw. The catch would have swallowed that, leaving the feature
+  // silently inert on exactly the path it was added for.
+  const drainDueEffects = async (finishedPrs = []) => {
     // `--execute` gates DELIVERY as well as dispatch, and that is the CLI's own
     // definition of the flag: act, rather than observe. Posting a comment on
     // someone's pull request is acting -- it is visible, it is not undoable, and a
@@ -919,7 +975,30 @@ export async function tick(ctx) {
     // The dead-letter escalation below still runs. Refusing to ACT is not a reason
     // to stop SAYING what is stuck -- an observational run is the one most likely
     // to be looked at by a person.
-    if (execute && ctx.drain !== false) {
+    // HALTED is rechecked here, not inherited from the per-pull-request loop. The
+    // marker can appear after the last of those checks and before this runs --
+    // backup and the self-audit both sit in between -- and posting a comment is
+    // exactly what an emergency stop exists to prevent. It is read at the moment
+    // of acting, because that is the only reading that decides anything.
+    //
+    // `reviewActionsOn` is here as well as in the producer. Gating production
+    // alone left the case the queue exists to create: rows persisted by an earlier
+    // run, drained after the operator turned the switch OFF. A safety switch that
+    // stops new work but not the work already queued has not stopped anything a
+    // person can see.
+    //
+    // Expressed as a FILTER over handlers rather than a condition on the block,
+    // so a kind reeve may not perform is simply not performable -- the drainer
+    // never leases it, and the "pending with no handler" line already says so.
+    const permitted = Object.fromEntries(Object.entries(ctx.handlers ?? HANDLERS)
+      .filter(([kind]) => (kind === "gh.pr.comment" || kind === "gh.thread.resolve")
+        ? reviewActionsOn(profile) : true));
+    // BEFORE the drain, on every path. A request the profile no longer asks for
+    // must not be posted by a tick that happens to be unable to evaluate the pull
+    // request it belongs to.
+    try { retireUnconfigured(); } catch (e) { log(logPath, `  outbox: could not reconcile against the profile — ${e.message}`); }
+
+    if (execute && !halted(ctx.haltMarker) && Object.keys(permitted).length && ctx.drain !== false) {
       try {
         // The QUEUE is read before the credential. Authenticating first meant an
         // installation lookup and a fresh token mint on every ordinary tick --
@@ -966,7 +1045,7 @@ export async function tick(ctx) {
           // `auth.actor` is the login reeve's own comments carry. A handler needs it
           // to tell its own writing from a contributor's; null means GitHub did not
           // say, and a handler must read that as "cannot tell" rather than "matches".
-          const r = await drainOutbox({ db, log: m => log(logPath, m), handlers: ctx.handlers ?? HANDLERS,
+          const r = await drainOutbox({ db, log: m => log(logPath, m), handlers: permitted,
                                         api, actor: auth.actor ?? null });
           const posted = r.done.filter(d => d.verdict === "done").length;
           if (posted) log(logPath, `  outbox: performed ${posted} effect(s)`);
@@ -1006,6 +1085,22 @@ export async function tick(ctx) {
         } catch { /* a store that cannot be read must not take the tick down */ }
       }
     }
+    // A terminal row whose pull request is over is retired before it is counted.
+    //
+    // Nothing else can reach it: `effectsFor` only reconciles a pull request that
+    // is being EVALUATED, and a closed one leaves the open list and is never
+    // evaluated again. The aggregate below also discards the pull-request
+    // identity, and the clearing rule only recognises a `#<pr>:` escalation key --
+    // so a shared dead-letter alert for a merged pull request would stand forever,
+    // with a count nothing could ever reduce.
+    try {
+      for (const pr of finishedPrs) {
+        const prefix = `review-request:${nwo}:${pr}:`;
+        const n = tx(db, () => supersedeEffects(db, { prefix, keep: new Set() }));
+        if (n) log(logPath, `  outbox: withdrew ${n} effect(s) for #${pr}, which is finished`);
+      }
+    } catch (e) { log(logPath, `  outbox: could not retire finished pull requests — ${e.message}`); }
+
     // OUTSIDE the execute gate, deliberately. A terminal row is a fact about the
     // store, not about whether this run is allowed to act -- and an observational
     // run is the one most likely to have a person reading it. Raised after every
@@ -1014,7 +1109,7 @@ export async function tick(ctx) {
     // then clear it as resolved.
     try {
       for (const d of deadLetters())
-        escalations.set(deadLetterCause(d.kind), d.n);
+        escalations.set(deadLetterCause(d.kind), d.prs);
     } catch { /* an unreadable store is reported by the audit, not by crashing here */ }
   };
 
@@ -1240,8 +1335,14 @@ export async function tick(ctx) {
       escalations.set(`${login} blocks merges but declares no trigger comment, so reeve cannot request their review`, 1);
     }
     const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire });
-    if (effects.length && !decided.ok)
+    if (effects.length && !decided.ok) {
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
+      // Escalated, not merely logged. Nothing else covers this: no worker is
+      // dispatched for the action, no row exists to spend an attempt or become a
+      // dead letter, and the pull request simply waits. A locked, read-only or
+      // full database is a state that does not fix itself.
+      escalations.set(`#${pr}: reeve could not record the review request it decided to make — ${decided.why}`, 1);
+    }
     else if (decided.queued)
       log(logPath, `  #${pr}: REQUEST_REVIEW — queued ${decided.queued} trigger comment(s) for reeve to post`
                  + (decided.dropped ? `, withdrawing ${decided.dropped} for a head that has moved on` : ""));
@@ -1999,7 +2100,7 @@ export async function tick(ctx) {
   // A drain failure never fails the tick. Watching, judging and escalating do not
   // depend on it, and a queue that cannot move is a reason to say so rather than to
   // stop reading pull requests.
-  await drainDueEffects();
+  await drainDueEffects([...finished]);
 
   const { fresh, cleared } = announce({ covered: evaluated, waiting, finished,
                                         complete: evaluated.size === prs.length });

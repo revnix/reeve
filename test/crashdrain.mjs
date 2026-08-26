@@ -1,8 +1,16 @@
 // Prove: a crash BETWEEN the external side effect and recording it locally
 // is recovered without performing the side effect twice.
 import { open, tx, enqueue, leaseOutbox, settleOutbox, recoverOutbox } from "../src/db/ops.mjs";
-import { rmSync, existsSync, readFileSync, appendFileSync } from "node:fs";
-const P="./crash.db", EXT="./external.log";
+import { rmSync, existsSync, readFileSync, appendFileSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+// A temp directory, NOT the repository root. This wrote `crash.db` and
+// `external.log` beside the source: they are not gitignored, so a `git add -A`
+// commits them, and until then every `git status` in this checkout reads dirty --
+// which is the exact state reeve's own publication gate refuses. A test that
+// leaves litter where the work happens is the shape it exists to catch.
+const SCRATCH = mkdtempSync(join(tmpdir(), "reeve-crashdrain-"));
+const P = join(SCRATCH, "crash.db"), EXT = join(SCRATCH, "external.log");
 for (const s of ["","-wal","-shm"]) { try{rmSync(P+s)}catch{} }
 try{rmSync(EXT)}catch{}
 const db=open(P);
@@ -35,3 +43,6 @@ console.log("final outbox row:", fin);
 console.log(fin.status==="done" && readFileSync(EXT,"utf8").trim().split("\n").length===1
   ? "PASS  exactly-once external effect across a crash"
   : "FAIL");
+
+db.close?.();
+rmSync(SCRATCH, { recursive: true, force: true });

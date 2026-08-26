@@ -1,5 +1,9 @@
 # Session handoff — 2026-08-26
 
+> **SUPERSEDED by `docs/2026-08-27-session-handoff.md` (2026-08-27).** Kept as history.
+> Its state claims were true when written and are not maintained. Neither
+> docs test scans this file — they resolve the newest pair by date.
+
 Supersedes `docs/2026-08-24-session-handoff.md` for anything they disagree on.
 
 ---

@@ -203,9 +203,28 @@ check("an unrecognised merge state escalates with the state named",
 // "unclassified verdict … gap: true". That totality only helps if new clauses are
 // actually classified, so adding one without a branch turns a real finding into
 // an escalation about the decision function itself.
-check("an uncleared thread dispatches a fixer, not a gap",
+check("an uncleared thread ASKS THE REVIEWER, rather than dispatching a fixer",
   nextAction(ev(swap("cleared", "BLOCK", "1 thread(s) that codex has not come back to")), P).action,
-  ACTIONS.FIX_FINDINGS);
+  ACTIONS.REQUEST_REVIEW);
+// After a push, threads go uncleared because nobody has reviewed the new head
+// yet, and the review clause blocks for the same reason. The reviewer's return is
+// the only thing that clears them, so the stale review must be asked for FIRST --
+// dispatching a fixer here sends a worker at findings whose only problem is that
+// nobody has looked at them.
+{
+  const both = allPass().map(c => c.id === "cleared" ? cl("cleared", "BLOCK", "uncleared")
+                                : c.id === "review" ? cl("review", "BLOCK", "reviewed an older revision") : c);
+  const d = nextAction(ev(both), P);
+  check("a push that unclears threads asks for the review, not a fix", d.action, ACTIONS.REQUEST_REVIEW);
+  check("and says which, so the two cases are distinguishable", /older revision/.test(d.why ?? ""), true);
+}
+// Past the hard cap it stops asking and fetches a person.
+check("past the hard cap an uncleared thread escalates rather than asking again",
+  nextAction(ev(swap("cleared", "BLOCK", "uncleared"), { rounds: { n: 10, softCap: 5, hardCap: 10, unspilledCritical: 0 } }), P).action,
+  ACTIONS.ESCALATE);
+// And it must not steal the dispatch when a real finding is open.
+check("control: a genuine finding still dispatches a fixer",
+  nextAction(ev(swap("findings", "BLOCK", "2 open")), P).action, ACTIONS.FIX_FINDINGS);
 check("control: and it is NOT reported as an unclassified verdict",
   /unclassified/.test(nextAction(ev(swap("cleared", "BLOCK", "x")), P).why ?? ""), false);
 check("an unreadable projection waits rather than passing",

@@ -149,8 +149,15 @@ export function readReviewerStates(nwo, pr, head, reviewers, io = null) {
  */
 export function reviewFacts({ db, nwo, pr, profile, head, live = null,
                              at = Math.floor(Date.now() / 1000), io = {} }) {
+  // NOBODY TO GATE means nothing to be unknown about. With no blocking reviewer
+  // configured, no uncleared thread can hold a pull request -- so a transient
+  // projection failure must not produce an UNKNOWN clearance clause and stop an
+  // otherwise passing pull request. The scoping that decides whose silence counts
+  // has to apply to the unreadable path too, or it is only half applied.
+  const gating = (profile?.reviewers ?? []).some(r => r.kind === "blocking");
   const unknown = why => ({ unspilledCritical: null, rounds: null, threadDetails: null,
-                            cleared: { readable: false, why },
+                            cleared: gating ? { readable: false, why }
+                                            : { readable: true, uncleared: 0, reviewers: [] },
                             projection: { readable: false, why } });
   if (!db) return unknown("no state database");
   let st;

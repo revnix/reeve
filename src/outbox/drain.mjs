@@ -177,13 +177,15 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
     // still be delivered, and between the two lies a write lock that SQLite will
     // hold a caller on for as long as the connection's busy timeout allows.
     //
-    // Settled rather than simply skipped: the row is inflight now, and leaving it
-    // that way would keep it out of the next pass until its lease lapsed. The
-    // attempt it cost is spent and stays spent -- `leaseOutbox` is the only place
-    // that can bump it, and un-bumping it would deny a lease that really happened,
-    // which is exactly the lie the fence exists to make impossible.
+    // Settled as UNSTARTED rather than skipped or failed. Skipping would leave the
+    // row inflight until its lease lapsed, keeping it out of the next pass; a
+    // failure would charge it an attempt for work never begun, and on the last
+    // permitted delivery that is enough to move it into reconciliation with no
+    // POST ever sent -- where a correct "no marker" then dead-letters an effect
+    // that was never delivered. The fence stays bumped, because the lease did
+    // happen; the budget does not, because the attempt did not.
     if (remainingMs(passDeadlineAt, now) < floorMs) {
-      settleOutbox(db, { id: job.id, leaseToken: job.lease_token, ok: false, retryable: true,
+      settleOutbox(db, { id: job.id, leaseToken: job.lease_token, ok: false, unstarted: true,
                          error: "the pass budget was spent while this row was being leased; not started" });
       log(`  outbox: ${job.kind} #${job.id} returned unstarted — the pass budget went while it was being leased`);
       outOfTime = true;

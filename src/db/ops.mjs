@@ -483,7 +483,8 @@ export function pendingWithNoHandler(db, kinds) {
  * and the failure it produces -- an unfenced settle -- is the exact defect this
  * argument exists to prevent, so it must not be possible to reach it by omission.
  */
-export function settleOutbox(db, { id, leaseToken, ok, result, error, retryable = true, actor = "drainer" }) {
+export function settleOutbox(db, { id, leaseToken, ok, result, error, retryable = true,
+                                   unstarted = false, actor = "drainer" }) {
   if (!Number.isInteger(leaseToken))
     throw new Error("settleOutbox: leaseToken is required; an unfenced settle can overwrite another drainer's live delivery");
   return tx(db, () => {
@@ -515,6 +516,34 @@ export function settleOutbox(db, { id, leaseToken, ok, result, error, retryable 
     // retryable failure, because only reconciliation has already asked GitHub what
     // happened and been unable to find out.
     const reconciling = row.reconcile_attempts > 0;
+
+    // A lease that never reached the handler REFUNDS the budget it charged.
+    //
+    // The fence and the budget are separate facts and this is where the
+    // difference bites. The lease really happened, so `lease_token` stays bumped
+    // and a stalled holder is still fenced out. But no attempt was made, and
+    // charging one for work never begun is not merely untidy: on the LAST
+    // permitted delivery it moves the row into reconciliation without a single
+    // POST ever having been sent, and reconciliation then correctly finds no
+    // marker and dead-letters an effect that was never delivered. A review
+    // request silently never made, escalated as one reeve could not perform.
+    //
+    // I first wrote this as "the attempt is spent and stays spent", reasoning
+    // that un-bumping would deny a lease that really happened. That conflated the
+    // two counters the schema keeps apart on purpose: the fence counts leases,
+    // the budget counts attempts, and this is a lease that was not an attempt.
+    if (unstarted) {
+      db.prepare(`UPDATE outbox SET status='pending', last_error=?, not_before=unixepoch()+?,
+                  attempts = attempts - (CASE WHEN ? THEN 0 ELSE 1 END),
+                  reconcile_attempts = reconcile_attempts - (CASE WHEN ? THEN 1 ELSE 0 END),
+                  lease_expires_at=0, updated_at=unixepoch() WHERE id=? AND lease_token=?`)
+        .run(String(error).slice(0, 2000), backoffSeconds(0),
+             reconciling ? 1 : 0, reconciling ? 1 : 0, id, leaseToken);
+      emit(db, { actor, op: "outbox.unstarted",
+                 payload: { id, kind: row.kind, phase: reconciling ? "reconcile" : "deliver" } });
+      return "unstarted";
+    }
+
     const dead = !retryable || (reconciling && row.reconcile_attempts >= row.max_reconcile);
     db.prepare(`UPDATE outbox SET status=?, last_error=?, not_before=unixepoch()+?,
                 lease_expires_at=0, updated_at=unixepoch() WHERE id=? AND lease_token=?`)

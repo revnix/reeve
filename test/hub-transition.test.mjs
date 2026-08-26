@@ -102,14 +102,20 @@ const seed = (db, { id, phase, generation = 1, events = 12 }) => {
 // THE assertion of this task. A phase-only CAS passes every test above.
 {
   const db = openHub(join(dir, "t3.db")); seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 4 });
+  // `slice` is supplied because IMPLEMENTING + phase.succeeded is a SLICE REPORT
+  // and the applier now requires one. It matches the task's cursor (0), so this
+  // block still measures the GENERATION fence and not the slice fence -- a
+  // fixture whose slice disagreed would refuse for the wrong reason and pass.
   const stale = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 3,
-    evidence: { kind: "phase.succeeded", phase: "IMPLEMENTING" }, artifactSha: "x", op: "phase.advanced" });
+    evidence: { kind: "phase.succeeded", phase: "IMPLEMENTING" }, artifactSha: "x", slice: 0,
+    op: "phase.advanced" });
   check(stale.applied === false && stale.reason === "lost-race",
     "an attempt from generation 3 cannot act on a task now in generation 4", JSON.stringify(stale));
   check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "IMPLEMENTING", "the redesigned task did not move");
 
   const current = applyTransition(db, { taskId: "bt:1", expectedPhase: "IMPLEMENTING", expectedGeneration: 4,
-    evidence: { kind: "phase.succeeded", phase: "IMPLEMENTING" }, artifactSha: "x", op: "phase.advanced" });
+    evidence: { kind: "phase.succeeded", phase: "IMPLEMENTING" }, artifactSha: "x", slice: 0,
+    op: "phase.advanced" });
   check(current.applied === true, "control: the SAME call at generation 4 succeeds, so the predicate is the generation and not a blanket refusal");
   db.close();
 }
@@ -1233,6 +1239,65 @@ rmSync(dir, { recursive: true, force: true });
   check(db.prepare("SELECT repo_id FROM task_pr WHERE task='bt:1' AND kind='spec'").get().repo_id === 9,
     "control: and the spec PR still belongs to the repository it was opened in");
   db.close();
+}
+
+// ── the slice fence is not optional ────────────────────────────────────────
+// The first version fenced only when the caller happened to pass a slice, and
+// the parameter DEFAULTS to null -- so a caller that omits it gets exactly the
+// behaviour the fence was added to prevent. A guard a caller can switch off by
+// forgetting protects only the callers who did not need it.
+{
+  const db = openHub(join(dir, "t40.db"));
+  seed(db, { id: "bt:1", phase: "VERDICT_WAIT", generation: 1 });
+  db.exec(`UPDATE task SET slice_cursor = 1 WHERE id='bt:1'`);
+  const unnamed = applyTransition(db, { taskId: "bt:1", expectedPhase: "VERDICT_WAIT",
+    expectedGeneration: 1,                    // no slice at all
+    evidence: { kind: "slice.merged", mergedSha: "abc", mergedAt: 1 }, op: "phase.merged" });
+  check(unnamed.applied === false, "a slice report that names NO slice is refused",
+    JSON.stringify(unnamed));
+  check(/slice-scoped/.test(unnamed.refusal ?? ""), "and says why", String(unnamed.refusal));
+  check(db.prepare("SELECT phase FROM task WHERE id='bt:1'").get().phase === "VERDICT_WAIT",
+    "and the task has not moved");
+
+  // CONTROL: a transition from the SAME phase that is not a slice report needs
+  // no slice -- a hold is about the task, and demanding one would refuse it.
+  const held = applyTransition(db, { taskId: "bt:1", expectedPhase: "VERDICT_WAIT",
+    expectedGeneration: 1, evidence: { kind: "hold", reason: "over_budget" }, op: "phase.held" });
+  check(held.applied === true,
+    "control: a hold from a slice-scoped phase needs no slice", JSON.stringify(held));
+  db.close();
+}
+
+// ── a new generation starts at slice 0 ─────────────────────────────────────
+// The cursor is durable and a generation bump left it alone, so a task held
+// after finishing slices 0..N-1 re-entered IMPLEMENTING at slice N under a design
+// whose slice N is DIFFERENT work -- skipping the first N slices of the new plan
+// entirely, with the phase machine agreeing everything before them was done.
+{
+  const db = openHub(join(dir, "t41.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING', slice_cursor=3 WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',0)`);
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: true }, op: "phase.resumed" });
+  check(r.applied === true && r.to === "DESIGN", "a redesign resume applies", JSON.stringify(r));
+  check(db.prepare("SELECT slice_cursor FROM task WHERE id='bt:1'").get().slice_cursor === 0,
+    "and the slice cursor is back at 0: the new generation has implemented nothing",
+    String(db.prepare("SELECT slice_cursor FROM task WHERE id='bt:1'").get().slice_cursor));
+
+  // CONTROL: a PLAIN resume does NOT reset it -- same design, same slices, and
+  // restarting them would redo work that is already merged.
+  const db2 = openHub(join(dir, "t42.db"));
+  seed(db2, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db2.exec(`UPDATE task SET held_from='IMPLEMENTING', slice_cursor=3 WHERE id='bt:1'`);
+  db2.exec(`INSERT INTO task_territory(task,kind,path,pinned) VALUES('bt:1','prefix','packages/x',0)`);
+  const plain = applyTransition(db2, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(plain.applied === true, "control: a plain resume applies", JSON.stringify(plain));
+  check(db2.prepare("SELECT slice_cursor FROM task WHERE id='bt:1'").get().slice_cursor === 3,
+    "control: and leaves the cursor where it was",
+    String(db2.prepare("SELECT slice_cursor FROM task WHERE id='bt:1'").get().slice_cursor));
+  db.close(); db2.close();
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

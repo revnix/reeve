@@ -13,6 +13,29 @@
 export const ACTIVE = Object.freeze([
   "FILED","CLAIMING","SIZING","RESEARCH","DESIGN","SPEC_DRAFT","SPEC_PR_OPEN","GATE",
   "APPROVED","IMPLEMENTING","IMPL_PR_OPEN","VERDICT_WAIT","SLICE_MERGED","FINALIZING"]);
+// The phases the implementation LOOP returns to. A task at slice 1 occupies the
+// same phase, under the same generation, that it occupied for slice 0 -- so a
+// report about one of these says nothing about WHICH slice unless it names one,
+// and the transition applier requires it. Exported because the applier is where
+// the requirement is enforced and this is where the fact lives.
+export const SLICE_SCOPED = Object.freeze(
+  ["IMPLEMENTING","IMPL_PR_OPEN","VERDICT_WAIT","SLICE_MERGED"]);
+
+/**
+ * Is this transition ABOUT a slice, rather than merely happening during one?
+ *
+ * Both halves are needed. The PHASE alone is too broad: a hold, a cancel or a
+ * depth override from IMPLEMENTING is about the TASK, and demanding a slice
+ * number from them refuses ordinary transitions that have no slice to name. The
+ * EVIDENCE alone is too narrow in the other direction, since `phase.succeeded`
+ * means something different outside the loop.
+ *
+ * These three are the reports that advance the slice pipeline, and they are the
+ * ones a delayed duplicate can misapply to the slice that came after.
+ */
+export const isSliceReport = (phase, kind) =>
+  SLICE_SCOPED.includes(phase) &&
+  (kind === "slice.merged" || kind === "slice.next" || kind === "phase.succeeded");
 export const HELD     = Object.freeze(["BLOCKED","ESCALATED"]);
 export const DRAINING = Object.freeze(["CANCELLING"]);
 export const TERMINAL = Object.freeze(["DONE","CANCELLED","LOST","INFEASIBLE"]);
@@ -319,7 +342,14 @@ export function nextPhase(state, evidence) {
                       `${evidence.ownerNotReeve} cannot be projected for it`);
       }
       if (evidence.redesign)
-        return go("DESIGN", { generation: generation + 1, bumps: true,
+        // sliceCursor 0, because a REDESIGN is a new plan. The cursor is durable
+        // and a generation bump left it alone, so a task held after finishing
+        // slices 0..N-1 re-entered IMPLEMENTING at slice N under a design whose
+        // slice N is different work -- skipping the first N slices of the new
+        // plan entirely, with the phase machine agreeing that everything before
+        // them was done. The old slices belong to the old generation, and the new
+        // generation has never implemented anything.
+        return go("DESIGN", { generation: generation + 1, bumps: true, sliceCursor: 0,
           compensations: ["clear-holds","annotate-resumed","regrant-territory", ...(hasOpenPr ? ["close-prs"] : [])] });
       if (!heldFrom) return refuse(`${phase} has no held_from recorded; resume cannot know where to re-enter`);
       return go(heldFrom, { generation, compensations: ["clear-holds","annotate-resumed","regrant-territory"] });
@@ -556,7 +586,10 @@ export function nextPhase(state, evidence) {
     // nobody approved: it has to be held and closed like every other path that
     // abandons work, or it stays mergeable against a superseded plan.
     return go(PAST_GATE.includes(phase) ? "SPEC_DRAFT" : phase,
-      { generation: generation + 1, bumps: true,
+      // sliceCursor 0 here too, and for the same reason: `founder.regenerate`
+      // adopts a CHANGED CONTRACT under a new generation, so the slices the old
+      // one completed describe work the new plan does not contain.
+      { generation: generation + 1, bumps: true, sliceCursor: 0,
         compensations: [...(hasLiveRun ? ["terminate-worker"] : []),
                         "adopt-snapshot","annotate-resumed",
                         ...(hasOpenPr ? ["write-pr-hold","close-prs"] : [])] });

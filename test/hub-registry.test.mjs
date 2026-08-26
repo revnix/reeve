@@ -15,6 +15,16 @@ import { dirname, resolve, basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
+// `resolveSnapshot` returns the claims it WALKED as `snapshot.claims`, and
+// `admitTask` now grants only those -- it refuses a snapshot that carries none,
+// because a fallback to the filing's own list is the unchecked-territory hole
+// with a longer path to it. These blocks assemble snapshots by hand, so this
+// stands in for that half of resolveSnapshot: the resolved list IS the declared
+// one when nothing in the walk objected, which is what every fixture here means.
+const admitResolved = (db, snapshot, filing) =>
+  admitTask(db, { ...snapshot, claims: filing.claims }, filing);
+
+
 let fail = 0;
 const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
@@ -138,7 +148,7 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
     { lstat: () => ({ isSymbolicLink: () => false }), lsTree: () => ({ mode: "040000" }) });
   let threw = null, r;
   try {
-    r = admitTask(db, snap, { id: "bt:1", project: "nextly", title: "t", claims: resolved.claims });
+    r = admitResolved(db, snap, { id: "bt:1", project: "nextly", title: "t", claims: resolved.claims });
   } catch (e) { threw = e.message; }
   check(threw === null, "admitTask admits a resolved filing without throwing", String(threw));
   // Synchronous, asserted rather than assumed. An implementation that became
@@ -405,8 +415,8 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   // claims (see its interface above), and a fixture that passes raw strings
   // tests a signature the implementation does not have.
   const claim = (s) => [normalizeClaim(s)];
-  admitTask(db, snap, { id: "bt:root", project: "p", title: "t", claims: claim("") });
-  const blocked = admitTask(db, snap, { id: "bt:2", project: "p", title: "t", claims: claim("packages/anything") });
+  admitResolved(db, snap, { id: "bt:root", project: "p", title: "t", claims: claim("") });
+  const blocked = admitResolved(db, snap, { id: "bt:2", project: "p", title: "t", claims: claim("packages/anything") });
   check(blocked.ok === false, "a root-prefix task blocks every concurrent grant in its project");
   check(String(blocked.refusal).includes("bt:root"), "and the refusal names the blocking task", String(blocked.refusal));
 
@@ -415,14 +425,14 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   // passes every assertion above while serialising unrelated repositories that
   // both happen to contain `packages/x` -- a deadlock between projects that
   // share nothing, reported as a territory conflict.
-  const elsewhere = admitTask(db, { ...snap, repoId: 2, nwo: "o/other" },
+  const elsewhere = admitResolved(db, { ...snap, repoId: 2, nwo: "o/other" },
     { id: "bt:other", project: "q", title: "t", claims: claim("packages/anything") });
   check(elsewhere.ok === true,
     "control: the same path in another project is granted, so conflicts are scoped by project",
     JSON.stringify(elsewhere));
   // and the reverse direction, so the predicate cannot be satisfied by luck:
   // a root claim in project q blocks q, and still does not touch p.
-  const alsoBlocked = admitTask(db, snap, { id: "bt:3", project: "p", title: "t", claims: claim("packages/other") });
+  const alsoBlocked = admitResolved(db, snap, { id: "bt:3", project: "p", title: "t", claims: claim("packages/other") });
   check(alsoBlocked.ok === false, "control: project p is still blocked by its own root claim");
   db.close();
 }
@@ -436,9 +446,9 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   const db = openHub(join(dir, "r4.db"));
   const filing = { id: "bt:idem", project: "p", title: "t",
                    idempotencyKey: "founder:2026-08-23:001", claims: [normalizeClaim("packages/x")] };
-  const first = admitTask(db, snap, filing);
+  const first = admitResolved(db, snap, filing);
   check(first.ok === true && first.replayed !== true, "the first filing is admitted", JSON.stringify(first));
-  const again = admitTask(db, snap, { ...filing, id: "bt:different" });
+  const again = admitResolved(db, snap, { ...filing, id: "bt:different" });
   check(again.ok === true && again.replayed === true,
     "and the same key again returns the ORIGINAL task rather than minting a second",
     JSON.stringify(again));
@@ -448,7 +458,7 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   check(db.prepare("SELECT count(*) c FROM territory_lease").get().c === 1,
     "and exactly one territory lease, so the retry did not conflict with itself");
   // CONTROL: a DIFFERENT key still admits, or "idempotent" has become "admits once".
-  const other = admitTask(db, snap, { id: "bt:other", project: "p", title: "t",
+  const other = admitResolved(db, snap, { id: "bt:other", project: "p", title: "t",
     idempotencyKey: "founder:2026-08-23:002", claims: [normalizeClaim("packages/y")] });
   check(other.ok === true && other.replayed !== true,
     "control: a different key admits a new task", JSON.stringify(other));
@@ -458,7 +468,7 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
 // ── a filing with no --territory at all is refused ───────────────────────────
 {
   const db = openHub(join(dir, "r3.db"));
-  const r = admitTask(db, snap, { id: "bt:4", project: "p", title: "t", claims: [] });
+  const r = admitResolved(db, snap, { id: "bt:4", project: "p", title: "t", claims: [] });
   check(r.ok === false, "a filing with no territory is refused");
   check(db.prepare("SELECT count(*) c FROM task WHERE id='bt:4'").get().c === 0,
     "and nothing is inserted, so a refused filing leaves no half-task behind");
@@ -473,7 +483,7 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
 // filing, while the original task was still editing them.
 {
   const db = openHub(join(dir, "r5.db"));
-  const first = admitTask(db, snap, { id: "bt:old", project: "p", title: "t",
+  const first = admitResolved(db, snap, { id: "bt:old", project: "p", title: "t",
                                       claims: [normalizeClaim("packages/x")] });
   check(first.ok === true, "a task is admitted and holds its territory", JSON.stringify(first));
   // The clock runs out while the task is very much alive.
@@ -485,7 +495,7 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   // it is a red that takes every later block with it and prints no name.
   let stolen = null, stoleThrew = null;
   try {
-    stolen = admitTask(db, snap, { id: "bt:live", project: "p", title: "t",
+    stolen = admitResolved(db, snap, { id: "bt:live", project: "p", title: "t",
                                    claims: [normalizeClaim("packages/x")] });
   } catch (e) { stoleThrew = e; }
   check(stoleThrew === null,
@@ -504,7 +514,7 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   db.prepare("UPDATE task SET phase = 'CANCELLED' WHERE id = 'bt:old'").run();
   let threw = null, next = null;
   try {
-    next = admitTask(db, snap, { id: "bt:new", project: "p", title: "t",
+    next = admitResolved(db, snap, { id: "bt:new", project: "p", title: "t",
                                  claims: [normalizeClaim("packages/x")] });
   } catch (e) { threw = e; }
   check(threw === null, "admitting over a TERMINAL task's leftover row does not throw",
@@ -516,7 +526,7 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
 
   // CONTROL: a lease held by a live task on the same path is still refused, or
   // "replaces a dead task's row" has become "replaces any row".
-  const thief = admitTask(db, snap, { id: "bt:thief", project: "p", title: "t",
+  const thief = admitResolved(db, snap, { id: "bt:thief", project: "p", title: "t",
                                       claims: [normalizeClaim("packages/x")] });
   check(thief.ok === false, "control: a LIVE lease on the same path is still refused",
     JSON.stringify(thief));
@@ -532,7 +542,7 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
 // anything reading that column acted on a value no live claim asked for.
 {
   const db = openHub(join(dir, "r6.db"));
-  admitTask(db, snap, { id: "bt:unpinned", project: "p", title: "t",
+  admitResolved(db, snap, { id: "bt:unpinned", project: "p", title: "t",
                         claims: [normalizeClaim("packages/x")] });
   check(db.prepare("SELECT pinned_until FROM territory_lease WHERE path='packages/x'").get().pinned_until === null,
     "an unpinned filing leaves the pin empty");
@@ -541,7 +551,7 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   // recognising a terminal task's row refuses inside `grantLease`, which throws.
   let pinned = null, pinThrew = null;
   try {
-    pinned = admitTask(db, snap, { id: "bt:pinned", project: "p", title: "t",
+    pinned = admitResolved(db, snap, { id: "bt:pinned", project: "p", title: "t",
                                    pinTerritory: true, claims: [normalizeClaim("packages/x")] });
   } catch (e) { pinThrew = e; }
   check(pinThrew === null, "replacing a terminal task's row does not throw", String(pinThrew?.message));
@@ -556,7 +566,7 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   db.prepare("UPDATE task SET phase = 'DONE' WHERE id = 'bt:pinned'").run();
   let plainThrew = null;
   try {
-    admitTask(db, snap, { id: "bt:plain", project: "p", title: "t",
+    admitResolved(db, snap, { id: "bt:plain", project: "p", title: "t",
                           claims: [normalizeClaim("packages/x")] });
   } catch (e) { plainThrew = e; }
   check(plainThrew === null, "control: and neither does the unpinned replacement",
@@ -579,7 +589,7 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   const db = openHub(join(dir, "r7.db"));
   for (const field of ["specRepoId", "gateDefinitionHash", "founderUserId", "repoId", "profileHash"]) {
     const partial = { ...snap, [field]: null };
-    const r = admitTask(db, partial, { id: `bt:${field}`, project: "p", title: "t",
+    const r = admitResolved(db, partial, { id: `bt:${field}`, project: "p", title: "t",
                                        claims: [normalizeClaim(`packages/${field}`)] });
     check(r.ok === false, `a snapshot missing ${field} is refused`, JSON.stringify(r));
     check(String(r.refusal).includes(field), `and the refusal names ${field}`, String(r.refusal));
@@ -590,7 +600,7 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   }
   // CONTROL: the complete snapshot still admits, or "validates" has become
   // "refuses".
-  const ok = admitTask(db, snap, { id: "bt:complete", project: "p", title: "t",
+  const ok = admitResolved(db, snap, { id: "bt:complete", project: "p", title: "t",
                                    claims: [normalizeClaim("packages/complete")] });
   check(ok.ok === true, "control: a complete snapshot is admitted", JSON.stringify(ok));
   db.close();
@@ -624,7 +634,7 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   const db = openHub(join(dir, "r8.db"));
   let threw = null, r = null;
   try {
-    r = admitTask(db, snap, { id: "bt:dup", project: "p", title: "t",
+    r = admitResolved(db, snap, { id: "bt:dup", project: "p", title: "t",
       claims: [normalizeClaim("packages/x"), normalizeClaim("packages/./x"),
                normalizeClaim("packages/y")] });
   } catch (e) { threw = e; }
@@ -642,7 +652,7 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   check(String(r?.refusal ?? "") === "", "control: no self-conflict was reported",
     String(r?.refusal));
   // CONTROL: the same path claimed by ANOTHER task is still a conflict.
-  const other = admitTask(db, snap, { id: "bt:other", project: "p", title: "t",
+  const other = admitResolved(db, snap, { id: "bt:other", project: "p", title: "t",
                                       claims: [normalizeClaim("packages/x")] });
   check(other.ok === false, "control: another task claiming it is still refused",
     JSON.stringify(other));
@@ -712,21 +722,19 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
     "control: a path that does not exist yet is still a valid claim", JSON.stringify(fresh));
 }
 
-// ── admission grants the claims that were CHECKED ──────────────────────────
-// `resolveSnapshot` performs the symlink and gitlink walk on the claims it is
-// given and returns them as `snapshot.claims`; admission then granted
-// `filing.claims` instead. Two lists that happen to be equal in every current
-// caller is not the same as one list, and the failure is silent in the direction
-// that matters -- a harmless path is checked before the transaction while an
-// unchecked one receives the durable claim and the lease.
+// ── admission grants the claims that were CHECKED, and refuses without them ─
+// `resolveSnapshot` walks the claims it is given and returns them as
+// `snapshot.claims`; admission granted `filing.claims` instead. The first repair
+// FELL BACK to that list when the snapshot carried none, which is the same hole
+// with a longer path to it -- a caller that assembles a complete authority
+// snapshot and drops the claims gets unchecked territory, silently.
 {
   const db = openHub(join(dir, "r9.db"));
-  // The two lists DISAGREE, which is the whole point: no current caller does
-  // this, and that is exactly why nothing caught it.
-  const checked = [normalizeClaim("packages/checked")];
-  const unchecked = [normalizeClaim("packages/unchecked")];
-  const r = admitTask(db, { ...snap, claims: checked },
-    { id: "bt:bound", project: "p", title: "t", claims: unchecked });
+  // The two lists DISAGREE, which no current caller does -- and is exactly why
+  // nothing caught it. `admitTask` directly, not the resolved-snapshot helper,
+  // because the helper's whole job is to make them agree.
+  const r = admitTask(db, { ...snap, claims: [normalizeClaim("packages/checked")] },
+    { id: "bt:bound", project: "p", title: "t", claims: [normalizeClaim("packages/unchecked")] });
   check(r.ok === true, "the filing is admitted", JSON.stringify(r));
   const paths = db.prepare("SELECT path FROM task_territory WHERE task='bt:bound'").all().map(x => x.path);
   check(JSON.stringify(paths) === '["packages/checked"]',
@@ -736,14 +744,25 @@ const snap = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f",
   check(JSON.stringify(leased) === '["packages/checked"]',
     "and so is the lease", JSON.stringify(leased));
 
-  // CONTROL: a snapshot carrying no claims still falls back to the filing's, so
-  // this does not break the callers that never set the field.
-  const fallback = admitTask(db, snap,
-    { id: "bt:fallback", project: "p", title: "t", claims: [normalizeClaim("packages/fb")] });
-  check(fallback.ok === true, "control: a snapshot with no claims falls back to the filing's",
-    JSON.stringify(fallback));
-  check(db.prepare("SELECT count(*) c FROM task_territory WHERE task='bt:fallback' AND path='packages/fb'").get().c === 1,
-    "control: and grants them");
+  // AND A SNAPSHOT WITHOUT THEM IS REFUSED, not quietly served from the filing.
+  const unresolved = admitTask(db, snap,
+    { id: "bt:unresolved", project: "p", title: "t", claims: [normalizeClaim("packages/fb")] });
+  check(unresolved.ok === false,
+    "a snapshot carrying no resolved claims is refused rather than falling back",
+    JSON.stringify(unresolved));
+  check(/resolved claims/.test(unresolved.refusal ?? ""),
+    "and says what is missing", String(unresolved.refusal));
+  check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task='bt:unresolved'").get().c === 0,
+    "and NO territory was taken on the way to that refusal");
+
+  // CONTROL: an EMPTY resolved list is still the "declare your territory"
+  // refusal, not the unresolved one -- they are different mistakes and an
+  // operator needs to know which they made.
+  const empty = admitTask(db, { ...snap, claims: [] },
+    { id: "bt:empty", project: "p", title: "t", claims: [] });
+  check(empty.ok === false && /pass --territory/.test(empty.refusal ?? ""),
+    "control: an empty resolved list is refused as an undeclared territory",
+    String(empty.refusal));
   db.close();
 }
 

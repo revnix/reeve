@@ -129,6 +129,18 @@ const HANDLERS = {
   // when the spec PR joined it: `(task, generation, slice)` cannot address a spec
   // row, whose generation and slice are NULL by CHECK.
   "task_pr.bound":            { table: "task_pr", key: ["repo_id","pr"] },
+  // THE v1 KIND, STILL REPLAYABLE. A schema-1 durable tail records implementation
+  // PRs as `impl_pr.bound`, and removing the kind when migration 2 renamed the
+  // table made every such event UNKNOWN -- so restoring a v1 snapshot with a tail
+  // exported before the upgrade refuses recovery, and the PRs created after that
+  // snapshot cannot be carried forward at all. A migration that changes a table
+  // has to keep reading the events written against the old one: the tail is
+  // history and cannot be migrated in place.
+  //
+  // `map` translates the v1 row image into a v2 row. The image is already a
+  // task_pr implementation row in every column but the one v1 had no need for.
+  "impl_pr.bound":            { table: "task_pr", key: ["repo_id","pr"],
+                                map: (row) => ({ ...row, kind: "impl" }) },
   "attested_push.appended":   { table: "attested_push", key: ["task","generation","slice","sha"] },
   "guardian_receipt.imported":{ table: "guardian_receipt", key: ["repo_id","guardian_event_seq"] },
   "harness_acceptance.recorded": { table: "harness_acceptance", key: ["task","generation","slice","diff_hash"] },
@@ -169,7 +181,13 @@ export function replayHub(db, events) {
       // A lease grant, a heartbeat, or anything else that describes a process
       // is not part of the projection. Counted, never guessed at.
       if (!h) { skipped++; continue; }
-      const row = JSON.parse(e.payload);
+      let row = JSON.parse(e.payload);
+      // THE HANDLER'S OWN TRANSLATION FIRST, ahead of the key guard. A legacy
+      // kind's image is shaped for the table it was WRITTEN against; everything
+      // below -- the key check, the existence probe, the upsert -- is about the
+      // table it is being replayed INTO. Reading the key off the untranslated
+      // image would ask the wrong question of the wrong shape.
+      if (h.map) row = h.map(row);
       // THE KEY GUARD RUNS FIRST, above the delete branch.
       //
       // It sat below, so a `territory_lease.released` image with an incomplete

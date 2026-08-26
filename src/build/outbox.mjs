@@ -406,11 +406,20 @@ export async function recoverEffects(db, { reconcile, now = null, isAlive = isSa
       // externally ambiguous action every round. The bound is on the ROW, so
       // every path that writes `pending` has to honour it.
       const spent = row.attempts >= row.max_attempts;
+      // BACKED OFF LIKE ANY OTHER RETRY. A row returned here is due immediately,
+      // and `leaseEffect` takes every pending row whose schedule is due -- so an
+      // effect requeued because the external service was UNREACHABLE was leased
+      // again on the next pass and the externally ambiguous action attempted
+      // straight back at the service that just failed. `settleEffect` learned
+      // this in the previous round and this path did not: two ways out of
+      // inflight, one of them honouring the schedule.
+      const backoff = spent ? null : backoffSeconds(row.attempts + 1);
       db.prepare(
         `UPDATE outbox SET status=?, worker=NULL, lease_expires_at=0,
+                           not_before=CASE WHEN ? IS NULL THEN not_before ELSE unixepoch() + ? END,
                            last_error=COALESCE(?, last_error), updated_at=unixepoch()
           WHERE id=?`)
-        .run(spent ? "dead_letter" : "pending",
+        .run(spent ? "dead_letter" : "pending", backoff, backoff,
              spent ? `unobserved after ${row.attempts} of ${row.max_attempts} attempts` +
                      (verdict?.reconcileError ? `; last reconcile failed: ${verdict.reconcileError}` : "")
                    : (verdict?.reconcileError ? `reconcile failed: ${verdict.reconcileError}` : null),

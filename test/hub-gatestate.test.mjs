@@ -21,6 +21,16 @@ import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+// `resolveSnapshot` returns the claims it WALKED as `snapshot.claims`, and
+// `admitTask` now grants only those -- it refuses a snapshot that carries none,
+// because a fallback to the filing's own list is the unchecked-territory hole
+// with a longer path to it. These blocks assemble snapshots by hand, so this
+// stands in for that half of resolveSnapshot: the resolved list IS the declared
+// one when nothing in the walk objected, which is what every fixture here means.
+const admitResolved = (db, snapshot, filing) =>
+  admitTask(db, { ...snapshot, claims: filing.claims }, filing);
+
+
 let fail = 0;
 const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
@@ -297,7 +307,7 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
     const admitted = { repoId: 1, nwo: "o/r", repoPath: "/p", profilePath: "/f", profileHash: "h",
                        defaultBranch: "main", visibility: "private", specRepoId: 9,
                        gateDefinitionHash: "g", registryVersion: 3, founderUserId: 4242 };
-    admitTask(db2, admitted, { id: "bt:prod", project: "nextly", title: "t",
+    admitResolved(db2, admitted, { id: "bt:prod", project: "nextly", title: "t",
                            claims: [normalizeClaim("packages/x")] });
     const tick = await buildTick({ hub: db2, projects: [{ name: "nextly", nwo: "o/r" }] });
     check(tick.refreshed === 1 && tick.skipped.length === 0,
@@ -352,7 +362,7 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
     const base = { repoPath: "/p", profilePath: "/f", profileHash: "h", defaultBranch: "main",
                    visibility: "private", specRepoId: 9, gateDefinitionHash: "g",
                    registryVersion: 3, founderUserId: 4242 };
-    admitTask(db4, { ...base, repoId: 77, nwo: "o/old-name" },
+    admitResolved(db4, { ...base, repoId: 77, nwo: "o/old-name" },
       { id: "bt:renamed", project: "nextly", title: "t", claims: [normalizeClaim("packages/a")] });
     // The registry now carries the NEW name for the same project key.
     const tick = await buildTick({ hub: db4, projects: [{ name: "nextly", nwo: "o/new-name" }] });
@@ -402,7 +412,7 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
     const base = { repoPath: "/p", profilePath: "/f", profileHash: "h", defaultBranch: "main",
                    visibility: "private", specRepoId: 9, gateDefinitionHash: "g",
                    registryVersion: 3, founderUserId: 4242 };
-    admitTask(db5, { ...base, repoId: 55, nwo: "o/r" },
+    admitResolved(db5, { ...base, repoId: 55, nwo: "o/r" },
       { id: "bt:lock", project: "nextly", title: "t", claims: [normalizeClaim("packages/a")] });
     // A restore that DIED: the row is there, its process is not. `lstart` is what
     // distinguishes a dead pid from a recycled one, so a value no process can
@@ -445,9 +455,9 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
     const base = { repoPath: "/p", profilePath: "/f", profileHash: "h", defaultBranch: "main",
                    visibility: "private", specRepoId: 9, gateDefinitionHash: "g",
                    registryVersion: 3, founderUserId: 4242 };
-    admitTask(db3, { ...base, repoId: 11, nwo: "o/one" },
+    admitResolved(db3, { ...base, repoId: 11, nwo: "o/one" },
       { id: "bt:one", project: "one", title: "t", claims: [normalizeClaim("packages/a")] });
-    admitTask(db3, { ...base, repoId: 33, nwo: "o/three" },
+    admitResolved(db3, { ...base, repoId: 33, nwo: "o/three" },
       { id: "bt:three", project: "three", title: "t", claims: [normalizeClaim("packages/c")] });
 
     const tick = await buildTick({ hub: db3, projects: [
@@ -576,7 +586,7 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
   // proves nothing about whether the write is guarded.
   refused("settleEffect", () => settleEffect(db, { id: 1, ok: true, result: {} }));
   refused("voidPending", () => voidPending(db, "bt:1"));
-  refused("admitTask", () => admitTask(db, snap, { id: "bt:9", project: "p", title: "t",
+  refused("admitTask", () => admitResolved(db, snap, { id: "bt:9", project: "p", title: "t",
     claims: [normalizeClaim("packages/z")] }));
 
   // The async one is awaited, because a rejected promise from an unawaited call

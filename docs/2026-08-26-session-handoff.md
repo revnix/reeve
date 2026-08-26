@@ -76,6 +76,7 @@ this can tell you that its absence is deliberate.
 | capability 2 — repair red CI | built, and gated behind `--execute` above |
 | capability 3 — work review threads | being built now; §3 is the plan, and the row below is where it has got to |
 | the durable-effect stages | 1 and 2 landed; 3 is open; 4 not started. §3.2 says what each one IS — this row is the only place that says which have landed |
+| the R-03 merge shape | **undecided.** The enquiry was done on 2026-08-22 (§6); choosing what this repository declares is the founder's, and has not been made |
 | capability 4 — refuse an unsafe merge | not started; needs a shadow week and the R-01 ruleset flip |
 | the builder daemon | not something this programme runs; S2 is a peer's lane, see §7 |
 | the founder's merge rule | merge on CI green AND zero open threads. Reaffirmed 2026-08-25 over my recommendation to wait for a verdict |
@@ -324,14 +325,17 @@ reasons about ancestry differently from one that expects merge commits, so the
 repository's declared shape and its actual history have to agree. Whether they do
 today is §0.1's doctor line.
 
-It HAS been looked at once, and saying otherwise was wrong: `docs/2026-08-22-
-session-handoff-2.md` records the investigation and its result — four merge
-commits in the last twenty while the gate declared squash. Superseding that
-document replaces its outcome, which is volatile; it cannot make the investigation
-un-happen, and a session told nothing was ever looked at will look again. What
-remains undone is the consequence rather than the enquiry: nothing has been
-decided about which shape the repository should declare, and a gate written
-against a false premise passes for the wrong reason.
+It HAS been looked at once, and saying otherwise was wrong. The investigation and
+its result are recorded in [the 22 August handoff](2026-08-22-session-handoff-2.md)
+— four merge commits in the last twenty while the gate declared squash.
+Superseding a document replaces its outcome, which is volatile; it cannot make the
+investigation un-happen, and a session told nothing was ever looked at will look
+again.
+
+What is durable is the requirement rather than its status: someone has to decide
+which shape this repository declares, because a gate written against a false
+premise passes for the wrong reason. Whether that decision has been taken is a §0
+fact, not one for this section.
 
 **The wrong-worker experiment.** It published correctly on 2026-08-24 — 61s,
 $0.42, 16 turns, 0 denials — against a toy fixture, and it has never been run

@@ -369,6 +369,13 @@ const NOW = 1_800_000_000;
   // settleDrainFor path ran.
   const db = openHub(join(dir, "o6.db"));
   seed(db, { id: "bt:1", phase: "CANCELLING", generation: 1 });
+  // NON-CANCELLABLE effects, because those are the ones that genuinely reach a
+  // drain. Entering CANCELLING runs `void-pending`, which voids every cancellable
+  // pending row -- so a cancellable comment sitting leasable under a CANCELLING
+  // task is a state the machine does not produce, and a cancellable effect is no
+  // longer delivered once its task stops. A push mid-transport is the real case:
+  // the bytes may already be on the wire, so it is `cancellable = 0`, it survives
+  // the cancellation, and the drain is what waits for it.
   const drain = (id) => db.prepare(
     "INSERT INTO task_drain(task,outbox_id,recorded_at) VALUES('bt:1',?,unixepoch())").run(id);
   const settledAt = (id) => db.prepare(
@@ -378,7 +385,7 @@ const NOW = 1_800_000_000;
 
   // PATH 1 -- settleEffect.
   const a = hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:CANCELLING:comment:0",
-    kind: "gh.pr.comment", taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+    kind: "git.push.branch", taskId: "bt:1", generation: 1, fence: 1, cancellable: false, args: {} }));
   drain(a.id);
   // CONTROL, and it has to come before the settle: a recorded-but-unsettled row
   // reads null. Without it an implementation that stamps settled_at at INSERT
@@ -1084,11 +1091,98 @@ const NOW = 1_800_000_000;
   const before = db.prepare("SELECT not_before FROM outbox WHERE id=?").get(leased.id).not_before;
   db.exec(`UPDATE outbox SET attempts = max_attempts, lease_expires_at = unixepoch() - 1
            WHERE id = ${leased.id}`);
-  const r = await recoverEffects(db, { reconcile: () => { throw new Error("still unreachable"); } });
-  check(r.dead === 1, "control: an exhausted row is dead-lettered", JSON.stringify(r));
-  check(db.prepare("SELECT not_before FROM outbox WHERE id=?").get(leased.id).not_before === before,
-    "control: and its schedule is untouched");
+  // A RECONCILER THAT COULD NOT LOOK NEVER SPENDS THE DELIVERY BUDGET.
+  // `attempts` counts POSTs, each of which could duplicate an external act; a
+  // read that can only ever conclude "still cannot tell" performs no delivery.
+  // Charging it makes the safe act as scarce as the dangerous one -- and
+  // spending it dead-letters a row that MAY have landed and settles its drain,
+  // so CANCELLED becomes reachable with a push outstanding.
+  const errored = await recoverEffects(db, { reconcile: () => { throw new Error("still unreachable"); } });
+  check(errored.dead === 0 && errored.returned === 1,
+    "an exhausted row whose reconciler ERRORED is returned, not dead-lettered",
+    JSON.stringify(errored));
+  check(db.prepare("SELECT status FROM outbox WHERE id=?").get(leased.id).status === "pending",
+    "so it will be asked again rather than discarded as if it never happened");
+
+  // CONTROL: a reconciler that LOOKED and found nothing IS definitive -- the
+  // effect did not happen -- so the delivery budget applies and the row dies.
+  db.exec(`UPDATE outbox SET status='inflight', worker='w', lease_expires_at=unixepoch()-1
+           WHERE id = ${leased.id}`);
+  const looked = await recoverEffects(db, { reconcile: () => ({ settled: false }) });
+  check(looked.dead === 1,
+    "control: an exhausted row whose reconciler LOOKED and found nothing is dead-lettered",
+    JSON.stringify(looked));
   db.close();
+}
+
+// ── a stopped task delivers nothing it could abandon ───────────────────────
+// The generation fence cannot answer this. A hold, a cancellation, an
+// infeasibility and a lost claim all leave the generation ALONE -- deliberately,
+// because they stop the task without redefining its contract -- so an effect
+// enqueued before the stop still matches the fence. `void-pending` was meant to
+// cover it and marks `pending` rows only, so an effect INFLIGHT when the stop
+// commits is missed: the gap was never a row nobody caught, it was a row that
+// came BACK when its worker reported a retryable failure.
+{
+  const db = openHub(join(dir, "o25.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:stopped", kind: "gh.pr.comment",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+  const leased = leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW });
+  check(leased != null, "fixture: the effect is inflight when the task stops", JSON.stringify(leased));
+
+  // The hold commits, AS A TRANSITION. The phase alone is not enough: the fence
+  // asks WHEN the task stopped, so that the stop's own compensations -- the
+  // comment explaining the hold -- are still delivered while the work that
+  // preceded it is not. A fixture that only sets the column has no such moment,
+  // and the predicate correctly answers "deliverable" because nothing says
+  // otherwise.
+  db.exec(`UPDATE task SET phase='BLOCKED' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+           VALUES('bt:1',unixepoch(),'phase.held','IMPLEMENTING','BLOCKED',1,1,'{}')`);
+  check(db.prepare("SELECT generation FROM task WHERE id='bt:1'").get().generation === 1,
+    "fixture: and the hold did NOT bump the generation, so the fence still passes");
+
+  const r = settleEffect(db, { id: leased.id, worker: "w", leaseToken: leased.lease_token,
+                               ok: false, retryable: true, error: "502" });
+  check(r.status === "fenced",
+    "a retryable failure under a stopped task is fenced, not returned to the queue",
+    JSON.stringify(r));
+  check(leaseEffect(db, { worker: "w2", capabilities: allOn, now: NOW }) === null,
+    "so nothing can lease it again and perform the act the task was stopped to prevent");
+
+  // AND AT THE LEASE, which is the other door. A row still pending when the stop
+  // commits is fenced when the executor next reaches it.
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:pending", kind: "gh.pr.comment",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+  check(leaseEffect(db, { worker: "w3", capabilities: allOn, now: NOW }) === null,
+    "a PENDING effect for a stopped task is not leased either");
+  check(db.prepare("SELECT status FROM outbox WHERE idempotency_key='bt:1:g1:pending'").get().status === "fenced",
+    "it is fenced, which is terminal, so its drain settles rather than hanging");
+  db.close();
+}
+
+// CONTROL, both directions.
+{
+  const db = openHub(join(dir, "o26.db"));
+  seed(db, { id: "bt:1", phase: "IMPLEMENTING", generation: 1 });
+  // 1. An ACTIVE task still delivers, or "stopped" has become "never".
+  hubTx(db, () => enqueueEffect(db, { idempotencyKey: "bt:1:g1:live", kind: "gh.pr.comment",
+                                      taskId: "bt:1", generation: 1, fence: 1, args: {} }));
+  check(leaseEffect(db, { worker: "w", capabilities: allOn, now: NOW })?.idempotency_key === "bt:1:g1:live",
+    "control: an ACTIVE task's effect is still leased");
+
+  // 2. A NON-cancellable effect survives the stop. `cancellable = 0` means the
+  // bytes may already be on the wire and abandoning it is not a compensation --
+  // that is the whole reason the column exists, and the drain waits for it.
+  const db2 = openHub(join(dir, "o27.db"));
+  seed(db2, { id: "bt:1", phase: "CANCELLING", generation: 1 });
+  hubTx(db2, () => enqueueEffect(db2, { idempotencyKey: "bt:1:g1:push", kind: "git.push.branch",
+                                        taskId: "bt:1", generation: 1, fence: 1,
+                                        cancellable: false, args: {} }));
+  check(leaseEffect(db2, { worker: "w", capabilities: allOn, now: NOW })?.idempotency_key === "bt:1:g1:push",
+    "control: a NON-cancellable effect is still delivered after the task stops");
+  db.close(); db2.close();
 }
 
 rmSync(dir, { recursive: true, force: true });

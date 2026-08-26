@@ -23,7 +23,7 @@ import { isSameProcess } from "./supervisor.mjs";
 import {
   providerTx, providerState, heldCount, heldCountBy, queuedGuardianCount,
   queuedGuardianRequests, liveRequest, youngestHeldBuilder, requestPreemption,
-  insertLease, promoteToHeld, renewQueued, oldestQueuedGuardian, nowSeconds,
+  insertLease, promoteToHeld, renewQueued, oldestQueuedGuardian, nowSeconds, newToken,
   bindLease, touchLease, deleteLease, deleteLeaseById,
   deleteQueued, expiredLeases, recordRateLimit,
   DEFAULT_LIMIT, DEFAULT_RESERVED,
@@ -131,7 +131,7 @@ export function claimProvider(db, { owner, repoId, runRef, pid, lstart, priority
     // what distinguishes this process from whatever inherited its number.
     if (existing?.status === "held") {
       if (existing.pid === pid && existing.lstart === lstart)
-        return { ok: true, id: existing.id, owner, repoId, runRef };
+        return { ok: true, id: existing.id, token: existing.token, owner, repoId, runRef };
       // Not an at-limit and not a queue: the run itself is already in flight
       // somewhere, and the answer is neither "wait" nor "try later" but "this is
       // not yours". A caller that treats every refusal as "do not dispatch"
@@ -143,11 +143,11 @@ export function claimProvider(db, { owner, repoId, runRef, pid, lstart, priority
       const expiresAt = at + LEASE_SECONDS;
       if (existing) {
         promoteToHeld(db, { id: existing.id, pid, lstart, at, expiresAt });
-        return { ok: true, id: existing.id, owner, repoId, runRef };
+        return { ok: true, id: existing.id, token: existing.token, owner, repoId, runRef };
       }
       const row = insertLease(db, { owner, repoId, runRef, pid, lstart, priority,
-                                    budgetUsd, status: "held", at, expiresAt });
-      return { ok: true, id: row.id, owner, repoId, runRef };
+                                    budgetUsd, status: "held", at, expiresAt, token: newToken() });
+      return { ok: true, id: row.id, token: row.token, owner, repoId, runRef };
     };
 
     if (owner === "guardian") {
@@ -178,7 +178,8 @@ export function claimProvider(db, { owner, repoId, runRef, pid, lstart, priority
         renewQueued(db, { id, pid, lstart, at, expiresAt: at + LEASE_SECONDS });
       } else {
         id = insertLease(db, { owner, repoId, runRef, pid, lstart, priority, budgetUsd,
-                               status: "queued", at, expiresAt: at + LEASE_SECONDS }).id;
+                               status: "queued", at, expiresAt: at + LEASE_SECONDS,
+                               token: newToken() }).id;
       }
       // NOT WHILE COOLING. A guardian queued behind a cooldown is not waiting
       // for a SLOT, so asking a builder to surrender one suspends running work
@@ -229,7 +230,7 @@ export function claimProvider(db, { owner, repoId, runRef, pid, lstart, priority
  * the identity alone is sufficient; and `force` is the explicit, named way to
  * delete by id alone for a caller that has genuinely lost the identity.
  */
-export function releaseProvider(db, { id = null, owner = null, repoId = null,
+export function releaseProvider(db, { id = null, token = null, owner = null, repoId = null,
                                       runRef = null, force = false,
                                       isAlive = isSameProcess, now = null } = {}) {
   return guarded(db, { isAlive, now }, () => {
@@ -247,9 +248,13 @@ export function releaseProvider(db, { id = null, owner = null, repoId = null,
     // appears in review rather than being reached by omission.
     if (!hasIdentity && !force) return refuse("no-identity");
     if (!hasIdentity && id == null) return refuse("no-identity");
+    // A release with an identity must carry the token too. `force` remains the
+    // one named way past the fence, and it deletes by id alone -- typed at the
+    // call site so it shows up in review rather than being reached by omission.
+    if (hasIdentity && !force && token == null) return refuse("no-identity");
     const released = (!hasIdentity || (force && id != null))
       ? deleteLeaseById(db, id).changes
-      : deleteLease(db, { id, owner, repoId, runRef }).changes;
+      : deleteLease(db, { id, token, owner, repoId, runRef }).changes;
     return { ok: true, released };
   });
 }
@@ -267,7 +272,7 @@ export function releaseProvider(db, { id = null, owner = null, repoId = null,
  * rebind keyed on a renumbered id overwrites the NEW holder's pid and lstart,
  * and then neither row can ever be matched again.
  */
-export function bindProviderLease(db, { id = null, owner = null, repoId = null, runRef = null,
+export function bindProviderLease(db, { id = null, token = null, owner = null, repoId = null, runRef = null,
                                         pid, lstart, isAlive = isSameProcess, now = null } = {}) {
   return guarded(db, { isAlive, now }, () => {
     // THE FULL IDENTITY, REQUIRED. The predicate this builds always names owner,
@@ -277,9 +282,10 @@ export function bindProviderLease(db, { id = null, owner = null, repoId = null, 
     // asked about a process that is always alive, and a detached worker that
     // dies takes its slot with it until expiry.
     if (owner == null || repoId == null || runRef == null) return refuse("no-identity");
+    if (token == null) return refuse("no-identity");
     if (pid == null || lstart == null) return refuse("no-identity");
     const at = now ?? nowSeconds(db);
-    const bound = bindLease(db, { id, owner, repoId, runRef, pid, lstart, at }).changes;
+    const bound = bindLease(db, { id, token, owner, repoId, runRef, pid, lstart, at }).changes;
     return { ok: true, bound };
   });
 }
@@ -290,15 +296,18 @@ export function bindProviderLease(db, { id = null, owner = null, repoId = null, 
  * The expiry is taken from the HEARTBEAT's clock, not the claim's, which is the
  * only thing that makes a long run survive its own lease.
  */
-export function heartbeatProvider(db, { id = null, owner = null, repoId = null, runRef = null,
+export function heartbeatProvider(db, { id = null, token = null, owner = null, repoId = null, runRef = null,
                                         isAlive = isSameProcess, now = null } = {}) {
   return guarded(db, { isAlive, now }, () => {
     // The same requirement, for the same reason: an id-only heartbeat matched
     // nothing and reported a successful renewal of a lease it never touched, so
-    // the row expired under a worker that was still running.
+    // the row expired under a worker that was still running. The token is
+    // required too -- a restore reproduces the identity exactly, so identity
+    // alone renews whatever inherited the name.
     if (owner == null || repoId == null || runRef == null) return refuse("no-identity");
+    if (token == null) return refuse("no-identity");
     const at = now ?? nowSeconds(db);
-    const beat = touchLease(db, { id, owner, repoId, runRef, at,
+    const beat = touchLease(db, { id, token, owner, repoId, runRef, at,
                                   expiresAt: at + LEASE_SECONDS }).changes;
     return { ok: true, beat };
   });

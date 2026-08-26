@@ -203,6 +203,50 @@ const ALIVE = () => true, DEAD = () => false;
   db.close();
 }
 
+// ── nor is a re-used identity: a claim has an INCARNATION ───────────────────
+// `restoreHub` clears provider_lease in the restored file, so SQLite restarts
+// its integer keys. A re-claim of the same run afterwards therefore gets an
+// identical (owner, repo_id, run_ref) AND an identical id -- so the full-identity
+// fence, which was the previous answer, still cannot tell the new claim from the
+// old. A pre-restore mutation replayed afterwards deletes a live lease or
+// corrupts its liveness data, and the retry-on-maintenance loop is exactly the
+// caller that holds one across a restore.
+{
+  const db = openHub(join(dir, "p20.db"));
+  const before = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:9", pid: 5, lstart: "L5", isAlive: ALIVE });
+  check(before.ok && typeof before.token === "string" && before.token.length > 0,
+    "a claim returns an incarnation token beside its id", JSON.stringify(before));
+
+  // WHAT A RESTORE DOES: the table is cleared in the restored file.
+  db.exec("DELETE FROM provider_lease");
+  const after = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:9", pid: 6, lstart: "L6", isAlive: ALIVE });
+  check(after.ok && after.id === before.id,
+    "fixture: the re-claim inherits the SAME id, which is the whole hazard",
+    JSON.stringify({ before: before.id, after: after.id }));
+  check(after.token !== before.token,
+    "but not the same token: the incarnation is what changed", JSON.stringify({ b: before.token, a: after.token }));
+
+  // The three fenced mutations, each replayed with the PRE-RESTORE claim.
+  const staleRelease = releaseProvider(db, before);
+  check(staleRelease.released === 0,
+    "a pre-restore release deletes nothing, though its id and identity both match",
+    JSON.stringify(staleRelease));
+  check(bindProviderLease(db, { ...before, pid: 99, lstart: "GHOST" }).bound === 0,
+    "a pre-restore bind changes nothing");
+  check(heartbeatProvider(db, before).beat === 0, "and a pre-restore heartbeat renews nothing");
+
+  const row = db.prepare("SELECT pid, lstart, token FROM provider_lease WHERE id=?").get(after.id);
+  check(row != null && row.pid === 6 && row.lstart === "L6" && row.token === after.token,
+    "so the live claim is untouched, and still reapable by its own identity",
+    JSON.stringify(row));
+
+  // CONTROL: the CURRENT incarnation's own mutations still work, or the fence
+  // has become a blanket refusal and no lease can ever be released.
+  check(heartbeatProvider(db, after).beat === 1, "control: the current claim's heartbeat applies");
+  check(releaseProvider(db, after).released === 1, "control: and its release deletes exactly one row");
+  db.close();
+}
+
 // ── a renumbered id is not an identity ───────────────────────────────────────
 // A restore replaces the database, clears `provider_lease` and lets SQLite
 // renumber it, so an integer key can come back pointing at somebody else's
@@ -220,11 +264,12 @@ const ALIVE = () => true, DEAD = () => false;
     "fixture: the next request INHERITS the cleared row's id, which is the whole hazard",
     JSON.stringify({ old: old.id, fresh: fresh.id }));
 
-  const staleBind = bindProviderLease(db, { id: old.id, owner: "builder", repoId: 1,
-                                            runRef: "bt:old", pid: 999, lstart: "GHOST" });
-  check(staleBind.bound === 0, "a rebind carrying the OLD identity changes nothing",
+  // The stale call carries the OLD claim in full -- id, identity AND its token --
+  // which is what a caller replaying a pre-restore mutation actually holds.
+  const staleBind = bindProviderLease(db, { ...old, pid: 999, lstart: "GHOST" });
+  check(staleBind.bound === 0, "a rebind carrying the OLD claim changes nothing",
     JSON.stringify(staleBind));
-  const staleBeat = heartbeatProvider(db, { id: old.id, owner: "builder", repoId: 1, runRef: "bt:old" });
+  const staleBeat = heartbeatProvider(db, old);
   check(staleBeat.beat === 0, "and neither does a heartbeat carrying it", JSON.stringify(staleBeat));
   const row = db.prepare("SELECT pid, lstart, run_ref FROM provider_lease WHERE id = ?").get(fresh.id);
   check(row.pid === 22 && row.lstart === "NEW" && row.run_ref === "bt:new",
@@ -233,11 +278,9 @@ const ALIVE = () => true, DEAD = () => false;
 
   // CONTROL: the CURRENT owner's rebind and heartbeat still work, so the match
   // is a fence and not a blanket refusal.
-  const good = bindProviderLease(db, { id: fresh.id, owner: "builder", repoId: 1,
-                                       runRef: "bt:new", pid: 33, lstart: "SPAWNED" });
+  const good = bindProviderLease(db, { ...fresh, pid: 33, lstart: "SPAWNED" });
   check(good.bound === 1, "control: the current holder's rebind is applied", JSON.stringify(good));
-  check(heartbeatProvider(db, { id: fresh.id, owner: "builder", repoId: 1, runRef: "bt:new" }).beat === 1,
-    "control: and so is its heartbeat");
+  check(heartbeatProvider(db, fresh).beat === 1, "control: and so is its heartbeat");
   db.close();
 }
 
@@ -508,10 +551,10 @@ const ALIVE = () => true, DEAD = () => false;
 {
   const db = openHub(join(dir, "p15.db"));
   const held = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE });
-  const bareBind = bindProviderLease(db, { id: held.id, pid: 2, lstart: "W" });
+  const bareBind = bindProviderLease(db, { id: held.id, token: held.token, pid: 2, lstart: "W" });
   check(!bareBind.ok && bareBind.reason === "no-identity",
     "an id-only bind is refused rather than reported as a successful no-op", JSON.stringify(bareBind));
-  const bareBeat = heartbeatProvider(db, { id: held.id });
+  const bareBeat = heartbeatProvider(db, { id: held.id, token: held.token });
   check(!bareBeat.ok && bareBeat.reason === "no-identity",
     "and so is an id-only heartbeat", JSON.stringify(bareBeat));
   check(db.prepare("SELECT pid FROM provider_lease WHERE id=?").get(held.id).pid === 1,
@@ -597,7 +640,7 @@ const ALIVE = () => true, DEAD = () => false;
     "control: releasing with the identity the claim returned works");
   // A WRONG identity with a RIGHT id deletes nothing, which is the fence.
   const third = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:3", pid: 3, lstart: "C", isAlive: ALIVE });
-  check(releaseProvider(db, { id: third.id, owner: "builder", repoId: 1, runRef: "bt:WRONG" }).released === 0,
+  check(releaseProvider(db, { ...third, runRef: "bt:WRONG" }).released === 0,
     "and an id whose identity does not match deletes nothing");
   check(db.prepare("SELECT count(*) c FROM provider_lease").get().c === 1,
     "control: that lease survived, so the id alone did not carry the delete");

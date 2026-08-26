@@ -291,7 +291,7 @@ export function prAnchor({ nwo, pr }) {
   return { ok: true, headRef, baseRef, state, title, updatedAt, head: pin.sha, pin };
 }
 
-export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {} }) {
+export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}, hold = null }) {
   // Reuses the caller's anchor when it has one, so the head is pinned ONCE per
   // pull request per tick and the fold and the evaluation cannot disagree about
   // which revision they are talking about.
@@ -408,6 +408,13 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     base: { verdict: base.verdict },
     reviewers, rounds, threads, cleared: facts.cleared, ledgerBlockers,
     mergeState: threads.mergeState, profile,
+    // Passed through, never read here. `pr_hold` is a HUB row and this function
+    // holds the per-repository state database, so the reading is taken by the
+    // caller that has the hub connection and handed in. Null when the caller has
+    // no hub, which `computeVerdict` renders as no clause at all rather than as
+    // an UNKNOWN one -- a guardian that was never asked about holds must not
+    // drag every verdict to UNKNOWN.
+    hold,
   });
 
   return { ok: true, pr, title, headRef, baseRef, state, head: pin.sha, verdict,

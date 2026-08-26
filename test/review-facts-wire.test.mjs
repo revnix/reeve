@@ -17,6 +17,7 @@
 // gate's own tests hand `nextAction` a number directly and therefore prove the
 // watcher's arithmetic while proving nothing about whether anything supplies it.
 import { reviewFacts } from "../src/pr.mjs";
+import { CLAUSE_IDS } from "../src/verdict.mjs";
 import { nextAction, ACTIONS } from "../src/watcher.mjs";
 import { derivePr, reviewState } from "../src/review/derive.mjs";
 import { ingest, noteHead } from "../src/review/ingest.mjs";
@@ -84,7 +85,8 @@ derivePr(db, NWO, 1, PROFILE, { at: T, head: HEAD_A });
 // Shaped exactly as the watcher reads one: clauses keyed by `id`, and a verdict
 // state derived from them rather than asserted separately.
 const cl = (id, state, detail = "") => ({ id, state, detail });
-const CLAUSES = ["ci", "base", "review", "rounds", "threads", "findings", "mergeable"];
+// DERIVED, not restated: the fourth copy of this set was the one that drifted.
+const CLAUSES = CLAUSE_IDS;
 const ev = rounds => {
   const clauses = CLAUSES.map(id => (id === "threads" ? cl(id, "BLOCK", "2 unresolved") : cl(id, "PASS")));
   return { pr: 1, head: HEAD_A, state: "open", rounds, checks: {},

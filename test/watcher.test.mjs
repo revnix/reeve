@@ -1,7 +1,11 @@
 // The decision function must be TOTAL: every reachable verdict maps to exactly one
 // action, and no state falls through to a silent WAIT.
 import { nextAction, ACTIONS, ESCALATIONS } from "../src/watcher.mjs";
-import { computeVerdict } from "../src/verdict.mjs";
+// DERIVED, never restated. The clause set lived in verdict.mjs and ten test
+// files, three of which asserted TOTALITY over their own copy -- and a matrix
+// claiming totality over a stale copy is how a clause ships with no branch while
+// its test reports full coverage.
+import { computeVerdict, CLAUSE_IDS } from "../src/verdict.mjs";
 
 let fail = 0;
 const check = (n, got, want) => { const ok = got === want;
@@ -17,14 +21,16 @@ const cl = (id, state, detail = "") => ({ id, state, detail });
 // than by memory. A hardcoded list here silently stopped reaching the mechanism
 // the moment a clause was added: `swap("cleared", ...)` replaced nothing, the
 // fixture stayed all-pass, and the test reported MERGE instead of failing.
-const CLAUSES = ["ci", "base", "review", "rounds", "threads", "cleared", "findings", "mergeable"];
+// Was a hardcoded list here. It is `CLAUSE_IDS` now: one declaration,
+// compared against what `computeVerdict` actually emits in both directions.
+const CLAUSES = CLAUSE_IDS;
 const ev = (clauses, extra = {}) => ({
   pr: 1, state: "open",
   verdict: { state: clauses.some(c => c.state === "BLOCK") ? "BLOCK" : clauses.some(c => c.state === "UNKNOWN") ? "UNKNOWN" : "PASS", clauses, summary: "x" },
   rounds: { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 },
   checks: {}, ...extra,
 });
-const allPass = () => CLAUSES.map(id => cl(id, "PASS"));
+const allPass = () => CLAUSE_IDS.map(id => cl(id, "PASS"));
 const swap = (id, state, detail) => allPass().map(c => (c.id === id ? cl(id, state, detail) : c));
 
 // ── terminal shapes ───────────────────────────────────────────────────────
@@ -117,11 +123,49 @@ check("a BEHIND branch updates rather than escalating",
 check("an unrecognised merge state escalates with the state named",
   /UNMERGEABLE/.test(nextAction(ev(swap("mergeable", "BLOCK", "mergeStateStatus UNMERGEABLE")), P).why), true);
 
+// ── a builder hold is read before anything that could act on the PR ───────
+// A matrix that varies ONE clause at a time cannot see a precedence bug at all,
+// so these vary two. Both are the ways late placement loses.
+{
+  // A held PR with red CI. Reached in clause order the `ci` branch answers first
+  // and returns FIX_CI -- the guardian dispatching a fixer at a task the builder
+  // deliberately parked, which is the exact outcome `pr_hold` exists to prevent.
+  const both = swap("hold", "BLOCK", "ownership_lost: the task no longer owns this path")
+    .map(c => (c.id === "ci" ? cl("ci", "BLOCK", "failing: unit") : c));
+  const d = nextAction(ev(both, { checks: { caused: ["unit"], inherited: [] } }), P, { fixAttempts: new Map() });
+  check("a held PR with red CI parks rather than dispatching a fixer", d.action, ACTIONS.PARK);
+  check("and says the builder is holding it", /held by the builder/.test(d.why), true);
+
+  // CONTROL: the same red CI without the hold still dispatches, or the branch
+  // above has simply disabled FIX_CI rather than deferring to the hold.
+  const noHold = swap("ci", "BLOCK", "failing: unit");
+  check("control: the same red CI without a hold still dispatches a fixer",
+    nextAction(ev(noHold, { checks: { caused: ["unit"], inherited: [] } }), P, { fixAttempts: new Map() }).action,
+    ACTIONS.FIX_CI);
+}
+{
+  // A hold that could not be scoped, alongside another UNKNOWN. Left to fall
+  // through, the generic sweep reports it as an unscopeable clause rather than
+  // as the configuration fault it is.
+  const both = swap("hold", "UNKNOWN", "no hub connection")
+    .map(c => (c.id === "threads" ? cl("threads", "UNKNOWN", "projection unreadable") : c));
+  const d = nextAction(ev(both), P, { fixAttempts: new Map() });
+  check("an unscopeable hold escalates as itself, not as a generic unknown",
+    /builder hold state unknown/.test(d.why), true);
+  check("and is not reported as a classifier gap", d.gap, undefined);
+}
+{
+  // A hold present and CLEAR must not park: the clause exists on every verdict
+  // the guardian renders once a hub is wired, so a PASS that parked would stop
+  // every PR in the repository.
+  check("a PASS hold does not park", nextAction(ev(allPass()), P).action, ACTIONS.MERGE);
+}
+
 // ── totality ──────────────────────────────────────────────────────────────
 // No reachable combination may fall through to a silent WAIT with no reason.
 {
   const states = ["PASS", "BLOCK", "UNKNOWN"];
-  const ids = ["ci", "base", "review", "rounds", "threads", "findings", "mergeable"];
+  const ids = CLAUSE_IDS;
   let unclassified = 0, missingWhy = 0;
   for (const id of ids) for (const st of states) {
     const d = nextAction(ev(swap(id, st, "detail")), P, { fixAttempts: new Map() });

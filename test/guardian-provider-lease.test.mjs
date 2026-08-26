@@ -578,6 +578,63 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
   rmSync(dir, { recursive: true, force: true });
 }
 
+// ── every claim takes a FRESH handle, not the tick's opening snapshot ─────
+// `restoreHub` replaces the hub file mid-tick, and a handle taken at the top
+// then points at the unlinked pre-restore inode -- so a claim reserves capacity
+// in a database no other process sees while the restored hub admits its own.
+//
+// The fixture has to be able to TELL: an earlier version returned the same
+// object from the getter every time, so stale and fresh were indistinguishable
+// and a stub that reverted the fix produced no failures at all. This getter
+// hands out a different handle after the first call.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-fresh-"));
+  const first = { tag: "pre-restore" };
+  const second = { tag: "post-restore" };
+  let asked = 0;
+  const seen = [];
+  const ctx = {
+    nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+    execute: true, shadow: true, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-fresh-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+    },
+    // The first ask gets the pre-restore handle; every later one gets the
+    // replacement, as a restore during the tick would produce.
+    hub: () => ({ hub: (++asked === 1 ? first : second), why: null }),
+    repoId: 7, lstart: "boot-1",
+    providerClaim: (db, a) => { seen.push({ tag: db?.tag, runRef: a.runRef }); return { ok: true, id: seen.length, token: "t" }; },
+    providerBind: (db, a) => { seen.push({ tag: db?.tag, runRef: `bind:${a.runRef}` }); return { ok: true, bound: 1 }; },
+    providerRelease: () => ({ ok: true }),
+    reapProvider: () => ({ ok: true, reaped: 0 }),
+    queuedRequests: () => [],
+    openPrs: () => [42],
+    prAnchor: () => ({ ok: true, headRef: "mp/bt-1-s0", baseRef: "main", state: "open", title: "t",
+                       updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
+    evaluate: () => EVAL,
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    spawnWorker: async a => { a.onSpawn?.({ pid: 4242, lstart: "worker-start" }); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; },
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+  };
+  await tick(ctx); ctx.db.close();
+
+  check(asked > 1, "fixture: the tick asked for the hub more than once", String(asked));
+  check(seen.length > 0, "fixture: at least one claim reached the scheduler", JSON.stringify(seen));
+  const stale = seen.filter(x => x.tag === "pre-restore");
+  check(stale.length === 0,
+    "no claim or bind uses the handle taken at the top of the tick",
+    JSON.stringify({ stale, seen }));
+}
+
 // ── A-9: a maintenance refusal is retried, never swallowed ────────────────
 // `assertWritable` refuses every hub write while a restore holds the lock. A
 // release dropped there leaves the lease held until it expires, counted against

@@ -8,7 +8,7 @@
 import { existsSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { openHubAsGuest } from "./hubguest.mjs";
-import { SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION, COLUMNS_AT, columnDefectsAt } from "./hubdb.mjs";
+import { SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION, COLUMNS_AT, TABLES_AT, columnDefectsAt } from "./hubdb.mjs";
 
 /**
  * A getter over the hub at `hubPath`, answering three ways. See the notes below.
@@ -75,6 +75,20 @@ export function hubAccess(hubPath) {
     const v = probeRead(p, q => {
       const version = q.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get().v;
       const defects = [];
+      // THE TABLES FIRST, AND THIS WAS THE HALF THAT WAS MISSING. `COLUMNS_AT`
+      // describes only what migrations ADD to tables that already exist -- its
+      // sole entry is migration 3's two columns -- so a current-version hub that
+      // has lost a version-1 table like `provider_state` produced no defects at
+      // all. The guest opened, and `claimProvider` threw on its first
+      // `SELECT ... FROM provider_state` straight into the fail-open path.
+      //
+      // `TABLES_AT` is the inventory that answers this, and it already exists.
+      // Consulting one inventory and not the other is how a shape check ends up
+      // covering exactly the last migration and nothing before it.
+      const present = new Set(q.prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'table'`).all().map(r => r.name));
+      for (const t of TABLES_AT[version] ?? [])
+        if (!present.has(t)) defects.push(`${t} is missing`);
       for (const n of Object.keys(COLUMNS_AT).map(Number).filter(x => x <= version).sort((a, b) => a - b)) {
         try { defects.push(...columnDefectsAt(q, n)); }
         catch (err) { defects.push(`version ${n}: ${err.message}`); }

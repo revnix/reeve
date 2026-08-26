@@ -6,7 +6,7 @@
 // a newer store would read columns it does not know about as absent, and
 // absence is never read as success anywhere else in this system either.
 import { hubPathFor, statePathFor } from "../src/paths.mjs";
-import { openHub, hubTx, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
+import { openHub, hubTx, HUB_SCHEMA_VERSION, COLUMNS_AT } from "../src/build/hubdb.mjs";
 import { validateSnapshot } from "../src/backup.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -455,6 +455,45 @@ import { hubEvent, migrationPlan } from "../src/build/hubdb.mjs";
   openHub(good).close();
   const ok = validateSnapshot(good, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true });
   check(ok.ok === true, "control: an intact version-3 snapshot is usable", JSON.stringify(ok));
+
+  // AND THE WRONG TYPE, which a name-only inventory cannot see. Every hub table
+  // is STRICT, so a column of the wrong declared type does not coerce -- it
+  // refuses the write. This snapshot HAS `provider_lease.token`, passes a
+  // presence check, is chosen for recovery, and then fails the first
+  // `claimProvider` with `cannot store TEXT value in INTEGER column`: the same
+  // failure as the missing column, at the same worst moment.
+  const typed = join(dir, "v3-wrong-type.db");
+  const t = openHub(typed);
+  t.exec("ALTER TABLE provider_lease DROP COLUMN token");
+  t.exec("ALTER TABLE provider_lease ADD COLUMN token INTEGER");
+  t.close();
+  const tv = validateSnapshot(typed, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true });
+  check(tv.ok === false && /token/.test(tv.why ?? "") && /INTEGER/i.test(tv.why ?? ""),
+    "a version-3 snapshot with a migration-3 column at the WRONG TYPE is refused",
+    JSON.stringify(tv));
+
+  // THE DECLARATION IS CHECKED AGAINST THE MIGRATION, not trusted.
+  //
+  // COLUMNS_AT now restates the types migration 3's DDL declares, and a restated
+  // fact drifts the moment one side changes -- a validator that requires TEXT
+  // where the migration produces INTEGER would refuse every healthy snapshot,
+  // which is worse than the gap it closes. So the intact store above, which was
+  // built by running the migrations, is the authority: what it actually has is
+  // what COLUMNS_AT must say.
+  {
+    const live = openHub(good);
+    const drift = [];
+    for (const [table, cols] of Object.entries(COLUMNS_AT[HUB_SCHEMA_VERSION] ?? {})) {
+      const have = new Map(live.prepare("SELECT name, type FROM pragma_table_info(?)").all(table)
+                             .map(r => [r.name, String(r.type ?? "").toUpperCase()]));
+      for (const [c, want] of Object.entries(cols))
+        if (have.get(c) !== want.toUpperCase())
+          drift.push(`${table}.${c}: migration says ${have.get(c) ?? "absent"}, COLUMNS_AT says ${want}`);
+    }
+    live.close();
+    check(drift.length === 0,
+      "COLUMNS_AT describes the shape the migrations actually produce", drift.join("; "));
+  }
 }
 
 rmSync(dir, { recursive: true, force: true });

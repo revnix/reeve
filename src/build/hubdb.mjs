@@ -673,24 +673,37 @@ export const TABLES_AT = Object.freeze({ 1: V1, 2: V2, 3: V3 });
  */
 export const COLUMNS_AT = Object.freeze({
   3: Object.freeze({
-    task_territory: ["pinned_until"],
-    provider_lease: ["token"],
+    task_territory: Object.freeze({ pinned_until: "INTEGER" }),
+    provider_lease: Object.freeze({ token: "TEXT" }),
   }),
 });
 
 /**
- * Which required columns a store is missing at a given version, as
- * `table.column` strings. Empty means it has them all.
+ * How a store's columns fail this version's requirements, one string each.
+ * Empty means it satisfies them.
+ *
+ * NAMES ARE NOT ENOUGH, and the difference is not academic. Every hub table is
+ * STRICT, so a column of the wrong declared type does not coerce -- it refuses
+ * the write. A snapshot carrying `provider_lease.token INTEGER` has the column,
+ * passes a name-only inventory, is selected for recovery, and then fails the
+ * first `claimProvider` with `cannot store TEXT value in INTEGER column`. That
+ * is the same failure mode as the missing column this function was written for,
+ * arriving at the same worst moment, so it is the same check.
  */
-export function missingColumnsAt(db, version) {
+export function columnDefectsAt(db, version) {
   const want = COLUMNS_AT[version];
   if (!want) return [];
-  const gone = [];
+  const bad = [];
   for (const [table, cols] of Object.entries(want)) {
-    const have = new Set(db.prepare(`SELECT name FROM pragma_table_info(?)`).all(table).map(r => r.name));
-    for (const c of cols) if (!have.has(c)) gone.push(`${table}.${c}`);
+    const have = new Map(db.prepare(`SELECT name, type FROM pragma_table_info(?)`).all(table)
+                           .map(r => [r.name, String(r.type ?? "").toUpperCase()]));
+    for (const [c, type] of Object.entries(cols)) {
+      if (!have.has(c)) { bad.push(`${table}.${c} is missing`); continue; }
+      const got = have.get(c);
+      if (got !== type.toUpperCase()) bad.push(`${table}.${c} is ${got || "untyped"}, want ${type}`);
+    }
   }
-  return gone;
+  return bad;
 }
 
 /**

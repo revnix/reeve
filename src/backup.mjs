@@ -28,7 +28,7 @@ import { open as openStore, exportJsonl } from "./db/ops.mjs";
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
 // naming a module that does not exist yet breaks every import of this file.
 import { openHub, isOperational, faultKind, HUB_SCHEMA_VERSION, HUB_TABLES, TABLES_AT,
-         missingColumnsAt } from "./build/hubdb.mjs";
+         columnDefectsAt } from "./build/hubdb.mjs";
 // Task 9's additions. `restoreHub` takes the maintenance lock before it refuses,
 // enumerates live writers to name them, and replays the tail -- and it needs
 // `replayableKinds`/`NON_REPLAYED_KINDS` to refuse a tail exported by a NEWER
@@ -265,17 +265,18 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo", de
       if (missing.length)
         return { ok: false, why: `snapshot at version ${version} is missing ${missing.length} table(s): ${missing.slice(0, 5).join(", ")}`,
                  version, integrity };
-      // AND THE COLUMNS, which a table-name inventory cannot describe. Migration
+      // AND THE COLUMNS' SHAPE, which a table-name inventory cannot describe. Migration
       // 3 adds no tables, so a snapshot recording version 3 without its columns
       // satisfies every check above -- `integrity_check` proves the file is
       // structurally sound and the list above proves the tables are present, and
       // neither asks what shape they are. `openHub` would then read version 3 as
-      // completed, skip the migration, and fail with `no such column` on the
-      // first pin or provider query, after this snapshot had been chosen for
-      // recovery.
-      const missingCols = missingColumnsAt(probe, version);
-      if (missingCols.length)
-        return { ok: false, why: `snapshot at version ${version} is missing ${missingCols.length} column(s): ${missingCols.slice(0, 5).join(", ")}`,
+      // completed, skip the migration, and fail on the first pin or provider
+      // query -- with `no such column` when the column is absent, and with a
+      // STRICT type refusal when it is present at the wrong type -- after this
+      // snapshot had been chosen for recovery.
+      const colDefects = columnDefectsAt(probe, version);
+      if (colDefects.length)
+        return { ok: false, why: `snapshot at version ${version} has ${colDefects.length} column defect(s): ${colDefects.slice(0, 5).join("; ")}`,
                  version, integrity };
       // schema_version alone is too weak a marker: a physically valid SQLite file
       // carrying only that table passes, is retained as a usable backup, and is

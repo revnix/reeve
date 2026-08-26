@@ -528,6 +528,56 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
   rmSync(dir, { recursive: true, force: true });
 }
 
+// ── the CANARY's own rate limit reaches provider_state ────────────────────
+// The canary is a paid model call. A failed canary is never a cache hit, so
+// without recording its rate limit the next tick claims another slot and spends
+// another request into the same exhausted window -- while builders stay eligible
+// against the same untouched provider_state.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-canary-"));
+  const cooldowns = [];
+  const ctx = {
+    nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+    execute: true, shadow: true, running: 0,
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-canary-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5, model: "claude-x" },
+      worker: { isolation: "scratch-home" },
+    },
+    // The canary RESULT is injected, carrying the shape `sandboxCanary` really
+    // returns: the worker's outcome preserved in `evidence.outcome`.
+    isolationReady: () => true,
+    canary: { ok: false, id: "c1", why: "the canary was rate limited",
+              evidence: { outcome: "rate_limited", why: "provider returned 429" } },
+    hub: () => ({ hub: {}, why: null }), repoId: 7, lstart: "boot-1",
+    providerClaim: () => ({ ok: true, id: 1, token: "t" }),
+    providerRelease: () => ({ ok: true }),
+    reapProvider: () => ({ ok: true, reaped: 0 }),
+    queuedRequests: () => [],
+    noteRateLimit: (db, a) => { cooldowns.push(a); return { ok: true, until: 1 }; },
+    openPrs: () => [42],
+    prAnchor: () => ({ ok: true, headRef: "mp/bt-1-s0", baseRef: "main", state: "open", title: "t",
+                       updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
+    evaluate: () => EVAL,
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }),
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+  };
+  await tick(ctx); ctx.db.close();
+  check(cooldowns.length > 0,
+    "a rate-limited CANARY records the provider cooldown", JSON.stringify(cooldowns));
+  check(cooldowns[0]?.cooldownSeconds > 0,
+    "with a cooldown the next admission will see", JSON.stringify(cooldowns[0]));
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // ── A-9: a maintenance refusal is retried, never swallowed ────────────────
 // `assertWritable` refuses every hub write while a restore holds the lock. A
 // release dropped there leaves the lease held until it expires, counted against

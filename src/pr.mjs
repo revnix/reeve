@@ -231,7 +231,22 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
   };
 }
 
-export function evaluatePr({ nwo, pr, profile, db = null, io = {} }) {
+/**
+ * The two facts everything else about a pull request is decided AGAINST: the
+ * revision under judgement, and when GitHub last saw it change.
+ *
+ * Extracted so the caller can establish them BEFORE folding review data rather
+ * than as a side effect of evaluating. The fold needs the head -- clearing is
+ * computed against it -- and the ingest needs `updatedAt` to decide whether the
+ * pull request has moved. While these were produced by `evaluatePr`, the only
+ * possible order was evaluate-then-fold, so every decision read a projection
+ * derived from the PREVIOUS tick.
+ *
+ * `evaluatePr` takes the result back so the pin is paid for once. Pinning twice
+ * would be worse than the ordering it fixes: the two reads could return different
+ * revisions, and the evaluation would then judge a head the fold did not describe.
+ */
+export function prAnchor({ nwo, pr }) {
   // updated_at rides along so ingest can skip a pull request that has not moved.
   // It is GitHub's timestamp, so a change reeve has not seen yet still triggers a
   // read -- unlike a local clock, which would skip whatever it slept through.
@@ -241,6 +256,16 @@ export function evaluatePr({ nwo, pr, profile, db = null, io = {} }) {
 
   const pin = pinHead(nwo, headRef);
   if (!pin.ok) return { ok: false, why: `could not pin head: ${pin.why}` };
+  return { ok: true, headRef, baseRef, state, title, updatedAt, head: pin.sha, pin };
+}
+
+export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {} }) {
+  // Reuses the caller's anchor when it has one, so the head is pinned ONCE per
+  // pull request per tick and the fold and the evaluation cannot disagree about
+  // which revision they are talking about.
+  const a = anchor ?? prAnchor({ nwo, pr });
+  if (!a.ok) return { ok: false, why: a.why };
+  const { headRef, baseRef, state, title, updatedAt, pin } = a;
 
   // A reviewer's commit status is never CI evidence: a rate-limited CodeRabbit
   // reports success. Excluded at the read, for the head AND the base alike.

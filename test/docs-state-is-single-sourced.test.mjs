@@ -259,11 +259,21 @@ const offendersIn = text => {
   const esc = s => s.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
   const CLAIM = c => new RegExp(
     `\\b${esc(c)}\\b[^.]{0,40}\\b(reports?|said|says?|shows?|returns?|answers?|reported|contains?|sits at|is at|points at|tip|broken|degraded|clean|zero|empty)\\b`, "i");
+  // Sentence boundaries have to survive MARKDOWN, or the whole rule is inert.
+  //
+  // `/(?<=[.!?])\s+/` requires whitespace immediately after the stop, and these
+  // documents write emphasis: "**The last two PRs of the programme.** §3.2 says…"
+  // puts `**` between the two. Nothing split there, the paragraph stayed one
+  // "sentence", it contained a §0 pointer, and it was exempt in full -- so the
+  // rule written to catch exactly that line did not catch it. Measured: the stub
+  // stayed green until this changed.
+  const SENTENCE = /(?<=[.!?][*_`"')\]]*)\s+/;
+
   const offenders = [];
   for (const [label, text] of [[HANDOFF, handoff.replace(/^## 0\. STATE[\s\S]*?(?=^## )/m, "")], [PROMPT, prompt]])
     for (const b of blocksOf(text)) {
       const joined = b.lines.join(" ");
-      for (const sentence of joined.split(/(?<=[.!?])\s+/)) {
+      for (const sentence of joined.split(SENTENCE)) {
         if (/§0/.test(sentence.replace(/\(§0\)/g, ""))) continue;
         const lowerS = sentence.toLowerCase();
         const named = [...commands, ...subjectsInComments].filter(c => CLAIM(c).test(sentence))
@@ -272,13 +282,60 @@ const offendersIn = text => {
             .map(([label]) => `${label} (restated, not named)`));
         if (named.length) offenders.push(`${label}:${b.nums[0]} claims a "${named[0]}" outcome — ${sentence.trim().slice(0, 70)}`);
       }
-      if (/§0/.test(joined.replace(/\(§0\)/g, ""))) continue;
-      const lower = joined.toLowerCase();
-      const named = subjects.filter(s => lower.includes(s.toLowerCase()));
-      if (named.length) offenders.push(`${label}:${b.nums[0]} names "${named[0]}" — ${joined.trim().slice(0, 70)}`);
+      // Row LABELS are judged per sentence too, and that is the third time the
+      // block-scoped exemption has been the defect rather than the rule.
+      //
+      // A block that mentions §0 anywhere was exempt in full. That is generous in
+      // exactly the wrong direction: the paragraphs most likely to restate a
+      // volatile fact are the ones ALREADY discussing it, so they are the ones
+      // carrying a §0 pointer. Three findings came from that one allowance -- a
+      // doctor outcome, a restated merge rule, and a progress count -- each in a
+      // block whose later sentence deferred correctly.
+      //
+      // The rule is the same one the other two halves already use: the deferral
+      // has to be in the same breath as the claim. A sentence that says "see §0"
+      // is exempt; the sentence next to it is not.
+      for (const sentence of joined.split(SENTENCE)) {
+        if (/§0/.test(sentence.replace(/\(§0\)/g, ""))) continue;
+        const lower = sentence.toLowerCase();
+        const named = subjects.filter(s => lower.includes(s.toLowerCase()));
+        if (named.length) offenders.push(`${label}:${b.nums[0]} names "${named[0]}" — ${sentence.trim().slice(0, 70)}`);
+
+        // Two shapes that recurred and that nothing above could see. Both were
+        // found in review AFTER a fix that did not cover them, which is the whole
+        // reason they are rules and not resolutions to be careful.
+
+        // A RULE'S OUTCOME. §6 explains what R-01 and R-03 mean; what either
+        // currently reports is doctor's answer. A sentence that says an R-number
+        // "is" or "lets" or "requires" something has copied that answer, and the
+        // copy primes a reader to treat real drift as the finding they expected.
+        if (/\bR-\d+\b[^.]{0,40}\b(is|are|lets|allows|requires|carries|exempts|declares|reports?)\b/i.test(sentence))
+          offenders.push(`${label}:${b.nums[0]} states an R-rule's OUTCOME — ${sentence.trim().slice(0, 70)}`);
+
+        // A COUNT OF REMAINING WORK. "The last two PRs" is true until one lands
+        // and then silently sequences a session onto work that is done. §0 says
+        // which stages remain; a number here is a second copy of that.
+        if (/\b(last|first|remaining|final|next)?\s*(one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(sentence)
+            && /\b(last|remaining|final|next|more|left|still)\b/i.test(sentence))
+          offenders.push(`${label}:${b.nums[0]} counts REMAINING work — ${sentence.trim().slice(0, 70)}`);
+      }
     }
   check(offenders.length === 0, "no block outside §0 names a §0 subject without deferring to it",
     offenders.slice(0, 4).join("\n        "));
+
+  // Controls, because both rules above are regexes over prose and a regex that
+  // stopped matching would read exactly like documents that stopped offending.
+  for (const [what, sample, want] of [
+    ["an R-rule outcome", "R-01 is the ruleset that lets admins bypass every rule.", true],
+    ["a remaining-work count", "The last two PRs of the programme remain.", true],
+    ["a rule's MEANING, which is durable", "R-01 means reeve must stand as a required check.", false],
+    ["the programme's own size, which does not change", "§3.2 lists all four PRs of the plan.", false],
+  ]) {
+    const hit = /\bR-\d+\b[^.]{0,40}\b(is|are|lets|allows|requires|carries|exempts|declares|reports?)\b/i.test(sample)
+      || (/\b(last|first|remaining|final|next)?\s*(one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(sample)
+          && /\b(last|remaining|final|next|more|left|still)\b/i.test(sample));
+    check(hit === want, `control: the state-claim rules ${want ? "catch" : "spare"} ${what}`, sample);
+  }
 }
 
 // --- DERIVED: the prompt names no PR and no commit ---------------------------

@@ -190,25 +190,45 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
   // it has had -- and with a soft cap of five, no decision gated on the cap could
   // ever be reached. Carrying the count without carrying the criticals, or the
   // other way round, wires up half a rule.
-  // The COUNT and the DETAILS are separated here, because they are trusted for
-  // different things and one of them is not ready.
+  // WHAT IS HANDED ON, and what is withheld until it can be trusted.
   //
-  // The details are strictly better than what they replace: FIX_FINDINGS and
-  // SPILL were handed an empty array and told those were the findings. Any real
-  // list beats that, and being short of a body-only finding cannot make a worker
-  // do something unsafe -- it can only give it less to work on.
+  // Three things could come out of the projection, each gated on a different
+  // precondition. Stating them separately is the point: an answer withheld for a
+  // written reason is a different thing from one that is simply absent, which is
+  // what the hard-coded null used to be.
   //
-  // The count is different. A known zero is what licenses SPILL, and a zero that
-  // may be missing a critical stated in a review body would spill a P0 -- the one
-  // outcome the standing ruling forbids outright. So until the fold derives body
-  // findings, this stays UNKNOWN, and it stays unknown for a REASON that is
-  // written down rather than by the accident of a hard-coded null.
-  const complete = st.bodyFindingsDerived === true;
-  return { unspilledCritical: complete ? st.unspilledCritical : null,
-           rounds: st.rounds, threadDetails: st.threads,
-           projection: complete
-             ? { readable: true }
-             : { readable: true, countUnknown: "review-body findings are not derived yet, so a zero could be missing a body-only critical" } };
+  // ROUNDS is safe now. It counts distinct reviewed revisions and depends on no
+  // thread's content, so a tick of lag cannot make it wrong in a direction that
+  // matters -- it lags DOWNWARD, and a cap not yet reached is the conservative
+  // side of every decision it feeds.
+  //
+  // THE CRITICAL COUNT waits on the fold learning to classify review BODIES. The
+  // fold reads severity from thread rows only, so a P0 stated in a body with no
+  // inline thread is invisible, and a known zero is precisely what licenses SPILL.
+  // Spilling a critical is the single thing the standing ruling forbids outright,
+  // so a zero that might be missing one is worse than no answer.
+  //
+  // THE THREAD DETAILS wait on the tick being REORDERED. The daemon evaluates
+  // before it observes and folds, so these are a tick old -- and the count
+  // cross-check above cannot see the difference, because a reviewer EDITING a
+  // thread in place changes no total, no resolved count and no open count. A
+  // worker dispatched with a superseded excerpt would modify code against a
+  // request that has been withdrawn, and that is worse than the empty list it
+  // gets today: an empty list makes a worker go and look, a stale one makes it
+  // act. Comparing aggregates catches things appearing and disappearing, never
+  // things changing in place, and no amount of further counting fixes that.
+  const bodies = st.bodyFindingsDerived === true;
+  const fresh = io.foldPrecedesEvaluation === true;
+  return {
+    rounds: st.rounds,
+    unspilledCritical: bodies ? st.unspilledCritical : null,
+    threadDetails: fresh ? st.threads : null,
+    projection: {
+      readable: true,
+      ...(bodies ? {} : { countUnknown: "review-body findings are not derived yet, so a zero could be missing a body-only critical" }),
+      ...(fresh ? {} : { detailsUnknown: "the fold runs after this evaluation, so a thread edited in place would not be seen" }),
+    },
+  };
 }
 
 export function evaluatePr({ nwo, pr, profile, db = null, io = {} }) {

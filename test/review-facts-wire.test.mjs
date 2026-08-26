@@ -95,9 +95,29 @@ const ev = rounds => {
 {
   const f = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A, at: T + 100, live: liveOf(2, 2) });
   check(f.projection.readable === true, "the projection is readable at this head", JSON.stringify(f.projection));
-  check(Array.isArray(f.threadDetails) && f.threadDetails.length === 2,
-    "the evaluation receives the thread details a worker is dispatched with, where it used to receive nothing",
-    JSON.stringify(f.threadDetails?.length));
+  // WITHHELD, and for a written reason. The details are a tick old, because the
+  // daemon folds after it evaluates, and the count cross-check below cannot see a
+  // thread EDITED in place -- no total, resolved or open count moves. A worker
+  // given a superseded excerpt acts on a withdrawn request; the empty list it
+  // gets today at least makes it go and look. They arrive when the fold precedes
+  // the evaluation, which is a change to the tick and not to this function.
+  check(f.threadDetails === null,
+    "the thread details are WITHHELD while the fold still runs after the evaluation",
+    JSON.stringify(f.threadDetails));
+  check(/edited in place/.test(String(f.projection.detailsUnknown)),
+    "and say why, so the precondition is written down rather than remembered",
+    JSON.stringify(f.projection));
+  // With the fold ahead of the evaluation they are handed on, and that is the ONE
+  // thing that flips: same projection, same everything else.
+  const ordered = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A,
+                                at: T + 100, live: liveOf(2, 2),
+                                io: { foldPrecedesEvaluation: true } });
+  check(Array.isArray(ordered.threadDetails) && ordered.threadDetails.length === 2,
+    "control: once the fold precedes it, the details a worker is dispatched with arrive",
+    JSON.stringify(ordered.threadDetails?.length));
+  check(ordered.threadDetails[0].id && ordered.threadDetails[0].severity && ordered.threadDetails[0].path,
+    "control: carrying what a follow-up issue or a fix would need",
+    JSON.stringify(ordered.threadDetails?.[0]));
   check(f.rounds === 1,
     "and the DERIVED round count, which `judged.size` cannot produce past one for a single reviewer",
     String(f.rounds));
@@ -112,10 +132,7 @@ const ev = rounds => {
   check(/body/.test(String(f.projection.countUnknown)),
     "and it says WHY, so the next stage has a stated precondition rather than a mystery",
     JSON.stringify(f.projection));
-  const d = f.threadDetails[0];
-  check(d.id && d.severity && d.path,
-    "control: each detail carries what a follow-up issue or a fix would need",
-    JSON.stringify(d));
+
 }
 
 // --- THE BRANCH THAT COULD NOT BE TAKEN --------------------------------------
@@ -194,7 +211,8 @@ const ev = rounds => {
   // cannot carry both, which is why the details are null rather than [].
   const f = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A, at: T + 800,
                           live: liveOf(0, 0),
-                          io: { reviewState: () => ({ readable: true, bodyFindingsDerived: true, total: 0,
+                          io: { foldPrecedesEvaluation: true,
+                                reviewState: () => ({ readable: true, bodyFindingsDerived: true, total: 0,
                                                       open: 0, resolved: 0, unspilledCritical: 0,
                                                       rounds: 3, threads: [] }) } });
   check(f.unspilledCritical === 0 && Array.isArray(f.threadDetails) && f.threadDetails.length === 0,
@@ -264,7 +282,7 @@ const ev = rounds => {
   check(/unspilledCritical:\s*facts\.unspilledCritical/.test(body),
     "evaluatePr takes its critical count from the projection, not from a literal", "");
   check(/threadDetails:\s*facts\.threadDetails/.test(body),
-    "and hands on the thread details a dispatched worker is given", "");
+    "and hands on whatever the projection permits as thread details", "");
   check(/n:\s*facts\.rounds\s*\?\?/.test(body),
     "and prefers the DERIVED round count, without which every cap decision is unreachable", "");
   check(/live:\s*threads/.test(body),

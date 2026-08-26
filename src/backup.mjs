@@ -28,7 +28,7 @@ import { open as openStore, exportJsonl } from "./db/ops.mjs";
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
 // naming a module that does not exist yet breaks every import of this file.
 import { openHub, isOperational, faultKind, HUB_SCHEMA_VERSION, HUB_TABLES, TABLES_AT,
-         columnDefectsAt } from "./build/hubdb.mjs";
+         columnDefectsAt, backfillPinDeadlines } from "./build/hubdb.mjs";
 // Task 9's additions. `restoreHub` takes the maintenance lock before it refuses,
 // enumerates live writers to name them, and replays the tail -- and it needs
 // `replayableKinds`/`NON_REPLAYED_KINDS` to refuse a tail exported by a NEWER
@@ -1889,6 +1889,24 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
                           `replaying it would rebuild the log without the projection. Upgrade reeve.` };
           replayed = r.applied;
         }
+        // AFTER THE REPLAY, because the migration that does this ran BEFORE it.
+        //
+        // `openHub(staging)` above brings the snapshot up to the current schema,
+        // and migration 3 carries every pin's deadline from its lease onto its
+        // claim. The tail is replayed afterwards, so a task pinned after the
+        // snapshot was taken arrives once that has already happened -- and a
+        // tail written by a v2 binary carries a `task_territory.claimed` image
+        // with no `pinned_until`, while the `territory_lease.granted` image that
+        // follows holds the deadline and never copies it across. Without this
+        // the restore ends in precisely the state migration 3 exists to remove,
+        // and the next regrant mints a fresh deadline over a pin the founder had
+        // time-boxed.
+        //
+        // Runs unconditionally: it is a repair of a projection against the row
+        // that is already the authority for it, deterministic from data the
+        // store holds, and it matches nothing when the tail was written by a
+        // binary that records the deadline on the claim.
+        backfillPinDeadlines(back);
         releaseMaintenanceLock(back, { pid, lstart });
       } finally { back.close(); }
     }

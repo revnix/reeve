@@ -29,6 +29,42 @@ export const HUB_SCHEMA_VERSION = 3;
  * Forward-only. Each entry runs exactly once, in order, in its own transaction,
  * and records itself. Never edit a merged entry -- add the next number.
  */
+/**
+ * Move a pin's deadline from the LEASE onto the CLAIM, wherever that has not
+ * happened yet.
+ *
+ * A pin is one promise, and its deadline now lives on `task_territory` beside
+ * the intent. Anything still carrying the deadline only on `territory_lease`
+ * says "pinned" with no end once the lease goes, so the next grant reads "no
+ * deadline", treats itself as the first grant, and mints a fresh one --
+ * resurrecting a promise that was deliberately time-boxed.
+ *
+ * TWO CALLERS, ONE STATEMENT, and the second caller is why this is a function.
+ * Migration 3 runs it over whatever the store already holds. But `restoreHub`
+ * opens the staging database -- which runs the migration -- and only THEN
+ * replays the tail, so a task pinned after the snapshot arrives afterwards. A
+ * tail written by a v2 binary carries a `task_territory.claimed` image with no
+ * `pinned_until` in it, and the `territory_lease.granted` image that follows
+ * holds the deadline without ever copying it across. The restore therefore ends
+ * in exactly the state the migration exists to remove, having already run.
+ * Restore reconciles again after replay.
+ *
+ * Idempotent and safe to repeat: it touches only a pinned claim with no
+ * deadline whose lease has one, so a v3 tail -- whose claim image already
+ * carries the value -- matches nothing.
+ */
+export function backfillPinDeadlines(db) {
+  db.exec(`
+    UPDATE task_territory AS t
+       SET pinned_until = (SELECT l.pinned_until FROM territory_lease l
+                            WHERE l.task = t.task AND l.kind = t.kind AND l.path = t.path)
+     WHERE t.pinned = 1
+       AND t.pinned_until IS NULL
+       AND EXISTS (SELECT 1 FROM territory_lease l
+                    WHERE l.task = t.task AND l.kind = t.kind AND l.path = t.path
+                      AND l.pinned_until IS NOT NULL)`);
+}
+
 const MIGRATIONS = [
   { version: 1, up: (db) => db.exec(readFileSync(SCHEMA_PATH, "utf8")) },
   // ---------------------------------------------------------------- 2
@@ -137,15 +173,7 @@ const MIGRATIONS = [
         db.exec("ALTER TABLE task_territory ADD COLUMN pinned_until INTEGER");
       // CARRIED FROM THE LEASE, so a hub mid-flight keeps the deadlines it has
       // rather than silently re-minting them. Only live leases have one to give.
-      db.exec(`
-        UPDATE task_territory AS t
-           SET pinned_until = (SELECT l.pinned_until FROM territory_lease l
-                                WHERE l.task = t.task AND l.kind = t.kind AND l.path = t.path)
-         WHERE t.pinned = 1
-           AND t.pinned_until IS NULL
-           AND EXISTS (SELECT 1 FROM territory_lease l
-                        WHERE l.task = t.task AND l.kind = t.kind AND l.path = t.path
-                          AND l.pinned_until IS NOT NULL)`);
+      backfillPinDeadlines(db);
 
       if (!hasColumn("provider_lease", "token"))
         db.exec("ALTER TABLE provider_lease ADD COLUMN token TEXT");

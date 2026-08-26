@@ -15,7 +15,8 @@
 // and only if that stage was built. The row claims a set; the tree shows a set;
 // the test fails if they differ. Raising or lowering a claim stays a considered
 // act, because the test asserts agreement rather than any particular answer.
-import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
+import { newestDoc } from "./newest-doc.mjs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -28,10 +29,12 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
 
-// The newest handoff, by filename sort — the same rule the single-source test
-// uses, so the two cannot end up reading different documents.
 const docs = join(root, "docs");
-const newest = readdirSync(docs).filter(f => /^\d{4}-\d\d-\d\d-session-handoff\.md$/.test(f)).sort().pop();
+
+// The SHARED resolver, so this test and the single-source guard cannot inspect
+// different documents. Each had grown its own idea of "newest" and they had
+// already diverged on same-day revisions.
+const newest = newestDoc(docs, "session-handoff");
 check(Boolean(newest), "control: a handoff was found to read", String(newest));
 const handoff = readFileSync(join(docs, newest), "utf8");
 
@@ -42,7 +45,18 @@ const handoff = readFileSync(join(docs, newest), "utf8");
 const WITNESSES = [
   [1, "the fencing token", "src/db/schema.sql", /\blease_token\b/],
   [2, "the drainer and its first producer", "src/outbox/drain.mjs", /export async function drainOutbox\b/],
-  [3, "SPILL onto the durable path", "src/outbox/effects.mjs", /["']gh\.issue\.create["']/],
+  // Stage 3 is SPILL reaching the durable path, so the witness is the PRODUCER --
+  // the decision enqueuing the effect — and not the handler's name. A kind
+  // constant or a handler added ahead of the wiring would otherwise make the tree
+  // claim a stage §0 correctly says has not landed, and the comparison would
+  // pressure someone into an inaccurate progress update.
+  // The witness is an effect DECLARATION -- `kind: "gh.issue.create"` -- which is
+  // the shape a producer takes when it enqueues one, and is how the existing
+  // review-request effect is written. Requiring the two tokens within four
+  // hundred characters was far too loose: a comment, an uncalled helper or a
+  // nearby handler declaration would all have satisfied it, and the witness would
+  // have claimed a stage §0 correctly denies.
+  [3, "SPILL onto the durable path", "src/daemon.mjs", /kind:\s*["']gh\.issue\.create["']/],
   [4, "real thread details into FIX_FINDINGS", "src/daemon.mjs", /threads:\s*e\.threadDetails\b/],
 ];
 
@@ -62,7 +76,22 @@ check(built.size >= 1, "control: at least one stage's witness matched, so the pa
 const row = /^\|\s*the durable-effect stages\s*\|([^|]*)\|/m.exec(handoff)?.[1] ?? "";
 check(row.length > 0, "control: §0 has a durable-effect stages row to compare against", row.slice(0, 80));
 const landedClause = /([^.]*\bhave landed\b[^.]*)\./i.exec(row)?.[1] ?? row;
-const claimed = new Set([...landedClause.matchAll(/\b([1-4])\b/g)].map(m => Number(m[1])));
+// "All four stages have landed" is the natural way to write the final state, and
+// a digit-only parser reads it as claiming NOTHING -- so the row that says the
+// programme is finished would fail the comparison against a tree that agrees.
+// Number words are read, and `all` expands to every stage with a witness defined.
+const WORDS = { one: 1, two: 2, three: 3, four: 4 };
+// `all` only when it is an AFFIRMATIVE all-stages claim. "Not all stages have
+// landed" and "All but stage 3 have landed" both contain the word and both mean
+// the opposite of what expanding it would assert -- one would report a false
+// disagreement, the other could certify prose that says the programme is
+// unfinished.
+const ALL_LANDED = /\ball\b(?![^.]*\bbut\b)/i.test(landedClause)
+  && !/\b(not|no|none|neither)\b[^.]*\ball\b|\ball\b[^.]*\b(not|except|but)\b/i.test(landedClause);
+const claimed = ALL_LANDED
+  ? new Set(WITNESSES.map(([n]) => n))
+  : new Set([...landedClause.matchAll(/\b([1-4]|one|two|three|four)\b/gi)]
+      .map(m => WORDS[m[1].toLowerCase()] ?? Number(m[1])));
 check(claimed.size >= 1, "control: and the row names at least one stage", landedClause.trim().slice(0, 80));
 
 // THE COMPARISON. Neither side is authoritative here on purpose: if they differ,

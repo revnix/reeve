@@ -7,7 +7,7 @@
 // intact and every assertion green. The property was asserted and untested at
 // the same time. It is exercised here instead.
 import { hubAccess } from "../src/build/hubaccess.mjs";
-import { openHub, SCHEDULER_MIN_HUB_VERSION } from "../src/build/hubdb.mjs";
+import { openHub, SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
 import { mkdtempSync, rmSync, writeFileSync, renameSync, copyFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
@@ -73,6 +73,30 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubaccess-"));
   const q = join(dir, "old-control.db");
   openHub(q).close();
   check(hubAccess(q)().hub != null, "control: the same store at the current version still opens");
+}
+
+// ── a hub NEWER than this binary is refused too ───────────────────────────
+// `openHub` refuses a forward schema in three places: migrations are
+// forward-only and a store a newer binary migrated is one this one cannot
+// reason about. The guest had only a floor, so a newer builder migrating the
+// shared hub left this guardian issuing scheduler mutations against a layout it
+// does not know -- and the moment a future migration changes those statements
+// they throw, which takes the fail-open path and dispatches outside the limit.
+{
+  const p = join(dir, "future.db");
+  openHub(p).close();
+  const w = new DatabaseSync(p);
+  w.exec(`INSERT INTO schema_version(version, applied_at) VALUES(${HUB_SCHEMA_VERSION + 1}, unixepoch())`);
+  w.close();
+  const a = hubAccess(p)();
+  check(a.hub === null, "a hub newer than this binary does NOT open for dispatch", JSON.stringify(a));
+  check(/forward-only|newer binary/.test(a.why ?? ""),
+    "and says the schema is ahead of this binary", String(a.why));
+  // CONTROL: one version lower is the current schema and still opens, so the
+  // bound is an upper bound and not an off-by-one that refuses everything.
+  const q = join(dir, "future-control.db");
+  openHub(q).close();
+  check(hubAccess(q)().hub != null, "control: the current version still opens");
 }
 
 // ── an existing hub that cannot be READ is a fault, not an absence ────────

@@ -217,6 +217,13 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
     },
     hub: () => ({ hub: guest, why: null }), repoId: 7, lstart: "boot-1",
     openPrs: () => [42],
+    // THE ANCHOR IS THE CLASSIFIER'S INPUT. The tick decides whether a pull
+    // request is the builder's from the head ref and the author, and reads
+    // `pr_hold` only for those -- so a fixture with no anchor is correctly
+    // classified as a stranger's PR and never reaches the hub at all.
+    prAnchor: () => ({ ok: true, headRef: "mp/bt-1-s0", baseRef: "main", state: "open",
+                       title: "t", updatedAt: "2026-08-26T00:00:00Z", head: "b".repeat(40),
+                       pin: { ok: true, sha: "b".repeat(40) }, authorIsApp: false }),
     evaluate: (a) => { seen = a; return EVAL; },
     publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
     oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
@@ -234,6 +241,104 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
   try { guest.close(); } catch {}
   rmSync(dir, { recursive: true, force: true });
   rmSync(dir2, { recursive: true, force: true });
+}
+
+// ── an UNREADABLE hub reaches the verdict as UNKNOWN, not as silence ──────
+// Passing a bare null when the hub could not be opened made computeVerdict omit
+// the clause, which reads as "not asked" -- so the same tick could publish a
+// passing verdict while the builder's holds were unreadable. Absent is null;
+// unreadable is a reading that says so.
+{
+  let seen;
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-unread-"));
+  const base = {
+    nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+    execute: false, shadow: false, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-unread-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+    },
+    repoId: 7, lstart: "boot-1",
+    openPrs: () => [42],
+    prAnchor: () => ({ ok: true, headRef: "mp/bt-1-s0", baseRef: "main", state: "open",
+                       title: "t", updatedAt: "x", head: "b".repeat(40),
+                       pin: { ok: true, sha: "b".repeat(40) }, authorIsApp: false }),
+    evaluate: (a) => { seen = a; return EVAL; },
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+  };
+  const r1 = await tick({ ...base, hub: () => ({ hub: null, why: "the hub could not be opened as a guest: disk image is malformed" }) });
+  base.db.close();
+  check(seen?.hold?.readable === false,
+    "an unreadable hub becomes a hold reading that says so", JSON.stringify(seen?.hold));
+  check(/malformed/.test(seen?.hold?.why ?? ""),
+    "carrying the reason, so the verdict can say why it cannot answer", JSON.stringify(seen?.hold));
+  check(/hub:unreadable/.test([...(r1.escalations?.keys?.() ?? [])].join(" ")),
+    "and it escalates as well as blocking", [...(r1.escalations?.keys?.() ?? [])].join(" | "));
+
+  // CONTROL: a hub that is genuinely ABSENT stays null -- no clause at all. A
+  // guardian on a machine with no builder must not have every verdict dragged to
+  // UNKNOWN over a question nobody put to it.
+  seen = undefined;
+  const b2 = { ...base, db: open(join(dir, "s2.db")), hub: () => ({ hub: null, why: null }) };
+  await tick(b2); b2.db.close();
+  check(seen?.hold === null, "control: an ABSENT hub is still no clause at all", JSON.stringify(seen?.hold));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── the hold is read only for the builder's own pull requests ─────────────
+// `pr_hold` records nothing else, so consulting it for a stranger's PR can only
+// return PASS -- or, when the table is unreadable, an UNKNOWN that blocks every
+// pull request in the repository over rows none of them have.
+{
+  for (const [label, headRef, authorIsApp, wantAsked] of [
+    ["a builder branch",   "mp/bt-1-s0",       false, true],
+    ["an App author",      "feature/ordinary", true,  true],
+    ["a lookalike branch", "mpx/not-ours",     false, false],
+    ["a stranger's PR",    "feature/ordinary", false, false],
+  ]) {
+    let seen;
+    const dir = mkdtempSync(join(tmpdir(), "reeve-prov-cls-"));
+    const ctx = {
+      nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+      execute: false, shadow: false, running: 0,
+      containment: { credentialRead: "closed", why: "test" },
+      keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+      capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+      profile: {
+        identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-cls-cl-")) },
+        authority: { policy: "propose_and_merge" },
+        rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+        ci: { provider: "github-actions", requiredChecks: [] },
+        watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+      },
+      // An UNREADABLE hub, deliberately: it is the case where asking and not
+      // asking produce visibly different verdicts.
+      hub: () => ({ hub: null, why: "unreadable for this fixture" }),
+      repoId: 7, lstart: "boot-1",
+      openPrs: () => [42],
+      prAnchor: () => ({ ok: true, headRef, baseRef: "main", state: "open", title: "t",
+                         updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorIsApp }),
+      evaluate: (a) => { seen = a; return EVAL; },
+      publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+      oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+      resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+      prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+    };
+    await tick(ctx); ctx.db.close();
+    const asked = seen?.hold != null;
+    check(asked === wantAsked,
+      `${label}: the hold is ${wantAsked ? "read" : "NOT read"}`, JSON.stringify(seen?.hold));
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // ── A-9: a maintenance refusal is retried, never swallowed ────────────────
@@ -313,20 +418,27 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
     "and that connection is opened as a GUEST, never with the privileged opener",
     getter.slice(0, 200));
 
-  // THE ONE PRIVILEGED READ, bounded rather than forbidden. Section 13 keeps the
-  // guardian off `task`, and the repository id lives there -- so `bin/reeve`
-  // answers it with a handle held for one statement. Asserting it does not exist
-  // would be asserting something false; what must hold is that it is confined to
-  // this helper and closed on every path out.
+  // THE REPOSITORY-ID READ IS READ-ONLY AND DOES NOT MIGRATE. `openHub` applies
+  // every pending migration before answering, and this path holds no builder
+  // singleton lease -- so a newer guardian restarting beside an older running
+  // builder would upgrade the schema underneath it. A lookup must never be a
+  // schema change.
   const resolver = cli.slice(cli.indexOf("const repoIdOnce"), cli.indexOf("const registryProjects"));
-  check(/openHub\(/.test(resolver) && /finally\s*\{[^}]*close/.test(resolver),
-    "the one privileged read on the guardian path is closed in a finally",
-    resolver.slice(0, 300));
-  const cliNoResolver = cli.replace(resolver, "");
-  const guardianBlock = cliNoResolver.slice(cliNoResolver.indexOf("const guardianHubAccess"));
-  check(!/[^s]openHub\(/.test(guardianBlock.slice(0, guardianBlock.indexOf("if (cmd === \"build\"") + 1 || 4000)),
-    "and no OTHER privileged open appears beside the guardian's wiring",
-    (guardianBlock.slice(0, 4000).match(/.*[^s]openHub\(.*/g) ?? []).join(" | "));
+  check(/readOnly:\s*true/.test(resolver) && !/openHub\(/.test(resolver),
+    "the repository-id read uses a read-only connection, never the migrating opener",
+    resolver.slice(0, 400));
+  check(/finally\s*\{[^}]*close/.test(resolver),
+    "and closes it on every path out", resolver.slice(0, 400));
+
+  // The readiness gate is a POSITIVELY READ version. `completedVersion` catches
+  // every open and query failure and answers 0, so using it here made a corrupt
+  // hub take the benign absent-hub path before the three-way logic could run.
+  // A CALL, not a mention: the getter's own comment explains why it does not use
+  // `completedVersion`, and a bare substring test reads that explanation as the
+  // defect it warns about.
+  check(/versionOf\s*\(/.test(getter) && !/completedVersion\s*\(/.test(getter),
+    "the hub getter reads the version itself rather than through the error-collapsing helper",
+    (getter.match(/.*completedVersion\s*\(.*/g) ?? ["no call"]).join(" | "));
 
   const daemon = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
   check(!/\bopenHub\b/.test(daemon),

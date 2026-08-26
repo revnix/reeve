@@ -278,17 +278,40 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
  * would be worse than the ordering it fixes: the two reads could return different
  * revisions, and the evaluation would then judge a head the fold did not describe.
  */
+/**
+ * Is this pull request the builder's?
+ *
+ * TWO SIGNALS, EITHER SUFFICIENT, and the second is the one that gets missed.
+ * The builder pushes `mp/*` branches, so the branch alone looks like enough --
+ * but a task's PR can be opened by the App on an ordinary branch, and a
+ * classifier that recognises only the branch treats that as a stranger's PR,
+ * skips `pr_hold` entirely, and leaves a cancelled or blocked task's pull
+ * request green and mergeable. That is the exact failure the hold clause exists
+ * to prevent.
+ *
+ * A SEGMENT PREFIX, not a string one. `mpx/not-ours` starts with `mp` and is
+ * nobody's builder branch; matching on the string would claim it.
+ */
+export function isBuilderPr({ headRef = null, authorIsApp = false } = {}) {
+  if (authorIsApp) return true;
+  return typeof headRef === "string" && /^mp\//.test(headRef);
+}
+
 export function prAnchor({ nwo, pr }) {
   // updated_at rides along so ingest can skip a pull request that has not moved.
   // It is GitHub's timestamp, so a change reeve has not seen yet still triggers a
   // read -- unlike a local clock, which would skip whatever it slept through.
-  const meta = ghJson([`repos/${nwo}/pulls/${pr}`, "--jq", "[.head.ref,.base.ref,.state,.title,.updated_at]|@tsv"]);
+  // `.user.type` rides along for the builder classification below. Appended
+  // rather than inserted: the destructuring below is positional, so a new field
+  // in the middle silently shifts every one after it.
+  const meta = ghJson([`repos/${nwo}/pulls/${pr}`, "--jq", "[.head.ref,.base.ref,.state,.title,.updated_at,.user.type]|@tsv"]);
   if (!meta.ok) return { ok: false, why: meta.err.split("\n")[0] };
-  const [headRef, baseRef, state, title, updatedAt] = meta.out.split("\t");
+  const [headRef, baseRef, state, title, updatedAt, authorType] = meta.out.split("\t");
 
   const pin = pinHead(nwo, headRef);
   if (!pin.ok) return { ok: false, why: `could not pin head: ${pin.why}` };
-  return { ok: true, headRef, baseRef, state, title, updatedAt, head: pin.sha, pin };
+  return { ok: true, headRef, baseRef, state, title, updatedAt, head: pin.sha, pin,
+           authorIsApp: authorType === "Bot" };
 }
 
 export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}, hold = null }) {

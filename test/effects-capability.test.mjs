@@ -11,12 +11,23 @@
 // So the property is checked rather than asserted in prose. The walk is
 // TRANSITIVE: a boundary that only inspects direct imports is defeated by one
 // level of indirection, which is the ordinary way it gets defeated.
-import { readFileSync, existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { readFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, resolve, relative } from "node:path";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const src = join(here, "..", "src");
+
+/**
+ * A file's CODE, with whole-line comments removed.
+ *
+ * Comments discuss these capabilities by name -- `effects.mjs`'s own docblock does
+ * -- so scanning the raw text would report the documentation as the defect. Crude
+ * but honest: a line whose first non-space characters start a comment is dropped.
+ */
+const codeOf = text => text.split("\n").filter(l => !/^\s*(\*|\/\/|\/\*)/.test(l)).join("\n");
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -105,6 +116,29 @@ const reachableFrom = entry => {
   // would still pass -- so the walk itself is exercised against a file that does
   // import things, above.
 
+  // An import the walker CANNOT READ is a violation in itself.
+  //
+  // Every pattern above matches a quoted literal, so `await import(specifier)`
+  // with a computed argument is invisible: the boundary reports clean and the
+  // handler pulls in whatever it likes at run time. Widening the matcher cannot
+  // fix that -- the specifier does not exist until the line runs -- so the answer
+  // is not to see it but to refuse it. An allowlist can only be enforced over
+  // things that can be named, and this makes "cannot be named" fail rather than
+  // pass. It is the same move as the allowlist itself: stop enumerating the ways
+  // out, and require every way IN to be legible.
+  const opaque = [];
+  for (const f of reachableFrom(join(src, "outbox", "effects.mjs")).files) {
+    const code = codeOf(readFileSync(f, "utf8"));
+    if (/\b(?:import|require)\s*\(\s*(?!["'`])/.test(code)) opaque.push(relative(src, f));
+  }
+  check(opaque.length === 0,
+    "and pulls nothing in by a specifier that cannot be read before it runs",
+    `dynamic, non-literal import in ${opaque.join(", ")}`);
+  check(/\b(?:import|require)\s*\(\s*(?!["'`])/.test("const m = await import(name);"),
+    "control: the opaque-import detector recognises a computed specifier", "");
+  check(!/\b(?:import|require)\s*\(\s*(?!["'`])/.test('const m = await import("./x.mjs");'),
+    "control: and does not fire on a literal one, which the walk can follow", "");
+
   // GLOBALS, which need no import at all and which the walk therefore cannot see.
   // `fetch` is the one that matters: a handler calling it directly makes its own
   // network call while the import graph stays perfectly clean. Scanned over the
@@ -120,11 +154,7 @@ const reachableFrom = entry => {
   ];
   const ambient = [];
   for (const f of files) {
-    const text = readFileSync(f, "utf8");
-    // Comments discuss these by name -- this file's own docblock does -- so only
-    // CODE is scanned. Crude but honest: a line whose first non-space characters
-    // start a comment is skipped.
-    const code = text.split("\n").filter(l => !/^\s*(\*|\/\/|\/\*)/.test(l)).join("\n");
+    const code = codeOf(readFileSync(f, "utf8"));
     for (const [re, name] of AMBIENT) if (re.test(code)) ambient.push(`${relative(src, f)}: ${name}`);
   }
   check(ambient.length === 0,
@@ -144,6 +174,74 @@ const reachableFrom = entry => {
   const text = readFileSync(join(src, "outbox", "effects.mjs"), "utf8");
   check(/\{\s*api\b/.test(text), "because the caller is handed to it, not fetched by it",
     "no `api` parameter found");
+}
+
+// --- the boundary, PROVED at run time rather than read off the source ---------
+{
+  // A regex cannot answer this half and should not pretend to.
+  //
+  // `const request = fetch; await request(url)` names the capability once and then
+  // never again, and a pattern looking for `fetch(` sees nothing. Widening it to the
+  // bare identifier helps until someone writes `globalThis["fet" + "ch"]`, and then
+  // the pattern is back to enumerating the ways out -- the same losing race the
+  // allowlist was introduced to end.
+  //
+  // So the capability is REMOVED and the handler is run. Every ambient route to the
+  // network is replaced with a thrower before `effects.mjs` is imported, so an
+  // alias captures the thrower and a late lookup finds it. If the handler completes
+  // against nothing but its injected caller, it did not use them -- not because the
+  // source does not appear to, but because they were not there to use.
+  const box = mkdtempSync(join(tmpdir(), "reeve-cap-"));
+  const effects = pathToFileURL(join(src, "outbox", "effects.mjs")).href;
+  const POISON = [
+    'const dead = name => () => { throw new Error("USED AMBIENT CAPABILITY: " + name); };',
+    'for (const name of ["fetch", "WebSocket", "XMLHttpRequest", "EventSource"])',
+    '  Object.defineProperty(globalThis, name, { value: dead(name), configurable: true, writable: true });',
+  ].join("\n");
+  const CALL = [
+    'const api = () => ({ ok: true, out: "" });',
+    'const r = handler({ nwo: "o/r", pr: 1, body: "b" }, { api, idemKey: "k", actor: null });',
+    'console.log(JSON.stringify({ ok: r.ok, result: r.result ?? null }));',
+  ].join("\n");
+
+  const runIsolated = (name, source) => {
+    const f = join(box, name);
+    writeFileSync(f, source);
+    try { return { ok: true, out: execFileSync(process.execPath, [f], { encoding: "utf8" }).trim() }; }
+    catch (e) { return { ok: false, out: String(e.stdout ?? "") + String(e.stderr ?? "") }; }
+  };
+
+  const real = runIsolated("real.mjs", [
+    POISON,
+    `const { ghPrComment: handler } = await import(${JSON.stringify(effects)});`,
+    CALL,
+  ].join("\n"));
+  check(real.ok && JSON.parse(real.out || "{}").ok === true,
+    "the real handler completes with every ambient capability removed",
+    real.out.slice(0, 400));
+
+  // CONTROL, and this one is the whole reason the block is worth its cost. Without
+  // it a harness that silently failed to poison anything would report the same
+  // green, and so would one whose child never ran the handler at all.
+  const alias = runIsolated("alias.mjs", [
+    POISON,
+    'const handler = (args, { api }) => { const request = fetch; request("https://example.invalid"); return { ok: true }; };',
+    CALL,
+  ].join("\n"));
+  check(!alias.ok && /USED AMBIENT CAPABILITY: fetch/.test(alias.out),
+    "control: a handler that ALIASES fetch is caught by it, which no source pattern here does",
+    alias.out.slice(0, 400));
+
+  // And the third shape: a late, computed lookup, which defeats even a bare-identifier scan.
+  const computed = runIsolated("computed.mjs", [
+    POISON,
+    'const handler = (args, { api }) => { globalThis["fet" + "ch"]("https://example.invalid"); return { ok: true }; };',
+    CALL,
+  ].join("\n"));
+  check(!computed.ok && /USED AMBIENT CAPABILITY: fetch/.test(computed.out),
+    "control: and so is one that assembles the name at run time", computed.out.slice(0, 400));
+
+  rmSync(box, { recursive: true, force: true });
 }
 
 // --- and the drainer holds the weaker version of the same line ----------------

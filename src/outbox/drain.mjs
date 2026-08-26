@@ -12,6 +12,10 @@
  *  · ONE holder at a time. `leaseOutbox` takes a row and bumps its fence;
  *    `settleOutbox` refuses a settle from anyone else. A stalled drainer therefore
  *    cannot mark done a delivery that a live one is in the middle of making.
+ *  · DELIVERY is bounded; CONFIRMING a delivery is bounded separately. A retry
+ *    that posts and a retry that only reads have different costs and different
+ *    risks, so charging them to one budget made the safe one as scarce as the
+ *    dangerous one -- and dead-lettered comments that had actually been posted.
  *  · BOUNDED per call. This runs inside a tick that also has pull requests to
  *    read; a queue that grew faster than a tick could drain would otherwise starve
  *    everything else. What is left stays pending and the next tick continues.
@@ -100,7 +104,16 @@ const SETTLE_RESERVE = 1 / 6;   // of the lease, kept back so the settle can hap
  */
 const PASS_BUDGET_MS = 60_000;
 
-const remainingMs = (deadlineAt) => deadlineAt - Date.now();
+/**
+ * Time left until an absolute instant, on the SAME clock the budget was set by.
+ *
+ * The clock is passed in rather than reached for. Half of this file used the
+ * injected `now` and half used `Date.now()`, which agree exactly until a test
+ * injects a clock -- and then the pass budget and the delivery deadline are
+ * measured against two different notions of the time, and neither reading means
+ * what it says.
+ */
+const remainingMs = (deadlineAt, now) => deadlineAt - now();
 
 export async function drainOutbox({ db, log = () => {}, handlers, api, actor = null,
                                     worker = "drainer", max = 10, leaseSeconds = 300,
@@ -123,6 +136,23 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
   for (const d of recovered.deadLettered ?? [])
     log(`  outbox: ${d.kind} #${d.id} DEAD-LETTERED — ${d.attempts} lease(s) and never once settled; its drainer is crashing`);
 
+  // ONE absolute instant for the pass, computed once and never re-derived.
+  //
+  // It used to be re-derived per iteration as `Date.now() + leftInPass`, where
+  // `leftInPass` had been sampled before the lease. Any wait between the two --
+  // `leaseOutbox` can block behind another SQLite writer for up to the ten seconds
+  // the connection permits -- was silently REFUNDED to the pass, because the
+  // remainder was old and the instant it was added to was new. A one-second pass
+  // could wait ten seconds and then hand a delivery another full second. An
+  // absolute deadline cannot be refunded: waiting spends it.
+  const passDeadlineAt = startedAt + budgetMs;
+  // The settle reserve of the BUDGET, not of the lease. I wrote it against the
+  // lease first: at the defaults that is 50s of a 60s budget, so the pass would
+  // have refused to start a second delivery ever. Same constant, and it has to be
+  // applied to the quantity being spent -- reserving a fraction of a number the
+  // budget has no relation to reserves the wrong thing.
+  const floorMs = Math.max(1, budgetMs * SETTLE_RESERVE);
+
   const done = [];
   let outOfTime = false;
   for (let i = 0; i < max; i++) {
@@ -135,20 +165,30 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
     // whole lease -- around 250s against an advertised 60s budget -- and the pass
     // was over by the time the check came round again. A bound that the work
     // inside it does not see is not a bound.
-    const leftInPass = budgetMs - (now() - startedAt);
     // Not merely "any time left". A row leased with a sliver remaining is a row
     // whose attempt is spent on a call that cannot finish, and it then sits
     // inflight until its lease expires.
-    //
-    // The floor is the settle reserve of the BUDGET, not of the lease. I wrote it
-    // against the lease first: at the defaults that is 50s of a 60s budget, so the
-    // pass would have refused to start a second delivery ever. Same constant, and
-    // it has to be applied to the quantity being spent -- reserving a fraction of
-    // a number the budget has no relation to reserves the wrong thing.
-    const floorMs = Math.max(1, budgetMs * SETTLE_RESERVE);
-    if (leftInPass < floorMs) { outOfTime = true; break; }
+    if (remainingMs(passDeadlineAt, now) < floorMs) { outOfTime = true; break; }
     const job = leaseOutbox(db, { worker, leaseSeconds, kinds });
     if (!job) break;
+
+    // Asked AGAIN, because the lease itself can wait. The check above decides
+    // whether to reach for a row; this one decides whether the row it got can
+    // still be delivered, and between the two lies a write lock that SQLite will
+    // hold a caller on for as long as the connection's busy timeout allows.
+    //
+    // Settled rather than simply skipped: the row is inflight now, and leaving it
+    // that way would keep it out of the next pass until its lease lapsed. The
+    // attempt it cost is spent and stays spent -- `leaseOutbox` is the only place
+    // that can bump it, and un-bumping it would deny a lease that really happened,
+    // which is exactly the lie the fence exists to make impossible.
+    if (remainingMs(passDeadlineAt, now) < floorMs) {
+      settleOutbox(db, { id: job.id, leaseToken: job.lease_token, ok: false, retryable: true,
+                         error: "the pass budget was spent while this row was being leased; not started" });
+      log(`  outbox: ${job.kind} #${job.id} returned unstarted — the pass budget went while it was being leased`);
+      outOfTime = true;
+      break;
+    }
 
     let outcome;
     try {
@@ -164,11 +204,10 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
       // The SMALLER of what the lease allows and what the pass has left. The lease
       // protects the row from a second drainer; the pass protects the tick from
       // this one. A delivery has to respect both, and neither implies the other.
-      const byLease = Date.now() + Math.max(1, leaseSeconds * (1 - SETTLE_RESERVE)) * 1000;
-      const byPass = startedAt === undefined ? byLease : Date.now() + leftInPass;
-      const deadlineAt = Math.min(byLease, byPass);
+      const byLease = now() + Math.max(1, leaseSeconds * (1 - SETTLE_RESERVE)) * 1000;
+      const deadlineAt = Math.min(byLease, passDeadlineAt);
       const bounded = (a, opts = {}) => {
-        const left = remainingMs(deadlineAt);
+        const left = remainingMs(deadlineAt, now);
         if (left <= 0) return { ok: false, out: "", err: "the delivery deadline passed before this call started", timedOut: true };
         // The bound goes LAST, so a handler cannot spread its own over it. The
         // spread order was the other way round: a handler passing a conventional
@@ -193,14 +232,20 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
       };
       const deliver = Promise.resolve(
         handlers[job.kind](args, { api: bounded, idemKey: job.idem_key, actor, log,
-          // The over-budget lease exists to RECONCILE, never to deliver. Recovery
-          // hands an exhausted row back once so the marker pre-check can find a
-          // delivery whose settle was lost to a crash -- but if the check finds
-          // nothing, posting would deliver on attempt max+1, past the budget the
-          // extra pass was granted in spite of. A handler that cannot confirm a
-          // prior delivery must decline instead.
-          reconcileOnly: job.attempts > job.max_attempts }));
-      const clock = deadline(remainingMs(deadlineAt));
+          // A reconciling lease exists to CONFIRM, never to deliver. A row that has
+          // spent its delivery budget is handed back so the marker pre-check can
+          // find a delivery whose settle was lost -- but if the check finds
+          // nothing, posting would deliver past the budget the reconciling phase
+          // was granted in spite of. A handler that cannot confirm a prior
+          // delivery must decline instead.
+          // Read from the RECONCILIATION counter, which is only ever bumped in that
+          // phase, and never from `attempts` against its budget. The latter is
+          // ambiguous by one: a row leased on its last permitted delivery comes
+          // back with `attempts === max_attempts`, indistinguishable from a row
+          // that has spent them, so the test would refuse to post on the very
+          // attempt the budget had granted.
+          reconcileOnly: job.reconcile_attempts > 0 }));
+      const clock = deadline(remainingMs(deadlineAt, now));
       try { outcome = await Promise.race([deliver, clock]); }
       finally { clock.cancel(); }   // the loser's timer must not outlive the race
     } catch (e) {
@@ -218,7 +263,9 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
     });
     done.push({ id: job.id, kind: job.kind, verdict });
     if (verdict === "dead_letter")
-      log(`  outbox: ${job.kind} #${job.id} DEAD-LETTERED after ${job.attempts} attempt(s) — ${String(outcome.error).slice(0, 200)}`);
+      log(`  outbox: ${job.kind} #${job.id} DEAD-LETTERED after ${job.attempts} delivery attempt(s)`
+          + `${job.reconcile_attempts ? ` and ${job.reconcile_attempts} reconciliation(s)` : ""}`
+          + ` — ${String(outcome.error).slice(0, 200)}`);
     else if (verdict === "stale")
       log(`  outbox: ${job.kind} #${job.id} settle refused — another drainer holds it`);
   }

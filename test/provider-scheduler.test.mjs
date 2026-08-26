@@ -283,6 +283,137 @@ const ALIVE = () => true, DEAD = () => false;
   db.close();
 }
 
+// CONTROL on the withdrawal rule: the REAPER empties the queue too.
+// A guardian queues behind a full set of builder leases, marks one for
+// preemption, and then its daemon dies. The reaper eventually deletes the
+// expired queued row -- and the mark outlived it, so a builder went on planning
+// to surrender its slot for a guardian that no longer exists. Three paths can
+// empty that queue and two of them were taught this rule one round at a time,
+// which is why it now runs on the way out of every provider transaction.
+{
+  const db = openHub(join(dir, "p16.db"));
+  db.exec(`INSERT INTO provider_state(provider,concurrency_limit,guardian_reserved)
+           VALUES('claude',1,0)
+           ON CONFLICT(provider) DO UPDATE SET concurrency_limit=1, guardian_reserved=0`);
+  claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE, now: 1000 });
+  claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 900, lstart: "DEAD", isAlive: ALIVE, now: 1001 });
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE preempt_requested=1").get().c === 1,
+    "fixture: the builder is marked for a guardian that is waiting");
+
+  // The guardian's daemon dies and its queued row expires.
+  db.exec(`UPDATE provider_lease SET expires_at = unixepoch() - 1 WHERE status='queued'`);
+  const { reaped } = reapProviderLeases(db, { isAlive: (pid) => pid !== 900 });
+  check(reaped === 1, `fixture: the dead daemon's queued row is reaped (${reaped})`);
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE status='queued'").get().c === 0,
+    "fixture: nothing is queued any more");
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE preempt_requested=1").get().c === 0,
+    "and the mark goes with it: no builder yields for a guardian that no longer exists",
+    JSON.stringify(db.prepare("SELECT owner,run_ref,status,preempt_requested FROM provider_lease").all()));
+  db.close();
+}
+
+// CONTROL: a mark is NOT withdrawn while another guardian is still queued, or
+// the rule has become "never preempt".
+{
+  const db = openHub(join(dir, "p17.db"));
+  db.exec(`INSERT INTO provider_state(provider,concurrency_limit,guardian_reserved)
+           VALUES('claude',1,0)
+           ON CONFLICT(provider) DO UPDATE SET concurrency_limit=1, guardian_reserved=0`);
+  claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE, now: 1000 });
+  claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 2, lstart: "G1", isAlive: ALIVE, now: 1001 });
+  claimProvider(db, { owner: "guardian", repoId: 2, runRef: "pr:2", pid: 3, lstart: "G2", isAlive: ALIVE, now: 1002 });
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE status='queued'").get().c === 2,
+    "fixture: two guardians are queued");
+  cancelQueued(db, { owner: "guardian", repoId: 1, runRef: "pr:1" });
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE preempt_requested=1").get().c === 1,
+    "control: with one guardian still queued, the mark stands",
+    JSON.stringify(db.prepare("SELECT owner,run_ref,status,preempt_requested FROM provider_lease").all()));
+  db.close();
+}
+
+// ── the queue is served in ORDER ────────────────────────────────────────────
+// Admitting whichever guardian asks next lets a newer request from another
+// watched repository take the slot an older one is waiting for, and a steady
+// stream of new guardian work starves it indefinitely -- while the whole promise
+// made to a queued request is that it will be served in turn.
+{
+  const db = openHub(join(dir, "p13.db"));
+  db.exec(`INSERT INTO provider_state(provider,concurrency_limit,guardian_reserved)
+           VALUES('claude',1,0)
+           ON CONFLICT(provider) DO UPDATE SET concurrency_limit=1, guardian_reserved=0`);
+  const b = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE, now: 1000 });
+  const first = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 2, lstart: "G1", isAlive: ALIVE, now: 1001 });
+  check(b.ok && !first.ok && first.reason === "queued", "fixture: one guardian is queued behind a full slot",
+    JSON.stringify({ b, first }));
+
+  releaseProvider(db, b);
+  // A DIFFERENT repository's guardian asks first, into the slot that just freed.
+  const newcomer = claimProvider(db, { owner: "guardian", repoId: 2, runRef: "pr:9", pid: 3, lstart: "G2", isAlive: ALIVE, now: 1002 });
+  check(!newcomer.ok && newcomer.reason === "queued",
+    "a newer guardian does not take the slot an older queued one is waiting for",
+    JSON.stringify(newcomer));
+
+  const served = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 2, lstart: "G1", isAlive: ALIVE, now: 1003 });
+  check(served.ok, "control: and the OLDEST queued guardian takes it when it asks", JSON.stringify(served));
+  db.close();
+}
+
+// ── a queued guardian that restarts keeps its place ─────────────────────────
+// Reusing the row but leaving the old pid, lstart and expiry behind means a
+// guardian that restarted while queued is represented by its dead predecessor:
+// once the original expiry passes, the reaper deletes a queue entry that a live
+// daemon is still polling for, and a builder takes the next opening ahead of it.
+{
+  const db = openHub(join(dir, "p14.db"));
+  db.exec(`INSERT INTO provider_state(provider,concurrency_limit,guardian_reserved)
+           VALUES('claude',1,0)
+           ON CONFLICT(provider) DO UPDATE SET concurrency_limit=1, guardian_reserved=0`);
+  claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE, now: 1000 });
+  claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 900, lstart: "DEAD", isAlive: ALIVE, now: 1001 });
+  const before = db.prepare("SELECT pid, lstart, expires_at FROM provider_lease WHERE status='queued'").get();
+  check(before.pid === 900, "fixture: the queued row names the first daemon", JSON.stringify(before));
+
+  // The daemon restarts and re-asks for the same run.
+  claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 901, lstart: "LIVE", isAlive: ALIVE, now: 1100 });
+  const after = db.prepare("SELECT pid, lstart, expires_at FROM provider_lease WHERE status='queued'").get();
+  check(after.pid === 901 && after.lstart === "LIVE",
+    "a re-ask records the daemon that is waiting NOW, not the one that died",
+    JSON.stringify(after));
+  check(after.expires_at > before.expires_at,
+    "and refreshes the expiry, so the reaper does not delete a live queue entry",
+    JSON.stringify({ before: before.expires_at, after: after.expires_at }));
+
+  // The sharp end: the reaper must not take it while its holder is alive.
+  const { reaped } = reapProviderLeases(db, { isAlive: (pid) => pid === 901, now: after.expires_at - 1 });
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE status='queued'").get().c === 1,
+    `control: the reaper leaves the live daemon's queue entry alone (reaped ${reaped})`);
+  db.close();
+}
+
+// ── a bind or heartbeat that matched nothing is not a success ───────────────
+// The predicate always names owner, repo_id and run_ref, so an id-only call
+// matched nothing and returned a zero count wearing an `ok`. The lease then
+// stays bound to the long-lived daemon, liveness is asked about a process that
+// is always alive, and a detached worker that dies takes its slot until expiry.
+{
+  const db = openHub(join(dir, "p15.db"));
+  const held = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE });
+  const bareBind = bindProviderLease(db, { id: held.id, pid: 2, lstart: "W" });
+  check(!bareBind.ok && bareBind.reason === "no-identity",
+    "an id-only bind is refused rather than reported as a successful no-op", JSON.stringify(bareBind));
+  const bareBeat = heartbeatProvider(db, { id: held.id });
+  check(!bareBeat.ok && bareBeat.reason === "no-identity",
+    "and so is an id-only heartbeat", JSON.stringify(bareBeat));
+  check(db.prepare("SELECT pid FROM provider_lease WHERE id=?").get(held.id).pid === 1,
+    "control: the lease is untouched, so the refusals were not silent writes");
+  // CONTROL: with the identity both work, or "refuse incomplete" has become
+  // "refuse everything" and no worker can ever be bound.
+  check(bindProviderLease(db, { ...held, pid: 2, lstart: "W" }).bound === 1,
+    "control: with the identity the claim returned, the bind applies");
+  check(heartbeatProvider(db, held).beat === 1, "control: and so does the heartbeat");
+  db.close();
+}
+
 // ── a cooldown is a floor, never shortened by a later observation ───────────
 // `provider_state` is one row shared by every daemon on the host, and their
 // profiles need not agree. A 300-second cooldown followed ten seconds later by a

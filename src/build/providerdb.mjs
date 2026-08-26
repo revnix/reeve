@@ -31,6 +31,13 @@ import { assertWritable } from "./locks.mjs";
 export const DEFAULT_LIMIT = 2, DEFAULT_RESERVED = 1;
 export const PROVIDER = "claude";
 
+// The database clock. It lives here for the same reason every other statement
+// does: `src/provider.mjs` sits at the top level, outside the two directories
+// allowed to contain raw SQL, and a `SELECT unixepoch()` there is a second
+// definition of the guardian's SQL surface in a file the allowlist and the
+// audits do not inspect. One statement is enough to make the boundary untrue.
+export const nowSeconds = (db) => db.prepare("SELECT unixepoch() n").get().n;
+
 export const LEASE_COLS =
   `id, owner, repo_id, run_ref, pid, lstart, priority, budget_usd, status,
    requested_at, started_at, heartbeat_at, expires_at, preempt_requested`;
@@ -137,10 +144,19 @@ export const oldestQueuedGuardian = (db) => db.prepare(
     WHERE status = 'queued' AND owner = 'guardian'
     ORDER BY requested_at, id LIMIT 1`).get();
 
-export const promoteToHeld = (db, { id, at, expiresAt }) => db.prepare(
+// A promotion records WHO is being admitted, in the same statement.
+//
+// Promoting a queued row without refreshing its pid and lstart leaves it naming
+// whichever process first asked -- and a guardian that restarted while queued is
+// then admitted under its dead predecessor's identity. The restore holder scan
+// can read that process as gone and replace the hub mid-dispatch, an idempotent
+// re-ask gets `held-elsewhere` from its own lease until the worker bind lands,
+// and the reaper is watching a pid that will never be alive again. `renewQueued`
+// covers the re-ask path; this is the one that bypasses it.
+export const promoteToHeld = (db, { id, pid, lstart, at, expiresAt }) => db.prepare(
   `UPDATE provider_lease
-      SET status = 'held', started_at = ?, heartbeat_at = ?, expires_at = ?
-    WHERE id = ? AND status = 'queued'`).run(at, at, expiresAt, id);
+      SET status = 'held', pid = ?, lstart = ?, started_at = ?, heartbeat_at = ?, expires_at = ?
+    WHERE id = ? AND status = 'queued'`).run(pid, lstart, at, at, expiresAt, id);
 
 // THE IDENTITY IS PART OF THE KEY, on every mutation that names a row by id.
 //

@@ -8,6 +8,8 @@
 // the same time. It is exercised here instead.
 import { hubAccess } from "../src/build/hubaccess.mjs";
 import { openHub, SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
+import { SCHEDULER_COLUMNS } from "../src/build/providerdb.mjs";
+import { HOLD_COLUMNS } from "../src/build/holds.mjs";
 import { mkdtempSync, rmSync, writeFileSync, renameSync, copyFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
@@ -124,30 +126,71 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubaccess-"));
   check(hubAccess(q)().hub != null, "control: an intact store at the same version still opens");
 }
 
-// ── a LOST TABLE is a defect too, not only a missing column ───────────────
-// `COLUMNS_AT` describes what migrations ADD to tables that already exist -- its
-// only entry is migration 3's two columns. So a current-version hub that has
-// lost a version-1 table produced no defects at all: the guest opened, and the
-// first `SELECT ... FROM provider_state` threw into the fail-open path.
-// Consulting one inventory and not the other covered exactly the last migration
-// and nothing before it.
+// ── the GUARDIAN's surface, not the whole hub and not only the last migration
+// Too narrow and too wide were the same mistake. `COLUMNS_AT` describes only
+// what later migrations ADD, so a hub missing a migration-1 column passed and
+// the first claim threw into the fail-open path. `TABLES_AT` is the whole hub,
+// so losing an unrelated builder table reported the SCHEDULER unusable and an
+// ordinary pull request was dispatched unscheduled. The surface is the guest
+// connection's own allowlist.
 {
-  const p = join(dir, "notable.db");
-  openHub(p).close();
-  const w = new DatabaseSync(p);
-  w.exec("DROP TABLE provider_state");
-  w.close();
-  const a = hubAccess(p)();
-  check(a.hub === null,
-    "a hub that has lost a scheduler TABLE does not open", JSON.stringify(a));
-  check(/provider_state/.test(a.why ?? ""),
-    "and the refusal names the table", String(a.why));
+  // A table the guardian needs.
+  const a = join(dir, "notable.db");
+  openHub(a).close();
+  const wa = new DatabaseSync(a); wa.exec("DROP TABLE provider_state"); wa.close();
+  const ra = hubAccess(a)();
+  check(ra.hub === null && /provider_state/.test(ra.why ?? ""),
+    "a hub that has lost a scheduler TABLE does not open, and the refusal names it", JSON.stringify(ra));
 
-  // CONTROL: the same store intact still opens -- this is a shape check, not a
-  // refusal of everything with a schema_version row.
-  const q = join(dir, "notable-control.db");
-  openHub(q).close();
-  check(hubAccess(q)().hub != null, "control: an intact store at the same version still opens");
+  // A BASELINE column, created in migration 1 -- the case COLUMNS_AT could not
+  // see, because it only describes what later migrations added.
+  const b = join(dir, "nocol.db");
+  openHub(b).close();
+  const wb = new DatabaseSync(b); wb.exec("ALTER TABLE provider_state DROP COLUMN cooldown_until"); wb.close();
+  const rb = hubAccess(b)();
+  check(rb.hub === null && /cooldown_until/.test(rb.why ?? ""),
+    "nor one that has lost a column the scheduler reads, whatever migration made it",
+    JSON.stringify(rb));
+
+  // AND THE OTHER DIRECTION. A builder projection the guardian never touches is
+  // none of its business: refusing here dispatches ordinary pull requests
+  // unscheduled over a table that has no bearing on the quota.
+  const c = join(dir, "unrelated.db");
+  openHub(c).close();
+  const wc = new DatabaseSync(c); wc.exec("PRAGMA foreign_keys=OFF"); wc.exec("DROP TABLE approval"); wc.close();
+  const rc = hubAccess(c)();
+  check(rc.hub != null,
+    "but a builder table outside the guardian's surface does NOT stop it scheduling",
+    JSON.stringify({ why: rc.why }));
+  rc.hub?.close?.();
+
+  // CONTROL: an intact store still opens, so none of the above has become
+  // "refuse everything".
+  const d = join(dir, "surface-control.db");
+  openHub(d).close();
+  const rd = hubAccess(d)();
+  check(rd.hub != null, "control: an intact store at the same version still opens");
+  rd.hub?.close?.();
+}
+
+// ── the declared shape matches a freshly migrated hub ─────────────────────
+// `SCHEDULER_COLUMNS.provider_state` is written out rather than derived, so it
+// can drift from the schema. A declaration demanding a column that does not
+// exist would refuse every healthy hub -- worse than the gap it closes.
+{
+  const p = join(dir, "drift.db");
+  const db = openHub(p);
+  const drift = [];
+  for (const [t, cols] of Object.entries({ ...SCHEDULER_COLUMNS, pr_hold: HOLD_COLUMNS })) {
+    const have = new Set(db.prepare("SELECT name FROM pragma_table_info(?)").all(t).map(r => r.name));
+    for (const c of cols) if (!have.has(c)) drift.push(`${t}.${c}`);
+  }
+  db.close();
+  check(drift.length === 0,
+    "every column the scheduler declares it needs exists in a freshly migrated hub", drift.join(", "));
+  check(SCHEDULER_COLUMNS.provider_lease.length > 5 && SCHEDULER_COLUMNS.provider_state.length > 3,
+    "fixture: the declarations are non-empty, so the check above compares something",
+    JSON.stringify({ lease: SCHEDULER_COLUMNS.provider_lease.length, state: SCHEDULER_COLUMNS.provider_state.length }));
 }
 
 // ── an existing hub that cannot be READ is a fault, not an absence ────────

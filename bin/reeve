@@ -96,6 +96,29 @@ const guardianHubAccess = () => hubAccess(hubPathFor(HOME));
 // closed immediately. The running loop never sees privilege; `src/daemon.mjs`
 // cannot reach the privileged opener at all. The end state -- an identity table
 // the guest may read, removing this last privileged read -- is issue #46.
+// GitHub's numeric id for a repository, the fallback half of the founder's
+// resolver ruling.
+//
+// The hub is asked FIRST and answers for any project it has admitted a task
+// for. A registered project it has not is an ordinary state for the shared
+// resolver -- and for the GUARDIAN it is fatal, because a null id fails every
+// dispatch closed and the ten-minute retry only repeats the same empty local
+// query. Adding a repository to the registry would have disabled its guardian
+// until the builder happened to file something.
+//
+// Never guessed and never cached anywhere but the hub: this asks GitHub, and a
+// non-integer answer is no answer. A failure returns null rather than throwing,
+// because the caller's contract is that the id may be unknown -- what must not
+// happen is inventing one.
+const repoIdFromGitHub = (nwo) => {
+  try {
+    const out = execFileSync("gh", ["api", `repos/${nwo}`, "--jq", ".id"],
+                             { encoding: "utf8", timeout: 15_000 }).trim();
+    const id = Number(out);
+    return Number.isInteger(id) && id > 0 ? id : null;
+  } catch { return null; }
+};
+
 const repoIdOnce = async (project) => {
   if (!project) return null;
   const p = hubPathFor(HOME);
@@ -113,7 +136,7 @@ const repoIdOnce = async (project) => {
     // unknown, which is the honest answer: the guardian fails closed and says so
     // rather than migrating someone else's database to find out.
     db = new DatabaseSync(p, { readOnly: true });
-    return await resolveRepoId(db, project);
+    return await resolveRepoId(db, project, { fetchRepoId: repoIdFromGitHub });
   } catch (err) {
     // ONLY THE ABSENT CASE IS BENIGN. A hub too old to have `task` yet is
     // genuinely "no id known", which is an ordinary state. A `task` table that

@@ -461,6 +461,11 @@ export async function sandboxCanary({
   dir, outsideDir, tmpDir, decoyPath,
   bin, env,
   runner = runWorker, budgetMs = 5 * 60_000, maxOutputBytes = 8 * 1024 * 1024,
+  // Forwarded to the runner so the caller can bind the canary's DETACHED child
+  // before it is let go. Without it the canary's provider lease stays on the
+  // guardian's pid, and a guardian that dies while the canary runs leaves a
+  // lease whose holder looks dead while the model call is still being paid for.
+  onSpawn = () => {},
   validate = validateSettings, keepOnFailure = true,
   // The network positive control: a daemon-local listener (netListener above)
   // the sandboxed curl tries to reach. `{ url, selfReachable, wasHit }`. The
@@ -567,7 +572,7 @@ export async function sandboxCanary({
                               allowedTools: canaryGrant(dir, decoyPath).join(","),
                               settings: settingsPath, maxTurns: 8 }),
       cwd: dir, env, outPath: join(dir, "canary.out"), errPath: join(dir, "canary.err"),
-      maxOutputBytes, budgetMs, isHalted: () => false,
+      maxOutputBytes, budgetMs, isHalted: () => false, onSpawn,
     });
   } catch (err) {
     r = { outcome: "failed", why: `the canary runner threw: ${err.message}` };

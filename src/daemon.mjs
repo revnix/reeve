@@ -630,6 +630,13 @@ export async function measuredContainment(ctx, profile, nwo, logPath) {
       // process.platform in production; injectable so a test on one OS can
       // exercise the verdict for another (the fail-closed matrix is per-OS).
       platform: ctx.platform ?? undefined,
+      // BOUND BEFORE IT RUNS, like every other dispatch. The canary is a
+      // detached model call of up to five minutes; without this its provider
+      // lease stays on the guardian's own pid, so a guardian that dies mid-canary
+      // leaves a lease whose holder reads dead while the call is still being
+      // paid for -- and a restore or a reap then frees a slot the provider is
+      // still serving.
+      onSpawn: ctx.canaryOnSpawn ?? (() => {}),
       // The profile LABEL is necessary but not sufficient: it closes containment
       // only when the topology it names is actually in place. The scratch-home
       // arrangement (a home of reeve's making, a per-run standalone clone, a
@@ -943,6 +950,10 @@ export async function tick(ctx) {
   const logPath = ctx.logPath ? resolve(ctx.logPath) : ctx.logPath;
   if (logPath !== ctx.logPath) ctx = { ...ctx, logPath };
   const decisions = [];
+  // Pull requests this tick could not read. Their queued provider requests are
+  // preserved rather than cancelled: absence from `decisions` means "unknown",
+  // not "no longer wanted".
+  const unreadable = new Set();
   const escalations = new Map();
   /**
    * Raise a cause. The count is the VALUE and can never be part of the key.
@@ -1621,7 +1632,18 @@ export async function tick(ctx) {
     }
     const e = (ctx.evaluate ?? evaluatePr)({ nwo, pr, profile, db, anchor, hold,
                                              io: { foldPrecedesEvaluation: true } });
-    if (!e.ok) { log(logPath, `  #${pr}: could not evaluate — ${e.why}`); continue; }
+    if (!e.ok) {
+      // UNREAD IS NOT WITHDRAWN. A pull request whose anchor or evaluation
+      // failed transiently contributes nothing to `wanted`, and the queued sweep
+      // below reads that absence as "this tick no longer wants it" and cancels
+      // its provider request. The PR has not closed and its action has not
+      // changed -- reeve simply could not look -- so cancelling costs the
+      // guardian its queue position, lets a builder take the opening it was
+      // holding, and re-queues the work at the tail once the read succeeds.
+      unreadable.add(pr);
+      log(logPath, `  #${pr}: could not evaluate — ${e.why}`);
+      continue;
+    }
 
     // GitHub is authoritative for PR facts; this is also what releases a lease
     // when a PR merges.
@@ -1737,7 +1759,18 @@ export async function tick(ctx) {
   // by both the queued sweep below and the canary block further down: two
   // statements of the same condition drift, and the sweep cancelling a request
   // the next few lines are about to make is the shape that drift takes here.
-  const willAttemptCanary = Boolean(execute && wanted.length && !(ctx.containment ?? null));
+  // A CACHED PASS IS A MEASUREMENT, and the first version of this read only
+  // `ctx.containment`. Production never assigns that: `measuredContainment`
+  // keeps its verdict in `ctx.containmentCache`, so from the second tick onward
+  // the canary was claimed for a run that `measureContainment` would answer from
+  // cache without spending anything. At capacity that queues `canary:<nwo>`,
+  // requests builder preemption and sets `skipDispatch` -- blocking the real
+  // worker tasks behind a canary that was never going to run.
+  //
+  // A non-empty cache is enough: its keys are per (CLI build, sandbox block),
+  // and this asks only whether a paid measurement is still owed at all.
+  const containmentCached = (ctx.containmentCache?.size ?? 0) > 0;
+  const willAttemptCanary = Boolean(execute && wanted.length && !(ctx.containment ?? null) && !containmentCached);
 
   // ── the scheduler's own housekeeping, before anything asks it for a slot ──
   //
@@ -1794,8 +1827,15 @@ export async function tick(ctx) {
           ...(willAttemptCanary ? [`canary:${nwo}`] : []),
           ...wanted.map(d => `${nwo}#${d.e.pr}:${d.decision.action}`)]);
         const queued = (ctx.queuedRequests ?? queuedGuardianRequests)(h, { repoId });
+        // A request belonging to a pull request this tick could not READ is left
+        // alone: only a positive evaluation may withdraw one.
+        const unread = [...unreadable].map(pr => `${nwo}#${pr}:`);
         for (const row of queued) {
           if (intended.has(row.run_ref)) continue;
+          if (unread.some(prefix => row.run_ref.startsWith(prefix))) {
+            log(logPath, `provider: keeping the queued request for a PR this tick could not read (${row.run_ref})`);
+            continue;
+          }
           const c = (ctx.cancelQueued ?? cancelQueued)(h, {
             owner: "guardian", repoId, runRef: row.run_ref, isAlive: isSameProcess });
           if (c?.ok) log(logPath, `provider: cancelled a queued request this tick no longer wants (${row.run_ref})`);
@@ -1905,8 +1945,23 @@ export async function tick(ctx) {
     }
   }
   if (execute && wanted.length && !containment && !skipDispatch) {
+    // The canary's lease follows its child, exactly as a worker's does. Bound on
+    // the same terms: full identity, exactly one row, and a failure that is
+    // logged rather than fatal -- unlike the worker path, refusing here would
+    // abort a containment measurement that is otherwise fine, and an unbound
+    // canary lease is released by the `finally` below within five minutes.
+    const measureCtx = canaryLease
+      ? { ...ctx, canaryOnSpawn: ({ pid, lstart }) => {
+            try {
+              const b = (ctx.providerBind ?? bindProviderLease)(hubOr(() => null) ?? hub,
+                { ...canaryLease, pid, lstart, isAlive: isSameProcess });
+              if (b?.ok === false || b?.bound !== 1)
+                log(logPath, `execute: canary lease not rebound (${b?.reason ?? `bound ${b?.bound}`})`);
+            } catch (err) { log(logPath, `execute: canary lease could not be rebound — ${err.message}`); }
+          } }
+      : ctx;
     try {
-      containment = await measuredContainment(ctx, profile, nwo, logPath);
+      containment = await measuredContainment(measureCtx, profile, nwo, logPath);
     } finally {
       // THE CANARY IS A PAID MODEL CALL, so its rate limit is the provider's
       // state and not this measurement's private business. `sandboxCanary`
@@ -2070,7 +2125,20 @@ export async function tick(ctx) {
       // Spent here, beside the run: past every refusal, before any work. A crash
       // after this point costs an attempt, which is the correct direction --
       // a crashed fix that silently earns a free retry is the runaway loop.
-      if (run.ok && decision.action === "FIX_CI" && fp) recordFixAttempt(db, nwo, e.pr, fp, e.head);
+      // GUARDED, because the provider lease is already held by this point and the
+      // worker block's try/finally has not begun. `fix_attempt` is an ordinary
+      // local write and it can throw -- a damaged table, a full store -- and a
+      // throw here left the tick with the lease still held, bound to the live
+      // guardian pid, which the expiry reaper preserves for ever. Nothing
+      // reclaims it if the next tick decides differently about this PR.
+      try {
+        if (run.ok && decision.action === "FIX_CI" && fp) recordFixAttempt(db, nwo, e.pr, fp, e.head);
+      } catch (err) {
+        if (prLease) { releaseWithRetry(prRunRef, prLease); prLease = null; }
+        log(logPath, `  #${e.pr}: NOT dispatching — the fix attempt could not be recorded: ${err.message}`);
+        raise(`#${e.pr}: the fix attempt could not be recorded`);
+        continue;
+      }
       if (!run.ok) {
         // Refusing to act is the only safe answer when the transition cannot be
         // recorded: an unrecorded worker is one nothing can reason about later.

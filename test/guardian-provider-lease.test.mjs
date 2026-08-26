@@ -571,6 +571,13 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
     // The canary RESULT is injected, carrying the shape `sandboxCanary` really
     // returns: the worker's outcome preserved in `evidence.outcome`.
     isolationReady: () => true,
+    // PINNED, or this test measures the HOST. `cheapContainmentReasons` opens
+    // containment on any platform but darwin, and `measuredContainment` returns
+    // on a cheap reason before it ever consumes the canary -- so on the
+    // ubuntu-latest runner this block passed locally and would have failed in
+    // CI, which is down and could not have told me. The cooldown wiring is what
+    // is under test; the platform gate is measured elsewhere.
+    platform: "darwin",
     canary: { ok: false, id: "c1", why: "the canary was rate limited",
               evidence: { outcome: "rate_limited", why: "provider returned 429" } },
     hub: () => ({ hub: {}, why: null }), repoId: 7, lstart: "boot-1",
@@ -703,6 +710,121 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
     JSON.stringify(beats[0]));
   check(beats[0]?.token === "tok",
     "carrying the claim's token, which the fence requires", JSON.stringify(beats[0]?.token));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── a WARM containment cache means no canary claim at all ─────────────────
+// Production never assigns `ctx.containment`: `measuredContainment` keeps its
+// verdict in `ctx.containmentCache`. Reading only the former meant every tick
+// after the first claimed a lease for a canary that would be answered from
+// cache without spending anything -- and at capacity that queues the canary,
+// requests preemption and sets skipDispatch, blocking the real workers.
+{
+  const mk = (cache) => {
+    const dir = mkdtempSync(join(tmpdir(), "reeve-prov-cache-"));
+    const claims = [];
+    return { dir, claims, ctx: {
+      nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+      execute: true, shadow: true, running: 0,
+      keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+      platform: "darwin",
+      capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+      profile: {
+        identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-cache-cl-")) },
+        authority: { policy: "propose_and_merge" },
+        rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+        ci: { provider: "github-actions", requiredChecks: [] },
+        watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+        worker: { isolation: "scratch-home" },
+      },
+      isolationReady: () => true,
+      // An injected canary RESULT, so containment comes back CLOSED without
+      // spawning anything and the worker actually dispatches. With
+      // `isolation: "none"` the cheap gates open containment, no worker runs,
+      // and the follow-on assertion measures a tick that never got that far --
+      // which is exactly what the first version of this fixture did.
+      canary: { ok: true, id: "c1", why: null, evidence: { outcome: "ok" } },
+      containmentCache: cache,
+      hub: () => ({ hub: {}, why: null }), repoId: 7, lstart: "boot-1",
+      providerClaim: (db, a) => { claims.push(a.runRef); return { ok: true, id: claims.length, token: "t" }; },
+      providerBind: () => ({ ok: true, bound: 1 }),
+      providerRelease: () => ({ ok: true }),
+      providerHeartbeat: () => ({ ok: true }),
+      reapProvider: () => ({ ok: true, reaped: 0 }),
+      queuedRequests: () => [],
+      openPrs: () => [42],
+      prAnchor: () => ({ ok: true, headRef: "mp/bt-1-s0", baseRef: "main", state: "open", title: "t",
+                         updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
+      evaluate: () => EVAL,
+      publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+      spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }),
+      oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+      resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+      prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+    } };
+  };
+
+  // COLD cache: the canary is a real paid call, so it takes a lease.
+  const cold = mk(new Map());
+  await tick(cold.ctx); cold.ctx.db.close();
+  check(cold.claims.some(r => r.startsWith("canary:")),
+    "control: with a cold cache the canary claims a lease", JSON.stringify(cold.claims));
+
+  // WARM cache: measureContainment answers from it without spawning anything,
+  // so claiming would reserve capacity for a call that never happens.
+  const warm = mk(new Map([["some-canary-id", { credentialRead: "closed", why: "cached" }]]));
+  await tick(warm.ctx); warm.ctx.db.close();
+  check(!warm.claims.some(r => r.startsWith("canary:")),
+    "with a WARM cache no canary lease is claimed at all", JSON.stringify(warm.claims));
+  check(warm.claims.length > 0,
+    "and the worker still claims its own, so this did not simply stop dispatch",
+    JSON.stringify(warm.claims));
+  rmSync(cold.dir, { recursive: true, force: true });
+  rmSync(warm.dir, { recursive: true, force: true });
+}
+
+// ── a PR this tick could not READ keeps its queue position ────────────────
+// Absence from `wanted` means "unknown", not "withdrawn": cancelling costs the
+// guardian its place in the queue and lets a builder take the opening.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-unread-q-"));
+  const cancelled = [];
+  const ctx = {
+    nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+    execute: true, shadow: true, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-unread-q-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+    },
+    hub: () => ({ hub: {}, why: null }), repoId: 7, lstart: "boot-1",
+    // One queued request for PR 42, and PR 42 cannot be evaluated this tick.
+    queuedRequests: () => [{ run_ref: "o/r#42:FIX_CI" }, { run_ref: "o/r#99:FIX_CI" }],
+    cancelQueued: (db, a) => { cancelled.push(a.runRef); return { ok: true, cancelled: 1 }; },
+    providerClaim: () => ({ ok: true, id: 1, token: "t" }),
+    providerBind: () => ({ ok: true, bound: 1 }),
+    providerRelease: () => ({ ok: true }),
+    reapProvider: () => ({ ok: true, reaped: 0 }),
+    openPrs: () => [42],
+    prAnchor: () => ({ ok: true, headRef: "mp/bt-1-s0", baseRef: "main", state: "open", title: "t",
+                       updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
+    evaluate: () => ({ ok: false, why: "GitHub could not be reached" }),
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }),
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+  };
+  await tick(ctx); ctx.db.close();
+  check(!cancelled.includes("o/r#42:FIX_CI"),
+    "a queued request for a PR this tick could not read is KEPT", JSON.stringify(cancelled));
+  check(cancelled.includes("o/r#99:FIX_CI"),
+    "control: one for a PR this tick never saw at all is still cancelled", JSON.stringify(cancelled));
   rmSync(dir, { recursive: true, force: true });
 }
 

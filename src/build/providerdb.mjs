@@ -43,6 +43,28 @@ export const LEASE_COLS =
    requested_at, started_at, heartbeat_at, expires_at, preempt_requested, token`;
 
 /**
+ * The shape the provider scheduler REQUIRES, table by table.
+ *
+ * A version number is a claim about shape and `COLUMNS_AT` describes only what
+ * later migrations ADD -- so a current-version hub missing a column created in
+ * migration 1, `provider_state.cooldown_until` among them, satisfied both and
+ * still threw on the first `providerState` read, into the guardian's fail-open
+ * path. What the scheduler needs is what its own SQL names, and that is here.
+ *
+ * `provider_lease` is DERIVED from `LEASE_COLS` rather than restated: that
+ * constant is already the one place naming those columns, and a second list
+ * would drift from it. `provider_state` is declared, and the test compares the
+ * declaration against a freshly migrated hub in both directions.
+ */
+export const SCHEDULER_COLUMNS = Object.freeze({
+  provider_lease: Object.freeze(LEASE_COLS.split(",").map(c => c.trim()).filter(Boolean)),
+  provider_state: Object.freeze([
+    "provider", "concurrency_limit", "guardian_reserved", "cooldown_until",
+    "last_429_at", "last_signature", "measured_at",
+  ]),
+});
+
+/**
  * A claim's INCARNATION, and the reason an identity is not enough.
  *
  * `restoreHub` clears provider_lease in the restored file, so SQLite restarts

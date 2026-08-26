@@ -635,6 +635,58 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
     JSON.stringify({ stale, seen }));
 }
 
+// ── the provider lease is RENEWED while the worker works ──────────────────
+// LEASE_SECONDS is 300 and watch.workerBudgetMinutes defaults to 20, so without
+// a heartbeat every worker spends three quarters of its run holding an expired
+// lease. Nothing over-admits today -- heldCount ignores expiry and the reaper
+// spares a live holder -- but `expires_at` stops describing reality, and
+// `expiredLeases` reads it.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-beat-"));
+  const beats = [];
+  const ctx = {
+    nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+    execute: true, shadow: true, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-beat-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+    },
+    hub: () => ({ hub: {}, why: null }), repoId: 7, lstart: "boot-1",
+    // Fast enough that a short worker still gets one.
+    heartbeatMs: 5,
+    providerClaim: () => ({ ok: true, id: 1, token: "tok" }),
+    providerBind: () => ({ ok: true, bound: 1 }),
+    providerRelease: () => ({ ok: true }),
+    providerHeartbeat: (db, a) => { beats.push(a); return { ok: true }; },
+    reapProvider: () => ({ ok: true, reaped: 0 }),
+    queuedRequests: () => [],
+    openPrs: () => [42],
+    prAnchor: () => ({ ok: true, headRef: "mp/bt-1-s0", baseRef: "main", state: "open", title: "t",
+                       updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
+    evaluate: () => EVAL,
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    // Long enough for the 5ms beat to fire at least once.
+    spawnWorker: async () => { await new Promise(r => setTimeout(r, 60)); return { outcome: "ok", why: "done", ms: 60, cost: 0, sessionId: "s" }; },
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+  };
+  await tick(ctx); ctx.db.close();
+  check(beats.length > 0, "the provider lease is renewed while the worker runs", `${beats.length} beat(s)`);
+  check(beats[0]?.owner === "guardian" && beats[0]?.repoId === 7 && beats[0]?.runRef != null,
+    "renewed by IDENTITY, so it works before and after the spawn rebinds the row",
+    JSON.stringify(beats[0]));
+  check(beats[0]?.token === "tok",
+    "carrying the claim's token, which the fence requires", JSON.stringify(beats[0]?.token));
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // ── A-9: a maintenance refusal is retried, never swallowed ────────────────
 // `assertWritable` refuses every hub write while a restore holds the lock. A
 // release dropped there leaves the lease held until it expires, counted against

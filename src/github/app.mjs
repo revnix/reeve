@@ -116,9 +116,18 @@ export function apiAsInstallation(token, args, { timeoutMs = 60_000, maxBuffer =
     });
     return { ok: true, out: out.trim() };
   } catch (e) {
-    // A timeout kill is reported as itself. Otherwise it arrives as an empty
-    // stderr and reads like an ordinary refusal, which is the one thing it is not.
-    if (e?.killed || e?.signal === "SIGTERM")
+    // `code`, and only `code`. Measured on node v24.17.0, both failures set
+    // `signal === "SIGTERM"` and leave `killed` undefined:
+    //
+    //   maxBuffer overflow -> code=ENOBUFS  signal=SIGTERM  killed=undefined
+    //   timeout            -> code=ETIMEDOUT signal=SIGTERM killed=undefined
+    //
+    // So a signal test cannot separate them and reported every overflow as a
+    // timeout, making the truncation branch unreachable for the failure it names
+    // -- and `killed` never fired at all. These two need telling apart because a
+    // caller acts on them differently: a timeout is transient and worth retrying,
+    // an overflow means the request SUCCEEDED and the answer did not fit.
+    if (e?.code === "ETIMEDOUT")
       return { ok: false, out: "", err: `gh api exceeded ${timeoutMs}ms and was killed`, timedOut: true };
     if (e?.code === "ENOBUFS")
       return { ok: false, out: "", err: `gh api output exceeded ${maxBuffer} bytes`, truncated: true };

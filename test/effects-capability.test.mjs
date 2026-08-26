@@ -83,11 +83,48 @@ const reachableFrom = entry => {
 
   // A credential, by any route. `github/app.mjs` is what loads the App key and
   // mints tokens; the node modules are what would let a handler go around it.
+  // SUBPATHS too. `^node:fs$` does not match `node:fs/promises`, which is the same
+  // capability through a door the pattern left open -- and an exact-match list is
+  // exactly the shape that looks complete while being one character short.
   const forbidden = [...reached].filter(s =>
-    /github\/app\.mjs$/.test(s) || /^node:(child_process|fs|net|http|https|tls|dns)$/.test(s));
+    /github\/app\.mjs$/.test(s) || /^node:(child_process|fs|net|http|https|tls|dns|worker_threads|vm)(\/|$)/.test(s));
   check(forbidden.length === 0,
     "an effect handler can reach neither a credential nor a way to make its own network call",
     `reaches ${forbidden.join(", ")}`);
+
+  // GLOBALS, which need no import at all and which the walk therefore cannot see.
+  // `fetch` is the one that matters: a handler calling it directly makes its own
+  // network call while the import graph stays perfectly clean. Scanned over the
+  // files the walk actually reached, so it covers a helper module too.
+  const { files } = reachableFrom(join(src, "outbox", "effects.mjs"));
+  const AMBIENT = [
+    [/\bfetch\s*\(/, "fetch"],
+    [/\bnew\s+WebSocket\b/, "WebSocket"],
+    [/\bXMLHttpRequest\b/, "XMLHttpRequest"],
+    [/\bnew\s+Function\s*\(/, "new Function"],
+    [/\bprocess\.binding\s*\(/, "process.binding"],
+    [/\bcreateRequire\s*\(/, "createRequire"],
+  ];
+  const ambient = [];
+  for (const f of files) {
+    const text = readFileSync(f, "utf8");
+    // Comments discuss these by name -- this file's own docblock does -- so only
+    // CODE is scanned. Crude but honest: a line whose first non-space characters
+    // start a comment is skipped.
+    const code = text.split("\n").filter(l => !/^\s*(\*|\/\/|\/\*)/.test(l)).join("\n");
+    for (const [re, name] of AMBIENT) if (re.test(code)) ambient.push(`${relative(src, f)}: ${name}`);
+  }
+  check(ambient.length === 0,
+    "and reaches no ambient capability either, which needs no import to use",
+    ambient.join(", "));
+
+  // Control: the scanner finds these when they ARE present. Without it a clean
+  // result and a broken matcher are the same reading.
+  for (const [re, name] of AMBIENT)
+    check(re.test({ fetch: "await fetch(url)", WebSocket: "new WebSocket(u)", XMLHttpRequest: "new XMLHttpRequest()",
+                    "new Function": "new Function(s)", "process.binding": "process.binding('x')",
+                    createRequire: "createRequire(import.meta.url)" }[name]),
+      `control: the scanner recognises ${name}`, "");
 
   // And the positive half: the claim is that it takes its caller as an argument.
   // Without this, a handler that simply stopped working would also pass above.

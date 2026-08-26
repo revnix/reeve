@@ -4,12 +4,18 @@
 // Asserted at the connection, not by review. A guardian that grew a third touch
 // would still pass every functional test it has; this is the only thing that
 // would notice.
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openHubAsGuest, stripSql } from "../src/build/hubguest.mjs";
-import { openHub } from "../src/build/hubdb.mjs";
+import { openHub, HUB_BUSY_TIMEOUT_MS } from "../src/build/hubdb.mjs";
 import { claimProvider } from "../src/provider.mjs";   // the end-to-end guest assertion
+
+// How long the out-of-process holder keeps the hub write lock. Long enough
+// that the guest provably blocks, short enough that the suite does not pay ten
+// seconds to learn it.
+const HOLD_MS = 700;
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -249,39 +255,98 @@ for (const [sql, name] of refused) {
 // a scheduler exception as fail-open, so routine contention would dispatch
 // unscheduled and defeat the quota this connection exists to enforce.
 {
-  // PRAGMA is denied to a guest by design, so the timeout cannot be read back
-  // through this connection. It is asserted through BEHAVIOUR instead, which is
-  // the property that matters anyway: a competing writer holds the lock and the
-  // guest WAITS rather than failing at once.
-  const holder = openHub(p);
-  holder.exec("BEGIN IMMEDIATE");
+  // THE HOLDER LIVES IN ANOTHER PROCESS, and this is the whole design of the
+  // fixture rather than an implementation detail.
+  //
+  // `DatabaseSync` is synchronous. A holder in THIS process can never reach its
+  // own ROLLBACK while the guest is blocked, so the guest waits out the entire
+  // production timeout and then fails -- ten seconds every run, twenty in a CI
+  // that runs the suite twice, to prove only that the wait is long. A holder
+  // that RELEASES proves the stronger property in a fraction of the time: the
+  // guest waited AND then got through, which is what a real contended write
+  // looks like.
+  //
+  // The child announces `ready` only after it holds the lock, so the guest
+  // cannot win the race and measure a wait that never happened -- a fixture
+  // that never reaches the mechanism passes for the wrong reason.
+  const holderSrc = join(dir, "holder.mjs");
+  const hubUrl = new URL("../src/build/hubdb.mjs", import.meta.url).href;
+  writeFileSync(holderSrc, [
+    `import { openHub } from ${JSON.stringify(hubUrl)};`,
+    `const db = openHub(process.argv[2]);`,
+    `db.exec("BEGIN IMMEDIATE");`,
+    `process.stdout.write("ready\\n");`,
+    `setTimeout(() => { try { db.exec("ROLLBACK"); } catch {} db.close(); }, ${HOLD_MS});`,
+  ].join("\n"));
+
+  const child = spawn(process.execPath, [holderSrc, p], { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", d => { stderr += d; });
+  const ready = await new Promise(resolve => {
+    let seen = "";
+    const t = setTimeout(() => resolve(false), 10000);
+    child.stdout.on("data", d => {
+      seen += d;
+      if (seen.includes("ready")) { clearTimeout(t); resolve(true); }
+    });
+    child.on("exit", () => { clearTimeout(t); resolve(seen.includes("ready")); });
+  });
+  // A fixture that could not take the lock proves nothing about waiting, and
+  // must say so instead of letting the assertion below pass on an empty case.
+  check(ready, "fixture: another process holds the hub write lock", stderr.slice(0, 200));
+
+  const waiter = openHubAsGuest(p);
   const started = Date.now();
   let why = null;
+  try { waiter.exec("BEGIN IMMEDIATE"); } catch (e) { why = e.message; }
+  const waited = Date.now() - started;
   // HELD AND CLOSED, not discarded. A guest dropped on the floor leaves its
   // DatabaseSync open until GC finalises it, and this block removes the
   // temporary database immediately afterwards -- which on Windows fails with a
   // sharing violation while the file is still open. reeve has to run on Windows
   // as well as macOS and Ubuntu, so a test that only cleans up on one of them is
   // a test that fails on the other two for a reason unrelated to what it checks.
-  const waiter = openHubAsGuest(p);
-  try { waiter.exec("BEGIN IMMEDIATE"); } catch (e) { why = e.message; }
-  finally { try { waiter.close(); } catch {} }
-  const waited = Date.now() - started;
-  try { holder.exec("ROLLBACK"); } catch {}
-  holder.close();
-  check(why !== null && waited >= 50,
+  try { waiter.exec("ROLLBACK"); } catch {}
+  waiter.close();
+
+  // WAITED, THEN GOT THROUGH. On a zero timeout this is `why != null` with
+  // `waited` near zero, so the assertion fails on exactly the implementation it
+  // exists to catch. The margin between the assertion and HOLD_MS is wide
+  // enough that a loaded machine cannot turn a real wait into a failure.
+  check(why === null && waited >= 200,
     "the guest WAITS for a contended write lock rather than failing instantly",
-    JSON.stringify({ waitedMs: waited, why: String(why).slice(0, 60) }));
+    JSON.stringify({ waitedMs: waited, why: why && String(why).slice(0, 60) }));
+}
+
+// The guest's contention budget is READ from the hub's, never repeated. Four
+// copies of the number lived across two files and the comments beside them
+// asserted they agreed; nothing checked. This fails the moment a copy comes
+// back, which the behavioural assertion above cannot see -- it would still pass
+// with the guest waiting a different amount from every other connection.
+{
+  const guestSrc = readFileSync(new URL("../src/build/hubguest.mjs", import.meta.url), "utf8");
+  const body = guestSrc.slice(guestSrc.indexOf("export function openHubAsGuest"));
+  check(/HUB_BUSY_TIMEOUT_MS/.test(body) && !/\b\d{4,}\b/.test(body),
+    "the guest reads the shared busy timeout instead of restating it",
+    (body.match(/\b\d{4,}\b/g) ?? []).join(","));
+  check(HUB_BUSY_TIMEOUT_MS === 10000,
+    "the shared busy timeout is still the production value",
+    String(HUB_BUSY_TIMEOUT_MS));
 }
 
 // The module refuses to hand back a connection it could not restrain. `engines`
 // is advisory and `bin/reeve`'s floor guards the CLI, not an import from
 // elsewhere, so the guarantee has to be checked where it is made.
 {
-  const proto = Object.getPrototypeOf(openHub(join(dir, "probe.db")));
+  // HELD AND CLOSED for the same reason as the guest above: an unclosed
+  // DatabaseSync keeps `probe.db` open until GC finalises it, and the
+  // recursive removal below fails on Windows while the file is still in use.
+  const probe = openHub(join(dir, "probe.db"));
+  const proto = Object.getPrototypeOf(probe);
   check(typeof proto.setAuthorizer === "function",
     "fixture: this runtime HAS setAuthorizer, so the guard below is dormant rather than absent",
     `node ${process.versions.node}`);
+  probe.close();
 }
 
 g.close();

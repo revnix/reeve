@@ -21,6 +21,7 @@
 // REQUIRES admission to be evaluated under one -- so an allowlist of tables
 // alone does not narrow the surface, it breaks it.
 import { DatabaseSync, constants } from "node:sqlite";
+import { HUB_BUSY_TIMEOUT_MS } from "./hubdb.mjs";
 
 // What each permitted table may be asked to do. Anything absent is denied,
 // including tables that do not exist: the default is refusal, so a table added
@@ -189,20 +190,21 @@ export function openHubAsGuest(path) {
       `node ${process.versions.node} has no DatabaseSync.setAuthorizer (added in 24.10.0), so the ` +
       `guardian's hub connection cannot be restricted; refusing to open an unrestricted one`);
 
-  // THE SAME BUSY TIMEOUT AS EVERY OTHER HUB CONNECTION. `openHub` opens with
-  // `{ timeout: 10000 }`; a guest on SQLite's default of zero fails instantly
-  // with SQLITE_BUSY the moment a builder or a restore holds the write lock for
-  // an instant. The guardian treats a scheduler exception as FAIL-OPEN and
-  // dispatches unscheduled, so routine write contention would quietly defeat the
-  // global quota this connection exists to enforce.
+  // THE SAME BUSY TIMEOUT AS EVERY OTHER HUB CONNECTION -- the same VALUE, read
+  // from the one place that defines it, not a copy that happens to agree today.
+  // A guest on SQLite's default of zero fails instantly with SQLITE_BUSY the
+  // moment a builder or a restore holds the write lock for an instant. The
+  // guardian treats a scheduler exception as FAIL-OPEN and dispatches
+  // unscheduled, so routine write contention would quietly defeat the global
+  // quota this connection exists to enforce.
   //
   // Set BEFORE the authorizer is installed, because the authorizer denies PRAGMA
   // -- correctly, since a guest must not reach the schema sideways. The
   // constructor option and the pragma say the same thing; both are set because
   // `openHub` sets both and a guest that behaved differently under contention
   // would be a second answer to the same question.
-  const db = new DatabaseSync(path, { timeout: 10000 });
-  db.exec("PRAGMA busy_timeout = 10000");
+  const db = new DatabaseSync(path, { timeout: HUB_BUSY_TIMEOUT_MS });
+  db.exec(`PRAGMA busy_timeout = ${HUB_BUSY_TIMEOUT_MS}`);
   db.setAuthorizer((action, arg1, arg2) => {
     if (TABLELESS_OK.has(action)) return constants.SQLITE_OK;
     // THE NAME IS arg2 FOR SQLITE_FUNCTION, measured rather than assumed: SQLite

@@ -124,6 +124,32 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubaccess-"));
   check(hubAccess(q)().hub != null, "control: an intact store at the same version still opens");
 }
 
+// ── a LOST TABLE is a defect too, not only a missing column ───────────────
+// `COLUMNS_AT` describes what migrations ADD to tables that already exist -- its
+// only entry is migration 3's two columns. So a current-version hub that has
+// lost a version-1 table produced no defects at all: the guest opened, and the
+// first `SELECT ... FROM provider_state` threw into the fail-open path.
+// Consulting one inventory and not the other covered exactly the last migration
+// and nothing before it.
+{
+  const p = join(dir, "notable.db");
+  openHub(p).close();
+  const w = new DatabaseSync(p);
+  w.exec("DROP TABLE provider_state");
+  w.close();
+  const a = hubAccess(p)();
+  check(a.hub === null,
+    "a hub that has lost a scheduler TABLE does not open", JSON.stringify(a));
+  check(/provider_state/.test(a.why ?? ""),
+    "and the refusal names the table", String(a.why));
+
+  // CONTROL: the same store intact still opens -- this is a shape check, not a
+  // refusal of everything with a schema_version row.
+  const q = join(dir, "notable-control.db");
+  openHub(q).close();
+  check(hubAccess(q)().hub != null, "control: an intact store at the same version still opens");
+}
+
 // ── an existing hub that cannot be READ is a fault, not an absence ────────
 {
   const p = join(dir, "corrupt.db");

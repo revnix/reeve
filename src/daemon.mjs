@@ -1793,12 +1793,46 @@ export async function tick(ctx) {
         const intended = new Set([
           ...(willAttemptCanary ? [`canary:${nwo}`] : []),
           ...wanted.map(d => `${nwo}#${d.e.pr}:${d.decision.action}`)]);
-        for (const row of (ctx.queuedRequests ?? queuedGuardianRequests)(h, { repoId })) {
+        const queued = (ctx.queuedRequests ?? queuedGuardianRequests)(h, { repoId });
+        for (const row of queued) {
           if (intended.has(row.run_ref)) continue;
           const c = (ctx.cancelQueued ?? cancelQueued)(h, {
             owner: "guardian", repoId, runRef: row.run_ref, isAlive: isSameProcess });
           if (c?.ok) log(logPath, `provider: cancelled a queued request this tick no longer wants (${row.run_ref})`);
           else log(logPath, `provider: could not cancel ${row.run_ref} — ${c?.reason}`);
+        }
+
+        // AND SERVE THE HEAD OF THE QUEUE BEFORE ASKING FOR ANYTHING NEW.
+        //
+        // `claimProvider` serves guardian requests in order: a claim is granted
+        // only when there is no queued guardian request older than this
+        // caller's. The canary asks FIRST every tick and is therefore refused
+        // the moment any worker request is already queued -- and that refusal
+        // sets `skipDispatch`, which stops the per-decision loop, which is the
+        // only thing that would have re-asked for that worker. Neither ever
+        // moves again, and `queuedGuardianCount` blocks every BUILDER admission
+        // behind two requests nobody will ever serve.
+        //
+        // Reproduced against the real scheduler before fixing: with a limit of
+        // one, the canary is granted on tick 1, the worker queues, and from tick
+        // 2 onward the canary is refused `queued` for ever.
+        //
+        // So the oldest request this tick still wants is re-asked here, ahead of
+        // the canary. Granting it is what removes it from the queue; it is
+        // released again immediately because this tick has not measured
+        // containment yet and may never dispatch. A wasted promote-and-release
+        // is the price of the queue draining in order, and the next tick finds
+        // it empty.
+        const head = queued.find(r => intended.has(r.run_ref) && r.run_ref !== `canary:${nwo}`);
+        if (head) {
+          const got = (ctx.providerClaim ?? claimProvider)(h, {
+            owner: "guardian", repoId, runRef: head.run_ref,
+            pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
+          if (got?.ok) {
+            log(logPath, `provider: served the queue head (${head.run_ref}) so the canary is not blocked behind it`);
+            releaseWithRetry(head.run_ref, { owner: "guardian", repoId, runRef: head.run_ref,
+                                             id: got.id, token: got.token ?? null });
+          }
         }
       } catch (err) {
         log(logPath, `provider: could not sweep queued requests — ${err.message}`);
@@ -1837,7 +1871,13 @@ export async function tick(ctx) {
       // guardian proceed unscheduled -- inverting the founder's decision at the
       // one site a stubbed-containment fixture never reaches.
       try {
-        got = (ctx.providerClaim ?? claimProvider)(hub, {
+        // FRESH, like every other scheduler operation. `hubNow()` was wired into
+        // cleanup and the sweep and NOT into the claims, so a restore during the
+        // tick left these reserving capacity in an unlinked database while the
+        // restored hub admitted its own -- the defect the getter was introduced
+        // for, surviving at the two sites that matter most. The bind at spawn
+        // time is the furthest point in the tick from where the handle was taken.
+        got = (ctx.providerClaim ?? claimProvider)(hubOr(() => null) ?? hub, {
           owner: "guardian", repoId, runRef: `canary:${nwo}`,
           pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
       } catch (err) {
@@ -1998,7 +2038,7 @@ export async function tick(ctx) {
         // to prevent and a silent version of it is indistinguishable from a
         // working one.
         try {
-          got = (ctx.providerClaim ?? claimProvider)(hub, {
+          got = (ctx.providerClaim ?? claimProvider)(hubOr(() => null) ?? hub, {
             owner: "guardian", repoId, runRef: prRunRef,
             pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
         } catch (err) {
@@ -2256,7 +2296,7 @@ export async function tick(ctx) {
             // a success, and zero rebound is indistinguishable in effect from not
             // having called it.
             if (prLease) {
-              const b = (ctx.providerBind ?? bindProviderLease)(hub, { ...prLease, pid, lstart, isAlive: isSameProcess });
+              const b = (ctx.providerBind ?? bindProviderLease)(hubOr(() => null) ?? hub, { ...prLease, pid, lstart, isAlive: isSameProcess });
               if (b?.ok === false)
                 throw new Error(`the provider lease could not be rebound to the worker: ${b.reason}`);
               if (b?.bound !== 1)

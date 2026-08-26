@@ -298,12 +298,12 @@ These cost hours. They are the reason to read this file rather than re-derive it
 
 ## 6. Unfinished work, and what each piece needs
 
-**The durable-effect programme is not finished.** §3.2 lists its stages and §0
-says which of them have landed; the count is not repeated here, because a count is
-the first thing to go stale and the block it sat in was exempt from the guard for
-mentioning §0 at all. What is durable is the shape: the stage that matters most
-makes `FIX_FINDINGS` able to ACT on a review finding rather than merely notice one,
-and it reads `e.threadDetails`, which is written by nothing.
+**The durable-effect programme.** §3.2 lists its stages and §0 says which of them
+have landed, including whether any remain — a count here would be a second copy of
+that, and so would a sentence asserting the programme is unfinished, which is the
+same claim with the number removed. What is durable is the shape: the stage that
+matters most makes `FIX_FINDINGS` able to ACT on a review finding rather than
+merely notice one, by giving it the thread details it is dispatched with.
 
 **Bring `docs/TRACKER.md` up to date.** §0 says how current it is. What is owed:
 the PR split and why, the two halves, and this session's findings.
@@ -321,17 +321,20 @@ repository's declared shape and its actual history have to agree. Whether they d
 today is §0.1's doctor line. Not investigated either way — a gate written against
 a false premise passes for the wrong reason.
 
-**The wrong-worker experiment would have to be REBUILT to be re-run.** It
-published correctly on 2026-08-24 — 61s, $0.42, 16 turns, 0 denials — against a toy
-fixture, and it has never been run against a real repository. Its harness lived in
-a session scratchpad and **that scratchpad is gone**: `build-fixture.sh` and
-`run.mjs` exist nowhere now, in this repository or on this machine, and the earlier
-draft of this section pointed at them by a placeholder path as though they did.
+**The wrong-worker experiment.** It published correctly on 2026-08-24 — 61s,
+$0.42, 16 turns, 0 denials — against a toy fixture, and it has never been run
+against a real repository.
 
-Recorded as the cost rather than hidden, because it is the lesson twice over. A
-tool a document tells someone to run belongs in the repository: `tools/watch-prs.sh`
-is here for the same reason, after the same finding. Rebuilding this one is perhaps
-an hour, and if it is rebuilt it goes in `tools/` and not in a scratchpad.
+**Its original harness was LOST**, and that is the durable fact worth carrying: it
+was written into a session's scratchpad, that scratchpad was discarded with the
+session, and an earlier draft of this section went on naming `build-fixture.sh` and
+`run.mjs` by a placeholder path afterwards. Whether a harness exists in the tree
+today is a question `ls tools/` answers, and this section deliberately does not
+answer it.
+
+The lesson is the one that put `tools/watch-prs.sh` in the repository, arriving a
+day too late for this: a tool a document tells someone to run has to live where the
+document lives. Rebuilding is perhaps an hour, and it goes in `tools/`.
 
 **Also open:** ntfy read user (needs shell on 95.217.11.127); second project
 (`rextaihq/rext-backend`).

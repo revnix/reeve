@@ -197,5 +197,25 @@ check(both.length === 0, "control: no kind is both replayed and declared unrepla
     `${scanned} column references across ${consuming.length} plans`);
 }
 
+// The DDL's CHECK and the machine's domain must be the same set. A state the
+// machine emits and the database refuses is a transition that throws at commit
+// time, in production, on the one path that must not throw.
+{
+  const { PHASES } = await import("../src/build/phases.mjs");
+  const sql = readFileSync(new URL("../src/build/hub.sql", import.meta.url), "utf8");
+  const block = sql.slice(sql.indexOf("phase          TEXT    NOT NULL CHECK"));
+  const fromDdl = (block.slice(0, block.indexOf("))")).match(/'([A-Z_]+)'/g) ?? []).map(s => s.slice(1, -1));
+  // The anchor is asserted before the comparison. A slice from indexOf(-1) is
+  // the whole file, and a match against that would gather every quoted upper-case
+  // token in the schema -- so a MOVED CHECK reads as a disagreeing enumeration
+  // rather than as a stale anchor, and the failure names the wrong defect.
+  check(fromDdl.length > 0,
+    "control: the task.phase CHECK was found in hub.sql, so this compares two real sets",
+    `${fromDdl.length} phases parsed from the DDL`);
+  check(JSON.stringify([...fromDdl].sort()) === JSON.stringify([...PHASES].sort()),
+    "the task.phase CHECK and phases.mjs PHASES are the same set",
+    `ddl-only: ${fromDdl.filter(p => !PHASES.includes(p))}\n        machine-only: ${PHASES.filter(p => !fromDdl.includes(p))}`);
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

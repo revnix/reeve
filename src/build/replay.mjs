@@ -25,7 +25,7 @@ import { hubTx } from "./hubdb.mjs";
 // dropped every imported receipt passed the recovery acceptance test -- and
 // those receipts are what clause B1 reads to decide a push was attested.
 export const COMPARISON_SET = [
-  "task", "task_territory", "task_drain", "phase_event", "phase_run", "approval", "gate_request", "notice_receipt", "impl_pr", "attested_push",
+  "task", "task_territory", "task_drain", "phase_event", "phase_run", "approval", "gate_request", "notice_receipt", "task_pr", "attested_push",
   "harness_acceptance", "gate_run", "pr_hold", "hold_reason", "project_authority",
   "outbox", "territory_lease", "merge_decision", "guardian_receipt",
   // `escalation` joined the set when `escalation.raised` became replayable: a
@@ -51,6 +51,12 @@ export const NON_REPLAYED_KINDS = Object.freeze([
   // RESEARCH was skipped, not lost. The reason is durable in hub_event as
   // history; there is no row it projects into.
   "research.skipped",
+  // `repo_gate_state` has a LIVE WRITER: the builder tick re-derives it every
+  // pass, and `tables.mjs` declares it `replayed: false`. Restoring an older
+  // reading would put a staler gate state in front of clause U4 than the one the
+  // loop is about to write. The event is the record of what reeve saw and when;
+  // the row is a projection that rebuilds itself.
+  "repo_gate_state.refreshed",
   // The singleton lease is PROCESS-scoped: `singleton_lease` is cleared by
   // `restoreHub` along with every other row naming a pid, because no process
   // from before the restore still holds anything. Replaying a grant would
@@ -83,6 +89,11 @@ const HANDLERS = {
   // image left it. S2-B's depth override writes this on both the accepted-and-
   // moved and the accepted-but-refused paths.
   "sizing.overridden":        { table: "task", key: ["id"] },
+  // The SAME row image, a DIFFERENT fact. `sizing.recorded` is the classifier
+  // choosing a depth; `sizing.overridden` is the founder replacing it. Replay
+  // treats them identically -- same table, same key -- and a reader asking how
+  // the depth was chosen gets an answer instead of a guess.
+  "sizing.recorded":          { table: "task", key: ["id"] },
   // The transition LOG, not just the projection. Without it every transition
   // after the snapshot vanishes from history: `task why` and dash's
   // age-in-state lose the record, and restored outbox rows keep fence values
@@ -114,7 +125,22 @@ const HANDLERS = {
   "approval.recorded":        { table: "approval", key: ["spec_repo_id","spec_pr","head_sha","actor_id","source_id"] },
   "gate_request.minted":      { table: "gate_request", key: ["spec_repo_id","spec_pr","head_sha"] },
   "notice_receipt.recorded":  { table: "notice_receipt", key: ["task","head_sha","clean_source_id"] },
-  "impl_pr.bound":            { table: "impl_pr", key: ["task","generation","slice"] },
+  // Keyed on the PR's OWN identity, which is what the table's primary key became
+  // when the spec PR joined it: `(task, generation, slice)` cannot address a spec
+  // row, whose generation and slice are NULL by CHECK.
+  "task_pr.bound":            { table: "task_pr", key: ["repo_id","pr"] },
+  // THE v1 KIND, STILL REPLAYABLE. A schema-1 durable tail records implementation
+  // PRs as `impl_pr.bound`, and removing the kind when migration 2 renamed the
+  // table made every such event UNKNOWN -- so restoring a v1 snapshot with a tail
+  // exported before the upgrade refuses recovery, and the PRs created after that
+  // snapshot cannot be carried forward at all. A migration that changes a table
+  // has to keep reading the events written against the old one: the tail is
+  // history and cannot be migrated in place.
+  //
+  // `map` translates the v1 row image into a v2 row. The image is already a
+  // task_pr implementation row in every column but the one v1 had no need for.
+  "impl_pr.bound":            { table: "task_pr", key: ["repo_id","pr"],
+                                map: (row) => ({ ...row, kind: "impl" }) },
   "attested_push.appended":   { table: "attested_push", key: ["task","generation","slice","sha"] },
   "guardian_receipt.imported":{ table: "guardian_receipt", key: ["repo_id","guardian_event_seq"] },
   "harness_acceptance.recorded": { table: "harness_acceptance", key: ["task","generation","slice","diff_hash"] },
@@ -155,7 +181,13 @@ export function replayHub(db, events) {
       // A lease grant, a heartbeat, or anything else that describes a process
       // is not part of the projection. Counted, never guessed at.
       if (!h) { skipped++; continue; }
-      const row = JSON.parse(e.payload);
+      let row = JSON.parse(e.payload);
+      // THE HANDLER'S OWN TRANSLATION FIRST, ahead of the key guard. A legacy
+      // kind's image is shaped for the table it was WRITTEN against; everything
+      // below -- the key check, the existence probe, the upsert -- is about the
+      // table it is being replayed INTO. Reading the key off the untranslated
+      // image would ask the wrong question of the wrong shape.
+      if (h.map) row = h.map(row);
       // THE KEY GUARD RUNS FIRST, above the delete branch.
       //
       // It sat below, so a `territory_lease.released` image with an incomplete

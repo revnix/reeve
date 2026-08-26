@@ -11,8 +11,8 @@
 // versioned instead: a numbered, forward-only list, each step in its own
 // transaction, and a store recorded above this binary's version does not open.
 import { DatabaseSync } from "node:sqlite";
-import { readFileSync, mkdirSync, existsSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
+import { dirname, join, basename } from "node:path";
 import { canonical } from "../db/ops.mjs";
 // `migrationPlan` hashes each migration's `up` so the freeze test has a stable,
 // INERT representation of what migration 1 is. Exporting MIGRATIONS itself would
@@ -23,7 +23,7 @@ import { createHash } from "node:crypto";
 // read it; two spellings of the same path is how they drift.
 const SCHEMA_PATH = new URL("./hub.sql", import.meta.url);
 
-export const HUB_SCHEMA_VERSION = 1;
+export const HUB_SCHEMA_VERSION = 2;
 
 /**
  * Forward-only. Each entry runs exactly once, in order, in its own transaction,
@@ -31,6 +31,75 @@ export const HUB_SCHEMA_VERSION = 1;
  */
 const MIGRATIONS = [
   { version: 1, up: (db) => db.exec(readFileSync(SCHEMA_PATH, "utf8")) },
+  // ---------------------------------------------------------------- 2
+  // ONE SHAPE FOR EVERY PULL REQUEST A TASK OWNS.
+  //
+  // Migration 1 put implementation PRs in a table and the spec PR in three
+  // columns on `task`, so every question of the form "what is open for this
+  // task" had to be asked twice and the two answers merged by hand. Five places
+  // ask it. Three learned about the spec PR one review round at a time, and
+  // four consecutive rounds produced eight findings of that single shape --
+  // rising, not falling. The sites were not the defect: asking one question in
+  // two shapes was.
+  //
+  // A NEW MIGRATION rather than an edit to hub.sql, which is frozen by design
+  // and by a recorded hash. Migration 1 has no deployed instance today, so
+  // editing it would have worked and taught the wrong habit; a schema whose
+  // history can be rewritten cannot be reasoned about the first time it cannot.
+  { version: 2, up: (db) => {
+      // RE-RUNNABLE, exactly as migration 1 is. `openHub` wraps each migration in
+      // BEGIN IMMEDIATE, so an interrupted one rolls back -- but a hub whose
+      // `schema_version` rows are lost while its TABLES survive reports version 0
+      // and replays every migration over a store that already has them. Migration
+      // 1 survives that because it is `CREATE TABLE IF NOT EXISTS` throughout;
+      // this one has to earn the same property, and `ALTER TABLE ... DROP COLUMN`
+      // has no IF EXISTS to lean on. The suite already had a fixture for this
+      // state and it is the one that caught it.
+      const hasTable = (t) => db.prepare(
+        `SELECT count(*) c FROM sqlite_master WHERE type='table' AND name = ?`).get(t).c > 0;
+      const hasColumn = (t, c) => db.prepare(
+        `SELECT count(*) c FROM pragma_table_info(?) WHERE name = ?`).get(t, c).c > 0;
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS task_pr (
+          task       TEXT    NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+          kind       TEXT    NOT NULL CHECK (kind IN ('spec','impl')),
+          generation INTEGER,
+          slice      INTEGER,
+          repo_id    INTEGER NOT NULL,
+          pr         INTEGER NOT NULL,
+          head_sha   TEXT    NOT NULL,
+          created_at INTEGER NOT NULL,
+          merged_sha TEXT,
+          PRIMARY KEY (repo_id, pr),
+          CHECK ((kind = 'impl' AND generation IS NOT NULL AND slice IS NOT NULL)
+              OR (kind = 'spec' AND generation IS NULL     AND slice IS NULL))
+        ) STRICT, WITHOUT ROWID;
+        CREATE UNIQUE INDEX IF NOT EXISTS one_spec_pr ON task_pr(task) WHERE kind = 'spec';
+        CREATE UNIQUE INDEX IF NOT EXISTS impl_pr_slice
+          ON task_pr(task, generation, slice) WHERE kind = 'impl';
+        CREATE INDEX IF NOT EXISTS task_pr_open ON task_pr(task) WHERE merged_sha IS NULL;
+      `);
+
+      // Each carry is guarded by the shape it reads FROM, so a second run over an
+      // already-migrated store finds nothing to do rather than failing.
+      if (hasTable("impl_pr"))
+        db.exec(`INSERT OR IGNORE INTO task_pr(task, kind, generation, slice, repo_id, pr,
+                                               head_sha, created_at, merged_sha)
+                   SELECT task, 'impl', generation, slice, repo_id, pr, head_sha, created_at, merged_sha
+                     FROM impl_pr`);
+      if (hasColumn("task", "spec_pr"))
+        db.exec(`INSERT OR IGNORE INTO task_pr(task, kind, generation, slice, repo_id, pr,
+                                               head_sha, created_at)
+                   SELECT id, 'spec', NULL, NULL, spec_repo_id, spec_pr,
+                          COALESCE(${hasColumn("task", "spec_head") ? "spec_head" : "NULL"}, ''), created_at
+                     FROM task
+                    WHERE spec_repo_id IS NOT NULL AND spec_pr IS NOT NULL`);
+
+      db.exec("DROP TABLE IF EXISTS impl_pr");
+      if (hasColumn("task", "spec_pr"))   db.exec("ALTER TABLE task DROP COLUMN spec_pr");
+      if (hasColumn("task", "spec_head")) db.exec("ALTER TABLE task DROP COLUMN spec_head");
+    } },
 ];
 
 /**
@@ -112,6 +181,13 @@ export function isOperational(e) {
   // through the damage branch told a concurrent `build run` that its lock tables
   // had failed and sent it at another forced restore, when the correct answer is
   // to wait for the one already running.
+  // REEVE'S OWN DAMAGE VERDICT, which carries no errcode because no SQLite call
+  // failed -- `quick_check` ANSWERED, and the answer was that the file is broken.
+  // Without this the rule below reads it as "not a storage error, therefore not
+  // damage" and every recovery path treats a corrupt hub as a healthy one that
+  // was merely busy. The marker is explicit rather than a fabricated errcode: an
+  // invented 11 would be a lie about where the verdict came from.
+  if (e?.hubDamaged) return false;
   if (e?.errcode === undefined) return true;
   // Access and contention: the file is untouched and the situation is what
   // failed. CANTOPEN is the one this list was missing -- a healthy hub the CLI
@@ -130,12 +206,54 @@ export function isOperational(e) {
       || e.errcode === 14;    // SQLITE_CANTOPEN
 }
 
-export function openHub(path) {
+/**
+ * The newest snapshot an operator could restore, named WITHOUT importing
+ * `backup.mjs`.
+ *
+ * `backup.mjs` imports this module, so importing `latestSnapshot` back would be
+ * a cycle. This is the cheap half of that function -- list and sort -- and it
+ * deliberately validates nothing: the refusal below is the safety property, and
+ * naming a file is DX on top of it. A wrong guess about the layout degrades the
+ * MESSAGE and never the refusal, so it says what it could not find rather than
+ * inventing a path.
+ *
+ * The layout is the CLI's own default (`join(HOME, "backups")`, `bin/reeve:496`)
+ * and `hubPathFor`'s `<home>/state/hub.db`, so the hub's snapshots live in
+ * `<home>/backups/hub`.
+ */
+function newestHubSnapshot(path) {
+  try {
+    const home = dirname(dirname(path));
+    const dir = join(home, "backups", basename(path, ".db"));
+    const newest = readdirSync(dir)
+      .filter(f => /^\d+\.db$/.test(f))
+      .sort((a, b) => Number(b.split(".")[0]) - Number(a.split(".")[0]))[0];
+    return newest ? join(dir, newest) : null;
+  } catch { return null; }
+}
+
+export function openHub(path, { skipIntegrity = false } = {}) {
   // state/ may not exist yet: on a fresh REEVE_HOME no guardian store has
   // created it, and DatabaseSync will not create a missing parent. Without this
   // the very first hub-writing command fails before migration 1 can run.
   mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path, { timeout: 10000 });
+
+  // CLOSED EXACTLY ONCE, from whichever path exits first.
+  //
+  // Seven places in this function close the handle and two of them already
+  // carried an ad-hoc try/catch, which was the warning. A third then fell
+  // through: the corruption branch closed, converted the exception into a
+  // verdict, and the common damage branch closed AGAIN. `DatabaseSync.close()`
+  // throws `database is not open` on a closed handle, so that error REPLACED the
+  // hubDamaged verdict and its recovery guidance -- and it carries no errcode,
+  // which `isOperational` reads as "not a storage error", so a genuinely corrupt
+  // hub was classified as merely operational. The exact misclassification the
+  // three-answer split was added to prevent, reintroduced by the split itself.
+  //
+  // Guarded here rather than by ordering, because ordering is what failed.
+  let closed = false;
+  const closeHub = () => { if (closed) return; closed = true; db.close(); };
 
   // AN UNREADABLE FILE IS REFUSED HERE, ONCE, FOR EVERY CALLER.
   //
@@ -167,7 +285,7 @@ export function openHub(path) {
              ) STRICT`);
     db.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get();
   } catch (e) {
-    try { db.close(); } catch { /* the throw below is the answer either way */ }
+    closeHub();
     // WHICH FAILURE, not merely that one happened. These pragmas WRITE, so they
     // fail for reasons that have nothing to do with the file being damaged:
     //
@@ -211,6 +329,98 @@ export function openHub(path) {
       { cause: e });
   }
 
+  // AND THE FILE ITSELF IS CHECKED, not merely opened.
+  //
+  // SQLite opens a database with damage in an index or an unrelated table
+  // perfectly happily, and every probe above can succeed against exactly that
+  // file -- so a refusal built on "the open threw" hands the caller a corrupt hub
+  // and calls it healthy. The guard above catches damage in the pages it happens
+  // to touch; this catches the rest.
+  //
+  // `quick_check(1)`, not `integrity_check`. This runs on EVERY command and every
+  // tick, and the full check is measured at ~1.1 ms/MB -- 52 ms on a 47 MB hub,
+  // per open. `quick_check` skips the index cross-references, which is the
+  // expensive half, and still refuses the page-level damage that matters here.
+  // The deep check stays where it already is: `snapshotAll`, `restoreHub` and
+  // `builder doctor`, each of which runs once and on purpose. Moving a full scan
+  // onto the hot path to fix this would be the same mistake as the earlier
+  // `latestSnapshot` repair, in the other direction.
+  //
+  // `1` is the row limit, not a depth: it stops after the first problem, which
+  // is all a refusal needs.
+  //
+  // ONE CALLER IS EXEMPT, and it is the one whose job is to replace the file.
+  // `restoreHub` opens the hub to take the maintenance lock IN it -- that is the
+  // only exclusion a bootstrapping builder honours -- and then quarantines it and
+  // installs a snapshot. Refusing there would make `restore --hub --force`
+  // unable to recover exactly the hubs it exists for: measured, adding this check
+  // turned five of that command's own recovery assertions red, including "names
+  // the table it could not read" and "force carries it through". The check is for
+  // callers about to USE the hub; the restore is about to REPLACE it, and it
+  // validates the SNAPSHOT it installs rather than the wreck it is removing.
+  if (!skipIntegrity) {
+    // THREE ANSWERS, because a check that could not RUN has not answered.
+    //
+    // "not ok" and "could not tell" are different facts with different remedies:
+    // one is restore-from-backup, the other is find out why the check would not
+    // run — a locked file, an odd page size, SQLite unhappy for a reason that is
+    // not corruption. Collapsing them sends an operator to replace a database
+    // that may be perfectly intact, which is the strongest claim this file makes
+    // and the one that must not be made on a guess. `rawOpen` and the admission
+    // probe in `backup.mjs` each had to learn this separately; it is the same
+    // shape a third time.
+    let verdict = null, checkFailed = null;
+    try { verdict = Object.values(db.prepare("PRAGMA quick_check(1)").get() ?? {})[0]; }
+    catch (e) { checkFailed = e; }
+
+    if (checkFailed) {
+      closeHub();
+      // A CHECK THAT THREW *CORRUPTION* HAS ANSWERED. SQLITE_CORRUPT and
+      // SQLITE_NOTADB out of `quick_check` are not "could not tell": they are the
+      // file saying so through a different door, and calling that unknown would
+      // leave an operator with no remedy for a hub that is genuinely broken. Any
+      // other errcode -- BUSY, READONLY, PERM, CANTOPEN, IOERR -- is the
+      // situation failing rather than the file.
+      if (checkFailed.errcode === 11 || checkFailed.errcode === 26)
+        verdict = `the check failed with ${checkFailed.message}`;
+      else {
+        // NOT marked `hubDamaged`: nothing here established damage. The errcode
+        // is carried ONTO this error rather than left only on `cause`, so
+        // `isOperational` classifies it on the evidence it actually has instead
+        // of on the wrapper happening to have no errcode of its own.
+        throw Object.assign(new Error(
+          `the hub at ${path} could not be checked (${checkFailed.message}).\n` +
+          `  This is NOT a verdict on the file: the integrity check itself did not run, so the hub ` +
+          `may be perfectly intact.\n` +
+          `  recover  find out why the check could not run — another process may hold the file, or ` +
+          `its permissions may be wrong — and re-run. Do NOT restore over it on this evidence.`,
+          { cause: checkFailed }),
+          checkFailed.errcode === undefined ? {} : { errcode: checkFailed.errcode });
+      }
+    }
+
+    if (verdict !== "ok") {
+      closeHub();
+      const newest = newestHubSnapshot(path);
+      throw Object.assign(new Error(
+        // `quick_check(1)` stops at the FIRST problem, which is what makes it
+        // cheap enough for every open — and it means this line is a sample, not
+        // a census. Saying so stops an operator reading one reported error as
+        // one actual problem.
+        `the hub at ${path} is damaged. The first problem found is: ${verdict}\n` +
+        `  (the check stops at the first problem, so there may be more; ` +
+        `reeve builder doctor runs the full integrity_check)\n` +
+        (newest
+          ? `  recover  reeve restore --hub --force --from ${newest}\n` +
+            `           pass --tail from a durable export-events --hub to carry history forward`
+          : `  recover  no snapshot was found under ${join(dirname(dirname(path)), "backups", basename(path, ".db"))}; ` +
+            `if one exists elsewhere, pass it with --from`)),
+        // The marker `isOperational` reads. This verdict is reeve's, not
+        // SQLite's, so it has no errcode to classify by.
+        { hubDamaged: true });
+    }
+  }
+
   // `schema_version` was created and first read INSIDE the guard above, so it
   // is not repeated here -- two copies of one statement is the duplication this
   // file keeps having to remove elsewhere.
@@ -230,7 +440,7 @@ export function openHub(path) {
     const gaps = [];
     for (let v = 1; v <= seen; v++) if (!rows.includes(v)) gaps.push(v);
     if (gaps.length) {
-      db.close();
+      closeHub();
       throw new Error(
         `hub store at ${path} records schema version ${seen} but is missing migration(s) ` +
         `${gaps.join(", ")}. The history has holes, so the store's real shape is unknown and the ` +
@@ -238,7 +448,7 @@ export function openHub(path) {
     }
   }
   if (seen > HUB_SCHEMA_VERSION) {
-    db.close();
+    closeHub();
     throw new Error(
       `hub store at ${path} is schema version ${seen}; this binary knows ${HUB_SCHEMA_VERSION}. ` +
       `Migrations are forward-only: run the newer binary, or restore a snapshot taken at ${HUB_SCHEMA_VERSION}.`);
@@ -256,7 +466,7 @@ export function openHub(path) {
     try {
       const now = db.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get().v;
       if (now > HUB_SCHEMA_VERSION) {
-        db.exec("ROLLBACK"); db.close();
+        db.exec("ROLLBACK"); closeHub();
         throw new Error(
           `hub store at ${path} is schema version ${now}; this binary knows ${HUB_SCHEMA_VERSION}. ` +
           `It was migrated by a newer reeve while this one was opening it.`);
@@ -303,7 +513,7 @@ export function openHub(path) {
       db.exec("COMMIT");
     } catch (e) {
       try { db.exec("ROLLBACK"); } catch {}
-      try { db.close(); } catch {}
+      closeHub();
       // The version-race error is RETHROWN verbatim. Wrapping it as "migration N
       // failed" is wrong twice: no migration was attempted, and the wrapper hides
       // the two version numbers an operator needs to know which binary to run.
@@ -333,7 +543,7 @@ export const canonicalHub = canonical;
  *
  * This function deliberately does not open a transaction. Every
  * authority-bearing write appends one of these in the same tx that performs
- * it -- an approval, a gate request, a notice receipt, an impl_pr, an attested
+ * it -- an approval, a gate request, a notice receipt, a task_pr, an attested
  * push, a guardian receipt, a harness acceptance, a gate run, a pr_hold create
  * or clear, a hold reason, a project authority grant, a merge decision, a
  * territory or singleton lease grant or release, and every outbox enqueue,
@@ -385,7 +595,11 @@ const V1 = Object.freeze([
   ...[...readFileSync(SCHEMA_PATH, "utf8")
         .matchAll(/CREATE TABLE IF NOT EXISTS ([a-z_]+)\s*\(/g)].map(m => m[1]),
 ]);
-export const TABLES_AT = Object.freeze({ 1: V1 });
+// Migration 2 replaces `impl_pr` with `task_pr`: one table out, one in, so the
+// COUNT is unchanged and only the name moves. Built from V1 rather than restated,
+// which is what stops the two drifting.
+const V2 = Object.freeze([...V1.filter(t => t !== "impl_pr"), "task_pr"].sort());
+export const TABLES_AT = Object.freeze({ 1: V1, 2: V2 });
 
 /**
  * The CURRENT schema's tables: what snapshot validation compares a

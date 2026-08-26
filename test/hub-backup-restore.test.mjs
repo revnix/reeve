@@ -9,7 +9,7 @@
 import { snapshot, everyStore, snapshotAll, latestSnapshot, validateSnapshot } from "../src/backup.mjs";
 import { open as openStore } from "../src/db/ops.mjs";      // builds the real guardian fixture
 import { readFileSync } from "node:fs";                      // reads the durable tail back
-import { openHub, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION, HUB_TABLES } from "../src/build/hubdb.mjs";
 import { hubPathFor } from "../src/paths.mjs";
 import { DatabaseSync } from "node:sqlite";
 // `statSync` reads the inode, which is what tells `link` and `rename` apart.
@@ -185,8 +185,8 @@ openHub(hubPathFor(home)).close();
   // write the constraint is there to stop, planted so the validator has
   // something real to catch.
   o.exec("PRAGMA foreign_keys=OFF");
-  o.exec("INSERT INTO impl_pr(task,generation,slice,repo_id,pr,head_sha,created_at) " +
-         "VALUES('bt:nosuchtask',1,0,1,1,'h',unixepoch())");
+  o.exec("INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at) " +
+         "VALUES('bt:nosuchtask','impl',1,0,1,1,'h',unixepoch())");
   o.close();
   check(validateSnapshot(orphan, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION }).ok === true,
     "control: the orphaned snapshot PASSES cheap validation, so only `deep` can reject it");
@@ -459,6 +459,12 @@ const writeRow = (table, kind) => Object.assign((db, task, over = {}) => {
 const ENUMS = {
   "task.phase": "GATE", "task.source_kind": "founder", "task.visibility": "private",
   "task_territory.kind": "prefix",
+  // Migration 2 folded the spec PR into `task_pr` alongside implementation PRs,
+  // so the table gained an enumerated `kind`. 'spec', because `minimalRow` fills
+  // only NOT NULL columns and leaves `generation` and `slice` NULL -- which is
+  // exactly the shape the CHECK requires of a spec row, and exactly what it
+  // forbids of an impl one.
+  "task_pr.kind": "spec",
   // 'succeeded', not 'settled'. The CHECK admits only
   // ('live','succeeded','failed','adopted','killed'), and a settled row is what
   // the comparison set is about -- a live one would be cleared by restoreHub and
@@ -569,7 +575,7 @@ const POST_SNAPSHOT = {
   approval:          (db, t) => writeApproval(db, t, "a".repeat(40)),
   gate_request:      writeRow("gate_request", "gate_request.minted"),
   notice_receipt:    writeRow("notice_receipt", "notice_receipt.recorded"),
-  impl_pr:           writeRow("impl_pr", "impl_pr.bound"),
+  task_pr:           writeRow("task_pr", "task_pr.bound"),
   attested_push:     writeRow("attested_push", "attested_push.appended"),
   guardian_receipt:  writeRow("guardian_receipt", "guardian_receipt.imported"),
   harness_acceptance: writeRow("harness_acceptance", "harness_acceptance.recorded"),
@@ -665,7 +671,7 @@ function writeAuthority(db, project) {
     "outbox",                                 // task_drain.outbox_id references its id
     "task_drain", "task_territory", "territory_lease", "hold_reason", "pr_hold",
     "phase_run", "gate_request", "gate_run", "approval", "notice_receipt",
-    "impl_pr", "attested_push", "guardian_receipt", "harness_acceptance",
+    "task_pr", "attested_push", "guardian_receipt", "harness_acceptance",
     "project_authority", "merge_decision",
     // No foreign keys of its own (`why` is the primary key and nothing
     // references it), so its position here is free.
@@ -1122,7 +1128,7 @@ function writeAuthority(db, project) {
   const tablesAfter = back.prepare("SELECT count(*) c FROM sqlite_master WHERE type='table'").get().c;
   const versionAfter = back.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
   back.close();
-  check(versionAfter === 1 && tablesAfter > 1,
+  check(versionAfter === HUB_SCHEMA_VERSION && tablesAfter > 1,
     "and the store is whole afterwards", `version ${versionAfter}, ${tablesAfter} tables`);
   // The half-created file is KEPT. It carries no completed migration, but a
   // recovery that silently deletes what it replaced is one an operator cannot
@@ -1545,7 +1551,8 @@ function writeAuthority(db, project) {
     { const q = new DatabaseSync(target, { readOnly: true });
       const v = q.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
       q.close();
-      check(v === 1, `fixture: the hub missing ${dropped} still reports version 1`, `version ${v}`); }
+      check(v === HUB_SCHEMA_VERSION,
+        `fixture: the hub missing ${dropped} still reports this binary's version`, `version ${v}`); }
 
     const r = restoreHub(snapL.path, target, { isAlive: () => false, pid: process.pid, lstart: "L", force: true });
     check(r.ok, `a hub missing ${dropped} is recovered rather than refused`, JSON.stringify(r).slice(0, 200));
@@ -1554,7 +1561,9 @@ function writeAuthority(db, project) {
     const q = new DatabaseSync(target, { readOnly: true });
     const tables = q.prepare("SELECT count(*) c FROM sqlite_master WHERE type='table'").get().c;
     q.close();
-    check(tables === 32, `and the store is whole afterwards (missing ${dropped})`, `${tables} tables`);
+    check(tables === HUB_TABLES.length,
+      `and the store is whole afterwards (missing ${dropped})`,
+      `${tables} of ${HUB_TABLES.length} tables`);
   }
 
   // CONTROL: an INTACT hub is still classified readable, so the check above did
@@ -1895,7 +1904,7 @@ function writeAuthority(db, project) {
   probe.close();
   check(listed === 1, "fixture: the corrupt table is still listed in sqlite_master", `${listed}`);
   check(readThrows, "fixture: and reading it throws", `${readThrows}`);
-  check(versionStillReadable === 1,
+  check(versionStillReadable === HUB_SCHEMA_VERSION,
     "fixture: while the rest of the hub is fine, which is what made it look readable",
     `version ${versionStillReadable}`);
 
@@ -2708,7 +2717,7 @@ function writeAuthority(db, project) {
     const v = h.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
     const lock = h.prepare("SELECT count(*) c FROM pragma_table_info('maintenance_lock') WHERE name='name'").get().c;
     h.close();
-    check(v === 1 && lock === 1,
+    check(v === HUB_SCHEMA_VERSION && lock === 1,
       "and the hub at the canonical path is a whole one afterwards",
       `version ${v}, maintenance_lock.name present ${lock}`);
   }
@@ -2955,7 +2964,8 @@ function writeAuthority(db, project) {
     const h = openHub(target);
     const v = h.prepare("SELECT COALESCE(max(version),0) v FROM schema_version").get().v;
     h.close();
-    check(v === 1, "and it is a whole hub, not just a minted empty file", `version ${v}`);
+    check(v === HUB_SCHEMA_VERSION, "and it is a whole hub, not just a minted empty file",
+      `version ${v} of ${HUB_SCHEMA_VERSION}`);
   }
   rmSync(fHome, { recursive: true, force: true });
 }
@@ -3023,5 +3033,42 @@ function writeAuthority(db, project) {
 }
 
 rmSync(home, { recursive: true, force: true });
+// ── a schema-1 durable tail still replays after migration 2 ────────────────
+// The tail is HISTORY and cannot be migrated in place: a v1 export records
+// implementation PRs as `impl_pr.bound`, and removing that kind when the table
+// was renamed made every such event UNKNOWN. Restoring a v1 snapshot with a tail
+// exported before the upgrade would then refuse recovery, and the PRs created
+// after that snapshot could not be carried forward at all.
+{
+  const d = mkdtempSync(join(tmpdir(), "reeve-legacy-tail-"));
+  const p2 = join(d, "hub.db");
+  const db = openHub(p2);                       // migrations 1 and 2
+  db.prepare(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,generation,source_kind,
+                               source_key,repo_path,profile_path,profile_hash,default_branch,
+                               visibility,registry_version,created_at,updated_at)
+              VALUES('bt:1','p',1,'o/r','t','IMPLEMENTING',1,'founder','k1','/r','/p','h','main',
+                     'private',1,unixepoch(),unixepoch())`).run();
+
+  // A v1 EVENT, exactly as a schema-1 binary wrote it: the old kind, the old
+  // row image, no `kind` column because v1's table had none.
+  hubTx(db, () => hubEvent(db, { kind: "impl_pr.bound", task: "bt:1",
+    payload: { task: "bt:1", generation: 1, slice: 0, repo_id: 1, pr: 7,
+               head_sha: "implsha", created_at: 1, merged_sha: null } }));
+
+  const tail = db.prepare("SELECT seq, at, kind, task, payload FROM hub_event ORDER BY seq").all();
+  db.exec("DELETE FROM task_pr");               // as a restore-from-snapshot would leave it
+  const out = replayHub(db, tail.filter(e => e.kind === "impl_pr.bound"));
+  check(out.skipped === 0,
+    "a v1 impl_pr.bound event is not skipped as unknown", JSON.stringify(out));
+  const row = db.prepare("SELECT kind, generation, slice, repo_id, pr, head_sha FROM task_pr").get();
+  check(row != null, "it replays into the table that replaced impl_pr", JSON.stringify(row));
+  check(row?.kind === "impl",
+    "translated to an implementation row, which is what it always was", JSON.stringify(row));
+  check(row?.repo_id === 1 && row?.pr === 7 && row?.slice === 0,
+    "carrying its repository, number and slice", JSON.stringify(row));
+  db.close();
+  rmSync(d, { recursive: true, force: true });
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

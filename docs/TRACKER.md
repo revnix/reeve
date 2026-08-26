@@ -244,6 +244,225 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       **The durable finding is about plan SIZE**: a plan needing four rounds and
       still finding sixteen defects at the fourth is one document doing three
       documents' work.
+- [ ] **S2-B, the phase machine and its effects — BUILT, PR #30 open
+      (2026-08-25).** Branch `feat/s2b-phase-machine`, based on `b4bec5d`
+      (S2-A's merge plus its four correction PRs). All seven tasks of
+      `docs/superpowers/plans/2026-08-23-s2b-phase-machine.md`:
+      `src/build/{phases,transition,outbox,registry,gatestate,loop}.mjs`, the
+      `buildTick` call in `bin/reeve`'s `build run`, and the crash, recovery and
+      corruption drills. **Measured 2026-08-25: suite 77 files, 0 failures,
+      3755 assertions**, `escape.test.mjs` excluded as always. No builder worker
+      is dispatched and no GitHub call is made from any code path.
+
+      **Round 1 of review: 8 findings (5×P1), all genuine, all fixed at
+      `347f804`.** Four of them were one shape — a decision made twice, in two
+      places, that had drifted. `admitTask` and `regrant-territory` each kept
+      their own territory logic and disagreed three ways at once, so a resume
+      could be granted paths a live lease already covered by ancestry or under
+      the other claim kind; `src/build/territory.mjs` now owns the predicate, the
+      scan, the grant, and the two constants both files had copied.
+
+      The two that could not have been found by reading: **`founder.infeasible`
+      required a prose reason and `write-pr-hold` read that same field as a
+      closed enum**, so the more carefully a founder explained themselves the
+      more certainly the terminal transition threw and rolled back; and
+      **`recoverEffects` called its reconciler inside `BEGIN IMMEDIATE`**, where
+      an async reconciler's Promise made `verdict.settled` `undefined` — the
+      system's one defence against re-performing an action that already happened
+      answered "could not tell" for every async reconciler ever passed to it, and
+      answered it silently.
+
+      **The durable finding is about FIXTURE SHAPE.** `registryProjects` returns
+      `{name, nwo}` and nothing else, so in the real `build run` path every
+      registered project hit `buildTick`'s no-id guard and was skipped on every
+      heartbeat: the wiring test passed, the behaviour tests passed, and not one
+      gate-state row was ever written for a real project — because every fixture
+      handed the tick a `repoId` production never supplies. A fixture richer than
+      production cannot exhibit the defect, however many assertions it carries.
+      `build run` was also discarding the tick's return value, which is the half
+      that would have made the silence visible.
+
+      **And the same lesson a second way, from the peer lane.** Every fixture
+      written for those eight fixes was ONE element over a loop applying a scoped
+      rule: one expired effect, one `impl_pr`, one territory claim, one project
+      per `buildTick` call. With one element, a rule scoped per-row, per-PR,
+      per-claim or per-project is indistinguishable from one scoped to the batch,
+      to the task, or to nothing — and from one that stops at the first item. All
+      four were rewritten multi-element with the odd item in the MIDDLE, and
+      three scope bugs were then stubbed to check the new coverage: `continue` →
+      `break` in the tick loop, the retry bound read from the first row rather
+      than each row, and the `pr_hold` lookup keyed by task instead of
+      `(repo_id, pr)`. **All three were caught, and every failure was a new
+      assertion — the one-element tests stayed green under all three.** The
+      three-claim block also established something no one-claim fixture could:
+      a conflict on the third claim rolls the first two grants back, so a resume
+      cannot leave a task holding part of its territory while believing it holds
+      all of it.
+
+      **Round 2 of review: 8 findings (5×P1), all genuine, all fixed at
+      `0827932`.** One was MINE, from round 1, and it is the shape worth keeping:
+      the three-answer `quick_check` split closed the handle on its corruption
+      branch and then fell through into the common damage branch, which closed it
+      again. `DatabaseSync.close()` throws on a closed handle, that error
+      replaced the `hubDamaged` verdict, and — carrying no errcode —
+      `isOperational` classified it as operational. **A corrupt hub reported as
+      merely busy: the exact misclassification the split was added to prevent,
+      reintroduced by the split.** Seven sites in `openHub` closed that handle and
+      two already carried an ad-hoc `try/catch`, which was the warning that
+      ordering was load-bearing. One idempotent `closeHub()` now.
+
+      **The durable finding is about WHAT A PREDICATE IS MEASURING.** The
+      territory conflict scan asked `expires_at > now`, and nothing in this system
+      renews a territory lease — searched: the only writes are the grant and
+      `release-territory`'s delete. So every active task's lease went invisible an
+      hour after it was granted and its paths were handed to the next filing,
+      while the task was still editing them. `hub.sql` states the opposite
+      invariant directly above the table: *"a task is a row, not a process, so
+      dead is a state question... never merely because it looks old."* The clock
+      was measuring nothing but the age of the row. This also **superseded round
+      1's fix in the same file**, which had made an expired row REPLACEABLE — right
+      about the primary-key abort, wrong about when a replacement is allowed.
+
+      Two more where a switch or a field governed nothing:
+      `builder.capabilities.mergeBuilderPr` was declared, defaulted false
+      independently of `publishPr`, and read by no code — every merge was gated on
+      publishing. `persistDepth` travelled on the founder-override edges alone, so
+      an ordinarily sized task kept `depth = NULL` and the RESEARCH-skipping edge
+      read the depth to skip a whole phase and then discarded it. And one where
+      absence was spent as an answer: `slice.next` treated a missing `moreSlices`
+      as "no slices remain", finishing tasks with planned work unimplemented.
+
+      **Round 3: 6 findings (2×P1), all genuine, all fixed at `6d1a2ef`.** Four
+      were follow-ups on round 2's own repairs. The two that matter: awaiting the
+      reconciler outside any `try` meant ONE throwing row aborted the whole pass,
+      and the scan is `ORDER BY id`, so a single malformed row at the front
+      stopped the outbox recovering on every pass for ever; and `gate.capReached`
+      emitted `write-pr-hold` for a task that by definition has a spec PR and no
+      implementation PR, so the compensation ran and wrote nothing — the task sat
+      ESCALATED with its spec PR still mergeable. Also: the repo-id lookup keyed
+      on `nwo_snapshot` while its own comment said that column is only ever a
+      snapshot, so a rename made it return null for an id the hub was holding.
+
+      **Round 4: 8 findings (3×P1), all genuine, all fixed at `4176f22`.** Four
+      were follow-ups on rounds 2-3. The one worth remembering: `write-pr-hold`
+      learned to hold the spec PR in round 3, and `hasOpenBuilderPr` — the
+      predicate deciding whether the machine EMITS that compensation — still
+      counted `impl_pr` alone. **The repair was correct and unreachable**, because
+      the gate in front of it had not moved. A fix is not landed until something
+      calls it.
+
+      **And an interaction that was individually defensible and jointly wrong.**
+      Round 2 made a lease live while its TASK is non-terminal rather than while
+      its clock runs. Round 4 found `hasLivePin` reading `task_territory.pinned`
+      — the durable bit recording what the filing asked for, which nothing
+      clears — instead of `territory_lease.pinned_until`. Separately each is
+      arguable; together, an omitted `release-territory` stopped being a lease
+      that expires in an hour and became one that blocks every overlapping filing
+      FOR EVER. Worth stating as a rule: when a change widens what counts as
+      live, re-audit every predicate that decides what counts as released.
+
+      **Round 5: 6 findings (3×P1), all genuine, all fixed at `3769d4c`.** The
+      one to remember: `leaseEffect` tested `capabilities[cap] === false`, and
+      every builder capability defaults to FALSE — so an OMITTED key read as
+      enabled, and the `capabilities = {}` default authorised a real push, PR
+      operation or merge. **It silently undid the merge switch added two rounds
+      earlier without touching that code.** Fail-closed means present AND true.
+
+      Also: a pin ends with no reaper to end it. Round 4 fixed which column
+      `hasLivePin` reads AT THE TRANSITION; nothing revisited the decision when
+      `pinned_until` later passed, and a repo-wide search finds no reaper. The
+      rule was already written in hub.sql — dead when "terminal, or held with no
+      live pin" — and is now ONE predicate both the scan and the replacement
+      apply, because those two asking the same question differently is how this
+      file's last three defects happened.
+
+      **TWO INSTRUMENT DEFECTS found this round, both mine.** The closed
+      compensation set was asserted by a hardcoded count of fourteen — a number
+      maintained by hand whose failure names no cause; it now derives both
+      directions from the machine. And a per-file harness line read `$?` AFTER a
+      command substitution (`echo "$(basename $f): exit=$?"`), so it reported
+      basename's status rather than the test's: **a crashing test file would have
+      read as a clean exit.** Caught only because an assertion count dropped by
+      31 and I chased the number instead of the green.
+
+      **Round 6: 7 findings (4×P1), all fixed at `83bf001`.** FOUR of the seven
+      were one shape, and rounds 2, 3, 4 and 6 had now produced EIGHT of it —
+      rising, not falling. Measured rather than patched again: five places ask
+      "what is open for this task", three learned about the spec PR one review
+      round at a time, and the two that had not were this round's report.
+
+      **THE FIX WAS THE SHAPE, NOT THE SITES.** Implementation PRs were rows;
+      the spec PR was three columns on `task`. **Migration 2** folds both into
+      `task_pr`, keyed on `(repo_id, pr)` — a PR number is unique within its
+      repository and nowhere else, which is also round 4's duplicate-key
+      collision. Partial unique indexes now ENFORCE what were sentences in
+      comments: one spec PR per task, one impl PR per slice. `src/build/prs.mjs`
+      owns the only query, and a test asserts no other module reaches the table —
+      verified to fail when a direct query is reintroduced.
+
+      **A new migration, not an edit to hub.sql.** Its freeze test exists for this
+      reason, and migration 1 having no deployed instance would have made the
+      wrong habit free: a schema whose history can be rewritten cannot be reasoned
+      about the first time it cannot. Migration 2 is re-runnable, which the
+      suite's own interrupted-migration fixture caught.
+
+      **Eleven test assertions pinned the schema version or table count as a
+      literal** and failed on a schema change rather than on what they tested.
+      They derive from `HUB_SCHEMA_VERSION`/`HUB_TABLES` now, and a new test
+      carries a genuine v1 hub forward with both old shapes seeded.
+
+      **AND A FINDING WHOSE MECHANISM WAS WRONG.** Codex reported that node:sqlite
+      binds an Error as NULL. Measured: it depends on ARITY. A lone object
+      argument is read as a named-parameter bag (→ NULL); positionally among
+      several arguments — the shape every statement here uses — it THROWS. So the
+      real failure is a settle that rolls back and leaves the effect inflight, not
+      a lost message. My first fixture reproduced only the arity this code cannot
+      have, written while fixing a finding about that call.
+
+      **FOUNDER DECISIONS, 2026-08-25:**
+      - **#30 merge:** ask again when Codex returns a clean pass at the current
+        head. No conditional or pre-authorised grant. Every merge stays explicit.
+      - **S2-C shape: SPLIT into 3-4 PRs**, overriding the plan's single-PR
+        structure. Rationale: #30 ran 3 rounds and 22 findings at 6,700 lines and
+        findings-per-round did not decay (8, then 6). The daemon-touching part
+        lands alone and last.
+      - **While a verdict is pending:** audit the S2-C plan against the code as it
+        now stands rather than idling — on S2-B, executing the plan found 6
+        defects that ~490 review findings over 16 rounds had missed.
+
+      **A control I wrote failed and was wrong, which is worth recording too.** It
+      asserted `hubDamaged` on the pragma-guard path; the marker belongs only to
+      the `quick_check` verdict, which has no SQLite error behind it, and
+      `restoreHub` unwraps `cause` before classifying. Roughly one in ten needs
+      reframing — including one's own.
+
+      The §14 S2 Verify clause is checked item by item: the transition matrix
+      (588 cells, all total), the GATE → ESCALATED edge, the CANCELLING
+      exclusion, the CAS lost-race no-op, the generation fence in both the
+      transition and the outbox lease, and the crash, recovery, corruption and
+      duplicate-delivery drills. The three guardian-side items — provider lease,
+      hub connection allowlist, and the verdict reading `pr_hold` — belong to
+      PR-C and are deliberately absent.
+
+      **`openHub` now runs `PRAGMA quick_check(1)`** on every open and refuses on
+      any answer but `ok`, naming the newest usable snapshot. `quick_check`
+      rather than `integrity_check` because this is on every command and every
+      tick (~1.1 ms/MB measured; 52 ms on a 47 MB hub). Two interactions the
+      plan did not anticipate: the refusal carries no errcode, so `isOperational`
+      needed an explicit marker or every recovery path would read a corrupt hub
+      as merely busy; and `restoreHub` is EXEMPT, because it opens a damaged hub
+      on purpose to take the lock inside it — without the exemption five of that
+      command's own recovery assertions went red.
+
+      **Six plan defects found by executing rather than reviewing**, each fixed
+      in the commit that carries it: `phases.mjs`'s source reads an
+      undestructured `sliceCursor`; the plan claims the matrix asserts CLAIMING
+      is off the spine and it does not; Task 15 imports a module Task 16 creates;
+      two of Task 15's fixtures share a database and collide on the task key;
+      Task 15's compensation table and its test disagree on `regrant-territory`'s
+      shape; and every event kind Task 15 says it adds to `replay.mjs` was
+      already there.
+
 - [ ] **S2-A, the hub store — BUILT, PR open (2026-08-24).** Branch
       `feat/s2-hub-store`, based on `bc17a06`. All 13 tasks of
       `docs/superpowers/plans/2026-08-23-s2a-hub-store.md` implemented:

@@ -1681,6 +1681,52 @@ rmSync(dir, { recursive: true, force: true });
   db.close();
 }
 
+// ── a resume does not announce restarting on a PR it is abandoning ─────────
+// `annotate-resumed` decided which pull requests to skip from the CURRENT
+// transition's evidence, which only knows about a redesign happening right now.
+// A close CARRIED FORWARD -- voided by a hold, re-enqueued by `clear-holds` in
+// this very transition -- was invisible to it, so an ordinary resume posted
+// "resumed" to a pull request it was in the middle of abandoning.
+{
+  const db = openHub(join(dir, "t61.db"));
+  seed(db, { id: "bt:1", phase: "BLOCKED", generation: 1 });
+  db.exec(`UPDATE task SET held_from='IMPLEMENTING' WHERE id='bt:1'`);
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','impl',1,0,1,7,'${"c".repeat(40)}',unixepoch())`);
+  // A SECOND pull request with nothing owed on it, so "skip the abandoned one"
+  // cannot pass by skipping everything. The odd one out is in the middle.
+  // A spec row carries NULL generation and slice -- migration 2's CHECK enforces
+  // that the two kinds are shaped differently, and the fixture has to obey it.
+  db.exec(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+           VALUES('bt:1','spec',NULL,NULL,1,8,'${"d".repeat(40)}',unixepoch())`);
+  db.exec(`INSERT INTO pr_hold(task,repo_id,pr,head_sha,reason,created_at)
+           VALUES('bt:1',1,7,'${"c".repeat(40)}','over_budget',unixepoch())`);
+  // The carried obligation: a close from an earlier redesign, voided by a hold.
+  db.prepare(
+    `INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,cancellable,args,
+                        status,created_at,updated_at)
+     VALUES('bt:1:g1:r1:pr7:close','gh.pr.close','bt:1',1,1,1,'{"repo_id":1,"pr":7}',
+            'voided',unixepoch(),unixepoch())`).run();
+
+  const r = applyTransition(db, { taskId: "bt:1", expectedPhase: "BLOCKED", expectedGeneration: 1,
+    evidence: { kind: "founder.resume", redesign: false }, op: "phase.resumed" });
+  check(r.applied === true, "fixture: the ordinary resume applies", JSON.stringify(r));
+
+  const said = db.prepare(
+    `SELECT args FROM outbox WHERE kind='gh.pr.comment' AND task_id='bt:1'`).all()
+    .map(x => JSON.parse(x.args)).filter(a => a.note === "resumed").map(a => a.pr);
+  check(!said.includes(7),
+    "no `resumed` note goes to the pull request whose close is still owed",
+    JSON.stringify({ resumedOn: said }));
+  check(said.includes(8),
+    "control: the pull request with nothing owed IS told, so this is not 'annotate nothing'",
+    JSON.stringify({ resumedOn: said }));
+  check(db.prepare(
+    "SELECT count(*) c FROM outbox WHERE kind='gh.pr.close' AND status='pending'").get().c === 1,
+    "fixture: and the carried close really was re-enqueued by this transition");
+  db.close();
+}
+
 // ── an OLD success does not forgive a NEWER dropped close ──────────────────
 // Asking "was there ever a done close" is a question about history, not about
 // the obligation. A pull request closed, REOPENED, and re-closed by an attempt

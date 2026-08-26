@@ -100,6 +100,38 @@ export class CompensationRefused extends Error {
 // an obligation that has been dropped, whatever the reason.
 const LIVE_OUTBOX = Object.freeze(["pending", "inflight"]);
 
+/**
+ * The pull requests this task still owes a close, and the state of each.
+ *
+ * ONE definition, because two readers ask it and they were answering it
+ * differently. `clear-holds` asks it to decide which holds outlive the resume;
+ * `annotate-resumed` asks it to decide which pull requests must NOT be told that
+ * work has restarted. The second used to derive its own answer from the CURRENT
+ * transition's evidence -- so a close CARRIED FORWARD from a redesign several
+ * transitions ago was invisible to it, and an ordinary resume cheerfully posted
+ * "resumed" to a pull request it was in the middle of abandoning.
+ *
+ * Keyed on the pull request and decided by its LATEST close attempt, because
+ * close rows accumulate: a hold voids one and the next resume enqueues another,
+ * so "was there ever a done" is a question about history rather than about what
+ * is owed now.
+ */
+function closeObligations(db, taskId) {
+  const byPr = new Map();
+  for (const row of db.prepare(
+    `SELECT o.args, o.status, o.kind, o.idempotency_key FROM outbox o
+      WHERE o.task_id = ? AND o.kind = 'gh.pr.close'
+      ORDER BY o.id`).all(taskId)) {
+    let a; try { a = JSON.parse(row.args); } catch { continue; }
+    if (a?.repo_id == null || a?.pr == null) continue;
+    byPr.set(`${a.repo_id}:${a.pr}`, { row, args: a });
+  }
+  // Settled ones are not obligations: the pull request is closed and nothing is
+  // owed, so its hold may clear and nobody needs telling about it.
+  for (const [key, { row }] of byPr) if (row.status === "done") byPr.delete(key);
+  return byPr;
+}
+
 const PR_HOLD_COLS = `id, task, repo_id, pr, head_sha, reason, detail, created_at, cleared_at`;
 const HOLD_REASON_COLS = `id, task, reason, detail, at, cleared_at`;
 const DRAIN_COLS = `task, outbox_id, recorded_at, settled_at, forced, last_known`;
@@ -408,17 +440,7 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       // question -- the state of the most recent obligation is. Rows arrive in
       // `id` order, which is enqueue order, so the last one for a PR is that
       // obligation and its status is the answer.
-      const byPr = new Map();
-      for (const row of db.prepare(
-        `SELECT o.args, o.status, o.kind, o.idempotency_key FROM outbox o
-          WHERE o.task_id = ? AND o.kind = 'gh.pr.close'
-          ORDER BY o.id`).all(taskId)) {
-        let a; try { a = JSON.parse(row.args); } catch { continue; }
-        if (a?.repo_id == null || a?.pr == null) continue;
-        byPr.set(`${a.repo_id}:${a.pr}`, { row, args: a });
-      }
-      for (const [key, { row, args }] of byPr) {
-        if (row.status === "done") continue;        // the PR is closed; the hold may clear
+      for (const [key, { row, args }] of closeObligations(db, taskId)) {
         keepHeld.add(key);
         // AND RE-ESTABLISHED IF A HOLD VOIDED IT. A PR with no successful close
         // and nothing still going to happen is an obligation that was dropped:
@@ -492,9 +514,20 @@ export function applyCompensation(db, { c, taskId, generation, seq, evidence = {
       // The spec PR is the exception on exactly these paths: it is REUSED, the
       // transition pushes a new head to it, and it is the one place a "resumed"
       // note is true.
+      // AND NOT THE ONES IT IS STILL ABANDONING FROM AN EARLIER TRANSITION.
+      //
+      // `closing` reads the CURRENT evidence, which only knows about a redesign
+      // happening right now. A close carried forward -- voided by a hold and
+      // re-enqueued by `clear-holds` in this very transition -- is invisible to
+      // it, so an ordinary resume announced that work had restarted on a pull
+      // request it was in the middle of abandoning. Same misleading sequence the
+      // direct redesign path already avoids, reached by the longer route.
       const closing = evidence?.kind === "founder.regenerate"
                    || (evidence?.kind === "founder.resume" && evidence?.redesign === true);
-      for (const pr of (closing ? openPrs(db, taskId, { kind: "spec" }) : openPrs(db, taskId)))
+      const owed = closeObligations(db, taskId);
+      const speaking = (closing ? openPrs(db, taskId, { kind: "spec" }) : openPrs(db, taskId))
+        .filter(pr => !owed.has(`${pr.repo_id}:${pr.pr}`));
+      for (const pr of speaking)
         enqueue("gh.pr.comment",
                 `${taskId}:g${generation}:r${task.resume_seq}:repo${pr.repo_id}:pr${pr.pr}:resumed`,
                 { repo_id: pr.repo_id, pr: pr.pr, note: "resumed",

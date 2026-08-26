@@ -401,9 +401,14 @@ export function supersedeEffects(db, { prefix, keep }) {
   //
   // INFLIGHT is still excluded: a drainer may be mid-delivery, and deleting a row
   // it holds would leave it settling into nothing.
+  // `_` and `%` are LIKE wildcards, and a repository name may legitimately contain
+  // an underscore -- `my_repo` would also match `myXrepo`, so a prefix could reach
+  // into another repository's rows and delete them. Escaped explicitly rather than
+  // hoping the input never contains one.
+  const esc = prefix.replace(/[\\%_]/g, c => "\\" + c);
   const rows = db.prepare(`SELECT id, idem_key, kind, status FROM outbox
                            WHERE status IN ('pending','dead_letter')
-                             AND idem_key LIKE ?`).all(prefix + "%")
+                             AND idem_key LIKE ? ESCAPE '\\'`).all(esc + "%")
                  .filter(r => !spare.has(r.idem_key));
   for (const r of rows) {
     db.prepare(`DELETE FROM outbox WHERE id=? AND status IN ('pending','dead_letter')`).run(r.id);

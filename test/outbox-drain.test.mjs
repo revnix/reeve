@@ -24,6 +24,59 @@ const put = (key, kind = "gh.pr.comment", args = { nwo: "o/r", pr: 1, body: "ple
   tx(db, () => enqueue(db, { idemKey: key, kind, args }));
 const statusOf = key => db.prepare(`SELECT status, attempts, result, last_error FROM outbox WHERE idem_key=?`).get(key);
 
+// --- the subprocess timeout is always a positive integer ----------------------
+{
+  // Measured on node v24.17.0:
+  //
+  //   timeout: 8333.333 -> ERR_OUT_OF_RANGE, thrown before the call runs
+  //   timeout: 0        -> no bound at all; a 1.5s child ran to completion
+  //
+  // `left` is fractional whenever the lease binds (`leaseSeconds: 10` gives
+  // 8333.333ms), so every GitHub call would have failed without running -- and a
+  // handler asking for 0 would have removed the bound entirely, which is the one
+  // thing the clamp exists to make impossible.
+  const seen = [];
+  const spy = (a, opts) => { seen.push(opts?.timeoutMs); return { ok: true, out: "" }; };
+  const d8 = mkdtempSync(join(tmpdir(), "reeve-int-"));
+  const db8 = open(join(d8, "s.db"));
+  const call = (handlerOpts, leaseSeconds) => {
+    tx(db8, () => enqueue(db8, { idemKey: `k${seen.length}`, kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "b" } }));
+    const h = { "gh.pr.comment": (a, { api }) => { api(["-X", "GET", "x"], handlerOpts); return { ok: true }; } };
+    return drainOutbox({ db: db8, handlers: h, api: spy, max: 1, leaseSeconds, budgetMs: 600_000 });
+  };
+  await call({}, 10);
+  check(Number.isInteger(seen[0]) && seen[0] >= 1,
+    "a lease-derived deadline reaches the subprocess as a positive integer", `timeoutMs=${seen[0]}`);
+  await call({ timeoutMs: 0 }, 300);
+  check(Number.isInteger(seen[1]) && seen[1] >= 1,
+    "and a handler asking for zero does not remove the bound", `timeoutMs=${seen[1]}`);
+  await call({ timeoutMs: 12.7 }, 300);
+  check(Number.isInteger(seen[2]) && seen[2] >= 1,
+    "nor does a fractional request reach it unrounded", `timeoutMs=${seen[2]}`);
+  // Control: the clamp still respects a legitimate tighter bound.
+  await call({ timeoutMs: 50 }, 300);
+  check(seen[3] === 50, "control: and a valid tighter bound is still honoured", `timeoutMs=${seen[3]}`);
+  db8.close();
+  rmSync(d8, { recursive: true, force: true });
+}
+
+// --- a reconciliation pass may confirm a delivery, never make one -------------
+{
+  // Recovery grants one lease past `max_attempts` so the marker check can find a
+  // delivery whose settle was lost to a crash. If the check finds nothing, posting
+  // would deliver on an attempt the budget had already refused -- the opposite of
+  // what the extra pass is for.
+  let posted = 0;
+  const api = a => { if (a.includes("GET")) return { ok: true, out: "" }; posted++; return { ok: true, out: "{}" }; };
+  const args = { nwo: "o/r", pr: 1, body: "b" };
+  const normal = ghPrComment(args, { api, idemKey: "rc1", actor: "x[bot]" });
+  check(normal.ok && posted === 1, "control: an ordinary pass posts", JSON.stringify(normal));
+  const recon = ghPrComment(args, { api, idemKey: "rc2", actor: "x[bot]", reconcileOnly: true });
+  check(posted === 1, "a reconciliation pass that finds no marker does NOT post", `posted ${posted}`);
+  check(recon.ok === false && recon.retryable === false,
+    "and is terminal, because another pass would ask the same question", JSON.stringify(recon));
+}
+
 // --- ENOBUFS and a timeout are told apart ------------------------------------
 {
   // Measured on node v24.17.0, both failures set `signal === "SIGTERM"` and leave
@@ -46,6 +99,57 @@ const statusOf = key => db.prepare(`SELECT status, attempts, result, last_error 
   check(slow.ok === false, "control: a one-millisecond timeout really does fail", JSON.stringify(slow));
   check(slow.timedOut === true && !slow.truncated,
     "and a timeout is reported as a timeout", JSON.stringify(slow));
+}
+
+// --- a wildcard in a prefix is a literal character ----------------------------
+{
+  // `_` and `%` are LIKE wildcards, and a repository name may legitimately contain
+  // an underscore -- so `my_repo` also matched `myXrepo`, and a reconciliation for
+  // one repository could delete another's queued effects.
+  const d9 = mkdtempSync(join(tmpdir(), "reeve-esc-"));
+  const db9 = open(join(d9, "s.db"));
+  tx(db9, () => {
+    enqueue(db9, { idemKey: "review-request:o/my_repo:1:a:h:x", kind: "gh.pr.comment", args: {} });
+    enqueue(db9, { idemKey: "review-request:o/myXrepo:1:a:h:x", kind: "gh.pr.comment", args: {} });
+  });
+  const n = tx(db9, () => supersedeEffects(db9, { prefix: "review-request:o/my_repo:", keep: new Set() }));
+  const left = db9.prepare(`SELECT idem_key FROM outbox`).all().map(r => r.idem_key);
+  check(n === 1, "an underscore in a prefix matches only itself", String(n));
+  check(left.length === 1 && left[0].includes("myXrepo"),
+    "so another repository's effects are untouched", JSON.stringify(left));
+  // Control: the prefix still matches its own rows, or the assertion above would
+  // pass on an escape that matched nothing at all.
+  const m = tx(db9, () => supersedeEffects(db9, { prefix: "review-request:o/myXrepo:", keep: new Set() }));
+  check(m === 1, "control: and the prefix does still match its own", String(m));
+  db9.close();
+  rmSync(d9, { recursive: true, force: true });
+}
+
+// --- a dead letter is reported on every pass, not only the one that made it ---
+{
+  // A process that exits after `settleOutbox` commits `dead_letter` and before the
+  // log line leaves a row nothing ever mentions again: not leaseable, not in
+  // `pendingWithNoHandler`, and a terminal effect is precisely the one needing a
+  // person. Read from the store so a crash cannot lose the notification.
+  const dA = mkdtempSync(join(tmpdir(), "reeve-standing-"));
+  const dbA = open(join(dA, "s.db"));
+  tx(dbA, () => enqueue(dbA, { idemKey: "gone", kind: "gh.pr.comment", args: {} }));
+  dbA.prepare(`UPDATE outbox SET status='dead_letter' WHERE idem_key='gone'`).run();
+  const lines = [];
+  const r = await drainOutbox({ db: dbA, handlers: { "gh.pr.comment": () => ({ ok: true }) },
+                                log: m => lines.push(m), max: 1 });
+  check((r.deadLettered ?? []).some(d => d.kind === "gh.pr.comment"),
+    "a pass reports dead letters it did not create", JSON.stringify(r.deadLettered));
+  check(lines.some(l => /DEAD-LETTERED and waiting/.test(l)),
+    "and says so out loud", JSON.stringify(lines));
+  // Control: a store with no dead letters says nothing, so the line above is not
+  // simply printed unconditionally.
+  const dbB = open(join(dA, "b.db"));
+  const q = [];
+  await drainOutbox({ db: dbB, handlers: { "gh.pr.comment": () => ({ ok: true }) }, log: m => q.push(m), max: 1 });
+  check(!q.some(l => /DEAD-LETTERED and waiting/.test(l)), "control: and stays quiet when there are none", JSON.stringify(q));
+  dbA.close(); dbB.close();
+  rmSync(dA, { recursive: true, force: true });
 }
 
 // --- an effect cannot be enqueued outside a transaction ----------------------

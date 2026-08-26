@@ -63,8 +63,25 @@ check("control: zero uncleared is a pass, so the clause is not blocking everythi
 // `null > 0` is false, so an unreadable critical count fell through to the pass
 // -- absence read as success in the clause that exists to stop a critical being
 // carried past the budget.
-check("past the soft cap with an unknown critical count is UNKNOWN",
-  withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null }; }), UNKNOWN);
+// UNKNOWN only when the count COULD have been known. A projection unreadable
+// right now is a per-pull-request uncertainty; review-body findings never being
+// derived is an unbuilt capability, and reporting THAT as UNKNOWN made every pull
+// request past the cap UNKNOWN -- which the watcher handles before BLOCK
+// findings, so the cap stopped every repair instead of stopping a spill. Absence
+// read as success was the defect; absence read as paralysis is not the fix.
+check("past the soft cap with an UNREADABLE projection is UNKNOWN",
+  withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "unreadable" }; }), UNKNOWN);
+check("but a capability that is simply unbuilt does not make it unknown",
+  withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "not-derived" }; }), PASS);
+{
+  // And it SAYS the cap is unenforced, because a pass that quietly skips a check
+  // is the thing this whole clause exists to stop.
+  const i = good();
+  i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "not-derived" };
+  const c = computeVerdict(i).clauses.find(x => x.id === "rounds");
+  check("and says the cap is not enforced rather than passing silently",
+    /NOT enforced/.test(c.detail), true);
+}
 check("control: BELOW the cap an unknown critical count still passes, because it changes nothing there",
   withOut(i => { i.rounds = { n: 1, softCap: 5, hardCap: 10, unspilledCritical: null }; }), PASS);
 check("control: and a KNOWN zero past the cap still passes",

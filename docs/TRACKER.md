@@ -328,6 +328,69 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       terminal. The rule now: no `head` on a search whose result is a
       population, and where output could be long, the count goes first.
 
+      **SEVEN REVIEW ROUNDS, 41 findings, all verified against source before
+      acting.** Per round: 9, 8, 3, 5, 3, 3, 10. It converged and then did not:
+      the plateau at three broke upward when the reviewer started reading the
+      workflow file and the plan rather than only the diff.
+
+      Rebased from `8e5135a` onto `601b0e0` when the peer's #47 landed; that
+      rebase is also where a `git push HEAD:branch` during a conflict replaced
+      the branch with main and GitHub auto-closed the PR. Nothing was lost, and
+      the rule is now: push the branch NAME, never HEAD, and never chain
+      `rebase && push`.
+
+      **What the 41 reduced to.** Almost every finding was one of five
+      distinctions, which is more useful than the list:
+
+      - **Absent is not unreadable.** No hub, a hub that will not open, one too
+        old, one too new, one whose scheduler tables are damaged: five answers
+        with five consequences. Collapsing any pair fails OPEN, and this
+        accounted for the largest share of findings by far.
+      - **A version is a claim; the columns are the evidence.**
+      - **An inventory answers the question it was built for.** `COLUMNS_AT`
+        describes what later migrations add; `TABLES_AT` describes the whole
+        hub. Neither is the guardian's surface — the guest's own allowlist is.
+        Reaching for the nearest inventory produced the same defect twice, once
+        too narrow and once too wide.
+      - **Shipped is not wired.** FOUR functions here were written, documented
+        and never called: `openHold`, `noteRateLimit`, `reapProviderLeases`,
+        `heartbeatProvider`. The last was found by auditing for the class rather
+        than by review.
+      - **One fact, one home.** The hub's contention budget was re-invented at
+        two new connections after #40 extracted it; the clause-id set had ELEVEN
+        homes; the App's name, the canary predicate.
+
+      **A livelock, reproduced before it was fixed.** `claimProvider` serves
+      guardian requests in order and the canary asks first, so once a worker
+      queued the canary was refused for ever — and that refusal stopped the loop
+      that would have re-asked for the worker. Both stuck, and
+      `queuedGuardianCount` blocks every BUILDER admission behind them. The tick
+      serves the queue head before asking for anything new.
+
+      **The most valuable finding was about the tests, not the code.** A fixture
+      of mine would have been RED on `ubuntu-latest`:
+      `cheapContainmentReasons` opens containment on any platform but darwin, so
+      the rate-limited-canary block passed on this Mac and would have failed on
+      the runner. With CI down nothing would have said so — and "90 files, 0
+      failures" had been reported for seven rounds as a property of the code
+      when it was a property of this machine.
+
+      **Three stubs produced no failures, and each time that WAS the finding.**
+      Assertions that read the source for a constant's name survive the branch
+      being disabled; an ordering assertion that compares two string positions
+      survives the repair being removed with its log line intact; a fixture whose
+      getter returns the same object every call cannot tell stale from fresh.
+      The first of those moved real logic out of `bin/reeve` into
+      `src/build/hubaccess.mjs` so it could be exercised at all. **If the only
+      assertions available are structural, the logic is in the wrong place.**
+
+      Filed rather than done: **#43** (derive snapshot schema validation from the
+      migrations) and **#46** (a hub identity table so the guardian reads its
+      repository id with no privileged read at all). The queued-request sweep was
+      named as deferred in the first description and is IN the PR — a queued row
+      owned by the live guardian blocks the other lane indefinitely, so naming a
+      gap does not make deferring it free.
+
 - [ ] **S2-C PR-C2, the guardian's hub guest — BUILT (2026-08-26).** Branch
       `feat/s2c-hub-guest`, stacked on **PR-C1** rather than on main, because
       Task 23a's test imports `claimProvider` to assert a real admission

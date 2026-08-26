@@ -35,6 +35,10 @@ const ADDED_COLUMNS = [
   // is exactly true of every row written before the column existed.
   ["outbox", "reconcile_attempts", "INTEGER NOT NULL DEFAULT 0"],
   ["outbox", "max_reconcile", "INTEGER NOT NULL DEFAULT 3"],
+  // The head a projection was derived for. Nullable on purpose: an existing row
+  // was derived before anyone recorded this, and "we do not know which head"
+  // must read as unusable rather than as a match.
+  ["projection_meta", "head", "TEXT"],
 ];
 
 function addMissingColumns(db) {

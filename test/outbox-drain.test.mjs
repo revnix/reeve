@@ -279,6 +279,163 @@ const statusOf = key => db.prepare(`SELECT status, attempts, result, last_error 
   const left = db.prepare(`SELECT count(*) n FROM outbox WHERE status='pending' AND idem_key LIKE 'g%'`).get().n;
   check(left === 4, "and the rest stay pending for the next tick", String(left));
 }
+// --- time spent getting the row is spent, not refunded ------------------------
+{
+  // The pass deadline is an ABSOLUTE instant, so waiting spends it.
+  //
+  // It used to be re-derived each iteration as `now + leftInPass`, where the
+  // remainder had been sampled BEFORE `leaseOutbox`. Anything that happened in
+  // between was silently refunded: SQLite will hold a writer behind another writer
+  // for as long as the connection's busy timeout allows, and the pass would then
+  // add a ten-second-old remainder to a fresh reading of the clock. A one-second
+  // pass could wait ten seconds and still grant a delivery a full second.
+  //
+  // Driven with an injected clock that advances on every reading, which is what a
+  // clock does. The assertion is the property and not a number: the instant a call
+  // is made, plus the time it is granted, may not land beyond the pass's deadline.
+  const d4 = mkdtempSync(join(tmpdir(), "reeve-clock-"));
+  const db4 = open(join(d4, "s.db"));
+  tx(db4, () => enqueue(db4, { idemKey: "slow-lease", kind: "gh.pr.comment",
+                               args: { nwo: "o/r", pr: 1, body: "b" } }));
+
+  const STEP = 5_000, BUDGET = 60_000;
+  let reading = 0;
+  const clock = () => 1_000_000 + STEP * reading++;
+  const startedAt = 1_000_000;          // what the drainer's first reading will be
+
+  const grants = [];
+  const handlers = { "gh.pr.comment": (_a, { api }) => { api(["-X", "GET", "repos/o/r/pulls/1"]); return { ok: true }; } };
+  const api = (_a, opts) => { grants.push({ at: clock() - STEP, ms: opts?.timeoutMs }); return { ok: true, out: "" }; };
+
+  await drainOutbox({ db: db4, handlers, api, max: 1, budgetMs: BUDGET, leaseSeconds: 300, now: clock });
+
+  check(grants.length === 1, "control: the delivery was made and the bound was handed to it", JSON.stringify(grants));
+  const g = grants[0];
+  check(g.at > startedAt,
+    "control: the clock really did advance between the pass starting and the call",
+    `started ${startedAt}, called at ${g.at}`);
+  check(g.at + g.ms <= startedAt + BUDGET,
+    "no call may be granted time that reaches past the end of the pass",
+    `called at +${g.at - startedAt}ms with ${g.ms}ms, which ends at +${g.at - startedAt + g.ms}ms of a ${BUDGET}ms budget`);
+
+  // And the other end of it: if the budget goes WHILE the row is being leased, the
+  // row is put back rather than left inflight until its lease lapses.
+  tx(db4, () => enqueue(db4, { idemKey: "too-late", kind: "gh.pr.comment",
+                               args: { nwo: "o/r", pr: 2, body: "b" } }));
+  db4.prepare(`UPDATE outbox SET status='done' WHERE idem_key='slow-lease'`).run();
+  let calls = 0;
+  // One reading inside the budget, and every later one past it. The pass therefore
+  // clears its pre-lease check, takes a row, and only then finds the time gone.
+  let n = 0;
+  const jumping = () => (n++ === 0 ? 2_000_000 : 2_000_000 + BUDGET * 10);
+  const res = await drainOutbox({ db: db4, handlers: { "gh.pr.comment": () => { calls++; return { ok: true }; } },
+                                  api, max: 1, budgetMs: BUDGET, now: jumping });
+  const late = db4.prepare(`SELECT status FROM outbox WHERE idem_key='too-late'`).get();
+  check(calls === 0, "a row leased with the budget already gone is not delivered", `${calls} call(s)`);
+  check(late.status === "pending",
+    "and is returned to pending rather than left inflight until its lease expires", JSON.stringify(late));
+  check(res.outOfTime === true, "and the pass says out loud that the budget is what stopped it", JSON.stringify(res));
+
+  db4.close();
+  rmSync(d4, { recursive: true, force: true });
+}
+
+// --- the last POST landed and only its answer was lost ------------------------
+{
+  // The failure this whole phase exists for, driven end to end through the real
+  // handler and the real settle path.
+  //
+  // The final permitted delivery reaches GitHub, GitHub creates the comment, and
+  // the response never comes back -- `gh` times out, the connection drops, the
+  // buffer overruns. The handler can only report a retryable failure. Settling
+  // that as terminal recorded an effect that EXISTS as one reeve could not perform
+  // and put it in front of a person, and nothing was ever going to look again.
+  const d3 = mkdtempSync(join(tmpdir(), "reeve-lost-"));
+  const db3 = open(join(d3, "s.db"));
+  const key = "lost-answer";
+  tx(db3, () => enqueue(db3, { idemKey: key, kind: "gh.pr.comment",
+                               args: { nwo: "o/r", pr: 7, body: "please review" } }));
+  db3.prepare(`UPDATE outbox SET max_attempts=1 WHERE idem_key=?`).run(key);
+  const row3 = () => db3.prepare(`SELECT status, attempts, reconcile_attempts, result FROM outbox WHERE idem_key=?`).get(key);
+  // A settled failure backs off before it is due again, which is correct and is
+  // asserted where the backoff is the subject. Here it would only make the test
+  // sleep, so the wait is cleared explicitly rather than by a drain that quietly
+  // leased nothing -- a pass that finds no due row and a pass that finds no row at
+  // all are the same empty result, and this block would have read one as the other.
+  const makeDue = k => db3.prepare(`UPDATE outbox SET not_before=0 WHERE idem_key=?`).run(k);
+
+  // GitHub's side of the story: the comment is created, and only then does the
+  // call fail. `posted` is what GitHub would hold afterwards, so the marker read
+  // on a later pass finds it exactly as a real one would.
+  let posted = false, reads = 0;
+  const api = (a) => {
+    const path = a.find(s => typeof s === "string" && s.startsWith("repos/")) ?? "";
+    if (a.includes("POST")) { posted = true; return { ok: false, err: "post https://api.github.com: net/http: TLS handshake timeout", timedOut: true }; }
+    if (path.endsWith("/comments")) { reads++; return { ok: true, out: posted ? "424242" : "" }; }
+    return { ok: true, out: "" };
+  };
+
+  const first = await drainOutbox({ db: db3, handlers: HANDLERS, api, actor: "reeve[bot]", max: 1 });
+  check(posted === true, "control: the delivery really did reach GitHub before it failed", JSON.stringify(first.done));
+  const afterPost = row3();
+  check(afterPost.status === "pending" && afterPost.attempts === 1,
+    "a retryable failure on the last permitted delivery is NOT terminal; it is handed to reconciliation",
+    JSON.stringify(afterPost));
+
+  // The reconciling pass. It must READ and must not post again.
+  makeDue(key);
+  const postsBefore = posted;
+  const second = await drainOutbox({ db: db3, handlers: HANDLERS, api, actor: "reeve[bot]", max: 1 });
+  const settled = row3();
+  check(settled.status === "done",
+    "and the reconciling pass finds the comment and settles the row DONE", JSON.stringify(settled));
+  check(JSON.parse(settled.result ?? "{}").alreadyThere === true,
+    "recording that the delivery was found rather than made", String(settled.result));
+  check(reads >= 2, "control: it looked, rather than assuming", `${reads} marker read(s)`);
+  check(second.done.length === 1 && postsBefore === posted,
+    "and it posted nothing, because confirming a delivery is not making one", JSON.stringify(second.done));
+
+  // The other half of the same fork: if GitHub answers and the comment is NOT
+  // there, the delivery budget really is spent and this is terminal.
+  const key2 = "never-landed";
+  tx(db3, () => enqueue(db3, { idemKey: key2, kind: "gh.pr.comment",
+                               args: { nwo: "o/r", pr: 8, body: "please review" } }));
+  db3.prepare(`UPDATE outbox SET max_attempts=1 WHERE idem_key=?`).run(key2);
+  const empty = (a) => a.includes("POST")
+    ? { ok: false, err: "post https://api.github.com: TLS handshake timeout", timedOut: true }
+    : { ok: true, out: "" };
+  await drainOutbox({ db: db3, handlers: HANDLERS, api: empty, actor: "reeve[bot]", max: 1 });
+  makeDue(key2);
+  await drainOutbox({ db: db3, handlers: HANDLERS, api: empty, actor: "reeve[bot]", max: 1 });
+  const gone = db3.prepare(`SELECT status FROM outbox WHERE idem_key=?`).get(key2);
+  check(gone.status === "dead_letter",
+    "while a definite 'no such comment' with the budget spent is still terminal", JSON.stringify(gone));
+
+  // And the third: GitHub could not be READ. That is not a definite no, and
+  // treating it as one is absence read as an answer.
+  const key3 = "cannot-tell";
+  tx(db3, () => enqueue(db3, { idemKey: key3, kind: "gh.pr.comment",
+                               args: { nwo: "o/r", pr: 9, body: "please review" } }));
+  db3.prepare(`UPDATE outbox SET max_attempts=1, max_reconcile=2 WHERE idem_key=?`).run(key3);
+  const blind = (a) => a.includes("POST")
+    ? { ok: false, err: "post https://api.github.com: TLS handshake timeout", timedOut: true }
+    : { ok: false, err: "get https://api.github.com: TLS handshake timeout", timedOut: true };
+  await drainOutbox({ db: db3, handlers: HANDLERS, api: blind, actor: "reeve[bot]", max: 1 });
+  makeDue(key3);
+  await drainOutbox({ db: db3, handlers: HANDLERS, api: blind, actor: "reeve[bot]", max: 1 });
+  const blindRow = db3.prepare(`SELECT status, reconcile_attempts FROM outbox WHERE idem_key=?`).get(key3);
+  check(blindRow.status === "pending" && blindRow.reconcile_attempts === 1,
+    "an unreadable marker keeps the row reconciling rather than condemning it", JSON.stringify(blindRow));
+  makeDue(key3);
+  await drainOutbox({ db: db3, handlers: HANDLERS, api: blind, actor: "reeve[bot]", max: 1 });
+  check(db3.prepare(`SELECT status FROM outbox WHERE idem_key=?`).get(key3).status === "dead_letter",
+    "but its budget is finite, so it still reaches a person instead of looping",
+    JSON.stringify(db3.prepare(`SELECT status, reconcile_attempts FROM outbox WHERE idem_key=?`).get(key3)));
+
+  db3.close();
+  rmSync(d3, { recursive: true, force: true });
+}
+
 // --- a crash-loop dead-letters instead of retrying forever --------------------
 {
   // Its OWN store. `leaseOutbox` takes the lowest-id due row, and earlier blocks
@@ -289,9 +446,10 @@ const statusOf = key => db.prepare(`SELECT status, attempts, result, last_error 
   const d2 = mkdtempSync(join(tmpdir(), "reeve-loop-"));
   const db2 = open(join(d2, "s.db"));
   const put2 = key => tx(db2, () => enqueue(db2, { idemKey: key, kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "b" } }));
-  const status2 = key => db2.prepare(`SELECT status, attempts, last_error FROM outbox WHERE idem_key=?`).get(key);
+  const status2 = key => db2.prepare(`SELECT status, attempts, reconcile_attempts, max_reconcile, last_error
+                                      FROM outbox WHERE idem_key=?`).get(key);
   put2("loop");
-  db2.prepare(`UPDATE outbox SET max_attempts=3 WHERE idem_key='loop'`).run();
+  db2.prepare(`UPDATE outbox SET max_attempts=3, max_reconcile=2 WHERE idem_key='loop'`).run();
   // Three leases that never settle: a drainer dying between the API call and the
   // settle, three times. `settleOutbox` is where the budget is checked, and a hard
   // crash never reaches it -- so without a check on the recovery path this row is
@@ -302,35 +460,63 @@ const statusOf = key => db.prepare(`SELECT status, attempts, result, last_error 
     if (i < 2) recoverOutbox(db2);
   }
   const before = status2("loop");
-  check(before.attempts === 3, "control: the row has spent its whole budget on leases", JSON.stringify(before));
+  check(before.attempts === 3 && before.reconcile_attempts === 0,
+    "control: the row has spent its whole DELIVERY budget and no reconciliation", JSON.stringify(before));
 
-  // ONE more pass first, and it is not generosity. The final allowed lease can
-  // POST the comment and crash before settling: at that point attempts equals the
-  // budget, and dead-lettering records a delivered effect as one reeve "could not
-  // perform" -- and escalates it -- while GitHub already contains it. The handler's
-  // marker pre-check is the only thing that can tell those apart, and it needs a
-  // lease to run.
+  // Reconciliation begins, and it is not generosity. The final allowed lease can
+  // POST the comment and crash before settling: at that point the delivery budget
+  // is spent, and dead-lettering records a delivered effect as one reeve "could
+  // not perform" -- and escalates it -- while GitHub already contains it. The
+  // handler's marker pre-check is the only thing that can tell those apart, and it
+  // needs a lease to run.
   const recon = recoverOutbox(db2);
   check(status2("loop").status === "pending",
-    "a row at its budget gets ONE reconciliation pass before terminal failure", JSON.stringify(status2("loop")));
+    "a row at its delivery budget is handed back to be reconciled", JSON.stringify(status2("loop")));
   check((recon.deadLettered ?? []).length === 0, "and is not dead-lettered yet", JSON.stringify(recon.deadLettered));
 
-  // That pass is spent, and now it terminates.
+  // The lease bumps the RECONCILIATION counter and leaves the delivery one alone.
+  // Charging both to `attempts` is what made the reconciliation budget exactly one.
   const j4 = leaseOutbox(db2, { worker: "crasher", leaseSeconds: -5, kinds: ["gh.pr.comment"] });
-  check(j4 !== undefined && status2("loop").attempts === 4,
-    "control: the reconciliation lease happened and went past the budget", JSON.stringify(status2("loop")));
+  const afterRecon1 = status2("loop");
+  check(j4 !== undefined && afterRecon1.attempts === 3 && afterRecon1.reconcile_attempts === 1,
+    "control: a reconciling lease spends the reconciliation budget, not the delivery one",
+    JSON.stringify(afterRecon1));
+  check(j4.reconcile_attempts === 1,
+    "and the drainer is told which phase it is in, by a counter that cannot be off by one",
+    JSON.stringify({ attempts: j4.attempts, max: j4.max_attempts, reconcile: j4.reconcile_attempts }));
+
+  // THE POINT OF THE SECOND BUDGET. That reconciling lease has just crashed --
+  // after confirming the marker, for all anyone knows, and before settling. One
+  // reconciliation was the first answer here and it was one short: an unrelated
+  // process failure turned a confirmed delivery into a permanent false dead letter.
+  const recon2 = recoverOutbox(db2);
+  check(status2("loop").status === "pending",
+    "a crashed reconciliation is retried rather than condemning the row", JSON.stringify(status2("loop")));
+  check((recon2.deadLettered ?? []).length === 0, "and is still not dead-lettered", JSON.stringify(recon2.deadLettered));
+
+  // It still terminates, and the bound is the sum of the two budgets.
+  const j5 = leaseOutbox(db2, { worker: "crasher", leaseSeconds: -5, kinds: ["gh.pr.comment"] });
+  check(j5 !== undefined && status2("loop").reconcile_attempts === 2,
+    "control: the second reconciliation happened and spent the last of that budget",
+    JSON.stringify(status2("loop")));
   const rec = recoverOutbox(db2);
   const after = status2("loop");
-  check(after.status === "dead_letter", "a row recovered past its budget is dead-lettered, not handed out again",
+  check(after.status === "dead_letter",
+    "a row whose reconciliation budget is spent is dead-lettered, not handed out again",
     JSON.stringify(after));
   check(!rec.some(r => r.id === undefined) && (rec.deadLettered ?? []).length >= 1,
     "and recovery reports it, because a crash-loop needs a person rather than another pass",
     JSON.stringify(rec.deadLettered));
-  // Names the BUDGET, which is the fact, rather than a phrasing. I wrote this as a
-  // prose match first and it failed on a sentence that said the same thing in
-  // different words -- an hour after fixing three assertions for exactly that.
-  check(/max_attempts/.test(String(after.last_error)) && String(after.last_error).length > 0,
-    "with a reason naming the budget it exhausted", String(after.last_error));
+  // The COUNTERS, not the phrasing. This was a prose match first and it failed on a
+  // sentence that said the same thing in different words. What the report has to
+  // carry is which budget ran out, and that is a number.
+  check((rec.deadLettered ?? []).some(d => d.attempts === 3 && d.reconcile_attempts === 2),
+    "reporting both budgets, so the reason it gave up is a fact rather than a sentence",
+    JSON.stringify(rec.deadLettered));
+  check(String(after.last_error ?? "").length > String(before.last_error ?? "").length,
+    "and the row itself records that recovery, rather than only the event log",
+    String(after.last_error));
+
   // Control: a row still inside its budget is still recovered normally.
   put2("ok-loop");
   leaseOutbox(db2, { worker: "crasher", leaseSeconds: -5, kinds: ["gh.pr.comment"] });

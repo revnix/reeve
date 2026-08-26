@@ -96,11 +96,20 @@ export function ghPrComment(args, { api, idemKey, actor = null, reconcileOnly = 
   // "cannot tell", not "matches", so the suppression is skipped entirely and the
   // comment is posted: a duplicate comment is a nuisance, an unrequested review is
   // a pull request that waits forever.
+  // Whether GitHub actually ANSWERED, as distinct from whether it said no.
+  //
+  // Both arrive here as "no marker": a timeout, a truncated buffer, a rate limit
+  // and a genuinely absent comment are the same empty result. On the delivery path
+  // the difference does not change what happens -- either way it posts -- so it was
+  // never recorded. The reconciling path turns on it exactly: a definite "not
+  // there" is an answer worth acting on, and a read that never completed is not.
+  let answered = false;
   if (actor) {
     const seen = api(["--paginate", "-X", "GET", `repos/${nwo}/issues/${pr}/comments`,
                       "-F", "per_page=100",
                       "--jq", `.[] | select(.user.login == "${actor}") | select(.body | contains("${marker}")) | .id`]);
     if (seen.ok) {
+      answered = true;
       const ids = String(seen.out || "").split("\n").map(s => s.trim()).filter(Boolean);
       if (ids.length) return { ok: true, result: { commentId: Number(ids[ids.length - 1]), alreadyThere: true } };
     }
@@ -109,16 +118,25 @@ export function ghPrComment(args, { api, idemKey, actor = null, reconcileOnly = 
     // buffer, a rate limit -- LOOKS exactly like "no marker found".
   }
 
-  // A reconciliation pass may confirm a delivery. It may not make one.
+  // A reconciling attempt may confirm a delivery. It may not make one.
   //
-  // This is the lease recovery grants past `max_attempts` so the marker check can
-  // find a comment whose settle was lost to a crash. Reaching here means no such
-  // comment was found -- so posting would deliver on an attempt the budget had
-  // already refused, which is the opposite of what the extra pass was for.
-  // Terminal, because another pass would ask the same question.
+  // This is a lease granted after the delivery budget is spent, so the marker
+  // check can find a comment whose settle was lost -- to a crash, or to a response
+  // that never came back from a POST GitHub had already accepted. Reaching here
+  // means no such comment was found, so posting would deliver on an attempt the
+  // budget had already refused, which is the opposite of what the phase is for.
+  //
+  // Terminal rather than retryable, and that is a statement about THIS answer, not
+  // about the phase. The marker read returned a definite "not there", so asking
+  // again would ask a question already answered. A read that FAILED does not reach
+  // this line: it falls through the block above, which treats an unreadable answer
+  // as no answer.
   if (reconcileOnly)
-    return { ok: false, retryable: false,
-             error: "the retry budget is spent and no earlier delivery could be confirmed; not posting" };
+    return answered
+      ? { ok: false, retryable: false,
+          error: "the delivery budget is spent and GitHub reports no comment carrying this effect's marker; not posting" }
+      : { ok: false, retryable: true,
+          error: "the delivery budget is spent and the marker could not be READ, so whether a delivery landed is unknown; not posting" };
 
   const r = api(["-X", "POST", `repos/${nwo}/issues/${pr}/comments`,
                  "-f", `body=${body}\n\n${marker}`]);

@@ -112,8 +112,18 @@ export function computeVerdict(i) {
   // critical being carried past the budget. Only asked past the soft cap, because
   // below it the critical count changes nothing and claiming ignorance there
   // would make every pull request UNKNOWN for a fact that does not matter yet.
-  else if (R.n >= R.softCap && R.unspilledCritical == null)
+  // UNKNOWN only when the count COULD have been known. A projection that is
+  // unreadable right now is a per-pull-request uncertainty and saying so is
+  // honest. Review-body findings never being derived is neither uncertain nor
+  // per-pull-request: it is an unbuilt capability, recorded elsewhere, and
+  // reporting it here as UNKNOWN made every pull request past the cap UNKNOWN --
+  // which the watcher handles before BLOCK findings, so the cap stopped every
+  // repair instead of stopping a spill. Absence read as success was the defect;
+  // absence read as paralysis is not the fix.
+  else if (R.n >= R.softCap && R.unspilledCritical == null && R.criticalGap !== "not-derived")
     add("rounds", UNKNOWN, `past soft cap ${R.softCap} and reeve cannot say how many criticals are open`);
+  else if (R.n >= R.softCap && R.unspilledCritical == null)
+    add("rounds", PASS, `round ${R.n} of ${R.softCap}/${R.hardCap} — the critical cap is NOT enforced: review-body findings are not derived`);
   else add("rounds", PASS, `round ${R.n} of ${R.softCap}/${R.hardCap}`);
 
   // 5. Unresolved threads. A truncated read is not zero: reviewThreads(first:100)

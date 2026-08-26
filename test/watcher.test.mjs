@@ -218,6 +218,38 @@ check("an uncleared thread ASKS THE REVIEWER, rather than dispatching a fixer",
   check("a push that unclears threads asks for the review, not a fix", d.action, ACTIONS.REQUEST_REVIEW);
   check("and says which, so the two cases are distinguishable", /older revision/.test(d.why ?? ""), true);
 }
+// THE REGRESSION THIS ORDERING CAUSED, asserted directly. Past the soft cap with
+// an unbuilt critical count, a real finding must still reach a fixer: the
+// watcher handles UNKNOWN before BLOCK findings, so an UNKNOWN rounds clause
+// stopped every repair rather than stopping a spill.
+{
+  const past = { rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "not-derived" } };
+  check("past the cap with an unbuilt critical count, a finding still dispatches a fixer",
+    nextAction(ev(swap("findings", "BLOCK", "2 open"), past), P).action, ACTIONS.FIX_FINDINGS);
+
+  // END TO END, through computeVerdict rather than a hand-built clause list.
+  //
+  // The check above hands `nextAction` clauses directly, so it cannot see the
+  // verdict deciding what state `rounds` is in -- and that decision is the P1.
+  // Collapsing the transient/permanent split left this file GREEN while the
+  // composition was broken, which is the seam-versus-mounted trap: the watcher
+  // was fine, the verdict was fine in isolation, and together they waited
+  // forever. Only a test that runs both catches it.
+  const composed = computeVerdict({
+    head: "c".repeat(40),
+    checks: { verdict: "GREEN", settled: true, failing: [] },
+    base: { verdict: "GREEN" },
+    reviewers: [{ login: "codex", kind: "blocking", state: "CLEAN", reviewedHead: "c".repeat(10) }],
+    rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "not-derived" },
+    threads: { unresolved: 2, total: 4, readable: true },
+    cleared: { readable: true, uncleared: 0, reviewers: [] },
+    ledgerBlockers: 0, mergeState: "CLEAN",
+  });
+  const d = nextAction({ pr: 1, state: "open", verdict: composed, checks: {},
+                         rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null } }, P);
+  check("and the same holds through computeVerdict, which is where the state is decided",
+    d.action, ACTIONS.FIX_FINDINGS);
+}
 // Past the hard cap it stops asking and fetches a person.
 check("past the hard cap an uncleared thread escalates rather than asking again",
   nextAction(ev(swap("cleared", "BLOCK", "uncleared"), { rounds: { n: 10, softCap: 5, hardCap: 10, unspilledCritical: 0 } }), P).action,

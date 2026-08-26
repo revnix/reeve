@@ -370,7 +370,22 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // across the latest state per reviewer, so a single-reviewer pull request stays
   // at one however many rounds it has had -- and every decision gated on the soft
   // cap was therefore unreachable for the commonest shape there is.
+  // WHY the critical count is missing, because two reasons need two answers.
+  //
+  //   · the projection is unreadable -- transient, this pull request, this tick.
+  //     reeve genuinely cannot tell, and saying UNKNOWN is honest.
+  //   · review-body findings are not derived at all -- permanent, global, and
+  //     already recorded. Nothing about this pull request is uncertain; a
+  //     capability is unbuilt.
+  //
+  // Collapsing them made every pull request past the soft cap UNKNOWN, and the
+  // watcher handles UNKNOWN before BLOCK findings -- so the cap stopped ALL
+  // remediation rather than stopping a spill. A permanent gap must not present
+  // as a per-pull-request uncertainty.
+  const criticalGap = facts.unspilledCritical != null ? null
+    : (facts.projection?.readable === false ? "unreadable" : "not-derived");
   const rounds = { n: facts.rounds ?? judged.size, softCap: profile.rounds?.softCap ?? 5,
+                   criticalGap,
                    // A number when the projection is readable AT THIS HEAD, and null
                    // otherwise. Claiming "no criticals open" is a fact reeve may only
                    // state when it has it -- the alternative licenses spilling a P0.

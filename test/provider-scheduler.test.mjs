@@ -4,7 +4,7 @@
 //
 // The asymmetry between the two owners is deliberate. The guardian is the
 // watchman; the builder is the thing being restrained.
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -390,6 +390,45 @@ const ALIVE = () => true, DEAD = () => false;
   db.close();
 }
 
+// ── a PROMOTION records who is being admitted ───────────────────────────────
+// `renewQueued` covers the re-ask path, and this one bypasses it: when capacity
+// opens before the restarted daemon polls again, the queued row is promoted
+// directly. Left naming the dead predecessor, the lease is held by a pid that
+// will never be alive again -- the restore holder scan can read it as gone and
+// replace the hub mid-dispatch, the reaper watches a corpse, and the admitted
+// daemon's own idempotent re-ask is refused `held-elsewhere` by its own lease.
+{
+  const db = openHub(join(dir, "p18.db"));
+  db.exec(`INSERT INTO provider_state(provider,concurrency_limit,guardian_reserved)
+           VALUES('claude',1,0)
+           ON CONFLICT(provider) DO UPDATE SET concurrency_limit=1, guardian_reserved=0`);
+  const b = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE, now: 1000 });
+  claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 900, lstart: "DEAD", isAlive: ALIVE, now: 1001 });
+  check(db.prepare("SELECT pid FROM provider_lease WHERE status='queued'").get().pid === 900,
+    "fixture: the queued row names the daemon that first asked");
+
+  // The slot frees, and the RESTARTED daemon is the next to ask.
+  releaseProvider(db, b);
+  const got = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 901, lstart: "LIVE", isAlive: ALIVE, now: 1002 });
+  check(got.ok, "fixture: it is admitted straight from the queue", JSON.stringify(got));
+  const held = db.prepare("SELECT pid, lstart, status FROM provider_lease WHERE id=?").get(got.id);
+  check(held.pid === 901 && held.lstart === "LIVE",
+    "the promoted lease names the daemon that was actually admitted",
+    JSON.stringify(held));
+
+  // The consequence, asserted rather than inferred: its own re-ask is idempotent
+  // rather than refused by its own lease.
+  const again = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 901, lstart: "LIVE", isAlive: ALIVE, now: 1003 });
+  check(again.ok && again.id === got.id,
+    "so its own idempotent re-ask is not refused `held-elsewhere` by its own lease",
+    JSON.stringify(again));
+  // And it is reapable by its REAL identity, not its predecessor's.
+  db.exec(`UPDATE provider_lease SET expires_at = unixepoch() - 1 WHERE id = ${got.id}`);
+  check(reapProviderLeases(db, { isAlive: (pid) => pid !== 901 }).reaped === 1,
+    "control: and the reaper watches the live pid, not the one that died");
+  db.close();
+}
+
 // ── a bind or heartbeat that matched nothing is not a success ───────────────
 // The predicate always names owner, repo_id and run_ref, so an id-only call
 // matched nothing and returned a zero count wearing an `ok`. The lease then
@@ -675,6 +714,30 @@ console.log(r.ok ? "HELD" : "no");
     JSON.stringify(crashed.slice(0, 3).map(r => ({ code: r.code, err: String(r.err).slice(0, 120) }))));
   const held = results.filter(r => r.out === "HELD").length;
   check(held === 1, `exactly one of 20 racing processes holds the last slot (got ${held})`);
+}
+
+// ── the SQL boundary, asserted rather than stated ───────────────────────────
+// `src/provider.mjs` is imported by both daemons and therefore sits at the top
+// level, outside the two directories allowed to contain raw SQL. Its own header
+// claims it holds no statements -- and a claim in a comment is checked by
+// whoever remembers. One stray `SELECT unixepoch()` is a second definition of
+// the guardian's SQL surface, in a file the allowlist and the audits do not
+// inspect, which is enough to make the boundary untrue.
+{
+  const src = readFileSync(new URL("../src/provider.mjs", import.meta.url), "utf8");
+  // Comments describe the SQL that lives elsewhere, so they are stripped first:
+  // this is a claim about what the module EXECUTES.
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, " ").split("\n")
+                  .map(l => l.replace(/^\s*\/\/.*$/, " ")).join("\n");
+  const hits = code.match(/\b(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|BEGIN\s+IMMEDIATE|COMMIT|ROLLBACK)\b/gi) ?? [];
+  check(hits.length === 0,
+    "src/provider.mjs executes no SQL of its own: every statement lives under src/build/",
+    JSON.stringify(hits.slice(0, 5)));
+  // CONTROL: the detector finds SQL when there IS some, or the assertion above
+  // is satisfied by a pattern that matches nothing.
+  const db = readFileSync(new URL("../src/build/providerdb.mjs", import.meta.url), "utf8");
+  check((db.match(/\bSELECT\b/gi) ?? []).length > 0,
+    "control: the same scan finds plenty of SQL in providerdb.mjs, so it is not blind");
 }
 
 rmSync(dir, { recursive: true, force: true });

@@ -23,7 +23,7 @@ import { isSameProcess } from "./supervisor.mjs";
 import {
   providerTx, providerState, heldCount, heldCountBy, queuedGuardianCount,
   queuedGuardianRequests, liveRequest, youngestHeldBuilder, requestPreemption,
-  insertLease, promoteToHeld, renewQueued, oldestQueuedGuardian,
+  insertLease, promoteToHeld, renewQueued, oldestQueuedGuardian, nowSeconds,
   bindLease, touchLease, deleteLease, deleteLeaseById,
   deleteQueued, expiredLeases, recordRateLimit,
   DEFAULT_LIMIT, DEFAULT_RESERVED,
@@ -40,7 +40,6 @@ export const LEASE_SECONDS = 300;
 // question even though its body is a single SELECT.
 export { queuedGuardianRequests };
 
-const unix = (db) => db.prepare("SELECT unixepoch() n").get().n;
 const refuse = (reason, extra = {}) => ({ ok: false, reason, ...extra });
 
 // `assertWritable` is the only thing that throws out of a provider transaction
@@ -112,7 +111,7 @@ export function claimProvider(db, { owner, repoId, runRef, pid, lstart, priority
     if (repoId == null || runRef == null || pid == null || lstart == null)
       return refuse("no-identity");
 
-    const at = now ?? unix(db);
+    const at = now ?? nowSeconds(db);
     const state = providerState(db);
     const cooling = state.cooldownUntil != null && state.cooldownUntil > at;
     const existing = liveRequest(db, { owner, repoId, runRef });
@@ -143,7 +142,7 @@ export function claimProvider(db, { owner, repoId, runRef, pid, lstart, priority
     const granted = () => {
       const expiresAt = at + LEASE_SECONDS;
       if (existing) {
-        promoteToHeld(db, { id: existing.id, at, expiresAt });
+        promoteToHeld(db, { id: existing.id, pid, lstart, at, expiresAt });
         return { ok: true, id: existing.id, owner, repoId, runRef };
       }
       const row = insertLease(db, { owner, repoId, runRef, pid, lstart, priority,
@@ -268,7 +267,7 @@ export function bindProviderLease(db, { id = null, owner = null, repoId = null, 
     // dies takes its slot with it until expiry.
     if (owner == null || repoId == null || runRef == null) return refuse("no-identity");
     if (pid == null || lstart == null) return refuse("no-identity");
-    const at = now ?? unix(db);
+    const at = now ?? nowSeconds(db);
     const bound = bindLease(db, { id, owner, repoId, runRef, pid, lstart, at }).changes;
     return { ok: true, bound };
   });
@@ -287,7 +286,7 @@ export function heartbeatProvider(db, { id = null, owner = null, repoId = null, 
     // nothing and reported a successful renewal of a lease it never touched, so
     // the row expired under a worker that was still running.
     if (owner == null || repoId == null || runRef == null) return refuse("no-identity");
-    const at = now ?? unix(db);
+    const at = now ?? nowSeconds(db);
     const beat = touchLease(db, { id, owner, repoId, runRef, at,
                                   expiresAt: at + LEASE_SECONDS }).changes;
     return { ok: true, beat };
@@ -323,7 +322,7 @@ export function cancelQueued(db, { owner, repoId, runRef,
 export function noteRateLimit(db, { signature, cooldownSeconds, provider = "claude",
                                     isAlive = isSameProcess, now = null } = {}) {
   return guarded(db, { isAlive, now }, () => {
-    const at = now ?? unix(db);
+    const at = now ?? nowSeconds(db);
     const until = at + (cooldownSeconds ?? 0);
     const state = providerState(db);
     // The limits are carried through on the INSERT half of the upsert so a first
@@ -347,7 +346,7 @@ export function noteRateLimit(db, { signature, cooldownSeconds, provider = "clau
  */
 export function reapProviderLeases(db, { isAlive = isSameProcess, now = null } = {}) {
   return guarded(db, { isAlive, now }, () => {
-    const at = now ?? unix(db);
+    const at = now ?? nowSeconds(db);
     let reaped = 0;
     for (const lease of expiredLeases(db, at)) {
       if (isAlive(lease.pid, lease.lstart)) continue;

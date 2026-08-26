@@ -305,6 +305,20 @@ const ev = rounds => {
     JSON.stringify(g.cleared));
 
   // And an unusable projection is UNKNOWN here too, never zero.
+  // NOBODY TO GATE means nothing to be unknown about. With no blocking reviewer,
+  // an unusable projection must NOT make the clearance clause unknown -- there is
+  // nothing it could hold up, and an UNKNOWN there would stop an otherwise
+  // passing pull request on a transient failure. The scoping has to apply to the
+  // unreadable path too, or it is only half applied.
+  const noneBlocking = { ...PROFILE, reviewers: PROFILE.reviewers.map(r => ({ ...r, kind: "advisory" })) };
+  const nb = reviewFacts({ db, nwo: NWO, pr: 999, profile: noneBlocking, head: HEAD_A,
+                           at: T + 900, live: liveOf(0, 0), io: { foldPrecedesEvaluation: true } });
+  check(nb.projection.readable === false,
+    "control: the projection really is unusable here", JSON.stringify(nb.projection.why));
+  check(nb.cleared.readable === true && nb.cleared.uncleared === 0,
+    "and with no blocking reviewer the clearance clause is satisfied rather than unknown",
+    JSON.stringify(nb.cleared));
+
   derivePr(db, NWO, 1, PROFILE, { at: T + 960, head: HEAD_A });   // restore for anything after
   const blind = reviewFacts({ db, nwo: NWO, pr: 999, profile: PROFILE, head: HEAD_A,
                               at: T + 900, live: liveOf(0, 0), io: { foldPrecedesEvaluation: true } });

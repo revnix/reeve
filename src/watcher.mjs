@@ -165,22 +165,18 @@ export function nextAction(e, p, h = {}) {
 
   const threads = clause(v, "threads");
   const findings = clause(v, "findings");
-  // `cleared` joins these two rather than getting a branch of its own: a thread a
-  // reviewer has not come back to is a finding that needs work, which is the same
-  // answer. Adding a BLOCK clause with no branch would fall through to the
-  // "unclassified verdict" escalation at the end -- total by construction, and
-  // that totality is only useful if new clauses are actually classified.
+  // `cleared` deliberately does NOT join these two, and getting that wrong was a
+  // real defect. See its own branch below, after the stale-review one.
   const cleared = clause(v, "cleared");
-  if (threads?.state === "BLOCK" || findings?.state === "BLOCK" || cleared?.state === "BLOCK") {
+  if (threads?.state === "BLOCK" || findings?.state === "BLOCK") {
     const R = e.rounds ?? {};
     // `?? 0` here would read an UNKNOWN critical count as "no criticals" and spill
     // on it, which is the standing ruling inverted. Only a known zero may spill.
     if ((R.n ?? 0) >= (R.softCap ?? 5) && R.unspilledCritical === 0)
       return act(ACTIONS.SPILL, `past the soft cap with only non-critical findings open`, { round: R.n });
-    const blocking = [threads, findings, cleared].filter(c => c?.state === "BLOCK");
+    const blocking = [threads, findings].filter(c => c?.state === "BLOCK");
     return act(ACTIONS.FIX_FINDINGS, blocking.map(c => c.detail).filter(Boolean).join("; ") || "findings block this PR",
-               { threads: threads?.state === "BLOCK", findings: findings?.state === "BLOCK",
-                 uncleared: cleared?.state === "BLOCK" });
+               { threads: threads?.state === "BLOCK", findings: findings?.state === "BLOCK" });
   }
 
   // 6. A stale verdict: reviewed, but not this revision.
@@ -189,6 +185,32 @@ export function nextAction(e, p, h = {}) {
     const R = e.rounds ?? {};
     if ((R.n ?? 0) < (R.hardCap ?? 10)) return act(ACTIONS.REQUEST_REVIEW, review.detail, { round: (R.n ?? 0) + 1, stale: true });
     return act(ACTIONS.ESCALATE, ESCALATIONS.CAP_WITH_CRITICAL, { detail: review.detail });
+  }
+
+  // 6b. A thread the blocking reviewer has not come back to. AFTER the stale
+  //     review above, and the action is to ask them rather than to fix anything.
+  //
+  //     Putting this in the findings branch was wrong twice over. After a push,
+  //     `derivePr` marks previously cleared threads uncleared until the reviewer
+  //     covers the new head -- so every push dispatched a worker at findings that
+  //     were uncleared only because nobody had looked at the new revision yet,
+  //     when the one thing that could clear them is the review this skipped past.
+  //
+  //     And where the reviewer HAS covered this head, a thread going uncleared
+  //     means it was resolved AFTER their round -- the bot dismissing its own
+  //     finding, which is the case this clause exists for. The answer there is the
+  //     same: ask the reviewer to come back and confirm. Nothing about either case
+  //     says "send a worker to change code".
+  //
+  //     Not dispatching also closes a narrower window: a reviewer's round landing
+  //     between the fold and this decision leaves the count a tick stale, and a
+  //     stale count that costs a review request is self-correcting where one that
+  //     costs a worker is not.
+  if (cleared?.state === "BLOCK") {
+    const R = e.rounds ?? {};
+    if ((R.n ?? 0) < (R.hardCap ?? 10))
+      return act(ACTIONS.REQUEST_REVIEW, cleared.detail, { round: (R.n ?? 0) + 1, uncleared: true });
+    return act(ACTIONS.ESCALATE, ESCALATIONS.CAP_WITH_CRITICAL, { detail: cleared.detail });
   }
 
   if (v.state === "PASS") {

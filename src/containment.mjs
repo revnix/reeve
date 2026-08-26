@@ -119,6 +119,11 @@ export async function measureContainment({
   // runs. Only used on the paid path: a cached or injected verdict spawns
   // nothing, so there is nothing to bind.
   onSpawn = () => {},
+  // Forwarded to the canary and asked immediately before it spends anything.
+  // Reachable ONLY on the paid branch below -- the cheap gates, an injected
+  // verdict and a cache hit all return before it -- which is what makes it a
+  // sound place to take a provider lease.
+  beforeSpawn = async () => ({ ok: true }),
 }) {
   // The keychain is probed for the RECORD, not as a gate. It was a gate while a
   // worker ran with the founder's HOME and could ask securityd directly, and it
@@ -157,7 +162,7 @@ export async function measureContainment({
   else if (!id) cn = { ok: false, id: null, why: "no CLI version or sandbox block to run a canary under" };
   else {
     const run = typeof canary === "function" ? canary : sandboxCanary;
-    cn = await run({ cliVersion, sandbox, permissionsDeny, allowedTools, binaryId, ...canaryPaths, bin, env, onSpawn, ...(netProbe ? { netProbe } : {}) });
+    cn = await run({ cliVersion, sandbox, permissionsDeny, allowedTools, binaryId, ...canaryPaths, bin, env, onSpawn, beforeSpawn, ...(netProbe ? { netProbe } : {}) });
     cn = { ...cn, at: now() };
     cache.set(id, cn);
     if (stateDir && nwo) { try { writeCanaryState(stateDir, nwo, { id: cn.id, cliVersion, bin, binaryId, instrument: instrumentHash({ hasNet: !!netProbe }), policyHash: policyHashOf(sandbox, canaryPaths?.dir ?? null, { permissionsDeny, allowedTools }), stateRoots, allowedTools, canaryDir: canaryPaths?.dir ?? null, ok: cn.ok, why: cn.why, at: cn.at, evidence: cn.evidence ?? null }); } catch { /* the verdict stands without the doctor's copy */ } }

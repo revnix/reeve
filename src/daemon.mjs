@@ -637,6 +637,7 @@ export async function measuredContainment(ctx, profile, nwo, logPath) {
       // paid for -- and a restore or a reap then frees a slot the provider is
       // still serving.
       onSpawn: ctx.canaryOnSpawn ?? (() => {}),
+      beforeSpawn: ctx.canaryBeforeSpawn ?? (async () => ({ ok: true })),
       // The profile LABEL is necessary but not sufficient: it closes containment
       // only when the topology it names is actually in place. The scratch-home
       // arrangement (a home of reeve's making, a per-run standalone clone, a
@@ -954,6 +955,10 @@ export async function tick(ctx) {
   // preserved rather than cancelled: absence from `decisions` means "unknown",
   // not "no longer wanted".
   const unreadable = new Set();
+  // Run refs this tick actually put to the scheduler, and the queued rows it
+  // read. The cancel phase after the dispatch loop needs both.
+  const askedFor = new Set();
+  let queuedNow = [];
   const escalations = new Map();
   /**
    * Raise a cause. The count is the VALUE and can never be part of the key.
@@ -1272,6 +1277,16 @@ export async function tick(ctx) {
   // stream of alerts that each retire the last.
   let hubFaultSaid = false;
   let projectFaultSaid = false;
+  // A scheduler mutation gets a CURRENT handle or nothing.
+  //
+  // `?? hub` was written as a safety fallback and WAS the defect: when the
+  // getter reports the hub unreadable or replaced, falling back to the handle
+  // taken at the top of the tick is exactly the stale-inode write the getter
+  // exists to prevent -- the claim reserves capacity in an unlinked database
+  // while the restored scheduler admits its own. There is no safe old handle;
+  // there is a current one or none. Four sites had it, not the two I counted:
+  // both claims and both binds.
+  const claimHub = () => hubOr(() => null);
   const hubOr = (onFault) => {
     const a = hubNow();
     if (a.why && !hubFaultSaid) {
@@ -1759,18 +1774,17 @@ export async function tick(ctx) {
   // by both the queued sweep below and the canary block further down: two
   // statements of the same condition drift, and the sweep cancelling a request
   // the next few lines are about to make is the shape that drift takes here.
-  // A CACHED PASS IS A MEASUREMENT, and the first version of this read only
-  // `ctx.containment`. Production never assigns that: `measuredContainment`
-  // keeps its verdict in `ctx.containmentCache`, so from the second tick onward
-  // the canary was claimed for a run that `measureContainment` would answer from
-  // cache without spending anything. At capacity that queues `canary:<nwo>`,
-  // requests builder preemption and sets `skipDispatch` -- blocking the real
-  // worker tasks behind a canary that was never going to run.
+  // Whether this tick MIGHT ask for a canary lease. Used only by the queued
+  // sweep, to decide whether a `canary:<nwo>` row is still wanted.
   //
-  // A non-empty cache is enough: its keys are per (CLI build, sandbox block),
-  // and this asks only whether a paid measurement is still owed at all.
-  const containmentCached = (ctx.containmentCache?.size ?? 0) > 0;
-  const willAttemptCanary = Boolean(execute && wanted.length && !(ctx.containment ?? null) && !containmentCached);
+  // Deliberately NOT a prediction of whether the canary will actually run: two
+  // rounds were spent trying to make one and both were wrong, once by claiming
+  // for a call the cheap gates refuse and once by skipping the claim for a call
+  // a failed cache entry does not satisfy. The claim itself now happens inside
+  // the paid path (`canaryBeforeSpawn`), where the question does not arise. What
+  // the sweep needs is only "could this tick still want one", and an injected
+  // verdict is the one case where it certainly cannot.
+  const mightClaimCanary = Boolean(execute && wanted.length && !(ctx.containment ?? null));
 
   // ── the scheduler's own housekeeping, before anything asks it for a slot ──
   //
@@ -1824,23 +1838,19 @@ export async function tick(ctx) {
         // The same predicate the canary block uses, not a second one that agrees
         // today.
         const intended = new Set([
-          ...(willAttemptCanary ? [`canary:${nwo}`] : []),
+          ...(mightClaimCanary ? [`canary:${nwo}`] : []),
           ...wanted.map(d => `${nwo}#${d.e.pr}:${d.decision.action}`)]);
         const queued = (ctx.queuedRequests ?? queuedGuardianRequests)(h, { repoId });
-        // A request belonging to a pull request this tick could not READ is left
-        // alone: only a positive evaluation may withdraw one.
-        const unread = [...unreadable].map(pr => `${nwo}#${pr}:`);
-        for (const row of queued) {
-          if (intended.has(row.run_ref)) continue;
-          if (unread.some(prefix => row.run_ref.startsWith(prefix))) {
-            log(logPath, `provider: keeping the queued request for a PR this tick could not read (${row.run_ref})`);
-            continue;
-          }
-          const c = (ctx.cancelQueued ?? cancelQueued)(h, {
-            owner: "guardian", repoId, runRef: row.run_ref, isAlive: isSameProcess });
-          if (c?.ok) log(logPath, `provider: cancelled a queued request this tick no longer wants (${row.run_ref})`);
-          else log(logPath, `provider: could not cancel ${row.run_ref} — ${c?.reason}`);
-        }
+        // THE CANCEL PHASE RUNS AFTER THE DISPATCH LOOP, not here. `wanted` is
+        // every worker DECISION, and the loop then applies capacity, the
+        // preparation backoff, root-cause resolution, flake assessment, prompt
+        // construction and checkout preparation on top -- so a request can be
+        // "intended" by this set and never actually re-asked. Cancelling from
+        // intent leaves those queued; cancelling from what the tick ACTUALLY
+        // asked for is the honest predicate, and it is only known afterwards.
+        //
+        // Recorded here so the post-loop phase has the rows it read.
+        queuedNow = queued;
 
         // AND SERVE THE HEAD OF THE QUEUE BEFORE ASKING FOR ANYTHING NEW.
         //
@@ -1865,6 +1875,7 @@ export async function tick(ctx) {
         // it empty.
         const head = queued.find(r => intended.has(r.run_ref) && r.run_ref !== `canary:${nwo}`);
         if (head) {
+          askedFor.add(head.run_ref);
           const got = (ctx.providerClaim ?? claimProvider)(h, {
             owner: "guardian", repoId, runRef: head.run_ref,
             pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
@@ -1884,82 +1895,82 @@ export async function tick(ctx) {
   let containment = ctx.containment ?? null;
 
   // THE CANARY IS A DISPATCH. It runs a real model under a real sandbox and
-  // spends real quota, once per tick, so it takes its own lease exactly as a
-  // worker does. Leaving it unleased would let every guardian on the machine run
-  // one unscheduled model call per tick, which is precisely the capacity the
-  // scheduler cannot see.
+  // spends real quota, so it takes its own lease exactly as a worker does.
+  //
+  // THE CLAIM IS MADE INSIDE THE PAID PATH, not predicted from outside it, and
+  // two rounds of trying to predict it is why. Whether a canary actually runs
+  // depends on the cheap platform gates and on a cache hit under an EXACT key
+  // with `ok: true` -- so an outside guess is wrong in both directions:
+  // claiming for a call the cheap gates will refuse (queuing the canary and
+  // blocking builder admission every tick, for a call that never happens), and
+  // skipping the claim when the cache holds a FAILED or obsolete entry (a paid
+  // model call with no lease at all, which is unmetered spend and strictly worse
+  // than the waste it replaced).
+  //
+  // `beforeSpawn` is asked immediately before the runner and can refuse. The
+  // claim now coincides with the spend by construction, and no predicate is
+  // restated anywhere.
   let skipDispatch = false;
   let canaryLease = null;
-  if (willAttemptCanary && hub) {
-    if (repoId == null) {
-      // FAIL CLOSED, unlike an unreadable hub below. A missing repository id is
-      // not "the scheduler is down"; it is "this lease cannot be scoped to
-      // anything", and a lease keyed on a null repo_id is invisible to the live
-      // request index -- so the guardian would insert a fresh live request on
-      // every tick and the limit would never bind.
-      raise("the repository numeric id is unknown; provider leases cannot be scoped");
-      log(logPath, "execute: NOT running the containment canary — the repository id is unknown");
-      // Suppress the DISPATCH, finish the TICK. An early return would skip the
-      // epilogue that sends this very escalation, which is a fail-closed path
-      // silencing its own alarm.
-      skipDispatch = true;
-    } else {
-      let got;
-      // FAIL OPEN on an unreadable scheduler, and the try is what makes that
-      // true. `claimProvider` runs against a handle that can throw, and an
-      // exception outside a catch aborts the tick instead of letting the
-      // guardian proceed unscheduled -- inverting the founder's decision at the
-      // one site a stubbed-containment fixture never reaches.
-      try {
-        // FRESH, like every other scheduler operation. `hubNow()` was wired into
-        // cleanup and the sweep and NOT into the claims, so a restore during the
-        // tick left these reserving capacity in an unlinked database while the
-        // restored hub admitted its own -- the defect the getter was introduced
-        // for, surviving at the two sites that matter most. The bind at spawn
-        // time is the furthest point in the tick from where the handle was taken.
-        got = (ctx.providerClaim ?? claimProvider)(hubOr(() => null) ?? hub, {
-          owner: "guardian", repoId, runRef: `canary:${nwo}`,
-          pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
-      } catch (err) {
-        raise("the provider scheduler is unreadable; dispatching unscheduled");
-        log(logPath, `execute: provider unreadable, running the containment canary unscheduled: ${err.message}`);
-        got = { ok: true, id: null };          // unscheduled, not blocked
-      }
-      if (!got.ok) {
-        // NO RETURN. `queued`, `cooldown` and `at-limit` are ORDINARY outcomes,
-        // and returning here would skip the tick's whole epilogue -- self-audit,
-        // escalation reconciliation and notification, supply derivation, and
-        // noteTick -- on exactly the ticks most likely to need all of them.
-        //
-        // `no-identity` IS NOT ONE OF THEM, and treating every `{ok:false}` the
-        // same buried it. It means this process could not read its own start
-        // time, so liveness could never match the lease it was about to take.
-        // Waiting for a free slot cannot repair that: the guardian would skip
-        // every dispatch for ever with nothing but a log line to show for it.
-        if (got.reason === "no-identity") raise("the guardian cannot read its own process identity; no work can be scheduled");
-        log(logPath, `execute: NOT running the containment canary — provider ${got.reason}`);
-        skipDispatch = true;
-      } else if (got.id != null) {
-        canaryLease = { owner: "guardian", repoId, runRef: `canary:${nwo}`, id: got.id, token: got.token ?? null };
-      }
-    }
-  }
-  if (execute && wanted.length && !containment && !skipDispatch) {
-    // The canary's lease follows its child, exactly as a worker's does. Bound on
-    // the same terms: full identity, exactly one row, and a failure that is
-    // logged rather than fatal -- unlike the worker path, refusing here would
-    // abort a containment measurement that is otherwise fine, and an unbound
-    // canary lease is released by the `finally` below within five minutes.
-    const measureCtx = canaryLease
-      ? { ...ctx, canaryOnSpawn: ({ pid, lstart }) => {
-            try {
-              const b = (ctx.providerBind ?? bindProviderLease)(hubOr(() => null) ?? hub,
-                { ...canaryLease, pid, lstart, isAlive: isSameProcess });
-              if (b?.ok === false || b?.bound !== 1)
-                log(logPath, `execute: canary lease not rebound (${b?.reason ?? `bound ${b?.bound}`})`);
-            } catch (err) { log(logPath, `execute: canary lease could not be rebound — ${err.message}`); }
-          } }
-      : ctx;
+  if (execute && wanted.length && !containment) {
+    const measureCtx = {
+      ...ctx,
+      canaryBeforeSpawn: async () => {
+        const h = claimHub();
+        // FAIL CLOSED on an unscopeable lease. A lease keyed on a null repo_id
+        // is invisible to the live-request index, so the guardian would insert a
+        // fresh live request every tick and the limit would never bind.
+        if (repoId == null) {
+          raise("the repository numeric id is unknown; provider leases cannot be scoped");
+          skipDispatch = true;
+          return { ok: false, why: "the repository id is unknown" };
+        }
+        // No hub is no scheduler: unscheduled, as the founder's decision says,
+        // and the tick still measures.
+        if (!h) return { ok: true };
+        let got;
+        // FAIL OPEN on an unreadable scheduler. An exception outside a catch
+        // would abort the tick instead of letting the guardian proceed.
+        try {
+          got = (ctx.providerClaim ?? claimProvider)(h, {
+            owner: "guardian", repoId, runRef: `canary:${nwo}`,
+            pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
+          askedFor.add(`canary:${nwo}`);
+        } catch (err) {
+          raise("the provider scheduler is unreadable; dispatching unscheduled");
+          log(logPath, `execute: provider unreadable, running the containment canary unscheduled: ${err.message}`);
+          return { ok: true };
+        }
+        if (!got.ok) {
+          // `queued`, `cooldown` and `at-limit` are the scheduler working.
+          // `no-identity` is not: this process cannot read its own start time,
+          // so no lease it takes could ever be matched by liveness, and waiting
+          // repairs nothing.
+          if (got.reason === "no-identity") raise("the guardian cannot read its own process identity; no work can be scheduled");
+          log(logPath, `execute: NOT running the containment canary — provider ${got.reason}`);
+          skipDispatch = true;
+          return { ok: false, why: `provider ${got.reason}` };
+        }
+        if (got.id != null) canaryLease = { owner: "guardian", repoId, runRef: `canary:${nwo}`, id: got.id, token: got.token ?? null };
+        return { ok: true };
+      },
+      // BOUND OR IT DOES NOT RUN, the same rule as a worker's. I made this
+      // non-fatal and argued that refusing would abort a measurement that is
+      // otherwise fine -- which privileged completing the measurement over the
+      // invariant the whole change exists for. A throw here means `withhold`,
+      // `killGroup` and an UNBOUND outcome, so the canary fails and containment
+      // stays open: no dispatch this tick, which is safe and self-correcting.
+      // An unbound canary lease is not.
+      canaryOnSpawn: ({ pid, lstart }) => {
+        if (!canaryLease) return;
+        const b = (ctx.providerBind ?? bindProviderLease)(claimHub(),
+          { ...canaryLease, pid, lstart, isAlive: isSameProcess });
+        if (b?.ok === false)
+          throw new Error(`the canary's provider lease could not be rebound: ${b.reason}`);
+        if (b?.bound !== 1)
+          throw new Error(`the canary's provider lease rebind matched ${b?.bound ?? "no"} row(s); it would stay on the guardian`);
+      },
+    };
     try {
       containment = await measuredContainment(measureCtx, profile, nwo, logPath);
     } finally {
@@ -2093,7 +2104,8 @@ export async function tick(ctx) {
         // to prevent and a silent version of it is indistinguishable from a
         // working one.
         try {
-          got = (ctx.providerClaim ?? claimProvider)(hubOr(() => null) ?? hub, {
+          askedFor.add(prRunRef);
+          got = (ctx.providerClaim ?? claimProvider)(claimHub(), {
             owner: "guardian", repoId, runRef: prRunRef,
             pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
         } catch (err) {
@@ -2386,7 +2398,7 @@ export async function tick(ctx) {
             // a success, and zero rebound is indistinguishable in effect from not
             // having called it.
             if (prLease) {
-              const b = (ctx.providerBind ?? bindProviderLease)(hubOr(() => null) ?? hub, { ...prLease, pid, lstart, isAlive: isSameProcess });
+              const b = (ctx.providerBind ?? bindProviderLease)(claimHub(), { ...prLease, pid, lstart, isAlive: isSameProcess });
               if (b?.ok === false)
                 throw new Error(`the provider lease could not be rebound to the worker: ${b.reason}`);
               if (b?.bound !== 1)
@@ -2712,6 +2724,42 @@ export async function tick(ctx) {
       // A worker whose tools were denied wrote a plausible answer it could not
       // support. Treating that as progress is the fail-open this exists to close.
       if (r.outcome === OUTCOMES.RATE_LIMITED) { raise("the provider is rate limiting; work is paused"); break; }
+    }
+  }
+
+  // ── withdraw what this tick did not actually ask for ──────────────────────
+  //
+  // AFTER the loop, and keyed on what was ASKED rather than on what was
+  // intended. `wanted` is every worker decision; the loop then applies capacity,
+  // the preparation backoff, root-cause resolution, flake assessment, prompt
+  // construction and checkout preparation on top. A request that survives the
+  // first filter and not the rest was never re-asked, so cancelling from intent
+  // preserved it and cancelling from the ask withdraws it -- and a queued row
+  // owned by the live guardian blocks builder admission for as long as it sits
+  // there.
+  //
+  // A pull request this tick could not READ is still exempt: absence there means
+  // unknown, not unwanted, and only a positive evaluation may withdraw one.
+  if (execute && repoId != null && queuedNow.length) {
+    const h = claimHub();
+    if (h) {
+      const unread = [...unreadable].map(pr => `${nwo}#${pr}:`);
+      for (const row of queuedNow) {
+        if (askedFor.has(row.run_ref)) continue;
+        if (unread.some(prefix => row.run_ref.startsWith(prefix))) {
+          log(logPath, `provider: keeping the queued request for a PR this tick could not read (${row.run_ref})`);
+          continue;
+        }
+        try {
+          const c = (ctx.cancelQueued ?? cancelQueued)(h, {
+            owner: "guardian", repoId, runRef: row.run_ref, isAlive: isSameProcess });
+          if (c?.ok) log(logPath, `provider: cancelled a queued request this tick never asked for (${row.run_ref})`);
+          else log(logPath, `provider: could not cancel ${row.run_ref} — ${c?.reason}`);
+        } catch (err) {
+          log(logPath, `provider: could not cancel ${row.run_ref} — ${err.message}`);
+          raise("the provider scheduler is unreadable; dispatching unscheduled");
+        }
+      }
     }
   }
 

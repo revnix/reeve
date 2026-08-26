@@ -1,6 +1,8 @@
 // init must never destroy what it cannot detect, and must never write agent
 // artifacts into a repo that may not carry them.
 import { mergeProfile, semanticDiff, profilePath, compose, prove, canonical } from "../src/init.mjs";
+import { resolveHome } from "../src/home.mjs";
+import { join } from "node:path";
 
 let fail = 0;
 const check = (n, got, want) => { const ok = got === want;
@@ -80,8 +82,14 @@ check("with no existing profile, detection is used whole",
   const priv = compose(structuredClone(base), q, { "project.kind": "product", "authority.policy": "propose_and_merge" });
   check("a private product repo may commit its profile", priv.profile.authority.profileLocation, "committed");
 }
+// THE PROPERTY, not the spelling. This asserted that the path contains the
+// literal `.reeve/profiles`, which is only true when REEVE_HOME happens to be a
+// directory NAMED `.reeve` -- so the standing rule to scope every run with a
+// scratch REEVE_HOME made this fail on a correct configuration. What matters is
+// that a sidecar profile lands under the reeve home and never inside the
+// repository it describes.
 check("a sidecar path never points inside the repo",
-  profilePath("o/r", "sidecar").includes(".reeve/profiles"), true);
+  profilePath("o/r", "sidecar").startsWith(join(resolveHome(), "profiles")), true);
 
 // ── an unanswered question is fatal ───────────────────────────────────────
 // Every unanswerable question is one where a wrong guess makes a gate judge the

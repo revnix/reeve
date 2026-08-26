@@ -212,6 +212,11 @@ export const FIELDS = {
   // the id, and a renamed login must not silently become a stranger.
   "builder.founder.userId":              [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
   "builder.founder.login":               [false, isStr],
+  // How long a cancelling task's effects get to reconcile before `cancel --force`
+  // becomes available. A forced cancel is the one terminal transition whose
+  // external truth was never confirmed, so it must not be reachable before the
+  // reconcilers have had a window at all.
+  "builder.cancel.drainMinutes":         [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
   // Cap on a worker's durable stdout/stderr files. Read by both daemons.
   "worker.maxOutputBytes":               [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
   // How a dispatched worker is isolated from the founder's account. "none"
@@ -334,7 +339,7 @@ export function validate(profile) {
 
   // A container that is not a plain object (an array, a string) would take
   // the defaults as named properties and validate, then serialize to nothing.
-  for (const c of ["builder", "builder.capabilities", "builder.founder", "builder.network", "builder.network.research", "worker"]) {
+  for (const c of ["builder", "builder.capabilities", "builder.cancel", "builder.founder", "builder.network", "builder.network.research", "worker"]) {
     const v = get(profile, c);
     if (v !== undefined && v !== null && (typeof v !== "object" || Array.isArray(v))) errors.push(`${c} must be an object`);
   }
@@ -419,6 +424,7 @@ const UNIVERSAL_DEFAULTS = {
   "builder.capabilities.implementLocal": false,
   "builder.capabilities.publishPr": false,
   "builder.capabilities.mergeBuilderPr": false,
+  "builder.cancel.drainMinutes": 30,
   "worker.maxOutputBytes": 64 * 1024 * 1024,
   "worker.isolation": "none",
 };

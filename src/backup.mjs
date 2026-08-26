@@ -1038,7 +1038,12 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
       // releases it.
       let canonicalFault = null, canonicalGot = null;
       try {
-        live = openHub(dbPath);
+        // THE ONE EXEMPTION from openHub's integrity refusal. This branch opens a
+      // hub that may well be damaged, on purpose: the lock a bootstrapping
+      // builder honours lives INSIDE the file, so exclusion has to be taken there
+      // before the wreck can be quarantined and replaced. A refusal here would
+      // make the recovery command unable to recover.
+      live = openHub(dbPath, { skipIntegrity: true });
         canonicalGot = acquireMaintenanceLock(live, { pid, lstart, isAlive });
         if (canonicalGot.ok) locked = true;
       } catch (e) {

@@ -22,8 +22,17 @@ export PATH="$HOME/.nvm/versions/node/v24.17.0/bin:$PATH"   # node 24 is a floor
 cd ~/Work/Products/reeve && git fetch -q origin
 
 git log --oneline -1 origin/main                     # what `main` is
-git log --oneline -1 HEAD                            # what the DAEMON runs; drift is normal
-gh pr list --state open --json number,headRefName,author,baseRefName \
+git log --oneline -1 HEAD                            # what the CHECKOUT is; NOT what runs
+
+# What the DAEMON runs, which is a different fact. A running process holds the
+# modules it loaded at startup, so fast-forwarding the checkout moves the tree and
+# not the process -- and does not move it until a restart actually succeeds, which
+# it may not. The daemon writes this itself at the moment it starts.
+grep "daemon starting" ~/.reeve/reeve.log | tail -1
+
+# --limit, because `gh pr list` fetches 30 by default and a silent truncation
+# presents a partial list as the whole work queue.
+gh pr list --state open --limit 100 --json number,headRefName,author,baseRefName \
    -q '.[] | "#\(.number) \(.author.login) \(.headRefName) -> \(.baseRefName)"'
 
 # Is reeve ARMED? Read the PROCESS, never the plist: `launchctl kickstart`
@@ -33,8 +42,13 @@ ps -o args= -p "$(launchctl print gui/$(id -u)/com.revnix.reeve | awk '/pid = /{
 # Has a real dispatch ever happened? The store is PER REPO, and read-only here:
 # sqlite3 opens a missing path by CREATING it, so a wrong path answers "zero rows"
 # for a database it just made.
+# A SPAWN, not a prepared contract. Both tables get a row before any process is
+# started, so counting them answers "was a dispatch prepared" -- which is positive
+# for a run that failed before it ever spawned. `worker_run.pid` is written from
+# the spawn callback, so it is the witness that a worker actually ran.
 sqlite3 -readonly ~/.reeve/state/nextlyhq/nextly.db \
-  'select (select count(*) from run) as runs, (select count(*) from worker_run) as workers'
+  'select (select count(*) from run) as prepared,
+          (select count(*) from worker_run where pid is not null) as spawned'
 
 ./bin/reeve doctor nextlyhq/nextly --as-app           # what is broken today
 grep "shadow:" ~/.reeve/reeve.log | tail -1           # the review shadow streak
@@ -162,18 +176,29 @@ because re-deriving them costs more than reading them.
   synchronous call is in flight.
 - **It never leases a kind it cannot perform, and says how many wait.** A stuck
   queue and an idle one look identical otherwise.
-- **Delivery is at-most-once.** The unique key stops a double enqueue and the fence
-  stops two drainers settling over each other; neither closes the window where the
-  comment posts and the drainer dies before recording it. So the key travels into
-  the comment as an invisible marker, filtered at the source, with the AUTHOR
-  checked — the key is built from public values, so without that a contributor
-  could post the marker and the retry would settle done having never asked.
+- **Delivery is AT-LEAST-ONCE, with deduplication that is best-effort by design.**
+  The name matters and an earlier draft got it wrong by calling it at-most-once —
+  a promise this cannot keep, and one this repository had already ruled against in
+  `docs/2026-08-21-builder-design-audit.md`, which records the transactional-outbox
+  contract as at-least-once with idempotent consumers and never exactly-once. What
+  is true, in order of strength: the unique key makes a double ENQUEUE impossible;
+  the fence makes two drainers settling over each other impossible; the marker
+  makes a duplicate COMMENT unlikely. Only the third is about delivery, and the
+  bullet below is why "unlikely" is the honest word. The AUTHOR is checked as well
+  as the marker — the key is built from public values, so without that a
+  contributor could post the marker and the retry would settle done having never
+  asked.
 - **Every failed read falls THROUGH and posts.** A timeout, a truncated buffer and
   a rate limit all look exactly like "no marker found".
-- **A reconciliation pass may confirm a delivery, never make one.** Recovery grants
-  one lease past the budget so the marker check can find a delivery whose settle
-  was lost to a crash; if it finds nothing, posting would deliver on an attempt the
-  budget already refused.
+- **Reconciliation is a second PHASE with a second BUDGET, and may confirm a
+  delivery without ever making one.** Delivery POSTs and must be scarce;
+  reconciliation only reads and can conclude nothing worse than "still cannot
+  tell". Charging both to one counter made the safe act as scarce as the dangerous
+  one, and dead-lettered comments GitHub had actually created. A definite "not
+  there" from GitHub is terminal; a marker that could not be READ is not.
+- **A lease that never ran refunds the budget it charged, and keeps the fence.**
+  The two counters exist separately for exactly this: the lease happened, so the
+  fence stands; no attempt was made, so the budget is not spent.
 - **Reconciliation is against the desired SET, not one key.** Doing it while
   creating a replacement meant it never ran when the desired set was empty — a
   reviewer removed from the profile would still be summoned.
@@ -258,8 +283,13 @@ These cost hours. They are the reason to read this file rather than re-derive it
   roughly triples the review rounds. Both halves of PR 2 are under it.
 - **Reply to AND resolve every thread via GraphQL** — replying alone does not clear
   it — then comment `@codex review` to request the next round.
-- **A 15-minute watcher** on open PRs, at
-  `<scratchpad>/watch-prs.sh`. It emits a heartbeat every eighth tick, keeps the
+- **A 15-minute watcher** on open PRs: `tools/watch-prs.sh`, in this repository.
+  It used to live under whichever scratchpad the session that wrote it happened to
+  own, which this document named as a placeholder — so the one task that most needs
+  it, a fresh session with no watcher running, could not find it and would have had
+  to rebuild a failure-sensitive script from prose. Run it as
+  `tools/watch-prs.sh [PR ...]`, or with no arguments for every open PR you author.
+  It emits a heartbeat every eighth tick, keeps the
   last good reading when a probe fails, alarms after two blind ticks, and only a
   positively-read closed state stops it. An earlier version treated an API blip as
   "the PR closed" and exited with a line that looked like a clean stop.
@@ -276,16 +306,18 @@ is written by nothing.
 **Bring `docs/TRACKER.md` up to date.** §0 says how current it is. What is owed:
 the PR split and why, the two halves, and this session's findings.
 
-**R-01, the merge authority.** doctor reports it broken on `nextlyhq/nextly`:
-admins exempt from every rule, an org-admin bypass with mode `always`, and the
-ruleset carries **no required status check at all**. Instructions were written and
-sent to the founder on 2026-08-24; they need the founder's account, about fifteen
-minutes. It blocks the fourth capability in §2, which has nowhere to stand without
-a required check — see §0 for where that capability sits.
+**R-01, the merge authority.** What the rule MEANS: reeve's fourth capability
+stands between a pull request and `main` as a required status check, so it needs
+a ruleset that actually requires one and does not exempt the people most likely to
+merge. Whether it does today is §0.1's doctor line, not a sentence here.
+Instructions were written and sent to the founder on 2026-08-24; they need the
+founder's account, about fifteen minutes.
 
-**R-03, the merge shape.** doctor reports the repository declares squash while 8
-of the last 20 commits on `main` are merge commits. Not investigated. A gate
-written against a false premise passes for the wrong reason.
+**R-03, the merge shape.** What the rule MEANS: a gate that assumes squash merges
+reasons about ancestry differently from one that expects merge commits, so the
+repository's declared shape and its actual history have to agree. Whether they do
+today is §0.1's doctor line. Not investigated either way — a gate written against
+a false premise passes for the wrong reason.
 
 **The wrong-worker experiment could be re-run.** It published correctly on
 2026-08-24 — 61s, $0.42, 16 turns, 0 denials — against a toy fixture. The harness

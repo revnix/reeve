@@ -34,12 +34,20 @@ Run §0.1's command block. Every one of those lines matters, but two especially:
     CACHED plist, so the file can say `--execute` while the running process does
     not. That happened once and I nearly reported it as done. If the process and
     §0 disagree about arming, find out which changed before doing anything else.
+    The same gap applies to CODE: a running daemon holds the modules it loaded at
+    startup, so the checkout's `HEAD` is not what it runs. The daemon writes its
+    own commit into the log when it starts, and §0.1 greps for that line. Never
+    substitute `git log -1 HEAD` for it — that reports a fix as deployed when the
+    restart it needed has not happened.
 
   · The sqlite line must use `-readonly` and the PER-REPO path. `sqlite3` opens a
     missing file by CREATING it, so a wrong path answers "zero rows" for a
     database it just made. That exact mistake produced a confident zero once.
 
-Expect doctor `broken` on R-01 and R-03. Both are mine and both are in §6.
+§0.1 runs doctor; whatever it reports is the answer. §6 says what R-01 and R-03
+MEAN and which of them need me, and deliberately records no outcome for either,
+because a resumed session told to expect a finding will read real drift as the
+expected one.
 
 ## Your tasks, in priority order
 
@@ -68,9 +76,10 @@ Expect doctor `broken` on R-01 and R-03. Both are mine and both are in §6.
    finding first, and the list exists so you do not pay for them twice.
 
 3. **Keep a 15-minute watcher on my open PRs**, if one is not already running.
-   §5 says where it is and what it must do. It must emit a HEARTBEAT and alarm on
-   a FAILED PROBE: an earlier version read an API blip as "the PR closed" and
-   exited with a line that looked like a clean stop.
+   It is `tools/watch-prs.sh` in the repository — run it, do not rewrite it. Every
+   lesson in its header was paid for once, and the one that matters most is that it
+   must emit a HEARTBEAT and alarm on a FAILED PROBE: an earlier version read an
+   API blip as "the PR closed" and exited with a line that looked like a clean stop.
 
 4. **When those are done**, analyse what is left in §6 and §8 and bring me a
    recommendation with options and trade-offs. Do not pick a big new direction

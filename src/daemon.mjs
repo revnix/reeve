@@ -243,6 +243,20 @@ function trackedAmong(worktree, wanted) {
 export const deadLetterCause = kind =>
   `${kind} effect(s) reeve could not perform and will not retry — they need a person`;
 
+/**
+ * The pull request an effect belongs to, read out of its idempotency key.
+ *
+ * `review-request:<owner>/<repo>:<pr>:...`. Anything that does not match returns
+ * null, and a caller then treats the row as its own subject rather than silently
+ * merging it with another pull request's.
+ *
+ * ONE parse, because two callers need it for opposite purposes -- one to count
+ * dead letters per pull request, one to find out which of those pull requests are
+ * over -- and a key that two readers disagree about is a row that is counted under
+ * one identity and retired under another.
+ */
+export const prFromIdemKey = key => /^[^:]+:[^:]+\/[^:]+:(\d+):/.exec(String(key))?.[1] ?? null;
+
 export const reviewActionsOn = profile => profile?.watch?.reviewActions === true;
 
 export function uncommittedFiles(worktree, copiedBaseline = {}, { digest = digestOf } = {}) {
@@ -682,16 +696,42 @@ function prIsFinished(nwo, pr) {
  * finished work, and an operator stops reading it. That is the same muting the
  * repeat-push guard exists to prevent, arriving from the other direction.
  */
-function finishedSubjects(db, nwo, open, io = {}) {
+export function finishedSubjects(db, nwo, open, io = {}) {
   const isFinished = io.prIsFinished ?? prIsFinished;
   const gone = new Set();
-  let rows = [];
-  try { rows = db.prepare("SELECT why FROM escalation").all(); } catch { return gone; }
-  for (const { why } of rows) {
-    const m = why.match(/^#(\d+):/);
-    if (!m) continue;
-    const pr = Number(m[1]);
-    if (open.has(pr) || gone.has(pr)) continue;
+  const candidates = new Set();
+
+  // Two sources, because a pull request can be standing in this store under an
+  // identity the other source cannot express.
+  //
+  // An escalation names its subject as `#<pr>:`. A dead-letter escalation
+  // deliberately does NOT -- `deadLetterCause` is keyed by kind alone, so that two
+  // reads in one pass update one cause instead of raising two -- and the aggregate
+  // it carries is a count, with the pull requests already summed away. So when a
+  // dead letter is the only escalation a pull request has, scanning escalations
+  // alone finds nothing, the retirement below never runs for it, and its terminal
+  // row and its alert stand for good with a count nothing can reduce. The rows
+  // themselves still know: the pull request is in the idempotency key.
+  try {
+    for (const { why } of db.prepare("SELECT why FROM escalation").all()) {
+      const m = String(why).match(/^#(\d+):/);
+      if (m) candidates.add(Number(m[1]));
+    }
+  } catch { return gone; }
+  try {
+    // Queued as well as terminal. A pending effect for a finished pull request is
+    // the same standing claim on a person's attention, arriving a little earlier:
+    // on the degraded path nothing evaluates the pull request, so nothing else is
+    // ever going to withdraw it.
+    for (const { idem_key } of db.prepare(
+      `SELECT idem_key FROM outbox WHERE status IN ('pending','dead_letter')`).all()) {
+      const pr = prFromIdemKey(idem_key);
+      if (pr !== null) candidates.add(Number(pr));
+    }
+  } catch { /* an unreadable outbox must not cost us the escalation half */ }
+
+  for (const pr of candidates) {
+    if (open.has(pr)) continue;
     if (isFinished(nwo, pr)) gone.add(pr);
   }
   return gone;
@@ -913,9 +953,7 @@ export async function tick(ctx) {
     const rows = db.prepare(`SELECT kind, idem_key FROM outbox WHERE status='dead_letter'`).all();
     const byKind = new Map();
     for (const r of rows) {
-      // `review-request:<owner>/<repo>:<pr>:...` -- anything else counts as its own
-      // subject rather than being silently merged with another.
-      const pr = /^[^:]+:[^:]+\/[^:]+:(\d+):/.exec(r.idem_key)?.[1] ?? r.idem_key;
+      const pr = prFromIdemKey(r.idem_key) ?? r.idem_key;
       if (!byKind.has(r.kind)) byKind.set(r.kind, new Set());
       byKind.get(r.kind).add(pr);
     }

@@ -7,7 +7,7 @@
 //
 // Two things have to hold: the gate is OFF unless a profile says otherwise, and a
 // repeated tick at one head must not ask twice while a NEW head must ask again.
-import { reviewActionsOn, effectsFor, deadLetterCause } from "../src/daemon.mjs";
+import { reviewActionsOn, effectsFor, deadLetterCause, finishedSubjects } from "../src/daemon.mjs";
 import { open, tx, enqueue, supersedeEffects, sha256 } from "../src/db/ops.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -325,6 +325,63 @@ const check = (ok, name, detail) => {
 
   db.close();
   rmSync(dir, { recursive: true, force: true });
+}
+
+// --- a dead letter names no pull request, so something else has to -----------
+{
+  // The retirement finds nothing when a dead letter is a pull request's ONLY
+  // standing claim.
+  //
+  // `deadLetterCause` is keyed by kind alone and carries a count, deliberately:
+  // two reads in one pass have to update one cause rather than raise two, so the
+  // pull requests are summed away before the escalation is written. The clearing
+  // rule recognises only a `#<pr>:` subject. Between those two correct decisions
+  // sits a pull request that merges and can never be discovered as finished --
+  // its terminal row and its alert stand for good, with a count nothing can
+  // reduce, in the surface whose whole value is that it is normally empty.
+  const d = mkdtempSync(join(tmpdir(), "reeve-fin-"));
+  const db2 = open(join(d, "s.db"));
+  const put2 = (pr, key) => tx(db2, () => enqueue(db2, {
+    idemKey: `review-request:o/r:${pr}:${key}`, kind: "gh.pr.comment",
+    args: { nwo: "o/r", pr, body: "please review" } }));
+
+  put2(41, "a");
+  db2.prepare(`UPDATE outbox SET status='dead_letter' WHERE idem_key='review-request:o/r:41:a'`).run();
+  put2(42, "b");                                    // queued, not terminal
+  // #43 is the control: it has an escalation of the kind the old scan could see.
+  put2(43, "c");
+  db2.prepare(`INSERT INTO escalation(why, count, first_seen_at, last_seen_at, announced_count)
+               VALUES('#43: something', 1, unixepoch(), unixepoch(), 1)`).run();
+
+  const asked = [];
+  const io = { prIsFinished: (_nwo, pr) => { asked.push(pr); return pr === 41 || pr === 42 || pr === 43; } };
+  const gone = finishedSubjects(db2, "o/r", new Set(), io);
+
+  check(gone.has(41),
+    "a pull request known only through a dead-lettered effect is still discovered as finished",
+    JSON.stringify([...gone]));
+  check(gone.has(42),
+    "and so is one known only through an effect still queued for it", JSON.stringify([...gone]));
+  check(gone.has(43),
+    "control: without losing the pull requests an escalation names, which is how it used to work",
+    JSON.stringify([...gone]));
+
+  // Asked ONCE each. The two sources overlap in the ordinary case -- a dead letter
+  // usually arrives beside an escalation -- and a set that let a duplicate through
+  // would spend a `gh` call per copy on every tick.
+  check(asked.length === new Set(asked).size,
+    "and GitHub is asked once per pull request, however many rows name it",
+    JSON.stringify(asked));
+
+  // Control: an OPEN pull request is never asked about at all. The open list is
+  // the cheap answer and it has to come first.
+  const openOnly = finishedSubjects(db2, "o/r", new Set([41, 42, 43]), { prIsFinished: () => {
+    check(false, "control: an open pull request must not be asked about", ""); return true;
+  } });
+  check(openOnly.size === 0, "control: nothing open is retired", JSON.stringify([...openOnly]));
+
+  db2.close();
+  rmSync(d, { recursive: true, force: true });
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

@@ -102,15 +102,34 @@ const blocksOf = text => {
   return blocks;
 };
 
+// Sentence machinery, at module scope because EVERY matcher needs it.
+//
+// A sentence ends at a stop, but these documents put emphasis and links between
+// that stop and the next space -- "**...programme.** §3.2 says", or
+// "[doctor reports degraded.](d.md) See §0.1" -- so a naive split leaves the
+// paragraph whole, the §0 pointer in it exempts the lot, and the claim beside the
+// pointer walks through. Both markdown link forms are removed first, leaving the
+// visible text, which is what a reader reads and what these rules are about.
+const SENTENCE = /(?<=[.!?][*_`"')\]]*)\s+/;
+const unlink = s => s
+  .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")     // [text](target)
+  .replace(/\[([^\]]*)\]\[[^\]]*\]/g, "$1");   // [text][ref]
+const sentencesOf = s => unlink(s).split(SENTENCE);
+const defersToZero = s => /§0/.test(s.replace(/\(§0\)/g, ""));
+
 const offendersIn = text => {
   const out = [];
   for (const b of blocksOf(text)) {
-    const joined = b.lines.join(" ");
-    const defers = /§0/.test(joined.replace(/\(§0\)/g, ""));
-    if (defers) continue;
-    b.lines.forEach((line, k) => {
-      if (STATE_CLAIMS.some(re => re.test(line))) out.push(`${b.nums[k]}: ${line.trim().slice(0, 88)}`);
-    });
+    // PER SENTENCE, like every other matcher in this file. This one was left
+    // block-scoped when the others were fixed, and a claim beside a pointer went
+    // straight through it -- "The work is still open. See §0 for details." was
+    // green. Declaring a class swept is not sweeping it: the fix has to be
+    // applied at every site, and this is the site that was missed.
+    for (const sentence of sentencesOf(b.lines.join(" "))) {
+      if (defersToZero(sentence)) continue;
+      if (STATE_CLAIMS.some(re => re.test(sentence)))
+        out.push(`${b.nums[0]}: ${sentence.trim().slice(0, 88)}`);
+    }
   }
   return out;
 };
@@ -267,7 +286,6 @@ const offendersIn = text => {
   // "sentence", it contained a §0 pointer, and it was exempt in full -- so the
   // rule written to catch exactly that line did not catch it. Measured: the stub
   // stayed green until this changed.
-  const SENTENCE = /(?<=[.!?][*_`"')\]]*)\s+/;
 
   // ...and markdown LINKS, which the character class above cannot express.
   //
@@ -277,8 +295,6 @@ const offendersIn = text => {
   // case had, reached through syntax no widening of that class can cover. Link
   // syntax is removed before splitting instead, leaving the visible text, which
   // is what a reader reads and what these rules are about.
-  const unlink = s => s.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
-  const sentencesOf = s => unlink(s).split(SENTENCE);
 
   // THE PREDICATES, defined ONCE and called by both the scan and its controls.
   //
@@ -312,9 +328,16 @@ const offendersIn = text => {
   // strictly worse than nothing, since it would have spared a live claim that
   // happened to mention a date. Tolerance added is detection subtracted, and an
   // exemption that never fires still widens what gets through.
-  const statesRuleOutcome = s => /\bR-\d+\b/.test(s)
-    && /\bR-\d+\b[^.]{0,60}?\b(is|are|lets|allows|requires|carries|exempts|declares|reports?|remains?)\b/i.test(s)
-    && (RULE_OUTCOME.test(s) || NEGATIVE_CHECK.test(s));
+  // The outcome has to be the PREDICATE'S COMPLEMENT, not merely somewhere in the
+  // sentence. "R-01 requires a status check so a broken build cannot merge" is
+  // ordinary rule rationale -- `broken` describes the build -- and a sentence-wide
+  // test rejected it, which pushes exactly the explanation §6 exists to carry out
+  // of the document. Fifteen characters is the room for "is CURRENTLY broken" and
+  // "reports degraded TODAY", and not enough for a noun phrase to intervene.
+  const OUTCOME_NEAR = new RegExp(
+    `\\bR-\\d+\\b[^.]{0,60}?\\b(is|are|lets|allows|requires|carries|exempts|declares|reports?|remains?)\\b`
+    + `[^.]{0,15}?${RULE_OUTCOME.source}`, "i");
+  const statesRuleOutcome = s => /\bR-\d+\b/.test(s) && (OUTCOME_NEAR.test(s) || NEGATIVE_CHECK.test(s));
 
   // `countsRemainingWork` matches a remaining-work CONSTRUCTION, with the
   // qualifier attached to the count rather than merely somewhere in the sentence.
@@ -326,7 +349,7 @@ const offendersIn = text => {
   // because `first` and `next` were accepted unconditionally -- which pressures an
   // author to delete valid context to get a green run. So an ordinal count has to
   // appear in a construction that actually SAYS the items remain.
-  const REMAINS = /\b(remain(s|ing)?|left|outstanding|still to (land|come|do)|to go|not yet)\b/i;
+  const REMAINS = /\b(remain(s|ing)?|left|outstanding|still to (land|come|do)|to go|not yet|are open|is open|still open)\b/i;
   // COMPLETION puts a count in the past, which is history and not a claim about
   // what is left. I argued that `last` was safe unconditionally, on the reasoning
   // that nothing calls finished work "the last two" -- and "the last two PRs
@@ -337,12 +360,16 @@ const offendersIn = text => {
   // check before keeping one: removing it turns both of the sentences below back
   // into offenders, and there is a stub that proves it. An exemption that never
   // fires would be a widened surface waiting for the input that reaches it.
-  const COMPLETED = /\b(landed|merged|shipped|completed|closed|went in|finished|are done|were done)\b/i;
+  // Completion has to attach to the COUNTED WORK. Exempting any sentence that
+  // contains a completion verb anywhere let a live claim through: "The final two
+  // PRs are open, although setup completed yesterday" is remaining work, and
+  // `completed` -- about the setup -- disabled the rule.
+  const COMPLETED_COUNT = /\b(last|final|remaining|first|one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b[^.]{0,20}?\b(landed|merged|shipped|completed|closed|went in|finished)\b/i;
   const countsRemainingWork = s =>
     // "The last two PRs of the durable-effect programme." -- a bare heading
     // naming outstanding work, with no verb to place it in time.
     (/\b(last|remaining|final)\s+(one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(s)
-     && !COMPLETED.test(s))
+     && !COMPLETED_COUNT.test(s))
     // any count, when the sentence says they remain
     || (/\b(first|next|last|one|two|three|four|\d+)\s+(more\s+)?(prs?|pull requests?|stages?)\b/i.test(s)
         && REMAINS.test(s))
@@ -353,7 +380,7 @@ const offendersIn = text => {
     for (const b of blocksOf(text)) {
       const joined = b.lines.join(" ");
       for (const sentence of sentencesOf(joined)) {
-        if (/§0/.test(sentence.replace(/\(§0\)/g, ""))) continue;
+        if (defersToZero(sentence)) continue;
         const lowerS = sentence.toLowerCase();
         const named = [...commands, ...subjectsInComments].filter(c => CLAIM(c).test(sentence))
           .concat(rowWords
@@ -375,7 +402,7 @@ const offendersIn = text => {
       // has to be in the same breath as the claim. A sentence that says "see §0"
       // is exempt; the sentence next to it is not.
       for (const sentence of sentencesOf(joined)) {
-        if (/§0/.test(sentence.replace(/\(§0\)/g, ""))) continue;
+        if (defersToZero(sentence)) continue;
         const lower = sentence.toLowerCase();
         const named = subjects.filter(s => lower.includes(s.toLowerCase()));
         if (named.length) offenders.push(`${label}:${b.nums[0]} names "${named[0]}" — ${sentence.trim().slice(0, 70)}`);
@@ -426,6 +453,15 @@ const offendersIn = text => {
     ["a LAST-count in durable history", "The last two PRs landed on 24 Aug.", false],
     ["a FINAL-count in durable history", "The final two stages landed together.", false],
     ["a bare heading naming outstanding work", "The last two PRs of the durable-effect programme.", true],
+    ["rule rationale mentioning a broken BUILD", "R-01 requires a status check so a broken build cannot merge.", false],
+    ["a live count beside an unrelated completion", "The final two PRs are open, although setup completed yesterday.", true],
+    // Isolates the BINDING. The case above is also caught by the remaining-work
+    // predicate ("are open"), so it passes whether or not completion is tied to
+    // the count -- it proves the rule and not the binding. This one has no
+    // remaining predicate at all, so only the binding can catch it, and the stub
+    // that unbinds completion turns it green.
+    ["a live count whose only completion word is unrelated",
+     "The final two PRs of the programme, although setup completed yesterday.", true],
   ]) check((statesRuleOutcome(sample) || countsRemainingWork(sample)) === want,
            `control: the state-claim rules ${want ? "catch" : "spare"} ${what}`, sample);
 

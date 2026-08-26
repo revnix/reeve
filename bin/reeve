@@ -8,6 +8,7 @@ import { runDoctor, render, checkAppIdentity, hubFindings, renderHub } from "../
 import { open } from "../src/db/ops.mjs";
 import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor, hubPathFor } from "../src/paths.mjs";
 import { openHubAsGuest } from "../src/build/hubguest.mjs";
+import { resolveRepoId } from "../src/build/repoid.mjs";
 import { snapshot, restore, latestSnapshot, exportEvents,
          snapshotAll, restoreHub, validateSnapshot } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
@@ -25,7 +26,7 @@ import { execFileSync } from "node:child_process";
 // over a file whose bytes are still only in the page cache publishes a name for
 // content that a power loss can take away.
 import { existsSync, mkdirSync, renameSync, readFileSync, writeFileSync, readdirSync,
-         openSync, writeSync, fsyncSync, closeSync, rmSync } from "node:fs";
+         openSync, writeSync, fsyncSync, closeSync, rmSync, statSync } from "node:fs";
 // `basename` is `snapshotFor`/`newestCandidate`'s: they read a snapshot's
 // creation time from its `<epoch>.db` FILENAME rather than its mtime, because
 // a copy back from off-device carries a fresh mtime and would report a
@@ -73,23 +74,75 @@ const die = (msg) => { console.error(msg); process.exit(1); };
 // (§1.5, and measured -- resolving one needs the App client, which
 // `builder doctor` deliberately does not use). So H-4 matches projects to
 // `repo_gate_state` rows by `nwo_snapshot`, which both sides have.
-// The guardian's hub handle, or null.
+// The guardian's hub access: a GETTER, and the reasons it is not a handle.
 //
 // RESTRICTED BY CONSTRUCTION. `openHubAsGuest` returns a facade whose authorizer
 // refuses every table outside the guardian's declared surface, and which does not
 // carry the methods that could switch that authorizer off. The privileged
-// `openHub` appears in this file only under `build`, which is the builder's own
-// command and legitimately holds the whole schema.
+// `openHub` appears on the guardian path only in `repoIdOnce` below, for one
+// statement, closed immediately.
 //
-// A hub that is absent or has never been migrated is NOT an error here. A
-// guardian can run on a machine with no builder, and `tick` reads a missing
-// `ctx.hub` as "there is no scheduler", which dispatches unscheduled rather than
-// refusing to work.
-const guardianHub = () => {
+// A GETTER BECAUSE THE FILE MOVES UNDER US. `restoreHub` replaces the hub by
+// renaming a new file over the old one, and a SQLite handle opened beforehand
+// stays attached to the unlinked inode. A daemon that cached one connection for
+// its lifetime would go on claiming and releasing leases in a database nobody
+// else can see -- so the guardian and the builder would each admit up to the
+// global limit, and the guardian would read holds that stopped being true at the
+// restore. The identity is re-checked on every call and the connection reopened
+// when it changes.
+//
+// THREE ANSWERS, NOT TWO, and the earlier version had two. A hub that is absent
+// or unmigrated is `{ hub: null, why: null }` -- an ordinary state, since a
+// guardian can run on a machine with no builder, and the tick dispatches
+// unscheduled. A hub that EXISTS and cannot be opened is
+// `{ hub: null, why: "..." }`, which the tick escalates. Collapsing them made a
+// corrupt hub look like an absent one: no scheduling, no holds, and nothing said.
+const guardianHubAccess = () => {
+  let handle = null, ident = null;
+  const identOf = (p) => { try { const st = statSync(p); return `${st.dev}:${st.ino}`; } catch { return null; } };
+  return () => {
+    const p = hubPathFor(HOME);
+    if (!existsSync(p) || completedVersion(p) < 1) {
+      if (handle) { try { handle.close(); } catch {} handle = null; ident = null; }
+      return { hub: null, why: null };
+    }
+    const now = identOf(p);
+    if (handle && now && now === ident) return { hub: handle, why: null };
+    if (handle) { try { handle.close(); } catch {} handle = null; ident = null; }
+    try {
+      handle = openHubAsGuest(p);
+      ident = now;
+      return { hub: handle, why: null };
+    } catch (err) {
+      handle = null; ident = null;
+      return { hub: null, why: `the hub at ${p} could not be opened as a guest: ${err.message}` };
+    }
+  };
+};
+
+// The numeric repository id, resolved OUTSIDE the guardian's restricted
+// connection and handed in as a number.
+//
+// The guest cannot answer this. `repoIdFromHub` reads `task`, and `task` is not
+// on the guardian's allowlist -- deliberately, because section 13 says the
+// guardian's surface is the provider scheduler and `pr_hold`, and reading the
+// builder's work table would be the third touch the guest connection exists to
+// refuse. Handing the guest to the resolver made every production tick throw,
+// leave `repoId` null, and fail closed on every dispatch.
+//
+// So the CLI answers it, with a privileged handle held for one statement and
+// closed immediately. The running loop never sees privilege; `src/daemon.mjs`
+// cannot reach the privileged opener at all. The end state -- an identity table
+// the guest may read, removing this last privileged read -- is issue #46.
+const repoIdOnce = async (project) => {
+  if (!project) return null;
+  const p = hubPathFor(HOME);
+  if (!existsSync(p) || completedVersion(p) < 1) return null;
+  let db = null;
   try {
-    if (!existsSync(hubPathFor(HOME)) || completedVersion(hubPathFor(HOME)) < 1) return null;
-    return openHubAsGuest(hubPathFor(HOME));
-  } catch { return null; }
+    db = openHub(p);
+    return await resolveRepoId(db, project);
+  } finally { try { db?.close(); } catch {} }
 };
 
 const registryProjects = (home) => {
@@ -1577,13 +1630,23 @@ switch (cmd) {
       // Absent rather than open when there is no hub: a guardian on a machine
       // with no builder has nothing to schedule against, and `tick` treats a
       // missing `ctx.hub` as "unscheduled" rather than failing.
-      hub: guardianHub(),
+      // A GETTER, called per tick. See `guardianHubAccess`: the hub file is
+      // replaced wholesale by a restore, and a cached handle would go on
+      // scheduling in an unlinked database while the builder used the new one.
+      hub: guardianHubAccess(),
       // The registry entry for THIS repository, which is what the repository-id
       // resolver is keyed on. A rename changes `nwo` and never the id, so the
       // project key is the stable half; a repository absent from the registry
       // has no project and the guardian dispatches unscheduled.
       project: (registryProjects(HOME).projects ?? []).find(p => p.nwo === nwo) ?? null,
     };
+    // RESOLVED HERE, not in the tick, because the tick's connection cannot read
+    // it. Re-resolved on the tick's own cadence through this same closure when
+    // it comes back null -- a project whose first task is admitted after the
+    // daemon started would otherwise leave the guardian fail-closed on every
+    // dispatch until someone restarted it.
+    ctx.resolveRepoId = () => repoIdOnce(ctx.project);
+    ctx.repoId = await repoIdOnce(ctx.project);
     // Honour the FLAG as well as the command. The help has always documented
     // `run --tick` as "one pass and exit" while only the separate `tick` command
     // did that, so `reeve run --tick` started the long-running daemon -- the

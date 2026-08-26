@@ -193,8 +193,54 @@ const offendersIn = text => {
       .flatMap(l => l.split(/\s+/).slice(0, 2))
       .map(w => w.replace(/^\.?\/?(?:bin\/)?/, "").replace(/[^\w-]/g, ""))
       .filter(w => w.length >= 6 && /^[a-z][\w-]*$/.test(w)))];
+
+  // The SHORT commands need their subject, because their name is not usable.
+  //
+  // `git`, `gh` and `ps` are three, two and two characters and appear in correct
+  // prose everywhere, so the length filter above drops them -- which left the
+  // measurements they perform completely unpoliced while this test claimed to
+  // cover §0.1. Demonstrated rather than argued: "the current main tip contains
+  // the outbox repair" outside §0 passed a green run of this file.
+  //
+  // §0.1 already names each subject, in backticks, in the comment on its own
+  // line. That is the thing to read: a command added with a comment is policed by
+  // what the comment says it answers, and there is no second list to maintain.
+  const subjectsInComments = [...new Set(
+    [...(/```bash\n([\s\S]*?)```/.exec(zero)?.[1] ?? "").matchAll(/#[^\n]*/g)]
+      .flatMap(m => [...m[0].matchAll(/`([^`]+)`/g)].map(b => b[1]))
+      .map(s => s.trim().toLowerCase())
+      .filter(s => s && s.length >= 3))];
+
   check(commands.length >= 2, "control: §0.1's command block yielded commands to police",
     commands.join(" / "));
+  check(subjectsInComments.length >= 2,
+    "control: and its comments yielded the subjects its short commands measure",
+    subjectsInComments.join(" / "));
+
+  // A row's VALUE is as volatile as its label, and it was not policed at all.
+  //
+  // The label check catches "the founder's merge rule says X". It does not catch a
+  // paragraph that never names the rule and simply RESTATES it -- which is what the
+  // resume prompt did with the merge condition, through green runs of this file.
+  // §0 says change these here and nowhere else; a copy that avoids the label is
+  // still a copy, and it is the one that goes stale silently because nothing links
+  // it back.
+  //
+  // Matched by distinctive-word OVERLAP rather than as a substring, because a
+  // restatement is never a substring: "merge on CI green AND zero open threads"
+  // became "merge when CI is green AND zero threads are open". Four words from one
+  // row, in one sentence, is a restatement rather than a coincidence -- three
+  // fired on ordinary prose when I tried it.
+  const STOP = new Set(["that","this","with","from","have","been","were","will","when","then",
+                        "over","into","only","also","which","after","before","their","there",
+                        "would","could","should","about","while","every","because","rather"]);
+  const rowWords = [...zero.matchAll(/^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*$/gm)]
+    .map(m => [m[1].replace(/`/g, "").trim(),
+               [...new Set(m[2].toLowerCase().replace(/[^a-z0-9\s-]/g, " ").split(/\s+/)
+                 .filter(w => w.length >= 4 && !STOP.has(w)))]])
+    .filter(([, ws]) => ws.length >= 5);
+  check(rowWords.length >= 3, "control: §0's rows yielded VALUES to police, not only labels",
+    rowWords.map(([l, w]) => `${l}(${w.length})`).join(" "));
 
   check(subjects.length >= 4, "control: §0's table yielded subjects to police",
     `${subjects.length}: ${subjects.join(" / ")}`);
@@ -210,15 +256,20 @@ const offendersIn = text => {
   // sentence back and watching the guard stay green. A paragraph can defer to §0
   // and still copy an answer out of it, so the deferral has to be in the same
   // breath as the claim.
+  const esc = s => s.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
   const CLAIM = c => new RegExp(
-    `\\b${c}\\b[^.]{0,40}\\b(reports?|said|says?|shows?|returns?|answers?|reported|broken|degraded|clean|zero|empty)\\b`, "i");
+    `\\b${esc(c)}\\b[^.]{0,40}\\b(reports?|said|says?|shows?|returns?|answers?|reported|contains?|sits at|is at|points at|tip|broken|degraded|clean|zero|empty)\\b`, "i");
   const offenders = [];
   for (const [label, text] of [[HANDOFF, handoff.replace(/^## 0\. STATE[\s\S]*?(?=^## )/m, "")], [PROMPT, prompt]])
     for (const b of blocksOf(text)) {
       const joined = b.lines.join(" ");
       for (const sentence of joined.split(/(?<=[.!?])\s+/)) {
         if (/§0/.test(sentence.replace(/\(§0\)/g, ""))) continue;
-        const named = commands.filter(c => CLAIM(c).test(sentence));
+        const lowerS = sentence.toLowerCase();
+        const named = [...commands, ...subjectsInComments].filter(c => CLAIM(c).test(sentence))
+          .concat(rowWords
+            .filter(([, ws]) => ws.filter(w => new RegExp(`\\b${w}\\b`).test(lowerS)).length >= 4)
+            .map(([label]) => `${label} (restated, not named)`));
         if (named.length) offenders.push(`${label}:${b.nums[0]} claims a "${named[0]}" outcome — ${sentence.trim().slice(0, 70)}`);
       }
       if (/§0/.test(joined.replace(/\(§0\)/g, ""))) continue;

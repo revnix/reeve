@@ -173,7 +173,7 @@ export function nextPhase(state, evidence) {
   // totality matrix reports it as a hole rather than as the crash it is.
   const { phase, generation = 1, heldFrom = null, drainRemaining = 0,
           hasOpenPr = false, pinnedTerritory = false, sourceKind = "founder",
-          hasLiveRun = false, sliceCursor = 0 } = state ?? {};
+          hasLiveRun = false, sliceCursor = 0, drainBeforeStop = 0 } = state ?? {};
   const kind = evidence?.kind;
 
   if (!PHASES.includes(phase)) return refuse(`unknown phase ${JSON.stringify(phase)}`);
@@ -296,8 +296,14 @@ export function nextPhase(state, evidence) {
       // here and this branch simply never read it, so the drain protected the
       // cancellation path and not the resume path -- the one a founder actually
       // reaches for, and reaches for quickly.
-      if (drainRemaining > 0)
-        return refuse(`${drainRemaining} effect(s) from the hold are still draining; ` +
+      // `drainBeforeStop`, not `drainRemaining`. The hold's OWN explanatory
+      // comment is in the full count -- `record-drain` runs last precisely so it
+      // snapshots the compensations too, which CANCELLING needs -- and counting
+      // it here refused every hold-then-resume until something delivered a
+      // comment. The question a resume asks is whether the work the task was
+      // DOING is still in flight.
+      if (drainBeforeStop > 0)
+        return refuse(`${drainBeforeStop} effect(s) from the hold are still draining; ` +
                       `they settle under this generation and would run beside the resumed task. ` +
                       `Resume once they reconcile, or cancel if they never will`);
       // Section 3.4 requires TWO preconditions on resume, not one. A task held
@@ -349,8 +355,19 @@ export function nextPhase(state, evidence) {
         // plan entirely, with the phase machine agreeing that everything before
         // them was done. The old slices belong to the old generation, and the new
         // generation has never implemented anything.
+        // `clear-holds-except-closing`, NOT `clear-holds`. A redesign clears every
+        // hold and then merely ENQUEUES the close -- so between the two, an
+        // abandoned implementation PR is open with no guardian-visible hold. If
+        // the close is delayed, retried, or refused because `publishPr` is off,
+        // its next verdict goes GREEN and a human or a stale client can merge
+        // work from a design that has been superseded. The hold is what makes a
+        // stopped PR unmergeable, and it must outlive the decision to close it.
+        //
+        // The spec PR's hold IS cleared: it is reused, this transition pushes a
+        // new head to it, and it is meant to be workable again.
         return go("DESIGN", { generation: generation + 1, bumps: true, sliceCursor: 0,
-          compensations: ["clear-holds","annotate-resumed","regrant-territory", ...(hasOpenPr ? ["close-prs"] : [])] });
+          compensations: ["clear-holds-except-closing","annotate-resumed","regrant-territory",
+                          ...(hasOpenPr ? ["close-prs"] : [])] });
       if (!heldFrom) return refuse(`${phase} has no held_from recorded; resume cannot know where to re-enter`);
       return go(heldFrom, { generation, compensations: ["clear-holds","annotate-resumed","regrant-territory"] });
     }
@@ -412,8 +429,20 @@ export function nextPhase(state, evidence) {
     // out of attempts and a worker that is still trying look identical from
     // outside. `<id>` stays a placeholder because applyTransition substitutes the
     // task id; `<phase>` cannot, because only the machine knows it.
+    // AN ESCALATION IS A STOP, so it gets the same durable pre-stop accounting
+    // every other stop gets. Without `void-pending` a cancellable effect from
+    // before the escalation stays deliverable, and `stillDeliverable` only
+    // fences it while the task is still ESCALATED -- so whether the external
+    // action happened came down to whether an executor reached the row before
+    // the founder resumed. And without `record-drain` there is no record of what
+    // was INFLIGHT when it stopped, which `void-pending` cannot reach and which
+    // a resume must not run beside. `record-drain` LAST, so it snapshots the
+    // compensations too.
     return go("ESCALATED", { generation, escalate: `bt:<id>:phase:failed:${phase}`,
-      compensations: [...(hasOpenPr ? ["write-pr-hold"] : []), ...(pinnedTerritory ? [] : ["release-territory"])] });
+      compensations: ["void-pending",
+                      ...(hasOpenPr ? ["write-pr-hold"] : []),
+                      ...(pinnedTerritory ? [] : ["release-territory"]),
+                      "record-drain"] });
   }
 
   // CLAIMING leaves on a claim-specific witness, never the generic spine. The
@@ -446,9 +475,12 @@ export function nextPhase(state, evidence) {
     // the rounds were spent on -- so this edge holds it like every other path
     // into a held state. The cap is a founder-held stop, and section 11.7 names
     // the identity for it: fail-closed must never mean fail-quiet.
+    // The same durable accounting as every other stop, for the same reason.
     if (kind === "gate.capReached")  return go("ESCALATED", { generation,
       escalate: `bt:<id>:gate:revision-loop`,
-      compensations: ["write-pr-hold", ...(pinnedTerritory ? [] : ["release-territory"])] });
+      compensations: ["void-pending", "write-pr-hold",
+                      ...(pinnedTerritory ? [] : ["release-territory"]),
+                      "record-drain"] });
     // depth.override from GATE is handled by the shared block below, so the two
     // cannot drift apart.
   }

@@ -16,6 +16,10 @@
 // It is given a `db` and never reaches for one, which is what lets both callers
 // use it inside their own `BEGIN IMMEDIATE` without nesting a transaction.
 import { TERMINAL, HELD } from "./phases.mjs";
+// `task_territory` is a replayed projection, so clearing a spent pin here has to
+// append its row image like every other write to it: an unrecorded change is
+// undone by the next restore, which would hand the resurrection straight back.
+import { hubEvent } from "./hubdb.mjs";
 
 // The terminal phases, as a SQL list. A lease belonging to a task in one of
 // these is dead; every other lease is live, whatever its clock says.
@@ -122,12 +126,47 @@ export const conflictRefusal = (claim, lease) =>
  * that holds when a scan is skipped, reordered, or added to later.
  */
 export function grantLease(db, { project, claim, taskId, at, pinned = false,
-                                 seconds = LEASE_SECONDS }) {
+                                 pinnedUntil = undefined, seconds = LEASE_SECONDS }) {
   const until = at + seconds;
+  // THE PIN'S DEADLINE IS NOT THE LEASE'S. A lease is renewed by working; a pin
+  // is a promise with an END, and deriving it from `at + seconds` on every grant
+  // renews it every time the holder resumes -- so a time-boxed pin never
+  // expires. `pinnedUntil` lets a caller carry the ORIGINAL deadline forward.
+  // Omitted, it behaves as before and takes the lease's expiry, which is right
+  // for a FIRST grant: that is the moment the promise is made.
+  //
+  // An explicit null means "pinned no longer", which is how an expired pin
+  // regrants unpinned rather than being silently renewed.
+  const pinUntil = pinned ? (pinnedUntil === undefined ? until : pinnedUntil) : null;
   // EVERY column the insert would have set, `pinned_until` included. Leaving it
   // out let a replacement keep the previous holder's pin -- or its absence --
   // while that column is the only home of the pin, so a reaper reading it acted
   // on a value no live claim asked for.
+  // THE SECOND DOOR ONTO THE SAME DEFECT, and it is a replacement rather than a
+  // release. The upsert below takes over a row whose holder is no longer LIVE --
+  // which a held task with an expired pin is -- and that overwrite destroys the
+  // previous holder's `pinned_until`. Its `task_territory.pinned` bit survives,
+  // so when THAT task resumes it finds no row, reads the intent, and mints a
+  // fresh deadline: the expired pin, live again, by a path that never touches
+  // `release-territory` and so never reaches the clear there.
+  //
+  // The real repair is to keep the deadline beside the intent, where their
+  // lifetimes cannot diverge. That is a schema change and belongs in its own
+  // pull request; until it lands, the spent intent is cleared here too, so both
+  // ways a lease row can disappear record the same fact.
+  const previous = db.prepare(
+    `SELECT task, pinned_until FROM territory_lease WHERE project=? AND kind=? AND path=?`)
+    .get(project, claim.kind, claim.path);
+  if (previous && previous.task !== taskId
+      && previous.pinned_until !== null && previous.pinned_until <= at) {
+    const spent = db.prepare(
+      `UPDATE task_territory SET pinned = 0
+        WHERE task = ? AND kind = ? AND path = ? AND pinned = 1
+        RETURNING task, kind, path, pinned`)
+      .get(previous.task, claim.kind, claim.path);
+    if (spent) hubEvent(db, { kind: "task_territory.claimed", task: previous.task, payload: spent });
+  }
+
   db.prepare(
     `INSERT INTO territory_lease(project, kind, path, task, expires_at, pinned_until)
      VALUES(?,?,?,?,?,?)
@@ -142,7 +181,7 @@ export function grantLease(db, { project, claim, taskId, at, pinned = false,
                           AND l.kind    = territory_lease.kind
                           AND l.path    = territory_lease.path
                           AND ${LEASE_IS_LIVE})`)
-    .run(project, claim.kind, claim.path, taskId, until, pinned ? until : null);
+    .run(project, claim.kind, claim.path, taskId, until, pinUntil);
 
   const row = db.prepare(
     `SELECT ${LEASE_COLS} FROM territory_lease WHERE project=? AND kind=? AND path=?`)

@@ -244,6 +244,46 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       **The durable finding is about plan SIZE**: a plan needing four rounds and
       still finding sixteen defects at the fourth is one document doing three
       documents' work.
+- [ ] **S2-C PR-C1, the provider admission rule — BUILT (2026-08-26).** Branch
+      `feat/s2c-provider-admission`, based on `0fd2f9a` (S2-B's merge). Task 21
+      of `docs/superpowers/plans/2026-08-23-s2c-provider-scheduler.md`:
+      `src/build/providerdb.mjs` (every scheduler statement) and
+      `src/provider.mjs` (policy only — admission, reservation arithmetic,
+      cooldown), plus `test/provider-scheduler.test.mjs`. **Creates two files and
+      modifies none**, which is why it is first of the four: it cannot affect the
+      running guardian. **Measured 2026-08-26: 79 files, 0 failures, against a
+      78/0 baseline taken on this worktree before anything was written**;
+      `escape.test.mjs` excluded as always, so 79 is not a full-suite count.
+
+      Four stub loops, four checks each. With `BEGIN IMMEDIATE` removed **every
+      single-process assertion still passed and only the 20-process race went
+      red, 10 of 20 holding the last slot** — the plan predicted exactly that,
+      and it is why the race spawns real children instead of looping over one
+      connection.
+
+      **Two defects in the plan, both found by executing it rather than reading
+      it, both of the "test that cannot fail" family** (recorded as A-6 and A-7
+      in the S2-C audit):
+      - `bindProviderLease` is declared with two contradictory signatures. The
+        safe one — matching on `(owner, repo_id, run_ref)` as well as the id — is
+        stated once in prose; the unsafe id-only form appears three times in the
+        code an executor types, **including the plan's own test**, so the test
+        would pass against the unsafe implementation. Stubbing the id-only form
+        fails three assertions, so this is measurable, not stylistic.
+      - The restore-lock block calls seven mutators under a held
+        `maintenance_lock` but passes `isAlive` to one. `assertWritable` asks
+        `isAlive` about the **lock holder** and deletes the lock when it answers
+        no, so the six that default to `isSameProcess` reap the lock and the rest
+        of the block measures an unlocked hub. Six of seven assertions plus both
+        controls fail against a correct implementation. Fixed with one targeted
+        predicate and a new assertion that the lock survived the loop, without
+        which the whole block passes vacuously.
+
+      **Not started: Tasks 22/23/23b (PR-C2/C3/C4).** They touch
+      `src/daemon.mjs` and collide with the peer lane's #32; they wait for that
+      pair to land on main. The repo-id resolver (audit A-2) is settled — one
+      resolver, hub first, GitHub fallback, keyed on the project — and is built
+      in C4, not here.
 - [ ] **S2-B, the phase machine and its effects — BUILT, PR #30 open
       (2026-08-25).** Branch `feat/s2b-phase-machine`, based on `b4bec5d`
       (S2-A's merge plus its four correction PRs). All seven tasks of

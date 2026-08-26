@@ -16,15 +16,29 @@
 export const markerFor = idemKey => `<!-- reeve:effect:${idemKey} -->`;
 
 /**
- * Post a comment on a pull request, at most once.
+ * Post a comment on a pull request. AT-LEAST-ONCE, with deduplication that is
+ * best-effort by design.
  *
- * The outbox's UNIQUE `idem_key` stops the same effect being enqueued twice. It
- * does NOT make delivery exactly-once: a drainer that posts the comment and dies
- * before settling leaves a row that recovery returns to pending, and the retry
- * posts a second comment. The fence prevents two drainers settling over each
- * other; it cannot prevent a crash in the window between the API call and the
- * settle, because that window is on the far side of an effect the API will happily
- * repeat.
+ * The name matters, and an earlier version of this docblock got it wrong by
+ * calling the result "at most once". That is a promise this cannot keep, and the
+ * repository had already ruled against making it: `docs/2026-08-21-builder-design-
+ * audit.md` records the ordinary transactional-outbox contract as at-least-once
+ * delivery with idempotent consumers, and never exactly-once. An implementer who
+ * reads "at most once" will build on a guarantee that does not exist.
+ *
+ * What is actually true, in order of strength:
+ *
+ *  · the outbox's UNIQUE `idem_key` makes double ENQUEUE impossible;
+ *  · the fence makes two drainers settling over each other impossible;
+ *  · the marker below makes a duplicate COMMENT unlikely.
+ *
+ * Only the third is about delivery, and "unlikely" is the honest word. A drainer
+ * that posts and dies before settling leaves a row recovery returns to pending;
+ * the retry's marker read is what stops it posting again, and that read can fail.
+ * When it does, this code posts anyway -- see below -- so the duplicate it was
+ * meant to prevent happens. That is a deliberate choice about which failure to
+ * take, not a gap: a duplicate comment is a nuisance, and a review request that
+ * was silently dropped is a pull request that waits forever.
  *
  * So the key is carried INTO the effect as an invisible marker and looked for
  * first. That is the ordinary answer for an API with no idempotency key of its own:

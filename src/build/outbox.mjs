@@ -163,9 +163,24 @@ const conversationOf = (row) => {
 const blockedByEarlierComment = (db, row) => {
   const conv = conversationOf(row);
   if (!conv) return false;
+  // A PREDECESSOR THE GENERATION FENCE HAS ALREADY CONDEMNED IS NOT ONE.
+  //
+  // `founder.regenerate` bumps the generation without voiding pending rows, so
+  // an old-generation comment sitting on a backoff is certain to settle `fenced`
+  // -- but not until its `not_before` arrives, because the due scan cannot see
+  // it before then. Waiting behind it delays the regenerated task's own status
+  // and close-notice comments by up to the backoff ceiling, for an ordering risk
+  // that cannot exist: the row it is ordered against will never be delivered.
+  //
+  // Matched against the task's CURRENT generation rather than against this row's,
+  // because the question is whether the predecessor can still act at all, not
+  // whether the two agree with each other.
   return db.prepare(
-    `SELECT id, kind, args FROM outbox
-      WHERE kind = ? AND status IN ('pending','inflight') AND id < ? ORDER BY id`)
+    `SELECT o.id, o.kind, o.args FROM outbox o
+       LEFT JOIN task t ON t.id = o.task_id
+      WHERE o.kind = ? AND o.status IN ('pending','inflight') AND o.id < ?
+        AND (o.task_id IS NULL OR t.id IS NULL OR o.task_generation = t.generation)
+      ORDER BY o.id`)
     .all(COMMENT_KIND, row.id)
     .some(earlier => conversationOf(earlier) === conv);
 };

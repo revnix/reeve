@@ -41,6 +41,7 @@ import { compare, record as recordShadow, streak } from "./review/shadow.mjs";
 import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, mkdirSync, fstatSync, statSync, readFileSync, writeFileSync, rmSync, openSync, closeSync, readSync, unlinkSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { resolveHome } from "./home.mjs";
@@ -2270,9 +2271,35 @@ export function announceable(db, escalations, { covered = null, waiting = null, 
 }
 
 /** The long-running loop. Ticks until halted or stopped. */
+/**
+ * The commit this PROCESS is running, read from the tree its own modules came from.
+ *
+ * A commit that cannot be read is reported as unreadable, never guessed: an
+ * invented value here is worse than the checkout reading it replaces.
+ */
+export function runningCommit(from = dirname(fileURLToPath(import.meta.url))) {
+  try {
+    return execFileSync("git", ["-C", from, ...GIT_NEUTRALISE, "rev-parse", "--short", "HEAD"],
+                        { encoding: "utf8", timeout: 10_000 }).trim() || "unreadable";
+  } catch { return "unreadable"; }
+}
+
 export async function run(ctx) {
   const { logPath, intervalMs = 90_000 } = ctx;
-  log(logPath, `reeve daemon starting — node ${process.version}, pid ${process.pid}`);
+  // The COMMIT this process is about to run from, recorded at startup.
+  //
+  // Nothing else can answer the question. `git log -1 HEAD` in the checkout
+  // describes the working tree as it is NOW, and a running daemon holds modules
+  // loaded when it started: fast-forward the checkout and the tree moves while the
+  // process does not, and it does not move until a restart actually succeeds --
+  // which it may not, if tests fail or the session doing it is interrupted between
+  // the two. Reading the checkout then reports a fix as deployed that is not
+  // running anywhere. This line is the only witness taken at the moment that
+  // decides, so it is the one to grep for.
+  //
+  // A commit that cannot be read is recorded as unreadable, never guessed. An
+  // invented value here would be worse than the checkout it replaces.
+  log(logPath, `reeve daemon starting — node ${process.version}, pid ${process.pid}, running commit ${runningCommit()}`);
 
   // Assert the floor rather than trusting the environment: node on this machine's
   // PATH is v22, and launchd never sources a shell profile.

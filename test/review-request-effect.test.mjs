@@ -7,11 +7,12 @@
 //
 // Two things have to hold: the gate is OFF unless a profile says otherwise, and a
 // repeated tick at one head must not ask twice while a NEW head must ask again.
-import { reviewActionsOn, effectsFor, deadLetterCause, finishedSubjects } from "../src/daemon.mjs";
+import { reviewActionsOn, effectsFor, deadLetterCause, finishedSubjects, runningCommit } from "../src/daemon.mjs";
 import { open, tx, enqueue, supersedeEffects, sha256 } from "../src/db/ops.mjs";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -425,6 +426,31 @@ const check = (ok, name, detail) => {
   check(seen.size === 1 && seen.get("codex blocks merges but declares no trigger comment") === 2,
     "two pull requests blocked by one misconfigured reviewer raise one cause counting two",
     JSON.stringify([...seen]));
+}
+
+// --- what the daemon RUNS is recorded, not inferred from the checkout ---------
+{
+  // A running daemon holds modules loaded when it started. Fast-forward the
+  // checkout and the tree moves while the process does not, and it does not move
+  // until a restart actually succeeds -- which it may not, if the suite fails or
+  // the session doing it is interrupted between the update and the restart. So
+  // `git log -1 HEAD` in the checkout answers a different question, and answering
+  // the wrong one reports a fix as deployed that is running nowhere. This is the
+  // witness taken at the moment that decides.
+  const here = execFileSync("git", ["-C", new URL("..", import.meta.url).pathname,
+                                    "rev-parse", "--short", "HEAD"], { encoding: "utf8" }).trim();
+  check(runningCommit() === here,
+    "the daemon reads its commit from the tree its own modules came from",
+    `${runningCommit()} vs ${here}`);
+  check(/^[0-9a-f]{7,}$/.test(runningCommit()),
+    "control: and it is a commit, so the comparison above is not two equal mistakes",
+    runningCommit());
+
+  // A commit it cannot read is UNREADABLE, never guessed. An invented value is
+  // worse than the checkout reading it replaces, because it looks authoritative.
+  check(runningCommit("/nonexistent-path-for-this-test") === "unreadable",
+    "and a tree it cannot read reports unreadable rather than inventing one",
+    runningCommit("/nonexistent-path-for-this-test"));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

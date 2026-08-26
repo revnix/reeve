@@ -302,8 +302,9 @@ These cost hours. They are the reason to read this file rather than re-derive it
 
 ## 6. Unfinished work, and what each piece needs
 
-**The durable-effect programme** (§0). §3.2 says what each stage IS while §0.2's
-durable-effect row says which have landed, and that row is the only place saying so.
+**The durable-effect programme** (§0). What each stage IS lives in §3.2. Which of
+them have landed lives in §0.2's durable-effect row, and §0.2 is the only place
+it is written.
 That pointer was wrong until now: §0 carried no per-stage state at all, so a
 resumed session was sent to a source that could not answer, and the §0.1 commands
 report a git tip and open pull requests rather than plan stages. A count here
@@ -354,9 +355,9 @@ The lesson is the one that put `tools/watch-prs.sh` in the repository, arriving 
 day too late for this: a tool a document tells someone to run has to live where the
 document lives. Rebuilding is perhaps an hour, and it goes in `tools/`.
 
-**Also open:** the ntfy read user and the second project, both §0.2 rows now,
-because both are person-owned states that a session would otherwise have to infer
-from an unticked line here.
+**Also open:** two person-owned items whose state lives in §0.2 rather than in
+this section — §0.2 lists them, because a session would otherwise infer their
+state from an unticked line here.
 
 ---
 
@@ -401,7 +402,7 @@ The order that follows from that:
    proven so far, which is the whole reason this ranks second. In this project a
    dispatch once found what roughly 640 green tests missed.
 3. **R-01** (§0 for its state), because refusing an unsafe merge means standing
-   as a required status check, and a ruleset with no required checks has nowhere
+   as a required status check. A ruleset with no required checks has nowhere
 4. **The merge-refusal capability** (§2, fourth row), after a shadow week.
 
 Re-arming is the founder's decision at every step, and §0 records that the current

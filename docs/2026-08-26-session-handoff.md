@@ -22,7 +22,7 @@ export PATH="$HOME/.nvm/versions/node/v24.17.0/bin:$PATH"   # node 24 is a floor
 cd ~/Work/Products/reeve && git fetch -q origin
 
 git log --oneline -1 origin/main                     # what `main` is
-git log --oneline -1 HEAD                            # what the CHECKOUT is; NOT what runs
+git log --oneline -1 HEAD                            # what `HEAD` is; NOT what runs
 
 # What the DAEMON runs, which is a different fact. A running process holds the
 # modules it loaded at startup, so fast-forwarding the checkout moves the tree and
@@ -75,7 +75,9 @@ this can tell you that its absence is deliberate.
 | capability 1 — watch, judge, escalate | the one that is meant to be on |
 | capability 2 — repair red CI | built, and gated behind `--execute` above |
 | capability 3 — work review threads | being built now; §3 is the plan, and the row below is where it has got to |
-| the durable-effect stages | 1 and 2 landed; 3 is open; 4 not started. §3.2 says what each one IS — this row is the only place that says which have landed |
+| the durable-effect stages | **1, 2 and 4 have landed. 3 has not.** §3.2 says what each one IS — this row is the only place that says which have landed. Stage 4 arrived out of order: wiring the projection gave `FIX_FINDINGS` its real thread list, so the stage defined as "thread details into FIX_FINDINGS" was complete before SPILL's own delivery was built |
+| the second project | `rextaihq/rext-backend` — **not started.** No profile, no store, nothing watching it |
+| the ntfy read user | **not created.** Needs shell on 95.217.11.127, which is the founder's |
 | the R-03 merge shape | **undecided.** The enquiry was done on 2026-08-22 (§6); choosing what this repository declares is the founder's, and has not been made |
 | capability 4 — refuse an unsafe merge | not started; needs a shadow week and the R-01 ruleset flip |
 | the builder daemon | not something this programme runs; S2 is a peer's lane, see §7 |
@@ -306,9 +308,9 @@ That pointer was wrong until now: §0 carried no per-stage state at all, so a
 resumed session was sent to a source that could not answer, and the §0.1 commands
 report a git tip and open pull requests rather than plan stages. A count here
 would be a second copy of that row, and so would a sentence asserting the
-programme is unfinished, which is the same claim with the number removed. What is durable is the shape: the stage that
-matters most makes `FIX_FINDINGS` able to ACT on a review finding rather than
-merely notice one, by giving it the thread details it is dispatched with.
+programme is unfinished, which is the same claim with the number removed. What is durable is the shape (§0 for where it stands): the stage that matters most
+makes `FIX_FINDINGS` able to ACT on a review finding rather than merely notice
+one, by giving it the thread details it is dispatched with.
 
 **Bring `docs/TRACKER.md` up to date.** §0 says how current it is. What is owed:
 the PR split and why, the two halves, and this session's findings.
@@ -352,8 +354,9 @@ The lesson is the one that put `tools/watch-prs.sh` in the repository, arriving 
 day too late for this: a tool a document tells someone to run has to live where the
 document lives. Rebuilding is perhaps an hour, and it goes in `tools/`.
 
-**Also open:** ntfy read user (needs shell on 95.217.11.127); second project
-(`rextaihq/rext-backend`).
+**Also open:** the ntfy read user and the second project — both §0.2 rows now,
+because both are person-owned states that a session would otherwise have to infer
+from an unticked line here.
 
 ---
 

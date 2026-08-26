@@ -223,9 +223,15 @@ const offendersIn = text => {
   const bash = /```bash\n([\s\S]*?)```/.exec(zero)?.[1] ?? "";
   // The backticked terms in §0.1's COMMENTS, which is where §0.1 already says
   // what each command answers.
+  // NO LENGTH FILTER here, and that was a real hole. A term is in a §0.1 comment
+  // and in backticks because §0.1 is naming it as the thing that command answers
+  // -- `main`, `HEAD`, `run`. Dropping them for being short meant "HEAD points at
+  // 1234567." passed, which is exactly a fact §0.1 exists to measure. The length
+  // filter is for terms INFERRED from a label, where a common word would fire on
+  // ordinary prose; these are declared, so there is nothing to infer.
   const fromComments = [...bash.matchAll(/#[^\n]*/g)]
     .flatMap(m => [...m[0].matchAll(/`([^`]+)`/g)].map(b => b[1]))
-    .map(s => s.trim()).filter(s => s.length >= 6);
+    .map(s => s.trim()).filter(Boolean);
   // And the COMMAND NAMES themselves. Dropping these was a regression I nearly
   // shipped: the simplification passed on clean documents, and the stub loop then
   // showed it caught NONE of the four defects the old rules had caught -- a
@@ -233,6 +239,12 @@ const offendersIn = text => {
   // DECISION is the change the founder asked for; narrowing what the decision is
   // made ABOUT was an accident of the same edit.
   const fromCommands = [...new Set(bash.split("\n")
+    // A CONTINUATION line is not a command. The sqlite query wraps, and its
+    // second line begins `(select count(*) ...` -- so `select` became a
+    // "command name" and any durable sentence containing the word Select was
+    // rejected. Continuations and quoted bodies are indented; command starts are
+    // not, which is a fact about the block's own formatting rather than a guess.
+    .filter(l => !/^\s/.test(l))
     .map(l => l.split("#")[0].trim()).filter(Boolean)
     .flatMap(l => l.split(/\s+/).slice(0, 2))
     // A QUOTED token is an argument, never a command name. `grep "daemon
@@ -272,16 +284,48 @@ const offendersIn = text => {
 
   // A DATE, in any form these documents actually use. Mechanical, and the only
   // thing standing in for "this is history".
-  const DATED = /\b20\d\d-\d\d-\d\d\b|\b\d{1,2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\b|\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}\b/;
+  const DATE = /\b20\d\d-\d\d-\d\d\b|\b\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\b|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]* \d{1,2}\b/;
+  // "SINCE <date>" is not history. It is a claim that reaches today with a
+  // starting point attached, and a date escape that took it at face value would
+  // excuse the most confident form of the thing this rule exists to stop:
+  // "R-01 has been broken since 2026-08-22." Mechanical -- the word before the
+  // date -- so it needs no view about tense.
+  const ONGOING = new RegExp(`\\b(since|as of|from)\\s+(?:${DATE.source})`, "i");
+  const DATED = s => DATE.test(s) && !ONGOING.test(s);
   // A HEADING or a bold LABEL names its subject; it does not assert anything about
   // it. Both are markdown structure rather than grammar, so recognising them
   // needs no opinion about English: a line beginning `#`, or a sentence wholly
   // wrapped in emphasis. Requiring "## 3. The durable-effect programme (§0)"
   // would be noise for no reader's benefit, and a rule that fires on right text
   // is weakened until someone turns it off.
+  // WORD BOUNDARIES, not substrings. `main` is a subject and `remaining` contains
+  // it, so a substring test rejected a sentence about a drainer's remaining
+  // budget for naming the default branch. This had to arrive WITH the change that
+  // stopped dropping short declared subjects: keeping `main` under a substring
+  // test would have fired on ordinary prose everywhere, which is how a guard gets
+  // switched off rather than fixed.
+  const namesSubject = (sentence, s) => {
+    // CASE MATTERS when the subject carries a capital. `HEAD` is a git ref and
+    // `head` is an ordinary English word these documents use constantly -- "the
+    // head, the profile", "the MERGED head" -- so a case-insensitive match
+    // rejected four sentences that had nothing to do with the ref. A subject
+    // written in lower case (`main`, `doctor`) is matched either way, because
+    // nothing is lost by it.
+    const cased = /[A-Z]/.test(s);
+    const esc = s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const lead = /^[a-z0-9]/i.test(s) ? "\\b" : "";
+    const tail = /[a-z0-9]$/i.test(s) ? "\\b" : "";
+    return new RegExp(`${lead}${esc}${tail}`, cased ? "" : "i").test(sentence);
+  };
   const isHeading = s => /^\s*#/.test(s);
   const isLabel = s => /^\s*\*\*[^*]+\*\*[.:,;]?\s*$/.test(s);
-  const excused = s => defersToZero(s) || DATED.test(s) || isHeading(s) || isLabel(s);
+  // `isLabel` is deliberately NOT here. Label handling lives in the scan, where
+  // it can see whether anything FOLLOWS the label -- a lead-in is exempt, a bold
+  // sentence standing alone is the assertion. Leaving it in this chain too meant
+  // the scan's careful version was never reached: "**doctor reports degraded.**"
+  // fell through to the blanket exemption one line later. Two places deciding one
+  // thing, and the looser of them won.
+  const excused = s => defersToZero(s) || DATED(s) || isHeading(s);
 
   const offenders = [];
   for (const [label, text] of [[HANDOFF, handoff.replace(/^## 0\. STATE[\s\S]*?(?=^## )/m, "")], [PROMPT, prompt]])
@@ -290,7 +334,15 @@ const offendersIn = text => {
       // durable-effect programme" splits at "3." into two, and the half carrying
       // the subject no longer looks like a heading -- so the exemption has to be
       // taken where the structure is still visible.
-      if (isHeading(b.lines[0])) continue;
+      // The heading LINE, not the block. Markdown does not require a blank line
+      // after a heading, so "## Doctor state" followed straight by a paragraph is
+      // one block -- and skipping the block skipped the paragraph with it.
+      // TABLE ROWS are structure, and they are policed by a rule of their own --
+      // "no table outside §0 has a state column", a few blocks below. A row saying
+      // what capability 4 DOES is a definition, and running the sentence scan over
+      // it would demand a §0 pointer inside a table cell for no reader's benefit.
+      const body = b.lines.filter(l => !isHeading(l) && !/^\s*\|/.test(l));
+      if (!body.length) continue;
       // A LABEL carries its subject forward.
       //
       // "**R-01.** It is broken right now." is two sentences: the first is a label
@@ -300,11 +352,17 @@ const offendersIn = text => {
       // the label's subject into the sentences that follow it needs no grammar at
       // all, and covers the same case.
       let carried = [];
-      for (const sentence of sentencesOf(b.lines.join(" "))) {
+      const sentences = sentencesOf(body.join(" "));
+      for (const sentence of sentences) {
         const lower = sentence.toLowerCase();
-        const here = subjects.filter(s => lower.includes(s.toLowerCase()))
+        const here = subjects.filter(s => namesSubject(sentence, s))
           .concat(SUBJECT_PATTERNS.filter(([re]) => re.test(sentence)).map(([, n]) => n));
-        if (isLabel(sentence)) { carried = here; continue; }
+        // A LABEL is a lead-in: bold text INTRODUCING the prose that follows it in
+        // the same block. A bold sentence standing alone is not introducing
+        // anything, it is the assertion -- "**doctor reports degraded.**" was
+        // being waved through as a label. Judged by whether anything follows it,
+        // which is structure rather than grammar.
+        if (isLabel(sentence) && sentences.length > 1) { carried = here; continue; }
         if (excused(sentence)) { carried = []; continue; }
         const named = here.concat(carried.map(s => `${s} (from the label above)`))
           .concat(rowValues
@@ -326,9 +384,20 @@ const offendersIn = text => {
     ["one carrying an ISO date", "R-01 was broken on 2026-08-22.", true],
     ["one carrying a written date", "R-01 was broken on 22 Aug.", true],
     ["a dated count", "The last two PRs landed on 24 Aug.", true],
+    ["an ONGOING claim wearing a date", "R-01 has been broken since 2026-08-22.", false],
+    // THE TRADE, stated rather than discovered again. Rationale that names an
+    // R-rule is not excused: "R-01 requires a status check so a broken build
+    // cannot merge" has to say "(§0 for its state)" or carry a date. The previous
+    // design tried to tell rationale from a live claim by reading the sentence,
+    // and that is what cost five rounds. Asking the author for four words is the
+    // price of a rule that can never be wrong about English, and it is the price
+    // the founder chose.
+    ["rationale that names a rule, which must still defer",
+     "R-01 requires a status check so a broken build cannot merge.", false],
+    ["another ongoing form", "doctor has reported degraded as of 2026-08-22.", false],
     ["an undated count", "The last two PRs of the programme.", false],
     ["a section heading", "## 3. The durable-effect programme", true],
-    ["a bold label", "**R-01, the merge authority.**", true],
+    ["a bold label — excused by the SCAN, not by this chain", "**R-01, the merge authority.**", false],
 
   ]) check(excused(sample) === want, `control: "defer or date" ${want ? "excuses" : "catches"} ${what}`, sample);
 

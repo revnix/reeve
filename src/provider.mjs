@@ -140,7 +140,12 @@ export function claimProvider(db, { owner, repoId, runRef, pid, lstart, priority
       const id = existing?.id ?? insertLease(db, {
         owner, repoId, runRef, pid, lstart, priority, budgetUsd,
         status: "queued", at, expiresAt: at + LEASE_SECONDS }).id;
-      requestPreemptionIfStarved(db, state);
+      // NOT WHILE COOLING. A guardian queued behind a cooldown is not waiting
+      // for a SLOT, so asking a builder to surrender one suspends running work
+      // to produce capacity that then sits idle until the cooldown lifts. The
+      // helper says so in its own contract and this call site ignored it, which
+      // is a documented invariant enforced nowhere.
+      if (!cooling) requestPreemptionIfStarved(db, state);
       return refuse("queued", { id });
     }
 
@@ -178,8 +183,20 @@ export function releaseProvider(db, { id = null, owner = null, repoId = null,
                                       isAlive = isSameProcess, now = null } = {}) {
   return guarded(db, { isAlive, now }, () => {
     const hasIdentity = owner != null && repoId != null && runRef != null;
+    // AN ID ALONE IS NOT AN IDENTITY, and defaulting to one silently undid the
+    // fence this function documents. A restore clears `provider_lease` and lets
+    // SQLite reuse the integer, so a cleanup running in a `finally` after that
+    // has happened deletes an unrelated LIVE lease -- and the scheduler then
+    // undercounts held capacity and admits work past the provider limit. The
+    // dangerous call is the easy one to write, which is why it has to be refused
+    // rather than merely discouraged.
+    //
+    // `force` is the named way to say it anyway. It is for a caller that has
+    // genuinely lost the identity, and it has to be TYPED at the call site so it
+    // appears in review rather than being reached by omission.
+    if (!hasIdentity && !force) return refuse("no-identity");
     if (!hasIdentity && id == null) return refuse("no-identity");
-    const released = (!hasIdentity || force)
+    const released = (!hasIdentity || (force && id != null))
       ? deleteLeaseById(db, id).changes
       : deleteLease(db, { id, owner, repoId, runRef }).changes;
     return { ok: true, released };

@@ -33,7 +33,11 @@ const ALIVE = () => true, DEAD = () => false;
   check(!b.ok && b.reason === "at-limit",
     "a builder claim is refused when held leases reach limit minus guardian_reserved (2-1=1)", JSON.stringify(b));
 
-  releaseProvider(db, { id: g.id });
+  // THE CLAIM HANDS BACK WHAT THE RELEASE NEEDS. `claimProvider` returns the
+  // identity alongside the id precisely so a caller never has to release by an
+  // integer a restore can renumber, and passing the whole result is the shape
+  // production should copy.
+  releaseProvider(db, g);
   const b2 = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 2, lstart: "B", isAlive: ALIVE });
   check(b2.ok, "control: once the guardian releases, the builder is admitted");
   db.close();
@@ -102,7 +106,7 @@ const ALIVE = () => true, DEAD = () => false;
   check(db.prepare("SELECT count(*) c FROM provider_lease WHERE owner='guardian' AND status='queued'").get().c === 1,
     "re-asking for the SAME run does not add a second queued row");
 
-  releaseProvider(db, { id: a.id });
+  releaseProvider(db, a);
   const e = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:4", pid: 5, lstart: "E", isAlive: ALIVE });
   check(!e.ok && e.reason === "queued",
     "and the freed slot is not taken by the next builder while a guardian is queued", JSON.stringify(e));
@@ -197,6 +201,71 @@ const ALIVE = () => true, DEAD = () => false;
   check(good.bound === 1, "control: the current holder's rebind is applied", JSON.stringify(good));
   check(heartbeatProvider(db, { id: fresh.id, owner: "builder", repoId: 1, runRef: "bt:new" }).beat === 1,
     "control: and so is its heartbeat");
+  db.close();
+}
+
+// ── releasing by an id alone is refused ─────────────────────────────────────
+// The id is a fast path, never an identity. A restore clears `provider_lease`
+// and SQLite reuses the integer, so a cleanup running in a `finally` after that
+// deletes an unrelated LIVE lease -- and the scheduler then undercounts held
+// capacity and admits work past the provider limit. The dangerous call is the
+// easy one to write, so it has to be refused rather than discouraged.
+{
+  const db = openHub(join(dir, "p7.db"));
+  const held = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE });
+  const bare = releaseProvider(db, { id: held.id });
+  check(!bare.ok && bare.reason === "no-identity",
+    "a release carrying only an id is refused", JSON.stringify(bare));
+  check(db.prepare("SELECT count(*) c FROM provider_lease").get().c === 1,
+    "control: and the lease is still there, so the refusal was not a silent delete");
+
+  // FORCE is the named way to say it anyway, for a caller that has genuinely
+  // lost the identity. It has to be typed at the call site so it shows up in a
+  // review rather than being reached by omission.
+  const forced = releaseProvider(db, { id: held.id, force: true });
+  check(forced.ok && forced.released === 1,
+    "control: `force` still deletes by id, explicitly", JSON.stringify(forced));
+
+  // And the ordinary path: the whole claim result, which carries the identity.
+  const again = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:2", pid: 2, lstart: "B", isAlive: ALIVE });
+  check(releaseProvider(db, again).released === 1,
+    "control: releasing with the identity the claim returned works");
+  // A WRONG identity with a RIGHT id deletes nothing, which is the fence.
+  const third = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:3", pid: 3, lstart: "C", isAlive: ALIVE });
+  check(releaseProvider(db, { id: third.id, owner: "builder", repoId: 1, runRef: "bt:WRONG" }).released === 0,
+    "and an id whose identity does not match deletes nothing");
+  check(db.prepare("SELECT count(*) c FROM provider_lease").get().c === 1,
+    "control: that lease survived, so the id alone did not carry the delete");
+  db.close();
+}
+
+// ── a cooldown queue is not a capacity queue ────────────────────────────────
+// A guardian queued behind a cooldown is not waiting for a SLOT. Asking a
+// builder to surrender one suspends running work to produce capacity that then
+// sits idle until the cooldown lifts.
+{
+  const db = openHub(join(dir, "p8.db"));
+  db.exec(`INSERT INTO provider_state(provider,concurrency_limit,guardian_reserved)
+           VALUES('claude',1,0)
+           ON CONFLICT(provider) DO UPDATE SET concurrency_limit=1, guardian_reserved=0`);
+  const b = claimProvider(db, { owner: "builder", repoId: 1, runRef: "bt:1", pid: 1, lstart: "A", isAlive: ALIVE, now: 1000 });
+  check(b.ok, "fixture: the single slot is builder-held", JSON.stringify(b));
+  noteRateLimit(db, { signature: "429", now: 1000, cooldownSeconds: 300 });
+
+  const gq = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 2, lstart: "G", isAlive: ALIVE, now: 1100 });
+  check(!gq.ok && gq.reason === "queued", "fixture: the guardian queues during the cooldown", JSON.stringify(gq));
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE preempt_requested=1").get().c === 0,
+    "no builder is asked to give up a slot the guardian could not use anyway",
+    JSON.stringify(db.prepare("SELECT owner,run_ref,preempt_requested FROM provider_lease").all()));
+
+  // CONTROL: once the cooldown has passed, the SAME starved state does request
+  // preemption -- or "skip while cooling" has become "never preempt".
+  const after = claimProvider(db, { owner: "guardian", repoId: 1, runRef: "pr:1", pid: 2, lstart: "G", isAlive: ALIVE, now: 1400 });
+  check(!after.ok && after.reason === "queued", "control: still queued after the cooldown, since the slot is held",
+    JSON.stringify(after));
+  check(db.prepare("SELECT count(*) c FROM provider_lease WHERE preempt_requested=1").get().c === 1,
+    "control: and NOW the youngest builder is asked to yield",
+    JSON.stringify(db.prepare("SELECT owner,run_ref,preempt_requested FROM provider_lease").all()));
   db.close();
 }
 

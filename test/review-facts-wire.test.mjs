@@ -263,6 +263,55 @@ const ev = rounds => {
     "an unreadable live read is not agreement either", JSON.stringify(blind.projection));
 }
 
+// --- uncleared threads, scoped to whose silence counts -----------------------
+{
+  // "Resolved" and "cleared" answer different questions. Resolved is a CLAIM --
+  // the bot resolves its own threads, and `@coderabbitai resolve` is
+  // author-invokable and bulk-resolves -- so a critical finding can leave the
+  // verdict by being dismissed by the thing that filed it. Cleared is EVIDENCE.
+  //
+  // The scoping is the part that needed thought rather than the counting. An
+  // advisory reviewer that files a thread and never returns leaves it uncleared
+  // FOREVER, so gating on every reviewer would block every pull request
+  // permanently the first time one went quiet. Blocking-ness is what says whose
+  // silence counts, and it is the same rule the review clause already applies.
+  // The store has moved on by this point in the file: an earlier block resolved
+  // one thread and gave the reviewer a later round, so one is cleared and one is
+  // not. The live read has to describe THAT moment -- the projection is checked
+  // against it, and a live read from an earlier moment reads as disagreement,
+  // which is the cross-check working rather than the fixture being right.
+  const f = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A,
+                          at: T + 900, live: liveOf(2, 1), io: { foldPrecedesEvaluation: true } });
+  check(f.cleared.readable === true, "control: the projection is usable", JSON.stringify(f.cleared));
+  check(f.cleared.uncleared === 1,
+    "the blocking reviewer's uncleared thread is counted, and the cleared one is not",
+    JSON.stringify(f.cleared));
+  check(f.cleared.reviewers.includes("codex"),
+    "and the reviewer is named, because a person needs to know WHO has not returned",
+    JSON.stringify(f.cleared.reviewers));
+
+  // An ADVISORY reviewer's threads do not gate. Same store, same threads, one
+  // word changed in the profile.
+  const advisory = { ...PROFILE, reviewers: PROFILE.reviewers.map(r => ({ ...r, kind: "advisory" })) };
+  // RE-DERIVED under that profile, and it has to be. A reviewer's kind is part of
+  // the classifier version, so reading the old projection with a changed profile
+  // is UNKNOWN rather than a different answer -- which is correct, and would have
+  // made this control pass for the wrong reason had I not looked at the `why`.
+  derivePr(db, NWO, 1, advisory, { at: T + 900, head: HEAD_A });
+  const g = reviewFacts({ db, nwo: NWO, pr: 1, profile: advisory, head: HEAD_A,
+                          at: T + 950, live: liveOf(2, 1), io: { foldPrecedesEvaluation: true } });
+  check(g.cleared.readable === true && g.cleared.uncleared === 0,
+    "an advisory reviewer's uncleared threads do not gate, so going quiet cannot block forever",
+    JSON.stringify(g.cleared));
+
+  // And an unusable projection is UNKNOWN here too, never zero.
+  derivePr(db, NWO, 1, PROFILE, { at: T + 960, head: HEAD_A });   // restore for anything after
+  const blind = reviewFacts({ db, nwo: NWO, pr: 999, profile: PROFILE, head: HEAD_A,
+                              at: T + 900, live: liveOf(0, 0), io: { foldPrecedesEvaluation: true } });
+  check(blind.cleared.readable === false,
+    "an unusable projection cannot say what is uncleared, and says so", JSON.stringify(blind.cleared));
+}
+
 // --- and the EVALUATION is actually wired to it ------------------------------
 {
   // Everything above proves the seam works. None of it proves the product uses

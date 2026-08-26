@@ -150,6 +150,7 @@ export function readReviewerStates(nwo, pr, head, reviewers, io = null) {
 export function reviewFacts({ db, nwo, pr, profile, head, live = null,
                              at = Math.floor(Date.now() / 1000), io = {} }) {
   const unknown = why => ({ unspilledCritical: null, rounds: null, threadDetails: null,
+                            cleared: { readable: false, why },
                             projection: { readable: false, why } });
   if (!db) return unknown("no state database");
   let st;
@@ -219,10 +220,34 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
   // things changing in place, and no amount of further counting fixes that.
   const bodies = st.bodyFindingsDerived === true;
   const fresh = io.foldPrecedesEvaluation === true;
+  // UNCLEARED THREADS, scoped to the reviewers whose opinion gates a merge.
+  //
+  // "Resolved" and "cleared" answer different questions and the difference is the
+  // reason the fold exists. Resolved is a CLAIM: the bot resolves its own threads
+  // -- measured, eight on one pull request with nobody replying -- and
+  // `@coderabbitai resolve` is author-invokable and bulk-resolves. Cleared is
+  // EVIDENCE: a later substantive round by the same reviewer, at this head, has
+  // been and gone. The verdict has been reading the claim.
+  //
+  // Scoped to BLOCKING reviewers, and that is not a detail. An advisory reviewer
+  // that files a thread and never returns leaves it uncleared forever, so gating
+  // on every reviewer would block every pull request permanently the first time
+  // one of them went quiet. Blocking-ness is what says whose silence counts,
+  // which is the same rule the `review` clause already applies to coverage.
+  const blockingLogins = new Set((profile?.reviewers ?? [])
+    .filter(r => r.kind === "blocking").map(r => r.login));
+  const uncleared = (st.threads ?? []).filter(t => blockingLogins.has(t.reviewer));
+
   return {
     rounds: st.rounds,
     unspilledCritical: bodies ? st.unspilledCritical : null,
     threadDetails: fresh ? st.threads : null,
+    // Readable independently of `fresh`: a tick-old list of WHICH threads are
+    // uncleared is not safe to dispatch a worker against, but the COUNT is safe
+    // to block on -- being one tick behind can only mean blocking slightly too
+    // long, never merging something a reviewer has not returned to.
+    cleared: { readable: true, uncleared: uncleared.length,
+               reviewers: [...new Set(uncleared.map(t => t.reviewer))] },
     projection: {
       readable: true,
       ...(bodies ? {} : { countUnknown: "review-body findings are not derived yet, so a zero could be missing a body-only critical" }),
@@ -359,7 +384,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     head: pin.sha,
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, failing: c.failing, inherited: c.inherited },
     base: { verdict: base.verdict },
-    reviewers, rounds, threads, ledgerBlockers,
+    reviewers, rounds, threads, cleared: facts.cleared, ledgerBlockers,
     mergeState: threads.mergeState, profile,
   });
 
@@ -369,7 +394,8 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
            // empty array and an unreadable projection are different facts, so the
            // second is null: a caller must be able to tell "nothing is open" from
            // "reeve cannot say what is open".
-           threadDetails: facts.threadDetails, reviewProjection: facts.projection };
+           threadDetails: facts.threadDetails, reviewProjection: facts.projection,
+           cleared: facts.cleared };
 }
 
 /**

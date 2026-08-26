@@ -20,10 +20,55 @@ const good = () => ({
   reviewers: [{ login: "codex", kind: "blocking", state: "CLEAN", reviewedHead: HEAD.slice(0, 10) }],
   rounds: { n: 2, softCap: 5, hardCap: 10, unspilledCritical: 0 },
   threads: { unresolved: 0, total: 4, readable: true },
+  // A satisfied revision has both: GitHub calls nothing unresolved AND every
+  // blocking reviewer has come back to what it filed. They are different facts,
+  // and the second is the one a bot self-resolving its own thread cannot fake.
+  cleared: { readable: true, uncleared: 0, reviewers: [] },
   ledgerBlockers: 0,
   mergeState: "CLEAN",
 });
 const withOut = mut => { const i = good(); mut(i); return computeVerdict(i).state; };
+
+// --- resolved is a CLAIM; cleared is EVIDENCE -------------------------------
+//
+// The verdict read GitHub's `isResolved` and nothing else, so a thread the bot
+// resolved itself left the threads clause PASSing. Measured on nextly: the bot
+// resolves its own threads, eight on one pull request with nobody replying, and
+// `@coderabbitai resolve` is author-invokable and bulk-resolves. A critical
+// finding could therefore leave the verdict by being dismissed by the thing that
+// filed it.
+const clauseOf = (i, id) => computeVerdict(i).clauses.find(c => c.id === id);
+check("a thread nobody came back to BLOCKS, even with GitHub calling it resolved",
+  withOut(i => { i.cleared = { readable: true, uncleared: 1, reviewers: ["codex"] }; }), BLOCK);
+check("and it blocks BELOW the round cap too, because the cap is a different question",
+  withOut(i => { i.rounds = { n: 1, softCap: 5, hardCap: 10, unspilledCritical: 0 };
+                 i.cleared = { readable: true, uncleared: 1, reviewers: ["codex"] }; }), BLOCK);
+check("an unreadable projection is UNKNOWN, never a pass",
+  withOut(i => { i.cleared = { readable: false, why: "not derived" }; }), UNKNOWN);
+check("and an absent one is too, because absence is not evidence of agreement",
+  withOut(i => { delete i.cleared; }), UNKNOWN);
+check("control: zero uncleared is a pass, so the clause is not blocking everything",
+  withOut(i => { i.cleared = { readable: true, uncleared: 0, reviewers: [] }; }), PASS);
+
+// The clause NAMES the reviewer, because "a thread is open" and "codex has not
+// come back" send a person to different places.
+{
+  const i = good();
+  i.cleared = { readable: true, uncleared: 2, reviewers: ["codex"] };
+  check("the clause names who has not returned", /codex/.test(clauseOf(i, "cleared").detail), true);
+}
+
+// --- past the cap with an UNKNOWN critical count is not a pass ---------------
+//
+// `null > 0` is false, so an unreadable critical count fell through to the pass
+// -- absence read as success in the clause that exists to stop a critical being
+// carried past the budget.
+check("past the soft cap with an unknown critical count is UNKNOWN",
+  withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null }; }), UNKNOWN);
+check("control: BELOW the cap an unknown critical count still passes, because it changes nothing there",
+  withOut(i => { i.rounds = { n: 1, softCap: 5, hardCap: 10, unspilledCritical: null }; }), PASS);
+check("control: and a KNOWN zero past the cap still passes",
+  withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 0 }; }), PASS);
 
 // Positive control. Without this, every refusal below proves nothing.
 check("a fully satisfied revision PASSes", computeVerdict(good()).state, PASS);

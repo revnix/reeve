@@ -105,6 +105,15 @@ export function computeVerdict(i) {
     add("rounds", BLOCK, `hard cap ${R.hardCap} reached with ${R.unspilledCritical} P0/P1 finding(s) open — escalate, never spill a critical`);
   else if (R.n >= R.softCap && R.unspilledCritical > 0)
     add("rounds", BLOCK, `past soft cap ${R.softCap} with ${R.unspilledCritical} critical finding(s) still open`);
+  // PAST THE CAP with an UNKNOWN critical count is not a pass.
+  //
+  // `null > 0` is false, so an unreadable projection fell straight through to the
+  // pass below -- absence read as success, in the clause that exists to stop a
+  // critical being carried past the budget. Only asked past the soft cap, because
+  // below it the critical count changes nothing and claiming ignorance there
+  // would make every pull request UNKNOWN for a fact that does not matter yet.
+  else if (R.n >= R.softCap && R.unspilledCritical == null)
+    add("rounds", UNKNOWN, `past soft cap ${R.softCap} and reeve cannot say how many criticals are open`);
   else add("rounds", PASS, `round ${R.n} of ${R.softCap}/${R.hardCap}`);
 
   // 5. Unresolved threads. A truncated read is not zero: reviewThreads(first:100)
@@ -112,6 +121,27 @@ export function computeVerdict(i) {
   if (!i.threads || i.threads.readable === false) add("threads", UNKNOWN, "thread state not readable");
   else if (i.threads.unresolved > 0) add("threads", BLOCK, `${i.threads.unresolved} of ${i.threads.total} thread(s) unresolved`);
   else add("threads", PASS, `0 of ${i.threads.total} threads unresolved`);
+
+  // 5b. Threads a reviewer has not come back to. A DIFFERENT question from the one
+  //     above, and the difference is why the fold exists.
+  //
+  //     Resolved is a CLAIM. The bot resolves its own threads -- eight on one pull
+  //     request with nobody replying -- and `@coderabbitai resolve` is
+  //     author-invokable and bulk-resolves. So a critical finding can leave the
+  //     clause above by being marked resolved by the thing that filed it.
+  //
+  //     Cleared is EVIDENCE: a later substantive round by the same reviewer, at
+  //     this head, has been and gone. Uncleared threads block independently of the
+  //     round cap -- being under the cap is not a reason to accept a finding
+  //     nobody came back to.
+  //
+  //     Scoped upstream to blocking reviewers, so an advisory reviewer going quiet
+  //     cannot block a pull request for ever.
+  if (!i.cleared || i.cleared.readable === false)
+    add("cleared", UNKNOWN, `cannot say which threads a reviewer has returned to${i.cleared?.why ? ` — ${i.cleared.why}` : ""}`);
+  else if (i.cleared.uncleared > 0)
+    add("cleared", BLOCK, `${i.cleared.uncleared} thread(s) that ${i.cleared.reviewers.join(", ") || "a blocking reviewer"} has not come back to`);
+  else add("cleared", PASS, "every blocking reviewer's threads have been returned to");
 
   // 6. Ledger blockers. null means the store could not answer, which is not zero.
   //    The previous gate skipped this check entirely when the read failed.

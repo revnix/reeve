@@ -1,5 +1,9 @@
 # Resume prompt — paste this into a new session
 
+> **SUPERSEDED by `docs/2026-08-26-resume-prompt.md` (2026-08-26).** Kept as history.
+> Its state claims were true when written and are not maintained. The
+> single-source test does not scan this file.
+
 Supersedes `docs/2026-08-23-resume-prompt.md`. Copy everything inside the fence.
 
 ---

@@ -32,6 +32,7 @@ export const ESCALATIONS = {
   PROTECTION_UNMET: "GitHub's protection requires something reeve does not provide (typically an approving review)",
   REVIEWERS_DOWN: "no blocking reviewer is reachable",
   NOT_CHECKABLE: "a clause could not be evaluated and stayed that way",
+  FINDINGS_UNMOVED: "a findings repair changed nothing and would run again on the same findings",
   BODY_UNREADABLE: "a reviewer wrote a review body reeve cannot read",
 };
 
@@ -40,7 +41,8 @@ const clause = (v, id) => v.clauses.find(c => c.id === id);
 /**
  * @param {object} e   the evaluatePr() result
  * @param {object} p   the profile
- * @param {object} h   history: {fixAttempts: Map<fingerprint,int>, unknownSince: epoch|null, now: epoch}
+ * @param {object} h   history: {fixAttempts: Map<fingerprint,int>, unknownSince: epoch|null,
+ *                  now: epoch, findingsFingerprint: string|null, findingsAttempts: int}
  */
 /**
  * Review actions are gated OFF until review ingest exists.
@@ -240,6 +242,29 @@ export function nextAction(e, p, h = {}) {
     // on it, which is the standing ruling inverted. Only a known zero may spill.
     if ((R.n ?? 0) >= (R.softCap ?? 5) && R.unspilledCritical === 0)
       return act(ACTIONS.SPILL, `past the soft cap with only non-critical findings open`, { round: R.n });
+    // ONE REPAIR PER SET OF FINDINGS, for the same reason CI gets one per failure:
+    // a second attempt at an unchanged problem is another guess, and guessing
+    // twice is the loop that runs away.
+    //
+    // FIX_CI has had this cap since it was written and FIX_FINDINGS never did,
+    // which survived only because a thread finding leaves a TRACE. A worker that
+    // refutes one still writes a reply; resolving one changes GitHub state. Either
+    // way the next tick sees a different world. A BODY finding leaves nothing at
+    // all — no thread to reply on, no resolve to record — so a worker that refutes
+    // one, or reports it needs a human, produces a projection identical to the one
+    // before it ran, and the same worker goes out again for as long as the budget
+    // lasts.
+    //
+    // Keyed by the SET of open findings rather than by revision, exactly as the CI
+    // cap is keyed by cause: the count answers "has this survived a repair?". Fix
+    // one and the set changes, which is a different problem and gets its own
+    // budget. Change nothing and it is the same problem, which does not.
+    const ftried = h.findingsAttempts ?? 0;
+    const fcap = p.rounds?.maxFixAttemptsPerFinding ?? 1;
+    if (h.findingsFingerprint && ftried >= fcap)
+      return act(ACTIONS.ESCALATE, ESCALATIONS.FINDINGS_UNMOVED,
+                 { fingerprint: h.findingsFingerprint, tried: ftried });
+
     const blocking = [threads, findings, bodyActionable ? bodyFindings : null].filter(c => c?.state === "BLOCK");
     return act(ACTIONS.FIX_FINDINGS, blocking.map(c => c.detail).filter(Boolean).join("; ") || "findings block this PR",
                { threads: threads?.state === "BLOCK", findings: findings?.state === "BLOCK",

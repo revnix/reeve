@@ -26,9 +26,9 @@
 import { derivePr, reviewState, bodyFindingsOf, BLOCKING_SEVERITIES } from "../src/review/derive.mjs";
 import { ingest, noteHead } from "../src/review/ingest.mjs";
 import { compare } from "../src/review/shadow.mjs";
-import { reviewFacts, readReviewerStates } from "../src/pr.mjs";
+import { reviewFacts, readReviewerStates, readThreads } from "../src/pr.mjs";
 import { fixFindingsPrompt, spillPrompt } from "../src/prompts.mjs";
-import { dispatchable } from "../src/daemon.mjs";
+import { dispatchable, findingsFingerprint, attemptKey } from "../src/daemon.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { open } from "../src/db/ops.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -492,6 +492,86 @@ ingest(db, NWO, 1, [
   check(reviewState(dbC, NWO, 12, PROFILE(), { at: T + 200, head: HEAD_A }).unreadableBodies.length === 0,
     "control: declaring the reviewer is what retires it, which is the action the escalation asks for");
   rmSync(dirC, { recursive: true, force: true });
+}
+
+// ── the identity of a findings-repair problem is WHICH findings are open ────
+{
+  const A = [{ id: "t1" }, { id: "b1" }];
+  const B = [{ id: "b1" }, { id: "t1" }];          // same set, other order
+  const C = [{ id: "t1" }];                        // one repaired
+  check(findingsFingerprint(A) === findingsFingerprint(B),
+    "the order a projection happened to return does not change the identity",
+    `${findingsFingerprint(A)} vs ${findingsFingerprint(B)}`);
+  check(findingsFingerprint(A) !== findingsFingerprint(C),
+    "but repairing one DOES — a smaller set is a different problem and earns its own budget");
+  check(findingsFingerprint([]) === null && findingsFingerprint(null) === null,
+    "and nothing open is not a problem to cap, so it has no identity at all");
+  check(findingsFingerprint([{ id: "" }, { anchor: "body" }]) === null,
+    "control: items with no usable id contribute nothing rather than an empty-string identity");
+}
+
+// ── both ENDS of the live review cross-check, not just the comparison ───────
+//
+// `compare` is exercised with hand-built inputs, which proves it compares and
+// nothing about whether either side reports what it compares. Stubbing each end
+// out changed no test until these existed.
+{
+  // The LIVE end.
+  const page = JSON.stringify({ data: { repository: { pullRequest: {
+    mergeStateStatus: "CLEAN",
+    reviews: { totalCount: 11 },
+    reviewThreads: { totalCount: 2, pageInfo: { hasNextPage: false },
+                     nodes: [{ isResolved: true }, { isResolved: false }] } } } } });
+  const live = readThreads(NWO, 1, { gh: () => ({ ok: true, out: page }) });
+  check(live.reviewTotal === 11,
+    "the live read carries the review count it was asked for", JSON.stringify(live.reviewTotal));
+  check(live.total === 2 && live.unresolved === 1,
+    "control: and still carries the thread counts, so the surface was added not swapped",
+    JSON.stringify({ total: live.total, unresolved: live.unresolved }));
+
+  // The PROJECTION end.
+  const dirF = mkdtempSync(join(tmpdir(), "reeve-bodyF-"));
+  const dbF = open(join(dirF, "s.db"));
+  noteHead(dbF, NWO, 15, HEAD_A, T);
+  const p = PROFILE();
+  ingest(dbF, NWO, 15, [
+    review(1, "codex", "**![P2 Badge](x) one**", HEAD_A, T),
+    review(2, "codex", "two", HEAD_A, T + 10),
+    review(3, "crab", "three", HEAD_A, T + 20),
+  ], { at: T });
+  derivePr(dbF, NWO, 15, p, { at: T, head: HEAD_A });
+  check(reviewState(dbF, NWO, 15, p, { at: T, head: HEAD_A }).reviewTotal === 3,
+    "and the projection reports how many review objects it was derived from",
+    String(reviewState(dbF, NWO, 15, p, { at: T, head: HEAD_A }).reviewTotal));
+
+  // An EDIT is a new generation of the same review, not a fourth review. Counting
+  // rows instead of distinct ids would report the edit as a new review and make
+  // the two sides disagree for ever.
+  ingest(dbF, NWO, 15, [review(2, "codex", "two, revised", HEAD_A, T + 10)], { at: T + 100 });
+  derivePr(dbF, NWO, 15, p, { at: T + 110, head: HEAD_A });
+  check(reviewState(dbF, NWO, 15, p, { at: T + 110, head: HEAD_A }).reviewTotal === 3,
+    "control: an edit is a new generation of one review, not a fourth review",
+    String(reviewState(dbF, NWO, 15, p, { at: T + 110, head: HEAD_A }).reviewTotal));
+  rmSync(dirF, { recursive: true, force: true });
+}
+
+// ── what a decision spends, asked in one place ──────────────────────────────
+//
+// FIX_CI has had a budget since it was written and FIX_FINDINGS had none, and
+// nothing in either call site said the other should exist. Asking the question in
+// one function is what makes a missing answer visible.
+{
+  const items = [{ id: "t1" }, { id: "b1" }];
+  check(attemptKey({ action: "FIX_CI" }, "ci:abc", items) === "ci:abc",
+    "a CI repair spends its failure cause");
+  check(attemptKey({ action: "FIX_FINDINGS" }, "ci:abc", items) === findingsFingerprint(items),
+    "a findings repair spends the identity of the finding set, not the CI cause");
+  check(attemptKey({ action: "MERGE" }, "ci:abc", items) === null,
+    "and a decision that repairs nothing spends nothing");
+  check(attemptKey({ action: "FIX_CI" }, null, items) === null,
+    "control: a CI repair with no nameable cause spends nothing rather than a false key");
+  check(attemptKey({ action: "FIX_FINDINGS" }, "ci:abc", []) === null,
+    "control: nor does a findings repair with nothing open");
 }
 
 // ── a stale body finding is withheld from a MIXED dispatch ───────────────────

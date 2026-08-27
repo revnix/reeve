@@ -708,6 +708,22 @@ export const TABLES_AT = Object.freeze({ 1: V1, 2: V2, 3: V3 });
  * Empty for versions 1 and 2 by construction: their table lists already imply
  * their columns, because those migrations created the tables.
  */
+/**
+ * The lowest hub schema the PROVIDER SCHEDULER can be used against.
+ *
+ * Migration 3 adds `provider_lease.token`, and every claim names that column --
+ * so against a v1 or v2 hub the first `claimProvider` throws. The guardian's
+ * documented response to a throwing scheduler is to dispatch UNSCHEDULED, which
+ * means a newer guardian beside an older builder would quietly run model work
+ * outside the shared limit. "The hub opened" is therefore not the same question
+ * as "the scheduler can be used", and only the second one gates dispatch.
+ *
+ * Checked against `COLUMNS_AT` rather than trusted: the test asserts this is the
+ * version that introduces `provider_lease.token`, so moving the column without
+ * moving this constant fails rather than drifting.
+ */
+export const SCHEDULER_MIN_HUB_VERSION = 3;
+
 export const COLUMNS_AT = Object.freeze({
   3: Object.freeze({
     task_territory: Object.freeze({ pinned_until: "INTEGER" }),

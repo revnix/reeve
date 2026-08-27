@@ -10,6 +10,9 @@ import { pinHead, readChecks, classify, settle, inheritedOrCaused, readTimeline,
 import { loadSettlement, saveSettlement } from "./db/ops.mjs";
 import { rootCause } from "./ci-rootcause.mjs";
 import { computeVerdict, renderVerdict, PASS, BLOCK, UNKNOWN } from "./verdict.mjs";
+// The builder App's name has one home already; the classifier reads it rather
+// than restating it.
+import { POLICY_APP } from "./github/reconciler.mjs";
 import { reviewState } from "./review/derive.mjs";
 import { compare } from "./review/shadow.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
@@ -278,20 +281,55 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
  * would be worse than the ordering it fixes: the two reads could return different
  * revisions, and the evaluation would then judge a head the fold did not describe.
  */
+/**
+ * Is this pull request the builder's?
+ *
+ * TWO SIGNALS, EITHER SUFFICIENT, and the second is the one that gets missed.
+ * The builder pushes `mp/*` branches, so the branch alone looks like enough --
+ * but a task's PR can be opened by the App on an ordinary branch, and a
+ * classifier that recognises only the branch treats that as a stranger's PR,
+ * skips `pr_hold` entirely, and leaves a cancelled or blocked task's pull
+ * request green and mergeable. That is the exact failure the hold clause exists
+ * to prevent.
+ *
+ * The second signal is the App's LOGIN and not "is a bot": widening it to every
+ * bot account is the opposite error, and pulls every dependency and review bot
+ * into a table that has no row for any of them.
+ *
+ * A SEGMENT PREFIX, not a string one. `mpx/not-ours` starts with `mp` and is
+ * nobody's builder branch; matching on the string would claim it.
+ */
+export function isBuilderPr({ headRef = null, authorLogin = null } = {}) {
+  // THE APP, not any bot. `user.type` is `Bot` for dependency bots, review bots
+  // and every other integration in the repository, so testing it marked every
+  // automated pull request as the builder's -- and during a hub or repository-id
+  // fault those PRs would take an UNKNOWN hold clause and an action-required
+  // policy result over `pr_hold` rows that can never exist for them. The
+  // identity is the App's login, and `POLICY_APP` is where that name already
+  // lives.
+  if (typeof authorLogin === "string" &&
+      authorLogin.toLowerCase() === `${POLICY_APP}[bot]`.toLowerCase()) return true;
+  return typeof headRef === "string" && /^mp\//.test(headRef);
+}
+
 export function prAnchor({ nwo, pr }) {
   // updated_at rides along so ingest can skip a pull request that has not moved.
   // It is GitHub's timestamp, so a change reeve has not seen yet still triggers a
   // read -- unlike a local clock, which would skip whatever it slept through.
-  const meta = ghJson([`repos/${nwo}/pulls/${pr}`, "--jq", "[.head.ref,.base.ref,.state,.title,.updated_at]|@tsv"]);
+  // `.user.login` rides along for the builder classification below. Appended
+  // rather than inserted: the destructuring below is positional, so a new field
+  // in the middle silently shifts every one after it.
+  const meta = ghJson([`repos/${nwo}/pulls/${pr}`, "--jq", "[.head.ref,.base.ref,.state,.title,.updated_at,.user.login]|@tsv"]);
   if (!meta.ok) return { ok: false, why: meta.err.split("\n")[0] };
-  const [headRef, baseRef, state, title, updatedAt] = meta.out.split("\t");
+  const [headRef, baseRef, state, title, updatedAt, authorLogin] = meta.out.split("\t");
 
   const pin = pinHead(nwo, headRef);
   if (!pin.ok) return { ok: false, why: `could not pin head: ${pin.why}` };
-  return { ok: true, headRef, baseRef, state, title, updatedAt, head: pin.sha, pin };
+  return { ok: true, headRef, baseRef, state, title, updatedAt, head: pin.sha, pin,
+           authorLogin };
 }
 
-export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {} }) {
+export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}, hold = null }) {
   // Reuses the caller's anchor when it has one, so the head is pinned ONCE per
   // pull request per tick and the fold and the evaluation cannot disagree about
   // which revision they are talking about.
@@ -408,6 +446,13 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     base: { verdict: base.verdict },
     reviewers, rounds, threads, cleared: facts.cleared, ledgerBlockers,
     mergeState: threads.mergeState, profile,
+    // Passed through, never read here. `pr_hold` is a HUB row and this function
+    // holds the per-repository state database, so the reading is taken by the
+    // caller that has the hub connection and handed in. Null when the caller has
+    // no hub, which `computeVerdict` renders as no clause at all rather than as
+    // an UNKNOWN one -- a guardian that was never asked about holds must not
+    // drag every verdict to UNKNOWN.
+    hold,
   });
 
   return { ok: true, pr, title, headRef, baseRef, state, head: pin.sha, verdict,

@@ -13,6 +13,7 @@
 // these actions must not be reachable at all, and "not built" must not look like
 // "nothing to do".
 import { nextAction, ACTIONS } from "../src/watcher.mjs";
+import { CLAUSE_IDS } from "../src/verdict.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -21,7 +22,9 @@ const check = (ok, name, detail) => {
 };
 
 const cl = (id, state, detail = "") => ({ id, state, detail });
-const all = () => ["ci", "base", "review", "rounds", "threads", "findings", "mergeable"].map(id => cl(id, "PASS"));
+// DERIVED from the one declaration, so a clause added later is exercised here
+// too rather than silently absent from every case in this file.
+const all = () => CLAUSE_IDS.map(id => cl(id, "PASS"));
 const swap = (id, state, detail) => all().map(c => (c.id === id ? cl(id, state, detail) : c));
 const ev = (clauses, rounds) => ({
   pr: 1, state: "open",

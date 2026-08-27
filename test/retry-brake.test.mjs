@@ -13,6 +13,7 @@
 // The identity a cap is counted against must therefore be HEAD-INDEPENDENT: the
 // same root cause surviving a fix is a repeat, whatever revision it reappears on.
 import { fingerprint, causeKey } from "../src/ci-rootcause.mjs";
+import { CLAUSE_IDS } from "../src/verdict.mjs";
 import { open, countFixAttempts, recordFixAttempt } from "../src/db/ops.mjs";
 import { nextAction, ACTIONS, ESCALATIONS } from "../src/watcher.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -81,7 +82,9 @@ const K = causeKey("o/r", cause);
 // --- the decision ------------------------------------------------------------
 const P = { rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 }, authority: { policy: "propose_and_merge" } };
 const cl = (id, state, detail = "") => ({ id, state, detail });
-const allPass = () => ["ci", "base", "review", "rounds", "threads", "findings", "mergeable"].map(id => cl(id, "PASS"));
+// DERIVED from the one declaration, so a clause added later is exercised here
+// too rather than silently absent from every case in this file.
+const allPass = () => CLAUSE_IDS.map(id => cl(id, "PASS"));
 const redCi = () => allPass().map(c => (c.id === "ci" ? cl("ci", "BLOCK", "failing: CI Gate") : c));
 const ev = (extra = {}) => ({
   pr: 7, state: "open",

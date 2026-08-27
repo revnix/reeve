@@ -293,8 +293,17 @@ export function bindProviderLease(db, { id = null, token = null, owner = null, r
 /**
  * Renew a held lease while its worker works.
  *
- * The expiry is taken from the HEARTBEAT's clock, not the claim's, which is the
- * only thing that makes a long run survive its own lease.
+ * The expiry is taken from the HEARTBEAT's clock, not the claim's.
+ *
+ * NOT the only thing that makes a long run survive its own lease -- that claim
+ * was here and was false. `heldCount` counts a held row whatever its expiry, and
+ * `reapProviderLeases` spares an expired lease whose holder is still alive, so a
+ * run outliving `LEASE_SECONDS` is admitted and reaped correctly with no
+ * heartbeat at all. What this actually buys is that `expires_at` keeps
+ * describing reality: without it a 20-minute worker spends 15 minutes holding an
+ * expired lease, and every query that reads expiry -- `expiredLeases` is one --
+ * is then one liveness misread away from acting on a lease that is perfectly
+ * healthy.
  */
 export function heartbeatProvider(db, { id = null, token = null, owner = null, repoId = null, runRef = null,
                                         isAlive = isSameProcess, now = null } = {}) {
@@ -340,10 +349,23 @@ export function cancelQueued(db, { owner, repoId, runRef,
  * founder whether the limit is concurrency, spend, or a per-model cap.
  */
 export function noteRateLimit(db, { signature, cooldownSeconds, provider = "claude",
-                                    isAlive = isSameProcess, now = null } = {}) {
+                                    isAlive = isSameProcess, now = null,
+                                    observedAt = null, expiresAt = null } = {}) {
   return guarded(db, { isAlive, now }, () => {
-    const at = now ?? nowSeconds(db);
-    const until = at + (cooldownSeconds ?? 0);
+    // WHEN IT WAS SEEN AND WHEN THE WINDOW ENDS ARE TWO FACTS, and carrying them
+    // through one number made a deferred observation corrupt a newer one.
+    //
+    // `recordRateLimit` keeps the metadata that is latest BY TIMESTAMP, precisely
+    // so observations committing out of order cannot walk `last_429_at`
+    // backwards. A caller retrying a 429 it could not write earlier has to say
+    // two things: this was observed THEN, and the window still ends THEN+n. With
+    // only a duration it could say neither -- it re-derived both from the retry
+    // time, so an older observation retried after a newer one had landed looked
+    // like the newest and replaced `last_signature` with the stale one. The
+    // cooldown stayed right; the diagnostic naming what threw last did not, and
+    // that is the whole reason the signature is stored.
+    const at = observedAt ?? now ?? nowSeconds(db);
+    const until = expiresAt ?? at + (cooldownSeconds ?? 0);
     const state = providerState(db);
     // The limits are carried through on the INSERT half of the upsert so a first
     // 429 against a hub that has never been measured does not silently install

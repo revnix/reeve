@@ -7,6 +7,8 @@
 import { runDoctor, render, checkAppIdentity, hubFindings, renderHub } from "../src/doctor.mjs";
 import { open } from "../src/db/ops.mjs";
 import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor, hubPathFor } from "../src/paths.mjs";
+import { hubAccess } from "../src/build/hubaccess.mjs";
+import { resolveRepoIdAt } from "../src/build/repoid.mjs";
 import { snapshot, restore, latestSnapshot, exportEvents,
          snapshotAll, restoreHub, validateSnapshot } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
@@ -44,7 +46,7 @@ import { resolveHome } from "../src/home.mjs";
 // builder migrates a store it is about to be refused from. Task 9 adds the same
 // import for the export/restore routes; whichever lands first owns it.
 import { DatabaseSync } from "node:sqlite";
-import { openHub, HUB_SCHEMA_VERSION, completedVersion, faultKind } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION, HUB_BUSY_TIMEOUT_MS, completedVersion, faultKind } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
 import { buildTick } from "../src/build/loop.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
@@ -72,6 +74,62 @@ const die = (msg) => { console.error(msg); process.exit(1); };
 // (§1.5, and measured -- resolving one needs the App client, which
 // `builder doctor` deliberately does not use). So H-4 matches projects to
 // `repo_gate_state` rows by `nwo_snapshot`, which both sides have.
+// The guardian's hub access lives in `src/build/hubaccess.mjs` so it can be
+// TESTED. It was written here first, and a stub loop proved the point: with the
+// logic inside a CLI script the only assertions available were structural, and
+// disabling the version gate with `if (false && ...)` left the source text
+// intact and every one of them green. A property whose test cannot fail is not
+// tested.
+const guardianHubAccess = () => hubAccess(hubPathFor(HOME));
+
+// The numeric repository id, resolved OUTSIDE the guardian's restricted
+// connection and handed in as a number.
+//
+// The guest cannot answer this. `repoIdFromHub` reads `task`, and `task` is not
+// on the guardian's allowlist -- deliberately, because section 13 says the
+// guardian's surface is the provider scheduler and `pr_hold`, and reading the
+// builder's work table would be the third touch the guest connection exists to
+// refuse. Handing the guest to the resolver made every production tick throw,
+// leave `repoId` null, and fail closed on every dispatch.
+//
+// So the CLI answers it, with a privileged handle held for one statement and
+// closed immediately. The running loop never sees privilege; `src/daemon.mjs`
+// cannot reach the privileged opener at all. The end state -- an identity table
+// the guest may read, removing this last privileged read -- is issue #46.
+// GitHub's numeric id for a repository, the fallback half of the founder's
+// resolver ruling.
+//
+// The hub is asked FIRST and answers for any project it has admitted a task
+// for. A registered project it has not is an ordinary state for the shared
+// resolver -- and for the GUARDIAN it is fatal, because a null id fails every
+// dispatch closed and the ten-minute retry only repeats the same empty local
+// query. Adding a repository to the registry would have disabled its guardian
+// until the builder happened to file something.
+//
+// Never guessed and never cached anywhere but the hub: this asks GitHub, and a
+// non-integer answer is no answer. A failure returns null rather than throwing,
+// because the caller's contract is that the id may be unknown -- what must not
+// happen is inventing one.
+const repoIdFromGitHub = (nwo) => {
+  try {
+    const out = execFileSync("gh", ["api", `repos/${nwo}`, "--jq", ".id"],
+                             { encoding: "utf8", timeout: 15_000 }).trim();
+    const id = Number(out);
+    return Number.isInteger(id) && id > 0 ? id : null;
+  } catch { return null; }
+};
+
+const repoIdOnce = async (project) => {
+  if (!project) return null;
+  const p = hubPathFor(HOME);
+  // DELEGATED, NOT RESTATED. The open options and the benign/fault split are the
+  // lookup's own invariants, and while they lived in this catch the only thing
+  // that could assert them was a regex over this file's source text -- so
+  // disabling either left every assertion green. `resolveRepoIdAt` owns both,
+  // where a hub can be built in each state and asked.
+  return await resolveRepoIdAt(p, project, { fetchRepoId: repoIdFromGitHub });
+};
+
 const registryProjects = (home) => {
   const path = join(home, "projects.json");
   try {
@@ -1192,7 +1250,10 @@ switch (cmd) {
         ? openHub(hubPathFor(HOME))
         : (raw = sub === "status"
             ? new DatabaseSync(hubPathFor(HOME), { readOnly: true })
-            : new DatabaseSync(hubPathFor(HOME), { timeout: 10000 }));
+            // The constant, not the number it happens to equal. #40 exported it
+            // so the hub's contention budget had one home; this literal is what
+            // that change left behind in the same file.
+            : new DatabaseSync(hubPathFor(HOME), { timeout: HUB_BUSY_TIMEOUT_MS }));
       // The first read is what proves the file answers at all. On the raw path
       // nothing has touched it yet, so this is where a corrupt store surfaces.
       // Its VALUE is kept: `build status` re-read the same version a few lines
@@ -1528,6 +1589,14 @@ switch (cmd) {
     // nobody. (Codex #4g-[2].)
     const dbPath = resolve(opt("db") ?? stateFor(nwo));
     if (!existsSync(dbPath)) { console.error(`reeve run: no state database at ${dbPath}`); process.exit(1); }
+    // Resolved before the context so the REASON survives. A project that is
+    // simply not registered is `{ project: null, why: null }` -- an ordinary
+    // state. A registry that could not be parsed is a fault that says so.
+    const registry = registryProjects(HOME);
+    const guardianProject = {
+      project: (registry.projects ?? []).find(p => p.nwo === nwo) ?? null,
+      why: (registry.projects ?? []).some(p => p.nwo === nwo) ? null : (registry.error ?? null),
+    };
     const ctx = {
       nwo, profile, db: open(dbPath),
       // The database's own path: the worker must not be able to read the event
@@ -1545,7 +1614,81 @@ switch (cmd) {
       // The sandbox canary's result is written here and read by `reeve doctor`
       // from the same place, independent of any --log directory.
       canaryStateDir: HOME,
+      // THE GUARDIAN'S OWN START TIME, read once. `provider_lease` is reaped by
+      // `isAlive(pid, lstart)`, and a lease whose holder has no start time can
+      // never be recognised as dead: a pid alone is reused.
+      lstart: readStart(process.pid),
+      // THE RESTRICTED CONNECTION, never `openHub`. The guardian's hub surface is
+      // the provider scheduler and `pr_hold`, and a comment saying so is checked
+      // by whoever remembers -- this is checked by the connection. `openHub`
+      // would hand the guardian the whole schema and every migration right.
+      //
+      // Absent rather than open when there is no hub: a guardian on a machine
+      // with no builder has nothing to schedule against, and `tick` treats a
+      // missing `ctx.hub` as "unscheduled" rather than failing.
+      // A GETTER, called per tick. See `guardianHubAccess`: the hub file is
+      // replaced wholesale by a restore, and a cached handle would go on
+      // scheduling in an unlinked database while the builder used the new one.
+      hub: guardianHubAccess(),
+      // The registry entry for THIS repository, which is what the repository-id
+      // resolver is keyed on. A rename changes `nwo` and never the id, so the
+      // project key is the stable half; a repository absent from the registry
+      // has no project and the guardian dispatches unscheduled.
+      project: guardianProject.project,
+      // WHY there is no project, when there is a reason. `registryProjects`
+      // rejects the WHOLE registry if any single entry is malformed -- by
+      // design, because a partially-read registry silently narrows what doctor
+      // reports on. But converting that global diagnostic into a bare
+      // `project: null` here meant one unrelated bad entry left this repository
+      // unable to resolve its numeric id: every provider dispatch fail-closed
+      // and every builder-PR hold UNKNOWN, with nothing saying why.
+      projectError: guardianProject.why,
     };
+    // RESOLVED HERE, not in the tick, because the tick's connection cannot read
+    // it. Re-resolved on the tick's own cadence through this same closure when
+    // it comes back null -- a project whose first task is admitted after the
+    // daemon started would otherwise leave the guardian fail-closed on every
+    // dispatch until someone restarted it.
+    // AND THE REGISTRY IS RE-READ WHEN THERE IS STILL NO PROJECT.
+    //
+    // `ctx.project` was fixed at startup, so a `projects.json` that was missing,
+    // malformed, or simply did not name this repository yet pinned it to null for
+    // the life of the process -- and this closure then called `repoIdOnce(null)`
+    // every ten minutes for ever. Adding the entry could not recover the daemon:
+    // every provider dispatch stayed fail-closed and every builder-PR hold stayed
+    // UNKNOWN until someone restarted it, while the retry cadence advertised that
+    // it was trying. A retry that cannot observe the thing it is waiting for is
+    // not a retry.
+    //
+    // Only when there is no project: a registry read per tick is wasted work once
+    // the answer is known, and the project key is stable by design.
+    ctx.resolveRepoId = () => {
+      if (!ctx.project) {
+        const again = registryProjects(HOME);
+        const found = (again.projects ?? []).find(p => p.nwo === nwo) ?? null;
+        ctx.project = found;
+        // The WHY is refreshed with it, or a registry that has been fixed would
+        // go on reporting the stale reason it was broken for.
+        ctx.projectError = found ? null : (again.error ?? null);
+      }
+      return repoIdOnce(ctx.project);
+    };
+    // GUARDED, because this one is OUTSIDE the tick. Narrowing `repoIdOnce`'s
+    // catch so operational failures propagate was right for the retry path
+    // inside `tick`, which logs them and raises `guardian:hub:unreadable` -- and
+    // it made THIS call, which has no such catch, able to kill `reeve run` at
+    // startup over a transient lock. A fix that makes an error visible must not
+    // make it fatal somewhere the error was previously impossible.
+    //
+    // Left null on failure: the tick re-asks on its own cadence through the same
+    // resolver, and until it succeeds the guardian fails closed and says so.
+    try {
+      ctx.repoId = await repoIdOnce(ctx.project);
+    } catch (err) {
+      console.error(`reeve run: the repository id could not be resolved at startup (${err.message}); ` +
+                    `continuing, and the tick will retry.`);
+      ctx.repoId = null;
+    }
     // Honour the FLAG as well as the command. The help has always documented
     // `run --tick` as "one pass and exit" while only the separate `tick` command
     // did that, so `reeve run --tick` started the long-running daemon -- the

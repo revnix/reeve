@@ -244,6 +244,305 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       **The durable finding is about plan SIZE**: a plan needing four rounds and
       still finding sixteen defects at the fourth is one document doing three
       documents' work.
+- [ ] **S2-C PR-C4, the guardian claims and the hold clause — BUILT
+      (2026-08-26).** Branch `feat/s2c-guardian-provider`, based on `8e5135a`
+      (PR-C2's merge). Tasks **23b + 22 + 24 in ONE PR**, on the founder's
+      decision: they are one change and its proof. This is the only PR in S2
+      that changes what the running guardian DOES.
+
+      **Task 23b** — the guardian's verdict reads `pr_hold`. That table has had
+      a writer since S2-B and its declared reader was never built, so a task the
+      builder deliberately parked looked to the guardian like any other pull
+      request. The clause is read FIRST, before anything that could act: read
+      after `ci`, a held PR with red checks returns FIX_CI and the guardian
+      dispatches a fixer at the task the hold exists to protect; read later
+      still, it reaches the unclassified escalation, which carries `gap: true`,
+      so every ordinary held PR reports an implementation gap on a loop with the
+      merge correctly blocked and the reason a lie.
+
+      Absent and unreadable are kept apart the whole way down. `openHold`
+      answers three ways and an unreadable hub renders UNKNOWN, never PASS — a
+      boolean would make an unreachable hub read as nothing-is-held, which is
+      the fail-open the guest connection exists to stop. A caller supplying no
+      reading gets no clause at all, so a guardian with no hub is not dragged to
+      UNKNOWN over a question nobody asked it.
+
+      **The clause set had ELEVEN homes** — `verdict.mjs` and ten test files,
+      three of which assert TOTALITY over their own private copy. `CLAUSE_IDS`
+      is declared once and compared against what `computeVerdict` actually
+      emits, **in both directions**: an id declared and never emitted is as
+      wrong as one emitted and never declared, and only the second is caught by
+      running the code. The count was printed before the listing, which is why
+      it was eleven and not the four a truncated search showed.
+
+      **Task 22** — a provider lease at BOTH dispatch sites, the containment
+      canary and each worker. Fail OPEN on an unreadable scheduler and CLOSED on
+      an unscopeable one, which are not the same case: a broken hub must not
+      stop the guardian working, but it escalates, because silent unscheduled
+      dispatch is indistinguishable from scheduled dispatch. A null repository
+      id DOES stop it — `provider_lease.repo_id` spans the live-request unique
+      index and SQLite does not deduplicate keys containing a NULL, so a lease
+      scoped to nothing is invisible to the index and the limit never binds.
+
+      The claim precedes `startRun`, which spends a fixer's attempt two lines
+      later: a dispatch refused for capacity AFTER the run exists burns the one
+      retry the design allows on work that never ran. The release lives in the
+      `finally` every dispatched run already passes through — one release path
+      rather than one per outcome, which is how the outcome nobody thought of
+      ends up holding a lease until expiry.
+
+      **A-9 is wired and tested**: a release refused because a restore holds the
+      hub is inspected and retried next tick, never swallowed. The retry stores
+      the IDENTITY and never the id — a restore clears `provider_lease` and
+      SQLite reuses the integer, so an id-keyed retry deletes whatever inherited
+      that key.
+
+      **A-11 was unsatisfiable as written** and is scoped to the guardian, as
+      the audit said: both `openHub(` sites in `bin/reeve` are inside the
+      `build` command, which legitimately holds the whole schema. What is
+      asserted instead is that the guardian's connection is the guest one and
+      that `src/daemon.mjs` cannot reach the privileged opener at all.
+
+      **The repo-id resolver moved** to `src/build/repoid.mjs`. A-12 claimed it
+      had zero occurrences on main; it had two, in `src/build/loop.mjs`. C4 is
+      the change that makes it shared, so this is the cheapest moment to put it
+      in the right place — a resolver two lanes call that lives in one lane's
+      tick file is a shared module nobody decided on. Identity unchanged per the
+      founder's A-2 ruling: one resolver, keyed on the project, hub first.
+
+      **Task 24** — the §14 acceptance observation is recorded at
+      `docs/measured/2026-08-26-guardian-claims-provider.md`: a guardian lease
+      held during dispatch and zero rows after, on the real `tick` path with a
+      fixture `spawnWorker`, over the RESTRICTED connection rather than a
+      privileged one. Running it found a defect in the plan's own fixture —
+      `checks.caused` takes check NAMES, and the plan supplied `{name}` objects,
+      so the first run escalated with "could not name it" before any provider
+      claim and reported the acceptance failed for a reason that had nothing to
+      do with what it measures.
+
+      **The durable finding is the truncated search.** Three times in one day I
+      piped a search whose result I then reasoned about as a set through `head`
+      or `tail` — an anchor sweep that reported one call site of two, a clause
+      count that said four of eleven, and a test run that showed 7 assertions of
+      24. A truncated listing and a complete one are indistinguishable in the
+      terminal. The rule now: no `head` on a search whose result is a
+      population, and where output could be long, the count goes first.
+
+      **SEVEN REVIEW ROUNDS, 41 findings, all verified against source before
+      acting.** Per round: 9, 8, 3, 5, 3, 3, 10. It converged and then did not:
+      the plateau at three broke upward when the reviewer started reading the
+      workflow file and the plan rather than only the diff.
+
+      Rebased from `8e5135a` onto `601b0e0` when the peer's #47 landed; that
+      rebase is also where a `git push HEAD:branch` during a conflict replaced
+      the branch with main and GitHub auto-closed the PR. Nothing was lost, and
+      the rule is now: push the branch NAME, never HEAD, and never chain
+      `rebase && push`.
+
+      **What the 41 reduced to.** Almost every finding was one of five
+      distinctions, which is more useful than the list:
+
+      - **Absent is not unreadable.** No hub, a hub that will not open, one too
+        old, one too new, one whose scheduler tables are damaged: five answers
+        with five consequences. Collapsing any pair fails OPEN, and this
+        accounted for the largest share of findings by far.
+      - **A version is a claim; the columns are the evidence.**
+      - **An inventory answers the question it was built for.** `COLUMNS_AT`
+        describes what later migrations add; `TABLES_AT` describes the whole
+        hub. Neither is the guardian's surface — the guest's own allowlist is.
+        Reaching for the nearest inventory produced the same defect twice, once
+        too narrow and once too wide.
+      - **Shipped is not wired.** FOUR functions here were written, documented
+        and never called: `openHold`, `noteRateLimit`, `reapProviderLeases`,
+        `heartbeatProvider`. The last was found by auditing for the class rather
+        than by review.
+      - **One fact, one home.** The hub's contention budget was re-invented at
+        two new connections after #40 extracted it; the clause-id set had ELEVEN
+        homes; the App's name, the canary predicate.
+
+      **A livelock, reproduced before it was fixed.** `claimProvider` serves
+      guardian requests in order and the canary asks first, so once a worker
+      queued the canary was refused for ever — and that refusal stopped the loop
+      that would have re-asked for the worker. Both stuck, and
+      `queuedGuardianCount` blocks every BUILDER admission behind them. The tick
+      serves the queue head before asking for anything new.
+
+      **The most valuable finding was about the tests, not the code.** A fixture
+      of mine would have been RED on `ubuntu-latest`:
+      `cheapContainmentReasons` opens containment on any platform but darwin, so
+      the rate-limited-canary block passed on this Mac and would have failed on
+      the runner. With CI down nothing would have said so — and "90 files, 0
+      failures" had been reported for seven rounds as a property of the code
+      when it was a property of this machine.
+
+      **Three stubs produced no failures, and each time that WAS the finding.**
+      Assertions that read the source for a constant's name survive the branch
+      being disabled; an ordering assertion that compares two string positions
+      survives the repair being removed with its log line intact; a fixture whose
+      getter returns the same object every call cannot tell stale from fresh.
+      The first of those moved real logic out of `bin/reeve` into
+      `src/build/hubaccess.mjs` so it could be exercised at all. **If the only
+      assertions available are structural, the logic is in the wrong place.**
+
+      Filed rather than done: **#43** (derive snapshot schema validation from the
+      migrations) and **#46** (a hub identity table so the guardian reads its
+      repository id with no privileged read at all). The queued-request sweep was
+      named as deferred in the first description and is IN the PR — a queued row
+      owned by the live guardian blocks the other lane indefinitely, so naming a
+
+      **ROUND 10 — five findings, and two of them were invisible to the suite.**
+      A pull request whose ANCHOR could not be read was not marked unreadable,
+      so the queued-request sweep read it as withdrawn and cancelled its
+      provider request; scheduler housekeeping sat behind the pull-request
+      listing, so a GitHub outage skipped reaping entirely; the worker's lease
+      guard read the tick-opening hub snapshot while the claim below it took a
+      fresh one; and two reads still conflated a hub that is ABSENT with one
+      that cannot be REACHED, `existsSync` being false for EACCES as well as
+      ENOENT.
+
+      **Stubbing two of the five fixes produced no failures at all.** The hub
+      guard had no test — and I had explicitly judged that asymmetry
+      "acceptable" in round 9, which is how a wrong belief survives a round: a
+      decision NOT to fix is the one verdict in a review that nothing checks.
+      The repository-id benign/fault split had assertions, and every one was a
+      regex over `bin/reeve`'s own source text, so disabling the logic left them
+      green. That sent it out of the CLI: `resolveRepoIdAt` in
+      `src/build/repoid.mjs` now owns the open options AND the benign/fault
+      split, `repoIdOnce` delegates, and `test/repo-id-lookup.test.mjs` asserts
+      all of it over a hub built in each state. **Second time this PR that "the
+      only assertions available are structural" moved logic to where it could be
+      exercised, and both extractions have produced no repeat findings since.**
+
+      Fixing the lookup made the daemon's catch on it load-bearing for the first
+      time — it can throw now where it answered null — so that is asserted too.
+      91 files, 0 failures, under both UTC and Asia/Karachi, CI still producing
+      no steps repo-wide since 2026-08-26T16:35:36Z.
+
+      Recorded on **#50** rather than fixed: housekeeping is still behind a
+      SECOND early exit, the halt marker. The peer lane measured the asymmetry —
+      an outbox row is consumed only by the drain, which is itself halt-gated,
+      so that stall is self-limiting; provider leases are consumed by a DIFFERENT
+      process and the builder never reaps, so a halted guardian plus a running
+      builder is a deadlock neither can break.
+
+      **ROUND 11 — three findings, and the first one had never worked at all.**
+      `measuredContainment` attaches its canary cache to whatever context it is
+      handed, and `tick` handed it a fresh shallow copy of `ctx` on every pass,
+      built only to carry two hook functions. `run` loops on ONE persistent
+      context and nothing in the repository ever seeded the field, so the Map was
+      allocated on a throwaway and discarded with it **every tick since the cache
+      was written** — the guardian paid for the containment canary on every pass
+      and the cache had never once survived. Seeding the copy would have closed
+      the call site and left the mechanism, so the copy is gone and the hooks are
+      parameters. This makes cache HITS reachable in production for the first
+      time; that behaviour was already covered where the cache is passed
+      directly, so only the plumbing was dead.
+
+      **The scheduler gate was a fail-open reached by PASSING it.** It reduced
+      `pragma_table_info` to names, and these tables are STRICT — measured
+      against node:sqlite with a control, a correct `provider_lease` accepts the
+      generated text token and one rebuilt with `token INTEGER` throws "cannot
+      store TEXT value in INTEGER column". So a mistyped hub was reported usable,
+      every claim threw, and the daemon dispatched model work outside the shared
+      limit. Two earlier attempts to reproduce it were worthless — one used
+      `state` for `status`, one was mangled by shell quoting — and neither was
+      evidence; only the third, with a passing control, was. The three
+      inventories carry declared types now, read from a freshly migrated hub.
+
+      That cost `provider_lease` its derivation from `LEASE_COLS`, which carries
+      no types. **The derivation is replaced by an asserted AGREEMENT in both
+      directions** rather than a second list left to drift: a column added to the
+      lease SQL without a type here fails the suite instead of leaving a silent
+      hole in the gate, and both maps are compared against a freshly migrated hub
+      both ways, so a declaration demanding a column that does not exist would
+      refuse every healthy hub and is caught too.
+
+      Third: a refused canary now cleans up after itself. `queued`, `cooldown`
+      and `at-limit` are ordinary scheduler answers that repeat every tick, and
+      the refusal returned before the cleanup — leaving one uniquely-named decoy
+      per refusal under the reeve home, the one artefact the caller cannot reach.
+
+      **The suite is not hanging; it is 8.5–10.6 minutes depending on load.** Two
+      timed runs measured 511s and 635s over the same 91 files, both green, so it
+      straddles a ten-minute budget rather than exceeding one. `dispatch-e2e`
+      alone is a third of it. Worth knowing before CI returns.
+
+      **A GUARD OF MINE WAS INERT, and predicting it would fire is what hid it.**
+      I told the review lane twice that the `CLAUSE_IDS` both-directions test
+      would go red when their branch added new clause ids — "the guard working,
+      not a conflict" — and they planned around it as a safety net.
+
+      It would not have fired. Built the actual merged tree
+      (`git merge-tree --write-tree`, `commit-tree`, a scratch worktree) and ran
+      `test/verdict.test.mjs` on it: **68 assertions PASS, 0 FAIL**, on a tree
+      where `computeVerdict` emits `bodyFindings` and `bodyReadable` and
+      `CLAUSE_IDS` declares neither. The comparison scraped the source with
+      `add\("([a-z_]+)"`, and every clause id in the repository is lowercase — so
+      the pattern was **correct by accident** and blind to the first id that was
+      not. The ids were never SEEN, so both directions agreed on a set that
+      silently excluded them. Three totality matrices consume `CLAUSE_IDS`, so a
+      clause could have shipped with no branch while its coverage read complete.
+
+      Fixed: it reads any quoted id, and a second assertion guards the READER —
+      ids parsed must equal `add(` occurrences, so a call the pattern cannot read
+      fails as unreadable rather than vanishing into "not emitted", which is the
+      same defect in a new costume.
+
+      **This is the third instrument failure of the day and the only dangerous
+      one.** The `timeout` watchdog announced itself by printing FAILED beside
+      `rc=0`; the peer's bad stub announced itself by leaving the matched
+      sentences intact. Both were CONTRADICTIONS, catchable by reading the whole
+      line. This one had none: a clean green and a plausible assertion count. A
+      narrowing read does not report narrowing — it reports a smaller set as
+      though it were the whole one. **A guard is untested until you construct the
+      state that should trip it**, and never promise a peer a guard will catch
+      something you have not watched it catch.
+
+      **ROUND 12 — five findings, three of them one shape for the fourth, fifth
+      and sixth time.** The reaper was gated on `execute`, so an observational
+      guardian — the DEFAULT, and what a crash is restarted into — never reaped,
+      and the dead guardian's queued row then blocked every builder admission
+      because the builder never reaps at all. The queued-request cancellation sat
+      after the halt returns, so a halted guardian kept its queue position while
+      it slept and expiry could not clear a row whose holder is alive. And an
+      absent hub read as silence on a BUILDER pull request, letting the policy
+      check pass over a `pr_hold` nobody could read.
+
+      The halt gate moved below the hub/repo-id resolution and the reaper, and
+      every halt exit now runs through one `haltStop()` that withdraws this
+      guardian's queued requests first. **Halt inertness had never been tested** —
+      one fixture set the marker and asserted nothing — so it has a positive
+      control now, with the control that makes it mean something: the same
+      fixture spawns a worker when the marker is absent.
+
+      Two more: `noteRateLimit` carried the observation time and the expiry
+      through ONE number, so a deferred 429 retried after a newer one looked
+      newest and replaced `last_signature` with the stale one; and `reeve run`
+      pinned `ctx.project` at startup, so a `projects.json` that did not yet name
+      the repository made the advertised ten-minute retry ask about nothing, for
+      ever.
+
+      **Re-gating the reaper on `execute` reddened NOTHING** — the halt fixture
+      runs armed, so that property had no test at all. It has one now.
+
+      **The peer's correction is the lesson of the round.** I enumerated the side
+      effects the halt move crossed and told them there were three; they found a
+      fourth, `retireUnconfigured()`, unconditional and writing. The list did not
+      read as "the ones I found", it read as the set — the same narrowing defect
+      as the CLAUSE_IDS regex, committed within the hour of recording it.
+
+      **MERGED at the founder's direction**, with three P1s open and deferred to
+      a follow-up: a durable run left `leased` when `recordFixAttempt` throws
+      (permanent, since `run_one_live_per_task` is UNIQUE and nothing reaps
+      runs); `askedFor` marked from INTENT at the queue-head preflight, so a row
+      the later gates refuse is never cancelled — a regression from this PR's own
+      round-10 fix; and a provider heartbeat whose `beat: 0` is discarded, so a
+      worker outlives its lease. **All three require `--execute`.** The live
+      guardian runs `reeve run nextlyhq/nextly` with no such flag, from a
+      checkout pinned at main that reeve never self-updates, so none of them can
+      bite until both change.
+      gap does not make deferring it free.
+
 - [ ] **S2-C PR-C2, the guardian's hub guest — BUILT (2026-08-26).** Branch
       `feat/s2c-hub-guest`, stacked on **PR-C1** rather than on main, because
       Task 23a's test imports `claimProvider` to assert a real admission

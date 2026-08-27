@@ -26,7 +26,7 @@ import { HUB_BUSY_TIMEOUT_MS } from "./hubdb.mjs";
 // What each permitted table may be asked to do. Anything absent is denied,
 // including tables that do not exist: the default is refusal, so a table added
 // to the schema later is unreachable from here until someone decides otherwise.
-const ALLOWED = Object.freeze({
+export const ALLOWED = Object.freeze({
   provider_lease: ["read", "insert", "update", "delete"],
   provider_state: ["read", "insert", "update", "delete"],
   // READ ONLY. The guardian renders a BLOCK from these rows; the builder is the

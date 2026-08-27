@@ -80,7 +80,14 @@ const db = open(join(dir, "c.db"));
   check(/^[0-9a-f]{64}$/.test(row?.env_hash ?? ""), "and a hash of the exact environment it ran under", String(row?.env_hash));
   // The daemon binds through the revalidating store call, not the plain write.
   const dsrc2 = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
-  check(/onSpawn: \(\{ pid, lstart \}\) => \{ bindRun\(db/.test(dsrc2), "control: the daemon's binding calls bindRun", "");
+  // WHITESPACE-TOLERANT, because the previous form pinned the LAYOUT rather than
+  // the wiring: it required `onSpawn` to be a single line beginning with
+  // `bindRun`, so adding a second statement to that callback broke a control
+  // that has nothing to say about statement count. What must hold is that the
+  // spawn callback binds the run through `bindRun`, whatever else it does.
+  const spawnBinding = /onSpawn:\s*\(\{\s*pid,\s*lstart\s*\}\)\s*=>\s*\{[\s\S]{0,200}?bindRun\(db/;
+  check(spawnBinding.test(dsrc2), "control: the daemon's binding calls bindRun",
+    (dsrc2.match(/onSpawn:[\s\S]{0,120}/) ?? [""])[0]);
   // The settings file is immutable per run: two daemons sharing the state dir
   // and a PR number must never overwrite each other's file between the hash
   // and the spawn.

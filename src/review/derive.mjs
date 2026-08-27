@@ -248,7 +248,15 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     // observation -- and `>` on equal seconds is a coin toss decided by whichever
     // GitHub timestamp happens to round which way.
     const ord = rounds.length;
-    rounds.push({ reviewer: r.source, source_id: r.external_id, event_at: r.event_at ?? at, ...c });
+    // DISMISSED is carried ON the round rather than keeping the round out.
+    //
+    // It still happened, so it still counts toward the round budget and toward
+    // coverage — rewriting those is a bigger question than this. What it must not
+    // be is EVIDENCE THAT THE REVIEWER LOOKED AGAIN. Suppressing only its own
+    // findings left it clearing everyone else's: dismiss a review and the earlier
+    // findings it was never about quietly went away.
+    const dismissed = String(o.payload?.state ?? "").toUpperCase() === "DISMISSED";
+    rounds.push({ reviewer: r.source, source_id: r.external_id, event_at: r.event_at ?? at, dismissed, ...c });
 
     // A substantive review BODY is the only place a body finding can come from.
     // `classifyObservation` already returned null for a 0-byte review -- the
@@ -275,6 +283,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     // historical round can then be later than any historical finding. Every old
     // body finding would stay open until some future review arrived, on a pull
     // request whose reviewers had long since finished with it.
+    const edited = (r.generation ?? 1) > 1;
     const seenAt = (r.generation ?? 1) > 1
       ? (r.observed_at ?? r.event_at ?? at)
       : (r.event_at ?? r.observed_at ?? at);
@@ -283,7 +292,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     // somebody explicitly discarded, and no later round can clear them because the
     // dismissal is not a round. Its ROUND classification is left alone: it still
     // happened, and rewriting coverage history is a larger question than this.
-    if (String(o.payload?.state ?? "").toUpperCase() === "DISMISSED") continue;
+    if (dismissed) continue;
 
     const declared = typeof rev?.bodyFindings === "string" || rev?.bodyFindings === false;
     if (!declared) bodyComplete = false;
@@ -312,7 +321,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
                  `so this body is counted as one finding of unknown severity: ` +
                  String(o.payload?.body ?? "").replace(/\s+/g, " ").slice(0, 240),
         event_at: r.event_at ?? at, head_full: c.head_full ?? null, ord,
-        seen_at: seenAt, unreadable: 1,
+        seen_at: seenAt, edited, unreadable: 1,
       });
       continue;
     }
@@ -325,7 +334,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
         // be filed as a nit.
         severity: severityOf(text, rev?.severityMarkers ?? []),
         excerpt: text.slice(0, 400), event_at: r.event_at ?? at,
-        head_full: c.head_full ?? null, ord, seen_at: seenAt, unreadable: 0,
+        head_full: c.head_full ?? null, ord, seen_at: seenAt, edited, unreadable: 0,
       });
     }
   }
@@ -370,14 +379,34 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
   // the edit cleared text that did not exist when that round ran. A newly added P0
   // could leave the count without anybody having looked at it.
   //
-  // The ordinal still decides the same-instant case, where two rounds share a
-  // second and comparing timestamps is a coin toss. Both are required: the ordinal
-  // for ties, `seen_at` for text that arrived later than its container.
-  const roundClearsAfter = (reviewer, ord, seenAt) => rounds.some(
-    (x, i) => i > ord && x.reviewer === reviewer &&
+  // The timestamp is asked ONLY of an edit, and that restriction is the whole
+  // point of it. For a first generation `seen_at` IS the review's own event_at, so
+  // two same-second rounds give `x.event_at === seenAt` and a strict comparison
+  // rejects the very case the ordinal exists to decide — the timestamp vetoing
+  // the tiebreak it was supposed to accompany. The comment here used to claim the
+  // ordinal still decided ties; it did not.
+  //
+  // A DISMISSED round is excluded outright: a maintainer saying a review no longer
+  // counts is not that reviewer having looked again.
+  const roundClearsAfter = (reviewer, ord, seenAt, edited) => rounds.some(
+    (x, i) => i > ord && x.reviewer === reviewer && !x.dismissed &&
               (x.outcome === "findings" || x.outcome === "clean") && covers(x) &&
-              (x.event_at ?? 0) > seenAt);
-  for (const f of bodyFindings) f.is_cleared = roundClearsAfter(f.reviewer, f.ord, f.seen_at) ? 1 : 0;
+              (!edited || (x.event_at ?? 0) > seenAt));
+  for (const f of bodyFindings)
+    // A SENTINEL IS NEVER CLEARED BY A ROUND, because a round is not what would
+    // fix it. It does not say "this reviewer raised something"; it says reeve
+    // cannot parse this reviewer's bodies at all — a fact about the profile, not
+    // about the pull request. An ordinary clearance let a later clean comment
+    // retire it while reeve was exactly as unable to read as before, and since
+    // sentinels are minted only from review OBJECTS, that round created no
+    // replacement. The count fell to zero and the pull request was free to merge.
+    //
+    // It leaves by being re-derived without one: declaring `bodyFindings` for that
+    // reviewer changes the classifier version, which makes the projection stale
+    // and rebuilds it. So the escape is the operator action the escalation asks
+    // for, and nothing else.
+    f.is_cleared = f.unreadable ? 0
+                 : (roundClearsAfter(f.reviewer, f.ord, f.seen_at, f.edited) ? 1 : 0);
 
   db.exec("BEGIN IMMEDIATE");
   try {

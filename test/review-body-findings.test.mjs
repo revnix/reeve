@@ -28,6 +28,7 @@ import { ingest, noteHead } from "../src/review/ingest.mjs";
 import { compare } from "../src/review/shadow.mjs";
 import { reviewFacts } from "../src/pr.mjs";
 import { fixFindingsPrompt, spillPrompt } from "../src/prompts.mjs";
+import { dispatchable } from "../src/daemon.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
 import { open } from "../src/db/ops.mjs";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -317,6 +318,121 @@ ingest(db, NWO, 1, [
     "control: the same body on a live review yields both findings");
   rmSync(dir7, { recursive: true, force: true });
   rmSync(dir8, { recursive: true, force: true });
+}
+
+// ── a DISMISSED review clears nothing, not even other reviews' findings ──────
+//
+// Suppressing only its OWN findings left it clearing everyone else's: dismiss a
+// review and the earlier findings it was never about quietly went away. A
+// maintainer saying a review no longer counts is not that reviewer having looked
+// again.
+{
+  const dir9 = mkdtempSync(join(tmpdir(), "reeve-body9-"));
+  const db9 = open(join(dir9, "s.db"));
+  noteHead(db9, NWO, 9, HEAD_A, T);
+  const p = PROFILE();
+  ingest(db9, NWO, 9, [
+    review(1, "codex", "**![P1 Badge](x) an earlier finding**", HEAD_A, T),
+    review(2, "codex", "a later look", HEAD_A, T + 100, "DISMISSED"),
+  ], { at: T });
+  derivePr(db9, NWO, 9, p, { at: T + 200, head: HEAD_A });
+  check(reviewState(db9, NWO, 9, p, { at: T + 200, head: HEAD_A }).bodyOpen === 1,
+    "a dismissed later review does not clear an earlier finding it was never about");
+
+  // Control: the identical timeline with that review NOT dismissed does clear it,
+  // so the assertion is about the dismissal and not about the timeline.
+  const dirA = mkdtempSync(join(tmpdir(), "reeve-bodyA-"));
+  const dbA = open(join(dirA, "s.db"));
+  noteHead(dbA, NWO, 10, HEAD_A, T);
+  ingest(dbA, NWO, 10, [
+    review(1, "codex", "**![P1 Badge](x) an earlier finding**", HEAD_A, T),
+    review(2, "codex", "a later look", HEAD_A, T + 100),
+  ], { at: T });
+  derivePr(dbA, NWO, 10, p, { at: T + 200, head: HEAD_A });
+  check(reviewState(dbA, NWO, 10, p, { at: T + 200, head: HEAD_A }).bodyOpen === 0,
+    "control: undismissed, the same later review clears it");
+  rmSync(dir9, { recursive: true, force: true });
+  rmSync(dirA, { recursive: true, force: true });
+}
+
+// ── two rounds in the same SECOND: the ordinal decides ───────────────────────
+//
+// For a first generation `seen_at` IS the review's own event_at, so a strict
+// timestamp comparison rejects a later round sharing that second — the timestamp
+// vetoing the tiebreak it was supposed to accompany. The comment claimed the
+// ordinal still decided ties. It did not.
+{
+  const dirB = mkdtempSync(join(tmpdir(), "reeve-bodyB-"));
+  const dbB = open(join(dirB, "s.db"));
+  noteHead(dbB, NWO, 11, HEAD_A, T);
+  const p = PROFILE();
+  ingest(dbB, NWO, 11, [
+    review(1, "codex", "**![P1 Badge](x) filed**", HEAD_A, T),
+    review(2, "codex", "looked again in the same second", HEAD_A, T),
+  ], { at: T });
+  derivePr(dbB, NWO, 11, p, { at: T + 100, head: HEAD_A });
+  check(reviewState(dbB, NWO, 11, p, { at: T + 100, head: HEAD_A }).bodyOpen === 0,
+    "a later round sharing the filing second still clears, decided by the ordinal");
+  rmSync(dirB, { recursive: true, force: true });
+}
+
+// ── a sentinel is never cleared by a round ───────────────────────────────────
+//
+// It does not say "this reviewer raised something"; it says reeve cannot parse
+// this reviewer's bodies at all — a fact about the profile, not the pull request.
+// Ordinary clearance let a later clean round retire it while reeve was exactly as
+// unable to read as before, and since sentinels are minted only from review
+// OBJECTS, that round created no replacement. The count fell to zero.
+{
+  const dirC = mkdtempSync(join(tmpdir(), "reeve-bodyC-"));
+  const dbC = open(join(dirC, "s.db"));
+  noteHead(dbC, NWO, 12, HEAD_A, T);
+  // codex is blocking and configured, but with no bodyFindings declaration.
+  const undeclared = PROFILE();
+  undeclared.reviewers[0] = { ...undeclared.reviewers[0] };
+  delete undeclared.reviewers[0].bodyFindings;
+  ingest(dbC, NWO, 12, [review(1, "codex", "something I cannot parse", HEAD_A, T)], { at: T });
+  derivePr(dbC, NWO, 12, undeclared, { at: T + 50, head: HEAD_A });
+  check(reviewState(dbC, NWO, 12, undeclared, { at: T + 50, head: HEAD_A }).unreadableBodies.length === 1,
+    "control: the unreadable body produced a sentinel");
+
+  // A later round at the same head. Nothing about the profile has changed.
+  ingest(dbC, NWO, 12, [review(2, "codex", "looked again", HEAD_A, T + 100)], { at: T + 100 });
+  derivePr(dbC, NWO, 12, undeclared, { at: T + 150, head: HEAD_A });
+  const after = reviewState(dbC, NWO, 12, undeclared, { at: T + 150, head: HEAD_A });
+  // BOTH, and counting them is the point. The later round is itself an unreadable
+  // body, so it mints a sentinel of its own — which means "at least one survives"
+  // passes even when the first one has been wrongly cleared, satisfied by the
+  // replacement rather than by the rule. Naming the specific one is what makes
+  // this a measurement.
+  check(after.unreadableBodies.length === 2,
+    "a later round does not retire the earlier sentinel — reeve is exactly as unable to read as before",
+    JSON.stringify(after.unreadableBodies.map(b => b.excerpt.slice(0, 40))));
+  check(after.unreadableBodies.some(b => /cannot parse/.test(b.excerpt)),
+    "and it is the ORIGINAL one still open, not merely its successor",
+    JSON.stringify(after.unreadableBodies.map(b => b.excerpt.slice(-40))));
+  check(after.unspilledCritical > 0,
+    "so the count cannot fall to zero behind an unread body", String(after.unspilledCritical));
+
+  // And it leaves the only way it should: by the reviewer being declared, which
+  // changes the classifier version and re-derives without one.
+  derivePr(dbC, NWO, 12, PROFILE(), { at: T + 200, head: HEAD_A });
+  check(reviewState(dbC, NWO, 12, PROFILE(), { at: T + 200, head: HEAD_A }).unreadableBodies.length === 0,
+    "control: declaring the reviewer is what retires it, which is the action the escalation asks for");
+  rmSync(dirC, { recursive: true, force: true });
+}
+
+// ── a stale body finding is withheld from a MIXED dispatch ───────────────────
+{
+  const items = [{ id: "t1", anchor: "thread" }, { id: "b1", anchor: "body" }];
+  check(dispatchable({ action: "FIX_FINDINGS", bodyFindings: false }, items).length === 1 &&
+        dispatchable({ action: "FIX_FINDINGS", bodyFindings: false }, items)[0].anchor === "thread",
+    "when the decision withheld body findings, the worker is sent only the thread",
+    JSON.stringify(dispatchable({ action: "FIX_FINDINGS", bodyFindings: false }, items)));
+  check(dispatchable({ action: "FIX_FINDINGS", bodyFindings: true }, items).length === 2,
+    "control: when it did NOT withhold them, both travel");
+  check(dispatchable({ bodyFindings: true }, null).length === 0,
+    "control: an absent list is empty rather than a crash");
 }
 
 // ── completeness, decided against what was POSTED ────────────────────────────

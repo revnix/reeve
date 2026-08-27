@@ -57,7 +57,19 @@ const WITNESSES = [
   // nearby handler declaration would all have satisfied it, and the witness would
   // have claimed a stage §0 correctly denies.
   [3, "SPILL onto the durable path", "src/daemon.mjs", /kind:\s*["']gh\.issue\.create["']/],
-  [4, "real thread details into FIX_FINDINGS", "src/daemon.mjs", /threads:\s*e\.threadDetails\b/],
+  // Stage 4's witness is the PRODUCER too, for the same reason stage 3's is, and
+  // it was moved here after the consumer's shape changed underneath it.
+  //
+  // It used to match `threads: e.threadDetails` in the daemon — the CONSUMER, and
+  // a literal one. The moment the dispatch learned to withhold a body finding the
+  // reviewer has not returned to, that expression stopped being a bare pass-through
+  // and the witness reported stage 4 as not built. The stage was built; the proxy
+  // had rotted. A witness tied to the shape of a call site measures the call site.
+  //
+  // `threadDetails: fresh ? st.threads` cannot exist unless the projection really
+  // feeds the decision path: before stage 4 that field was hard-coded null, which
+  // is precisely what stage 4 replaced.
+  [4, "real thread details into FIX_FINDINGS", "src/pr.mjs", /threadDetails:\s*fresh\s*\?\s*st\.threads\b/],
 ];
 
 const built = new Set();

@@ -461,6 +461,21 @@ export async function sandboxCanary({
   dir, outsideDir, tmpDir, decoyPath,
   bin, env,
   runner = runWorker, budgetMs = 5 * 60_000, maxOutputBytes = 8 * 1024 * 1024,
+  // Forwarded to the runner so the caller can bind the canary's DETACHED child
+  // before it is let go. Without it the canary's provider lease stays on the
+  // guardian's pid, and a guardian that dies while the canary runs leaves a
+  // lease whose holder looks dead while the model call is still being paid for.
+  onSpawn = () => {},
+  // Asked immediately before the paid model call, and able to REFUSE it.
+  //
+  // The caller's provider lease belongs here rather than around this function:
+  // whether a canary actually runs depends on the cheap platform gates and on a
+  // cache hit under an exact key with `ok: true`, and a caller that tries to
+  // predict that from outside gets it wrong in both directions -- claiming for a
+  // call that will not happen, or skipping the claim for one that will and
+  // spending unmetered. Asking here makes the claim coincide with the spend by
+  // construction.
+  beforeSpawn = async () => ({ ok: true }),
   validate = validateSettings, keepOnFailure = true,
   // The network positive control: a daemon-local listener (netListener above)
   // the sandboxed curl tries to reach. `{ url, selfReachable, wasHit }`. The
@@ -477,6 +492,28 @@ export async function sandboxCanary({
   // denies while regressing exact-file matching cannot pass. (Codex #4g-[6].)
   const fileDecoyPath = join(outsideDir, "FILE-DECOY.txt");
   const fileControlPath = join(outsideDir, "FILE-CONTROL.txt");
+
+  // EVERY PATH OUT REMOVES WHAT THIS FUNCTION CREATED.
+  //
+  // The refusal below returns before the cleanup at the bottom, and `decoyPath`
+  // is the one artefact the CALLER cannot reach for us: `dir`, `outsideDir` and
+  // `tmpDir` all sit under `canaryRoot`, which the daemon removes on a skip, but
+  // the decoy is written under the reeve home with a per-invocation, timestamped
+  // name. A refusal is not an exceptional case either -- the scheduler answers
+  // `queued`, `cooldown` and `at-limit` as ORDINARY outcomes that repeat every
+  // tick -- so each one left another uniquely named file behind for ever, in the
+  // deny-read state tree, which is the last place that should accumulate litter.
+  //
+  // A function rather than a repeated block, so a future early return cannot
+  // omit half of it.
+  const sweep = ({ keepRunDir = false } = {}) => {
+    if (!keepRunDir) rmSync(dir, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+    rmSync(tmpDir, { recursive: true, force: true });
+    rmSync(decoyPath, { force: true });
+    rmSync(fileDecoyPath, { force: true });
+    rmSync(fileControlPath, { force: true });
+  };
   // The listener's URL is not known until it is ready, and the script embeds it.
   // Awaited HERE rather than lower down, because the script is built next: with
   // the await after it, `netUrl` was null, the network control never made it
@@ -560,6 +597,18 @@ export async function sandboxCanary({
   // again after the run, so a hit at any point counts.
   const selfBefore = netProbe ? await Promise.resolve(netProbe.selfReachable?.() ?? null) : null;
 
+  // REFUSED BEFORE ANYTHING IS SPENT. A refusal is not a canary failure: nothing
+  // ran, so nothing was measured, and the verdict stays open for want of
+  // evidence rather than because evidence was gathered and was bad.
+  const permit = await beforeSpawn();
+  if (permit?.ok === false) {
+    evidence.outcome = "not-run";
+    evidence.why = permit.why ?? "the canary was not permitted to run";
+    // NOTHING RAN, so there is no evidence to preserve and nothing to keep.
+    sweep();
+    return { ok: false, id, why: `not run: ${evidence.why}`, skipped: true, evidence };
+  }
+
   let r;
   try {
     r = await runner({
@@ -567,7 +616,7 @@ export async function sandboxCanary({
                               allowedTools: canaryGrant(dir, decoyPath).join(","),
                               settings: settingsPath, maxTurns: 8 }),
       cwd: dir, env, outPath: join(dir, "canary.out"), errPath: join(dir, "canary.err"),
-      maxOutputBytes, budgetMs, isHalted: () => false,
+      maxOutputBytes, budgetMs, isHalted: () => false, onSpawn,
     });
   } catch (err) {
     r = { outcome: "failed", why: `the canary runner threw: ${err.message}` };
@@ -692,11 +741,8 @@ export async function sandboxCanary({
   else if (evidence.readTool === "not-denied") problems.push("the Read tool was called on the decoy without a denial in the event stream");
 
   const ok = problems.length === 0;
-  if (ok || !keepOnFailure) { rmSync(dir, { recursive: true, force: true }); }
-  rmSync(outsideDir, { recursive: true, force: true });
-  rmSync(tmpDir, { recursive: true, force: true });
-  rmSync(decoyPath, { force: true });
-  rmSync(fileDecoyPath, { force: true }); rmSync(fileControlPath, { force: true });
+  // A FAILED canary keeps its run directory for evidence; everything else goes.
+  sweep({ keepRunDir: !(ok || !keepOnFailure) });
   return ok ? { ok: true, id, why: null, evidence } : { ok: false, id, why: problems.join("; "), evidence };
 }
 

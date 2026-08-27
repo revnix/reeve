@@ -94,6 +94,28 @@ export function nextAction(e, p, h = {}) {
   // pushing into one strands the work silently.
   if (e.state && e.state !== "open") return act(ACTIONS.PARK, `PR is ${e.state}`);
 
+  // 0. A BUILDER HOLD, read before anything that might act on the PR.
+  //
+  // The builder wrote `pr_hold` on purpose and a founder clears it with `reeve
+  // task resume`. That is a decision already taken, not a defect to repair and
+  // not a gap in reeve, so it is PARK.
+  //
+  // ORDER IS THE WHOLE POINT, and late placement loses in two directions at
+  // once. A held PR that also has red CI reaches the `ci` branch below and
+  // returns FIX_CI -- the guardian dispatching a fixer at a task the builder
+  // deliberately parked, which is the precise outcome `pr_hold` exists to
+  // prevent. And a `hold` clause left to fall through reaches the unclassified
+  // escalation at the end of this function, which carries `gap: true` -- the
+  // flag reserved for a verdict reeve does not understand -- so every ordinary
+  // held PR would report an implementation gap, every tick, with the merge
+  // correctly blocked and the reason a lie.
+  //
+  // UNKNOWN escalates rather than parking: "the hold cannot be scoped" is a
+  // configuration fault for the founder to fix, not a decision to respect.
+  const hold = clause(v, "hold");
+  if (hold?.state === "BLOCK") return act(ACTIONS.PARK, `held by the builder: ${hold.detail}`);
+  if (hold?.state === "UNKNOWN") return act(ACTIONS.ESCALATE, `builder hold state unknown: ${hold.detail}`);
+
   // 1. Conflicts first: nothing else can be evaluated meaningfully on a branch
   //    that cannot merge at all, and rebasing is a decision, not a repair.
   const mergeable = clause(v, "mergeable");

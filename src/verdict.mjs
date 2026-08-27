@@ -49,6 +49,22 @@ function worst(a, b) {
  * @param {string} i.mergeState      GitHub mergeStateStatus
  * @param {object} i.profile
  */
+/**
+ * Every clause id `computeVerdict` can emit.
+ *
+ * ONE LIST, because there were four: this function's `add` calls, and three
+ * test matrices that each restated the set and claimed totality over it. A
+ * clause added without updating a matrix leaves that matrix asserting totality
+ * over a set one short -- which is how a missing branch reaches production while
+ * its test reports full coverage.
+ *
+ * `hold` is CONDITIONAL: it appears only when the caller supplies a reading. It
+ * is listed here because the question is "which ids exist", not "which appear on
+ * every verdict".
+ */
+export const CLAUSE_IDS = Object.freeze(
+  ["ci", "base", "review", "rounds", "threads", "findings", "mergeable", "cleared", "hold"]);
+
 export function computeVerdict(i) {
   const clauses = [];
   const add = (id, state, detail) => clauses.push({ id, state, detail });
@@ -158,6 +174,24 @@ export function computeVerdict(i) {
   if (i.ledgerBlockers === null || i.ledgerBlockers === undefined) add("findings", UNKNOWN, "could not read blocking findings");
   else if (i.ledgerBlockers > 0) add("findings", BLOCK, `${i.ledgerBlockers} active finding(s) block this PR`);
   else add("findings", PASS, "no active blocking findings");
+
+  // 7b. A BUILDER HOLD. The builder wrote `pr_hold` deliberately and a founder
+  //     clears it; the guardian's job is to render it, never to act on it.
+  //
+  //     ABSENT IS NOT THE SAME AS UNREADABLE. `openHold` answers three ways for
+  //     that reason: no hold lets the PR proceed, an unreadable hub must not. A
+  //     boolean here would make an unreachable hub read as "nothing is held",
+  //     which is precisely the fail-open the guest connection exists to stop.
+  //
+  //     Omitted entirely when the caller passes nothing, rather than defaulting
+  //     to UNKNOWN: a guardian built before the hub existed has no opinion about
+  //     holds, and an UNKNOWN clause would drag every verdict it renders to
+  //     UNKNOWN for a question it was never asked.
+  if (i.hold) {
+    if (i.hold.readable === false) add("hold", UNKNOWN, `builder hold not readable: ${i.hold.why}`);
+    else if (i.hold.held) add("hold", BLOCK, i.hold.detail ? `${i.hold.reason}: ${i.hold.detail}` : String(i.hold.reason));
+    else add("hold", PASS, "the builder has not held this PR");
+  }
 
   // 7. GitHub's own mergeability. UNKNOWN is GitHub still computing; retry.
   const MS = String(i.mergeState ?? "").toUpperCase();

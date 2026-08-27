@@ -43,6 +43,48 @@ export const LEASE_COLS =
    requested_at, started_at, heartbeat_at, expires_at, preempt_requested, token`;
 
 /**
+ * The shape the provider scheduler REQUIRES, table by table.
+ *
+ * A version number is a claim about shape and `COLUMNS_AT` describes only what
+ * later migrations ADD -- so a current-version hub missing a column created in
+ * migration 1, `provider_state.cooldown_until` among them, satisfied both and
+ * still threw on the first `providerState` read, into the guardian's fail-open
+ * path. What the scheduler needs is what its own SQL names, and that is here.
+ *
+ * NAMES ARE NOT ENOUGH, and a name-only gate is a fail-open. These tables are
+ * STRICT, so a column whose DECLARED TYPE is wrong accepts the schema check and
+ * then refuses the write: a hub carrying `provider_lease.token INTEGER` passed
+ * every name comparison, and `claimProvider` threw "cannot store TEXT value in
+ * INTEGER column" into the guardian's documented fail-open path, which dispatches
+ * model work outside the shared limit. Measured against node:sqlite, with a
+ * control on the correct schema, rather than reasoned about.
+ *
+ * So the shape is a column-to-TYPE map, not a list of names.
+ *
+ * `provider_lease` can no longer be derived from `LEASE_COLS`, since that
+ * constant carries no types. The derivation is replaced by an ASSERTED
+ * AGREEMENT: the test requires these keys to equal `LEASE_COLS` exactly, in both
+ * directions, so a column added to the SQL without a type here fails the suite
+ * rather than silently leaving a hole in the gate. Both maps are also compared
+ * against a freshly migrated hub, in both directions, so neither can drift from
+ * what the migrations actually build.
+ */
+export const SCHEDULER_COLUMNS = Object.freeze({
+  provider_lease: Object.freeze({
+    id: "INTEGER", owner: "TEXT", repo_id: "INTEGER", run_ref: "TEXT",
+    pid: "INTEGER", lstart: "TEXT", priority: "INTEGER", budget_usd: "REAL",
+    status: "TEXT", requested_at: "INTEGER", started_at: "INTEGER",
+    heartbeat_at: "INTEGER", expires_at: "INTEGER",
+    preempt_requested: "INTEGER", token: "TEXT",
+  }),
+  provider_state: Object.freeze({
+    provider: "TEXT", concurrency_limit: "INTEGER", guardian_reserved: "INTEGER",
+    cooldown_until: "INTEGER", last_429_at: "INTEGER", last_signature: "TEXT",
+    measured_at: "INTEGER",
+  }),
+});
+
+/**
  * A claim's INCARNATION, and the reason an identity is not enough.
  *
  * `restoreHub` clears provider_lease in the restored file, so SQLite restarts

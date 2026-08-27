@@ -14,10 +14,10 @@
 //     it WOULD do. Shipping a loop that acts before its decisions have been
 //     watched is how an unattended run becomes an incident.
 
-import { evaluatePr, publishVerdict, prAnchor } from "./pr.mjs";
+import { evaluatePr, publishVerdict, prAnchor, isBuilderPr } from "./pr.mjs";
 import { nextAction, describe, ACTIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
-import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, OUTCOMES } from "./supervisor.mjs";
+import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, isSameProcess, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
 import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE, gitEnv } from "./gitguard.mjs";
@@ -26,6 +26,10 @@ import { rootCause, resolveFailureCause, flakeAssessment } from "./ci-rootcause.
 import { workerEnv, writeGitConfig, readOauthToken, workerHomeFor } from "./workerenv.mjs";
 import { measureContainment, revalidateContainment, probeKeychain, isolationTopologyReady, cheapContainmentReasons, binaryIdentity } from "./containment.mjs";
 import { canaryIdFor, netListener, instrumentHash } from "./canary.mjs";
+import { claimProvider, releaseProvider, bindProviderLease, noteRateLimit, heartbeatProvider,
+         reapProviderLeases, cancelQueued, queuedGuardianRequests } from "./provider.mjs";
+import { openHold } from "./build/holds.mjs";
+import { resolveRepoId } from "./build/repoid.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects } from "./db/ops.mjs";
@@ -538,7 +542,20 @@ export function stateRootsFor(stateDir, logPath, worktree, dbPath = null) {
  * sandbox canary. Exported so `reeve canary` can run exactly this, rather than a
  * reconstruction of it that could drift from what dispatch actually does.
  */
-export async function measuredContainment(ctx, profile, nwo, logPath) {
+export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSpawn = null, onSpawn = null } = {}) {
+  // THE CACHE LIVES ON THE CALLER'S PERSISTENT CONTEXT, and that is why these
+  // two hooks are parameters rather than fields on it.
+  //
+  // `tick` used to build `{ ...ctx, canaryBeforeSpawn, canaryOnSpawn }` purely to
+  // carry two functions, and this lazy `??=` then created the Map on that
+  // per-tick COPY. `run` loops on ONE persistent ctx, so every tick began with an
+  // empty cache and paid for the containment canary again -- and since nothing in
+  // the repository ever seeded the field, the cache had never once survived a
+  // tick since it was written.
+  //
+  // Seeding the copy before spreading would have fixed this call site and left
+  // the mechanism intact: the next field a callee lazily attaches to `ctx` is the
+  // same defect again. Removing the copy removes the class.
   const cache = (ctx.containmentCache ??= new Map());
   try {
     const root = profile.identity?.worktreeRoot;
@@ -626,6 +643,14 @@ export async function measuredContainment(ctx, profile, nwo, logPath) {
       // process.platform in production; injectable so a test on one OS can
       // exercise the verdict for another (the fail-closed matrix is per-OS).
       platform: ctx.platform ?? undefined,
+      // BOUND BEFORE IT RUNS, like every other dispatch. The canary is a
+      // detached model call of up to five minutes; without this its provider
+      // lease stays on the guardian's own pid, so a guardian that dies mid-canary
+      // leaves a lease whose holder reads dead while the call is still being
+      // paid for -- and a restore or a reap then frees a slot the provider is
+      // still serving.
+      onSpawn: onSpawn ?? (() => {}),
+      beforeSpawn: beforeSpawn ?? (async () => ({ ok: true })),
       // The profile LABEL is necessary but not sufficient: it closes containment
       // only when the topology it names is actually in place. The scratch-home
       // arrangement (a home of reeve's making, a per-run standalone clone, a
@@ -918,6 +943,16 @@ function unknownSince(db, pr) {
 // path is the one place where a mistake costs real work, and it was the only
 // path with no test at all -- because driving it otherwise needs GitHub and a
 // live `claude`. A ReferenceError sat in it undetected for exactly that reason.
+// How long before the guardian re-asks for a repository id it could not resolve.
+// A constant, not a profile key: the value only matters when the answer is
+// missing, and a knob the schema does not declare fails validation for anyone
+// who tries to turn it.
+const REPO_ID_RETRY_SECONDS = 600;
+// How long the provider is treated as exhausted after a worker comes back rate
+// limited. A constant for the same reason as the retry above: an undeclared
+// profile key fails validation for anyone who tries to turn it.
+const RATE_LIMIT_COOLDOWN_SECONDS = 600;
+
 export async function tick(ctx) {
   const { nwo, profile, db, execute = false, shadow = true } = ctx;
   // Absolute, once, before ANYTHING derives from it. A relative `--log` made
@@ -929,6 +964,14 @@ export async function tick(ctx) {
   const logPath = ctx.logPath ? resolve(ctx.logPath) : ctx.logPath;
   if (logPath !== ctx.logPath) ctx = { ...ctx, logPath };
   const decisions = [];
+  // Pull requests this tick could not read. Their queued provider requests are
+  // preserved rather than cancelled: absence from `decisions` means "unknown",
+  // not "no longer wanted".
+  const unreadable = new Set();
+  // Run refs this tick actually put to the scheduler, and the queued rows it
+  // read. The cancel phase after the dispatch loop needs both.
+  const askedFor = new Set();
+  let queuedNow = [];
   const escalations = new Map();
   /**
    * Raise a cause. The count is the VALUE and can never be part of the key.
@@ -948,11 +991,6 @@ export async function tick(ctx) {
    * so that putting it in the key requires deliberately going around this.
    */
   const raise = (cause, n = 1) => escalations.set(cause, (escalations.get(cause) ?? 0) + n);
-
-  if (halted(ctx.haltMarker)) {
-    log(logPath, `HALTED: ${ctx.haltMarker} exists — no work will be started`);
-    return { decisions, escalations, halted: true };
-  }
 
   // Carrying out queued effects does not depend on being able to LIST pull
   // requests, and the two use different credentials -- `openPrs` uses the ambient
@@ -1223,6 +1261,325 @@ export async function tick(ctx) {
     return { fresh, cleared };
   };
 
+  // ── the hub, the repository id, and the provider scheduler ───────────────
+  //
+  // ABOVE THE PULL-REQUEST LOOP, because the loop needs both: the verdict reads
+  // `pr_hold` per PR, and the dispatch below claims a lease scoped to the
+  // repository id.
+  //
+  // `ctx.hub` is a GETTER, not a handle. `restoreHub` replaces the hub file, and
+  // a connection opened before that stays attached to the unlinked inode -- so a
+  // daemon holding one for its lifetime would schedule in a database nobody else
+  // can see, letting the guardian and the builder each admit up to the global
+  // limit. It is re-asked once per tick.
+  // ASKED AT EVERY OPERATION, not once per tick. A tick spans PR evaluation and
+  // worker preparation, which is plenty of time for a restore to rename the hub
+  // underneath it -- and a snapshot taken at the top would then serve an unlinked
+  // inode for the rest of the pass, so a later claim succeeds in a scheduler
+  // database nobody else can see and the restored hub admits work past the limit
+  // at the same time. The getter compares the file's identity and reopens; it is
+  // a stat and a comparison, so asking often is cheap.
+  const hubNow = () => (typeof ctx.hub === "function" ? ctx.hub() : { hub: ctx.hub ?? null, why: null });
+  // Reported ONCE per tick even though it is asked many times: an outage is one
+  // cause, and raising it per operation would turn a standing failure into a
+  // stream of alerts that each retire the last.
+  let hubFaultSaid = false;
+  let projectFaultSaid = false;
+  // A scheduler mutation gets a CURRENT handle or nothing.
+  //
+  // `?? hub` was written as a safety fallback and WAS the defect: when the
+  // getter reports the hub unreadable or replaced, falling back to the handle
+  // taken at the top of the tick is exactly the stale-inode write the getter
+  // exists to prevent -- the claim reserves capacity in an unlinked database
+  // while the restored scheduler admits its own. There is no safe old handle;
+  // there is a current one or none. Four sites had it, not the two I counted:
+  // both claims and both binds.
+  const claimHub = () => hubOr(() => null);
+  const hubOr = (onFault) => {
+    const a = hubNow();
+    if (a.why && !hubFaultSaid) {
+      hubFaultSaid = true;
+      log(logPath, `hub: ${a.why}`);
+      raise("guardian:hub:unreadable");
+    }
+    return a.why ? onFault(a.why) : a.hub;
+  };
+  // A hub that EXISTS and cannot be opened is not a hub that is absent. The first
+  // is an outage the founder must hear about; the second is an ordinary machine
+  // with no builder on it.
+  const hub = hubOr(() => null);
+
+  // RESOLVED OUTSIDE THE GUEST CONNECTION. `repoIdFromHub` reads `task`, which is
+  // not on the guardian's allowlist -- section 13 gives it the provider scheduler
+  // and `pr_hold`, and reading the builder's work table would be the third touch
+  // the guest exists to refuse. Handing the guest to the resolver made every
+  // production tick throw and fail closed on every dispatch, while the fixture
+  // that was supposed to cover it injected a plain object as the hub and could
+  // not exhibit it. `bin/reeve` answers this with a privileged handle held for
+  // one statement; issue #46 removes even that.
+  //
+  // RE-ASKED WHEN IT IS STILL UNKNOWN, on a fixed cadence. A project whose first
+  // task is admitted after the daemon started would otherwise leave the guardian
+  // fail-closed on every dispatch until someone restarted it. The cadence is a
+  // constant rather than a profile key: an earlier revision read
+  // `builder.provider.repoIdRetryMinutes`, which the profile schema does not
+  // declare, so an operator who tuned the knob it advertised made `reeve run`
+  // fail validation instead.
+  // A REGISTRY THAT COULD NOT BE PARSED IS NOT A MISSING PROJECT. `bin/reeve`
+  // rejects the whole registry when any single entry is malformed, so an
+  // unrelated bad entry leaves this repository with no project, no repository
+  // id, every dispatch fail-closed and every builder-PR hold UNKNOWN. Failing
+  // closed is right; doing it silently is not.
+  if (ctx.projectError && !projectFaultSaid) {
+    projectFaultSaid = true;
+    log(logPath, `registry: ${ctx.projectError}`);
+    raise("the project registry could not be read; this repository has no resolvable identity");
+  }
+  if (ctx.repoId == null && ctx.resolveRepoId) {
+    const at = Math.floor(Date.now() / 1000);
+    if (at - (ctx._repoIdTriedAt ?? 0) >= REPO_ID_RETRY_SECONDS) {
+      ctx._repoIdTriedAt = at;
+      try {
+        ctx.repoId = await ctx.resolveRepoId();
+      } catch (err) {
+        log(logPath, `provider: the repository id could not be resolved — ${err.message}`);
+        raise("guardian:hub:unreadable");
+      }
+    }
+  }
+  const repoId = ctx.repoId ?? null;
+
+  // Releases refused because a restore holds `maintenance_lock`, carried to the
+  // next tick. A refusal is a REAL outcome to inspect and retry, never something
+  // to swallow: a `catch {}` here leaves a lease held until expiry while the
+  // scheduler counts it against the limit, so the guardian throttles itself for
+  // five minutes over a restore that took one second.
+  //
+  // The IDENTITY is stored and never the id. A restore clears `provider_lease`
+  // and SQLite reuses the integer key, so an id-keyed retry deletes whatever
+  // inherited it -- an unrelated live lease, and the limit is breached by the
+  // very bookkeeping meant to protect it.
+  const pendingReleases = (ctx.providerRetry ??= new Map());
+  const releaseWithRetry = (key, identity) => {
+    // FRESH, not the tick's opening snapshot: a release is the operation most
+    // likely to run long after the hub was first opened.
+    const a = hubNow();
+    // RETAINED, NOT DROPPED. This early return handled the exception path and
+    // the maintenance refusal and then threw the identity away on the third
+    // route out -- a hub that is momentarily unreadable between the claim and
+    // the cleanup. A pre-bind lease is still attached to the guardian's own
+    // always-alive pid, so even past its expiry the liveness-aware reaper keeps
+    // it and the slot is lost for good.
+    //
+    // Only a hub that is genuinely ABSENT drops it: there is no scheduler, so
+    // there is no lease and nothing to give back.
+    if (!a.hub) {
+      if (a.why) {
+        pendingReleases.set(key, identity);
+        if (!hubFaultSaid) { hubFaultSaid = true; log(logPath, `hub: ${a.why}`); raise("guardian:hub:unreadable"); }
+        log(logPath, `provider: release deferred — the hub could not be reached; retrying next tick (${key})`);
+      }
+      return;
+    }
+    const h = a.hub;
+    let r;
+    // A THROW IS NOT A REFUSAL, and only the refusal was handled. On the worker
+    // path this runs at the top of the `finally`, so an exception here skips the
+    // result recording and `finishRun` below it, masks whatever the worker
+    // actually did, and takes the rest of the tick with it. Cleanup must not be
+    // able to destroy the outcome it exists to record.
+    try {
+      r = (ctx.providerRelease ?? releaseProvider)(h, { ...identity, isAlive: isSameProcess });
+    } catch (err) {
+      pendingReleases.set(key, identity);
+      log(logPath, `provider: release THREW — ${err.message}; retrying next tick (${key})`);
+      raise("the provider scheduler is unreadable; dispatching unscheduled");
+      return;
+    }
+    if (r?.ok === false && r.reason === "maintenance") {
+      pendingReleases.set(key, identity);
+      log(logPath, `provider: release deferred — a restore holds the hub; retrying next tick (${key})`);
+    } else {
+      pendingReleases.delete(key);
+    }
+  };
+  // AND THE SAME TREATMENT FOR THE COOLDOWN. `noteRateLimit` REFUSES rather than
+  // throws while a restore holds `maintenance_lock`, and handling only the
+  // exception lost the refusal silently -- so a rate limit hit during a restore
+  // was never recorded, the release was retried, and admissions resumed straight
+  // back into the exhausted window the moment the restore finished. A refusal is
+  // a result to inspect, and it is the same shape as the one two lines above.
+  const pendingCooldowns = (ctx.cooldownRetry ??= new Map());
+  const noteCooldownWithRetry = (key, note) => {
+    // THE WINDOW STARTED WHEN THE 429 WAS SEEN, not when we managed to record it.
+    //
+    // A deferred note that only carries a DURATION restarts the whole cooldown
+    // at retry time, so an outage longer than the cooldown recovers and then
+    // imposes a fresh ten-minute block on every builder and guardian admission
+    // for a window that had already passed. The absolute expiry is stamped at
+    // observation and carried; the retry asks for whatever is left of it.
+    //
+    // AND THE OBSERVATION TIME IS CARRIED TOO, not just the expiry. `recordRateLimit`
+    // keeps whichever metadata is latest by timestamp, so a note re-derived from
+    // the RETRY time looks newer than a 429 seen after it -- and the older
+    // signature then overwrites the newer one, leaving doctor naming the wrong
+    // throttling cause. Both facts are stamped once, at observation, and neither
+    // is re-derived from the other.
+    const nowSec = Math.floor(Date.now() / 1000);
+    const stamped = note.expiresAt != null ? note
+      : { ...note, observedAt: nowSec, expiresAt: nowSec + (note.cooldownSeconds ?? 0) };
+    const left = stamped.expiresAt - nowSec;
+    // Already elapsed while we could not write it. Recording a zero or negative
+    // cooldown would be recording a fact that has stopped being true.
+    if (left <= 0) { pendingCooldowns.delete(key); return; }
+    const send = { signature: stamped.signature, cooldownSeconds: left,
+                   observedAt: stamped.observedAt ?? null, expiresAt: stamped.expiresAt };
+
+    const h = hubOr(() => null);
+    if (!h) { pendingCooldowns.set(key, stamped); return; }
+    let r;
+    try {
+      r = (ctx.noteRateLimit ?? noteRateLimit)(h, { ...send, isAlive: isSameProcess });
+    } catch (err) {
+      pendingCooldowns.set(key, stamped);
+      log(logPath, `provider: could not record the rate limit — ${err.message}; retrying next tick`);
+      raise("the provider scheduler is unreadable; dispatching unscheduled");
+      return;
+    }
+    if (r?.ok === false && r.reason === "maintenance") {
+      pendingCooldowns.set(key, stamped);
+      log(logPath, `provider: cooldown deferred — a restore holds the hub; retrying next tick (${key})`);
+    } else {
+      pendingCooldowns.delete(key);
+    }
+  };
+  if (pendingCooldowns.size) {
+    for (const [key, note] of [...pendingCooldowns]) noteCooldownWithRetry(key, note);
+  }
+
+  if (hub && pendingReleases.size) {
+    for (const [key, identity] of [...pendingReleases]) releaseWithRetry(key, identity);
+  }
+
+  // ── the scheduler's own housekeeping, before ANYTHING can end the tick ────
+  //
+  // Ahead of the pull-request listing, because that listing can return early:
+  // when GitHub cannot be asked, the tick stops there. Housekeeping needs
+  // nothing from GitHub -- it is SQLite and a liveness check -- so leaving it
+  // downstream meant a prolonged GitHub outage let an expired lease from a dead
+  // guardian go on counting against capacity, and a stale queued row go on
+  // blocking every builder admission, while the database that could have
+  // cleared them was healthy the whole time.
+  //
+  // REAP FIRST. `claimProvider` counts held rows and does not reap, and nothing
+  // in production called `reapProviderLeases` at all -- so a guardian or a
+  // detached worker that died before its `finally` left a held row that outlived
+  // its expiry and went on being counted for ever. Enough crashes and the
+  // scheduler returns `at-limit` permanently, to both the guardian and the
+  // builder, with no lease that any live process holds.
+  //
+  // Expiry AND liveness together: a row past `expires_at` whose holder is still
+  // running is a long job, not an abandoned one.
+  // NOT gated on `wanted.length`. A guardian that died holding a lease leaves a
+  // row only its successor can clear, and a successor with nothing to dispatch
+  // this tick is exactly the state a restart lands in -- so gating housekeeping
+  // on local demand meant the rows that most need reaping were reaped least. The
+  // builder never calls the reaper at all, so a held row would count against
+  // capacity for ever and a queued one would block every builder admission.
+  //
+  // NOT GATED ON `execute` EITHER, and that was the third gate found in front of
+  // this block in as many rounds. Dispatch authority is about whether THIS
+  // guardian may start work; reaping is about rows a DEAD one left behind. An
+  // observational guardian -- the default, and exactly what someone restarts
+  // into after an armed guardian crashed -- would skip the only production call
+  // to the reaper, so the dead guardian's queued row sat for ever and
+  // `claimProvider` refused every builder admission while it did. The builder
+  // never reaps at all, so nothing else was coming.
+  {
+    const h = hubOr(() => null);
+    if (h) {
+      try {
+        const rp = (ctx.reapProvider ?? reapProviderLeases)(h, { isAlive: isSameProcess });
+        if (rp?.reaped) log(logPath, `provider: reaped ${rp.reaped} expired lease(s) whose holder is gone`);
+      } catch (err) {
+        // Housekeeping must never take the tick with it.
+        log(logPath, `provider: could not reap expired leases — ${err.message}`);
+        raise("the provider scheduler is unreadable; dispatching unscheduled");
+      }
+    }
+  }
+
+  // ONE READER for this guardian's queued rows. Two callers need them now -- the
+  // dispatch phase, to serve the head of the queue and to cancel what this tick
+  // will not ask for, and the halt path, to withdraw the lot -- and a second copy
+  // of the query would be a second thing to keep in step with `owner` and
+  // `repo_id`. A read that fails answers with nothing AND says so: an empty list
+  // returned silently would let the halt path report that it withdrew everything
+  // when it had read nothing.
+  const readQueuedNow = (h) => {
+    try {
+      return (ctx.queuedRequests ?? queuedGuardianRequests)(h, { repoId }) ?? [];
+    } catch (err) {
+      log(logPath, `provider: could not read the queued requests — ${err.message}`);
+      raise("the provider scheduler is unreadable; dispatching unscheduled");
+      return [];
+    }
+  };
+
+  /**
+   * Stop for the halt marker -- through here, and only through here.
+   *
+   * A HALTED GUARDIAN MUST NOT HOLD A QUEUE POSITION. `claimProvider` serves
+   * guardian requests in order and refuses builder admission while any queued
+   * guardian row exists, and expiry cannot clear this one because the holder pid
+   * is alive and sleeping. So a halt turned into a deadlock that neither party
+   * could break: the guardian is not going to ask for the work, and the builder
+   * cannot have the slot.
+   *
+   * The gate itself moved BELOW the hub and repository-id resolution and the
+   * reaper for this reason -- housekeeping depends on nothing the halt is about,
+   * and it was the third gate found sitting in front of it. What a halted
+   * guardian now does before returning is: read the hub, read its repository id,
+   * retry its own deferred releases and cooldown writes, reap rows whose holders
+   * are gone, and withdraw its own queue position. Every one of those either
+   * completes an obligation it already incurred or removes something that blocks
+   * another process. None of them starts work. The outbox drain is untouched: it
+   * asks `halted` for itself.
+   *
+   * ONE FUNCTION, because three sites stop for this marker and a fourth will be
+   * added by someone who does not know about the queue.
+   */
+  const haltStop = (why) => {
+    log(logPath, why);
+    const h = claimHub();
+    if (h && repoId != null) {
+      for (const row of readQueuedNow(h)) {
+        try {
+          const c = (ctx.cancelQueued ?? cancelQueued)(h, {
+            owner: "guardian", repoId, runRef: row.run_ref, isAlive: isSameProcess });
+          if (c?.ok) log(logPath, `provider: withdrew a queued request while halted (${row.run_ref})`);
+          else log(logPath, `provider: could not withdraw ${row.run_ref} — ${c?.reason}`);
+        } catch (err) {
+          log(logPath, `provider: could not withdraw ${row.run_ref} — ${err.message}`);
+        }
+      }
+    }
+    return { decisions, escalations, halted: true };
+  };
+
+  // NAMING WHAT STILL HAPPENS. This line is the operator's only signal, and they
+  // read it while debugging whatever made them halt -- so "no work will be
+  // started" being TRUE is not enough if the tick also mutates shared state. It
+  // reaps rows whose holders are dead, completes releases and cooldown writes it
+  // already owed, withdraws its own queue position, and retires review requests
+  // the profile no longer asks for. None of those starts work; every one of them
+  // either finishes an obligation or stops blocking another process. But an
+  // operator who believes nothing at all is moving will misread the hub.
+  if (halted(ctx.haltMarker))
+    return haltStop(`HALTED: ${ctx.haltMarker} exists — no work will be started; ` +
+                    `releasing this guardian's scheduler claims and finishing what it already owed`);
+
+
   const prs = (ctx.openPrs ?? openPrs)(nwo, profile.watch?.maxOpenPrs ?? 20);
   if (prs === null) {
     // Could not ask is not none. Returning an empty list here would look exactly
@@ -1275,7 +1632,7 @@ export async function tick(ctx) {
 
   const waiting = new Set();
   for (const pr of prs) {
-    if (halted(ctx.haltMarker)) { log(logPath, "HALTED mid-tick"); return { decisions, escalations, halted: true }; }
+    if (halted(ctx.haltMarker)) return haltStop("HALTED mid-tick");
 
     // THE HEAD IS PINNED FIRST, and the fold runs before the evaluation.
     //
@@ -1293,7 +1650,16 @@ export async function tick(ctx) {
     // both, so the fold and the evaluation cannot disagree about which revision
     // they describe -- which pinning twice would have permitted.
     const anchor = anchorFor({ nwo, pr });
-    if (!anchor.ok) { log(logPath, `  #${pr}: could not read — ${anchor.why}`); continue; }
+    if (!anchor.ok) {
+      // UNREAD, exactly as an evaluation failure is. The marker was added at the
+      // `evaluate` failure only, and a pull request whose ANCHOR could not be
+      // read takes this earlier exit -- so the sweep saw it missing from
+      // `wanted`, read that as withdrawal, and cancelled its queued request.
+      // Two ways to fail a read; the rule covered one.
+      unreadable.add(pr);
+      log(logPath, `  #${pr}: could not read — ${anchor.why}`);
+      continue;
+    }
 
     if (ctx.reviewIngest !== false) {
       noteHead(db, nwo, pr, anchor.head);
@@ -1405,9 +1771,69 @@ export async function tick(ctx) {
     // AFTER the fold, and handed the anchor the fold used. `foldPrecedesEvaluation`
     // is what releases the thread details to the decision: they were withheld
     // precisely because this order was the other way round.
-    const e = (ctx.evaluate ?? evaluatePr)({ nwo, pr, profile, db, anchor,
+    // THE BUILDER'S HOLD, read here because this is where the hub connection is.
+    //
+    // `evaluatePr` holds the per-repository state database; `pr_hold` is a HUB
+    // row, so the reading is taken by the caller that can take it and handed in.
+    // It was imported and never called in the first revision of this change:
+    // every unit test passed against a hold object supplied by hand, the clause
+    // worked perfectly, and no production tick ever produced one -- so a pull
+    // request the builder had parked could still reach FIX_CI or MERGE. Proving
+    // a mechanism works is not proving it is wired.
+    //
+    // Null when there is no hub or no repository id, which `computeVerdict`
+    // renders as NO CLAUSE rather than an UNKNOWN one: a guardian that cannot be
+    // asked about holds must not drag every verdict it renders to UNKNOWN.
+    // ONLY FOR THE BUILDER'S OWN PULL REQUESTS. `pr_hold` records nothing else,
+    // so consulting it for a dependency bump or a stranger's feature branch can
+    // only ever produce PASS -- or, when the table cannot be read, an UNKNOWN
+    // that publishes an action-required merge-policy result. A builder-store
+    // fault would then block every pull request in the repository over a table
+    // that has no row for any of them.
+    const builderPr = isBuilderPr({ headRef: anchor?.headRef, authorLogin: anchor?.authorLogin });
+    // AND THE FAILURE REASON TRAVELS. Passing a bare `null` when the hub could
+    // not be opened made `computeVerdict` omit the clause entirely -- which reads
+    // as "not asked" and lets the same tick publish a passing verdict or choose
+    // FIX_CI while the builder's holds are unreadable. That is the fail-open this
+    // clause exists to close, reintroduced at the wiring. Absent is null;
+    // unreadable is a reading that says so.
+    let hold = null;
+    if (builderPr) {
+      const access = hubNow();
+      if (access.why) hold = { readable: false, why: access.why };
+      // NO HUB IS NOT "NOT ASKED", HERE, and the scoping is what makes that safe.
+      //
+      // Everywhere else an absent hub means an ordinary machine with no builder
+      // on it, and dragging a verdict to UNKNOWN over a question nobody put to it
+      // would be wrong. But this branch sits inside `if (builderPr)`: an ordinary
+      // pull request never reaches it. What is in front of us is a pull request
+      // the BUILDER opened, and the builder shares this guardian's hub -- so a
+      // builder PR with no hub is not "a machine with no builder", it is the
+      // authority database for this PR's merge safety being gone: deleted, its
+      // mount vanished, or the store not yet migrated.
+      //
+      // Answering `null` omitted the clause, which reads as "not asked", and the
+      // required policy check could then pass while the guardian had no way to
+      // know whether an active `pr_hold` existed -- the fail-open this clause was
+      // written to close, reintroduced at the wiring for the one case where the
+      // hub is the whole answer.
+      else if (!access.hub) hold = { readable: false, why: "there is no hub on this machine, so this builder pull request's holds cannot be read" };
+      else hold = openHold(access.hub, { repoId, pr });
+    }
+    const e = (ctx.evaluate ?? evaluatePr)({ nwo, pr, profile, db, anchor, hold,
                                              io: { foldPrecedesEvaluation: true } });
-    if (!e.ok) { log(logPath, `  #${pr}: could not evaluate — ${e.why}`); continue; }
+    if (!e.ok) {
+      // UNREAD IS NOT WITHDRAWN. A pull request whose anchor or evaluation
+      // failed transiently contributes nothing to `wanted`, and the queued sweep
+      // below reads that absence as "this tick no longer wants it" and cancels
+      // its provider request. The PR has not closed and its action has not
+      // changed -- reeve simply could not look -- so cancelling costs the
+      // guardian its queue position, lets a builder take the opening it was
+      // holding, and re-queues the work at the tail once the read succeeds.
+      unreadable.add(pr);
+      log(logPath, `  #${pr}: could not evaluate — ${e.why}`);
+      continue;
+    }
 
     // GitHub is authoritative for PR facts; this is also what releases a lease
     // when a PR merges.
@@ -1518,14 +1944,216 @@ export async function tick(ctx) {
   // comment that no worker was ever going to post.
   const wanted = decisions.filter(d => WORKER_ACTIONS.includes(d.decision.action)
                                     && !(d.decision.action === "REQUEST_REVIEW" && execute && reviewActionsOn(profile)));
+
+  // Whether this tick will ask for a canary lease at all. Declared ONCE and read
+  // by both the queued sweep below and the canary block further down: two
+  // statements of the same condition drift, and the sweep cancelling a request
+  // the next few lines are about to make is the shape that drift takes here.
+  // Whether this tick MIGHT ask for a canary lease. Used only by the queued
+  // sweep, to decide whether a `canary:<nwo>` row is still wanted.
+  //
+  // Deliberately NOT a prediction of whether the canary will actually run: two
+  // rounds were spent trying to make one and both were wrong, once by claiming
+  // for a call the cheap gates refuse and once by skipping the claim for a call
+  // a failed cache entry does not satisfy. The claim itself now happens inside
+  // the paid path (`canaryBeforeSpawn`), where the question does not arise. What
+  // the sweep needs is only "could this tick still want one", and an injected
+  // verdict is the one case where it certainly cannot.
+  const mightClaimCanary = Boolean(execute && wanted.length && !(ctx.containment ?? null));
+
+  // AND CANCEL WHAT THIS TICK IS NO LONGER GOING TO ASK FOR.
+  //
+  // A `queued` request is a standing claim on the next free slot, and it is
+  // owned by the guardian process -- which is alive, so expiry reaping preserves
+  // it. If the pull request closed, became held, or changed action between
+  // ticks, its run ref is never claimed or released again and the row sits there
+  // for ever, with `queuedGuardianCount` blocking every subsequent BUILDER
+  // admission behind work nobody is going to do.
+  //
+  // A per-path cancel on the way out of the dispatch block cannot fix this: the
+  // request whose PR has since closed never enters that block at all. So the
+  // live queued rows are compared against what this tick actually decided, and
+  // the difference is cancelled. This was deliberately left out of the first
+  // revision and named as a follow-up; that was the wrong call, because the row
+  // it leaves behind blocks the other lane.
+  if (execute && repoId != null) {
+    const h = hubOr(() => null);
+    if (h) {
+      try {
+        // THE CANARY ONLY IF THIS TICK WILL ATTEMPT IT. Treating its run ref as
+        // intended unconditionally meant a queued canary request survived every
+        // later tick that had no worker decisions -- never claimed, never
+        // cancelled, and owned by the live guardian so the reaper preserves it,
+        // while `queuedGuardianCount` blocks every builder admission behind it.
+        // The same predicate the canary block uses, not a second one that agrees
+        // today.
+        const intended = new Set([
+          ...(mightClaimCanary ? [`canary:${nwo}`] : []),
+          ...wanted.map(d => `${nwo}#${d.e.pr}:${d.decision.action}`)]);
+        const queued = readQueuedNow(h);
+        // THE CANCEL PHASE RUNS AFTER THE DISPATCH LOOP, not here. `wanted` is
+        // every worker DECISION, and the loop then applies capacity, the
+        // preparation backoff, root-cause resolution, flake assessment, prompt
+        // construction and checkout preparation on top -- so a request can be
+        // "intended" by this set and never actually re-asked. Cancelling from
+        // intent leaves those queued; cancelling from what the tick ACTUALLY
+        // asked for is the honest predicate, and it is only known afterwards.
+        //
+        // Recorded here so the post-loop phase has the rows it read.
+        queuedNow = queued;
+
+        // AND SERVE THE HEAD OF THE QUEUE BEFORE ASKING FOR ANYTHING NEW.
+        //
+        // `claimProvider` serves guardian requests in order: a claim is granted
+        // only when there is no queued guardian request older than this
+        // caller's. The canary asks FIRST every tick and is therefore refused
+        // the moment any worker request is already queued -- and that refusal
+        // sets `skipDispatch`, which stops the per-decision loop, which is the
+        // only thing that would have re-asked for that worker. Neither ever
+        // moves again, and `queuedGuardianCount` blocks every BUILDER admission
+        // behind two requests nobody will ever serve.
+        //
+        // Reproduced against the real scheduler before fixing: with a limit of
+        // one, the canary is granted on tick 1, the worker queues, and from tick
+        // 2 onward the canary is refused `queued` for ever.
+        //
+        // So the oldest request this tick still wants is re-asked here, ahead of
+        // the canary. Granting it is what removes it from the queue; it is
+        // released again immediately because this tick has not measured
+        // containment yet and may never dispatch. A wasted promote-and-release
+        // is the price of the queue draining in order, and the next tick finds
+        // it empty.
+        const head = queued.find(r => intended.has(r.run_ref) && r.run_ref !== `canary:${nwo}`);
+        if (head) {
+          askedFor.add(head.run_ref);
+          const got = (ctx.providerClaim ?? claimProvider)(h, {
+            owner: "guardian", repoId, runRef: head.run_ref,
+            pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
+          if (got?.ok) {
+            log(logPath, `provider: served the queue head (${head.run_ref}) so the canary is not blocked behind it`);
+            releaseWithRetry(head.run_ref, { owner: "guardian", repoId, runRef: head.run_ref,
+                                             id: got.id, token: got.token ?? null });
+          }
+        }
+      } catch (err) {
+        log(logPath, `provider: could not sweep queued requests — ${err.message}`);
+        raise("the provider scheduler is unreadable; dispatching unscheduled");
+      }
+    }
+  }
+
   let containment = ctx.containment ?? null;
-  if (execute && wanted.length && !containment) containment = await measuredContainment(ctx, profile, nwo, logPath);
-  if (execute && wanted.length && containment.credentialRead !== "closed") {
+
+  // THE CANARY IS A DISPATCH. It runs a real model under a real sandbox and
+  // spends real quota, so it takes its own lease exactly as a worker does.
+  //
+  // THE CLAIM IS MADE INSIDE THE PAID PATH, not predicted from outside it, and
+  // two rounds of trying to predict it is why. Whether a canary actually runs
+  // depends on the cheap platform gates and on a cache hit under an EXACT key
+  // with `ok: true` -- so an outside guess is wrong in both directions:
+  // claiming for a call the cheap gates will refuse (queuing the canary and
+  // blocking builder admission every tick, for a call that never happens), and
+  // skipping the claim when the cache holds a FAILED or obsolete entry (a paid
+  // model call with no lease at all, which is unmetered spend and strictly worse
+  // than the waste it replaced).
+  //
+  // `beforeSpawn` is asked immediately before the runner and can refuse. The
+  // claim now coincides with the spend by construction, and no predicate is
+  // restated anywhere.
+  let skipDispatch = false;
+  let canaryLease = null;
+  if (execute && wanted.length && !containment) {
+    const canaryBeforeSpawn = async () => {
+        const h = claimHub();
+        // NO HUB IS NO SCHEDULER, and that answer comes FIRST.
+        //
+        // Asking for the repository id before asking whether a scheduler exists
+        // turned the documented fail-open case into a total outage: with an
+        // unreadable hub the id lookup also fails, so the canary was refused and
+        // `skipDispatch` set, and the guardian did nothing at all -- over a lease
+        // that could not have been written to the unavailable hub anyway. The
+        // worker path already had this order; the canary did not, and two paths
+        // disagreeing about the same question is the defect.
+        if (!h) return { ok: true };
+        // FAIL CLOSED on an unscopeable lease, once a scheduler is known to
+        // exist. A lease keyed on a null repo_id is invisible to the
+        // live-request index, so the guardian would insert a fresh live request
+        // every tick and the limit would never bind.
+        if (repoId == null) {
+          raise("the repository numeric id is unknown; provider leases cannot be scoped");
+          skipDispatch = true;
+          return { ok: false, why: "the repository id is unknown" };
+        }
+        let got;
+        // FAIL OPEN on an unreadable scheduler. An exception outside a catch
+        // would abort the tick instead of letting the guardian proceed.
+        try {
+          got = (ctx.providerClaim ?? claimProvider)(h, {
+            owner: "guardian", repoId, runRef: `canary:${nwo}`,
+            pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
+          askedFor.add(`canary:${nwo}`);
+        } catch (err) {
+          raise("the provider scheduler is unreadable; dispatching unscheduled");
+          log(logPath, `execute: provider unreadable, running the containment canary unscheduled: ${err.message}`);
+          return { ok: true };
+        }
+        if (!got.ok) {
+          // `queued`, `cooldown` and `at-limit` are the scheduler working.
+          // `no-identity` is not: this process cannot read its own start time,
+          // so no lease it takes could ever be matched by liveness, and waiting
+          // repairs nothing.
+          if (got.reason === "no-identity") raise("the guardian cannot read its own process identity; no work can be scheduled");
+          log(logPath, `execute: NOT running the containment canary — provider ${got.reason}`);
+          skipDispatch = true;
+          return { ok: false, why: `provider ${got.reason}` };
+        }
+        if (got.id != null) canaryLease = { owner: "guardian", repoId, runRef: `canary:${nwo}`, id: got.id, token: got.token ?? null };
+        return { ok: true };
+    };
+      // BOUND OR IT DOES NOT RUN, the same rule as a worker's. I made this
+      // non-fatal and argued that refusing would abort a measurement that is
+      // otherwise fine -- which privileged completing the measurement over the
+      // invariant the whole change exists for. A throw here means `withhold`,
+      // `killGroup` and an UNBOUND outcome, so the canary fails and containment
+      // stays open: no dispatch this tick, which is safe and self-correcting.
+      // An unbound canary lease is not.
+    const canaryOnSpawn = ({ pid, lstart }) => {
+        if (!canaryLease) return;
+        const b = (ctx.providerBind ?? bindProviderLease)(claimHub(),
+          { ...canaryLease, pid, lstart, isAlive: isSameProcess });
+        if (b?.ok === false)
+          throw new Error(`the canary's provider lease could not be rebound: ${b.reason}`);
+        if (b?.bound !== 1)
+          throw new Error(`the canary's provider lease rebind matched ${b?.bound ?? "no"} row(s); it would stay on the guardian`);
+    };
+    try {
+      containment = await measuredContainment(ctx, profile, nwo, logPath,
+        { beforeSpawn: canaryBeforeSpawn, onSpawn: canaryOnSpawn });
+    } finally {
+      // THE CANARY IS A PAID MODEL CALL, so its rate limit is the provider's
+      // state and not this measurement's private business. `sandboxCanary`
+      // preserves the worker's outcome in `evidence.outcome`, and a failed
+      // canary is never a cache hit -- so without this the next tick claims
+      // another slot and spends another request into the same exhausted window,
+      // while builders stay eligible against the same untouched `provider_state`.
+      // The cooldown goes in BEFORE the slot goes back, exactly as on the worker
+      // path.
+      if (containment?.canary?.evidence?.outcome === OUTCOMES.RATE_LIMITED) {
+        noteCooldownWithRetry(`cooldown:canary:${nwo}`,
+          { signature: profile.watch?.model ?? "claude", cooldownSeconds: RATE_LIMIT_COOLDOWN_SECONDS });
+      }
+      // RELEASED WHATEVER HAPPENED. The canary can throw, and a lease left
+      // behind by a throw is counted against the limit until it expires -- five
+      // minutes of the guardian throttling itself over one failed measurement.
+      if (canaryLease) releaseWithRetry(`canary:${nwo}`, canaryLease);
+    }
+  }
+  if (execute && wanted.length && !skipDispatch && containment.credentialRead !== "closed") {
     log(logPath, `execute: NOT dispatching ${wanted.length} worker task(s) — worker containment is open: ${containment.why}`);
     raise("guardian:containment:open");
   }
 
-  if (execute && wanted.length && containment.credentialRead === "closed") {
+  if (execute && wanted.length && !skipDispatch && containment.credentialRead === "closed") {
     // Injectable: the real reading is the machine's load average, which is right
     // for production and wrong for a test — a busy host makes canStart 0 and the
     // suite reports "no worker dispatched" about the laptop rather than the code.
@@ -1610,6 +2238,61 @@ export async function tick(ctx) {
         continue;
       }
 
+      // A PROVIDER LEASE BEFORE A DURABLE RUN, in that order and not the other
+      // way round. `startRun` spends a fixer's attempt two lines below it, so a
+      // dispatch refused for capacity AFTER the run exists burns the single
+      // retry the design allows on work that never ran.
+      let prLease = null;
+      const prRunRef = `${nwo}#${e.pr}:${decision.action}`;
+      // THE SAME FRESH HANDLE THE CLAIM WILL USE. This guarded on the snapshot
+      // taken at the top of the tick while the claim below took a current one --
+      // so a hub that was absent or unreadable at that first read and usable by
+      // dispatch time meant the worker skipped `claimProvider` entirely and ran
+      // UNSCHEDULED against a scheduler that was available. I noticed this
+      // asymmetry last round and judged it acceptable; it is not, and "the guard
+      // and the operation must ask the same question at the same moment" is the
+      // rule I had already applied everywhere else.
+      if (claimHub()) {
+        if (repoId == null) {
+          // FAIL CLOSED, the same as the canary: a lease that cannot be scoped
+          // is invisible to the live-request index, so the guardian would insert
+          // a fresh request every tick and the limit would never bind.
+          log(logPath, `  #${e.pr}: NOT dispatching — the repository id is unknown, so a provider lease cannot be scoped`);
+          raise("the repository numeric id is unknown; provider leases cannot be scoped");
+          continue;
+        }
+        let got;
+        // FAIL OPEN on an unreadable scheduler. The founder's decision is that a
+        // broken scheduler must not stop the guardian working -- but it must say
+        // so, because dispatching unscheduled is exactly what the limit exists
+        // to prevent and a silent version of it is indistinguishable from a
+        // working one.
+        try {
+          askedFor.add(prRunRef);
+          got = (ctx.providerClaim ?? claimProvider)(claimHub(), {
+            owner: "guardian", repoId, runRef: prRunRef,
+            pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
+        } catch (err) {
+          raise("the provider scheduler is unreadable; dispatching unscheduled");
+          log(logPath, `  #${e.pr}: provider unreadable, dispatching unscheduled: ${err.message}`);
+          got = { ok: true, id: null };
+        }
+        if (!got.ok) {
+          // ORDINARY OUTCOMES. `queued`, `cooldown` and `at-limit` are the
+          // scheduler working, not failing: this PR waits for the next tick and
+          // the others in this loop still get their turn.
+          //
+          // `no-identity` is not the scheduler working. It means this process
+          // could not read its own start time, so no lease it takes could ever
+          // be matched by liveness -- and no amount of waiting repairs it. It
+          // still fails closed, but it says so to a human.
+          if (got.reason === "no-identity") raise("the guardian cannot read its own process identity; no work can be scheduled");
+          log(logPath, `  #${e.pr}: NOT dispatching — provider ${got.reason}${got.until ? ` until ${got.until}` : ""}`);
+          continue;
+        }
+        if (got.id != null) prLease = { owner: "guardian", repoId, runRef: prRunRef, id: got.id, token: got.token ?? null };
+      }
+
       // A durable run is the ONLY way a worker may start. The exclusive right to
       // act on this PR is taken FIRST, so a restarted daemon cannot re-dispatch
       // work already in flight -- the log shows exactly that happening, the same
@@ -1618,10 +2301,27 @@ export async function tick(ctx) {
       // Spent here, beside the run: past every refusal, before any work. A crash
       // after this point costs an attempt, which is the correct direction --
       // a crashed fix that silently earns a free retry is the runaway loop.
-      if (run.ok && decision.action === "FIX_CI" && fp) recordFixAttempt(db, nwo, e.pr, fp, e.head);
+      // GUARDED, because the provider lease is already held by this point and the
+      // worker block's try/finally has not begun. `fix_attempt` is an ordinary
+      // local write and it can throw -- a damaged table, a full store -- and a
+      // throw here left the tick with the lease still held, bound to the live
+      // guardian pid, which the expiry reaper preserves for ever. Nothing
+      // reclaims it if the next tick decides differently about this PR.
+      try {
+        if (run.ok && decision.action === "FIX_CI" && fp) recordFixAttempt(db, nwo, e.pr, fp, e.head);
+      } catch (err) {
+        if (prLease) { releaseWithRetry(prRunRef, prLease); prLease = null; }
+        log(logPath, `  #${e.pr}: NOT dispatching — the fix attempt could not be recorded: ${err.message}`);
+        raise(`#${e.pr}: the fix attempt could not be recorded`);
+        continue;
+      }
       if (!run.ok) {
         // Refusing to act is the only safe answer when the transition cannot be
         // recorded: an unrecorded worker is one nothing can reason about later.
+        // The lease taken above is given back here: nothing is going to run
+        // under it, and holding it until expiry throttles the guardian for five
+        // minutes over a store that refused one row.
+        if (prLease) releaseWithRetry(prRunRef, prLease);
         log(logPath, `  #${e.pr}: NOT dispatching — ${run.why}`);
         continue;
       }
@@ -1638,6 +2338,28 @@ export async function tick(ctx) {
           const hb = (ctx.heartbeat ?? heartbeat)(db, { runId: run.runId });
           if (!hb.alive) revoked = hb.reason ?? "lease not alive";
         } catch (err) { revoked = `heartbeat write failed: ${err.message}`; }
+        // AND THE PROVIDER LEASE, on the same beat.
+        //
+        // `LEASE_SECONDS` is 300 and `watch.workerBudgetMinutes` defaults to 20,
+        // so without this every worker spends three quarters of its run holding
+        // a lease that expired, and `expires_at` means nothing for exactly the
+        // runs it was meant to bound. Nothing over-admits today -- `heldCount`
+        // counts held rows whatever their expiry, and the reaper spares one
+        // whose holder is alive -- so this is not a live defect; it is a column
+        // that has stopped describing reality, and `expiredLeases` is one
+        // liveness misread away from acting on it.
+        //
+        // Renewed by IDENTITY, which is why this works before and after the
+        // spawn rebinds the row from the guardian's pid to the worker's.
+        //
+        // Failure is logged, never fatal: the run is under way, and a lease that
+        // stops being renewed still ends when the process does.
+        if (prLease) {
+          try {
+            const h = hubOr(() => null);
+            if (h) (ctx.providerHeartbeat ?? heartbeatProvider)(h, { ...prLease, isAlive: isSameProcess });
+          } catch (err) { log(logPath, `  #${e.pr}: provider lease not renewed — ${err.message}`); }
+        }
       }, ctx.heartbeatMs ?? HEARTBEAT_MS);
       // The deterministic boundary, built from the profile rather than described
       // to the model. Measured against the CLI first: a scoped allowlist refuses
@@ -1806,7 +2528,47 @@ export async function tick(ctx) {
           isRevoked: () => revoked ?? (cancelRequested(db, run.runId) ? "cancelled" : null),
           // Bind the process to the run the instant it exists, before it can
           // touch anything, so a crash leaves something probeable.
-          onSpawn: ({ pid, lstart }) => { bindRun(db, { runId: run.runId, pid, boot: lstart }); noteWorkerBinding(db, { runId: run.runId, pid, lstart }); },
+          onSpawn: ({ pid, lstart }) => {
+            bindRun(db, { runId: run.runId, pid, boot: lstart });
+            noteWorkerBinding(db, { runId: run.runId, pid, lstart });
+            // AND THE PROVIDER LEASE, onto the process actually spending the
+            // quota. The claim above is recorded against the guardian's own pid,
+            // which is long-lived and therefore always alive -- so liveness was
+            // being asked about the wrong process. `runWorker` launches a
+            // DETACHED child: if the guardian dies while that child works on, the
+            // next scheduler transaction sees the guardian pid gone, reaps the
+            // lease as abandoned, and admits replacement work while the original
+            // worker is still consuming the window.
+            //
+            // The full identity, because `bindProviderLease` refuses anything
+            // less: an id-only call matches nothing and returns a silent
+            // `{ ok: true, bound: 0 }` wearing a success.
+            // A GATE, NOT AN OBSERVER -- and the first revision had this exactly
+            // backwards. `onSpawn` is called BEFORE `runWorker` releases the
+            // child's execution gate: a throw here means `withhold()`,
+            // `killGroup(SIGKILL)` and an UNBOUND outcome, which is the same
+            // treatment `bindRun` already gets one line above. The comment in
+            // `supervisor.mjs` states the rule: a worker whose binding could not
+            // be written is one a restart can neither adopt nor kill with
+            // confidence, so it does not get to run at all.
+            //
+            // Logging and continuing left the lease attached to the guardian's
+            // own always-alive pid -- so a guardian that died during a detached
+            // run left a row the reaper would collect while the worker was still
+            // spending the window. The whole point of rebinding.
+            //
+            // EXACTLY ONE ROW. `bindProviderLease` returns `{ ok: true, bound: 0 }`
+            // when its predicate matches nothing, which is a silent no-op wearing
+            // a success, and zero rebound is indistinguishable in effect from not
+            // having called it.
+            if (prLease) {
+              const b = (ctx.providerBind ?? bindProviderLease)(claimHub(), { ...prLease, pid, lstart, isAlive: isSameProcess });
+              if (b?.ok === false)
+                throw new Error(`the provider lease could not be rebound to the worker: ${b.reason}`);
+              if (b?.bound !== 1)
+                throw new Error(`the provider lease rebind matched ${b?.bound ?? "no"} row(s); the lease would stay on the guardian`);
+            }
+          },
         });
         }
       } catch (err) {
@@ -1822,6 +2584,32 @@ export async function tick(ctx) {
         raise(`#${e.pr}: the worker could not be prepared; reeve is backing off`);
       } finally {
         clearInterval(beat);
+        // THE PROVIDER LEASE GOES BACK HERE, and this is the only place it does
+        // for a dispatched run. Every exit from this block passes through --
+        // success, worker failure, a throw during preparation -- so there is one
+        // release path rather than one per outcome, which is how the outcome
+        // nobody thought of ends up holding a lease until it expires.
+        //
+        // THE COOLDOWN GOES IN BEFORE THE SLOT GOES BACK.
+        //
+        // A worker that came back rate-limited proves the provider's window is
+        // exhausted, and that is a fact about the PROVIDER rather than about
+        // this run. Releasing the lease without recording it hands the slot
+        // straight back, so the next tick claims it and spends another request
+        // into the same exhausted window -- and the builder, admitting against
+        // the same `provider_state`, does too. `raise` alone told a human and
+        // changed nothing the scheduler reads.
+        //
+        // Read before the classification below, which only ever rewrites UNBOUND
+        // and CANCELLED: a RATE_LIMITED outcome is already final here.
+        if (r?.outcome === OUTCOMES.RATE_LIMITED) {
+          noteCooldownWithRetry(`cooldown:${nwo}#${e.pr}`,
+            { signature: r?.model ?? profile.watch?.model ?? "claude",
+              cooldownSeconds: RATE_LIMIT_COOLDOWN_SECONDS });
+        }
+        // A release refused because a restore holds the hub is RETRIED, not
+        // swallowed: `releaseWithRetry` carries the identity to the next tick.
+        if (prLease) { releaseWithRetry(prRunRef, prLease); prLease = null; }
         // Classified FIRST, before anything is recorded: a binding refused
         // because a cancel landed first is a cancellation, not a preparation
         // failure, and the audit trail must say so (run.finish, cancelled),
@@ -2100,6 +2888,42 @@ export async function tick(ctx) {
       // A worker whose tools were denied wrote a plausible answer it could not
       // support. Treating that as progress is the fail-open this exists to close.
       if (r.outcome === OUTCOMES.RATE_LIMITED) { raise("the provider is rate limiting; work is paused"); break; }
+    }
+  }
+
+  // ── withdraw what this tick did not actually ask for ──────────────────────
+  //
+  // AFTER the loop, and keyed on what was ASKED rather than on what was
+  // intended. `wanted` is every worker decision; the loop then applies capacity,
+  // the preparation backoff, root-cause resolution, flake assessment, prompt
+  // construction and checkout preparation on top. A request that survives the
+  // first filter and not the rest was never re-asked, so cancelling from intent
+  // preserved it and cancelling from the ask withdraws it -- and a queued row
+  // owned by the live guardian blocks builder admission for as long as it sits
+  // there.
+  //
+  // A pull request this tick could not READ is still exempt: absence there means
+  // unknown, not unwanted, and only a positive evaluation may withdraw one.
+  if (execute && repoId != null && queuedNow.length) {
+    const h = claimHub();
+    if (h) {
+      const unread = [...unreadable].map(pr => `${nwo}#${pr}:`);
+      for (const row of queuedNow) {
+        if (askedFor.has(row.run_ref)) continue;
+        if (unread.some(prefix => row.run_ref.startsWith(prefix))) {
+          log(logPath, `provider: keeping the queued request for a PR this tick could not read (${row.run_ref})`);
+          continue;
+        }
+        try {
+          const c = (ctx.cancelQueued ?? cancelQueued)(h, {
+            owner: "guardian", repoId, runRef: row.run_ref, isAlive: isSameProcess });
+          if (c?.ok) log(logPath, `provider: cancelled a queued request this tick never asked for (${row.run_ref})`);
+          else log(logPath, `provider: could not cancel ${row.run_ref} — ${c?.reason}`);
+        } catch (err) {
+          log(logPath, `provider: could not cancel ${row.run_ref} — ${err.message}`);
+          raise("the provider scheduler is unreadable; dispatching unscheduled");
+        }
+      }
     }
   }
 

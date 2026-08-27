@@ -1,0 +1,142 @@
+# The claim protocol
+
+**Multiple lanes work this repository at once.** A lane is one session in one worktree. Two
+lanes editing the same file, or opening PRs against the same task, is the failure this protocol
+exists to prevent — and it is the same failure reeve's own territory leases prevent for builder
+tasks, so this protocol is modelled on them deliberately.
+
+**Read this before starting anything. Then read `../MASTER.md` to see what is already held.**
+
+---
+
+## The rules
+
+1. **Claim before starting. Nothing is worked unclaimed.** Not "I'll claim it once I know it's
+   feasible" — the exploration is part of the task.
+2. **One task at a time per lane.** Finish it, verify it, get it merged, release the claim, then
+   claim the next. A lane holding two claims is a lane that will abandon one.
+3. **Read the tracker first**, every time, including on resume. Another lane may have claimed
+   something since you last looked. Do not touch files another lane's claim names.
+4. **Update the tracker after each task, not in a batch.** STATE, PR number, rounds, findings,
+   and any decision taken. A batched update is an update that does not happen.
+5. **"Done" means merged and verified by content** — never "PR opened", never "PR approved".
+   This has already bitten: `docs/TRACKER.md` carries **10 of 20 unchecked boxes sitting on
+   merged work**, two of them reading "PR open" for PRs that had merged the day before, because
+   the tracker is edited by the PR that builds the work and never again after the merge.
+6. **Release a claim you abandon.** A stale claim blocks another lane exactly like a stale
+   provider lease blocks a dispatch — a defect this repository fixed in its own code this week.
+   Releasing costs one commit. Not releasing costs another lane a day.
+7. **A claim is not permission to merge.** Merging needs the founder's explicit **per-PR** grant,
+   and grants never carry over.
+
+---
+
+## The mechanism: one file per claim
+
+**One small file per claim, named for the task, under this directory.** Two lanes claiming
+different tasks never touch the same file, so **claims never conflict on merge**, and a claim
+is visible on `main` the moment it is pushed.
+
+```
+trackers/claims/
+  README.md      this file
+  T1.md          claim on S3 task T1
+  P2.md          claim on the pre-S3 PR for issue reeve#50
+```
+
+**Name the file for the task id in the stage tracker** — `T1`, `T13`, `P1`, `P2` — not for the
+branch and not for the lane. The task id is what two lanes could collide on.
+
+### The file
+
+Copy this exactly. Every field is required; an absent field is not a default.
+
+```markdown
+# Claim: T1 — builder.* FIELDS, and the one reader of the capability switches
+
+stage:      S3
+tracker:    ../s3.md
+lane:       <session or worktree name, e.g. reeve-wt/c4>
+host:       <hostname>
+branch:     feat/s3-fields
+claimed:    2026-08-27T18:40:00Z
+refreshed:  2026-08-27T18:40:00Z
+state:      HELD
+pr:         —
+
+## Files this claim covers
+
+- `src/profile/schema.mjs`
+- `src/build/capabilities.mjs` (new)
+- `src/init.mjs`
+- `test/profile-validate.test.mjs`
+- `test/build-capabilities.test.mjs` (new)
+
+## Notes
+
+<anything another lane needs to know before touching an adjacent file>
+```
+
+`state` is one of exactly three words: **HELD · RELEASED · TAKEN OVER.**
+
+### The heartbeat, and what makes a claim stale
+
+**Touch `refreshed` every time you push.** That is the heartbeat, and it is the only signal
+another lane has that you are still alive.
+
+**A claim whose `refreshed` is more than 24 hours old is STALE.** A stale claim may be taken
+over — but **takeover is recorded, never silent**:
+
+1. Set `state: TAKEN OVER` in the existing file, add a line saying who took it and when, and
+   **leave the original claim text in place**. Do not rewrite history into agreement.
+2. Add your own claim below it in the same file.
+3. Say so in `../MASTER.md`'s *In flight* table.
+
+Twenty-four hours is a **convention, not a measurement**. It is the number at which a lane that
+has genuinely stopped is more likely than a lane that is thinking. If it turns out to be wrong,
+change it here and say why — do not work around it silently in one lane.
+
+### Releasing
+
+Set `state: RELEASED`, add the reason and the date, and commit. **Do not delete the file.** The
+history of who held what, and why they let it go, is the thing that makes a stale claim
+diagnosable next time.
+
+---
+
+## Territory: the files a claim covers
+
+**A claim names its files, and the names are the boundary.** Before touching a file that
+another lane's claim lists, say so to that lane first.
+
+Some files belong to the **guardian lane** and are never touched without telling it, claim or
+no claim:
+
+```
+src/daemon.mjs      src/db/**        src/outbox/**     src/github/**
+src/pr.mjs          src/verdict.mjs  src/watcher.mjs   src/review/**
+src/prompts.mjs
+```
+
+And two changes require telling the peer lane **even when you hold the claim**, because they
+change a shape other code is written against rather than a behaviour:
+
+- changing the **SHAPE** of `computeVerdict`'s clause set;
+- changing the **ORDER** of `nextAction`'s branches.
+
+Use `ListAgents` to find the peer lane (a session named `nextly-integrations-*`), and tell it
+before the edit, not after the push.
+
+---
+
+## Why one file per claim, and not a table
+
+A shared claims table is the obvious design and it is the wrong one here. Two lanes claiming
+two different tasks would edit the same table on two branches and conflict on every merge —
+and the resolution of a claims conflict is exactly the moment when one lane's claim silently
+disappears. One file per claim makes the data structure match the concurrency: **independent
+facts live in independent files.**
+
+This is the same reason a stage tracker's close-out line is the **last** commit before the PR:
+`docs/TRACKER.md` conflicts on every branch, so the conflict is deliberately reduced to one
+line.

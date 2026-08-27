@@ -24,16 +24,19 @@ Facts here were true at `c500cfe` on 2026-08-27 and the repository moves.
 ## Where you are
 
 - Worktree `~/Work/Products/reeve-wt/c4`, branch **`docs/s3-foundation`**, cut from `main`.
-- **S2 is complete.** Six PRs merged: #20, #30, #35, #40, #44, #53. `main` was `c500cfe`.
-- The only open PR is **#49**, and it belongs to the peer lane, not to you.
+- **S2 is complete.** Six PRs merged: #20, #30, #35, #40, #44, #53. `main` is now
+  **`16cd880`** — the peer merged #49 at 17:51:13Z, after `c500cfe`.
+- #49 **merged**. The only open PR is **#54** `fix/ci-concurrency`; it is not yours either.
 - Four open issues: **#43, #46, #50, #51**.
-- GitHub Actions has been dead **org-wide across `revnix`** since `2026-08-26T16:35:36Z`.
-  Measured, not assumed: `rext-site-v3` and `rext-admin` show the same zero-step signature.
-  `nextlyhq` is healthy. The cause needs `admin:org` and is unknown — report the outage,
-  never assert a billing explanation. Verify with the four-state discriminator in the
-  handoff, **not** with `jobs_with_steps == 0`, which is one step short.
-- Test baseline: **91 files, 0 failures** (exclude `test/escape.test.mjs`; `REEVE_HOME` must
-  point at a directory literally named `.reeve`). Use
+- **CI RECOVERED at ~2026-08-27T16:31Z after ~22 hours.** Measured: run `33068759549`,
+  `run_attempt=2`, `completed/success`, `Test` 9 steps, `CI Gate` 3 steps. `main` is green.
+  PR #54 `fix/ci-concurrency` landed in the window and is the plausible cause; **that is a
+  correlation, not a measurement** — do not report it as the cause. The four-state
+  discriminator in the handoff stays the instrument (**not** `jobs_with_steps == 0`, which is
+  one step short), because the next outage will look identical to the last one.
+- Test baseline: **re-measure it.** #49 added two test files, so the 91-file figure is one
+  merge out of date; the current count is **93 runnable** (exclude `test/escape.test.mjs`;
+  `REEVE_HOME` must point at a directory literally named `.reeve`). Use
   `~/.nvm/versions/node/v24.17.0/bin/node` — the PATH node is v22 and warns on `node:sqlite`.
 
 ## The task: write eleven documents

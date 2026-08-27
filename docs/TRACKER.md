@@ -389,6 +389,41 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       repository id with no privileged read at all). The queued-request sweep was
       named as deferred in the first description and is IN the PR — a queued row
       owned by the live guardian blocks the other lane indefinitely, so naming a
+
+      **ROUND 10 — five findings, and two of them were invisible to the suite.**
+      A pull request whose ANCHOR could not be read was not marked unreadable,
+      so the queued-request sweep read it as withdrawn and cancelled its
+      provider request; scheduler housekeeping sat behind the pull-request
+      listing, so a GitHub outage skipped reaping entirely; the worker's lease
+      guard read the tick-opening hub snapshot while the claim below it took a
+      fresh one; and two reads still conflated a hub that is ABSENT with one
+      that cannot be REACHED, `existsSync` being false for EACCES as well as
+      ENOENT.
+
+      **Stubbing two of the five fixes produced no failures at all.** The hub
+      guard had no test — and I had explicitly judged that asymmetry
+      "acceptable" in round 9, which is how a wrong belief survives a round: a
+      decision NOT to fix is the one verdict in a review that nothing checks.
+      The repository-id benign/fault split had assertions, and every one was a
+      regex over `bin/reeve`'s own source text, so disabling the logic left them
+      green. That sent it out of the CLI: `resolveRepoIdAt` in
+      `src/build/repoid.mjs` now owns the open options AND the benign/fault
+      split, `repoIdOnce` delegates, and `test/repo-id-lookup.test.mjs` asserts
+      all of it over a hub built in each state. **Second time this PR that "the
+      only assertions available are structural" moved logic to where it could be
+      exercised, and both extractions have produced no repeat findings since.**
+
+      Fixing the lookup made the daemon's catch on it load-bearing for the first
+      time — it can throw now where it answered null — so that is asserted too.
+      91 files, 0 failures, under both UTC and Asia/Karachi, CI still producing
+      no steps repo-wide since 2026-08-26T16:35:36Z.
+
+      Recorded on **#50** rather than fixed: housekeeping is still behind a
+      SECOND early exit, the halt marker. The peer lane measured the asymmetry —
+      an outbox row is consumed only by the drain, which is itself halt-gated,
+      so that stall is self-limiting; provider leases are consumed by a DIFFERENT
+      process and the builder never reaps, so a halted guardian plus a running
+      builder is a deadlock neither can break.
       gap does not make deferring it free.
 
 - [ ] **S2-C PR-C2, the guardian's hub guest — BUILT (2026-08-26).** Branch

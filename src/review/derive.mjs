@@ -85,14 +85,25 @@ export function severityOf(body, markers = []) {
  * also runs against stored history whose profile is long gone.
  */
 export function bodyFindingsOf(body, start) {
-  if (typeof start !== "string" || !start) return [];
+  if (typeof start !== "string" || !start) return { findings: [], readable: false };
   const text = String(body ?? "");
   let re;
-  try { re = new RegExp(start, "gi"); } catch { return []; }
-  const at = [...text.matchAll(re)].filter(m => m[0].length > 0).map(m => m.index);
-  return at
-    .map((i, k) => text.slice(i, k + 1 < at.length ? at[k + 1] : text.length).trim())
-    .filter(Boolean);
+  try { re = new RegExp(start, "gi"); } catch { return { findings: [], readable: false }; }
+  const all = [...text.matchAll(re)];
+  const at = all.filter(m => m[0].length > 0).map(m => m.index);
+  // A pattern can be zero-width WITHOUT matching the empty string. `(?=!\[P\d
+  // Badge\])` returns false for test("") and so passes profile validation, then
+  // produces nothing but zero-length matches against a real body. Dropping them
+  // silently turned a blind read into a confident zero, which is the one answer
+  // that licenses a spill. Reported instead, so the fold can say it cannot read
+  // this reviewer rather than that this reviewer found nothing.
+  const readable = !(all.length > 0 && at.length === 0);
+  return {
+    readable,
+    findings: readable
+      ? at.map((i, k) => text.slice(i, k + 1 < at.length ? at[k + 1] : text.length).trim()).filter(Boolean)
+      : [],
+  };
 }
 
 /** Reviewer config by normalised login, or null when unrostered. */
@@ -244,8 +255,37 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     // would report complete for exactly that pull request. Asking "did everyone
     // who actually wrote a review body declare how their bodies work" is the
     // question the count depends on, and it fails closed on a stranger.
-    if (!(typeof rev?.bodyFindings === "string" || rev?.bodyFindings === false)) bodyComplete = false;
-    for (const [n, text] of bodyFindingsOf(o.payload?.body, rev?.bodyFindings).entries()) {
+    const declared = typeof rev?.bodyFindings === "string" || rev?.bodyFindings === false;
+    if (!declared) bodyComplete = false;
+    // `false` is a declaration that this reviewer's bodies carry no findings, so
+    // it is READ, not skipped. Anything else is read by the splitter, which
+    // reports separately whether it could read it at all.
+    const split = rev?.bodyFindings === false
+      ? { readable: true, findings: [] }
+      : bodyFindingsOf(o.payload?.body, rev?.bodyFindings);
+
+    // AN UNREADABLE BODY BECOMES ONE UNKNOWN FINDING, rather than nothing.
+    //
+    // Withholding the count instead was silent: `computeVerdict` reads a null
+    // critical count as no reason to stop, so an undeclared reviewer writing a
+    // P0 in a body left every clause passing and the pull request mergeable.
+    // Absence read as success, in the exact place the count exists to prevent it.
+    //
+    // A sentinel is also what this codebase already does one layer down: a thread
+    // whose severity nobody can read is `unknown`, and `unknown` blocks. A body
+    // nobody can read is the same statement about a different surface, so it gets
+    // the same answer rather than a new kind of silence.
+    if (!split.readable) {
+      bodyFindings.push({
+        finding_id: `${r.external_id}#unreadable`, reviewer: r.source, severity: "unknown",
+        excerpt: `reeve cannot read this reviewer's review bodies (no usable bodyFindings declaration), ` +
+                 `so this body is counted as one finding of unknown severity: ` +
+                 String(o.payload?.body ?? "").replace(/\s+/g, " ").slice(0, 240),
+        event_at: r.event_at ?? at, head_full: c.head_full ?? null, ord,
+      });
+      continue;
+    }
+    for (const [n, text] of split.findings.entries()) {
       bodyFindings.push({
         finding_id: `${r.external_id}#${n}`, reviewer: r.source,
         // Severity is read from the FINDING, never the whole body. Markers are

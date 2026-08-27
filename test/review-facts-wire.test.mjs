@@ -114,24 +114,33 @@ const ev = rounds => {
   const ordered = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A,
                                 at: T + 100, live: liveOf(2, 2),
                                 io: { foldPrecedesEvaluation: true } });
-  check(Array.isArray(ordered.threadDetails) && ordered.threadDetails.length === 2,
+  // Three, not two: the reviewer wrote a review BODY and this profile does not
+  // declare how its bodies carry findings, so the fold counts that body as one
+  // finding of unknown severity rather than leaving it out. A worker is dispatched
+  // at the whole population, which is the point of handing this list on at all.
+  check(Array.isArray(ordered.threadDetails) && ordered.threadDetails.length === 3,
     "control: once the fold precedes it, the details a worker is dispatched with arrive",
     JSON.stringify(ordered.threadDetails?.length));
+  check(ordered.threadDetails.filter(t => t.anchor === "thread").length === 2 &&
+        ordered.threadDetails.filter(t => t.anchor === "body").length === 1,
+    "control: and each one says which kind it is, so a worker is not told to resolve what has no thread",
+    JSON.stringify(ordered.threadDetails.map(t => t.anchor)));
   check(ordered.threadDetails[0].id && ordered.threadDetails[0].severity && ordered.threadDetails[0].path,
     "control: carrying what a follow-up issue or a fix would need",
     JSON.stringify(ordered.threadDetails?.[0]));
   check(f.rounds === 1,
     "and the DERIVED round count, which `judged.size` cannot produce past one for a single reviewer",
     String(f.rounds));
-  // The count is deliberately still UNKNOWN, and for a written reason rather than
-  // by the accident of a hard-coded null. The fold classifies severity for THREAD
-  // rows only, so a P0 stated in a review body with no inline thread is invisible
-  // -- and a zero missing a body-only critical would spill a P0, which is the one
-  // outcome the standing ruling forbids outright.
-  check(f.unspilledCritical === null,
-    "but the critical COUNT stays unknown while a body-only finding could be missing from it",
+  // THE PROPERTY IS UNCHANGED AND ITS MECHANISM IS NOT. A count that could be
+  // missing a body-only critical must never license a spill. It used to be kept
+  // safe by withholding the number, which was silent: a null count is no reason
+  // for `computeVerdict` to stop, so an unreadable body left every clause passing.
+  // Now the ignorance is COUNTED -- an unreadable body is one `unknown` finding,
+  // and unknown blocks -- so the number is handed on and is not zero.
+  check(f.unspilledCritical > 0,
+    "the critical count is handed on, and an unreadable review body keeps it off zero",
     JSON.stringify(f.unspilledCritical));
-  check(/body/.test(String(f.projection.countUnknown)),
+  check(/declar/.test(String(f.projection.undeclaredBodyAuthor)),
     "and it says WHY, so the next stage has a stated precondition rather than a mystery",
     JSON.stringify(f.projection));
 
@@ -164,8 +173,11 @@ const ev = rounds => {
   ingest(db, NWO, 1, [review(2, "codex", "| _🟡 Minor_ | one nit left", HEAD_A, T + 700)], { at: T + 700 });
   derivePr(db, NWO, 1, PROFILE, { at: T + 800, head: HEAD_A });
   const cleared = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A, at: T + 900, live: liveOf(2, 1) });
-  check(cleared.unspilledCritical === null,
-    "control: and it stays unknown even once the fold really has no criticals left",
+  // Even with every THREAD critical cleared, the count does not fall to zero while
+  // a review body remains unreadable -- which is the same protection the old null
+  // gave, arrived at by counting the gap instead of hiding it.
+  check(cleared.unspilledCritical > 0,
+    "control: and it stays off zero even once the fold really has no thread criticals left",
     JSON.stringify({ c: cleared.unspilledCritical, readable: cleared.projection.readable }));
 
   // With the precondition MET -- a fold that has derived body findings -- the same

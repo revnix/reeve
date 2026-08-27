@@ -54,6 +54,34 @@ function gh(args) {
 const secs = t => (t ? Math.floor(new Date(t).getTime() / 1000) || null : null);
 
 /**
+ * Every page of a REST collection, or a refusal.
+ *
+ * ONE reader for both paged surfaces, because the defect it fixes was the same on
+ * each and fixing one of two sites is a near miss that has already happened. A
+ * full page is indistinguishable from a complete read, so the loop continues
+ * while a page comes back full and stops on a short one -- and a page that fails
+ * mid-way reports `ok: false` rather than returning what it has, because a
+ * partial list that says nothing about being partial is exactly the shape that
+ * produced four consecutive false zeroes on the thread surface.
+ */
+function restPages(api, path, max = 20) {
+  const items = [];
+  for (let page = 1; page <= max; page++) {
+    const r = api([`${path}?per_page=100&page=${page}`]);
+    if (!r.ok) return { ok: false, items };
+    let batch;
+    try { batch = JSON.parse(r.out || "[]"); } catch { return { ok: false, items }; }
+    if (!Array.isArray(batch)) return { ok: false, items };
+    items.push(...batch);
+    if (batch.length < 100) return { ok: true, items };
+  }
+  // The cap was reached with every page full, so there is more and reeve has not
+  // read it. Refusing is the honest answer; returning 2000 items as if they were
+  // all of them is the one that reads as complete.
+  return { ok: false, items };
+}
+
+/**
  * One spelling for one reviewer.
  *
  * The same App answers to two names depending on which API you ask: REST reports
@@ -87,9 +115,16 @@ export function observe(nwo, pr, io = {}) {
 
   // Review objects. commit_id is the FULL forty-hex sha for every author -- only
   // comment BODIES abbreviate -- so this is the one surface that binds exactly.
-  const reviews = api([`repos/${nwo}/pulls/${pr}/reviews?per_page=100`]);
+  //
+  // PAGINATED, like the threads below and for the same reason. A single page of
+  // 100 is not a safe ceiling here: every inline reply mints a 0-byte COMMENTED
+  // review -- nine at one commit on #1124 -- so review OBJECTS outnumber real
+  // rounds by an order of magnitude, and a busy pull request passes 100 while
+  // having had five. A short read that reports success is how a body-only
+  // critical would go unseen behind a projection that called itself complete.
+  const reviews = restPages(api, `repos/${nwo}/pulls/${pr}/reviews`);
   if (!reviews.ok) incomplete = true;
-  else for (const r of JSON.parse(reviews.out || "[]")) {
+  else for (const r of reviews.items) {
     out.push({ source: normalizeLogin(r.user?.login), external_id: `review:${r.id}`,
                kind: "review", head_sha: r.commit_id || null,
                event_at: secs(r.submitted_at), edited_at: null,
@@ -98,9 +133,11 @@ export function observe(nwo, pr, io = {}) {
   }
 
   // Issue comments: refusals, clean passes, trigger commands, rate-limit notices.
-  const comments = api([`repos/${nwo}/issues/${pr}/comments?per_page=100`]);
+  // Paginated for the same reason as the reviews above -- a clean pass or a
+  // refusal past comment 100 is evidence that simply would not arrive.
+  const comments = restPages(api, `repos/${nwo}/issues/${pr}/comments`);
   if (!comments.ok) incomplete = true;
-  else for (const c of JSON.parse(comments.out || "[]")) {
+  else for (const c of comments.items) {
     out.push({ source: normalizeLogin(c.user?.login), external_id: `comment:${c.id}`,
                kind: "issue_comment", head_sha: null,
                event_at: secs(c.created_at), edited_at: secs(c.updated_at),

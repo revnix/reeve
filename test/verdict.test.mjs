@@ -25,6 +25,11 @@ const good = () => ({
   // blocking reviewer has come back to what it filed. They are different facts,
   // and the second is the one a bot self-resolving its own thread cannot fake.
   cleared: { readable: true, uncleared: 0, reviewers: [] },
+  // A THIRD fact about review state, and it is separate from both above for the
+  // reason its clause explains: a finding stated in a review body is not one of
+  // GitHub's unresolved threads, so `threads` cannot see it, and answering it by
+  // asking for another round -- which is what `cleared` means -- skips the fix.
+  bodyFindings: { readable: true, open: 0, reviewers: [] },
   ledgerBlockers: 0,
   mergeState: "CLEAN",
 });
@@ -72,21 +77,49 @@ check("control: zero uncleared is a pass, so the clause is not blocking everythi
 // read as success was the defect; absence read as paralysis is not the fix.
 check("past the soft cap with an UNREADABLE projection is UNKNOWN",
   withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "unreadable" }; }), UNKNOWN);
-check("but a capability that is simply unbuilt does not make it unknown",
-  withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "not-derived" }; }), PASS);
+// The permanent gap that PASS existed for is closed: a review body reeve cannot
+// read is now counted as one `unknown` finding rather than omitted from the
+// count, so a missing count is always transient and UNKNOWN clears itself.
+// Nothing is left that can report "not derived", and the branch that spared it is
+// gone with it -- which means the cap is now ENFORCED rather than announced as
+// unenforced.
+check("past the cap with a critical open BLOCKS, which is the cap actually enforced",
+  withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1 }; }), BLOCK);
 {
-  // And it SAYS the cap is unenforced, because a pass that quietly skips a check
-  // is the thing this whole clause exists to stop.
   const i = good();
-  i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "not-derived" };
+  i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "unreadable" };
   const c = computeVerdict(i).clauses.find(x => x.id === "rounds");
-  check("and says the cap is not enforced rather than passing silently",
-    /NOT enforced/.test(c.detail), true);
+  check("and an unreadable count says so rather than passing silently",
+    /cannot say how many criticals/.test(c.detail), true);
 }
 check("control: BELOW the cap an unknown critical count still passes, because it changes nothing there",
   withOut(i => { i.rounds = { n: 1, softCap: 5, hardCap: 10, unspilledCritical: null }; }), PASS);
 check("control: and a KNOWN zero past the cap still passes",
   withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 0 }; }), PASS);
+
+// The body-finding clause. Its whole reason to exist is that neither neighbour
+// can see what it sees.
+check("an open review-body finding BLOCKS, though no thread is unresolved",
+  withOut(i => { i.bodyFindings = { readable: true, open: 1, reviewers: ["codex"] }; }), BLOCK);
+check("control: and zero of them passes, so the clause is not blocking everything",
+  withOut(i => { i.bodyFindings = { readable: true, open: 0, reviewers: [] }; }), PASS);
+check("an unreadable body population is UNKNOWN, never zero",
+  withOut(i => { i.bodyFindings = { readable: false, why: "no projection" }; }), UNKNOWN);
+{
+  // The isolating control: with the OTHER two review clauses explicitly satisfied,
+  // only this one can be producing the block. Without it, the assertion above
+  // would pass just as well if `threads` were doing the work.
+  const i = good();
+  i.threads = { unresolved: 0, total: 4, readable: true };
+  i.cleared = { readable: true, uncleared: 0, reviewers: [] };
+  i.bodyFindings = { readable: true, open: 2, reviewers: ["codex"] };
+  const v = computeVerdict(i);
+  const c = v.clauses.find(x => x.id === "bodyFindings");
+  check("and it is THIS clause blocking, with threads and cleared both satisfied",
+    `${v.state}/${c.state}`, `${BLOCK}/${BLOCK}`);
+  check("control: its neighbours really did pass, so the block is not theirs",
+    v.clauses.filter(x => x.id === "threads" || x.id === "cleared").every(x => x.state === PASS), true);
+}
 
 // Positive control. Without this, every refusal below proves nothing.
 check("a fully satisfied revision PASSes", computeVerdict(good()).state, PASS);

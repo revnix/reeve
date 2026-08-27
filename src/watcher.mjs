@@ -190,15 +190,20 @@ export function nextAction(e, p, h = {}) {
   // `cleared` deliberately does NOT join these two, and getting that wrong was a
   // real defect. See its own branch below, after the stale-review one.
   const cleared = clause(v, "cleared");
-  if (threads?.state === "BLOCK" || findings?.state === "BLOCK") {
+  // A body finding is actionable work, so it joins this branch rather than the
+  // `cleared` one below. `cleared` asks the reviewer to come back; here the
+  // reviewer has already spoken and the fix is what is missing.
+  const bodyFindings = clause(v, "bodyFindings");
+  if (threads?.state === "BLOCK" || findings?.state === "BLOCK" || bodyFindings?.state === "BLOCK") {
     const R = e.rounds ?? {};
     // `?? 0` here would read an UNKNOWN critical count as "no criticals" and spill
     // on it, which is the standing ruling inverted. Only a known zero may spill.
     if ((R.n ?? 0) >= (R.softCap ?? 5) && R.unspilledCritical === 0)
       return act(ACTIONS.SPILL, `past the soft cap with only non-critical findings open`, { round: R.n });
-    const blocking = [threads, findings].filter(c => c?.state === "BLOCK");
+    const blocking = [threads, findings, bodyFindings].filter(c => c?.state === "BLOCK");
     return act(ACTIONS.FIX_FINDINGS, blocking.map(c => c.detail).filter(Boolean).join("; ") || "findings block this PR",
-               { threads: threads?.state === "BLOCK", findings: findings?.state === "BLOCK" });
+               { threads: threads?.state === "BLOCK", findings: findings?.state === "BLOCK",
+                 bodyFindings: bodyFindings?.state === "BLOCK" });
   }
 
   // 6. A stale verdict: reviewed, but not this revision.

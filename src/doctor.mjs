@@ -383,7 +383,14 @@ export async function checkAppIdentity(nwo) {
  * finding text no marker could read. Those findings block as critical, so a
  * rotted taxonomy shows up as a repository that stops merging.
  */
-function checkDetectors(db, profile) {
+/**
+ * R-08, exported so the positive control it provides can itself be controlled.
+ *
+ * A detector reported as demonstrated when it has never fired against the surface
+ * it governs is worse than no report: it is the check that exists to catch a
+ * changed taxonomy, saying the taxonomy is fine.
+ */
+export function checkDetectors(db, profile) {
   const reviewers = profile?.reviewers ?? [];
   if (!db) return { id: "R-08", level: UNKNOWN, title: "detectors", lines: ["no state database"] };
   if (!reviewers.length) return null;
@@ -397,7 +404,7 @@ function checkDetectors(db, profile) {
   }
 
   const bodyOf = r => { try { return String(JSON.parse(r.payload)?.body ?? ""); } catch { return ""; } };
-  const all = new Map(), findings = new Map();
+  const all = new Map(), findings = new Map(), bodies = new Map();
   for (const r of rows) {
     const body = bodyOf(r);
     if (!body) continue;
@@ -405,6 +412,12 @@ function checkDetectors(db, profile) {
     // Severity markers classify FINDINGS. Measuring them against trigger comments
     // and carrier reviews made a healthy profile look two-thirds blind.
     if (r.kind === "review_thread") (findings.get(r.source) ?? findings.set(r.source, []).get(r.source)).push(body);
+    // Review BODIES, kept apart from everything else. `bodyFindings` delimits ONE
+    // surface, and codex uses the same severity badge in inline comments -- so
+    // measuring it against every ingested text lets a match in a THREAD report the
+    // body grammar as demonstrated. The positive control then passes without the
+    // thing it controls ever having fired.
+    if (r.kind === "review") (bodies.get(r.source) ?? bodies.set(r.source, []).get(r.source)).push(body);
   }
 
   const lines = [], broken = [], idle = [];
@@ -420,15 +433,22 @@ function checkDetectors(db, profile) {
       return texts.filter(t => rx.test(t)).length;
     };
     const named = [["refusal", rev.refusal], ["clean", rev.clean], ["commitPattern", rev.commitPattern],
-                   // `false` is a declaration, not a pattern, and falls out at the
-                   // `!pattern` guard below like any other absent one.
-                   ["bodyFindings", rev.bodyFindings],
                    ...(rev.severityMarkers ?? []).map(([pat], i) => [`severityMarkers[${i}]`, pat])];
     for (const [name, pattern] of named) {
       if (!pattern) continue;
       const n = fires(pattern);
       if (n === -1) broken.push(`${rev.login}.${name} does not compile`);
       else if (n === 0) idle.push(`${rev.login}.${name}`);
+    }
+
+    // `bodyFindings` is measured against review BODIES alone, never `texts`.
+    // `false` is a declaration rather than a pattern and has nothing to fire.
+    if (typeof rev.bodyFindings === "string") {
+      const bodyTexts = bodies.get(rev.login) ?? [];
+      let rx = null; try { rx = new RegExp(rev.bodyFindings, "i"); } catch { rx = null; }
+      if (!rx) broken.push(`${rev.login}.bodyFindings does not compile`);
+      else if (!bodyTexts.length) lines.push(`${rev.login.padEnd(26)} no review bodies ingested yet — bodyFindings unproven`);
+      else if (!bodyTexts.some(t => rx.test(t))) idle.push(`${rev.login}.bodyFindings`);
     }
 
     // An UNDECLARED reviewer is worth saying out loud, because its consequence is

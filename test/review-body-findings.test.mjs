@@ -80,23 +80,32 @@ const BODY_TWO =
 
 // ── the splitter ─────────────────────────────────────────────────────────────
 {
-  const parts = bodyFindingsOf(BODY_TWO, BADGE);
-  check(parts.length === 2, "a body with two badges yields two findings", `got ${parts.length}`);
-  check(/P2 Badge/.test(parts[0]) && /reads badly/.test(parts[0]),
-    "each finding runs from its badge to the next one, carrying its own text", parts[0]);
-  check(!/preamble/.test(parts.join(" ")),
+  const r = bodyFindingsOf(BODY_TWO, BADGE);
+  check(r.readable === true && r.findings.length === 2,
+    "a body with two badges yields two findings", JSON.stringify(r.findings.length));
+  check(/P2 Badge/.test(r.findings[0]) && /reads badly/.test(r.findings[0]),
+    "each finding runs from its badge to the next one, carrying its own text", r.findings[0]);
+  check(!/preamble/.test(r.findings.join(" ")),
     "prose BEFORE the first badge is not a finding — codex opens with a summary");
-  check(bodyFindingsOf(BODY_TWO, undefined).length === 0,
-    "no declaration yields NOTHING, which is not the same as 'this reviewer had no findings'");
-  // A pattern that matches only the EMPTY string matches at every index, and
-  // without the zero-length filter would mint one finding per character. The
-  // profile refuses such a pattern outright; this is the second half of the same
-  // guard, because the fold also runs over stored history whose profile is gone.
+  check(bodyFindingsOf(BODY_TWO, undefined).readable === false,
+    "no declaration is UNREADABLE, which is not the same as 'this reviewer had no findings'");
+
+  // A ZERO-WIDTH pattern need not match the empty string. A lookahead returns
+  // false for test("") and so passes profile validation, then produces nothing but
+  // zero-length matches against a real body. Dropping them silently turned a blind
+  // read into a confident zero, which is the one answer that licenses a spill.
+  const look = bodyFindingsOf(BODY_TWO, "(?=!\\[P\\d Badge\\])");
+  check(look.readable === false && look.findings.length === 0,
+    "a zero-width pattern reports UNREADABLE rather than a confident zero",
+    JSON.stringify(look));
+  check(new RegExp("(?=!\\[P\\d Badge\\])", "g").test("") === false,
+    "control: and that pattern really does pass an empty-string check, which is why the fold has to catch it");
+
   check(!/q/i.test(BODY_TWO), "control: the fixture contains no `q`, so `q*` can only match empty");
-  check(bodyFindingsOf(BODY_TWO, "q*").length === 0,
-    "a pattern that can only match the empty string yields nothing, not one finding per character",
-    String(bodyFindingsOf(BODY_TWO, "q*").length));
-  check(bodyFindingsOf("", BADGE).length === 0, "control: an empty body yields nothing");
+  check(bodyFindingsOf(BODY_TWO, "q*").readable === false,
+    "a pattern that can only match the empty string is unreadable too, not one finding per character",
+    JSON.stringify(bodyFindingsOf(BODY_TWO, "q*")));
+  check(bodyFindingsOf("", BADGE).findings.length === 0, "control: an empty body yields nothing");
 }
 
 // ── the fold ─────────────────────────────────────────────────────────────────
@@ -198,18 +207,27 @@ ingest(db, NWO, 1, [
   const st = reviewState(db2, NWO, 2, p, { at: T, head: HEAD_A });
   check(st.bodyFindingsDerived === false,
     "an unrostered reviewer writing a body makes the count incomplete, however good the roster is");
-  check(st.unspilledCritical >= 1,
-    "control: the findings it COULD read are still derived — incomplete is not empty",
-    String(st.unspilledCritical));
 
-  // And the flag is what the decision path reads, so an incomplete count must not
-  // reach it.
+  // AND THE IGNORANCE IS COUNTED, not withheld. Withholding was the silent option:
+  // `computeVerdict` reads a null critical count as no reason to stop, so an
+  // undeclared reviewer writing a P0 in a body left every clause passing and the
+  // pull request mergeable. One `unknown` finding stands for the body instead, and
+  // unknown blocks — the same answer this codebase already gives a thread whose
+  // severity nobody can read.
+  const sentinel = st.threads.find(t => t.anchor === "body" && /cannot read/.test(t.excerpt));
+  check(sentinel && sentinel.severity === "unknown",
+    "an unreadable body becomes ONE finding of unknown severity", JSON.stringify(sentinel?.severity));
+  check(/a-human/.test(String(sentinel?.reviewer)),
+    "attributed to the reviewer whose body could not be read", String(sentinel?.reviewer));
+  check(/whole approach is wrong/.test(String(sentinel?.excerpt)),
+    "and carrying the text, so a person can see what was said", String(sentinel?.excerpt).slice(0, 80));
+
   const facts = reviewFacts({
     db: db2, nwo: NWO, pr: 2, profile: p, head: HEAD_A, at: T,
     live: { readable: true, total: 0, unresolved: 0 },
   });
-  check(facts.unspilledCritical === null,
-    "so reviewFacts withholds the number rather than handing on a possibly-short zero",
+  check(facts.unspilledCritical > 0,
+    "so the number reaches the decision path and is not zero — a spill cannot be licensed by a body nobody read",
     JSON.stringify(facts.unspilledCritical));
 
   // The mounted half: with every body author declared, the SAME call hands it on.
@@ -273,9 +291,28 @@ ingest(db, NWO, 1, [
   check(/stated in the review body, no thread/.test(fix),
     "and marks the ones with no thread behind them");
 
+  // A CONTRACT A BODY FINDING CAN SATISFY. Labelling the item is not enough: the
+  // prompt went on to require exactly one outcome, and every branch of it replied
+  // on a thread. A worker that fixed a body finding could not report the fix
+  // without inventing a thread, and the honest move left to it was to call the
+  // whole run a failure or to say it needed a human.
+  check(/FOR EACH FINDING WITH A THREAD/.test(fix),
+    "the thread contract says which findings it governs");
+  check(/there is no thread, so there\s+is nothing to reply to and nothing to resolve/.test(fix),
+    "and a body finding gets branches it can actually satisfy");
+  check(/do not treat\s+its absence as a reason to skip the finding or to fail the run/.test(fix),
+    "and is told not to fail the run over the thread it will not find");
+
   const spill = spillPrompt({ profile: p, nwo: NWO, pr: 1, head: HEAD_A, findings: st.threads });
   check(/do not attempt to reply to it or resolve it/i.test(spill),
     "the spill instruction exempts them from a resolve that could only fail");
+  // The issue-body requirement is the other half, and it was still absolute: every
+  // entry had to carry a file, a line and a pinned permalink. A body finding has
+  // none, so the worker could satisfy the contract only by fabricating an anchor.
+  check(/for a finding that\s+names a file/.test(spill),
+    "the issue-body requirement is conditional on the finding naming a file");
+  check(/carry its text alone rather than inventing an anchor for it/.test(spill),
+    "and says what to do instead, rather than leaving the worker to invent one");
   const bodyLine = spill.split("\n").find(l => /stated in the review body/.test(l));
   check(bodyLine && !/permalink/.test(bodyLine),
     "and no permalink is minted for a finding with no file or line", String(bodyLine));

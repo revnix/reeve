@@ -30,6 +30,11 @@ const good = () => ({
   // GitHub's unresolved threads, so `threads` cannot see it, and answering it by
   // asking for another round -- which is what `cleared` means -- skips the fix.
   bodyFindings: { readable: true, open: 0, reviewers: [] },
+  // A FOURTH, and it is not the same question as the one above. That clause asks
+  // whether there are open findings in review bodies; this asks whether reeve
+  // could read those bodies at all. One is work a worker can do; the other is
+  // reeve saying it does not know what was said.
+  unreadableBodies: { readable: true, open: 0, reviewers: [] },
   ledgerBlockers: 0,
   mergeState: "CLEAN",
 });
@@ -119,6 +124,27 @@ check("an unreadable body population is UNKNOWN, never zero",
     `${v.state}/${c.state}`, `${BLOCK}/${BLOCK}`);
   check("control: its neighbours really did pass, so the block is not theirs",
     v.clauses.filter(x => x.id === "threads" || x.id === "cleared").every(x => x.state === PASS), true);
+}
+
+// A body reeve cannot read stops the merge, whoever wrote it.
+check("an unreadable review body BLOCKS",
+  withOut(i => { i.unreadableBodies = { readable: true, open: 1, reviewers: ["a-human"] }; }), BLOCK);
+check("control: and a readable one passes",
+  withOut(i => { i.unreadableBodies = { readable: true, open: 0, reviewers: [] } }), PASS);
+check("not knowing whether they were readable is UNKNOWN, never zero",
+  withOut(i => { i.unreadableBodies = { readable: false, why: "no projection" }; }), UNKNOWN);
+{
+  // Isolating control: the finding clause explicitly satisfied, so only this one
+  // can be producing the block.
+  const i = good();
+  i.bodyFindings = { readable: true, open: 0, reviewers: [] };
+  i.unreadableBodies = { readable: true, open: 2, reviewers: ["a-human"] };
+  const v = computeVerdict(i);
+  check("and it is THIS clause blocking, with bodyFindings satisfied",
+    `${v.clauses.find(c => c.id === "bodyReadable").state}/${v.clauses.find(c => c.id === "bodyFindings").state}`,
+    `${BLOCK}/${PASS}`);
+  check("and it names the reviewer to declare, because the fix is a line of profile",
+    /a-human/.test(v.clauses.find(c => c.id === "bodyReadable").detail), true);
 }
 
 // Positive control. Without this, every refusal below proves nothing.

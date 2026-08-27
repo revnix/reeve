@@ -281,13 +281,21 @@ ingest(db, NWO, 1, [
   // pull request mergeable. One `unknown` finding stands for the body instead, and
   // unknown blocks — the same answer this codebase already gives a thread whose
   // severity nobody can read.
-  const sentinel = st.threads.find(t => t.anchor === "body" && /cannot read/.test(t.excerpt));
-  check(sentinel && sentinel.severity === "unknown",
-    "an unreadable body becomes ONE finding of unknown severity", JSON.stringify(sentinel?.severity));
+  const sentinel = (st.unreadableBodies ?? []).find(b => /cannot read/.test(b.excerpt));
+  check(!!sentinel, "an unreadable body is reported as its own fact", JSON.stringify(st.unreadableBodies));
   check(/a-human/.test(String(sentinel?.reviewer)),
     "attributed to the reviewer whose body could not be read", String(sentinel?.reviewer));
   check(/whole approach is wrong/.test(String(sentinel?.excerpt)),
     "and carrying the text, so a person can see what was said", String(sentinel?.excerpt).slice(0, 80));
+  // And it is NOT in the list a worker is dispatched at. There is nothing in
+  // "reeve cannot parse this reviewer" for a worker to do: no code is wrong, no
+  // thread exists, and the fix is a line of profile only the operator can write.
+  check(!st.threads.some(t => /cannot read/.test(t.excerpt)),
+    "and it is kept OUT of the findings a worker is sent at, having nothing a worker could do",
+    JSON.stringify(st.threads.map(t => t.anchor)));
+  check(st.unspilledCritical > 0,
+    "control: while still counting, so it cannot be spilled — routed apart, counted together",
+    String(st.unspilledCritical));
 
   const facts = reviewFacts({
     db: db2, nwo: NWO, pr: 2, profile: p, head: HEAD_A, at: T,
@@ -296,6 +304,26 @@ ingest(db, NWO, 1, [
   check(facts.unspilledCritical > 0,
     "so the number reaches the decision path and is not zero — a spill cannot be licensed by a body nobody read",
     JSON.stringify(facts.unspilledCritical));
+
+  // AND IT IS NOT SCOPED TO BLOCKING REVIEWERS, which is the whole difference
+  // between this fact and the findings beside it. `a-human` is in no roster at
+  // all. Blocking-ness answers whose OPINION gates a merge; this is not an
+  // opinion, it is reeve reporting that it does not know what was said, and a
+  // stranger's unread body is exactly as unread as a configured reviewer's.
+  check(facts.unreadableBodies.readable === true && facts.unreadableBodies.open === 1,
+    "an UNROSTERED author's unreadable body still reaches the decision path",
+    JSON.stringify(facts.unreadableBodies));
+  check(facts.unreadableBodies.reviewers.includes("a-human"),
+    "and names them, because the fix is a line of profile describing that reviewer",
+    JSON.stringify(facts.unreadableBodies.reviewers));
+  // Control: the findings clause beside it IS scoped, so the two really are being
+  // treated differently rather than both happening to include everyone.
+  // Control: the findings clause beside it carries codex, who IS blocking, and not
+  // `a-human`, who is not — so the two facts really are scoped differently rather
+  // than both happening to include everyone.
+  check(!facts.bodyFindings.reviewers.includes("a-human") && facts.bodyFindings.reviewers.includes("codex"),
+    "control: while the findings clause stays scoped to blocking reviewers, so the two differ by design",
+    JSON.stringify(facts.bodyFindings));
 
   // The mounted half: with every body author declared, the SAME call hands it on.
   const dir3 = mkdtempSync(join(tmpdir(), "reeve-body3-"));

@@ -298,6 +298,14 @@ CREATE TABLE IF NOT EXISTS review_body_finding (
   is_cleared INTEGER NOT NULL DEFAULT 0,
   excerpt    TEXT NOT NULL,
   event_at   INTEGER,
+  -- Is this row a FINDING, or a statement that reeve could not read the body it
+  -- came from? Both are counted -- an unreadable body must not be spillable -- but
+  -- only one of them is work. There is nothing for a worker to fix in "I cannot
+  -- parse this reviewer", and nothing for a reviewer to clear either; it is
+  -- cleared by the operator describing that reviewer in the profile. So it is
+  -- routed to a person rather than to a worker, and keeping the two apart in the
+  -- row is what lets the readers ask their own question instead of sharing one.
+  unreadable INTEGER NOT NULL DEFAULT 0,
   -- The revision the filing round was bound to. Recorded so a later reader can
   -- tell a finding filed against this head from one carried over from an older
   -- one, without re-deriving.

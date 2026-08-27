@@ -289,7 +289,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
                  `so this body is counted as one finding of unknown severity: ` +
                  String(o.payload?.body ?? "").replace(/\s+/g, " ").slice(0, 240),
         event_at: r.event_at ?? at, head_full: c.head_full ?? null, ord,
-        seen_at: r.observed_at ?? r.event_at ?? at,
+        seen_at: r.observed_at ?? r.event_at ?? at, unreadable: 1,
       });
       continue;
     }
@@ -303,6 +303,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
         severity: severityOf(text, rev?.severityMarkers ?? []),
         excerpt: text.slice(0, 400), event_at: r.event_at ?? at,
         head_full: c.head_full ?? null, ord, seen_at: r.observed_at ?? r.event_at ?? at,
+        unreadable: 0,
       });
     }
   }
@@ -372,10 +373,10 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     for (const t of threads) it.run(nwo, pr, t.thread_id, t.reviewer, t.path, t.line, t.severity,
       t.is_resolved, t.is_outdated, t.resolved_by, t.resolved_at, t.is_cleared, t.excerpt, t.event_at, version);
     const ib = db.prepare(`INSERT INTO review_body_finding
-      (nwo,pr,finding_id,reviewer,severity,is_cleared,excerpt,event_at,head_full,classifier_version)
-      VALUES (?,?,?,?,?,?,?,?,?,?)`);
+      (nwo,pr,finding_id,reviewer,severity,is_cleared,excerpt,event_at,head_full,unreadable,classifier_version)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
     for (const f of bodyFindings) ib.run(nwo, pr, f.finding_id, f.reviewer, f.severity,
-      f.is_cleared, f.excerpt, f.event_at, f.head_full, version);
+      f.is_cleared, f.excerpt, f.event_at, f.head_full, f.unreadable ?? 0, version);
     // The head is stored WITH the projection, in the same transaction as the rows
     // it explains. Clearing was computed against it, so a projection and the head
     // it describes are one fact and must not be able to drift apart.
@@ -477,6 +478,10 @@ export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() /
   const body = db.prepare("SELECT * FROM review_body_finding WHERE nwo=? AND pr=?").all(nwo, pr);
   const bodyOpen = body.filter(f => !f.is_cleared);
   const bodyBlocking = bodyOpen.filter(f => BLOCKING_SEVERITIES.has(f.severity));
+  // The two populations are counted together and ROUTED apart. Both keep a spill
+  // from happening; only one of them is work a worker can do.
+  const unreadable = bodyOpen.filter(f => f.unreadable);
+  const realBody = bodyOpen.filter(f => !f.unreadable);
   const rounds = db.prepare(
     `SELECT reviewer, COUNT(DISTINCT head10) n FROM review_round
       WHERE nwo=? AND pr=? AND outcome IN ('findings','clean') AND head10 IS NOT NULL
@@ -528,9 +533,19 @@ export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() /
       ...open.map(t => ({ id: t.thread_id, reviewer: t.reviewer, path: t.path,
                           line: t.line, severity: t.severity, excerpt: t.excerpt,
                           anchor: "thread" })),
-      ...bodyOpen.map(f => ({ id: f.finding_id, reviewer: f.reviewer, path: null,
+      // Sentinels are NOT here. This list is what a worker is dispatched at, and
+      // there is nothing in "reeve cannot parse this reviewer" for a worker to do:
+      // no code is wrong, no thread exists, and the fix is a line of profile only
+      // the operator can write. It travels as its own fact below instead.
+      ...realBody.map(f => ({ id: f.finding_id, reviewer: f.reviewer, path: null,
                               line: null, severity: f.severity, excerpt: f.excerpt,
                               anchor: "body" })),
     ],
+    // Bodies reeve could not read, whoever wrote them. Deliberately NOT scoped to
+    // blocking reviewers the way findings are: blocking-ness answers whose opinion
+    // gates a merge, and this is not an opinion — it is reeve saying it does not
+    // know what was said. A stranger's unread body is exactly as unread as a
+    // configured reviewer's.
+    unreadableBodies: unreadable.map(f => ({ reviewer: f.reviewer, excerpt: f.excerpt })),
   };
 }

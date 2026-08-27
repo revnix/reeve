@@ -192,6 +192,26 @@ export function computeVerdict(i) {
     add("bodyFindings", BLOCK, `${B.open} finding(s) stated in a review body by ${B.reviewers.join(", ") || "a blocking reviewer"}, with no thread to resolve`);
   else add("bodyFindings", PASS, "no open review-body findings");
 
+  // 5d. Bodies reeve could not READ, which is a different question from whether
+  //     there are findings in them and must not share a clause with it.
+  //
+  //     Its own clause because its answer is its own too. A body finding is work:
+  //     a worker can fix it and a reviewer can supersede it. This is neither. No
+  //     code is wrong, no thread exists, and the only thing that clears it is the
+  //     operator describing that reviewer in the profile — so the watcher routes
+  //     it to a person rather than to a worker.
+  //
+  //     Every author counts, rostered or not. Blocking-ness says whose OPINION
+  //     gates a merge; this is not an opinion, it is reeve reporting that it does
+  //     not know what was said, and a stranger's unread body is exactly as unread
+  //     as a configured reviewer's.
+  const U = i.unreadableBodies;
+  if (!U || U.readable === false)
+    add("bodyReadable", UNKNOWN, `cannot say whether every review body was readable${U?.why ? ` — ${U.why}` : ""}`);
+  else if (U.open > 0)
+    add("bodyReadable", BLOCK, `${U.open} review body/bodies from ${U.reviewers.join(", ")} that reeve cannot read — declare bodyFindings for them`);
+  else add("bodyReadable", PASS, "every review body was readable");
+
   // 6. Ledger blockers. null means the store could not answer, which is not zero.
   //    The previous gate skipped this check entirely when the read failed.
   if (i.ledgerBlockers === null || i.ledgerBlockers === undefined) add("findings", UNKNOWN, "could not read blocking findings");

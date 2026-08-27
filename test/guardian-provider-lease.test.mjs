@@ -59,7 +59,9 @@ const EVAL = {
  * A fixture that cannot exhibit the defect reports the code healthy. The default
  * is now the connection production actually uses.
  */
-const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false, hubGetter } = {}) => {
+const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false, hubGetter,
+                    heartbeatMs, providerHeartbeat, spawnWorker, capacity,
+                    queuedRequests, cancelQueued } = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "reeve-prov-"));
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -70,7 +72,7 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false,
     execute: true, shadow: true, running: 0,
     containment: containmentThrows ? null : { credentialRead: "closed", why: "test" },
     keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
-    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    capacity: capacity ?? (() => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 })),
     profile: {
       identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-clone-")) },
       authority: { policy: "propose_and_merge" },
@@ -84,7 +86,11 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false,
     openPrs: () => [42],
     evaluate: () => EVAL,
     publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
-    spawnWorker: async a => { spawned.push(a); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; },
+    spawnWorker: spawnWorker ?? (async a => { spawned.push(a); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; }),
+    ...(heartbeatMs != null ? { heartbeatMs } : {}),
+    ...(providerHeartbeat ? { providerHeartbeat } : {}),
+    ...(queuedRequests ? { queuedRequests } : {}),
+    ...(cancelQueued ? { cancelQueued } : {}),
     oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
     resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
     prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
@@ -1296,6 +1302,160 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false,
   check(reaped.length > 0,
     "an OBSERVATIONAL guardian still reaps the rows a dead one left behind",
     String(reaped.length));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── the preflight ASKS the scheduler; it does not claim the work ─────────
+// `askedFor` means "this tick put this run ref to the scheduler AND still wants
+// it", and the sweep cancels every queued row outside it. Marking at the
+// queue-head preflight marked from INTENT — the thing the sweep's own comment
+// calls dishonest — because the per-decision loop below still applies local
+// capacity and everything after it. A row the preflight touched and those gates
+// then refused was neither re-asked nor cancelled: it sat queued under the live
+// guardian, and `queuedGuardianCount` blocks every builder admission behind it.
+{
+  const cancelled = [];
+  const s1 = await run({
+    // The gate that refuses AFTER the preflight has already run.
+    capacity: () => ({ allowed: 5, running: 0, canStart: 0, load1: 0, perfCores: 10 }),
+    queuedRequests: () => [{ run_ref: "o/r#42:FIX_CI" }],
+    cancelQueued: (db, a) => { cancelled.push(a.runRef); return { ok: true, cancelled: 1 }; },
+    // Refused, so the preflight cannot drain the row by being granted it.
+    claim: () => ({ ok: false, reason: "at-limit" }),
+  });
+  check(s1.spawned.length === 0, "fixture: local capacity really did refuse the dispatch", JSON.stringify(s1.spawned.length));
+  check(cancelled.includes("o/r#42:FIX_CI"),
+    "a queued row the later gates refuse is CANCELLED, not left blocking the builder",
+    JSON.stringify(cancelled));
+
+  // CONTROL: a row the dispatch path DID ask for must survive, or the assertion
+  // above would pass on a guardian that cancels its own queue every tick.
+  cancelled.length = 0;
+  const s2 = await run({
+    queuedRequests: () => [{ run_ref: "o/r#42:FIX_CI" }],
+    cancelQueued: (db, a) => { cancelled.push(a.runRef); return { ok: true, cancelled: 1 }; },
+    claim: a => (/^canary:/.test(a.runRef) ? { ok: true, id: 1 } : { ok: false, reason: "queued" }),
+  });
+  check(!cancelled.includes("o/r#42:FIX_CI"),
+    "control: a row this tick actually asked for is KEPT, even when the ask was refused",
+    JSON.stringify(cancelled));
+  void s2;
+}
+
+// ── a provider heartbeat that renews NOTHING is lease loss ───────────────
+// `heartbeatProvider` answers `{ ok: true, beat: 0 }` when the fenced row has
+// gone — reaped after a liveness misread, cleared by a restore — and the result
+// was discarded. The worker went on spending provider capacity while the
+// scheduler counted no lease for it and could admit replacement work beside it,
+// which is the double-spend admission exists to prevent. The run heartbeat three
+// lines above already fed `revoked`; this half never reached the gate.
+{
+  const seen = [];
+  const s1 = await run({
+    heartbeatMs: 5,
+    providerHeartbeat: () => ({ ok: true, beat: 0 }),
+    spawnWorker: async (a) => {
+      await new Promise(r => setTimeout(r, 40));
+      seen.push(a.isRevoked?.() ?? null);
+      return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" };
+    },
+  });
+  check(seen.length === 1, "fixture: the worker ran and was asked whether it was revoked", JSON.stringify(seen.length));
+  check(/provider lease is gone/.test(seen[0] ?? ""),
+    "a zero-row provider heartbeat revokes the worker", JSON.stringify(seen[0]));
+
+  // CONTROL: a heartbeat that DID renew a row must not revoke, or the assertion
+  // above would pass on a guardian that revokes every worker unconditionally.
+  seen.length = 0;
+  const s2 = await run({
+    heartbeatMs: 5,
+    providerHeartbeat: () => ({ ok: true, beat: 1 }),
+    spawnWorker: async (a) => {
+      await new Promise(r => setTimeout(r, 40));
+      seen.push(a.isRevoked?.() ?? null);
+      return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" };
+    },
+  });
+  check(seen[0] == null, "control: a heartbeat that renewed a row does NOT revoke", JSON.stringify(seen[0]));
+
+  // AND A REFUSAL IS NOT LOSS. `ok: false` is the hub held by a restore, which
+  // says nothing about whether the lease still exists — revoking there would
+  // kill live workers over a maintenance window.
+  seen.length = 0;
+  const s3 = await run({
+    heartbeatMs: 5,
+    providerHeartbeat: () => ({ ok: false, reason: "maintenance" }),
+    spawnWorker: async (a) => {
+      await new Promise(r => setTimeout(r, 40));
+      seen.push(a.isRevoked?.() ?? null);
+      return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" };
+    },
+  });
+  check(seen[0] == null,
+    "and a REFUSED heartbeat is not loss either: that is a restore holding the hub", JSON.stringify(seen[0]));
+  void s1; void s2; void s3;
+}
+
+// ── a run that cannot record its attempt is RETIRED, not left live ────────
+// `startRun` has already succeeded when `recordFixAttempt` throws, so releasing
+// only the provider lease left a durable run `leased` for ever:
+// `run_one_live_per_task` is UNIQUE, every later `startRun` for the pull request
+// answers "already live", and NO run reaper exists in production. The store that
+// threw could be repaired and dispatch still would not come back.
+//
+// Driven against the REAL `recordFixAttempt` with a real damaged store, rather
+// than an injected throw, because "a damaged table" is the failure the finding
+// describes and a seam added for the test would not have exercised it.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-attempt-"));
+  const store = open(join(dir, "s.db"));
+  const spawned = [];
+  const ctx = {
+    nwo: "o/r", db: store, logPath: join(dir, "log.txt"),
+    execute: true, shadow: true, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-attempt-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+    },
+    hub: () => ({ hub: {}, why: null }), repoId: 7, lstart: "boot-1",
+    reapProvider: () => ({ ok: true, reaped: 0 }), queuedRequests: () => [],
+    providerClaim: () => ({ ok: true, id: 1, token: "t" }),
+    providerBind: () => ({ ok: true, bound: 1 }),
+    providerRelease: () => ({ ok: true }),
+    openPrs: () => [42],
+    prAnchor: () => ({ ok: true, headRef: "f", baseRef: "main", state: "open", title: "t",
+                       updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
+    evaluate: () => EVAL,
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    spawnWorker: async a => { spawned.push(a); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; },
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+    // The one write that fails. Dropping `fix_attempt` outright cannot isolate
+    // this: `countFixAttempts` reads the same table earlier in the loop, so the
+    // pull request never reaches `startRun` and the run this block is about is
+    // never created — the fixture would assert over an empty table and pass on
+    // nothing, which is exactly what the precondition below caught.
+    recordFixAttempt: () => { throw new Error("no such table: fix_attempt"); },
+  };
+  await tick(ctx);
+  const runs = store.prepare("SELECT status FROM run").all().map(r => r.status);
+  check(spawned.length === 0, "fixture: the throw really did stop the dispatch", JSON.stringify(spawned.length));
+  check(runs.length > 0, "fixture: a durable run really was created before the throw", JSON.stringify(runs));
+  check(!runs.includes("leased"),
+    "a run whose attempt could not be recorded is RETIRED, not left live for ever", JSON.stringify(runs));
+  check(runs.every(st => st === "abandoned"),
+    "and abandoned rather than failed, because nothing ran and nothing was learned", JSON.stringify(runs));
+  const nodes = store.prepare("SELECT status FROM node").all().map(r => r.status);
+  check(nodes.includes("ready"),
+    "so the pull request is dispatchable again on the next tick", JSON.stringify(nodes));
+  store.close();
   rmSync(dir, { recursive: true, force: true });
 }
 

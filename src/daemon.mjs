@@ -2025,7 +2025,24 @@ export async function tick(ctx) {
         // it empty.
         const head = queued.find(r => intended.has(r.run_ref) && r.run_ref !== `canary:${nwo}`);
         if (head) {
-          askedFor.add(head.run_ref);
+          // NOT `askedFor`, and marking it here was a regression this PR
+          // introduced against its own rule.
+          //
+          // `askedFor` means "this tick put this run ref to the scheduler AND
+          // still wants it", and the sweep cancels every queued row outside it.
+          // Marking at the preflight marks from INTENT -- the thing the sweep's
+          // own comment says is dishonest -- because the per-decision loop below
+          // still applies local capacity, the preparation backoff, root-cause
+          // resolution, prompt construction and checkout preparation. A row the
+          // preflight touched and those gates then refused was neither re-asked
+          // nor cancelled: it sat queued under the live guardian, and
+          // `queuedGuardianCount` blocks every builder admission behind it.
+          //
+          // Nothing is lost by not marking. A GRANTED claim removes the row from
+          // the queue, so the sweep has nothing to cancel. A REFUSED one leaves
+          // it queued, and then the honest question is the one the sweep already
+          // asks: did the dispatch path actually ask for this work? If it did, it
+          // marks `askedFor` itself; if it did not, the row should go.
           const got = (ctx.providerClaim ?? claimProvider)(h, {
             owner: "guardian", repoId, runRef: head.run_ref,
             pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
@@ -2308,9 +2325,28 @@ export async function tick(ctx) {
       // guardian pid, which the expiry reaper preserves for ever. Nothing
       // reclaims it if the next tick decides differently about this PR.
       try {
-        if (run.ok && decision.action === "FIX_CI" && fp) recordFixAttempt(db, nwo, e.pr, fp, e.head);
+        if (run.ok && decision.action === "FIX_CI" && fp) (ctx.recordFixAttempt ?? recordFixAttempt)(db, nwo, e.pr, fp, e.head);
       } catch (err) {
         if (prLease) { releaseWithRetry(prRunRef, prLease); prLease = null; }
+        // AND RETIRE THE RUN, because nothing else ever will.
+        //
+        // `startRun` has already succeeded by this point, so a durable run is
+        // live. Releasing only the provider lease left it `leased` for ever:
+        // `run_one_live_per_task` is UNIQUE, so every later `startRun` for this
+        // pull request answers "already live", and there is no run reaper in
+        // production -- the only reaper the tick calls is `reapProviderLeases`,
+        // which is about provider rows. Repairing the table that threw would not
+        // have restored dispatch; the row had to be cleared by hand.
+        //
+        // UNBOUND rather than failed: nothing ran and nothing was learned, so the
+        // node returns to `ready` and the pull request is dispatchable again on
+        // the next tick. `finishRun` retires the row on every outcome for exactly
+        // this reason, and it is the caller's job to ask.
+        if (run.ok) {
+          const fin = finishRun(db, { runId: run.runId, outcome: OUTCOMES.UNBOUND,
+                                      why: `the fix attempt could not be recorded: ${err.message}` });
+          if (!fin?.applied) log(logPath, `  #${e.pr}: the run could not be retired — ${fin?.why}`);
+        }
         log(logPath, `  #${e.pr}: NOT dispatching — the fix attempt could not be recorded: ${err.message}`);
         raise(`#${e.pr}: the fix attempt could not be recorded`);
         continue;
@@ -2357,7 +2393,25 @@ export async function tick(ctx) {
         if (prLease) {
           try {
             const h = hubOr(() => null);
-            if (h) (ctx.providerHeartbeat ?? heartbeatProvider)(h, { ...prLease, isAlive: isSameProcess });
+            if (h) {
+              const phb = (ctx.providerHeartbeat ?? heartbeatProvider)(h, { ...prLease, isAlive: isSameProcess });
+              // A ZERO-ROW RENEWAL IS LEASE LOSS, and the result was discarded.
+              //
+              // `heartbeatProvider` answers `{ ok: true, beat: 0 }` when the
+              // fenced row is GONE -- reaped after a liveness misread, cleared by
+              // a restore -- which is `ok` in the sense that the query ran and
+              // nothing in the sense that matters. The worker went on consuming
+              // provider capacity while the scheduler counted no lease for it and
+              // could admit replacement work beside it, which is the double-spend
+              // the scheduler exists to prevent.
+              //
+              // The run heartbeat three lines above already feeds `revoked`; this
+              // half never reached `runWorker`'s gate. Only `ok && beat === 0` is
+              // loss: a REFUSAL is the hub being held by a restore, which says
+              // nothing about whether the lease still exists.
+              if (phb?.ok === true && phb.beat === 0)
+                revoked = "the provider lease is gone; the scheduler no longer counts this worker";
+            }
           } catch (err) { log(logPath, `  #${e.pr}: provider lease not renewed — ${err.message}`); }
         }
       }, ctx.heartbeatMs ?? HEARTBEAT_MS);

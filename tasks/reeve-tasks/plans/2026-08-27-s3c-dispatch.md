@@ -91,7 +91,7 @@ Every reference to `src/daemon.mjs`, `src/sandbox.mjs`, `src/prompts.mjs`, `src/
 - **The full guardian suite is green in every guardian-touching PR** (design `:810`, *"Shared-code touches, each verified by running the full guardian suite in its PR"*). PR-C2 and PR-C3 are guardian-shared.
 - No `as any`, no `@ts-expect-error`, no lint suppression.
 - **Every timestamp is `INTEGER` seconds from `unixepoch()`** unless the column name ends `_ms`. Never a TEXT date.
-- Nothing in any public or client repository may name reeve. This plan touches only `revnix/reeve`, which is private.
+- **Rule 15 (§1.7) still binds, and its premise has changed.** `revnix/reeve` was made **PUBLIC** on 2026-08-27 — a deliberate founder decision, taken with the exposure audited and in front of them, to restore Actions minutes exhausted at the org level. So the old form of this constraint (*"this plan touches only `revnix/reeve`, which is private"*) is **false and must not be restated**. What survives is the rule itself, unchanged: **no effect this stage produces against any OTHER repository may name reeve** — not a branch, a commit message, a PR title or body, a check name, a label, or a comment marker. The spec repos S3 provisions must be **private**, and design `:77` refuses to run against a spec repo whose visibility is anything but exactly `private`. Reeve naming itself, inside its own now-public repository, is not a Rule 15 violation; naming reeve in an artifact it sends elsewhere always is.
 
 ### Isolation while this plan is being written or executed
 

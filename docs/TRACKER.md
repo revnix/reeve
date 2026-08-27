@@ -424,6 +424,48 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       so that stall is self-limiting; provider leases are consumed by a DIFFERENT
       process and the builder never reaps, so a halted guardian plus a running
       builder is a deadlock neither can break.
+
+      **ROUND 11 — three findings, and the first one had never worked at all.**
+      `measuredContainment` attaches its canary cache to whatever context it is
+      handed, and `tick` handed it a fresh shallow copy of `ctx` on every pass,
+      built only to carry two hook functions. `run` loops on ONE persistent
+      context and nothing in the repository ever seeded the field, so the Map was
+      allocated on a throwaway and discarded with it **every tick since the cache
+      was written** — the guardian paid for the containment canary on every pass
+      and the cache had never once survived. Seeding the copy would have closed
+      the call site and left the mechanism, so the copy is gone and the hooks are
+      parameters. This makes cache HITS reachable in production for the first
+      time; that behaviour was already covered where the cache is passed
+      directly, so only the plumbing was dead.
+
+      **The scheduler gate was a fail-open reached by PASSING it.** It reduced
+      `pragma_table_info` to names, and these tables are STRICT — measured
+      against node:sqlite with a control, a correct `provider_lease` accepts the
+      generated text token and one rebuilt with `token INTEGER` throws "cannot
+      store TEXT value in INTEGER column". So a mistyped hub was reported usable,
+      every claim threw, and the daemon dispatched model work outside the shared
+      limit. Two earlier attempts to reproduce it were worthless — one used
+      `state` for `status`, one was mangled by shell quoting — and neither was
+      evidence; only the third, with a passing control, was. The three
+      inventories carry declared types now, read from a freshly migrated hub.
+
+      That cost `provider_lease` its derivation from `LEASE_COLS`, which carries
+      no types. **The derivation is replaced by an asserted AGREEMENT in both
+      directions** rather than a second list left to drift: a column added to the
+      lease SQL without a type here fails the suite instead of leaving a silent
+      hole in the gate, and both maps are compared against a freshly migrated hub
+      both ways, so a declaration demanding a column that does not exist would
+      refuse every healthy hub and is caught too.
+
+      Third: a refused canary now cleans up after itself. `queued`, `cooldown`
+      and `at-limit` are ordinary scheduler answers that repeat every tick, and
+      the refusal returned before the cleanup — leaving one uniquely-named decoy
+      per refusal under the reeve home, the one artefact the caller cannot reach.
+
+      **The suite is not hanging; it is 8.5–10.6 minutes depending on load.** Two
+      timed runs measured 511s and 635s over the same 91 files, both green, so it
+      straddles a ten-minute budget rather than exceeding one. `dispatch-e2e`
+      alone is a third of it. Worth knowing before CI returns.
       gap does not make deferring it free.
 
 - [ ] **S2-C PR-C2, the guardian's hub guest — BUILT (2026-08-26).** Branch

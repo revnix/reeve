@@ -466,6 +466,37 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       timed runs measured 511s and 635s over the same 91 files, both green, so it
       straddles a ten-minute budget rather than exceeding one. `dispatch-e2e`
       alone is a third of it. Worth knowing before CI returns.
+
+      **A GUARD OF MINE WAS INERT, and predicting it would fire is what hid it.**
+      I told the review lane twice that the `CLAUSE_IDS` both-directions test
+      would go red when their branch added new clause ids — "the guard working,
+      not a conflict" — and they planned around it as a safety net.
+
+      It would not have fired. Built the actual merged tree
+      (`git merge-tree --write-tree`, `commit-tree`, a scratch worktree) and ran
+      `test/verdict.test.mjs` on it: **68 assertions PASS, 0 FAIL**, on a tree
+      where `computeVerdict` emits `bodyFindings` and `bodyReadable` and
+      `CLAUSE_IDS` declares neither. The comparison scraped the source with
+      `add\("([a-z_]+)"`, and every clause id in the repository is lowercase — so
+      the pattern was **correct by accident** and blind to the first id that was
+      not. The ids were never SEEN, so both directions agreed on a set that
+      silently excluded them. Three totality matrices consume `CLAUSE_IDS`, so a
+      clause could have shipped with no branch while its coverage read complete.
+
+      Fixed: it reads any quoted id, and a second assertion guards the READER —
+      ids parsed must equal `add(` occurrences, so a call the pattern cannot read
+      fails as unreadable rather than vanishing into "not emitted", which is the
+      same defect in a new costume.
+
+      **This is the third instrument failure of the day and the only dangerous
+      one.** The `timeout` watchdog announced itself by printing FAILED beside
+      `rc=0`; the peer's bad stub announced itself by leaving the matched
+      sentences intact. Both were CONTRADICTIONS, catchable by reading the whole
+      line. This one had none: a clean green and a plausible assertion count. A
+      narrowing read does not report narrowing — it reports a smaller set as
+      though it were the whole one. **A guard is untested until you construct the
+      state that should trip it**, and never promise a peer a guard will catch
+      something you have not watched it catch.
       gap does not make deferring it free.
 
 - [ ] **S2-C PR-C2, the guardian's hub guest — BUILT (2026-08-26).** Branch

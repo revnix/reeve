@@ -25,6 +25,16 @@ const good = () => ({
   // blocking reviewer has come back to what it filed. They are different facts,
   // and the second is the one a bot self-resolving its own thread cannot fake.
   cleared: { readable: true, uncleared: 0, reviewers: [] },
+  // A THIRD fact about review state, and it is separate from both above for the
+  // reason its clause explains: a finding stated in a review body is not one of
+  // GitHub's unresolved threads, so `threads` cannot see it, and answering it by
+  // asking for another round -- which is what `cleared` means -- skips the fix.
+  bodyFindings: { readable: true, open: 0, reviewers: [] },
+  // A FOURTH, and it is not the same question as the one above. That clause asks
+  // whether there are open findings in review bodies; this asks whether reeve
+  // could read those bodies at all. One is work a worker can do; the other is
+  // reeve saying it does not know what was said.
+  unreadableBodies: { readable: true, open: 0, reviewers: [] },
   ledgerBlockers: 0,
   mergeState: "CLEAN",
 });
@@ -72,21 +82,70 @@ check("control: zero uncleared is a pass, so the clause is not blocking everythi
 // read as success was the defect; absence read as paralysis is not the fix.
 check("past the soft cap with an UNREADABLE projection is UNKNOWN",
   withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "unreadable" }; }), UNKNOWN);
-check("but a capability that is simply unbuilt does not make it unknown",
-  withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "not-derived" }; }), PASS);
+// The permanent gap that PASS existed for is closed: a review body reeve cannot
+// read is now counted as one `unknown` finding rather than omitted from the
+// count, so a missing count is always transient and UNKNOWN clears itself.
+// Nothing is left that can report "not derived", and the branch that spared it is
+// gone with it -- which means the cap is now ENFORCED rather than announced as
+// unenforced.
+check("past the cap with a critical open BLOCKS, which is the cap actually enforced",
+  withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1, blockingCritical: 1 }; }), BLOCK);
 {
-  // And it SAYS the cap is unenforced, because a pass that quietly skips a check
-  // is the thing this whole clause exists to stop.
   const i = good();
-  i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "not-derived" };
+  i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "unreadable" };
   const c = computeVerdict(i).clauses.find(x => x.id === "rounds");
-  check("and says the cap is not enforced rather than passing silently",
-    /NOT enforced/.test(c.detail), true);
+  check("and an unreadable count says so rather than passing silently",
+    /cannot say how many criticals/.test(c.detail), true);
 }
 check("control: BELOW the cap an unknown critical count still passes, because it changes nothing there",
   withOut(i => { i.rounds = { n: 1, softCap: 5, hardCap: 10, unspilledCritical: null }; }), PASS);
 check("control: and a KNOWN zero past the cap still passes",
   withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 0 }; }), PASS);
+
+// The body-finding clause. Its whole reason to exist is that neither neighbour
+// can see what it sees.
+check("an open review-body finding BLOCKS, though no thread is unresolved",
+  withOut(i => { i.bodyFindings = { readable: true, open: 1, reviewers: ["codex"] }; }), BLOCK);
+check("control: and zero of them passes, so the clause is not blocking everything",
+  withOut(i => { i.bodyFindings = { readable: true, open: 0, reviewers: [] }; }), PASS);
+check("an unreadable body population is UNKNOWN, never zero",
+  withOut(i => { i.bodyFindings = { readable: false, why: "no projection" }; }), UNKNOWN);
+{
+  // The isolating control: with the OTHER two review clauses explicitly satisfied,
+  // only this one can be producing the block. Without it, the assertion above
+  // would pass just as well if `threads` were doing the work.
+  const i = good();
+  i.threads = { unresolved: 0, total: 4, readable: true };
+  i.cleared = { readable: true, uncleared: 0, reviewers: [] };
+  i.bodyFindings = { readable: true, open: 2, reviewers: ["codex"] };
+  const v = computeVerdict(i);
+  const c = v.clauses.find(x => x.id === "bodyFindings");
+  check("and it is THIS clause blocking, with threads and cleared both satisfied",
+    `${v.state}/${c.state}`, `${BLOCK}/${BLOCK}`);
+  check("control: its neighbours really did pass, so the block is not theirs",
+    v.clauses.filter(x => x.id === "threads" || x.id === "cleared").every(x => x.state === PASS), true);
+}
+
+// A body reeve cannot read stops the merge, whoever wrote it.
+check("an unreadable review body BLOCKS",
+  withOut(i => { i.unreadableBodies = { readable: true, open: 1, reviewers: ["a-human"] }; }), BLOCK);
+check("control: and a readable one passes",
+  withOut(i => { i.unreadableBodies = { readable: true, open: 0, reviewers: [] } }), PASS);
+check("not knowing whether they were readable is UNKNOWN, never zero",
+  withOut(i => { i.unreadableBodies = { readable: false, why: "no projection" }; }), UNKNOWN);
+{
+  // Isolating control: the finding clause explicitly satisfied, so only this one
+  // can be producing the block.
+  const i = good();
+  i.bodyFindings = { readable: true, open: 0, reviewers: [] };
+  i.unreadableBodies = { readable: true, open: 2, reviewers: ["a-human"] };
+  const v = computeVerdict(i);
+  check("and it is THIS clause blocking, with bodyFindings satisfied",
+    `${v.clauses.find(c => c.id === "bodyReadable").state}/${v.clauses.find(c => c.id === "bodyFindings").state}`,
+    `${BLOCK}/${PASS}`);
+  check("and it names the reviewer to declare, because the fix is a line of profile",
+    /a-human/.test(v.clauses.find(c => c.id === "bodyReadable").detail), true);
+}
 
 // Positive control. Without this, every refusal below proves nothing.
 check("a fully satisfied revision PASSes", computeVerdict(good()).state, PASS);
@@ -147,10 +206,33 @@ check("GitHub still computing is UNKNOWN", withOut(i => { i.mergeState = "UNKNOW
 
 // The founder's rule: past the cap, only P0/P1 keep going, and a critical is
 // never spilled to a follow-up PR.
+//
+// TWO COUNTS SERVE TWO RULES. The cap blocks on criticals from a BLOCKING
+// reviewer, because blocking-ness is what says whose opinion gates a merge. The
+// spill refusal counts EVERY reviewer, because a critical is never deferred
+// whoever filed it. Sharing one number made an advisory reviewer's P0 escalate a
+// pull request that every gating clause had passed.
 check("the hard cap with an open critical BLOCKs",
-  withOut(i => { i.rounds = { n: 10, softCap: 5, hardCap: 10, unspilledCritical: 1 }; }), BLOCK);
+  withOut(i => { i.rounds = { n: 10, softCap: 5, hardCap: 10, unspilledCritical: 1, blockingCritical: 1 }; }), BLOCK);
 check("past the soft cap with an open critical BLOCKs",
-  withOut(i => { i.rounds = { n: 7, softCap: 5, hardCap: 10, unspilledCritical: 2 }; }), BLOCK);
+  withOut(i => { i.rounds = { n: 7, softCap: 5, hardCap: 10, unspilledCritical: 2, blockingCritical: 2 }; }), BLOCK);
+// THE CASE THE SPLIT EXISTS FOR: past the cap, the only open critical belongs to
+// an ADVISORY reviewer. Every gating clause passes, so the pull request must not
+// escalate on an opinion the profile says does not gate.
+check("an advisory reviewer's critical does NOT block at the cap",
+  withOut(i => { i.rounds = { n: 7, softCap: 5, hardCap: 10, unspilledCritical: 1, blockingCritical: 0 }; }), PASS);
+{
+  // ...while still refusing a spill, which is the other half and reads the other
+  // number. Asserted through the same clause set, so the two rules are shown to
+  // disagree deliberately rather than by accident.
+  const i = good();
+  i.rounds = { n: 7, softCap: 5, hardCap: 10, unspilledCritical: 1, blockingCritical: 0 };
+  const v = computeVerdict(i);
+  check("control: and the rounds clause really is the one passing it",
+    v.clauses.find(c => c.id === "rounds").state, PASS);
+  check("control: while the universal count still says a critical is open, so nothing may be spilled",
+    i.rounds.unspilledCritical > 0, true);
+}
 check("past the soft cap with everything spilled PASSes",
   withOut(i => { i.rounds = { n: 7, softCap: 5, hardCap: 10, unspilledCritical: 0 }; }), PASS);
 

@@ -39,6 +39,15 @@ const ADDED_COLUMNS = [
   // was derived before anyone recorded this, and "we do not know which head"
   // must read as unusable rather than as a match.
   ["projection_meta", "head", "TEXT"],
+  // Whether body-finding derivation could have been complete. Defaulted to 0 on
+  // purpose: every projection written before this column existed derived no body
+  // findings at all, so 0 is not a conservative guess, it is the truth about
+  // those rows. The reader treats 0 as "the critical count may be short one".
+  ["projection_meta", "body_derived", "INTEGER NOT NULL DEFAULT 0"],
+  // A body finding that is really a statement that the body could not be read.
+  // Defaulted to 0: every row written before this column existed was a real
+  // finding, because sentinels did not exist to be written.
+  ["review_body_finding", "unreadable", "INTEGER NOT NULL DEFAULT 0"],
 ];
 
 function addMissingColumns(db) {

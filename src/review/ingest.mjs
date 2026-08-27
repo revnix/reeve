@@ -54,6 +54,34 @@ function gh(args) {
 const secs = t => (t ? Math.floor(new Date(t).getTime() / 1000) || null : null);
 
 /**
+ * Every page of a REST collection, or a refusal.
+ *
+ * ONE reader for both paged surfaces, because the defect it fixes was the same on
+ * each and fixing one of two sites is a near miss that has already happened. A
+ * full page is indistinguishable from a complete read, so the loop continues
+ * while a page comes back full and stops on a short one -- and a page that fails
+ * mid-way reports `ok: false` rather than returning what it has, because a
+ * partial list that says nothing about being partial is exactly the shape that
+ * produced four consecutive false zeroes on the thread surface.
+ */
+function restPages(api, path, max = 20) {
+  const items = [];
+  for (let page = 1; page <= max; page++) {
+    const r = api([`${path}?per_page=100&page=${page}`]);
+    if (!r.ok) return { ok: false, items };
+    let batch;
+    try { batch = JSON.parse(r.out || "[]"); } catch { return { ok: false, items }; }
+    if (!Array.isArray(batch)) return { ok: false, items };
+    items.push(...batch);
+    if (batch.length < 100) return { ok: true, items };
+  }
+  // The cap was reached with every page full, so there is more and reeve has not
+  // read it. Refusing is the honest answer; returning 2000 items as if they were
+  // all of them is the one that reads as complete.
+  return { ok: false, items };
+}
+
+/**
  * One spelling for one reviewer.
  *
  * The same App answers to two names depending on which API you ask: REST reports
@@ -87,9 +115,16 @@ export function observe(nwo, pr, io = {}) {
 
   // Review objects. commit_id is the FULL forty-hex sha for every author -- only
   // comment BODIES abbreviate -- so this is the one surface that binds exactly.
-  const reviews = api([`repos/${nwo}/pulls/${pr}/reviews?per_page=100`]);
+  //
+  // PAGINATED, like the threads below and for the same reason. A single page of
+  // 100 is not a safe ceiling here: every inline reply mints a 0-byte COMMENTED
+  // review -- nine at one commit on #1124 -- so review OBJECTS outnumber real
+  // rounds by an order of magnitude, and a busy pull request passes 100 while
+  // having had five. A short read that reports success is how a body-only
+  // critical would go unseen behind a projection that called itself complete.
+  const reviews = restPages(api, `repos/${nwo}/pulls/${pr}/reviews`);
   if (!reviews.ok) incomplete = true;
-  else for (const r of JSON.parse(reviews.out || "[]")) {
+  else for (const r of reviews.items) {
     out.push({ source: normalizeLogin(r.user?.login), external_id: `review:${r.id}`,
                kind: "review", head_sha: r.commit_id || null,
                event_at: secs(r.submitted_at), edited_at: null,
@@ -98,9 +133,11 @@ export function observe(nwo, pr, io = {}) {
   }
 
   // Issue comments: refusals, clean passes, trigger commands, rate-limit notices.
-  const comments = api([`repos/${nwo}/issues/${pr}/comments?per_page=100`]);
+  // Paginated for the same reason as the reviews above -- a clean pass or a
+  // refusal past comment 100 is evidence that simply would not arrive.
+  const comments = restPages(api, `repos/${nwo}/issues/${pr}/comments`);
   if (!comments.ok) incomplete = true;
-  else for (const c of JSON.parse(comments.out || "[]")) {
+  else for (const c of comments.items) {
     out.push({ source: normalizeLogin(c.user?.login), external_id: `comment:${c.id}`,
                kind: "issue_comment", head_sha: null,
                event_at: secs(c.created_at), edited_at: secs(c.updated_at),
@@ -185,8 +222,11 @@ export function ingest(db, nwo, pr, observations, { at = Math.floor(Date.now() /
   const byObject = new Map();      // source|external_id -> {hashes:Set, maxGen}
   for (const r of existing) {
     const k = `${r.source}|${r.external_id}`;
-    const e = byObject.get(k) ?? { hashes: new Set(), maxGen: 0 };
+    const e = byObject.get(k) ?? { hashes: new Set(), genByHash: new Map(), maxGen: 0 };
     e.hashes.add(r.content_hash);
+    // Which generation carried each text, so a revert can point back at the
+    // generation that already holds it rather than inventing a new one.
+    e.genByHash.set(r.content_hash, r.generation);
     e.maxGen = Math.max(e.maxGen, r.generation);
     byObject.set(k, e);
   }
@@ -197,27 +237,52 @@ export function ingest(db, nwo, pr, observations, { at = Math.floor(Date.now() /
      VALUES (?,?,?,?,?,?,?,?,?,?,?)
      ON CONFLICT(source, external_id, content_hash) DO NOTHING`);
 
-  let inserted = 0, generations = 0, unchanged = 0;
+  // The CURRENT pointer, written for every observation whether or not its payload
+  // was new. A de-duplicated write still carries one fact: this is what the object
+  // says now. Skipping it is what let a revert to previously-seen text leave the
+  // fold reading the version that had been replaced.
+  const point = db.prepare(
+    `INSERT INTO inbox_current (pr_number, source, external_id, content_hash, generation, observed_at)
+     VALUES (?,?,?,?,?,?)
+     ON CONFLICT(pr_number, source, external_id) DO UPDATE SET
+       content_hash = excluded.content_hash,
+       generation   = excluded.generation,
+       observed_at  = excluded.observed_at`);
+
+  let inserted = 0, generations = 0, unchanged = 0, repointed = 0;
   db.exec("BEGIN IMMEDIATE");
   try {
     for (const o of observations) {
       const hash = hashOf(o.payload);
       const k = `${o.source}|${o.external_id}`;
       const e = byObject.get(k);
-      if (e?.hashes.has(hash)) { unchanged++; continue; }
+      if (e?.hashes.has(hash)) {
+        unchanged++;
+        // Already stored, so nothing is inserted -- but the pointer still moves.
+        // A revert lands here: the payload is old, and being current again is new.
+        const gen = e.genByHash?.get(hash) ?? e.maxGen;
+        point.run(pr, o.source, o.external_id, hash, gen, at);
+        repointed++;
+        continue;
+      }
       const generation = (e?.maxGen ?? 0) + 1;
       insert.run(o.source, o.external_id, pr, o.head_sha ?? null, o.kind,
                  canonical(o.payload), hash, generation, at,
                  o.event_at ?? null, o.edited_at ?? null);
       if (generation > 1) generations++; else inserted++;
+      // A new generation is current by definition, so it moves the pointer too.
+      // Both paths write it; only the payload write is conditional.
+      point.run(pr, o.source, o.external_id, hash, generation, at);
       // Keep the in-memory view current so two observations of the same object in
       // ONE batch do not both claim the same generation.
-      byObject.set(k, { hashes: new Set([...(e?.hashes ?? []), hash]), maxGen: generation });
+      byObject.set(k, { hashes: new Set([...(e?.hashes ?? []), hash]),
+                        genByHash: new Map([...(e?.genByHash ?? []), [hash, generation]]),
+                        maxGen: generation });
     }
     db.exec("COMMIT");
   } catch (err) { try { db.exec("ROLLBACK"); } catch {} throw err; }
 
-  return { inserted, generations, unchanged, total: observations.length };
+  return { inserted, generations, unchanged, repointed, total: observations.length };
 }
 
 /**

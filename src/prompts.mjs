@@ -335,6 +335,26 @@ function measuredReview(profile, { triage = false } = {}) {
 const SEVERITY_RANK = { critical: 0, major: 1, minor: 2, nit: 3, unknown: 4 };
 
 /**
+ * The finding's own words.
+ *
+ * `excerpt` is what the projection stores and therefore what production supplies;
+ * `body` is what several fixtures supply. Both are read because the mismatch was
+ * live: every prompt built from a real projection rendered its findings as a
+ * numbered list of severities with no text after them, and the test that proved
+ * the text appeared was passing a shape production never produces.
+ */
+const findingText = f => String(f?.excerpt ?? f?.body ?? "").replace(/\s+/g, " ");
+
+/**
+ * A finding stated in a review BODY has no GitHub object behind it.
+ *
+ * It cannot be replied to, cannot be resolved, and has no file or line to
+ * permalink. Every instruction that assumes otherwise has to be withheld from it,
+ * or the worker is handed a step that can only fail.
+ */
+const isBodyFinding = f => f?.anchor === "body";
+
+/**
  * Criticals first; within a severity, the reviewer the measurement names first;
  * given order otherwise. The ordering is the triage guidance made physical: a
  * worker reads top-down and its budget can end mid-list, so a list that buries a
@@ -408,7 +428,8 @@ ${OUTPUT_CONTRACT}`;
 export function fixFindingsPrompt({ profile, nwo, pr, head, branch, threads = [] }) {
   const list = orderThreads(threads, profile).slice(0, 20).map((t, i) =>
     `${i + 1}. ${t.severity || t.reviewer ? `[${[t.severity, t.reviewer].filter(Boolean).join(" · ")}] ` : ""}` +
-    `${t.path ? t.path + (t.line ? ":" + t.line : "") + " — " : ""}${String(t.body ?? "").replace(/\s+/g, " ").slice(0, 400)}`
+    `${isBodyFinding(t) ? "(stated in the review body, no thread) " : ""}` +
+    `${t.path ? t.path + (t.line ? ":" + t.line : "") + " — " : ""}${findingText(t).slice(0, 400)}`
   ).join("\n");
   return `You are working the unresolved review findings on pull request #${pr} of ${nwo}.
 
@@ -419,7 +440,7 @@ ${list || "(none were extracted; read the PR's review threads yourself)"}
 
 ${invariants(profile)}
 
-${measuredReview(profile, { triage: true })}FOR EACH FINDING, exactly one of:
+${measuredReview(profile, { triage: true })}FOR EACH FINDING WITH A THREAD, exactly one of:
   · Fix it, with a test that fails on the broken code (rule 4), then reply on the
     thread saying what changed, then resolve the thread.
   · Disagree, with evidence: quote the file and line that refutes it. Reply on the
@@ -429,6 +450,12 @@ ${measuredReview(profile, { triage: true })}FOR EACH FINDING, exactly one of:
 
 Never resolve a thread you did not fix or refute. Never resolve another person's
 thread on their behalf.
+
+FOR EACH FINDING MARKED "stated in the review body", there is no thread, so there
+is nothing to reply to and nothing to resolve. Do the same work and report it in
+your final json instead: fix it with a test, or refute it quoting the file and
+line, or say it needs a human. Do not go looking for a thread, and do not treat
+its absence as a reason to skip the finding or to fail the run.
 
 HOW TO VERIFY
 ${verification(profile)}
@@ -460,7 +487,11 @@ Then stop. Do not wait for a response and do not act on one.
  */
 export function spillPrompt({ profile, nwo, pr, head, findings = [] }) {
   const list = findings.map((f, i) =>
-    `${i + 1}. ${f.path ? f.path + (f.line ? ":" + f.line : "") + " — " : ""}${String(f.body ?? "").replace(/\s+/g, " ").slice(0, 300)}\n   permalink: https://github.com/${nwo}/blob/${head}/${f.path ?? ""}${f.line ? "#L" + f.line : ""}`
+    `${i + 1}. ${isBodyFinding(f) ? "(stated in the review body, no thread) " : ""}` +
+    `${f.path ? f.path + (f.line ? ":" + f.line : "") + " — " : ""}${findingText(f).slice(0, 300)}` +
+    // No path means no line to point at, and a permalink built from one anyway
+    // is a link to the repository root dressed up as evidence.
+    `${f.path ? `\n   permalink: https://github.com/${nwo}/blob/${head}/${f.path}${f.line ? "#L" + f.line : ""}` : ""}`
   ).join("\n");
   return `Pull request #${pr} of ${nwo} has reached its review round cap with
 non-critical findings still open. Move them to ONE follow-up issue so they are not
@@ -470,11 +501,15 @@ THE REMAINDER
 ${list || "(none supplied)"}
 
 Create a single GitHub issue titled "Follow-up from #${pr}: deferred review findings".
-Its body must carry, for each finding: the original text, the file and line, and a
-permalink pinned to ${head} so it still resolves after the parent merges.
+Its body must carry, for each finding: the original text, and — for a finding that
+names a file — its file and line and a permalink pinned to ${head} so it still
+resolves after the parent merges. A finding marked "stated in the review body" has
+no file or line: carry its text alone rather than inventing an anchor for it.
 
 Then reply on each corresponding thread naming the new issue, and resolve that
-thread. Do not fix anything here.
+thread. A finding marked "stated in the review body" has no thread: carry it into
+the issue like the rest, and do not attempt to reply to it or resolve it. Report
+only the threads you actually resolved. Do not fix anything here.
 
 ${invariants(profile)}
 

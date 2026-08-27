@@ -177,6 +177,72 @@ const obs = (over = {}) => ({
     "one failed surface makes the whole observation incomplete", JSON.stringify(partial.incomplete));
 }
 
+// ── observe(): the REST surfaces are paginated too ───────────────────────────
+//
+// The threads surface above has been paginated since it was written. The two REST
+// surfaces beside it were not, and a single page of 100 is not a safe ceiling for
+// either: every inline reply mints a 0-byte COMMENTED review — nine at one commit
+// on #1124 — so review OBJECTS outnumber real rounds by an order of magnitude and
+// a busy pull request passes 100 having had five rounds. A short read that reports
+// success is how a body-only critical goes unseen behind a projection calling
+// itself complete.
+{
+  const emptyThreads = JSON.stringify({ data: { repository: { pullRequest: {
+    reviewThreads: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] } } } } });
+  const rev = i => ({ id: i, user: { login: "codex" }, state: "COMMENTED",
+                      commit_id: "a".repeat(40), body: `finding ${i}`,
+                      submitted_at: "2026-08-21T00:00:00Z" });
+  // Two full pages then a short one: 250 reviews, which one request cannot carry.
+  const paged = observe(NWO, 1, { gh: args => {
+    if (args[0] === "graphql") return { ok: true, out: emptyThreads };
+    const path = args[0];
+    const page = Number(/[?&]page=(\d+)/.exec(path)?.[1] ?? 1);
+    if (/\/pulls\/1\/reviews/.test(path)) {
+      const n = page === 1 || page === 2 ? 100 : page === 3 ? 50 : 0;
+      return { ok: true, out: JSON.stringify(Array.from({ length: n }, (_, i) => rev(page * 1000 + i))) };
+    }
+    return { ok: true, out: "[]" };
+  } });
+  check(paged.observations.filter(o => o.kind === "review").length === 250,
+    "every page of the review surface is read, not just the first hundred",
+    String(paged.observations.filter(o => o.kind === "review").length));
+  check(paged.incomplete === false, "and a read that reached the end is complete",
+    JSON.stringify(paged.incomplete));
+
+  // A page that FAILS mid-way must not return what it has as though that were all.
+  const broke = observe(NWO, 1, { gh: args => {
+    if (args[0] === "graphql") return { ok: true, out: emptyThreads };
+    const path = args[0];
+    if (/\/pulls\/1\/reviews/.test(path)) {
+      const page = Number(/[?&]page=(\d+)/.exec(path)?.[1] ?? 1);
+      if (page === 1) return { ok: true, out: JSON.stringify(Array.from({ length: 100 }, (_, i) => rev(i))) };
+      return { ok: false, out: "", err: "boom" };
+    }
+    return { ok: true, out: "[]" };
+  } });
+  check(broke.incomplete === true,
+    "a page that fails part-way through marks the read incomplete, not short",
+    JSON.stringify(broke.incomplete));
+
+  // The same reader serves the comment surface, because fixing one of two sites is
+  // a near miss that has already happened here.
+  const comments = observe(NWO, 1, { gh: args => {
+    if (args[0] === "graphql") return { ok: true, out: emptyThreads };
+    const path = args[0];
+    if (/\/issues\/1\/comments/.test(path)) {
+      const page = Number(/[?&]page=(\d+)/.exec(path)?.[1] ?? 1);
+      const n = page === 1 ? 100 : page === 2 ? 5 : 0;
+      return { ok: true, out: JSON.stringify(Array.from({ length: n },
+        (_, i) => ({ id: page * 1000 + i, user: { login: "codex" }, body: "c",
+                     created_at: "2026-08-21T00:00:00Z", updated_at: "2026-08-21T00:00:00Z" }))) };
+    }
+    return { ok: true, out: "[]" };
+  } });
+  check(comments.observations.filter(o => o.kind === "issue_comment").length === 105,
+    "and the comment surface is paginated by the same reader",
+    String(comments.observations.filter(o => o.kind === "issue_comment").length));
+}
+
 // ── observe(): the shapes that only exist in the real data ───────────────────
 {
   const r = observe(NWO, 1, { gh: args => {

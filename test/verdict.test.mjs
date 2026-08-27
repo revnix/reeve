@@ -232,11 +232,27 @@ check("a too-short prefix does not cover", coversHead(HEAD.slice(0, 6), HEAD), f
 {
   const src = readFileSync(new URL("../src/verdict.mjs", import.meta.url), "utf8");
   const body = src.slice(src.indexOf("export function computeVerdict"));
-  const emitted = [...new Set([...body.matchAll(/\badd\("([a-z_]+)"/g)].map(m => m[1]))].sort();
+  // ANY quoted id, not a character class. This read was `[a-z_]+`, and every
+  // clause id in the repository happened to be lowercase -- so the pattern was
+  // correct by accident and totally blind to the first id that was not. Measured
+  // against a trial merge with the lane adding `bodyFindings` and `bodyReadable`:
+  // the two ids were never SEEN, both directions agreed on a set that silently
+  // excluded them, and this block reported full agreement while `computeVerdict`
+  // emitted two clauses the list did not declare. A narrowing read does not fail;
+  // it answers a smaller question and calls it the answer.
+  const calls = [...body.matchAll(/\badd\(\s*"([^"]*)"/g)].map(m => m[1]);
+  const emitted = [...new Set(calls)].sort();
   const declared = [...CLAUSE_IDS].sort();
   // Fixture: a regex that matched nothing would make both sides trivially agree
   // on the empty set and pass while comparing nothing at all.
   check("fixture: the source really emits clauses this test can read", emitted.length > 0, true);
+  // AND EVERY CALL WAS READ. The count is the guard on the guard: an `add(` whose
+  // first argument this pattern cannot parse -- a renamed helper, a computed id,
+  // a template literal -- would otherwise vanish from `emitted` and be declared
+  // absent rather than unreadable, which is the exact failure above in a new
+  // costume. Disagreement here means the reader is out of date, not the list.
+  check("and every add() call in the body was actually read",
+    calls.length, (body.match(/\badd\(/g) ?? []).length);
   check("every id computeVerdict emits is declared in CLAUSE_IDS",
     emitted.filter(id => !declared.includes(id)).join(",") || "none", "none");
   check("and every id CLAUSE_IDS declares is one computeVerdict emits",

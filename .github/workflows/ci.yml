@@ -11,6 +11,38 @@ on:
 permissions:
   contents: read
 
+# One run per ref at a time, and a superseded one is stopped rather than raced.
+#
+# A review round can push five times in an hour, and without this all five runs
+# continue to completion. That is not only waste: reeve reads check CONCLUSIONS,
+# so four stale runs finish against revisions nobody is judging any more, and the
+# reconciler has to work out which of them describes the head under judgement.
+# Stopping them removes the ambiguity at the source.
+#
+# Safe here specifically because reeve already treats a cancelled check as
+# UNINFORMATIVE rather than failing — `src/github/reconciler.mjs` calls it
+# superseded, not failed, and that distinction was written for exactly this.
+#
+# NEVER on main. A push to the default branch is history, and its run is the
+# evidence R-04 reads for base health; cancelling one because the next commit
+# arrived would leave a gap that reads as a commit nobody ever tested.
+#
+# `cancel-in-progress: false` DOES NOT ACHIEVE THAT ON ITS OWN, which is the
+# whole reason main gets its own group per commit. GitHub's documentation is
+# explicit: "any existing pending job or workflow in the same concurrency group
+# will be canceled", and cancel-in-progress governs only the RUNNING one. So three
+# quick pushes to main would leave the first running, the second pending, and the
+# third replacing the second — and the middle commit would carry no evidence at
+# all. Exactly the gap the paragraph above forbids, created by the mechanism meant
+# to prevent it.
+#
+# A group keyed by the COMMIT makes every main run alone in its group, so there is
+# never another run to cancel or be cancelled by. Pull request refs keep sharing a
+# group, which is what makes a superseded run stop.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || 'shared' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   test:
     # A LITERAL name. A matrix expression here expands at runtime and can never be
@@ -27,7 +59,14 @@ jobs:
           node-version: '24'
       - name: Assert the Node floor
         run: node -e 'const [m]=process.versions.node.split(".").map(Number); if(m<24){console.error("node "+process.versions.node+" is below the 24 floor"); process.exit(1)} console.log("node",process.versions.node)'
+      # TZ stated rather than inherited. The pair of runs below exists to catch
+      # offset bugs, and the first one was relying on the runner HAPPENING to be
+      # UTC — an ambient property of the hosted image, not a property of this
+      # workflow. A self-hosted or differently-configured runner would have run
+      # the same suite twice in one zone while still reporting two zones covered.
       - name: Run the suite
+        env:
+          TZ: UTC
         run: |
           set -euo pipefail
           fail=0

@@ -70,5 +70,41 @@ const idleFor = r => JSON.stringify(r).includes("codex.bodyFindings");
   rmSync(dir, { recursive: true, force: true });
 }
 
+// A grammar that WORKED and has stopped working must show up. Unlike the inline
+// severity markers beside it, this detector has no miss ratio to give it away: a
+// body the delimiter cannot parse yields no findings rather than an unclassified
+// one, so one match from months ago would otherwise vouch for it for ever. The
+// taxonomy here has already been replaced wholesale once.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-r08-c-"));
+  const db = open(join(dir, "s.db"));
+  noteHead(db, NWO, 1, HEAD, T);
+  // One old body the delimiter parses, then a dozen recent ones in a taxonomy it
+  // does not. Ingested in separate calls so observed_at orders them.
+  ingest(db, NWO, 1, [review(1, "**![P1 Badge](x) an old-style finding**")], { at: T });
+  for (let i = 0; i < 12; i++)
+    ingest(db, NWO, 1, [review(100 + i, `<severity level="high"/> a new-style finding ${i}`)], { at: T + 100 + i });
+  const r = checkDetectors(db, profile);
+  check(idleFor(r), "a delimiter that no longer parses recent bodies is reported idle",
+    JSON.stringify(r.lines));
+  check(/0\/10 recent review/.test(JSON.stringify(r.lines)),
+    "and the report says how many of the recent ones it parsed", JSON.stringify(r.lines));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// Control: the same window with the grammar still working is NOT idle, so the
+// assertion above is about drift and not about the window being too small.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-r08-d-"));
+  const db = open(join(dir, "s.db"));
+  noteHead(db, NWO, 1, HEAD, T);
+  ingest(db, NWO, 1, [review(1, "**![P1 Badge](x) an old-style finding**")], { at: T });
+  for (let i = 0; i < 12; i++)
+    ingest(db, NWO, 1, [review(100 + i, `**![P1 Badge](x) still parsing ${i}**`)], { at: T + 100 + i });
+  const r = checkDetectors(db, profile);
+  check(!idleFor(r), "control: a grammar still parsing recent bodies is not idle",
+    JSON.stringify(r.lines));
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

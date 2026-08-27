@@ -321,6 +321,29 @@ check("an uncleared thread ASKS THE REVIEWER, rather than dispatching a fixer",
     ACTIONS.FIX_FINDINGS);
   check("control: and with none open the same shape does not dispatch one",
     through({}), ACTIONS.MERGE);
+
+  // A BODY FINDING PLUS A STALE REVIEW ASKS, IT DOES NOT FIX AGAIN.
+  //
+  // Nothing a worker does can close a body finding: it has no thread, so the only
+  // operation that clears one is the same reviewer reviewing again. Fixing it
+  // therefore pushes a new head, which leaves the finding open AND makes the
+  // review stale — and this branch sits above the stale-review branch, so it would
+  // dispatch another worker at the finding it had just repaired, once per push for
+  // as long as the budget lasted.
+  const staleReviewer = [{ login: "codex", kind: "blocking", state: "CLEAN", reviewedHead: "d".repeat(10) }];
+  check("with the review stale, an open body finding asks for a round instead of fixing again",
+    through({ reviewers: staleReviewer,
+              bodyFindings: { readable: true, open: 1, reviewers: ["codex"] } }),
+    ACTIONS.REQUEST_REVIEW);
+  check("control: with the reviewer covering THIS head, the same finding does dispatch a fixer",
+    through({ bodyFindings: { readable: true, open: 1, reviewers: ["codex"] } }),
+    ACTIONS.FIX_FINDINGS);
+  // And the exemption is scoped to body findings alone: an unresolved THREAD can
+  // be closed by a worker, so a stale review must not stop that.
+  check("control: a stale review does NOT hold back a fixer for an unresolved thread",
+    through({ reviewers: staleReviewer,
+              threads: { unresolved: 2, total: 4, readable: true } }),
+    ACTIONS.FIX_FINDINGS);
 }
 // Past the hard cap it stops asking and fetches a person.
 check("past the hard cap an uncleared thread escalates rather than asking again",

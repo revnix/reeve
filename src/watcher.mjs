@@ -193,17 +193,32 @@ export function nextAction(e, p, h = {}) {
   // A body finding is actionable work, so it joins this branch rather than the
   // `cleared` one below. `cleared` asks the reviewer to come back; here the
   // reviewer has already spoken and the fix is what is missing.
+  //
+  // BUT ONLY WHILE THE REVIEWER HAS COVERED THIS HEAD, and that condition is the
+  // difference between a fix and a loop. A body finding has no thread, so nothing
+  // a worker does can close it: the only operation that clears one is the same
+  // reviewer reviewing again. Fixing it therefore pushes a new head, which leaves
+  // the finding open AND makes the review stale -- and this branch, sitting above
+  // the stale-review branch, would dispatch another worker at the finding it just
+  // repaired, for as many pushes as the budget allows.
+  //
+  // So when the review is stale, the request for a round below takes precedence.
+  // It is the same rule `cleared` already follows and this branch was quietly
+  // exempting itself from: where only the reviewer can close something, ask the
+  // reviewer.
   const bodyFindings = clause(v, "bodyFindings");
-  if (threads?.state === "BLOCK" || findings?.state === "BLOCK" || bodyFindings?.state === "BLOCK") {
+  const reviewStale = clause(v, "review")?.state === "BLOCK";
+  const bodyActionable = bodyFindings?.state === "BLOCK" && !reviewStale;
+  if (threads?.state === "BLOCK" || findings?.state === "BLOCK" || bodyActionable) {
     const R = e.rounds ?? {};
     // `?? 0` here would read an UNKNOWN critical count as "no criticals" and spill
     // on it, which is the standing ruling inverted. Only a known zero may spill.
     if ((R.n ?? 0) >= (R.softCap ?? 5) && R.unspilledCritical === 0)
       return act(ACTIONS.SPILL, `past the soft cap with only non-critical findings open`, { round: R.n });
-    const blocking = [threads, findings, bodyFindings].filter(c => c?.state === "BLOCK");
+    const blocking = [threads, findings, bodyActionable ? bodyFindings : null].filter(c => c?.state === "BLOCK");
     return act(ACTIONS.FIX_FINDINGS, blocking.map(c => c.detail).filter(Boolean).join("; ") || "findings block this PR",
                { threads: threads?.state === "BLOCK", findings: findings?.state === "BLOCK",
-                 bodyFindings: bodyFindings?.state === "BLOCK" });
+                 bodyFindings: bodyActionable });
   }
 
   // 6. A stale verdict: reviewed, but not this revision.

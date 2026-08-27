@@ -102,6 +102,22 @@ const BODY_TWO =
     "control: and that pattern really does pass an empty-string check, which is why the fold has to catch it");
 
   check(!/q/i.test(BODY_TWO), "control: the fixture contains no `q`, so `q*` can only match empty");
+  // MIXED WIDTH is the harder case, and the first fix made it worse rather than
+  // catching it. Requiring EVERY match to be zero-width meant an alternation with
+  // one zero-width branch kept the body "readable": the zero-width match is
+  // dropped, the full-width one survives, and the finding the dropped match should
+  // have started is swallowed into the text above it. One finding silently gone,
+  // and a confident count over what is left.
+  {
+    const mixed = "pre\n**![P2 Badge](x) two** text\n**![P1 Badge](x) one** more";
+    const r2 = bodyFindingsOf(mixed, "(?=!\\[P2 Badge\\])|!\\[P\\d Badge\\]");
+    check(r2.readable === false && r2.findings.length === 0,
+      "a delimiter with ANY zero-width match is unreadable, not partly readable",
+      JSON.stringify(r2));
+    check(bodyFindingsOf(mixed, BADGE).findings.length === 2,
+      "control: the same body under a wholly full-width delimiter yields both findings",
+      JSON.stringify(bodyFindingsOf(mixed, BADGE).findings.length));
+  }
   check(bodyFindingsOf(BODY_TWO, "q*").readable === false,
     "a pattern that can only match the empty string is unreadable too, not one finding per character",
     JSON.stringify(bodyFindingsOf(BODY_TWO, "q*")));
@@ -189,6 +205,57 @@ ingest(db, NWO, 1, [
   check(st.bodyOpen === 3, "a push un-clears every body finding until the reviewer answers again",
     String(st.bodyOpen));
   derivePr(db, NWO, 1, p, { at: T + 200, head: HEAD_A });   // restore for the blocks below
+}
+
+// ── a finding ADDED BY AN EDIT is not cleared by a round that predates it ────
+//
+// CodeRabbit rewrites its own bodies in place, and an edit keeps the original
+// `submitted_at`. Ordering the fold by that timestamp meant a finding added later
+// inherited the position of the review it was added to — so a round that had
+// already happened cleared text that did not exist when that round ran, and a
+// newly added P0 could leave the count without anyone having looked at it.
+{
+  const dir5 = mkdtempSync(join(tmpdir(), "reeve-body5-"));
+  const db5 = open(join(dir5, "s.db"));
+  noteHead(db5, NWO, 5, HEAD_A, T);
+  const p = PROFILE();
+  const ONE = "**![P1 Badge](x) the first thing**\n\ndetail.";
+  ingest(db5, NWO, 5, [review(1, "codex", ONE, HEAD_A, T)], { at: T });
+  ingest(db5, NWO, 5, [review(2, "codex", "**![P2 Badge](x) a later round**", HEAD_A, T + 100)], { at: T + 100 });
+  derivePr(db5, NWO, 5, p, { at: T + 150, head: HEAD_A });
+  const before = reviewState(db5, NWO, 5, p, { at: T + 150, head: HEAD_A });
+  check(before.bodyOpen === 1,
+    "control: the later round clears the first body's finding, leaving only its own",
+    String(before.bodyOpen));
+
+  // The edit. Same review id, same submitted_at, new text, observed later.
+  ingest(db5, NWO, 5, [review(1, "codex", ONE + "\n\n**![P1 Badge](x) added by an edit**", HEAD_A, T)],
+         { at: T + 200 });
+  derivePr(db5, NWO, 5, p, { at: T + 250, head: HEAD_A });
+  const after = reviewState(db5, NWO, 5, p, { at: T + 250, head: HEAD_A });
+  check(after.threads.some(t => t.anchor === "body" && /added by an edit/.test(t.excerpt)),
+    "the finding added by the edit is open, not cleared by the round that preceded it",
+    JSON.stringify(after.threads.filter(t => t.anchor === "body").map(t => t.excerpt.slice(0, 40))));
+  check(after.unspilledCritical >= 1,
+    "and it reaches the critical count, which is what an added P0 must do",
+    String(after.unspilledCritical));
+
+  // The conservative consequence, asserted so it is a decision rather than a
+  // surprise: the whole edited body is judged by when its NEW text was seen, so
+  // the finding that was already there re-opens too. The reviewer's later round
+  // read a body that no longer exists, and saying so is the honest reading.
+  check(after.threads.filter(t => t.anchor === "body" && /the first thing/.test(t.excerpt)).length === 1,
+    "and the unchanged finding beside it re-opens too — the round read a body that has since changed");
+
+  // Control: another round AFTER the edit clears both, so this is a delay and not
+  // a wedge.
+  ingest(db5, NWO, 5, [review(3, "codex", "looked again", HEAD_A, T + 300)], { at: T + 300 });
+  derivePr(db5, NWO, 5, p, { at: T + 350, head: HEAD_A });
+  const done = reviewState(db5, NWO, 5, p, { at: T + 350, head: HEAD_A });
+  check(done.bodyOpen === 0,
+    "control: a round after the edit clears them, so the rule delays rather than wedges",
+    String(done.bodyOpen));
+  rmSync(dir5, { recursive: true, force: true });
 }
 
 // ── completeness, decided against what was POSTED ────────────────────────────

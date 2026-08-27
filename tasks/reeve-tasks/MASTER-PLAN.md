@@ -357,12 +357,29 @@ MEASURED over 40 merged PRs, 1,282 review threads and 273 review rounds, on 2026
 
 1. **Budget changed LINES, not files.** Target **≤ 1,200 changed lines** per code PR; hard stop
    at 2,000. #20 proves 30 files is fine at 3.2 findings/1k when the design is settled first.
-2. **A plan document is reviewed as code, at roughly five times the density.** Cap a plan
-   document at **~1,200 lines** and split a stage across a family. Do not write one
-   6,000-line stage plan: that is precisely the artifact measured at 213 findings on a single
-   file. The S2 family exists because a 5,300-line single document was retired after four
-   rounds found 54 defects, *"a majority of them caused by the previous round's own fixes: an
-   edit in a document that large cannot see its neighbourhood."*
+2. **A plan document is reviewed as code, at roughly five times the density.** Split a stage
+   across a family rather than writing one 6,000-line stage plan: that is precisely the
+   artifact measured at 213 findings on a single file. The S2 family exists because a
+   5,300-line single document was retired after four rounds found 54 defects, *"a majority of
+   them caused by the previous round's own fixes: an edit in a document that large cannot see
+   its neighbourhood."*
+
+   **The unit of the cap is TASKS, not lines — corrected 2026-08-27, on measurement.** The
+   original rule read *"cap each document at ~1,200 lines"*, and it was computed against the
+   wrong denominator: S3's **16 PRs**, when a PR decomposes into three to five *plan tasks*
+   and the house style runs **~500 lines per plan task** (MEASURED: S2-A is 6,328 lines over
+   13 tasks = 487; S2-C is 2,724 over 5 = 545). At that rate ~1,200 lines buys **two to three
+   tasks**, not the eight to twelve a three-or-four-PR document actually contains. Written
+   against the line number, the S3 family came out at 1,677–1,957 lines per document, and
+   **every one of those lines is house-style content, not padding.**
+
+   **So the rule is: at most three or four plan tasks per document, and never thin a task to
+   fit a line count.** The lever is *fewer tasks per document*; it is never *shorter tasks*.
+   Thinning the controls is the failure mode this repository has actually measured — the
+   worst-converging PR in the corpus took 66 findings over 15 rounds with no taper, and every
+   one of them was a control that was not there. A document that needs 1,900 lines to carry
+   eleven tasks honestly is correct at 1,900 lines; a document that carries eleven tasks in
+   1,200 has removed something.
 3. **Isolate every guardian-touching change into its own smallest possible PR.** The two
    worst-converging PRs in the corpus (#44 and #3) both changed the running guardian.
 4. **The taper rule** (founder, 2026-08-26): **ten rounds without the findings tapering means

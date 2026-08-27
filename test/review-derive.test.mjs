@@ -150,9 +150,9 @@ ingest(db, NWO, 1, [
   check(st.unspilledCritical === 3,
     "the P1, the UNREADABLE thread and the UNREADABLE body all block — unknown counts as critical",
     `got ${st.unspilledCritical}`);
-  check(st.bodyOpen === 1 && st.threads.some(t => t.anchor === "body" && t.severity === "unknown"),
-    "control: and the third really is the body, counted as its own kind",
-    JSON.stringify({ bodyOpen: st.bodyOpen }));
+  check(st.bodyOpen === 1 && st.unreadableBodies.length === 1,
+    "control: and the third really is the body, reported as its own kind",
+    JSON.stringify({ bodyOpen: st.bodyOpen, unreadable: st.unreadableBodies.length }));
   check(st.rounds === 1, "one blocking reviewer answered once at one head", String(st.rounds));
 }
 
@@ -170,7 +170,7 @@ ingest(db, NWO, 1, [
 
   const atA = reviewState(db, NWO, 1, PROFILE, { at: T, head: HEAD_A });
   check(atA.readable === true, "a projection derived for this head is readable", JSON.stringify(atA.why ?? ""));
-  check(atA.unspilledCritical === 3 && atA.threads.length === 4,
+  check(atA.unspilledCritical === 3 && atA.threads.length === 3,
     "control: and carries the counts and the threads a decision needs",
     JSON.stringify({ c: atA.unspilledCritical, n: atA.threads?.length }));
 

@@ -288,6 +288,7 @@ check("an uncleared thread ASKS THE REVIEWER, rather than dispatching a fixer",
     threads: { unresolved: 0, total: 4, readable: true },
     cleared: { readable: true, uncleared: 0, reviewers: [] },
     bodyFindings: { readable: true, open: 0, reviewers: [] },
+    unreadableBodies: { readable: true, open: 0, reviewers: [] },
     ledgerBlockers: 0, mergeState: "CLEAN", ...over,
   });
   const through = (over, hist) => nextAction(
@@ -340,6 +341,22 @@ check("an uncleared thread ASKS THE REVIEWER, rather than dispatching a fixer",
     ACTIONS.FIX_FINDINGS);
   // And the exemption is scoped to body findings alone: an unresolved THREAD can
   // be closed by a worker, so a stale review must not stop that.
+  // A BODY REEVE CANNOT READ FETCHES A PERSON, and does it before anything that
+  // could act on the pull request. Not a worker: there is nothing for one to fix.
+  // Not a silent block: clearing a body finding needs its author to review the
+  // same head again, which a one-time commenter never will, so blocking alone
+  // leaves a pull request nothing can free.
+  check("an unreadable review body escalates rather than dispatching a worker",
+    through({ unreadableBodies: { readable: true, open: 1, reviewers: ["a-human"] } }),
+    ACTIONS.ESCALATE);
+  check("and it wins over a fixer that would otherwise run, because it is read first",
+    through({ unreadableBodies: { readable: true, open: 1, reviewers: ["a-human"] },
+              threads: { unresolved: 2, total: 4, readable: true } }),
+    ACTIONS.ESCALATE);
+  check("control: with every body readable, that same shape dispatches the fixer",
+    through({ threads: { unresolved: 2, total: 4, readable: true } }),
+    ACTIONS.FIX_FINDINGS);
+
   check("control: a stale review does NOT hold back a fixer for an unresolved thread",
     through({ reviewers: staleReviewer,
               threads: { unresolved: 2, total: 4, readable: true } }),

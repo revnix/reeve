@@ -163,6 +163,11 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
                                             : { readable: true, uncleared: 0, reviewers: [] },
                             bodyFindings: gating ? { readable: false, why }
                                                  : { readable: true, open: 0, reviewers: [] },
+                            // NOT gated on there being a blocking reviewer. Whether
+                            // reeve could read what a reviewer wrote is not a
+                            // question about whose opinion counts, so an
+                            // unreadable projection leaves it unknown either way.
+                            unreadableBodies: { readable: false, why },
                             projection: { readable: false, why } });
   if (!db) return unknown("no state database");
   let st;
@@ -289,6 +294,13 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
                reviewers: [...new Set(uncleared.map(t => t.reviewer))] },
     bodyFindings: { readable: true, open: bodyOpen.length,
                     reviewers: [...new Set(bodyOpen.map(t => t.reviewer))] },
+    // Bodies reeve could not read. Every author counts, rostered or not: this is
+    // not an opinion whose weight depends on who holds it, it is reeve reporting
+    // that it does not know what was said. The founder's ruling of 2026-08-27 is
+    // that this stops a merge AND fetches a person, rather than blocking silently
+    // on something only the operator can clear.
+    unreadableBodies: { readable: true, open: (st.unreadableBodies ?? []).length,
+                        reviewers: [...new Set((st.unreadableBodies ?? []).map(b => b.reviewer))] },
     projection: {
       readable: true,
       ...(bodies ? {} : { undeclaredBodyAuthor: "a reviewer wrote a review body without declaring how its bodies carry findings — counted as one unknown finding, and worth declaring so it can be read properly" }),
@@ -480,7 +492,8 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, failing: c.failing, inherited: c.inherited },
     base: { verdict: base.verdict },
     reviewers, rounds, threads, cleared: facts.cleared,
-    bodyFindings: facts.bodyFindings, ledgerBlockers,
+    bodyFindings: facts.bodyFindings, unreadableBodies: facts.unreadableBodies,
+    ledgerBlockers,
     mergeState: threads.mergeState, profile,
     // Passed through, never read here. `pr_hold` is a HUB row and this function
     // holds the per-repository state database, so the reading is taken by the

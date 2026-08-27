@@ -114,17 +114,20 @@ const ev = rounds => {
   const ordered = reviewFacts({ db, nwo: NWO, pr: 1, profile: PROFILE, head: HEAD_A,
                                 at: T + 100, live: liveOf(2, 2),
                                 io: { foldPrecedesEvaluation: true } });
-  // Three, not two: the reviewer wrote a review BODY and this profile does not
-  // declare how its bodies carry findings, so the fold counts that body as one
-  // finding of unknown severity rather than leaving it out. A worker is dispatched
-  // at the whole population, which is the point of handing this list on at all.
-  check(Array.isArray(ordered.threadDetails) && ordered.threadDetails.length === 3,
+  check(Array.isArray(ordered.threadDetails) && ordered.threadDetails.length === 2,
     "control: once the fold precedes it, the details a worker is dispatched with arrive",
     JSON.stringify(ordered.threadDetails?.length));
-  check(ordered.threadDetails.filter(t => t.anchor === "thread").length === 2 &&
-        ordered.threadDetails.filter(t => t.anchor === "body").length === 1,
+  // TWO, not three. This reviewer also wrote a review body that the profile does
+  // not say how to read, and that is counted — it reaches `unspilledCritical`
+  // below, so nothing can be spilled past it — but it is deliberately not in the
+  // list a worker is dispatched at, because there is nothing in it for a worker
+  // to do. Counted together, routed apart.
+  check(ordered.threadDetails.every(t => t.anchor === "thread"),
     "control: and each one says which kind it is, so a worker is not told to resolve what has no thread",
     JSON.stringify(ordered.threadDetails.map(t => t.anchor)));
+  check(ordered.unreadableBodies?.open === 1,
+    "control: while the unreadable body travels as its own fact, for a person rather than a worker",
+    JSON.stringify(ordered.unreadableBodies));
   check(ordered.threadDetails[0].id && ordered.threadDetails[0].severity && ordered.threadDetails[0].path,
     "control: carrying what a follow-up issue or a fix would need",
     JSON.stringify(ordered.threadDetails?.[0]));

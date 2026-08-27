@@ -934,6 +934,40 @@ export function effectsFor({ nwo, e, decision, profile, execute }) {
  * A named function rather than a line inside `tick`, because a rule buried in a
  * branch of a 2000-line loop is a rule nothing can test. Pure, so it can be.
  */
+/**
+ * The identity of a findings-repair problem: WHICH findings are open.
+ *
+ * Keyed by the SET rather than by revision, matching how the CI cap is keyed by
+ * cause. Fixing one changes the set, which is a different problem and earns a
+ * fresh budget; changing nothing leaves the same set, which does not.
+ *
+ * Sorted, so the identity does not depend on the order a projection happened to
+ * return. Null for an empty set, because "nothing is open" is not a problem to be
+ * capped and a fingerprint over nothing would collide with every other empty case.
+ */
+export function findingsFingerprint(items) {
+  const ids = (items ?? []).map(t => String(t?.id ?? "")).filter(Boolean).sort();
+  return ids.length ? `findings:${sha256(ids.join("\n")).slice(0, 16)}` : null;
+}
+
+/**
+ * What identifies the attempt this decision is about to spend, or null for a
+ * decision that spends nothing.
+ *
+ * One function rather than a conditional per action, because the two were drifting
+ * apart: FIX_CI had a budget from the day it was written and FIX_FINDINGS had none
+ * at all, and nothing in either call site said the other should exist. Asking
+ * "what identifies this attempt" in one place makes a missing answer visible.
+ *
+ * The caller decides WHETHER to spend — an attempt that never started is not an
+ * attempt — and this decides WHAT would be spent.
+ */
+export function attemptKey(decision, ciFingerprint, threadDetails) {
+  if (decision?.action === "FIX_CI") return ciFingerprint || null;
+  if (decision?.action === "FIX_FINDINGS") return findingsFingerprint(threadDetails);
+  return null;
+}
+
 export function dispatchable(decision, threadDetails) {
   const items = threadDetails ?? [];
   return decision?.bodyFindings ? items : items.filter(t => t?.anchor !== "body");
@@ -1887,9 +1921,16 @@ export async function tick(ctx) {
     let cause = null, fp = null;
     if (red) ({ cause, fp } = resolveFailureCause(nwo, e.checks, ctx.resolveCause ?? rootCause));
 
+    // The findings-repair budget, read from the store like the CI one beside it
+    // rather than from a map rebuilt empty on every tick.
+    const ffp = findingsFingerprint(e.threadDetails);
     const decision = nextAction(e, profile, {
       now: now(),
       unknownSince: unknownSince(db, pr),
+      findingsFingerprint: ffp,
+      // Guarded the same way as the CI count: an unreadable store must not grant a
+      // free retry, so it reads as exhausted rather than as zero.
+      findingsAttempts: ffp ? attemptsFor(db, nwo, pr, ffp, logPath) : 0,
       // From the store, not from a map rebuilt empty on every tick.
       fingerprint: fp,
       // Guarded: an unreadable store must not take down the whole tick, and a
@@ -2363,7 +2404,8 @@ export async function tick(ctx) {
       // guardian pid, which the expiry reaper preserves for ever. Nothing
       // reclaims it if the next tick decides differently about this PR.
       try {
-        if (run.ok && decision.action === "FIX_CI" && fp) (ctx.recordFixAttempt ?? recordFixAttempt)(db, nwo, e.pr, fp, e.head);
+        const spend = run.ok ? attemptKey(decision, fp, e.threadDetails) : null;
+        if (spend) (ctx.recordFixAttempt ?? recordFixAttempt)(db, nwo, e.pr, spend, e.head);
       } catch (err) {
         if (prLease) { releaseWithRetry(prRunRef, prLease); prLease = null; }
         // AND RETIRE THE RUN, because nothing else ever will.

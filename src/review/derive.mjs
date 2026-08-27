@@ -537,6 +537,12 @@ export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() /
     if (meta.head !== head) return { readable: false, why: `projection was derived for ${String(meta.head).slice(0, 10)}, not ${String(head).slice(0, 10)}` };
   }
 
+  // HOW MANY REVIEW OBJECTS this projection was derived from, so a caller can ask
+  // whether the review surface has moved since. Distinct external ids rather than
+  // rows: an edit lands as a new generation of the SAME review, and counting rows
+  // would report the edit as an extra review.
+  const reviewTotal = db.prepare(
+    "SELECT COUNT(DISTINCT external_id) c FROM inbox WHERE pr_number=? AND kind='review'").get(pr)?.c ?? 0;
   const threads = db.prepare("SELECT * FROM review_thread WHERE nwo=? AND pr=?").all(nwo, pr);
   const open = threads.filter(t => !t.is_cleared);
   const blocking = open.filter(t => BLOCKING_SEVERITIES.has(t.severity));
@@ -598,6 +604,8 @@ export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() /
     // The body population, reported on its own as well as folded into the count
     // above, so a reader can tell WHICH kind of finding is holding a pull request.
     bodyTotal: body.length, bodyOpen: bodyOpen.length,
+    // For the live cross-check. Not a thread count and deliberately beside them.
+    reviewTotal,
     rounds: n,
     // ONE list, because everything downstream of it -- what blocks a merge, what
     // a worker is sent at -- treats both kinds the same way. `anchor` is what

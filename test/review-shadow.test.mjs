@@ -201,5 +201,45 @@ const db = open(join(dir, "s.db"));
 
 db.close();
 rmSync(dir, { recursive: true, force: true });
+
+// ── the REVIEW surface, which nothing compared while only threads could gate ──
+//
+// A review body can hold a pull request now. A body posted between the fold and
+// the evaluation that reads it leaves the thread counts agreeing, the projection
+// fresh by every clock, and its body facts a tick out of date — the same shape
+// the thread comparison exists for, on a surface it never covered.
+{
+  const base = { readable: true, total: 3, unresolved: 1 };
+  const proj = { readable: true, total: 3, open: 1, resolved: 2 };
+
+  const same = compare({ ...base, reviewTotal: 7 }, { ...proj, reviewTotal: 7 });
+  check(same.comparable && same.agree,
+    "matching review counts agree, so the new check does not break agreement", same.why ?? "");
+
+  const moved = compare({ ...base, reviewTotal: 8 }, { ...proj, reviewTotal: 7 });
+  check(moved.comparable && !moved.agree,
+    "a review posted since the fold is a DISAGREEMENT, not a fresh projection", JSON.stringify(moved));
+  check(/review count differs/.test(moved.why ?? ""),
+    "and it says which surface moved, not merely that something did", moved.why ?? "");
+
+  // Compared only when BOTH sides report it, so a caller that does not read the
+  // review surface is unaffected rather than silently incomparable.
+  const oneSided = compare({ ...base }, { ...proj, reviewTotal: 7 });
+  check(oneSided.comparable && oneSided.agree,
+    "control: a live read without the review surface still compares on threads alone",
+    oneSided.why ?? "");
+  const otherSide = compare({ ...base, reviewTotal: 7 }, { ...proj });
+  check(otherSide.comparable && otherSide.agree,
+    "control: and so does a projection without it", otherSide.why ?? "");
+
+  // The residual, asserted so it is a decision rather than a surprise: counts
+  // cannot see a body EDITED in place, which changes no count. Catching that
+  // exactly means hashing every review body every tick.
+  const edited = compare({ ...base, reviewTotal: 7 }, { ...proj, reviewTotal: 7 });
+  check(edited.agree,
+    "known residual: an in-place edit changes no count and is NOT caught here");
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
+
 process.exit(fail ? 1 : 0);

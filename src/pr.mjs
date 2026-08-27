@@ -23,9 +23,21 @@ function ghJson(args) {
   catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
 }
 
+// The REVIEW surface rides along on the query that was already being made.
+//
+// `compare` measured threads only, which was right while nothing else gated. Now
+// that a review BODY can hold a pull request, a body posted between the fold and
+// this evaluation would leave the thread counts agreeing, the projection fresh by
+// every clock, and its body facts a tick out of date.
+//
+// Counts rather than bodies, deliberately. Fetching every review body on every
+// tick to hash it would be exact and would move real bandwidth for a window that
+// is sub-second; the counts are already carried by this response for free. See
+// `reviewsAgree` for what that does and does not catch.
 const THREADS_QUERY = `query($o:String!,$r:String!,$n:Int!,$c:String){
   repository(owner:$o,name:$r){ pullRequest(number:$n){
     mergeStateStatus
+    reviews(first:1){ totalCount }
     reviewThreads(first:100, after:$c){
       totalCount
       pageInfo{ hasNextPage endCursor }
@@ -37,17 +49,26 @@ const THREADS_QUERY = `query($o:String!,$r:String!,$n:Int!,$c:String){
  * reviewThreads(first:100) has produced four consecutive false "zero unresolved"
  * reports, so `readable` is false unless every page was fetched.
  */
-export function readThreads(nwo, pr) {
+export function readThreads(nwo, pr, io = null) {
+  // Injected for tests. The counts this returns feed the live cross-check, and
+  // without a seam the only way to exercise them is a real GitHub — which is how
+  // the review surface came to be carried by this function and asserted by
+  // nothing.
+  const call = io?.gh ?? ghJson;
   const [o, r] = nwo.split("/");
   let cursor = null, total = null, seen = 0, unresolved = 0, mergeState = null, pages = 0;
+  let reviewTotal = null;
   for (;;) {
     const args = ["graphql", "-f", `query=${THREADS_QUERY}`, "-F", `o=${o}`, "-F", `r=${r}`, "-F", `n=${pr}`];
     if (cursor) args.push("-F", `c=${cursor}`);
-    const res = ghJson(args);
+    const res = call(args);
     if (!res.ok) return { readable: false, why: res.err.split("\n")[0], mergeState };
     const pr_ = JSON.parse(res.out).data?.repository?.pullRequest;
     if (!pr_) return { readable: false, why: "no pullRequest in response", mergeState };
     mergeState = pr_.mergeStateStatus;
+    // Read from the FIRST page only: it is a totalCount, identical on every page,
+    // and re-reading it per page would just be the same number again.
+    if (reviewTotal === null) reviewTotal = pr_.reviews?.totalCount ?? null;
     const t = pr_.reviewThreads;
     total = t.totalCount;
     seen += t.nodes.length;
@@ -57,7 +78,7 @@ export function readThreads(nwo, pr) {
     cursor = t.pageInfo.endCursor;
   }
   // Only claim readability when the count seen matches the count declared.
-  return { readable: seen >= total, total, unresolved, seen, mergeState };
+  return { readable: seen >= total, total, unresolved, seen, mergeState, reviewTotal };
 }
 
 /**

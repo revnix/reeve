@@ -39,6 +39,7 @@ export function compare(live, projected) {
   const out = {
     live_total: live?.total ?? null, live_unresolved: live?.unresolved ?? null,
     proj_total: projected?.total ?? null, proj_open: projected?.open ?? null,
+    live_reviews: live?.reviewTotal ?? null, proj_reviews: projected?.reviewTotal ?? null,
     proj_resolved: projected?.resolved ?? null,
   };
 
@@ -53,6 +54,24 @@ export function compare(live, projected) {
   const projResolved = projected.resolved;
 
   const problems = [];
+  // THE REVIEW SURFACE, which nothing compared while only threads could gate.
+  //
+  // A review body can hold a pull request now, so a body posted between the fold
+  // and the evaluation that reads it leaves the thread counts agreeing, the
+  // projection fresh by every clock, and its body facts a tick out of date. That
+  // is the same shape the thread comparison exists for, on a surface it never
+  // covered.
+  //
+  // COUNTS, and the residual is named rather than hidden: this catches a review
+  // POSTED or removed in that window and does not catch one EDITED in place,
+  // which changes no count. Catching an edit exactly would mean hashing every
+  // review body on every tick, which is real bandwidth for a window measured in
+  // fractions of a second. Compared only when BOTH sides report it, so a caller
+  // that does not read the review surface is unaffected rather than incomparable.
+  if (live.reviewTotal != null && projected.reviewTotal != null &&
+      live.reviewTotal !== projected.reviewTotal) {
+    problems.push(`review count differs: live ${live.reviewTotal}, derived ${projected.reviewTotal}`);
+  }
   if (live.total !== projected.total) {
     problems.push(`thread count differs: live ${live.total}, derived ${projected.total}`);
   }

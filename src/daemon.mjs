@@ -971,7 +971,13 @@ export async function tick(ctx) {
   // Run refs this tick actually put to the scheduler, and the queued rows it
   // read. The cancel phase after the dispatch loop needs both.
   const askedFor = new Set();
+  // Run refs this tick WANTS but could not put to the scheduler, because the
+  // SCHEDULER refused rather than because this tick decided against the work.
+  // The sweep must tell those apart: a local refusal is a withdrawal, a `queued`
+  // is the scheduler saying "not yet".
+  const heldByScheduler = new Set();
   let queuedNow = [];
+  let intendedNow = new Set();
   const escalations = new Map();
   /**
    * Raise a cause. The count is the VALUE and can never be part of the key.
@@ -2001,6 +2007,7 @@ export async function tick(ctx) {
         //
         // Recorded here so the post-loop phase has the rows it read.
         queuedNow = queued;
+        intendedNow = intended;
 
         // AND SERVE THE HEAD OF THE QUEUE BEFORE ASKING FOR ANYTHING NEW.
         //
@@ -2025,7 +2032,24 @@ export async function tick(ctx) {
         // it empty.
         const head = queued.find(r => intended.has(r.run_ref) && r.run_ref !== `canary:${nwo}`);
         if (head) {
-          askedFor.add(head.run_ref);
+          // NOT `askedFor`, and marking it here was a regression this PR
+          // introduced against its own rule.
+          //
+          // `askedFor` means "this tick put this run ref to the scheduler AND
+          // still wants it", and the sweep cancels every queued row outside it.
+          // Marking at the preflight marks from INTENT -- the thing the sweep's
+          // own comment says is dishonest -- because the per-decision loop below
+          // still applies local capacity, the preparation backoff, root-cause
+          // resolution, prompt construction and checkout preparation. A row the
+          // preflight touched and those gates then refused was neither re-asked
+          // nor cancelled: it sat queued under the live guardian, and
+          // `queuedGuardianCount` blocks every builder admission behind it.
+          //
+          // Nothing is lost by not marking. A GRANTED claim removes the row from
+          // the queue, so the sweep has nothing to cancel. A REFUSED one leaves
+          // it queued, and then the honest question is the one the sweep already
+          // asks: did the dispatch path actually ask for this work? If it did, it
+          // marks `askedFor` itself; if it did not, the row should go.
           const got = (ctx.providerClaim ?? claimProvider)(h, {
             owner: "guardian", repoId, runRef: head.run_ref,
             pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
@@ -2127,7 +2151,13 @@ export async function tick(ctx) {
           throw new Error(`the canary's provider lease rebind matched ${b?.bound ?? "no"} row(s); it would stay on the guardian`);
     };
     try {
-      containment = await measuredContainment(ctx, profile, nwo, logPath,
+      // INJECTABLE, like the other fifty-eight collaborators this tick reaches
+      // through `ctx`. `beforeSpawn` is reachable only on the PAID branch of
+      // `measuredContainment` -- the cheap gates, an injected verdict and a cache
+      // hit all return before it -- so `skipDispatch`, and everything downstream
+      // of it, could not be exercised by any fixture. It appeared in the suite
+      // only inside comments.
+      containment = await (ctx.measureContainment ?? measuredContainment)(ctx, profile, nwo, logPath,
         { beforeSpawn: canaryBeforeSpawn, onSpawn: canaryOnSpawn });
     } finally {
       // THE CANARY IS A PAID MODEL CALL, so its rate limit is the provider's
@@ -2298,6 +2328,12 @@ export async function tick(ctx) {
       // work already in flight -- the log shows exactly that happening, the same
       // fix launched at 15:02 and again at 15:12.
       const run = startRun(db, { nwo, pr: e.pr, action: decision.action, head: e.head, cause });
+      // READ BEFORE, so the refund below can tell whether THIS call spent an
+      // attempt. `attemptsFor` answers MAX_SAFE_INTEGER when it cannot read, and
+      // that is the safe sentinel in both directions here: an unreadable count
+      // makes "did it go up?" answer no, and no attempt is taken back.
+      const attemptsBefore = (decision.action === "FIX_CI" && fp)
+        ? attemptsFor(db, nwo, e.pr, fp, logPath) : 0;
       // Spent here, beside the run: past every refusal, before any work. A crash
       // after this point costs an attempt, which is the correct direction --
       // a crashed fix that silently earns a free retry is the runaway loop.
@@ -2308,9 +2344,68 @@ export async function tick(ctx) {
       // guardian pid, which the expiry reaper preserves for ever. Nothing
       // reclaims it if the next tick decides differently about this PR.
       try {
-        if (run.ok && decision.action === "FIX_CI" && fp) recordFixAttempt(db, nwo, e.pr, fp, e.head);
+        if (run.ok && decision.action === "FIX_CI" && fp) (ctx.recordFixAttempt ?? recordFixAttempt)(db, nwo, e.pr, fp, e.head);
       } catch (err) {
         if (prLease) { releaseWithRetry(prRunRef, prLease); prLease = null; }
+        // AND RETIRE THE RUN, because nothing else ever will.
+        //
+        // `startRun` has already succeeded by this point, so a durable run is
+        // live. Releasing only the provider lease left it `leased` for ever:
+        // `run_one_live_per_task` is UNIQUE, so every later `startRun` for this
+        // pull request answers "already live", and there is no run reaper in
+        // production -- the only reaper the tick calls is `reapProviderLeases`,
+        // which is about provider rows. Repairing the table that threw would not
+        // have restored dispatch; the row had to be cleared by hand.
+        //
+        // UNBOUND rather than failed: nothing ran and nothing was learned, so the
+        // node returns to `ready` and the pull request is dispatchable again on
+        // the next tick. `finishRun` retires the row on every outcome for exactly
+        // this reason, and it is the caller's job to ask.
+        // GUARDED, because this is a CATCH and the tick is fail-soft here.
+        //
+        // `finishRun` writes several rows in a transaction and rethrows database
+        // errors, and the store that just refused `recordFixAttempt` is the same
+        // store — full, locked, damaged. An unguarded throw inside this catch
+        // escapes `tick` entirely: the escalation is never raised, the remaining
+        // pull requests are never seen, the queued-request sweep never runs, and
+        // the run this block exists to retire is left live anyway. A repair that
+        // can take the tick with it is worse than the leak it repairs.
+        //
+        // AND REFUND THE ATTEMPT THIS CALL ACTUALLY SPENT — no more than that.
+        //
+        // `recordFixAttempt` INSERTs and then RETURNS a count, so the write can
+        // commit and the trailing read still throw: an attempt spent for work
+        // that never started. The next tick then reads the cause as exhausted and
+        // escalates rather than redispatching, contradicting this path's own
+        // UNBOUND outcome.
+        //
+        // BUT AN UNCONDITIONAL REFUND IS NOT A NO-OP. I claimed it was, having
+        // checked only the case where no row exists at all. `refundFixAttempt` is
+        // an UPDATE with a WHERE: against a cause that already carries a
+        // LEGITIMATE prior attempt it decrements THAT row. Measured — a prior
+        // attempt of 1 becomes 0 — so with `maxFixAttemptsPerFinding` above one,
+        // a pre-commit failure here would erase a real attempt and hand out a
+        // repair beyond the configured cap. The schema permits any integer.
+        //
+        // So the count is compared across the call and the refund is taken only
+        // when this invocation is the one that raised it.
+        if (run.ok) {
+          try {
+            if (decision.action === "FIX_CI" && fp
+                && attemptsFor(db, nwo, e.pr, fp, logPath) > attemptsBefore)
+              refundFixAttempt(db, nwo, e.pr, fp);
+          } catch (e2) {
+            log(logPath, `  #${e.pr}: the fix attempt could not be refunded — ${e2.message}`);
+          }
+          try {
+            const fin = finishRun(db, { runId: run.runId, outcome: OUTCOMES.UNBOUND,
+                                        why: `the fix attempt could not be recorded: ${err.message}` });
+            if (!fin?.applied) log(logPath, `  #${e.pr}: the run could not be retired — ${fin?.why}`);
+          } catch (e2) {
+            log(logPath, `  #${e.pr}: the run could not be retired — ${e2.message}`);
+            raise(`#${e.pr}: a run was left live because it could not be retired`);
+          }
+        }
         log(logPath, `  #${e.pr}: NOT dispatching — the fix attempt could not be recorded: ${err.message}`);
         raise(`#${e.pr}: the fix attempt could not be recorded`);
         continue;
@@ -2357,7 +2452,25 @@ export async function tick(ctx) {
         if (prLease) {
           try {
             const h = hubOr(() => null);
-            if (h) (ctx.providerHeartbeat ?? heartbeatProvider)(h, { ...prLease, isAlive: isSameProcess });
+            if (h) {
+              const phb = (ctx.providerHeartbeat ?? heartbeatProvider)(h, { ...prLease, isAlive: isSameProcess });
+              // A ZERO-ROW RENEWAL IS LEASE LOSS, and the result was discarded.
+              //
+              // `heartbeatProvider` answers `{ ok: true, beat: 0 }` when the
+              // fenced row is GONE -- reaped after a liveness misread, cleared by
+              // a restore -- which is `ok` in the sense that the query ran and
+              // nothing in the sense that matters. The worker went on consuming
+              // provider capacity while the scheduler counted no lease for it and
+              // could admit replacement work beside it, which is the double-spend
+              // the scheduler exists to prevent.
+              //
+              // The run heartbeat three lines above already feeds `revoked`; this
+              // half never reached `runWorker`'s gate. Only `ok && beat === 0` is
+              // loss: a REFUSAL is the hub being held by a restore, which says
+              // nothing about whether the lease still exists.
+              if (phb?.ok === true && phb.beat === 0)
+                revoked = "the provider lease is gone; the scheduler no longer counts this worker";
+            }
           } catch (err) { log(logPath, `  #${e.pr}: provider lease not renewed — ${err.message}`); }
         }
       }, ctx.heartbeatMs ?? HEARTBEAT_MS);
@@ -2908,8 +3021,27 @@ export async function tick(ctx) {
     const h = claimHub();
     if (h) {
       const unread = [...unreadable].map(pr => `${nwo}#${pr}:`);
+      // EVERYTHING THIS TICK STILL WANTS BUT NEVER GOT TO ASK FOR.
+      //
+      // The distinction is whose refusal it was. When the per-decision loop RUNS,
+      // it is the authority: it marks `askedFor` before every claim, so a request
+      // it asked for is kept whatever the scheduler answered, and one it refused
+      // locally — capacity, the preparation backoff, a failed checkout — is a
+      // genuine withdrawal and the row should go.
+      //
+      // `skipDispatch` is the case where the loop never ran at all, because the
+      // scheduler refused the CANARY. No decision was made about any pull
+      // request, so cancelling would surrender queue positions the tick still
+      // wants, and the next tick would re-queue them at the BACK behind whatever
+      // arrived in between. Removing the preflight's unconditional mark was
+      // right; removing it without this was one step short.
+      if (skipDispatch) for (const ref of intendedNow) heldByScheduler.add(ref);
       for (const row of queuedNow) {
         if (askedFor.has(row.run_ref)) continue;
+        if (heldByScheduler.has(row.run_ref)) {
+          log(logPath, `provider: keeping a queued request the SCHEDULER refused, not this tick (${row.run_ref})`);
+          continue;
+        }
         if (unread.some(prefix => row.run_ref.startsWith(prefix))) {
           log(logPath, `provider: keeping the queued request for a PR this tick could not read (${row.run_ref})`);
           continue;

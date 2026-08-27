@@ -658,8 +658,10 @@ Two structural hazards belong beside them:
   adds a column owes three inventory entries; a stage that adds none owes nothing.**
 - **W6 — the raw-SQL rule is true of one file and false of twelve.** `src/provider.mjs:9-13`
   states *"the two directories allowed to contain raw SQL"* (`src/db/`, `src/build/`).
-  MEASURED: **12 paths violate it with 98 `.prepare()` calls**, and the guard that exists
-  (with a proper positive control) checks **exactly one file**. **Do not add a thirteenth.**
+  MEASURED at `16cd880`: **12 paths violate it with 102 `.prepare()` calls** (98 at
+  `c500cfe` — `src/review/derive.mjs` grew 16 → 19 when reeve#49 merged, so **the violation is
+  growing**), and the guard that exists (with a proper positive control) checks **exactly one
+  file**. **Do not add a thirteenth.**
   New statements go in `src/build/`; widening the guard is a separate cleanup.
 
 ### B.12 The tracker, and what belongs there instead of in the plan

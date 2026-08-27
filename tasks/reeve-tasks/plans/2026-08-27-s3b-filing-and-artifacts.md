@@ -347,9 +347,10 @@ export function normalizeFiling({ title, territory, depth, priority }) {
 
 `fileTask`'s full body arrives in Task 3, which adds the network-first ordering and the writer lease. This task adds the smallest version that satisfies its own assertions: normalize, resolve, admit.
 
+Extend Step 3's `import { normalizeClaim } from "./registry.mjs";` to `import { normalizeClaim, resolveSnapshot, admitTask } from "./registry.mjs";` rather than writing a second import of the same module, and add the two below.
+
 ```js
 import { randomBytes } from "node:crypto";
-import { resolveSnapshot, admitTask } from "./registry.mjs";
 import { readStart } from "../supervisor.mjs";
 
 // bt:<ulid>. Crockford base32 over 48 bits of millisecond time and 80 bits of
@@ -916,6 +917,20 @@ and a self-contained route, inserted immediately **before** `case "build": {` (a
     const pin = pinSeconds(opt("pin-territory"));
     if (pin?.refusal) { console.error(`reeve task: ${pin.refusal}`); process.exit(1); }
 
+    // `loadProfile` is keyed on the NWO, not on the home: it looks under
+    // `<home>/profiles/<owner>/<repo>.json`. So the project has to resolve in
+    // the registry before the switches can be read, and a `--project` that names
+    // nothing is refused here rather than reaching `resolveSnapshot` with a
+    // profile of `null` already in hand.
+    const entry = registry.projects[opt("project")];
+    if (!entry) {
+      console.error(`reeve task: ${JSON.stringify(opt("project"))} is not a project in the registry`);
+      console.error(`-> known projects: ${Object.keys(registry.projects).join(", ") || "(none)"}`);
+      process.exit(1);
+    }
+    const profile = loadProfile(entry.nwo);
+    if (!profile) { console.error(`reeve task: no profile for ${entry.nwo}`); process.exit(1); }
+
     // Repeatable, already: the argv walk pushes every occurrence of a valued
     // flag and `all` returns the list. `--territory-file` appends to the same
     // list rather than replacing it, so the two flags compose.
@@ -933,7 +948,7 @@ and a self-contained route, inserted immediately **before** `case "build": {` (a
       pinSeconds: pin, dryRun: flag("dry-run"),
       io: registryIo({ home: HOME }), isAlive: isSameProcess,
       pid: process.pid, lstart: readStart(process.pid),
-      switches: capabilitiesFrom(loadProfile(HOME)),
+      switches: capabilitiesFrom(profile),
     });
     db.close();
     if (flag("json")) console.log(JSON.stringify(r, null, 2));
@@ -1107,3 +1122,1198 @@ Comment `@codex review` on **every push**, not only the first. Read **both** end
 **Do not merge.** Founder grant required.
 
 ---
+
+# PR-B2: Artifacts, the durable store and `reviewArtifact`
+
+**Branch:** `feat/s3-artifacts`, based on T3's merge commit. **Scope:** the three path functions, `src/build/artifact.mjs`, and one additive throw in `reviewDiff`. ~700 changed lines. **No GitHub call, no outbox row, no worker.**
+
+---
+
+### Task 1: A write interrupted before its rename leaves no artifact, no sha, and a transition that refuses
+
+**Files:**
+- Create: `src/build/artifact.mjs`, `test/artifact.test.mjs`
+- Modify: `src/paths.mjs` (the block after `export function hubPathFor(home) {`, `:68`)
+- Test: `test/state-paths.test.mjs` (append before the terminator — the closing `console.log` / `process.exit(fail ? 1 : 0)` pair; that file has **no** `rmSync`, because it computes paths and creates nothing)
+
+**Interfaces:**
+- Consumes: `applyTransition` (`src/build/transition.mjs:660`), the artifact-sha gate (`:775`), `fileTask` (PR-B1 Task 1), `openHub`, `isSameProcess`.
+- Produces: `ARTIFACT_FILE` — `{SIZING: "sizing.json", RESEARCH: "research.md", DESIGN: "design.md"}`, declared **once**, in `src/paths.mjs`, and imported by `artifact.mjs`; a second copy would be a second inventory of the same three facts. `taskPathFor(home, taskId)`, `artifactPathFor(home, taskId, phase)`, `runPathFor(home, taskId, run)` where `run` is `{generation, phase, slice, attempt, stream}`. `writeArtifact({dir, phase, bytes}) -> {path, sha256, bytes}`; `readArtifact({dir, phase, expectSha}) -> {ok:true, text, sha256} | {ok:false, why}`. S3-C Task 1 records `writeArtifact`'s `sha256` as `phase_event.artifact_sha`; S3-D reads `readArtifact` back at every phase boundary.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `test/artifact.test.mjs` with `/* ... standard harness ... */` (slug `artifact`), plus:
+
+```js
+import { mkdirSync, lstatSync, readdirSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { openHub } from "../src/build/hubdb.mjs";
+import { applyTransition } from "../src/build/transition.mjs";
+import { isSameProcess, readStart } from "../src/supervisor.mjs";
+import { fileTask } from "../src/build/taskfile.mjs";
+import { writeArtifact, readArtifact } from "../src/build/artifact.mjs";
+
+// A filed task, so the transition assertions run against a real row rather than
+// against a hand-built one. A hand-built task cannot exhibit the CAS.
+const repo = join(dir, "repo");
+mkdirSync(join(repo, "packages", "x"), { recursive: true });
+writeFileSync(join(repo, "p.json"), "{}\n");
+const registry = { version: 1, projects: {
+  nextly: { nwo: "nextlyhq/nextly", repoPath: repo, profilePath: join(repo, "p.json") } } };
+const io = { lstat: (p) => lstatSync(p), lsTree: () => null,
+  repoId: async () => 42, profileHash: async () => "ph-1", defaultBranch: async () => "main",
+  visibility: async () => "private", specRepoId: async () => 77,
+  gateDefinitionHash: async () => "gd-1", founderUserId: async () => 9 };
+const db = openHub(join(dir, "hub.db"));
+const filed = await fileTask({ db, registry, project: "nextly", title: "a scout task",
+  territory: ["packages/x"], io, isAlive: isSameProcess,
+  pid: process.pid, lstart: readStart(process.pid) });
+check(filed.ok === true, "fixture: a task is filed", JSON.stringify(filed));
+const toSizing = applyTransition(db, { taskId: filed.task, expectedPhase: "FILED",
+  expectedGeneration: 1, evidence: { kind: "phase.succeeded", phase: "FILED" },
+  op: "phase.advanced", isAlive: isSameProcess });
+check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringify(toSizing));
+
+// THE INTERRUPTED WRITE. A child writes a 64 MiB artifact through the real
+// function; the parent kills its process GROUP the moment a tmp entry appears.
+//
+// What this fixture can exhibit: a process that died between the tmp write and
+// the rename. What it CANNOT exhibit: a power loss, or a rename that a
+// filesystem reordered against the fsync -- those are the platform's guarantee,
+// not this function's. And if the child finishes before the parent sees the tmp
+// entry the drill never reached its window: that is reported RED below, never
+// skipped, because an unreached window and a passing guard look identical.
+{
+  const adir = join(dir, "interrupted");
+  const worker = join(dir, "slow-write.mjs");
+  writeFileSync(worker,
+    `import { writeArtifact } from "${join(process.cwd(), "src/build/artifact.mjs")}";\n` +
+    `writeArtifact({ dir: process.argv[2], phase: "RESEARCH",\n` +
+    `                bytes: Buffer.alloc(64 * 1024 * 1024, 0x61) });\n` +
+    `console.log("finished");\n`);
+  const child = spawn(process.execPath, [worker, adir], { detached: true, stdio: "ignore" });
+  let sawTmp = false;
+  for (let i = 0; i < 2000 && !sawTmp; i++) {
+    try { sawTmp = readdirSync(adir).some(f => f.includes(".tmp-")); } catch { /* not yet created */ }
+    if (!sawTmp) await new Promise(r => setTimeout(r, 2));
+  }
+  check(sawTmp, "control: the drill reached the window between tmp and rename");
+  try { process.kill(-child.pid, "SIGKILL"); } catch { /* already gone */ }
+  await new Promise(r => child.on("exit", r));
+
+  const left = (() => { try { return readdirSync(adir); } catch { return []; } })();
+  check(!existsSync(join(adir, "research.md")),
+    "no artifact exists after a write interrupted before its rename", left.join(","));
+  check(left.length > 0 && left.every(f => f.includes(".tmp-")),
+    "and the artifacts directory holds only the temporary file", left.join(","));
+  const r = readArtifact({ dir: adir, phase: "RESEARCH", expectSha: "0".repeat(64) });
+  check(r.ok === false, "reading it back refuses rather than returning empty content", JSON.stringify(r));
+
+  // AND THE TRANSITION REFUSES, which is the property that matters: an artifact
+  // that is not durable must not be able to justify a phase advance.
+  const t = applyTransition(db, { taskId: filed.task, expectedPhase: "SIZING",
+    expectedGeneration: 1, evidence: { kind: "phase.succeeded", phase: "SIZING", depth: "standard" },
+    artifactSha: null, op: "phase.advanced", isAlive: isSameProcess });
+  check(t.applied === false && t.reason === "refused",
+    "and the transition it would have justified is refused", JSON.stringify(t));
+  check(/no artifact sha/.test(String(t.refusal)),
+    "naming the missing sha as the reason", String(t.refusal));
+  const ev = db.prepare(
+    "SELECT payload FROM hub_event WHERE task=? AND kind='transition.refused' ORDER BY seq DESC LIMIT 1")
+    .get(filed.task);
+  check(ev !== undefined && /no artifact sha/.test(ev.payload),
+    "and the refusal is durable, not merely returned", JSON.stringify(ev));
+}
+
+// THE READ-BACK. The sha recorded is the sha of the bytes on disk, checked by
+// mutating the file underneath a known-good sha.
+{
+  const adir = join(dir, "readback");
+  const w = writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from("# design\n\n## Slice 1\n") });
+  check(typeof w.sha256 === "string" && w.sha256.length === 64, "a write returns a sha256", w.sha256);
+  check(existsSync(w.path) && readdirSync(adir).length === 1,
+    "and leaves exactly one file, with no temporary beside it", readdirSync(adir).join(","));
+  const good = readArtifact({ dir: adir, phase: "DESIGN", expectSha: w.sha256 });
+  check(good.ok === true, "control: reading it back with the recorded sha succeeds", JSON.stringify(good));
+  check(good.sha256 === w.sha256, "and re-derives the same sha from the bytes on disk", good.sha256);
+
+  writeFileSync(w.path, "# design\n\n## Slice 1\ntampered\n");
+  const bad = readArtifact({ dir: adir, phase: "DESIGN", expectSha: w.sha256 });
+  check(bad.ok === false, "and a file mutated after the write is refused on read-back", JSON.stringify(bad));
+  check(/sha/.test(String(bad.why)), "with the sha mismatch as the reason", String(bad.why));
+}
+db.close();
+```
+
+Append to `test/state-paths.test.mjs`, before its closing `console.log` / `process.exit(fail ? 1 : 0)` pair, adding `taskPathFor, artifactPathFor, runPathFor` to that file's existing `import … from "../src/paths.mjs"` line rather than writing a second import of the same module:
+
+```js
+{
+  const id = "bt:01JABCDEFGHJKMNPQRSTVWXYZ0";
+  check(taskPathFor(HOME, id).startsWith(join(HOME, "tasks")),
+    "a task's tree lives under the reeve home's tasks directory", taskPathFor(HOME, id));
+  check(!taskPathFor(HOME, "../../etc").includes(".."),
+    "and a task id cannot walk out of it", taskPathFor(HOME, "../../etc"));
+  check(artifactPathFor(HOME, id, "RESEARCH").endsWith(join("artifacts", "research.md")),
+    "RESEARCH's artifact is research.md", artifactPathFor(HOME, id, "RESEARCH"));
+  check(artifactPathFor(HOME, id, "SIZING").endsWith(join("artifacts", "sizing.json")),
+    "and SIZING's is sizing.json, because the extension follows the phase",
+    artifactPathFor(HOME, id, "SIZING"));
+  check(runPathFor(HOME, id, { generation: 2, phase: "RESEARCH", slice: 0, attempt: 1, stream: "out" })
+        .endsWith(join("runs", "g2-RESEARCH-s0-a1.out")),
+    "and a run's output file names its generation, phase, slice and attempt",
+    runPathFor(HOME, id, { generation: 2, phase: "RESEARCH", slice: 0, attempt: 1, stream: "out" }));
+  let threw = null;
+  try { artifactPathFor(HOME, id, "IMPLEMENTING"); } catch (e) { threw = String(e.message); }
+  check(threw !== null, "and a phase with no artifact has no artifact path", String(threw));
+}
+```
+
+- [ ] **Step 2: Run them and watch them fail**
+
+Run: `$N test/artifact.test.mjs; $N test/state-paths.test.mjs`
+Expected: `Cannot find module '.../src/build/artifact.mjs'` for the first, and `taskPathFor is not defined` for the second — neither exists at `16cd880` (`git grep -c taskPathFor -- src bin test` returns zero files; positive control, `hubPathFor` returns ten).
+
+**On the broken implementation** — the one that writes with a plain `writeFileSync(path, bytes)` because "the rename is an optimisation" — `no artifact exists after a write interrupted before its rename` and `and the artifacts directory holds only the temporary file` both go red, because a killed plain write leaves a **short `research.md`**, not a tmp file. `control: the drill reached the window` stays green, and that is what stops the red being read as "the child was never killed". The subtler broken implementation is the one that renames but never fsyncs the directory: this test cannot exhibit that, and it is stated rather than implied — the ordering guarantee after a `fsync` of the containing directory is the platform's, and the code is written to ask for it, not to prove it.
+
+**The stub loop for this task**: run `test/artifact.test.mjs` green (control); apply the stub by replacing `writeArtifact`'s tmp-then-rename body with a single `writeFileSync(path, bytes)`, confirmed with `grep -c 'renameSync' src/build/artifact.mjs` dropping from 1 to 0; re-run and confirm the two named assertions are red while the read-back block stays green; restore from `src/build/artifact.mjs.bak`, copied before the edit, and re-run green.
+
+- [ ] **Step 3: Implement the paths, then the store**
+
+In `src/paths.mjs`, after `hubPathFor`:
+
+```js
+/**
+ * The artifact each report phase produces. ONE declaration, exported, because
+ * the phase-to-filename map is a fact about the design's section 4.1 table and a
+ * second copy in the artifact store would be a second inventory to drift from.
+ */
+export const ARTIFACT_FILE = Object.freeze({
+  SIZING: "sizing.json", RESEARCH: "research.md", DESIGN: "design.md",
+});
+
+/**
+ * One task's tree. The id is sanitised for the same reason a repository name is:
+ * it arrives from a command line, and `..` in it would walk out of the home.
+ * `bt:<ulid>` is [0-9A-Z] apart from the colon, so the substitution is injective
+ * over real ids and two tasks can never share a directory.
+ */
+export function taskPathFor(home, taskId) {
+  return join(home, "tasks", safe(taskId));
+}
+
+/** Where a report phase's artifact lands, durable before its transition. */
+export function artifactPathFor(home, taskId, phase) {
+  const name = ARTIFACT_FILE[phase];
+  if (!name) throw new Error(`${phase} produces no artifact; its product is a diff, reviewed by reviewDiff`);
+  return join(taskPathFor(home, taskId), "artifacts", name);
+}
+
+/**
+ * A run's durable output. Every field is required: a run file that omits the
+ * attempt overwrites the previous attempt's transcript, which is how a measured
+ * comparison lost two of its three runs.
+ */
+export function runPathFor(home, taskId, { generation, phase, slice, attempt, stream }) {
+  if (![generation, slice, attempt].every(Number.isInteger) || !phase || !stream)
+    throw new Error("a run path needs generation, phase, slice, attempt and stream; none is optional");
+  return join(taskPathFor(home, taskId), "runs", `g${generation}-${phase}-s${slice}-a${attempt}.${stream}`);
+}
+```
+
+Create `src/build/artifact.mjs`:
+
+```js
+// artifact -- the durable phase artifact, and the gate that reads it.
+//
+// A transition commits only after its artifact is durable, so the write has to
+// be atomic against a crash and the sha recorded has to be the sha of the bytes
+// that are actually on disk. Both halves matter: a sha computed from the buffer
+// in memory certifies what was intended, not what survived.
+import { createHash, randomBytes } from "node:crypto";
+import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { ARTIFACT_FILE } from "../paths.mjs";
+
+const sha = (buf) => createHash("sha256").update(buf).digest("hex");
+
+/** tmp + fsync + rename + fsync of the directory. Every step, in that order. */
+export function writeArtifact({ dir, phase, bytes }) {
+  const name = ARTIFACT_FILE[phase];
+  if (!name) throw new Error(`${phase} produces no artifact; use reviewDiff's path`);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, name);
+  const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
+  const fd = openSync(tmp, "wx");
+  try { writeSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
+  renameSync(tmp, path);
+  // THE DIRECTORY TOO. Without it the rename itself may not survive a crash,
+  // and the artifact is durable only in the sense that its bytes were.
+  const dfd = openSync(dir, "r");
+  try { fsyncSync(dfd); } finally { closeSync(dfd); }
+  return { path, sha256: sha(bytes), bytes: bytes.length };
+}
+
+/**
+ * Read it back and check it. `expectSha` is required: a read that returns
+ * whatever is there certifies nothing, and this function exists to be the check.
+ */
+export function readArtifact({ dir, phase, expectSha }) {
+  const name = ARTIFACT_FILE[phase];
+  if (!name) throw new Error(`${phase} produces no artifact; use reviewDiff's path`);
+  if (typeof expectSha !== "string" || expectSha.length !== 64)
+    throw new Error("readArtifact needs the sha it expects; a read with nothing to compare is not a check");
+  let buf;
+  try { buf = readFileSync(join(dir, name)); }
+  catch (e) { return { ok: false, why: `${name} is not there: ${e.code ?? e.message}` }; }
+  const got = sha(buf);
+  if (got !== expectSha)
+    return { ok: false, why: `${name}'s sha is ${got}, not the recorded ${expectSha}; the bytes changed after the write` };
+  return { ok: true, text: buf.toString("utf8"), sha256: got };
+}
+```
+
+- [ ] **Step 4: Run them, then commit**
+
+```bash
+cp src/build/artifact.mjs src/build/artifact.mjs.bak
+$N test/artifact.test.mjs && $N test/state-paths.test.mjs
+fail=0
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
+done
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
+rm -f src/build/artifact.mjs.bak
+git add src/paths.mjs src/build/artifact.mjs test/artifact.test.mjs test/state-paths.test.mjs
+git commit -m "feat(build): durable phase artifacts, hashed and read back"
+```
+
+---
+
+### Task 2: The two gates refuse each other's phases, and `reviewArtifact` refuses an uncited claim while passing the minimum
+
+**Files:**
+- Modify: `src/build/artifact.mjs` (adds `reviewArtifact`), `src/sandbox.mjs` (`reviewDiff`; the block after `export function reviewDiff({ files, profile, lane = null, action = null }) {`, `:856`)
+- Test: `test/artifact.test.mjs` (append before the terminator — the closing `rmSync` / `console.log` / `process.exit(fail ? 1 : 0)` group)
+
+**Interfaces:**
+- Consumes: `writeArtifact` (Task 1), `reviewDiff` (`src/sandbox.mjs:856`), `ARTIFACT_FILE` (`src/paths.mjs`).
+- Produces: `reviewArtifact({phase, dir, expect}) -> {ok, why, findings}` — **three required properties and no optional parameter anywhere.** S3-C Task 2 asserts it at the dispatch seam; S3-D Tasks 2 and 3 supply the `expect` a real depth produces.
+
+- [ ] **Step 1: Append the failing test**
+
+Append to `test/artifact.test.mjs`, before its closing `rmSync` / `console.log` / `process.exit(fail ? 1 : 0)` group, adding `reviewArtifact` to that file's existing `import … from "../src/build/artifact.mjs"` line and one new import for the sibling:
+
+```js
+import { reviewDiff } from "../src/sandbox.mjs";
+```
+
+```js
+// THE MINIMUM, AND THE CONTROL. A checker that refuses everything proves
+// nothing about the thing it refuses, so the passing case is asserted first and
+// the failing case differs from it by exactly the citation.
+{
+  const adir = join(dir, "review");
+  const cited = "# research\n\n- openHub refuses a hub above the schema version " +
+                "(src/build/hubaccess.mjs:170)\n- the guest handle revalidates dev:ino " +
+                "(src/build/hubaccess.mjs:42)\n";
+  writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(cited) });
+  const good = reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+  check(good.ok === true,
+    "control: a research artifact whose every claim carries a file:line citation passes",
+    JSON.stringify(good));
+
+  writeArtifact({ dir: adir, phase: "RESEARCH",
+    bytes: Buffer.from(cited.replace(" (src/build/hubaccess.mjs:170)", "")) });
+  const bad = reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+  check(bad.ok === false, "a claim with no file:line citation is refused", JSON.stringify(bad));
+  check(bad.findings.length === 1,
+    "and exactly the one uncited claim is named, not the whole file", JSON.stringify(bad.findings));
+}
+
+// THE TWO GATES, ASSERTED IN BOTH DIRECTIONS. Each is mandatory for its own
+// dispatch path, so each must refuse the other's -- an artifact phase that fell
+// through reviewDiff would be gated on a diff it does not produce, and would
+// pass on the empty-diff refusal reading as "nothing was changed".
+{
+  let a = null, b = null;
+  try { reviewDiff({ files: ["packages/x/a.ts"], profile: {}, lane: null, action: "RESEARCH" }); }
+  catch (e) { a = String(e.message); }
+  check(a !== null, "reviewDiff throws when handed an artifact phase", String(a));
+  check(/reviewArtifact/.test(String(a)), "and names the sibling that owns that path", String(a));
+
+  try { reviewArtifact({ phase: "IMPLEMENTING", dir: join(dir, "review"), expect: { depth: "standard" } }); }
+  catch (e) { b = String(e.message); }
+  check(b !== null, "and reviewArtifact throws when handed a diff phase", String(b));
+  check(/reviewDiff/.test(String(b)), "and names its sibling too", String(b));
+
+  // CONTROL: the guardian's own actions still go through unchanged. This asserts
+  // that reviewDiff RETURNS rather than that it returns ok, because what the new
+  // guard must not do is throw -- its verdict on an ordinary diff is the
+  // existing shipped behaviour and is not this task's to change.
+  let threw = false, ordinary = null;
+  try { ordinary = reviewDiff({ files: ["packages/x/a.ts"], profile: {}, lane: null, action: "FIX_CI" }); }
+  catch { threw = true; }
+  check(threw === false && ordinary !== null,
+    "control: reviewDiff still returns for an ordinary guardian action", JSON.stringify(ordinary));
+}
+
+// NO OPTIONAL PARAMETER. The optional `gate` parameter lost to the sibling
+// function precisely because an optional safety parameter is omitted by the
+// caller that most needs it.
+{
+  check(reviewArtifact.length === 1,
+    "reviewArtifact takes exactly one required argument", String(reviewArtifact.length));
+  let missing = null;
+  try { reviewArtifact({ phase: "RESEARCH", dir: join(dir, "review") }); }
+  catch (e) { missing = String(e.message); }
+  check(missing !== null && /expect/.test(missing),
+    "and refuses a call that omits `expect` rather than defaulting it", String(missing));
+}
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `$N test/artifact.test.mjs`
+Expected: `reviewArtifact is not a function` at the first review assertion, and `reviewDiff throws when handed an artifact phase` red — `reviewDiff` accepts `action: null` today and never throws for any value.
+
+**On the broken implementation** — the one that adds `reviewArtifact` but leaves `reviewDiff` alone, on the argument that "nothing calls `reviewDiff` with a phase name" — `reviewDiff throws when handed an artifact phase` and `and names the sibling that owns that path` go red while every `reviewArtifact` assertion stays green. That is the whole point of asserting both directions: the dangerous half is the one where an artifact phase silently reaches the diff gate, gets an empty file list, and is refused with *"the worker produced an empty diff"* — a refusal that reads as the worker's fault and is the gate's.
+
+**The stub loop for this task**: run green (control); apply the stub by weakening `reviewArtifact`'s citation check from a per-claim scan to `if (!/:\d+/.test(text))`, confirmed present with `grep -c 'findings.push' src/build/artifact.mjs` dropping from 1 to 0; re-run and confirm `a claim with no file:line citation is refused` and `and exactly the one uncited claim is named` are red while the control passes — the weakened check accepts the file, because the *other* claim still carries a citation; restore from `src/build/artifact.mjs.bak` and re-run green.
+
+- [ ] **Step 3: Implement both halves**
+
+In `src/build/artifact.mjs`:
+
+```js
+// A claim is a list item that asserts something. Section 4.6 names the minimum
+// for research: at least one file:line citation per claim. Prose between the
+// lists is context, not a claim, and is not asked to cite.
+const CLAIM = /^\s*(?:[-*]|\d+\.)\s+\S/;
+const CITATION = /[\w./-]+:\d+/;
+
+/**
+ * The gate for a report phase's product. The sibling of `reviewDiff`, never a
+ * parameter of it: an optional safety parameter is omitted by exactly the caller
+ * that needs it, and two functions that refuse each other's phases cannot be.
+ */
+export function reviewArtifact({ phase, dir, expect }) {
+  if (!ARTIFACT_FILE[phase])
+    throw new Error(`${phase} produces a diff, not an artifact; reviewDiff is its gate`);
+  if (!expect || typeof expect.depth !== "string")
+    throw new Error("reviewArtifact needs `expect` with a depth; expectations adjust by depth and a default would pick one");
+
+  let text;
+  try { text = readFileSync(join(dir, ARTIFACT_FILE[phase]), "utf8"); }
+  catch (e) { return { ok: false, why: `${ARTIFACT_FILE[phase]} is not there: ${e.code ?? e.message}`, findings: [] }; }
+
+  const findings = [];
+  if (phase === "SIZING") {
+    try { JSON.parse(text); } catch (e) { findings.push(`sizing.json does not parse: ${e.message}`); }
+  }
+  if (phase === "RESEARCH") {
+    if (expect.depth === "trivial")
+      return { ok: false, why: "RESEARCH is skipped at trivial depth; there is no research artifact to gate",
+               findings: [] };
+    for (const line of text.split("\n"))
+      if (CLAIM.test(line) && !CITATION.test(line)) findings.push(`no file:line citation: ${line.trim()}`);
+  }
+  if (phase === "DESIGN") {
+    const slices = text.split("\n").filter(l => /^##\s+Slice\b/.test(l));
+    if (!slices.length) findings.push("design.md carries no ordered slice list");
+    for (const need of ["Files:", "Packages:", "Tests:", "Done when:"])
+      if (!text.includes(need)) findings.push(`every slice needs a ${need} line and none was found`);
+    if (expect.depth === "trivial" && !/^##\s+Measured context\b/m.test(text))
+      findings.push("at trivial depth design.md stands in for the absent research and needs a Measured context section");
+  }
+  return findings.length
+    ? { ok: false, why: `${ARTIFACT_FILE[phase]} does not meet the minimum for ${phase}`, findings }
+    : { ok: true, why: null, findings: [] };
+}
+```
+
+In `src/sandbox.mjs`, as the first statement inside `reviewDiff`:
+
+```js
+  // THE SIBLING'S PHASES ARE NOT THIS FUNCTION'S. A report phase produces an
+  // artifact and no diff, so it would arrive here with an empty file list and be
+  // refused as "the worker produced an empty diff" -- a refusal that reads as
+  // the worker's fault and is the gate's. Throwing is deliberate: this is a
+  // wiring error at the dispatch seam, not an operator condition.
+  if (action === "RESEARCH" || action === "DESIGN" || action === "SIZING")
+    throw new Error(`${action} produces an artifact, not a diff; reviewArtifact is its gate`);
+```
+
+- [ ] **Step 4: Run it, then commit**
+
+```bash
+$N test/artifact.test.mjs      # expect all green
+fail=0
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
+done
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
+git add src/build/artifact.mjs src/sandbox.mjs test/artifact.test.mjs
+git commit -m "feat(build): reviewArtifact, and the two gates refuse each other"
+```
+
+---
+
+### Task 3: PR-B2 close-out — freeze the artifact path shape, tracker, PR
+
+**Files:**
+- Create: `test/fixtures/artifact-paths-v1.json`
+- Modify: `test/state-paths.test.mjs` (append before the terminator), `tasks/reeve-tasks/trackers/s3.md` (**last commit only**)
+
+- [ ] **Step 1: Freeze both halves of the path shape**
+
+The path layout has two halves that fail differently: the **artifact** names, which S3-D writes and S3-E renders, and the **run** file name, which S3-C's adopt-or-kill finds a surviving worker's transcript by. A freeze covering only the first passes while a run file silently loses its attempt number — the shape that overwrote two of three runs in a measured comparison and forced a figure to be withdrawn.
+
+Append to `test/state-paths.test.mjs`, before its closing `console.log` / `process.exit(fail ? 1 : 0)` pair:
+
+```js
+{
+  const frozen = JSON.parse(readFileSync(new URL("./fixtures/artifact-paths-v1.json", import.meta.url), "utf8"));
+  const id = "bt:01JABCDEFGHJKMNPQRSTVWXYZ0";
+  const rel = (p) => p.slice(HOME.length);
+  check(rel(artifactPathFor(HOME, id, "RESEARCH")) === frozen.artifact,
+    "the artifact path shape is frozen", `${rel(artifactPathFor(HOME, id, "RESEARCH"))} vs ${frozen.artifact}`);
+  check(rel(runPathFor(HOME, id, { generation: 2, phase: "RESEARCH", slice: 0, attempt: 1, stream: "out" }))
+        === frozen.run,
+    "and so is the run path, which is how a surviving worker's transcript is found",
+    `${rel(runPathFor(HOME, id, { generation: 2, phase: "RESEARCH", slice: 0, attempt: 1, stream: "out" }))} vs ${frozen.run}`);
+  check(frozen.version === 1, "and the fixture records which shape it froze", String(frozen.version));
+}
+```
+
+`readFileSync` is not in `test/state-paths.test.mjs`'s imports today — that file imports nothing from `node:fs`, because it computes paths and touches no disk. Add `import { readFileSync } from "node:fs";` to its import block, not to this appended chunk.
+
+Generate the fixture through the same exports the test calls:
+
+```bash
+mkdir -p test/fixtures
+$N -e '
+  const { writeFileSync } = await import("node:fs");
+  const { artifactPathFor, runPathFor } = await import("./src/paths.mjs");
+  const H = "/home/x/.reeve", id = "bt:01JABCDEFGHJKMNPQRSTVWXYZ0";
+  const rel = p => p.slice(H.length);
+  writeFileSync("test/fixtures/artifact-paths-v1.json", JSON.stringify({ version: 1,
+    artifact: rel(artifactPathFor(H, id, "RESEARCH")),
+    run: rel(runPathFor(H, id, { generation: 2, phase: "RESEARCH", slice: 0, attempt: 1, stream: "out" })),
+    frozen_at: "2026-08-27",
+    note: "S3-C finds a surviving run by this name; a change here breaks adoption" }, null, 2) + "\n");
+  console.log((await import("node:fs")).readFileSync("test/fixtures/artifact-paths-v1.json", "utf8"));
+'
+$N test/state-paths.test.mjs
+```
+
+Verify the freeze guards, with the four-check stub loop, **twice — once per half**:
+
+1. Change `ARTIFACT_FILE.RESEARCH` to `"research.markdown"`; re-run and expect **only** `the artifact path shape is frozen` red; restore from `src/paths.mjs.bak`; re-run green.
+2. Drop `-a${attempt}` from `runPathFor`'s template; re-run and expect `and so is the run path` red; restore from the same copy; re-run green.
+
+The second is the one that matters: it is the half an artifact-only freeze cannot see, and it is the exact shape that made two runs overwrite a third.
+
+- [ ] **Step 2: Full suite, from a clean checkout**
+
+```bash
+fail=0
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac   # writes into the LIVE daemon's ~/.reeve/canary
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
+done
+# NONZERO on red. `|| echo` turns a failing node process into a SUCCESSFUL
+# command, so this loop exited 0 with any number of red files -- and it is the
+# mandatory pre-commit gate, so an executor checking the command status commits
+# on a suite that just failed.
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
+```
+
+Expected: no `FAILED` lines. The 93-file baseline plus S3-A's files, plus `task-file` and `artifact`.
+
+- [ ] **Step 3: The tracker row, as the LAST commit**
+
+In `tasks/reeve-tasks/trackers/s3.md` §1, set T4's `PR` and `STATE` to `reeve#NN` and **BUILT** — never MERGED; this commit precedes the PR, and T5, T6, T10, T11 and T12 are all ordered behind T4.
+
+```bash
+git add tasks/reeve-tasks/trackers/s3.md
+git commit -m "docs(tracker): s3 T4 built"
+```
+
+- [ ] **Step 4: Push and open the PR**
+
+```bash
+git push -u origin feat/s3-artifacts
+gh pr create --title "S3 T4: durable phase artifacts, and reviewArtifact" --body-file - <<'BODY'
+## What
+
+`taskPathFor`/`artifactPathFor`/`runPathFor`, a tmp+fsync+rename+fsync artifact
+write that returns the sha of the bytes on disk, a read-back that requires the
+sha it expects, and `reviewArtifact` as a sibling of `reviewDiff`.
+
+No GitHub call, no outbox row, and no worker is dispatched.
+
+## Decisions taken in this PR
+
+- **`ARTIFACT_FILE` is declared once, in `paths.mjs`.** The phase-to-filename
+  map is one fact; a copy in the artifact store would be a second inventory.
+- **`reviewDiff`'s signature is unchanged.** It gains one throw for artifact
+  phase names and nothing else. Removing its `lane = null, action = null`
+  defaults is a guardian-touching change and the corpus's two worst-converging
+  PRs both touched the running guardian.
+- **`readArtifact` requires `expectSha`.** A read that returns whatever is there
+  certifies nothing, and this function exists to be the check.
+
+## Review focus
+
+- The interrupted-write drill's window. It reports RED when the child finishes
+  before the parent sees the tmp entry, rather than skipping: an unreached
+  window and a passing guard look identical otherwise. Please check that
+  reading.
+- What the drill cannot exhibit is stated in the test's own comment: a power
+  loss, and a rename a filesystem reordered against the fsync. Those are the
+  platform's guarantee, and the code asks for them rather than proving them.
+BODY
+gh pr comment --body "@codex review"
+```
+
+- [ ] **Step 5: Work the gate**
+
+Comment `@codex review` on **every push**. Read **both** endpoints. Reply to **and resolve** every thread via GraphQL. Apply the taper rule.
+
+**Do not merge.** Founder grant required.
+
+---
+
+# PR-B3: Phase report schemas and the report contract
+
+**Branch:** `feat/s3-report-schema`, based on T4's merge commit. **Scope:** three JSON Schema files, `src/build/report.mjs`, and the tests that assert a report becomes evidence only through `nextPhase`. ~600 changed lines. **No GitHub call, no outbox row, no worker.**
+
+---
+
+### Task 1: Each schema rejects the empty object, and an outcome becomes exactly the evidence the machine already accepts
+
+**Files:**
+- Create: `src/build/schemas/build_size.json`, `src/build/schemas/build_research.json`, `src/build/schemas/build_design.json`, `src/build/report.mjs`, `test/phase-report.test.mjs`
+
+**Interfaces:**
+- Consumes: `PHASES` (`src/build/phases.mjs:42`, exported), `HOLD_ESCALATION` (`:89`).
+- Produces: `ACTIONS`, `PHASE_FOR_ACTION`, `schemaFor(action)`, `validateReport(action, value) -> {ok:true, report} | {ok:false, errors}`, `evidenceFor({action, report}) -> evidence`, `badReportPlan({resumedAlready}) -> {resume:true} | {resume:false, evidence}`. S3-C Task 1 passes `schemaFor(action)` to `workerArgs`'s `jsonSchema`; S3-D Tasks 1-3 call `validateReport` on the structured result and hand `evidenceFor`'s return straight to `applyTransition`.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `test/phase-report.test.mjs` with `/* ... standard harness ... */` (slug `report`), plus:
+
+```js
+import { PHASES } from "../src/build/phases.mjs";
+import { ACTIONS, PHASE_FOR_ACTION, schemaFor, validateReport, evidenceFor, badReportPlan }
+  from "../src/build/report.mjs";
+
+// A SCHEMA THAT VALIDATES {} IS A SCHEMA THAT PROVES NOTHING. Every one of the
+// three is asked the same question, by iteration rather than by three copies of
+// the assertion, so a fourth action added later cannot quietly skip it.
+{
+  check(ACTIONS.length === 3, "there are three report actions", ACTIONS.join(","));
+  for (const action of ACTIONS) {
+    const empty = validateReport(action, {});
+    check(empty.ok === false, `${action}'s schema rejects the empty object`, JSON.stringify(empty));
+    check(empty.errors.some(e => /outcome/.test(e)) && empty.errors.some(e => /reason/.test(e)),
+      `${action} says which required properties were missing`, JSON.stringify(empty.errors));
+    const s = schemaFor(action);
+    check(s.additionalProperties === false,
+      `${action}'s schema refuses properties it does not declare`, JSON.stringify(s.additionalProperties));
+    check(PHASES.includes(PHASE_FOR_ACTION[action]),
+      `${action} maps to a phase the machine knows`, PHASE_FOR_ACTION[action]);
+  }
+  let unknown = null;
+  try { schemaFor("BUILD_NOPE"); } catch (e) { unknown = String(e.message); }
+  check(unknown !== null, "control: an unknown action has no schema and throws", String(unknown));
+}
+
+// THE ACCEPTING HALF. Each schema's own minimal valid report, so the rejections
+// above are not a validator that refuses everything.
+const SIZE_OK = { outcome: "ok", reason: "sized", depth: "standard", est_files: 4,
+  est_weighted_files: 6, est_packages: 1, est_slices: 2, risk_paths_touched: [],
+  rationale: "two packages, one of them a test tree" };
+const RESEARCH_OK = { outcome: "ok", reason: "researched", artifact: "research.md" };
+const DESIGN_OK = { outcome: "ok", reason: "designed", artifact: "design.md",
+  slices: [{ title: "the store", files: ["src/build/hubdb.mjs"], weighted_files: 1,
+             packages: ["src"], tests: "test/hub-schema.test.mjs", done_when: "the suite is green" }] };
+{
+  for (const [action, doc] of [["BUILD_SIZE", SIZE_OK], ["BUILD_RESEARCH", RESEARCH_OK],
+                               ["BUILD_DESIGN", DESIGN_OK]]) {
+    const r = validateReport(action, doc);
+    check(r.ok === true, `control: ${action} accepts its own minimal valid report`, JSON.stringify(r.errors));
+  }
+  const extra = validateReport("BUILD_SIZE", { ...SIZE_OK, confidence: 0.9 });
+  check(extra.ok === false, "and refuses a property the schema does not declare", JSON.stringify(extra.errors));
+  const wrong = validateReport("BUILD_SIZE", { ...SIZE_OK, est_files: "four" });
+  check(wrong.ok === false, "and refuses a declared property of the wrong type", JSON.stringify(wrong.errors));
+  const noSlices = validateReport("BUILD_DESIGN", { ...DESIGN_OK, slices: [] });
+  check(noSlices.ok === false, "and a design with an empty slice list is not a design", JSON.stringify(noSlices.errors));
+}
+
+// THE MAPPING. An outcome becomes evidence the machine already accepts, and
+// nothing here invents a field the machine would refuse.
+{
+  const size = evidenceFor({ action: "BUILD_SIZE", report: SIZE_OK });
+  check(size.kind === "phase.succeeded" && size.phase === "SIZING" && size.depth === "standard",
+    "an ok SIZING report becomes a phase.succeeded naming its phase and depth", JSON.stringify(size));
+  const res = evidenceFor({ action: "BUILD_RESEARCH", report: RESEARCH_OK });
+  check(res.kind === "phase.succeeded" && res.phase === "RESEARCH" && !("depth" in res),
+    "an ok RESEARCH report names its phase and no depth", JSON.stringify(res));
+
+  const blocked = evidenceFor({ action: "BUILD_DESIGN",
+    report: { outcome: "blocked", reason: "the lockfile needs a change I cannot make",
+              escalation: "bt:x:phase:blocked:DESIGN" } });
+  check(blocked.kind === "hold" && blocked.reason === "blocked_other",
+    "a blocked outcome becomes a hold", JSON.stringify(blocked));
+  check(blocked.escalation === "bt:x:phase:blocked:DESIGN",
+    "carrying the escalation identity the report supplied", JSON.stringify(blocked));
+
+  // AND NEVER MANUFACTURES ONE. `holdReasonRefusal` refuses a blocked_other with
+  // an empty escalation, and that rule has exactly one home. A default here
+  // would be a second copy of it, and the copy that wins is the one that runs.
+  const noId = evidenceFor({ action: "BUILD_DESIGN", report: { outcome: "blocked", reason: "stuck" } });
+  check(noId.escalation === undefined || String(noId.escalation).trim() === "",
+    "and an absent escalation identity stays absent", JSON.stringify(noId));
+
+  const inf = evidenceFor({ action: "BUILD_DESIGN",
+    report: { outcome: "infeasible", reason: "the API this needs was removed upstream" } });
+  check(inf.kind === "founder.infeasible" && /removed upstream/.test(inf.reason),
+    "an infeasible outcome carries its reason, which is required", JSON.stringify(inf));
+}
+
+// ONE resumed retry, then the attempt budget is exhausted.
+{
+  const first = badReportPlan({ resumedAlready: false });
+  check(first.resume === true, "a malformed report gets one --resume retry", JSON.stringify(first));
+  const second = badReportPlan({ resumedAlready: true });
+  check(second.resume === false, "and exactly one", JSON.stringify(second));
+  check(second.evidence.kind === "phase.failed" && second.evidence.retriesExhausted === true,
+    "after which the evidence is a phase.failed with retries exhausted", JSON.stringify(second.evidence));
+}
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `$N test/phase-report.test.mjs`
+Expected: `Cannot find module '.../src/build/report.mjs'` — the module does not exist. Measured at `16cd880`: `grep -rn "BUILD_SIZE\|BUILD_RESEARCH\|BUILD_DESIGN" src/` returns **one** hit, `src/sandbox.mjs:348`, the RESEARCH domain allowlist; nothing else in `src/` names any of the three.
+
+**On the broken implementation** — the one whose schemas require only `outcome`, so `{outcome: "ok"}` validates and a report with no reason, no depth and no slices becomes evidence — every `rejects the empty object` assertion stays **green** (an empty object still has no `outcome`), and `${action} says which required properties were missing` goes red on the `reason` half, `and a design with an empty slice list is not a design` goes red, and `and refuses a declared property of the wrong type` stays green. That distribution is the point: rejecting `{}` is the cheapest possible schema assertion and it passes against a schema that is almost entirely absent, which is why the accepting half and the wrong-type half are asserted beside it.
+
+**The stub loop for this task**: run green (control); apply the stub by deleting `"reason"` from `build_size.json`'s `required` array, confirmed with `grep -c '"reason"' src/build/schemas/build_size.json` dropping from 2 to 1; re-run and confirm `BUILD_SIZE says which required properties were missing` is red while `BUILD_SIZE's schema rejects the empty object` stays **green** — the stub is chosen precisely because it leaves the headline assertion passing; restore from `src/build/schemas/build_size.json.bak` and re-run green.
+
+- [ ] **Step 3: Write the three schemas**
+
+`src/build/schemas/build_size.json`:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BUILD_SIZE",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["outcome", "reason"],
+  "properties": {
+    "outcome": { "enum": ["ok", "blocked", "infeasible"] },
+    "reason": { "type": "string", "minLength": 1 },
+    "escalation": { "type": "string", "minLength": 1 },
+    "depth": { "enum": ["trivial", "standard", "deep"] },
+    "est_files": { "type": "integer", "minimum": 0 },
+    "est_weighted_files": { "type": "integer", "minimum": 0 },
+    "est_packages": { "type": "integer", "minimum": 0 },
+    "est_slices": { "type": "integer", "minimum": 0 },
+    "risk_paths_touched": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "rationale": { "type": "string", "minLength": 1 }
+  }
+}
+```
+
+`src/build/schemas/build_research.json`:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BUILD_RESEARCH",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["outcome", "reason"],
+  "properties": {
+    "outcome": { "enum": ["ok", "blocked", "infeasible"] },
+    "reason": { "type": "string", "minLength": 1 },
+    "escalation": { "type": "string", "minLength": 1 },
+    "artifact": { "enum": ["research.md"] },
+    "open_questions": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+  }
+}
+```
+
+`src/build/schemas/build_design.json`:
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BUILD_DESIGN",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["outcome", "reason"],
+  "properties": {
+    "outcome": { "enum": ["ok", "blocked", "infeasible"] },
+    "reason": { "type": "string", "minLength": 1 },
+    "escalation": { "type": "string", "minLength": 1 },
+    "artifact": { "enum": ["design.md"] },
+    "slices": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "files", "weighted_files", "packages", "tests", "done_when"],
+        "properties": {
+          "title": { "type": "string", "minLength": 1 },
+          "files": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+          "weighted_files": { "type": "integer", "minimum": 1 },
+          "packages": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+          "tests": { "type": "string", "minLength": 1 },
+          "done_when": { "type": "string", "minLength": 1 },
+          "atomicity_exception": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}
+```
+
+**Why the sizing shape and the slice list are not in `required`.** A `blocked` or `infeasible` SIZING worker has no depth to name and no slices to list, and forcing it to invent them is how a stop becomes a fabricated success. The conditional belongs where the rule already lives: `nextPhase` (`src/build/phases.mjs:654`) refuses a SIZING success whose evidence names no depth, with the §5 message, and `holdReasonRefusal` (`:132`) refuses a `blocked_other` with no escalation identity. Encoding either as an `if/then` here would be a second copy of a rule the machine owns, and the copy that wins is the one that runs. Task 2 asserts both through `applyTransition`.
+
+- [ ] **Step 4: Implement `src/build/report.mjs`, run it green, and commit**
+
+```js
+// report -- the phase report's schema, its validation, and what it becomes.
+//
+// The CLI's structured result is validated LOCALLY against the same schema that
+// was passed to it, because `--json-schema` is a request and not a guarantee.
+// Nothing here decides anything the phase machine decides: an outcome becomes
+// evidence, and `nextPhase` rules on it.
+import { readFileSync } from "node:fs";
+
+export const ACTIONS = Object.freeze(["BUILD_SIZE", "BUILD_RESEARCH", "BUILD_DESIGN"]);
+export const PHASE_FOR_ACTION = Object.freeze({
+  BUILD_SIZE: "SIZING", BUILD_RESEARCH: "RESEARCH", BUILD_DESIGN: "DESIGN",
+});
+
+const CACHE = new Map();
+export function schemaFor(action) {
+  if (!ACTIONS.includes(action)) throw new Error(`no report schema for ${JSON.stringify(action)}`);
+  if (!CACHE.has(action))
+    CACHE.set(action, JSON.parse(readFileSync(
+      new URL(`./schemas/${action.toLowerCase()}.json`, import.meta.url), "utf8")));
+  return CACHE.get(action);
+}
+
+// The subset of JSON Schema these three files use, and no more. A dependency is
+// not added for it, and a validator that silently ignores a keyword it does not
+// implement would make a schema look stricter than it is -- so an unknown
+// keyword is an error here rather than a shrug.
+const KNOWN = new Set(["$schema", "title", "type", "enum", "required", "properties",
+                       "additionalProperties", "items", "minItems", "minLength", "minimum"]);
+function walk(schema, value, path, errors) {
+  for (const k of Object.keys(schema))
+    if (!KNOWN.has(k)) errors.push(`${path}: schema uses unimplemented keyword ${k}`);
+  if (schema.enum && !schema.enum.includes(value))
+    errors.push(`${path}: ${JSON.stringify(value)} is not one of ${schema.enum.join(", ")}`);
+  if (schema.type === "object") {
+    if (value === null || typeof value !== "object" || Array.isArray(value))
+      return errors.push(`${path}: expected an object`);
+    for (const r of schema.required ?? [])
+      if (!Object.prototype.hasOwnProperty.call(value, r)) errors.push(`${path}${r}: required and missing`);
+    for (const [k, v] of Object.entries(value)) {
+      const sub = schema.properties?.[k];
+      if (!sub) { if (schema.additionalProperties === false) errors.push(`${path}${k}: not declared by this schema`); continue; }
+      walk(sub, v, `${path}${k}.`, errors);
+    }
+  } else if (schema.type === "array") {
+    if (!Array.isArray(value)) return errors.push(`${path}: expected an array`);
+    if (schema.minItems !== undefined && value.length < schema.minItems)
+      errors.push(`${path}: needs at least ${schema.minItems} item(s), got ${value.length}`);
+    value.forEach((v, i) => schema.items && walk(schema.items, v, `${path}${i}.`, errors));
+  } else if (schema.type === "integer") {
+    if (!Number.isInteger(value)) return errors.push(`${path}: expected an integer`);
+    if (schema.minimum !== undefined && value < schema.minimum) errors.push(`${path}: below ${schema.minimum}`);
+  } else if (schema.type === "string") {
+    if (typeof value !== "string") return errors.push(`${path}: expected a string`);
+    if (schema.minLength !== undefined && value.length < schema.minLength) errors.push(`${path}: is empty`);
+  }
+  return errors;
+}
+
+export function validateReport(action, value) {
+  const errors = walk(schemaFor(action), value, "", []);
+  return errors.length ? { ok: false, errors } : { ok: true, report: value };
+}
+
+/**
+ * An outcome, as the evidence `nextPhase` already accepts.
+ *
+ * It invents nothing. A `blocked` report with no escalation identity produces
+ * evidence with no escalation identity, and the machine refuses it -- because
+ * the rule that a blocked_other must reach a founder has one home, and a default
+ * supplied here would be a second copy of it that nobody could see.
+ */
+export function evidenceFor({ action, report }) {
+  const phase = PHASE_FOR_ACTION[action];
+  if (!phase) throw new Error(`no phase for ${JSON.stringify(action)}`);
+  if (report.outcome === "infeasible") return { kind: "founder.infeasible", reason: report.reason };
+  if (report.outcome === "blocked")
+    return { kind: "hold", reason: "blocked_other", detail: report.reason, escalation: report.escalation };
+  return action === "BUILD_SIZE"
+    ? { kind: "phase.succeeded", phase, depth: report.depth }
+    : { kind: "phase.succeeded", phase };
+}
+
+/**
+ * Malformed or missing structured output. ONE `--resume` retry with the schema
+ * and the parse error quoted, then the attempt budget is exhausted.
+ *
+ * `resumedAlready` is required rather than a counter, because a counter is what
+ * lets "one retry" become "one retry per attempt".
+ */
+export function badReportPlan({ resumedAlready }) {
+  if (typeof resumedAlready !== "boolean")
+    throw new Error("badReportPlan needs to be told whether this attempt has already been resumed");
+  return resumedAlready
+    ? { resume: false, evidence: { kind: "phase.failed", retriesExhausted: true } }
+    : { resume: true };
+}
+```
+
+```bash
+cp src/build/report.mjs src/build/report.mjs.bak
+cp src/build/schemas/build_size.json src/build/schemas/build_size.json.bak
+$N test/phase-report.test.mjs      # expect all green
+fail=0
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
+done
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
+rm -f src/build/report.mjs.bak src/build/schemas/build_size.json.bak
+git add src/build/schemas src/build/report.mjs test/phase-report.test.mjs
+git commit -m "feat(build): phase report schemas and the outcome-to-evidence map"
+```
+
+---
+
+### Task 2: A mis-attributed or depth-less report is refused, the refusal is what gets recorded, and a well-formed one advances the task
+
+**Files:**
+- Modify: `test/phase-report.test.mjs` (append before the terminator — the closing `rmSync` / `console.log` / `process.exit(fail ? 1 : 0)` group)
+
+**Interfaces:**
+- Consumes: `applyTransition` (`src/build/transition.mjs:660`), `refuseDurably`'s `transition.refused` event (`:761`), `nextPhase`'s three refusals (`src/build/phases.mjs:639,641,654`), `holdReasonRefusal`'s escalation rule (`:132`), `writeArtifact` (PR-B2 Task 1), `fileTask` (PR-B1 Task 1), `evidenceFor`/`badReportPlan` (Task 1).
+- Produces: nothing new. This task asserts that the module built in Task 1 cannot advance a task the machine would refuse to advance, **through `applyTransition`** rather than through `nextPhase` alone — a pure-function assertion cannot see whether the refusal reached the database, and the database is what `task why` renders.
+
+- [ ] **Step 1: Append the failing test**
+
+Append to `test/phase-report.test.mjs`, before its closing `rmSync` / `console.log` / `process.exit(fail ? 1 : 0)` group. It reuses `SIZE_OK`, `RESEARCH_OK`, `evidenceFor`, `validateReport` and `badReportPlan`, all declared at module scope by Task 1 in this same file; none is re-declared here, because a second `const SIZE_OK` makes the file fail to parse. Add these imports to that file's import block, not here:
+
+```js
+import { mkdirSync, lstatSync } from "node:fs";
+import { openHub } from "../src/build/hubdb.mjs";
+import { applyTransition } from "../src/build/transition.mjs";
+import { isSameProcess, readStart } from "../src/supervisor.mjs";
+import { fileTask } from "../src/build/taskfile.mjs";
+import { writeArtifact } from "../src/build/artifact.mjs";
+```
+
+```js
+// A real task, in a real phase, so every refusal below is asserted where it is
+// RECORDED and not only where it is decided. A refusal with no durable record is
+// indistinguishable from a report that was never sent.
+const repo = join(dir, "repo");
+mkdirSync(join(repo, "packages", "x"), { recursive: true });
+writeFileSync(join(repo, "p.json"), "{}\n");
+const registry = { version: 1, projects: {
+  nextly: { nwo: "nextlyhq/nextly", repoPath: repo, profilePath: join(repo, "p.json") } } };
+const io = { lstat: (p) => lstatSync(p), lsTree: () => null,
+  repoId: async () => 42, profileHash: async () => "ph-1", defaultBranch: async () => "main",
+  visibility: async () => "private", specRepoId: async () => 77,
+  gateDefinitionHash: async () => "gd-1", founderUserId: async () => 9 };
+
+let dbn = 0;
+const inSizing = async (title) => {
+  const db = openHub(join(dir, `h${++dbn}.db`));
+  const f = await fileTask({ db, registry, project: "nextly", title,
+    territory: ["packages/x"], io, isAlive: isSameProcess,
+    pid: process.pid, lstart: readStart(process.pid) });
+  const t = applyTransition(db, { taskId: f.task, expectedPhase: "FILED", expectedGeneration: 1,
+    evidence: { kind: "phase.succeeded", phase: "FILED" }, op: "phase.advanced", isAlive: isSameProcess });
+  check(f.ok === true && t.applied === true, `fixture: ${title} is in SIZING`, JSON.stringify(t));
+  return { db, id: f.task };
+};
+const phaseOf = (db, id) => db.prepare("SELECT phase FROM task WHERE id=?").get(id).phase;
+const lastRefusal = (db, id) => db.prepare(
+  "SELECT payload FROM hub_event WHERE task=? AND kind='transition.refused' ORDER BY seq DESC LIMIT 1")
+  .get(id)?.payload ?? "";
+
+// A report that names the wrong phase advances nothing, and the refusal says so.
+{
+  const { db, id } = await inSizing("mis-attributed");
+  const ev = evidenceFor({ action: "BUILD_RESEARCH", report: RESEARCH_OK });
+  const r = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
+    evidence: ev, artifactSha: "a".repeat(64), op: "phase.advanced", isAlive: isSameProcess });
+  check(r.applied === false && r.reason === "refused",
+    "a RESEARCH report against a task in SIZING is refused", JSON.stringify(r));
+  check(/RESEARCH report cannot advance a task in SIZING/.test(String(r.refusal)),
+    "with the machine's own message", String(r.refusal));
+  check(lastRefusal(db, id).includes("cannot advance"),
+    "and the refusal is the reason recorded, not merely returned", lastRefusal(db, id));
+  check(phaseOf(db, id) === "SIZING", "and the task did not move", phaseOf(db, id));
+  db.close();
+}
+
+// A SIZING report with no depth is refused with the section 5 message.
+{
+  const { db, id } = await inSizing("no depth");
+  const { depth, ...noDepth } = SIZE_OK;
+  const r = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
+    evidence: evidenceFor({ action: "BUILD_SIZE", report: noDepth }),
+    artifactSha: "b".repeat(64), op: "phase.advanced", isAlive: isSameProcess });
+  check(r.applied === false, "a SIZING report that names no depth is refused", JSON.stringify(r));
+  check(/must name the depth it selected/.test(String(r.refusal)),
+    "with the message that says why the depth is load-bearing", String(r.refusal));
+  // AND THE VALIDATOR IS NOT WHAT REFUSED IT. The schema deliberately does not
+  // require `depth`, so a blocked sizing worker need not invent one -- which
+  // means this refusal has to come from the machine, and only asserting it
+  // through applyTransition can tell the two apart.
+  check(validateReport("BUILD_SIZE", noDepth).ok === true,
+    "control: the schema itself accepts a depth-less report", JSON.stringify(validateReport("BUILD_SIZE", noDepth)));
+  db.close();
+}
+
+// A blocked outcome with no escalation identity reaches no founder, so it is
+// refused rather than held silently.
+{
+  const { db, id } = await inSizing("blocked with no identity");
+  const r = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
+    evidence: evidenceFor({ action: "BUILD_SIZE", report: { outcome: "blocked", reason: "stuck", escalation: "  " } }),
+    op: "hold", isAlive: isSameProcess });
+  check(r.applied === false, "a blocked_other hold with an empty escalation is refused", JSON.stringify(r));
+  check(/no identity reaches no founder/.test(String(r.refusal)),
+    "and says that a hold nobody is told about is not a hold", String(r.refusal));
+  check(phaseOf(db, id) === "SIZING", "and the task did not enter BLOCKED", phaseOf(db, id));
+
+  const ok = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
+    evidence: evidenceFor({ action: "BUILD_SIZE",
+      report: { outcome: "blocked", reason: "stuck", escalation: "bt:x:phase:blocked:SIZING" } }),
+    op: "hold", isAlive: isSameProcess });
+  check(ok.applied === true && phaseOf(db, id) === "BLOCKED",
+    "control: the same hold WITH an identity is accepted", JSON.stringify(ok));
+  db.close();
+}
+
+// Malformed structured output: one resumed retry, then ESCALATED, with the
+// identity the machine mints from the phase.
+{
+  const { db, id } = await inSizing("bad report");
+  check(badReportPlan({ resumedAlready: false }).resume === true,
+    "control: the first malformed report is retried, not escalated");
+  const plan = badReportPlan({ resumedAlready: true });
+  const r = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
+    evidence: plan.evidence, op: "phase.failed", isAlive: isSameProcess });
+  check(r.applied === true && phaseOf(db, id) === "ESCALATED",
+    "a second malformed report exhausts the budget and escalates", JSON.stringify(r));
+  const why = db.prepare("SELECT why FROM escalation").all().map(e => e.why);
+  check(why.includes(`${id}:phase:failed:SIZING`),
+    "raising bt:<id>:phase:failed:<phase>, with the id substituted once", why.join(","));
+  db.close();
+}
+
+// THE ADVANCING CONTROL. Without it every assertion above is satisfied by a
+// validator that refuses everything.
+{
+  const { db, id } = await inSizing("a good report");
+  const w = writeArtifact({ dir: join(dir, "art", id), phase: "SIZING",
+    bytes: Buffer.from(JSON.stringify(SIZE_OK)) });
+  const r = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
+    evidence: evidenceFor({ action: "BUILD_SIZE", report: SIZE_OK }),
+    artifactSha: w.sha256, op: "phase.advanced", isAlive: isSameProcess });
+  check(r.applied === true && phaseOf(db, id) === "RESEARCH",
+    "a well-formed report advances the task", JSON.stringify(r));
+  const pe = db.prepare(
+    "SELECT artifact_sha FROM phase_event WHERE task=? ORDER BY seq DESC LIMIT 1").get(id);
+  check(pe.artifact_sha === w.sha256,
+    "and the sha the artifact store computed is what justified it", JSON.stringify(pe));
+  check(db.prepare("SELECT depth FROM task WHERE id=?").get(id).depth === "standard",
+    "and the depth the report selected is now durable on the task");
+  db.close();
+}
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `$N test/phase-report.test.mjs`
+Expected: every assertion in this block is green on the first run **if Task 1 landed correctly**, because the refusals belong to `phases.mjs`, which already ships. That is not a reason to skip Step 3: run it and record which lines pass. If any line is red here, Task 1's `evidenceFor` is inventing or dropping a field, and that is exactly what this task exists to catch.
+
+**On the broken implementation** — the one whose `evidenceFor` supplies `escalation: report.escalation ?? "bt:unknown"` so a blocked report "always reaches someone" — `a blocked_other hold with an empty escalation is refused` and `and the task did not enter BLOCKED` go red, while `control: the same hold WITH an identity is accepted` stays green and every other block in the file stays green. The default reads as defensive and is the opposite: it routes a real stop into an identity nobody watches, and the founder learns nothing while the task sits in BLOCKED looking handled.
+
+**The stub loop for this task**: run `test/phase-report.test.mjs` green (control); apply the stub by changing `evidenceFor`'s hold return to `escalation: report.escalation ?? "bt:unknown"`, confirmed with `grep -c 'bt:unknown' src/build/report.mjs` reading 1; re-run and confirm exactly the two named assertions are red and the accepted-hold control is green; restore from `src/build/report.mjs.bak` and re-run green.
+
+- [ ] **Step 3: Run the suite, then commit**
+
+```bash
+$N test/phase-report.test.mjs      # expect all green
+fail=0
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
+done
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
+git add test/phase-report.test.mjs
+git commit -m "test(build): a report becomes evidence only through the machine"
+```
+
+---
+
+### Task 3: PR-B3 close-out — freeze the three schemas, tracker, PR
+
+**Files:**
+- Create: `test/fixtures/report-schemas-v1.json`
+- Modify: `test/phase-report.test.mjs` (append before the terminator), `tasks/reeve-tasks/trackers/s3.md` (**last commit only**)
+
+- [ ] **Step 1: Freeze both halves of the report contract**
+
+A phase schema has two halves that fail differently: the **schema files**, which are handed to the CLI as `--json-schema` and which a worker's output is validated against, and the **outcome-to-evidence map**, which turns a valid report into something `nextPhase` accepts. A freeze over the JSON alone passes while `evidenceFor` starts emitting a phase the machine refuses, and every worker's report then fails at the transition with a message about attribution.
+
+Append to `test/phase-report.test.mjs`, before its closing `rmSync` / `console.log` / `process.exit(fail ? 1 : 0)` group:
+
+```js
+{
+  const { createHash } = await import("node:crypto");
+  const frozen = JSON.parse(readFileSync(new URL("./fixtures/report-schemas-v1.json", import.meta.url), "utf8"));
+  for (const action of ACTIONS) {
+    const sha = createHash("sha256").update(JSON.stringify(schemaFor(action))).digest("hex");
+    check(sha === frozen.schemas[action],
+      `${action}'s schema is frozen`,
+      `${sha} vs ${frozen.schemas[action]}\n        A change here changes what every dispatched worker is asked for.`);
+  }
+  const map = createHash("sha256").update(JSON.stringify(
+    ACTIONS.map(a => [a, evidenceFor({ action: a, report: { outcome: "ok", reason: "r", depth: "standard" } })])
+  )).digest("hex");
+  check(map === frozen.evidence_map,
+    "and so is the outcome-to-evidence map, which the JSON freeze cannot see", `${map} vs ${frozen.evidence_map}`);
+  check(frozen.version === 1, "and the fixture records which contract it froze", String(frozen.version));
+}
+```
+
+Generate the fixture through the same exports the test calls, so the two cannot compute it differently:
+
+```bash
+$N -e '
+  const { createHash } = await import("node:crypto");
+  const { writeFileSync, readFileSync } = await import("node:fs");
+  const { ACTIONS, schemaFor, evidenceFor } = await import("./src/build/report.mjs");
+  const sha = v => createHash("sha256").update(JSON.stringify(v)).digest("hex");
+  writeFileSync("test/fixtures/report-schemas-v1.json", JSON.stringify({ version: 1,
+    schemas: Object.fromEntries(ACTIONS.map(a => [a, sha(schemaFor(a))])),
+    evidence_map: sha(ACTIONS.map(a => [a, evidenceFor({ action: a,
+      report: { outcome: "ok", reason: "r", depth: "standard" } })])),
+    frozen_at: "2026-08-27",
+    note: "a change here changes what every dispatched worker is asked for" }, null, 2) + "\n");
+  console.log(readFileSync("test/fixtures/report-schemas-v1.json", "utf8"));
+'
+$N test/phase-report.test.mjs
+```
+
+Verify the freeze guards, with the four-check stub loop, **twice — once per half**:
+
+1. Add `"confidence": { "type": "integer" }` to `build_size.json`'s `properties`; re-run and expect **only** `BUILD_SIZE's schema is frozen` red; restore from `src/build/schemas/build_size.json.bak`; re-run green.
+2. Change `evidenceFor`'s non-SIZING return to `{ kind: "phase.succeeded", phase, depth: null }`; re-run and expect `and so is the outcome-to-evidence map, which the JSON freeze cannot see` red **while all three schema hashes stay green**; restore from `src/build/report.mjs.bak`; re-run green.
+
+The second run is the one that matters: it is the half the JSON freeze cannot see, and a freeze verified only against the half it already covered proves nothing about the half that was added.
+
+- [ ] **Step 2: Full suite, from a clean checkout**
+
+```bash
+fail=0
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac   # writes into the LIVE daemon's ~/.reeve/canary
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
+done
+# NONZERO on red. `|| echo` turns a failing node process into a SUCCESSFUL
+# command, so this loop exited 0 with any number of red files -- and it is the
+# mandatory pre-commit gate, so an executor checking the command status commits
+# on a suite that just failed.
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
+```
+
+Expected: no `FAILED` lines. The 93-file baseline plus S3-A's files, plus `task-file`, `artifact` and `phase-report`.
+
+- [ ] **Step 3: The tracker row, as the LAST commit**
+
+In `tasks/reeve-tasks/trackers/s3.md` §1, set T5's `PR` and `STATE` to `reeve#NN` and **BUILT** — never MERGED; T6 and T10 are ordered behind it, and a MERGED written here would unblock the highest-risk PR in S3 on the strength of an unmerged review branch.
+
+```bash
+git add tasks/reeve-tasks/trackers/s3.md
+git commit -m "docs(tracker): s3 T5 built"
+```
+
+- [ ] **Step 4: Push and open the PR**
+
+```bash
+git push -u origin feat/s3-report-schema
+gh pr create --title "S3 T5: phase report schemas and the report contract" --body-file - <<'BODY'
+## What
+
+One JSON Schema per report action, a dependency-free validator for the subset
+those three files use, the map from a report's outcome to the evidence
+`nextPhase` already accepts, and the one-resume BAD_REPORT rule.
+
+No GitHub call, no outbox row, and no worker is dispatched.
+
+## Decisions taken in this PR
+
+- **The sizing shape and the slice list are not in `required`.** A blocked or
+  infeasible worker has no depth to name and no slices to list, and forcing it
+  to invent them is how a stop becomes a fabricated success. The conditional
+  lives where the rule already lives: `phases.mjs` refuses a SIZING success with
+  no depth, and refuses a `blocked_other` with no escalation identity.
+- **`evidenceFor` never manufactures an escalation identity.** A default there
+  would be a second copy of `holdReasonRefusal`'s rule, and the copy that wins
+  is the one that runs.
+- **The validator errors on a keyword it does not implement.** A validator that
+  ignores an unknown keyword makes a schema look stricter than it is.
+
+## Review focus
+
+- Every refusal is asserted through `applyTransition`, not through `nextPhase`
+  alone: a pure-function assertion cannot see whether the refusal reached the
+  database, and the database is what `task why` renders.
+- The depth-less SIZING block carries a control asserting the *schema* accepts
+  it, so the refusal is demonstrably the machine's and not the validator's.
+BODY
+gh pr comment --body "@codex review"
+```
+
+- [ ] **Step 5: Work the gate**
+
+Comment `@codex review` on **every push**. Read **both** endpoints. Reply to **and resolve** every thread via GraphQL. Apply the taper rule.
+
+**Do not merge.** Founder grant required.
+
+---
+
+---
+
+## Self-review
+
+**Spec coverage.** §2.2's command in full, including the two named admission tests — a territory-less insert refused (PR-B1 Task 1) and a root-prefix task blocking every concurrent grant in its project (PR-B1 Task 1) — and *"nothing is inserted"* asserted as an unchanged row **count** rather than as a returned refusal (Task 2). §2.1's `--idempotency-key` replay and `--anyway` salt (Task 4). §11.2's writer lease, on both the success and the refusal path (Task 3). §11.6's mutating `--json` shape, frozen (Task 5). §3.2's *"a transition commits only after its phase artifact is durable"* (PR-B2 Task 1, asserted at the transition and not only at the file). §3.3's run-file path with its attempt number (PR-B2 Tasks 1 and 3). §4.6's `reviewArtifact` as a sibling, each function refusing the other's phases, and the research minimum with its control (PR-B2 Task 2). §4.1's `outcome`/`reason`, §5's sizing shape, §6's slice list, and the one-resume BAD_REPORT rule (PR-B3 Tasks 1 and 2). **The S3 Verify table is not reproduced here.** It lives in `2026-08-27-s3a-profile-and-registry.md`, the family's first document, and is re-walked by `-s3f-`; a second copy would be a second inventory, which is the defect this family is trying not to add to.
+
+**Placeholder scan.** Clean. No `TBD`, no `TODO`, no "add appropriate error handling", no "similar to Task N" in place of code. Every symbol referenced is either defined by a task in this plan, named with its `file:line` in the consumed-interfaces table above, or — for the three rows marked **(as specified)** — flagged as a shape taken from `S3-DESIGN-BRIEF.md` §2.2 rather than from merged code, with the instruction to reconcile rather than adapt. That is the plan's one known deficit and it is stated rather than smoothed: S3-A had not been written when this document was, so `capabilitiesFrom`, `registryProjects`'s four-field return and `registryIo`'s nine members are the only names here that were not read out of the source.
+
+**Type consistency.** `TERRITORY_GRAMMAR: string`; `normalizeFiling({title, territory, depth, priority}) -> {claims} | {refusal}`; `mintTaskId() -> "bt:<26 Crockford chars>"`; `pinSeconds(raw) -> number | null | {refusal}`; `fileTask({...}) -> {ok:false, refusal} | {ok:true, dryRun:true, plan} | {ok:true, task, prev:null, next:{phase,generation}, evidence_id, next_action, replayed}`; `dryRunPlan({...}) -> {project, nwo, profileHash, territory, conflicts, floors, switches}`; `titleHash(title) -> string`; `ARTIFACT_FILE: {SIZING,RESEARCH,DESIGN} -> string`; `taskPathFor/artifactPathFor/runPathFor -> string` (the last two throw rather than returning a wrong path); `writeArtifact({dir,phase,bytes}) -> {path, sha256, bytes}`; `readArtifact({dir,phase,expectSha}) -> {ok:true,text,sha256} | {ok:false,why}`; `reviewArtifact({phase,dir,expect}) -> {ok, why, findings}`; `schemaFor(action) -> object`; `validateReport(action,value) -> {ok:true,report} | {ok:false,errors}`; `evidenceFor({action,report}) -> evidence`; `badReportPlan({resumedAlready}) -> {resume:true} | {resume:false,evidence}`. Three of these carry a deliberate asymmetry worth naming: `pinSeconds` returns a refusal **object** rather than throwing, because a bad duration is an operator typo; `reviewArtifact` and `readArtifact` **throw** on a wrong phase, because that is a wiring error at the dispatch seam and not something an operator typed.
+
+**What this plan does not carry, and where it went.** The Verify table (S3-A). The risks, the open questions, the defect log and the PR states (`../trackers/s3.md`; F1, the spec-repo names, is still unanswered and blocks S3-A T2, not this plan). And the one thing an executor should check before Task 1: three names in the consumed-interfaces table are specified, not measured. Stop and reconcile if S3-A shipped them differently.

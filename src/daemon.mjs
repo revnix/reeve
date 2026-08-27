@@ -2328,6 +2328,12 @@ export async function tick(ctx) {
       // work already in flight -- the log shows exactly that happening, the same
       // fix launched at 15:02 and again at 15:12.
       const run = startRun(db, { nwo, pr: e.pr, action: decision.action, head: e.head, cause });
+      // READ BEFORE, so the refund below can tell whether THIS call spent an
+      // attempt. `attemptsFor` answers MAX_SAFE_INTEGER when it cannot read, and
+      // that is the safe sentinel in both directions here: an unreadable count
+      // makes "did it go up?" answer no, and no attempt is taken back.
+      const attemptsBefore = (decision.action === "FIX_CI" && fp)
+        ? attemptsFor(db, nwo, e.pr, fp, logPath) : 0;
       // Spent here, beside the run: past every refusal, before any work. A crash
       // after this point costs an attempt, which is the correct direction --
       // a crashed fix that silently earns a free retry is the runaway loop.
@@ -2365,17 +2371,29 @@ export async function tick(ctx) {
         // the run this block exists to retire is left live anyway. A repair that
         // can take the tick with it is worse than the leak it repairs.
         //
-        // AND REFUND THE ATTEMPT. `recordFixAttempt` INSERTs and then RETURNS a
-        // count, so the write can commit and the trailing read still throw: the
-        // attempt is spent for work that never started. With the default cap of
-        // one per finding, the next tick reads the cause as exhausted and
-        // escalates rather than redispatching — while this path's own UNBOUND
-        // outcome says, correctly, that nothing ran and nothing was learned.
-        // `refundFixAttempt` is an UPDATE with a WHERE, so it is a no-op when the
-        // insert never landed, and `MAX(0, attempts - 1)` cannot go negative.
+        // AND REFUND THE ATTEMPT THIS CALL ACTUALLY SPENT — no more than that.
+        //
+        // `recordFixAttempt` INSERTs and then RETURNS a count, so the write can
+        // commit and the trailing read still throw: an attempt spent for work
+        // that never started. The next tick then reads the cause as exhausted and
+        // escalates rather than redispatching, contradicting this path's own
+        // UNBOUND outcome.
+        //
+        // BUT AN UNCONDITIONAL REFUND IS NOT A NO-OP. I claimed it was, having
+        // checked only the case where no row exists at all. `refundFixAttempt` is
+        // an UPDATE with a WHERE: against a cause that already carries a
+        // LEGITIMATE prior attempt it decrements THAT row. Measured — a prior
+        // attempt of 1 becomes 0 — so with `maxFixAttemptsPerFinding` above one,
+        // a pre-commit failure here would erase a real attempt and hand out a
+        // repair beyond the configured cap. The schema permits any integer.
+        //
+        // So the count is compared across the call and the refund is taken only
+        // when this invocation is the one that raised it.
         if (run.ok) {
           try {
-            if (decision.action === "FIX_CI" && fp) refundFixAttempt(db, nwo, e.pr, fp);
+            if (decision.action === "FIX_CI" && fp
+                && attemptsFor(db, nwo, e.pr, fp, logPath) > attemptsBefore)
+              refundFixAttempt(db, nwo, e.pr, fp);
           } catch (e2) {
             log(logPath, `  #${e.pr}: the fix attempt could not be refunded — ${e2.message}`);
           }

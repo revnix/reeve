@@ -62,10 +62,16 @@ Claims are one file each under `claims/`. **Read `claims/README.md` before start
 
 | # | What | Blocks | Asked |
 |---|---|---|---|
-| F1 | **Name the spec repos.** Each project's registry entry needs `specRepo` (one private repo per project) and `gateDefinitionPaths`. Say the names, or say "create them" and this lane proposes them. | **S3 T2**, and every `reeve task file` after it — admission refuses an incomplete snapshot | 2026-08-27 |
-| F2 | **Arm `--execute`, or leave it off.** The gate from issue #52 is lifted (closed by #53) but nothing has been armed. The live guardian still runs without it. | nothing in S3; it is a live-system decision | 2026-08-27 |
-| F3 | **The 15-minute watcher loop.** Every PR it watched has merged. Stop it, repoint it at #50, or leave it as an outage watch. | nothing | 2026-08-27 |
 | F4 | **Six defaulted answers may be overridden** — worker isolation, instruction-file neutralization, the V6 measurement shape, whether S3 flips `observe` live, escalation-versus-paging, and the `--json` contract. Each was defaulted to the brief's recommendation and recorded so an override is cheap. | S3 T7, T8, T15, T16 | 2026-08-27, recorded in `s3.md` §2 |
+| F5 | **Create the three spec repos** — F1 named them; none exists yet. Private, one per project. | **S3 T2** | 2026-08-27 |
+
+### Answered 2026-08-27
+
+| # | What | Answer |
+|---|---|---|
+| F1 | Name the spec repos | **Create them, one per project, named `<project>-specs`**: `revnix/reeve-specs`, `nextlyhq/nextly-specs`, `revnix/rext-specs`, all private. Rejected, with the reason recorded so it is not reopened: **one shared repo** fails because `specRepoId` is a numeric GitHub id **per project**, so three projects sharing one id makes the snapshot stop distinguishing them — which fights the design's own identity model (§11.1, *"immutable numeric GitHub ids… with human-readable snapshots beside them"*); **reusing the code repos** fails because spec PRs would land beside code PRs, which is exactly the separation S4's gate depends on. |
+| F2 | Arm `--execute` on the live guardian? | **Leave it off for now.** S3's first code PRs (T7, T8) modify files the running daemon executes, so arming before those merge means a live daemon acting on code that is mid-change. Revisit after T8 merges. The #52 gate itself is lifted — this is a separate, deliberate decision not to arm. |
+| F3 | The 15-minute watcher loop | **STOPPED**, 2026-08-27; job `0011c181` cancelled. Nothing of this lane's was open. A watcher with no subject reports "quiet" every fifteen minutes, and quiet-with-no-subject is the exact reading that let a 22-hour CI outage go unremarked. **Restart it when S3's first PR opens.** |
 
 ---
 
@@ -89,11 +95,11 @@ Claims are one file each under `claims/`. **Read `claims/README.md` before start
 
 | ruling | date | why it is closed |
 |---|---|---|
-| **S3 splits into six plan documents**, ~1,200 lines each | 2026-08-27 | The three S2 *plan* PRs produced 561 of 1,282 findings (43.8% of every finding this repo's review has ever produced). PR#12 was one file, 213 findings, 15 rounds. |
+| **S3 splits into six plan documents**, at most three or four plan tasks each | 2026-08-27 | The three S2 *plan* PRs produced 561 of 1,282 findings (43.8% of every finding this repo's review has ever produced). PR#12 was one file, 213 findings, 15 rounds. |
 | **The master plan is roadmap + authoring spec in ONE file** | 2026-08-27 | So they cannot drift apart. |
 | **`docs/TRACKER.md` is untouched as the historical record**; per-stage trackers hold live state | 2026-08-27 | 10 of its 20 unchecked boxes sit on merged work; the format, not the file, was the defect. |
 | **Issue #50 lands before S3's dispatcher** | 2026-08-27 | S3's T8 is the second call site that makes #50's own acceptance test writable. |
 | **The test suite's dead network is fixed in a standalone PR before T1** | 2026-08-27 | 550.1s → 159.8s measured with a control; it is the instrument S3 is measured with sixteen times. |
-| **`specRepo` and `gateDefinitionPaths` are provisioned now** (Option A) | 2026-08-27 | Splitting `SNAPSHOT_FIELDS` re-opens the shape it was consolidated to close. Blocked on **F1**. |
+| **`specRepo` and `gateDefinitionPaths` are provisioned now** (Option A) | 2026-08-27 | Splitting `SNAPSHOT_FIELDS` re-opens the shape it was consolidated to close. F1 named the repos; now blocked on **F5**, their creation. |
 | **The builder always shares the guardian's hub** | 2026-08-27 | So an absent hub on a builder PR is the merge authority being gone, not an ordinary machine. |
 | **Stay headless**; `--json` becomes a contract, not a courtesy | 2026-08-27 | `src/dash.mjs` records why there is no server: a previous stack *"spent weeks serving unauthenticated admin to the LAN."* A future GUI is a second renderer over the same read model and must argue against that decision explicitly, not forget it. |

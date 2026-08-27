@@ -222,8 +222,11 @@ export function ingest(db, nwo, pr, observations, { at = Math.floor(Date.now() /
   const byObject = new Map();      // source|external_id -> {hashes:Set, maxGen}
   for (const r of existing) {
     const k = `${r.source}|${r.external_id}`;
-    const e = byObject.get(k) ?? { hashes: new Set(), maxGen: 0 };
+    const e = byObject.get(k) ?? { hashes: new Set(), genByHash: new Map(), maxGen: 0 };
     e.hashes.add(r.content_hash);
+    // Which generation carried each text, so a revert can point back at the
+    // generation that already holds it rather than inventing a new one.
+    e.genByHash.set(r.content_hash, r.generation);
     e.maxGen = Math.max(e.maxGen, r.generation);
     byObject.set(k, e);
   }
@@ -234,27 +237,52 @@ export function ingest(db, nwo, pr, observations, { at = Math.floor(Date.now() /
      VALUES (?,?,?,?,?,?,?,?,?,?,?)
      ON CONFLICT(source, external_id, content_hash) DO NOTHING`);
 
-  let inserted = 0, generations = 0, unchanged = 0;
+  // The CURRENT pointer, written for every observation whether or not its payload
+  // was new. A de-duplicated write still carries one fact: this is what the object
+  // says now. Skipping it is what let a revert to previously-seen text leave the
+  // fold reading the version that had been replaced.
+  const point = db.prepare(
+    `INSERT INTO inbox_current (pr_number, source, external_id, content_hash, generation, observed_at)
+     VALUES (?,?,?,?,?,?)
+     ON CONFLICT(pr_number, source, external_id) DO UPDATE SET
+       content_hash = excluded.content_hash,
+       generation   = excluded.generation,
+       observed_at  = excluded.observed_at`);
+
+  let inserted = 0, generations = 0, unchanged = 0, repointed = 0;
   db.exec("BEGIN IMMEDIATE");
   try {
     for (const o of observations) {
       const hash = hashOf(o.payload);
       const k = `${o.source}|${o.external_id}`;
       const e = byObject.get(k);
-      if (e?.hashes.has(hash)) { unchanged++; continue; }
+      if (e?.hashes.has(hash)) {
+        unchanged++;
+        // Already stored, so nothing is inserted -- but the pointer still moves.
+        // A revert lands here: the payload is old, and being current again is new.
+        const gen = e.genByHash?.get(hash) ?? e.maxGen;
+        point.run(pr, o.source, o.external_id, hash, gen, at);
+        repointed++;
+        continue;
+      }
       const generation = (e?.maxGen ?? 0) + 1;
       insert.run(o.source, o.external_id, pr, o.head_sha ?? null, o.kind,
                  canonical(o.payload), hash, generation, at,
                  o.event_at ?? null, o.edited_at ?? null);
       if (generation > 1) generations++; else inserted++;
+      // A new generation is current by definition, so it moves the pointer too.
+      // Both paths write it; only the payload write is conditional.
+      point.run(pr, o.source, o.external_id, hash, generation, at);
       // Keep the in-memory view current so two observations of the same object in
       // ONE batch do not both claim the same generation.
-      byObject.set(k, { hashes: new Set([...(e?.hashes ?? []), hash]), maxGen: generation });
+      byObject.set(k, { hashes: new Set([...(e?.hashes ?? []), hash]),
+                        genByHash: new Map([...(e?.genByHash ?? []), [hash, generation]]),
+                        maxGen: generation });
     }
     db.exec("COMMIT");
   } catch (err) { try { db.exec("ROLLBACK"); } catch {} throw err; }
 
-  return { inserted, generations, unchanged, total: observations.length };
+  return { inserted, generations, unchanged, repointed, total: observations.length };
 }
 
 /**

@@ -89,7 +89,7 @@ check("past the soft cap with an UNREADABLE projection is UNKNOWN",
 // gone with it -- which means the cap is now ENFORCED rather than announced as
 // unenforced.
 check("past the cap with a critical open BLOCKS, which is the cap actually enforced",
-  withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1 }; }), BLOCK);
+  withOut(i => { i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1, blockingCritical: 1 }; }), BLOCK);
 {
   const i = good();
   i.rounds = { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "unreadable" };
@@ -206,10 +206,33 @@ check("GitHub still computing is UNKNOWN", withOut(i => { i.mergeState = "UNKNOW
 
 // The founder's rule: past the cap, only P0/P1 keep going, and a critical is
 // never spilled to a follow-up PR.
+//
+// TWO COUNTS SERVE TWO RULES. The cap blocks on criticals from a BLOCKING
+// reviewer, because blocking-ness is what says whose opinion gates a merge. The
+// spill refusal counts EVERY reviewer, because a critical is never deferred
+// whoever filed it. Sharing one number made an advisory reviewer's P0 escalate a
+// pull request that every gating clause had passed.
 check("the hard cap with an open critical BLOCKs",
-  withOut(i => { i.rounds = { n: 10, softCap: 5, hardCap: 10, unspilledCritical: 1 }; }), BLOCK);
+  withOut(i => { i.rounds = { n: 10, softCap: 5, hardCap: 10, unspilledCritical: 1, blockingCritical: 1 }; }), BLOCK);
 check("past the soft cap with an open critical BLOCKs",
-  withOut(i => { i.rounds = { n: 7, softCap: 5, hardCap: 10, unspilledCritical: 2 }; }), BLOCK);
+  withOut(i => { i.rounds = { n: 7, softCap: 5, hardCap: 10, unspilledCritical: 2, blockingCritical: 2 }; }), BLOCK);
+// THE CASE THE SPLIT EXISTS FOR: past the cap, the only open critical belongs to
+// an ADVISORY reviewer. Every gating clause passes, so the pull request must not
+// escalate on an opinion the profile says does not gate.
+check("an advisory reviewer's critical does NOT block at the cap",
+  withOut(i => { i.rounds = { n: 7, softCap: 5, hardCap: 10, unspilledCritical: 1, blockingCritical: 0 }; }), PASS);
+{
+  // ...while still refusing a spill, which is the other half and reads the other
+  // number. Asserted through the same clause set, so the two rules are shown to
+  // disagree deliberately rather than by accident.
+  const i = good();
+  i.rounds = { n: 7, softCap: 5, hardCap: 10, unspilledCritical: 1, blockingCritical: 0 };
+  const v = computeVerdict(i);
+  check("control: and the rounds clause really is the one passing it",
+    v.clauses.find(c => c.id === "rounds").state, PASS);
+  check("control: while the universal count still says a critical is open, so nothing may be spilled",
+    i.rounds.unspilledCritical > 0, true);
+}
 check("past the soft cap with everything spilled PASSes",
   withOut(i => { i.rounds = { n: 7, softCap: 5, hardCap: 10, unspilledCritical: 0 }; }), PASS);
 

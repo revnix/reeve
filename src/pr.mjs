@@ -76,13 +76,32 @@ export function readReviewerStates(nwo, pr, head, reviewers, io = null) {
   // Injected for tests: classifying a reviewer is pure once the rows are in hand,
   // and every branch here was previously reachable only with a live GitHub.
   let cRows, rRows;
-  if (io) {
+  // `io.rows` supplies parsed rows and skips the network entirely, which is how
+  // the CLASSIFICATION is tested. `io.gh` replaces only the runner, which is how
+  // the READ is tested — the two need different seams because they are different
+  // questions, and the pagination defect lived in the half the first one skips.
+  const run = io?.gh ?? ghJson;
+  if (io && !io.gh) {
     cRows = io.comments ?? [];
     rRows = io.reviews ?? [];
   } else {
-    const comments = ghJson([`repos/${nwo}/issues/${pr}/comments?per_page=100`, "--jq",
+    // `--paginate`, because `per_page=100` is a page SIZE and not a promise that
+    // one page is all of it. A pull request passes 100 review objects easily:
+    // every inline reply mints a 0-byte COMMENTED review, nine at one commit on
+    // nextly #1124, so review objects outrun real rounds by an order of magnitude.
+    //
+    // Without it the fold could see and apply a current-head clean round from page
+    // two while this read still showed coverage as stale — so reeve would ask for
+    // a review it had already received and could never observe, for ever.
+    //
+    // `--jq` is applied per page and the results concatenate, which is exactly
+    // right for line-oriented tsv. gh has no page cap, so this is unbounded where
+    // the ingest reader stops at twenty; that difference is recorded rather than
+    // reconciled here, because two pagination mechanisms is a design question and
+    // not a line in this function.
+    const comments = run(["--paginate", `repos/${nwo}/issues/${pr}/comments?per_page=100`, "--jq",
       '.[] | [.user.login, (.created_at), (.body|gsub("\n";" "))] | @tsv']);
-    const reviews = ghJson([`repos/${nwo}/pulls/${pr}/reviews?per_page=100`, "--jq",
+    const reviews = run(["--paginate", `repos/${nwo}/pulls/${pr}/reviews?per_page=100`, "--jq",
       '.[] | [.user.login, (.commit_id // ""), (.state), (.body|gsub("\n";" "))] | @tsv']);
     cRows = comments.ok ? comments.out.split("\n").filter(Boolean).map(l => l.split("\t")) : [];
     rRows = reviews.ok ? reviews.out.split("\n").filter(Boolean).map(l => l.split("\t")) : [];
@@ -161,6 +180,7 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
   const unknown = why => ({ unspilledCritical: null, rounds: null, threadDetails: null,
                             cleared: gating ? { readable: false, why }
                                             : { readable: true, uncleared: 0, reviewers: [] },
+                            blockingCritical: null,
                             bodyFindings: gating ? { readable: false, why }
                                                  : { readable: true, open: 0, reviewers: [] },
                             // NOT gated on there being a blocking reviewer. Whether
@@ -285,6 +305,10 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
     // better answer than no number, and it is the same answer this codebase
     // already gives for a thread whose severity nobody can read.
     unspilledCritical: st.unspilledCritical,
+    // What the ROUND CAP reads. Blocking-scoped, for the same reason `cleared`
+    // and `bodyFindings` are: blocking-ness says whose opinion gates a merge. The
+    // universal count above keeps its own job, which is refusing to spill.
+    blockingCritical: st.blockingCritical,
     threadDetails: fresh ? st.threads : null,
     // Readable independently of `fresh`: a tick-old list of WHICH threads are
     // uncleared is not safe to dispatch a worker against, but the COUNT is safe
@@ -470,7 +494,7 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // remediation; a transient one is honestly UNKNOWN and clears itself.
   const criticalGap = facts.unspilledCritical != null ? null : "unreadable";
   const rounds = { n: facts.rounds ?? judged.size, softCap: profile.rounds?.softCap ?? 5,
-                   criticalGap,
+                   criticalGap, blockingCritical: facts.blockingCritical,
                    // A number when the projection is readable AT THIS HEAD, and null
                    // otherwise. Claiming "no criticals open" is a fact reeve may only
                    // state when it has it -- the alternative licenses spilling a P0.

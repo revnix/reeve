@@ -284,7 +284,7 @@ check("an uncleared thread ASKS THE REVIEWER, rather than dispatching a fixer",
     checks: { verdict: "GREEN", settled: true, failing: [] },
     base: { verdict: "GREEN" },
     reviewers: [{ login: "codex", kind: "blocking", state: "CLEAN", reviewedHead: "c".repeat(10) }],
-    rounds: { n: 2, softCap: 5, hardCap: 10, unspilledCritical: 0 },
+    rounds: { n: 2, softCap: 5, hardCap: 10, unspilledCritical: 0, blockingCritical: 0 },
     threads: { unresolved: 0, total: 4, readable: true },
     cleared: { readable: true, uncleared: 0, reviewers: [] },
     bodyFindings: { readable: true, open: 0, reviewers: [] },
@@ -303,10 +303,20 @@ check("an uncleared thread ASKS THE REVIEWER, rather than dispatching a fixer",
   // must NOT have cost is the property the block exists to protect: the cap stops
   // a spill, never every repair.
   check("past the cap a critical now ESCALATES, which is the cap actually enforced",
-    through({ rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1 },
+    through({ rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1, blockingCritical: 1 },
               threads: { unresolved: 2, total: 4, readable: true } },
             { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1 }),
     ACTIONS.ESCALATE);
+  // ...and an ADVISORY reviewer's critical does not, which is why the count was
+  // split. Every gating clause passes, so escalating here would be the pull
+  // request stopped by an opinion the profile says does not gate. The universal
+  // count is still 1, so the spill branch below still refuses — one fixture
+  // showing the two rules reading two numbers and disagreeing on purpose.
+  check("control: an advisory critical past the cap dispatches instead of escalating",
+    through({ rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1, blockingCritical: 0 },
+              threads: { unresolved: 2, total: 4, readable: true } },
+            { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1 }),
+    ACTIONS.FIX_FINDINGS);
   check("control: and past the cap with a KNOWN zero it still spills rather than stalling",
     through({ rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 0 },
               threads: { unresolved: 2, total: 4, readable: true } },

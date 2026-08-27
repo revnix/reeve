@@ -122,12 +122,17 @@ export function computeVerdict(i) {
 
   // 4. Round budget. Past the soft cap only P0/P1 keep the loop running, and a
   //    critical finding is never spilled to a follow-up.
+  // The cap BLOCKS on `blockingCritical` and refuses to SPILL on
+  // `unspilledCritical`, and they are different numbers on purpose. Blocking-ness
+  // says whose opinion gates a merge; the spill rule says a critical is never
+  // deferred whoever filed it. Sharing one number made an advisory reviewer's
+  // critical escalate a pull request every gating clause had passed.
   const R = i.rounds;
   if (!R) add("rounds", PASS, "no round accounting");
-  else if (R.n >= R.hardCap && R.unspilledCritical > 0)
-    add("rounds", BLOCK, `hard cap ${R.hardCap} reached with ${R.unspilledCritical} P0/P1 finding(s) open — escalate, never spill a critical`);
-  else if (R.n >= R.softCap && R.unspilledCritical > 0)
-    add("rounds", BLOCK, `past soft cap ${R.softCap} with ${R.unspilledCritical} critical finding(s) still open`);
+  else if (R.n >= R.hardCap && R.blockingCritical > 0)
+    add("rounds", BLOCK, `hard cap ${R.hardCap} reached with ${R.blockingCritical} P0/P1 finding(s) open from a blocking reviewer — escalate, never spill a critical`);
+  else if (R.n >= R.softCap && R.blockingCritical > 0)
+    add("rounds", BLOCK, `past soft cap ${R.softCap} with ${R.blockingCritical} critical finding(s) still open from a blocking reviewer`);
   // PAST THE CAP with an UNKNOWN critical count is not a pass.
   //
   // `null > 0` is false, so an unreadable projection fell straight through to the

@@ -148,7 +148,10 @@ export function releaseMaintenanceLock(db, { pid, lstart }) {
  * as dead, is reaped, and a concurrent mutation proceeds against a hub that is
  * being replaced underneath it.
  */
-export const LOCK_COLUMNS = Object.freeze(["name", "pid", "lstart"]);
+// COLUMN TO DECLARED TYPE, for the same reason as the scheduler's own tables:
+// `maintenance_lock` is STRICT, so a wrong declared type passes a name check and
+// refuses the write.
+export const LOCK_COLUMNS = Object.freeze({ name: "TEXT", pid: "INTEGER", lstart: "TEXT" });
 
 export function assertWritable(db, { isAlive, at = now(), inTx = false }) {
   const row = db.prepare("SELECT * FROM maintenance_lock WHERE name='restore'").get();

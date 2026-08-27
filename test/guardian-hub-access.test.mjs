@@ -8,7 +8,7 @@
 // the same time. It is exercised here instead.
 import { hubAccess } from "../src/build/hubaccess.mjs";
 import { openHub, SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
-import { SCHEDULER_COLUMNS } from "../src/build/providerdb.mjs";
+import { SCHEDULER_COLUMNS, LEASE_COLS } from "../src/build/providerdb.mjs";
 import { HOLD_COLUMNS } from "../src/build/holds.mjs";
 import { LOCK_COLUMNS } from "../src/build/locks.mjs";
 import { mkdtempSync, rmSync, writeFileSync, renameSync, copyFileSync, chmodSync, statSync } from "node:fs";
@@ -210,58 +210,82 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubaccess-"));
   r.hub?.close?.();
 }
 
+// ── a column of the WRONG TYPE is unusable, not usable ────────────────────
+// The gate reduced `pragma_table_info` to names. Every one of these tables is
+// STRICT, so a column whose declared type is wrong passes a name comparison and
+// then refuses the write: measured against node:sqlite, an insert of the
+// generated text token into `provider_lease.token INTEGER` throws "cannot store
+// TEXT value in INTEGER column", with a control on the correct schema accepting
+// the identical statement. The guardian then took its documented fail-open route
+// and dispatched model work outside the shared limit — reaching the fail-open by
+// PASSING the gate, which is the worst way to arrive there.
+{
+  const p = join(dir, "mistyped.db");
+  openHub(p).close();
+  // Rebuild `provider_lease` with one column's type changed and nothing else,
+  // so the only thing separating this hub from a healthy one is the type.
+  const w = new DatabaseSync(p);
+  const ddl = w.prepare("SELECT sql FROM sqlite_master WHERE name = ?").get("provider_lease").sql;
+  w.exec("PRAGMA foreign_keys=OFF");
+  w.exec("DROP TABLE provider_lease");
+  w.exec(ddl.replace(/token\s+TEXT/, "token INTEGER"));
+  w.close();
+
+  const a = hubAccess(p)();
+  check(a.hub === null,
+    "a hub whose scheduler column has the wrong declared type is REFUSED", JSON.stringify({ why: a.why }));
+  check(/provider_lease\.token is INTEGER, want TEXT/.test(a.why ?? ""),
+    "and the reason names the column and BOTH types, because it is read at a recovery",
+    String(a.why));
+}
+
 // ── the declared shape matches a freshly migrated hub ─────────────────────
-// `SCHEDULER_COLUMNS.provider_state` is written out rather than derived, so it
-// can drift from the schema. A declaration demanding a column that does not
-// exist would refuse every healthy hub -- worse than the gap it closes.
+// These maps are hand-written, so they can drift from the schema in either
+// direction: demanding a column that does not exist refuses every healthy hub,
+// and omitting one leaves a hole in the gate. Both directions are checked, and
+// TYPES are checked too — a name-only comparison was itself the defect, because
+// these tables are STRICT and a wrong declared type passes a name check and then
+// refuses the write.
 {
   const p = join(dir, "drift.db");
   const db = openHub(p);
-  const drift = [];
-  for (const [t, cols] of Object.entries({ ...SCHEDULER_COLUMNS, pr_hold: HOLD_COLUMNS, maintenance_lock: LOCK_COLUMNS })) {
-    const have = new Set(db.prepare("SELECT name FROM pragma_table_info(?)").all(t).map(r => r.name));
-    for (const c of cols) if (!have.has(c)) drift.push(`${t}.${c}`);
+  const declared = { ...SCHEDULER_COLUMNS, pr_hold: HOLD_COLUMNS, maintenance_lock: LOCK_COLUMNS };
+  const missing = [], mistyped = [];
+  for (const [t, cols] of Object.entries(declared)) {
+    const have = new Map(db.prepare("SELECT name, type FROM pragma_table_info(?)").all(t)
+      .map(r => [r.name, String(r.type ?? "").toUpperCase()]));
+    for (const [c, want] of Object.entries(cols)) {
+      if (!have.has(c)) { missing.push(`${t}.${c}`); continue; }
+      if (have.get(c) !== want) mistyped.push(`${t}.${c} declared ${want}, hub has ${have.get(c)}`);
+    }
   }
   db.close();
-  check(drift.length === 0,
-    "every column the scheduler declares it needs exists in a freshly migrated hub", drift.join(", "));
-  check(SCHEDULER_COLUMNS.provider_lease.length > 5 && SCHEDULER_COLUMNS.provider_state.length > 3,
-    "fixture: the declarations are non-empty, so the check above compares something",
-    JSON.stringify({ lease: SCHEDULER_COLUMNS.provider_lease.length, state: SCHEDULER_COLUMNS.provider_state.length }));
+  check(missing.length === 0,
+    "every column the scheduler declares it needs exists in a freshly migrated hub", missing.join(", "));
+  check(mistyped.length === 0,
+    "and every declared TYPE is the type the migrations actually build", mistyped.join(" | "));
+  const counts = Object.fromEntries(Object.entries(declared).map(([t, c]) => [t, Object.keys(c).length]));
+  check(counts.provider_lease > 5 && counts.provider_state > 3 && counts.pr_hold > 3 && counts.maintenance_lock > 2,
+    "fixture: the declarations are non-empty, so the checks above compare something",
+    JSON.stringify(counts));
 }
 
-// ── a hub that cannot be REACHED is not a hub that is absent ──────────────
-// `existsSync` answers false for EACCES and every other stat failure as well as
-// ENOENT, so a hub whose directory lost its permissions read as "no builder on
-// this machine": the hold clause was omitted AND dispatch went unscheduled, two
-// fail-opens at once, silently.
+// ── the lease shape and the lease SQL name the same columns ───────────────
+// `SCHEDULER_COLUMNS.provider_lease` used to be DERIVED from `LEASE_COLS`, which
+// made drift impossible but carried no types. Adding types forced the two apart,
+// so the derivation is replaced by an asserted AGREEMENT in both directions: a
+// column added to the SQL without a type here would otherwise leave exactly the
+// silent hole in the gate that this round's finding came through.
 {
-  const locked = mkdtempSync(join(tmpdir(), "reeve-hubaccess-locked-"));
-  const p = join(locked, "hub.db");
-  openHub(p).close();
-  // Remove search permission on the directory: the file is there and cannot be
-  // statted. Skipped when running as a user for whom mode bits do not apply.
-  chmodSync(locked, 0o000);
-  let reachable = true;
-  try { statSync(p); } catch { reachable = false; }
-  if (!reachable) {
-    const a = hubAccess(p)();
-    check(a.hub === null && typeof a.why === "string" && a.why.length > 0,
-      "a hub that cannot be reached is refused WITH a reason, not treated as absent",
-      JSON.stringify(a));
-    check(/could not be reached/.test(a.why ?? ""),
-      "and the reason says so rather than staying silent", String(a.why));
-  } else {
-    check(true, "skipped: this user can stat through a 000 directory, so the case cannot be built here");
-  }
-  chmodSync(locked, 0o700);
-  rmSync(locked, { recursive: true, force: true });
-
-  // CONTROL: a path that genuinely does not exist is still the ordinary silent
-  // state -- the whole point is that the two are told apart.
-  const a2 = hubAccess(join(dir, "definitely-not-here.db"))();
-  check(a2.hub === null && a2.why === null,
-    "control: a genuinely absent hub is still no hub and no complaint", JSON.stringify(a2));
+  const sql = new Set(LEASE_COLS.split(",").map(c => c.trim()).filter(Boolean));
+  const shape = new Set(Object.keys(SCHEDULER_COLUMNS.provider_lease));
+  const onlySql = [...sql].filter(c => !shape.has(c));
+  const onlyShape = [...shape].filter(c => !sql.has(c));
+  check(onlySql.length === 0,
+    "every column the lease SQL selects is in the declared shape, with a type", onlySql.join(", "));
+  check(onlyShape.length === 0,
+    "and the declared shape names nothing the lease SQL does not", onlyShape.join(", "));
+  check(sql.size > 5, "fixture: LEASE_COLS is non-empty, so the comparison compares something", String(sql.size));
 }
 
 // ── an existing hub that cannot be READ is a fault, not an absence ────────

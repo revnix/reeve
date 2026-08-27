@@ -542,7 +542,20 @@ export function stateRootsFor(stateDir, logPath, worktree, dbPath = null) {
  * sandbox canary. Exported so `reeve canary` can run exactly this, rather than a
  * reconstruction of it that could drift from what dispatch actually does.
  */
-export async function measuredContainment(ctx, profile, nwo, logPath) {
+export async function measuredContainment(ctx, profile, nwo, logPath, { beforeSpawn = null, onSpawn = null } = {}) {
+  // THE CACHE LIVES ON THE CALLER'S PERSISTENT CONTEXT, and that is why these
+  // two hooks are parameters rather than fields on it.
+  //
+  // `tick` used to build `{ ...ctx, canaryBeforeSpawn, canaryOnSpawn }` purely to
+  // carry two functions, and this lazy `??=` then created the Map on that
+  // per-tick COPY. `run` loops on ONE persistent ctx, so every tick began with an
+  // empty cache and paid for the containment canary again -- and since nothing in
+  // the repository ever seeded the field, the cache had never once survived a
+  // tick since it was written.
+  //
+  // Seeding the copy before spreading would have fixed this call site and left
+  // the mechanism intact: the next field a callee lazily attaches to `ctx` is the
+  // same defect again. Removing the copy removes the class.
   const cache = (ctx.containmentCache ??= new Map());
   try {
     const root = profile.identity?.worktreeRoot;
@@ -636,8 +649,8 @@ export async function measuredContainment(ctx, profile, nwo, logPath) {
       // leaves a lease whose holder reads dead while the call is still being
       // paid for -- and a restore or a reap then frees a slot the provider is
       // still serving.
-      onSpawn: ctx.canaryOnSpawn ?? (() => {}),
-      beforeSpawn: ctx.canaryBeforeSpawn ?? (async () => ({ ok: true })),
+      onSpawn: onSpawn ?? (() => {}),
+      beforeSpawn: beforeSpawn ?? (async () => ({ ok: true })),
       // The profile LABEL is necessary but not sufficient: it closes containment
       // only when the topology it names is actually in place. The scratch-home
       // arrangement (a home of reeve's making, a per-run standalone clone, a
@@ -1952,9 +1965,7 @@ export async function tick(ctx) {
   let skipDispatch = false;
   let canaryLease = null;
   if (execute && wanted.length && !containment) {
-    const measureCtx = {
-      ...ctx,
-      canaryBeforeSpawn: async () => {
+    const canaryBeforeSpawn = async () => {
         const h = claimHub();
         // NO HUB IS NO SCHEDULER, and that answer comes FIRST.
         //
@@ -2000,7 +2011,7 @@ export async function tick(ctx) {
         }
         if (got.id != null) canaryLease = { owner: "guardian", repoId, runRef: `canary:${nwo}`, id: got.id, token: got.token ?? null };
         return { ok: true };
-      },
+    };
       // BOUND OR IT DOES NOT RUN, the same rule as a worker's. I made this
       // non-fatal and argued that refusing would abort a measurement that is
       // otherwise fine -- which privileged completing the measurement over the
@@ -2008,7 +2019,7 @@ export async function tick(ctx) {
       // `killGroup` and an UNBOUND outcome, so the canary fails and containment
       // stays open: no dispatch this tick, which is safe and self-correcting.
       // An unbound canary lease is not.
-      canaryOnSpawn: ({ pid, lstart }) => {
+    const canaryOnSpawn = ({ pid, lstart }) => {
         if (!canaryLease) return;
         const b = (ctx.providerBind ?? bindProviderLease)(claimHub(),
           { ...canaryLease, pid, lstart, isAlive: isSameProcess });
@@ -2016,10 +2027,10 @@ export async function tick(ctx) {
           throw new Error(`the canary's provider lease could not be rebound: ${b.reason}`);
         if (b?.bound !== 1)
           throw new Error(`the canary's provider lease rebind matched ${b?.bound ?? "no"} row(s); it would stay on the guardian`);
-      },
     };
     try {
-      containment = await measuredContainment(measureCtx, profile, nwo, logPath);
+      containment = await measuredContainment(ctx, profile, nwo, logPath,
+        { beforeSpawn: canaryBeforeSpawn, onSpawn: canaryOnSpawn });
     } finally {
       // THE CANARY IS A PAID MODEL CALL, so its rate limit is the provider's
       // state and not this measurement's private business. `sandboxCanary`

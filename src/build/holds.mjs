@@ -12,7 +12,13 @@
  * a hub whose `pr_hold` has lost one of these does not throw until the first
  * held pull request is evaluated, which is the worst moment to find out.
  */
-export const HOLD_COLUMNS = Object.freeze(["repo_id", "pr", "cleared_at", "reason", "detail", "head_sha"]);
+// COLUMN TO DECLARED TYPE, because `pr_hold` is STRICT and a name-only check
+// passes a store whose types are wrong -- which then refuses the read. The test
+// compares this against a freshly migrated hub in both directions.
+export const HOLD_COLUMNS = Object.freeze({
+  repo_id: "INTEGER", pr: "INTEGER", cleared_at: "INTEGER",
+  reason: "TEXT", detail: "TEXT", head_sha: "TEXT",
+});
 
 /**
  * The open hold on one pull request, if any.

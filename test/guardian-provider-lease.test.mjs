@@ -620,7 +620,25 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false,
     resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
     prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
   };
-  await tick(ctx); ctx.db.close();
+  await tick(ctx);
+  // THE CACHE LANDED ON THIS OBJECT, not on a per-tick copy of it.
+  //
+  // `tick` used to hand `measuredContainment` a shallow copy built only to carry
+  // two hook functions, and the cache is created lazily by `??=` on whatever it
+  // is given -- so the Map was allocated on the copy and discarded with it. `run`
+  // loops on ONE ctx, so every tick began with an empty cache and paid for the
+  // containment canary again; nothing in the repository ever seeded the field,
+  // so it had never survived a tick since it was written. This assertion is over
+  // the caller's own object precisely because that is what was wrong.
+  check(ctx.containmentCache instanceof Map,
+    "the containment cache is attached to the caller's PERSISTENT context",
+    String(ctx.containmentCache));
+  const cacheAfterFirst = ctx.containmentCache;
+  await tick(ctx);
+  check(ctx.containmentCache === cacheAfterFirst,
+    "and a second tick on the same context reuses that very cache, rather than allocating another",
+    JSON.stringify({ same: ctx.containmentCache === cacheAfterFirst }));
+  ctx.db.close();
   check(cooldowns.length > 0,
     "a rate-limited CANARY records the provider cooldown", JSON.stringify(cooldowns));
   check(cooldowns[0]?.cooldownSeconds > 0,

@@ -1516,7 +1516,16 @@ git commit -m "feat(build): a real io for resolveSnapshot"
   const snap = await resolveSnapshot(registry, "nextly", [normalizeClaim("packages/x")], io);
 
   const after = openHub(hubPathFor(home));
-  check(JSON.stringify(census.call(null)) !== undefined, "control: the census helper is callable");
+  // THE POSITIVE CONTROL, and it is the half that makes the negative mean
+  // anything: "no row changed" is also true of a lookup that never opened the
+  // hub. So prove the read reached the hub before believing that nothing moved.
+  // (The previous form here asserted `JSON.stringify(census.call(null)) !==
+  // undefined`, which is true of every value JSON can encode -- and `census`
+  // closes over a db that is closed by this point, so it would have thrown
+  // rather than passed. An assertion that cannot fail is not a control.)
+  check(!snap.refusal && snap.repoId === 77,
+    "control: the snapshot really was resolved, and carries the repo id the hub recorded",
+    JSON.stringify(snap));
   const now = JSON.stringify(Object.fromEntries(tables.map(t =>
     [t, after.prepare(`SELECT count(*) c FROM "${t}"`).get().c])));
   check(now === before, "resolving a snapshot changed no row in any hub table", `${before}\n        ${now}`);
@@ -1539,9 +1548,12 @@ git commit -m "feat(build): a real io for resolveSnapshot"
   openHub(hubPathFor(home)).close();
 
   let attempted = null;
+  // `DatabaseSync` is imported at the top of the file, beside the other imports.
+  // An inline `await import(...)` here does NOT work: this arrow is not async,
+  // and `await` in a non-async function is a syntax error, so the file would
+  // fail to parse and every assertion in it would be skipped rather than red.
   const guarded = (path) => {
-    const real = new (globalThis.__DatabaseSync ?? (globalThis.__DatabaseSync =
-      (await import("node:sqlite")).DatabaseSync))(path, { readOnly: true });
+    const real = new DatabaseSync(path, { readOnly: true });
     return {
       prepare: (sql) => {
         if (!/^\s*SELECT\b/i.test(sql)) { attempted = sql; throw new Error("a lookup may not write"); }
@@ -1559,7 +1571,7 @@ git commit -m "feat(build): a real io for resolveSnapshot"
 }
 ```
 
-The `guarded` helper's dynamic import must be hoisted: put `import { DatabaseSync } from "node:sqlite";` beside the file's other imports and use it directly rather than the inline expression above, which is not valid outside an async context. Written as a plain import it is three lines shorter and runnable:
+`guarded` needs `DatabaseSync` at module scope. Add it to the file's existing import group; the whole helper then reads:
 
 ```js
 import { DatabaseSync } from "node:sqlite";
@@ -1577,7 +1589,7 @@ import { DatabaseSync } from "node:sqlite";
   };
 ```
 
-Use that form; delete the `check(JSON.stringify(census.call(null)) !== undefined, ...)` line, which was a placeholder for a control the census comparison already carries.
+**Why this is spelled out rather than left to the executor.** An `await` inside a non-async arrow is a *parse* error, so the file does not run at all -- and a test file that does not parse reports no failures, which reads exactly like a test file that passed. That is the same shape as every other entry in this plan's controls: the failure is silent in the direction that looks like success.
 
 - [ ] **Step 2: Run it red, then green**
 

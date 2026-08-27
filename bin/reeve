@@ -1649,7 +1649,30 @@ switch (cmd) {
     // it comes back null -- a project whose first task is admitted after the
     // daemon started would otherwise leave the guardian fail-closed on every
     // dispatch until someone restarted it.
-    ctx.resolveRepoId = () => repoIdOnce(ctx.project);
+    // AND THE REGISTRY IS RE-READ WHEN THERE IS STILL NO PROJECT.
+    //
+    // `ctx.project` was fixed at startup, so a `projects.json` that was missing,
+    // malformed, or simply did not name this repository yet pinned it to null for
+    // the life of the process -- and this closure then called `repoIdOnce(null)`
+    // every ten minutes for ever. Adding the entry could not recover the daemon:
+    // every provider dispatch stayed fail-closed and every builder-PR hold stayed
+    // UNKNOWN until someone restarted it, while the retry cadence advertised that
+    // it was trying. A retry that cannot observe the thing it is waiting for is
+    // not a retry.
+    //
+    // Only when there is no project: a registry read per tick is wasted work once
+    // the answer is known, and the project key is stable by design.
+    ctx.resolveRepoId = () => {
+      if (!ctx.project) {
+        const again = registryProjects(HOME);
+        const found = (again.projects ?? []).find(p => p.nwo === nwo) ?? null;
+        ctx.project = found;
+        // The WHY is refreshed with it, or a registry that has been fixed would
+        // go on reporting the stale reason it was broken for.
+        ctx.projectError = found ? null : (again.error ?? null);
+      }
+      return repoIdOnce(ctx.project);
+    };
     // GUARDED, because this one is OUTSIDE the tick. Narrowing `repoIdOnce`'s
     // catch so operational failures propagate was right for the retry path
     // inside `tick`, which logs them and raises `guardian:hub:unreadable` -- and

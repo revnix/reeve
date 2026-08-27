@@ -992,11 +992,6 @@ export async function tick(ctx) {
    */
   const raise = (cause, n = 1) => escalations.set(cause, (escalations.get(cause) ?? 0) + n);
 
-  if (halted(ctx.haltMarker)) {
-    log(logPath, `HALTED: ${ctx.haltMarker} exists — no work will be started`);
-    return { decisions, escalations, halted: true };
-  }
-
   // Carrying out queued effects does not depend on being able to LIST pull
   // requests, and the two use different credentials -- `openPrs` uses the ambient
   // `gh` login, the outbox uses the GitHub App. A broken ambient credential would
@@ -1423,13 +1418,22 @@ export async function tick(ctx) {
     // imposes a fresh ten-minute block on every builder and guardian admission
     // for a window that had already passed. The absolute expiry is stamped at
     // observation and carried; the retry asks for whatever is left of it.
+    //
+    // AND THE OBSERVATION TIME IS CARRIED TOO, not just the expiry. `recordRateLimit`
+    // keeps whichever metadata is latest by timestamp, so a note re-derived from
+    // the RETRY time looks newer than a 429 seen after it -- and the older
+    // signature then overwrites the newer one, leaving doctor naming the wrong
+    // throttling cause. Both facts are stamped once, at observation, and neither
+    // is re-derived from the other.
     const nowSec = Math.floor(Date.now() / 1000);
-    const stamped = note.expiresAt != null ? note : { ...note, expiresAt: nowSec + (note.cooldownSeconds ?? 0) };
+    const stamped = note.expiresAt != null ? note
+      : { ...note, observedAt: nowSec, expiresAt: nowSec + (note.cooldownSeconds ?? 0) };
     const left = stamped.expiresAt - nowSec;
     // Already elapsed while we could not write it. Recording a zero or negative
     // cooldown would be recording a fact that has stopped being true.
     if (left <= 0) { pendingCooldowns.delete(key); return; }
-    const send = { signature: stamped.signature, cooldownSeconds: left };
+    const send = { signature: stamped.signature, cooldownSeconds: left,
+                   observedAt: stamped.observedAt ?? null, expiresAt: stamped.expiresAt };
 
     const h = hubOr(() => null);
     if (!h) { pendingCooldowns.set(key, stamped); return; }
@@ -1482,7 +1486,16 @@ export async function tick(ctx) {
   // on local demand meant the rows that most need reaping were reaped least. The
   // builder never calls the reaper at all, so a held row would count against
   // capacity for ever and a queued one would block every builder admission.
-  if (execute) {
+  //
+  // NOT GATED ON `execute` EITHER, and that was the third gate found in front of
+  // this block in as many rounds. Dispatch authority is about whether THIS
+  // guardian may start work; reaping is about rows a DEAD one left behind. An
+  // observational guardian -- the default, and exactly what someone restarts
+  // into after an armed guardian crashed -- would skip the only production call
+  // to the reaper, so the dead guardian's queued row sat for ever and
+  // `claimProvider` refused every builder admission while it did. The builder
+  // never reaps at all, so nothing else was coming.
+  {
     const h = hubOr(() => null);
     if (h) {
       try {
@@ -1495,6 +1508,76 @@ export async function tick(ctx) {
       }
     }
   }
+
+  // ONE READER for this guardian's queued rows. Two callers need them now -- the
+  // dispatch phase, to serve the head of the queue and to cancel what this tick
+  // will not ask for, and the halt path, to withdraw the lot -- and a second copy
+  // of the query would be a second thing to keep in step with `owner` and
+  // `repo_id`. A read that fails answers with nothing AND says so: an empty list
+  // returned silently would let the halt path report that it withdrew everything
+  // when it had read nothing.
+  const readQueuedNow = (h) => {
+    try {
+      return (ctx.queuedRequests ?? queuedGuardianRequests)(h, { repoId }) ?? [];
+    } catch (err) {
+      log(logPath, `provider: could not read the queued requests — ${err.message}`);
+      raise("the provider scheduler is unreadable; dispatching unscheduled");
+      return [];
+    }
+  };
+
+  /**
+   * Stop for the halt marker -- through here, and only through here.
+   *
+   * A HALTED GUARDIAN MUST NOT HOLD A QUEUE POSITION. `claimProvider` serves
+   * guardian requests in order and refuses builder admission while any queued
+   * guardian row exists, and expiry cannot clear this one because the holder pid
+   * is alive and sleeping. So a halt turned into a deadlock that neither party
+   * could break: the guardian is not going to ask for the work, and the builder
+   * cannot have the slot.
+   *
+   * The gate itself moved BELOW the hub and repository-id resolution and the
+   * reaper for this reason -- housekeeping depends on nothing the halt is about,
+   * and it was the third gate found sitting in front of it. What a halted
+   * guardian now does before returning is: read the hub, read its repository id,
+   * retry its own deferred releases and cooldown writes, reap rows whose holders
+   * are gone, and withdraw its own queue position. Every one of those either
+   * completes an obligation it already incurred or removes something that blocks
+   * another process. None of them starts work. The outbox drain is untouched: it
+   * asks `halted` for itself.
+   *
+   * ONE FUNCTION, because three sites stop for this marker and a fourth will be
+   * added by someone who does not know about the queue.
+   */
+  const haltStop = (why) => {
+    log(logPath, why);
+    const h = claimHub();
+    if (h && repoId != null) {
+      for (const row of readQueuedNow(h)) {
+        try {
+          const c = (ctx.cancelQueued ?? cancelQueued)(h, {
+            owner: "guardian", repoId, runRef: row.run_ref, isAlive: isSameProcess });
+          if (c?.ok) log(logPath, `provider: withdrew a queued request while halted (${row.run_ref})`);
+          else log(logPath, `provider: could not withdraw ${row.run_ref} — ${c?.reason}`);
+        } catch (err) {
+          log(logPath, `provider: could not withdraw ${row.run_ref} — ${err.message}`);
+        }
+      }
+    }
+    return { decisions, escalations, halted: true };
+  };
+
+  // NAMING WHAT STILL HAPPENS. This line is the operator's only signal, and they
+  // read it while debugging whatever made them halt -- so "no work will be
+  // started" being TRUE is not enough if the tick also mutates shared state. It
+  // reaps rows whose holders are dead, completes releases and cooldown writes it
+  // already owed, withdraws its own queue position, and retires review requests
+  // the profile no longer asks for. None of those starts work; every one of them
+  // either finishes an obligation or stops blocking another process. But an
+  // operator who believes nothing at all is moving will misread the hub.
+  if (halted(ctx.haltMarker))
+    return haltStop(`HALTED: ${ctx.haltMarker} exists — no work will be started; ` +
+                    `releasing this guardian's scheduler claims and finishing what it already owed`);
 
 
   const prs = (ctx.openPrs ?? openPrs)(nwo, profile.watch?.maxOpenPrs ?? 20);
@@ -1549,7 +1632,7 @@ export async function tick(ctx) {
 
   const waiting = new Set();
   for (const pr of prs) {
-    if (halted(ctx.haltMarker)) { log(logPath, "HALTED mid-tick"); return { decisions, escalations, halted: true }; }
+    if (halted(ctx.haltMarker)) return haltStop("HALTED mid-tick");
 
     // THE HEAD IS PINNED FIRST, and the fold runs before the evaluation.
     //
@@ -1718,8 +1801,23 @@ export async function tick(ctx) {
     if (builderPr) {
       const access = hubNow();
       if (access.why) hold = { readable: false, why: access.why };
-      else if (!access.hub) hold = null;                       // no hub at all: not asked
-      else if (repoId == null) hold = { readable: false, why: "the repository numeric id is unknown" };
+      // NO HUB IS NOT "NOT ASKED", HERE, and the scoping is what makes that safe.
+      //
+      // Everywhere else an absent hub means an ordinary machine with no builder
+      // on it, and dragging a verdict to UNKNOWN over a question nobody put to it
+      // would be wrong. But this branch sits inside `if (builderPr)`: an ordinary
+      // pull request never reaches it. What is in front of us is a pull request
+      // the BUILDER opened, and the builder shares this guardian's hub -- so a
+      // builder PR with no hub is not "a machine with no builder", it is the
+      // authority database for this PR's merge safety being gone: deleted, its
+      // mount vanished, or the store not yet migrated.
+      //
+      // Answering `null` omitted the clause, which reads as "not asked", and the
+      // required policy check could then pass while the guardian had no way to
+      // know whether an active `pr_hold` existed -- the fail-open this clause was
+      // written to close, reintroduced at the wiring for the one case where the
+      // hub is the whole answer.
+      else if (!access.hub) hold = { readable: false, why: "there is no hub on this machine, so this builder pull request's holds cannot be read" };
       else hold = openHold(access.hub, { repoId, pr });
     }
     const e = (ctx.evaluate ?? evaluatePr)({ nwo, pr, profile, db, anchor, hold,
@@ -1892,7 +1990,7 @@ export async function tick(ctx) {
         const intended = new Set([
           ...(mightClaimCanary ? [`canary:${nwo}`] : []),
           ...wanted.map(d => `${nwo}#${d.e.pr}:${d.decision.action}`)]);
-        const queued = (ctx.queuedRequests ?? queuedGuardianRequests)(h, { repoId });
+        const queued = readQueuedNow(h);
         // THE CANCEL PHASE RUNS AFTER THE DISPATCH LOOP, not here. `wanted` is
         // every worker DECISION, and the loop then applies capacity, the
         // preparation backoff, root-cause resolution, flake assessment, prompt

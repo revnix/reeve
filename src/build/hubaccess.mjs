@@ -5,7 +5,7 @@
 // the only assertions available were structural, so disabling the schema gate
 // with `if (false && ...)` left every one of them green. The property was
 // asserted and untested at the same time.
-import { existsSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { openHubAsGuest, ALLOWED } from "./hubguest.mjs";
 import { SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION, HUB_BUSY_TIMEOUT_MS } from "./hubdb.mjs";
@@ -71,7 +71,19 @@ export function hubAccess(hubPath) {
   return () => {
     const p = hubPath;
     const drop = () => { if (handle) { try { handle.close(); } catch {} handle = null; ident = null; } };
-    if (!existsSync(p)) { drop(); return { hub: null, why: null }; }
+    // ABSENT, OR UNREACHABLE? `existsSync` answers false for both -- it swallows
+    // EACCES, ELOOP and every other stat failure alongside ENOENT. So a hub whose
+    // directory lost its permissions read as an ordinary machine with no builder:
+    // the guardian omitted the hold clause AND dispatched unscheduled, turning a
+    // permissions outage into a merge-policy fail-open and a quota fail-open at
+    // once, silently. Only ENOENT is genuinely absent.
+    try {
+      statSync(p);
+    } catch (err) {
+      if (err?.code === "ENOENT") { drop(); return { hub: null, why: null }; }
+      drop();
+      return { hub: null, why: `the hub at ${p} could not be reached: ${err?.code ?? ""} ${err?.message ?? err}`.trim() };
+    }
     // ONE PROBE, BOTH READINGS. The version and the column shape are two facts
     // about the same store at the same moment; taking them through separate
     // handles would be two moments, and a restore between them would have the

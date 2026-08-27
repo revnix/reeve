@@ -1444,6 +1444,46 @@ export async function tick(ctx) {
     for (const [key, identity] of [...pendingReleases]) releaseWithRetry(key, identity);
   }
 
+  // ── the scheduler's own housekeeping, before ANYTHING can end the tick ────
+  //
+  // Ahead of the pull-request listing, because that listing can return early:
+  // when GitHub cannot be asked, the tick stops there. Housekeeping needs
+  // nothing from GitHub -- it is SQLite and a liveness check -- so leaving it
+  // downstream meant a prolonged GitHub outage let an expired lease from a dead
+  // guardian go on counting against capacity, and a stale queued row go on
+  // blocking every builder admission, while the database that could have
+  // cleared them was healthy the whole time.
+  //
+  // REAP FIRST. `claimProvider` counts held rows and does not reap, and nothing
+  // in production called `reapProviderLeases` at all -- so a guardian or a
+  // detached worker that died before its `finally` left a held row that outlived
+  // its expiry and went on being counted for ever. Enough crashes and the
+  // scheduler returns `at-limit` permanently, to both the guardian and the
+  // builder, with no lease that any live process holds.
+  //
+  // Expiry AND liveness together: a row past `expires_at` whose holder is still
+  // running is a long job, not an abandoned one.
+  // NOT gated on `wanted.length`. A guardian that died holding a lease leaves a
+  // row only its successor can clear, and a successor with nothing to dispatch
+  // this tick is exactly the state a restart lands in -- so gating housekeeping
+  // on local demand meant the rows that most need reaping were reaped least. The
+  // builder never calls the reaper at all, so a held row would count against
+  // capacity for ever and a queued one would block every builder admission.
+  if (execute) {
+    const h = hubOr(() => null);
+    if (h) {
+      try {
+        const rp = (ctx.reapProvider ?? reapProviderLeases)(h, { isAlive: isSameProcess });
+        if (rp?.reaped) log(logPath, `provider: reaped ${rp.reaped} expired lease(s) whose holder is gone`);
+      } catch (err) {
+        // Housekeeping must never take the tick with it.
+        log(logPath, `provider: could not reap expired leases — ${err.message}`);
+        raise("the provider scheduler is unreadable; dispatching unscheduled");
+      }
+    }
+  }
+
+
   const prs = (ctx.openPrs ?? openPrs)(nwo, profile.watch?.maxOpenPrs ?? 20);
   if (prs === null) {
     // Could not ask is not none. Returning an empty list here would look exactly
@@ -1514,7 +1554,16 @@ export async function tick(ctx) {
     // both, so the fold and the evaluation cannot disagree about which revision
     // they describe -- which pinning twice would have permitted.
     const anchor = anchorFor({ nwo, pr });
-    if (!anchor.ok) { log(logPath, `  #${pr}: could not read — ${anchor.why}`); continue; }
+    if (!anchor.ok) {
+      // UNREAD, exactly as an evaluation failure is. The marker was added at the
+      // `evaluate` failure only, and a pull request whose ANCHOR could not be
+      // read takes this earlier exit -- so the sweep saw it missing from
+      // `wanted`, read that as withdrawal, and cancelled its queued request.
+      // Two ways to fail a read; the rule covered one.
+      unreadable.add(pr);
+      log(logPath, `  #${pr}: could not read — ${anchor.why}`);
+      continue;
+    }
 
     if (ctx.reviewIngest !== false) {
       noteHead(db, nwo, pr, anchor.head);
@@ -1801,37 +1850,6 @@ export async function tick(ctx) {
   // verdict is the one case where it certainly cannot.
   const mightClaimCanary = Boolean(execute && wanted.length && !(ctx.containment ?? null));
 
-  // ── the scheduler's own housekeeping, before anything asks it for a slot ──
-  //
-  // REAP FIRST. `claimProvider` counts held rows and does not reap, and nothing
-  // in production called `reapProviderLeases` at all -- so a guardian or a
-  // detached worker that died before its `finally` left a held row that outlived
-  // its expiry and went on being counted for ever. Enough crashes and the
-  // scheduler returns `at-limit` permanently, to both the guardian and the
-  // builder, with no lease that any live process holds.
-  //
-  // Expiry AND liveness together: a row past `expires_at` whose holder is still
-  // running is a long job, not an abandoned one.
-  // NOT gated on `wanted.length`. A guardian that died holding a lease leaves a
-  // row only its successor can clear, and a successor with nothing to dispatch
-  // this tick is exactly the state a restart lands in -- so gating housekeeping
-  // on local demand meant the rows that most need reaping were reaped least. The
-  // builder never calls the reaper at all, so a held row would count against
-  // capacity for ever and a queued one would block every builder admission.
-  if (execute) {
-    const h = hubOr(() => null);
-    if (h) {
-      try {
-        const rp = (ctx.reapProvider ?? reapProviderLeases)(h, { isAlive: isSameProcess });
-        if (rp?.reaped) log(logPath, `provider: reaped ${rp.reaped} expired lease(s) whose holder is gone`);
-      } catch (err) {
-        // Housekeeping must never take the tick with it.
-        log(logPath, `provider: could not reap expired leases — ${err.message}`);
-        raise("the provider scheduler is unreadable; dispatching unscheduled");
-      }
-    }
-  }
-
   // AND CANCEL WHAT THIS TICK IS NO LONGER GOING TO ASK FOR.
   //
   // A `queued` request is a standing claim on the next free slot, and it is
@@ -2117,7 +2135,15 @@ export async function tick(ctx) {
       // retry the design allows on work that never ran.
       let prLease = null;
       const prRunRef = `${nwo}#${e.pr}:${decision.action}`;
-      if (hub) {
+      // THE SAME FRESH HANDLE THE CLAIM WILL USE. This guarded on the snapshot
+      // taken at the top of the tick while the claim below took a current one --
+      // so a hub that was absent or unreadable at that first read and usable by
+      // dispatch time meant the worker skipped `claimProvider` entirely and ran
+      // UNSCHEDULED against a scheduler that was available. I noticed this
+      // asymmetry last round and judged it acceptable; it is not, and "the guard
+      // and the operation must ask the same question at the same moment" is the
+      // rule I had already applied everywhere else.
+      if (claimHub()) {
         if (repoId == null) {
           // FAIL CLOSED, the same as the canary: a lease that cannot be scoped
           // is invisible to the live-request index, so the guardian would insert

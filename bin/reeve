@@ -8,7 +8,7 @@ import { runDoctor, render, checkAppIdentity, hubFindings, renderHub } from "../
 import { open } from "../src/db/ops.mjs";
 import { statePathFor, dashPathFor, legacyStatePathFor, legacyDashPathFor, hubPathFor } from "../src/paths.mjs";
 import { hubAccess } from "../src/build/hubaccess.mjs";
-import { resolveRepoId } from "../src/build/repoid.mjs";
+import { resolveRepoIdAt } from "../src/build/repoid.mjs";
 import { snapshot, restore, latestSnapshot, exportEvents,
          snapshotAll, restoreHub, validateSnapshot } from "../src/backup.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
@@ -122,43 +122,12 @@ const repoIdFromGitHub = (nwo) => {
 const repoIdOnce = async (project) => {
   if (!project) return null;
   const p = hubPathFor(HOME);
-  if (!existsSync(p)) return null;
-  let db = null;
-  try {
-    // READ-ONLY, AND DELIBERATELY NOT `openHub`. `openHub` MIGRATES: it applies
-    // every pending migration before answering anything. This path holds no
-    // builder singleton lease, so a newer guardian restarting beside an older
-    // running builder would have upgraded the schema underneath that builder --
-    // exactly the ordering `build run` avoids by taking its lease on a raw
-    // handle first. A lookup must never be a schema change.
-    //
-    // A hub too old to have `task` yet simply throws here and the id stays
-    // unknown, which is the honest answer: the guardian fails closed and says so
-    // rather than migrating someone else's database to find out.
-    // THE SHARED CONTENTION BUDGET, like every other hub connection. On
-    // SQLite's default of zero this fails the instant a migration or a restore
-    // holds the lock -- and the caller then records the attempt and waits
-    // REPO_ID_RETRY_SECONDS before asking again, so a moment's contention costs
-    // ten minutes of fail-closed dispatch and UNKNOWN holds.
-    //
-    // This is the second read-only hub connection this change opened and the
-    // second to be missed: the constant was extracted in #40 precisely so there
-    // would be one answer, and a new connection is exactly where the old answer
-    // gets re-invented.
-    db = new DatabaseSync(p, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS });
-    return await resolveRepoId(db, project, { fetchRepoId: repoIdFromGitHub });
-  } catch (err) {
-    // ONLY THE ABSENT CASE IS BENIGN. A hub too old to have `task` yet is
-    // genuinely "no id known", which is an ordinary state. A `task` table that
-    // exists and cannot be read is an operational fault, and collapsing the two
-    // defeated `resolveRepoId`'s three-outcome contract: the daemon's own catch
-    // never saw it, nothing reported the hub unreadable, and the guardian sat
-    // fail-closed under the misleading "the repository numeric id is unknown"
-    // with only the ten-minute absence cadence to retry it.
-    if (/no such table/i.test(err.message)) return null;
-    throw err;
-  }
-  finally { try { db?.close(); } catch {} }
+  // DELEGATED, NOT RESTATED. The open options and the benign/fault split are the
+  // lookup's own invariants, and while they lived in this catch the only thing
+  // that could assert them was a regex over this file's source text -- so
+  // disabling either left every assertion green. `resolveRepoIdAt` owns both,
+  // where a hub can be built in each state and asked.
+  return await resolveRepoIdAt(p, project, { fetchRepoId: repoIdFromGitHub });
 };
 
 const registryProjects = (home) => {

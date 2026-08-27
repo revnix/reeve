@@ -11,7 +11,7 @@ import { openHub, SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION } from "../src/b
 import { SCHEDULER_COLUMNS } from "../src/build/providerdb.mjs";
 import { HOLD_COLUMNS } from "../src/build/holds.mjs";
 import { LOCK_COLUMNS } from "../src/build/locks.mjs";
-import { mkdtempSync, rmSync, writeFileSync, renameSync, copyFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, renameSync, copyFileSync, chmodSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -228,6 +228,40 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubaccess-"));
   check(SCHEDULER_COLUMNS.provider_lease.length > 5 && SCHEDULER_COLUMNS.provider_state.length > 3,
     "fixture: the declarations are non-empty, so the check above compares something",
     JSON.stringify({ lease: SCHEDULER_COLUMNS.provider_lease.length, state: SCHEDULER_COLUMNS.provider_state.length }));
+}
+
+// ── a hub that cannot be REACHED is not a hub that is absent ──────────────
+// `existsSync` answers false for EACCES and every other stat failure as well as
+// ENOENT, so a hub whose directory lost its permissions read as "no builder on
+// this machine": the hold clause was omitted AND dispatch went unscheduled, two
+// fail-opens at once, silently.
+{
+  const locked = mkdtempSync(join(tmpdir(), "reeve-hubaccess-locked-"));
+  const p = join(locked, "hub.db");
+  openHub(p).close();
+  // Remove search permission on the directory: the file is there and cannot be
+  // statted. Skipped when running as a user for whom mode bits do not apply.
+  chmodSync(locked, 0o000);
+  let reachable = true;
+  try { statSync(p); } catch { reachable = false; }
+  if (!reachable) {
+    const a = hubAccess(p)();
+    check(a.hub === null && typeof a.why === "string" && a.why.length > 0,
+      "a hub that cannot be reached is refused WITH a reason, not treated as absent",
+      JSON.stringify(a));
+    check(/could not be reached/.test(a.why ?? ""),
+      "and the reason says so rather than staying silent", String(a.why));
+  } else {
+    check(true, "skipped: this user can stat through a 000 directory, so the case cannot be built here");
+  }
+  chmodSync(locked, 0o700);
+  rmSync(locked, { recursive: true, force: true });
+
+  // CONTROL: a path that genuinely does not exist is still the ordinary silent
+  // state -- the whole point is that the two are told apart.
+  const a2 = hubAccess(join(dir, "definitely-not-here.db"))();
+  check(a2.hub === null && a2.why === null,
+    "control: a genuinely absent hub is still no hub and no complaint", JSON.stringify(a2));
 }
 
 // ── an existing hub that cannot be READ is a fault, not an absence ────────

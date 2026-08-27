@@ -59,7 +59,7 @@ const EVAL = {
  * A fixture that cannot exhibit the defect reports the code healthy. The default
  * is now the connection production actually uses.
  */
-const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false } = {}) => {
+const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false, hubGetter } = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "reeve-prov-"));
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -78,7 +78,7 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
       ci: { provider: "github-actions", requiredChecks: [] },
       watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
     },
-    hub: () => ({ hub: guest, why: null }), repoId, lstart: "boot-1",
+    hub: hubGetter ? () => hubGetter(guest) : () => ({ hub: guest, why: null }), repoId, lstart: "boot-1",
     providerClaim: (db, a) => { claims.push(a); return (claim ?? (() => ({ ok: true, id: claims.length })))(a); },
     providerRelease: (db, a) => { releases.push(a); return (release ?? (() => ({ ok: true })))(a); },
     openPrs: () => [42],
@@ -1078,6 +1078,176 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
   rmSync(dir, { recursive: true, force: true });
 }
 
+// ── an unreadable ANCHOR keeps its queue position too ─────────────────────
+// There are two ways to fail a read, and the marker covered one. A PR whose
+// anchor cannot be read takes an earlier exit than the evaluation failure, so
+// the sweep saw it missing from `wanted` and cancelled its queued request.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-anchor-"));
+  const cancelled = [];
+  const ctx = {
+    nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+    execute: true, shadow: true, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-anchor-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+    },
+    hub: () => ({ hub: {}, why: null }), repoId: 7, lstart: "boot-1",
+    queuedRequests: () => [{ run_ref: "o/r#42:FIX_CI" }, { run_ref: "o/r#99:FIX_CI" }],
+    cancelQueued: (db, a) => { cancelled.push(a.runRef); return { ok: true, cancelled: 1 }; },
+    providerClaim: () => ({ ok: true, id: 1, token: "t" }),
+    providerBind: () => ({ ok: true, bound: 1 }),
+    providerRelease: () => ({ ok: true }),
+    reapProvider: () => ({ ok: true, reaped: 0 }),
+    openPrs: () => [42],
+    // The ANCHOR fails, not the evaluation.
+    prAnchor: () => ({ ok: false, why: "GitHub could not be reached" }),
+    evaluate: () => EVAL,
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }),
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+  };
+  await tick(ctx); ctx.db.close();
+  check(!cancelled.includes("o/r#42:FIX_CI"),
+    "a queued request for a PR whose ANCHOR could not be read is KEPT", JSON.stringify(cancelled));
+  check(cancelled.includes("o/r#99:FIX_CI"),
+    "control: one for a PR this tick never saw at all is still cancelled", JSON.stringify(cancelled));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── housekeeping survives a GitHub outage ─────────────────────────────────
+// The reaper needs nothing from GitHub -- it is SQLite and a liveness check --
+// but it sat after the pull-request listing, which returns early when GitHub
+// cannot be asked. So an expired lease from a dead guardian went on counting
+// against capacity throughout an outage, with the database that could clear it
+// healthy the whole time.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-outage-"));
+  const reaped = [];
+  const ctx = {
+    nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+    execute: true, shadow: true, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-outage-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+    },
+    hub: () => ({ hub: {}, why: null }), repoId: 7, lstart: "boot-1",
+    reapProvider: () => { reaped.push(1); return { ok: true, reaped: 1 }; },
+    queuedRequests: () => [],
+    providerClaim: () => ({ ok: true, id: 1, token: "t" }),
+    providerRelease: () => ({ ok: true }),
+    // GitHub cannot be asked: `openPrs` answers null, which ends the tick early.
+    openPrs: () => null,
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+  };
+  const r = await tick(ctx); ctx.db.close();
+  check(r?.unreadable === true, "fixture: the tick really did end early on the PR listing", JSON.stringify(r?.unreadable));
+  check(reaped.length > 0,
+    "and abandoned leases were still reaped, because that needs no GitHub at all",
+    String(reaped.length));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── a lookup that THROWS is an outage, and the tick must say so ───────────
+// Newly load-bearing. While the CLI's lookup answered `null` for a hub it could
+// not open, this catch was reachable only in theory; now that absent and
+// unreachable are told apart, an unreadable hub arrives here as a throw. What
+// must hold is both halves at once: the founder hears `guardian:hub:unreadable`,
+// AND the tick carries on -- an unreadable scheduler fails OPEN, so a permissions
+// fault on the builder's database must not stop the guardian working.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-idthrow-"));
+  const ctx = {
+    nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+    execute: true, shadow: true, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-idthrow-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+    },
+    hub: () => ({ hub: {}, why: null }),
+    // No id known yet, and the lookup cannot answer: the hub is there and cannot
+    // be reached. This is the shape `resolveRepoIdAt` now propagates.
+    repoId: null,
+    resolveRepoId: () => { const e = new Error("EACCES: permission denied, stat hub.db"); e.code = "EACCES"; throw e; },
+    lstart: "boot-1",
+    reapProvider: () => ({ ok: true, reaped: 0 }),
+    queuedRequests: () => [],
+    providerClaim: () => ({ ok: true, id: 1 }),
+    providerRelease: () => ({ ok: true }),
+    openPrs: () => [],
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+  };
+  const r = await tick(ctx);
+  const esc = [...(r.escalations?.keys?.() ?? [])];
+  const logged = readFileSync(join(dir, "log.txt"), "utf8");
+  ctx.db.close();
+  check(esc.includes("guardian:hub:unreadable"),
+    "a repository-id lookup that throws raises guardian:hub:unreadable", esc.join(" | "));
+  check(/the repository id could not be resolved/.test(logged),
+    "and the log says which read failed and why",
+    logged.split("\n").filter(l => /repository id/.test(l)).join(" | "));
+  check(r?.halted !== true,
+    "and the tick still finishes: an unreadable scheduler fails OPEN", JSON.stringify(r?.halted));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── the guard and the claim must ask the hub at the SAME moment ───────────
+// The worker's lease was guarded on the hub read taken at the TOP of the tick
+// while the claim beneath it took a current one. Those are different moments,
+// and a tick is not instant: a hub that was unreadable at the first read and
+// usable by the time dispatch came round meant the worker skipped `claimProvider`
+// altogether and ran UNSCHEDULED against a scheduler that was available -- quota
+// spent that the scheduler could not see, which is the whole failure it exists
+// to prevent. Every other site in this file already re-read; this one did not.
+{
+  let reads = 0;
+  const s = await run({
+    hubGetter: (guest) => (++reads === 1
+      ? { hub: null, why: "the hub could not be read at that instant" }
+      : { hub: guest, why: null }),
+  });
+  check(reads > 1, "fixture: the tick really did read the hub more than once", String(reads));
+  check(s.spawned.length === 1, "fixture: a worker is still dispatched", s.esc);
+  const worker = s.claims.find(c => !/^canary:/.test(c.runRef));
+  check(worker != null,
+    "a hub unreadable only at the tick's FIRST read still gets the worker a lease",
+    JSON.stringify(s.claims.map(c => c.runRef)));
+}
+
+// CONTROL: unreadable at EVERY read really does dispatch unscheduled, so the
+// claim above is the RE-READ and not something the fixture does unconditionally.
+{
+  const s = await run({ hubGetter: () => ({ hub: null, why: "unreadable throughout" }) });
+  check(s.spawned.length === 1, "control fixture: the worker is dispatched anyway — an unreadable scheduler FAILS OPEN", s.esc);
+  check(!s.claims.some(c => !/^canary:/.test(c.runRef)),
+    "control: with the hub unreadable at every read there is no lease to take",
+    JSON.stringify(s.claims.map(c => c.runRef)));
+}
+
 // ── A-9: a maintenance refusal is retried, never swallowed ────────────────
 // `assertWritable` refuses every hub write while a restore holds the lock. A
 // release dropped there leaves the lease held until it expires, counted against
@@ -1154,29 +1324,18 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false 
     "and it comes from the extracted, tested hub accessor",
     (cli.match(/const guardianHubAccess.*/) ?? [""])[0]);
 
-  // THE REPOSITORY-ID READ IS READ-ONLY AND DOES NOT MIGRATE. `openHub` applies
-  // every pending migration before answering, and this path holds no builder
-  // singleton lease -- so a newer guardian restarting beside an older running
-  // builder would upgrade the schema underneath it. A lookup must never be a
-  // schema change.
-  const resolver = cli.slice(cli.indexOf("const repoIdOnce"), cli.indexOf("const registryProjects"));
-  check(/readOnly:\s*true/.test(resolver) && !/openHub\(/.test(resolver),
-    "the repository-id read uses a read-only connection, never the migrating opener",
-    resolver.slice(0, 400));
-  // AND IT WAITS. On SQLite's default of zero this fails the instant a migration
-  // or restore holds the lock, and the caller then waits REPO_ID_RETRY_SECONDS
-  // before asking again -- ten minutes of fail-closed dispatch bought by a
-  // moment's contention. Every hub connection takes the same budget.
-  check(/timeout:\s*HUB_BUSY_TIMEOUT_MS/.test(resolver),
-    "and waits the shared hub contention budget rather than SQLite's zero",
-    resolver.slice(0, 400));
-  // No hub connection in the CLI restates the number the constant holds.
+  // THE REPOSITORY-ID READ moved out of this file's reach, deliberately. It was
+  // asserted here by reading the CLI's source for `readOnly: true` and for the
+  // shared timeout -- and a source-text assertion cannot fail when the logic
+  // beneath it is disabled, which is exactly what happened to the benign/fault
+  // split that lived in the same function. Both are now behavioural, over a hub
+  // built in each state, in `test/repo-id-lookup.test.mjs`; that suite also
+  // holds the assertion that fails if the decision is ever inlined back here.
+  // No hub connection in the CLI restates the contention budget as a number.
   const literals = (cli.match(/new DatabaseSync\([^)]*timeout:\s*\d+/g) ?? []);
   check(literals.length === 0,
     "and no hub connection in the CLI restates the timeout as a literal",
     literals.join(" | "));
-  check(/finally\s*\{[^}]*close/.test(resolver),
-    "and closes it on every path out", resolver.slice(0, 400));
 
   // That the readiness gate reads the version ITSELF rather than through
   // `completedVersion` -- which catches every failure and answers 0 -- is now a

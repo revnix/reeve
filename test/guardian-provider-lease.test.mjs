@@ -18,7 +18,7 @@ import { resolveRepoId } from "../src/build/repoid.mjs";
 import { COLUMNS_AT, SCHEDULER_MIN_HUB_VERSION } from "../src/build/hubdb.mjs";
 import { isBuilderPr } from "../src/pr.mjs";
 import { CLAUSE_IDS } from "../src/verdict.mjs";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -291,13 +291,37 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false,
   check(/hub:unreadable/.test([...(r1.escalations?.keys?.() ?? [])].join(" ")),
     "and it escalates as well as blocking", [...(r1.escalations?.keys?.() ?? [])].join(" | "));
 
-  // CONTROL: a hub that is genuinely ABSENT stays null -- no clause at all. A
-  // guardian on a machine with no builder must not have every verdict dragged to
-  // UNKNOWN over a question nobody put to it.
+  // AN ABSENT HUB, ON A BUILDER PULL REQUEST, IS ALSO A READING THAT SAYS SO.
+  //
+  // This control used to assert the opposite, justified by "a guardian on a
+  // machine with no builder must not have every verdict dragged to UNKNOWN". That
+  // rationale was written before `isBuilderPr` narrowed this branch, and it stopped
+  // matching the fixture underneath it: `headRef: "mp/bt-1-s0"` IS a builder pull
+  // request, so the control was describing the general case while measuring the
+  // builder one. The builder shares this guardian's hub, so a builder PR with no
+  // hub is not an ordinary machine — it is the authority for this PR's merge
+  // safety being absent, and omitting the clause let the policy check pass over a
+  // `pr_hold` nobody could read.
   seen = undefined;
   const b2 = { ...base, db: open(join(dir, "s2.db")), hub: () => ({ hub: null, why: null }) };
   await tick(b2); b2.db.close();
-  check(seen?.hold === null, "control: an ABSENT hub is still no clause at all", JSON.stringify(seen?.hold));
+  check(seen?.hold?.readable === false,
+    "an ABSENT hub on a BUILDER pull request is a reading that says so, not silence",
+    JSON.stringify(seen?.hold));
+
+  // AND THE GENERAL CASE THE OLD RATIONALE WAS ACTUALLY ABOUT, which nothing was
+  // measuring: an ordinary pull request never reaches that branch at all, so a
+  // machine with no builder is not dragged to UNKNOWN. This is the assertion that
+  // makes the one above safe rather than merely stricter.
+  seen = undefined;
+  const b3 = { ...base, db: open(join(dir, "s3.db")), hub: () => ({ hub: null, why: null }),
+               prAnchor: () => ({ ok: true, headRef: "feature/ordinary", baseRef: "main", state: "open",
+                                  title: "t", updatedAt: "x", head: "b".repeat(40),
+                                  pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "a-person" }) };
+  await tick(b3); b3.db.close();
+  check(seen?.hold === null,
+    "control: an ORDINARY pull request on a hubless machine still gets no clause at all",
+    JSON.stringify(seen?.hold));
   rmSync(dir, { recursive: true, force: true });
 }
 
@@ -1230,6 +1254,123 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false,
     logged.split("\n").filter(l => /repository id/.test(l)).join(" | "));
   check(r?.halted !== true,
     "and the tick still finishes: an unreadable scheduler fails OPEN", JSON.stringify(r?.halted));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── housekeeping is not dispatch, so it does not need dispatch authority ──
+// The reaper was gated on `execute`. Dispatch authority is about whether THIS
+// guardian may start work; reaping is about rows a DEAD one left behind — and
+// observational mode is the default, so it is exactly what someone restarts into
+// after an armed guardian crashed. The dead guardian's queued row then sat for
+// ever, `claimProvider` refuses every builder admission while any queued guardian
+// row exists, and the builder never reaps at all, so nothing else was coming.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-observe-"));
+  const reaped = [];
+  const ctx = {
+    nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+    // OBSERVATIONAL: the default, and the whole point of this block.
+    execute: false, shadow: true, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-observe-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+    },
+    hub: () => ({ hub: {}, why: null }), repoId: 7, lstart: "boot-1",
+    reapProvider: () => { reaped.push(1); return { ok: true, reaped: 1 }; },
+    queuedRequests: () => [],
+    providerClaim: () => ({ ok: true, id: 1 }),
+    providerRelease: () => ({ ok: true }),
+    openPrs: () => [],
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+  };
+  const r = await tick(ctx); ctx.db.close();
+  check(r?.halted !== true, "fixture: the tick ran and was not halted", JSON.stringify(r?.halted));
+  check(reaped.length > 0,
+    "an OBSERVATIONAL guardian still reaps the rows a dead one left behind",
+    String(reaped.length));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// ── HALT: what stops, and what deliberately does not ──────────────────────
+// The halt gate moved BELOW the hub/repo-id resolution and the reaper, because
+// scheduler housekeeping depends on nothing the halt is about and was sitting
+// behind a third unrelated gate. That trade has to be paid for with a positive
+// control, and there was none: across the whole suite `haltMarker` appeared once,
+// in a fixture that asserted nothing about it, so "no work will be started" had
+// never been measured — it was a promise in a log line.
+//
+// The sharp half is the queue. `claimProvider` serves guardian requests in order
+// and refuses builder admission while any queued guardian row exists, and expiry
+// cannot clear one whose holder is alive and sleeping under halt. So the guardian
+// must WITHDRAW rather than merely stop.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-halt-"));
+  const marker = join(dir, "HALT");
+  writeFileSync(marker, "stop");
+  const cancelled = [], spawned = [], reaped = [];
+  const base = {
+    nwo: "o/r", db: open(join(dir, "s.db")), logPath: join(dir, "log.txt"),
+    execute: true, shadow: true, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-halt-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 1 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+    },
+    hub: () => ({ hub: {}, why: null }), repoId: 7, lstart: "boot-1",
+    queuedRequests: () => [{ run_ref: "o/r#42:FIX_CI" }],
+    cancelQueued: (db, a) => { cancelled.push(a.runRef); return { ok: true, cancelled: 1 }; },
+    reapProvider: () => { reaped.push(1); return { ok: true, reaped: 0 }; },
+    providerClaim: () => ({ ok: true, id: 1, token: "t" }),
+    providerBind: () => ({ ok: true, bound: 1 }),
+    providerRelease: () => ({ ok: true }),
+    openPrs: () => [42],
+    prAnchor: () => ({ ok: true, headRef: "f", baseRef: "main", state: "open", title: "t",
+                       updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
+    evaluate: () => EVAL,
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    spawnWorker: async a => { spawned.push(a); return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }; },
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+  };
+
+  const halted = { ...base, haltMarker: marker, db: open(join(dir, "halted.db")) };
+  const r = await tick(halted); halted.db.close();
+  check(r?.halted === true, "fixture: the marker really did halt the tick", JSON.stringify(r?.halted));
+  check(spawned.length === 0, "a halted tick spawns NO worker", JSON.stringify(spawned.length));
+  check(cancelled.includes("o/r#42:FIX_CI"),
+    "but it WITHDRAWS its queued request, which nothing else can clear while its holder sleeps",
+    JSON.stringify(cancelled));
+  check(reaped.length > 0,
+    "and it still reaps rows whose holders are dead, which is not starting work",
+    String(reaped.length));
+  const logged = readFileSync(join(dir, "log.txt"), "utf8");
+  check(/no work will be started/.test(logged) && /releasing this guardian/.test(logged),
+    "and the operator's line names what still happens, not only what stops",
+    logged.split("\n").filter(l => /HALTED/.test(l)).join(" | "));
+
+  // CONTROL, or "spawns no worker" would pass on a fixture that cannot spawn one
+  // at all — which is exactly how a halt test proves nothing.
+  spawned.length = 0; cancelled.length = 0;
+  const running = { ...base, haltMarker: join(dir, "NO-SUCH-MARKER"), db: open(join(dir, "running.db")) };
+  const r2 = await tick(running); running.db.close();
+  check(r2?.halted !== true, "control: without the marker the tick is not halted", JSON.stringify(r2?.halted));
+  check(spawned.length === 1,
+    "control: and the very same fixture DOES spawn a worker, so the assertion above measured the halt",
+    JSON.stringify(spawned.length));
   rmSync(dir, { recursive: true, force: true });
 }
 

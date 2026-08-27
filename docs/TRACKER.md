@@ -497,6 +497,50 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       though it were the whole one. **A guard is untested until you construct the
       state that should trip it**, and never promise a peer a guard will catch
       something you have not watched it catch.
+
+      **ROUND 12 — five findings, three of them one shape for the fourth, fifth
+      and sixth time.** The reaper was gated on `execute`, so an observational
+      guardian — the DEFAULT, and what a crash is restarted into — never reaped,
+      and the dead guardian's queued row then blocked every builder admission
+      because the builder never reaps at all. The queued-request cancellation sat
+      after the halt returns, so a halted guardian kept its queue position while
+      it slept and expiry could not clear a row whose holder is alive. And an
+      absent hub read as silence on a BUILDER pull request, letting the policy
+      check pass over a `pr_hold` nobody could read.
+
+      The halt gate moved below the hub/repo-id resolution and the reaper, and
+      every halt exit now runs through one `haltStop()` that withdraws this
+      guardian's queued requests first. **Halt inertness had never been tested** —
+      one fixture set the marker and asserted nothing — so it has a positive
+      control now, with the control that makes it mean something: the same
+      fixture spawns a worker when the marker is absent.
+
+      Two more: `noteRateLimit` carried the observation time and the expiry
+      through ONE number, so a deferred 429 retried after a newer one looked
+      newest and replaced `last_signature` with the stale one; and `reeve run`
+      pinned `ctx.project` at startup, so a `projects.json` that did not yet name
+      the repository made the advertised ten-minute retry ask about nothing, for
+      ever.
+
+      **Re-gating the reaper on `execute` reddened NOTHING** — the halt fixture
+      runs armed, so that property had no test at all. It has one now.
+
+      **The peer's correction is the lesson of the round.** I enumerated the side
+      effects the halt move crossed and told them there were three; they found a
+      fourth, `retireUnconfigured()`, unconditional and writing. The list did not
+      read as "the ones I found", it read as the set — the same narrowing defect
+      as the CLAUSE_IDS regex, committed within the hour of recording it.
+
+      **MERGED at the founder's direction**, with three P1s open and deferred to
+      a follow-up: a durable run left `leased` when `recordFixAttempt` throws
+      (permanent, since `run_one_live_per_task` is UNIQUE and nothing reaps
+      runs); `askedFor` marked from INTENT at the queue-head preflight, so a row
+      the later gates refuse is never cancelled — a regression from this PR's own
+      round-10 fix; and a provider heartbeat whose `beat: 0` is discarded, so a
+      worker outlives its lease. **All three require `--execute`.** The live
+      guardian runs `reeve run nextlyhq/nextly` with no such flag, from a
+      checkout pinned at main that reeve never self-updates, so none of them can
+      bite until both change.
       gap does not make deferring it free.
 
 - [ ] **S2-C PR-C2, the guardian's hub guest — BUILT (2026-08-26).** Branch

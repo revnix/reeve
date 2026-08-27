@@ -29,21 +29,24 @@ Their review history — every finding and what each changed — is `s3-review-h
 
 S3-A through S3-E must all be merged first. These are the exact names this plan builds on; **if any has changed, stop and reconcile rather than adapting the code here.**
 
-**How this table was built, stated because it changes how much it is worth.** At the time of writing, `tasks/reeve-tasks/plans/` is empty — `ls -la` on `16cd880` returns two directory entries and no files — so none of S3-A through S3-E exists yet. Every row below is derived from `../S3-DESIGN-BRIEF.md` §2.2, which specifies each task's `**Builds.**` and `**Files.**` clauses, plus the S2 surface those tasks consume, re-measured here at `16cd880`. **A row marked `(S3, planned)` is a name this plan expects, not a name this plan has seen.** The first executor of Task 1 re-checks the whole table against the merged documents before writing any code, and reconciles rather than adapts.
+**How this table was built, stated because it changes how much it is worth.** MEASURED at `3becdd0`: `tasks/reeve-tasks/plans/` holds **four** files — S3-A (1,833 lines, 11 tasks), S3-B (1,674 / 8), S3-D (1,957 / 13) and this one. **S3-C and S3-E do not exist yet.** So rows marked `(S3-A/B/D, read)` were taken from those documents' own `**Produces:**` clauses and are names this plan has seen; rows marked `(S3-C/E, derived)` come from `../S3-DESIGN-BRIEF.md` §2.2 and from S3-D's own derived table, and are names this plan **expects**. The first executor of Task 1 re-checks every derived row against the merged documents and **reconciles rather than adapts**.
+
+**Two disagreements found by doing exactly that, recorded rather than smoothed over.** S3-D's derived rows for two of S3-B's exports disagree with what S3-B actually ships, and **S3-B owns those files, so S3-B wins**: the phase schemas are `src/build/schemas/build_size.json`, `build_research.json`, `build_design.json` with **underscores** (S3-B `:169`), not the hyphens S3-D's table carries; and `writeArtifact` takes **one object** — `writeArtifact({dir, phase, bytes}) -> {path, sha256, bytes}` (S3-B `:1126`) — not the positional `writeArtifact(path, bytes) -> {sha}` S3-D derived. Task 9's schema guard is built on the underscore names, and would have refused every real schema had this gone unchecked.
 
 | from | name | shape |
 |---|---|---|
 | S3-A T1 `src/profile/schema.mjs` | `builder.budgets.<ACTION>` | `{budgetMinutes, maxTurns, model, effort, maxBudgetUsd, maxAttempts}` for `BUILD_SIZE\|BUILD_RESEARCH\|BUILD_DESIGN`. V2 writes measured values back into these keys or into the tracker (S3, planned) |
-| S3-A T1 `src/profile/schema.mjs` | `builder.provider.{concurrencyLimit, guardianReserved, cooldownSeconds, preemptAtBoundary}` | validated profile keys; **the numbers V6 measures are written to `provider_state`, not here** — the profile carries the operator's intent, the table carries the measurement (S3, planned) |
-| S3-A T1 `src/build/capabilities.mjs` | `capabilities(profile) -> {observe, draftSpec, …}` | the single reader of `builder.capabilities.*`; V1 cannot dispatch with `observe` false (S3, planned) |
-| S3-B T4 `src/build/artifact.mjs` | `writeArtifact(dir, phase, bytes) -> {path, sha256}` | durable write (tmp + rename + fsync) then read-back-and-verify; the sha is what justifies the transition. V1 compares this sha against `phase_event.artifact_sha` (S3, planned) |
-| S3-B T4 `src/paths.mjs` | `taskPathFor(home, taskId)`, `artifactPathFor(home, taskId, phase)` | `~/.reeve/tasks/<bt>/artifacts/<phase>.{md,json}` and `~/.reeve/tasks/<bt>/runs/g<gen>-<phase>-s<slice>-a<attempt>.{out,err}` (S3, planned) |
-| S3-B T5 `src/build/schemas/` | `BUILD_SIZE.json`, `BUILD_RESEARCH.json`, `BUILD_DESIGN.json` | the **real** phase schemas. V5 runs against these three files and against nothing else (S3, planned) |
-| S3-C T6 `src/build/dispatch.mjs` | `dispatchPhase(db, {taskId, phase, …}) -> {runKey, pid}` | writes one `phase_run` row before the process exists; records the §4.7 contract snapshot including a **fully resolved `model_id`, never an alias** (S3, planned) |
-| S3-C T6 `src/build/run.mjs` | the `phase_run` statements | `PRIMARY KEY(task, generation, phase, slice, attempt)`; V2 and V3 read `started_at`, `outcome`, `max_turns`, `cli_version`, `model_id` off these rows (S3, planned) |
-| S3-C T7 `src/build/agents.mjs` | the four subagent definitions + `agentsHash` | measurer, prior-art-scout, adversarial-critic, judge. V4 dispatches at the **maximum** width these support (S3, planned) |
-| S3-D T11 `src/build/research.mjs` | `researchWidth(depth) -> 0 \| 3 \| 6` | §6 `:355` — trivial none, standard up to 3, deep up to 6 plus one adversarial-critic pass. V4's probe runs at the `deep` value (S3, planned) |
-| S3-E T15 `src/build/announce.mjs` | the builder's `announceable` | the page list is `builder:sandbox:canary-failed`, `builder:backup:failed`, `bt:<id>:phase:blocked:<phase>`. A failed measurement raises the first (S3, planned) |
+| S3-A PR-A1 `src/profile/schema.mjs` | `builder.provider.{concurrencyLimit, guardianReserved, cooldownSeconds, preemptAtBoundary}` | validated profile keys; **the numbers V6 measures are written to `provider_state`, not here** — the profile carries the operator's intent, the table carries the measurement (S3-A, read) |
+| S3-A PR-A1 `src/build/capabilities.mjs` | `CAPABILITY_KEYS -> readonly string[]`, `capabilitiesFrom(profile) -> Readonly<Record<string,boolean>>`, `capabilityOn(profile, name) -> boolean` | the only reader of `builder.capabilities.*`; `capabilityOn` **throws** on a name the profile does not declare. V1's precondition reads `observe` through it (S3-A `:485`, read) |
+| S3-B PR-B2 `src/build/artifact.mjs` | `writeArtifact({dir, phase, bytes}) -> {path, sha256, bytes}`, `readArtifact({dir, phase, expectSha}) -> {ok:true, text, sha256} \| {ok:false, why}`, `reviewArtifact` | durable write (tmp + fsync + rename + directory fsync) then read-back-and-verify. V1 compares `sha256` against `phase_event.artifact_sha`, which S3-C Task 1 writes (S3-B `:1126`, read) |
+| S3-B PR-B2 `src/paths.mjs` | `ARTIFACT_FILE = {SIZING:"sizing.json", RESEARCH:"research.md", DESIGN:"design.md"}`, `taskPathFor(home, taskId)`, `artifactPathFor(home, taskId, phase)`, `runPathFor(home, taskId, run)` | `ARTIFACT_FILE` is declared **once**, in `src/paths.mjs`; Task 5 imports it rather than restating the three names, because a second copy is a second inventory (S3-B `:1126`, read) |
+| S3-B PR-B3 `src/build/schemas/` | `build_size.json`, `build_research.json`, `build_design.json` — **lowercase, underscores** | the **real** phase schemas, each rejecting `{}` (S3-B `:169`, read). V5 runs against these three files and nothing else. **S3-D's derived table spells them with hyphens; S3-B owns them and wins** |
+| S3-B PR-B3 `src/build/report.mjs` | `validateReport(action, raw) -> {ok:true, report} \| {ok:false, kind:"BAD_REPORT", errors}` | V5 classifies each of its twenty runs through this, so "malformed" means what the product means by it (S3-B, read) |
+| S3-C T6 `src/build/dispatch.mjs` | `PHASE_SPECS`, `specFor(phase) -> spec \| null`, `dispatchPhase(db, ctx) -> {ok:true, runKey, argv, env} \| {ok:false, reason}` | `specFor` returning `null` is the "no action for this phase" answer, and it is why SPEC_DRAFT is where V1 stops. Writes one `phase_run` row before the process exists, with the §4.7 snapshot and a **fully resolved `model_id`, never an alias** (S3-C, derived — corroborated by S3-D `:52`) |
+| S3-C T6 `src/build/run.mjs` | the `phase_run` statements | `PRIMARY KEY(task, generation, phase, slice, attempt)`; V2 and V3 read `started_at`, `heartbeat_at`, `outcome`, `max_turns`, `max_budget_usd`, `cli_version`, `model_id` off these rows (S3-C, derived) |
+| S3-C T7 `src/build/agents.mjs` | `AGENT_DEFS`, `agentsFor(depth) -> {json, width}`, `agentsHash(json)` | the four definitions of §6 `:353`; `json` is what `workerArgs` passes to `--agents` and `width` is the subagent count. **V4 dispatches at `agentsFor("deep").width`**, and Task 7's precondition compares the observed subagent rows against exactly that number (S3-C, derived — S3-D `:52,:844` reads the same shape) |
+| S3-D PR-D2 `src/build/research.mjs` + `agents.mjs` | the depth-keyed fan-out: trivial none, standard up to 3, deep up to 6 plus one adversarial-critic pass | §6 `:355`, derived from `task.depth` **in code**, not requested in the prompt (S3-D `:833-846`, read) |
+| S3-E T15 `src/build/announce.mjs` | the builder's `announceable` | the page list is `builder:sandbox:canary-failed`, `builder:backup:failed`, `bt:<id>:phase:blocked:<phase>`. A failed measurement raises the first (S3-E, derived) |
 | S2 `src/build/hubdb.mjs:322` | `openHub(path, {skipIntegrity = false}) -> DatabaseSync` | the privileged opener. **MEASURED at `16cd880`, unchanged** |
 | S2 `src/build/providerdb.mjs:111` | `providerState(db, {provider = PROVIDER}) -> {provider, limit, reserved, cooldownUntil, lastSignature, seeded}` | **MEASURED at `16cd880`**: it SELECTs `measured_at` (`:114`) and does not return it. Task 1 adds `measuredAt` to the returned object |
 | S2 `src/build/providerdb.mjs:326` | `providerTx(db, {isAlive, at = null}, fn) -> fn's return` | `BEGIN IMMEDIATE`, `assertWritable` first, `COMMIT`, returns `r` (`:365`). **Every** `provider_state` mutation goes through it |
@@ -127,7 +130,7 @@ Do not re-derive any of these. Each is recorded under `docs/measured/` or re-mea
 
 Recorded so no executor re-litigates them. Each is defaulted where the founder has not answered; **a defaulted answer is a decision that was taken without them and can be reversed cheaply**, and the reasoning is in `../S3-DESIGN-BRIEF.md` §6.
 
-1. **S3 splits into six plan documents, ~1,200 lines each**, and this is the sixth. The measured reason is in the family block above.
+1. **S3 splits into six plan documents**, and this is the sixth. The measured reason is in the family block above. **The cap's unit was CORRECTED on 2026-08-27 (`../trackers/s3.md` §4.13): it is TASKS, not lines** — the "~1,200 lines" figure was computed against S3's 16 PRs when a PR decomposes into three to five plan tasks at ~500 lines each (MEASURED: S2-A 6,328 / 13 = 487; S2-C 2,724 / 5 = 545). **The rule is at most three or four plan tasks per document, and never thin a task to fit a line count.** The six-document decision is unchanged.
 2. **S3 is §14 verbatim, including all six measurements.** No obligation is dropped because it is expensive.
 3. **Q7 — V6 is measured TWICE: guardian idle and guardian live**, and the ramp is **jittered, not simultaneous**, because acceleration limits trip on a sharp usage increase independently of steady-state limits and would otherwise produce a 429 that looks like a pool limit and is not. **Research R5 adds that the practical parallel ceiling is 3–5, and that bounds what V6 can honestly measure: a ramp that stops at 5 cannot report a ceiling above 5, and the document says so in its limits section rather than reporting the top of the ramp as the top of the pool.**
 4. **Q3 — one real probe in T16 with a PLANTED INSTRUCTION FILE.** T7 neutralizes repository-supplied `CLAUDE.md`, `AGENTS.md` and `.claude/` from the run checkout and records the digest of what it removed; **Task 8 here plants one in a fixture repository, dispatches a real RESEARCH worker, and records whether the instruction reached the worker after neutralization.** Research X9 constrains the form: simulated red-teaming missed **71.2%** of confirmed real attacks because it cannot model sandbox constraints, credential state and network policy, so this probe runs against a real worker in the real sandbox or the property is not claimed.
@@ -147,7 +150,11 @@ Recorded so no executor re-litigates them. Each is defaulted where the founder h
   | **V5** | 20 × BUILD_SIZE 15t sonnet/low, plus 3 × BUILD_DESIGN 60t fable/high | $6.60 + $7.92 | **$14.52** |
   | **V6** | 2 passes × ramp 1→5 = 30 BUILD_SIZE slots, plus 2 guardian dispatches on the live pass | $9.90 + $1.77 | **$11.67** |
 
-  **Floor $29.19** (every run works first time, V5 stays on `BUILD_SIZE` alone). **Central $50.58** (one repeat of V1 and V4, which the corpus says to expect: two of the comparator's three runs hit `max_turns`). **Ceiling $79.11** (one further full repeat of V1, V4, V5 and V6). The two levers are that **V2 and V3 cost nothing if and only if V1 is instrumented to record cost, turns and wall-clock per phase**, and that **V5 stays on `BUILD_SIZE`** for the twenty runs that are the sample.
+  **Floor $29.19** (every run works first time, V5 stays on `build_size.json` alone). **Central $50.58** (one repeat of V1 and V4, which the corpus says to expect: two of the comparator's three runs hit `max_turns`). **Ceiling $79.11** (one further full repeat of V1, V4, V5 and V6). The two levers are that **V2 and V3 cost nothing if and only if V1 is instrumented to record cost, turns and wall-clock per phase**, and that **V5 stays on `build_size.json`** for the twenty runs that are the sample.
+
+10. **2026-08-27, F1 answered — the spec repos are `<project>-specs`, one private repo per project:** `revnix/reeve-specs`, `nextlyhq/nextly-specs`, `revnix/rext-specs`. **They do not exist yet (F5, open, and it is the founder's action).** T2's `SNAPSHOT_FIELDS` needs `specRepoId`, so no `reeve task file` succeeds until they exist — which means **V1 cannot run until F5 is done**, and Task 5's preconditions check that before spending anything.
+11. **2026-08-27, F2 answered — `--execute` stays OFF on the live guardian for now**, revisited after T8 merges, because T7 and T8 modify files the running daemon executes. **V6's `live` pass therefore needs a deliberate arming decision at measurement time; Task 10 records the observed state and refuses a mislabelled pass rather than establishing one.**
+12. **2026-08-27, F3 answered — the 15-minute watcher loop is STOPPED** (job `0011c181`), to be restarted when S3's first PR opens. Task 11's close-out works the gate by hand until then; a watcher with no subject reports "quiet" every fifteen minutes, and quiet-with-no-subject is the reading that let a 22-hour CI outage pass unremarked.
 
 ---
 
@@ -213,8 +220,8 @@ Each task names any imports it needs **beyond** these.
 | **V1** — one real scout task through to artifacts: FILED → SIZING → RESEARCH → DESIGN, stopping at SPEC_DRAFT, three artifacts on disk, three shas in `phase_event`, three `phase_run` rows carrying contract snapshots, **zero** GitHub effects | **S3-F Task 5**, `docs/measured/<date>-scout-task-end-to-end.md`, and the guarded acceptance script's five named exits (`ARTIFACTS`, `SHAS`, `RUNS`, `PHASE`, `EFFECTS`). The pipeline it exercises is S3-D **T12** (`src/build/design.mjs`, the SPEC_DRAFT stop) and S3-C **T9** (`src/build/resume.mjs`, so a crash mid-run does not end the measurement) | **not satisfied.** Blocked on decision 5: `observe` must be flipped in the live profile first, and that is a founder action after the last S3 PR merges |
 | **V2** — **measure** real phase budgets: wall-clock, turns and USD per phase against the §4.1 guesses (8 / 20–60 / 20–60 min), written into `builder.budgets.*` **or** the tracker, with dates | **S3-F Task 6**, `docs/measured/<date>-phase-budgets.md`, derived from V1's `phase_run` rows by `phaseBudgets()` in `src/build/measure.mjs`, asserted in `test/build-measure.test.mjs` block `phase budgets come from rows` | **not satisfied.** Zero incremental spend, and it is zero **only** if Task 5 records cost and turns per phase; Task 5's `RUNS` exit is what makes that true |
 | **V3** — **measure** alias-to-model resolution: the resolved model id for `fable` and for `sonnet`, from a **real** `phase_run.model_id`, with the CLI version beside it | **unit half: S3-C T6**, `test/phase-run.test.mjs`, the assertion that the recorded value is never an alias (`model_id !== "fable"`, `!== "sonnet"`). **Measured half: S3-F Task 6**, `docs/measured/<date>-alias-to-model-resolution.md`, from V1's rows, with `phase_run.cli_version` beside each | **not satisfied in either half.** The unit half proves the recorder refuses an alias; only the measured half says what the alias actually resolved to on the day |
-| **V4** — **measure** sandbox behaviour under fan-out: a RESEARCH worker at the **maximum** subagent width, with the canary's write and network probes, run **from inside a subagent** | **unit half: S3-D T11**, `test/build-research.test.mjs`, the assertion that the `--agents` payload width derives from `task.depth` and not from the prompt. **Measured half: S3-F Task 7**, `docs/measured/<date>-sandbox-under-fanout.md`, whose run refuses to be written up unless the subagent marker count is at least the configured width. **Design §6 `:354` claims *"Subagents inherit the worker's sandbox; they have no more authority than the worker"* — this measurement is what makes that a fact rather than a sentence** | **not satisfied in either half** |
-| **V5** — **measure** `--json-schema` reliability across **20 runs**, on the **real** phase schemas, reporting the count of malformed or missing structured outputs and what each one looked like | **S3-F Task 9**, `docs/measured/<date>-json-schema-reliability.md`, running against `src/build/schemas/BUILD_SIZE.json` and `BUILD_DESIGN.json` as shipped by S3-B **T5**, with a hash check that refuses any other schema path | **not satisfied.** Blocked on T5 shipping the real schemas; **20 runs against a toy schema measures nothing about them**, so the refusal is the assertion |
+| **V4** — **measure** sandbox behaviour under fan-out: a RESEARCH worker at the **maximum** subagent width, with the canary's write and network probes, run **from inside a subagent** | **unit half: S3-D T11** (that document's Task 5, `test/build-research.test.mjs`), the assertion that `agentsFor(depth)` derives the `--agents` payload width from `task.depth` and not from the prompt. **Measured half: S3-F Task 7**, `docs/measured/<date>-sandbox-under-fanout.md`, whose run refuses to be written up unless the subagent marker count is at least the configured width. **Design §6 `:354` claims *"Subagents inherit the worker's sandbox; they have no more authority than the worker"* — this measurement is what makes that a fact rather than a sentence** | **not satisfied in either half** |
+| **V5** — **measure** `--json-schema` reliability across **20 runs**, on the **real** phase schemas, reporting the count of malformed or missing structured outputs and what each one looked like | **S3-F Task 9**, `docs/measured/<date>-json-schema-reliability.md`, running against `src/build/schemas/build_size.json` and `build_design.json` as shipped by S3-B **T5** (PR-B3), classified through that PR's own `validateReport`, with a path guard that refuses any other schema | **not satisfied.** Blocked on T5 shipping the real schemas; **20 runs against a toy schema measures nothing about them**, so the refusal is the assertion |
 | **V6** — **measure** the headless-versus-interactive subscription pool (§10.4), guardian live **and** guardian idle, written to `provider_state` with `measured_at` | **S3-F Task 10**, `docs/measured/<date>-subscription-pool.md`, written through **Task 1**'s `recordProviderMeasurement` and **Task 2**'s `reeve build measure-provider`, asserted in `test/build-measure.test.mjs` blocks `a measurement is recorded` and `a write with no measured_at is REFUSED`. The scheduler it calibrates is S3-C **T8** | **not satisfied.** The writer does not exist: MEASURED at `16cd880`, `measured_at` has zero writers in `src/`+`bin/` |
 
 ---
@@ -298,13 +305,12 @@ Expected: the process dies before its first assertion with `Cannot find module` 
 - [ ] **Step 3: Implement `src/build/measure.mjs` and the one additive field**
 
 ```js
-// The writer of provider_state's MEASURED columns. hub.sql:696 says measured_at
-// is "null until `build measure-provider` runs", and until this file existed
-// exactly one statement wrote this table -- the 429 path in providerdb.mjs --
-// naming six columns, none of them measured_at. A limit somebody measured and a
-// limit nobody measured are two different facts, and that column is the only
-// thing that tells them apart, so a write that cannot supply it is refused
-// rather than defaulted. Defaulting it would make every 429 look like evidence.
+// The writer of provider_state's MEASURED columns. Until this file existed, one
+// statement wrote this table -- the 429 path in providerdb.mjs -- naming six
+// columns, none of them measured_at. A limit somebody measured and a limit
+// nobody measured are two different facts and that column is the only thing
+// telling them apart, so a write that cannot supply it is refused rather than
+// defaulted: defaulting it would make every 429 look like evidence.
 import { providerTx, PROVIDER } from "./providerdb.mjs";
 
 const upsert = (db, { provider, limit, reserved, measuredAt }) => db.prepare(
@@ -319,13 +325,11 @@ const upsert = (db, { provider, limit, reserved, measuredAt }) => db.prepare(
 export function recordProviderMeasurement(db, { provider = PROVIDER, limit, reserved,
                                                 measuredAt, isAlive, at = null }) {
   // Validation BEFORE the transaction, so a refusal takes no lock and cannot be
-  // reported as a restore conflict.
+  // reported as a restore conflict. A reservation above the limit admits nobody
+  // and is an exclusion rather than a limit.
   if (!Number.isInteger(measuredAt)) return { ok: false, reason: "unmeasured" };
   if (!Number.isInteger(limit) || limit < 1) return { ok: false, reason: "bad-limit" };
   if (!Number.isInteger(reserved) || reserved < 0) return { ok: false, reason: "bad-reserved" };
-  // A reservation at or above the limit admits nobody but the reserved owner,
-  // which is not a limit but an exclusion, and it would be indistinguishable
-  // from a scheduler bug once written.
   if (reserved > limit) return { ok: false, reason: "reserved-exceeds-limit" };
   return providerTx(db, { isAlive, at }, () => {
     upsert(db, { provider, limit, reserved, measuredAt });
@@ -411,20 +415,21 @@ import { mkdirSync } from "node:fs";
     "--dry-run reports the resolved numbers and says it wrote nothing",
     JSON.stringify({ status: dry.status, out: dry.stdout.slice(0, 200) }));
 
-  const dbAfterDry = openHub(join(home, "state", "hub.db"));
-  check(providerState(dbAfterDry).measuredAt === null,
-    "and the store agrees: --dry-run left measured_at null");
-  dbAfterDry.close();
+  const dryDb = openHub(join(home, "state", "hub.db"));
+  const dryAt = providerState(dryDb).measuredAt;
+  dryDb.close();
+  check(dryAt === null, "and the store agrees: --dry-run left measured_at null", `measuredAt=${dryAt}`);
 
   const wrote = run("measure-provider", "--from", good, "--json");
   check(wrote.status === 0 && /"wrote":true/.test(wrote.stdout),
-    "the real run reports that it wrote", JSON.stringify({ status: wrote.status, out: wrote.stdout.slice(0, 200) }));
+    "the real run reports that it wrote",
+    JSON.stringify({ status: wrote.status, out: wrote.stdout.slice(0, 200) }));
 
-  const dbAfter = openHub(join(home, "state", "hub.db"));
-  const st = providerState(dbAfter);
+  const db2 = openHub(join(home, "state", "hub.db"));
+  const st = providerState(db2);
+  db2.close();
   check(st.limit === 4 && st.reserved === 1 && st.measuredAt === 1756300000,
     "and the store carries all three, read back through providerState", JSON.stringify(st));
-  dbAfter.close();
 }
 ```
 
@@ -534,10 +539,10 @@ Append to `test/build-measure.test.mjs`, before its closing `rmSync` / `process.
 
   const a = experimentRoot(base, { label: "v5-json-schema", at: 1756300000, nonce: "aaaa" });
   const b = experimentRoot(base, { label: "v5-json-schema", at: 1756300000, nonce: "bbbb" });
-  check(a.ok === true && b.ok === true, "two runs of one experiment both get a root",
+  check(a.ok === true && b.ok === true, "control: two runs of one experiment both get a root",
     JSON.stringify([a, b]));
   check(a.root !== b.root,
-    "and the roots differ even at the SAME second, because a nonce is in the path — the withdrawn " +
+    "and the roots differ at the SAME second, because a nonce is in the path — the withdrawn " +
     "figure in the three-dispatches document was lost to one path reused across three runs",
     JSON.stringify([a.root, b.root]));
 
@@ -545,17 +550,17 @@ Append to `test/build-measure.test.mjs`, before its closing `rmSync` / `process.
   check(again.ok === false && again.reason === "exists",
     "a root that already exists is REFUSED, not reused", JSON.stringify(again));
   check(again.root === a.root,
-    "and the refusal names the root, so the operator can read what is already there", JSON.stringify(again));
+    "and the refusal names the root, so the operator can read what is already there",
+    JSON.stringify(again));
 
-  const mpath = writeRunManifest(a.root, { label: "v5-json-schema", guardian: "idle",
-    model: "claude-sonnet-4-5-20250929", costUsd: 0.33, turns: 15, wallMs: 214000,
-    cliVersion: "2.1.237", argvHash: "deadbeef" });
-  const m = JSON.parse(readFileSync(mpath, "utf8"));
+  const m = JSON.parse(readFileSync(writeRunManifest(a.root, { label: "v5-json-schema",
+    guardian: "idle", model: "claude-sonnet-4-5-20250929", costUsd: 0.33, turns: 15,
+    wallMs: 214000, cliVersion: "2.1.237", argvHash: "deadbeef" }), "utf8"));
   check(m.costUsd === 0.33 && m.turns === 15 && m.wallMs === 214000,
     "the manifest records cost, turns and wall-clock PER RUN, which is what makes the next " +
     "estimate a measurement instead of an inheritance", JSON.stringify(m));
   check(m.guardian === "idle",
-    "and which guardian state the run was taken under, because V6 makes that an experimental variable");
+    "and which guardian state it was taken under, because V6 makes that an experimental variable");
 
   check(existsSync(join(a.root, "run.json")) && !existsSync(join(b.root, "run.json")),
     "control: the manifest landed in the root it was given and in no other", a.root);
@@ -579,17 +584,13 @@ Append to `src/build/measure.mjs`:
 import { mkdirSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-// ONE ROOT PER RUN, AND A SECOND RUN NEVER LANDS IN THE FIRST ONE'S.
-//
-// The alternative was measured and cost a published figure: an experiment
-// fixture that reused a single path let a third run overwrite the transcripts
-// and the state database of the two before it, and the number derived from
-// those two had to be withdrawn because it could not be re-read. A collision is
-// therefore an error that stops the run, not a warning: by the time anyone
-// notices, the evidence is already gone.
-//
-// The nonce is in the path rather than the timestamp alone because two runs of
-// one ramp start inside the same second by design -- that is what a ramp is.
+// ONE ROOT PER RUN, AND A SECOND RUN NEVER LANDS IN THE FIRST ONE'S. The
+// alternative was measured and cost a published figure: a fixture that reused
+// one path let a third run overwrite the transcripts of the two before it, and
+// the number derived from those two had to be withdrawn. A collision is an
+// error that stops the run, not a warning -- by the time anyone notices, the
+// evidence is gone. The nonce is in the path rather than the timestamp alone
+// because two runs of one ramp start inside the same second by design.
 export function experimentRoot(base, { label, at, nonce }) {
   const stamp = new Date(at * 1000).toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const root = join(base, label, `${stamp}-${nonce}`);
@@ -599,8 +600,8 @@ export function experimentRoot(base, { label, at, nonce }) {
 }
 
 // Cost, turns and wall-clock PER RUN. Without them the next estimate inherits
-// the last document's total and the programme carries a tuned number instead of
-// a contract; with them, every measured document can state its own price.
+// the last document's total, and the programme carries a tuned number instead
+// of a contract.
 export function writeRunManifest(root, { label, guardian, model, costUsd, turns,
                                          wallMs, cliVersion, argvHash }) {
   const path = join(root, "run.json");
@@ -658,9 +659,10 @@ const LIMITS = "## What this does NOT establish";
     "control: with none of the six present, all six are reported MISSING — the gate can fail");
 
   for (const s of S3_MEASURED_DOCS) write(s, `# Measured: ${s}\n\n${LIMITS}\n\nNothing yet.\n`);
-  check(measuredDocDefects(fx, { slugs: S3_MEASURED_DOCS }).length === 0,
+  const clean = measuredDocDefects(fx, { slugs: S3_MEASURED_DOCS });
+  check(clean.length === 0,
     "control: with all six present and each carrying its limits section, the gate passes",
-    JSON.stringify(measuredDocDefects(fx, { slugs: S3_MEASURED_DOCS })));
+    JSON.stringify(clean));
 
   write(S3_MEASURED_DOCS[3], `# Measured: no limits here\n\nA finding, and no limits.\n`);
   const d = measuredDocDefects(fx, { slugs: S3_MEASURED_DOCS });
@@ -705,15 +707,12 @@ export const S3_MEASURED_DOCS = Object.freeze([
   "subscription-pool",            // V6
 ]);
 
-// ANCHORED TO A HEADING, not to the phrase. A document that mentions its limits
+// ANCHORED TO A HEADING, not to the phrase: a document that mentions its limits
 // in a sentence has not written the section, and the section is what names the
-// population the measurement does not cover -- which is the part a later reader
-// needs and the author is least inclined to write.
-//
-// Scoped to the slugs it is GIVEN, never to the whole directory: thirteen of the
-// twenty-one documents already here inline their limits rather than heading
-// them, and a gate that goes red on files nobody intends to change is a gate
-// that gets deleted.
+// population the measurement does not cover. Scoped to the slugs it is GIVEN,
+// never to the whole directory -- thirteen of the twenty-one documents already
+// here inline their limits rather than heading them, and a gate that goes red
+// on files nobody intends to change is a gate that gets deleted.
 const LIMITS_HEADING = /^## What this does NOT establish\s*$/m;
 
 export function measuredDocDefects(dir, { slugs }) {
@@ -748,7 +747,7 @@ git commit -m "test(build): a measured document without its limits section is a 
 - Test: `test/build-measure.test.mjs` (append before the terminator)
 
 **Interfaces:**
-- Consumes: `experimentRoot`, `writeRunManifest` (Task 3); `openHub`, `hubPathFor`; S3-B T4's `artifactPathFor`; S3-D T12's SPEC_DRAFT stop; S3-C T9's adopt-or-kill.
+- Consumes: `experimentRoot`, `writeRunManifest` (Task 3); `openHub`, `hubPathFor`; S3-B PR-B2's `artifactPathFor(home, taskId, phase)` and `ARTIFACT_FILE` from `src/paths.mjs`; S3-A PR-A1's `capabilityOn(profile, name)`; S3-D PR-D3's SPEC_DRAFT stop (`specFor("SPEC_DRAFT")` returns `null`); S3-C T9's adopt-or-kill.
 - Produces: `acceptanceDefects(db, {taskId, home}) -> [{id, detail}]` with `id ∈ {ARTIFACTS, SHAS, RUNS, PHASE, EFFECTS}` — the five checks V1 must pass, returned as data so the same function is asserted offline under a fixture and run online against the real task.
 
 **This task produces a measured DOCUMENT rather than code, and it still carries an `On the broken implementation` block.** The broken implementation there is *the measurement was taken with a fixture that could not have shown the failure*, and the control is the fixture check.
@@ -799,17 +798,21 @@ Expected: `does not provide an export named 'acceptanceDefects'`.
 Append to `src/build/measure.mjs`:
 
 ```js
-// The five checks section 14's first Verify item names, returned as DATA so the
-// same code is asserted offline under a fixture and run online against the real
-// task. A checker that exists only inside the online script is a checker nobody
-// has ever seen fail.
+import { artifactPathFor } from "../paths.mjs";
+
+// The five checks section 14's first Verify item names, returned as DATA so one
+// implementation is asserted offline under a fixture and run online against the
+// real task. A checker living only inside the online script is one nobody has
+// ever seen fail.
 export function acceptanceDefects(db, { taskId, home }) {
   const out = [];
   const phases = ["SIZING", "RESEARCH", "DESIGN"];
 
+  // THROUGH ARTIFACT_FILE, never by restating the three filenames. paths.mjs
+  // declares them once; a second copy here is a second inventory that goes stale
+  // silently the first time one of them is renamed.
   const present = phases.filter(p =>
-    existsSync(join(home, "tasks", taskId, "artifacts", p === "SIZING" ? "sizing.json"
-              : p === "RESEARCH" ? "research.md" : "design.md")));
+    existsSync(join(artifactPathFor(home, taskId, p))));
   if (present.length !== 3)
     out.push({ id: "ARTIFACTS", detail: `${present.length} of 3 artifacts on disk: ${present.join(",")}` });
 
@@ -826,9 +829,8 @@ export function acceptanceDefects(db, { taskId, home }) {
   if (phase !== "SPEC_DRAFT")
     out.push({ id: "PHASE", detail: `task phase is ${phase ?? "absent"}, expected SPEC_DRAFT` });
 
-  // ZERO, AS A COUNT, WITH ITS POSITIVE CONTROL BESIDE IT. `total` is reported
-  // whether or not `gh` is zero: a zero that comes from an empty table and a
-  // zero that comes from an enforced switch are two different facts, and only
+  // ZERO, AS A COUNT, WITH ITS POSITIVE CONTROL BESIDE IT: a zero from an empty
+  // table and a zero from an enforced switch are two different facts, and only
   // the pair distinguishes them.
   const gh = db.prepare(
     `SELECT count(*) c FROM outbox WHERE kind LIKE 'gh.%' OR kind = 'git.push.branch'`).get().c;
@@ -968,12 +970,10 @@ Expected: `does not provide an export named 'phaseBudgets'`.
 Append to `src/build/measure.mjs`:
 
 ```js
-// V2 AND V3 COME OFF THE ROWS, NEVER OFF THE TRANSCRIPT.
-//
-// The transcript is what the worker said; phase_run is what reeve recorded at
-// dispatch under section 4.7's contract snapshot. Reading the first would make
-// the budget a claim rather than a measurement, and would make both numbers cost
-// a second run -- which is the whole reason V2 and V3 are free.
+// V2 AND V3 COME OFF THE ROWS, NEVER OFF THE TRANSCRIPT. The transcript is what
+// the worker said; phase_run is what reeve recorded at dispatch under section
+// 4.7's contract snapshot. Reading the first would make the budget a claim
+// rather than a measurement, and would cost a second run.
 const ALIASES = new Set(["fable", "sonnet", "haiku", "opus"]);
 const PHASES_MEASURED = Object.freeze(["SIZING", "RESEARCH", "DESIGN"]);
 
@@ -986,9 +986,9 @@ export function phaseBudgets(db, { taskId }) {
   const rows = [], defects = [];
   for (const p of PHASES_MEASURED) {
     const r = found.find(x => x.phase === p);
-    // ABSENT IS NOT ZERO. A phase that never ran has no budget, and reporting a
-    // zero for it would put a number in the tracker that nobody measured -- the
-    // exact shape the measured_at column exists to prevent one table over.
+    // ABSENT IS NOT ZERO. Reporting a zero for a phase that never ran puts a
+    // number in the tracker that nobody measured -- the exact shape measured_at
+    // exists to prevent one table over.
     if (!r) { defects.push({ phase: p, defect: "no-run" }); continue; }
     if (r.model_id == null || ALIASES.has(r.model_id))
       defects.push({ phase: p, defect: "alias-not-resolved", modelId: r.model_id });
@@ -1038,7 +1038,7 @@ git commit -m "docs(measured): phase budgets and alias resolution, read from pha
 - Test: `test/build-measure.test.mjs` (append before the terminator)
 
 **Interfaces:**
-- Consumes: `canaryScript` (`src/canary.mjs:270`), `netListener` (`src/canary.mjs`); S3-C T7's `src/build/agents.mjs`; S3-D T11's `researchWidth(depth)`; `experimentRoot`, `writeRunManifest` (Task 3).
+- Consumes: `canaryScript` (`src/canary.mjs:270`), `netListener` (`src/canary.mjs`); S3-C T7's `AGENT_DEFS` / `agentsFor(depth) -> {json, width}` / `agentsHash(json)` in `src/build/agents.mjs`, depth-keyed by S3-D PR-D2; `experimentRoot`, `writeRunManifest` (Task 3).
 - Produces: `fanoutProbeDefects(results, {width}) -> [{id, detail}]` with `id ∈ {WIDTH, SUBAGENT, UNSANDBOXED, PROBES}` — the preconditions a fan-out probe must satisfy before its results mean anything.
 
 **Design §6 `:354` claims, verbatim: *"Subagents inherit the worker's sandbox; they have no more authority than the worker."* This measurement is what makes that a fact rather than a sentence.** A probe that runs in the main agent measures the thing that was already known — `docs/measured/2026-08-22-claude-print-mode.md` established the main agent's boundary in detail — and would report agreement while never having asked the question.
@@ -1099,14 +1099,12 @@ Append to `src/build/measure.mjs`:
 
 ```js
 // THE PRECONDITIONS A FAN-OUT PROBE MUST MEET BEFORE ITS RESULTS MEAN ANYTHING.
-//
 // Design section 6 says subagents inherit the worker's sandbox and have no more
-// authority than the worker. A probe run in the LEAD agent cannot test that: it
+// authority than it. A probe run in the LEAD agent cannot test that: it
 // re-measures the worker, agrees with itself, and reports the claim confirmed.
-// So the probe rows must be attributed to subagents, there must be at least as
-// many as the width the run was configured for, and there must be an
-// unsandboxed row in which the shapes DO occur -- otherwise a denial and a
-// broken probe script are the same output.
+// So rows must be attributed to subagents, be at least as many as the
+// configured width, and sit beside an unsandboxed row in which the shapes DO
+// occur -- otherwise a denial and a broken probe script are the same output.
 export function fanoutProbeDefects(results, { width }) {
   const out = [];
   const subs = results?.subagents ?? [];
@@ -1140,7 +1138,7 @@ mkdir -p ./probe-repo/.git; touch ./probe-repo/.git/PROBE 2>/dev/null; rec git_w
 ( cd ./probe-repo && git init -q . && git commit --allow-empty -m probe ) >/dev/null 2>&1; rec git_commit $?
 ```
 
-Then dispatch a real RESEARCH worker at `deep` depth so `researchWidth("deep")` is 6, with `--agents` carrying the four definitions plus the adversarial-critic pass, and a prompt that instructs **each subagent** to run the probe script and write `./probe-<agent>.txt`. Collect, check, and refuse to write up a run whose preconditions failed:
+Then dispatch a real RESEARCH worker at `deep` depth, with `--agents` carrying `agentsFor("deep").json`, and a prompt that instructs **each subagent** to run the probe script and write `./probe-<agent>.txt`. **The width the check compares against is `agentsFor("deep").width`, read from the code rather than written as a literal** — a hard-coded 6 beside a payload that carries 3 agrees with nothing and reports a pass. Collect, check, and refuse to write up a run whose preconditions failed:
 
 ```bash
 $N -e '
@@ -1153,8 +1151,10 @@ $N -e '
     .map(f => ({ agent: f.slice(6, -4), results: parse(readFileSync(root + "/" + f, "utf8")) }));
   const unsandboxed = existsSync(root + "/unsandboxed.txt")
     ? parse(readFileSync(root + "/unsandboxed.txt", "utf8")) : null;
-  const d = fanoutProbeDefects({ unsandboxed, subagents }, { width: 6 });
-  console.log(JSON.stringify({ subagents: subagents.length, defects: d }, null, 2));
+  const { agentsFor } = await import("./src/build/agents.mjs");
+  const { width } = agentsFor("deep");
+  const d = fanoutProbeDefects({ unsandboxed, subagents }, { width });
+  console.log(JSON.stringify({ width, subagents: subagents.length, defects: d }, null, 2));
   process.exit(d.length === 0 ? 0 : 1);
 ' "$R" | tee "$R/fanout.json"
 ```
@@ -1253,7 +1253,7 @@ git commit -m "docs(measured): a planted instruction file after neutralization"
 - Test: `test/build-measure.test.mjs` (append before the terminator)
 
 **Interfaces:**
-- Consumes: S3-B T5's `src/build/schemas/{BUILD_SIZE,BUILD_RESEARCH,BUILD_DESIGN}.json`; `experimentRoot`, `writeRunManifest` (Task 3); `workerArgs`'s `--json-schema` (`src/supervisor.mjs:149`).
+- Consumes: S3-B PR-B3's `src/build/schemas/{build_size,build_research,build_design}.json` and `validateReport(action, raw)`; `experimentRoot`, `writeRunManifest` (Task 3); `workerArgs`'s `--json-schema` (`src/supervisor.mjs:149`).
 - Produces: `assertRealSchema(path) -> {ok:true, action} | {ok:false, reason:"not-a-phase-schema"}` — the guard that keeps V5 on the real schemas.
 
 **Risk 1's most concrete instance.** *"`--json-schema` reliability across 20 runs"* against a toy schema measures nothing about the real phase schemas: a two-field object is not a sizing report with an enum, three required numbers and a rationale, and structured-output failures are a function of schema shape. The plan therefore makes the toy schema a **refusal**, not a discouragement.
@@ -1264,7 +1264,11 @@ Append to `test/build-measure.test.mjs`, before its closing `rmSync` / `process.
 
 ```js
 {
-  const real = "src/build/schemas/BUILD_SIZE.json";
+  // The filename is lowercase with underscores. S3-B PR-B3 owns these files and
+  // spells them `build_size.json`; S3-D's derived table spells them with hyphens
+  // and is wrong. A guard built on the wrong spelling refuses every real schema
+  // and passes nothing, which reads as "V5 could not run" rather than as a bug.
+  const real = "src/build/schemas/build_size.json";
   check(assertRealSchema(real).ok === true && assertRealSchema(real).action === "BUILD_SIZE",
     "control: a real phase schema is accepted and names its action",
     JSON.stringify(assertRealSchema(real)));
@@ -1300,39 +1304,37 @@ Append to `src/build/measure.mjs`:
 
 ```js
 // V5 RUNS AGAINST THE FILES THE PRODUCT SHIPS, OR IT MEASURES NOTHING.
-//
 // Structured-output reliability is a function of the schema's shape -- enums,
 // required numbers, nested objects -- so twenty runs against a two-field toy
-// answers a question nobody asked and reports it as the answer to this one. The
-// guard is on the PATH, not on the bytes: a byte-identical copy elsewhere can
-// drift from the shipped file the moment the shipped file changes.
-const PHASE_SCHEMA = /^src\/build\/schemas\/(BUILD_SIZE|BUILD_RESEARCH|BUILD_DESIGN)\.json$/;
+// answer a question nobody asked. The guard is on the PATH, not on the bytes: a
+// byte-identical copy elsewhere drifts the moment the shipped file changes.
+const PHASE_SCHEMA = /^src\/build\/schemas\/(build_size|build_research|build_design)\.json$/;
 
 export function assertRealSchema(path) {
   const m = PHASE_SCHEMA.exec(path);
   if (!m) return { ok: false, reason: "not-a-phase-schema" };
   if (!existsSync(path)) return { ok: false, reason: "not-a-phase-schema" };
-  return { ok: true, action: m[1] };
+  return { ok: true, action: m[1].toUpperCase() };
 }
 ```
 
-Then run the sample. **Twenty on `BUILD_SIZE`** (sonnet/low, 8 min, 15 turns — decision 8), plus **three on `BUILD_DESIGN`** at fable/high because that schema is the largest and its shape is what the twenty cannot speak to:
+Then run the sample. **Twenty on `build_size.json`** (sonnet/low, 8 min, 15 turns — decision 8), plus **three on `build_design.json`** at fable/high because that schema is the largest and its shape is what the twenty cannot speak to:
 
 ```bash
 for i in $(seq 1 20); do
   R=~/.reeve/runs/v5-json-schema/$(date -u +%FT%H-%M-%S)-$(openssl rand -hex 4)
   mkdir -p "$R" || { echo "root exists at run $i; stop"; exit 1; }
   $N bin/reeve build measure-json-schema \
-     --schema src/build/schemas/BUILD_SIZE.json --root "$R" --json | tee "$R/result.json"
+     --schema src/build/schemas/build_size.json --root "$R" --json | tee "$R/result.json"
 done
 ```
 
-Classify every run into exactly one of: `valid` (parsed and validated), `malformed` (present but failed validation), `missing` (no structured output at all). **Report the count for each, and for every non-`valid` run report what it actually looked like** — the raw bytes, truncated to a stated cap, with the cap stated, and the validator's own error beside it. A count with no examples is a number nobody can act on.
+Classify every run through S3-B's own `validateReport(action, raw)` into exactly one of: `valid` (parsed and validated), `malformed` (present but `{ok:false, kind:"BAD_REPORT"}`), `missing` (no structured output at all). Using the product's validator rather than a second one is the point: a classifier that disagrees with the code measures its own opinion. **Report the count for each, and for every non-`valid` run report what it actually looked like** — the raw bytes, truncated to a stated cap, with the cap stated, and the validator's own error beside it. A count with no examples is a number nobody can act on.
 
 **`## What this does NOT establish`** — and V5's is the one that most needs writing, because *"20 runs"* is a sample and the document must say what population it does not cover:
 
 - Twenty runs of **`BUILD_SIZE`** at sonnet/low with 15 turns. It says nothing about the same schema at a different model, a different effort, a longer turn budget, or under `--resume`.
-- It says nothing about `BUILD_RESEARCH`'s schema at all: three runs touched `BUILD_DESIGN` and **zero** touched `BUILD_RESEARCH`.
+- It says nothing about `build_research.json` at all: three runs touched `build_design.json` and **zero** touched `build_research.json`.
 - Twenty is not a rate anyone should quote to two decimal places. At twenty runs, **zero malformed outputs is consistent with a true failure rate up to roughly 14%** at 95% confidence, and the document states the interval rather than the point estimate.
 - All twenty ran on one host, one account, one CLI build, within one window. Rate limits, model routing and CLI releases all move underneath this number, and `cli_version` is recorded per run so the next reading can be compared rather than inherited.
 - It says nothing about whether a malformed output is *recoverable*: the single `--resume` retry S3-B T5 specifies was **not** exercised here, and its success rate is a separate measurement nobody has taken.
@@ -1403,12 +1405,11 @@ Expected: `does not provide an export named 'rampPlan'`.
 Append to `src/build/measure.mjs`:
 
 ```js
-// JITTER, BECAUSE A SHARP RAMP MEASURES THE WRONG LIMIT.
-//
-// Acceleration limits trip on a sudden increase independently of the steady-state
-// limit, so five workers started in the same millisecond produce a 429 that reads
-// as "the pool holds four" and means "you climbed too fast". Deterministic from a
-// seed so a surprising pass can be repeated exactly rather than approximately.
+// JITTER, BECAUSE A SHARP RAMP MEASURES THE WRONG LIMIT. Acceleration limits
+// trip on a sudden increase independently of the steady-state limit, so five
+// workers started in the same millisecond produce a 429 that reads as "the pool
+// holds four" and means "you climbed too fast". Deterministic from a seed, so a
+// surprising pass can be repeated exactly rather than approximately.
 export function rampPlan({ max, jitterMs, seed }) {
   let s = seed >>> 0;
   const next = () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
@@ -1422,10 +1423,9 @@ export function rampPlan({ max, jitterMs, seed }) {
   return plan;
 }
 
-// TWO 429 SHAPES, AND THEY ARE NOT THE SAME OBSERVATION. One says wait; the
-// other says the month's budget is gone and no wait will help. Folding them --
-// which is what the scheduler does today, treating every rate-limit signature
-// alike -- would put a spend cap into the pool measurement as a ceiling.
+// TWO 429 SHAPES, AND THEY ARE NOT ONE OBSERVATION. One says wait; the other
+// says the month's budget is gone and no wait helps. Folding them -- what the
+// scheduler does today -- puts a spend cap into the pool number as a ceiling.
 export function classify429(headers, body) {
   const h = Object.fromEntries(Object.entries(headers ?? {})
     .map(([k, v]) => [String(k).toLowerCase(), v]));
@@ -1550,7 +1550,11 @@ $N -e '
   const { hubPathFor } = await import("./src/paths.mjs");
   const home = process.env.REEVE_HOME ?? (process.env.HOME + "/.reeve");
   const db = openHub(hubPathFor(home));
-  const gh = db.prepare("SELECT count(*) c FROM outbox WHERE kind LIKE \'gh.%\' OR kind = \'git.push.branch\'").get().c;
+  // BOUND PARAMETERS, not literals: a single quote inside this -e argument would
+  // close the shell string, and a backslash cannot escape one inside single
+  // quotes -- the snippet would not run as written.
+  const gh = db.prepare("SELECT count(*) c FROM outbox WHERE kind LIKE ? OR kind = ?")
+    .get("gh.%", "git.push.branch").c;
   const total = db.prepare("SELECT count(*) c FROM outbox").get().c;
   console.log("gh-kind rows:", gh, "| total outbox rows:", total);
   process.exit(gh === 0 ? 0 : 1);
@@ -1646,6 +1650,8 @@ Comment `@codex review` on **every push**, not only the first. Read **both** end
 
 **Type consistency.** `recordProviderMeasurement(db, {provider, limit, reserved, measuredAt, isAlive, at}) -> {ok:true, provider, limit, reserved, measuredAt} | {ok:false, reason}` with `reason ∈ {unmeasured, bad-limit, bad-reserved, reserved-exceeds-limit}`; `readManifest(path) -> {ok:true, limit, reserved, measuredAt, guardian} | {ok:false, reason}` with `reason ∈ {unreadable, unmeasured, guardian-state-unrecorded}`; `experimentRoot(base, {label, at, nonce}) -> {ok:true, root} | {ok:false, reason:"exists", root}`; `writeRunManifest(root, {...}) -> path`; `measuredDocDefects(dir, {slugs}) -> [{slug, defect}]` with `defect ∈ {missing, no-limits-section}`; `acceptanceDefects(db, {taskId, home}) -> [{id, detail}]` with `id ∈ {ARTIFACTS, SHAS, RUNS, PHASE, EFFECTS}`; `phaseBudgets(db, {taskId}) -> {rows, defects}`; `fanoutProbeDefects(results, {width}) -> [{id, detail}]` with `id ∈ {WIDTH, SUBAGENT, UNSANDBOXED, PROBES}`; `assertRealSchema(path) -> {ok:true, action} | {ok:false, reason:"not-a-phase-schema"}`; `rampPlan({max, jitterMs, seed}) -> [{n, startOffsetMs}]`; `classify429(headers, body) -> "backoff" | "spend-cap" | "unknown"`. `providerState`'s return gains exactly one field, `measuredAt`, and loses none.
 
-**The deficit this plan carries, stated plainly.** Every consumed name from S3-A through S3-E is marked `(S3, planned)` because **none of those five documents existed when this one was written** — `tasks/reeve-tasks/plans/` was empty at `16cd880`. The S2 and S1 rows were re-measured here and are facts; the S3 rows are derived from `../S3-DESIGN-BRIEF.md` §2.2 and are expectations. The first executor of Task 1 re-checks the whole consumed-interfaces table against the merged documents and **reconciles rather than adapts** — an inherited hypothesis measured against as though it were an inherited fact has cost this programme two lanes before.
+**The size of this document, measured against the corrected rule.** §B.1.2's cap was corrected on 2026-08-27 to count **tasks, not lines**, with the standing instruction *"never thin a task to fit a line count — the lever is fewer tasks per document, never shorter tasks."* This document is **11 tasks / 1,657 lines**, which against its three written siblings — S3-A 11 tasks / 1,833, S3-B 8 / 1,674, S3-D 13 / 1,957 — is the **smallest document in the family** and sits at its density. It exceeds the three-or-four-task guidance the same way every document in the family does, and the guidance's own lever applies: **if the founder wants it held, the split is at Task 4/5 — S3-F1 = Tasks 1–4, the harness that makes a measurement recordable and re-readable; S3-F2 = Tasks 5–11, the six documents and the Verify re-walk.** That is recommended rather than taken, because it would make the family seven documents and the six-document ruling is explicitly unchanged. An earlier draft of this paragraph reported the document as "36% over a 1,200-line cap" and trimmed comments and assertion granularity to close the gap; both were restored when the correction landed, which is the case the correction exists to prevent.
+
+**The deficit this plan carries.** **S3-C and S3-E do not exist yet**, so every name this plan takes from them — `PHASE_SPECS`, `specFor`, `dispatchPhase`, `AGENT_DEFS`, `agentsFor`, `agentsHash`, the `phase_run` statements, the builder's `announceable` — is marked `(S3-C/E, derived)` and is an **expectation**, corroborated where possible against S3-D's own derived table but not against a written document. The S3-A, S3-B and S3-D rows were read from those documents at `3becdd0` and are facts; the S1 and S2 rows were re-measured here at `16cd880` and are facts. **Reconciling rather than adapting is what caught the two disagreements recorded above the table**, one of which — hyphens where S3-B ships underscores — would have made Task 9's schema guard refuse every real schema and report V5 as unrunnable rather than as broken. The first executor of Task 1 repeats that reconciliation against S3-C and S3-E once they land; an inherited hypothesis measured against as though it were an inherited fact has cost this programme two lanes before.
 
 **The thing this plan is most likely to get wrong, and where it is guarded.** Every one of the six measurements can be taken in a way that reads as success while measuring nothing, and that class already has seven instances here — including two tests that could not see their own stub, one of which compared `currentInstrument()` against `currentInstrument()` so that stubbing moved both sides. The guards are: V1's checker must report five defects on a task that never ran (Task 5's control), V4's probe must have subagent-attributed rows and an unsandboxed BEFORE row (Task 7's four preconditions), the Q3 probe must have an un-neutralized control arm that **does** obey (Task 8, where a control arm that fails means neither arm may be written up), V5 must run against the shipped schema by path (Task 9), and V6 must classify a spend cap out of the ceiling (Task 10). **And the money: floor $29.19, central $50.58, ceiling $79.11, from a comparator of $2.66 for three real dispatches — stated in decision 9 before the stage starts, with the arithmetic shown, because a spend estimate produced afterwards is not an estimate.**

@@ -115,10 +115,27 @@ export function hubAccess(hubPath) {
       const present = new Set(q.prepare(
         `SELECT name FROM sqlite_master WHERE type = 'table'`).all().map(r => r.name));
       const needCols = { ...SCHEDULER_COLUMNS, pr_hold: HOLD_COLUMNS, maintenance_lock: LOCK_COLUMNS };
+      // NAME AND DECLARED TYPE. Reducing `pragma_table_info` to names made this
+      // gate a fail-open: every one of these tables is STRICT, so a column whose
+      // declared type is wrong passes the check and then REFUSES THE WRITE. A hub
+      // carrying `provider_lease.token INTEGER` was reported usable, `claimProvider`
+      // threw "cannot store TEXT value in INTEGER column", and the daemon took its
+      // documented fail-open route and dispatched model work outside the shared
+      // limit -- the exact outcome this gate exists to prevent, reached by passing
+      // it rather than by failing it.
+      //
+      // The defect names the column AND both types, because this is read at a
+      // recovery: "provider_lease.token is INTEGER, want TEXT" is actionable and
+      // "the scheduler is unusable" is not.
       for (const t of Object.keys(ALLOWED)) {
         if (!present.has(t)) { defects.push(`${t} is missing`); continue; }
-        const have = new Set(q.prepare(`SELECT name FROM pragma_table_info(?)`).all(t).map(r => r.name));
-        for (const c of needCols[t] ?? []) if (!have.has(c)) defects.push(`${t}.${c} is missing`);
+        const have = new Map(q.prepare(`SELECT name, type FROM pragma_table_info(?)`).all(t)
+          .map(r => [r.name, String(r.type ?? "").toUpperCase()]));
+        for (const [c, want] of Object.entries(needCols[t] ?? {})) {
+          if (!have.has(c)) { defects.push(`${t}.${c} is missing`); continue; }
+          const got = have.get(c);
+          if (got !== want) defects.push(`${t}.${c} is ${got || "untyped"}, want ${want}`);
+        }
       }
       // `COLUMNS_AT` is deliberately NOT consulted here any more:
       // `task_territory.pinned_until` is the builder's, not the guardian's, and

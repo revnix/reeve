@@ -165,6 +165,19 @@ const runnerThat = ({ inside = true, tmp = true, outside = false, curl = false, 
     "the result is a SKIP, not a failure: nothing ran, so nothing was measured", JSON.stringify({ ok: refused.ok, skipped: refused.skipped }));
   check(/at-limit/.test(refused.why ?? ""), "and it carries the caller's reason", String(refused.why));
 
+  // AND IT LEAVES NOTHING BEHIND. The refusal returned before the cleanup at the
+  // bottom of the function, and the DECOY is the one artefact the caller cannot
+  // reach for us: `dir`, `outsideDir` and `tmpDir` sit under `canaryRoot`, which
+  // the daemon removes on a skip, but the decoy is written under the reeve home
+  // with a per-invocation timestamped name. `queued`, `cooldown` and `at-limit`
+  // are ORDINARY scheduler answers that repeat every tick, so a refused canary
+  // left one more uniquely named file in the deny-read state tree every time.
+  check(!existsSync(base.decoyPath),
+    "a refused canary removes its decoy, which no caller can clean up for it", base.decoyPath);
+  check(!existsSync(base.dir) && !existsSync(base.outsideDir),
+    "and its working trees too: nothing ran, so there is no evidence to keep",
+    JSON.stringify({ dir: existsSync(base.dir), outside: existsSync(base.outsideDir) }));
+
   // CONTROL, or "never runs" would pass by breaking the canary outright.
   asked = 0; ran = 0;
   const allowed = await sandboxCanary({ ...base, runner: countingRunner,

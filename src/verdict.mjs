@@ -63,7 +63,14 @@ function worst(a, b) {
  * every verdict".
  */
 export const CLAUSE_IDS = Object.freeze(
-  ["ci", "base", "review", "rounds", "threads", "findings", "mergeable", "cleared", "hold"]);
+  ["ci", "base", "review", "rounds", "threads", "findings", "mergeable", "cleared", "hold",
+   // Two facts about review BODIES, and they are separate because their answers
+   // are. `bodyFindings` is work — a worker can fix one and a later round can
+   // supersede it. `bodyReadable` is reeve reporting that it cannot parse a
+   // reviewer's bodies at all, which no worker can act on and only the operator
+   // can clear by declaring that reviewer. The watcher routes them to different
+   // places, so one id could not have carried both.
+   "bodyFindings", "bodyReadable"]);
 
 export function computeVerdict(i) {
   const clauses = [];

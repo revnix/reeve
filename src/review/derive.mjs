@@ -262,6 +262,29 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     // would report complete for exactly that pull request. Asking "did everyone
     // who actually wrote a review body declare how their bodies work" is the
     // question the count depends on, and it fails closed on a stranger.
+    // WHEN THIS TEXT ARRIVED, and the two generations answer it differently.
+    //
+    // A first generation's text arrived WITH the review, so its submission time is
+    // the honest answer. Only an EDIT adds text later than its container, and only
+    // then is reeve's own observation the earliest moment the text can be proved
+    // to have existed.
+    //
+    // Using observation for both looked conservative and was a wedge. When reeve
+    // first watches an existing pull request it ingests all of its history in one
+    // batch, so every historical review shares one observed_at of `now` -- and no
+    // historical round can then be later than any historical finding. Every old
+    // body finding would stay open until some future review arrived, on a pull
+    // request whose reviewers had long since finished with it.
+    const seenAt = (r.generation ?? 1) > 1
+      ? (r.observed_at ?? r.event_at ?? at)
+      : (r.event_at ?? r.observed_at ?? at);
+    // A DISMISSED review is a maintainer saying that review no longer counts.
+    // Recreating its findings would put a worker to work implementing feedback
+    // somebody explicitly discarded, and no later round can clear them because the
+    // dismissal is not a round. Its ROUND classification is left alone: it still
+    // happened, and rewriting coverage history is a larger question than this.
+    if (String(o.payload?.state ?? "").toUpperCase() === "DISMISSED") continue;
+
     const declared = typeof rev?.bodyFindings === "string" || rev?.bodyFindings === false;
     if (!declared) bodyComplete = false;
     // `false` is a declaration that this reviewer's bodies carry no findings, so
@@ -289,7 +312,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
                  `so this body is counted as one finding of unknown severity: ` +
                  String(o.payload?.body ?? "").replace(/\s+/g, " ").slice(0, 240),
         event_at: r.event_at ?? at, head_full: c.head_full ?? null, ord,
-        seen_at: r.observed_at ?? r.event_at ?? at, unreadable: 1,
+        seen_at: seenAt, unreadable: 1,
       });
       continue;
     }
@@ -302,8 +325,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
         // be filed as a nit.
         severity: severityOf(text, rev?.severityMarkers ?? []),
         excerpt: text.slice(0, 400), event_at: r.event_at ?? at,
-        head_full: c.head_full ?? null, ord, seen_at: r.observed_at ?? r.event_at ?? at,
-        unreadable: 0,
+        head_full: c.head_full ?? null, ord, seen_at: seenAt, unreadable: 0,
       });
     }
   }

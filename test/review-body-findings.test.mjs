@@ -258,6 +258,67 @@ ingest(db, NWO, 1, [
   rmSync(dir5, { recursive: true, force: true });
 }
 
+// ── history ingested in ONE batch still clears ───────────────────────────────
+//
+// When reeve first watches an existing pull request it ingests all of its history
+// at once, so every historical review shares one `observed_at` of now. Taking
+// that as when the text arrived made no historical round later than any
+// historical finding, so every old body finding stayed open until some future
+// review arrived — on a pull request whose reviewers had long since finished.
+// A first generation's text arrived WITH its review; only an edit arrives later.
+{
+  const dir6 = mkdtempSync(join(tmpdir(), "reeve-body6-"));
+  const db6 = open(join(dir6, "s.db"));
+  noteHead(db6, NWO, 6, HEAD_A, T);
+  const p = PROFILE();
+  // Both reviews are historical, and both are seen for the first time NOW.
+  ingest(db6, NWO, 6, [
+    review(1, "codex", "**![P1 Badge](x) an old finding**", HEAD_A, T),
+    review(2, "codex", "looked again and it is fine", HEAD_A, T + 100),
+  ], { at: T + 100000 });
+  derivePr(db6, NWO, 6, p, { at: T + 100000, head: HEAD_A });
+  const st = reviewState(db6, NWO, 6, p, { at: T + 100000, head: HEAD_A });
+  check(st.bodyOpen === 0,
+    "a later historical round clears an earlier historical finding, though both were first seen at once",
+    JSON.stringify({ open: st.bodyOpen, total: st.bodyTotal }));
+  check(st.bodyTotal === 1,
+    "control: the finding was really derived, so this is clearing and not a failure to read it",
+    String(st.bodyTotal));
+  rmSync(dir6, { recursive: true, force: true });
+}
+
+// ── a DISMISSED review's findings are not recreated ──────────────────────────
+//
+// Dismissing is a maintainer saying that review no longer counts. Recreating its
+// findings would put a worker to work implementing feedback somebody explicitly
+// discarded, and no later round can clear them, because a dismissal is not a
+// round.
+{
+  const dir7 = mkdtempSync(join(tmpdir(), "reeve-body7-"));
+  const db7 = open(join(dir7, "s.db"));
+  noteHead(db7, NWO, 7, HEAD_A, T);
+  const p = PROFILE();
+  ingest(db7, NWO, 7, [review(1, "codex", BODY_TWO, HEAD_A, T, "DISMISSED")], { at: T });
+  derivePr(db7, NWO, 7, p, { at: T, head: HEAD_A });
+  const st = reviewState(db7, NWO, 7, p, { at: T, head: HEAD_A });
+  check(st.bodyTotal === 0, "a dismissed review contributes no body findings", String(st.bodyTotal));
+  check(st.unreadableBodies.length === 0,
+    "and no unreadable sentinel either — a dismissed body is not an unread one",
+    JSON.stringify(st.unreadableBodies));
+
+  // Control: the identical body on a live review DOES produce them, so the
+  // assertion above is about the dismissal and not about the fixture.
+  const dir8 = mkdtempSync(join(tmpdir(), "reeve-body8-"));
+  const db8 = open(join(dir8, "s.db"));
+  noteHead(db8, NWO, 8, HEAD_A, T);
+  ingest(db8, NWO, 8, [review(1, "codex", BODY_TWO, HEAD_A, T)], { at: T });
+  derivePr(db8, NWO, 8, p, { at: T, head: HEAD_A });
+  check(reviewState(db8, NWO, 8, p, { at: T, head: HEAD_A }).bodyTotal === 2,
+    "control: the same body on a live review yields both findings");
+  rmSync(dir7, { recursive: true, force: true });
+  rmSync(dir8, { recursive: true, force: true });
+}
+
 // ── completeness, decided against what was POSTED ────────────────────────────
 {
   // A reviewer nobody rostered writes a review body. The roster is untouched and

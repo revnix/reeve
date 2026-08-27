@@ -353,6 +353,19 @@ check("an uncleared thread ASKS THE REVIEWER, rather than dispatching a fixer",
     through({ unreadableBodies: { readable: true, open: 1, reviewers: ["a-human"] },
               threads: { unresolved: 2, total: 4, readable: true } }),
     ACTIONS.ESCALATE);
+  // AND AN UNRELATED UNCERTAINTY DOES NOT DEFER IT. This is a definite state —
+  // reeve knows it cannot read the body — so it must not queue behind the generic
+  // "something is in flight" wait. GitHub still computing mergeability is the
+  // ordinary case, and below that branch the operator got "a clause could not be
+  // evaluated" after the settling window instead of the sentence naming the
+  // reviewer to declare. An immediate escalation anything else can postpone is not
+  // immediate.
+  check("an unrelated UNKNOWN clause does not defer it into a wait",
+    through({ unreadableBodies: { readable: true, open: 1, reviewers: ["a-human"] },
+              mergeState: "" }),
+    ACTIONS.ESCALATE);
+  check("control: that same UNKNOWN really does produce a wait on its own",
+    through({ mergeState: "" }), ACTIONS.WAIT);
   check("control: with every body readable, that same shape dispatches the fixer",
     through({ threads: { unresolved: 2, total: 4, readable: true } }),
     ACTIONS.FIX_FINDINGS);

@@ -159,6 +159,30 @@ export function nextAction(e, p, h = {}) {
     return act(ACTIONS.FIX_CI, `failing: ${named.join(", ")}`, { caused: named, attempt: tried + 1 });
   }
 
+  // A body reeve cannot READ goes straight to a person.
+  //
+  // Not a worker, because there is nothing for one to do: no code is wrong, no
+  // thread exists, and the fix is a line of profile only the operator can write.
+  // Not a silent block either, which was the alternative and the worse one:
+  // clearing a body finding needs its author to review the same head again, and
+  // someone who comments once never will, leaving a pull request nothing can free.
+  // Escalating stops the merge AND gives a person the decision — the founder's
+  // ruling of 2026-08-27.
+  //
+  // ABOVE the UNKNOWN branch, and that placement is load-bearing. This is a
+  // DEFINITE state, not an uncertainty: reeve knows it cannot read the body. Below
+  // that branch, any unrelated UNKNOWN — GitHub still computing mergeability is
+  // the ordinary one — returned WAIT instead, and after the settling window the
+  // operator got the generic "a clause could not be evaluated" rather than the one
+  // sentence naming the reviewer to declare. An immediate escalation that any
+  // other uncertainty can defer is not immediate.
+  //
+  // Still below CI, deliberately: a red check is actionable, independent of this,
+  // and repairing it merges nothing.
+  const bodyReadable = clause(v, "bodyReadable");
+  if (bodyReadable?.state === "BLOCK")
+    return act(ACTIONS.ESCALATE, ESCALATIONS.BODY_UNREADABLE, { detail: bodyReadable.detail });
+
   // 4. Anything still in flight: wait. But an UNKNOWN that never resolves is a
   //    stall, so it escalates once it has outlived a reasonable settling window.
   const unknowns = v.clauses.filter(c => c.state === "UNKNOWN");
@@ -191,20 +215,6 @@ export function nextAction(e, p, h = {}) {
   // `cleared` deliberately does NOT join these two, and getting that wrong was a
   // real defect. See its own branch below, after the stale-review one.
   const cleared = clause(v, "cleared");
-  // A body reeve cannot READ goes straight to a person, before anything that
-  // might act on the pull request.
-  //
-  // Not a worker, because there is nothing for one to do: no code is wrong, no
-  // thread exists, and the fix is a line of profile only the operator can write.
-  // Not a silent block either — that was the alternative and it is the worse one,
-  // since clearing a body finding needs its author to review the same head again
-  // and someone who comments once will never do that, leaving a pull request
-  // nothing can free. Escalating stops the merge AND gives a person the decision,
-  // which is the founder's ruling of 2026-08-27.
-  const bodyReadable = clause(v, "bodyReadable");
-  if (bodyReadable?.state === "BLOCK")
-    return act(ACTIONS.ESCALATE, ESCALATIONS.BODY_UNREADABLE, { detail: bodyReadable.detail });
-
   // A body finding is actionable work, so it joins this branch rather than the
   // `cleared` one below. `cleared` asks the reviewer to come back; here the
   // reviewer has already spoken and the fix is what is missing.

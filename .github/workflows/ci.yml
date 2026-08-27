@@ -26,8 +26,21 @@ permissions:
 # NEVER on main. A push to the default branch is history, and its run is the
 # evidence R-04 reads for base health; cancelling one because the next commit
 # arrived would leave a gap that reads as a commit nobody ever tested.
+#
+# `cancel-in-progress: false` DOES NOT ACHIEVE THAT ON ITS OWN, which is the
+# whole reason main gets its own group per commit. GitHub's documentation is
+# explicit: "any existing pending job or workflow in the same concurrency group
+# will be canceled", and cancel-in-progress governs only the RUNNING one. So three
+# quick pushes to main would leave the first running, the second pending, and the
+# third replacing the second — and the middle commit would carry no evidence at
+# all. Exactly the gap the paragraph above forbids, created by the mechanism meant
+# to prevent it.
+#
+# A group keyed by the COMMIT makes every main run alone in its group, so there is
+# never another run to cancel or be cancelled by. Pull request refs keep sharing a
+# group, which is what makes a superseded run stop.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || 'shared' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:

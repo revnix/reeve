@@ -20,7 +20,9 @@ existed and its squash SHA (`0d31350`) carries no number. Verified 2026-08-27 by
 Any other pre-convention PR would be invisible the same way; the count above (38) against 42
 merged PRs is the measure of how many.
 
-**Last verified:** 2026-08-27, `main` = `16cd880`.
+**Last verified:** 2026-08-28, `main` = **`36b4107`**. It moved twice during the S3 planning
+session (`c500cfe` → `16cd880` → `36b4107`); #54 was workflow-only so no source anchor moved.
+**`revnix/reeve` is PUBLIC** since 2026-08-27 — a closed founder decision, see `s3.md`.
 
 ---
 

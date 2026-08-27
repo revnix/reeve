@@ -48,6 +48,10 @@ const ADDED_COLUMNS = [
   // Defaulted to 0: every row written before this column existed was a real
   // finding, because sentinels did not exist to be written.
   ["review_body_finding", "unreadable", "INTEGER NOT NULL DEFAULT 0"],
+  // How many review objects a projection was folded from. Nullable on purpose:
+  // an existing row was derived before anyone recorded this, and "we do not know"
+  // must read as not-reported rather than as a matching count.
+  ["projection_meta", "review_total", "INTEGER"],
 ];
 
 function addMissingColumns(db) {

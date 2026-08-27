@@ -945,8 +945,16 @@ export function effectsFor({ nwo, e, decision, profile, execute }) {
  * return. Null for an empty set, because "nothing is open" is not a problem to be
  * capped and a fingerprint over nothing would collide with every other empty case.
  */
-export function findingsFingerprint(items) {
-  const ids = (items ?? []).map(t => String(t?.id ?? "")).filter(Boolean).sort();
+export function findingsFingerprint(items, ledgerIds) {
+  const ids = [
+    ...(items ?? []).map(t => String(t?.id ?? "")),
+    // LEDGER BLOCKERS COUNT TOO. `FIX_FINDINGS` is selected by the `findings`
+    // clause as well as the thread ones, and when a ledger blocker is the only
+    // reason there are no review findings at all — so a key built from review
+    // threads alone was null, `attemptKey` recorded nothing, and the brake never
+    // engaged for the one kind of repair that has no GitHub state to change.
+    ...(ledgerIds ?? []).map(id => `ledger:${String(id ?? "")}`),
+  ].filter(Boolean).sort();
   return ids.length ? `findings:${sha256(ids.join("\n")).slice(0, 16)}` : null;
 }
 
@@ -962,9 +970,9 @@ export function findingsFingerprint(items) {
  * The caller decides WHETHER to spend — an attempt that never started is not an
  * attempt — and this decides WHAT would be spent.
  */
-export function attemptKey(decision, ciFingerprint, threadDetails) {
+export function attemptKey(decision, ciFingerprint, threadDetails, ledgerIds) {
   if (decision?.action === "FIX_CI") return ciFingerprint || null;
-  if (decision?.action === "FIX_FINDINGS") return findingsFingerprint(threadDetails);
+  if (decision?.action === "FIX_FINDINGS") return findingsFingerprint(threadDetails, ledgerIds);
   return null;
 }
 
@@ -1923,7 +1931,7 @@ export async function tick(ctx) {
 
     // The findings-repair budget, read from the store like the CI one beside it
     // rather than from a map rebuilt empty on every tick.
-    const ffp = findingsFingerprint(e.threadDetails);
+    const ffp = findingsFingerprint(e.threadDetails, e.ledgerBlockerIds);
     const decision = nextAction(e, profile, {
       now: now(),
       unknownSince: unknownSince(db, pr),
@@ -1938,6 +1946,13 @@ export async function tick(ctx) {
       // than grant a free retry.
       fixAttempts: fp ? new Map([[fp, attemptsFor(db, nwo, pr, fp, logPath)]]) : new Map(),
     });
+
+    // ONE KEY for the whole attempt: the count read before, the write after, and
+    // every refund in between. They were three separate expressions and only two
+    // of them knew about findings, so a transient failure BEFORE the worker ran
+    // spent a findings attempt that nothing gave back — and with the default cap
+    // of one, the next tick escalated instead of retrying.
+    const spendKey = attemptKey(decision, fp, e.threadDetails, e.ledgerBlockerIds);
 
     // Posting a comment launches no worker and hands no credential to one, so it
     // is decided and made durable HERE -- not below, where dispatch is gated on
@@ -1975,7 +1990,7 @@ export async function tick(ctx) {
     // Carried on the entry rather than left in this block's scope: the dispatch
     // loop below is a SEPARATE block, and reaching for these there threw a
     // ReferenceError on every FIX_CI the moment --execute was on.
-    decisions.push({ e, decision, cause, fp });
+    decisions.push({ e, decision, cause, fp, spendKey });
     log(logPath, "  " + describe(e, decision));
 
     // Republish on every tick: a verdict is bound to a revision, so when the head
@@ -2252,7 +2267,7 @@ export async function tick(ctx) {
     let started = 0;
 
     const PREP_BACKOFF = (ctx.prepBackoff ??= new Map());   // pr -> { until, failures }
-    for (const { e, decision, cause, fp } of decisions) {
+    for (const { e, decision, cause, fp, spendKey } of decisions) {
       // Already handled at decision time, in the same transaction as the decision.
       // Nothing to dispatch: reeve posts it.
       // The same condition the producer uses. If they disagree, a disarmed run
@@ -2404,8 +2419,7 @@ export async function tick(ctx) {
       // guardian pid, which the expiry reaper preserves for ever. Nothing
       // reclaims it if the next tick decides differently about this PR.
       try {
-        const spend = run.ok ? attemptKey(decision, fp, e.threadDetails) : null;
-        if (spend) (ctx.recordFixAttempt ?? recordFixAttempt)(db, nwo, e.pr, spend, e.head);
+        if (run.ok && spendKey) (ctx.recordFixAttempt ?? recordFixAttempt)(db, nwo, e.pr, spendKey, e.head);
       } catch (err) {
         if (prLease) { releaseWithRetry(prRunRef, prLease); prLease = null; }
         // AND RETIRE THE RUN, because nothing else ever will.
@@ -2454,7 +2468,7 @@ export async function tick(ctx) {
           try {
             if (decision.action === "FIX_CI" && fp
                 && attemptsFor(db, nwo, e.pr, fp, logPath) > attemptsBefore)
-              refundFixAttempt(db, nwo, e.pr, fp);
+              if (spendKey) refundFixAttempt(db, nwo, e.pr, spendKey);
           } catch (e2) {
             log(logPath, `  #${e.pr}: the fix attempt could not be refunded — ${e2.message}`);
           }
@@ -2752,7 +2766,7 @@ export async function tick(ctx) {
         // spent above is refunded: this failure is reeve's, not the fix's.
         r = { outcome: OUTCOMES.FAILED, why: `could not prepare the worker: ${err.message}`, ms: 0, cost: null, sessionId: null };
         prepFailed = true;
-        if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+        if (spendKey) { try { refundFixAttempt(db, nwo, e.pr, spendKey); } catch { /* the run still closes */ } }
         const prev = PREP_BACKOFF.get(prepKey)?.failures ?? 0;
         PREP_BACKOFF.set(prepKey, { failures: prev + 1, until: Date.now() + Math.min(PREP_BACKOFF_CAP_MS, PREP_BACKOFF_BASE_MS * 2 ** prev) });
         raise(`#${e.pr}: the worker could not be prepared; reeve is backing off`);
@@ -2791,7 +2805,7 @@ export async function tick(ctx) {
         // attempt is given back as well.
         if (r?.outcome === OUTCOMES.UNBOUND && /cancel/.test(r?.why ?? "")) {
           r = { ...r, outcome: OUTCOMES.CANCELLED, why: r.why };
-          if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+          if (spendKey) { try { refundFixAttempt(db, nwo, e.pr, spendKey); } catch { /* the run still closes */ } }
         }
         // Pre-execution outcomes are classified BEFORE the recorder and the
         // finish, so a recorder that fails cannot rewrite them into a spent
@@ -2801,7 +2815,7 @@ export async function tick(ctx) {
         // lease and refuse the PR on every tick with nobody told.
         if (r?.outcome === OUTCOMES.UNBOUND) {
           prepFailed = true;
-          if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+          if (spendKey) { try { refundFixAttempt(db, nwo, e.pr, spendKey); } catch { /* the run still closes */ } }
           const prev = PREP_BACKOFF.get(prepKey)?.failures ?? 0;
           PREP_BACKOFF.set(prepKey, { failures: prev + 1, until: Date.now() + Math.min(PREP_BACKOFF_CAP_MS, PREP_BACKOFF_BASE_MS * 2 ** prev) });
           raise(`#${e.pr}: the worker could not be prepared; reeve is backing off`);

@@ -229,6 +229,9 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
      WHERE i.pr_number = ?
      ORDER BY i.event_at, i.id`).all(pr, pr, pr);
 
+  // Counted from the rows this fold is reading, not from the table afterwards, so
+  // the number belongs to this snapshot and no other.
+  const reviewSeen = new Set();
   const rounds = [], threads = [], bodyFindings = [];
   // Which reviewers wrote a review body at all, and whether every one of them had
   // declared how their bodies carry findings. Both are needed: the count is only
@@ -277,6 +280,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     // carrier GitHub mints for every inline reply -- so reaching here with
     // kind 'review' IS the definition of one.
     if (r.kind !== "review") continue;
+    reviewSeen.add(r.external_id);
     bodyAuthors.add(r.source);
     // COMPLETENESS is decided per pull request against what was actually posted,
     // not against the roster. A profile can be fully configured and still miss a
@@ -445,13 +449,15 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     // The head is stored WITH the projection, in the same transaction as the rows
     // it explains. Clearing was computed against it, so a projection and the head
     // it describes are one fact and must not be able to drift apart.
-    db.prepare(`INSERT INTO projection_meta (nwo,scope,classifier_version,derived_at,complete,head,body_derived)
-                VALUES (?,?,?,?,?,?,?)
+    db.prepare(`INSERT INTO projection_meta (nwo,scope,classifier_version,derived_at,complete,head,body_derived,review_total)
+                VALUES (?,?,?,?,?,?,?,?)
                 ON CONFLICT(nwo,scope) DO UPDATE SET
                   classifier_version=excluded.classifier_version,
                   derived_at=excluded.derived_at, complete=excluded.complete,
-                  head=excluded.head, body_derived=excluded.body_derived`)
-      .run(nwo, `pr:${pr}`, version, at, complete ? 1 : 0, head ?? null, bodyComplete ? 1 : 0);
+                  head=excluded.head, body_derived=excluded.body_derived,
+                  review_total=excluded.review_total`)
+      .run(nwo, `pr:${pr}`, version, at, complete ? 1 : 0, head ?? null, bodyComplete ? 1 : 0,
+           reviewSeen.size);
     db.exec("COMMIT");
   } catch (e) { try { db.exec("ROLLBACK"); } catch {} throw e; }
 
@@ -537,12 +543,17 @@ export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() /
     if (meta.head !== head) return { readable: false, why: `projection was derived for ${String(meta.head).slice(0, 10)}, not ${String(head).slice(0, 10)}` };
   }
 
-  // HOW MANY REVIEW OBJECTS this projection was derived from, so a caller can ask
-  // whether the review surface has moved since. Distinct external ids rather than
-  // rows: an edit lands as a new generation of the SAME review, and counting rows
-  // would report the edit as an extra review.
-  const reviewTotal = db.prepare(
-    "SELECT COUNT(DISTINCT external_id) c FROM inbox WHERE pr_number=? AND kind='review'").get(pr)?.c ?? 0;
+  // HOW MANY REVIEW OBJECTS THIS PROJECTION WAS FOLDED FROM, read from the
+  // projection rather than counted from the inbox now.
+  //
+  // The two look equivalent because ingest and derive run together in a tick.
+  // They stop being equivalent the moment derive FAILS after ingest succeeded:
+  // the inbox then holds the new review, the projection does not, and a count
+  // taken from the inbox matches the live read and accepts the stale projection —
+  // the cross-check agreeing with itself, vacuous in exactly the failure it is
+  // for. Null when the projection predates the column, which the comparison reads
+  // as not-reported rather than as a match.
+  const reviewTotal = meta.review_total ?? null;
   const threads = db.prepare("SELECT * FROM review_thread WHERE nwo=? AND pr=?").all(nwo, pr);
   const open = threads.filter(t => !t.is_cleared);
   const blocking = open.filter(t => BLOCKING_SEVERITIES.has(t.severity));

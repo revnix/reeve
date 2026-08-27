@@ -388,6 +388,21 @@ CREATE TABLE IF NOT EXISTS projection_meta (
   -- the critical count below may be missing one. Default 0 -- a projection
   -- written before this column existed derived no body findings at all.
   body_derived INTEGER NOT NULL DEFAULT 0,
+  -- How many REVIEW OBJECTS this projection was folded from.
+  --
+  -- Stored here rather than counted from the inbox at read time, for the same
+  -- reason `head` is: it is a property of the fold, and recomputing it answers
+  -- about a different moment. Counting the inbox looked equivalent because ingest
+  -- and derive run together in a tick — until derive FAILS or rolls back after
+  -- ingest succeeded. Then the inbox holds the new review, the projection does
+  -- not, and a live cross-check comparing against the inbox count agrees with
+  -- itself and accepts the stale projection. The check would be vacuous in exactly
+  -- the failure it exists for.
+  --
+  -- NULL means a projection written before this column existed. The comparison
+  -- treats that as "not reported" and falls back to threads alone, rather than
+  -- inventing a number.
+  review_total INTEGER,
   PRIMARY KEY (nwo, scope)) STRICT;
 
 -- ------------------------------------------------------------ review shadow

@@ -91,13 +91,20 @@ export function bodyFindingsOf(body, start) {
   try { re = new RegExp(start, "gi"); } catch { return { findings: [], readable: false }; }
   const all = [...text.matchAll(re)];
   const at = all.filter(m => m[0].length > 0).map(m => m.index);
-  // A pattern can be zero-width WITHOUT matching the empty string. `(?=!\[P\d
-  // Badge\])` returns false for test("") and so passes profile validation, then
-  // produces nothing but zero-length matches against a real body. Dropping them
-  // silently turned a blind read into a confident zero, which is the one answer
-  // that licenses a spill. Reported instead, so the fold can say it cannot read
-  // this reviewer rather than that this reviewer found nothing.
-  const readable = !(all.length > 0 && at.length === 0);
+  // ANY zero-width match condemns the whole delimiter set, not merely a set where
+  // every match is zero-width.
+  //
+  // A pattern can be zero-width WITHOUT matching the empty string: `(?=!\[P\d
+  // Badge\])` returns false for test("") and passes profile validation. Requiring
+  // ALL of them to be zero-width then left a worse hole than the one it closed --
+  // `(?=!\[P2 Badge\])|!\[P\d Badge\]` matches the P2 at zero width and the P1 at
+  // full width, so the P2 match is dropped, the P1 keeps the body "readable", and
+  // the slice that should have been the P2 finding is swallowed into the text
+  // before it. One finding silently gone, and a confident count over the rest.
+  //
+  // `every` over an empty list is true, which is the right answer for a pattern
+  // that simply found nothing: that body has no findings, and reeve could read it.
+  const readable = all.every(m => m[0].length > 0);
   return {
     readable,
     findings: readable
@@ -200,7 +207,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
   // Latest generation per object: an edit supersedes, and the fold reads what the
   // object says NOW while the earlier text stays on record in inbox.
   const rows = db.prepare(`
-    SELECT i.source, i.external_id, i.kind, i.payload, i.event_at, i.generation
+    SELECT i.source, i.external_id, i.kind, i.payload, i.event_at, i.generation, i.observed_at
       FROM inbox i
       JOIN (SELECT source, external_id, MAX(generation) g FROM inbox
              WHERE pr_number = ? GROUP BY source, external_id) m
@@ -282,6 +289,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
                  `so this body is counted as one finding of unknown severity: ` +
                  String(o.payload?.body ?? "").replace(/\s+/g, " ").slice(0, 240),
         event_at: r.event_at ?? at, head_full: c.head_full ?? null, ord,
+        seen_at: r.observed_at ?? r.event_at ?? at,
       });
       continue;
     }
@@ -294,7 +302,7 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
         // be filed as a nit.
         severity: severityOf(text, rev?.severityMarkers ?? []),
         excerpt: text.slice(0, 400), event_at: r.event_at ?? at,
-        head_full: c.head_full ?? null, ord,
+        head_full: c.head_full ?? null, ord, seen_at: r.observed_at ?? r.event_at ?? at,
       });
     }
   }
@@ -331,10 +339,22 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
   // cut short clears the finding by not repeating it. What limits the damage is
   // that the reviewer is looking at the same code, so a problem still there is
   // restated and returns as a new finding.
-  const roundClearsAfter = (reviewer, ord) => rounds.some(
+  //
+  // Measured from when the finding's TEXT was first seen, not from when its review
+  // object was submitted. CodeRabbit edits its own bodies in place, and an edit
+  // keeps the original `submitted_at` -- so a finding ADDED by an edit inherited
+  // the position of the review it was added to, and a round that happened before
+  // the edit cleared text that did not exist when that round ran. A newly added P0
+  // could leave the count without anybody having looked at it.
+  //
+  // The ordinal still decides the same-instant case, where two rounds share a
+  // second and comparing timestamps is a coin toss. Both are required: the ordinal
+  // for ties, `seen_at` for text that arrived later than its container.
+  const roundClearsAfter = (reviewer, ord, seenAt) => rounds.some(
     (x, i) => i > ord && x.reviewer === reviewer &&
-              (x.outcome === "findings" || x.outcome === "clean") && covers(x));
-  for (const f of bodyFindings) f.is_cleared = roundClearsAfter(f.reviewer, f.ord) ? 1 : 0;
+              (x.outcome === "findings" || x.outcome === "clean") && covers(x) &&
+              (x.event_at ?? 0) > seenAt);
+  for (const f of bodyFindings) f.is_cleared = roundClearsAfter(f.reviewer, f.ord, f.seen_at) ? 1 : 0;
 
   db.exec("BEGIN IMMEDIATE");
   try {

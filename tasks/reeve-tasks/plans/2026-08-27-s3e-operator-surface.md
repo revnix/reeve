@@ -29,7 +29,7 @@ Their review history — every finding and what each changed — is `s3-review-h
 
 S3-A and S3-B must be merged first, in that order. These are the exact names this plan builds on; **if any has changed, stop and reconcile rather than adapting the code here.**
 
-**Read this warning before the table.** MEASURED 2026-08-27: `tasks/reeve-tasks/plans/` is **empty** — `ls tasks/reeve-tasks/plans/` returns nothing, against a positive control that `ls tasks/reeve-tasks/` returns seven entries. Neither S3-A nor S3-B exists yet. Every row below marked **(derived)** is taken from `S3-DESIGN-BRIEF.md` §2.2's specification of T1–T5, not from a merged document, so it is a *claim about what S3-A and S3-B will produce*, not a measurement of what they did. Rows marked **(measured)** were re-derived in this worktree at `16cd880` by searching the anchor string. Reconcile every **(derived)** row against the real S3-A and S3-B before writing a line of code.
+**Read this warning before the table.** MEASURED 2026-08-27, immediately before this document was written into it: `tasks/reeve-tasks/plans/` was **empty** — `ls tasks/reeve-tasks/plans/` returned nothing, against a positive control that `ls tasks/reeve-tasks/` returned eight entries. Neither S3-A nor S3-B exists yet. Every row below marked **(derived)** is taken from `S3-DESIGN-BRIEF.md` §2.2's specification of T1–T5, not from a merged document, so it is a *claim about what S3-A and S3-B will produce*, not a measurement of what they did. Rows marked **(measured)** were re-derived in this worktree at `16cd880` by searching the anchor string. Reconcile every **(derived)** row against the real S3-A and S3-B before writing a line of code.
 
 | from | name | shape |
 |---|---|---|
@@ -973,7 +973,7 @@ import { whyModel, renderWhy } from "../src/build/why.mjs";
   db.prepare(`INSERT INTO phase_run(task,generation,phase,slice,attempt,status,pid,lstart,started_at,
                                     heartbeat_at,lease_expires_at,out_path,err_path,model_id,cli_version,
                                     snapshot_hash,contract_drift)
-              VALUES(?,1,'SIZING',0,1,'succeeded',321,'L',?,?,?,'/o','/e','claude-x','2.0.0','snap1',?)`)
+              VALUES(?,1,'SIZING',0,1,'succeeded',321,'L',?,?,?,'/o','/e','model-x','2.0.0','snap1',?)`)
     .run("bt:full", NOW - 900, NOW - 880, NOW - 600, JSON.stringify({ model_id: "asked for y" }));
   db.prepare(`INSERT INTO provider_lease(owner,repo_id,run_ref,pid,lstart,status,requested_at,expires_at)
               VALUES('builder',1,'bt:full',321,'L','held',?,?)`).run(NOW - 910, NOW + 600);
@@ -994,8 +994,12 @@ import { whyModel, renderWhy } from "../src/build/why.mjs";
   // row -- otherwise a broken query and an empty table read identically.
   check(m.prs.length === 0 && m.absent.includes("prs"),
     "S3 has no pull requests, and `prs` says absent", JSON.stringify(m.prs));
+  // `task_pr` is NOT in hub.sql: migration 2 creates it in hubdb.mjs and drops
+  // `impl_pr`. And its CHECK forbids generation and slice on a spec row --
+  // passing 1 and 0 there fails the constraint, not the assertion, and the test
+  // then reports a database error where it meant to report a missing reader.
   db.prepare(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
-              VALUES(?, 'spec', 1, 0, 1, 5, 'headsha', ?)`).run("bt:full", NOW);
+              VALUES(?, 'spec', NULL, NULL, 1, 5, 'headsha', ?)`).run("bt:full", NOW);
   const withPr = whyModel(db, "bt:full", { now: NOW });
   check(withPr.prs.length === 1 && !withPr.absent.includes("prs"),
     "control: openPrs does return a row when one exists, so the emptiness above is the table's",
@@ -1860,7 +1864,11 @@ git commit -m "feat(build): age-in-state from the event log, never updated_at"
 
 - [ ] **Step 1: Append the failing test**
 
-Append to `test/build-dash.test.mjs`, **before** its closing group:
+Append to `test/build-dash.test.mjs`, **before** its closing group. It needs one more import, added at the top of the file beside the others — the lease length, read from the module that owns it rather than written as a number, because a tuned constant copied into a test hides a real defect behind a green run:
+
+```js
+import { LEASE_SECONDS } from "../src/build/locks.mjs";
+```
 
 ```js
 // Five questions, and a test that the sixth cannot be added quietly. The failure
@@ -1910,8 +1918,18 @@ Append to `test/build-dash.test.mjs`, **before** its closing group:
 // ── a draining cancel says how many rows are left ────────────────────────────
 {
   insertTask(db, { id: "bt:cancel", phase: "CANCELLING" });
-  db.prepare(`INSERT INTO outbox(idempotency_key,kind,task,generation,fence,args,not_before,created_at,status,attempts,max_attempts)
-              VALUES('k1','notify',?,1,1,'{}',0,?, 'pending',0,8)`).run("bt:cancel", NOW);
+  // `outbox.fence` REFERENCES phase_event(seq), so the event comes first or the
+  // insert fails on the foreign key rather than on anything this task is about.
+  db.prepare(`INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,artifact_sha,detail)
+              VALUES(?,?,?,?,?,?,?,?,?)`)
+    .run("bt:cancel", NOW - 40, "cancel.requested", "SIZING", "CANCELLING", 1, 1, null, "{}");
+  const fence = db.prepare("SELECT max(seq) s FROM phase_event WHERE task='bt:cancel'").get().s;
+  // Columns as `src/build/hub.sql` declares them: task_id and task_generation,
+  // not task and generation, and both created_at and updated_at are NOT NULL.
+  db.prepare(`INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,args,not_before,
+                                 status,attempts,max_attempts,created_at,updated_at)
+              VALUES('k1','notify',?,1,?,'{}',0,'pending',0,8,?,?)`)
+    .run("bt:cancel", fence, NOW, NOW);
   const oid = db.prepare("SELECT id FROM outbox WHERE idempotency_key='k1'").get().id;
   db.prepare("INSERT INTO task_drain(task,outbox_id,recorded_at) VALUES(?,?,?)").run("bt:cancel", oid, NOW - 30);
 
@@ -1944,18 +1962,42 @@ Append to `test/build-dash.test.mjs`, **before** its closing group:
 }
 
 // ── is it alive ──────────────────────────────────────────────────────────────
+//
+// MEASURED at 16cd880 and it changes the shape of this block: `singleton_lease`
+// has NO heartbeat_at column. Its columns are (name, pid, lstart, command,
+// acquired_at, expires_at), and `heartbeatSingleton` (src/build/locks.mjs:67)
+// expresses the heartbeat by sliding `expires_at` forward by LEASE_SECONDS. So
+// last-seen is DERIVED -- LEASE_SECONDS minus the remaining life -- and the
+// derivation is only sound while the lease length is a constant, which is why
+// LEASE_SECONDS is imported rather than written as a number here.
+//
+// The lease is named "builder", measured at bin/reeve:1421, not "build".
 {
   const dead = dashModel(db, { now: NOW, capabilities: ALL_ON, projects: PROJECTS });
   check(dead.alive?.running === false,
     "with no singleton lease the digest says the builder is not running, rather than saying nothing",
     JSON.stringify(dead.alive));
+  check(dead.alive?.last_seen_seconds === null,
+    "and last-seen is null rather than 0, because never-seen and seen-just-now are different facts",
+    JSON.stringify(dead.alive));
 
-  db.prepare(`INSERT INTO singleton_lease(name,pid,lstart,command,acquired_at,heartbeat_at,expires_at)
-              VALUES('build',424242,'L','reeve build run',?,?,?)`).run(NOW - 300, NOW - 20, NOW + 300);
+  db.prepare(`INSERT INTO singleton_lease(name,pid,lstart,command,acquired_at,expires_at)
+              VALUES('builder',424242,'L','reeve build run',?,?)`)
+    .run(NOW - 300, NOW + LEASE_SECONDS - 20);
   const live = dashModel(db, { now: NOW, capabilities: ALL_ON, projects: PROJECTS });
-  check(live.alive?.running === true && live.alive?.last_seen_seconds === 20,
-    "control: with a lease it says running, and how long since the heartbeat",
+  check(live.alive?.running === true, "control: with a live lease it says running", JSON.stringify(live.alive));
+  check(live.alive?.last_seen_seconds === 20,
+    "and how long since the heartbeat, derived from the remaining lease life",
     JSON.stringify(live.alive));
+
+  // An EXPIRED lease row is not a live builder. The row outlives the process --
+  // that is what makes it a lease -- so `running` must read the clock and not
+  // the row's existence.
+  db.prepare("UPDATE singleton_lease SET expires_at = ? WHERE name = 'builder'").run(NOW - 1);
+  const stale = dashModel(db, { now: NOW, capabilities: ALL_ON, projects: PROJECTS });
+  check(stale.alive?.running === false,
+    "control: an expired lease row is not a running builder", JSON.stringify(stale.alive));
+  db.prepare("DELETE FROM singleton_lease WHERE name = 'builder'").run();
 }
 ```
 
@@ -1970,7 +2012,13 @@ Expected: `the digest answers "alive"` passes (the key exists from Task 7, holdi
 
 - [ ] **Step 3: Fill the five, and add the route**
 
-In `src/build/dash.mjs`:
+In `src/build/dash.mjs`, add one import beside the existing one — Task 7 deliberately did not add it, because an import nothing uses is a lint error and this is the task that uses it:
+
+```js
+import { LEASE_SECONDS } from "./locks.mjs";
+```
+
+then replace `dashModel` and `renderDash`:
 
 ```js
 // The two substates only a human can clear. The other four clear themselves --
@@ -1983,8 +2031,13 @@ const TERMINAL = new Set(["DONE", "CANCELLED", "LOST", "INFEASIBLE"]);
 
 export function dashModel(db, { now, capabilities, projects = [], since = null }) {
   const tasks = taskList(db, { now, capabilities });
+  // `builder`, which is the name bin/reeve takes. And there is no heartbeat_at
+  // column: heartbeatSingleton slides `expires_at` forward by LEASE_SECONDS, so
+  // last-seen is the lease length minus what is left of it. LEASE_SECONDS is
+  // imported rather than written here, because the derivation is only sound
+  // while the two agree, and a copied constant agrees until the day it does not.
   const lease = db.prepare(
-    `SELECT pid, heartbeat_at, expires_at FROM singleton_lease WHERE name = 'build'`).get() ?? null;
+    `SELECT pid, acquired_at, expires_at FROM singleton_lease WHERE name = 'builder'`).get() ?? null;
 
   return {
     format_version: READ_FORMAT_VERSION,
@@ -1995,11 +2048,14 @@ export function dashModel(db, { now, capabilities, projects = [], since = null }
     since,
 
     // 1. Is it alive? A heartbeat AND when it was last seen: "running" without
-    // a last-seen is a claim a dead process can still make through its row.
+    // a last-seen is a claim a dead process can still make through its row --
+    // the row outlives the process, which is what makes it a lease, so `running`
+    // reads the clock rather than the row's existence. `null`, never 0, when
+    // there is no lease: never-seen and seen-just-now are different facts.
     alive: {
       running: !!lease && lease.expires_at > now,
       pid: lease?.pid ?? null,
-      last_seen_seconds: lease ? Math.max(0, now - lease.heartbeat_at) : null,
+      last_seen_seconds: lease ? Math.max(0, LEASE_SECONDS - (lease.expires_at - now)) : null,
     },
 
     // 2. What is it doing? A live run, or a task that is moving.
@@ -2226,4 +2282,1485 @@ Comment `@codex review` on **every push**. Read **both** endpoints — a clean p
 **Do not merge.** Founder grant required.
 
 ---
-<!-- NEXT-CHUNK -->
+# PR-E3: Escalations reach the founder from the builder process, and `builder doctor` grows S3's rows
+
+**Branch:** `feat/s3-escalate-doctor`. **Scope:** `src/build/announce.mjs`; one additive field per channel result in `src/notify.mjs`; six new findings in `src/doctor.mjs`; a `notify --test` route. **Budget:** ~900 changed lines. **PR-E3 is the one place in this plan that writes, and it writes exactly five columns of one table: `escalation`'s `count`, `first_seen_at`, `last_seen_at`, `announced_count` and its `why` primary key. Task 16 asserts that `builder doctor` still writes nothing at all.**
+
+**Base this on PR-E1's merge commit**, in parallel with PR-E2. It shares nothing with the dash but the read model's `escalations` field, and the two can be reviewed independently.
+
+---
+
+### Task 11: A builder escalation key is a bare identity, and the failure type rides in the body
+
+**Files:**
+- Create: `src/build/announce.mjs`
+- Test: `test/build-escalations.test.mjs` (new)
+
+**Interfaces:**
+- Consumes: nothing at runtime. `IDENTITY_SHAPES` is transcribed by hand from §11.7 and is deliberately not derived from anything, for the reason `src/build/tables.mjs:10-12` already records about `PROSE_TABLES`: two lists built from one source agree with each other and prove nothing.
+- Produces: `FAILURE_TYPES = ["FAILED", "UNCERTAIN", "REFUSED", "BLOCKED"]`; `escalationKey({ task, kind, phase }) -> string`, which **throws** on anything that would put variable detail in the key; `IDENTITY_SHAPES` (frozen); `body({ type, ... }) -> object`. Tasks 12, 13 and 15 use them.
+
+**The property, and why it needs two layers.** §11.7 asserts *no builder `escalations.set` call interpolates variable detail into the key*, and the natural test is a negative regex over source text. MEASURED: **74 of 3,205 assertions in this repository are regexes over source text, and the two headline assertions in `test/guardian-provider-lease.test.mjs` are negative ones** — `!/resolveRepoId\s*\(\s*(ctx\.)?hub/` at `:182` and `!/\bopenHub\b/` at `:1878`. A rename disables such a guard and **it still prints PASS**. So the source-level assertion here is paired with a **literal counter-control**: the same extraction is run over a string that contains a violating call and must find it. And the source-level layer is backed by a runtime one, because a key can also be assembled at runtime by a caller the regex never sees.
+
+The identity list itself is not free-form. S3 can produce nine: `bt:<id>:phase:failed:<phase>`, `bt:<id>:phase:blocked:<phase>`, `bt:<id>:infeasible`, `bt:<id>:depth:post-approval`, `bt:<id>:lease:conflict`, `bt:<id>:lease:starved`, `bt:<id>:cancel:draining`, `builder:sandbox:canary-failed`, `builder:backup:failed`. The task id and the phase are **identity components** — they say *which* task and *which* phase, and two tasks blocked at RESEARCH are two situations. A count, a duration, a path or a sha is **detail**: it changes while the situation does not, and putting it in the key turns one standing escalation into a new one every tick.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `test/build-escalations.test.mjs`.
+
+```js
+// A key is an identity. `bt:7:lease:starved` is one situation however long it
+// has been starved; `bt:7:lease:starved:4200s` is a new situation every tick,
+// and a standing cause that re-announces itself is how an unattended system
+// trains its owner to ignore it. Measured elsewhere and it generalises: alert
+// acceptance drops about 30% for each repeat.
+import { escalationKey, IDENTITY_SHAPES, FAILURE_TYPES, body } from "../src/build/announce.mjs";
+/* ... standard harness ... */
+
+// ── the closed identity list ─────────────────────────────────────────────────
+{
+  check(IDENTITY_SHAPES.length === 9,
+    `S3 produces exactly nine identities, not ${IDENTITY_SHAPES.length}`, IDENTITY_SHAPES.join("\n        "));
+  check(Object.isFrozen(IDENTITY_SHAPES), "and the list cannot be widened at runtime");
+  for (const s of IDENTITY_SHAPES)
+    check(/^(bt:<id>:|builder:)/.test(s),
+      `${s} is dispatched by the builder: every identity starts bt: or builder:`, s);
+  check(IDENTITY_SHAPES.every(s => !/<sha>|<count>|<seconds>|<path>/.test(s)),
+    "and no shape carries a placeholder for detail", IDENTITY_SHAPES.join(","));
+}
+
+// ── the runtime layer: the minter refuses detail ─────────────────────────────
+{
+  check(escalationKey({ task: "bt:7", kind: "phase:blocked", phase: "RESEARCH" }) === "bt:7:phase:blocked:RESEARCH",
+    "a task-scoped identity is task, kind and phase, in that order",
+    escalationKey({ task: "bt:7", kind: "phase:blocked", phase: "RESEARCH" }));
+  check(escalationKey({ kind: "sandbox:canary-failed" }) === "builder:sandbox:canary-failed",
+    "a process-scoped identity has no task and is prefixed builder:",
+    escalationKey({ kind: "sandbox:canary-failed" }));
+  check(escalationKey({ task: "bt:7", kind: "infeasible" }) === "bt:7:infeasible",
+    "and a phase-less task identity omits the phase rather than padding it",
+    escalationKey({ task: "bt:7", kind: "infeasible" }));
+
+  const refused = (args) => { try { escalationKey(args); return "returned"; } catch (e) { return e.kind ?? "threw"; } };
+  check(refused({ task: "bt:7", kind: "lease:starved", detail: "4200s" }) === "escalation_key_detail",
+    "a detail component is REFUSED: detail rides in the body",
+    refused({ task: "bt:7", kind: "lease:starved", detail: "4200s" }));
+  check(refused({ task: "bt:7", kind: "lease:starved 4200s" }) === "escalation_key_shape",
+    "and so is detail smuggled into the kind, because a space is not a component",
+    refused({ task: "bt:7", kind: "lease:starved 4200s" }));
+  check(refused({ task: "bt:7", kind: "phase:failed", phase: "sizing" }) === "escalation_key_shape",
+    "and a lowercase phase, which is not one of the enumerated phases",
+    refused({ task: "bt:7", kind: "phase:failed", phase: "sizing" }));
+
+  // CONTROL: the refusal is not "everything throws". Without this every
+  // assertion above passes on a function whose body is `throw`.
+  check(refused({ task: "bt:7", kind: "infeasible" }) === "returned",
+    "control: a well-formed identity is minted, not refused");
+
+  // Every minted key matches one declared shape. A key nobody declared is a
+  // situation nobody wrote down, and the page list cannot decide about it.
+  const asShape = k => k.replace(/^bt:[^:]+:/, "bt:<id>:").replace(/:[A-Z_]+$/, ":<phase>");
+  for (const [args, expected] of [
+    [{ task: "bt:1", kind: "phase:failed", phase: "SIZING" }, "bt:<id>:phase:failed:<phase>"],
+    [{ task: "bt:1", kind: "cancel:draining" }, "bt:<id>:cancel:draining"],
+    [{ kind: "backup:failed" }, "builder:backup:failed"],
+  ]) {
+    const shape = asShape(escalationKey(args));
+    check(shape === expected && IDENTITY_SHAPES.includes(shape),
+      `${escalationKey(args)} is the declared shape ${expected}`, shape);
+  }
+}
+
+// ── the source layer, with a literal counter-control ─────────────────────────
+{
+  const src = readFileSync(new URL("../src/build/announce.mjs", import.meta.url), "utf8");
+
+  // The first argument of every escalations.set call in this file.
+  const CALL = /escalations\.set\(\s*([^,]+),/g;
+  const args = [...src.matchAll(CALL)].map(m => m[1].trim());
+  check(args.length > 0, `control: the extraction finds ${args.length} escalations.set call(s)`, args.join(" | "));
+  check(args.every(a => /^escalationKey\(/.test(a)),
+    "every builder escalation key comes from escalationKey(), never from a template literal",
+    args.join(" | "));
+
+  // COUNTER-CONTROL. A negative regex that stops matching after a rename prints
+  // PASS while guarding nothing, and this repository has two such assertions in
+  // production already. The same pattern is run over a literal it has never
+  // seen: if THIS goes quiet, the pattern is broken, not the source.
+  const FIXTURE =
+    'escalations.set(`bt:${id}:lease:starved:${secs}`, 1);\n' +
+    'escalations.set(escalationKey({ task, kind: "infeasible" }), 1);';
+  const fromFixture = [...FIXTURE.matchAll(new RegExp(CALL.source, "g"))].map(m => m[1].trim());
+  check(fromFixture.length === 2,
+    "counter-control: the extraction finds both calls in a literal it has never seen", fromFixture.join(" | "));
+  check(fromFixture.some(a => !/^escalationKey\(/.test(a)),
+    "counter-control: and it still recognises a raw interpolated key as a violation", fromFixture.join(" | "));
+}
+
+// ── the failure types, which ride in the body ────────────────────────────────
+{
+  check(JSON.stringify([...FAILURE_TYPES]) === JSON.stringify(["FAILED", "UNCERTAIN", "REFUSED", "BLOCKED"]),
+    "the four failure types, in order", FAILURE_TYPES.join(","));
+
+  const b = body({ type: "BLOCKED", reason: "provider quota", waiting_seconds: 4200, task: "bt:7" });
+  check(b.type === "BLOCKED", "a body names its type", JSON.stringify(b));
+  check(b.waiting_seconds === 4200,
+    "and carries the number that must NOT be in the key", JSON.stringify(b));
+  check(b.next === "wait, or raise the concurrency limit",
+    "and BLOCKED names what clears it, because an alert with no specific action should not exist",
+    JSON.stringify(b));
+
+  const bad = (() => { try { body({ type: "SOMETHING_WENT_WRONG" }); return "returned"; } catch (e) { return e.kind ?? "threw"; } })();
+  check(bad === "escalation_body_type",
+    "and an untyped failure is refused: never collapse to 'something went wrong'", bad);
+
+  for (const t of FAILURE_TYPES)
+    check(typeof body({ type: t, reason: "r" }).next === "string",
+      `${t} carries a distinct next action`, JSON.stringify(body({ type: t, reason: "r" })));
+  const nexts = FAILURE_TYPES.map(t => body({ type: t, reason: "r" }).next);
+  check(new Set(nexts).size === 4,
+    "and the four next actions are four, not one repeated", nexts.join(" | "));
+}
+
+rmSync(dir, { recursive: true, force: true });
+console.log(fail ? `\nfailed=${fail}` : "\nall green");
+process.exit(fail ? 1 : 0);
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `$N test/build-escalations.test.mjs 2>&1 | head -3`
+Expected: `Cannot find module '.../src/build/announce.mjs'`. **After Step 3, watch the two counter-controls specifically**: they read a string literal and must be green whatever the source says. A counter-control that goes red means the extraction itself is broken, and every assertion beside it is then unreadable rather than false.
+
+**On the broken implementation** — the shape this guards against is `escalations.set(\`bt:${id}:lease:starved:${secs}\`, 1)`, which is what a developer writes when the duration is the useful part of the message. Under it **`every builder escalation key comes from escalationKey()`** goes red and both counter-controls stay green, which is the reading that says "the source has a violation" rather than "the check stopped working". A second shape is an `escalationKey` that accepts anything and joins with colons; under it every source-level assertion stays green and the four runtime refusals go red — two layers, two different failures, and neither alone covers the other. A third is `body()` returning one generic `next`; under it every per-type assertion passes and **`the four next actions are four, not one repeated`** goes red alone.
+
+**The stub loop for this task**: green after Step 3 (**control green**); then in `src/build/announce.mjs` delete the `detail` check from `escalationKey` and confirm with `grep -n 'escalation_key_detail' src/build/announce.mjs` that it is gone (**stub verified applied**); re-run and confirm **`a detail component is REFUSED`** goes red while `control: a well-formed identity is minted, not refused` and both counter-controls stay green (**the RIGHT assertion red**); restore by `cp` from a pre-edit copy and re-run green (**restore verified by file copy**). Then run it a second time for the source layer: add `escalations.set(\`bt:${"x"}:lease:starved:9\`, 1);` to an unreachable branch, confirm it is on disk, re-run, and expect **`every builder escalation key comes from escalationKey()`** red with both counter-controls still green; restore by `cp`.
+
+- [ ] **Step 3: Implement `src/build/announce.mjs`**
+
+```js
+// announce -- the builder's own escalation dispatch.
+//
+// Escalation ownership is by PROCESS. The builder's copy reads the HUB's
+// escalation table and dispatches `^bt:` and `^builder:` subjects; the guardian
+// never writes a builder identity and the builder never writes a guardian one.
+// The shape is copied from the guardian's `announceable` rather than imported:
+// importing it would mean the builder reads whichever store the guardian was
+// pointed at, which is the confusion this separation exists to prevent.
+//
+// A KEY IS AN IDENTITY. The task id and the phase say WHICH situation; a count,
+// a duration, a path or a sha says how it is going right now, and that changes
+// while the situation does not. Put one in the key and a standing cause becomes
+// a new cause every tick -- which is the failure that trains an operator to
+// ignore the channel, measured in medicine at about a 30% drop in acceptance for
+// each repeat.
+
+/** Section 4.1's `{ok, blocked, infeasible}` plus phase.failed, made explicit. */
+export const FAILURE_TYPES = Object.freeze(["FAILED", "UNCERTAIN", "REFUSED", "BLOCKED"]);
+
+// What each type means and what clears it. Four types with one next action is
+// "something went wrong" wearing four names: the value is that a reader knows
+// which of four different things to do, and a refusal that carries its rationale
+// is the one a reader can resolve without asking.
+const NEXT = Object.freeze({
+  FAILED:    "read the artifact and the phase_run row; retry or file a new generation",
+  UNCERTAIN: "the worker could not decide; read its report and settle the question",
+  REFUSED:   "a rule refused this; the rule and its reason are in the body",
+  BLOCKED:   "wait, or raise the concurrency limit",
+});
+
+// Transcribed BY HAND from section 11.7's list of what S3 can produce. It is
+// deliberately not derived from the minter: two lists built from one source
+// agree with each other and prove nothing, which is the same reason
+// `src/build/tables.mjs` transcribes PROSE_TABLES by hand.
+export const IDENTITY_SHAPES = Object.freeze([
+  "bt:<id>:phase:failed:<phase>",
+  "bt:<id>:phase:blocked:<phase>",
+  "bt:<id>:infeasible",
+  "bt:<id>:depth:post-approval",
+  "bt:<id>:lease:conflict",
+  "bt:<id>:lease:starved",
+  "bt:<id>:cancel:draining",
+  "builder:sandbox:canary-failed",
+  "builder:backup:failed",
+]);
+
+const refuse = (kind, message) => { const e = new Error(message); e.kind = kind; throw e; };
+
+// The phases a key may name. Same domain as `task.phase`'s CHECK and
+// `phases.mjs`'s PHASES; written here rather than imported because this module
+// must not depend on the machine to mint a name for a failure the machine
+// produced.
+const PHASE = /^[A-Z][A-Z_]*$/;
+const KIND = /^[a-z][a-z-]*(?::[a-z][a-z-]*)*$/;
+
+/**
+ * The one way a builder escalation key is made.
+ *
+ * Refuses rather than sanitising: a key quietly stripped of its detail is a key
+ * whose author believed the detail was being carried somewhere, and the body is
+ * where it goes.
+ */
+export function escalationKey({ task = null, kind, phase = null, ...rest } = {}) {
+  const extra = Object.keys(rest);
+  if (extra.length)
+    refuse("escalation_key_detail",
+      `an escalation key takes task, kind and phase only; ${extra.join(", ")} is detail and rides in the body`);
+  if (typeof kind !== "string" || !KIND.test(kind))
+    refuse("escalation_key_shape", `kind must be lowercase colon-separated words, got ${JSON.stringify(kind)}`);
+  if (phase !== null && !PHASE.test(phase))
+    refuse("escalation_key_shape", `phase must be an upper-case phase name, got ${JSON.stringify(phase)}`);
+  if (task !== null && !/^bt:[A-Za-z0-9]+$/.test(task))
+    refuse("escalation_key_shape", `task must be a bt: id, got ${JSON.stringify(task)}`);
+  const head = task === null ? "builder" : task;
+  return phase === null ? `${head}:${kind}` : `${head}:${kind}:${phase}`;
+}
+
+/**
+ * The body: everything the key must not carry.
+ *
+ * `next` is not decoration. SRE's filter is that an alert nobody can take a
+ * specific action on should not exist, and four failure types sharing one next
+ * action is one type wearing four names.
+ */
+export function body({ type, reason = null, ...detail }) {
+  if (!FAILURE_TYPES.includes(type))
+    refuse("escalation_body_type",
+      `type must be one of ${FAILURE_TYPES.join(", ")}; "something went wrong" is not a type`);
+  return { type, reason, next: NEXT[type], ...detail };
+}
+```
+
+- [ ] **Step 4: Run it, then commit**
+
+```bash
+$N test/build-escalations.test.mjs      # expect all green
+fail=0
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
+done
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
+git add src/build/announce.mjs test/build-escalations.test.mjs
+git commit -m "feat(build): mint builder escalation keys as bare identities"
+```
+
+Commit body: record that the source-level assertion is paired with a literal counter-control and why; that `IDENTITY_SHAPES` is transcribed by hand rather than derived; and that `escalationKey` refuses rather than sanitises.
+
+---
+
+### Task 12: The builder announces from the hub, and neither process can read the other's store
+
+**Files:**
+- Modify: `src/build/announce.mjs`
+- Test: `test/build-escalations.test.mjs` (append before its closing `rmSync` / `console.log` / `process.exit` group), `test/escalation-dedup.test.mjs` (append before its closing `db.close()` / `rmSync` / blank line / `console.log` / `process.exit` group)
+
+**Interfaces:**
+- Consumes: `openHub` (S2-A); `openHubAsGuest` and `ALLOWED` (S2-C `src/build/hubguest.mjs:29,181`); `announceable` (`src/daemon.mjs:3236`) — **imported by the test only, never by `src/build/announce.mjs`**; `hubTx`, `assertWritable`.
+- Produces: `assertHub(db)` — throws `.kind = "not_a_hub"` when handed a store that is not one; `builderAnnounceable(db, escalations, { at, isAlive }) -> { fresh, cleared }`.
+
+**What is already true, and what is not.** MEASURED at `16cd880`, and it changes half of this task from work into a proof:
+
+```
+guest reads provider_lease:  {"c":0}
+guest reads escalation:      THREW  access to escalation.why is prohibited
+guardian announceable on a guest handle:
+                             THREW  access to escalation.why is prohibited
+guardian store has escalation: true | phase_run: false | hub_event: false | task: false
+```
+
+**The guardian half is already structural and needs no new code.** `openHubAsGuest`'s authorizer allows exactly `provider_lease`, `provider_state`, `pr_hold` (read) and `maintenance_lock` (read, delete), so the guardian's `announceable` handed the hub through its own guest handle throws before it reads a row — with `provider_lease` as the positive control that the handle works at all. **Only the builder half needs building**, and it needs building because the guardian's store *does* have an `escalation` table with the same shape: hand `builderAnnounceable` a guardian store and it would silently write builder identities into it, and nothing anywhere would report that it had.
+
+- [ ] **Step 1: Append the failing tests**
+
+Append to `test/build-escalations.test.mjs`, **before** its closing group. It needs three more imports at the top of the file:
+
+```js
+import { openHub } from "../src/build/hubdb.mjs";
+import { openHubAsGuest } from "../src/build/hubguest.mjs";
+import { open as openGuardianStore } from "../src/db/ops.mjs";
+import { announceable } from "../src/daemon.mjs";
+import { assertHub, builderAnnounceable, escalationKey } from "../src/build/announce.mjs";
+```
+
+```js
+// Escalation ownership is by process, and the proof is that each reader REFUSES
+// the other's store. The two halves are not symmetric and pretending they are
+// would hide the asymmetry: the guardian is already refused structurally, by the
+// guest allowlist; the builder is not refused by anything, because the guardian
+// store has an `escalation` table of the same shape and a write would land.
+const NOW = 1_800_000_000;
+{
+  const hubPath = join(dir, "hub.db");
+  openHub(hubPath).close();
+  const hub = openHub(hubPath);
+  const guardian = openGuardianStore(join(dir, "guardian.db"));
+
+  // --- the guardian half: already true, asserted rather than built -----------
+  const guest = openHubAsGuest(hubPath);
+  const readsLease = (() => { try { guest.prepare("SELECT count(*) c FROM provider_lease").get(); return true; }
+                              catch { return false; } })();
+  check(readsLease, "control: the guardian's guest handle CAN read the hub's provider_lease");
+
+  let guardianThrew = null;
+  try { announceable(guest, new Map([["x", 1]]), { at: NOW }); } catch (e) { guardianThrew = e.message; }
+  check(guardianThrew !== null && /escalation/.test(guardianThrew),
+    "the guardian's announceable is refused the hub's escalation table by the guest allowlist",
+    String(guardianThrew));
+
+  // --- the builder half: the one that needs code ----------------------------
+  const wrong = (() => { try { builderAnnounceable(guardian, new Map(), { at: NOW }); return "returned"; }
+                         catch (e) { return e.kind ?? "threw"; } })();
+  check(wrong === "not_a_hub",
+    "the builder's announceable refuses a guardian store, naming the kind", wrong);
+
+  // CONTROL: it is a refusal of THIS store, not a refusal of everything.
+  const right = (() => { try { builderAnnounceable(hub, new Map(), { at: NOW }); return "returned"; }
+                         catch (e) { return e.kind ?? "threw"; } })();
+  check(right === "returned", "control: handed a real hub it proceeds", right);
+
+  // CONTROL that names the danger: the guardian store DOES carry an escalation
+  // table, so the refusal cannot be "the table is missing" -- which is what a
+  // try/catch around the query would have given, and which would pass here for
+  // the wrong reason and fail the day the schemas converged.
+  const cols = guardian.prepare("SELECT count(*) c FROM pragma_table_info('escalation')").get().c;
+  check(cols > 0,
+    "control: the guardian store HAS an escalation table, so a write would have landed", String(cols));
+  const before = guardian.prepare("SELECT count(*) c FROM escalation").get().c;
+  try { builderAnnounceable(guardian, new Map([[escalationKey({ task: "bt:1", kind: "infeasible" }), 1]]),
+                            { at: NOW }); } catch { /* expected */ }
+  check(guardian.prepare("SELECT count(*) c FROM escalation").get().c === before,
+    "and the refused call wrote nothing into it", String(before));
+
+  guest.close?.(); guardian.close(); hub.close();
+}
+```
+
+And append to `test/escalation-dedup.test.mjs`, **before** its closing `db.close()` / `rmSync` / blank line / `console.log` / `process.exit` group — the mirror assertion, placed beside the guardian's own dedup tests so a reader of that file sees both owners:
+
+```js
+// The builder's copy lives beside this one and reads a different store. Asserted
+// here as well as in test/build-escalations.test.mjs, because this file is what
+// a reader opens when they ask "who announces what", and an answer that is only
+// true in another file is an answer they will not find.
+{
+  const { builderAnnounceable } = await import("../src/build/announce.mjs");
+  const wrong = (() => { try { builderAnnounceable(db, new Map(), { at: 1_800_000_000 }); return "returned"; }
+                         catch (e) { return e.kind ?? "threw"; } })();
+  check(wrong === "not_a_hub",
+    "the builder's announceable refuses THIS store, which is the guardian's", wrong);
+  check(db.prepare("SELECT count(*) c FROM escalation").get().c >= 0,
+    "control: this store has an escalation table it could have written to");
+}
+```
+
+- [ ] **Step 2: Run both and watch them fail**
+
+Run: `$N test/build-escalations.test.mjs 2>&1 | grep -E "^FAIL"` then `$N test/escalation-dedup.test.mjs 2>&1 | grep -E "^FAIL"`
+Expected: the two `builderAnnounceable` assertions red (the function does not exist), and **`the guardian's announceable is refused the hub's escalation table` green from the first run** — it must be, because it is a measurement of what already holds, and if it is red the guest allowlist has changed and this task's premise is gone.
+
+**On the broken implementation** — the shape this guards against is a `builderAnnounceable` that discovers the wrong store by catching the query error: `try { ... } catch { throw new Error("not a hub") }`. Under it **every assertion in the block passes today** and the guard is inert, because it depends on the guardian store *not* having an `escalation` table — and it does have one, so the query succeeds and the write lands. That is why `control: the guardian store HAS an escalation table` and `and the refused call wrote nothing into it` are both here: the first says the danger is real, the second says the refusal happened before the write rather than instead of a failure. A second shape is an `assertHub` that probes for `escalation`; under it `the builder's announceable refuses a guardian store` goes red, because both stores have it.
+
+**The stub loop for this task**: green after Step 3 (**control green**); then change `assertHub`'s probe from `phase_run` to `escalation` and confirm with `grep -n "phase_run" src/build/announce.mjs` that the probe moved (**stub verified applied**); re-run and confirm **`the builder's announceable refuses a guardian store`** goes red while `control: handed a real hub it proceeds` stays green (**the RIGHT assertion red** — a probe on a table both stores have is exactly the mistake, and this is the reading that shows it); restore by `cp` from a pre-edit copy and re-run both files green (**restore verified by file copy**).
+
+- [ ] **Step 3: Implement `assertHub` and `builderAnnounceable`**
+
+Add to `src/build/announce.mjs`:
+
+```js
+import { hubTx } from "./hubdb.mjs";
+import { assertWritable } from "./locks.mjs";
+
+/**
+ * Refuse a store that is not the hub.
+ *
+ * Probes for `phase_run`, NOT for `escalation`. Both stores have an escalation
+ * table of the same shape -- measured -- so a reader that discovered the wrong
+ * store by catching a query error would never catch anything: the query would
+ * succeed and builder identities would land in the guardian's store, where the
+ * guardian's own reducer would then announce and retire them. The probe has to
+ * name a table only one of the two has.
+ */
+export function assertHub(db) {
+  const ok = db.prepare(
+    "SELECT count(*) c FROM sqlite_master WHERE type='table' AND name IN ('phase_run','hub_event','task')")
+    .get().c;
+  if (ok !== 3) {
+    const e = new Error(
+      "this is not the builder hub: escalation ownership is by process, and the builder writes only bt: and " +
+      "builder: identities into the hub");
+    e.kind = "not_a_hub";
+    throw e;
+  }
+}
+
+/**
+ * Reduce this tick's escalations against the standing set.
+ *
+ * The SHAPE of the guardian's `announceable`, deliberately re-implemented rather
+ * than imported: importing it would mean the builder announces from whichever
+ * store the guardian was pointed at, which is precisely the confusion the
+ * process-ownership rule exists to prevent. The two are allowed to diverge and
+ * the divergence is legible, because each is beside the store it reads.
+ *
+ * Announced on ARRIVAL and on CHANGE, never per tick. `announced_count` is what
+ * makes that a fact rather than an intention: a cause whose count has not moved
+ * is written back and not re-announced.
+ *
+ * @param {Map<string, number>} escalations  identity -> how many things share it
+ * @returns {{fresh: {why: string, count: number}[], cleared: string[]}}
+ */
+export function builderAnnounceable(db, escalations, { at, isAlive }) {
+  assertHub(db);
+  for (const why of escalations.keys())
+    if (!/^(bt:[A-Za-z0-9]+:|builder:)/.test(why)) {
+      const e = new Error(`the builder does not own the identity ${JSON.stringify(why)}`);
+      e.kind = "not_a_builder_identity";
+      throw e;
+    }
+
+  return hubTx(db, () => {
+    assertWritable(db, { isAlive, at, inTx: true });
+    const fresh = [], cleared = [];
+    const standing = new Map(
+      db.prepare("SELECT why, count, announced_count FROM escalation WHERE why LIKE 'bt:%' OR why LIKE 'builder:%'")
+        .all().map(r => [r.why, r]));
+
+    for (const [why, count] of escalations) {
+      const prev = standing.get(why);
+      if (!prev) {
+        db.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count)
+                    VALUES(?,?,?,?,?)`).run(why, count, at, at, count);
+        fresh.push({ why, count });
+        continue;
+      }
+      db.prepare("UPDATE escalation SET count=?, last_seen_at=? WHERE why=?").run(count, at, why);
+      // The count is the SHAPE of a shared cause: one task blocked at RESEARCH
+      // and four are different situations and both deserve saying. Everything
+      // else about the cause is unchanged, and re-announcing it is the behaviour
+      // that gets a channel muted.
+      if (prev.announced_count !== count) {
+        db.prepare("UPDATE escalation SET announced_count=? WHERE why=?").run(count, why);
+        fresh.push({ why, count });
+      }
+    }
+
+    for (const why of standing.keys()) {
+      // ABSENT FROM THIS TICK IS NOT GONE. A tick that could not evaluate a task
+      // -- a lock, an unreadable artifact, an early return -- produces no
+      // escalation for it, and retiring on that silence announces "resolved" for
+      // something nobody looked at. Only an explicit clear retires a cause, and
+      // in S3 the only clear is the task reaching a terminal phase.
+      if (escalations.has(why)) continue;
+      const task = /^bt:([A-Za-z0-9]+):/.exec(why)?.[1];
+      if (!task) continue;
+      const row = db.prepare("SELECT phase FROM task WHERE id = ?").get(`bt:${task}`);
+      if (!row || !["DONE", "CANCELLED", "LOST", "INFEASIBLE"].includes(row.phase)) continue;
+      db.prepare("DELETE FROM escalation WHERE why = ?").run(why);
+      cleared.push(why);
+    }
+    return { fresh, cleared };
+  });
+}
+```
+
+- [ ] **Step 4: Run it, then commit**
+
+```bash
+$N test/build-escalations.test.mjs      # expect all green
+$N test/escalation-dedup.test.mjs       # expect all green
+fail=0
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
+done
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
+git add src/build/announce.mjs test/build-escalations.test.mjs test/escalation-dedup.test.mjs
+git commit -m "feat(build): announce from the hub, and refuse the guardian's store"
+```
+
+Commit body: record that `assertHub` probes `phase_run` and **not** `escalation`, with the measurement that both stores carry `escalation`; that the guardian half of the property is already structural through the guest allowlist and is asserted rather than built; and that absence from a tick does not retire a cause.
+
+---
+### Task 13: Three identities page, and the other six stay durable and reach the digest
+
+**Files:**
+- Modify: `src/build/announce.mjs`
+- Test: `test/build-escalations.test.mjs` (append before its closing group)
+
+**Interfaces:**
+- Consumes: `IDENTITY_SHAPES`, `escalationKey`, `builderAnnounceable` (Tasks 11–12).
+- Produces: `PAGES` (frozen, three entries, each `{ name, match }`); `pages(key) -> boolean`; `announce(db, { escalations, at, isAlive, send, profile }) -> { paged, digested, declined }`. Task 15 drives it across ticks; Task 14 supplies the real `send`.
+
+**The decision this implements, and the measurement behind it.** Founder decision 5. Realised danger-through is **U-shaped in escalation rate**: at reviewer capacity C=25, escalating 64% of actions let 42% of dangerous actions through while escalating **100% let 57% through** — escalating everything is strictly worse than the optimum, and OWASP classifies "Overwhelming HITL" as a deliberate threat vector rather than an accident. Medicine measures the same curve from the other end: 72–99% of clinical alarms are false, one unit acknowledged **18.8%**, and acceptance dropped **30% for each repeat reminder**. `src/notify.mjs:6-11` is already independently right about this in prose — *"an over-pushing channel gets muted within days and is then worse than nothing"* — and **the gap is that the policy is a comment, not a closed list.** This task makes it one.
+
+**Nothing stops being recorded.** All nine identities remain durable rows that stop work and appear in `task show`, `task why` and `task dash`. Three of them additionally interrupt a human. **No daily budget number is chosen** — decision 6, and `docs/2026-08-21-builder-design.md:572`: limits are measured before they are chosen, and this rate has not been observed once.
+
+- [ ] **Step 1: Append the failing test**
+
+Append to `test/build-escalations.test.mjs`, **before** its closing group. It needs `PAGES`, `pages` and `announce` added to the existing `announce.mjs` import.
+
+```js
+// Fail-closed is never fail-quiet, and an escalation is not a page. All nine
+// identities stay durable rows that stop work and show up in dash and why;
+// exactly three interrupt a human. Escalating everything is not the safe
+// default -- it is measurably worse than the optimum, and it is attackable:
+// 88% escalation gave 40% attack success after 50 filler actions, while a
+// load-aware policy at 26% held 0% until about 100.
+{
+  check(PAGES.length === 3, `exactly three identities page, not ${PAGES.length}`,
+    PAGES.map(p => p.name).join(", "));
+  check(Object.isFrozen(PAGES), "and the list cannot be widened at runtime");
+
+  const PAGED = ["builder:sandbox:canary-failed", "builder:backup:failed", "bt:7:phase:blocked:RESEARCH"];
+  for (const k of PAGED) check(pages(k), `${k} pages`, k);
+
+  // The other six. Enumerated from IDENTITY_SHAPES rather than retyped, so an
+  // identity added to section 11.7 without a decision about paging shows up here
+  // as a failure rather than as silence.
+  const asKey = s => s.replace("<id>", "7").replace("<phase>", "RESEARCH");
+  const notPaged = IDENTITY_SHAPES.map(asKey).filter(k => !PAGED.includes(k));
+  check(notPaged.length === 6, `and six do not (got ${notPaged.length})`, notPaged.join(", "));
+  for (const k of notPaged) check(!pages(k), `${k} does not page`, k);
+
+  // The templated one matches by SHAPE, not by literal, or a page list of three
+  // literals would page for exactly one task id.
+  check(pages("bt:99:phase:blocked:SIZING") && pages("bt:1:phase:blocked:DESIGN"),
+    "the templated entry pages for any task and any phase");
+  check(!pages("bt:7:phase:failed:RESEARCH"),
+    "control: failed is not blocked, and the two are one character apart in the shape list");
+  check(!pages("bt:7:phase:blocked"), "control: and a shape missing its phase does not match");
+}
+
+// ── every identity is durable; only three are dispatched ─────────────────────
+{
+  const hubPath = join(dir, "pages.db");
+  openHub(hubPath).close();
+  const db = openHub(hubPath);
+  const NOW2 = 1_800_001_000;
+  const sent = [];
+  const send = a => { sent.push(a); return { ok: true, channels: [{ name: "test", ok: true, ref: "r1" }] }; };
+
+  const esc = new Map([
+    [escalationKey({ task: "bt:7", kind: "phase:blocked", phase: "RESEARCH" }), 1],  // pages
+    [escalationKey({ kind: "backup:failed" }), 1],                                    // pages
+    [escalationKey({ task: "bt:7", kind: "lease:starved" }), 3],                      // digest
+    [escalationKey({ task: "bt:7", kind: "cancel:draining" }), 1],                    // digest
+  ]);
+  const r = announce(db, { escalations: esc, at: NOW2, isAlive: () => true, send, profile: {} });
+
+  check(db.prepare("SELECT count(*) c FROM escalation").get().c === 4,
+    "all four identities are durable rows: nothing stops being recorded",
+    JSON.stringify(db.prepare("SELECT why FROM escalation").all()));
+  check(r.paged.length === 2, `two paged (got ${r.paged.length})`, JSON.stringify(r.paged));
+  check(r.digested.length === 2, `and two digested (got ${r.digested.length})`, JSON.stringify(r.digested));
+  check(sent.length === 2, "and notify was called exactly twice", String(sent.length));
+  check(sent.every(a => /blocked|backup/.test(a.message)),
+    "for the two on the page list and no others", JSON.stringify(sent.map(a => a.title)));
+
+  // CONTROL: the digested two are visible somewhere. "Not paged" must not mean
+  // "not reported" -- that would be fail-quiet, which is the invariant this
+  // whole design exists to keep.
+  const durable = db.prepare("SELECT why FROM escalation ORDER BY why").all().map(x => x.why);
+  for (const d of r.digested)
+    check(durable.includes(d.why), `${d.why} is in the store for dash and why to read`, durable.join(","));
+
+  db.close();
+}
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `$N test/build-escalations.test.mjs 2>&1 | grep -E "^FAIL"`
+Expected: every assertion in both blocks red — `PAGES`, `pages` and `announce` are not exported. Watch `and six do not (got N)` after Step 3: if it reports anything but 6, either the page list or `IDENTITY_SHAPES` moved and the two must be reconciled before anything else is believed.
+
+**On the broken implementation** — the shape this guards against is `PAGES` as a `Set` of three literal strings, which is the obvious encoding and reads correctly. Under it the two `builder:` assertions pass, **`bt:7:phase:blocked:RESEARCH` pages` passes for that one id**, and **`the templated entry pages for any task and any phase` goes red** — the page list would fire for exactly one task, and every other blocked task would go to the digest silently. A second shape is `pages()` implemented with `startsWith`; under it `control: failed is not blocked` stays green but `control: and a shape missing its phase does not match` goes red. A third is an `announce` that pages and does **not** persist the digested ones; under it every paging assertion passes and the two `is in the store for dash and why to read` assertions go red — which is fail-quiet, and is the one outcome this design must not produce.
+
+**The stub loop for this task**: green after Step 3 (**control green**); then change the templated `PAGES` entry's `match` to `k => k === "bt:<id>:phase:blocked:<phase>"` and confirm with `grep -n 'bt:<id>:phase:blocked' src/build/announce.mjs` that a literal comparison is on disk (**stub verified applied**); re-run and confirm **`bt:7:phase:blocked:RESEARCH pages`** and **`the templated entry pages for any task and any phase`** go red while the two `builder:` page assertions and every `does not page` assertion stay green (**the RIGHT assertion red**); restore by `cp` from a pre-edit copy and re-run green (**restore verified by file copy**).
+
+- [ ] **Step 3: Implement the page list and the dispatcher**
+
+Add to `src/build/announce.mjs`:
+
+```js
+/**
+ * THE CLOSED PAGE LIST. Three, for S3.
+ *
+ * An escalation and a page are two different facts and the design conflates
+ * them. An escalation is a durable row that stops work; a page is an
+ * interruption. Every identity above stays an escalation -- nothing stops being
+ * recorded, and dash and why read all of them. These three additionally reach a
+ * phone.
+ *
+ * Why not all nine: escalating everything is not the conservative choice. A 2026
+ * model of a reviewer whose reliability degrades past a capacity found realised
+ * danger-through to be U-SHAPED in the escalation rate -- at capacity 25,
+ * escalating 64% let 42% of dangerous actions through while escalating 100% let
+ * 57% through. A paranoid policy is also attackable: 88% escalation gave 40%
+ * attack success after only 50 filler actions. Medicine measures acceptance
+ * dropping about 30% for each repeat reminder. This file's neighbour,
+ * src/notify.mjs, already says the same thing in prose; the gap was that it was
+ * a comment rather than a list.
+ *
+ * There is deliberately NO daily budget yet. Limits are measured before they are
+ * chosen, and this rate has not been observed once. Revisit with the measured
+ * rate after S3's first week.
+ *
+ * `match` is a predicate, not a literal: the third identity names a task and a
+ * phase, and a list of three literals would page for exactly one task id and
+ * send every other blocked task quietly to the digest.
+ */
+export const PAGES = Object.freeze([
+  // Nothing may dispatch until this is settled.
+  Object.freeze({ name: "builder:sandbox:canary-failed", match: k => k === "builder:sandbox:canary-failed" }),
+  // The store is at risk, and the store is the only record of everything else.
+  Object.freeze({ name: "builder:backup:failed", match: k => k === "builder:backup:failed" }),
+  // A worker stopped and named a reason only the founder can settle. `failed` is
+  // NOT on this list: a failure retries, a block does not.
+  Object.freeze({ name: "bt:<id>:phase:blocked:<phase>",
+                  match: k => /^bt:[A-Za-z0-9]+:phase:blocked:[A-Z][A-Z_]*$/.test(k) }),
+]);
+
+export const pages = key => PAGES.some(p => p.match(key));
+
+/**
+ * Reduce, persist, then dispatch: durable first, interruption second.
+ *
+ * The order is the invariant. A page sent before the row is committed is a
+ * phone that rang about something the store cannot show you, which is the exact
+ * shape of an alert an operator cannot act on.
+ *
+ * `send` is injected so the channel can be exercised without a network, and so
+ * `reeve notify --test` and this path go through one function rather than two
+ * that agree today.
+ */
+export function announce(db, { escalations, at, isAlive, send, profile }) {
+  const { fresh, cleared } = builderAnnounceable(db, escalations, { at, isAlive });
+  const paged = [], digested = [], declined = [];
+
+  for (const f of fresh) {
+    if (!pages(f.why)) { digested.push(f); continue; }
+    const r = send({
+      title: `reeve builder · ${f.why}`,
+      message: `${f.why}${f.count > 1 ? ` (x${f.count})` : ""}`,
+      priority: "high", tags: "warning",
+      profile,
+    });
+    // A decline is RETURNED, never swallowed: a push channel nobody knows is
+    // broken is the same as no push channel, and the row is already durable, so
+    // the caller can log this and carry on.
+    if (r.ok) paged.push({ ...f, ref: r.channels?.map(c => c.ref).filter(Boolean).join(",") || null });
+    else declined.push({ ...f, why_declined: r.why ?? "the channel returned no reason" });
+  }
+  return { paged, digested, declined, cleared };
+}
+```
+
+- [ ] **Step 4: Run it, then commit**
+
+```bash
+$N test/build-escalations.test.mjs      # expect all green
+fail=0
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
+done
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
+git add src/build/announce.mjs test/build-escalations.test.mjs
+git commit -m "feat(build): a closed page list of three, every identity durable"
+```
+
+Commit body: record the U-shaped danger-through measurement and the 30%-per-repeat acceptance drop; that all nine identities stay durable; that `match` is a predicate because one identity is templated; and that no daily budget is chosen because the rate has not been measured.
+
+---
+
+### Task 14: `notify` returns a delivery reference or a reason, and `notify --test` is how you find out which
+
+**Files:**
+- Modify: `src/notify.mjs` (`postViaCurl`, `postViaOsascript`, `notify`), `bin/reeve` (a `notify` route; `test` in `FLAGS`; `test` in `APPLIES`)
+- Test: `test/build-escalations.test.mjs` (append before its closing group), `test/cli-flags.test.mjs` (append before its closing group)
+
+**Interfaces:**
+- Consumes: `notify` (`src/notify.mjs:127`), `fail`, `EXITS` (PR-E1 Task 2), `buildAlert` (`src/notify.mjs:71`).
+- Produces: each entry of `channels` additionally carries `ref` — a delivery reference, or `null` **with a `why` naming why there is none**. `notify` itself is otherwise unchanged. And `reeve notify --test`, which sends one clearly-marked test alert through every configured channel and prints what each returned.
+
+**Why both halves.** §11.5 `:731` calls `notify.mjs` *"Reused with one additive change"*, and that change is the delivery reference. And R21: `src/notify.mjs:13-16` promises *"never SILENTLY: every decline is returned with a reason"* — **and there is no way to exercise the channel without a real escalation, so the promise has never been checked.** MEASURED at `16cd880`: `notify` returns `{ ok, why?, channels }` with `channels = [{ name, ok, why? }]` and **no reference of any kind**; `postViaCurl` passes `-o /dev/null -w "%{http_code}"`, so the server's response body — which is where a message id would be — is discarded before anything can read it.
+
+- [ ] **Step 1: Append the failing tests**
+
+Append to `test/build-escalations.test.mjs`, **before** its closing group. It needs `import { notify } from "../src/notify.mjs";` at the top of the file.
+
+```js
+// "Never silently" is a promise this file's header has made since it was
+// written, and until now there was no way to check it: every decline path
+// required a real escalation and a real server. A reference or a reason, never
+// silence -- and `ok` alone is neither.
+{
+  const profile = { notify: { provider: "ntfy", url: "https://x", topic: "t", credentialFile: "/c" } };
+  const alert = { title: "t", message: "m" };
+
+  const withRef = notify({ profile, alert, readCredential: () => ":tk",
+                           post: () => ({ ok: true, ref: "ntfy:12345" }) });
+  check(withRef.ok && withRef.channels[0].ref === "ntfy:12345",
+    "a channel that returns a reference carries it up", JSON.stringify(withRef.channels));
+
+  // A channel that succeeded and gave no id must SAY so, or a caller cannot
+  // tell "delivered, no id available" from "the field was never populated".
+  const noRef = notify({ profile, alert, readCredential: () => ":tk", post: () => ({ ok: true }) });
+  check(noRef.ok === true, "a channel that returns no reference still succeeded", JSON.stringify(noRef));
+  check(noRef.channels[0].ref === null && typeof noRef.channels[0].why === "string",
+    "and the absent reference is null WITH a reason, not undefined",
+    JSON.stringify(noRef.channels[0]));
+
+  const failed = notify({ profile, alert, readCredential: () => ":tk",
+                          post: () => ({ ok: false, why: "HTTP 403" }) });
+  check(failed.ok === false && /403/.test(failed.why),
+    "control: a failure still reports the reason it already did", JSON.stringify(failed));
+  check(failed.channels[0].ref === null,
+    "and a failed channel has no reference rather than an empty string", JSON.stringify(failed.channels[0]));
+
+  // Every channel entry, in every outcome, answers the question.
+  for (const r of [withRef, noRef, failed])
+    for (const c of r.channels)
+      check(c.ref !== undefined && (c.ref !== null || typeof c.why === "string"),
+        `${c.name} returned a reference or a reason, never silence`, JSON.stringify(c));
+
+  // The unconfigured decline is unchanged: it has no channel to have a reference
+  // for, and inventing one would be the opposite mistake.
+  const none = notify({ profile: { notify: {} }, alert });
+  check(none.ok === false && /no notify channel/.test(none.why ?? ""),
+    "control: an unconfigured notify still declines with its own reason", JSON.stringify(none));
+}
+```
+
+And append to `test/cli-flags.test.mjs`, **before** its closing group:
+
+```js
+// The channel is exercisable without a real escalation. A promise that can only
+// be checked by causing the emergency it reports is not a promise anyone checks.
+{
+  const r = run("notify", "--test", "--json");
+  let j = null; try { j = JSON.parse(r.stdout); } catch { /* stays null */ }
+  check(j !== null, "reeve notify --test emits JSON", r.out.slice(0, 200));
+  check(Array.isArray(j?.data?.channels),
+    "listing every channel it tried", JSON.stringify(j?.data)?.slice(0, 200));
+  check(j.data.channels.every(c => c.ref !== undefined && (c.ref !== null || typeof c.why === "string")),
+    "each with a reference or a reason", JSON.stringify(j.data.channels));
+  check(/test/i.test(JSON.stringify(j.data)),
+    "and the alert is marked as a test, so a phone that rings is not mistaken for an incident",
+    JSON.stringify(j.data)?.slice(0, 200));
+
+  // On this machine, with no notify configured, the honest answer is a decline
+  // with a reason -- and it is a typed refusal, not an exit-0 silence.
+  check(r.status === EXITS_REFUSED || j.data.channels.length > 0,
+    "an unconfigured notify --test refuses with a kind rather than exiting 0 quietly",
+    `rc=${r.status} ${JSON.stringify(j.data).slice(0, 160)}`);
+
+  // CONTROL: `notify` without --test does nothing. A route that sends on a bare
+  // invocation is one typo away from paging the founder.
+  const bare = run("notify");
+  check(bare.status !== 0 && /--test/.test(bare.out),
+    "control: `reeve notify` with no --test refuses and says what it wanted", bare.out.slice(0, 160));
+}
+```
+
+`EXITS_REFUSED` is bound once at the top of the file beside the other imports: `const { EXITS: { refused: EXITS_REFUSED } } = await import("../bin/reeve.flags.mjs");`
+
+- [ ] **Step 2: Run both and watch them fail**
+
+Run: `$N test/build-escalations.test.mjs 2>&1 | grep -E "^FAIL"` then `$N test/cli-flags.test.mjs 2>&1 | grep -E "^FAIL"`
+Expected: every `ref` assertion red (`c.ref` is `undefined`), and every `notify --test` assertion red (the route does not exist). `control: a failure still reports the reason it already did` and `control: an unconfigured notify still declines` are green from the first run, and must stay green through Step 3 — this is an *additive* change, and **`test/notify.test.mjs` must remain green untouched**, which is the real control on "additive".
+
+**On the broken implementation** — the shape this guards against is `ref: r.ref ?? null` with nothing else: a channel that delivered and produced no id then looks identical to a field nobody populated. Under it every assertion passes except **`and the absent reference is null WITH a reason, not undefined`**, and that one assertion is the whole difference between "no id was available" and "this code path forgot". A second shape is a `notify --test` route that constructs the alert itself instead of going through `buildAlert`; under it every assertion here passes and the route drifts from the real path, so Step 3 routes both through one function and says so.
+
+**The stub loop for this task**: green after Step 3 (**control green**); then change `notify`'s channel push to `ref: r.ref ?? null` with the `why` line deleted, and confirm with `grep -n 'no reference' src/notify.mjs` that the reason is gone (**stub verified applied**); re-run and confirm **`and the absent reference is null WITH a reason, not undefined`** and the three-outcome loop go red while `a channel that returns a reference carries it up` and both controls stay green (**the RIGHT assertion red**); restore by `cp` and re-run `test/build-escalations.test.mjs` **and `test/notify.test.mjs`** green (**restore verified by file copy**).
+
+- [ ] **Step 3: Add the reference, and the route**
+
+In `src/notify.mjs`, `postViaCurl` currently discards the response body — `-o /dev/null -w "%{http_code}"`. Keep the code, and keep the body:
+
+```js
+function postViaCurl({ url, auth, title, priority, tags, body }) {
+  try {
+    // The BODY as well as the code. It was discarded, which is where a message
+    // id lives: an operator asking "did it arrive" could be told yes and given
+    // nothing to look it up with.
+    const args = ["-s", "-m", "8", "-w", "\n%{http_code}",
+                  "-u", auth,
+                  "-H", `Title: ${title}`, "-H", `Priority: ${priority}`, "-H", `Tags: ${tags}`,
+                  "-d", body, url];
+    const raw = execFileSync("curl", args, { encoding: "utf8" });
+    const nl = raw.lastIndexOf("\n");
+    const code = raw.slice(nl + 1).trim();
+    if (!code.startsWith("2")) return { ok: false, why: `the server answered HTTP ${code}` };
+    let ref = null, why = null;
+    try { ref = JSON.parse(raw.slice(0, nl)).id ?? null; } catch { ref = null; }
+    // A reference the SERVER did not give is not invented. `http:202` would look
+    // like an id and be useless as one, so the absence is named instead.
+    if (!ref) why = `delivered with HTTP ${code}; the server returned no message id`;
+    return { ok: true, ref, why };
+  } catch (e) { return { ok: false, why: String(e.message).split("\n")[0] }; }
+}
+```
+
+`postViaOsascript` has no id to return, and says so rather than pretending: add `ref: null, why: "the desktop channel has no delivery reference"` to its success return.
+
+And in `notify`, normalise every channel entry so the property holds whatever a channel returned — including an injected test double that returns bare `{ ok: true }`:
+
+```js
+  // Every channel answers the question in every outcome: a reference, or a
+  // reason there is none. `ok` alone says a call returned, not that anything
+  // arrived anywhere a human will see.
+  for (const c of channels) {
+    if (c.ref === undefined) c.ref = null;
+    if (c.ref === null && typeof c.why !== "string")
+      c.why = c.ok ? "the channel reported success and returned no reference" : "the channel gave no reason";
+  }
+```
+
+In `bin/reeve`, add `test: { value: false, what: "send a marked test alert through every configured channel" }` to `FLAGS`, add `"notify"` to `APPLIES.json` and `notify: ["notify"]` to `APPLIES`, then:
+
+```js
+// notify --test -- exercise the channel without an emergency.
+//
+// `src/notify.mjs` has promised since it was written that it never declines
+// silently. There was no way to check that without causing a real escalation,
+// so the promise had never been checked. This goes through the SAME notify()
+// the announcer uses: a test path that builds its own alert proves the test
+// path works.
+case "notify": {
+  if (!flag("test")) fail("usage", "usage: reeve notify --test", { exit: EXITS.misuse });
+  const profile = loadProfileFor(HOME);
+  const r = notifyChannel({
+    profile,
+    alert: { title: "reeve · TEST", priority: "low", tags: "white_check_mark",
+             message: `TEST alert from reeve notify --test at ${new Date().toISOString()}. ` +
+                      `Nothing is wrong; this exercises the channel.` },
+  });
+  const data = { ok: r.ok, why: r.why ?? null, channels: r.channels ?? [] };
+  console.log(flag("json")
+    ? JSON.stringify({ format_version: 1, kind: "notify.test", data }, null, 2)
+    : [`notify --test  ${r.ok ? "delivered" : "declined"}`,
+       ...(data.channels.length
+         ? data.channels.map(c => `  ${c.name}  ${c.ok ? "ok" : "FAILED"}  ref ${c.ref ?? "none"}` +
+                                  (c.why ? `  (${c.why})` : ""))
+         : [`  no channel: ${data.why}`])].join("\n"));
+  if (!r.ok) fail("notify_declined", `notify declined: ${data.why}`, { exit: EXITS.refused, retryable: true });
+  process.exit(EXITS.ok);
+}
+```
+
+`notifyChannel` is `notify` imported under an alias, because `bin/reeve` already binds `notify` as a route name string in the switch and shadowing it would be a silent rename. Import it as `import { notify as notifyChannel } from "../src/notify.mjs";`.
+
+- [ ] **Step 4: Run it, then commit**
+
+```bash
+$N test/build-escalations.test.mjs      # expect all green
+$N test/notify.test.mjs                 # expect all green, UNTOUCHED: this is the control on "additive"
+$N test/cli-flags.test.mjs              # expect all green
+fail=0
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
+done
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
+git add src/notify.mjs bin/reeve bin/reeve.flags.mjs test/build-escalations.test.mjs test/cli-flags.test.mjs
+git commit -m "feat(notify): return a delivery reference or a reason, and a test route"
+```
+
+Commit body: record that `postViaCurl` previously discarded the response body with `-o /dev/null`; that a reference the server did not give is never invented; and that `test/notify.test.mjs` is untouched and green, which is the evidence the change is additive.
+
+---
+
+### Task 15: A standing escalation is announced on arrival and on change, and never per tick
+
+**Files:**
+- Test: `test/build-escalations.test.mjs` (append before its closing group)
+
+**Interfaces:**
+- Consumes: `announce`, `escalationKey` (Tasks 11–13).
+- Produces: nothing. **This task is a test and a comment**, and it is a separate task because the property it proves is the one that decides whether the channel survives contact with a real week — `builderAnnounceable` was written in Task 12 and asserted there only for which *store* it reads.
+
+**Why this is its own task rather than a block in Task 12.** The measured failure it guards against is not hypothetical: `test/escalation-dedup.test.mjs:1-5` records that *"the first launchd run announced the same two PRs on all five of its ticks; at a 2.5-minute cadence that is ~576 phone pushes overnight for two conditions that never changed, which is how an unattended system trains its owner to ignore it."* A reviewer can approve Task 12's store-refusal and reject this, or the reverse, so they are two tasks.
+
+- [ ] **Step 1: Append the failing test**
+
+Append to `test/build-escalations.test.mjs`, **before** its closing group:
+
+```js
+// ~576 phone pushes overnight for two conditions that never changed. That is
+// what "announce on every tick" cost the last time, measured on the first
+// launchd run, and it is why the count -- not the presence -- is the change
+// signal. The count IS a shape: one task blocked and four are different
+// situations. Everything else about a standing cause is not.
+{
+  const hubPath = join(dir, "ticks.db");
+  openHub(hubPath).close();
+  const db = openHub(hubPath);
+  const sent = [];
+  const send = a => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true, ref: "r" }] }; };
+  const KEY = escalationKey({ task: "bt:9", kind: "phase:blocked", phase: "RESEARCH" });
+  const tick = (at, count) => announce(db, {
+    escalations: new Map([[KEY, count]]), at, isAlive: () => true, send, profile: {},
+  });
+
+  const t1 = tick(1_800_002_000, 1);
+  check(t1.paged.length === 1 && sent.length === 1, "arrival announces once", JSON.stringify(t1.paged));
+
+  const t2 = tick(1_800_002_150, 1);
+  check(t2.paged.length === 0 && sent.length === 1,
+    "a second tick with the same cause announces nothing", JSON.stringify(t2));
+  const t3 = tick(1_800_002_300, 1);
+  check(sent.length === 1, "and so does a third", String(sent.length));
+
+  const row = db.prepare("SELECT count, first_seen_at, last_seen_at, announced_count FROM escalation WHERE why = ?")
+    .get(KEY);
+  check(row.last_seen_at === 1_800_002_300,
+    "while last_seen_at still moves: still-happening and gone are different facts", JSON.stringify(row));
+  check(row.first_seen_at === 1_800_002_000,
+    "and first_seen_at does not, so the age of the cause is readable", JSON.stringify(row));
+
+  const t4 = tick(1_800_002_450, 4);
+  check(t4.paged.length === 1 && sent.length === 2,
+    "a CHANGED count announces again, because 1 blocked task and 4 are different situations",
+    JSON.stringify(t4.paged));
+  const t5 = tick(1_800_002_600, 4);
+  check(sent.length === 2, "and the new count then goes quiet too", String(sent.length));
+
+  // CONTROL: the loop can produce a page at all. Without it every "announces
+  // nothing" assertion passes on a `send` that is never called for any reason.
+  const OTHER = escalationKey({ kind: "backup:failed" });
+  announce(db, { escalations: new Map([[KEY, 4], [OTHER, 1]]), at: 1_800_002_750,
+                 isAlive: () => true, send, profile: {} });
+  check(sent.length === 3, "control: a NEW cause in the same tick still pages", String(sent.length));
+
+  // Absent from a tick is not gone. A tick that could not evaluate a task
+  // produces no escalation for it, and retiring on that silence announces
+  // "resolved" for something nobody looked at.
+  const quiet = announce(db, { escalations: new Map(), at: 1_800_002_900,
+                               isAlive: () => true, send, profile: {} });
+  check(quiet.cleared.length === 0,
+    "an empty tick clears nothing: absence is not resolution", JSON.stringify(quiet.cleared));
+  check(db.prepare("SELECT count(*) c FROM escalation").get().c === 2,
+    "and both causes are still standing", String(db.prepare("SELECT count(*) c FROM escalation").get().c));
+
+  // CONTROL: something CAN clear it, or "clears nothing" is a function that
+  // never clears and the assertion above is vacuous.
+  db.prepare(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,generation,source_kind,source_key,
+                               repo_path,profile_path,profile_hash,default_branch,visibility,registry_version,
+                               created_at,updated_at)
+              VALUES('bt:9','p',1,'o/r','t','CANCELLED',1,'founder','k9','/r','/p','h','main','private',1,?,?)`)
+    .run(1_800_002_000, 1_800_002_000);
+  const done = announce(db, { escalations: new Map([[OTHER, 1]]), at: 1_800_003_000,
+                              isAlive: () => true, send, profile: {} });
+  check(done.cleared.includes(KEY),
+    "control: a task reaching a terminal phase DOES retire its cause", JSON.stringify(done.cleared));
+
+  db.close();
+}
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `$N test/build-escalations.test.mjs 2>&1 | grep -E "^FAIL"`
+Expected: **all green on the first run**, because Task 12 already implemented the reducer. That is the honest outcome and it is not a reason to skip the task — **a test that has never been seen red is a test nobody has checked**, so Step 3 is the stub loop and it is mandatory here rather than optional.
+
+**On the broken implementation** — the shape this guards against is the one that already happened: a reducer that pushes to `fresh` on every tick a cause is present. Under it **`a second tick with the same cause announces nothing`**, **`and so does a third`** and **`and the new count then goes quiet too`** all go red, and every arrival and change assertion stays green — the pattern that says "it announces, and it never stops". A second shape is retiring a cause that is merely absent from a tick; under it `an empty tick clears nothing` goes red and `control: a task reaching a terminal phase DOES retire its cause` stays green, which distinguishes over-retiring from not retiring at all.
+
+**The stub loop for this task**: green as it stands (**control green**); then in `src/build/announce.mjs` change `if (prev.announced_count !== count)` to `if (true)` and confirm with `grep -n 'announced_count !== count' src/build/announce.mjs` that the comparison is gone (**stub verified applied**); re-run and confirm **`a second tick with the same cause announces nothing`** and **`and so does a third`** go red while `arrival announces once` and `control: a NEW cause in the same tick still pages` stay green (**the RIGHT assertion red**); restore by `cp` from a pre-edit copy and re-run green (**restore verified by file copy**). Run it a second time for the retirement half: delete the terminal-phase condition so any absence clears, confirm the edit, re-run, and expect **`an empty tick clears nothing`** red with `control: a task reaching a terminal phase DOES retire its cause` still green; restore by `cp`.
+
+- [ ] **Step 3: Run it, then commit**
+
+```bash
+$N test/build-escalations.test.mjs      # expect all green
+fail=0
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
+done
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
+git add test/build-escalations.test.mjs
+git commit -m "test(build): announce on arrival and on change, never per tick"
+```
+
+Commit body: record that the assertions were green on the first run and were therefore driven red twice by stub, once per half, and name which line each stub reddened.
+
+---
+### Task 16: `builder doctor` grows six S3 rows, reports every unprobed input as UNKNOWN, and still writes nothing
+
+**Files:**
+- Modify: `src/doctor.mjs` (`hubFindings`), `bin/reeve` (the `builder` route, the block after `const newest = newestCandidate("hub");`'s call site — the `hubFindings(db, { ... })` invocation)
+- Test: `test/hub-doctor.test.mjs` (append before its closing `rmSync(dir, { recursive: true, force: true });` / `console.log` / `process.exit` group)
+
+**Interfaces:**
+- Consumes: `hubFindings` (`src/doctor.mjs:1075`), and its existing `Finding = { id, severity, classification, title, detail, action }` with `classification ∈ {configuration, dependency-outage, stale-evidence, unsafe-authority}`.
+- Produces: six findings — `H-8` sandbox canary per contract, `H-9` capability switches in force, `H-10` the platform matrix row, `H-11` node v24 pinned, `H-12` artifacts dir writable, `H-13` subscription-auth probe — and six new **optional inputs**, each defaulting to `null` meaning *not probed*.
+
+**Three things this task must not do, each measured.**
+
+1. **It must not emit a second `H-5`.** MEASURED at `16cd880` with `grep -o '"H-[0-9]*[^"]*"'`: `src/doctor.mjs` already emits `H-1`, `H-2`, `H-2:newest`, `H-3`, `H-5`, `H-6`, plus `H-4:<nwo>` per project, and `bin/reeve` emits `H-0` and `H-7`. **`H-5` is already "provider scheduler state and stale leases"**, which the design brief lists among the rows S3 should add. Adding it again is the second-inventory shape: two declarations of one fact, and the day they disagree nothing reports which is right.
+2. **A finding whose input was never probed reads UNKNOWN, never pass.** This is the `H-7` lesson, and `src/doctor.mjs:1075` already carries its mechanism in `projectsKnown`: `hubFindings` takes the project list as an *input* and therefore **cannot distinguish a failed read from an empty registry**, which is exactly why `H-7` is emitted at the route rather than inside the function. Every new input here follows the same rule — `null` means *not probed*, and `null` produces a finding at severity `warn`, classification `stale-evidence`, saying so.
+3. **It must still write nothing.** `test/hub-doctor.test.mjs` already asserts that `hubFindings` does not write `repo_gate_state` and appends no `hub_event`. This task extends the assertion to the whole file: the hub's bytes are unchanged across a `builder doctor` run. *A reporter that can write what it reports can agree with itself.*
+
+- [ ] **Step 1: Append the failing test**
+
+Append to `test/hub-doctor.test.mjs`, **before** its closing `rmSync` / `console.log` / `process.exit` group. It needs `createHash` from `node:crypto`, added at the top of the file if it is not already imported.
+
+```js
+// Six S3 rows, and the rule every one of them follows: an input that was never
+// probed is UNKNOWN, never pass. That is the H-7 lesson made general -- a
+// function that takes a fact as an argument cannot tell "the probe said no" from
+// "nobody ran the probe", and answering `pass` on the second is the shape that
+// hid a broken backup behind a fresh fallback.
+{
+  const db = openHub(join(dir, "s3rows.db"));
+  const NOW = 1_800_000_000;
+  const base = { root: "/b", now: NOW, snapshotFor: () => ({ path: "/b/hub/1.db", at: NOW - 60, ok: true, version: 3 }) };
+  const idsOf = fs => fs.map(f => f.id);
+
+  // Nothing probed: six UNKNOWNs, and not one pass.
+  const blind = hubFindings(db, base);
+  for (const id of ["H-8", "H-9", "H-10", "H-11", "H-12", "H-13"]) {
+    const f = blind.find(x => x.id === id);
+    check(f, `${id} is emitted even when its input was not probed`, idsOf(blind).join(","));
+    check(f?.severity === "warn" && f?.classification === "stale-evidence",
+      `${id} unprobed is a warn classified stale-evidence, never a pass`, JSON.stringify(f));
+    check(/not probed|unknown/i.test(`${f?.title} ${f?.detail}`),
+      `${id} says in words that nobody looked`, JSON.stringify(f));
+  }
+
+  // H-5 is NOT re-emitted. The design brief lists "provider scheduler state and
+  // stale leases" among S3's new rows and it already exists; a second one is two
+  // declarations of one fact.
+  check(idsOf(blind).filter(x => x === "H-5").length <= 1,
+    "H-5 is emitted at most once: S3 adds no second provider-scheduler row",
+    idsOf(blind).join(","));
+
+  // H-8: the canary, PER CONTRACT. A canary that passed over a probe set which
+  // never touched .git is not evidence about .git -- and the .git write block
+  // that stopped three real dispatches was found by a paid worker over thirteen
+  // consecutive tool calls, beneath reeve's own declarations.
+  const withCanary = hubFindings(db, { ...base,
+    canary: { at: NOW - 300, contracts: { write: "pass", network: "pass", keychain: "pass" }, missing: ["git-write", "commit"] } });
+  const h8 = withCanary.find(x => x.id === "H-8");
+  check(h8?.severity === "warn",
+    "a canary that passed everything it ran, with probes it did not run, is a warn", JSON.stringify(h8));
+  check(/git-write/.test(h8?.detail ?? ""),
+    "and it names the probes that were not run", JSON.stringify(h8));
+
+  const fullCanary = hubFindings(db, { ...base,
+    canary: { at: NOW - 300, contracts: { write: "pass", network: "pass", keychain: "pass" }, missing: [] } });
+  check(fullCanary.find(x => x.id === "H-8")?.severity === "pass",
+    "control: a canary with nothing unprobed passes, so H-8 is not always warn",
+    JSON.stringify(fullCanary.find(x => x.id === "H-8")));
+
+  const failedCanary = hubFindings(db, { ...base,
+    canary: { at: NOW - 300, contracts: { write: "pass", network: "FAIL", keychain: "pass" }, missing: [] } });
+  const h8f = failedCanary.find(x => x.id === "H-8");
+  check(h8f?.severity === "fail" && h8f?.classification === "unsafe-authority",
+    "a failed contract is unsafe authority: nothing may dispatch", JSON.stringify(h8f));
+
+  // H-9: the switches in force. `observe` off is not a fault -- it is the S3
+  // default, and reporting it as one would make the whole report noise.
+  const sw = hubFindings(db, { ...base,
+    capabilities: { observe: false, draftSpec: false, implementLocal: false, publishPr: false, mergeBuilderPr: false } });
+  const h9 = sw.find(x => x.id === "H-9");
+  check(h9?.severity === "pass", "every switch off is a pass, not a fault", JSON.stringify(h9));
+  check(/observe=off/.test(h9?.detail ?? ""), "and the detail names each switch and its state", JSON.stringify(h9));
+
+  const armed = hubFindings(db, { ...base,
+    capabilities: { observe: true, draftSpec: false, implementLocal: false, publishPr: false, mergeBuilderPr: true } });
+  const h9a = armed.find(x => x.id === "H-9");
+  check(h9a?.severity === "fail" && h9a?.classification === "unsafe-authority",
+    "control: mergeBuilderPr on before S10 is unsafe authority", JSON.stringify(h9a));
+
+  // H-10: the platform matrix. An unmeasured platform REFUSES rather than
+  // assuming macOS behaviour holds -- `ps -o lstart=` is POSIX-only, and without
+  // a process start time the pid-reuse guard silently degrades to pid-only.
+  const plat = hubFindings(db, { ...base, platform: { name: "linux", measured: false } });
+  const h10 = plat.find(x => x.id === "H-10");
+  check(h10?.severity === "fail" && /linux/.test(h10?.detail ?? ""),
+    "an unmeasured platform is a failure, named", JSON.stringify(h10));
+  check(hubFindings(db, { ...base, platform: { name: "darwin", measured: true } })
+          .find(x => x.id === "H-10")?.severity === "pass",
+    "control: a measured platform passes");
+
+  // H-11: node 24. The floor is real -- `node:sqlite` warns below it and
+  // `openHubAsGuest` refuses outright without DatabaseSync.setAuthorizer.
+  check(hubFindings(db, { ...base, nodeVersion: "22.14.0" }).find(x => x.id === "H-11")?.severity === "fail",
+    "node 22 is a failure: the guest handle cannot be restrained there");
+  check(hubFindings(db, { ...base, nodeVersion: "24.17.0" }).find(x => x.id === "H-11")?.severity === "pass",
+    "control: node 24 passes");
+
+  // H-12: artifacts. A directory that is not writable is where every phase's
+  // durable evidence would have gone.
+  const noWrite = hubFindings(db, { ...base, artifacts: { path: "/x/art", writable: false, why: "EACCES" } });
+  check(noWrite.find(x => x.id === "H-12")?.severity === "fail" &&
+        /EACCES/.test(noWrite.find(x => x.id === "H-12")?.detail ?? ""),
+    "an unwritable artifacts directory fails and carries the reason", JSON.stringify(noWrite.find(x => x.id === "H-12")));
+  check(hubFindings(db, { ...base, artifacts: { path: "/x/art", writable: true, why: null } })
+          .find(x => x.id === "H-12")?.severity === "pass", "control: a writable one passes");
+
+  // H-13: the subscription-auth probe. A BOOLEAN, never the credential.
+  const auth = hubFindings(db, { ...base, subscriptionAuth: { at: NOW - 120, ok: true, source: "oauth" } });
+  const h13 = auth.find(x => x.id === "H-13");
+  check(h13?.severity === "pass", "a successful auth probe passes", JSON.stringify(h13));
+  const dump = JSON.stringify(h13);
+  check(!/tk_|sk-|ghp_|Bearer/.test(dump),
+    "and it reports a boolean and a source, never a credential", dump);
+}
+
+// ── the reporter is still a reader, over the WHOLE file ──────────────────────
+{
+  const p = join(dir, "readonly.db");
+  const db = openHub(p);
+  const NOW = 1_800_000_000;
+  const before = createHash("sha256").update(readFileSync(p)).digest("hex");
+  hubFindings(db, {
+    root: "/b", now: NOW, snapshotFor: () => null,
+    canary: null, capabilities: null, platform: null, nodeVersion: null, artifacts: null, subscriptionAuth: null,
+  });
+  db.close();
+  const after = createHash("sha256").update(readFileSync(p)).digest("hex");
+  check(before === after,
+    "builder doctor leaves the hub byte-identical: a reporter that can write what it reports agrees with itself",
+    `${before.slice(0, 12)} vs ${after.slice(0, 12)}`);
+}
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `$N test/hub-doctor.test.mjs 2>&1 | grep -E "^FAIL"`
+Expected: every `H-8` through `H-13` assertion red, because none of the ids is emitted. **`H-5 is emitted at most once` is green from the first run** and must stay green — it is a guard against this task, not a target of it. And `builder doctor leaves the hub byte-identical` should be green from the first run; if it is not, `openHub` itself wrote on open (a migration, a WAL checkpoint) and the assertion needs a `skipIntegrity` open before anything else is believed.
+
+**On the broken implementation** — the shape this guards against is the one the existing code was built to avoid and which a new author reproduces by default: `if (!canary) return;` — skip the finding when the input was not supplied. Under it every *content* assertion passes, `H-5 is emitted at most once` passes, and **the eighteen unprobed assertions go red together** at `f` being undefined. That is the whole task: the report must say "nobody looked", because a report that omits what it did not check is indistinguishable from one where everything was fine. A second shape is `H-9` failing on `observe: false`; under it `every switch off is a pass, not a fault` goes red alone, and a doctor that flags the documented S3 default as a fault is a report an operator learns to skip.
+
+**The stub loop for this task**: green after Step 3 (**control green**); then change `H-12`'s branch to `if (artifacts === null) return;` — an early return that skips the finding — and confirm with `grep -n 'artifacts === null' src/doctor.mjs` (**stub verified applied**); re-run and confirm **`H-12 is emitted even when its input was not probed`** and its two siblings go red while the five other unprobed groups and `control: a writable one passes` stay green (**the RIGHT assertion red** — if all six groups red, the stub hit the shared helper rather than one finding); restore by `cp` from a pre-edit copy and re-run green (**restore verified by file copy**).
+
+- [ ] **Step 3: Implement the six findings**
+
+In `src/doctor.mjs`, extend `hubFindings`'s destructured options with the six new inputs, each defaulting to `null`, and add the findings. The shared helper is what makes rule 2 mechanical rather than remembered:
+
+```js
+// Every S3 input arrives as an argument, the way `projects` does, because this
+// function must not shell out or touch the filesystem: it is the half of doctor
+// that reads the hub. And every one of them defaults to null meaning NOT PROBED,
+// which is a finding of its own -- H-7 exists because this function could not
+// tell a failed registry read from an empty registry, and answering `pass` on
+// the second is the same mistake wearing a different id.
+const unprobed = (id, what, action) => ({
+  id, severity: "warn", classification: "stale-evidence",
+  title: `${what} was not probed`,
+  detail: "no result was supplied to doctor, so this is UNKNOWN rather than healthy",
+  action,
+});
+
+// H-8 -- the sandbox canary, PER CONTRACT and per probe.
+//
+// `missing` is not decoration. The .git write block that stopped three real
+// dispatches lives in the CLI's own sandbox layer, BENEATH reeve's declarations,
+// and a canary whose probe set never touched .git says nothing about it. A
+// contract set that passed over an incomplete probe set is a smaller measurement
+// wearing the name of a bigger one.
+if (canary === null) out.push(unprobed("H-8", "the sandbox canary", "reeve canary <owner>/<repo>"));
+else {
+  const failed = Object.entries(canary.contracts ?? {}).filter(([, v]) => v !== "pass").map(([k]) => k);
+  if (failed.length)
+    out.push({ id: "H-8", severity: "fail", classification: "unsafe-authority",
+      title: "a sandbox contract did not hold", detail: `failed: ${failed.join(", ")}`,
+      action: "nothing may dispatch until the canary is clean; reeve canary <owner>/<repo>" });
+  else if ((canary.missing ?? []).length)
+    out.push({ id: "H-8", severity: "warn", classification: "stale-evidence",
+      title: "the canary passed every contract it ran, and did not run them all",
+      detail: `not probed: ${canary.missing.join(", ")}`,
+      action: "extend the canary, or treat these capabilities as unmeasured" });
+  else
+    out.push({ id: "H-8", severity: "pass", classification: "stale-evidence",
+      title: "the sandbox canary is clean over its whole probe set",
+      detail: `measured ${Math.round((now - canary.at) / 60)}m ago`, action: null });
+}
+
+// H-9 -- the switches in force.
+//
+// Every switch off is the S3 default and a PASS. A doctor that flagged the
+// documented default as a fault would make its own report noise, and a report an
+// operator skips is a report that is not there.
+if (capabilities === null) out.push(unprobed("H-9", "the capability switches", "check the profile loads"));
+else {
+  const detail = Object.entries(capabilities).map(([k, v]) => `${k}=${v ? "on" : "off"}`).join(" ");
+  // The one switch that must be off before S10, independently of authority.*.
+  out.push(capabilities.mergeBuilderPr
+    ? { id: "H-9", severity: "fail", classification: "unsafe-authority",
+        title: "mergeBuilderPr is on", detail,
+        action: "S10 is the stage that proves it; turn it off" }
+    : { id: "H-9", severity: "pass", classification: "configuration",
+        title: "the capability switches are readable", detail, action: null });
+}
+
+// H-10 -- the platform matrix row.
+//
+// Fail-closed per platform. `ps -o lstart=` is POSIX-only, and without a process
+// start time the pid-reuse guard degrades to pid-only WITHOUT SAYING SO -- which
+// is a liveness check that answers yes for a recycled pid.
+if (platform === null) out.push(unprobed("H-10", "the platform matrix row", "record this platform's row"));
+else out.push(platform.measured
+  ? { id: "H-10", severity: "pass", classification: "configuration",
+      title: `the platform matrix has a measured row for ${platform.name}`, detail: platform.name, action: null }
+  : { id: "H-10", severity: "fail", classification: "unsafe-authority",
+      title: `no measured platform row for ${platform.name}`,
+      detail: "process start time, and therefore the pid-reuse guard, is unverified here",
+      action: `measure ${platform.name} before running the builder on it` });
+
+// H-11 -- the node floor. Real, not a preference: node:sqlite warns below 24,
+// and openHubAsGuest refuses to open at all without DatabaseSync.setAuthorizer,
+// which arrived in 24.10.0.
+if (nodeVersion === null) out.push(unprobed("H-11", "the node version", "run doctor from the builder's node"));
+else out.push(Number(String(nodeVersion).split(".")[0]) >= 24
+  ? { id: "H-11", severity: "pass", classification: "dependency-outage",
+      title: "node is 24 or newer", detail: String(nodeVersion), action: null }
+  : { id: "H-11", severity: "fail", classification: "dependency-outage",
+      title: "node is below 24", detail: String(nodeVersion),
+      action: "the guardian's hub guest handle cannot be restrained below 24.10.0" });
+
+// H-12 -- the artifacts directory. Where every phase's durable evidence goes,
+// and a transition commits only after its artifact is durable.
+if (artifacts === null) out.push(unprobed("H-12", "the artifacts directory", "probe it and pass the result"));
+else out.push(artifacts.writable
+  ? { id: "H-12", severity: "pass", classification: "configuration",
+      title: "the artifacts directory is writable", detail: artifacts.path, action: null }
+  : { id: "H-12", severity: "fail", classification: "configuration",
+      title: "the artifacts directory is not writable",
+      detail: `${artifacts.path}: ${artifacts.why ?? "no reason given"}`,
+      action: "a phase cannot commit a transition whose artifact cannot be written" });
+
+// H-13 -- the subscription-auth probe.
+//
+// A BOOLEAN and a SOURCE, never the credential. Reporting a credential as a
+// length, an exit code or a boolean is the repository's rule and this is the one
+// finding that would otherwise be tempted to quote one.
+if (subscriptionAuth === null) out.push(unprobed("H-13", "the subscription-auth probe", "run the probe"));
+else out.push(subscriptionAuth.ok
+  ? { id: "H-13", severity: "pass", classification: "dependency-outage",
+      title: "the worker can authenticate",
+      detail: `source ${subscriptionAuth.source}, probed ${Math.round((now - subscriptionAuth.at) / 60)}m ago`,
+      action: null }
+  : { id: "H-13", severity: "fail", classification: "dependency-outage",
+      title: "the worker cannot authenticate",
+      detail: `source ${subscriptionAuth.source}`, action: "re-authenticate before dispatching" });
+```
+
+In `bin/reeve`'s `builder` route, pass the six inputs at the existing `hubFindings(db, { ... })` call. **Where the route cannot probe something, pass `null` rather than a guess** — that is the whole contract, and a route that supplies a default is the `H-7` defect reappearing at the caller:
+
+```js
+        canary: readCanaryResult(HOME),            // null when no canary has ever run here
+        capabilities: capabilities(loadProfileFor(HOME)),
+        platform: platformRow(process.platform),   // { name, measured }
+        nodeVersion: process.versions.node,
+        artifacts: probeArtifacts(HOME),           // { path, writable, why }
+        subscriptionAuth: readAuthProbe(HOME),     // null until the probe has run
+```
+
+`readCanaryResult`, `platformRow`, `probeArtifacts` and `readAuthProbe` are four small helpers in `bin/reeve` beside the route. Each returns `null` on any failure to read, and **none of them invents a value**: a probe that could not run is not a probe that found nothing.
+
+- [ ] **Step 4: Run it, then commit**
+
+```bash
+$N test/hub-doctor.test.mjs      # expect all green
+fail=0
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
+done
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
+git add src/doctor.mjs bin/reeve test/hub-doctor.test.mjs
+git commit -m "feat(doctor): six S3 hub findings, and UNKNOWN for every unprobed input"
+```
+
+Commit body: record that `H-5` is deliberately not re-emitted with the measurement showing it already exists; that every new input defaults to `null` meaning not-probed and produces a warn; and that the byte-identical assertion now covers the whole file rather than one table.
+
+---
+
+### Task 17: PR-E3 close-out — freeze the page list, tracker, PR
+
+**Files:**
+- Modify: `test/build-escalations.test.mjs` (append before its closing group), `tasks/reeve-tasks/trackers/s3.md` (**last commit only**)
+
+- [ ] **Step 1: Freeze the page list, both halves**
+
+The page list is a founder decision with a measurement behind it, and the way such a list stops being a decision is one defensible addition at a time. Freeze **both** the three that page and the six that do not: freezing the page list alone would let an identity be *removed* from `IDENTITY_SHAPES` — silently un-escalating a whole class — with every assertion still green.
+
+Append to `test/build-escalations.test.mjs`, **before** its closing group:
+
+```js
+// Frozen, both directions. A fourth pager and a deleted identity are both
+// decisions; neither is a diff someone lands while passing. The second half is
+// the one a page-list freeze cannot see: delete an identity from IDENTITY_SHAPES
+// and the page list is still exactly three.
+{
+  const PAGE_NAMES = ["bt:<id>:phase:blocked:<phase>", "builder:backup:failed", "builder:sandbox:canary-failed"];
+  check(JSON.stringify(PAGES.map(p => p.name).sort()) === JSON.stringify(PAGE_NAMES),
+    "the page list is exactly these three", PAGES.map(p => p.name).sort().join(" | "));
+
+  const SHAPES = [
+    "bt:<id>:cancel:draining", "bt:<id>:depth:post-approval", "bt:<id>:infeasible",
+    "bt:<id>:lease:conflict", "bt:<id>:lease:starved",
+    "bt:<id>:phase:blocked:<phase>", "bt:<id>:phase:failed:<phase>",
+    "builder:backup:failed", "builder:sandbox:canary-failed",
+  ];
+  check(JSON.stringify([...IDENTITY_SHAPES].sort()) === JSON.stringify(SHAPES),
+    "and the nine identities are exactly these nine",
+    `now ${[...IDENTITY_SHAPES].sort().join(" | ")}\n        was ${SHAPES.join(" | ")}`);
+  check(PAGE_NAMES.every(n => SHAPES.includes(n)),
+    "and every pager is one of the nine, so nothing pages that is not also durable",
+    PAGE_NAMES.filter(n => !SHAPES.includes(n)).join(","));
+}
+```
+
+Verify the guard guards, with the four-check stub loop, **twice — once per half**:
+
+1. Add a fourth entry to `PAGES`; re-run and expect **`the page list is exactly these three`** red and `and the nine identities are exactly these nine` **green**, which is the pair that shows the two halves are independent. Restore by `cp`; re-run green.
+2. Delete `"bt:<id>:lease:starved"` from `IDENTITY_SHAPES`; re-run and expect **`and the nine identities are exactly these nine`** red, and Task 11's `S3 produces exactly nine identities` red beside it, while `the page list is exactly these three` stays **green**. Restore by `cp`; re-run green.
+
+The second run is the one that matters: it is the half that a page-list freeze cannot see, and an identity silently removed is a class of failure that stops being recorded anywhere.
+
+- [ ] **Step 2: Full suite, from a clean checkout**
+
+```bash
+fail=0
+for f in test/*.test.mjs; do
+  case "$f" in */escape.test.mjs) continue;; esac   # writes into the LIVE daemon's ~/.reeve/canary
+  $N "$f" >/dev/null || { echo "FAILED $f"; fail=1; }
+done
+# NONZERO on red. `|| echo` turns a failing node process into a SUCCESSFUL
+# command, so this loop exited 0 with any number of red files -- and it is the
+# mandatory pre-commit gate, so an executor checking the command status commits
+# on a suite that just failed.
+[ "$fail" -eq 0 ] || { echo "the suite is RED; do not commit"; exit 1; }
+```
+
+Expected: no `FAILED` lines. 94 files after PR-E1, plus `test/build-escalations.test.mjs`.
+
+- [ ] **Step 3: The tracker row, as the LAST commit**
+
+In §1's task table, set T15's `PR` and `STATE` to **BUILT**:
+
+```markdown
+| T15 | Escalations reach the founder from the builder process; `builder doctor` grows S3's rows | S3-E | `feat/s3-escalate-doctor` | T13 | reeve#NN | BUILT | | | |
+```
+
+And add one line to §4, *Decisions taken during this stage*, because Q9's default was exercised rather than merely recorded:
+
+```markdown
+13. **2026-08-27 — Q9's default is implemented as written.** All nine S3 identities are
+    durable escalation rows; the closed page list is three —
+    `builder:sandbox:canary-failed`, `builder:backup:failed`, `bt:<id>:phase:blocked:<phase>`.
+    **No daily page budget number was chosen**, because the rate has not been observed once
+    and `docs/2026-08-21-builder-design.md:572` says limits are measured before they are
+    chosen. Revisit after S3's first week with the measured rate.
+```
+
+```bash
+git add tasks/reeve-tasks/trackers/s3.md
+git commit -m "docs(tracker): s3 T15 built, and Q9's page list as implemented"
+```
+
+- [ ] **Step 4: Push and open the PR**
+
+```bash
+git push -u origin feat/s3-escalate-doctor
+gh pr create --title "S3 PR-E3: escalations from the builder, and doctor's S3 rows" --body-file - <<'BODY'
+## What
+
+The builder's own escalation dispatch, reading the hub. Nine S3 identities, every
+one a durable row that shows up in `task show`, `task why` and `task dash`;
+exactly three of them interrupt a human. Keys are bare identities and the failure
+type, the count and the duration ride in the body. `notify` now returns a
+delivery reference or a named reason for every channel in every outcome, and
+`reeve notify --test` exercises the channel without an emergency. `builder
+doctor` gains six S3 rows and still writes nothing — the assertion now covers the
+whole hub file, not one table.
+
+## Decisions taken in this PR
+
+- **An escalation and a page are two different facts.** All nine identities stay
+  durable; three page. Escalating everything is not the conservative choice:
+  realised danger-through is U-shaped in the escalation rate, and at reviewer
+  capacity 25 escalating 100% let 57% of dangerous actions through against 42%
+  at the optimum. `src/notify.mjs`'s header was already right about this in
+  prose; the gap was that it was a comment rather than a list.
+- **No daily page budget is chosen.** Limits are measured before they are
+  chosen, and this rate has not been observed once.
+- **`assertHub` probes `phase_run`, not `escalation`.** Measured: the guardian
+  store HAS an escalation table of the same shape, so a reader that discovered
+  the wrong store by catching a query error would catch nothing and the write
+  would land.
+- **The guardian half of the two-store property was already true** through the
+  guest allowlist, and is asserted rather than built. Measured: the guardian's
+  `announceable` handed the hub's guest handle throws `access to escalation.why
+  is prohibited`, with `provider_lease` as the control that the handle works.
+- **`builder doctor` emits no second `H-5`.** The design brief lists "provider
+  scheduler state and stale leases" among S3's new rows; it already exists.
+- **Every unprobed doctor input is a warn saying nobody looked**, never a pass.
+  That is the `H-7` lesson generalised.
+
+## Review focus
+
+- The `PAGES` predicates. Three lines, and they are the whole difference between
+  a channel that survives a real week and one that gets muted. `phase:failed` is
+  deliberately not on the list — a failure retries, a block does not.
+- `postViaCurl` no longer passes `-o /dev/null`, so the response body reaches the
+  parser. Please check the `\n%{http_code}` split against a body that itself ends
+  in a newline.
+- The `unprobed()` helper in `src/doctor.mjs` is what makes "null means nobody
+  looked" mechanical rather than remembered. If a seventh row lands without it,
+  the rule is back to being a convention.
+- Task 15's assertions were green on the first run and were driven red by stub
+  twice, once per half. The commit body names which line each stub reddened;
+  please check that is the line you would expect.
+BODY
+gh pr comment --body "@codex review"
+```
+
+- [ ] **Step 5: Work the gate**
+
+Comment `@codex review` on **every push**. Read **both** endpoints — a clean pass arrives as an issue comment and findings as a review object, so reading one is one shape short. Reply to **and resolve** every thread via GraphQL; replying alone does not clear it. Apply the taper rule: ten rounds without the findings tapering means stop and bring the shape, not the next fix.
+
+**Do not merge.** Founder grant required.
+
+---
+
+---
+## Self-review
+
+**Spec coverage.** §11.6 `:733-737` — `task list` (Task 3), `task show` with all six waiting substates as first-class fields *"derived from rows, never stored as phases"* (Task 3, with `WAITING_FOR_CAPABILITY` proved derived by flipping a switch and asserting the hub is unchanged), and `task why` rendering the evidence lineage — generation, depth and floors, the `phase_event` chain with artifact shas, `phase_run` with contract snapshot and drift, provider lease, escalations (Task 4). §11.6 `:738` — `dash` with state, age-in-state from the event log with server-clock elapsed, waiting substate, capability switches in force, and every UNKNOWN rendered as UNKNOWN (Tasks 7–9); *"the single next action"* is carried as each failure type's `next` (Task 11) and as `waiting_on_you`'s ordering by `for_seconds` (Task 9); **spec and impl PR links are structurally empty in S3 and Task 4 asserts both the emptiness and that `openPrs` can see a row**. §2.2 `:136` territory pins and their expiry (Task 9). §3.5 `:272` the CANCELLING drain count (Task 9). §11.7 `:749` escalation ownership by process, both directions (Task 12), the nine identities as bare keys (Task 11), the closed page list (Task 13), announce-on-arrival-and-change (Task 15). §11.5 `:731` `notify.mjs` reused with one additive change (Task 14). §4.1's `{ok, blocked, infeasible}` extended to four typed failures with distinct next actions (Task 11). Research adopted where the brief maps it here: **R7** (Task 1), **R8** (Task 2), **R11** (Tasks 8–9), **R12** (Task 11), **R21** (Task 14), and X1/X2's escalation-rate contradiction resolved as founder decision 5 and implemented in Task 13. **R20 (the dead man's switch) is NOT in this plan.** The brief files it as "S3 or S4"; it needs an external endpoint and a pinger outside the process, which is a different lane from a read surface, and pretending `alive` covers it would be the fourth kind of the mistake this plan spends most of its length on — the digest's `alive` field is read *by* an operator who is already looking, and the one failure a daemon structurally cannot self-report is that it stopped. Stated here rather than omitted.
+
+**Placeholder scan.** Clean. No `TBD`, no `TODO`, no "implement later", no "add appropriate error handling", no "similar to Task N". Every code block is complete as written. Four names are referenced that **no task in this plan defines**, and each is named as a consumed interface with the file it must come from and an instruction to stop if it has changed: `capabilities(profile)` and `loadProfileFor(HOME)` (S3-A T1), `registryProjects(HOME)` (S3-A T2), the `case "task":` route (S3-B T3). Four more are helpers Task 16 requires in `bin/reeve` and specifies by contract rather than body — `readCanaryResult`, `platformRow`, `probeArtifacts`, `readAuthProbe` — each stated as "returns `null` on any failure to read, and none of them invents a value"; that is a contract an executor can satisfy, and their bodies are four filesystem reads that would be invented text here rather than measured.
+
+**Type consistency.** `READ_FORMAT_VERSION = 1` is declared once in `src/build/show.mjs` and imported by `why.mjs` and `dash.mjs` — **one version, not three**, because three versions of one envelope is W2's second-inventory shape at a smaller scale. `envelope(kind, data) -> {format_version, kind, data}`. `waitingFor(row, ev) -> {first, all, since, capability}`. `ageInState(row, ev) -> {seconds, from}` where `from ∈ {"phase_event", "created_at"}` and never `"updated_at"`. `taskShow -> model | null`; `whyModel -> model | null`; both return `null` for a missing task and the CLI turns that into `kind: "task_not_found"`. `escalationKey({task, kind, phase}) -> string`, throwing with `.kind ∈ {escalation_key_detail, escalation_key_shape}`. `body({type, reason, ...}) -> {type, reason, next, ...}`, throwing `.kind = "escalation_body_type"`. `assertHub(db)` throws `.kind = "not_a_hub"`; `builderAnnounceable` additionally throws `.kind = "not_a_builder_identity"`. `announce -> {paged, digested, declined, cleared}`. `notify`'s channel entries gain `ref: string | null` and, when `ref` is null, a `why: string`. `Finding` is unchanged: `{id, severity, classification, title, detail, action}` with the existing four classifications; the six new ids are `H-8` … `H-13` and **`H-5` is not re-emitted**. `EXITS = {ok: 0, refused: 1, misuse: 2, degraded: 3}`; `ERROR_KINDS` is closed at six.
+
+**A deficit this plan carries, stated plainly.** Task 2 introduces `fail()` and converts **one** existing exit-code site. The roughly twenty-five `die()` calls in `bin/reeve` keep answering unrelated conditions with one shape, so a script consuming reeve still cannot tell a mistyped command from an unreadable store on any route this plan did not add. That is deliberate — converting them touches every route including the running daemon's, and the corpus says mixed PRs converge worse — but it means **`--json` is a contract only for the surfaces listed in `APPLIES.json`**, and the guarantee is narrower than the decision that motivated it. The narrowing is visible in the map rather than hidden: `APPLIES` says absence means unconstrained, and Task 1's test asserts every name in it is a real route, so what is covered is enumerable rather than assumed. A second, smaller deficit: `waiting_on_you` uses `HUMAN_WAITS`, a two-entry set, and no test can tell you the set is *right* — only that the code uses it. The PR body asks for that by eye.
+
+**Where this plan and the design brief disagree, and what the source says.**
+
+Every row was re-derived in this worktree at `16cd880` by searching the anchor string, never by trusting a number. **The brief measured at `c500cfe`; reeve#49 merged between them.** This list is the most useful thing this document produces, and nothing in it has been smoothed over or silently adapted.
+
+1. **`announceable` is at `src/daemon.mjs:3236`, not `:3217`.** `git grep -n "export function announceable" -- src/daemon.mjs` → `3236`. The brief's T15 cites `:3217`. The tracker §7 already re-derived this; confirmed independently here.
+2. **`hubFindings` is at `src/doctor.mjs:1075`, not `:1021+`.** `git grep -n "export function hubFindings" -- src/doctor.mjs` → `1075`. The brief's T15 cites `:1021+`.
+3. **`nextPhase`'s refusal field is `refusal`, not `reason`.** The brief's §2.1 gives the shape as `{ok:false,reason,…}`. `src/build/phases.mjs:81` reads `const refuse = (refusal, extra = {}) => ({ ok: false, refusal, ...extra });`. No task in this plan destructures it, but S3-B, S3-C and S3-D all do, and a plan that quotes the brief there sends an executor after a field that is always `undefined` — which reads as "no reason given" rather than as a bug.
+4. **The `--json` figure is wrong in both directions.** The brief says *"honoured by only four sites"*. MEASURED: **three read commands honour it** — `doctor`, `status`, `builder doctor` — across **eight `flag("json")` call sites** in `bin/reeve` (two in `doctor`, one in `status`, five in `builder doctor`). Neither four commands nor four sites. And **nine read commands accept it**, so the silent-ignore count is six, not five. The measurement, its command and its controls are in Task 1.
+5. **`H-7` is emitted by `bin/reeve`, not by `src/doctor.mjs`,** and so is `H-0`. `grep -o '"H-[0-9]*[^"]*"' src/doctor.mjs` → `H-1, H-2, H-2:newest, H-3, H-5, H-6`; the same grep over `bin/reeve` → `H-0, H-7`. `H-4` is only ever emitted scoped as `H-4:<nwo>` and never bare. The brief's T15 files all of `builder doctor`'s growth against `src/doctor.mjs (hub findings)`; Task 16 splits it the way the existing code already does, and the reason is in `bin/reeve`'s own comment: `hubFindings` takes the project list as an input and cannot distinguish a failed read from an empty registry.
+6. **`builder doctor` already has "provider scheduler state and stale leases".** The brief's T15 lists it among the rows S3 adds; it is `H-5`, shipped in S2-A. Task 16 adds six rows, not seven, and asserts `H-5` appears at most once.
+7. **`singleton_lease` has no `heartbeat_at` column.** §11.6 asks the dash for a heartbeat and a last-seen. `src/build/hub.sql`'s `singleton_lease` is `(name, pid, lstart, command, acquired_at, expires_at)`, and `heartbeatSingleton` (`src/build/locks.mjs:67`) expresses the heartbeat by sliding `expires_at` forward by `LEASE_SECONDS`. So last-seen is **derived** — `LEASE_SECONDS - (expires_at - now)` — and the derivation is only sound while the lease length is a constant. Task 9 imports `LEASE_SECONDS` rather than writing a number, and says so in a comment. The lease is also named **`"builder"`** (`bin/reeve:1421`), not `"build"`.
+8. **There is no HTML, so the brief's T14 Verify clause cannot be satisfied as written.** It asks that *"The HTML and the JSON derive from one value"*. Founder decision 2 makes S3 headless — with a recorded reason that is a scar rather than a preference — and R11 makes the surface a CLI digest. Task 7 keeps the property and changes the nouns: one model, a **text** renderer and a JSON renderer, compared by rendering both from one object and mutating it.
+9. **The brief's `dash.mjs` positive control is now 4, not 3.** W9 states *"positive control: `schema.mjs` is found in 3"*. MEASURED at `16cd880`: `git grep -l 'schema\.mjs' -- test/ | wc -l` → **4** (`checkout-root`, `profile-validate`, `review-body-findings`, `reviewer-status`); reeve#49 added the third of those. **The claim the control supports still holds**: `git grep -l -e 'dash\.mjs' -e 'renderHtml' -e 'writeDash' -- test/ | wc -l` → **0**. The number moved; the conclusion did not, and both are recorded because a control quoted from memory is the thing this repository has measured going stale.
+10. **The test baseline in the brief is one merge out of date.** Brief §3.1: *"91 test files, 0 failures, 5,006 PASS, measured on `c500cfe`"*. The tracker's re-measure at `16cd880` is **93 files, 0 failures, 5,131 PASS**. This plan's Global Constraints carry the tracker's number, which is the one every task is measured against.
+11. **`bin/reeve`'s `build` route says unknown flags are ignored, and they are not.** `bin/reeve:1136-1145` reads *"Unknown flags are IGNORED rather than refused, so `reeve build run --home /tmp/x` silently operates on the operator's real home"*. MEASURED: `reeve why 1 o/r --nonsense` → `reeve: unknown flag --nonsense`, exit 1, followed by the accepted-flag list. The single-walk parser closed this. The comment is a W10-class stale claim living in a file Tasks 5, 9, 14 and 16 all modify; **this plan does not fix it**, because the fix belongs with whoever next touches that route's body and a drive-by comment edit in four PRs is four conflicts.
+12. **`bin/reeve:1116` cites a line number for the exit-code convention that does not hold it.** It reads *"The CLI's existing doctor convention, documented at `bin/reeve:364`: 0 ok, 1 broken, 3 degraded"*; `:364` is the unknown-flag branch of the argv parser. The convention's only statement anywhere is the usage text at `:1723`. Task 2 gives it one home in `EXITS` and is the reason that task exists at all.
+13. **`hubAccess` cannot read `escalation`, so the brief's T13 "Consumes" line is not a usable read path for this plan.** The brief lists *"`hubAccess`/`openHub` read path; … `escalation` tables"*. MEASURED: `openHubAsGuest`'s authorizer allows exactly `provider_lease`, `provider_state`, `pr_hold` (read) and `maintenance_lock` (read, delete), and a `SELECT why FROM escalation` through that handle throws `access to escalation.why is prohibited`, with `provider_lease` reading `{"c":0}` as the control that the handle works. So `task show`, `why` and `dash` open a **read-only `DatabaseSync`**, not `hubAccess` and not `openHub`. The same measurement is what makes Task 12's guardian half already true.
+14. **`outbox`'s columns are not what a fixture writer would guess, and `fence` is a foreign key.** They are `task_id` and `task_generation`, not `task` and `generation`; `created_at` and `updated_at` are both NOT NULL; and `fence INTEGER NOT NULL REFERENCES phase_event(seq)` means a drain fixture must insert a `phase_event` first or fail on the foreign key rather than on anything the test is about. Task 9's fixture does that and says why. Not a brief error — the brief does not specify it — but it is the kind of thing that turns a runnable snippet into a non-runnable one, which is the largest single finding shape in this corpus at 176 findings, 137 of them inside `.md` files.
+15. **S3-A and S3-B do not exist.** Measured immediately before this file was written into it: `ls tasks/reeve-tasks/plans/` returned nothing, against a positive control that `ls tasks/reeve-tasks/` returned eight entries. Every row in this plan's consumed-interfaces table is therefore marked **(derived)** or **(measured)**, and the derived rows are claims about what S3-A and S3-B will produce, taken from brief §2.2. **Reconcile them before writing code, and if a name differs, stop rather than adapting.**
+
+16. **`task_pr` is not in `src/build/hub.sql` at all**, and its CHECK refuses the obvious fixture. `grep -n "task_pr" src/build/hub.sql` → **0 hits**; the table is created by migration 2 at `src/build/hubdb.mjs:100`, which also drops `impl_pr` — the C1 contradiction `../MASTER-PLAN.md` §B.11 records, met from the fixture side. Its CHECK is `(kind = 'impl' AND generation IS NOT NULL AND slice IS NOT NULL) OR (kind = 'spec' AND generation IS NULL AND slice IS NULL)`, so `INSERT … VALUES(task, 'spec', 1, 0, …)` — which is what a reader of `openPrs`'s `PR_COLS` would write — fails with `CHECK constraint failed`. Verified both ways in this worktree: the four-column form failed and the NULL form inserted and came back through `openPrs`. Task 4's control fixture uses the NULL form and says why in a comment. This is the shape that turns a snippet into a non-runnable one, and it would have surfaced as a database error standing in for the assertion it was meant to make.
+
+One thing that is *not* a disagreement and is worth saying, because it is the reason this plan exists: **`src/build/tables.mjs` has declared `why`, `dash` and `notify.mjs` as the readers of `phase_event`, `phase_run` and `escalation` since S2-A, and none of the three has existed.** `test/hub-crosscheck.test.mjs:66` asserts only that the `reader` field is a non-empty string, so the declaration was green for the whole of S2 while nothing read those tables. The brief records the same shape about `pr_hold` in S2-C's consumed table — *permission to read is not a reader* — and this is the second instance, found by reading the declaration rather than by any test.
+

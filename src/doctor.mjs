@@ -251,18 +251,74 @@ function checkMergeShape(nwo, declared) {
  * No gate downstream of a red base can mean anything, and a base that is red for
  * many runs hides whatever breaks next behind an already-red rollup.
  */
-function checkBaseHealth(nwo, workflow = "ci.yml", branch = "main") {
-  const r = sh("gh", ["run", "list", "--repo", nwo, "--workflow", workflow, "--branch", branch,
-                      "--limit", "10", "--json", "conclusion", "--jq", ".[].conclusion"]);
+/**
+ * Did a run FAIL, or did it never run at all?
+ *
+ * A workflow whose runner never starts reports `conclusion: failure` with zero
+ * executed steps, and from the run list alone that is byte-identical to a genuine
+ * test failure. They are opposite problems: one says the code is broken, the
+ * other says nothing has been measured. Reading the conclusion answers a narrower
+ * question than the caller needs, and this repository lost most of a day to that
+ * exact reading on its own CI.
+ *
+ * The step count is the positive signal, and it only exists on the jobs endpoint.
+ * Asked ONLY of runs that report failure: a healthy base spends no extra request,
+ * and the cost is paid exactly when the answer matters.
+ *
+ * A jobs read that fails returns null — unknown, which is neither "failed" nor
+ * "never ran", because guessing either way is how this defect happened.
+ */
+function runExecutedSteps(nwo, runId) {
+  const j = sh("gh", ["api", `repos/${nwo}/actions/runs/${runId}/jobs`,
+                      "--jq", "[.jobs[].steps | length] | add // 0"]);
+  if (!j.ok) return null;
+  const n = Number(j.out.trim());
+  return Number.isFinite(n) ? n > 0 : null;
+}
+
+/**
+ * No gate downstream of a red base can mean anything, and a base that is red for
+ * many runs hides whatever breaks next behind an already-red rollup.
+ *
+ * "Red" and "never ran" are reported separately, because the remedies have
+ * nothing in common: one is a bug to fix, the other is infrastructure to restore,
+ * and calling the second one a failing base sends somebody to read a diff that is
+ * fine.
+ */
+export function checkBaseHealth(nwo, workflow = "ci.yml", branch = "main", io = null) {
+  const run = io?.sh ?? sh;
+  const steps = io?.steps ?? runExecutedSteps;
+  const r = run("gh", ["run", "list", "--repo", nwo, "--workflow", workflow, "--branch", branch,
+                       "--limit", "10", "--json", "conclusion,databaseId",
+                       "--jq", ".[] | [.conclusion, (.databaseId|tostring)] | @tsv"]);
   if (!r.ok) return { id: "R-04", level: UNKNOWN, title: "base health", lines: [`could not read ${workflow} runs on ${branch}`] };
-  const runs = r.out.split("\n").filter(Boolean);
-  const failures = runs.filter(c => c === "failure").length;
-  const lines = [`${branch}: ${failures} of the last ${runs.length} ${workflow} runs failed`];
-  if (failures === runs.length && runs.length > 0) {
+  const runs = r.out.split("\n").filter(Boolean).map(l => l.split("\t"));
+  const reported = runs.filter(([c]) => c === "failure");
+
+  let failed = 0, neverRan = 0, unreadable = 0;
+  for (const [, id] of reported) {
+    const ran = steps(nwo, id);
+    if (ran === null) unreadable++;
+    else if (ran) failed++;
+    else neverRan++;
+  }
+
+  const lines = [`${branch}: ${failed} of the last ${runs.length} ${workflow} runs failed`];
+  if (neverRan) lines.push(`${neverRan} run(s) reported failure without executing a single step — those never ran`);
+  if (unreadable) lines.push(`${unreadable} run(s) could not be read, so whether they ran is unknown`);
+
+  // NOTHING HAS RUN is its own answer, and the loudest one: every gate downstream
+  // of a base nobody has measured is meaningless, and it is not the code's fault.
+  if (runs.length > 0 && neverRan === runs.length) {
+    lines.push("-> CI is not executing on this branch; nothing here has been measured");
+    return { id: "R-04", level: BROKEN, title: "base health", lines };
+  }
+  if (failed === runs.length && runs.length > 0) {
     lines.push("-> every PR inherits a red rollup, so a new failure is invisible");
     return { id: "R-04", level: BROKEN, title: "base health", lines };
   }
-  if (failures > 0) return { id: "R-04", level: DEGRADED, title: "base health", lines };
+  if (unreadable && !failed && !neverRan) return { id: "R-04", level: UNKNOWN, title: "base health", lines };
+  if (failed > 0 || neverRan > 0) return { id: "R-04", level: DEGRADED, title: "base health", lines };
   return { id: "R-04", level: OK, title: "base health", lines };
 }
 

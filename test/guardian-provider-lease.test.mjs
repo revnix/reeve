@@ -1397,6 +1397,77 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false,
   void s1; void s2; void s3;
 }
 
+// ── refund only the attempt THIS call spent ──────────────────────────────
+// I claimed the refund was a no-op when the insert never landed, having checked
+// only the case where no row exists at all. It is an UPDATE with a WHERE: against
+// a cause that already carries a LEGITIMATE prior attempt it decrements THAT row.
+// Measured directly — a prior attempt of 1 becomes 0 — so with
+// `maxFixAttemptsPerFinding` above one, a PRE-COMMIT failure would erase a real
+// attempt and hand out a repair beyond the configured cap.
+//
+// Two ticks against one store: the first spends an attempt for real, the second
+// fails before its insert lands. The first tick is what makes the second one
+// mean anything.
+{
+  const dir = mkdtempSync(join(tmpdir(), "reeve-prov-refund-"));
+  const store = open(join(dir, "s.db"));
+  let calls = 0;
+  const mk = () => ({
+    nwo: "o/r", db: store, logPath: join(dir, "log.txt"),
+    execute: true, shadow: true, running: 0,
+    containment: { credentialRead: "closed", why: "test" },
+    keychain: { measured: true, items: [], why: null }, claudeBin: "/bin/sh", cliVersion: "test",
+    capacity: () => ({ allowed: 5, running: 0, canStart: 5, load1: 0, perfCores: 10 }),
+    profile: {
+      identity: { key: "o/r", defaultBranch: "main", worktreeRoot: dir, checkout: mkdtempSync(join(tmpdir(), "reeve-prov-refund-cl-")) },
+      authority: { policy: "propose_and_merge" },
+      // ABOVE ONE, which is the only configuration in which this defect can bite.
+      rounds: { softCap: 5, hardCap: 10, maxFixAttemptsPerFinding: 3 },
+      ci: { provider: "github-actions", requiredChecks: [] },
+      watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
+    },
+    hub: () => ({ hub: {}, why: null }), repoId: 7, lstart: "boot-1",
+    reapProvider: () => ({ ok: true, reaped: 0 }), queuedRequests: () => [],
+    providerClaim: () => ({ ok: true, id: 1, token: "t" }),
+    providerBind: () => ({ ok: true, bound: 1 }), providerRelease: () => ({ ok: true }),
+    openPrs: () => [42],
+    prAnchor: () => ({ ok: true, headRef: "f", baseRef: "main", state: "open", title: "t",
+                       updatedAt: "x", head: "b".repeat(40), pin: { ok: true, sha: "b".repeat(40) }, authorLogin: "someone" }),
+    evaluate: () => EVAL,
+    publish: async () => ({ ok: true, id: 1, conclusion: "neutral" }),
+    spawnWorker: async () => ({ outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }),
+    oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
+    resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
+    prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
+    recordFixAttempt: (d, n2, pr2, cause, sha) => {
+      calls++;
+      // FIRST CALL: a real, legitimate attempt.
+      if (calls === 1) {
+        d.prepare(`INSERT INTO fix_attempt(nwo,pr,cause,attempts,first_at,last_at,last_sha)
+                   VALUES(?,?,?,1,unixepoch(),unixepoch(),?)
+                   ON CONFLICT(nwo,pr,cause) DO UPDATE SET attempts = attempts + 1`)
+          .run(n2, pr2, cause, sha ?? null);
+        return 1;
+      }
+      // SECOND CALL: fails BEFORE the insert lands. Nothing is written.
+      throw new Error("database is locked");
+    },
+  });
+
+  await tick(mk());
+  const afterFirst = store.prepare("SELECT COALESCE(SUM(attempts),0) n FROM fix_attempt").get().n;
+  check(afterFirst === 1, "fixture: the first tick spent one legitimate attempt", String(afterFirst));
+
+  await tick(mk());
+  const afterSecond = store.prepare("SELECT COALESCE(SUM(attempts),0) n FROM fix_attempt").get().n;
+  check(calls === 2, "fixture: the second tick really did reach the attempt write", String(calls));
+  check(afterSecond === 1,
+    "a PRE-COMMIT failure refunds nothing, so the earlier legitimate attempt survives",
+    JSON.stringify({ afterFirst, afterSecond }));
+  store.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // ── the retirement must not take the tick with it ────────────────────────
 // The retirement runs inside a CATCH, and `finishRun` writes several rows in a
 // transaction and rethrows database errors — against the same store that just

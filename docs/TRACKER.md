@@ -541,6 +541,46 @@ HANDOFF §0 and re-opens ruling 16 (ledger import).
       guardian runs `reeve run nextlyhq/nextly` with no such flag, from a
       checkout pinned at main that reeve never self-updates, so none of them can
       bite until both change.
+
+- [ ] **S2-C follow-up, the three deferred dispatch P1s — BUILT (2026-08-27).**
+      Branch `fix/s2c-dispatch-followups`, based on `db1b129`, tracked as #52.
+      Closes what #44 merged with open.
+
+      A run whose fix attempt cannot be recorded is now RETIRED rather than left
+      `leased` for ever behind a UNIQUE one-live-run index that no production
+      reaper clears. The queue-head preflight no longer marks `askedFor`, which
+      had reintroduced marking from INTENT — the exact thing the sweep's own
+      comment calls dishonest — so a row the later gates refused sat queued under
+      the live guardian blocking every builder admission. And a provider
+      heartbeat that renews NO row now revokes the worker, where the result had
+      been discarded entirely and the worker outlived its lease while the
+      scheduler admitted replacement work beside it.
+
+      **Two fixture traps, both caught by precondition assertions rather than by
+      reading the output.** Dropping `fix_attempt` to make `recordFixAttempt`
+      throw does not isolate it — `countFixAttempts` reads the same table earlier
+      in the loop, so the pull request never reaches `startRun`, the run under
+      test is never created, and the assertions run over an empty table and pass
+      on nothing. And a harness edit silently failed to apply because a fixture
+      added earlier in the same session had introduced a second copy of the
+      anchor line, so the options were ignored and two controls passed vacuously.
+      **Write the "fixture:" assertion first, not last.**
+
+      **The arming picture is three flags, not one, and I had it wrong.** The
+      peer lane measured it: `--execute` gates #52; `--execute` AND
+      `watch.reviewActions` gate one half of #51; `--enforce` gates the other,
+      with `--execute` not involved. `publishVerdict` is called UNCONDITIONALLY,
+      so reeve publishes a check every tick today, harmless only because the
+      conclusion is `neutral` and no check is required. **reeve never merges** —
+      `ACTIONS.MERGE` is decided in `watcher.mjs` and handled nowhere in the
+      daemon (control: FIX_CI 12 refs, REQUEST_REVIEW 11, MERGE 0), so a bad
+      verdict publishes a wrongly-green check rather than merging anything.
+
+      **And the gate is not the one written down.** #51's second hole can make a
+      SHADOW verdict wrongly PASS, and the shadow agreement streak is the
+      evidence for enabling enforcement — so the signal that argues for the
+      switch is contaminated by the defect the switch makes dangerous. The real
+      gate is "close #51 before the shadow week is READ as evidence".
       gap does not make deferring it free.
 
 - [ ] **S2-C PR-C2, the guardian's hub guest — BUILT (2026-08-26).** Branch

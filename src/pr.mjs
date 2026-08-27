@@ -522,14 +522,18 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
                    hardCap: profile.rounds?.hardCap ?? 10,
                    unspilledCritical: facts.unspilledCritical };
 
-  let ledgerBlockers = null;
+  let ledgerBlockers = null, ledgerBlockerIds = null;
   if (db) {
     try {
-      ledgerBlockers = db.prepare(
-        `SELECT count(*) AS c FROM edge e JOIN node n ON n.id = e.src
+      // The IDS as well as the count. The count is what the verdict clause reads;
+      // the ids are what makes a repair of them identifiable, so a second attempt
+      // at the same blockers can be recognised as the same problem.
+      ledgerBlockerIds = db.prepare(
+        `SELECT n.id AS id FROM edge e JOIN node n ON n.id = e.src
          WHERE e.dst = ? AND e.type = 'BLOCKS'
-           AND n.status NOT IN ('done','decided','cancelled','refuted')`).get(`pr:${pr}`).c;
-    } catch { ledgerBlockers = null; }
+           AND n.status NOT IN ('done','decided','cancelled','refuted')`).all(`pr:${pr}`).map(r => r.id);
+      ledgerBlockers = ledgerBlockerIds.length;
+    } catch { ledgerBlockers = null; ledgerBlockerIds = null; }
   }
 
   const verdict = computeVerdict({
@@ -556,6 +560,11 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
            // second is null: a caller must be able to tell "nothing is open" from
            // "reeve cannot say what is open".
            threadDetails: facts.threadDetails, reviewProjection: facts.projection,
+           // Carried out so the dispatcher can identify a ledger-driven repair.
+           // `FIX_FINDINGS` fires on this clause too, and a fingerprint built only
+           // from review threads is null when the ledger is the only blocker — so
+           // the retry brake never engaged for exactly that case.
+           ledgerBlockerIds,
            cleared: facts.cleared };
 }
 

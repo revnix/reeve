@@ -305,5 +305,39 @@ ingest(db, NWO, 1, [
 
 db.close();
 rmSync(dir, { recursive: true, force: true });
+// ── the review count belongs to the PROJECTION, not to the inbox now ────────
+//
+// Counting the inbox at read time looks equivalent, because ingest and derive run
+// together in a tick. They stop being equivalent the moment derive FAILS after
+// ingest succeeded: the inbox holds the new review, the projection does not, and
+// a count taken from the inbox matches the live read and accepts the stale
+// projection — the cross-check agreeing with itself, in exactly the failure it
+// exists for.
+{
+  const dirR = mkdtempSync(join(tmpdir(), "reeve-revtotal-"));
+  const dbR = open(join(dirR, "s.db"));
+  noteHead(dbR, NWO, 7, HEAD_A, T);
+  ingest(dbR, NWO, 7, [review(1, "codex", "**![P1 Badge](x) one**", HEAD_A, T)], { at: T });
+  derivePr(dbR, NWO, 7, PROFILE, { at: T, head: HEAD_A });
+  check(reviewState(dbR, NWO, 7, PROFILE, { at: T, head: HEAD_A }).reviewTotal === 1,
+    "the projection reports the review count it was folded from",
+    String(reviewState(dbR, NWO, 7, PROFILE, { at: T, head: HEAD_A }).reviewTotal));
+
+  // Ingest a second review and do NOT re-derive — the shape of a fold that failed
+  // after ingest succeeded.
+  ingest(dbR, NWO, 7, [review(2, "codex", "a second review", HEAD_A, T + 50)], { at: T + 50 });
+  const stale = reviewState(dbR, NWO, 7, PROFILE, { at: T + 60, head: HEAD_A });
+  check(stale.reviewTotal === 1,
+    "an inbox that has moved without a re-derive does NOT move the projection's count",
+    String(stale.reviewTotal));
+  check(stale.reviewTotal !== 2,
+    "control: counting the inbox now would have said 2, and agreed with a live read of 2");
+
+  derivePr(dbR, NWO, 7, PROFILE, { at: T + 70, head: HEAD_A });
+  check(reviewState(dbR, NWO, 7, PROFILE, { at: T + 70, head: HEAD_A }).reviewTotal === 2,
+    "control: and re-deriving does move it, so this is binding rather than freezing");
+  rmSync(dirR, { recursive: true, force: true });
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

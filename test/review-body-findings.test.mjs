@@ -508,6 +508,20 @@ ingest(db, NWO, 1, [
     "and nothing open is not a problem to cap, so it has no identity at all");
   check(findingsFingerprint([{ id: "" }, { anchor: "body" }]) === null,
     "control: items with no usable id contribute nothing rather than an empty-string identity");
+
+  // LEDGER BLOCKERS ARE PART OF THE PROBLEM'S IDENTITY. FIX_FINDINGS is selected
+  // by the ledger clause too, and when a ledger blocker is the only reason there
+  // are no review findings at all — so a key built from review threads alone was
+  // null, nothing was recorded, and the brake never engaged for the one kind of
+  // repair that changes no GitHub state.
+  check(findingsFingerprint([], ["node:7"]) !== null,
+    "a ledger-only repair has an identity, where before it had none");
+  check(findingsFingerprint([], ["node:7"]) !== findingsFingerprint([], ["node:8"]),
+    "and different blockers are a different problem");
+  check(findingsFingerprint(A, ["node:7"]) !== findingsFingerprint(A),
+    "control: the same review findings with a blocker are not the same problem without one");
+  check(findingsFingerprint([], []) === null,
+    "control: neither findings nor blockers is still nothing to cap");
 }
 
 // ── both ENDS of the live review cross-check, not just the comparison ───────

@@ -63,7 +63,14 @@ function worst(a, b) {
  * every verdict".
  */
 export const CLAUSE_IDS = Object.freeze(
-  ["ci", "base", "review", "rounds", "threads", "findings", "mergeable", "cleared", "hold"]);
+  ["ci", "base", "review", "rounds", "threads", "findings", "mergeable", "cleared", "hold",
+   // Two facts about review BODIES, and they are separate because their answers
+   // are. `bodyFindings` is work — a worker can fix one and a later round can
+   // supersede it. `bodyReadable` is reeve reporting that it cannot parse a
+   // reviewer's bodies at all, which no worker can act on and only the operator
+   // can clear by declaring that reviewer. The watcher routes them to different
+   // places, so one id could not have carried both.
+   "bodyFindings", "bodyReadable"]);
 
 export function computeVerdict(i) {
   const clauses = [];
@@ -115,12 +122,17 @@ export function computeVerdict(i) {
 
   // 4. Round budget. Past the soft cap only P0/P1 keep the loop running, and a
   //    critical finding is never spilled to a follow-up.
+  // The cap BLOCKS on `blockingCritical` and refuses to SPILL on
+  // `unspilledCritical`, and they are different numbers on purpose. Blocking-ness
+  // says whose opinion gates a merge; the spill rule says a critical is never
+  // deferred whoever filed it. Sharing one number made an advisory reviewer's
+  // critical escalate a pull request every gating clause had passed.
   const R = i.rounds;
   if (!R) add("rounds", PASS, "no round accounting");
-  else if (R.n >= R.hardCap && R.unspilledCritical > 0)
-    add("rounds", BLOCK, `hard cap ${R.hardCap} reached with ${R.unspilledCritical} P0/P1 finding(s) open — escalate, never spill a critical`);
-  else if (R.n >= R.softCap && R.unspilledCritical > 0)
-    add("rounds", BLOCK, `past soft cap ${R.softCap} with ${R.unspilledCritical} critical finding(s) still open`);
+  else if (R.n >= R.hardCap && R.blockingCritical > 0)
+    add("rounds", BLOCK, `hard cap ${R.hardCap} reached with ${R.blockingCritical} P0/P1 finding(s) open from a blocking reviewer — escalate, never spill a critical`);
+  else if (R.n >= R.softCap && R.blockingCritical > 0)
+    add("rounds", BLOCK, `past soft cap ${R.softCap} with ${R.blockingCritical} critical finding(s) still open from a blocking reviewer`);
   // PAST THE CAP with an UNKNOWN critical count is not a pass.
   //
   // `null > 0` is false, so an unreadable projection fell straight through to the
@@ -136,10 +148,14 @@ export function computeVerdict(i) {
   // which the watcher handles before BLOCK findings, so the cap stopped every
   // repair instead of stopping a spill. Absence read as success was the defect;
   // absence read as paralysis is not the fix.
-  else if (R.n >= R.softCap && R.unspilledCritical == null && R.criticalGap !== "not-derived")
-    add("rounds", UNKNOWN, `past soft cap ${R.softCap} and reeve cannot say how many criticals are open`);
+  // A missing count is now always transient -- the projection could not be read on
+  // this tick -- so UNKNOWN is honest and clears itself. The PASS that used to sit
+  // here existed because the count was permanently missing, and a permanent gap
+  // reported as UNKNOWN stopped every remediation instead of stopping a spill.
+  // That gap is closed: a body reeve cannot read is counted as one unknown
+  // finding, so the cap is enforced rather than announced as unenforced.
   else if (R.n >= R.softCap && R.unspilledCritical == null)
-    add("rounds", PASS, `round ${R.n} of ${R.softCap}/${R.hardCap} — the critical cap is NOT enforced: review-body findings are not derived`);
+    add("rounds", UNKNOWN, `past soft cap ${R.softCap} and reeve cannot say how many criticals are open`);
   else add("rounds", PASS, `round ${R.n} of ${R.softCap}/${R.hardCap}`);
 
   // 5. Unresolved threads. A truncated read is not zero: reviewThreads(first:100)
@@ -168,6 +184,45 @@ export function computeVerdict(i) {
   else if (i.cleared.uncleared > 0)
     add("cleared", BLOCK, `${i.cleared.uncleared} thread(s) that ${i.cleared.reviewers.join(", ") || "a blocking reviewer"} has not come back to`);
   else add("cleared", PASS, "every blocking reviewer's threads have been returned to");
+
+  // 5c. Findings stated in a review BODY, which have no thread to resolve.
+  //
+  //     Their OWN clause, and that is the whole point of it. The `threads` clause
+  //     reads GitHub's live count of unresolved threads, and a body finding is not
+  //     one, so a body-only finding left it passing. `cleared` did block, but the
+  //     watcher answers `cleared` by asking for another review round -- right for a
+  //     thread nobody has come back to, wrong here, because the reviewer has
+  //     already spoken and what is missing is the fix. Between them a body finding
+  //     was derived, counted, and acted on by nothing.
+  //
+  //     Routed alongside `threads` and `findings` in the watcher, so it dispatches
+  //     a worker rather than another request for a round.
+  const B = i.bodyFindings;
+  if (!B || B.readable === false)
+    add("bodyFindings", UNKNOWN, `cannot say what a reviewer stated in a review body${B?.why ? ` — ${B.why}` : ""}`);
+  else if (B.open > 0)
+    add("bodyFindings", BLOCK, `${B.open} finding(s) stated in a review body by ${B.reviewers.join(", ") || "a blocking reviewer"}, with no thread to resolve`);
+  else add("bodyFindings", PASS, "no open review-body findings");
+
+  // 5d. Bodies reeve could not READ, which is a different question from whether
+  //     there are findings in them and must not share a clause with it.
+  //
+  //     Its own clause because its answer is its own too. A body finding is work:
+  //     a worker can fix it and a reviewer can supersede it. This is neither. No
+  //     code is wrong, no thread exists, and the only thing that clears it is the
+  //     operator describing that reviewer in the profile — so the watcher routes
+  //     it to a person rather than to a worker.
+  //
+  //     Every author counts, rostered or not. Blocking-ness says whose OPINION
+  //     gates a merge; this is not an opinion, it is reeve reporting that it does
+  //     not know what was said, and a stranger's unread body is exactly as unread
+  //     as a configured reviewer's.
+  const U = i.unreadableBodies;
+  if (!U || U.readable === false)
+    add("bodyReadable", UNKNOWN, `cannot say whether every review body was readable${U?.why ? ` — ${U.why}` : ""}`);
+  else if (U.open > 0)
+    add("bodyReadable", BLOCK, `${U.open} review body/bodies from ${U.reviewers.join(", ")} that reeve cannot read — declare bodyFindings for them`);
+  else add("bodyReadable", PASS, "every review body was readable");
 
   // 6. Ledger blockers. null means the store could not answer, which is not zero.
   //    The previous gate skipped this check entirely when the read failed.

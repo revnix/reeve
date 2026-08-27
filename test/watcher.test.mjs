@@ -279,20 +279,111 @@ check("an uncleared thread ASKS THE REVIEWER, rather than dispatching a fixer",
   // composition was broken, which is the seam-versus-mounted trap: the watcher
   // was fine, the verdict was fine in isolation, and together they waited
   // forever. Only a test that runs both catches it.
-  const composed = computeVerdict({
+  const compose = over => computeVerdict({
     head: "c".repeat(40),
     checks: { verdict: "GREEN", settled: true, failing: [] },
     base: { verdict: "GREEN" },
     reviewers: [{ login: "codex", kind: "blocking", state: "CLEAN", reviewedHead: "c".repeat(10) }],
-    rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "not-derived" },
-    threads: { unresolved: 2, total: 4, readable: true },
+    rounds: { n: 2, softCap: 5, hardCap: 10, unspilledCritical: 0, blockingCritical: 0 },
+    threads: { unresolved: 0, total: 4, readable: true },
     cleared: { readable: true, uncleared: 0, reviewers: [] },
-    ledgerBlockers: 0, mergeState: "CLEAN",
+    bodyFindings: { readable: true, open: 0, reviewers: [] },
+    unreadableBodies: { readable: true, open: 0, reviewers: [] },
+    ledgerBlockers: 0, mergeState: "CLEAN", ...over,
   });
-  const d = nextAction({ pr: 1, state: "open", verdict: composed, checks: {},
-                         rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null } }, P);
+  const through = (over, hist) => nextAction(
+    { pr: 1, state: "open", verdict: compose(over), checks: {}, rounds: hist ?? { n: 2, softCap: 5, hardCap: 10, unspilledCritical: 0 } }, P).action;
+
   check("and the same holds through computeVerdict, which is where the state is decided",
-    d.action, ACTIONS.FIX_FINDINGS);
+    through({ threads: { unresolved: 2, total: 4, readable: true } }), ACTIONS.FIX_FINDINGS);
+
+  // The permanent gap this block was written for is closed -- an unreadable review
+  // body is counted as one `unknown` finding instead of being left out of the
+  // count -- so the cap is enforced rather than announced as unenforced. What that
+  // must NOT have cost is the property the block exists to protect: the cap stops
+  // a spill, never every repair.
+  check("past the cap a critical now ESCALATES, which is the cap actually enforced",
+    through({ rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1, blockingCritical: 1 },
+              threads: { unresolved: 2, total: 4, readable: true } },
+            { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1 }),
+    ACTIONS.ESCALATE);
+  // ...and an ADVISORY reviewer's critical does not, which is why the count was
+  // split. Every gating clause passes, so escalating here would be the pull
+  // request stopped by an opinion the profile says does not gate. The universal
+  // count is still 1, so the spill branch below still refuses — one fixture
+  // showing the two rules reading two numbers and disagreeing on purpose.
+  check("control: an advisory critical past the cap dispatches instead of escalating",
+    through({ rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1, blockingCritical: 0 },
+              threads: { unresolved: 2, total: 4, readable: true } },
+            { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1 }),
+    ACTIONS.FIX_FINDINGS);
+  check("control: and past the cap with a KNOWN zero it still spills rather than stalling",
+    through({ rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 0 },
+              threads: { unresolved: 2, total: 4, readable: true } },
+            { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 0 }),
+    ACTIONS.SPILL);
+
+  // A body finding composes to a FIXER, not to another request for a round. Both
+  // halves worked in isolation before this: the fold derived it and the clause
+  // blocked on it, and the watcher answered by asking the reviewer to come back --
+  // so the finding was derived, counted, and acted on by nothing.
+  check("an open review-body finding dispatches a fixer, with no thread unresolved",
+    through({ bodyFindings: { readable: true, open: 1, reviewers: ["codex"] } }),
+    ACTIONS.FIX_FINDINGS);
+  check("control: and with none open the same shape does not dispatch one",
+    through({}), ACTIONS.MERGE);
+
+  // A BODY FINDING PLUS A STALE REVIEW ASKS, IT DOES NOT FIX AGAIN.
+  //
+  // Nothing a worker does can close a body finding: it has no thread, so the only
+  // operation that clears one is the same reviewer reviewing again. Fixing it
+  // therefore pushes a new head, which leaves the finding open AND makes the
+  // review stale — and this branch sits above the stale-review branch, so it would
+  // dispatch another worker at the finding it had just repaired, once per push for
+  // as long as the budget lasted.
+  const staleReviewer = [{ login: "codex", kind: "blocking", state: "CLEAN", reviewedHead: "d".repeat(10) }];
+  check("with the review stale, an open body finding asks for a round instead of fixing again",
+    through({ reviewers: staleReviewer,
+              bodyFindings: { readable: true, open: 1, reviewers: ["codex"] } }),
+    ACTIONS.REQUEST_REVIEW);
+  check("control: with the reviewer covering THIS head, the same finding does dispatch a fixer",
+    through({ bodyFindings: { readable: true, open: 1, reviewers: ["codex"] } }),
+    ACTIONS.FIX_FINDINGS);
+  // And the exemption is scoped to body findings alone: an unresolved THREAD can
+  // be closed by a worker, so a stale review must not stop that.
+  // A BODY REEVE CANNOT READ FETCHES A PERSON, and does it before anything that
+  // could act on the pull request. Not a worker: there is nothing for one to fix.
+  // Not a silent block: clearing a body finding needs its author to review the
+  // same head again, which a one-time commenter never will, so blocking alone
+  // leaves a pull request nothing can free.
+  check("an unreadable review body escalates rather than dispatching a worker",
+    through({ unreadableBodies: { readable: true, open: 1, reviewers: ["a-human"] } }),
+    ACTIONS.ESCALATE);
+  check("and it wins over a fixer that would otherwise run, because it is read first",
+    through({ unreadableBodies: { readable: true, open: 1, reviewers: ["a-human"] },
+              threads: { unresolved: 2, total: 4, readable: true } }),
+    ACTIONS.ESCALATE);
+  // AND AN UNRELATED UNCERTAINTY DOES NOT DEFER IT. This is a definite state —
+  // reeve knows it cannot read the body — so it must not queue behind the generic
+  // "something is in flight" wait. GitHub still computing mergeability is the
+  // ordinary case, and below that branch the operator got "a clause could not be
+  // evaluated" after the settling window instead of the sentence naming the
+  // reviewer to declare. An immediate escalation anything else can postpone is not
+  // immediate.
+  check("an unrelated UNKNOWN clause does not defer it into a wait",
+    through({ unreadableBodies: { readable: true, open: 1, reviewers: ["a-human"] },
+              mergeState: "" }),
+    ACTIONS.ESCALATE);
+  check("control: that same UNKNOWN really does produce a wait on its own",
+    through({ mergeState: "" }), ACTIONS.WAIT);
+  check("control: with every body readable, that same shape dispatches the fixer",
+    through({ threads: { unresolved: 2, total: 4, readable: true } }),
+    ACTIONS.FIX_FINDINGS);
+
+  check("control: a stale review does NOT hold back a fixer for an unresolved thread",
+    through({ reviewers: staleReviewer,
+              threads: { unresolved: 2, total: 4, readable: true } }),
+    ACTIONS.FIX_FINDINGS);
 }
 // Past the hard cap it stops asking and fetches a person.
 check("past the hard cap an uncleared thread escalates rather than asking again",

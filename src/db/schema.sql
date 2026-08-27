@@ -268,6 +268,82 @@ CREATE TABLE IF NOT EXISTS review_thread (
   PRIMARY KEY (nwo, pr, thread_id)) STRICT;
 CREATE INDEX IF NOT EXISTS thread_pr ON review_thread(nwo, pr, is_cleared, severity);
 
+-- A finding stated in a review's BODY, with no inline thread of its own.
+--
+-- A SEPARATE table from review_thread on purpose, not a flag on it. The two
+-- populations answer different questions and only one of them has a GitHub
+-- object behind it: a thread can be replied to and resolved, a body finding
+-- cannot. Sharing a table would put a synthetic id one careless filter away from
+-- a resolve mutation that can only fail, and would break the live cross-check
+-- besides -- `compare` measures the projection's thread counts against a live
+-- THREAD read, so a body finding counted as a thread is a permanent disagreement
+-- that would turn the whole review path UNKNOWN.
+--
+-- `is_cleared` here carries a WEAKER rule than the one on a thread, and the
+-- difference is the founder's decision of 2026-08-27. A thread clears when it is
+-- resolved AND a later substantive round by the same reviewer covered this head.
+-- A body finding has no resolve to observe, so only the second half survives: the
+-- reviewer looked at this same revision again. If the problem is still there the
+-- reviewer restates it and it returns as a new finding.
+CREATE TABLE IF NOT EXISTS review_body_finding (
+  nwo        TEXT NOT NULL,
+  pr         INTEGER NOT NULL,
+  -- `<review external_id>#<ordinal>`. Stable across re-derivation because the
+  -- fold reads the LATEST generation of each review, so an edited body re-derives
+  -- under the same external_id rather than accumulating.
+  finding_id TEXT NOT NULL,
+  reviewer   TEXT NOT NULL,
+  severity   TEXT NOT NULL CHECK (severity IN
+               ('critical','major','minor','nit','unknown')),
+  is_cleared INTEGER NOT NULL DEFAULT 0,
+  excerpt    TEXT NOT NULL,
+  event_at   INTEGER,
+  -- Is this row a FINDING, or a statement that reeve could not read the body it
+  -- came from? Both are counted -- an unreadable body must not be spillable -- but
+  -- only one of them is work. There is nothing for a worker to fix in "I cannot
+  -- parse this reviewer", and nothing for a reviewer to clear either; it is
+  -- cleared by the operator describing that reviewer in the profile. So it is
+  -- routed to a person rather than to a worker, and keeping the two apart in the
+  -- row is what lets the readers ask their own question instead of sharing one.
+  unreadable INTEGER NOT NULL DEFAULT 0,
+  -- The revision the filing round was bound to. Recorded so a later reader can
+  -- tell a finding filed against this head from one carried over from an older
+  -- one, without re-deriving.
+  head_full  TEXT,
+  classifier_version TEXT NOT NULL,
+  PRIMARY KEY (nwo, pr, finding_id)) STRICT;
+CREATE INDEX IF NOT EXISTS body_finding_pr
+  ON review_body_finding(nwo, pr, is_cleared, severity);
+
+-- WHICH generation of an object is the one being observed NOW.
+--
+-- The inbox is content-addressed: re-polling unchanged data writes nothing,
+-- because (source, external_id, content_hash) already holds it. That is right for
+-- STORAGE and wrong as an answer to "what does this object say today", and the
+-- fold was using MAX(generation) as a stand-in for it.
+--
+-- The two only agree while content never repeats. A body edited A -> B -> A
+-- matches A's existing hash on the third observation, so nothing is written, and
+-- MAX(generation) still points at B. The fold then reads text the reviewer has
+-- already replaced, and a finding restored by the revert is invisible.
+--
+-- The split is the one Git makes and this table is the missing half: blobs are
+-- content-addressed and deduplicated, while a ref records which blob is current.
+-- Storing the pointer separately keeps de-duplication AND makes "current" a
+-- recorded fact rather than one inferred from an ordering that does not hold.
+--
+-- Upserted on EVERY observation, including one whose payload was already stored.
+-- That is the whole point: the write that was being skipped is the one that
+-- carries the information.
+CREATE TABLE IF NOT EXISTS inbox_current (
+  pr_number    INTEGER NOT NULL,
+  source       TEXT NOT NULL,
+  external_id  TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  generation   INTEGER NOT NULL,
+  observed_at  INTEGER NOT NULL,
+  PRIMARY KEY (pr_number, source, external_id)) STRICT;
+
 -- Per-reviewer availability as a BAND, not a rate. Measured: 15/15 refusals in
 -- one 7-hour window, then ~30 straight answers over 29 hours.
 CREATE TABLE IF NOT EXISTS reviewer_supply (
@@ -302,6 +378,16 @@ CREATE TABLE IF NOT EXISTS projection_meta (
   -- with no head in hand. Both are UNKNOWN and neither is usable, which is the
   -- same fail-closed reading as the four staleness reasons beside it.
   head       TEXT,
+  -- Could the body-finding derivation have been COMPLETE for this pull request?
+  --
+  -- Stored with the projection rather than computed by a reader, for the same
+  -- reason `head` is: it is a property of how these rows were derived, and a
+  -- reader recomputing it from today's profile would answer about a fold that
+  -- never ran. 0 means at least one reviewer posted a substantive review body
+  -- and the profile does not say how that reviewer's bodies carry findings, so
+  -- the critical count below may be missing one. Default 0 -- a projection
+  -- written before this column existed derived no body findings at all.
+  body_derived INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (nwo, scope)) STRICT;
 
 -- ------------------------------------------------------------ review shadow

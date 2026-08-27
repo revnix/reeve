@@ -32,6 +32,7 @@ export const ESCALATIONS = {
   PROTECTION_UNMET: "GitHub's protection requires something reeve does not provide (typically an approving review)",
   REVIEWERS_DOWN: "no blocking reviewer is reachable",
   NOT_CHECKABLE: "a clause could not be evaluated and stayed that way",
+  BODY_UNREADABLE: "a reviewer wrote a review body reeve cannot read",
 };
 
 const clause = (v, id) => v.clauses.find(c => c.id === id);
@@ -158,6 +159,30 @@ export function nextAction(e, p, h = {}) {
     return act(ACTIONS.FIX_CI, `failing: ${named.join(", ")}`, { caused: named, attempt: tried + 1 });
   }
 
+  // A body reeve cannot READ goes straight to a person.
+  //
+  // Not a worker, because there is nothing for one to do: no code is wrong, no
+  // thread exists, and the fix is a line of profile only the operator can write.
+  // Not a silent block either, which was the alternative and the worse one:
+  // clearing a body finding needs its author to review the same head again, and
+  // someone who comments once never will, leaving a pull request nothing can free.
+  // Escalating stops the merge AND gives a person the decision — the founder's
+  // ruling of 2026-08-27.
+  //
+  // ABOVE the UNKNOWN branch, and that placement is load-bearing. This is a
+  // DEFINITE state, not an uncertainty: reeve knows it cannot read the body. Below
+  // that branch, any unrelated UNKNOWN — GitHub still computing mergeability is
+  // the ordinary one — returned WAIT instead, and after the settling window the
+  // operator got the generic "a clause could not be evaluated" rather than the one
+  // sentence naming the reviewer to declare. An immediate escalation that any
+  // other uncertainty can defer is not immediate.
+  //
+  // Still below CI, deliberately: a red check is actionable, independent of this,
+  // and repairing it merges nothing.
+  const bodyReadable = clause(v, "bodyReadable");
+  if (bodyReadable?.state === "BLOCK")
+    return act(ACTIONS.ESCALATE, ESCALATIONS.BODY_UNREADABLE, { detail: bodyReadable.detail });
+
   // 4. Anything still in flight: wait. But an UNKNOWN that never resolves is a
   //    stall, so it escalates once it has outlived a reasonable settling window.
   const unknowns = v.clauses.filter(c => c.state === "UNKNOWN");
@@ -190,15 +215,35 @@ export function nextAction(e, p, h = {}) {
   // `cleared` deliberately does NOT join these two, and getting that wrong was a
   // real defect. See its own branch below, after the stale-review one.
   const cleared = clause(v, "cleared");
-  if (threads?.state === "BLOCK" || findings?.state === "BLOCK") {
+  // A body finding is actionable work, so it joins this branch rather than the
+  // `cleared` one below. `cleared` asks the reviewer to come back; here the
+  // reviewer has already spoken and the fix is what is missing.
+  //
+  // BUT ONLY WHILE THE REVIEWER HAS COVERED THIS HEAD, and that condition is the
+  // difference between a fix and a loop. A body finding has no thread, so nothing
+  // a worker does can close it: the only operation that clears one is the same
+  // reviewer reviewing again. Fixing it therefore pushes a new head, which leaves
+  // the finding open AND makes the review stale -- and this branch, sitting above
+  // the stale-review branch, would dispatch another worker at the finding it just
+  // repaired, for as many pushes as the budget allows.
+  //
+  // So when the review is stale, the request for a round below takes precedence.
+  // It is the same rule `cleared` already follows and this branch was quietly
+  // exempting itself from: where only the reviewer can close something, ask the
+  // reviewer.
+  const bodyFindings = clause(v, "bodyFindings");
+  const reviewStale = clause(v, "review")?.state === "BLOCK";
+  const bodyActionable = bodyFindings?.state === "BLOCK" && !reviewStale;
+  if (threads?.state === "BLOCK" || findings?.state === "BLOCK" || bodyActionable) {
     const R = e.rounds ?? {};
     // `?? 0` here would read an UNKNOWN critical count as "no criticals" and spill
     // on it, which is the standing ruling inverted. Only a known zero may spill.
     if ((R.n ?? 0) >= (R.softCap ?? 5) && R.unspilledCritical === 0)
       return act(ACTIONS.SPILL, `past the soft cap with only non-critical findings open`, { round: R.n });
-    const blocking = [threads, findings].filter(c => c?.state === "BLOCK");
+    const blocking = [threads, findings, bodyActionable ? bodyFindings : null].filter(c => c?.state === "BLOCK");
     return act(ACTIONS.FIX_FINDINGS, blocking.map(c => c.detail).filter(Boolean).join("; ") || "findings block this PR",
-               { threads: threads?.state === "BLOCK", findings: findings?.state === "BLOCK" });
+               { threads: threads?.state === "BLOCK", findings: findings?.state === "BLOCK",
+                 bodyFindings: bodyActionable });
   }
 
   // 6. A stale verdict: reviewed, but not this revision.

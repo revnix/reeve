@@ -117,6 +117,31 @@ const REVIEWER = v => {
       if (!SEVERITY.includes(severity)) return `severityMarkers[${i}] severity must be one of ${SEVERITY.join(" | ")}`;
     }
   }
+  // How this reviewer's review BODIES carry findings, and the two legal answers
+  // are both POSITIVE statements.
+  //
+  //   a regex -- each match starts one finding, and the finding runs to the next
+  //             match. Codex marks every one with a severity badge, so the badge
+  //             is the delimiter.
+  //   false   -- this reviewer never states findings in a body; its bodies are
+  //             summaries and its findings arrive as inline threads. CodeRabbit
+  //             works this way.
+  //
+  // ABSENT is neither, and it is not a default. A missing declaration means
+  // nobody has said which of the two this reviewer is, so the fold records that
+  // its body-finding count could be short and the critical count stays unusable.
+  // Guessing the friendly answer here is how a P0 written in a body gets spilled.
+  if (v.bodyFindings !== undefined && v.bodyFindings !== false) {
+    const e = isStr(v.bodyFindings);
+    if (e) return `bodyFindings ${e} (or false, meaning this reviewer's bodies carry no findings)`;
+    try { new RegExp(v.bodyFindings, "g"); }
+    catch (err) { return `bodyFindings is not a valid regex: ${err.message}`; }
+    // A pattern that matches the empty string matches at EVERY index, which would
+    // split a body into one finding per character. Refused here rather than
+    // guarded in the fold, because a profile that cannot mean anything sensible
+    // should not load at all.
+    if (new RegExp(v.bodyFindings, "g").test("")) return "bodyFindings matches the empty string, so it would match at every position";
+  }
   // cleanReaction is NOT here: it is a literal GitHub reaction name compared with
   // ===, and "+1" is not a valid regex ("nothing to repeat"). Validating it as one
   // refused a correct profile.

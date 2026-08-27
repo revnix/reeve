@@ -920,6 +920,25 @@ export function effectsFor({ nwo, e, decision, profile, execute }) {
   return { effects: asking ? effects : [], unsummonable: asking ? unsummonable : [], retire };
 }
 
+/**
+ * What a FIX_FINDINGS worker is actually sent, given what the decision decided.
+ *
+ * The decision decides WHAT is dispatched, not merely whether to dispatch.
+ * `nextAction` withholds a body finding while its reviewer has not covered this
+ * head, because nothing a worker does can close one — there is no thread to
+ * resolve — and repairing it only pushes a head that re-opens it. That judgement
+ * was being made and then discarded: on a MIXED pull request, a stale body finding
+ * beside an unresolved thread, the branch still fires for the thread and the whole
+ * list went to the prompt, body finding included.
+ *
+ * A named function rather than a line inside `tick`, because a rule buried in a
+ * branch of a 2000-line loop is a rule nothing can test. Pure, so it can be.
+ */
+export function dispatchable(decision, threadDetails) {
+  const items = threadDetails ?? [];
+  return decision?.bodyFindings ? items : items.filter(t => t?.anchor !== "body");
+}
+
 /** How long has this PR been sitting in UNKNOWN? Read from the event log, not memory. */
 function unknownSince(db, pr) {
   try {
@@ -2244,7 +2263,7 @@ export async function tick(ctx) {
         // retry the design allows.
         promptCtx = { ...promptCtx, cause: worked, attempt: countFixAttempts(db, nwo, e.pr, fp) + 1 };
       } else if (decision.action === "FIX_FINDINGS") {
-        promptCtx = { ...promptCtx, threads: e.threadDetails ?? [] };
+        promptCtx = { ...promptCtx, threads: dispatchable(decision, e.threadDetails) };
       } else if (decision.action === "REQUEST_REVIEW") {
         promptCtx = { ...promptCtx, reviewers: (profile.reviewers ?? []).filter(r => r.trigger) };
       } else if (decision.action === "SPILL") {

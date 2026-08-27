@@ -383,13 +383,33 @@ export async function checkAppIdentity(nwo) {
  * finding text no marker could read. Those findings block as critical, so a
  * rotted taxonomy shows up as a repository that stops merging.
  */
-function checkDetectors(db, profile) {
+/**
+ * R-08, exported so the positive control it provides can itself be controlled.
+ *
+ * A detector reported as demonstrated when it has never fired against the surface
+ * it governs is worse than no report: it is the check that exists to catch a
+ * changed taxonomy, saying the taxonomy is fine.
+ */
+/**
+ * How many of a reviewer's most recent review bodies the delimiter is judged on.
+ *
+ * Small enough that a taxonomy change shows up within a handful of reviews, large
+ * enough that one body which genuinely contains no findings cannot condemn a
+ * working grammar on its own.
+ */
+const RECENT_BODIES = 10;
+
+export function checkDetectors(db, profile) {
   const reviewers = profile?.reviewers ?? [];
   if (!db) return { id: "R-08", level: UNKNOWN, title: "detectors", lines: ["no state database"] };
   if (!reviewers.length) return null;
 
   let rows;
-  try { rows = db.prepare("SELECT source, kind, payload FROM inbox").all(); }
+  // ORDERED, because one of the detectors below is a claim about the CURRENT
+  // grammar rather than about history, and an unordered read cannot tell the two
+  // apart. `observed_at` is when reeve first saw that text, so an edited body's
+  // new generation sorts after the original.
+  try { rows = db.prepare("SELECT source, kind, payload FROM inbox ORDER BY observed_at, id").all(); }
   catch { return { id: "R-08", level: UNKNOWN, title: "detectors", lines: ["inbox is not readable"] }; }
   if (!rows.length) {
     return { id: "R-08", level: UNKNOWN, title: "detectors",
@@ -397,7 +417,7 @@ function checkDetectors(db, profile) {
   }
 
   const bodyOf = r => { try { return String(JSON.parse(r.payload)?.body ?? ""); } catch { return ""; } };
-  const all = new Map(), findings = new Map();
+  const all = new Map(), findings = new Map(), bodies = new Map();
   for (const r of rows) {
     const body = bodyOf(r);
     if (!body) continue;
@@ -405,6 +425,12 @@ function checkDetectors(db, profile) {
     // Severity markers classify FINDINGS. Measuring them against trigger comments
     // and carrier reviews made a healthy profile look two-thirds blind.
     if (r.kind === "review_thread") (findings.get(r.source) ?? findings.set(r.source, []).get(r.source)).push(body);
+    // Review BODIES, kept apart from everything else. `bodyFindings` delimits ONE
+    // surface, and codex uses the same severity badge in inline comments -- so
+    // measuring it against every ingested text lets a match in a THREAD report the
+    // body grammar as demonstrated. The positive control then passes without the
+    // thing it controls ever having fired.
+    if (r.kind === "review") (bodies.get(r.source) ?? bodies.set(r.source, []).get(r.source)).push(body);
   }
 
   const lines = [], broken = [], idle = [];
@@ -427,6 +453,41 @@ function checkDetectors(db, profile) {
       if (n === -1) broken.push(`${rev.login}.${name} does not compile`);
       else if (n === 0) idle.push(`${rev.login}.${name}`);
     }
+
+    // `bodyFindings` is measured against review BODIES alone, never `texts`, and
+    // against RECENT ones rather than all of them. `false` is a declaration rather
+    // than a pattern and has nothing to fire.
+    //
+    // Two different mistakes, and the second is the one that outlives the first.
+    // Scanning every text let a badge in an inline comment vouch for the body
+    // grammar. Scanning every BODY ever ingested then let one match from months
+    // ago vouch for it for ever -- and this detector has no miss ratio to give it
+    // away, because a body the delimiter cannot parse produces no findings rather
+    // than an unclassified one. The taxonomy here has already been replaced
+    // wholesale once: the strings a previous audit recorded appear zero times in
+    // forty current bodies. A check that cannot notice that happening again is not
+    // worth running.
+    if (typeof rev.bodyFindings === "string") {
+      const bodyTexts = bodies.get(rev.login) ?? [];
+      const recent = bodyTexts.slice(-RECENT_BODIES);
+      let rx = null; try { rx = new RegExp(rev.bodyFindings, "i"); } catch { rx = null; }
+      if (!rx) broken.push(`${rev.login}.bodyFindings does not compile`);
+      else if (!recent.length) lines.push(`${rev.login.padEnd(26)} no review bodies ingested yet — bodyFindings unproven`);
+      else {
+        const hit = recent.filter(t => rx.test(t)).length;
+        lines.push(`${rev.login.padEnd(26)} ${hit}/${recent.length} recent review body/bodies parsed by bodyFindings`);
+        // Idle on the RECENT window, so a grammar that has stopped matching shows
+        // up here however long it worked before.
+        if (hit === 0) idle.push(`${rev.login}.bodyFindings`);
+      }
+    }
+
+    // An UNDECLARED reviewer is worth saying out loud, because its consequence is
+    // silent: the fold marks the whole pull request's body-finding count as
+    // possibly short, and the critical count stops being usable for every pull
+    // request this reviewer touches -- not just the ones where it wrote a body.
+    if (!(typeof rev.bodyFindings === "string" || rev.bodyFindings === false))
+      lines.push(`${rev.login.padEnd(26)} bodyFindings undeclared — the critical count cannot be complete`);
 
     const markers = rev.severityMarkers ?? [];
     if (markers.length && found.length) {

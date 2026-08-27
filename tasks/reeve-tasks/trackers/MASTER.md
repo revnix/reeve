@@ -51,8 +51,13 @@ A stage is MERGED only when every row of its Verify table names a file that exis
 
 | what | who | where |
 |---|---|---|
-| S3 plan family + trackers + implementation prompt | this lane | branch `docs/s3-foundation` |
+| S3 plan family, trackers and implementation prompt — **WRITTEN**, not yet in a PR | this lane | branch `docs/s3-foundation` |
 | #54 `fix/ci-concurrency` | founder | open PR, not this lane's |
+
+**S3's eleven documents are complete.** Six plans (14,167 lines, 78 tasks, 62 of them carrying
+`**On the broken implementation**` and a named stub loop), a master plan, an implementation
+prompt and five trackers. Nothing has been claimed and no code has been written; the next
+action is **P1**, the test suite's dead network.
 
 Claims are one file each under `claims/`. **Read `claims/README.md` before starting anything.**
 

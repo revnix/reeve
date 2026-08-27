@@ -26,7 +26,7 @@
 import { derivePr, reviewState, bodyFindingsOf, BLOCKING_SEVERITIES } from "../src/review/derive.mjs";
 import { ingest, noteHead } from "../src/review/ingest.mjs";
 import { compare } from "../src/review/shadow.mjs";
-import { reviewFacts } from "../src/pr.mjs";
+import { reviewFacts, readReviewerStates } from "../src/pr.mjs";
 import { fixFindingsPrompt, spillPrompt } from "../src/prompts.mjs";
 import { dispatchable } from "../src/daemon.mjs";
 import { validate, withDefaults } from "../src/profile/schema.mjs";
@@ -318,6 +318,78 @@ ingest(db, NWO, 1, [
     "control: the same body on a live review yields both findings");
   rmSync(dir7, { recursive: true, force: true });
   rmSync(dir8, { recursive: true, force: true });
+}
+
+// ── the two critical counts are derived differently, not just read differently ──
+//
+// The clause tests inject these numbers, so they prove the verdict READS them
+// correctly and nothing about whether `reviewState` COMPUTES them correctly. This
+// is the half that was missing: unscoping the blocking count changed no test.
+{
+  const dirE = mkdtempSync(join(tmpdir(), "reeve-bodyE-"));
+  const dbE = open(join(dirE, "s.db"));
+  noteHead(dbE, NWO, 14, HEAD_A, T);
+  const p = PROFILE();   // codex is blocking; crab is advisory
+  ingest(dbE, NWO, 14, [
+    thread("PRRT_X", "codex", "**![P1 Badge](x)** a blocking reviewer's critical"),
+    thread("PRRT_Y", "crab", "an advisory reviewer's finding nobody can classify"),
+  ], { at: T });
+  derivePr(dbE, NWO, 14, p, { at: T, head: HEAD_A });
+  const st = reviewState(dbE, NWO, 14, p, { at: T, head: HEAD_A });
+  check(st.unspilledCritical === 2,
+    "the universal count sees BOTH — a critical is never spilled whoever filed it",
+    String(st.unspilledCritical));
+  check(st.blockingCritical === 1,
+    "while the blocking count sees only the reviewer whose opinion gates a merge",
+    String(st.blockingCritical));
+  check(st.unspilledCritical !== st.blockingCritical,
+    "control: and they DIFFER here, so this fixture can tell the two apart at all");
+  rmSync(dirE, { recursive: true, force: true });
+}
+
+// ── a body reverted to earlier text is read as earlier text ─────────────────
+//
+// The inbox is content-addressed, so re-polling unchanged data writes nothing.
+// That is right for storage and wrong as an answer to "what does this object say
+// now": a body edited A -> B -> A matches A's stored hash on the third
+// observation, nothing is written, and MAX(generation) still points at B. The
+// fold then reads text the reviewer has already taken back, and a finding
+// restored by the revert is invisible while the pull request merges.
+{
+  const dirD = mkdtempSync(join(tmpdir(), "reeve-bodyD-"));
+  const dbD = open(join(dirD, "s.db"));
+  noteHead(dbD, NWO, 13, HEAD_A, T);
+  const p = PROFILE();
+  const A = "**![P1 Badge](x) a critical thing**\n\nit is broken.";
+  const B = "on reflection, never mind";
+
+  ingest(dbD, NWO, 13, [review(1, "codex", A, HEAD_A, T)], { at: T });
+  derivePr(dbD, NWO, 13, p, { at: T + 10, head: HEAD_A });
+  check(reviewState(dbD, NWO, 13, p, { at: T + 10, head: HEAD_A }).bodyTotal === 1,
+    "control: the original body yields its finding");
+
+  ingest(dbD, NWO, 13, [review(1, "codex", B, HEAD_A, T)], { at: T + 100 });
+  derivePr(dbD, NWO, 13, p, { at: T + 110, head: HEAD_A });
+  check(reviewState(dbD, NWO, 13, p, { at: T + 110, head: HEAD_A }).bodyTotal === 0,
+    "control: the edit withdrawing it is honoured");
+
+  // The revert. Byte-identical to A, so the content-addressed store holds it
+  // already and writes nothing at all.
+  const before = dbD.prepare("SELECT COUNT(*) c FROM inbox WHERE pr_number = 13").get().c;
+  const r = ingest(dbD, NWO, 13, [review(1, "codex", A, HEAD_A, T)], { at: T + 200 });
+  const after = dbD.prepare("SELECT COUNT(*) c FROM inbox WHERE pr_number = 13").get().c;
+  check(before === after && r.unchanged === 1,
+    "control: the revert really is de-duplicated — no row is written for it",
+    JSON.stringify({ before, after, r }));
+
+  derivePr(dbD, NWO, 13, p, { at: T + 210, head: HEAD_A });
+  const back = reviewState(dbD, NWO, 13, p, { at: T + 210, head: HEAD_A });
+  check(back.bodyTotal === 1,
+    "and the restored finding is read again, though nothing was stored for the revert",
+    JSON.stringify({ total: back.bodyTotal }));
+  check(back.unspilledCritical >= 1,
+    "so a P0 taken back and then restored reaches the count", String(back.unspilledCritical));
+  rmSync(dirD, { recursive: true, force: true });
 }
 
 // ── a DISMISSED review clears nothing, not even other reviews' findings ──────
@@ -623,6 +695,30 @@ ingest(db, NWO, 1, [
   check(withBody(undefined).ok,
     "an absent one is not an ERROR — it is a gap the fold records, not a bad profile",
     JSON.stringify(withBody(undefined).errors));
+}
+
+// ── the LIVE reviewer read asks GitHub for every page ───────────────────────
+//
+// `per_page=100` is a page size, not a promise that one page is all of it. Every
+// inline reply mints a 0-byte COMMENTED review — nine at one commit on nextly
+// #1124 — so review objects outrun real rounds by an order of magnitude and a
+// busy pull request passes 100 easily. Measured on this repository's own #49:
+// per_page=2 returns two rows unpaginated and every row with --paginate.
+//
+// Without it the fold could apply a current-head clean round from page two while
+// this read still reported coverage as stale, so reeve would ask for a review it
+// had already received and could never observe.
+{
+  const calls = [];
+  const fakeGh = args => { calls.push(args); return { ok: true, out: "" }; };
+  readReviewerStates(NWO, 1, HEAD_A, [codexReviewer()], { gh: fakeGh });
+  check(calls.length === 2, "control: both live surfaces are read", String(calls.length));
+  check(calls.every(a => a.includes("--paginate")),
+    "and each asks GitHub for every page rather than the first hundred",
+    JSON.stringify(calls.map(a => a[0])));
+  check(calls.some(a => a.some(x => /pulls\/1\/reviews/.test(String(x)))) &&
+        calls.some(a => a.some(x => /issues\/1\/comments/.test(String(x)))),
+    "control: and they are the surfaces this is about, not some other call");
 }
 
 rmSync(dir, { recursive: true, force: true });

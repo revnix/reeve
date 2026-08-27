@@ -315,6 +315,35 @@ CREATE TABLE IF NOT EXISTS review_body_finding (
 CREATE INDEX IF NOT EXISTS body_finding_pr
   ON review_body_finding(nwo, pr, is_cleared, severity);
 
+-- WHICH generation of an object is the one being observed NOW.
+--
+-- The inbox is content-addressed: re-polling unchanged data writes nothing,
+-- because (source, external_id, content_hash) already holds it. That is right for
+-- STORAGE and wrong as an answer to "what does this object say today", and the
+-- fold was using MAX(generation) as a stand-in for it.
+--
+-- The two only agree while content never repeats. A body edited A -> B -> A
+-- matches A's existing hash on the third observation, so nothing is written, and
+-- MAX(generation) still points at B. The fold then reads text the reviewer has
+-- already replaced, and a finding restored by the revert is invisible.
+--
+-- The split is the one Git makes and this table is the missing half: blobs are
+-- content-addressed and deduplicated, while a ref records which blob is current.
+-- Storing the pointer separately keeps de-duplication AND makes "current" a
+-- recorded fact rather than one inferred from an ordering that does not hold.
+--
+-- Upserted on EVERY observation, including one whose payload was already stored.
+-- That is the whole point: the write that was being skipped is the one that
+-- carries the information.
+CREATE TABLE IF NOT EXISTS inbox_current (
+  pr_number    INTEGER NOT NULL,
+  source       TEXT NOT NULL,
+  external_id  TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  generation   INTEGER NOT NULL,
+  observed_at  INTEGER NOT NULL,
+  PRIMARY KEY (pr_number, source, external_id)) STRICT;
+
 -- Per-reviewer availability as a BAND, not a rate. Measured: 15/15 refusals in
 -- one 7-hour window, then ~30 straight answers over 29 hours.
 CREATE TABLE IF NOT EXISTS reviewer_supply (

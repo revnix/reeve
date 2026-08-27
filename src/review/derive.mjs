@@ -206,14 +206,28 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
 
   // Latest generation per object: an edit supersedes, and the fold reads what the
   // object says NOW while the earlier text stays on record in inbox.
+  // CURRENT, not newest, and the difference is the whole reason `inbox_current`
+  // exists. MAX(generation) answers "which text arrived last", which is the same
+  // question only while content never repeats. A body edited A -> B -> A stores no
+  // third row -- A's hash is already there -- so the newest generation is still B,
+  // and the fold reads text the reviewer has already taken back.
+  //
+  // The pointer is written on EVERY observation, so it is correct from the first
+  // tick after this lands. LEFT JOIN with a MAX() fallback for a store written
+  // before it existed: that store self-heals on its next observation, and until
+  // then it behaves exactly as it did before rather than reading nothing.
   const rows = db.prepare(`
     SELECT i.source, i.external_id, i.kind, i.payload, i.event_at, i.generation, i.observed_at
       FROM inbox i
-      JOIN (SELECT source, external_id, MAX(generation) g FROM inbox
-             WHERE pr_number = ? GROUP BY source, external_id) m
-        ON m.source = i.source AND m.external_id = i.external_id AND m.g = i.generation
+      JOIN (SELECT m.source, m.external_id,
+                   COALESCE(c.generation, m.g) AS g
+              FROM (SELECT source, external_id, MAX(generation) g FROM inbox
+                     WHERE pr_number = ? GROUP BY source, external_id) m
+              LEFT JOIN inbox_current c
+                ON c.pr_number = ? AND c.source = m.source AND c.external_id = m.external_id) sel
+        ON sel.source = i.source AND sel.external_id = i.external_id AND sel.g = i.generation
      WHERE i.pr_number = ?
-     ORDER BY i.event_at, i.id`).all(pr, pr);
+     ORDER BY i.event_at, i.id`).all(pr, pr, pr);
 
   const rounds = [], threads = [], bodyFindings = [];
   // Which reviewers wrote a review body at all, and whether every one of them had
@@ -569,7 +583,18 @@ export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() /
     resolved: threads.filter(t => t.is_resolved).length,
     // Severity counts every reviewer, rostered or not, blocking or advisory: a
     // P0 is a P0 whoever filed it, and blocking-ness gates coverage not severity.
+    // TWO COUNTS, because two different questions are asked of them.
+    //
+    // `unspilledCritical` counts EVERY reviewer: spilling a critical is forbidden
+    // whoever filed it, so an advisory reviewer's P0 must still stop a spill.
+    //
+    // `blockingCritical` counts only reviewers whose opinion gates a merge, and it
+    // is what the round cap reads. One number serving both made an advisory
+    // reviewer's critical BLOCK at the cap while every gating clause passed — the
+    // pull request escalating on an opinion the profile says is advisory.
     unspilledCritical: blocking.length + bodyBlocking.length,
+    blockingCritical: blocking.filter(t => blockingLogins.has(t.reviewer)).length +
+                      bodyBlocking.filter(f => blockingLogins.has(f.reviewer)).length,
     // The body population, reported on its own as well as folded into the count
     // above, so a reader can tell WHICH kind of finding is holding a pull request.
     bodyTotal: body.length, bodyOpen: bodyOpen.length,

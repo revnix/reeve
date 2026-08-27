@@ -440,7 +440,7 @@ ${list || "(none were extracted; read the PR's review threads yourself)"}
 
 ${invariants(profile)}
 
-${measuredReview(profile, { triage: true })}FOR EACH FINDING, exactly one of:
+${measuredReview(profile, { triage: true })}FOR EACH FINDING WITH A THREAD, exactly one of:
   · Fix it, with a test that fails on the broken code (rule 4), then reply on the
     thread saying what changed, then resolve the thread.
   · Disagree, with evidence: quote the file and line that refutes it. Reply on the
@@ -450,6 +450,12 @@ ${measuredReview(profile, { triage: true })}FOR EACH FINDING, exactly one of:
 
 Never resolve a thread you did not fix or refute. Never resolve another person's
 thread on their behalf.
+
+FOR EACH FINDING MARKED "stated in the review body", there is no thread, so there
+is nothing to reply to and nothing to resolve. Do the same work and report it in
+your final json instead: fix it with a test, or refute it quoting the file and
+line, or say it needs a human. Do not go looking for a thread, and do not treat
+its absence as a reason to skip the finding or to fail the run.
 
 HOW TO VERIFY
 ${verification(profile)}
@@ -495,8 +501,10 @@ THE REMAINDER
 ${list || "(none supplied)"}
 
 Create a single GitHub issue titled "Follow-up from #${pr}: deferred review findings".
-Its body must carry, for each finding: the original text, the file and line, and a
-permalink pinned to ${head} so it still resolves after the parent merges.
+Its body must carry, for each finding: the original text, and — for a finding that
+names a file — its file and line and a permalink pinned to ${head} so it still
+resolves after the parent merges. A finding marked "stated in the review body" has
+no file or line: carry its text alone rather than inventing an anchor for it.
 
 Then reply on each corresponding thread naming the new issue, and resolve that
 thread. A finding marked "stated in the review body" has no thread: carry it into

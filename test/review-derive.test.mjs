@@ -142,9 +142,17 @@ ingest(db, NWO, 1, [
   derivePr(db, NWO, 1, PROFILE, { at: T, head: HEAD_A });
   const st = reviewState(db, NWO, 1, PROFILE, { at: T });
   check(st.readable && st.total === 3, "control: three threads folded", JSON.stringify(st.total));
-  check(st.unspilledCritical === 2,
-    "the P1 and the UNREADABLE one both block — unknown counts as critical",
+  // Three, not two. Two threads block -- the P1 and the one nobody can classify --
+  // and codex also wrote a review BODY that this profile does not say how to read,
+  // which the fold counts as one more finding of unknown severity rather than
+  // leaving out. An unreadable body and an unreadable thread are the same
+  // statement about different surfaces, so they get the same answer.
+  check(st.unspilledCritical === 3,
+    "the P1, the UNREADABLE thread and the UNREADABLE body all block — unknown counts as critical",
     `got ${st.unspilledCritical}`);
+  check(st.bodyOpen === 1 && st.threads.some(t => t.anchor === "body" && t.severity === "unknown"),
+    "control: and the third really is the body, counted as its own kind",
+    JSON.stringify({ bodyOpen: st.bodyOpen }));
   check(st.rounds === 1, "one blocking reviewer answered once at one head", String(st.rounds));
 }
 
@@ -162,7 +170,7 @@ ingest(db, NWO, 1, [
 
   const atA = reviewState(db, NWO, 1, PROFILE, { at: T, head: HEAD_A });
   check(atA.readable === true, "a projection derived for this head is readable", JSON.stringify(atA.why ?? ""));
-  check(atA.unspilledCritical === 2 && atA.threads.length === 3,
+  check(atA.unspilledCritical === 3 && atA.threads.length === 4,
     "control: and carries the counts and the threads a decision needs",
     JSON.stringify({ c: atA.unspilledCritical, n: atA.threads?.length }));
 

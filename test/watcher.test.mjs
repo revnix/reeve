@@ -279,20 +279,48 @@ check("an uncleared thread ASKS THE REVIEWER, rather than dispatching a fixer",
   // composition was broken, which is the seam-versus-mounted trap: the watcher
   // was fine, the verdict was fine in isolation, and together they waited
   // forever. Only a test that runs both catches it.
-  const composed = computeVerdict({
+  const compose = over => computeVerdict({
     head: "c".repeat(40),
     checks: { verdict: "GREEN", settled: true, failing: [] },
     base: { verdict: "GREEN" },
     reviewers: [{ login: "codex", kind: "blocking", state: "CLEAN", reviewedHead: "c".repeat(10) }],
-    rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null, criticalGap: "not-derived" },
-    threads: { unresolved: 2, total: 4, readable: true },
+    rounds: { n: 2, softCap: 5, hardCap: 10, unspilledCritical: 0 },
+    threads: { unresolved: 0, total: 4, readable: true },
     cleared: { readable: true, uncleared: 0, reviewers: [] },
-    ledgerBlockers: 0, mergeState: "CLEAN",
+    bodyFindings: { readable: true, open: 0, reviewers: [] },
+    ledgerBlockers: 0, mergeState: "CLEAN", ...over,
   });
-  const d = nextAction({ pr: 1, state: "open", verdict: composed, checks: {},
-                         rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: null } }, P);
+  const through = (over, hist) => nextAction(
+    { pr: 1, state: "open", verdict: compose(over), checks: {}, rounds: hist ?? { n: 2, softCap: 5, hardCap: 10, unspilledCritical: 0 } }, P).action;
+
   check("and the same holds through computeVerdict, which is where the state is decided",
-    d.action, ACTIONS.FIX_FINDINGS);
+    through({ threads: { unresolved: 2, total: 4, readable: true } }), ACTIONS.FIX_FINDINGS);
+
+  // The permanent gap this block was written for is closed -- an unreadable review
+  // body is counted as one `unknown` finding instead of being left out of the
+  // count -- so the cap is enforced rather than announced as unenforced. What that
+  // must NOT have cost is the property the block exists to protect: the cap stops
+  // a spill, never every repair.
+  check("past the cap a critical now ESCALATES, which is the cap actually enforced",
+    through({ rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1 },
+              threads: { unresolved: 2, total: 4, readable: true } },
+            { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 1 }),
+    ACTIONS.ESCALATE);
+  check("control: and past the cap with a KNOWN zero it still spills rather than stalling",
+    through({ rounds: { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 0 },
+              threads: { unresolved: 2, total: 4, readable: true } },
+            { n: 6, softCap: 5, hardCap: 10, unspilledCritical: 0 }),
+    ACTIONS.SPILL);
+
+  // A body finding composes to a FIXER, not to another request for a round. Both
+  // halves worked in isolation before this: the fold derived it and the clause
+  // blocked on it, and the watcher answered by asking the reviewer to come back --
+  // so the finding was derived, counted, and acted on by nothing.
+  check("an open review-body finding dispatches a fixer, with no thread unresolved",
+    through({ bodyFindings: { readable: true, open: 1, reviewers: ["codex"] } }),
+    ACTIONS.FIX_FINDINGS);
+  check("control: and with none open the same shape does not dispatch one",
+    through({}), ACTIONS.MERGE);
 }
 // Past the hard cap it stops asking and fetches a person.
 check("past the hard cap an uncleared thread escalates rather than asking again",

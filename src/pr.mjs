@@ -161,6 +161,8 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
   const unknown = why => ({ unspilledCritical: null, rounds: null, threadDetails: null,
                             cleared: gating ? { readable: false, why }
                                             : { readable: true, uncleared: 0, reviewers: [] },
+                            bodyFindings: gating ? { readable: false, why }
+                                                 : { readable: true, open: 0, reviewers: [] },
                             projection: { readable: false, why } });
   if (!db) return unknown("no state database");
   let st;
@@ -246,11 +248,38 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
   // which is the same rule the `review` clause already applies to coverage.
   const blockingLogins = new Set((profile?.reviewers ?? [])
     .filter(r => r.kind === "blocking").map(r => r.login));
-  const uncleared = (st.threads ?? []).filter(t => blockingLogins.has(t.reviewer));
+  // THREADS only. A body finding has no thread, so counting one here would answer
+  // "has a reviewer come back to what it filed" with a population that has nothing
+  // to come back TO -- and it would put the two kinds behind one number again,
+  // which is the conflation the clause below exists to undo.
+  const uncleared = (st.threads ?? []).filter(t => t.anchor !== "body" && blockingLogins.has(t.reviewer));
+  // FINDINGS STATED IN A REVIEW BODY, as their own fact.
+  //
+  // They cannot travel through the `threads` clause: that clause reads the LIVE
+  // count of unresolved GitHub threads, and a body finding is not one, so a
+  // body-only finding left it passing. `cleared` did block on them, but the
+  // watcher answers `cleared` by asking the reviewer for another round -- correct
+  // for a thread nobody has returned to, and wrong here, because the reviewer HAS
+  // spoken and what is missing is the fix. So a body finding was derived, counted,
+  // and then acted on by nothing.
+  //
+  // Scoped to BLOCKING reviewers for the same reason `cleared` is: clearing one
+  // requires THAT reviewer to review again, so an advisory reviewer going quiet
+  // would hold a pull request for ever. The residual is deliberate and named: an
+  // advisory reviewer's body finding still reaches `unspilledCritical`, so it can
+  // stop a spill, but it does not block a merge.
+  const bodyOpen = (st.threads ?? []).filter(t => t.anchor === "body" && blockingLogins.has(t.reviewer));
 
   return {
     rounds: st.rounds,
-    unspilledCritical: bodies ? st.unspilledCritical : null,
+    // HANDED ON, because a body reeve cannot read is now counted rather than
+    // omitted: the fold projects one `unknown` finding for it, and `unknown`
+    // blocks. Withholding the number was the silent option -- `computeVerdict`
+    // reads a null count as no reason to stop, so an unreadable body left every
+    // clause passing. A number that includes an admission of ignorance is a
+    // better answer than no number, and it is the same answer this codebase
+    // already gives for a thread whose severity nobody can read.
+    unspilledCritical: st.unspilledCritical,
     threadDetails: fresh ? st.threads : null,
     // Readable independently of `fresh`: a tick-old list of WHICH threads are
     // uncleared is not safe to dispatch a worker against, but the COUNT is safe
@@ -258,9 +287,11 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
     // long, never merging something a reviewer has not returned to.
     cleared: { readable: true, uncleared: uncleared.length,
                reviewers: [...new Set(uncleared.map(t => t.reviewer))] },
+    bodyFindings: { readable: true, open: bodyOpen.length,
+                    reviewers: [...new Set(bodyOpen.map(t => t.reviewer))] },
     projection: {
       readable: true,
-      ...(bodies ? {} : { countUnknown: "review-body findings are not derived yet, so a zero could be missing a body-only critical" }),
+      ...(bodies ? {} : { undeclaredBodyAuthor: "a reviewer wrote a review body without declaring how its bodies carry findings — counted as one unknown finding, and worth declaring so it can be read properly" }),
       ...(fresh ? {} : { detailsUnknown: "the fold runs after this evaluation, so a thread edited in place would not be seen" }),
     },
   };
@@ -420,8 +451,12 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
   // watcher handles UNKNOWN before BLOCK findings -- so the cap stopped ALL
   // remediation rather than stopping a spill. A permanent gap must not present
   // as a per-pull-request uncertainty.
-  const criticalGap = facts.unspilledCritical != null ? null
-    : (facts.projection?.readable === false ? "unreadable" : "not-derived");
+  // A missing count now means exactly one thing: the projection could not be read
+  // on this tick. The other reason it used to be missing -- review-body findings
+  // not being derived at all -- is closed, and the branch that distinguished them
+  // went with it. A permanent gap needed a PASS so the cap could not stop all
+  // remediation; a transient one is honestly UNKNOWN and clears itself.
+  const criticalGap = facts.unspilledCritical != null ? null : "unreadable";
   const rounds = { n: facts.rounds ?? judged.size, softCap: profile.rounds?.softCap ?? 5,
                    criticalGap,
                    // A number when the projection is readable AT THIS HEAD, and null
@@ -444,7 +479,8 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
     head: pin.sha,
     checks: { verdict: s.verdict, settled: s.settled, why: s.why, failing: c.failing, inherited: c.inherited },
     base: { verdict: base.verdict },
-    reviewers, rounds, threads, cleared: facts.cleared, ledgerBlockers,
+    reviewers, rounds, threads, cleared: facts.cleared,
+    bodyFindings: facts.bodyFindings, ledgerBlockers,
     mergeState: threads.mergeState, profile,
     // Passed through, never read here. `pr_hold` is a HUB row and this function
     // holds the per-repository state database, so the reading is taken by the

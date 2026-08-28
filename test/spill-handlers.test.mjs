@@ -226,8 +226,16 @@ const recorder = (replies = []) => {
     check(!UNGATED_BY_REVIEW_ACTIONS.has(kind),
       `${kind} is governed by the review switch`, kind);
 
+  // Double duty, and the second is the important one.
+  //
+  // As a CONTROL it stops the loop above passing vacuously — with a non-empty
+  // exemption set the loop could be satisfied by kinds nobody gated.
+  //
+  // As an ASSERTION it makes the first exemption argue for itself. An empty set is
+  // the strongest statement this file can make, and it is also the easiest thing to
+  // quietly add one entry to; a diff that turns this red cannot be read past.
   check(UNGATED_BY_REVIEW_ACTIONS.size === 0,
-    "control: the exemption list is empty, so the loop above is asserting something",
+    "the exemption list is EMPTY — adding to it must fail this and be argued for",
     String(UNGATED_BY_REVIEW_ACTIONS.size));
 
   // And the shape itself: an exemption must be an explicit declaration, never the

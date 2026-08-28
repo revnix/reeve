@@ -122,4 +122,15 @@ export const STUBS = [
       replace: "cascadeDeadLetter(db)",
     }],
   },
+  {
+    name: "sweep-restores-on-signal",
+    why: "stop the sweep restoring the tree when it is killed, leaving a deliberately broken file behind",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "a sweep killed mid-stub restores the source before exiting",
+    edits: [{
+      file: "scripts/stub-sweep.mjs",
+      find: `for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {`,
+      replace: "for (const sig of []) {",
+    }],
+  },
 ];

@@ -9,7 +9,7 @@
 // The end-to-end cases build a THROWAWAY GIT REPOSITORY: a source file, a test
 // that exercises it, and a manifest. That is what lets the real cleanliness guard
 // stay strict, rather than being loosened to make itself testable.
-import { applyEdit, validateManifest, classify, summarise, failedAssertions,
+import { applyEdit, validateManifest, classify, summarise, failedAssertions, describeMiss,
          reportedAnyAssertion, CAUGHT, NOT_CAUGHT, WRONG_RED, CRASHED, UNRUNNABLE }
   from "../src/stubsweep.mjs";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
@@ -46,6 +46,30 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // regex metacharacters.
   check(applyEdit("if (a.b) x", { find: "a.b", replace: "q" }) === "if (q) x",
     "anchors are literal, so dots and brackets in source do not behave as patterns");
+}
+
+// --- a rotted anchor says WHERE it stopped matching -----------------------------
+{
+  // The refusal is correct either way; this is about whether the next person
+  // spends a minute or an hour. A manifest pins to source, so it rots against
+  // refactors by design, and the useful thing a tool can do is say precisely what
+  // it could not do rather than only that it could not.
+  const source = "function f() {\n  const guard = true;\n  return guard;\n}\n";
+  const e = threw(() => applyEdit(source, { find: "  const guard = false;", replace: "x" }));
+  const msg = String(e?.message ?? "");
+  check(/matched the first \d+ character/.test(msg),
+    "a rotted anchor reports how far it matched", msg.split("\n")[1]);
+  check(/const guard = true/.test(msg),
+    "and shows what the file says there NOW", msg);
+  check(/the anchor expected/.test(msg), "beside what the anchor expected", msg);
+
+  const nowhere = threw(() => applyEdit(source, { find: "zzzz nothing", replace: "x" }));
+  check(/no part of the anchor appears/.test(String(nowhere?.message)),
+    "and an anchor with nothing in common says it may name the wrong file",
+    String(nowhere?.message));
+
+  check(describeMiss(source, "  const guard = true;\n  return guard;").length > 0,
+    "control: describeMiss returns something even for a near-complete match");
 }
 
 // --- a manifest that cannot produce a reading is refused ------------------------

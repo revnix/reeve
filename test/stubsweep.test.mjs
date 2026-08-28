@@ -1,0 +1,213 @@
+// The stub sweep, and whether it can be shown to FAIL.
+//
+// This tool exists because three tests in one pull request proved a mechanism
+// existed without proving it was reached. An instrument built to catch that shape,
+// which itself only ever reports success, would be the same defect wearing a
+// uniform — so the important assertions here are the ones that drive the runner
+// end to end and require it to come back non-zero.
+//
+// The end-to-end cases build a THROWAWAY GIT REPOSITORY: a source file, a test
+// that exercises it, and a manifest. That is what lets the real cleanliness guard
+// stay strict, rather than being loosened to make itself testable.
+import { applyEdit, validateManifest, classify, summarise, failedAssertions,
+         reportedAnyAssertion, CAUGHT, NOT_CAUGHT, WRONG_RED, CRASHED, UNRUNNABLE }
+  from "../src/stubsweep.mjs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+let fail = 0;
+const check = (ok, name, detail) => {
+  console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+  if (!ok) { if (detail !== undefined) console.log("        " + detail); fail++; }
+};
+const threw = fn => { try { fn(); return null; } catch (e) { return e; } };
+const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import.meta.url)));
+
+// --- applying an edit refuses anything ambiguous -------------------------------
+{
+  check(applyEdit("a b c", { find: "b", replace: "X" }) === "a X c", "an edit with one match applies");
+
+  const none = threw(() => applyEdit("a b c", { find: "zzz", replace: "X" }));
+  check(none && /appears 0 time/.test(none.message),
+    "an anchor that matches nothing REFUSES rather than doing nothing quietly", String(none?.message));
+
+  const many = threw(() => applyEdit("b a b", { find: "b", replace: "X" }));
+  check(many && /appears 2 time/.test(many.message),
+    "an anchor that matches twice refuses rather than picking one", String(many?.message));
+
+  const empty = threw(() => applyEdit("abc", { find: "", replace: "X" }));
+  check(empty !== null, "an empty anchor is refused", String(empty?.message));
+
+  // Literal, not regex: a stub anchor is a chunk of source and source is full of
+  // regex metacharacters.
+  check(applyEdit("if (a.b) x", { find: "a.b", replace: "q" }) === "if (q) x",
+    "anchors are literal, so dots and brackets in source do not behave as patterns");
+}
+
+// --- a manifest that cannot produce a reading is refused ------------------------
+{
+  const ok = [{ name: "n", why: "w", test: "t", expectRed: "e", edits: [{ file: "f", find: "a", replace: "b" }] }];
+  check(validateManifest(ok) === ok, "control: a well-formed manifest validates");
+
+  const cases = [
+    ["an empty manifest", [], /empty/],
+    ["a missing name", [{ why: "w", test: "t", expectRed: "e", edits: [{ file: "f", find: "a", replace: "b" }] }], /needs a name/],
+    ["a duplicate name", [ok[0], ok[0]], /duplicate/],
+    ["a missing why", [{ name: "n", test: "t", expectRed: "e", edits: [{ file: "f", find: "a", replace: "b" }] }], /needs a "why"/],
+    ["a missing expectRed", [{ name: "n", why: "w", test: "t", edits: [{ file: "f", find: "a", replace: "b" }] }], /expectRed/],
+    ["no edits", [{ name: "n", why: "w", test: "t", expectRed: "e", edits: [] }], /at least one edit/],
+    ["an edit that changes nothing", [{ name: "n", why: "w", test: "t", expectRed: "e", edits: [{ file: "f", find: "a", replace: "a" }] }], /itself/],
+  ];
+  for (const [what, m, re] of cases) {
+    const e = threw(() => validateManifest(m));
+    check(e !== null && re.test(e.message), `${what} is refused`, String(e?.message));
+  }
+}
+
+// --- reading a run's assertions ------------------------------------------------
+{
+  const out = "PASS  one\nFAIL  two is wrong\n        detail\nPASS  three\n";
+  check(JSON.stringify(failedAssertions(out)) === JSON.stringify(["two is wrong"]),
+    "the failed assertions are read by name", JSON.stringify(failedAssertions(out)));
+  check(reportedAnyAssertion(out) === true, "control: a normal run reports assertions");
+  check(reportedAnyAssertion("TypeError: x is not a function\n    at y") === false,
+    "and a stack trace with no assertions is recognised as reporting none");
+}
+
+// --- what the readings mean ----------------------------------------------------
+{
+  const base = { controlExit: 0, hashChanged: true, restored: true, expectRed: "the guard holds" };
+  const red = "PASS  something else\nFAIL  the guard holds\n";
+
+  check(classify({ ...base, stubExit: 1, stubOutput: red }).verdict === CAUGHT,
+    "the named assertion failing is the only CAUGHT case");
+
+  check(classify({ ...base, stubExit: 0, stubOutput: "PASS  the guard holds\n" }).verdict === NOT_CAUGHT,
+    "a suite that stays green with the defect back in is NOT CAUGHT");
+  check(/fixture/.test(classify({ ...base, stubExit: 0, stubOutput: "PASS  x\n" }).why),
+    "and the message names the fixture as a cause, not only a missing assertion",
+    classify({ ...base, stubExit: 0, stubOutput: "PASS  x\n" }).why);
+
+  check(classify({ ...base, stubExit: 1, stubOutput: "PASS  a\nFAIL  something adjacent\n" }).verdict === WRONG_RED,
+    "a failure in a DIFFERENT assertion leaves the property unmeasured");
+
+  check(classify({ ...base, stubExit: 1, stubOutput: "TypeError: boom\n    at z" }).verdict === CRASHED,
+    "a run that dies without reporting an assertion is a CRASH, not a pass-that-failed");
+
+  check(classify({ ...base, controlExit: 1, stubExit: 1, stubOutput: red }).verdict === UNRUNNABLE,
+    "a test that fails BEFORE stubbing makes every later reading meaningless");
+  check(classify({ ...base, hashChanged: false, stubExit: 1, stubOutput: red }).verdict === UNRUNNABLE,
+    "a stub whose file hash did not change never landed, so its red says nothing");
+  check(classify({ ...base, restored: false, stubExit: 1, stubOutput: red }).verdict === UNRUNNABLE,
+    "and a tree that did not restore would poison every reading after it");
+}
+
+// --- the sweep's own verdict ---------------------------------------------------
+{
+  check(summarise([{ verdict: CAUGHT }, { verdict: CAUGHT }]).ok === true, "all caught passes");
+  for (const v of [NOT_CAUGHT, WRONG_RED, CRASHED, UNRUNNABLE])
+    check(summarise([{ verdict: CAUGHT }, { verdict: v }]).ok === false,
+      `a single ${v} fails the sweep — there is no warning level`);
+  check(summarise([]).ok === false,
+    "and a sweep that measured NOTHING fails, rather than reporting success having done nothing");
+}
+
+// --- end to end: the runner must be able to come back non-zero -----------------
+{
+  // A throwaway repository, so the real cleanliness guard stays strict.
+  const root = mkdtempSync(join(tmpdir(), "sweep-e2e-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"),
+    `export function safe(v) {\n  if (typeof v === "object") throw new Error("not a scalar");\n  return String(v);\n}\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { safe } from "../src/thing.mjs";\n` +
+    `let fail = 0;\n` +
+    `const check = (ok, name) => { console.log((ok ? "PASS  " : "FAIL  ") + name); if (!ok) fail++; };\n` +
+    `let threwFor = null; try { safe({}); } catch (e) { threwFor = e; }\n` +
+    `check(threwFor !== null, "an object is refused");\n` +
+    `check(safe(3) === "3", "a scalar still works");\n` +
+    `process.exit(fail ? 1 : 0);\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q");
+  git("config", "user.email", "sweep@example.invalid");
+  git("config", "user.name", "sweep");
+
+  const writeManifest = stubs => writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = ${JSON.stringify(stubs, null, 2)};\n`);
+  const commit = () => { git("add", "-A"); git("commit", "-q", "-m", "fixture"); };
+  const run = () => {
+    const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+      env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+    return { exit: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+  };
+  const guard = { file: "src/thing.mjs", find: `  if (typeof v === "object") throw new Error("not a scalar");\n`, replace: "" };
+
+  // 1. A real stub, caught. Establishes the runner can pass at all.
+  writeManifest([{ name: "guard", why: "remove the scalar guard", test: "test/thing.test.mjs",
+                   expectRed: "an object is refused", edits: [guard] }]);
+  commit();
+  const caught = run();
+  check(caught.exit === 0, "control: a stub the test catches passes the sweep", caught.out.slice(-300));
+  check(/CAUGHT/.test(caught.out), "and says so");
+
+  // The file must be byte-identical afterwards. This is the property whose absence
+  // silently destroyed real work when a hand-run sweep used git checkout instead.
+  const after = createHash("sha256").update(readFileSync(join(root, "src", "thing.mjs"))).digest("hex");
+  const expected = createHash("sha256")
+    .update(`export function safe(v) {\n  if (typeof v === "object") throw new Error("not a scalar");\n  return String(v);\n}\n`)
+    .digest("hex");
+  check(after === expected, "and the source is restored byte for byte");
+
+  // 2. THE ONE THAT MATTERS: a stub nothing catches must FAIL the sweep.
+  writeManifest([{ name: "cosmetic", why: "change something no test observes", test: "test/thing.test.mjs",
+                   expectRed: "an object is refused",
+                   edits: [{ file: "src/thing.mjs", find: "  return String(v);", replace: "  return String(v); // noop" }] }]);
+  commit();
+  const uncaught = run();
+  check(uncaught.exit === 1, "a stub NO test catches fails the sweep", `exit=${uncaught.exit}`);
+  check(/NOT_CAUGHT/.test(uncaught.out), "and is reported as NOT_CAUGHT", uncaught.out.slice(-300));
+
+  // 3. A stub that breaks a different assertion is not success either.
+  writeManifest([{ name: "adjacent", why: "break an unrelated assertion", test: "test/thing.test.mjs",
+                   expectRed: "an object is refused",
+                   edits: [{ file: "src/thing.mjs", find: "  return String(v);", replace: "  return String(v) + \"!\";" }] }]);
+  commit();
+  const wrong = run();
+  check(wrong.exit === 1, "a stub that reddens a DIFFERENT assertion fails the sweep", `exit=${wrong.exit}`);
+  check(/WRONG_RED/.test(wrong.out), "and is reported as WRONG_RED, not as caught", wrong.out.slice(-300));
+
+  // 4. A stub that makes the test die is not a pass-that-failed.
+  writeManifest([{ name: "crash", why: "make the module fail to parse", test: "test/thing.test.mjs",
+                   expectRed: "an object is refused",
+                   edits: [{ file: "src/thing.mjs", find: "export function safe(v) {", replace: "export function safe(v) { (" }] }]);
+  commit();
+  const crash = run();
+  check(crash.exit === 1, "a stub that makes the test CRASH fails the sweep", `exit=${crash.exit}`);
+  check(/CRASHED/.test(crash.out), "and is reported as CRASHED rather than as a failing assertion", crash.out.slice(-300));
+
+  // 5. A rotted anchor is refused rather than silently skipped.
+  writeManifest([{ name: "rotted", why: "an anchor that no longer exists", test: "test/thing.test.mjs",
+                   expectRed: "an object is refused",
+                   edits: [{ file: "src/thing.mjs", find: "this text is not in the file", replace: "x" }] }]);
+  commit();
+  const rotted = run();
+  check(rotted.exit === 1, "a manifest that has rotted against the code fails the sweep", `exit=${rotted.exit}`);
+  check(/UNRUNNABLE|appears 0 time/.test(rotted.out), "and says the anchor matched nothing", rotted.out.slice(-300));
+
+  // 6. And it refuses a dirty tree outright, which is the precondition that once
+  //    cost real uncommitted work.
+  writeFileSync(join(root, "src", "thing.mjs"),
+    readFileSync(join(root, "src", "thing.mjs"), "utf8") + "\n// uncommitted\n");
+  const dirty = run();
+  check(dirty.exit === 2, "a dirty working tree is refused before anything is touched", `exit=${dirty.exit}`);
+  check(/uncommitted changes/.test(dirty.out), "and says why", dirty.out.slice(-200));
+  check(/uncommitted/.test(readFileSync(join(root, "src", "thing.mjs"), "utf8")),
+    "and the uncommitted work is still there afterwards");
+}
+
+console.log(fail ? `\nFAILED ${fail}` : "\nok");
+process.exit(fail ? 1 : 0);

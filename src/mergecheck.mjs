@@ -96,7 +96,7 @@ export function classifyFiles(paths, { squash, main, head = UNREAD, entryAt }) {
  * read that saw nothing, and answering "all intact" over nothing is how a
  * narrowing check reports success.
  */
-export function verdictFor(files, { branchOnly = [], crossCheck = "complete", squashProven = false } = {}) {
+export function verdictFor(files, { branchOnly = [], crossCheck = "complete" } = {}) {
   if (files.length === 0) {
     return { verdict: VERDICT.unreadable, counts: { intact: 0, drifted: 0, gone: 0, headDiverged: 0 },
              why: "the merge commit's own diff names zero paths, so there is nothing to compare. An empty set is not a pass." };
@@ -146,14 +146,14 @@ export function verdictFor(files, { branchOnly = [], crossCheck = "complete", sq
   // in branchOnly and were never compared -- exit 0 would report a pass over
   // work nothing checked. Same for a cross-check that could not run: it is the
   // only thing that would have revealed such paths at all.
-  if (!squashProven && (branchOnly.length > 0 || crossCheck !== "complete")) {
+  if (branchOnly.length > 0 || crossCheck !== "complete") {
     return { verdict: VERDICT.unreadable, counts,
              why: `every path this merge produced is intact on main, but the merge cannot be shown to cover the whole pull request, so this is NOT a pass.\n` +
                   (branchOnly.length > 0
                     ? `${branchOnly.length} path(s) the pull request touches are absent from the merge commit's diff and were never compared.\n`
                     : `the cross-check that would reveal such paths could not be completed.\n`) +
-                  `A squash merge carries the whole branch; a REBASE merge names only its LAST commit. This pull request has more than one commit, so the two cannot be told apart and the uncovered paths may never have been compared.\n` +
-                  `Check them by hand. A repository's CURRENT merge settings cannot settle this: they say nothing about how an EXISTING merge was performed.${note2}` };
+                  `A squash merge carries the whole branch; a REBASE merge names only its LAST commit, and nothing readable now distinguishes them for a merge that already happened.\n` +
+                  `Check the uncovered paths by hand. Neither the repository's current merge settings nor the pull request's current commit count can settle it: both are PRESENT state, and this is a question about a PAST merge.${note2}` };
   }
   return { verdict: VERDICT.intact, counts,
            why: `All ${files.length} path(s) on main are exactly what the merge produced, mode included.\n` +
@@ -283,6 +283,31 @@ export function branchOnlyPaths(apiPaths, mergePaths) {
 }
 
 /**
+ * Parse the command line.
+ *
+ * A VALUE-LESS `--repo` IS AN ERROR, never a fallback. An unset shell variable
+ * expanded unquoted leaves the flag with nothing after it, and taking the
+ * checkout's origin there would answer confidently about a repository the caller
+ * did not name. A following token that is itself a flag is not a value either.
+ */
+export function parseArgs(argv) {
+  const at = argv.indexOf("--repo");
+  const val = at >= 0 ? argv[at + 1] : undefined;
+  const repoMissingValue = at >= 0 && (val === undefined || val.startsWith("--"));
+  // The repo value is excluded from the pull-request search, or `--repo 12/x`
+  // could donate its digits. Guarded on `at >= 0`: with the -1 sentinel,
+  // `i !== at + 1` drops index 0 -- which is the pull-request number in the
+  // ordinary `verify-merge.mjs 57` invocation.
+  const rest = at >= 0 ? argv.filter((_, i) => i !== at && i !== at + 1) : argv;
+  return {
+    json: argv.includes("--json"),
+    repoArg: at >= 0 && !repoMissingValue ? val : null,
+    repoMissingValue,
+    pr: rest.find(a => /^\d+$/.test(a)) ?? null,
+  };
+}
+
+/**
  * Is the pull request's file list complete enough to cross-check with?
  *
  * COUNT THE RECORDS, NOT THE EXPANDED PATHS. A rename contributes two paths from
@@ -299,21 +324,26 @@ export function crossCheckState(recordCount, changedFiles) {
 }
 
 /**
- * Does this merge commit provably cover the WHOLE pull request?
+ * THERE IS NO COVERAGE PROOF, AND THERE WAS NOT ONE THE LAST TWO TIMES EITHER.
  *
  * `mergeCommit.oid` for a rebase merge is the LAST rebased commit: one parent,
- * like a squash, but covering only that commit. With exactly ONE commit in the
- * pull request the two produce identical coverage, so the merge carries the
- * whole branch whichever was used. With more, this cannot tell.
+ * like a squash, but covering only that commit. Two ways of ruling that out were
+ * tried and BOTH inferred a fact about a PAST merge from PRESENT mutable state:
  *
- * NOT DECIDABLE FROM THE REPOSITORY'S SETTINGS. `allow_rebase_merge` is present
- * state and says nothing about how an EXISTING merge was performed -- a pull
- * request rebase-merged while it was enabled would be marked proven the moment
- * an administrator turned it off. Unknown is the safe answer.
+ *   1. the repository's `allow_rebase_merge` -- a pull request rebase-merged
+ *      while it was enabled becomes "proven" the moment an admin turns it off;
+ *   2. the pull request's CURRENT commit count -- a multi-commit pull request
+ *      that was rebase-merged and then force-pushed to one commit reports 1.
+ *
+ * The second is unsound exactly where it was needed: uncovered paths exist only
+ * when the branch's current file list disagrees with the merge, which means the
+ * head the count came from is NOT the head that merged.
+ *
+ * So there is no `coverageProven`. Uncovered paths, or a cross-check that could
+ * not run, make the verdict UNREADABLE. A third inference would be the third
+ * instance of one shape, and the rule for that is to remove the fallible read
+ * rather than replace it.
  */
-export function coverageProven(prCommits) {
-  return prCommits === 1;
-}
 
 /**
  * Render a byte-string path for humans.

@@ -14,7 +14,7 @@
 
 import { execFileSync } from "node:child_process";
 import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, displayPath, toByteString,
-         crossCheckState, coverageProven, exitFor, EXIT, VERDICT, ABSENT } from "../src/mergecheck.mjs";
+         crossCheckState, parseArgs, exitFor, EXIT, VERDICT, ABSENT } from "../src/mergecheck.mjs";
 
 // execFileSync defaults to a 1 MiB stdout buffer and THROWS ENOBUFS past it.
 // The pull-request files endpoint carries a URL trio and often patch text per
@@ -24,11 +24,7 @@ import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, displayP
 // bodies never enter this buffer at all.
 const MAXBUF = 256 * 1024 * 1024;
 
-const argv = process.argv.slice(2);
-const json = argv.includes("--json");
-const at = argv.indexOf("--repo");
-const repoArg = at >= 0 ? argv[at + 1] : null;
-const pr = argv.find(a => /^\d+$/.test(a));
+const { json, repoArg, repoMissingValue, pr } = parseArgs(process.argv.slice(2));
 
 const emit = (doc, code) => {
   // process.exitCode, never process.exit(): exit() can truncate a pending write
@@ -61,6 +57,9 @@ const G = gitFacts(shGit);
 const first = (e) => String(e?.stderr || e?.message || e).split("\n")[0];
 
 const run = () => {
+  if (repoMissingValue) return emit({ verdict: "USAGE", files: [],
+    why: "--repo was given with no value. Refusing rather than falling back to this checkout's origin, which would answer about a repository you did not name.\n" +
+         "usage: node scripts/verify-merge.mjs <pr-number> [--json] [--repo owner/name]" }, EXIT.usage);
   if (!pr) return emit({ verdict: "USAGE", files: [],
     why: "usage: node scripts/verify-merge.mjs <pr-number> [--json] [--repo owner/name]" }, EXIT.usage);
 
@@ -192,18 +191,6 @@ const run = () => {
   // squash produce the same coverage, so the merge commit carries the whole
   // branch whichever was used. More than one commit and this cannot tell, so it
   // refuses -- unproven is the safe default.
-  let squashProven = false, prCommits = null;
-  try {
-    prCommits = JSON.parse(sh("gh", ["api", "--hostname", originHost,
-                                     `repos/${originNwo}/pulls/${pr}/commits`, "--paginate",
-                                     "--jq", ".[].sha"])).length;
-  } catch {
-    try { prCommits = sh("gh", ["api", "--hostname", originHost,
-                                `repos/${originNwo}/pulls/${pr}/commits`, "--paginate",
-                                "--jq", ".[].sha"]).split("\n").filter(Boolean).length; }
-    catch { prCommits = null; }
-  }
-  squashProven = coverageProven(prCommits);
 
   // THE API LIST IS NOW ONLY A CROSS-CHECK, and its failure is not the verdict's
   // failure: the verdict comes from the merge's own diff, read locally. Projected
@@ -263,10 +250,14 @@ const run = () => {
     return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, squash, files: [], why: first(e) }, EXIT.unreadable);
   }
   const branchOnly = branchOnlyPaths(apiPaths, mergePaths);
-  const { verdict, counts, why } = verdictFor(classified, { branchOnly, crossCheck, squashProven });
+  const { verdict, counts, why } = verdictFor(classified, { branchOnly, crossCheck });
+  // DECODE AT THE OUTPUT BOUNDARY. Paths are carried internally as latin1
+  // byte-strings so no byte is lost in comparison, but that is a transport, not
+  // a name: serialised straight to JSON, `café.txt` reads as `cafÃ©.txt` and the
+  // structured report names a file that does not exist.
   emit({ repo: ghRepo, pr, verdict, squash, main: mainOid, base: meta.baseRefName ?? null,
          headRead: headRev !== null, crossCheck, branchOnly: branchOnly.map(displayPath),
-         squashProven, prCommits, counts, files: classified, why },
+         counts, files: classified.map(f => ({ ...f, path: displayPath(f.path) })), why },
        exitFor(verdict));
 };
 

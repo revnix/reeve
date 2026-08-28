@@ -11,7 +11,7 @@
 // take days to produce.
 
 import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, safePath, exitFor,
-         displayPath, toByteString, crossCheckState, coverageProven,
+         displayPath, toByteString, crossCheckState, parseArgs,
          FILE_STATE, VERDICT, EXIT, ABSENT } from "../src/mergecheck.mjs";
 
 let fail = 0;
@@ -247,13 +247,14 @@ const F = "100644", X = "100755", L = "120000";
   check(verdictFor(files).verdict === VERDICT.intact,
     "control: the SAME files with no uncovered paths do verify, so the refusal is the uncovered path and not the fixture");
 
-  // ...unless a rebase merge has been ruled out at the repository level, which is
-  // the only thing that can distinguish a squash from a rebase tip.
-  const proven = verdictFor(files, { branchOnly: extra, squashProven: true });
-  check(proven.verdict === VERDICT.intact && exitFor(proven.verdict) === EXIT.ok,
-    "with rebase merges disabled on the repository, an uncovered path is a late push and verifies", proven.verdict);
-  check(/NOT COVERED BY THE VERDICT ABOVE/.test(proven.why),
-    "and is still reported, because a late push is worth seeing even when benign");
+  // THERE IS NO "UNLESS". Two ways of ruling out a rebase merge were tried and
+  // both inferred a PAST merge from PRESENT state -- the repository's current
+  // merge settings, then the pull request's current commit count. The second is
+  // unsound exactly where it was needed: uncovered paths exist only when the
+  // branch's current file list disagrees with the merge, so the head the count
+  // came from is not the head that merged.
+  check(/PAST merge/.test(v.why) && /PRESENT state/.test(v.why),
+    "and the refusal says why neither current setting nor current commit count can settle it", v.why);
 }
 
 // A cross-check that could not run says so, and does not become a verdict.
@@ -269,8 +270,6 @@ const F = "100644", X = "100755", L = "120000";
     "control: a complete cross-check adds no such note");
   check(verdictFor(files).verdict === VERDICT.intact,
     "control: the same files with a complete cross-check do verify");
-  check(verdictFor(files, { crossCheck: "rate limited", squashProven: true }).verdict === VERDICT.intact,
-    "with rebase merges ruled out, a failed cross-check no longer withholds the pass");
 
   // A DRIFTED verdict is NOT withheld: it already exits non-zero and sends a
   // human to look, and swapping it for UNREADABLE would lose a concrete finding.
@@ -382,16 +381,34 @@ const F = "100644", X = "100755", L = "120000";
     "control: with no reported count there is nothing to be short of");
 }
 
-// --- COVERAGE IS PROVEN PER PULL REQUEST, NEVER FROM REPO SETTINGS -----------
-// A rebase merge names only its LAST commit. With one commit in the pull
-// request, squash and rebase produce identical coverage; with more they do not,
-// and the repository's CURRENT settings say nothing about a PAST merge.
+// --- THE COMMAND LINE ---------------------------------------------------------
+// A VALUE-LESS `--repo` must not fall back to the checkout's origin: an unset
+// shell variable expanded unquoted leaves the flag bare, and answering about
+// origin there is a confident answer about a repository nobody named.
 {
-  check(coverageProven(1) === true,
-    "a one-commit pull request is covered by its merge commit whichever method was used");
-  check(coverageProven(2) === false, "a two-commit pull request is not");
-  check(coverageProven(null) === false && coverageProven(undefined) === false,
-    "and an unknown commit count is NOT proven -- unknown is the safe answer");
+  const P = parseArgs;
+  check(P(["57", "--repo"]).repoMissingValue === true,
+    "a trailing --repo with no value is rejected, not defaulted to origin");
+  check(P(["57", "--repo", "--json"]).repoMissingValue === true,
+    "and a following FLAG is not a value either");
+  check(P(["57", "--repo", "revnix/reeve"]).repoArg === "revnix/reeve" &&
+        P(["57", "--repo", "revnix/reeve"]).repoMissingValue === false,
+    "control: a real value is accepted", JSON.stringify(P(["57", "--repo", "revnix/reeve"])));
+
+  // The -1 sentinel: `i !== at + 1` drops index 0 when there is no --repo, which
+  // is the pull-request number in the ordinary invocation. Found by running it.
+  check(P(["57"]).pr === "57", "a bare pull-request number survives when --repo is absent", JSON.stringify(P(["57"])));
+  check(P(["57", "--json"]).pr === "57" && P(["57", "--json"]).json === true,
+    "and so does one followed by --json");
+  check(P(["--repo", "revnix/reeve", "57"]).pr === "57",
+    "the pull request is found whichever side of --repo it sits on");
+  // The value must be ALL DIGITS to exhibit this: `12/x` cannot match /^\d+$/,
+  // so a fixture using it leaves the property untested -- which is what the stub
+  // loop reported before this line was written this way.
+  check(P(["--repo", "12", "57"]).pr === "57",
+    "and an all-digits repo VALUE cannot donate itself as the pull-request number",
+    JSON.stringify(P(["--repo", "12", "57"])));
+  check(P([]).pr === null, "control: no arguments yields no pull request");
 }
 
 // --- PATHS RENDER FOR HUMANS WITHOUT LOSING BYTES ----------------------------
@@ -405,6 +422,25 @@ const F = "100644", X = "100755", L = "120000";
   const CR = String.fromCharCode(13);
   check(!displayPath(toByteString("ok" + CR + VERDICT.intact)).includes(CR),
     "and a carriage return still cannot forge a verdict line");
+}
+
+
+// --- THE BYTE-STRING IS A TRANSPORT, NOT A NAME ------------------------------
+// Paths are carried as latin1 so no byte is lost in comparison. Serialised
+// straight to JSON that representation names a DIFFERENT file: `café.txt`
+// reads as `cafÃ©.txt`, so the structured report points at something that does
+// not exist. Decode at the output boundary.
+{
+  const utf8Name = "docs/caf\u00e9.txt";
+  const carried = toByteString(utf8Name);
+  check(carried !== utf8Name,
+    "the transport form really does differ from the name, or this test proves nothing",
+    JSON.stringify([utf8Name, carried]));
+  check(displayPath(carried) === utf8Name,
+    "and decoding at the boundary restores the name exactly", JSON.stringify(displayPath(carried)));
+  // The control: the raw transport form is the wrong name, which is the defect.
+  check(carried.includes("\u00c3"),
+    "control: undecoded, it reads as the mojibake the report used to emit", JSON.stringify(carried));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

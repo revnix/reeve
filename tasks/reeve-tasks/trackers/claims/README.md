@@ -33,19 +33,26 @@ tasks, so this protocol is modelled on them deliberately.
 
 ## The mechanism: one file per claim
 
-**One small file per claim, named for the task, under this directory.** Two lanes claiming
-different tasks never touch the same file, so **claims never conflict on merge**, and a claim
-is visible on `main` the moment it is pushed.
+**One small file per claim, named `<stage>-<task>.md`, under this directory.** Two lanes claiming
+different tasks never touch the same file, so **claims never conflict on merge**.
+
+**The stage prefix is load-bearing, not decoration.** Task numbering **restarts at 1 in every
+stage** (`../../MASTER-PLAN.md` §B.8), and a released claim is **kept, never deleted** — so a bare
+`T1.md` would put S4's claimant on top of S3's historical record, and an S9 reader could not tell
+whether a `T1.md` marked HELD belongs to their stage or to one closed a year earlier. Two
+independent facts would share one file, which is the thing this design exists to prevent.
 
 ```
-trackers/claims/
-  README.md      this file
-  T1.md          claim on S3 task T1
-  P2.md          claim on the pre-S3 PR for issue reeve#50
+tasks/reeve-tasks/trackers/claims/
+  README.md         this file
+  S3-T1.md          claim on S3 task T1
+  S3-P2.md          claim on the pre-S3 PR for issue reeve#50
+  S4-T1.md          a DIFFERENT task, and a different file, in a later stage
 ```
 
-**Name the file for the task id in the stage tracker** — `T1`, `T13`, `P1`, `P2` — not for the
-branch and not for the lane. The task id is what two lanes could collide on.
+**Name the file `<stage>-<task>.md`** — `S3-T1`, `S3-P2`, `S4-T1` — never for the branch and never
+for the lane. The stage-and-task pair is what two lanes could collide on, and it is unique across
+the roadmap where the task id alone is not.
 
 ### The file
 

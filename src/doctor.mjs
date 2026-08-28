@@ -251,18 +251,113 @@ function checkMergeShape(nwo, declared) {
  * No gate downstream of a red base can mean anything, and a base that is red for
  * many runs hides whatever breaks next behind an already-red rollup.
  */
-function checkBaseHealth(nwo, workflow = "ci.yml", branch = "main") {
-  const r = sh("gh", ["run", "list", "--repo", nwo, "--workflow", workflow, "--branch", branch,
-                      "--limit", "10", "--json", "conclusion", "--jq", ".[].conclusion"]);
+/**
+ * Did a run execute any step, or none at all?
+ *
+ * A workflow whose runner never starts reports `conclusion: failure` with zero
+ * executed steps, and from the run list alone that is byte-identical to a genuine
+ * test failure. They are opposite problems: one says the code is broken, the
+ * other says nothing has been measured. Reading the conclusion answers a narrower
+ * question than the caller needs, and this repository lost most of a day to that
+ * exact reading on its own CI.
+ *
+ * The step count is the positive signal, and it only exists on the jobs endpoint.
+ * Asked ONLY of runs that report failure: a healthy base spends no extra request,
+ * and the cost is paid exactly when the answer matters.
+ *
+ * A jobs read that fails returns null — unknown, which is neither "failed" nor
+ * "never ran", because guessing either way is how this defect happened.
+ */
+export function runExecutedSteps(nwo, runId, io = null) {
+  // PAGINATED. The workflow-jobs endpoint defaults to 30 per page, and a matrix
+  // run can exceed that easily. Without this, a run whose first thirty jobs
+  // executed nothing but whose thirty-first did would be reported as unmeasured —
+  // a check that answers from part of its input and reports the part as the whole,
+  // which is the exact defect this whole function was written to correct.
+  //
+  // `--jq` is applied PER PAGE, so an aggregate like this yields one number per
+  // page rather than one overall. Measured, not assumed: with per_page=1 against a
+  // two-job run it prints "9" then "3". They are summed here.
+  const run = io?.sh ?? sh;
+  const j = run("gh", ["api", "--paginate", `repos/${nwo}/actions/runs/${runId}/jobs`,
+                      "--jq", "[.jobs[].steps | length] | add // 0"]);
+  if (!j.ok) return null;
+  const perPage = j.out.split("\n").map(l => l.trim()).filter(Boolean).map(Number);
+  if (perPage.some(n => !Number.isFinite(n))) return null;
+  return perPage.reduce((a2, b) => a2 + b, 0) > 0;
+}
+
+/**
+ * No gate downstream of a red base can mean anything, and a base that is red for
+ * many runs hides whatever breaks next behind an already-red rollup.
+ *
+ * "Red" and "never ran" are reported separately, because the remedies have
+ * nothing in common: one is a bug to fix, the other is infrastructure to restore,
+ * and calling the second one a failing base sends somebody to read a diff that is
+ * fine.
+ */
+export function checkBaseHealth(nwo, workflow = "ci.yml", branch = "main", io = null) {
+  const run = io?.sh ?? sh;
+  const steps = io?.steps ?? runExecutedSteps;
+  // COMPLETED RUNS ONLY, because a run that has not finished cannot answer the
+  // question and was still counting toward the denominator.
+  //
+  // `gh run list` returns queued and in-progress runs with an EMPTY conclusion.
+  // Nine completed failures beside one running job therefore read as "9 of the
+  // last 10" and DEGRADED, when the truth is that every completed run is red and
+  // this is BROKEN. The sample was not the sample the caller believed it was.
+  //
+  // The flag chooses the sample; the filter below refuses a malformed row. That is
+  // not two mechanisms for one job — it is a request and a parser, and the parser
+  // must not build a denominator out of rows that carry no answer even if the flag
+  // one day stops applying.
+  const r = run("gh", ["run", "list", "--repo", nwo, "--workflow", workflow, "--branch", branch,
+                       "--limit", "10", "--status", "completed", "--json", "conclusion,databaseId",
+                       "--jq", ".[] | [.conclusion, (.databaseId|tostring)] | @tsv"]);
   if (!r.ok) return { id: "R-04", level: UNKNOWN, title: "base health", lines: [`could not read ${workflow} runs on ${branch}`] };
-  const runs = r.out.split("\n").filter(Boolean);
-  const failures = runs.filter(c => c === "failure").length;
-  const lines = [`${branch}: ${failures} of the last ${runs.length} ${workflow} runs failed`];
-  if (failures === runs.length && runs.length > 0) {
-    lines.push("-> every PR inherits a red rollup, so a new failure is invisible");
+  const runs = r.out.split("\n").filter(Boolean).map(l => l.split("\t"))
+    // A row with no conclusion has not concluded. It is not a pass, and counting
+    // it as one is how a wholly red base reported as merely degraded.
+    .filter(([c]) => c && c.trim());
+  const reported = runs.filter(([c]) => c === "failure");
+
+  let failed = 0, noStep = 0, unreadable = 0;
+  for (const [, id] of reported) {
+    const ran = steps(nwo, id);
+    if (ran === null) unreadable++;
+    else if (ran) failed++;
+    else noStep++;
+  }
+
+  // TWO SOURCES OF EVIDENCE, AND THEY ANSWER DIFFERENT QUESTIONS.
+  //
+  // The run LIST says whether anything succeeded. That alone decides whether the
+  // base is usable, and it needs no help: a run that concluded failure did not
+  // succeed, whatever its steps did.
+  //
+  // The step reads only explain WHY, and they can be unreadable without changing
+  // the first answer. Folding them into the verdict is what produced three
+  // successive defects here — an unreadable step read subtracted from an all-red
+  // history, and a mix of causes matched no homogeneous test. Both were the same
+  // mistake: letting the explanation decide the conclusion.
+  const lines = [`${branch}: ${reported.length} of the last ${runs.length} completed ${workflow} runs concluded failure`];
+  if (noStep) lines.push(`${noStep} of those executed no steps`);
+  if (unreadable) lines.push(`${unreadable} of those could not be read, so why they failed is unknown`);
+
+  if (runs.length > 0 && reported.length === runs.length) {
+    // Nothing in this sample succeeded. The wording distinguishes the causes; the
+    // verdict does not depend on being able to tell them apart.
+    if (noStep === reported.length) {
+      lines.push("-> nothing on this branch has been measured; no gate downstream of it means anything");
+      lines.push("-> cause is NOT determined here: an exhausted runner quota and a workflow that cannot start look identical from the step count");
+    } else if (failed === reported.length) {
+      lines.push("-> every PR inherits a red rollup, so a new failure is invisible");
+    } else {
+      lines.push("-> no completed run in this sample produced a usable result");
+    }
     return { id: "R-04", level: BROKEN, title: "base health", lines };
   }
-  if (failures > 0) return { id: "R-04", level: DEGRADED, title: "base health", lines };
+  if (reported.length > 0) return { id: "R-04", level: DEGRADED, title: "base health", lines };
   return { id: "R-04", level: OK, title: "base health", lines };
 }
 

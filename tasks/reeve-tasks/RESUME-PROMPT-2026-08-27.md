@@ -1,5 +1,8 @@
 # Resume prompt — paste the block below into a fresh session
 
+> **SUPERSEDED 2026-08-28 by `RESUME-PROMPT-2026-08-28.md`.** Read that instead. This is kept as the
+> record of what was believed on 2026-08-27, unedited below its own banner.
+
 Everything between the rules is the prompt. It assumes nothing about what you remember.
 
 ---

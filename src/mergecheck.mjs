@@ -152,8 +152,8 @@ export function verdictFor(files, { branchOnly = [], crossCheck = "complete", sq
                   (branchOnly.length > 0
                     ? `${branchOnly.length} path(s) the pull request touches are absent from the merge commit's diff and were never compared.\n`
                     : `the cross-check that would reveal such paths could not be completed.\n`) +
-                  `A squash merge carries the whole branch; a REBASE merge names only its last commit, and this repository permits rebase merges, so the two cannot be told apart from here.\n` +
-                  `Disable rebase merges on the repository, or check the uncovered paths by hand.${note2}` };
+                  `A squash merge carries the whole branch; a REBASE merge names only its LAST commit. This pull request has more than one commit, so the two cannot be told apart and the uncovered paths may never have been compared.\n` +
+                  `Check them by hand. A repository's CURRENT merge settings cannot settle this: they say nothing about how an EXISTING merge was performed.${note2}` };
   }
   return { verdict: VERDICT.intact, counts,
            why: `All ${files.length} path(s) on main are exactly what the merge produced, mode included.\n` +
@@ -218,6 +218,11 @@ export function gitFacts(run) {
     // Resolved to an object id, because `origin/main` is MUTABLE: left as a
     // name, each lookup re-resolves it and a concurrent fetch can serve some
     // paths from the old main and some from the new.
+    // The leading `+` FORCES the remote-tracking update. Without it a REWRITTEN
+    // main is a non-fast-forward, git rejects it, the fetch fails, and every
+    // later run reports UNREADABLE against a stale origin/main -- permanently.
+    // `fetch`, never `pull`: a live guardian may run from this checkout.
+    fetchMain: () => g("fetch", "origin", "+refs/heads/main:refs/remotes/origin/main", "--quiet"),
     pinMain: () => g("rev-parse", "origin/main^{commit}").trim(),
     // Through `g` like every other read, so "every git call this makes carries
     // --literal-pathspecs" is one uniform invariant a test can assert, rather
@@ -234,13 +239,35 @@ export function gitFacts(run) {
     mergePaths: (rev) =>
       g("diff-tree", "--no-commit-id", "--no-renames", "--name-only", "-r", "-z", rev)
         .split("\0").filter(Boolean),
+    // THE WHOLE TREE AT ONCE, and paths are never handed BACK to git.
+    //
+    // A path is read out of git and would have to be passed to `ls-tree` as an
+    // argument to look it up again -- but argv is encoded as UTF-8, so a
+    // filename containing invalid UTF-8 cannot survive the round trip. Decoded
+    // as a JS string it becomes U+FFFD, git is then asked for a DIFFERENT name,
+    // that name is absent from both revisions, and the entry classifies REMOVED,
+    // which is a passing state, over a path that may have drifted. MEASURED by
+    // review with a filename containing byte 0xff.
+    //
+    // Listing the tree once and looking paths up in a Map removes the round trip
+    // entirely: the bytes are only ever READ. `latin1` maps each byte to one
+    // code point, so the string comparison is a byte comparison; it is a
+    // transport, not a claim about the encoding. It is also 2 git calls instead
+    // of 2N.
+    //
     // TREE ENTRY, not blob: mode lives in the tree, so an executable bit that
     // never arrived shares its blob id with the version that did.
-    entryAt: (rev, path) => {
-      const out = g("ls-tree", "--full-tree", rev, "--", path).trim();
-      if (!out) return ABSENT;
-      const [mode, , id] = out.slice(0, out.indexOf("\t")).split(/\s+/);
-      return { mode, id };
+    treeEntries: (rev) => {
+      const out = g("-c", "core.quotePath=false", "ls-tree", "-r", "-z", "--full-tree", rev);
+      const map = new Map();
+      for (const rec of out.split("\0")) {
+        if (!rec) continue;
+        const tab = rec.indexOf("\t");
+        if (tab < 0) continue;
+        const [mode, , id] = rec.slice(0, tab).split(/\s+/);
+        map.set(rec.slice(tab + 1), { mode, id });
+      }
+      return map;
     },
   };
 }
@@ -253,6 +280,65 @@ export function gitFacts(run) {
 export function branchOnlyPaths(apiPaths, mergePaths) {
   const produced = new Set(mergePaths);
   return apiPaths.filter(p => !produced.has(p));
+}
+
+/**
+ * Is the pull request's file list complete enough to cross-check with?
+ *
+ * COUNT THE RECORDS, NOT THE EXPANDED PATHS. A rename contributes two paths from
+ * one record, so comparing expanded paths against `changedFiles` lets one rename
+ * conceal one missing record. That is reachable at the endpoint's documented
+ * 3,000-file limit, where the short list would then read as complete.
+ */
+export function crossCheckState(recordCount, changedFiles) {
+  if (typeof changedFiles !== "number") return "complete";
+  if (recordCount < changedFiles) {
+    return `GitHub reports ${changedFiles} changed files and pagination returned ${recordCount} records`;
+  }
+  return "complete";
+}
+
+/**
+ * Does this merge commit provably cover the WHOLE pull request?
+ *
+ * `mergeCommit.oid` for a rebase merge is the LAST rebased commit: one parent,
+ * like a squash, but covering only that commit. With exactly ONE commit in the
+ * pull request the two produce identical coverage, so the merge carries the
+ * whole branch whichever was used. With more, this cannot tell.
+ *
+ * NOT DECIDABLE FROM THE REPOSITORY'S SETTINGS. `allow_rebase_merge` is present
+ * state and says nothing about how an EXISTING merge was performed -- a pull
+ * request rebase-merged while it was enabled would be marked proven the moment
+ * an administrator turned it off. Unknown is the safe answer.
+ */
+export function coverageProven(prCommits) {
+  return prCommits === 1;
+}
+
+/**
+ * Render a byte-string path for humans.
+ *
+ * Paths are carried as `latin1` byte-strings so no byte is lost. Most are valid
+ * UTF-8 and should read normally; the rest are shown as escapes rather than as
+ * replacement characters, so a name that cannot be decoded looks like what it is
+ * instead of like a different name.
+ */
+export function displayPath(byteStr) {
+  const buf = Buffer.from(String(byteStr), "latin1");
+  const asUtf8 = buf.toString("utf8");
+  const roundTrips = Buffer.from(asUtf8, "utf8").equals(buf);
+  if (roundTrips) return safePath(asUtf8);
+  return [...buf].map(b => (b >= 0x20 && b < 0x7f)
+    ? String.fromCharCode(b)
+    : "\\x" + b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Normalise a UTF-8 JS string (as JSON gives it) to the same `latin1`
+ * byte-string representation the git reads use, so the two can be compared.
+ */
+export function toByteString(s) {
+  return Buffer.from(String(s), "utf8").toString("latin1");
 }
 
 /**

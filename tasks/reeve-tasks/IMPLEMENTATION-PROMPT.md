@@ -282,12 +282,19 @@ When, and only when, the founder grants this specific PR:
 
 1. Update the stage tracker: STATE → **MERGED**, the **squash SHA on `main`** (the only SHA a
    tracker row carries — per-round fix SHAs do not survive a squash merge), rounds, findings.
+   **Publish it.** Phase 3 deliberately merges the feature PR with the row still at `BUILT`, so
+   this edit exists only in your checkout until it lands. Open a **tracker-only PR** — the same
+   shape as a claim update: one file, nothing else, reviews in a minute — and merge it. Until then
+   every other lane reads `BUILT` on work that is done, which is precisely the 10-of-20 defect the
+   per-stage tracker was designed to remove, reintroduced one step later in the workflow.
 2. Add any new **finding class** to the tracker's defect log — one row per class, ≤400
    characters, not one row per finding.
 3. Add any **durable finding** — a lesson about plans or designs being wrong — to §5.
 4. Add any decision taken during the task to §4, with its date and reason.
-5. **Release the claim**: `state: RELEASED`, with the reason and the date. Do not delete the
-   file.
+5. **Release the claim**: `state: RELEASED`, with the reason and the date, **published as a
+   claim-only PR** like every other claim transition. Do not delete the file. A release that lives
+   only on a merged feature branch leaves the task HELD to everyone reading `main`, and the next
+   task never starts.
 6. Report: what merged, what it changed, what review found, what is still open.
 
 ---

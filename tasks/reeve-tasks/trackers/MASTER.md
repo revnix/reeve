@@ -53,13 +53,20 @@ A stage is MERGED only when every row of its Verify table names a file that exis
 
 | what | who | where |
 |---|---|---|
-| S3 plan family, trackers and implementation prompt — **WRITTEN**, not yet in a PR | this lane | branch `docs/s3-foundation` |
-| #54 `fix/ci-concurrency` | founder | open PR, not this lane's |
+| The foundation — this commit | this lane | `reeve#58`, in review |
+| The merge verifier, split out of #58 | this lane | `reeve#60`, in review |
+| The six S3 stage plans — **written, not yet in a PR** | this lane | branch `docs/s3-foundation`; they land one at a time (decision 17) |
 
-**S3's eleven documents are complete.** Six plans (14,167 lines, 78 tasks, 62 of them carrying
-`**On the broken implementation**` and a named stub loop), a master plan, an implementation
-prompt and five trackers. Nothing has been claimed and no code has been written; the next
-action is **P1**, the test suite's dead network.
+**S3's eleven documents are complete.** Six plans (14,167 lines, 78 tasks), a master plan, an
+implementation prompt and five trackers.
+
+**P1 is DONE** — `reeve#57` merged as `89c4af6`, verified by content; the suite went 550s → 303s
+and `test/offline-tests.test.mjs` guards the relapse. Its claim is RELEASED.
+
+**The next action is P2 — issue `reeve#50`**, extracting the guardian's provider/hub session out
+of `tick()`. It is unclaimed. The design is written and reviewed
+(`../ISSUE-50-SESSION-DESIGN.md`); measured on `a529096`, `tick()` is **2,282 lines** and has
+grown 14% since the issue naming it was filed. **T1 does not start until P2 merges.**
 
 Claims are one file each under `claims/`. **Read `claims/README.md` before starting anything.**
 

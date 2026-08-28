@@ -370,7 +370,8 @@ MEASURED over 40 merged PRs, 1,282 review threads and 273 review rounds, on 2026
    them caused by the previous round's own fixes: an edit in a document that large cannot see
    its neighbourhood."*
 
-   **The unit of the cap is TASKS, not lines — corrected 2026-08-27, on measurement.** The
+   **The unit of the cap is PRs — not lines, and not tasks.** Corrected twice, both times on
+   measurement, and the history is kept because the next author should see it moved. The
    original rule read *"cap each document at ~1,200 lines"*, and it was computed against the
    wrong denominator: S3's **16 PRs**, when a PR decomposes into three to five *plan tasks*
    and the house style runs **~500 lines per plan task** (MEASURED: S2-A is 6,328 lines over

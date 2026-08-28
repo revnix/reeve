@@ -121,10 +121,13 @@ existed since `src/checkout.mjs` replaced them.
     set -o pipefail
     squash=$(gh pr view <pr> --json state,mergeCommit --jq 'select(.state=="MERGED")|.mergeCommit.oid // empty')
     [ -n "$squash" ] || { echo "UNREADABLE: not merged, or it reports no merge commit"; exit 23; }
-    git rev-parse --verify --quiet "${squash}^{commit}" >/dev/null \
-      || { echo "UNREADABLE: squash $squash is not readable in this checkout"; exit 23; }
+    # FETCH BEFORE VALIDATING. Immediately after a merge the squash object is on
+    # the remote and not yet here, so validating first calls a good merge
+    # unreadable -- and this is the close-out gate, run at exactly that moment.
     git fetch origin "+refs/heads/main:refs/remotes/origin/main" --quiet \
       || { echo "UNREADABLE: could not refresh origin"; exit 23; }
+    git rev-parse --verify --quiet "${squash}^{commit}" >/dev/null \
+      || { echo "UNREADABLE: squash $squash is not readable even after fetching origin"; exit 23; }
     main=$(git rev-parse "origin/main^{commit}") || exit 23
 
     # A TEMP FILE, not a process substitution and not a variable. Feeding the loop
@@ -431,6 +434,18 @@ When, and only when, the founder grants this specific PR:
 
 ### Phase 5: Close out
 
+0. **Cut the close-out worktree FIRST, and make every edit below in it.**
+
+   ```bash
+   git fetch origin "+refs/heads/main:refs/remotes/origin/main" --quiet || exit 1
+   git worktree add -b chore/<stage>-<task>-close-out ~/Work/Products/reeve-wt/<name>-closeout origin/main
+   ```
+
+   **Before step 1, not at step 5.** A worktree created afterwards is a fresh checkout of
+   `origin/main` and does **not** inherit uncommitted edits made in the feature worktree — so
+   following the old order left the MERGED state and the findings stranded where nobody would
+   publish them, and opened an empty tracker PR. Downstream lanes go on reading `BUILT`.
+
 1. Update the stage tracker: STATE → **MERGED**, the **squash SHA on `main`** (the only SHA a
    tracker row carries — per-round fix SHAs do not survive a squash merge), rounds, findings.
    *(Do not publish yet — steps 2 to 4 edit the same file. See step 5.)*
@@ -438,13 +453,8 @@ When, and only when, the founder grants this specific PR:
    characters, not one row per finding.
 3. Add any **durable finding** — a lesson about plans or designs being wrong — to §5.
 4. Add any decision taken during the task to §4, with its date and reason.
-5. **Publish the tracker, once, with every close-out edit in it — from a NEW branch cut from a
-   freshly fetched `origin/main`, never from the feature worktree.**
-
-   ```bash
-   git fetch origin "+refs/heads/main:refs/remotes/origin/main" --quiet || exit 1
-   git worktree add -b chore/<stage>-<task>-close-out ~/Work/Products/reeve-wt/<name>-closeout origin/main
-   ```
+5. **Publish the tracker, once, with every close-out edit in it** — from the close-out worktree
+   cut in step 0, never from the feature worktree.
 
    **The feature branch cannot carry this.** Rule 11's whole point is that a squash makes the
    feature head a NON-ancestor of `main` — so a PR opened from that branch after the merge

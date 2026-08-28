@@ -29,11 +29,11 @@
  *  · it proves a stub landed by a HASH CHANGE rather than by re-reading the file
  *    for the anchor. Confirmation greps have been measured inert here.
  */
-import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync, realpathSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname, basename, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyEdit, validateManifest, classify, summarise, CAUGHT, UNRUNNABLE, TIMED_OUT_EXIT } from "../src/stubsweep.mjs";
 
@@ -78,6 +78,33 @@ try {
   die(2, `stub-sweep: the manifest is not usable: ${err.message}`);
 }
 
+// EVERY TARGET MUST RESOLVE INSIDE THE REPOSITORY, checked before anything is
+// written and by REAL path, not by string.
+//
+// `join(ROOT, file)` happily produces a path outside the tree when the entry
+// contains `..`, and an in-repository symlink reaches outside without any `..` at
+// all. The runner would then snapshot, deliberately modify and restore a file the
+// git cleanliness guard cannot see — so a malformed manifest damages a sibling
+// project and nothing in the sweep's own safety net notices.
+//
+// `realpathSync` on the ROOT too, because a repository reached through a symlinked
+// parent would otherwise fail its own containment test.
+const REAL_ROOT = realpathSync(ROOT);
+const contained = file => {
+  const target = join(ROOT, file);
+  // The FILE may not exist yet in a malformed manifest; resolving its directory is
+  // enough to answer where it would be written.
+  let real;
+  try { real = realpathSync(target); }
+  catch { try { real = join(realpathSync(dirname(target)), basename(target)); } catch { return null; } }
+  return real === REAL_ROOT || real.startsWith(REAL_ROOT + sep) ? real : null;
+};
+for (const e of manifest)
+  for (const ed of e.edits)
+    if (!contained(ed.file))
+      die(2, `stub-sweep: ${e.name}: "${ed.file}" resolves outside the repository.\n` +
+             "A manifest may only edit files inside the tree the cleanliness guard can see.");
+
 const wanted = process.argv.slice(2);
 const entries = wanted.length ? manifest.filter(e => wanted.includes(e.name)) : manifest;
 if (wanted.length && entries.length !== wanted.length) {
@@ -100,7 +127,13 @@ if (wanted.length && entries.length !== wanted.length) {
 let activeChild = null;
 
 const runTest = file => new Promise(resolve => {
-  const child = spawn(process.execPath, [join(ROOT, file)], { cwd: ROOT });
+  // DETACHED, so the child leads its own process GROUP.
+  //
+  // Killing the direct pid leaves anything it spawned alive — and a helper that
+  // outlives the sweep keeps producing side effects against a tree that has since
+  // been restored, with no timer left anywhere to stop it. A group can be killed
+  // whole, which is the only way to end work we did not start ourselves.
+  const child = spawn(process.execPath, [join(ROOT, file)], { cwd: ROOT, detached: true });
   activeChild = child;
   // BOUNDED. A deliberately broken test that logs continuously would otherwise
   // grow one unbounded string for as long as the timeout allows, and exhausting
@@ -111,13 +144,34 @@ const runTest = file => new Promise(resolve => {
   const CAP = 1 << 20;   // 1 MiB of tail is far more than any verdict needs
   let out = "";
   let dropped = 0;
+  // ASSERTION LINES ARE KEPT SEPARATELY, and this is not belt-and-braces.
+  //
+  // A test that prints its named FAIL and THEN emits a megabyte of diagnostics
+  // would have had the evidence scrolled out of the tail — and the entry would be
+  // reported CRASHED or WRONG_RED, failing the sweep even though the assertion did
+  // catch the stub. The verdict must not depend on how noisy the failure was.
+  //
+  // Bounded too, so a test printing a million assertion lines cannot exhaust the
+  // heap through this route instead.
+  const ASSERTION_LINE = /^(PASS|FAIL) {2}(.+)$/;
+  const MAX_ASSERTION_LINES = 20_000;
+  const kept = [];
+  let partial = "";
   const take = d => {
+    const lines = (partial + d).split("\n");
+    partial = lines.pop() ?? "";     // an incomplete final line waits for more
+    for (const l of lines)
+      if (ASSERTION_LINE.test(l) && kept.length < MAX_ASSERTION_LINES) kept.push(l);
     out += d;
     if (out.length > CAP) { dropped += out.length - CAP; out = out.slice(-CAP); }
   };
   child.stdout.on("data", take);
   child.stderr.on("data", take);
-  const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, 600_000);
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { process.kill(-child.pid, "SIGKILL"); }
+    catch { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
+  }, 600_000);
   let timedOut = false;
   child.on("close", (code, signal) => {
     clearTimeout(timer);
@@ -125,8 +179,13 @@ const runTest = file => new Promise(resolve => {
     // "timed out" and "failed an assertion" are different readings and only one of
     // them is evidence.
     activeChild = null;
+    if (partial && ASSERTION_LINE.test(partial) && kept.length < MAX_ASSERTION_LINES) kept.push(partial);
+    // The kept assertions come FIRST, so they survive whatever the tail lost. The
+    // classifier reads whole lines, so prepending them changes nothing it can see
+    // except that the evidence is present.
+    const body = dropped ? `[${dropped} earlier byte(s) dropped]\n${out}` : out;
     resolve({ exit: timedOut || code === null ? TIMED_OUT_EXIT : code,
-              output: dropped ? `[${dropped} earlier byte(s) dropped]\n${out}` : out });
+              output: dropped ? `${kept.join("\n")}\n${body}` : body });
   });
 });
 
@@ -187,7 +246,13 @@ for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     // The CHILD first. It is holding the stubbed tree open, and killing it after
     // restoring would let it run on against files that no longer match what it
     // was started with.
-    if (activeChild) { try { activeChild.kill("SIGKILL"); } catch { /* already gone */ } }
+    // The GROUP, by negative pid. Falls back to the direct child if the group is
+    // already gone, so a race cannot leave the handler throwing instead of
+    // restoring the tree.
+    if (activeChild?.pid) {
+      try { process.kill(-activeChild.pid, "SIGKILL"); }
+      catch { try { activeChild.kill("SIGKILL"); } catch { /* already gone */ } }
+    }
     restoreActive();
     console.error(`\nstub-sweep: ${sig} — the tree was restored before exiting.`);
     // The conventional 128+n, so a caller can tell a signal from a verdict.
@@ -312,6 +377,29 @@ for (const entry of entries) {
 
   const verdict = classify({ controlExit: control.exit, stubExit: stub.exit, stubOutput: stub.output,
                              hashChanged, restored, expectRed: entry.expectRed });
+
+  // THE WHOLE TREE, rechecked after every entry.
+  //
+  // The startup guard proves the tree was clean when the sweep began; it cannot see
+  // what deliberately broken code did while it ran. A stubbed test that writes a
+  // file, or modifies one outside the manifest's targets, leaves the repository
+  // dirty — and the entry would still report CAUGHT and exit 0, while every
+  // FOLLOWING entry runs against a tree nobody intended.
+  //
+  // Reported as UNRUNNABLE rather than as a failure of the stub: the reading itself
+  // is void, because the code under test was not the code in the manifest.
+  let after = "";
+  try { after = execFileSync("git", ["status", "--porcelain"], { cwd: ROOT, encoding: "utf8" }).trim(); }
+  catch { after = ""; }
+  if (after) {
+    console.error(`stub-sweep: ${entry.name} left the repository dirty; the stubbed test had side effects.`);
+    console.error(after);
+    results.push({ name: entry.name, reintroduces: entry.why, verdict: UNRUNNABLE,
+                   why: "the stubbed test modified the repository outside its manifest targets, " +
+                        "so this reading is void and later entries would run against a different tree" });
+    console.log(`FAIL ${entry.name.padEnd(28)} ${UNRUNNABLE}`);
+    break;   // stop: every later reading is now suspect
+  }
 
   results.push({ name: entry.name, reintroduces: entry.why, ...verdict });
   const mark = verdict.verdict === CAUGHT ? "ok  " : "FAIL";

@@ -1,18 +1,19 @@
 #!/usr/bin/env node
-// Did a pull request's content actually reach main? The reasoning is in
+// Is a merged pull request's content still on main? The reasoning is in
 // src/mergecheck.mjs, where it is tested without a network; this is the shell
 // that gathers the facts, as capture-baseline.mjs is the shell over
 // src/baseline.mjs.
 //
 // EVERY WAY THIS CAN FAIL TO KNOW IS REPORTED AS UNREADABLE, never as a verdict.
-// A verifier that answers from a stale ref, a truncated file list, or a revision
-// it could not fetch is worse than no verifier: it is the false reassurance the
-// tool exists to remove, wearing the tool's authority.
+// A verifier that answers from a stale ref, a truncated file list, a revision it
+// could not fetch, or a merge into a branch it was not asked about is worse than
+// no verifier: it is the false reassurance the tool exists to remove, wearing
+// the tool's authority.
 //
 // Usage:  node scripts/verify-merge.mjs <pr-number> [--json] [--repo owner/name]
 
 import { execFileSync } from "node:child_process";
-import { classifyFiles, verdictFor, pathsOf, exitFor, EXIT, VERDICT, ABSENT, UNREAD }
+import { classifyFiles, verdictFor, pathsOf, safePath, exitFor, EXIT, VERDICT, ABSENT }
   from "../src/mergecheck.mjs";
 
 const argv = process.argv.slice(2);
@@ -27,7 +28,10 @@ const emit = (doc, code) => {
   if (json) console.log(JSON.stringify(doc, null, 2));
   else {
     console.log(`${doc.verdict}  ${doc.repo ?? "?"}#${doc.pr ?? "?"}${doc.squash ? `  squash=${doc.squash.slice(0, 7)}` : ""}`);
-    for (const f of doc.files ?? []) console.log(`  ${f.state.padEnd(9)} ${f.path}`);
+    // safePath, not the raw name: a filename is attacker-supplied on any
+    // repository taking outside contributions, and a carriage return or an ANSI
+    // escape in one can overwrite the verdict line above or forge a new one.
+    for (const f of doc.files ?? []) console.log(`  ${f.state.padEnd(8)} ${safePath(f.path)}`);
     if (doc.why) console.log(`\n${doc.why}`);
   }
   process.exitCode = code;
@@ -40,14 +44,10 @@ const run = () => {
   if (!pr) return emit({ verdict: "USAGE", files: [],
     why: "usage: node scripts/verify-merge.mjs <pr-number> [--json] [--repo owner/name]" }, EXIT.usage);
 
-  // THE CHECKOUT MUST BE THE REPOSITORY BEING ASKED ABOUT. Otherwise GitHub's
-  // metadata comes from one repository and every tree comparison from another,
-  // and the result is a confident verdict about two different things.
   // THE HOST IS PART OF THE IDENTITY. An origin on GitHub Enterprise, or a local
-  // mirror, has the same owner/name as a repository on github.com -- and `gh`
-  // defaults to github.com. Keeping only owner/name lets metadata come from one
-  // host while every tree comparison reads the other, and a mirror with matching
-  // objects would receive a confident verdict assembled from two repositories.
+  // mirror, can carry the same owner/name as a repository on github.com -- and
+  // `gh` defaults to github.com. Keeping only owner/name lets metadata come from
+  // one host while every tree comparison reads the other.
   let originHost = null, originNwo = null;
   try {
     const url = sh("git", ["remote", "get-url", "origin"]);
@@ -56,60 +56,57 @@ const run = () => {
   } catch (e) {
     return emit({ verdict: VERDICT.unreadable, files: [], why: `no usable origin remote: ${first(e)}` }, EXIT.unreadable);
   }
-  const repo = repoArg ?? originNwo;
-  // Declared before any use. An earlier revision referenced this from two emits
-  // above its declaration -- a temporal dead zone fault that `node --check`
-  // cannot see, because it is a runtime error and not a parse error.
   if (!originNwo || !originHost) return emit({ repo: repoArg, pr, verdict: VERDICT.unreadable, files: [],
     why: "could not parse a host and owner/name out of origin's URL, so the tree side cannot be bound to the repository being asked about." }, EXIT.unreadable);
-  // `--repo` may be given host-qualified, exactly as `gh` accepts it.
+
+  const repo = repoArg ?? originNwo;
   const ghRepo = `${originHost}/${originNwo}`;
   const wantHost = repo.split("/").length === 3 ? repo.split("/")[0] : originHost;
   const wantNwo = repo.split("/").slice(-2).join("/");
   if (wantNwo !== originNwo || wantHost !== originHost) {
     return emit({ repo: `${wantHost}/${wantNwo}`, pr, verdict: VERDICT.unreadable, files: [],
-      why: `--repo names ${wantHost}/${wantNwo} but this checkout's origin is ${originHost}/${originNwo}.\n` +
+      why: `--repo names ${wantHost}/${wantNwo} but this checkout's origin is ${ghRepo}.\n` +
            `Metadata would come from one repository and every tree comparison from the other. Run this from a checkout of it.` }, EXIT.unreadable);
   }
-  // Every `gh` call is bound to origin's host, not to gh's default.
 
   let meta;
   try {
     meta = JSON.parse(sh("gh", ["pr", "view", pr, "--repo", ghRepo, "--json",
-                                "state,mergedAt,mergeCommit,headRefOid,changedFiles"]));
+                                "state,mergedAt,mergeCommit,headRefOid,baseRefName,changedFiles"]));
   } catch (e) {
-    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [], why: `could not read ${repo}#${pr}: ${first(e)}` }, EXIT.unreadable);
+    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [], why: `could not read ${ghRepo}#${pr}: ${first(e)}` }, EXIT.unreadable);
   }
   if (meta.state !== "MERGED") {
     return emit({ repo: ghRepo, pr, verdict: "NOT MERGED", state: meta.state, files: [],
-      why: `${repo}#${pr} is ${meta.state}. There is nothing to verify yet.` }, EXIT.absent);
+      why: `${ghRepo}#${pr} is ${meta.state}. There is nothing to verify yet.` }, EXIT.absent);
+  }
+
+  // WHICH BRANCH DID IT MERGE INTO? Everything below compares against
+  // origin/main. A pull request merged into `release` produced a squash commit
+  // on THAT branch, and using it as evidence about main would report arrival
+  // somewhere else as arrival here.
+  if (meta.baseRefName && meta.baseRefName !== "main") {
+    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, base: meta.baseRefName, files: [],
+      why: `${ghRepo}#${pr} merged into '${meta.baseRefName}', not 'main'.\n` +
+           `Its squash commit is evidence about '${meta.baseRefName}' and says nothing about main. This only answers for main.` }, EXIT.unreadable);
+  }
+
+  const squash = meta.mergeCommit?.oid ?? null;
+  if (!squash) {
+    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [],
+      why: `${ghRepo}#${pr} is merged but reports no merge commit, so there is nothing authoritative to compare main against.` }, EXIT.unreadable);
   }
 
   // THE FILE LIST, PAGINATED, and checked against the count GitHub reports.
   // `gh pr view --json files` asks for `files(first: 100)`, so a larger pull
-  // request is silently truncated and a verdict over the prefix could exit 0
-  // while an omitted path is absent from main.
+  // request is silently truncated and a verdict over the prefix could pass while
+  // an omitted path is missing from main.
   let files;
   try {
-    files = JSON.parse(sh("gh", ["api", "--hostname", originHost, "--paginate", `repos/${originNwo}/pulls/${pr}/files`, "--slurp"])).flat();
+    files = JSON.parse(sh("gh", ["api", "--hostname", originHost, "--paginate",
+                                 `repos/${originNwo}/pulls/${pr}/files`, "--slurp"])).flat();
   } catch (e) {
-    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [], why: `could not list the files of ${repo}#${pr}: ${first(e)}` }, EXIT.unreadable);
-  }
-  // THE TWO READS MUST BE OF ONE MOMENT. The head came from the metadata call
-  // and the paths from a later one; a push landing between them -- which is
-  // exactly the lost-push case this tool exists to catch -- would have the old
-  // head checked against the new head's path list, and `changedFiles` cannot
-  // detect the substitution because the count can be identical.
-  try {
-    const again = JSON.parse(sh("gh", ["pr", "view", pr, "--repo", ghRepo, "--json", "headRefOid"]));
-    if (again.headRefOid !== meta.headRefOid) {
-      return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [],
-        why: `the pull request head moved while this was reading it: ${meta.headRefOid.slice(0, 7)} -> ${again.headRefOid.slice(0, 7)}.\n` +
-             `The head and the path list would be from two different moments. Re-run.` }, EXIT.unreadable);
-    }
-  } catch (e) {
-    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [],
-      why: `could not re-read the head to confirm it had not moved: ${first(e)}` }, EXIT.unreadable);
+    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [], why: `could not list the files of ${ghRepo}#${pr}: ${first(e)}` }, EXIT.unreadable);
   }
   if (typeof meta.changedFiles === "number" && files.length !== meta.changedFiles) {
     return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [],
@@ -117,13 +114,11 @@ const run = () => {
            `Refusing rather than verifying a prefix -- an omitted path is exactly what this would fail to notice.` }, EXIT.unreadable);
   }
 
-  // A FETCH THAT FAILED MUST NOT BECOME A VERDICT. Comparing against a stale
-  // origin/main can match a current head and exit 0 while the real remote tree
-  // differs. `fetch`, never `pull`: a live guardian may run from this checkout.
-  // AN EXPLICIT REFSPEC. A bare `git fetch origin` follows whatever
-  // remote.origin.fetch maps, and a narrow or customised clone may not map
-  // refs/heads/main at all -- the fetch then SUCCEEDS while origin/main stays
-  // stale, and a stale main can match a current head and produce exit 0.
+  // A FETCH THAT FAILED MUST NOT BECOME A VERDICT, and the refspec is explicit:
+  // a bare `git fetch origin` follows whatever remote.origin.fetch maps, and a
+  // narrow clone may not map refs/heads/main at all -- the fetch then SUCCEEDS
+  // while origin/main stays stale. `fetch`, never `pull`: a live guardian may be
+  // running from this checkout.
   try {
     execFileSync("git", ["fetch", "origin", "refs/heads/main:refs/remotes/origin/main", "--quiet"],
                  { stdio: ["ignore", "ignore", "pipe"] });
@@ -132,52 +127,45 @@ const run = () => {
       why: `could not refresh origin: ${first(e)}\nRefusing to classify against refs that may be stale.` }, EXIT.unreadable);
   }
 
-  // THE PULL REQUEST HEAD IS NOT NECESSARILY LOCAL. A squash commit does not
-  // retain the branch head as a parent, and origin's refspec is
-  // +refs/heads/*:refs/remotes/origin/* -- no refs/pull/*. So from a fresh clone
-  // of a repository whose merged branch was deleted, every path reads absent at
-  // head and the tool reports a correctly-merged pull request as MISSING.
-  const head = meta.headRefOid;
   const have = (rev) => { try { sh("git", ["cat-file", "-e", `${rev}^{commit}`]); return true; } catch { return false; } };
-  if (!have(head)) {
-    try { execFileSync("git", ["fetch", "origin", `pull/${pr}/head`, "--quiet"], { stdio: ["ignore", "ignore", "pipe"] }); }
-    catch { /* fall through to the check below, which reports it properly */ }
-  }
-  if (!have(head)) {
-    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [],
-      why: `the pull request head ${head.slice(0, 7)} is not in this checkout and could not be fetched from refs/pull/${pr}/head.\n` +
-           `Without it every path would read as absent at head, and a merged pull request would be reported as MISSING.` }, EXIT.unreadable);
+  if (!have(squash)) {
+    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, squash, files: [],
+      why: `the squash commit ${squash.slice(0, 7)} is not readable in this checkout, so there is nothing authoritative to compare main against.` }, EXIT.unreadable);
   }
 
-  const squash = meta.mergeCommit?.oid ?? null;
-  if (squash && !have(squash)) {
-    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [],
-      why: `the squash commit ${squash.slice(0, 7)} is not readable in this checkout, so arrival cannot be told from drift.` }, EXIT.unreadable);
+  // The head is OPTIONAL and never decides the verdict -- it only reports
+  // divergence. A squash keeps no parent link to the branch and origin's refspec
+  // carries no refs/pull/*, so it may simply not be present, and that is fine.
+  let headRev = null;
+  if (meta.headRefOid) {
+    if (!have(meta.headRefOid)) {
+      try { execFileSync("git", ["fetch", "origin", `pull/${pr}/head`, "--quiet"], { stdio: ["ignore", "ignore", "pipe"] }); } catch { /* optional */ }
+    }
+    if (have(meta.headRefOid)) headRev = meta.headRefOid;
   }
 
   // TREE ENTRY, not blob: mode lives in the tree, so an executable bit or a
   // symlink flag that never arrived shares its blob id with one that did.
-  // ABSENT only ever means "this revision was read and holds no such path" --
-  // every revision here has been proven readable above.
   const entryAt = (rev, path) => {
     let out;
     try { out = sh("git", ["ls-tree", "--full-tree", rev, "--", path]); }
-    catch (e) { throw new Error(`git ls-tree failed for ${rev}:${path}: ${first(e)}`); }
+    catch (e) { throw new Error(`git ls-tree failed for ${rev}: ${first(e)}`); }
     if (!out) return ABSENT;
-    const [meta_, rest] = [out.slice(0, out.indexOf("\t")), out.slice(out.indexOf("\t") + 1)];
-    const [mode, , id] = meta_.split(/\s+/);
-    void rest;
+    const [mode, , id] = out.slice(0, out.indexOf("\t")).split(/\s+/);
     return { mode, id };
   };
 
   let classified;
   try {
-    classified = classifyFiles(pathsOf(files), { head, main: "origin/main", squash: squash ?? UNREAD, entryAt });
+    const opts = { squash, main: "origin/main", entryAt };
+    if (headRev) opts.head = headRev;
+    classified = classifyFiles(pathsOf(files), opts);
   } catch (e) {
-    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [], why: first(e) }, EXIT.unreadable);
+    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, squash, files: [], why: first(e) }, EXIT.unreadable);
   }
   const { verdict, counts, why } = verdictFor(classified);
-  emit({ repo: ghRepo, pr, verdict, squash, counts, files: classified, why }, exitFor(verdict));
+  emit({ repo: ghRepo, pr, verdict, squash, base: meta.baseRefName ?? null,
+         headRead: headRev !== null, counts, files: classified, why }, exitFor(verdict));
 };
 
 run();

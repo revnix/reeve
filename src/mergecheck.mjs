@@ -1,172 +1,143 @@
-// Did a pull request's content actually reach main?
+// Is a merged pull request's content still on main?
 //
-// ANCESTRY CANNOT ANSWER THIS, and neither can a subject line. The repository
-// squash-merges: the merge collapses a branch into one new commit with a new
-// tree, so the branch head is NEVER an ancestor of main and
-// `git merge-base --is-ancestor` says "no" for a merged pull request and an
-// abandoned one alike. The squash also takes the PULL REQUEST TITLE, so grepping
-// main for an intermediate commit's subject reports every one of them missing.
+// WHAT THIS COMPARES, AND WHY IT CHANGED. The first version compared main
+// against the BRANCH HEAD, and that is wrong in the ordinary case. If main
+// touches a pull request's file after the branch diverges, the squash correctly
+// combines both edits -- so the merge's tree differs from the head's tree even
+// though the pull request's change landed perfectly. MEASURED on a real git
+// fixture: a branch editing line 1, a main editing line 3, and a GitHub-style
+// squash produced `MISSING / NOT ON MAIN` over a merge whose content was
+// demonstrably present. A false negative in the COMMON case, in a tool built to
+// prevent false readings.
 //
-// Both instruments produced a false alarm here in one week. The subject check
-// reported four fixes lost when one was -- at the moment someone was trying to
-// find out whether a fix had been lost, which is when an instrument earns its
-// keep or does not.
+// THE SQUASH COMMIT IS WHAT MERGED, and it already incorporates whatever main
+// did beforehand -- so comparing main against the squash is exact and cannot be
+// confounded by a moving base. That is the question this answers:
 //
-// The question that CAN be answered: for each path the pull request touched, is
-// the TREE ENTRY on main identical to the tree entry at the pull request's head?
-// Entry, not blob: the executable bit and the symlink flag live in the tree, so
-// two revisions can share a blob id and still differ in a way that matters --
-// a script that is no longer executable has the same bytes it always had.
+//     for every path the pull request touched, is main's tree entry still the
+//     one the merge produced?
 //
-// The logic lives here rather than in the script so it can be tested without a
-// network, exactly as `scripts/capture-baseline.mjs` delegates to
-// `src/baseline.mjs`.
+// ANCESTRY STILL CANNOT ANSWER IT. This repository squash-merges, so the branch
+// head is never an ancestor of main and `git merge-base --is-ancestor` gives the
+// same answer for a merged pull request and an abandoned one. Subject lines are
+// worse: a squash takes the pull request TITLE, so grepping main for an
+// intermediate commit reports every one as missing. Both produced a false alarm
+// here in one week.
+//
+// WHAT THIS DELIBERATELY NO LONGER CLAIMS. It does not tell you whether a commit
+// pushed to the branch AFTER the merge was lost. A branch head differing from
+// the squash has two causes -- a late push, or a base that moved before the
+// merge -- and tree entries cannot distinguish them. That divergence is reported
+// as an observation with both readings named, never as a verdict.
 
-/**
- * THREE ANSWERS, NOT TWO, and conflating them is the defect this module exists
- * to avoid making itself.
- *
- * `ABSENT` -- the revision was read and the path is not in it. A fact.
- * `UNREAD`  -- the revision was not consulted at all. NOT a fact about the path.
- *
- * They were one value (`null`) in the first version, and it produced a real
- * defect: a pull request that DELETES a file, where main later restores it,
- * has the path absent at head and absent at the squash -- which is arrival
- * followed by drift. Collapsed into `null` it read as "never arrived" and the
- * verifier said NOT ON MAIN over a change that had landed correctly.
- */
-export const ABSENT = Symbol("absent");
-export const UNREAD = Symbol("unread");
+export const ABSENT = Symbol("absent");   // the revision was read; it holds no such path
+export const UNREAD = Symbol("unread");   // the revision was not consulted at all
 
 export const FILE_STATE = Object.freeze({
-  matches: "MATCHES",   // main's entry equals the head's entry, mode included
-  drifted: "DRIFTED",   // it equalled the head at the squash commit, and main has moved since
-  missing: "MISSING",   // it matches neither: the content did not arrive
-  deleted: "deleted",   // absent from head and from main alike, which is consistent
+  intact: "INTACT",     // main's entry is the one the merge produced
+  drifted: "DRIFTED",   // main has changed this path since the merge
+  gone: "REMOVED",      // the merge left it absent, and main still has it absent
 });
 
 export const VERDICT = Object.freeze({
-  merged: "MERGED BY CONTENT",
-  moved: "MERGED, THEN MOVED",
-  absent: "NOT ON MAIN",
+  intact: "MERGED, AND INTACT ON MAIN",
+  drifted: "MERGED, THEN CHANGED ON MAIN",
   unreadable: "UNREADABLE",
 });
 
-/** Two tree entries are the same when the object AND the mode agree. */
 const sameEntry = (a, b) => {
   if (a === UNREAD || b === UNREAD) return false;
   if (a === ABSENT || b === ABSENT) return a === b;
   return a.id === b.id && a.mode === b.mode;
 };
 
+const describe = (e) => e === ABSENT ? "absent" : e === UNREAD ? "unread" : `${e.mode} ${e.id}`;
+
 /**
- * Classify one pull request's paths.
+ * Classify every path the pull request touched.
  *
- * `entryAt(rev, path)` returns `{mode, id}`, or `ABSENT` when the revision was
- * read and holds no such path. It must NEVER return `ABSENT` for a revision it
- * could not read -- the caller raises UNREADABLE for that case before getting
- * here, because "I could not look" and "it is not there" are different answers
- * and only one of them is about the path.
+ * `entryAt(rev, path)` returns `{mode, id}` or `ABSENT`. It must NEVER return
+ * `ABSENT` for a revision it could not read -- the caller proves each revision
+ * readable first, because "I could not look" and "it is not there" are different
+ * answers and only one of them is about the path.
  *
- * `squash` may be `UNREAD`, meaning no squash commit was available. Then DRIFTED
- * cannot be distinguished from MISSING, and the result degrades to MISSING --
- * the answer that prompts a look, never the reassuring one.
+ * `head` is optional and is NOT used to decide the verdict. It is compared only
+ * to report divergence, which is an observation rather than a finding.
  */
-export function classifyFiles(paths, { head, main, squash = null, entryAt }) {
-  const readSquash = squash !== null && squash !== UNREAD;
+export function classifyFiles(paths, { squash, main, head = UNREAD, entryAt }) {
   return paths.map(path => {
-    const atHead = entryAt(head, path);
+    const atSquash = entryAt(squash, path);
     const atMain = entryAt(main, path);
-    const atSquash = readSquash ? entryAt(squash, path) : UNREAD;
-    let state;
-    if (atHead === ABSENT && atMain === ABSENT) state = FILE_STATE.deleted;
-    else if (sameEntry(atHead, atMain)) state = FILE_STATE.matches;
-    // The squash comparison runs even when both sides are ABSENT: a deletion
-    // that arrived and was later undone is drift, not absence.
-    else if (sameEntry(atHead, atSquash)) state = FILE_STATE.drifted;
-    else state = FILE_STATE.missing;
-    return { path, state, head: describe(atHead), main: describe(atMain), squash: describe(atSquash) };
+    const atHead = head === UNREAD ? UNREAD : entryAt(head, path);
+    const state = sameEntry(atSquash, atMain)
+      ? (atSquash === ABSENT ? FILE_STATE.gone : FILE_STATE.intact)
+      : FILE_STATE.drifted;
+    return {
+      path, state,
+      squash: describe(atSquash), main: describe(atMain), head: describe(atHead),
+      // Recorded, never decisive. See the header: two causes, indistinguishable.
+      headDiffersFromMerge: atHead === UNREAD ? null : !sameEntry(atHead, atSquash),
+    };
   });
 }
 
-const describe = (e) =>
-  e === ABSENT ? "absent" : e === UNREAD ? "unread" : `${e.mode} ${e.id}`;
-
 /**
- * The verdict over classified paths.
+ * The verdict.
  *
- * AN EMPTY SET IS NOT A PASS. A pull request reporting zero changed files is a
- * read that saw nothing, and answering "all files match" over nothing is how a
- * narrowing check reports success. It returns UNREADABLE so the caller looks.
- *
- * MISSING outranks DRIFTED: if any path did not arrive at all, that is the
- * headline, and another having moved afterwards does not soften it.
+ * AN EMPTY SET IS NOT A PASS. A pull request reporting zero changed paths is a
+ * read that saw nothing, and answering "all intact" over nothing is how a
+ * narrowing check reports success.
  */
 export function verdictFor(files) {
   if (files.length === 0) {
-    return { verdict: VERDICT.unreadable, counts: { matches: 0, drifted: 0, missing: 0, deleted: 0 },
+    return { verdict: VERDICT.unreadable, counts: { intact: 0, drifted: 0, gone: 0, headDiverged: 0 },
              why: "the pull request reports zero changed paths, so there is nothing to compare. An empty set is not a pass." };
   }
-  const counts = { matches: 0, drifted: 0, missing: 0, deleted: 0 };
+  const counts = { intact: 0, drifted: 0, gone: 0, headDiverged: 0 };
   for (const f of files) {
-    if (f.state === FILE_STATE.matches) counts.matches++;
+    if (f.state === FILE_STATE.intact) counts.intact++;
     else if (f.state === FILE_STATE.drifted) counts.drifted++;
-    else if (f.state === FILE_STATE.missing) counts.missing++;
-    else counts.deleted++;
+    else counts.gone++;
+    if (f.headDiffersFromMerge === true) counts.headDiverged++;
   }
-  if (counts.missing > 0) {
-    // SAY ONLY WHAT WAS ESTABLISHED. MISSING means main differs from the head,
-    // and the squash did not match the head either -- it never compares main
-    // WITH the squash, and in the commonest case they are identical: a fix
-    // pushed after the merge leaves main and the squash both holding the merged
-    // version while the head has moved past both. Claiming the path "matches
-    // neither" would be false there, in a tool whose entire purpose is not
-    // overclaiming.
-    return { verdict: VERDICT.absent, counts,
-             why: `${counts.missing} of ${files.length} path(s) on main differ from the pull request head, and did not match it at the squash commit either.\n` +
-                  `The head's content is not on main. A common cause: a fix pushed to the branch AFTER the pull request merged -- that push succeeds and reaches nothing.` };
-  }
+  const note = counts.headDiverged > 0
+    ? `\n\nNote: ${counts.headDiverged} path(s) differ between the branch head and the merge. That has two causes and this cannot tell them apart:\n` +
+      `  - commits pushed to the branch AFTER it merged, which reached nothing and are carried by no merge;\n` +
+      `  - main having moved before the merge, which the squash correctly folded in.\n` +
+      `Look at the branch if it matters. It is not evidence about main either way.`
+    : "";
   if (counts.drifted > 0) {
-    return { verdict: VERDICT.moved, counts,
-             why: `${counts.drifted} path(s) matched at the squash commit and differ on main now. The content DID arrive, and something changed it since.\n` +
-                  `That may be a legitimate follow-up or someone overwriting the work. This cannot tell which, and a human decides.` };
+    return { verdict: VERDICT.drifted, counts,
+             why: `${counts.drifted} of ${files.length} path(s) on main differ from what the merge produced. The content arrived and something changed it since.\n` +
+                  `That may be a legitimate follow-up or someone overwriting the work. This cannot tell which, and a human decides.${note}` };
   }
-  return { verdict: VERDICT.merged, counts,
-           why: `All ${counts.matches + counts.deleted} path(s) on main are identical to the pull request head, mode included.\n` +
-                `Verified by tree entry, not by ancestry: the branch commit is not an ancestor of main and never will be, because this repository squash-merges.` };
+  return { verdict: VERDICT.intact, counts,
+           why: `All ${files.length} path(s) on main are exactly what the merge produced, mode included.\n` +
+                `Compared against the SQUASH COMMIT rather than the branch head: the squash already incorporates whatever main did before the merge, so a base that moved cannot make this read as missing.${note}` };
 }
 
 // Exit codes in the 15-125 band reeve owns. Node reserves 1 and 3-14 -- a
 // rethrowing uncaughtException handler exits 7, an unsettled top-level await
-// exits 13, and reeve has both -- bash owns 126-128+N, and launchd emits 78
-// into reeve's own log. Anything below 15 collides with something that is not
-// reeve, and the collision is invisible until a wrapper acts on it.
+// exits 13, and reeve has both -- bash owns 126-128+N, and launchd emits 78 into
+// reeve's own log. Anything below 15 collides with something that is not reeve.
 export const EXIT = Object.freeze({
   ok: 0,
   usage: 20,
-  absent: 22,       // no such pull request, or it is not merged yet
-  unreadable: 23,   // a revision, the file list, or the remote could not be read
-  no: 31,           // measured negative: the content did not arrive
-  drifted: 32,      // it arrived, and main has moved since
+  absent: 22,       // no such pull request, or it is not merged
+  unreadable: 23,   // a revision, the file list, the base or the remote could not be trusted
+  drifted: 32,      // it merged, and main has moved since
 });
 
 export function exitFor(verdict) {
-  if (verdict === VERDICT.merged) return EXIT.ok;
-  if (verdict === VERDICT.absent) return EXIT.no;
-  if (verdict === VERDICT.moved) return EXIT.drifted;
+  if (verdict === VERDICT.intact) return EXIT.ok;
+  if (verdict === VERDICT.drifted) return EXIT.drifted;
   return EXIT.unreadable;
 }
 
 /**
  * Every path a pull request touched, INCLUDING the source side of a rename.
- *
  * GitHub reports a rename as one entry carrying the destination and
- * `previous_filename`. Checking only the destination misses half the change: if
- * main later restores the old path while keeping the new one, every path checked
- * matches the head and the verifier exits 0 over a tree that has drifted.
- *
- * The old path is expected to be ABSENT at head, so it verifies as a deletion,
- * which is exactly what a rename is on that side.
+ * `previous_filename`; checking only the destination misses half the change.
  */
 export function pathsOf(files) {
   const out = [];
@@ -175,4 +146,21 @@ export function pathsOf(files) {
     if (f.previous_filename && f.previous_filename !== f.filename) out.push(f.previous_filename);
   }
   return [...new Set(out)];
+}
+
+/**
+ * Render an API-supplied path safely.
+ *
+ * A filename is attacker-supplied on any repository that takes outside
+ * contributions. A newline, a carriage return or an ANSI escape in one lets a
+ * contributor overwrite the displayed verdict or forge a line that reads like a
+ * successful result -- turning the report itself into the false reassurance this
+ * tool exists to remove. Control characters become visible escapes. The JSON
+ * output is left alone, because a consumer parses it rather than reading it.
+ */
+export function safePath(path) {
+  // C0 is \u0000-\u001f, DEL is \u007f, C1 is \u0080-\u009f. Written as escapes
+  // rather than literals so the pattern survives being copied through a shell.
+  return String(path).replace(/[\u0000-\u001f\u007f-\u009f]/g,
+    (c) => "\\x" + c.codePointAt(0).toString(16).padStart(2, "0"));
 }

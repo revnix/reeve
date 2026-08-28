@@ -30,12 +30,12 @@
  *    for the anchor. Confirmation greps have been measured inert here.
  */
 import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync } from "node:fs";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { applyEdit, validateManifest, classify, summarise, CAUGHT } from "../src/stubsweep.mjs";
+import { applyEdit, validateManifest, classify, summarise, CAUGHT, UNRUNNABLE, TIMED_OUT_EXIT } from "../src/stubsweep.mjs";
 
 // Overridable so the runner can be pointed at a throwaway repository built by its
 // own test. The cleanliness guard then applies to THAT tree, so the real one is
@@ -85,12 +85,29 @@ if (wanted.length && entries.length !== wanted.length) {
   die(2, `stub-sweep: no such stub(s): ${missing.join(", ")}`);
 }
 
-const runTest = file => {
-  const r = spawnSync(process.execPath, [join(ROOT, file)], { cwd: ROOT, encoding: "utf8", timeout: 600_000 });
-  // A killed child has a null status. Reported as its own thing rather than
-  // coerced to a number, because "timed out" and "failed" are different readings.
-  return { exit: r.status === null ? 124 : r.status, output: `${r.stdout ?? ""}${r.stderr ?? ""}` };
-};
+// ASYNCHRONOUS, and that is what makes the signal handlers work at all.
+//
+// `spawnSync` blocks the event loop for the whole of the child's life, so a signal
+// arriving while a stubbed test runs cannot be delivered to a handler until the
+// child exits — up to the full timeout. Anything that escalates to SIGKILL first,
+// which `timeout` and a cancelled workflow both do, then kills the process with the
+// stub still on disk. The handler was correct and unreachable, which is this
+// repository's favourite shape and I had just written a fresh instance of it.
+const runTest = file => new Promise(resolve => {
+  const child = spawn(process.execPath, [join(ROOT, file)], { cwd: ROOT });
+  let out = "";
+  child.stdout.on("data", d => { out += d; });
+  child.stderr.on("data", d => { out += d; });
+  const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, 600_000);
+  let timedOut = false;
+  child.on("close", (code, signal) => {
+    clearTimeout(timer);
+    // A killed child is reported as its own thing rather than coerced, because
+    // "timed out" and "failed an assertion" are different readings and only one of
+    // them is evidence.
+    resolve({ exit: timedOut || code === null ? TIMED_OUT_EXIT : code, output: out });
+  });
+});
 
 // --- restore on the way out, however we leave -------------------------------
 //
@@ -109,10 +126,21 @@ const restoreActive = () => {
   if (!active) return;
   // Synchronous on purpose: an exit handler cannot await, and this has to finish
   // before the process goes.
+  const failed = [];
   for (const [f, snap] of active.snaps) {
-    try { copyFileSync(snap.copy, f); } catch { /* nothing better is available here */ }
+    try { copyFileSync(snap.copy, f); } catch (err) { failed.push([f, snap.copy, err.message]); }
   }
-  try { rmSync(active.dir, { recursive: true, force: true }); } catch { /* ditto */ }
+  if (failed.length) {
+    // KEEP THE SNAPSHOTS. Deleting them here would destroy the only copy of the
+    // original while the deliberately broken file is still in the tree, and then
+    // report that restoration happened. Say where they are instead: a person can
+    // finish by hand, and cannot if the evidence is gone.
+    console.error("stub-sweep: COULD NOT RESTORE. The broken file is still in your tree.");
+    for (const [f, copy, why] of failed) console.error(`  ${f}\n    restore from: ${copy}\n    because: ${why}`);
+    active = null;
+    return;
+  }
+  try { rmSync(active.dir, { recursive: true, force: true }); } catch { /* the tree is right; the temp dir is not worth failing over */ }
   active = null;
 };
 process.on("exit", restoreActive);
@@ -134,7 +162,25 @@ process.on("uncaughtException", err => {
 const results = [];
 for (const entry of entries) {
   const files = [...new Set(entry.edits.map(e => join(ROOT, e.file)))];
-  const control = runTest(entry.test);
+  const control = await runTest(entry.test);
+
+  // STOP HERE if the control already fails. `classify` would return UNRUNNABLE
+  // whatever happens next, so stubbing production files and waiting out a second
+  // timeout buys nothing — and it runs deliberately broken code for up to ten
+  // minutes to learn something already known.
+  if (control.exit !== 0) {
+    const why = control.exit === TIMED_OUT_EXIT
+      ? "the test timed out BEFORE stubbing, so nothing it reports afterwards means anything"
+      : `the test does not pass before stubbing (exit ${control.exit}), so nothing it reports afterwards means anything`;
+    // `reintroduces` rather than a second `why`: the entry's reason and the
+    // verdict's reason are two different facts, and an object literal with the key
+    // twice silently keeps only the last.
+    results.push({ name: entry.name, reintroduces: entry.why, verdict: UNRUNNABLE, why });
+    console.log(`FAIL ${entry.name.padEnd(28)} ${UNRUNNABLE}`);
+    console.log(`       reintroduces: ${entry.why}`);
+    console.log(`       ${why}`);
+    continue;
+  }
 
   // Snapshot BEFORE touching anything, and restore from these copies. A run killed
   // partway then cannot leave a stub behind for the next reading to measure.
@@ -151,6 +197,7 @@ for (const entry of entries) {
 
   let applyError = null;
   let hashChanged = false;
+  const stubbedHashes = new Map();
   try {
     for (const f of files) {
       const edits = entry.edits.filter(e => join(ROOT, e.file) === f);
@@ -160,11 +207,30 @@ for (const entry of entries) {
     }
     // Proof the stub landed, independent of the anchors that placed it.
     hashChanged = files.some(f => sha(f) !== snaps.get(f).hash);
+    for (const f of files) stubbedHashes.set(f, sha(f));
   } catch (err) {
     applyError = err;
   }
 
-  const stub = applyError ? { exit: 0, output: "" } : runTest(entry.test);
+  const stub = applyError ? { exit: 0, output: "" } : await runTest(entry.test);
+
+  // THE FILE MUST STILL BE THE STUB WE WROTE.
+  //
+  // The cleanliness check at start-up cannot protect work created AFTER the
+  // snapshot, and a stubbed test can hold the tree for up to ten minutes. If an
+  // editor saved over one of these files in that window, copying the snapshot back
+  // silently destroys real work — the same class of loss as `git checkout`
+  // restoring to the last commit, which is what this whole mechanism replaced.
+  const meddled = files.filter(f => sha(f) !== stubbedHashes.get(f));
+  if (meddled.length) {
+    console.error("stub-sweep: a file changed while its stubbed test was running; NOT overwriting it.");
+    for (const f of meddled) console.error(`  ${f}\n    the pre-sweep original is at: ${snaps.get(f).copy}`);
+    active = null;   // the handlers must not overwrite it either
+    results.push({ name: entry.name, reintroduces: entry.why, verdict: UNRUNNABLE,
+                   why: `${meddled.join(", ")} changed during the run, so the tree was left alone and this reading is void` });
+    console.log(`FAIL ${entry.name.padEnd(28)} ${UNRUNNABLE}`);
+    continue;
+  }
 
   for (const [f, s] of snaps) copyFileSync(s.copy, f);
   const restored = files.every(f => sha(f) === snaps.get(f).hash);
@@ -178,7 +244,7 @@ for (const entry of entries) {
     : classify({ controlExit: control.exit, stubExit: stub.exit, stubOutput: stub.output,
                  hashChanged, restored, expectRed: entry.expectRed });
 
-  results.push({ name: entry.name, why: entry.why, ...verdict });
+  results.push({ name: entry.name, reintroduces: entry.why, ...verdict });
   const mark = verdict.verdict === CAUGHT ? "ok  " : "FAIL";
   console.log(`${mark} ${entry.name.padEnd(28)} ${verdict.verdict}`);
   if (verdict.verdict !== CAUGHT) {

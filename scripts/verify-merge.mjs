@@ -13,8 +13,16 @@
 // Usage:  node scripts/verify-merge.mjs <pr-number> [--json] [--repo owner/name]
 
 import { execFileSync } from "node:child_process";
-import { classifyFiles, verdictFor, pathsOf, safePath, exitFor, EXIT, VERDICT, ABSENT }
+import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, safePath, exitFor, EXIT, VERDICT }
   from "../src/mergecheck.mjs";
+
+// execFileSync defaults to a 1 MiB stdout buffer and THROWS ENOBUFS past it.
+// The pull-request files endpoint carries a URL trio and often patch text per
+// entry, so a pull request far below GitHub's 3,000-file ceiling can exceed it
+// -- turning the pagination that exists to handle large lists into the thing
+// that fails on them. Projected with --jq to two fields as well, so the patch
+// bodies never enter this buffer at all.
+const MAXBUF = 256 * 1024 * 1024;
 
 const argv = process.argv.slice(2);
 const json = argv.includes("--json");
@@ -37,7 +45,10 @@ const emit = (doc, code) => {
   process.exitCode = code;
 };
 
-const sh = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+const sh = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", maxBuffer: MAXBUF, stdio: ["ignore", "pipe", "pipe"] }).trim();
+// One runner, injected into the seam, so the argument lists this builds are the
+// same ones the tests drive. See src/mergecheck.mjs for what each read asserts.
+const G = gitFacts((args) => sh("git", args));
 const first = (e) => String(e?.stderr || e?.message || e).split("\n")[0];
 
 const run = () => {
@@ -97,23 +108,6 @@ const run = () => {
       why: `${ghRepo}#${pr} is merged but reports no merge commit, so there is nothing authoritative to compare main against.` }, EXIT.unreadable);
   }
 
-  // THE FILE LIST, PAGINATED, and checked against the count GitHub reports.
-  // `gh pr view --json files` asks for `files(first: 100)`, so a larger pull
-  // request is silently truncated and a verdict over the prefix could pass while
-  // an omitted path is missing from main.
-  let files;
-  try {
-    files = JSON.parse(sh("gh", ["api", "--hostname", originHost, "--paginate",
-                                 `repos/${originNwo}/pulls/${pr}/files`, "--slurp"])).flat();
-  } catch (e) {
-    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [], why: `could not list the files of ${ghRepo}#${pr}: ${first(e)}` }, EXIT.unreadable);
-  }
-  if (typeof meta.changedFiles === "number" && files.length !== meta.changedFiles) {
-    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [],
-      why: `the file list is short: GitHub reports ${meta.changedFiles} changed files and pagination returned ${files.length}.\n` +
-           `Refusing rather than verifying a prefix -- an omitted path is exactly what this would fail to notice.` }, EXIT.unreadable);
-  }
-
   // A FETCH THAT FAILED MUST NOT BECOME A VERDICT, and the refspec is explicit:
   // a bare `git fetch origin` follows whatever remote.origin.fetch maps, and a
   // narrow clone may not map refs/heads/main at all -- the fetch then SUCCEEDS
@@ -133,6 +127,59 @@ const run = () => {
       why: `the squash commit ${squash.slice(0, 7)} is not readable in this checkout, so there is nothing authoritative to compare main against.` }, EXIT.unreadable);
   }
 
+  // PIN origin/main TO AN OBJECT ID, immediately after the fetch. It is a
+  // MUTABLE ref: left as the name, every ls-tree below re-resolves it, and
+  // another process fetching mid-run (the live guardian's checkout does exactly
+  // this) would have some paths compared against the old main and some against
+  // the new. Neither snapshot need have contained the whole merged tree, and the
+  // mixture can read all-INTACT. One ref read, one snapshot, one answer.
+  let mainOid;
+  try { mainOid = G.pinMain(); }
+  catch (e) {
+    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, squash, files: [],
+      why: `could not resolve origin/main to a commit: ${first(e)}` }, EXIT.unreadable);
+  }
+
+  // THE PATHS COME FROM THE MERGE, NOT FROM THE API. `pulls/<n>/files` describes
+  // the branch HEAD, which a push after the merge moves -- and such a push can
+  // change WHICH paths are listed without changing HOW MANY, so a count check
+  // cannot catch it and the omitted path is never compared. The merge commit's
+  // own diff is the exact set the merge produced.
+  //
+  // `--no-renames` because rename detection would collapse a rename to its
+  // destination and drop the source side, and `diff.renames` is a repository
+  // setting this must not be at the mercy of. `-z` because a filename may
+  // contain a newline, and git would otherwise quote it into a different string.
+  const parents = G.parentsOf(squash);
+  if (parents.length !== 1) {
+    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, squash, files: [],
+      why: `the merge commit ${squash.slice(0, 7)} has ${parents.length} parents, so it is not a squash.\n` +
+           `This compares main against a single-parent squash and cannot enumerate the paths of a ${parents.length}-parent merge correctly. Refusing rather than verifying a subset.` }, EXIT.unreadable);
+  }
+  let mergePaths;
+  try {
+    mergePaths = G.mergePaths(squash);
+  } catch (e) {
+    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, squash, files: [],
+      why: `could not read the merge commit's diff: ${first(e)}` }, EXIT.unreadable);
+  }
+
+  // THE API LIST IS NOW ONLY A CROSS-CHECK, and its failure is not the verdict's
+  // failure: the verdict comes from the merge's own diff, read locally. Projected
+  // to two fields so the patch bodies never reach this process.
+  let apiPaths = [], crossCheck = "complete";
+  try {
+    const raw = sh("gh", ["api", "--hostname", originHost, "--paginate",
+                          `repos/${originNwo}/pulls/${pr}/files`,
+                          "--jq", ".[]|{filename,previous_filename}"]);
+    apiPaths = pathsOf(raw.split("\n").filter(Boolean).map(l => JSON.parse(l)));
+    if (typeof meta.changedFiles === "number" && apiPaths.length < meta.changedFiles) {
+      crossCheck = `GitHub reports ${meta.changedFiles} changed files and pagination returned ${apiPaths.length}`;
+    }
+  } catch (e) {
+    crossCheck = `could not list the files of ${ghRepo}#${pr}: ${first(e)}`;
+  }
+
   // The head is OPTIONAL and never decides the verdict -- it only reports
   // divergence. A squash keeps no parent link to the branch and origin's refspec
   // carries no refs/pull/*, so it may simply not be present, and that is fine.
@@ -147,25 +194,23 @@ const run = () => {
   // TREE ENTRY, not blob: mode lives in the tree, so an executable bit or a
   // symlink flag that never arrived shares its blob id with one that did.
   const entryAt = (rev, path) => {
-    let out;
-    try { out = sh("git", ["ls-tree", "--full-tree", rev, "--", path]); }
+    try { return G.entryAt(rev, path); }
     catch (e) { throw new Error(`git ls-tree failed for ${rev}: ${first(e)}`); }
-    if (!out) return ABSENT;
-    const [mode, , id] = out.slice(0, out.indexOf("\t")).split(/\s+/);
-    return { mode, id };
   };
 
   let classified;
   try {
-    const opts = { squash, main: "origin/main", entryAt };
+    const opts = { squash, main: mainOid, entryAt };
     if (headRev) opts.head = headRev;
-    classified = classifyFiles(pathsOf(files), opts);
+    classified = classifyFiles(mergePaths, opts);
   } catch (e) {
     return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, squash, files: [], why: first(e) }, EXIT.unreadable);
   }
-  const { verdict, counts, why } = verdictFor(classified);
-  emit({ repo: ghRepo, pr, verdict, squash, base: meta.baseRefName ?? null,
-         headRead: headRev !== null, counts, files: classified, why }, exitFor(verdict));
+  const branchOnly = branchOnlyPaths(apiPaths, mergePaths);
+  const { verdict, counts, why } = verdictFor(classified, { branchOnly, crossCheck });
+  emit({ repo: ghRepo, pr, verdict, squash, main: mainOid, base: meta.baseRefName ?? null,
+         headRead: headRev !== null, crossCheck, branchOnly, counts, files: classified, why },
+       exitFor(verdict));
 };
 
 run();

@@ -24,6 +24,7 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail !== undefined) console.log("        " + detail); fail++; }
 };
 const fresh = tag => open(join(mkdtempSync(join(tmpdir(), `reeve-spill-${tag}-`)), "state.db"));
+const threwFn = fn => { try { fn(); return null; } catch (e) { return e; } };
 
 // A recorder that also answers. `replies` is consulted in order; anything
 // unmatched answers ok with empty output, which is the shape `gh` gives for a
@@ -251,6 +252,58 @@ const recorder = (replies = []) => {
     "with the row intact");
   check(db3.prepare("SELECT count(*) n FROM sqlite_master WHERE name='_reshape_outbox'").get().n === 0,
     "and the staging table cleaned up afterwards");
+
+  // THE SECOND CRASH WINDOW. The rename, the copy and the drop each autocommit, so
+  // a process can also die AFTER the copy committed and before the drop — leaving a
+  // populated table beside a populated staging one. Deciding by row count gets this
+  // wrong: it looks exactly like a healthy table.
+  const dir4 = mkdtempSync(join(tmpdir(), "reeve-spill-crash2-"));
+  const path4 = join(dir4, "crash2.db");
+  const db4a = open(path4);   // a healthy, current-shape store
+  tx(db4a, () => enqueue(db4a, { idemKey: "already", kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "b" } }));
+  // Recreate the post-copy state by hand: the rows are in the real table AND a
+  // staging table still holds them.
+  db4a.exec(`CREATE TABLE _reshape_outbox AS SELECT * FROM outbox`);
+  const beforeRows = db4a.prepare("SELECT count(*) n FROM outbox").get().n;
+  check(beforeRows === 1, "control: the fixture holds one row in both tables", String(beforeRows));
+
+  let reopened = null;
+  const e4 = threwFn(() => { reopened = open(path4); });
+  check(e4 === null,
+    "a crash between the copy and the drop does not brick the database on every later open", String(e4));
+  check(reopened.prepare("SELECT count(*) n FROM outbox").get().n === 1,
+    "the row is not duplicated by the retried copy",
+    String(reopened?.prepare("SELECT count(*) n FROM outbox").get().n));
+  check(reopened.prepare("SELECT count(*) n FROM sqlite_master WHERE name='_reshape_outbox'").get().n === 0,
+    "and the staging table is finally dropped");
+
+  // AND the index names must be freed on the RECOVERY path too, not only after a
+  // fresh rename. A process dying between the rename and the index-drop loop left
+  // the names held, so the recovered table came back with no indexes.
+  const dir5 = mkdtempSync(join(tmpdir(), "reeve-spill-crash3-"));
+  const path5 = join(dir5, "crash3.db");
+  const raw5 = new DatabaseSync(path5);
+  raw5.exec(`CREATE TABLE _reshape_outbox (
+               id INTEGER PRIMARY KEY, idem_key TEXT NOT NULL UNIQUE,
+               kind TEXT NOT NULL, run_id TEXT, args TEXT NOT NULL,
+               status TEXT NOT NULL DEFAULT 'pending',
+               attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 8,
+               not_before INTEGER NOT NULL DEFAULT 0, lease_expires_at INTEGER NOT NULL DEFAULT 0,
+               result TEXT, last_error TEXT,
+               created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL) STRICT`);
+  // The names the rebuilt table needs, still held by the staged one.
+  raw5.exec(`CREATE INDEX outbox_due ON _reshape_outbox(not_before, id) WHERE status='pending'`);
+  raw5.exec(`CREATE INDEX outbox_inflight ON _reshape_outbox(lease_expires_at) WHERE status='inflight'`);
+  raw5.exec(`INSERT INTO _reshape_outbox(id,idem_key,kind,args,status,created_at,updated_at)
+             VALUES(5,'held','gh.pr.comment','{}','pending',1,2)`);
+  raw5.close();
+
+  const db5 = open(path5);
+  check(db5.prepare("SELECT count(*) n FROM outbox").get().n === 1, "control: the interrupted rebuild is recovered");
+  for (const idx of ["outbox_due", "outbox_inflight"])
+    check(db5.prepare("SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?").get(idx)?.tbl_name === "outbox",
+      `${idx} is freed on the RECOVERY path too, not only after a fresh rename`,
+      JSON.stringify(db5.prepare("SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?").get(idx)));
   // The queued row is still queued: a rebuild must not deliver or discard it.
   check(db2.prepare("SELECT status FROM outbox WHERE id=8").get().status === "pending",
     "a pending effect is still pending afterwards, neither delivered nor lost");

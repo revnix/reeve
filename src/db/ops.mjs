@@ -151,6 +151,25 @@ const RESHAPED = [
  * constraint they were never checked against loses whatever the key was added to
  * distinguish, and that is a migration to think about rather than to invent here.
  */
+/**
+ * Free the index names a renamed table is still holding.
+ *
+ * INDEXES FOLLOW A RENAME AND KEEP THEIR NAMES, so `outbox_due` and friends belong
+ * to the staging table while still occupying their names — and schema.sql's
+ * `CREATE INDEX IF NOT EXISTS outbox_due` then finds the name taken and does
+ * nothing, leaving the rebuilt table with no indexes at all on exactly the stores
+ * that were upgraded.
+ *
+ * Called from BOTH the rename path and the crash-recovery path. It used to live
+ * only in the former, so a process dying between the rename and this loop left the
+ * names held, and the recovered table came back unindexed.
+ */
+function stageOrphanIndexes(db, staging) {
+  for (const { name } of db.prepare(
+         `SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL`).all(staging))
+    db.exec(`DROP INDEX IF EXISTS ${name}`);
+}
+
 function reshapeTables(db) {
   const staged = [];
   for (const { table, requires, requiresSql } of RESHAPED) {
@@ -164,10 +183,21 @@ function reshapeTables(db) {
       const orphan = db.prepare(
         `SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(staging);
       if (orphan) {
+        // A staging table means a rebuild was interrupted, and there are TWO
+        // windows it can have stopped in, because the rename, the copy and the
+        // drop each autocommit separately:
+        //
+        //   · after the rename, before the copy — the real table is absent or was
+        //     recreated empty by a later open();
+        //   · after the copy, before the drop — the real table is populated and
+        //     already holds these rows.
+        //
+        // Both are handled by the same route: stage it, and let the copy be
+        // idempotent. Reading the real table's row count to decide would get the
+        // second window wrong — it looks exactly like a healthy table.
+        stageOrphanIndexes(db, staging);
         staged.push({ table, staging,
                       columns: db.prepare(`PRAGMA table_info(${staging})`).all().map(c => c.name) });
-        // If the real table exists it is the empty one a previous partial recovery
-        // created; dropping it lets schema.sql rebuild it in the right shape.
         const real = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table);
         if (real && db.prepare(`SELECT count(*) n FROM ${table}`).get().n === 0) db.exec(`DROP TABLE ${table}`);
         continue;
@@ -191,15 +221,7 @@ function reshapeTables(db) {
       // table and dropping staging on top would discard every queued and delivered
       // effect, which is the worst outcome this table can have.
       db.exec(`ALTER TABLE ${table} RENAME TO ${staging}`);
-      // INDEXES FOLLOW A RENAME AND KEEP THEIR NAMES. So `outbox_due` and friends
-      // now belong to the staging table while still occupying their names, and
-      // schema.sql's `CREATE INDEX IF NOT EXISTS outbox_due` finds the name taken
-      // and does nothing — leaving the rebuilt table with no indexes at all, on
-      // exactly the stores that were upgraded. Dropped here so the names are free
-      // before the schema runs.
-      for (const { name } of db.prepare(
-             `SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL`).all(staging))
-        db.exec(`DROP INDEX IF EXISTS ${name}`);
+      stageOrphanIndexes(db, staging);
       staged.push({ table, staging, columns: cols });
       continue;
     }
@@ -233,7 +255,16 @@ function finishReshape(db, staged) {
     const shared = columns.filter(c => now.includes(c));
     if (shared.length) {
       const list = shared.join(",");
-      db.exec(`INSERT INTO ${table}(${list}) SELECT ${list} FROM ${staging}`);
+      // OR IGNORE, because this statement and the DROP below autocommit separately.
+      // A process dying between them leaves a populated table beside a staging one,
+      // and a plain INSERT then fails on the duplicate ids and unique keys at every
+      // subsequent startup — a database that can never be opened again, which is a
+      // worse outcome than the crash it is recovering from.
+      //
+      // Safe rather than merely convenient: ids are preserved, so a row already
+      // copied conflicts with itself and nothing else. No other writer can be
+      // running, because this is open() and nothing holds the database yet.
+      db.exec(`INSERT OR IGNORE INTO ${table}(${list}) SELECT ${list} FROM ${staging}`);
     }
     db.exec(`DROP TABLE ${staging}`);
   }

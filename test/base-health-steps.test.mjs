@@ -11,7 +11,7 @@
 // organisation's Actions minutes were exhausted. R-04 read the conclusions and
 // reported "1 of the last 7 runs failed", treating six runs that never executed
 // as passing and one as a real failure. Every number in that sentence was wrong.
-import { checkBaseHealth } from "../src/doctor.mjs";
+import { checkBaseHealth, runExecutedSteps } from "../src/doctor.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -102,6 +102,34 @@ const stepsBy = map => (_nwo, id) => (id in map ? map[id] : true);
 {
   const r = checkBaseHealth(NWO, "ci.yml", "main", { sh: () => ({ ok: false, out: "" }) });
   check(r.level === "UNKNOWN", "control: an unreadable run list is UNKNOWN as before", r.level);
+}
+
+// ── the jobs read must cover EVERY page ─────────────────────────────────────
+//
+// The workflow-jobs endpoint defaults to 30 per page and a matrix run exceeds
+// that easily. `--jq` is applied PER PAGE, so an aggregate yields one number per
+// page rather than one overall — measured, not assumed: with per_page=1 against a
+// two-job run gh prints "9" then "3".
+//
+// Without summing, a run whose first thirty jobs executed nothing but whose
+// thirty-first did would be reported as unmeasured: a check answering from part
+// of its input and reporting the part as the whole, which is the exact defect the
+// surrounding function exists to correct.
+{
+  const pages = out => ({ sh: () => ({ ok: true, out }) });
+  check(runExecutedSteps("o/r", "1", pages("9\n3")) === true,
+    "pages are summed, not read one at a time");
+  check(runExecutedSteps("o/r", "1", pages("0\n0\n0")) === false,
+    "every page empty is the only way to conclude nothing ran");
+  // THE CASE CODEX NAMED: nothing on the first page, steps on a later one.
+  check(runExecutedSteps("o/r", "1", pages("0\n5")) === true,
+    "a later page carrying the only steps is still steps");
+  check(runExecutedSteps("o/r", "1", pages("0")) === false,
+    "control: a single empty page is still nothing ran");
+  check(runExecutedSteps("o/r", "1", { sh: () => ({ ok: false, out: "" }) }) === null,
+    "a failed read is UNKNOWN, not an answer");
+  check(runExecutedSteps("o/r", "1", pages("not-a-number")) === null,
+    "control: an unparseable page is UNKNOWN rather than counted as zero");
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

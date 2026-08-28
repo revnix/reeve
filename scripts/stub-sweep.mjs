@@ -92,6 +92,45 @@ const runTest = file => {
   return { exit: r.status === null ? 124 : r.status, output: `${r.stdout ?? ""}${r.stderr ?? ""}` };
 };
 
+// --- restore on the way out, however we leave -------------------------------
+//
+// The docblock above claimed a killed run cannot leave a stub behind. Taking the
+// snapshot is what makes that possible; it is not what makes it true. Without
+// these handlers a Ctrl-C, a `timeout`, or a cancelled workflow exits between
+// writing the stub and restoring it, leaving a DELIBERATELY BROKEN production file
+// in the tree — and the next sweep then refuses to run because the tree is dirty,
+// which reads as the guard working when it is really the wreckage of the last run.
+//
+// `active` is set before the first byte is written and cleared only after a
+// verified restore, so a handler firing at any other moment has something to undo
+// and a handler firing after a clean run has nothing.
+let active = null;
+const restoreActive = () => {
+  if (!active) return;
+  // Synchronous on purpose: an exit handler cannot await, and this has to finish
+  // before the process goes.
+  for (const [f, snap] of active.snaps) {
+    try { copyFileSync(snap.copy, f); } catch { /* nothing better is available here */ }
+  }
+  try { rmSync(active.dir, { recursive: true, force: true }); } catch { /* ditto */ }
+  active = null;
+};
+process.on("exit", restoreActive);
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, () => {
+    restoreActive();
+    console.error(`\nstub-sweep: ${sig} — the tree was restored before exiting.`);
+    // The conventional 128+n, so a caller can tell a signal from a verdict.
+    process.exit(sig === "SIGINT" ? 130 : sig === "SIGTERM" ? 143 : 129);
+  });
+}
+// An unexpected throw is the same situation arriving by a different door.
+process.on("uncaughtException", err => {
+  restoreActive();
+  console.error(`stub-sweep: ${err?.stack ?? err}`);
+  process.exit(2);
+});
+
 const results = [];
 for (const entry of entries) {
   const files = [...new Set(entry.edits.map(e => join(ROOT, e.file)))];
@@ -106,6 +145,9 @@ for (const entry of entries) {
     copyFileSync(f, to);
     snaps.set(f, { copy: to, hash: sha(f) });
   }
+  // Armed BEFORE the first write, so there is no window in which a stub exists
+  // and nothing knows how to undo it.
+  active = { snaps, dir: snapDir };
 
   let applyError = null;
   let hashChanged = false;
@@ -126,7 +168,10 @@ for (const entry of entries) {
 
   for (const [f, s] of snaps) copyFileSync(s.copy, f);
   const restored = files.every(f => sha(f) === snaps.get(f).hash);
-  rmSync(snapDir, { recursive: true, force: true });
+  // Disarmed only once the restore is VERIFIED. A failed restore leaves the
+  // handlers armed, so the exit path tries once more rather than walking away
+  // from a tree it knows is wrong.
+  if (restored) { active = null; rmSync(snapDir, { recursive: true, force: true }); }
 
   const verdict = applyError
     ? { verdict: "UNRUNNABLE", why: `the stub could not be applied: ${applyError.message}` }

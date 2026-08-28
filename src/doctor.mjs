@@ -299,11 +299,26 @@ export function runExecutedSteps(nwo, runId, io = null) {
 export function checkBaseHealth(nwo, workflow = "ci.yml", branch = "main", io = null) {
   const run = io?.sh ?? sh;
   const steps = io?.steps ?? runExecutedSteps;
+  // COMPLETED RUNS ONLY, because a run that has not finished cannot answer the
+  // question and was still counting toward the denominator.
+  //
+  // `gh run list` returns queued and in-progress runs with an EMPTY conclusion.
+  // Nine completed failures beside one running job therefore read as "9 of the
+  // last 10" and DEGRADED, when the truth is that every completed run is red and
+  // this is BROKEN. The sample was not the sample the caller believed it was.
+  //
+  // The flag chooses the sample; the filter below refuses a malformed row. That is
+  // not two mechanisms for one job — it is a request and a parser, and the parser
+  // must not build a denominator out of rows that carry no answer even if the flag
+  // one day stops applying.
   const r = run("gh", ["run", "list", "--repo", nwo, "--workflow", workflow, "--branch", branch,
-                       "--limit", "10", "--json", "conclusion,databaseId",
+                       "--limit", "10", "--status", "completed", "--json", "conclusion,databaseId",
                        "--jq", ".[] | [.conclusion, (.databaseId|tostring)] | @tsv"]);
   if (!r.ok) return { id: "R-04", level: UNKNOWN, title: "base health", lines: [`could not read ${workflow} runs on ${branch}`] };
-  const runs = r.out.split("\n").filter(Boolean).map(l => l.split("\t"));
+  const runs = r.out.split("\n").filter(Boolean).map(l => l.split("\t"))
+    // A row with no conclusion has not concluded. It is not a pass, and counting
+    // it as one is how a wholly red base reported as merely degraded.
+    .filter(([c]) => c && c.trim());
   const reported = runs.filter(([c]) => c === "failure");
 
   let failed = 0, noStep = 0, unreadable = 0;

@@ -104,6 +104,39 @@ const stepsBy = map => (_nwo, id) => (id in map ? map[id] : true);
   check(r.level === "UNKNOWN", "control: an unreadable run list is UNKNOWN as before", r.level);
 }
 
+// ── the denominator counts only runs that have ANSWERED ─────────────────────
+//
+// `gh run list` returns queued and in-progress runs with an empty conclusion, and
+// they were still counting toward the total. Nine completed failures beside one
+// running job read as "9 of the last 10" and DEGRADED, when every completed run
+// was red and the honest answer is BROKEN. A denominator quietly including rows
+// that cannot answer the question.
+{
+  const withRows = rows => ({
+    sh: (_c, args) => ({ ok: true, out: rows.map(([c, id]) => `${c}\t${id}`).join("\n"),
+                         // captured so the request itself can be asserted
+                         _args: args }),
+    steps: () => true,
+  });
+  // Two completed failures and one run still going.
+  const r = checkBaseHealth(NWO, "ci.yml", "main", withRows([["failure", "1"], ["failure", "2"], ["", "3"]]));
+  check(/2 of the last 2/.test(r.lines[0]),
+    "a run that has not concluded is not in the denominator", r.lines[0]);
+  check(r.level === "BROKEN",
+    "so a base whose every COMPLETED run is red reads as broken, not degraded", r.level);
+
+  // And the request asks for completed runs in the first place, so the parser is
+  // a second line of defence rather than the only one.
+  let seen = null;
+  checkBaseHealth(NWO, "ci.yml", "main", {
+    sh: (_c, args) => { seen = args; return { ok: true, out: "success\t1" }; },
+    steps: () => true,
+  });
+  check(seen.includes("--status") && seen[seen.indexOf("--status") + 1] === "completed",
+    "and the run list is asked for completed runs, not filtered only after the fact",
+    JSON.stringify(seen));
+}
+
 // ── the jobs read must cover EVERY page ─────────────────────────────────────
 //
 // The workflow-jobs endpoint defaults to 30 per page and a matrix run exceeds

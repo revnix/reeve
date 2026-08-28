@@ -15,7 +15,7 @@
 //     watched is how an unattended run becomes an incident.
 
 import { evaluatePr, publishVerdict, prAnchor, isBuilderPr } from "./pr.mjs";
-import { nextAction, describe, ACTIONS } from "./watcher.mjs";
+import { nextAction, describe, ACTIONS, ESCALATIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, isSameProcess, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
@@ -2013,18 +2013,22 @@ export async function tick(ctx) {
       // nothing survived anything, and a founder reading that goes looking for a
       // bad fix that was never made. The reason it gave is carried on the ledger
       // row for exactly this moment.
-      // Looked up under EITHER identity, because a findings repair has one too.
+      // Looked up for the escalation it BELONGS TO, and no other.
       //
-      // The blocker was stored and read under the CI fingerprint alone, so a
-      // FIX_FINDINGS worker that reported `needsHuman` had its reason recorded
-      // nowhere this branch could find it. The useful "#PR: needs a human —
-      // <reason>" escalation raised on the worker's own tick was then replaced on
-      // the next complete tick by the generic capped cause, and announcement
-      // reconciliation reported the original as cleared. The reason a person is
-      // needed is the whole content of the escalation; losing it to a rename is
-      // worse than not having capped at all.
-      const note = (fp ? fixAttemptNote(db, nwo, pr, fp) : null)
-                ?? (ffp ? fixAttemptNote(db, nwo, pr, ffp) : null);
+      // Two repairs each store a blocker, under their own identity. Consulting
+      // whichever one happens to exist meant a stale findings note displaced the
+      // real reason on any HIGHER-priority escalation that came later — a
+      // conflicted branch, an unreadable review body — so the operator was shown
+      // a blocker from a different problem and announcement reconciliation treated
+      // the actual one as absent.
+      //
+      // Matching on the escalation's own cause rather than on which fingerprint
+      // happens to be non-null: the cause is what the note is about.
+      const note = decision.why === ESCALATIONS.REPEATED_FAILURE && fp
+                     ? fixAttemptNote(db, nwo, pr, fp)
+                 : decision.why === ESCALATIONS.FINDINGS_UNMOVED && ffp
+                     ? fixAttemptNote(db, nwo, pr, ffp)
+                 : null;
       raise(note ? `#${pr}: needs a human — ${note}` : `#${pr}: ${decision.why}`);
     }
   }

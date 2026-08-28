@@ -33,6 +33,8 @@ export const WRONG_RED = "WRONG_RED";
 export const CRASHED = "CRASHED";
 /** The sweep could not take a reading, which is never a pass. */
 export const UNRUNNABLE = "UNRUNNABLE";
+/** What the runner reports for a child it had to kill. Not a failing assertion. */
+export const TIMED_OUT_EXIT = 124;
 
 /**
  * Apply one edit, or refuse.
@@ -85,7 +87,11 @@ export function describeMiss(source, find) {
   // Reporting the anchor's own line makes the difference visible: diverging at
   // line 1 of 6 is a move, diverging at line 5 of 6 is an edit. Suggested by the
   // session that raised the case.
-  const anchorLines = find.split("\n").length;
+  // A trailing newline is a TERMINATOR, not another line. `"a\nb\n"` is two lines;
+  // splitting it yields three segments because the last is the empty string after
+  // the final terminator. The inflated count also pushed anchors over the
+  // `anchorLines > 2` threshold and enabled a move hint the heuristic excludes.
+  const anchorLines = find.replace(/\n$/, "").split("\n").length;
   // COMPLETE lines, counted by newlines rather than by segments. A prefix that
   // matched line 1 and the first two characters of line 2 splits into two
   // segments, so a naive count calls that "two lines matched" when one did — and
@@ -93,7 +99,10 @@ export function describeMiss(source, find) {
   const completeLinesMatched = (find.slice(0, lo).match(/\n/g) ?? []).length;
   const divergedAtAnchorLine = completeLinesMatched + 1;
   const shown = source.slice(at, at + lo + 60).split("\n").slice(0, 4).join("\n");
-  const shape = anchorLines > 2 && completeLinesMatched <= 1
+  // EXACTLY ONE completed line. Zero means the divergence is inside the first
+  // line — an edit — and calling that a probable move collapses the two cases this
+  // hint exists to separate.
+  const shape = anchorLines > 2 && completeLinesMatched === 1
     ? "  only the anchor's FIRST line still matches, which usually means the block moved rather than changed\n"
     : "";
   return `  matched the first ${lo} character(s) — anchor line ${divergedAtAnchorLine} of ${anchorLines} — at file line ${fileLine}, then diverged.\n` +
@@ -112,7 +121,11 @@ function countOccurrences(haystack, needle) {
     const at = haystack.indexOf(needle, i);
     if (at === -1) return n;
     n++;
-    i = at + needle.length;
+    // ADVANCE BY ONE, not by the needle's length. Skipping ahead by the whole
+    // match misses OVERLAPPING occurrences: `countOccurrences("aaa", "aa")`
+    // returns 1, so `applyEdit` accepts an anchor that appears at two offsets and
+    // silently edits the first — the precise ambiguity the count exists to refuse.
+    i = at + 1;
   }
 }
 
@@ -209,6 +222,16 @@ export function classify({ controlExit, stubExit, stubOutput = "", hashChanged, 
     return { verdict: NOT_CAUGHT,
              why: "the suite stayed green with the defect reintroduced. Either nothing asserts this property, " +
                   "or something does and its fixture cannot reach the mechanism — check the fixture before the assertion" };
+
+  // A TIMEOUT IS NOT A RED. `spawnSync` reports a killed child with a null status,
+  // which the runner maps to 124 — and a test that printed the expected FAIL line
+  // and then hung would otherwise be read as CAUGHT, because the output matches and
+  // the exit is non-zero. The run never finished, so what it would have reported is
+  // unknown; an incomplete reading is not evidence.
+  if (stubExit === TIMED_OUT_EXIT)
+    return { verdict: UNRUNNABLE,
+             why: "the test was killed for exceeding its time limit, so the run never completed — " +
+                  "whatever it printed first is not a verdict" };
 
   const failures = failedAssertions(stubOutput);
   if (!reportedAnyAssertion(stubOutput))

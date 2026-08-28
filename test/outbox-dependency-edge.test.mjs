@@ -289,8 +289,15 @@ const fresh = tag => open(join(mkdtempSync(join(tmpdir(), `reeve-dep-${tag}-`)),
   // destroyed. Deleting it would throw; deleting the parent anyway would strand it.
   const p2 = mk("o/r#2:create"); mk("o/r#2:reply", p2);
   const kept = new Set(["o/r#2:reply"]);
-  const e2 = threw(() => tx(db, () => supersedeEffects(db, { prefix: "o/r#2:", keep: kept })));
+  let n2 = null;
+  const e2 = threw(() => { n2 = tx(db, () => supersedeEffects(db, { prefix: "o/r#2:", keep: kept })); });
   check(e2 === null, "a spared dependent does not make reconciliation throw either", String(e2));
+  // The count is asserted HERE and not in the inflight block below, because there
+  // both rows are already inflight, so candidates and retirements are both zero
+  // and the two readings cannot be told apart. A stub returning `rows.length`
+  // passed that assertion -- a test that could not fail. Here the parent IS a
+  // candidate and is NOT retired, so the numbers genuinely differ.
+  check(n2 === 0, "and the count reports what was RETIRED (0), not what was considered (1)", String(n2));
   check(db.prepare("SELECT count(*) n FROM outbox WHERE idem_key='o/r#2:create'").get().n === 1,
     "the parent is LEFT QUEUED rather than deleted out from under a wanted child");
   check(db.prepare("SELECT count(*) n FROM outbox WHERE idem_key='o/r#2:reply'").get().n === 1,

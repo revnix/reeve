@@ -13,8 +13,8 @@
 // Usage:  node scripts/verify-merge.mjs <pr-number> [--json] [--repo owner/name]
 
 import { execFileSync } from "node:child_process";
-import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, safePath, exitFor, EXIT, VERDICT }
-  from "../src/mergecheck.mjs";
+import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, displayPath, toByteString,
+         crossCheckState, coverageProven, exitFor, EXIT, VERDICT, ABSENT } from "../src/mergecheck.mjs";
 
 // execFileSync defaults to a 1 MiB stdout buffer and THROWS ENOBUFS past it.
 // The pull-request files endpoint carries a URL trio and often patch text per
@@ -39,7 +39,7 @@ const emit = (doc, code) => {
     // safePath, not the raw name: a filename is attacker-supplied on any
     // repository taking outside contributions, and a carriage return or an ANSI
     // escape in one can overwrite the verdict line above or forge a new one.
-    for (const f of doc.files ?? []) console.log(`  ${f.state.padEnd(8)} ${safePath(f.path)}`);
+    for (const f of doc.files ?? []) console.log(`  ${f.state.padEnd(8)} ${displayPath(f.path)}`);
     if (doc.why) console.log(`\n${doc.why}`);
   }
   process.exitCode = code;
@@ -49,9 +49,15 @@ const emit = (doc, code) => {
 // may BEGIN with a space or a tab: a global trim strips that byte off the first
 // path. Scalar results are trimmed at their own call sites instead.
 const sh = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", maxBuffer: MAXBUF, stdio: ["ignore", "pipe", "pipe"] });
+// GIT output is read as `latin1`, which maps every byte to one code point, so a
+// filename containing invalid UTF-8 survives intact. Decoding it as UTF-8 would
+// replace those bytes with U+FFFD -- a DIFFERENT name, absent from both
+// revisions, classified REMOVED, which is a passing state. `gh` stays UTF-8
+// because its output is JSON.
+const shGit = (args) => execFileSync("git", args, { encoding: "latin1", maxBuffer: MAXBUF, stdio: ["ignore", "pipe", "pipe"] });
 // One runner, injected into the seam, so the argument lists this builds are the
 // same ones the tests drive. See src/mergecheck.mjs for what each read asserts.
-const G = gitFacts((args) => sh("git", args));
+const G = gitFacts(shGit);
 const first = (e) => String(e?.stderr || e?.message || e).split("\n")[0];
 
 const run = () => {
@@ -117,8 +123,7 @@ const run = () => {
   // while origin/main stays stale. `fetch`, never `pull`: a live guardian may be
   // running from this checkout.
   try {
-    execFileSync("git", ["fetch", "origin", "refs/heads/main:refs/remotes/origin/main", "--quiet"],
-                 { stdio: ["ignore", "ignore", "pipe"] });
+    G.fetchMain();
   } catch (e) {
     return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [],
       why: `could not refresh origin: ${first(e)}\nRefusing to classify against refs that may be stale.` }, EXIT.unreadable);
@@ -153,7 +158,14 @@ const run = () => {
   // destination and drop the source side, and `diff.renames` is a repository
   // setting this must not be at the mercy of. `-z` because a filename may
   // contain a newline, and git would otherwise quote it into a different string.
-  const parents = G.parentsOf(squash);
+  let parents;
+  try { parents = G.parentsOf(squash); }
+  catch (e) {
+    // Throwing here would exit with Node's generic code and a stack trace,
+    // breaking the exit-code contract every caller reads.
+    return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, squash, files: [],
+      why: `could not read the merge commit's parents: ${first(e)}` }, EXIT.unreadable);
+  }
   if (parents.length !== 1) {
     return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, squash, files: [],
       why: `the merge commit ${squash.slice(0, 7)} has ${parents.length} parents, so it is not a squash.\n` +
@@ -168,16 +180,30 @@ const run = () => {
   }
 
   // CAN A REBASE MERGE BE RULED OUT? `mergeCommit.oid` for a rebase merge is the
-  // LAST rebased commit -- one parent, like a squash, but its diff covers only
-  // that commit. The two are indistinguishable from the commit alone. They are
-  // distinguishable from the REPOSITORY: if rebase merges are disabled, a
-  // one-parent merge commit is a squash and carries the whole branch. Unproven
-  // is the safe default, and it makes uncovered paths refuse rather than pass.
-  let squashProven = false;
+  // LAST rebased commit -- one parent, like a squash, but covering only that
+  // commit, so earlier commits' paths would go unchecked.
+  //
+  // NOT from the repository's current settings. `allow_rebase_merge` is present
+  // state and says nothing about how an EXISTING merge was performed: a pull
+  // request rebase-merged while it was enabled would be marked proven the moment
+  // an administrator turns it off, which is the exact false pass this guards.
+  //
+  // The sound test is per pull request: with ONE commit, a rebase merge and a
+  // squash produce the same coverage, so the merge commit carries the whole
+  // branch whichever was used. More than one commit and this cannot tell, so it
+  // refuses -- unproven is the safe default.
+  let squashProven = false, prCommits = null;
   try {
-    const repoCfg = JSON.parse(sh("gh", ["api", "--hostname", originHost, `repos/${originNwo}`]));
-    squashProven = repoCfg.allow_rebase_merge === false;
-  } catch { /* unproven, which is the safe direction */ }
+    prCommits = JSON.parse(sh("gh", ["api", "--hostname", originHost,
+                                     `repos/${originNwo}/pulls/${pr}/commits`, "--paginate",
+                                     "--jq", ".[].sha"])).length;
+  } catch {
+    try { prCommits = sh("gh", ["api", "--hostname", originHost,
+                                `repos/${originNwo}/pulls/${pr}/commits`, "--paginate",
+                                "--jq", ".[].sha"]).split("\n").filter(Boolean).length; }
+    catch { prCommits = null; }
+  }
+  squashProven = coverageProven(prCommits);
 
   // THE API LIST IS NOW ONLY A CROSS-CHECK, and its failure is not the verdict's
   // failure: the verdict comes from the merge's own diff, read locally. Projected
@@ -187,10 +213,15 @@ const run = () => {
     const raw = sh("gh", ["api", "--hostname", originHost, "--paginate",
                           `repos/${originNwo}/pulls/${pr}/files`,
                           "--jq", ".[]|{filename,previous_filename}"]);
-    apiPaths = pathsOf(raw.split("\n").filter(Boolean).map(l => JSON.parse(l)));
-    if (typeof meta.changedFiles === "number" && apiPaths.length < meta.changedFiles) {
-      crossCheck = `GitHub reports ${meta.changedFiles} changed files and pagination returned ${apiPaths.length}`;
-    }
+    const records = raw.split("\n").filter(Boolean).map(l => JSON.parse(l));
+    // COUNT THE RECORDS, NOT THE EXPANDED PATHS. `pathsOf` adds a rename's
+    // source as well as its destination, so one rename hides one missing
+    // record -- reachable at the endpoint's documented 3,000-file limit, where
+    // the short list would then read as complete.
+    crossCheck = crossCheckState(records.length, meta.changedFiles);
+    // Normalised to the same byte-string form the git reads use, or a non-ASCII
+    // path would differ from its own git-side spelling and read as uncovered.
+    apiPaths = pathsOf(records).map(toByteString);
   } catch (e) {
     crossCheck = `could not list the files of ${ghRepo}#${pr}: ${first(e)}`;
   }
@@ -208,9 +239,19 @@ const run = () => {
 
   // TREE ENTRY, not blob: mode lives in the tree, so an executable bit or a
   // symlink flag that never arrived shares its blob id with one that did.
+  // One listing per revision, then Map lookups. A path read out of git is never
+  // handed back to git as an argument, so no filename has to survive a round
+  // trip through argv's UTF-8 encoding.
+  const trees = new Map();
+  const treeOf = (rev) => {
+    if (!trees.has(rev)) trees.set(rev, G.treeEntries(rev));
+    return trees.get(rev);
+  };
   const entryAt = (rev, path) => {
-    try { return G.entryAt(rev, path); }
+    let t;
+    try { t = treeOf(rev); }
     catch (e) { throw new Error(`git ls-tree failed for ${rev}: ${first(e)}`); }
+    return t.get(path) ?? ABSENT;
   };
 
   let classified;
@@ -224,7 +265,8 @@ const run = () => {
   const branchOnly = branchOnlyPaths(apiPaths, mergePaths);
   const { verdict, counts, why } = verdictFor(classified, { branchOnly, crossCheck, squashProven });
   emit({ repo: ghRepo, pr, verdict, squash, main: mainOid, base: meta.baseRefName ?? null,
-         headRead: headRev !== null, crossCheck, branchOnly, squashProven, counts, files: classified, why },
+         headRead: headRev !== null, crossCheck, branchOnly: branchOnly.map(displayPath),
+         squashProven, prCommits, counts, files: classified, why },
        exitFor(verdict));
 };
 

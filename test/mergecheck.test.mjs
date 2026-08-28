@@ -11,6 +11,7 @@
 // take days to produce.
 
 import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, safePath, exitFor,
+         displayPath, toByteString, crossCheckState, coverageProven,
          FILE_STATE, VERDICT, EXIT, ABSENT } from "../src/mergecheck.mjs";
 
 let fail = 0;
@@ -175,7 +176,7 @@ const F = "100644", X = "100755", L = "120000";
   const G = gitFacts((args) => { calls.push(args); return REPLY.shift() ?? ""; });
 
   REPLY.push("deadbeef", "sha par", "a b", "100644 blob cafe\tf");
-  G.pinMain(); G.parentsOf("sha"); G.mergePaths("sha"); G.entryAt("sha", "f");
+  G.pinMain(); G.parentsOf("sha"); G.mergePaths("sha"); G.treeEntries("sha");
   check(calls.length === 4, "the four reads issue four git calls", String(calls.length));
   check(calls.every(a => a[0] === "--literal-pathspecs"),
     "every git call leads with --literal-pathspecs, so a path beginning ':' is never read as pathspec magic",
@@ -205,13 +206,15 @@ const F = "100644", X = "100755", L = "120000";
     "a path containing a newline survives enumeration as ONE path", JSON.stringify(got));
 }
 
-// entryAt returns the tree entry, and ABSENT only for an empty read.
+// treeEntries returns mode AND id, and an empty listing is an empty map -- the
+// revision was read and holds nothing, which the caller turns into ABSENT.
 {
   const G = gitFacts(() => "100755 blob abc123\trun.sh");
-  const e = G.entryAt("rev", "run.sh");
-  check(e.mode === "100755" && e.id === "abc123", "entryAt reads mode AND id from the tree entry", JSON.stringify(e));
-  check(gitFacts(() => "").entryAt("rev", "nope") === ABSENT,
-    "an empty ls-tree is ABSENT -- the revision was read and holds no such path");
+  const e = G.treeEntries("rev").get("run.sh");
+  check(e.mode === "100755" && e.id === "abc123", "treeEntries reads mode AND id from the tree entry", JSON.stringify(e));
+  check(G.treeEntries("rev").get("nope") === undefined,
+    "a path absent from the listing is a miss, which the caller reports as ABSENT");
+  check(gitFacts(() => "").treeEntries("rev").size === 0, "an empty listing is an empty map");
 }
 
 // --- PATHS THE MERGE DID NOT PRODUCE -----------------------------------------
@@ -297,7 +300,7 @@ const F = "100644", X = "100755", L = "120000";
 {
   const calls = [];
   const G = gitFacts((args) => { calls.push(args); return ""; });
-  G.pinMain(); G.parentsOf("s"); G.mergePaths("s"); G.entryAt("s", "f");
+  G.pinMain(); G.parentsOf("s"); G.mergePaths("s"); G.treeEntries("s");
   check(calls.every(a => a.includes("--no-replace-objects")),
     "every git call disables replacement objects, so a local git-replace cannot forge a match",
     JSON.stringify(calls.map(a => a.slice(0, 2))));
@@ -316,6 +319,92 @@ const F = "100644", X = "100755", L = "120000";
   // The scalar reads still trim, or a trailing newline would become part of a sha.
   check(gitFacts(() => "abc123\n").pinMain() === "abc123",
     "while a scalar read is still trimmed, so a trailing newline never enters a revision id");
+}
+
+
+// --- A FILENAME'S BYTES ARE NOT A UTF-8 STRING -------------------------------
+// Every invalid byte decodes to the SAME U+FFFD, so two paths differing only in
+// such a byte become one string. MEASURED on a real git fixture: under a UTF-8
+// runner, `x-\xfe.txt` and `x-\xff.txt` collapsed to a single map entry and the
+// verdict was MERGED, AND INTACT ON MAIN over a file that had drifted. A false
+// pass, produced by a decoder.
+{
+  const rec = (mode, id, path) => `${mode} blob ${id}\t${path}`;
+  const A = "x-þ.txt", B = "x-ÿ.txt";   // latin1 byte-strings: 0xfe, 0xff
+  const G = gitFacts(() => [rec(F, "a1", A), rec(F, "b1", B)].join("\0") + "\0");
+  const t = G.treeEntries("rev");
+  check(t.size === 2, "two paths differing only in an invalid byte stay TWO entries", String(t.size));
+  check(t.get(A).id === "a1" && t.get(B).id === "b1",
+    "and each keeps its own tree entry rather than one overwriting the other",
+    JSON.stringify([t.get(A), t.get(B)]));
+
+  // The control: collapse them the way a UTF-8 decode would, and the map loses one.
+  const collapsed = new Map([[A, 1], [B, 2]].map(([k, v]) => ["x-�.txt", v]));
+  check(collapsed.size === 1,
+    "control: collapsing both to U+FFFD really does lose one, which is the defect this prevents");
+}
+
+// treeEntries parses mode and id, and a path containing a tab survives.
+{
+  const withTab = "dir/a\tb.txt";
+  const G = gitFacts(() => `${X} blob deadbeef\t${withTab}\0${F} blob cafe\tplain\0`);
+  const t = G.treeEntries("rev");
+  check(t.get(withTab)?.mode === X && t.get(withTab)?.id === "deadbeef",
+    "a path containing a TAB is split on the FIRST tab only, so the name survives",
+    JSON.stringify([...t.keys()]));
+  check(t.size === 2, "and the rest of the listing is unaffected", String(t.size));
+}
+
+// --- THE FETCH REFSPEC -------------------------------------------------------
+// Without the leading `+`, a REWRITTEN main is a non-fast-forward: git refuses,
+// the fetch fails, and every later run reports UNREADABLE against a stale ref.
+{
+  const calls = [];
+  const G = gitFacts((a) => { calls.push(a); return ""; });
+  G.fetchMain();
+  const a = calls[0];
+  check(a.includes("+refs/heads/main:refs/remotes/origin/main"),
+    "the fetch refspec is FORCED, so a rewritten main can still be followed", JSON.stringify(a));
+  check(a.includes("fetch") && !a.includes("pull"),
+    "and it fetches rather than pulls, because a live guardian may run from this checkout");
+}
+
+// --- THE CROSS-CHECK COUNTS RECORDS, NOT EXPANDED PATHS ----------------------
+// A rename yields two paths from one record, so counting expanded paths lets one
+// rename hide one missing record -- reachable at the endpoint's 3,000-file cap.
+{
+  check(crossCheckState(3000, 3001) !== "complete",
+    "a file list one record short is NOT complete, even though a rename would expand it back to the count");
+  check(/3001/.test(crossCheckState(3000, 3001)) && /3000 records/.test(crossCheckState(3000, 3001)),
+    "and the shortfall is reported with both numbers", crossCheckState(3000, 3001));
+  check(crossCheckState(3001, 3001) === "complete", "control: a full list is complete");
+  check(crossCheckState(2, undefined) === "complete",
+    "control: with no reported count there is nothing to be short of");
+}
+
+// --- COVERAGE IS PROVEN PER PULL REQUEST, NEVER FROM REPO SETTINGS -----------
+// A rebase merge names only its LAST commit. With one commit in the pull
+// request, squash and rebase produce identical coverage; with more they do not,
+// and the repository's CURRENT settings say nothing about a PAST merge.
+{
+  check(coverageProven(1) === true,
+    "a one-commit pull request is covered by its merge commit whichever method was used");
+  check(coverageProven(2) === false, "a two-commit pull request is not");
+  check(coverageProven(null) === false && coverageProven(undefined) === false,
+    "and an unknown commit count is NOT proven -- unknown is the safe answer");
+}
+
+// --- PATHS RENDER FOR HUMANS WITHOUT LOSING BYTES ----------------------------
+{
+  check(displayPath(toByteString("src/naïve.mjs")) === "src/naïve.mjs",
+    "a valid UTF-8 path round-trips through the byte-string form and renders normally",
+    displayPath(toByteString("src/naïve.mjs")));
+  check(displayPath("bad-ÿ.txt") === "bad-\\xff.txt",
+    "an undecodable byte renders as an escape, not as a replacement character",
+    displayPath("bad-ÿ.txt"));
+  const CR = String.fromCharCode(13);
+  check(!displayPath(toByteString("ok" + CR + VERDICT.intact)).includes(CR),
+    "and a carriage return still cannot forge a verdict line");
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

@@ -52,8 +52,39 @@ export function applyEdit(source, { find, replace }) {
   const n = countOccurrences(source, find);
   if (n !== 1)
     throw new Error(
-      `anchor appears ${n} time(s), refusing to apply: ${JSON.stringify(find.slice(0, 80))}`);
+      `anchor appears ${n} time(s), refusing to apply: ${JSON.stringify(find.slice(0, 80))}` +
+      (n === 0 ? `\n${describeMiss(source, find)}` : ""));
   return source.replace(find, replace);
+}
+
+/**
+ * Where an anchor stopped matching, and what the file says there instead.
+ *
+ * A manifest rots against refactors — that is not a flaw in it, it is the cost of
+ * pinning to source. The refusal is correct either way; this is about whether the
+ * next person spends a minute or an hour. Same reasoning as the merge verifier
+ * printing a SCOPE line on a clean verdict: a tool that says precisely what it
+ * could not do is worth more than one that only says no. Suggested by the session
+ * that wrote that verifier.
+ *
+ * The longest matching PREFIX is the divergence point, so the file's text there is
+ * almost always the edit that moved the anchor.
+ */
+export function describeMiss(source, find) {
+  let lo = 0, hi = find.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (source.includes(find.slice(0, mid))) lo = mid; else hi = mid - 1;
+  }
+  if (lo === 0) return "  no part of the anchor appears in the file; it may name the wrong file entirely";
+  const at = source.indexOf(find.slice(0, lo));
+  const line = source.slice(0, at).split("\n").length;
+  const shown = source.slice(at, at + lo + 60).split("\n").slice(0, 4).join("\n");
+  return `  matched the first ${lo} character(s) at line ${line}, then diverged.\n` +
+         `  the file there now reads:\n` +
+         shown.split("\n").map(l => `    | ${l}`).join("\n") + "\n" +
+         `  the anchor expected:\n` +
+         find.slice(0, lo + 60).split("\n").slice(0, 4).map(l => `    | ${l}`).join("\n");
 }
 
 /** Literal, not regex. A stub anchor is a chunk of source, not a pattern. */

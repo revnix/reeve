@@ -12,7 +12,7 @@
 import { applyEdit, validateManifest, classify, summarise, failedAssertions, describeMiss,
          reportedAnyAssertion, CAUGHT, NOT_CAUGHT, WRONG_RED, CRASHED, UNRUNNABLE, TIMED_OUT_EXIT }
   from "../src/stubsweep.mjs";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -342,6 +342,10 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
     `console.log(f() === "ok" ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
     // Blocks the thread, so the runner is genuinely mid-test when the signal lands.
     `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);\n` +
+    // Only reached if the child was NOT killed. Its absence is how we prove the
+    // signal handler ended the child rather than only restoring the tree and
+    // leaving it running with its timeout timer dead alongside the parent.
+    `appendFileSync(${JSON.stringify(marker)}, "finished\\n");\n` +
     `process.exit(f() === "ok" ? 0 : 1);\n`);
   writeFileSync(join(root, "test", "stub-manifest.mjs"),
     `export const STUBS = [{ name: "g", why: "remove the guard", test: "test/thing.test.mjs",\n` +
@@ -362,8 +366,12 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
     // Wait until the SECOND run has begun: the first is the unstubbed control, so
     // only the second has a stub on disk to lose.
     const waitForStubbedRun = setInterval(() => {
+      // ONLY the start markers. Counting every non-empty line broke the moment the
+      // fixture also wrote a "finished" line: the control run alone then looked
+      // like two runs, so the kill landed BETWEEN runs with no stub on disk, and
+      // the assertion measured a control that had completed normally.
       const runs = existsSync(${JSON.stringify(marker)})
-        ? readFileSync(${JSON.stringify(marker)}, "utf8").split("\\n").filter(Boolean).length : 0;
+        ? readFileSync(${JSON.stringify(marker)}, "utf8").split("\\n").filter(l => l === "run").length : 0;
       if (runs >= 2) { clearInterval(waitForStubbedRun); p.kill("SIGTERM"); }
     }, 50);
     p.on("exit", () => { clearInterval(waitForStubbedRun); process.exit(0); });
@@ -375,6 +383,83 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
     "a sweep killed mid-stub restores the source before exiting", JSON.stringify(afterKill));
   check(execFileSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8" }).trim() === "",
     "so the tree is clean and the NEXT sweep is not blocked by the last one's wreckage");
+
+  // The CHILD must be dead too. Restoring the tree and exiting while the test runs
+  // on leaves it producing side effects after the sweep has reported it finished —
+  // and its timeout timer died with the parent, so nothing will ever stop it.
+  // COUNTS, not presence. The control run legitimately finishes, so asserting
+  // that "finished" never appears asserts something false — a started run that
+  // never finished is the signal, which is one fewer finish than start.
+  const log = readFileSync(marker, "utf8").split("\n").filter(Boolean);
+  const starts = log.filter(l => l === "run").length;
+  const finishes = log.filter(l => l === "finished").length;
+  check(starts === 2, "control: the stubbed run really did begin", JSON.stringify(log));
+  check(finishes === starts - 1,
+    "and the test process was killed rather than left running after the sweep exited",
+    `${starts} started, ${finishes} finished`);
+}
+
+// --- a target DELETED during a run is not resurrected ---------------------------
+{
+  // `sha` throws ENOENT on a file the test removed, the exception handler runs the
+  // emergency restore, and the snapshot recreates it — silently undoing a deletion
+  // somebody meant. What we cannot recognise as our own stub is not ours to replace.
+  const root = mkdtempSync(join(tmpdir(), "sweep-del-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { rmSync } from "node:fs";\n` +
+    `import { guard } from "../src/thing.mjs";\n` +
+    `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
+    // Deletes its own source mid-run, which is the hostile version of a person
+    // removing a file in the same window.
+    `rmSync(new URL("../src/thing.mjs", import.meta.url).pathname);\n` +
+    `process.exit(guard ? 0 : 1);\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  check(!existsSync(join(root, "src", "thing.mjs")),
+    "a target deleted during the run stays deleted, rather than being resurrected from the snapshot",
+    `${r.stdout ?? ""}${r.stderr ?? ""}`.slice(-300));
+  check(r.status !== 0, "and the sweep does not report success over a tree it could not restore", String(r.status));
+}
+
+// --- a partly applied stub restores the files it DID write ----------------------
+{
+  // With two files and a bad anchor in the second, the first was already written
+  // when the apply threw. `stubbedHashes` was never populated, so every file
+  // compared as meddled and the written one was left stubbed with the tree dirty.
+  const root = mkdtempSync(join(tmpdir(), "sweep-partial-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  const A = `export const a = 1;\n`;
+  writeFileSync(join(root, "src", "a.mjs"), A);
+  writeFileSync(join(root, "src", "b.mjs"), `export const b = 2;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `console.log("PASS  the guard holds");\nprocess.exit(0);\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "two", why: "two files, second anchor rotted", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/a.mjs", find: "export const a = 1;", replace: "export const a = 99;" },\n` +
+    `          { file: "src/b.mjs", find: "this anchor does not exist", replace: "x" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  check(readFileSync(join(root, "src", "a.mjs"), "utf8") === A,
+    "the file that WAS written is restored when a later edit's anchor fails",
+    readFileSync(join(root, "src", "a.mjs"), "utf8"));
+  check(execFileSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8" }).trim() === "",
+    "and the tree is left clean");
+  check(r.status === 1, "while the entry itself fails the sweep", String(r.status));
 }
 
 console.log(fail ? `\nFAILED ${fail}` : "\nok");

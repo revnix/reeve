@@ -20,9 +20,16 @@ existed and its squash SHA (`0d31350`) carries no number. Verified 2026-08-27 by
 Any other pre-convention PR would be invisible the same way; the count above (38) against 42
 merged PRs is the measure of how many.
 
-**Last verified:** 2026-08-28, `main` = **`4730b44`**. It has moved seven times since the S3
-planning session began (`c500cfe` → `16cd880` → `36b4107` → `a529096` → `281655a` → `45efacf` →
-`a136836` → `aaa558a` → `4730b44`); #54 was workflow-only so no source anchor moved.
+**Last verified:** 2026-08-28, `main` = **`4730b44`**. **Ten commits** have landed since the S3
+planning session began at `c500cfe`. **Do not maintain that chain by hand — it was written out
+here once and was already wrong in two ways** (it claimed seven movements while listing eight, and
+omitted `89c4af6` and `97838d9` entirely). Re-derive it:
+
+```bash
+git log --oneline c500cfe..origin/main     # 10 commits as of 4730b44
+```
+
+`#54` was workflow-only, so no source anchor moved with it.
 **`revnix/reeve` is PUBLIC** since 2026-08-27 — a closed founder decision, see `s3.md`.
 
 ---
@@ -104,7 +111,7 @@ the workflow says they do not need. **F5 is the only genuine blocker.**
 |---|---|---|
 | F1 | Name the spec repos | **Create them, one per project, named `<project>-specs`**: `revnix/reeve-specs`, `nextlyhq/nextly-specs`, `revnix/rext-specs`, all private. Rejected, with the reason recorded so it is not reopened: **one shared repo** fails because `specRepoId` is a numeric GitHub id **per project**, so three projects sharing one id makes the snapshot stop distinguishing them — which fights the design's own identity model (§11.1, *"immutable numeric GitHub ids… with human-readable snapshots beside them"*); **reusing the code repos** fails because spec PRs would land beside code PRs, which is exactly the separation S4's gate depends on. |
 | F2 | Arm `--execute` on the live guardian? | **Leave it off for now.** S3's first code PRs (T7, T8) modify files the running daemon executes, so arming before those merge means a live daemon acting on code that is mid-change. Revisit after T8 merges. The #52 gate itself is lifted — this is a separate, deliberate decision not to arm. |
-| F3 | The 15-minute watcher loop | **RUNNING again**, 2026-08-28, job `75eb5153`, subjects `reeve#58` and `reeve#60`. It was STOPPED 2026-08-27 (job `0011c181`) because nothing of this lane's was open, and restarted when S3's first PRs opened, as that row required. A watcher with no subject reports "quiet" every fifteen minutes, and quiet-with-no-subject is the exact reading that let a 22-hour CI outage go unremarked. |
+| F3 | The 15-minute watcher loop | **RUNNING**, job `75eb5153`. Its subject is **whatever `gh pr list --state open` returns**, re-derived every tick, so it followed `reeve#58`/`reeve#60` to `reeve#62` when those merged — no retarget was needed or performed. That is deliberate: a watcher holding a hard-coded subject list goes on reporting "quiet" truthfully while watching nothing, which is the reading that let a 22-hour CI outage pass unremarked. It was STOPPED 2026-08-27 (job `0011c181`) with nothing open, and restarted when S3's first PRs opened. **It stops when this lane has no open PR, not when one subject closes.** |
 
 ---
 

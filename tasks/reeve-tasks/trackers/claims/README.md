@@ -120,10 +120,16 @@ another lane has that you are still alive.
 **A claim whose `refreshed` is more than 24 hours old is STALE.** A stale claim may be taken
 over — but **takeover is recorded, never silent**:
 
-1. Set `state: TAKEN OVER` in the existing file, add a line saying who took it and when, and
-   **leave the original claim text in place**. Do not rewrite history into agreement.
-2. Add your own claim below it in the same file.
-3. Say so in `../MASTER.md`'s *In flight* table.
+1. **Archive the outgoing claim as history**: move the previous holder's block down under a
+   `## Taken over <date>` heading, marked `TAKEN OVER`, with a line saying who took it and when.
+   **Leave its text unedited.** Do not rewrite history into agreement.
+2. **Set the file's top-level header to `HELD` in your own name**, with your lane, host and
+   timestamps. The header is authoritative; the blocks below it are history. Leaving the header at
+   `TAKEN OVER` publishes **no active holder at all**, and a third lane reading `main` sees the
+   task as free or ambiguously owned — which is the duplicate work this protocol exists to stop,
+   arriving through the procedure meant to prevent it.
+3. Publish it as a claim-only PR, like every other transition.
+4. Say so in `../MASTER.md`'s *In flight* table.
 
 Twenty-four hours is a **convention, not a measurement**. It is the number at which a lane that
 has genuinely stopped is more likely than a lane that is thinking. If it turns out to be wrong,

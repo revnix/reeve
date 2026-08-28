@@ -39,8 +39,14 @@ Four rules follow, and they are what the roadmap actually enforces:
    green. There is no "start S4 in parallel while S3 finishes."
 2. **A switch turns on at the stage that proves it, and not before.** The switch column below
    is not a plan; it is a permission that the stage's Verify clause purchases.
-3. **New `ctx` keys default off** in the opt-out shape, so guardian test files stay green
-   untouched. A new key that changes an existing test's result is a defect in the key.
+3. **New `ctx` keys default off — which means `ctx.newKey === true`, NOT the expression §14
+   names.** The design's preamble says *"New ctx keys default off, following the
+   `ctx.reviewIngest !== false` opt-out pattern"*, and **those two halves contradict each other**:
+   `ctx.reviewIngest !== false` evaluates to **`true` when the key is absent** (measured; the live
+   gate is `src/daemon.mjs:1736`), so a new side effect written that way **runs in every legacy
+   call site** — the opposite of the compatibility the rule exists to protect. Use an **opt-in**
+   test, `ctx.newKey === true`. A new key that changes an existing test's result is a defect in
+   the key. See §B.11, contradiction **C9**.
 4. **Nothing merges a builder PR before S10.** reeve's *own* PRs merge under the founder's
    explicit per-PR grant; that is a different thing, governed by §B.9.
 
@@ -695,6 +701,7 @@ that does not exist. Carry the rows your stage touches into that family's
 | C6 | §11.5 lists the intended `profile/schema.mjs` additions (`:731`) | `worker.isolation` and `worker.dependencyPaths` exist and the design names neither | **S3 T1** |
 | C7 | *"Reused untouched: `worktree.mjs`"* (`:731`), *"via the existing `acquireWorktree`"* (`:443`) | **Neither exists.** `src/checkout.mjs` replaced them; `src/build/tables.mjs:63` still declares `directory_lease: { writer: "worktree.mjs" }` | **S3 T9** |
 | C8 | *"the 7-clause worst-wins verdict"* (`:473,:500,:533,:804`) | `verdict.mjs` — **nine** ids | guardian lane |
+| **C9** | §14's preamble (`:818`): *"New ctx keys default off, following the `ctx.reviewIngest !== false` opt-out pattern"* | **The two halves contradict each other.** `ctx.reviewIngest !== false` is **`true` when the key is absent**, so it is default-**ON**. MEASURED: the live gate at `src/daemon.mjs:1736` is opt-out and default-on, which is correct *for that key* — review ingest should run unless a test disables it. It is simply not an example of "default off". A new key copying the named shape runs in every legacy call site. | **every stage that adds a `ctx` key** — use `ctx.newKey === true` |
 
 Two structural hazards belong beside them:
 
@@ -773,8 +780,10 @@ text into agreement.**
    `file:line` it will consume, with the anchor string beside each number and the sha they were
    true at. This becomes the consumed-interfaces table, and it is the single most expensive
    thing to get wrong.
-3. **Decompose into tasks**, each one PR, each budgeted in changed **lines**, each with a
-   dependency and a Verify criterion. Guardian-touching tasks travel alone.
+3. **Decompose into tasks. A task is one COMMIT (§B.1.5), and tasks are GROUPED into PRs** under
+   the changed-line budget of §B.1.1 — S3's 78 plan tasks become **16 PRs**, not 78. Each PR
+   carries a dependency, a Verify criterion, and one close-out task. Guardian-touching PRs travel
+   alone.
 4. **Ask the founder the questions the decomposition surfaced**, in the required shape:
    plain-English context → options with plain-English pros and cons and a concrete example in
    this codebase → an honest recommendation with reasoning → one clear line stating what needs
@@ -784,8 +793,12 @@ text into agreement.**
    order, all from one style reference so the family does not drift.
 6. **Create the stage tracker** from the template, with the Verify table pre-seeded from step 1
    and every row naming the task that will satisfy it.
-7. **Land the plan family**, then execute it task by task under the claim protocol in
-   `IMPLEMENTATION-PROMPT.md`.
+7. **Land ONE plan document, execute its tasks, then revise and land the next.** Not the family
+   at once. The measured reason is this programme's own strongest finding: **a plan can survive
+   sixteen adversarial review rounds and still contain a test that cannot fail, and that was found
+   by EXECUTING Task 1, not by reviewing it.** Landing every document up front freezes each later
+   one before the feedback that would correct it exists. Writing them together is fine and keeps
+   the interfaces coherent; *landing* them together is what throws the learning away.
 8. **Close the stage** only when every Verify row names a file that exists and is green — and,
    for a `measure` clause, a document under `docs/measured/` that carries its own
    *What this does NOT establish* section.

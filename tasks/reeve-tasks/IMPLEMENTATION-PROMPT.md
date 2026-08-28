@@ -282,20 +282,23 @@ When, and only when, the founder grants this specific PR:
 
 1. Update the stage tracker: STATE → **MERGED**, the **squash SHA on `main`** (the only SHA a
    tracker row carries — per-round fix SHAs do not survive a squash merge), rounds, findings.
-   **Publish it.** Phase 3 deliberately merges the feature PR with the row still at `BUILT`, so
-   this edit exists only in your checkout until it lands. Open a **tracker-only PR** — the same
-   shape as a claim update: one file, nothing else, reviews in a minute — and merge it. Until then
-   every other lane reads `BUILT` on work that is done, which is precisely the 10-of-20 defect the
-   per-stage tracker was designed to remove, reintroduced one step later in the workflow.
+   *(Do not publish yet — steps 2 to 4 edit the same file. See step 5.)*
 2. Add any new **finding class** to the tracker's defect log — one row per class, ≤400
    characters, not one row per finding.
 3. Add any **durable finding** — a lesson about plans or designs being wrong — to §5.
 4. Add any decision taken during the task to §4, with its date and reason.
-5. **Release the claim**: `state: RELEASED`, with the reason and the date, **published as a
+5. **Publish the tracker, once, with every close-out edit in it.** Steps 1 to 4 all write the
+   same file, so open **one tracker-only PR** carrying the STATE change, the defect-log rows, the
+   durable findings and the decisions together — one file, nothing else, reviews in a minute.
+   **Publishing after step 1 would leave steps 2 to 4 in your checkout only**, and the workflow
+   says to follow the phases in order, so they would never be published at all. Until this merges,
+   every other lane reads `BUILT` on work that is done — precisely the 10-of-20 defect the
+   per-stage tracker exists to remove, reintroduced one step later in the workflow.
+6. **Release the claim**: `state: RELEASED`, with the reason and the date, **published as a
    claim-only PR** like every other claim transition. Do not delete the file. A release that lives
    only on a merged feature branch leaves the task HELD to everyone reading `main`, and the next
    task never starts.
-6. Report: what merged, what it changed, what review found, what is still open.
+7. Report: what merged, what it changed, what review found, what is still open.
 
 ---
 

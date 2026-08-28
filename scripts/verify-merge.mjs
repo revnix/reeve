@@ -45,7 +45,10 @@ const emit = (doc, code) => {
   process.exitCode = code;
 };
 
-const sh = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", maxBuffer: MAXBUF, stdio: ["ignore", "pipe", "pipe"] }).trim();
+// RAW, not trimmed. `git diff-tree -z` output is NUL-delimited and a filename
+// may BEGIN with a space or a tab: a global trim strips that byte off the first
+// path. Scalar results are trimmed at their own call sites instead.
+const sh = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", maxBuffer: MAXBUF, stdio: ["ignore", "pipe", "pipe"] });
 // One runner, injected into the seam, so the argument lists this builds are the
 // same ones the tests drive. See src/mergecheck.mjs for what each read asserts.
 const G = gitFacts((args) => sh("git", args));
@@ -61,7 +64,7 @@ const run = () => {
   // one host while every tree comparison reads the other.
   let originHost = null, originNwo = null;
   try {
-    const url = sh("git", ["remote", "get-url", "origin"]);
+    const url = sh("git", ["remote", "get-url", "origin"]).trim();
     const m = url.match(/^(?:git@([^:]+):|(?:ssh:\/\/)?git@([^/:]+)(?::\d+)?\/|https?:\/\/(?:[^@/]+@)?([^/:]+)(?::\d+)?\/)(.+?)(?:\.git)?\/?$/);
     if (m) { originHost = m[1] || m[2] || m[3] || null; originNwo = m[4] || null; }
   } catch (e) {
@@ -164,6 +167,18 @@ const run = () => {
       why: `could not read the merge commit's diff: ${first(e)}` }, EXIT.unreadable);
   }
 
+  // CAN A REBASE MERGE BE RULED OUT? `mergeCommit.oid` for a rebase merge is the
+  // LAST rebased commit -- one parent, like a squash, but its diff covers only
+  // that commit. The two are indistinguishable from the commit alone. They are
+  // distinguishable from the REPOSITORY: if rebase merges are disabled, a
+  // one-parent merge commit is a squash and carries the whole branch. Unproven
+  // is the safe default, and it makes uncovered paths refuse rather than pass.
+  let squashProven = false;
+  try {
+    const repoCfg = JSON.parse(sh("gh", ["api", "--hostname", originHost, `repos/${originNwo}`]));
+    squashProven = repoCfg.allow_rebase_merge === false;
+  } catch { /* unproven, which is the safe direction */ }
+
   // THE API LIST IS NOW ONLY A CROSS-CHECK, and its failure is not the verdict's
   // failure: the verdict comes from the merge's own diff, read locally. Projected
   // to two fields so the patch bodies never reach this process.
@@ -207,9 +222,9 @@ const run = () => {
     return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, squash, files: [], why: first(e) }, EXIT.unreadable);
   }
   const branchOnly = branchOnlyPaths(apiPaths, mergePaths);
-  const { verdict, counts, why } = verdictFor(classified, { branchOnly, crossCheck });
+  const { verdict, counts, why } = verdictFor(classified, { branchOnly, crossCheck, squashProven });
   emit({ repo: ghRepo, pr, verdict, squash, main: mainOid, base: meta.baseRefName ?? null,
-         headRead: headRev !== null, crossCheck, branchOnly, counts, files: classified, why },
+         headRead: headRev !== null, crossCheck, branchOnly, squashProven, counts, files: classified, why },
        exitFor(verdict));
 };
 

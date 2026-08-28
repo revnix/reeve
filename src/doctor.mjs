@@ -344,13 +344,27 @@ export function checkBaseHealth(nwo, workflow = "ci.yml", branch = "main", io = 
   // not executing" would have sent an operator to check billing for a broken
   // workflow file — the same class of mistake as the conclusion-reading this
   // whole check exists to correct, one level up.
-  if (runs.length > 0 && noStep === runs.length) {
-    lines.push("-> nothing on this branch has been measured; no gate downstream of it means anything");
-    lines.push("-> cause is NOT determined here: an exhausted runner quota and a workflow that cannot start look identical from the step count");
-    return { id: "R-04", level: BROKEN, title: "base health", lines };
-  }
-  if (failed === runs.length && runs.length > 0) {
-    lines.push("-> every PR inherits a red rollup, so a new failure is invisible");
+  // BROKEN IS ABOUT THE ABSENCE OF A USABLE RESULT, not about which way the runs
+  // were unusable.
+  //
+  // Splitting "failed" from "executed nothing" made each test homogeneous, so a
+  // sample of five real failures and five that never ran — ten out of ten with no
+  // usable measurement in it — fell through both and reported DEGRADED. The
+  // previous implementation called that same all-failure history BROKEN, so
+  // classifying the causes more precisely made the base look HEALTHIER. A
+  // refinement that loses the coarser truth it refined.
+  //
+  // The condition is therefore the union, and only the wording below distinguishes
+  // the causes.
+  if (runs.length > 0 && failed + noStep === runs.length) {
+    if (noStep === runs.length) {
+      lines.push("-> nothing on this branch has been measured; no gate downstream of it means anything");
+      lines.push("-> cause is NOT determined here: an exhausted runner quota and a workflow that cannot start look identical from the step count");
+    } else if (failed === runs.length) {
+      lines.push("-> every PR inherits a red rollup, so a new failure is invisible");
+    } else {
+      lines.push("-> no completed run in this sample produced a usable result: some failed, some executed nothing");
+    }
     return { id: "R-04", level: BROKEN, title: "base health", lines };
   }
   if (unreadable && !failed && !noStep) return { id: "R-04", level: UNKNOWN, title: "base health", lines };

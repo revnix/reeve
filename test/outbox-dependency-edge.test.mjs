@@ -446,13 +446,19 @@ const fresh = tag => open(join(mkdtempSync(join(tmpdir(), `reeve-dep-${tag}-`)),
     "while the FENCE stays bumped, because the lease really did happen", String(row.lease_token));
 }
 
-// --- one status transition emits exactly one event -----------------------------
+// --- an already-transitioned row is not cascaded or announced twice -----------
 {
-  // The batch is selected outside the write transaction, so two drainers can pick
-  // the same pending child before either commits. The loser's UPDATE matches
-  // nothing; without a `changes` test it would still emit a second event for one
-  // transition. A trail with two events for one change is worse than one with
-  // none, because it reads as two things having happened.
+  // What this DOES assert: the selection only ever picks rows that are still
+  // pending, so a row another pass already moved is neither reported as cascaded
+  // nor given a second event.
+  //
+  // What it does NOT assert, said plainly rather than implied: the `changes === 1`
+  // test inside the transaction. Reaching that needs a second writer to move the
+  // row between the select and the update, and the select now happens INSIDE the
+  // write transaction precisely so no writer can. It is unreachable by
+  // construction, and an assertion that appeared to cover it would be passing for
+  // another reason -- which is what the first version of this block did, and a
+  // stub of the guard left it green.
   const db = fresh("dup");
   const parent = tx(db, () => enqueue(db, {
     idemKey: "p", kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "p" } }));
@@ -464,21 +470,14 @@ const fresh = tag => open(join(mkdtempSync(join(tmpdir(), `reeve-dep-${tag}-`)),
   const first = cascadeDeadLetter(db);
   check(first.length === 1, "control: the first pass cascades the child", String(first.length));
   const afterFirst = db.prepare("SELECT count(*) n FROM event WHERE op='outbox.dead_letter'").get().n;
-
-  // The row is already dead_letter, so a racing drainer's UPDATE matches nothing.
-  // Driving it by re-running the cascade is the same situation the loser sees.
-  db.exec(`UPDATE outbox SET status='pending' WHERE id=${child}`);
-  const again = cascadeDeadLetter(db);
-  check(again.length === 1, "control: re-running it does transition the row again", String(again.length));
-
-  // And the loser's case: mark it dead BEFORE cascading, so the UPDATE cannot match.
-  db.exec(`UPDATE outbox SET status='dead_letter' WHERE id=${child}`);
-  const before = db.prepare("SELECT count(*) n FROM event WHERE op='outbox.dead_letter'").get().n;
-  const none = cascadeDeadLetter(db);
-  const after = db.prepare("SELECT count(*) n FROM event WHERE op='outbox.dead_letter'").get().n;
-  check(none.length === 0, "a row already transitioned is not reported as cascaded again", String(none.length));
-  check(after === before, "and emits no second event for one transition", `${before} -> ${after}`);
   check(afterFirst >= 1, "control: events are being written at all", String(afterFirst));
+
+  const again = cascadeDeadLetter(db);
+  const afterSecond = db.prepare("SELECT count(*) n FROM event WHERE op='outbox.dead_letter'").get().n;
+  check(again.length === 0, "a second pass does not report the same row as cascaded again", String(again.length));
+  check(afterSecond === afterFirst, "and writes no second event for one transition", `${afterFirst} -> ${afterSecond}`);
+  check(db.prepare("SELECT status FROM outbox WHERE id=?").get(child).status === "dead_letter",
+    "control: and the row really is in the terminal state throughout");
 }
 
 // --- a store whose outbox PREDATES the column must still open ------------------

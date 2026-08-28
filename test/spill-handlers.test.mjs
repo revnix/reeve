@@ -253,6 +253,17 @@ const recorder = (replies = []) => {
   // operator turned the switch off.
   check(permittedHandlers(HANDLERS, false)["gh.issue.create"] === undefined,
     "a queued spill issue is NOT filed once the switch is off");
+
+  // WHAT THIS DOES NOT COVER, stated rather than implied.
+  //
+  // These assertions exercise the rule. They do not prove the daemon CALLS it:
+  // stubbing `permittedHandlers(...)` back to a bare `ctx.handlers ?? HANDLERS`
+  // in the tick leaves every assertion here green. Reaching that needs a test
+  // that drives the tick, and the tick is being restructured in another change.
+  //
+  // Named here because an unstated gap reads as covered, and this is the third
+  // time in two pull requests that a correct mechanism turned out to have nothing
+  // plugged into it.
 }
 
 // --- nothing reaches GitHub except through an injected api ---------------------

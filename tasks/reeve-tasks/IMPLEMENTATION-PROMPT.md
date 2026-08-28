@@ -95,11 +95,14 @@ existed since `src/checkout.mjs` replaced them.
     invites the correction that *"the only side effects are three"* forecloses.
 11. **Verify a merge by CONTENT, never ancestry.** This repo squash-merges, so a branch commit
     is **never** an ancestor of `main`. Compare tree hashes or file blobs, or run
-    **`node scripts/verify-merge.mjs <pr>`**, which does the blob comparison and distinguishes the
-    states ancestry cannot: **`0`** merged by content · **`31`** the content did **not** arrive ·
-    **`32`** it arrived and `main` has moved since · **`22`** not merged yet. It reports an empty
-    file set as **UNREADABLE rather than as a pass**, because a check that saw nothing has verified
-    nothing.
+    **`node scripts/verify-merge.mjs <pr>`** — **which lands in its own PR, `reeve#60`, because it
+    is code and this one is documents.** It compares TREE ENTRIES (mode included, so a lost
+    executable bit is caught) and distinguishes the states ancestry cannot: **`0`** merged by
+    content · **`31`** the content did **not** arrive · **`32`** it arrived and `main` has moved
+    since · **`22`** not merged yet · **`23`** it could not tell. **Until reeve#60 merges, do the
+    comparison by hand** — `git rev-parse <head>:<path>` against `git rev-parse origin/main:<path>`
+    for every changed path — and treat any path you could not read as unverified rather than as
+    matching.
 12. **Conventional Commits**, lowercase, `type(scope): subject`, ≤72 characters.
 13. **Every change carries a what/why comment in the style of the file it lands in.** Comments
     never reference tasks, plans, findings, or any planning document.

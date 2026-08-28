@@ -947,7 +947,12 @@ export function effectsFor({ nwo, e, decision, profile, execute }) {
  */
 export function findingsFingerprint(items, ledgerIds) {
   const ids = [
-    ...(items ?? []).map(t => String(t?.id ?? "")),
+    // Only findings that can GATE. `gates === false` marks one that is neither
+    // dispatched nor blocking — an advisory reviewer's body finding — and letting
+    // it into the identity meant advisory churn reset the brake's budget against
+    // an unchanged problem. Undefined counts as gating, so a caller that does not
+    // mark items keeps the previous behaviour rather than silently narrowing.
+    ...(items ?? []).filter(t => t?.gates !== false).map(t => String(t?.id ?? "")),
     // LEDGER BLOCKERS COUNT TOO. `FIX_FINDINGS` is selected by the `findings`
     // clause as well as the thread ones, and when a ledger blocker is the only
     // reason there are no review findings at all — so a key built from review
@@ -2008,7 +2013,18 @@ export async function tick(ctx) {
       // nothing survived anything, and a founder reading that goes looking for a
       // bad fix that was never made. The reason it gave is carried on the ledger
       // row for exactly this moment.
-      const note = fp ? fixAttemptNote(db, nwo, pr, fp) : null;
+      // Looked up under EITHER identity, because a findings repair has one too.
+      //
+      // The blocker was stored and read under the CI fingerprint alone, so a
+      // FIX_FINDINGS worker that reported `needsHuman` had its reason recorded
+      // nowhere this branch could find it. The useful "#PR: needs a human —
+      // <reason>" escalation raised on the worker's own tick was then replaced on
+      // the next complete tick by the generic capped cause, and announcement
+      // reconciliation reported the original as cleared. The reason a person is
+      // needed is the whole content of the escalation; losing it to a rename is
+      // worse than not having capped at all.
+      const note = (fp ? fixAttemptNote(db, nwo, pr, fp) : null)
+                ?? (ffp ? fixAttemptNote(db, nwo, pr, ffp) : null);
       raise(note ? `#${pr}: needs a human — ${note}` : `#${pr}: ${decision.why}`);
     }
   }
@@ -2934,7 +2950,9 @@ export async function tick(ctx) {
 
       // Attached now rather than at dispatch: the reason only exists once the
       // worker has spoken, and it is what the retry cap will quote when it fires.
-      if (decision.action === "FIX_CI" && fp) noteFixAttempt(db, nwo, e.pr, fp, statedBlocker(r.report));
+      // Stored under the SAME key the attempt was spent against, whichever repair
+      // it was. Two identities, one place to look them up.
+      if (spendKey) noteFixAttempt(db, nwo, e.pr, spendKey, statedBlocker(r.report));
 
       if (r.outcome === OUTCOMES.OK) {
         // The worker cannot commit its own work. Its sandbox denies Bash writes

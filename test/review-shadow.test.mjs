@@ -12,10 +12,26 @@
 //   not looking. That is absence rendered as success, in the one place built to
 //   decide whether absence has been ruled out.
 import { compare, record, streak, divergences } from "../src/review/shadow.mjs";
+import { observe } from "../src/review/ingest.mjs";
 import { open } from "../src/db/ops.mjs";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// The snapshot `observe()` hands the daemon, built the way the daemon builds it.
+const observedSnapshot = () => {
+  const page = JSON.stringify({ data: { repository: { pullRequest: {
+    reviewThreads: { totalCount: 1, pageInfo: { hasNextPage: false },
+                     nodes: [{ id: "T1", isResolved: false, isOutdated: false, path: "a.ts", line: 1,
+                               comments: { nodes: [{ databaseId: 1, author: { login: "codex" },
+                                                     body: "x", createdAt: "2026-08-21T00:00:00Z" }] } }] } } } } });
+  return observe("o/r", 1, { gh: args => args[0] === "graphql"
+    ? { ok: true, out: page }
+    : { ok: true, out: /pulls\/1\/reviews/.test(String(args[0]))
+        ? JSON.stringify([{ id: 9, user: { login: "codex" }, state: "COMMENTED",
+                            commit_id: "a".repeat(40), body: "b", submitted_at: "2026-08-21T00:00:00Z" }])
+        : "[]" } }).threads;
+};
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -231,6 +247,16 @@ rmSync(dir, { recursive: true, force: true });
   const otherSide = compare({ ...base, reviewTotal: 7 }, { ...proj });
   check(otherSide.comparable && otherSide.agree,
     "control: and so does a projection without it", otherSide.why ?? "");
+
+  // AND THE SNAPSHOT THE DAEMON ACTUALLY PASSES CARRIES IT. `compare` skipping
+  // when either side is absent is right for a caller that does not read the review
+  // surface, and wrong for the daily shadow: it would keep reporting agreement on
+  // threads alone while the fold missed review bodies entirely, and the streak
+  // would say so.
+  const snap = observedSnapshot();
+  check(snap.reviewTotal !== undefined,
+    "observe()'s own snapshot reports the review count, so the shadow can compare it",
+    JSON.stringify(Object.keys(snap)));
 
   // The residual, asserted so it is a decision rather than a surprise: counts
   // cannot see a body EDITED in place, which changes no count. Catching that

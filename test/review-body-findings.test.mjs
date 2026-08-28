@@ -522,6 +522,21 @@ ingest(db, NWO, 1, [
     "control: the same review findings with a blocker are not the same problem without one");
   check(findingsFingerprint([], []) === null,
     "control: neither findings nor blockers is still nothing to cap");
+
+  // ONLY FINDINGS THAT CAN GATE. An advisory reviewer's body finding is neither
+  // dispatched nor blocking, so letting it into the identity meant an advisory
+  // reviewer posting or withdrawing one minted a fresh key with zero attempts and
+  // handed the brake's budget back against an unchanged set of blocking findings.
+  // Advisory churn could restart the repair loop indefinitely.
+  const gating = [{ id: "t1", gates: true }, { id: "b1", anchor: "body", gates: true }];
+  const plusAdvisory = [...gating, { id: "b2", anchor: "body", gates: false }];
+  check(findingsFingerprint(gating) === findingsFingerprint(plusAdvisory),
+    "an advisory body finding appearing does not change the problem's identity",
+    `${findingsFingerprint(gating)} vs ${findingsFingerprint(plusAdvisory)}`);
+  check(findingsFingerprint(gating) !== findingsFingerprint([{ id: "t1", gates: true }]),
+    "control: while a GATING one leaving does change it, so the filter is not dropping everything");
+  check(findingsFingerprint([{ id: "x" }]) === findingsFingerprint([{ id: "x", gates: true }]),
+    "control: an unmarked item counts as gating, so a caller that does not mark keeps the old behaviour");
 }
 
 // ── both ENDS of the live review cross-check, not just the comparison ───────

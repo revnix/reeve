@@ -330,7 +330,19 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
     // and `bodyFindings` are: blocking-ness says whose opinion gates a merge. The
     // universal count above keeps its own job, which is refusing to spill.
     blockingCritical: st.blockingCritical,
-    threadDetails: fresh ? st.threads : null,
+    // Each item says whether it can GATE, because two readers want different
+    // things from this one list. The prompt wants everything worth showing a
+    // worker; the retry identity wants only what can actually cause a repair.
+    //
+    // An advisory reviewer's body finding is in neither `bodyOpen` nor
+    // `dispatchable`, so it is never dispatched and never blocks — but it was
+    // still in the fingerprint, so an advisory reviewer posting or withdrawing one
+    // minted a fresh key with zero attempts and handed the brake's budget back
+    // against an unchanged set of blocking findings. Advisory churn could restart
+    // the repair loop indefinitely.
+    threadDetails: fresh
+      ? st.threads.map(t => ({ ...t, gates: t.anchor !== "body" || blockingLogins.has(t.reviewer) }))
+      : null,
     // Readable independently of `fresh`: a tick-old list of WHICH threads are
     // uncleared is not safe to dispatch a worker against, but the COUNT is safe
     // to block on -- being one tick behind can only mean blocking slightly too

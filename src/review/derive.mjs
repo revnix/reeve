@@ -257,6 +257,18 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
       continue;
     }
 
+    // COUNTED BEFORE CLASSIFICATION, and the order is the whole point.
+    //
+    // GitHub's `reviews.totalCount` counts review OBJECTS. `classifyObservation`
+    // returns null for a 0-byte COMMENTED review — the carrier it mints for every
+    // inline reply, nine at one commit on #1124 — so counting after it excluded
+    // exactly those. The projection would then report fewer reviews than the live
+    // read on any pull request with inline review activity, permanently, and a
+    // permanent disagreement makes `reviewFacts` answer UNKNOWN: no remediation,
+    // no merge, on most pull requests. The count is of objects seen, not of
+    // objects that said something.
+    if (r.kind === "review") reviewSeen.add(r.external_id);
+
     const c = classifyObservation(o, rev, resolve);
     if (!c) continue;
     // The round's ORDINAL, taken before the push so it indexes the round itself.
@@ -280,7 +292,6 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     // carrier GitHub mints for every inline reply -- so reaching here with
     // kind 'review' IS the definition of one.
     if (r.kind !== "review") continue;
-    reviewSeen.add(r.external_id);
     bodyAuthors.add(r.source);
     // COMPLETENESS is decided per pull request against what was actually posted,
     // not against the roster. A profile can be fully configured and still miss a

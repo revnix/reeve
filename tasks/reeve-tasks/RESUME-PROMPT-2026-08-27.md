@@ -1,4 +1,22 @@
-# Resume prompt — paste the block below into a fresh session
+# Resume prompt — 2026-08-27
+
+> # ⛔ HISTORICAL. DO NOT PASTE THIS INTO A SESSION.
+>
+> **Superseded 2026-08-28. Every document it orders written now exists**, and following it would
+> rewrite committed work: it says *"none has been started"* and instructs a fresh session to write
+> the master plan, the trackers, the implementation prompt and all six stage plans in parallel —
+> under the **superseded ~1,200-line cap**, which §B.1.2 has since corrected to a task cap.
+>
+> **What is actually next** is in `trackers/MASTER.md` under *In flight* and *Needs the founder*,
+> and the current rules are `MASTER-PLAN.md` Part B and `IMPLEMENTATION-PROMPT.md`. Start there.
+>
+> This file is kept, unedited below the banner, because it is the record of what was believed on
+> 2026-08-27 — and because editing a superseded document into agreement with the present is what
+> this programme's own correction discipline forbids. Read it as history, never as an instruction.
+
+---
+
+## The original prompt, as written on 2026-08-27
 
 Everything between the rules is the prompt. It assumes nothing about what you remember.
 

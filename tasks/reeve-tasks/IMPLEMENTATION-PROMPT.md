@@ -2,7 +2,7 @@
 
 **Use this for every task in this repository.** Paste it, name the task, and follow it in order.
 
-**Task:** `<tracker file>` → `<task id>`, e.g. `trackers/s3.md` → **T1**.
+**Task:** `<tracker file>` → `<task id>`, e.g. `tasks/reeve-tasks/trackers/s3.md` → **T1**.
 
 ---
 
@@ -17,7 +17,18 @@ implementation and publication, behind capability switches that turn on one stag
 `~/Work/Products/reeve`.** It watches real PRs on real repositories. Nothing you do may
 interrupt it, and several ordinary commands would.
 
-reeve is **private** and nothing in a public or client repository may name it.
+**reeve is a PUBLIC repository** as of 2026-08-27 — a deliberate founder decision taken with the
+exposure audited beforehand. Three things follow, and they are not one rule:
+
+- **Naming reeve inside `revnix/reeve` is fine.** It is reeve's own home and names itself throughout.
+- **Rule 15 (design §1.7) is unchanged and still binds**: no effect reeve produces against **any
+  other repository** may name it — not a branch, a commit message, a PR title or body, a check
+  name, a label, or a comment marker.
+- **The spec repositories must be PRIVATE.** Design `:77` refuses to run against a spec repo whose
+  visibility is anything but exactly `private`, re-queried per effect with no cache. reeve's own
+  repository going public relaxes that by nothing.
+
+**Assume everything you commit here is world-readable**, because it is.
 
 ---
 
@@ -84,7 +95,11 @@ existed since `src/checkout.mjs` replaced them.
     invites the correction that *"the only side effects are three"* forecloses.
 11. **Verify a merge by CONTENT, never ancestry.** This repo squash-merges, so a branch commit
     is **never** an ancestor of `main`. Compare tree hashes or file blobs, or run
-    `node scripts/verify-merge.mjs <pr>`.
+    **`node scripts/verify-merge.mjs <pr>`**, which does the blob comparison and distinguishes the
+    states ancestry cannot: **`0`** merged by content · **`31`** the content did **not** arrive ·
+    **`32`** it arrived and `main` has moved since · **`22`** not merged yet. It reports an empty
+    file set as **UNREADABLE rather than as a pass**, because a check that saw nothing has verified
+    nothing.
 12. **Conventional Commits**, lowercase, `type(scope): subject`, ≤72 characters.
 13. **Every change carries a what/why comment in the style of the file it lands in.** Comments
     never reference tasks, plans, findings, or any planning document.
@@ -149,12 +164,22 @@ Follow the phases in order. Each gate is completed before the next phase starts.
 
 ### Phase 0: Claim
 
-1. Read `trackers/claims/README.md` in full.
-2. Read the stage tracker and `trackers/MASTER.md` to see what other lanes hold.
+1. Read `tasks/reeve-tasks/trackers/claims/README.md` in full. **Every path in this prompt is
+   repository-relative**, because each later step runs from the repository root.
+2. Read the stage tracker (`tasks/reeve-tasks/trackers/s3.md`) and
+   `tasks/reeve-tasks/trackers/MASTER.md` to see what other lanes hold.
 3. Confirm the task's **dependencies are MERGED**, by content — not "the PR is open", not "it
    was approved".
-4. Write `trackers/claims/<task-id>.md` from the template, commit it, and **push it**. A claim
-   nobody can see is not a claim.
+4. **Publish the claim where the protocol says peers look, which is `main`.** Write
+   `tasks/reeve-tasks/trackers/claims/<stage>-<task-id>.md` from the template **on a branch of its
+   own**, open a PR containing **only that file**, and get it merged. One small file, touching
+   nothing else, reviews in a minute and cannot conflict with anyone.
+
+   **Why not just push it to your feature branch:** a commit on a feature branch is not on `main`,
+   and `claims/README.md` tells other lanes to look on `main`. Two lanes could each push a claim
+   to their own branch, each see nothing on `main`, and both start the same task — the protocol
+   failing in the one situation it exists for. **A claim nobody can see is not a claim, and
+   "pushed" is not "visible".**
 
 **⛔ GATE: no reading of implementation files, no branch, no code, until the claim is pushed.**
 
@@ -172,8 +197,15 @@ Follow the phases in order. Each gate is completed before the next phase starts.
 5. Research prior art and fetch current library docs (rule 16).
 6. Ask any question under rule 15.
 
-**⛔ GATE: do not proceed while a question is unanswered, or while a consumed interface has
-changed under the plan.**
+**⛔ GATE: do not proceed while a BLOCKING question is unanswered, or while a consumed interface
+has changed under the plan.**
+
+**A question with a recorded default is not blocking.** The stage tracker's §2 marks some
+questions *defaulted*: the decision was taken without the founder, is recorded with its reasoning,
+and is reversible cheaply. They exist precisely so work is not stopped — proceed under the default
+and name in the PR body which one you relied on. **A question with an empty Answer and no default
+IS blocking**; F5 (the spec repositories do not exist yet) is the current example, and no amount
+of reasoning substitutes for it.
 
 ### Phase 2: Implement — one task, in the plan's steps
 
@@ -181,7 +213,12 @@ changed under the plan.**
    `git worktree add -b <branch> ~/Work/Products/reeve-wt/<name> <base>`.
    A fresh worktree **cannot commit until `node_modules` exists** — husky needs it. Budget the
    install.
-2. **Write the failing test first**, exactly as the plan's Step 1 gives it.
+2. **Write the failing test first.** **The plan does not contain the test body** — it names the
+   behavioural claim, the interfaces, the assertion that must go red, and the ones that must stay
+   green as controls. **You write the test, in the editor, from those.** That is deliberate: code
+   inside a Markdown fence is never executed, so a test written there is never seen to run, and
+   ten of the defects found in the first two plan documents were exactly that. If a plan hands you
+   a test body verbatim it predates this rule — use it, but run it before you trust it.
 3. **Run it and watch it fail**, and check that the failure is the one the plan predicts. A test
    that fails for a different reason is not the test you meant to write.
 4. **Run the four-check stub loop** the task names (rule 4). This is the step that catches a

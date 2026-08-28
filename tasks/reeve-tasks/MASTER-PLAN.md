@@ -517,12 +517,17 @@ worse than one that sends them to a string: the string is still there.**
 
 - [ ] **Step 1: Write the failing test**
 
-<runnable code block>
+**The assertion that must go red**, named exactly as it will read in the output:
+`"<the check's name>"`. **The controls that must stay green**: `"<name>"`, `"<name>"`.
+**What the test must reach** to be able to fail at all: <the seam, fixture or state — a fixture
+that cannot exhibit the defect passes for the wrong reason>.
+
+*(No test body here. The executor writes it in the editor, where it runs. See §B.6.)*
 
 - [ ] **Step 2: Run it and watch it fail**
 
 Run: `$N test/x.test.mjs`
-Expected: <the literal failure text>
+Expected: the named assertion red, every control green.
 
 **On the broken implementation** — <the specific wrong implementation being guarded against> — <which named assertions go red, and which stay green because they are controls>.
 
@@ -774,8 +779,9 @@ text into agreement.**
    plain-English context → options with plain-English pros and cons and a concrete example in
    this codebase → an honest recommendation with reasoning → one clear line stating what needs
    deciding. Record the answers in the stage tracker §4 before writing any plan.
-5. **Write the plan family**, at most ~1,200 lines per document, in dependency order, all from
-   one style reference so the family does not drift.
+5. **Write the plan family**, **at most three or four plan tasks per document** (§B.1.2 — the
+   cap's unit is TASKS, not lines, and a task is never thinned to fit a line count), in dependency
+   order, all from one style reference so the family does not drift.
 6. **Create the stage tracker** from the template, with the Verify table pre-seeded from step 1
    and every row naming the task that will satisfy it.
 7. **Land the plan family**, then execute it task by task under the claim protocol in

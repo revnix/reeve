@@ -655,7 +655,16 @@ export function cascadeDeadLetter(db, { batch = 100, deadlineAt = Infinity, now 
         WHERE id=? AND status='pending'`);
       for (const r of rows) {
         const why = `the effect this one depends on (#${r.depends_on}) ended ${r.parent_status}; its result will never exist`;
-        mark.run(why, r.id);
+        // ONLY the transaction that actually moved the row may speak for it.
+        //
+        // The batch is selected outside this transaction, so two drainers can pick
+        // the same pending child before either commits. The second one's UPDATE
+        // matches nothing -- the guard is `AND status='pending'` -- and without
+        // this test it would still emit a second `outbox.dead_letter` for one
+        // transition and report the row as cascaded. An immutable trail with two
+        // events for one status change is worse than one with none, because it
+        // reads as two things having happened.
+        if (mark.run(why, r.id).changes !== 1) continue;
         // The SAME op `settleOutbox` and `recoverOutbox` emit, because this is the
         // same transition arriving by a third route. Without it the event trail has
         // no record of a real status change and stops agreeing with the projection
@@ -708,7 +717,7 @@ export function pendingWithNoHandler(db, kinds) {
  * argument exists to prevent, so it must not be possible to reach it by omission.
  */
 export function settleOutbox(db, { id, leaseToken, ok, result, error, retryable = true,
-                                   unstarted = false, actor = "drainer" }) {
+                                   unstarted = false, unattempted = false, actor = "drainer" }) {
   if (!Number.isInteger(leaseToken))
     throw new Error("settleOutbox: leaseToken is required; an unfenced settle can overwrite another drainer's live delivery");
   return tx(db, () => {
@@ -769,6 +778,26 @@ export function settleOutbox(db, { id, leaseToken, ok, result, error, retryable 
     }
 
     const dead = !retryable || (reconciling && row.reconcile_attempts >= row.max_reconcile);
+    // A lease that never reached the handler REFUNDS its attempt even when the
+    // outcome is terminal, and that combination did not exist before.
+    //
+    // `unstarted` already refunds, but it returns the row to pending, which is
+    // right for a budget that ran out and wrong for a failure that will never
+    // resolve. A dependency whose parent recorded no usable value is terminal --
+    // asking again re-reads a finished result -- and yet no delivery was attempted,
+    // so charging one makes the durable row and its event report an attempt that
+    // never happened. The counters are separate precisely so this can be said
+    // accurately, and this path was the one place saying it wrongly.
+    //
+    // The FENCE is untouched, as everywhere else: the lease really did happen.
+    if (unattempted) {
+      db.prepare(`UPDATE outbox SET attempts = attempts - (CASE WHEN ? THEN 0 ELSE 1 END),
+                         reconcile_attempts = reconcile_attempts - (CASE WHEN ? THEN 1 ELSE 0 END)
+                  WHERE id=? AND lease_token=?`)
+        .run(reconciling ? 1 : 0, reconciling ? 1 : 0, id, leaseToken);
+      row.attempts -= reconciling ? 0 : 1;
+      row.reconcile_attempts -= reconciling ? 1 : 0;
+    }
     db.prepare(`UPDATE outbox SET status=?, last_error=?, not_before=unixepoch()+?,
                 lease_expires_at=0, updated_at=unixepoch() WHERE id=? AND lease_token=?`)
       .run(dead ? "dead_letter" : "pending", String(error).slice(0, 2000),

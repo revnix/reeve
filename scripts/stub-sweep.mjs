@@ -37,7 +37,13 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyEdit, validateManifest, classify, summarise, CAUGHT } from "../src/stubsweep.mjs";
 
-const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
+// Overridable so the runner can be pointed at a throwaway repository built by its
+// own test. The cleanliness guard then applies to THAT tree, so the real one is
+// not weakened to make itself testable -- which would be the usual way a guard
+// becomes decorative.
+const ROOT = process.env.STUB_SWEEP_ROOT
+  ? resolve(process.env.STUB_SWEEP_ROOT)
+  : resolve(fileURLToPath(new URL("..", import.meta.url)));
 const sha = p => createHash("sha256").update(readFileSync(p)).digest("hex");
 
 function die(code, msg) { console.error(msg); process.exit(code); }
@@ -58,7 +64,13 @@ if (dirty)
          "This sweep restores files between entries and cannot tell your work from a stub.\n" +
          "Commit or stash first. Refusing rather than risking it:\n" + dirty);
 
-const manifestPath = join(ROOT, "test", "stub-manifest.mjs");
+// A SEAM, so the runner can be driven against a manifest built for a test.
+// Without it the only way to check that this tool FAILS on an uncaught stub would
+// be to break the repository on purpose and look — which is to say, no way at all.
+// An instrument that cannot be shown to fail is the exact shape it exists to find.
+const manifestPath = process.env.STUB_MANIFEST
+  ? resolve(process.env.STUB_MANIFEST)
+  : join(ROOT, "test", "stub-manifest.mjs");
 let manifest;
 try {
   manifest = validateManifest((await import(manifestPath)).STUBS);

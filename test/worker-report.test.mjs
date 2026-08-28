@@ -124,6 +124,22 @@ check(statedBlocker(null) === null, "and no report at all is not a blocker");
         /noteFixAttempt\(db, nwo, e\.pr, spendKey,/.test(src),
     "and files it under the same key the attempt was spent against",
     (src.match(/noteFixAttempt\([^;]*/) ?? ["(no call)"])[0]);
+  // AND READS IT BACK ONLY FOR THE ESCALATION IT BELONGS TO.
+  //
+  // Two repairs each store a blocker under their own identity. Consulting
+  // whichever happened to be non-null meant a stale findings note displaced the
+  // real reason on any higher-priority escalation that came later — a conflicted
+  // branch, an unreadable review body — so the operator saw a blocker from a
+  // different problem and reconciliation treated the actual one as absent.
+  check(/decision\.why === ESCALATIONS\.REPEATED_FAILURE && fp/.test(src),
+    "the CI note is consulted only for the CI escalation",
+    (src.match(/const note = [\s\S]{0,200}/) ?? ["(no lookup)"])[0]);
+  check(/decision\.why === ESCALATIONS\.FINDINGS_UNMOVED && ffp/.test(src),
+    "and the findings note only for the findings one");
+  // Control: an unguarded lookup is what this replaced, so the shape that would
+  // reintroduce it must not be present.
+  check(!/const note = \(fp \? fixAttemptNote/.test(src),
+    "control: the unguarded fallback that displaced the real blocker is gone");
   // Attached AFTER the worker speaks, not at dispatch: the attempt is spent
   // before any worker exists, and reading a not-yet-assigned result there threw
   // a ReferenceError on every FIX_CI.

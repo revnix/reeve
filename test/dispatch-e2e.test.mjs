@@ -83,6 +83,20 @@ const baseCtx = () => ({
   // rootCause reaches the network; the tick resolves it before deciding, so it
   // is stubbed at the same seam the daemon uses.
   resolveCause: () => CAUSE,
+  // `observe` reaches the network too, and unstubbed it was the single largest
+  // cost in this suite: four `gh api` round trips per tick against `o/r`, which
+  // does not exist, so every one waited for a 404. Measured on this file plus
+  // guardian-provider-lease: 321s unstubbed against 17s stubbed, with PASS and
+  // FAIL output byte-identical either way.
+  //
+  // The value is what the real call ALREADY returns here, not a success: with
+  // every request failing, `observe` reports the read incomplete and the thread
+  // count unreadable. Returning `ok: true` would be a different test -- the fold
+  // treats a complete read and a partial one differently, and a stub that
+  // quietly upgrades the answer is how a suite starts agreeing with itself
+  // rather than with the product.
+  observe: () => ({ ok: false, observations: [], incomplete: true,
+                    threads: { readable: false, total: null, unresolved: 0, seen: 0 } }),
   // Injected, never read from disk. The real reader looks at
   // ~/.reeve/claude-token, so a default makes these tests pass on a machine that
   // happens to have one and fail on CI, which is exactly what it did.

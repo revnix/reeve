@@ -31,9 +31,18 @@ const stepsBy = map => (_nwo, id) => (id in map ? map[id] : true);
     steps: stepsBy({ "1": false, "2": false, "3": false }),
   });
   check(r.level === "BROKEN", "a base where nothing executed is BROKEN", r.level);
-  check(/never ran/.test(r.lines.join(" ")), "and says so in those words", JSON.stringify(r.lines));
-  check(/not executing/.test(r.lines.join(" ")),
-    "naming the infrastructure rather than the code", JSON.stringify(r.lines));
+  check(/without executing a single step/.test(r.lines.join(" ")),
+    "and reports what was measured: no step executed", JSON.stringify(r.lines));
+  check(/nothing on this branch has been measured/.test(r.lines.join(" ")),
+    "and says what follows from it — no downstream gate means anything", JSON.stringify(r.lines));
+  // A zero step count says no step RAN. It does not say why, and the two causes
+  // want opposite responses: an exhausted runner quota is infrastructure and the
+  // code is blameless, while a workflow whose expressions cannot be evaluated is
+  // the repository's own bug and reads identically from here.
+  check(/cause is NOT determined here/.test(r.lines.join(" ")),
+    "and refuses to name a cause it cannot see", JSON.stringify(r.lines));
+  check(!/infrastructure is not|CI is not executing/.test(r.lines.join(" ")),
+    "control: it does NOT blame infrastructure, which would send an operator to billing for a broken workflow file");
   check(!/inherits a red rollup/.test(r.lines.join(" ")),
     "and NOT as a red base, which would send someone to read a diff that is fine");
   check(/0 of the last 3/.test(r.lines[0]),
@@ -74,7 +83,7 @@ const stepsBy = map => (_nwo, id) => (id in map ? map[id] : true);
   check(r.level === "DEGRADED", "a mix is DEGRADED rather than either extreme", r.level);
   check(/1 of the last 3/.test(r.lines[0]), "one real failure is counted as one", r.lines[0]);
   check(/1 run\(s\) reported failure without executing/.test(r.lines.join(" ")),
-    "and the one that never ran is counted separately", JSON.stringify(r.lines));
+    "and the one that executed nothing is counted separately", JSON.stringify(r.lines));
 }
 
 // A jobs read that fails is UNKNOWN — neither failed nor never-ran. Guessing

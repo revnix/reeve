@@ -126,11 +126,33 @@ const RESHAPED = [
   // inside the daemon on the first spill, not when the migration ran, and by then
   // the decision that produced the effect is already durable.
   //
+  // Its rows are COPIED, not refused, and that is not a convenience. A widening
+  // cannot invalidate an existing row, and `settleOutbox` marks a delivered effect
+  // `done` and never deletes it — so any store that has ever delivered anything
+  // holds rows for ever. Refusing on a row count made "drain the queue and retry"
+  // impossible to satisfy, and the daemon would simply never open again.
+  //
   // Keyed on the table's own SQL because there is no column to look for.
   { table: "outbox", requiresSql: "gh.issue.create" },
 ];
 
+/**
+ * Rename-aside, so the rows can be carried across after schema.sql rebuilds.
+ *
+ * Returns the tables it staged. A CHECK WIDENING cannot invalidate an existing
+ * row — every kind the old list allowed is in the new one — so the rows are
+ * COPIED rather than refused. That distinction matters more than it looks:
+ * `settleOutbox` marks a delivered effect `done` and never deletes it, so any
+ * store that has ever delivered anything holds rows for ever. Refusing on a raw
+ * count therefore made "drain the queue and retry" impossible to satisfy, and the
+ * daemon would never open again after the upgrade.
+ *
+ * A key change is different and still refuses: rewriting rows under a UNIQUE
+ * constraint they were never checked against loses whatever the key was added to
+ * distinguish, and that is a migration to think about rather than to invent here.
+ */
 function reshapeTables(db) {
+  const staged = [];
   for (const { table, requires, requiresSql } of RESHAPED) {
     let cols;
     try { cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name); }
@@ -140,22 +162,21 @@ function reshapeTables(db) {
     if (requiresSql) {
       const ddl = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`).get(table)?.sql ?? "";
       if (ddl.includes(requiresSql)) continue;               // already the new shape
+      // Renamed rather than dropped, and the rows are carried over below. Indexes
+      // attached to the old table follow the rename, so they are dropped with the
+      // staging table afterwards; schema.sql and ADDED_INDEXES rebuild the real ones.
+      const staging = `_reshape_${table}`;
+      db.exec(`DROP TABLE IF EXISTS ${staging}`);
+      db.exec(`ALTER TABLE ${table} RENAME TO ${staging}`);
+      staged.push({ table, staging, columns: cols });
+      continue;
     }
     const n = db.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n;
     if (n > 0) {
       throw new Error(
         `${table} has the old shape and ${n} row(s). Refusing to rebuild it at open(): ` +
         `export them, drop the table, and reopen. Silently copying between shapes ` +
-        `loses whatever the new key was added to distinguish.` +
-        // Named for the outbox specifically, because dropping THAT table discards
-        // queued side effects: a decision recorded as durable whose visible half
-        // never happens, which is the failure the outbox exists to prevent. Both
-        // live stores held zero rows when this shipped, measured on 2026-08-28,
-        // and that is what made the rebuild free rather than a migration.
-        (table === "outbox"
-          ? " These are QUEUED SIDE EFFECTS: each one is a decision already recorded as durable" +
-            " whose visible half has not happened yet. Drain the queue before upgrading."
-          : ""));
+        `loses whatever the new key was added to distinguish.`);
     }
     // Dropped only. schema.sql runs immediately after and rebuilds it, indexes
     // and all -- which is also WHY this runs first: the new index names a column
@@ -163,15 +184,38 @@ function reshapeTables(db) {
     // before anything gets a chance to fix it.
     db.exec(`DROP TABLE ${table}`);
   }
+  return staged;
+}
+
+/**
+ * Carry the staged rows into the rebuilt table.
+ *
+ * Only the columns both shapes have, because that is the whole set for a CHECK
+ * widening and is the safe subset otherwise: a column the new table added is
+ * exactly a column the old rows have no value for, and its default is the truth
+ * about them. Ids are preserved so `depends_on` still points where it did.
+ */
+function finishReshape(db, staged) {
+  for (const { table, staging, columns } of staged) {
+    const now = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+    const shared = columns.filter(c => now.includes(c));
+    if (shared.length) {
+      const list = shared.join(",");
+      db.exec(`INSERT INTO ${table}(${list}) SELECT ${list} FROM ${staging}`);
+    }
+    db.exec(`DROP TABLE ${staging}`);
+  }
 }
 
 export function open(path) {
   const db = new DatabaseSync(path, { timeout: 10000 });
-  reshapeTables(db);
+  const staged = reshapeTables(db);
   db.exec(readFileSync(new URL("./schema.sql", import.meta.url), "utf8"));
   addMissingColumns(db);
   // AFTER the columns, never before. See ADDED_INDEXES.
   addMissingIndexes(db);
+  // AFTER the table exists and has every column, since this writes into it.
+  finishReshape(db, staged);
   return db;
 }
 

@@ -115,9 +115,16 @@ export function verdictFor(files) {
     else counts.deleted++;
   }
   if (counts.missing > 0) {
+    // SAY ONLY WHAT WAS ESTABLISHED. MISSING means main differs from the head,
+    // and the squash did not match the head either -- it never compares main
+    // WITH the squash, and in the commonest case they are identical: a fix
+    // pushed after the merge leaves main and the squash both holding the merged
+    // version while the head has moved past both. Claiming the path "matches
+    // neither" would be false there, in a tool whose entire purpose is not
+    // overclaiming.
     return { verdict: VERDICT.absent, counts,
-             why: `${counts.missing} of ${files.length} path(s) on main match neither the head nor the squash commit. The content did not arrive.\n` +
-                  `A common cause: a fix pushed to the branch AFTER the pull request merged. That push succeeds and reaches nothing.` };
+             why: `${counts.missing} of ${files.length} path(s) on main differ from the pull request head, and did not match it at the squash commit either.\n` +
+                  `The head's content is not on main. A common cause: a fix pushed to the branch AFTER the pull request merged -- that push succeeds and reaches nothing.` };
   }
   if (counts.drifted > 0) {
     return { verdict: VERDICT.moved, counts,

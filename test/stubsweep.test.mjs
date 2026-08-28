@@ -16,7 +16,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 
 let fail = 0;
@@ -162,6 +162,40 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   check(reportedAnyAssertion(out) === true, "control: a normal run reports assertions");
   check(reportedAnyAssertion("TypeError: x is not a function\n    at y") === false,
     "and a stack trace with no assertions is recognised as reporting none");
+}
+
+// --- an assertion is recognised by its DELIMITER --------------------------------
+{
+  // A bare `FAIL` prefix also matches ordinary diagnostics. A crashing test that
+  // prints one containing the expected text would then be read as the named
+  // assertion failing, so a run where no assertion executed reports CAUGHT.
+  const noisy = "FAILURE: the guard holds\nFAILED 2\nFAIL: the guard holds\n";
+  check(failedAssertions(noisy).length === 0,
+    "lines beginning with FAIL but lacking the two-space delimiter are not assertions",
+    JSON.stringify(failedAssertions(noisy)));
+  check(reportedAnyAssertion(noisy) === false,
+    "and such a run counts as having reported no assertions at all");
+
+  check(JSON.stringify(failedAssertions("FAIL  the guard holds\n")) === JSON.stringify(["the guard holds"]),
+    "control: a properly delimited assertion is still read");
+
+  // End to end through the classifier, which is where it would have mattered.
+  const v = classify({ controlExit: 0, hashChanged: true, restored: true, expectRed: "the guard holds",
+                       stubExit: 1, stubOutput: noisy });
+  check(v.verdict === CRASHED,
+    "so a crash printing FAILURE: <expected text> is CRASHED, not CAUGHT", JSON.stringify(v));
+}
+
+// --- expectRed must be a non-empty STRING ---------------------------------------
+{
+  // `String.prototype.includes` coerces, so `expectRed: []` becomes "" and matches
+  // every failing assertion — the entry then reports CAUGHT whatever went red.
+  const base = { name: "n", why: "w", test: "t", edits: [{ file: "f", find: "a", replace: "b" }] };
+  for (const [what, v] of [["an array", []], ["a number", 1], ["an object", {}], ["an empty string", ""], ["whitespace", "   "]]) {
+    const e = threw(() => validateManifest([{ ...base, expectRed: v }]));
+    check(e !== null && /non-empty string/.test(e.message), `expectRed as ${what} is refused`, String(e?.message));
+  }
+  check(validateManifest([{ ...base, expectRed: "x" }]).length === 1, "control: a real string is accepted");
 }
 
 // --- what the readings mean ----------------------------------------------------
@@ -339,6 +373,12 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
     `import { appendFileSync } from "node:fs";\n` +
     `import { f } from "../src/thing.mjs";\n` +
     `appendFileSync(${JSON.stringify(marker)}, "run\\n");\n` +
+    // A helper in the same process group. If only the direct pid is killed, this
+    // survives and writes its marker after the sweep has exited.
+    `import { spawn } from "node:child_process";\n` +
+    `spawn(process.execPath, ["-e", ` +
+    `  \`setTimeout(() => require("node:fs").appendFileSync(${JSON.stringify(JSON.stringify(marker))}, "helper-ran\\\\n"), 3000)\`` +
+    `], { stdio: "ignore" });\n` +
     `console.log(f() === "ok" ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
     // Blocks the thread, so the runner is genuinely mid-test when the signal lands.
     `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);\n` +
@@ -397,6 +437,111 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   check(finishes === starts - 1,
     "and the test process was killed rather than left running after the sweep exited",
     `${starts} started, ${finishes} finished`);
+
+  // THE WHOLE PROCESS TREE, not just the direct child. A helper the test spawned
+  // outlives a kill aimed at the test's own pid, and keeps producing side effects
+  // against a tree that has since been restored — with no timer left anywhere to
+  // stop it, because the sweep's timer died with the sweep.
+  //
+  // The helper writes its marker after a delay, so the file's contents at the end
+  // say whether it survived.
+  check(!readFileSync(marker, "utf8").includes("helper-ran"),
+    "and a helper the test spawned was killed with it, rather than outliving the sweep",
+    JSON.stringify(readFileSync(marker, "utf8")));
+}
+
+// --- an edit that resolves outside the repository is refused --------------------
+{
+  // `join(ROOT, file)` happily produces a path outside the tree when the entry
+  // contains `..`, and the runner would snapshot, modify and restore a file the
+  // git guard cannot see — damaging a sibling project with nothing noticing.
+  const root = mkdtempSync(join(tmpdir(), "sweep-escape-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const a = 1;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"), `console.log("PASS  the guard holds");\nprocess.exit(0);\n`);
+  // A real sibling, outside the repository, that must be left alone.
+  const outsideDir = mkdtempSync(join(tmpdir(), "sweep-sibling-"));
+  const outside = join(outsideDir, "victim.mjs");
+  const VICTIM = `export const untouched = true;\n`;
+  writeFileSync(outside, VICTIM);
+
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "escape", why: "reach outside the tree", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: ${JSON.stringify("../" + basename(outsideDir) + "/victim.mjs")},\n` +
+    `            find: "export const untouched = true;", replace: "export const untouched = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  check(r.status === 2, "a manifest edit resolving outside the repository is refused outright", String(r.status));
+  check(/outside the repository/.test(`${r.stdout ?? ""}${r.stderr ?? ""}`), "and says so", `${r.stderr ?? ""}`.slice(0, 200));
+  check(readFileSync(outside, "utf8") === VICTIM,
+    "and the file outside the tree is untouched", readFileSync(outside, "utf8"));
+}
+
+// --- a stubbed test's side effects on the wider tree are caught -----------------
+{
+  // The startup guard proves the tree was clean when the sweep began. It cannot see
+  // what deliberately broken code did while it ran, and the entry would otherwise
+  // report CAUGHT and exit 0 with the repository dirty.
+  const root = mkdtempSync(join(tmpdir(), "sweep-side-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { writeFileSync } from "node:fs";\n` +
+    `import { guard } from "../src/thing.mjs";\n` +
+    `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
+    // A file the manifest never named, inside the repository.
+    `writeFileSync(new URL("../src/litter.mjs", import.meta.url).pathname, "// left behind\\n");\n` +
+    `process.exit(guard ? 0 : 1);\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 1, "a stub whose test litters the repository does not pass the sweep", `exit=${r.status}`);
+  check(/UNRUNNABLE/.test(out), "and the reading is void rather than reported as CAUGHT", out.slice(-300));
+  check(existsSync(join(root, "src", "litter.mjs")),
+    "control: the side effect really happened, so the check had something to find");
+}
+
+// --- a verdict line survives a flood of diagnostics -----------------------------
+{
+  // A test that prints its named FAIL and then a megabyte of noise would have had
+  // the evidence scrolled out of the capped tail, and the entry reported CRASHED —
+  // failing the sweep even though the assertion did catch the stub.
+  const root = mkdtempSync(join(tmpdir(), "sweep-flood-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { guard } from "../src/thing.mjs";\n` +
+    `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
+    `if (!guard) { const noise = "x".repeat(64 * 1024);\n` +
+    `  for (let i = 0; i < 24; i++) console.log(noise); }\n` +
+    `process.exit(guard ? 0 : 1);\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8", maxBuffer: 1 << 28,
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 0,
+    "a named assertion still counts when the failure buries it under 1.5 MiB of noise", `exit=${r.status}`);
+  check(/CAUGHT/.test(out), "and the verdict is CAUGHT rather than CRASHED", out.slice(-300));
 }
 
 // --- a target DELETED during a run is not resurrected ---------------------------

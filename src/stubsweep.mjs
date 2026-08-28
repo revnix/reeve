@@ -78,9 +78,26 @@ export function describeMiss(source, find) {
   }
   if (lo === 0) return "  no part of the anchor appears in the file; it may name the wrong file entirely";
   const at = source.indexOf(find.slice(0, lo));
-  const line = source.slice(0, at).split("\n").length;
+  const fileLine = source.slice(0, at).split("\n").length;
+  // WHERE IN THE ANCHOR, not only how many characters. A short prefix reads as
+  // "this line changed near its start" when it is very often "this block moved and
+  // only its first line still matches" — two situations with different repairs.
+  // Reporting the anchor's own line makes the difference visible: diverging at
+  // line 1 of 6 is a move, diverging at line 5 of 6 is an edit. Suggested by the
+  // session that raised the case.
+  const anchorLines = find.split("\n").length;
+  // COMPLETE lines, counted by newlines rather than by segments. A prefix that
+  // matched line 1 and the first two characters of line 2 splits into two
+  // segments, so a naive count calls that "two lines matched" when one did — and
+  // the move heuristic below then never fires for the case it exists for.
+  const completeLinesMatched = (find.slice(0, lo).match(/\n/g) ?? []).length;
+  const divergedAtAnchorLine = completeLinesMatched + 1;
   const shown = source.slice(at, at + lo + 60).split("\n").slice(0, 4).join("\n");
-  return `  matched the first ${lo} character(s) at line ${line}, then diverged.\n` +
+  const shape = anchorLines > 2 && completeLinesMatched <= 1
+    ? "  only the anchor's FIRST line still matches, which usually means the block moved rather than changed\n"
+    : "";
+  return `  matched the first ${lo} character(s) — anchor line ${divergedAtAnchorLine} of ${anchorLines} — at file line ${fileLine}, then diverged.\n` +
+         shape +
          `  the file there now reads:\n` +
          shown.split("\n").map(l => `    | ${l}`).join("\n") + "\n" +
          `  the anchor expected:\n` +

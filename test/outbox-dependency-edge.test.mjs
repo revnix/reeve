@@ -427,6 +427,60 @@ const fresh = tag => open(join(mkdtempSync(join(tmpdir(), `reeve-dep-${tag}-`)),
     String(db.prepare("SELECT count(*) n FROM outbox WHERE status='pending'").get().n));
 }
 
+// --- a resolution failure charges no delivery it never made --------------------
+{
+  const db = fresh("refund");
+  const parent = tx(db, () => enqueue(db, {
+    idemKey: "create", kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "the issue" } }));
+  tx(db, () => enqueue(db, { idemKey: "reply", kind: "gh.pr.comment",
+    args: { nwo: "o/r", pr: 1, body: "moved to #${dep.number}" }, dependsOn: parent }));
+
+  const handlers = { "gh.pr.comment": () => ({ ok: true, result: { url: "u" } }) };
+  await drainOutbox({ db, handlers, api: () => ({ ok: true, out: "" }), max: 5, budgetMs: 600_000 });
+
+  const row = db.prepare("SELECT status, attempts, lease_token FROM outbox WHERE idem_key='reply'").get();
+  check(row.status === "dead_letter", "control: the child really was dead-lettered", row.status);
+  check(row.attempts === 0,
+    "and no delivery attempt is charged, because the handler was never invoked", String(row.attempts));
+  check(row.lease_token >= 1,
+    "while the FENCE stays bumped, because the lease really did happen", String(row.lease_token));
+}
+
+// --- one status transition emits exactly one event -----------------------------
+{
+  // The batch is selected outside the write transaction, so two drainers can pick
+  // the same pending child before either commits. The loser's UPDATE matches
+  // nothing; without a `changes` test it would still emit a second event for one
+  // transition. A trail with two events for one change is worse than one with
+  // none, because it reads as two things having happened.
+  const db = fresh("dup");
+  const parent = tx(db, () => enqueue(db, {
+    idemKey: "p", kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "p" } }));
+  const child = tx(db, () => enqueue(db, { idemKey: "c", kind: "gh.pr.comment",
+    args: { nwo: "o/r", pr: 1, body: "c" }, dependsOn: parent }));
+  const l = leaseOutbox(db, { worker: "t", kinds: ["gh.pr.comment"] });
+  settleOutbox(db, { id: parent, leaseToken: l.lease_token, ok: false, retryable: false, error: "no" });
+
+  const first = cascadeDeadLetter(db);
+  check(first.length === 1, "control: the first pass cascades the child", String(first.length));
+  const afterFirst = db.prepare("SELECT count(*) n FROM event WHERE op='outbox.dead_letter'").get().n;
+
+  // The row is already dead_letter, so a racing drainer's UPDATE matches nothing.
+  // Driving it by re-running the cascade is the same situation the loser sees.
+  db.exec(`UPDATE outbox SET status='pending' WHERE id=${child}`);
+  const again = cascadeDeadLetter(db);
+  check(again.length === 1, "control: re-running it does transition the row again", String(again.length));
+
+  // And the loser's case: mark it dead BEFORE cascading, so the UPDATE cannot match.
+  db.exec(`UPDATE outbox SET status='dead_letter' WHERE id=${child}`);
+  const before = db.prepare("SELECT count(*) n FROM event WHERE op='outbox.dead_letter'").get().n;
+  const none = cascadeDeadLetter(db);
+  const after = db.prepare("SELECT count(*) n FROM event WHERE op='outbox.dead_letter'").get().n;
+  check(none.length === 0, "a row already transitioned is not reported as cascaded again", String(none.length));
+  check(after === before, "and emits no second event for one transition", `${before} -> ${after}`);
+  check(afterFirst >= 1, "control: events are being written at all", String(afterFirst));
+}
+
 // --- a store whose outbox PREDATES the column must still open ------------------
 {
   // Built rather than mocked, because the defect this guards is invisible to a

@@ -259,7 +259,11 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
         // budget doing it. This is a producer/handler disagreement about shape,
         // and it needs a person rather than another pass.
         if (err instanceof DependencyResolutionError) {
-          settleOutbox(db, { id: job.id, leaseToken: job.lease_token, ok: false, retryable: false, error: err.message });
+          // TERMINAL, and the attempt REFUNDED. The handler was never invoked, so
+          // charging a delivery would make the row and its event report an attempt
+          // that never happened. The fence stays bumped because the lease did.
+          settleOutbox(db, { id: job.id, leaseToken: job.lease_token, ok: false,
+                             retryable: false, unattempted: true, error: err.message });
           log(`  outbox: ${job.kind} #${job.id} DEAD-LETTERED — ${err.message}`);
           continue;
         }

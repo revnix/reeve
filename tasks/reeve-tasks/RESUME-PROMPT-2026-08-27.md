@@ -5,7 +5,8 @@
 > **Superseded 2026-08-28. Every document it orders written now exists**, and following it would
 > rewrite committed work: it says *"none has been started"* and instructs a fresh session to write
 > the master plan, the trackers, the implementation prompt and all six stage plans in parallel —
-> under the **superseded ~1,200-line cap**, which §B.1.2 has since corrected to a task cap.
+> under the **superseded ~1,200-line cap**. That cap's unit has since moved twice: to tasks, and
+> then to **PRs**, which is what `MASTER-PLAN.md` §B.1 and both live trackers now carry.
 >
 > **What is actually next** is in `trackers/MASTER.md` under *In flight* and *Needs the founder*,
 > and the current rules are `MASTER-PLAN.md` Part B and `IMPLEMENTATION-PROMPT.md`. Start there.

@@ -113,14 +113,29 @@ existed since `src/checkout.mjs` replaced them.
     shares its blob id with the version that never had one:
 
     ```bash
-    squash=$(gh pr view <pr> --json mergeCommit --jq .mergeCommit.oid)
-    git fetch origin refs/heads/main:refs/remotes/origin/main --quiet
-    main=$(git rev-parse origin/main)   # PIN it: origin/main is mutable and moves mid-run
-    for p in $(git diff-tree --no-commit-id --name-only -r "$squash"); do
+    #!/bin/bash
+    squash=$(gh pr view <pr> --json mergeCommit --jq .mergeCommit.oid) || exit 23
+    # A FETCH THAT FAILED MUST NOT BECOME A VERDICT. Unchained, the next line
+    # resolves a CACHED origin/main, and the loop then prints no DRIFTED paths --
+    # a network or auth failure reading exactly like a clean verification.
+    git fetch origin refs/heads/main:refs/remotes/origin/main --quiet \
+      || { echo "UNREADABLE: could not refresh origin; refusing to classify against stale refs"; exit 23; }
+    # PIN it. origin/main is MUTABLE: left as a name, every ls-tree below
+    # re-resolves it, and a concurrent fetch can serve some paths from the old
+    # main and some from the new.
+    main=$(git rev-parse "origin/main^{commit}") || exit 23
+    drift=0
+    # -z and `read -d ''`, NOT `for p in $(...)`. A filename may contain a space,
+    # a tab or a newline, and word splitting would iterate FRAGMENTS -- absent
+    # from both revisions, so both ls-tree reads come back empty and EQUAL, and a
+    # path that really had drifted reports clean. Filenames are attacker-supplied.
+    # Process substitution, not a pipe, so `drift` survives the loop.
+    while IFS= read -r -d '' p; do
       a=$(git --literal-pathspecs ls-tree "$squash" -- "$p")
       b=$(git --literal-pathspecs ls-tree "$main"   -- "$p")
-      [ "$a" = "$b" ] || echo "DRIFTED: $p"
-    done
+      [ "$a" = "$b" ] || { echo "DRIFTED: $p"; drift=1; }
+    done < <(git --literal-pathspecs diff-tree --no-commit-id --no-renames --name-only -r -z "$squash")
+    [ "$drift" -eq 0 ] && echo "MERGED, AND INTACT ON MAIN" || exit 32
     ```
 
     **`--literal-pathspecs`**, because a filename is attacker-supplied and git reads a path
@@ -227,7 +242,15 @@ Follow the phases in order. Each gate is completed before the next phase starts.
    failing in the one situation it exists for. **A claim nobody can see is not a claim, and
    "pushed" is not "visible".**
 
-**⛔ GATE: no reading of implementation files, no branch, no code, until the claim is pushed.**
+**READ THE PLAN'S TASKS FIRST — the claim cannot be written without them.** `claims/README.md`
+requires a claim to enumerate every file it covers, and that list is the plan's `**Files:**`
+block. Reading the plan to derive it is not working the task, and the gate below has never
+forbidden it; without this the protocol is circular, and the only ways out are publishing a claim
+with an incomplete territory boundary or working out of order. Read the plan tasks in the PR
+package you are claiming, take their `**Files:**` union, and write that into the claim.
+
+**⛔ GATE: no EDITS to implementation files, no branch, no code, until the claim is pushed.**
+Reading is always permitted — reading is how the claim is written.
 
 ### Phase 1: Understand
 
@@ -253,7 +276,21 @@ and name in the PR body which one you relied on. **A question with an empty Answ
 IS blocking**; F5 (the spec repositories do not exist yet) is the current example, and no amount
 of reasoning substitutes for it.
 
-### Phase 2: Implement — one task, in the plan's steps
+### Phase 2: Implement — EVERY task in the claimed PR package, in the plan's steps
+
+**A claimed row is a PR, and a PR holds several plan tasks.** S3's 78 plan tasks are grouped into
+16 PRs (`MASTER-PLAN.md` §B.1), so steps 2–6 below are **one task's cycle, and you repeat them
+for every task in the package** before Phase 3 opens the PR. **Each task is its own commit.**
+
+Run this loop until no task in the package is left:
+
+- [ ] every plan task in the claimed PR has had steps 2–6 run against it
+- [ ] each one is a separate commit, so a reviewer can read them apart
+- [ ] the gate below passed for the package as a whole, on the final state
+
+**Closing out after the first task, or collapsing several tasks into one commit, both produce a
+PR that reports BUILT over work that is not built.** The tracker's `BUILT` unblocks ordered
+downstream tasks, so a package marked built early is a dependency that is not there.
 
 1. Branch from **`origin/main`**, never from local `main`:
    `git fetch origin --quiet && git worktree add -b <branch> ~/Work/Products/reeve-wt/<name> origin/main`.
@@ -349,8 +386,15 @@ When, and only when, the founder grants this specific PR:
 1. **Re-verify at the moment of merge**, not from an earlier read: CI green with **real steps**
    (see *Reading CI* below), and zero unresolved threads on **both** endpoints.
 2. Merge, with **no AI attribution in the squash message**.
-3. **Verify by CONTENT:** compare the merged tree hash or the individual file blobs against the
-   branch head. **Never** by ancestry — the branch commit is not an ancestor.
+3. **Verify by CONTENT, by the procedure in rule 11 — do not restate it here.** Run
+   `node scripts/verify-merge.mjs <pr>`, or rule 11's fallback if reeve#60 has not landed.
+
+   **This step used to carry its own copy of the comparison, and the copy went stale**: it said
+   *"compare … against the branch head"*, which rule 11 had already been corrected to forbid, and
+   *"the merged tree hash"*, which compares the WHOLE tree and so reports every unrelated commit
+   on `main` as a failure. Both would have failed a valid merge. **One procedure, in one place,
+   referenced from everywhere else** — the drift between two copies of a rule is the single
+   most common defect this document has produced, and a reference cannot drift from itself.
 
 ### Phase 5: Close out
 

@@ -78,8 +78,14 @@ Claims are one file each under `claims/`. **Read `claims/README.md` before start
 
 | # | What | Blocks | Asked |
 |---|---|---|---|
-| F4 | **Six defaulted answers may be overridden** — worker isolation, instruction-file neutralization, the V6 measurement shape, whether S3 flips `observe` live, escalation-versus-paging, and the `--json` contract. Each was defaulted to the brief's recommendation and recorded so an override is cheap. | S3 T7, T8, T15, T16 | 2026-08-27, recorded in `s3.md` §2 |
+| F4 | **Six defaulted answers may be overridden** — worker isolation, instruction-file neutralization, the V6 measurement shape, whether S3 flips `observe` live, escalation-versus-paging, and the `--json` contract. Each was defaulted to the brief's recommendation and recorded so an override is cheap. | **Blocks nothing.** *Affects* S3 T7, T8, T15, T16 — reversibly | 2026-08-27, recorded in `s3.md` §2 |
 | F5 | **Create the three spec repos** — F1 named them; none exists yet. Private, one per project. | **S3 T2** | 2026-08-27 |
+
+**Only a row whose `Blocks` cell names a task actually stops work.** A *defaulted* question does
+not: `../IMPLEMENTATION-PROMPT.md` Phase 1 says a question with a recorded default is
+non-blocking and must be proceeded under, naming the default in the PR body. F4 sat in this table
+with four task ids in its `Blocks` cell, which would have halted four tasks waiting for answers
+the workflow says they do not need. **F5 is the only genuine blocker.**
 
 ### Answered 2026-08-27
 

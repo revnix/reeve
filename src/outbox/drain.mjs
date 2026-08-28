@@ -22,7 +22,8 @@
  *  · It never leases a kind it cannot perform, and it SAYS how many such rows are
  *    waiting. A row nothing can deliver looks exactly like an empty queue.
  */
-import { leaseOutbox, settleOutbox, recoverOutbox, pendingWithNoHandler } from "../db/ops.mjs";
+import { leaseOutbox, settleOutbox, recoverOutbox, pendingWithNoHandler, cascadeDeadLetter, blockedOnDependency } from "../db/ops.mjs";
+import { resolveDependencyArgs, DependencyResolutionError } from "./depends.mjs";
 
 /**
  * Resolves to a retryable failure once `seconds` have passed. Never rejects.
@@ -136,6 +137,18 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
   for (const d of recovered.deadLettered ?? [])
     log(`  outbox: ${d.kind} #${d.id} DEAD-LETTERED — ${d.attempts} lease(s) and never once settled; its drainer is crashing`);
 
+  // Failed forward BEFORE leasing, for the same reason recovery runs first: a
+  // child whose parent died is resolved in this pass rather than sitting pending
+  // through it. It cannot be done on the lease path, because the whole point is
+  // that these rows are never leased.
+  for (const c of cascadeDeadLetter(db))
+    log(`  outbox: ${c.kind} #${c.id} DEAD-LETTERED — the effect it depends on (#${c.depends_on}) ended ${c.parent_status}`);
+  // Said out loud, because a queue waiting on an edge and an idle queue produce
+  // the same pending count, and only one of them is worth looking at.
+  const waiting = blockedOnDependency(db);
+  if (waiting.length)
+    log(`  outbox: ${waiting.length} effect(s) waiting on a dependency that has not finished`);
+
   // ONE absolute instant for the pass, computed once and never re-derived.
   //
   // It used to be re-derived per iteration as `Date.now() + leftInPass`, where
@@ -194,7 +207,39 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
 
     let outcome;
     try {
-      const args = JSON.parse(job.args);
+      // Read at DELIVERY time, not at enqueue time. The child's stored args hold a
+      // token where the parent's value goes; see src/outbox/depends.mjs for why
+      // that indirection has to exist at all.
+      //
+      // The row is only leasable when the parent is `done`, so this read cannot
+      // find an unfinished parent -- but it is written to fail loudly rather than
+      // to assume it, because the guard and the read are in different statements
+      // and a future change to one would not visibly break the other.
+      let args;
+      try {
+        const parent = job.depends_on == null ? null
+          : db.prepare("SELECT status, result FROM outbox WHERE id=?").get(job.depends_on);
+        if (job.depends_on != null && parent?.status !== "done")
+          throw new DependencyResolutionError(
+            `the dependency #${job.depends_on} is ${parent ? parent.status : "missing"}, not done`);
+        let parentResult = null;
+        if (parent?.result != null) {
+          try { parentResult = JSON.parse(parent.result); }
+          catch { throw new DependencyResolutionError(`the dependency #${job.depends_on} recorded a result that is not JSON`); }
+        }
+        args = resolveDependencyArgs(JSON.parse(job.args), parentResult);
+      } catch (err) {
+        // TERMINAL, and deliberately so. The parent is finished, so its result is
+        // final: a retry asks a settled question again and spends a delivery
+        // budget doing it. This is a producer/handler disagreement about shape,
+        // and it needs a person rather than another pass.
+        if (err instanceof DependencyResolutionError) {
+          settleOutbox(db, { id: job.id, leaseToken: job.lease_token, ok: false, retryable: false, error: err.message });
+          log(`  outbox: ${job.kind} #${job.id} DEAD-LETTERED — ${err.message}`);
+          continue;
+        }
+        throw err;
+      }
       // A handler is awaited whether or not it is async, so one of each composes.
       // `attempt` reaches the handler because idempotency depends on it: only a
       // retry can find a previous delivery, and a first attempt that looked would

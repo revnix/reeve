@@ -110,9 +110,14 @@ CREATE TABLE IF NOT EXISTS checkpoint (
 CREATE TABLE IF NOT EXISTS outbox (
   id           INTEGER PRIMARY KEY,
   idem_key     TEXT NOT NULL UNIQUE,          -- deterministic; see the algorithms
+  -- Widening this list is a SHAPE change, not an additive one: ALTER TABLE cannot
+  -- touch a CHECK, so a store created under the old list keeps it and the failure
+  -- appears at the first INSERT of the new kind. `RESHAPED` in ops.mjs rebuilds the
+  -- table when it is empty and REFUSES when it is not, because these rows are
+  -- decisions already recorded as durable whose visible half has not happened.
   kind         TEXT NOT NULL CHECK (kind IN
                  ('git.push','gh.pr.create','gh.pr.comment','gh.pr.merge',
-                  'gh.thread.resolve','notify')),
+                  'gh.issue.create','gh.thread.resolve','notify')),
   run_id       TEXT REFERENCES run(id),
   -- The effect this one waits for, and the reason it is an EDGE rather than one
   -- compound handler that does both halves.

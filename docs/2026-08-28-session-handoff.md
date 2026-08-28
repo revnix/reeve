@@ -88,7 +88,6 @@ this can tell you that its absence is deliberate.
 | codex is a **blocking** reviewer | changed 2026-08-26. Before it, round counts were permanently zero and every cap-gated decision was unreachable |
 | the docs guard's review status | **out of the review rotation** since 2026-08-26. It stays in CI; it is not sent for further adversarial rounds |
 | the founder's merge rule | merge on CI green AND zero open threads, and **each merge needs its own grant** — a grant does not carry to the next pull request, and it does not override the rule |
-| R-01 is **half closed** | 2026-08-28, on the founder's decision and with the founder's approval to apply it. `nextlyhq/nextly`'s `protect-main` ruleset gained a `required_status_checks` rule and its `OrganizationAdmin` bypass narrowed from `always` to `pull_request`. Branch protection's `enforce_admins: false` was deliberately NOT changed: nextly's `main` was red on 10 of its last 10 runs, and enforcing a gate against a base that cannot pass it locks the founder out of the repair work. Revisit when main is green |
 | the R-03 merge shape | **undecided.** The enquiry was done on 2026-08-22 (§6); choosing what this repository declares is the founder's |
 | the second project | `rextaihq/rext-backend` — **not started.** No profile, no store, nothing watching it |
 | the ntfy read user | **not created.** Needs shell on the founder's server |
@@ -269,12 +268,23 @@ ordered effect — the replies depend on the issue's number — and the founder 
 a dependency edge between outbox rows over a compound handler, because each step
 then keeps its own retry budget and idempotency.
 
-**R-01** (§0), the merge authority — PART of it is now done; §0 says which part.
-What remains is one switch and a precondition rather than a project. Note when
-picking it up that the substantive checks on that repository are PATH-CONDITIONAL:
-a pull request touching nothing they watch runs neither of them, so requiring one
-directly would block a pull request that legitimately does not run it. That is why
-the required context is the aggregating job rather than a test job.
+**R-01** (§0), the merge authority. Part of it was applied on 2026-08-28: the
+default branch's ruleset on the guarded repository gained a required-status-check
+rule, and its organisation-admin bypass narrowed from always to pull-request-only.
+`docs/measured/2026-08-28-r01-merge-authority.md` has the before and after, read
+back from the API rather than assumed.
+
+What remains is one switch and a precondition rather than a project. The switch
+lives in BRANCH PROTECTION, a second mechanism governing the same branch, so
+changing the ruleset said nothing about it. It was left alone deliberately on
+2026-08-28, and the measured note records the base condition that has to change
+first.
+
+Note when picking it up that the substantive checks on that repository are
+PATH-CONDITIONAL: a pull request touching nothing they watch runs neither of them,
+so requiring one directly would block a pull request that legitimately does not run
+it. That is why the required context is the aggregating job rather than a test
+job.
 
 The original framing is kept because it still explains WHY: reeve's fourth capability stands between a branch
 and the default one as a required status check, so it wants a ruleset that

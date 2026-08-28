@@ -390,6 +390,40 @@ check("past the hard cap an uncleared thread escalates rather than asking again"
   nextAction(ev(swap("cleared", "BLOCK", "uncleared"), { rounds: { n: 10, softCap: 5, hardCap: 10, unspilledCritical: 0 } }), P).action,
   ACTIONS.ESCALATE);
 // And it must not steal the dispatch when a real finding is open.
+// ── ONE repair per set of findings ──────────────────────────────────────────
+//
+// FIX_CI has had a cap since it was written; FIX_FINDINGS never did. That
+// survived only because a THREAD finding leaves a trace — a refutation still
+// writes a reply, a resolve changes GitHub state — so the next tick sees a
+// different world. A BODY finding leaves nothing: no thread to reply on, no
+// resolve to record. A worker that refutes one, or says it needs a human,
+// produces a projection identical to the one before it ran, and the same worker
+// goes out again for as long as the budget allows.
+{
+  const open2 = [{ id: "b1", anchor: "body" }, { id: "t1", anchor: "thread" }];
+  const fp = "findings:deadbeef";
+  const at = (extra) => nextAction(ev(swap("findings", "BLOCK", "2 open")), P,
+                                   { findingsFingerprint: fp, ...extra }).action;
+  check("a first repair of a finding set dispatches", at({ findingsAttempts: 0 }), ACTIONS.FIX_FINDINGS);
+  check("a SECOND repair of the same set escalates instead of running again",
+    at({ findingsAttempts: 1 }), ACTIONS.ESCALATE);
+  check("and says why, so the escalation is not the generic one",
+    nextAction(ev(swap("findings", "BLOCK", "2 open")), P,
+               { findingsFingerprint: fp, findingsAttempts: 1 }).why,
+    ESCALATIONS.FINDINGS_UNMOVED);
+  // Control: without a fingerprint there is nothing to cap, and the cap must not
+  // fire on its absence — that would stop every repair rather than a repeat one.
+  check("control: no fingerprint means no cap, not a blanket refusal",
+    nextAction(ev(swap("findings", "BLOCK", "2 open")), P,
+               { findingsFingerprint: null, findingsAttempts: 99 }).action,
+    ACTIONS.FIX_FINDINGS);
+  check("control: the cap comes from the profile, so raising it permits the retry",
+    nextAction(ev(swap("findings", "BLOCK", "2 open")),
+               { ...P, rounds: { ...P.rounds, maxFixAttemptsPerFinding: 2 } },
+               { findingsFingerprint: fp, findingsAttempts: 1 }).action,
+    ACTIONS.FIX_FINDINGS);
+}
+
 check("control: a genuine finding still dispatches a fixer",
   nextAction(ev(swap("findings", "BLOCK", "2 open")), P).action, ACTIONS.FIX_FINDINGS);
 check("control: and it is NOT reported as an unclassified verdict",

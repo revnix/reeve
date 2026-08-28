@@ -23,9 +23,21 @@ function ghJson(args) {
   catch (e) { return { ok: false, out: "", err: String(e.stderr || e.message).trim() }; }
 }
 
+// The REVIEW surface rides along on the query that was already being made.
+//
+// `compare` measured threads only, which was right while nothing else gated. Now
+// that a review BODY can hold a pull request, a body posted between the fold and
+// this evaluation would leave the thread counts agreeing, the projection fresh by
+// every clock, and its body facts a tick out of date.
+//
+// Counts rather than bodies, deliberately. Fetching every review body on every
+// tick to hash it would be exact and would move real bandwidth for a window that
+// is sub-second; the counts are already carried by this response for free. See
+// `reviewsAgree` for what that does and does not catch.
 const THREADS_QUERY = `query($o:String!,$r:String!,$n:Int!,$c:String){
   repository(owner:$o,name:$r){ pullRequest(number:$n){
     mergeStateStatus
+    reviews(first:1){ totalCount }
     reviewThreads(first:100, after:$c){
       totalCount
       pageInfo{ hasNextPage endCursor }
@@ -37,17 +49,26 @@ const THREADS_QUERY = `query($o:String!,$r:String!,$n:Int!,$c:String){
  * reviewThreads(first:100) has produced four consecutive false "zero unresolved"
  * reports, so `readable` is false unless every page was fetched.
  */
-export function readThreads(nwo, pr) {
+export function readThreads(nwo, pr, io = null) {
+  // Injected for tests. The counts this returns feed the live cross-check, and
+  // without a seam the only way to exercise them is a real GitHub — which is how
+  // the review surface came to be carried by this function and asserted by
+  // nothing.
+  const call = io?.gh ?? ghJson;
   const [o, r] = nwo.split("/");
   let cursor = null, total = null, seen = 0, unresolved = 0, mergeState = null, pages = 0;
+  let reviewTotal = null;
   for (;;) {
     const args = ["graphql", "-f", `query=${THREADS_QUERY}`, "-F", `o=${o}`, "-F", `r=${r}`, "-F", `n=${pr}`];
     if (cursor) args.push("-F", `c=${cursor}`);
-    const res = ghJson(args);
+    const res = call(args);
     if (!res.ok) return { readable: false, why: res.err.split("\n")[0], mergeState };
     const pr_ = JSON.parse(res.out).data?.repository?.pullRequest;
     if (!pr_) return { readable: false, why: "no pullRequest in response", mergeState };
     mergeState = pr_.mergeStateStatus;
+    // Read from the FIRST page only: it is a totalCount, identical on every page,
+    // and re-reading it per page would just be the same number again.
+    if (reviewTotal === null) reviewTotal = pr_.reviews?.totalCount ?? null;
     const t = pr_.reviewThreads;
     total = t.totalCount;
     seen += t.nodes.length;
@@ -57,7 +78,7 @@ export function readThreads(nwo, pr) {
     cursor = t.pageInfo.endCursor;
   }
   // Only claim readability when the count seen matches the count declared.
-  return { readable: seen >= total, total, unresolved, seen, mergeState };
+  return { readable: seen >= total, total, unresolved, seen, mergeState, reviewTotal };
 }
 
 /**
@@ -309,7 +330,19 @@ export function reviewFacts({ db, nwo, pr, profile, head, live = null,
     // and `bodyFindings` are: blocking-ness says whose opinion gates a merge. The
     // universal count above keeps its own job, which is refusing to spill.
     blockingCritical: st.blockingCritical,
-    threadDetails: fresh ? st.threads : null,
+    // Each item says whether it can GATE, because two readers want different
+    // things from this one list. The prompt wants everything worth showing a
+    // worker; the retry identity wants only what can actually cause a repair.
+    //
+    // An advisory reviewer's body finding is in neither `bodyOpen` nor
+    // `dispatchable`, so it is never dispatched and never blocks — but it was
+    // still in the fingerprint, so an advisory reviewer posting or withdrawing one
+    // minted a fresh key with zero attempts and handed the brake's budget back
+    // against an unchanged set of blocking findings. Advisory churn could restart
+    // the repair loop indefinitely.
+    threadDetails: fresh
+      ? st.threads.map(t => ({ ...t, gates: t.anchor !== "body" || blockingLogins.has(t.reviewer) }))
+      : null,
     // Readable independently of `fresh`: a tick-old list of WHICH threads are
     // uncleared is not safe to dispatch a worker against, but the COUNT is safe
     // to block on -- being one tick behind can only mean blocking slightly too
@@ -501,14 +534,18 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
                    hardCap: profile.rounds?.hardCap ?? 10,
                    unspilledCritical: facts.unspilledCritical };
 
-  let ledgerBlockers = null;
+  let ledgerBlockers = null, ledgerBlockerIds = null;
   if (db) {
     try {
-      ledgerBlockers = db.prepare(
-        `SELECT count(*) AS c FROM edge e JOIN node n ON n.id = e.src
+      // The IDS as well as the count. The count is what the verdict clause reads;
+      // the ids are what makes a repair of them identifiable, so a second attempt
+      // at the same blockers can be recognised as the same problem.
+      ledgerBlockerIds = db.prepare(
+        `SELECT n.id AS id FROM edge e JOIN node n ON n.id = e.src
          WHERE e.dst = ? AND e.type = 'BLOCKS'
-           AND n.status NOT IN ('done','decided','cancelled','refuted')`).get(`pr:${pr}`).c;
-    } catch { ledgerBlockers = null; }
+           AND n.status NOT IN ('done','decided','cancelled','refuted')`).all(`pr:${pr}`).map(r => r.id);
+      ledgerBlockers = ledgerBlockerIds.length;
+    } catch { ledgerBlockers = null; ledgerBlockerIds = null; }
   }
 
   const verdict = computeVerdict({
@@ -535,6 +572,11 @@ export function evaluatePr({ nwo, pr, profile, db = null, anchor = null, io = {}
            // second is null: a caller must be able to tell "nothing is open" from
            // "reeve cannot say what is open".
            threadDetails: facts.threadDetails, reviewProjection: facts.projection,
+           // Carried out so the dispatcher can identify a ledger-driven repair.
+           // `FIX_FINDINGS` fires on this clause too, and a fingerprint built only
+           // from review threads is null when the ledger is the only blocker — so
+           // the retry brake never engaged for exactly that case.
+           ledgerBlockerIds,
            cleared: facts.cleared };
 }
 

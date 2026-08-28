@@ -229,6 +229,9 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
      WHERE i.pr_number = ?
      ORDER BY i.event_at, i.id`).all(pr, pr, pr);
 
+  // Counted from the rows this fold is reading, not from the table afterwards, so
+  // the number belongs to this snapshot and no other.
+  const reviewSeen = new Set();
   const rounds = [], threads = [], bodyFindings = [];
   // Which reviewers wrote a review body at all, and whether every one of them had
   // declared how their bodies carry findings. Both are needed: the count is only
@@ -253,6 +256,18 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
       });
       continue;
     }
+
+    // COUNTED BEFORE CLASSIFICATION, and the order is the whole point.
+    //
+    // GitHub's `reviews.totalCount` counts review OBJECTS. `classifyObservation`
+    // returns null for a 0-byte COMMENTED review — the carrier it mints for every
+    // inline reply, nine at one commit on #1124 — so counting after it excluded
+    // exactly those. The projection would then report fewer reviews than the live
+    // read on any pull request with inline review activity, permanently, and a
+    // permanent disagreement makes `reviewFacts` answer UNKNOWN: no remediation,
+    // no merge, on most pull requests. The count is of objects seen, not of
+    // objects that said something.
+    if (r.kind === "review") reviewSeen.add(r.external_id);
 
     const c = classifyObservation(o, rev, resolve);
     if (!c) continue;
@@ -445,13 +460,15 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     // The head is stored WITH the projection, in the same transaction as the rows
     // it explains. Clearing was computed against it, so a projection and the head
     // it describes are one fact and must not be able to drift apart.
-    db.prepare(`INSERT INTO projection_meta (nwo,scope,classifier_version,derived_at,complete,head,body_derived)
-                VALUES (?,?,?,?,?,?,?)
+    db.prepare(`INSERT INTO projection_meta (nwo,scope,classifier_version,derived_at,complete,head,body_derived,review_total)
+                VALUES (?,?,?,?,?,?,?,?)
                 ON CONFLICT(nwo,scope) DO UPDATE SET
                   classifier_version=excluded.classifier_version,
                   derived_at=excluded.derived_at, complete=excluded.complete,
-                  head=excluded.head, body_derived=excluded.body_derived`)
-      .run(nwo, `pr:${pr}`, version, at, complete ? 1 : 0, head ?? null, bodyComplete ? 1 : 0);
+                  head=excluded.head, body_derived=excluded.body_derived,
+                  review_total=excluded.review_total`)
+      .run(nwo, `pr:${pr}`, version, at, complete ? 1 : 0, head ?? null, bodyComplete ? 1 : 0,
+           reviewSeen.size);
     db.exec("COMMIT");
   } catch (e) { try { db.exec("ROLLBACK"); } catch {} throw e; }
 
@@ -537,6 +554,17 @@ export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() /
     if (meta.head !== head) return { readable: false, why: `projection was derived for ${String(meta.head).slice(0, 10)}, not ${String(head).slice(0, 10)}` };
   }
 
+  // HOW MANY REVIEW OBJECTS THIS PROJECTION WAS FOLDED FROM, read from the
+  // projection rather than counted from the inbox now.
+  //
+  // The two look equivalent because ingest and derive run together in a tick.
+  // They stop being equivalent the moment derive FAILS after ingest succeeded:
+  // the inbox then holds the new review, the projection does not, and a count
+  // taken from the inbox matches the live read and accepts the stale projection —
+  // the cross-check agreeing with itself, vacuous in exactly the failure it is
+  // for. Null when the projection predates the column, which the comparison reads
+  // as not-reported rather than as a match.
+  const reviewTotal = meta.review_total ?? null;
   const threads = db.prepare("SELECT * FROM review_thread WHERE nwo=? AND pr=?").all(nwo, pr);
   const open = threads.filter(t => !t.is_cleared);
   const blocking = open.filter(t => BLOCKING_SEVERITIES.has(t.severity));
@@ -598,6 +626,8 @@ export function reviewState(db, nwo, pr, profile, { at = Math.floor(Date.now() /
     // The body population, reported on its own as well as folded into the count
     // above, so a reader can tell WHICH kind of finding is holding a pull request.
     bodyTotal: body.length, bodyOpen: bodyOpen.length,
+    // For the live cross-check. Not a thread count and deliberately beside them.
+    reviewTotal,
     rounds: n,
     // ONE list, because everything downstream of it -- what blocks a merge, what
     // a worker is sent at -- treats both kinds the same way. `anchor` is what

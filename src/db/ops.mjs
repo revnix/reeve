@@ -52,6 +52,15 @@ const ADDED_COLUMNS = [
   // an existing row was derived before anyone recorded this, and "we do not know"
   // must read as not-reported rather than as a matching count.
   ["projection_meta", "review_total", "INTEGER"],
+  // The dependency edge. Additive and NULLABLE, which is what makes it safe on a
+  // populated table: every row written before this column existed waited for
+  // nothing, and null says exactly that rather than guessing.
+  //
+  // A REFERENCES clause is allowed in ALTER TABLE ADD COLUMN only because the
+  // default is null; SQLite refuses one with a non-null default. Measured on this
+  // build rather than assumed, because the failure would appear on a populated
+  // store at open() time and not in any test that starts from an empty one.
+  ["outbox", "depends_on", "INTEGER REFERENCES outbox(id)"],
 ];
 
 function addMissingColumns(db) {
@@ -338,7 +347,7 @@ export function resume(db, runId) {
 }
 
 // ------------------------------------------------------------------ outbox
-export function enqueue(db, { idemKey, kind, runId = null, args, notBefore = 0 }) {
+export function enqueue(db, { idemKey, kind, runId = null, args, notBefore = 0, dependsOn = null }) {
   // The outbox's whole invariant, ENFORCED rather than requested.
   //
   // "Must be called inside the same transaction as the state change that decided
@@ -352,11 +361,17 @@ export function enqueue(db, { idemKey, kind, runId = null, args, notBefore = 0 }
   // closes the case that needs no mistake to reach, only forgetting.
   if (!db.isTransaction)
     throw new Error("enqueue: an effect must be enqueued inside the transaction that decided it, or a crash between the two loses one of them");
+  // A dependency must already exist, and it is checked HERE rather than left to
+  // the foreign key. SQLite does not enforce foreign keys unless the pragma is on,
+  // so a typo'd parent id would insert cleanly and produce a row that waits for a
+  // parent that never finishes, which is indistinguishable from an idle queue.
+  if (dependsOn != null && !db.prepare("SELECT 1 FROM outbox WHERE id=?").get(dependsOn))
+    throw new Error(`enqueue: depends_on ${dependsOn} names no outbox row; a dependent effect would wait for ever`);
   const r = db.prepare(`
-    INSERT INTO outbox(idem_key,kind,run_id,args,not_before,created_at,updated_at)
-    VALUES(?,?,?,?,?,unixepoch(),unixepoch())
+    INSERT INTO outbox(idem_key,kind,run_id,args,not_before,depends_on,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,unixepoch(),unixepoch())
     ON CONFLICT(idem_key) DO NOTHING
-    RETURNING id`).get(idemKey, kind, runId, canonical(args), notBefore);
+    RETURNING id`).get(idemKey, kind, runId, canonical(args), notBefore, dependsOn);
   return r ? r.id : null;   // null = already enqueued; caller treats as success
 }
 
@@ -448,7 +463,11 @@ export function leaseOutbox(db, { worker, leaseSeconds = 300, kinds = null }) {
   // time around until the budget dead-letters it anyway. Not leasing it leaves it
   // untouched and visible -- `pendingWithNoHandler` counts exactly those.
   if (Array.isArray(kinds) && kinds.length === 0) return undefined;
-  const filter = Array.isArray(kinds) ? ` AND kind IN (${kinds.map(() => "?").join(",")})` : "";
+  // TABLE-QUALIFIED, because the subquery is now aliased. An unqualified `kind`
+  // still resolves -- to the alias -- so this is not a correctness fix today; it is
+  // written so that adding a second table to the subquery cannot silently make the
+  // filter read the wrong one.
+  const filter = Array.isArray(kinds) ? ` AND o.kind IN (${kinds.map(() => "?").join(",")})` : "";
   // The lease bumps whichever counter the row's PHASE names, and the phase is read
   // from the row as it stood BEFORE this statement. SQLite evaluates every
   // assignment's right-hand side against the original row, so both CASEs see the
@@ -465,11 +484,14 @@ export function leaseOutbox(db, { worker, leaseSeconds = 300, kinds = null }) {
            reconcile_attempts = reconcile_attempts
                               + (CASE WHEN attempts >= max_attempts THEN 1 ELSE 0 END),
            lease_expires_at=unixepoch()+?, updated_at=unixepoch()
-    WHERE id = (SELECT id FROM outbox
-                WHERE status='pending' AND not_before<=unixepoch()${filter}
-                ORDER BY id LIMIT 1)
+    WHERE id = (SELECT id FROM outbox o
+                WHERE o.status='pending' AND o.not_before<=unixepoch()${filter}
+                  AND (o.depends_on IS NULL
+                       OR EXISTS (SELECT 1 FROM outbox p
+                                  WHERE p.id = o.depends_on AND p.status='done'))
+                ORDER BY o.id LIMIT 1)
     RETURNING id, idem_key, kind, run_id, args, attempts, max_attempts,
-              reconcile_attempts, max_reconcile, lease_token`)
+              reconcile_attempts, max_reconcile, lease_token, depends_on`)
     .get(leaseSeconds, ...(Array.isArray(kinds) ? kinds : [])));
 }
 
@@ -480,6 +502,62 @@ export function leaseOutbox(db, { worker, leaseSeconds = 300, kinds = null }) {
  * looks exactly like an idle queue, so the count is surfaced instead of being left
  * for someone to notice a missing comment.
  */
+/**
+ * Effects waiting for a parent that will never finish.
+ *
+ * A dead-lettered parent has already summoned a person, and its child cannot
+ * proceed: the value it was going to substitute does not exist and no amount of
+ * retrying will produce it. Left alone the child sits pending for ever, which
+ * looks exactly like an idle queue -- the same failure `pendingWithNoHandler`
+ * exists to make visible, arriving by a different route.
+ *
+ * So the edge is FAILED FORWARD rather than left dangling, and it is done in one
+ * statement per generation so a chain longer than two collapses in full.
+ *
+ * `failed` counts as terminal here alongside `dead_letter`. Both mean the parent
+ * stopped without a result; only the reason differs, and a child cares about the
+ * result rather than about why there is none.
+ */
+export function cascadeDeadLetter(db) {
+  const cascaded = [];
+  // Bounded rather than `while (true)`: a cycle is impossible through `enqueue`,
+  // which requires the parent to exist before the child, but a bound costs
+  // nothing and a queue that never drains because two rows point at each other
+  // is not a failure worth risking on an argument.
+  for (let depth = 0; depth < 32; depth++) {
+    const rows = db.prepare(`
+      SELECT o.id, o.kind, o.depends_on, p.status AS parent_status
+      FROM outbox o JOIN outbox p ON p.id = o.depends_on
+      WHERE o.status='pending' AND p.status IN ('dead_letter','failed')`).all();
+    if (!rows.length) break;
+    const mark = db.prepare(`
+      UPDATE outbox SET status='dead_letter', last_error=?, updated_at=unixepoch()
+      WHERE id=? AND status='pending'`);
+    for (const r of rows) {
+      mark.run(`the effect this one depends on (#${r.depends_on}) ended ${r.parent_status}; its result will never exist`, r.id);
+      cascaded.push(r);
+    }
+  }
+  return cascaded;
+}
+
+/**
+ * Effects held back by a parent that has not finished YET.
+ *
+ * Distinct from `cascadeDeadLetter`, and the distinction is the point: this is the
+ * healthy case -- a child correctly waiting its turn -- and it is surfaced only so
+ * that "the queue is idle" and "the queue is waiting on an edge" can be told
+ * apart. Reading a pending count alone cannot tell them apart, and this repository
+ * has already paid once for a row that sat pending looking exactly like nothing.
+ */
+export function blockedOnDependency(db) {
+  return db.prepare(`
+    SELECT o.id, o.kind, o.depends_on, p.status AS parent_status
+    FROM outbox o JOIN outbox p ON p.id = o.depends_on
+    WHERE o.status='pending' AND p.status NOT IN ('done','dead_letter','failed')
+    ORDER BY o.id`).all();
+}
+
 export function pendingWithNoHandler(db, kinds) {
   if (!Array.isArray(kinds) || !kinds.length)
     return db.prepare(`SELECT kind, count(*) n FROM outbox WHERE status='pending' GROUP BY kind`).all();

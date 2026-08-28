@@ -187,6 +187,11 @@ const recorder = (replies = []) => {
                not_before INTEGER NOT NULL DEFAULT 0, lease_expires_at INTEGER NOT NULL DEFAULT 0,
                result TEXT, last_error TEXT,
                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL) STRICT`);
+  // WITH ITS INDEXES, which is the whole point of the assertion below. Without
+  // them the rename has nothing to carry, and the check that index names were
+  // freed passes for a fixture that could never have exhibited the defect.
+  raw2.exec(`CREATE INDEX outbox_due ON outbox(not_before, id) WHERE status='pending'`);
+  raw2.exec(`CREATE INDEX outbox_inflight ON outbox(lease_expires_at) WHERE status='inflight'`);
   raw2.exec(`INSERT INTO outbox(id,idem_key,kind,args,status,attempts,created_at,updated_at)
              VALUES(7,'delivered','gh.pr.comment','{"a":1}','done',3,111,222)`);
   raw2.exec(`INSERT INTO outbox(id,idem_key,kind,args,status,created_at,updated_at)

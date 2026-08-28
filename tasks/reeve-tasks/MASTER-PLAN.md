@@ -429,7 +429,7 @@ byte-identical across all four existing plans. Reproduce it exactly:
 
 **Architecture:** <how many PRs, against which repo and branch, what each adds or changes by filename, then a bolded NEGATIVE scope claim>
 
-**Tech Stack:** Node `~/.nvm/versions/node/v24.17.0/bin/node` (PATH node is v22 and `node:sqlite` warns there), `node:sqlite` `DatabaseSync`, plain-script tests under `test/*.test.mjs` (CI runs every file in that glob on ubuntu-latest under three TZs), no dependencies added.
+**Tech Stack:** Node `~/.nvm/versions/node/v24.17.0/bin/node` (PATH node is v22 and `node:sqlite` warns there), `node:sqlite` `DatabaseSync`, plain-script tests under `test/*.test.mjs` (CI runs every file in that glob on ubuntu-latest twice, under `TZ: UTC` and `TZ: Asia/Karachi` — two runs, not three; `.github/workflows/ci.yml` calls them a pair), no dependencies added.
 
 **Spec:** `docs/2026-08-21-builder-design.md` — §14 <stage> is the stage definition and its *Verify:* clause is the definition of done. The sections that bind this plan: §x.y (…), §x.y (…).
 

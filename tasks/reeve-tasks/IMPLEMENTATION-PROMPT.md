@@ -97,12 +97,36 @@ existed since `src/checkout.mjs` replaced them.
     is **never** an ancestor of `main`. Compare tree hashes or file blobs, or run
     **`node scripts/verify-merge.mjs <pr>`** — **which lands in its own PR, `reeve#60`, because it
     is code and this one is documents.** It compares TREE ENTRIES (mode included, so a lost
-    executable bit is caught) and distinguishes the states ancestry cannot: **`0`** merged by
-    content · **`31`** the content did **not** arrive · **`32`** it arrived and `main` has moved
-    since · **`22`** not merged yet · **`23`** it could not tell. **Until reeve#60 merges, do the
-    comparison by hand** — `git rev-parse <head>:<path>` against `git rev-parse origin/main:<path>`
-    for every changed path — and treat any path you could not read as unverified rather than as
-    matching.
+    executable bit is caught) against the **squash commit**, and distinguishes the states ancestry
+    cannot: **`0`** merged and still intact on `main` · **`32`** it merged and `main` has changed
+    since · **`22`** not merged yet · **`23`** it could not tell · **`20`** usage.
+
+    **Compare against the SQUASH COMMIT, never the branch head** — by hand or in code. If `main`
+    touches a file after the branch diverges, the squash folds both edits in, so the merge's tree
+    differs from the head's *even though the change landed perfectly*. Measured on a real git
+    fixture, the head-based comparison reported content that was demonstrably present as missing:
+    a false negative in the **common** case. The squash already incorporates whatever `main` did
+    beforehand, so it cannot be confounded by a moving base.
+
+    **Until reeve#60 merges, do it by hand — with `ls-tree`, not `rev-parse`.** `git rev-parse
+    <rev>:<path>` returns the blob, and **mode lives in the tree**, so a lost executable bit
+    shares its blob id with the version that never had one:
+
+    ```bash
+    squash=$(gh pr view <pr> --json mergeCommit --jq .mergeCommit.oid)
+    git fetch origin refs/heads/main:refs/remotes/origin/main --quiet
+    main=$(git rev-parse origin/main)   # PIN it: origin/main is mutable and moves mid-run
+    for p in $(git diff-tree --no-commit-id --name-only -r "$squash"); do
+      a=$(git --literal-pathspecs ls-tree "$squash" -- "$p")
+      b=$(git --literal-pathspecs ls-tree "$main"   -- "$p")
+      [ "$a" = "$b" ] || echo "DRIFTED: $p"
+    done
+    ```
+
+    **`--literal-pathspecs`**, because a filename is attacker-supplied and git reads a path
+    beginning `:` as pathspec magic. **The paths come from the squash's own diff**, not from the
+    API's file list: that list describes the branch head, which a push after the merge moves.
+    Treat any path you could not read as **unverified**, never as matching.
 12. **Conventional Commits**, lowercase, `type(scope): subject`, ≤72 characters.
 13. **Every change carries a what/why comment in the style of the file it lands in.** Comments
     never reference tasks, plans, findings, or any planning document.
@@ -169,8 +193,27 @@ Follow the phases in order. Each gate is completed before the next phase starts.
 
 1. Read `tasks/reeve-tasks/trackers/claims/README.md` in full. **Every path in this prompt is
    repository-relative**, because each later step runs from the repository root.
-2. Read the stage tracker (`tasks/reeve-tasks/trackers/s3.md`) and
-   `tasks/reeve-tasks/trackers/MASTER.md` to see what other lanes hold.
+2. **Read every claim file on a freshly fetched `origin/main` — that is the only authoritative
+   record of what is held.** Not `MASTER.md`, and not the stage tracker: **an initial claim writes
+   neither.** Step 4 below requires a PR containing *only* the claim file, so a new claim can
+   never appear in `MASTER.md`, and a lane that checks only there sees a claimed task as free,
+   overwrites the claim file, and starts duplicate work — the protocol failing in exactly the
+   situation it exists for.
+
+   ```bash
+   git fetch origin refs/heads/main:refs/remotes/origin/main --quiet
+   for f in $(git ls-tree --name-only origin/main tasks/reeve-tasks/trackers/claims/); do
+     case "$f" in */README.md) continue;; esac
+     echo "== $f"; git show "origin/main:$f" | sed -n '1,12p'   # header is authoritative
+   done
+   ```
+
+   The **top-level `state:`** is the answer — `HELD` · `RELEASED` · `TAKEN OVER` — and the blocks
+   below it are history. **If the loop lists no files, say so as "I could not read the claims",
+   not as "nothing is claimed"**: an empty listing and an unreadable one look identical here.
+   Then read the stage tracker (`tasks/reeve-tasks/trackers/s3.md`) and
+   `tasks/reeve-tasks/trackers/MASTER.md` for live state and context — they summarise, they do
+   not decide.
 3. Confirm the task's **dependencies are MERGED**, by content — not "the PR is open", not "it
    was approved".
 4. **Publish the claim where the protocol says peers look, which is `main`.** Write
@@ -219,6 +262,26 @@ of reasoning substitutes for it.
    does not contain it, silently omitting the very thing they just checked for. If you want to be
    certain, branch from the dependency's **verified squash SHA** instead: it is in the tracker's
    `Merge` column and cannot be stale by construction.
+
+   **A single squash SHA is only sufficient when the task has ONE dependency.** A *join* task has
+   more than one, and any one of their SHAs omits the others. **T16 is the worked example**: it
+   depends on **T12 and T15**, which merge independently. Branch from T15's squash and T12 is
+   missing; branch from T12's and T15 is — the failure is symmetric, and whichever merged second
+   is the one you silently lose. For a join, **the base must contain every dependency**: take
+   `origin/main` after verifying all of them merged, and check the base you chose actually holds
+   each one:
+
+   ```bash
+   for dep in <dep-squash-sha>...; do
+     git merge-base --is-ancestor "$dep" "$base" || echo "BASE OMITS $dep"
+   done
+   ```
+
+   **Ancestry is the right test here and it does not contradict rule 11.** Rule 11 forbids
+   ancestry for asking *did this PR merge*, because a squash makes the **branch head** a
+   permanent non-ancestor. This asks a different question — *does this base include that merge
+   commit* — and the squash commit is on `main` by construction, so ancestry answers it exactly.
+   Two questions that look alike are not one question.
    A fresh worktree **cannot commit until `node_modules` exists** — husky needs it. Budget the
    install.
 2. **Write the failing test first.** **The plan does not contain the test body** — it names the
@@ -248,27 +311,33 @@ of reasoning substitutes for it.
 
 ### Phase 3: Open the PR, and work the gate
 
-1. Commit; push; open the PR with `gh pr create --body-file - <<'BODY' … BODY`, with
+**The order of the first three steps is the rule, and it matches `MASTER-PLAN.md` §B.6's
+canonical sequence.** The tracker commit comes **before** `gh pr create`, so the PR carries its
+`BUILT` state from the outset. Opening first and amending the tracker after leaves the opened PR
+briefly claiming nothing, and the later push makes any verdict you already asked for stale.
+
+1. **Commit the work.**
+2. **Then the tracker line, as the LAST commit before the PR.** The tracker conflicts on every
+   branch; one line added last makes the conflict trivial. STATE is **BUILT**, never MERGED —
+   this commit precedes the PR and merging needs a grant.
+3. **Push, then open the PR** with `gh pr create --body-file - <<'BODY' … BODY`, with
    `## What` / `## Decisions taken in this PR` / `## Review focus`.
-2. **The tracker line is the LAST commit before the PR.** The tracker conflicts on every branch;
-   one line added last makes the conflict trivial. STATE is **BUILT**, never MERGED — this
-   commit precedes the PR and merging needs a grant.
-3. `gh pr comment --body "@codex review"`. **Comment it on every push, not only the first.**
-4. **Read BOTH verdict endpoints.** A clean pass arrives as an **issue** comment (*"Didn't find
+4. `gh pr comment --body "@codex review"`. **Comment it on every push, not only the first.**
+5. **Read BOTH verdict endpoints.** A clean pass arrives as an **issue** comment (*"Didn't find
    any major issues"* + *"Reviewed commit: <sha>"*); findings arrive as **review** objects.
    *"Something went wrong"* and *"You have reached your usage limits"* are **refusals, not
    passes** — and the reviewer refused **57% of requests** in one measured week.
-5. **Check the verdict's `commit_id` against the current head.** A verdict at an older head is
+6. **Check the verdict's `commit_id` against the current head.** A verdict at an older head is
    **stale** and says nothing about what you just pushed. Corollary: **commit the tracker and
    any docs BEFORE requesting review**, or your own push makes the verdict you asked for stale.
-6. For each finding: **verify the claim against the source before acting.** Bots are wrong often
+7. For each finding: **verify the claim against the source before acting.** Bots are wrong often
    enough that taking one at face value has produced real defects here. Then fix it properly,
    assert every text patch's anchor actually matched (**a bad anchor means nothing was
    written**), reply with what changed and why, and **resolve the thread via GraphQL — replying
    alone does not clear it.**
-7. **Fix the invariant, not the site.** If the same finding shape appears a third time, the
+8. **Fix the invariant, not the site.** If the same finding shape appears a third time, the
    design is wrong: remove the fallible read rather than patching its third instance.
-8. **The taper rule:** ten rounds without the findings tapering means **stop and bring the
+9. **The taper rule:** ten rounds without the findings tapering means **stop and bring the
    shape**, not the next fix. Split the PR; do not push an eleventh round.
 
 **⛔ GATE: `**Do not merge.** Founder grant required.`**

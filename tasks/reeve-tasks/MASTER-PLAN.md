@@ -667,7 +667,14 @@ Contents, in this order, and the order is itself the rule:
 
 **On merging, which is not the plan's decision.** reeve's own PRs merge only on the founder's
 explicit **per-PR** grant. Grants never carry over. CI and threads are re-verified **at the
-moment of merge**, and a merge is verified **by CONTENT — compare tree hashes or file blobs —
+moment of merge**, and a merge is verified **by CONTENT, by the one procedure in
+`IMPLEMENTATION-PROMPT.md` rule 11** — `node scripts/verify-merge.mjs <pr>`, or that rule's
+by-hand fallback. **Do not restate the comparison here.** This line used to say *"compare tree
+hashes or file blobs"*, and both are wrong: a whole-tree hash rejects a valid squash after any
+unrelated commit on `main`, and a blob comparison cannot see mode, so a lost executable bit
+compares equal. Phase 4 was corrected to delegate for exactly these reasons; a second copy here
+is a second thing to correct.
+**Never by ancestry —
 never by ancestry**, because this repo squash-merges and a branch commit is never an ancestor
 of `main`.
 

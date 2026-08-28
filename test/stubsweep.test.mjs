@@ -368,17 +368,32 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // OUTSIDE the repository. Kept inside, the marker is an untracked file, and the
   // final assertion — that the tree is clean — would fail on the test's own
   // artefact while reporting it as the sweep's wreckage.
-  const marker = join(mkdtempSync(join(tmpdir(), "sweep-marker-")), "started");
+  const markerDir = mkdtempSync(join(tmpdir(), "sweep-marker-"));
+  const marker = join(markerDir, "started");
+  // Outside the fixture repository, so neither file shows as untracked and makes
+  // the clean-tree assertion fail on the test's own artefacts.
+  const helperPath = join(markerDir, "helper.mjs");
+  writeFileSync(helperPath,
+    `import { appendFileSync } from "node:fs";\n` +
+    `setTimeout(() => appendFileSync(process.argv[2], "helper-ran\\n"), 3000);\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"),
     `import { appendFileSync } from "node:fs";\n` +
     `import { f } from "../src/thing.mjs";\n` +
     `appendFileSync(${JSON.stringify(marker)}, "run\\n");\n` +
-    // A helper in the same process group. If only the direct pid is killed, this
+    // A helper in the test's process tree. If only the direct pid is killed, this
     // survives and writes its marker after the sweep has exited.
+    //
+    // A real FILE rather than an inline `-e` string: the first version nested
+    // JSON.stringify twice, so the helper appended to a path with literal quotes
+    // in its name and the marker was never touched — the assertion could not fail,
+    // and the stub of the process-group kill proved it.
     `import { spawn } from "node:child_process";\n` +
-    `spawn(process.execPath, ["-e", ` +
-    `  \`setTimeout(() => require("node:fs").appendFileSync(${JSON.stringify(JSON.stringify(marker))}, "helper-ran\\\\n"), 3000)\`` +
-    `], { stdio: "ignore" });\n` +
+    `spawn(process.execPath, [${JSON.stringify(helperPath)}, ${JSON.stringify(marker)}], { stdio: "ignore" });\n` +
+    // Recorded AFTER the spawn, so the harness can wait for the helper to exist
+    // before signalling. Without it the kill can land first and the helper never
+    // gets created — the assertion then passes for a run that never had a
+    // grandchild to lose.
+    `appendFileSync(${JSON.stringify(marker)}, "helper-spawned\\n");\n` +
     `console.log(f() === "ok" ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
     // Blocks the thread, so the runner is genuinely mid-test when the signal lands.
     `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);\n` +
@@ -410,9 +425,15 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
       // fixture also wrote a "finished" line: the control run alone then looked
       // like two runs, so the kill landed BETWEEN runs with no stub on disk, and
       // the assertion measured a control that had completed normally.
-      const runs = existsSync(${JSON.stringify(marker)})
-        ? readFileSync(${JSON.stringify(marker)}, "utf8").split("\\n").filter(l => l === "run").length : 0;
-      if (runs >= 2) { clearInterval(waitForStubbedRun); p.kill("SIGTERM"); }
+      const text = existsSync(${JSON.stringify(marker)})
+        ? readFileSync(${JSON.stringify(marker)}, "utf8") : "";
+      const lines = text.split("\\n");
+      const runs = lines.filter(l => l === "run").length;
+      const helpers = lines.filter(l => l === "helper-spawned").length;
+      // BOTH conditions: the stubbed run has begun AND its helper exists. Waiting
+      // only on the run count let the signal land before the grandchild was
+      // created, so there was nothing for the group kill to prove.
+      if (runs >= 2 && helpers >= 2) { clearInterval(waitForStubbedRun); p.kill("SIGTERM"); }
     }, 50);
     p.on("exit", () => { clearInterval(waitForStubbedRun); process.exit(0); });
   `], { encoding: "utf8", timeout: 60_000 });
@@ -445,9 +466,21 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   //
   // The helper writes its marker after a delay, so the file's contents at the end
   // say whether it survived.
-  check(!readFileSync(marker, "utf8").includes("helper-ran"),
-    "and a helper the test spawned was killed with it, rather than outliving the sweep",
-    JSON.stringify(readFileSync(marker, "utf8")));
+  // WAIT PAST THE HELPER'S OWN DELAY before reading. Checking immediately passes
+  // whether or not the helper survived, because it would not have written yet —
+  // a test that cannot fail, and the stub of the process-group kill proved it.
+  execFileSync(process.execPath, ["-e", "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4500)"]);
+  // COUNTS again, for the same reason as the finishes above. The CONTROL run
+  // completes normally, so its helper legitimately writes — asserting that
+  // "helper-ran" never appears asserts something false. The signal is one fewer
+  // helper completion than helper spawn.
+  const after = readFileSync(marker, "utf8").split("\n").filter(Boolean);
+  const spawned = after.filter(l => l === "helper-spawned").length;
+  const ran = after.filter(l => l === "helper-ran").length;
+  check(spawned === 2, "control: both runs spawned a helper", JSON.stringify(after));
+  check(ran === spawned - 1,
+    "and the helper the STUBBED test spawned was killed with it, rather than outliving the sweep",
+    `${spawned} spawned, ${ran} ran`);
 }
 
 // --- an edit that resolves outside the repository is refused --------------------
@@ -526,8 +559,12 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
     `import { guard } from "../src/thing.mjs";\n` +
     `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
     `if (!guard) { const noise = "x".repeat(64 * 1024);\n` +
-    `  for (let i = 0; i < 24; i++) console.log(noise); }\n` +
-    `process.exit(guard ? 0 : 1);\n`);
+    `  for (let i = 0; i < 48; i++) console.log(noise); }\n` +
+    // `process.exitCode`, NOT `process.exit`. The latter does not flush pending
+    // stdout writes, so the flood this fixture exists to produce never reached the
+    // runner — and the verdict line survived for a reason that had nothing to do
+    // with the mechanism under test. The stub of that mechanism stayed green.
+    `process.exitCode = guard ? 0 : 1;\n`);
   writeFileSync(join(root, "test", "stub-manifest.mjs"),
     `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
     `  expectRed: "the guard holds",\n` +

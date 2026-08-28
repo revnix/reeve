@@ -268,12 +268,23 @@ function checkMergeShape(nwo, declared) {
  * A jobs read that fails returns null — unknown, which is neither "failed" nor
  * "never ran", because guessing either way is how this defect happened.
  */
-function runExecutedSteps(nwo, runId) {
-  const j = sh("gh", ["api", `repos/${nwo}/actions/runs/${runId}/jobs`,
+export function runExecutedSteps(nwo, runId, io = null) {
+  // PAGINATED. The workflow-jobs endpoint defaults to 30 per page, and a matrix
+  // run can exceed that easily. Without this, a run whose first thirty jobs
+  // executed nothing but whose thirty-first did would be reported as unmeasured —
+  // a check that answers from part of its input and reports the part as the whole,
+  // which is the exact defect this whole function was written to correct.
+  //
+  // `--jq` is applied PER PAGE, so an aggregate like this yields one number per
+  // page rather than one overall. Measured, not assumed: with per_page=1 against a
+  // two-job run it prints "9" then "3". They are summed here.
+  const run = io?.sh ?? sh;
+  const j = run("gh", ["api", "--paginate", `repos/${nwo}/actions/runs/${runId}/jobs`,
                       "--jq", "[.jobs[].steps | length] | add // 0"]);
   if (!j.ok) return null;
-  const n = Number(j.out.trim());
-  return Number.isFinite(n) ? n > 0 : null;
+  const perPage = j.out.split("\n").map(l => l.trim()).filter(Boolean).map(Number);
+  if (perPage.some(n => !Number.isFinite(n))) return null;
+  return perPage.reduce((a2, b) => a2 + b, 0) > 0;
 }
 
 /**

@@ -115,10 +115,19 @@ check(statedBlocker(null) === null, "and no report at all is not a blocker");
     (src.match(/const blocker = [^;]*/) ?? ["(no such assignment)"])[0]);
   check(/needs a human — \$\{blocker\}/.test(src),
     "and puts it in the message a human actually receives");
+  // FILED UNDER THE SAME IDENTITY IT WAS SPENT AGAINST, which is the invariant;
+  // the literal call text below is only its current spelling. The blocker used to
+  // be stored under the CI fingerprint alone, so a FIX_FINDINGS worker that said
+  // it needed a human had its reason recorded where no reader could find it, and
+  // the useful escalation was replaced next tick by a generic capped cause.
+  check(/recordFixAttempt\)\(db, nwo, e\.pr, spendKey,/.test(src) &&
+        /noteFixAttempt\(db, nwo, e\.pr, spendKey,/.test(src),
+    "and files it under the same key the attempt was spent against",
+    (src.match(/noteFixAttempt\([^;]*/) ?? ["(no call)"])[0]);
   // Attached AFTER the worker speaks, not at dispatch: the attempt is spent
   // before any worker exists, and reading a not-yet-assigned result there threw
   // a ReferenceError on every FIX_CI.
-  check(/noteFixAttempt\(db, nwo, e\.pr, fp, statedBlocker\(r\.report\)\)/.test(src),
+  check(/noteFixAttempt\(db, nwo, e\.pr, spendKey, statedBlocker\(r\.report\)\)/.test(src),
     "and attaches it to the fix attempt once the worker has spoken",
     (src.match(/noteFixAttempt\([^;]*/) ?? ["(no call found)"])[0]);
   check(!/recordFixAttempt\([\s\S]{0,140}?statedBlocker/.test(src),

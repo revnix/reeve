@@ -114,20 +114,48 @@ function addMissingColumns(db) {
  */
 const RESHAPED = [
   { table: "inbox", requires: "content_hash" },
+  // A widened CHECK, which is a SHAPE change and not a column one.
+  //
+  // ALTER TABLE cannot touch a CHECK constraint, and `CREATE TABLE IF NOT EXISTS`
+  // does nothing to a table that exists — so a store created before this kind
+  // existed keeps the old constraint, and the failure appears at the first INSERT
+  // of the new kind. Measured rather than assumed: an insert of an unlisted kind
+  // fails with `CHECK constraint failed: kind IN (...)`, SQLITE_CONSTRAINT (19).
+  //
+  // Loud rather than silent, which is better than the alternative — but it fires
+  // inside the daemon on the first spill, not when the migration ran, and by then
+  // the decision that produced the effect is already durable.
+  //
+  // Keyed on the table's own SQL because there is no column to look for.
+  { table: "outbox", requiresSql: "gh.issue.create" },
 ];
 
 function reshapeTables(db) {
-  for (const { table, requires } of RESHAPED) {
+  for (const { table, requires, requiresSql } of RESHAPED) {
     let cols;
     try { cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name); }
     catch { continue; }
-    if (!cols.length || cols.includes(requires)) continue;   // absent or already right
+    if (!cols.length) continue;                              // the table does not exist yet
+    if (requires && cols.includes(requires)) continue;       // already the new shape
+    if (requiresSql) {
+      const ddl = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`).get(table)?.sql ?? "";
+      if (ddl.includes(requiresSql)) continue;               // already the new shape
+    }
     const n = db.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n;
     if (n > 0) {
       throw new Error(
         `${table} has the old shape and ${n} row(s). Refusing to rebuild it at open(): ` +
         `export them, drop the table, and reopen. Silently copying between shapes ` +
-        `loses whatever the new key was added to distinguish.`);
+        `loses whatever the new key was added to distinguish.` +
+        // Named for the outbox specifically, because dropping THAT table discards
+        // queued side effects: a decision recorded as durable whose visible half
+        // never happens, which is the failure the outbox exists to prevent. Both
+        // live stores held zero rows when this shipped, measured on 2026-08-28,
+        // and that is what made the rebuild free rather than a migration.
+        (table === "outbox"
+          ? " These are QUEUED SIDE EFFECTS: each one is a decision already recorded as durable" +
+            " whose visible half has not happened yet. Drain the queue before upgrading."
+          : ""));
     }
     // Dropped only. schema.sql runs immediately after and rebuilds it, indexes
     // and all -- which is also WHY this runs first: the new index names a column

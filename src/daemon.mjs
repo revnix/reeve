@@ -35,7 +35,7 @@ import { buildAlert, notify, printable } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects } from "./db/ops.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
 import { drainOutbox } from "./outbox/drain.mjs";
-import { HANDLERS } from "./outbox/effects.mjs";
+import { HANDLERS, UNGATED_BY_REVIEW_ACTIONS } from "./outbox/effects.mjs";
 import { writeDash } from "./dash.mjs";
 import { snapshot, snapshotAll } from "./backup.mjs";
 import { selfAudit } from "./selfaudit.mjs";
@@ -1157,9 +1157,16 @@ export async function tick(ctx) {
     // Expressed as a FILTER over handlers rather than a condition on the block,
     // so a kind reeve may not perform is simply not performable -- the drainer
     // never leases it, and the "pending with no handler" line already says so.
+    //
+    // GATED BY DEFAULT, exempted by declaration. This was written the other way
+    // round -- a list of kinds that are gated, everything else permitted -- which
+    // is fail-open by construction: adding a handler silently added an ungated
+    // externally-visible effect, and that is precisely how `gh.issue.create`
+    // arrived unprotected. The exemption list lives beside the handlers in
+    // src/outbox/effects.mjs so adding one and deciding whether the switch governs
+    // it are the same edit.
     const permitted = Object.fromEntries(Object.entries(ctx.handlers ?? HANDLERS)
-      .filter(([kind]) => (kind === "gh.pr.comment" || kind === "gh.thread.resolve")
-        ? reviewActionsOn(profile) : true));
+      .filter(([kind]) => UNGATED_BY_REVIEW_ACTIONS.has(kind) ? true : reviewActionsOn(profile)));
     // BEFORE the drain, on every path. A request the profile no longer asks for
     // must not be posted by a tick that happens to be unable to evaluate the pull
     // request it belongs to.

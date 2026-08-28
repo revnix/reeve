@@ -286,6 +286,26 @@ export function retryableFrom(err = "") {
   return true;
 }
 
+/**
+ * Kinds the review switch does NOT gate, declared as an exemption list.
+ *
+ * The gate used to be written the other way round — a list of kinds that ARE
+ * gated, with everything else permitted — and that is fail-open by construction:
+ * adding a handler silently added an ungated externally-visible effect. It was
+ * found exactly that way. `gh.issue.create` was added to HANDLERS, became
+ * drainable, and took the unconditional branch, so an operator turning the review
+ * switch off would still have had a spill issue filed on their repository from a
+ * row queued earlier.
+ *
+ * Declared HERE, beside the handlers, so adding a handler and deciding whether the
+ * switch governs it are the same edit rather than two, the second of which is in
+ * another file and easy to miss.
+ *
+ * Empty today, and that is correct rather than a placeholder: every effect reeve
+ * currently performs is a review action.
+ */
+export const UNGATED_BY_REVIEW_ACTIONS = Object.freeze(new Set());
+
 /** Every kind this build can perform. A kind absent here is never leased. */
 export const HANDLERS = Object.freeze({
   "gh.pr.comment": ghPrComment,

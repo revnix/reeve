@@ -8,7 +8,8 @@
 // but "nothing reaches GitHub except through an injected api". A handler that
 // reached for `gh` itself would pass every behavioural test here and still bypass
 // the outbox entirely, which is the one failure the outbox exists to prevent.
-import { ghIssueCreate, ghThreadResolve, HANDLERS, markerFor } from "../src/outbox/effects.mjs";
+import { ghIssueCreate, ghThreadResolve, HANDLERS, markerFor,
+         UNGATED_BY_REVIEW_ACTIONS } from "../src/outbox/effects.mjs";
 import { open, tx, enqueue } from "../src/db/ops.mjs";
 import { drainOutbox } from "../src/outbox/drain.mjs";
 import { DatabaseSync } from "node:sqlite";
@@ -165,8 +166,11 @@ const recorder = (replies = []) => {
   const id = tx(db, () => enqueue(db, { idemKey: "i", kind: "gh.issue.create", args: { nwo: "o/r", title: "t", body: "b" } }));
   check(Number.isInteger(id), "and the new kind can actually be enqueued", String(id));
 
-  // Refused rather than rebuilt when it would DISCARD queued effects, because each
-  // one is a decision already durable whose visible half has not happened.
+  // ROWS SURVIVE, and this is the case that would have bricked every armed
+  // deployment. `settleOutbox` marks a delivered effect `done` and never deletes
+  // it, so any store that has ever delivered anything holds rows for ever —
+  // refusing on a row count made the error's own advice ("drain the queue")
+  // impossible to satisfy, and the daemon would never open again.
   const dir2 = mkdtempSync(join(tmpdir(), "reeve-spill-full-"));
   const path2 = join(dir2, "full.db");
   const raw2 = new DatabaseSync(path2);
@@ -179,13 +183,57 @@ const recorder = (replies = []) => {
                not_before INTEGER NOT NULL DEFAULT 0, lease_expires_at INTEGER NOT NULL DEFAULT 0,
                result TEXT, last_error TEXT,
                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL) STRICT`);
-  raw2.exec(`INSERT INTO outbox(idem_key,kind,args,created_at,updated_at) VALUES('queued','gh.pr.comment','{}',0,0)`);
+  raw2.exec(`INSERT INTO outbox(id,idem_key,kind,args,status,attempts,created_at,updated_at)
+             VALUES(7,'delivered','gh.pr.comment','{"a":1}','done',3,111,222)`);
+  raw2.exec(`INSERT INTO outbox(id,idem_key,kind,args,status,created_at,updated_at)
+             VALUES(8,'queued','gh.pr.comment','{}','pending',0,0)`);
   raw2.close();
+
   let refusal = null;
-  try { open(path2); } catch (e) { refusal = e; }
-  check(refusal !== null, "a store with QUEUED effects is refused rather than rebuilt", String(refusal));
-  check(/QUEUED SIDE EFFECTS/.test(String(refusal?.message)),
-    "and says what would be lost, rather than only that it refused", String(refusal?.message));
+  let db2 = null;
+  try { db2 = open(path2); } catch (e) { refusal = e; }
+  check(refusal === null, "a store holding delivered history still opens", String(refusal));
+  check(db2.prepare("SELECT count(*) n FROM outbox").get().n === 2,
+    "and every row is carried across the rebuild", String(db2?.prepare("SELECT count(*) n FROM outbox").get().n));
+
+  const carried = db2.prepare("SELECT id, idem_key, status, attempts, args, created_at FROM outbox WHERE id=7").get();
+  check(carried.idem_key === "delivered" && carried.status === "done" && carried.attempts === 3,
+    "with its status and counters intact", JSON.stringify(carried));
+  check(carried.created_at === 111, "and its original timestamps", String(carried.created_at));
+  // Ids preserved, because `depends_on` points at them.
+  check(carried.id === 7, "and its id, since a dependency edge points at it");
+  check(db2.prepare("SELECT sql FROM sqlite_master WHERE name='outbox'").get().sql.includes("gh.issue.create"),
+    "while the constraint really was widened");
+  check(db2.prepare("SELECT count(*) n FROM sqlite_master WHERE name='_reshape_outbox'").get().n === 0,
+    "and the staging table is gone");
+  // The queued row is still queued: a rebuild must not deliver or discard it.
+  check(db2.prepare("SELECT status FROM outbox WHERE id=8").get().status === "pending",
+    "a pending effect is still pending afterwards, neither delivered nor lost");
+}
+
+// --- the review switch governs EVERY effect, by default ------------------------
+{
+  // The gate was an allowlist of gated kinds, so anything not named took the
+  // unconditional branch. That is fail-open by construction, and it is how
+  // gh.issue.create arrived unprotected: adding it to HANDLERS made it drainable
+  // and nothing gated it, so an operator turning the switch off would still have
+  // had a spill issue filed from a row queued earlier.
+  //
+  // Asserted over the WHOLE handler set rather than over the kinds this change
+  // adds, so a handler added later is covered by this test without anyone
+  // remembering to extend it.
+  for (const kind of Object.keys(HANDLERS))
+    check(!UNGATED_BY_REVIEW_ACTIONS.has(kind),
+      `${kind} is governed by the review switch`, kind);
+
+  check(UNGATED_BY_REVIEW_ACTIONS.size === 0,
+    "control: the exemption list is empty, so the loop above is asserting something",
+    String(UNGATED_BY_REVIEW_ACTIONS.size));
+
+  // And the shape itself: an exemption must be an explicit declaration, never the
+  // absence of a mention.
+  check(UNGATED_BY_REVIEW_ACTIONS instanceof Set,
+    "exemption is a declared set, so a new kind is gated until someone says otherwise");
 }
 
 // --- nothing reaches GitHub except through an injected api ---------------------

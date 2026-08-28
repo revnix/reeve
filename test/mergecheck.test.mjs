@@ -443,5 +443,27 @@ const F = "100644", X = "100755", L = "120000";
     "control: undecoded, it reads as the mojibake the report used to emit", JSON.stringify(carried));
 }
 
+
+// --- THE VERDICT STATES ITS OWN SCOPE, INCLUDING WHEN IT PASSES --------------
+// Three attempts to prove the merge covers the whole pull request all inferred a
+// PAST merge from PRESENT state, so the claim is not made at all. It is stated
+// instead, on every verdict, so a clean pass cannot be read as more than it is.
+{
+  const entryAt = fixture({ [S]: { a: `${F} 1` }, [M]: { a: `${F} 1` } });
+  const clean = verdictFor(classifyFiles(["a"], { squash: S, main: M, entryAt }));
+  check(clean.verdict === VERDICT.intact, "control: this fixture verifies", clean.verdict);
+  check(/SCOPE: this verifies the content of the MERGE COMMIT/.test(clean.why),
+    "a PASSING verdict still states that it covers the merge commit, not the pull request", clean.why);
+  check(/REBASE merge names only its LAST commit/.test(clean.why),
+    "and names the case it does not cover");
+  check(/present state/.test(clean.why),
+    "and says why it is not merely unimplemented: the question is about a PAST merge");
+
+  const drifted = verdictFor(classifyFiles(["a"], {
+    squash: S, main: M, entryAt: fixture({ [S]: { a: `${F} 1` }, [M]: { a: `${F} 2` } }),
+  }));
+  check(/SCOPE:/.test(drifted.why), "and a DRIFTED verdict carries the same scope statement");
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

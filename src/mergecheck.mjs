@@ -130,7 +130,19 @@ export function verdictFor(files, { branchOnly = [], crossCheck = "complete" } =
   const incomplete = crossCheck !== "complete"
     ? `\n\nThe cross-check against the pull request's file list could not be completed (${crossCheck}), so paths the merge did not produce may exist and not be listed above. The verdict itself is unaffected: it is computed from the merge commit's own diff, which was read locally.`
     : "";
-  const note2 = note + uncovered + incomplete;
+  // WHAT THIS VERDICT IS ABOUT, stated on every answer including a clean one.
+  // The sound question is "is what THIS MERGE COMMIT produced still on main",
+  // and that is what is computed. The further claim -- "and this merge commit
+  // represents the whole pull request" -- has now failed three separate
+  // attempts, each inferring a fact about a PAST merge from PRESENT mutable
+  // state: the repository's merge settings, the pull request's commit count,
+  // and its file list. So the claim is not made. It is stated instead, on every
+  // verdict, so a pass cannot be read as more than it is.
+  const scope =
+    `\n\nSCOPE: this verifies the content of the MERGE COMMIT. It does not establish that the merge commit represents the whole pull request.\n` +
+    `A squash carries the whole branch; a REBASE merge names only its LAST commit, and its earlier commits are separate commits on main that this does not check.\n` +
+    `Nothing readable after the fact distinguishes them -- merge settings, commit counts and file lists are all present state, and this is a question about a past merge.`;
+  const note2 = note + uncovered + incomplete + scope;
   if (counts.drifted > 0) {
     return { verdict: VERDICT.drifted, counts,
              why: `${counts.drifted} of ${files.length} path(s) on main differ from what the merge produced. The content arrived and something changed it since.\n` +

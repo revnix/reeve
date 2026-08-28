@@ -29,13 +29,19 @@ const { json, repoArg, repoMissingValue, pr } = parseArgs(process.argv.slice(2))
 const emit = (doc, code) => {
   // process.exitCode, never process.exit(): exit() can truncate a pending write
   // to a pipe, and a report the caller never received is worse than a slow one.
-  if (json) console.log(JSON.stringify(doc, null, 2));
+  // DECODE EXACTLY ONCE, HERE, for whichever output is asked for. `doc` carries
+  // raw latin1 byte-strings throughout; decoding them earlier AND here would run
+  // displayPath over its own output, re-reading finished Unicode text as latin1
+  // bytes -- `café.txt` became `caf\xe9.txt`, and anything above U+00FF loses
+  // its high bits entirely, so the report names a different file.
+  const shown = (doc.files ?? []).map(f => ({ ...f, path: displayPath(f.path) }));
+  if (json) console.log(JSON.stringify({ ...doc, files: shown }, null, 2));
   else {
     console.log(`${doc.verdict}  ${doc.repo ?? "?"}#${doc.pr ?? "?"}${doc.squash ? `  squash=${doc.squash.slice(0, 7)}` : ""}`);
-    // safePath, not the raw name: a filename is attacker-supplied on any
+    // displayPath, not the raw name: a filename is attacker-supplied on any
     // repository taking outside contributions, and a carriage return or an ANSI
     // escape in one can overwrite the verdict line above or forge a new one.
-    for (const f of doc.files ?? []) console.log(`  ${f.state.padEnd(8)} ${displayPath(f.path)}`);
+    for (const f of shown) console.log(`  ${f.state.padEnd(8)} ${f.path}`);
     if (doc.why) console.log(`\n${doc.why}`);
   }
   process.exitCode = code;
@@ -221,7 +227,14 @@ const run = () => {
     if (!have(meta.headRefOid)) {
       try { execFileSync("git", ["fetch", "origin", `pull/${pr}/head`, "--quiet"], { stdio: ["ignore", "ignore", "pipe"] }); } catch { /* optional */ }
     }
-    if (have(meta.headRefOid)) headRev = meta.headRefOid;
+    // `have` proves the COMMIT is present; in a partial clone its tree may still
+    // be unfetchable. The head never decides the verdict, so a tree that cannot
+    // be read drops the divergence OBSERVATION rather than suppressing an
+    // authoritative answer the squash and main trees can still give.
+    if (have(meta.headRefOid)) {
+      try { G.treeEntries(meta.headRefOid); headRev = meta.headRefOid; }
+      catch { headRev = null; }
+    }
   }
 
   // TREE ENTRY, not blob: mode lives in the tree, so an executable bit or a
@@ -257,7 +270,7 @@ const run = () => {
   // structured report names a file that does not exist.
   emit({ repo: ghRepo, pr, verdict, squash, main: mainOid, base: meta.baseRefName ?? null,
          headRead: headRev !== null, crossCheck, branchOnly: branchOnly.map(displayPath),
-         counts, files: classified.map(f => ({ ...f, path: displayPath(f.path) })), why },
+         counts, files: classified, why },
        exitFor(verdict));
 };
 

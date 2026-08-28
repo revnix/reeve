@@ -86,6 +86,32 @@ pr:         —
 
 `state` is one of exactly three words: **HELD · RELEASED · TAKEN OVER.**
 
+### Every state change reaches `main` the same way, or it has not happened
+
+**This is the invariant, and everything below is an instance of it.** Peers discover claims on
+`main`. A change that lives on a feature branch is invisible to exactly the audience the protocol
+exists to serve, so **a claim file is only ever edited by a PR that contains nothing else, and is
+merged before the change counts.**
+
+That covers all five transitions, not just the first:
+
+| transition | when | what a peer sees if it is not published |
+|---|---|---|
+| **claim** | before any work starts | two lanes both start the same task |
+| **heartbeat** | on every push to the feature branch | a live task looks **stale after 24h and is taken over** |
+| **release** | when the task merges | a finished task stays **HELD forever**, and the next task never starts |
+| **takeover** | when a stale claim is adopted | two lanes both believe they hold it |
+| **reclaim** | when abandoned work is picked up | the same |
+
+**Why a whole PR for a one-line edit.** It is one file that nothing else touches, so it reviews
+in under a minute and can never conflict. That cost is the price of the property; a protocol whose
+state is only sometimes visible is worse than none, because it is trusted.
+
+**Batching is allowed for heartbeats only.** A heartbeat is the one transition whose staleness is
+bounded by the 24-hour rule rather than by correctness, so a lane pushing several times a day may
+publish one heartbeat PR per day. **Claim, release, takeover and reclaim are never batched** —
+each is a fact another lane acts on immediately.
+
 ### The heartbeat, and what makes a claim stale
 
 **Touch `refreshed` every time you push.** That is the heartbeat, and it is the only signal
@@ -103,9 +129,26 @@ Twenty-four hours is a **convention, not a measurement**. It is the number at wh
 has genuinely stopped is more likely than a lane that is thinking. If it turns out to be wrong,
 change it here and say why — do not work around it silently in one lane.
 
+### Reclaiming work that was released unfinished
+
+Rule 6 permits abandoning a task, and a released claim is kept rather than deleted — so a later
+lane finds a file at `RELEASED` and **no documented way in**. Recreating it destroys the history
+the protocol keeps deliberately; `TAKEN OVER` does not apply, because that transition is for a
+**stale `HELD`** claim whose holder may still be alive.
+
+**Append a new claim block to the same file, under a `## Reclaimed <date>` heading**, and set the
+file's top-level `state:` to `HELD` with your own lane, host and timestamps.
+
+**The top-level fields are always authoritative; the blocks below them are history.** A reader
+who wants to know who holds this task reads the header and stops. A reader who wants to know how
+it got here reads down. Never edit an earlier block to agree with the present.
+
+The same rule settles the ambiguity for takeover, which had the same gap: `state: TAKEN OVER` is
+the *outgoing* holder's record, and the incoming lane sets the header to `HELD` in its own name.
+
 ### Releasing
 
-Set `state: RELEASED`, add the reason and the date, and commit. **Do not delete the file.** The
+Set `state: RELEASED`, add the reason and the date, and **publish it as a claim-only PR like every other transition** — a release that only exists on a merged feature branch leaves the task HELD forever to anyone reading `main`. **Do not delete the file.** The
 history of who held what, and why they let it go, is the thing that makes a stale claim
 diagnosable next time.
 

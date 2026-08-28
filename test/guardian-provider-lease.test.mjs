@@ -14,6 +14,7 @@ import { tick } from "../src/daemon.mjs";
 import { open } from "../src/db/ops.mjs";
 import { openHub } from "../src/build/hubdb.mjs";
 import { openHubAsGuest } from "../src/build/hubguest.mjs";
+import { hubAccess } from "../src/build/hubaccess.mjs";
 import { resolveRepoId } from "../src/build/repoid.mjs";
 import { COLUMNS_AT, SCHEDULER_MIN_HUB_VERSION } from "../src/build/hubdb.mjs";
 import { isBuilderPr } from "../src/pr.mjs";
@@ -61,7 +62,8 @@ const EVAL = {
  */
 const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false, hubGetter,
                     heartbeatMs, providerHeartbeat, spawnWorker, capacity,
-                    queuedRequests, cancelQueued, measureContainment } = {}) => {
+                    queuedRequests, cancelQueued, measureContainment,
+                    resolveRepoIdFn, project } = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "reeve-prov-"));
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -81,6 +83,16 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false,
       watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
     },
     hub: hubGetter ? () => hubGetter(guest) : () => ({ hub: guest, why: null }), repoId, lstart: "boot-1",
+    // Injected so the repository-id read can be OBSERVED. The daemon consults
+    // `ctx.resolveRepoId` only when `repoId` is null, so a test that wants to
+    // watch the call must pass both.
+    ...(resolveRepoIdFn ? { resolveRepoId: resolveRepoIdFn } : {}),
+    // Opt-in, because `repoIdFromHub` returns before touching the connection
+    // unless `project.name` is set -- so a fixture without one cannot exhibit a
+    // connection-passing regression at all, and any assertion about it is
+    // vacuous. Production always has a project; the test that asserts over the
+    // connection must too.
+    ...(project ? { project } : {}),
     providerClaim: (db, a) => { claims.push(a); return (claim ?? (() => ({ ok: true, id: claims.length })))(a); },
     providerRelease: (db, a) => { releases.push(a); return (release ?? (() => ({ ok: true })))(a); },
     openPrs: () => [42],
@@ -186,10 +198,68 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false,
 
   // And the daemon must never put it in that position. `resolveRepoId` is a
   // privileged read by construction, so the tick has to be handed a number.
-  const daemon = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
-  check(!/resolveRepoId\s*\(\s*(ctx\.)?hub/.test(daemon),
-    "the daemon never hands its hub connection to the repository-id resolver",
-    (daemon.match(/.*resolveRepoId.*/g) ?? []).join(" | "));
+  //
+  // ASSERTED OVER THE CALL, NOT OVER THE FILE'S BYTES. This was a source-text
+  // regex, `!/resolveRepoId\s*\(\s*(ctx\.)?hub/`, and it was measured defeated by
+  // the daemon's own idiom: a handle spelled `h` -- which `const h =` already is
+  // at five sites in that file -- passes it while handing the resolver exactly
+  // the connection it forbids. It also FORBADE a comment mentioning the name, so
+  // the file could not document why the privileged reader is not used there.
+  //
+  // The pair below cannot be satisfied by a rename, a re-export, or the handle
+  // arriving as a parameter, because it observes the invocation:
+  //   line 1 is the vacuity check -- if the tick never asks, the test is empty;
+  //   line 2 is the property -- it asks for a number and is handed nothing.
+  // No arrangement leaves both green while the daemon passes a connection.
+  // BOTH CHANNELS ARE OBSERVED, because recording only the injected call proves
+  // the tick asked correctly and says nothing about whether it ALSO asked
+  // somewhere else. A tick that calls ctx.resolveRepoId() properly AND passes
+  // the guest handle to the imported resolver satisfies every assertion about
+  // `asks` -- so the connection itself is instrumented too, and the run's
+  // outcome is asserted rather than discarded.
+  const asks = [], sql = [];
+  const spyDir = mkdtempSync(join(tmpdir(), "reeve-prov-spy-"));
+  const spyPath = join(spyDir, "hub.db");
+  openHub(spyPath).close();
+  const realGuest = openHubAsGuest(spyPath);
+  // IDEMPOTENT close. The tick closes the handle it is given, so a second close
+  // from this fixture throws ERR_INVALID_STATE -- and it throws AFTER every
+  // assertion has printed PASS, so the file exits 1 while reading green.
+  let spyClosed = false;
+  const spy = {
+    prepare: (q) => { sql.push(q); return realGuest.prepare(q); },
+    exec: (q) => { sql.push(q); return realGuest.exec(q); },
+    close: () => { if (!spyClosed) { spyClosed = true; realGuest.close(); } },
+  };
+  const asked = await run({
+    hub: spy, repoId: null,
+    // A REAL project, or the read never reaches the connection: repoIdFromHub
+    // bails on `!project?.name`, so without this the SQL assertion below cannot
+    // fail and proves nothing. Measured -- the regression stub passed until this
+    // was added.
+    project: { name: "o/r", nwo: "o/r" },
+    resolveRepoIdFn: (...args) => { asks.push(args); return 7; },
+  });
+
+  check(asks.length > 0,
+    "control: the tick really does ask for a repository id when it lacks one",
+    `calls=${asks.length}`);
+  check(asks.every((args) => args.length === 0),
+    "and it asks with NO arguments -- the resolver is never handed a connection",
+    JSON.stringify(asks));
+  // The OTHER channel: the resolver reads `task`, which the guest refuses. A
+  // connection-passing call would show up here whatever it was spelled.
+  const privileged = sql.filter((q) => /\btask\b/i.test(q));
+  check(privileged.length === 0,
+    "and no privileged read reaches the guardian's connection by any other route",
+    JSON.stringify(privileged));
+  // The outcome, so a refusal that leaves the tick fail-closed cannot pass
+  // unnoticed: the resolver returned a number, so this tick must dispatch.
+  check(asked.spawned.length === 1,
+    "control: and the tick reaches dispatch, so the run really exercised the path",
+    `spawned=${asked.spawned.length}`);
+  spy.close();
+  rmSync(spyDir, { recursive: true, force: true });
 
   // A tick against the real guest reaches dispatch rather than throwing.
   const s2 = await run({ repoId: 7 });
@@ -1928,10 +1998,43 @@ const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false,
   // `completedVersion` -- which catches every failure and answers 0 -- is now a
   // behavioural assertion over a corrupt file in the hub-access suite.
 
-  const daemon = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
-  check(!/\bopenHub\b/.test(daemon),
-    "and the guardian's own module cannot reach the privileged opener at all",
-    (daemon.match(/.*\bopenHub\b.*/g) ?? []).join(" | "));
+  // THE CAPABILITY OF THE CONNECTION, not the absence of a name in a file.
+  //
+  // This was `!/\bopenHub\b/.test(daemon)`, and it is defeated by the exact move
+  // the extraction requires: MEASURED, a new module importing `openHub` and
+  // imported by the daemon leaves `grep -c openHub src/daemon.mjs` at 0 and the
+  // guard green, while the daemon reaches the privileged opener transitively.
+  // A name-absence assertion is not a reachability assertion -- a rename, a
+  // re-export, or a handle passed in as a parameter all defeat it.
+  //
+  // What must actually be true is a property of the OBJECT the guardian gets.
+  {
+    const dir = mkdtempSync(join(tmpdir(), "reeve-cap-"));
+    const hubPath = join(dir, "hub.db");
+    openHub(hubPath).close();
+    const got = hubAccess(hubPath)();
+    check(got.hub != null && got.why == null,
+      "control: the production accessor yields a usable handle over a migrated hub",
+      `hub=${got.hub != null} why=${String(got.why)}`);
+    check(JSON.stringify(Object.keys(got.hub)) === '["prepare","exec","close"]',
+      "the guardian's hub handle is the guest facade and has no other method",
+      JSON.stringify(Object.keys(got.hub ?? {})));
+    for (const m of ["createSession", "deserialize", "applyChangeset",
+                     "loadExtension", "serialize", "setAuthorizer"]) {
+      check(got.hub[m] === undefined, `and it cannot ${m}`, String(got.hub[m]));
+    }
+    // The control that stops the assertions above passing over an empty object:
+    // the facade must REFUSE the builder's table, not merely lack methods.
+    let why = null;
+    try { got.hub.prepare("SELECT repo_id FROM task LIMIT 1"); } catch (e) { why = e.message; }
+    check(why != null && /prohibited|not authorized|not permitted/i.test(why),
+      "control: and it REFUSES the builder's work table, so this is a real facade",
+      String(why));
+    // CLOSE BEFORE UNLINKING. An open SQLite database cannot be removed on
+    // Windows -- rmSync raises EPERM -- and Windows is a target for this suite.
+    got.hub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

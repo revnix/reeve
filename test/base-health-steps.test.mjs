@@ -31,7 +31,7 @@ const stepsBy = map => (_nwo, id) => (id in map ? map[id] : true);
     steps: stepsBy({ "1": false, "2": false, "3": false }),
   });
   check(r.level === "BROKEN", "a base where nothing executed is BROKEN", r.level);
-  check(/without executing a single step/.test(r.lines.join(" ")),
+  check(/executed no steps/.test(r.lines.join(" ")),
     "and reports what was measured: no step executed", JSON.stringify(r.lines));
   check(/nothing on this branch has been measured/.test(r.lines.join(" ")),
     "and says what follows from it — no downstream gate means anything", JSON.stringify(r.lines));
@@ -45,9 +45,10 @@ const stepsBy = map => (_nwo, id) => (id in map ? map[id] : true);
     "control: it does NOT blame infrastructure, which would send an operator to billing for a broken workflow file");
   check(!/inherits a red rollup/.test(r.lines.join(" ")),
     "and NOT as a red base, which would send someone to read a diff that is fine");
-  check(/0 of the last 3/.test(r.lines[0]),
-    "the failure count is zero, because none of them failed — they did not run",
-    r.lines[0]);
+  check(/3 of the last 3 completed/.test(r.lines[0]),
+    "the run list's own fact leads: three concluded failure", r.lines[0]);
+  check(/3 of those executed no steps/.test(r.lines.join(" ")),
+    "and the step read explains them rather than deciding them", JSON.stringify(r.lines));
 }
 
 // The opposite: real failures, steps executed. The original behaviour, preserved.
@@ -81,9 +82,10 @@ const stepsBy = map => (_nwo, id) => (id in map ? map[id] : true);
     steps: stepsBy({ "1": true, "2": false }),
   });
   check(r.level === "DEGRADED", "a mix is DEGRADED rather than either extreme", r.level);
-  check(/1 of the last 3/.test(r.lines[0]), "one real failure is counted as one", r.lines[0]);
-  check(/1 run\(s\) reported failure without executing/.test(r.lines.join(" ")),
-    "and the one that executed nothing is counted separately", JSON.stringify(r.lines));
+  check(/2 of the last 3 completed/.test(r.lines[0]),
+    "two concluded failure, which is what the run list says", r.lines[0]);
+  check(/1 of those executed no steps/.test(r.lines.join(" ")),
+    "and one of those executed nothing, which is what the step read adds", JSON.stringify(r.lines));
 }
 
 // A jobs read that fails is UNKNOWN — neither failed nor never-ran. Guessing
@@ -93,8 +95,12 @@ const stepsBy = map => (_nwo, id) => (id in map ? map[id] : true);
     ...list([["failure", "1"]]),
     steps: () => null,
   });
-  check(r.level === "UNKNOWN", "an unreadable run is UNKNOWN, not assumed either way", r.level);
-  check(/could not be read/.test(r.lines.join(" ")), "and says which way it is unknown",
+  // The run LIST already says nothing succeeded. Being unable to read WHY does not
+  // soften that: the unreadable run concluded failure either way.
+  check(r.level === "BROKEN",
+    "an all-failure history is broken even when the reason cannot be read", r.level);
+  check(/could not be read, so why they failed is unknown/.test(r.lines.join(" ")),
+    "and says the reason is unknown without letting that change the verdict",
     JSON.stringify(r.lines));
 }
 
@@ -102,6 +108,27 @@ const stepsBy = map => (_nwo, id) => (id in map ? map[id] : true);
 {
   const r = checkBaseHealth(NWO, "ci.yml", "main", { sh: () => ({ ok: false, out: "" }) });
   check(r.level === "UNKNOWN", "control: an unreadable run list is UNKNOWN as before", r.level);
+}
+
+// ── an unreadable step read does not subtract from an all-red history ───────
+//
+// The run list and the step reads answer different questions. The list says
+// whether anything succeeded — that alone decides whether the base is usable. The
+// step reads only explain why, and they can fail without changing the first
+// answer. Folding them into the verdict meant one transient jobs-endpoint error
+// turned nine executed failures plus one unreadable into DEGRADED, when all ten
+// concluded failure and nothing succeeded.
+{
+  const r = checkBaseHealth(NWO, "ci.yml", "main", {
+    ...list([["failure", "1"], ["failure", "2"], ["failure", "3"]]),
+    steps: (_n, id) => (id === "3" ? null : true),
+  });
+  check(r.level === "BROKEN",
+    "two executed failures and one unreadable is still an all-red base", r.level);
+  check(/3 of the last 3 completed/.test(r.lines[0]),
+    "because the run list says three of three concluded failure", r.lines[0]);
+  check(/1 of those could not be read/.test(r.lines.join(" ")),
+    "and the unreadable one is reported rather than silently dropped", JSON.stringify(r.lines));
 }
 
 // ── a base with NO usable result is broken however it got there ─────────────
@@ -151,7 +178,7 @@ const stepsBy = map => (_nwo, id) => (id in map ? map[id] : true);
   });
   // Two completed failures and one run still going.
   const r = checkBaseHealth(NWO, "ci.yml", "main", withRows([["failure", "1"], ["failure", "2"], ["", "3"]]));
-  check(/2 of the last 2/.test(r.lines[0]),
+  check(/2 of the last 2 completed/.test(r.lines[0]),
     "a run that has not concluded is not in the denominator", r.lines[0]);
   check(r.level === "BROKEN",
     "so a base whose every COMPLETED run is red reads as broken, not degraded", r.level);

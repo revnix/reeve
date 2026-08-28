@@ -329,46 +329,35 @@ export function checkBaseHealth(nwo, workflow = "ci.yml", branch = "main", io = 
     else noStep++;
   }
 
-  const lines = [`${branch}: ${failed} of the last ${runs.length} ${workflow} runs failed`];
-  if (noStep) lines.push(`${noStep} run(s) reported failure without executing a single step`);
-  if (unreadable) lines.push(`${unreadable} run(s) could not be read, so whether they ran is unknown`);
+  // TWO SOURCES OF EVIDENCE, AND THEY ANSWER DIFFERENT QUESTIONS.
+  //
+  // The run LIST says whether anything succeeded. That alone decides whether the
+  // base is usable, and it needs no help: a run that concluded failure did not
+  // succeed, whatever its steps did.
+  //
+  // The step reads only explain WHY, and they can be unreadable without changing
+  // the first answer. Folding them into the verdict is what produced three
+  // successive defects here — an unreadable step read subtracted from an all-red
+  // history, and a mix of causes matched no homogeneous test. Both were the same
+  // mistake: letting the explanation decide the conclusion.
+  const lines = [`${branch}: ${reported.length} of the last ${runs.length} completed ${workflow} runs concluded failure`];
+  if (noStep) lines.push(`${noStep} of those executed no steps`);
+  if (unreadable) lines.push(`${unreadable} of those could not be read, so why they failed is unknown`);
 
-  // A ZERO STEP COUNT IS A FACT ABOUT EXECUTION, NOT ABOUT ITS CAUSE.
-  //
-  // It says no step ran. It does not say why, and the two causes want opposite
-  // responses: an exhausted runner quota is infrastructure and the code is
-  // blameless, while a workflow whose matrix or job expression cannot be
-  // evaluated is the repository's own bug and reads identically from here.
-  //
-  // So this reports what was measured and refuses to name a cause. Saying "CI is
-  // not executing" would have sent an operator to check billing for a broken
-  // workflow file — the same class of mistake as the conclusion-reading this
-  // whole check exists to correct, one level up.
-  // BROKEN IS ABOUT THE ABSENCE OF A USABLE RESULT, not about which way the runs
-  // were unusable.
-  //
-  // Splitting "failed" from "executed nothing" made each test homogeneous, so a
-  // sample of five real failures and five that never ran — ten out of ten with no
-  // usable measurement in it — fell through both and reported DEGRADED. The
-  // previous implementation called that same all-failure history BROKEN, so
-  // classifying the causes more precisely made the base look HEALTHIER. A
-  // refinement that loses the coarser truth it refined.
-  //
-  // The condition is therefore the union, and only the wording below distinguishes
-  // the causes.
-  if (runs.length > 0 && failed + noStep === runs.length) {
-    if (noStep === runs.length) {
+  if (runs.length > 0 && reported.length === runs.length) {
+    // Nothing in this sample succeeded. The wording distinguishes the causes; the
+    // verdict does not depend on being able to tell them apart.
+    if (noStep === reported.length) {
       lines.push("-> nothing on this branch has been measured; no gate downstream of it means anything");
       lines.push("-> cause is NOT determined here: an exhausted runner quota and a workflow that cannot start look identical from the step count");
-    } else if (failed === runs.length) {
+    } else if (failed === reported.length) {
       lines.push("-> every PR inherits a red rollup, so a new failure is invisible");
     } else {
-      lines.push("-> no completed run in this sample produced a usable result: some failed, some executed nothing");
+      lines.push("-> no completed run in this sample produced a usable result");
     }
     return { id: "R-04", level: BROKEN, title: "base health", lines };
   }
-  if (unreadable && !failed && !noStep) return { id: "R-04", level: UNKNOWN, title: "base health", lines };
-  if (failed > 0 || noStep > 0) return { id: "R-04", level: DEGRADED, title: "base health", lines };
+  if (reported.length > 0) return { id: "R-04", level: DEGRADED, title: "base health", lines };
   return { id: "R-04", level: OK, title: "base health", lines };
 }
 

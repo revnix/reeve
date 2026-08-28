@@ -20,8 +20,16 @@ existed and its squash SHA (`0d31350`) carries no number. Verified 2026-08-27 by
 Any other pre-convention PR would be invisible the same way; the count above (38) against 42
 merged PRs is the measure of how many.
 
-**Last verified:** 2026-08-28, `main` = **`36b4107`**. It moved twice during the S3 planning
-session (`c500cfe` → `16cd880` → `36b4107`); #54 was workflow-only so no source anchor moved.
+**Last verified:** 2026-08-28, `main` = **`4730b44`**. **Ten commits** have landed since the S3
+planning session began at `c500cfe`. **Do not maintain that chain by hand — it was written out
+here once and was already wrong in two ways** (it claimed seven movements while listing eight, and
+omitted `89c4af6` and `97838d9` entirely). Re-derive it:
+
+```bash
+git log --oneline c500cfe..origin/main     # 10 commits as of 4730b44
+```
+
+`#54` was workflow-only, so no source anchor moved with it.
 **`revnix/reeve` is PUBLIC** since 2026-08-27 — a closed founder decision, see `s3.md`.
 
 ---
@@ -53,12 +61,28 @@ A stage is MERGED only when every row of its Verify table names a file that exis
 
 | what | who | where |
 |---|---|---|
-| The foundation — this commit | this lane | `reeve#58`, in review — **10 codex review objects, 78 threads**; findings per round 6 → 9 → 13 → **5**, tapering after the brief was demoted from normative. CI green. |
-| The merge verifier, split out of #58 | this lane | `reeve#60`, in review — **7 codex review objects, 25 threads**; findings per round 4 → 3 → 3 → 3. CI green. |
+| The close-out itself | this lane | `reeve#62`, in review — the PR containing this line. It is what the watcher is following. |
+| The P2 claim | this lane | `reeve#64`, in review — one file; **P2 does not start until it merges** (`claims/README.md`) |
 | The six S3 stage plans — **written, not yet in a PR** | this lane | branch `docs/s3-foundation`; they land one at a time (decision 17) |
 
+**The three FOUNDATION PRs are merged** — #57, #58, #60. This lane is not idle: the rows above are
+open. A close-out that declares nothing in flight while it is itself an open PR is a tracker
+disagreeing with the reason it exists.
+
+| PR | what | squash | rounds | findings | verified |
+|---|---|---|---|---|---|
+| `reeve#57` | the test suite's dead network | `89c4af6` | 1 | 1 | by content |
+| `reeve#58` | the planning foundation — roadmap, authoring spec, trackers, prompt | `a136836` | 10 | **33** (6 → 9 → 13 → 5) | 13/13 INTACT **at `4730b44`**; exit 32 once `reeve#62` lands, correctly — see below |
+| `reeve#60` | the merge verifier | `aaa558a` | 7 | **13** (4 → 3 → 3 → 3) | 3/3 INTACT **at `4730b44`**; no tracker work touches its paths |
+
+**`node scripts/verify-merge.mjs <pr>` is live on `main`** as of `aaa558a`, and its first real use
+was verifying its own merge.
+
+**Both verifications are anchored at `main` = `4730b44`; #58's becomes exit 32 when this PR merges,
+correctly.** Why, and how to read it: `s3.md` §1.
+
 **S3's eleven documents are complete.** Six plans (14,167 lines, 78 tasks), a master plan, an
-implementation prompt and five trackers.
+implementation prompt and five trackers. **The plans are still the only part not on `main`.**
 
 **P1 is DONE** — `reeve#57` merged as `89c4af6`, verified by content; the suite went 550s → 303s
 and `test/offline-tests.test.mjs` guards the relapse. Its claim is RELEASED.
@@ -93,7 +117,7 @@ the workflow says they do not need. **F5 is the only genuine blocker.**
 |---|---|---|
 | F1 | Name the spec repos | **Create them, one per project, named `<project>-specs`**: `revnix/reeve-specs`, `nextlyhq/nextly-specs`, `revnix/rext-specs`, all private. Rejected, with the reason recorded so it is not reopened: **one shared repo** fails because `specRepoId` is a numeric GitHub id **per project**, so three projects sharing one id makes the snapshot stop distinguishing them — which fights the design's own identity model (§11.1, *"immutable numeric GitHub ids… with human-readable snapshots beside them"*); **reusing the code repos** fails because spec PRs would land beside code PRs, which is exactly the separation S4's gate depends on. |
 | F2 | Arm `--execute` on the live guardian? | **Leave it off for now.** S3's first code PRs (T7, T8) modify files the running daemon executes, so arming before those merge means a live daemon acting on code that is mid-change. Revisit after T8 merges. The #52 gate itself is lifted — this is a separate, deliberate decision not to arm. |
-| F3 | The 15-minute watcher loop | **RUNNING again**, 2026-08-28, job `75eb5153`, subjects `reeve#58` and `reeve#60`. It was STOPPED 2026-08-27 (job `0011c181`) because nothing of this lane's was open, and restarted when S3's first PRs opened, as that row required. A watcher with no subject reports "quiet" every fifteen minutes, and quiet-with-no-subject is the exact reading that let a 22-hour CI outage go unremarked. |
+| F3 | The 15-minute watcher loop | **RUNNING**, job `75eb5153`. Its subject is **whatever `gh pr list --state open` returns**, re-derived every tick, so it followed `reeve#58`/`reeve#60` to `reeve#62` when those merged — no retarget was needed or performed. That is deliberate: a watcher holding a hard-coded subject list goes on reporting "quiet" truthfully while watching nothing, which is the reading that let a 22-hour CI outage pass unremarked. It was STOPPED 2026-08-27 (job `0011c181`) with nothing open, and restarted when S3's first PRs opened. **It stops when this lane has no open PR, not when one subject closes.** |
 
 ---
 

@@ -108,7 +108,11 @@ existed since `src/checkout.mjs` replaced them.
     a false negative in the **common** case. The squash already incorporates whatever `main` did
     beforehand, so it cannot be confounded by a moving base.
 
-    **Until reeve#60 merges, do it by hand — with `ls-tree`, not `rev-parse`.** `git rev-parse
+    **If `scripts/verify-merge.mjs` is not in your checkout, do it by hand — with `ls-tree`, not
+    `rev-parse`.** It merged as `aaa558a`, so a checkout without it is behind `main` and the
+    better fix is to update; this is for when you cannot. **It is a REDUCED capability, not an
+    equivalent** — it does not cross-check the pull request's file list and does not print the
+    scope statement, so it is silent about what it did not cover. `git rev-parse
     <rev>:<path>` returns the blob, and **mode lives in the tree**, so a lost executable bit
     shares its blob id with the version that never had one:
 
@@ -446,7 +450,8 @@ When, and only when, the founder grants this specific PR:
    (see *Reading CI* below), and zero unresolved threads on **both** endpoints.
 2. Merge, with **no AI attribution in the squash message**.
 3. **Verify by CONTENT, by the procedure in rule 11 — do not restate it here.** Run
-   `node scripts/verify-merge.mjs <pr>`, or rule 11's fallback if reeve#60 has not landed.
+   `node scripts/verify-merge.mjs <pr>` — on `main` since `aaa558a` — or rule 11's reduced
+   fallback only if your checkout does not have it.
 
    **This step used to carry its own copy of the comparison, and the copy went stale**: it said
    *"compare … against the branch head"*, which rule 11 had already been corrected to forbid, and

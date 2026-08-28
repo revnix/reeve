@@ -153,8 +153,13 @@ export function validateManifest(entries) {
     // ANY failure in that file, so a stub that breaks something adjacent reads as
     // success while the property it was aimed at stays unmeasured. Measured by a
     // neighbouring session, which hit exactly that.
-    if (!e.expectRed)
-      throw new Error(`${where}: needs "expectRed" — text from the assertion that must fail, not just a file`);
+    // A NON-EMPTY STRING, checked rather than merely truthy. `String.prototype
+    // .includes` coerces its argument, so `expectRed: []` becomes the empty string
+    // and matches EVERY failing assertion — the entry then reports CAUGHT whatever
+    // went red, which is exactly the named-assertion invariant this field exists
+    // to hold.
+    if (typeof e.expectRed !== "string" || !e.expectRed.trim())
+      throw new Error(`${where}: "expectRed" must be a non-empty string — text from the assertion that must fail, not just a file`);
     if (!Array.isArray(e.edits) || e.edits.length === 0)
       throw new Error(`${where}: needs at least one edit`);
     for (const [j, ed] of e.edits.entries()) {
@@ -176,15 +181,23 @@ export function validateManifest(entries) {
  * Tied to this repository's own test output — `PASS  name` / `FAIL  name` — rather
  * than to a framework, because that is what these tests emit.
  */
+const ASSERTION = /^(PASS|FAIL) {2}(.+)$/;
+
 export function failedAssertions(output) {
+  // THE DELIMITER IS PART OF THE PROTOCOL. Matching a bare `FAIL` prefix also
+  // matches ordinary diagnostics — `FAILURE: named guard`, `FAILED 2` — and a
+  // crashing test that prints one containing the expected text would be read as
+  // the named assertion failing, so a run where no assertion executed at all
+  // would report CAUGHT.
   return String(output).split("\n")
-    .filter(l => l.startsWith("FAIL"))
-    .map(l => l.slice(4).trim());
+    .map(l => ASSERTION.exec(l))
+    .filter(m => m && m[1] === "FAIL")
+    .map(m => m[2].trim());
 }
 
 /** Whether the run produced any assertion results at all. */
 export function reportedAnyAssertion(output) {
-  return String(output).split("\n").some(l => l.startsWith("PASS") || l.startsWith("FAIL"));
+  return String(output).split("\n").some(l => ASSERTION.test(l));
 }
 
 /**

@@ -323,6 +323,83 @@ const fresh = tag => open(join(mkdtempSync(join(tmpdir(), `reeve-dep-${tag}-`)),
   check(n3 === 0, "and the count reports what was RETIRED, not what was considered", String(n3));
 }
 
+// --- a cascaded transition and its event commit together, or not at all --------
+{
+  // Emitting the event was necessary and was not sufficient. The update and the
+  // insert were separate autocommit statements, so a failure between them left a
+  // dead-lettered row with no immutable event -- the exact projection/trail
+  // divergence the event was added to close.
+  //
+  // Driven by making the INSERT fail for real, with a trigger that aborts it,
+  // rather than by reading the code and agreeing with it.
+  const db = fresh("atomic");
+  const mk = (key, dependsOn = null) => tx(db, () => enqueue(db, {
+    idemKey: key, kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: key }, dependsOn }));
+  const a1 = mk("a"); const b1 = mk("b", a1);
+  const l = leaseOutbox(db, { worker: "t", kinds: ["gh.pr.comment"] });
+  settleOutbox(db, { id: a1, leaseToken: l.lease_token, ok: false, retryable: false, error: "no" });
+
+  db.exec(`CREATE TRIGGER no_cascade_events BEFORE INSERT ON event
+           WHEN NEW.op = 'outbox.dead_letter'
+           BEGIN SELECT RAISE(ABORT, 'event insert refused'); END`);
+
+  const e = threw(() => cascadeDeadLetter(db));
+  check(e !== null, "control: the trigger really did make the event insert fail", String(e).slice(0, 80));
+  check(db.prepare("SELECT status FROM outbox WHERE id=?").get(b1).status === "pending",
+    "the status change is ROLLED BACK when its event cannot be written", 
+    db.prepare("SELECT status FROM outbox WHERE id=?").get(b1).status);
+
+  db.exec("DROP TRIGGER no_cascade_events");
+  cascadeDeadLetter(db);
+  check(db.prepare("SELECT status FROM outbox WHERE id=?").get(b1).status === "dead_letter",
+    "and it goes through once the event can be written");
+
+  // Opening its own transaction per batch means it must not be handed one.
+  const e2 = threw(() => tx(db, () => cascadeDeadLetter(db)));
+  check(e2 && /must not be called inside one/.test(String(e2.message)),
+    "and being called inside a transaction is refused rather than nested", String(e2?.message));
+}
+
+// --- the cascade is bounded by the pass budget ---------------------------------
+{
+  // The drainer awaits this before it leases anything, and the daemon's tick
+  // awaits the drainer. So an unbounded cascade over a large dependent tree does
+  // not merely finish late, it delays evaluation, heartbeats and alerts.
+  const db = fresh("bounded");
+  const parent = tx(db, () => enqueue(db, {
+    idemKey: "p", kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "p" } }));
+  for (let i = 0; i < 5; i++)
+    tx(db, () => enqueue(db, { idemKey: `c${i}`, kind: "gh.pr.comment",
+      args: { nwo: "o/r", pr: 1, body: `c${i}` }, dependsOn: parent }));
+  const l = leaseOutbox(db, { worker: "t", kinds: ["gh.pr.comment"] });
+  settleOutbox(db, { id: parent, leaseToken: l.lease_token, ok: false, retryable: false, error: "no" });
+
+  // A deadline already in the past: the budget is spent deciding not to start.
+  const none = cascadeDeadLetter(db, { deadlineAt: 1000, now: () => 5000 });
+  check(none.length === 0, "a spent budget cascades nothing", String(none.length));
+  check(db.prepare("SELECT count(*) n FROM outbox WHERE status='pending'").get().n === 5,
+    "and every descendant is left pending for the next pass, not lost");
+
+  // One batch at a time, with the clock running out after the first.
+  let t = 0;
+  const some = cascadeDeadLetter(db, { batch: 2, deadlineAt: 10, now: () => (t += 10) - 10 });
+  check(some.length === 2, "a batch is completed and the rest deferred", String(some.length));
+  check(db.prepare("SELECT count(*) n FROM outbox WHERE status='pending'").get().n === 3,
+    "the remainder is still pending");
+
+  // And the next pass finishes the job, because the selection is idempotent.
+  const rest = cascadeDeadLetter(db);
+  check(rest.length === 3, "the next pass picks up exactly what was left", String(rest.length));
+  check(db.prepare("SELECT count(*) n FROM outbox WHERE status='pending'").get().n === 0,
+    "and nothing is stranded");
+  // SIX, not five: the parent's own terminal settle emits one too, and it is the
+  // same op because it is the same transition. Asserting five would have been
+  // asserting that the parent's death went unrecorded.
+  check(db.prepare("SELECT count(*) n FROM event WHERE op='outbox.dead_letter'").get().n === 6,
+    "with one event per transition — five cascaded plus the parent's own",
+    String(db.prepare("SELECT count(*) n FROM event WHERE op='outbox.dead_letter'").get().n));
+}
+
 // --- a store whose outbox PREDATES the column must still open ------------------
 {
   // Built rather than mocked, because the defect this guards is invisible to a

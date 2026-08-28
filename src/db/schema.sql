@@ -114,6 +114,19 @@ CREATE TABLE IF NOT EXISTS outbox (
                  ('git.push','gh.pr.create','gh.pr.comment','gh.pr.merge',
                   'gh.thread.resolve','notify')),
   run_id       TEXT REFERENCES run(id),
+  -- The effect this one waits for, and the reason it is an EDGE rather than one
+  -- compound handler that does both halves.
+  --
+  -- Spilling needs an issue created and then replies naming its number, and the
+  -- number does not exist until the first effect has delivered. A compound handler
+  -- would hold both, and would then have to share one retry budget and one
+  -- idempotency key across two writes with different costs: re-running it after a
+  -- successful create and a failed reply would file a second issue. Split in two,
+  -- each half keeps its own budget, its own key and its own marker.
+  --
+  -- Nullable, and null is the ordinary case: an effect that waits for nothing is
+  -- every effect written before this column existed, which is why it is additive.
+  depends_on   INTEGER REFERENCES outbox(id),
   args         TEXT NOT NULL,                 -- JSON
   status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN
                  ('pending','inflight','done','failed','dead_letter')),
@@ -167,6 +180,12 @@ CREATE TABLE IF NOT EXISTS outbox (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS outbox_due ON outbox(not_before, id) WHERE status='pending';
 CREATE INDEX IF NOT EXISTS outbox_inflight ON outbox(lease_expires_at) WHERE status='inflight';
+-- `outbox_depends` is NOT here, and that is deliberate. It indexes a column that
+-- ADDED_COLUMNS adds, and this file is executed BEFORE those columns exist -- so
+-- on a database whose outbox predates the column, CREATE TABLE IF NOT EXISTS is a
+-- no-op, the column is still absent, and creating the index here throws at open()
+-- on exactly the stores that carry real history. It lives in ADDED_INDEXES in
+-- ops.mjs, which runs after the column is in place.
 
 -- ---------------------------------------------------------------- inbox
 -- Facts observed from the outside world (GitHub). Dedup by external id so a

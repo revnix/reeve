@@ -485,6 +485,24 @@ worse than one that sends them to a string: the string is still there.**
 
 ### B.6 The task template
 
+> **AMENDED 2026-08-28, on measurement.** A task no longer carries its failing test written out
+> in full. **The measured reason:** the first two S3 plan documents drew **38 confirmed defects
+> across 4,164 lines**, and **ten of them were stub loops that could not be run as written** —
+> a loop restoring from a `.bak` the plan had already deleted, a "stub verified applied" grep
+> that read 1 only while the stub was *not* applied, stubs whose named assertions could not go
+> red. **Code inside a Markdown fence is never executed, so nothing catches any of that** until
+> an executor hits it; the corpus's largest single finding shape is *"the snippet is not runnable
+> as written"* at 176 findings, **137 of them inside `.md` files**.
+>
+> **What a task carries now:** the behavioural claim, the files, the consumed interfaces with
+> real signatures, the `**On the broken implementation**` block, and **the named stub with the
+> assertion that must go red and the ones that must stay green as controls**. What it no longer
+> carries is the test body. The executor writes that in the editor, where it runs.
+>
+> **What is emphatically NOT relaxed:** test-first, the four-check stub loop, and the rule that a
+> stub producing no failures means the property is untested. The discipline is unchanged; only
+> the place the code is written has moved to somewhere it can fail.
+
 ```markdown
 ### Task <N>: <a claim about behaviour — "Spawn binding fails closed", never "Implement X">
 

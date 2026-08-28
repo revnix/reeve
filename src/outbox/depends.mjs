@@ -95,14 +95,27 @@ export function resolveDependencyArgs(args, parentResult) {
       "these args carry a ${dep.…} token but the effect has no dependency, so there is no result to read from");
 
   const missing = new Set();
+  const nonScalar = new Set();
   const filled = walk(args, s => s.replace(TOKEN, (whole, path) => {
     const v = at(parentResult, path);
     // `null` counts as missing. A handler that recorded an explicit null is saying
     // it does not have the value, and interpolating "null" into a comment body is
     // the visibly-broken delivery this refuses to make.
     if (v === undefined || v === null) { missing.add(path); return whole; }
+    // SCALARS ONLY. `String({})` is "[object Object]" and `String([1,2])` is "1,2",
+    // and both are delivered without complaint -- which is the visibly-broken
+    // comment this whole module exists to refuse, arriving through the one path
+    // that was not checking. A token aimed one level too high (`${dep.issue}` when
+    // the result is `{issue:{number:3}}`) is an ordinary mistake, so it must fail
+    // like one rather than publish.
+    if (typeof v === "object") { nonScalar.add(path); return whole; }
     return String(v);
   }));
+
+  if (nonScalar.size)
+    throw new DependencyResolutionError(
+      `the dependency's result holds an object or array at ${[...nonScalar].map(p => `\`${p}\``).join(", ")}, ` +
+      `which cannot be interpolated into text; name a scalar inside it`);
 
   if (missing.size)
     throw new DependencyResolutionError(

@@ -10,7 +10,7 @@
 // involved, and the classification can be driven into states a real merge would
 // take days to produce.
 
-import { classifyFiles, verdictFor, pathsOf, safePath, exitFor,
+import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, safePath, exitFor,
          FILE_STATE, VERDICT, EXIT, ABSENT } from "../src/mergecheck.mjs";
 
 let fail = 0;
@@ -162,6 +162,102 @@ const F = "100644", X = "100755", L = "120000";
     "they become visible escapes rather than vanishing", JSON.stringify(out));
   check(safePath("src/a-b_c.mjs") === "src/a-b_c.mjs",
     "control: an ordinary path is returned unchanged", safePath("src/a-b_c.mjs"));
+}
+
+
+// --- THE GIT READS, AS ARGUMENT LISTS ----------------------------------------
+// These four properties live in the argv, not in the output, and each was a
+// review finding. A property nothing can observe is a property nothing defends,
+// so the runner is injected and the arguments themselves are the assertion.
+{
+  const calls = [];
+  const REPLY = [];
+  const G = gitFacts((args) => { calls.push(args); return REPLY.shift() ?? ""; });
+
+  REPLY.push("deadbeef", "sha par", "a b", "100644 blob cafe\tf");
+  G.pinMain(); G.parentsOf("sha"); G.mergePaths("sha"); G.entryAt("sha", "f");
+  check(calls.length === 4, "the four reads issue four git calls", String(calls.length));
+  check(calls.every(a => a[0] === "--literal-pathspecs"),
+    "every git call leads with --literal-pathspecs, so a path beginning ':' is never read as pathspec magic",
+    JSON.stringify(calls.map(a => a[0])));
+
+  const pinCall = calls[0];
+  check(pinCall.includes("rev-parse") && pinCall.includes("origin/main^{commit}"),
+    "pinMain resolves origin/main to a commit id rather than leaving the mutable name",
+    JSON.stringify(pinCall));
+
+  // --no-renames, or a rename collapses to its destination and the source side
+  // is never compared. -z, or a newline in a filename is quoted into a different
+  // string. Both are repository-level defaults this must not be at the mercy of.
+  const dt = calls[2];
+  check(dt.includes("--no-renames"), "mergePaths disables rename detection, which is otherwise a repo setting", JSON.stringify(dt));
+  check(dt.includes("-z"), "and asks for NUL-separated output", JSON.stringify(dt));
+  check(dt.includes("-r") && dt.includes("--no-commit-id"), "and recurses, without the commit-id line", JSON.stringify(dt));
+}
+
+// The enumeration must survive a filename containing a newline -- the reason -z
+// exists. A line-split would report this as two paths, neither of which exists.
+{
+  const evil = "src/a\nb.mjs";
+  const G = gitFacts(() => [evil, "plain.mjs"].join("\0") + "\0");
+  const got = G.mergePaths("sha");
+  check(got.length === 2 && got[0] === evil,
+    "a path containing a newline survives enumeration as ONE path", JSON.stringify(got));
+}
+
+// entryAt returns the tree entry, and ABSENT only for an empty read.
+{
+  const G = gitFacts(() => "100755 blob abc123\trun.sh");
+  const e = G.entryAt("rev", "run.sh");
+  check(e.mode === "100755" && e.id === "abc123", "entryAt reads mode AND id from the tree entry", JSON.stringify(e));
+  check(gitFacts(() => "").entryAt("rev", "nope") === ABSENT,
+    "an empty ls-tree is ABSENT -- the revision was read and holds no such path");
+}
+
+// --- PATHS THE MERGE DID NOT PRODUCE -----------------------------------------
+// The pull request's file list describes the branch HEAD. A push after the merge
+// can change WHICH paths it names without changing HOW MANY, so a count check
+// cannot catch it. These are reported, never folded into the verdict.
+{
+  const extra = branchOnlyPaths(["a.mjs", "late.mjs"], ["a.mjs"]);
+  check(extra.length === 1 && extra[0] === "late.mjs",
+    "a path the API lists and the merge did not produce is identified", JSON.stringify(extra));
+  check(branchOnlyPaths(["a.mjs"], ["a.mjs", "b.mjs"]).length === 0,
+    "control: the merge producing MORE than the API lists yields no branch-only paths");
+
+  const entryAt = fixture({ [S]: { "a.mjs": `${F} x` }, [M]: { "a.mjs": `${F} x` } });
+  const files = classifyFiles(["a.mjs"], { squash: S, main: M, entryAt });
+  const v = verdictFor(files, { branchOnly: extra });
+  check(v.verdict === VERDICT.intact && exitFor(v.verdict) === EXIT.ok,
+    "an uncovered path does NOT change the verdict -- it was not part of the merge", v.verdict);
+  check(/NOT COVERED BY THE VERDICT ABOVE/.test(v.why) && v.why.includes("late.mjs"),
+    "but it is named, loudly, so 'not covered' cannot be read as 'covered'", v.why);
+  check(/rebase merge names only its LAST commit/.test(v.why),
+    "and the reading under which it is NOT benign is named too");
+  check(!/NOT COVERED BY THE VERDICT ABOVE/.test(verdictFor(files).why),
+    "control: with no branch-only paths the section is absent, not empty");
+}
+
+// A cross-check that could not run says so, and does not become a verdict.
+{
+  const entryAt = fixture({ [S]: { a: `${F} 1` }, [M]: { a: `${F} 1` } });
+  const files = classifyFiles(["a"], { squash: S, main: M, entryAt });
+  const v = verdictFor(files, { crossCheck: "rate limited" });
+  check(v.verdict === VERDICT.intact,
+    "a failed cross-check leaves the verdict intact -- it is computed from the merge's own diff, read locally", v.verdict);
+  check(/could not be completed \(rate limited\)/.test(v.why),
+    "and the failure is reported with its reason rather than passing silently", v.why);
+  check(!/could not be completed/.test(verdictFor(files).why),
+    "control: a complete cross-check adds no such note");
+}
+
+// An empty merge diff is UNREADABLE, and names which read was empty.
+{
+  const v = verdictFor([]);
+  check(v.verdict === VERDICT.unreadable && exitFor(v.verdict) === EXIT.unreadable,
+    "a merge whose diff names zero paths is UNREADABLE, not intact", v.verdict);
+  check(/merge commit's own diff/.test(v.why),
+    "and names the merge diff as the empty read, not the API list", v.why);
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

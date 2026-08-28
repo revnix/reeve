@@ -24,6 +24,14 @@
 // intermediate commit reports every one as missing. Both produced a false alarm
 // here in one week.
 //
+// WHERE THE PATHS COME FROM, AND WHY NOT THE API. The set of paths to check is
+// taken from the SQUASH COMMIT'S OWN DIFF, not from `pulls/<n>/files`. That
+// endpoint describes the branch HEAD, which a push after the merge moves -- so a
+// late commit that restores one path and touches another changes the list
+// without changing its length, and the omitted path goes unchecked while the
+// count still agrees. The merge's diff is the exact set the merge produced, it
+// needs no network, and it cannot be edited after the fact.
+//
 // WHAT THIS DELIBERATELY NO LONGER CLAIMS. It does not tell you whether a commit
 // pushed to the branch AFTER the merge was lost. A branch head differing from
 // the squash has two causes -- a late push, or a base that moved before the
@@ -88,10 +96,10 @@ export function classifyFiles(paths, { squash, main, head = UNREAD, entryAt }) {
  * read that saw nothing, and answering "all intact" over nothing is how a
  * narrowing check reports success.
  */
-export function verdictFor(files) {
+export function verdictFor(files, { branchOnly = [], crossCheck = "complete" } = {}) {
   if (files.length === 0) {
     return { verdict: VERDICT.unreadable, counts: { intact: 0, drifted: 0, gone: 0, headDiverged: 0 },
-             why: "the pull request reports zero changed paths, so there is nothing to compare. An empty set is not a pass." };
+             why: "the merge commit's own diff names zero paths, so there is nothing to compare. An empty set is not a pass." };
   }
   const counts = { intact: 0, drifted: 0, gone: 0, headDiverged: 0 };
   for (const f of files) {
@@ -106,14 +114,31 @@ export function verdictFor(files) {
       `  - main having moved before the merge, which the squash correctly folded in.\n` +
       `Look at the branch if it matters. It is not evidence about main either way.`
     : "";
+  // Paths the branch touches that this MERGE did not produce. Benign for a late
+  // push; NOT benign if the merge commit is a rebase tip, where the earlier
+  // commits' paths are simply unverified. Both readings named, neither asserted
+  // -- and named LOUDLY, because "not covered" read as "covered" is exactly the
+  // false reassurance this tool exists to remove.
+  const uncovered = branchOnly.length > 0
+    ? `\n\nNOT COVERED BY THE VERDICT ABOVE: ${branchOnly.length} path(s) appear in the pull request's file list but are absent from this merge commit's diff:\n` +
+      branchOnly.map(p => `  - ${safePath(p)}`).join("\n") +
+      `\nTwo causes, and this cannot tell them apart:\n` +
+      `  - commits pushed to the branch AFTER it merged, which this merge correctly does not carry, and which are fine to ignore;\n` +
+      `  - a merge that is not a squash of the whole branch (a rebase merge names only its LAST commit), in which case those paths are UNVERIFIED and the verdict below covers less than the pull request.\n` +
+      `Look at the branch if it matters.`
+    : "";
+  const incomplete = crossCheck !== "complete"
+    ? `\n\nThe cross-check against the pull request's file list could not be completed (${crossCheck}), so paths the merge did not produce may exist and not be listed above. The verdict itself is unaffected: it is computed from the merge commit's own diff, which was read locally.`
+    : "";
+  const note2 = note + uncovered + incomplete;
   if (counts.drifted > 0) {
     return { verdict: VERDICT.drifted, counts,
              why: `${counts.drifted} of ${files.length} path(s) on main differ from what the merge produced. The content arrived and something changed it since.\n` +
-                  `That may be a legitimate follow-up or someone overwriting the work. This cannot tell which, and a human decides.${note}` };
+                  `That may be a legitimate follow-up or someone overwriting the work. This cannot tell which, and a human decides.${note2}` };
   }
   return { verdict: VERDICT.intact, counts,
            why: `All ${files.length} path(s) on main are exactly what the merge produced, mode included.\n` +
-                `Compared against the SQUASH COMMIT rather than the branch head: the squash already incorporates whatever main did before the merge, so a base that moved cannot make this read as missing.${note}` };
+                `Compared against the SQUASH COMMIT rather than the branch head: the squash already incorporates whatever main did before the merge, so a base that moved cannot make this read as missing.${note2}` };
 }
 
 // Exit codes in the 15-125 band reeve owns. Node reserves 1 and 3-14 -- a
@@ -146,6 +171,60 @@ export function pathsOf(files) {
     if (f.previous_filename && f.previous_filename !== f.filename) out.push(f.previous_filename);
   }
   return [...new Set(out)];
+}
+
+/**
+ * The git reads this needs, over an injected runner.
+ *
+ * `run(args)` executes git with `args` and returns stdout. It is injected so the
+ * ARGUMENT LISTS are testable without a repository: three of the properties here
+ * are properties of the argv itself -- `--literal-pathspecs` on every call,
+ * `--no-renames` and `-z` on the enumeration, and a PINNED sha rather than the
+ * name `origin/main` -- and a property nothing can observe is a property nothing
+ * defends. Each was a review finding whose fix would otherwise have shipped with
+ * no test able to fail on its removal.
+ */
+export function gitFacts(run) {
+  // `--literal-pathspecs` FIRST and on every call: a filename is
+  // attacker-supplied, and git reads a leading `:` as pathspec magic, so
+  // `:(literal):foo` would send a lookup after `:foo` instead. It also disables
+  // wildcards, so a filename containing `*` cannot match some other file.
+  const g = (...args) => run(["--literal-pathspecs", ...args]);
+  return {
+    // Resolved to an object id, because `origin/main` is MUTABLE: left as a
+    // name, each lookup re-resolves it and a concurrent fetch can serve some
+    // paths from the old main and some from the new.
+    pinMain: () => g("rev-parse", "origin/main^{commit}"),
+    // Through `g` like every other read, so "every git call this makes carries
+    // --literal-pathspecs" is one uniform invariant a test can assert, rather
+    // than a per-call judgement that rots the first time a call is added.
+    parentsOf: (rev) => g("rev-list", "--parents", "-n", "1", rev).trim().split(/\s+/).slice(1),
+    // `--no-renames` so a rename cannot collapse to its destination and drop the
+    // source side -- `diff.renames` is a repository setting, and this must not
+    // depend on it. `-z` because a filename may contain a newline, which git
+    // would otherwise quote into a different string.
+    mergePaths: (rev) =>
+      g("diff-tree", "--no-commit-id", "--no-renames", "--name-only", "-r", "-z", rev)
+        .split("\0").filter(Boolean),
+    // TREE ENTRY, not blob: mode lives in the tree, so an executable bit that
+    // never arrived shares its blob id with the version that did.
+    entryAt: (rev, path) => {
+      const out = g("ls-tree", "--full-tree", rev, "--", path).trim();
+      if (!out) return ABSENT;
+      const [mode, , id] = out.slice(0, out.indexOf("\t")).split(/\s+/);
+      return { mode, id };
+    },
+  };
+}
+
+/**
+ * Paths the pull request's file list names that the merge commit did not
+ * produce. Reported, never subtracted from the verdict: the verdict is about
+ * what the merge did, and these are by definition not part of it.
+ */
+export function branchOnlyPaths(apiPaths, mergePaths) {
+  const produced = new Set(mergePaths);
+  return apiPaths.filter(p => !produced.has(p));
 }
 
 /**

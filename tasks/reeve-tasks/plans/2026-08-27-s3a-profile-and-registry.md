@@ -10,7 +10,7 @@
 
 **Spec:** `docs/2026-08-21-builder-design.md` — §14 S3 (`:826`) is the stage definition and its *Verify:* clause is the definition of done. The sections that bind this plan: §1.4 (capability switches), §1.5 `:69` (the registry, the registry snapshot, and *"Every new profile key … is added to the profile `FIELDS` validator **first**"*), §4.1 `:290` (the per-action budget object), §5 `:335` (the `maxPackages` floor), §10.2 `:558` (`starvedHours`), §10.3 `:562` (`maxConcurrentTasks`), §10.4 `:569-572` (the scheduler knobs and *"Limits are measured before they are chosen"*), §11.6 (documentation generated from the validator).
 
-**This is one of six plans for S3.** The three S2 **plan** PRs — 14 files, all Markdown — produced **561 of the 1,282 findings review has ever raised in this repository, 43.8% of everything**; the decisive one, PR#12, was **one file, +3,994 lines, 213 findings, 15 rounds**, against PR#20's 30 files and 26 findings. A single S3 plan would be 6,000–8,000 lines, which is precisely the artifact measured to be unreviewable, so S3 is six documents of ~1,200 lines each.
+**This is one of six plans for S3.** The three S2 **plan** PRs — 14 files, all Markdown — produced **561 of the 1,282 findings review has ever raised in this repository, 43.8% of everything**; the decisive one, PR#12, was **one file, +3,994 lines, 213 findings, 15 rounds**, against PR#20's 30 files and 26 findings. A single S3 plan would be 6,000–8,000 lines, which is precisely the artifact measured to be unreviewable, so S3 is six documents carrying **at most three or four plan tasks each**. (The cap's unit is TASKS, not lines — corrected 2026-08-27, `../MASTER-PLAN.md` §B.1.2.)
 
 | plan | scope |
 |---|---|
@@ -84,7 +84,7 @@ Do not re-derive any of these.
 
 Recorded so no executor re-litigates them. Items 1–8 are the tracker's §4; items 9–11 are reading hazards this plan inherits.
 
-1. **S3 splits into six plan documents, ~1,200 lines each.** The three S2 plan PRs produced 561 of 1,282 findings — 43.8% of every finding this repository's review has ever produced. PR#12 was one file, 213 findings, 15 rounds.
+1. **S3 splits into six plan documents**, each carrying at most three or four plan tasks. *(The original form of this decision capped a document at ~1,200 LINES. That figure was computed against S3's 16 PRs, when a PR decomposes into three to five plan tasks and the house style runs ~500 lines per task; it was corrected to a TASK cap on 2026-08-27 — see `../MASTER-PLAN.md` §B.1.2 and tracker §4.13. The lever is fewer tasks per document, never thinner tasks.)* The three S2 plan PRs produced 561 of 1,282 findings — 43.8% of every finding this repository's review has ever produced. PR#12 was one file, 213 findings, 15 rounds.
 2. **S3 is §14 verbatim, including all six measurements.** No obligation is dropped for being expensive; V5 alone is 20 runs, and the comparator for real dispatch cost is $2.66 for three (`docs/measured/2026-08-23-three-real-dispatches.md`).
 3. **Issue reeve#50 lands before S3's dispatcher**, and its merge commit is **this plan's base**. #50's acceptance test is *"adding a new call site must not be able to skip a rule"*, and T8 is that call site.
 4. **The test suite's dead network is fixed in a standalone PR before T1.** Measured with a control: 550.1s → 159.8s, PASS output byte-identical on the four largest files. Standalone, because it touches guardian files.

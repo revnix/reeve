@@ -9,7 +9,7 @@
 // reached for `gh` itself would pass every behavioural test here and still bypass
 // the outbox entirely, which is the one failure the outbox exists to prevent.
 import { ghIssueCreate, ghThreadResolve, HANDLERS, markerFor,
-         UNGATED_BY_REVIEW_ACTIONS } from "../src/outbox/effects.mjs";
+         UNGATED_BY_REVIEW_ACTIONS, permittedHandlers } from "../src/outbox/effects.mjs";
 import { open, tx, enqueue } from "../src/db/ops.mjs";
 import { drainOutbox } from "../src/outbox/drain.mjs";
 import { DatabaseSync } from "node:sqlite";
@@ -238,10 +238,21 @@ const recorder = (replies = []) => {
     "the exemption list is EMPTY — adding to it must fail this and be argued for",
     String(UNGATED_BY_REVIEW_ACTIONS.size));
 
-  // And the shape itself: an exemption must be an explicit declaration, never the
-  // absence of a mention.
-  check(UNGATED_BY_REVIEW_ACTIONS instanceof Set,
-    "exemption is a declared set, so a new kind is gated until someone says otherwise");
+  // And the BEHAVIOUR, not only the declaration. Asserting the exemption set is
+  // empty proves what is declared and nothing about whether anything reads it —
+  // the first version of this change shipped with the daemon still applying its own
+  // inline allowlist, and a stub reverting that left every assertion above green.
+  check(Object.keys(permittedHandlers(HANDLERS, true)).length === Object.keys(HANDLERS).length,
+    "with the switch ON every handler is permitted",
+    JSON.stringify(Object.keys(permittedHandlers(HANDLERS, true))));
+  check(Object.keys(permittedHandlers(HANDLERS, false)).length === 0,
+    "and with the switch OFF none is — including any handler added later",
+    JSON.stringify(Object.keys(permittedHandlers(HANDLERS, false))));
+
+  // The specific case that was live: a queued issue-create drained after the
+  // operator turned the switch off.
+  check(permittedHandlers(HANDLERS, false)["gh.issue.create"] === undefined,
+    "a queued spill issue is NOT filed once the switch is off");
 }
 
 // --- nothing reaches GitHub except through an injected api ---------------------

@@ -137,17 +137,6 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
   for (const d of recovered.deadLettered ?? [])
     log(`  outbox: ${d.kind} #${d.id} DEAD-LETTERED — ${d.attempts} lease(s) and never once settled; its drainer is crashing`);
 
-  // Failed forward BEFORE leasing, for the same reason recovery runs first: a
-  // child whose parent died is resolved in this pass rather than sitting pending
-  // through it. It cannot be done on the lease path, because the whole point is
-  // that these rows are never leased.
-  for (const c of cascadeDeadLetter(db))
-    log(`  outbox: ${c.kind} #${c.id} DEAD-LETTERED — the effect it depends on (#${c.depends_on}) ended ${c.parent_status}`);
-  // Said out loud, because a queue waiting on an edge and an idle queue produce
-  // the same pending count, and only one of them is worth looking at.
-  const waiting = blockedOnDependency(db);
-  if (waiting.length)
-    log(`  outbox: ${waiting.length} effect(s) waiting on a dependency that has not finished`);
 
   // ONE absolute instant for the pass, computed once and never re-derived.
   //
@@ -165,6 +154,23 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
   // applied to the quantity being spent -- reserving a fraction of a number the
   // budget has no relation to reserves the wrong thing.
   const floorMs = Math.max(1, budgetMs * SETTLE_RESERVE);
+
+  // Failed forward BEFORE leasing, for the same reason recovery runs first: a
+  // child whose parent died is resolved in this pass rather than sitting pending
+  // through it. It cannot be done on the lease path, because the whole point is
+  // that these rows are never leased.
+  // The SAME absolute instant the deliveries are bounded by, so the cascade cannot
+  // spend a budget it is not accounted against. It runs before any lease, and the
+  // daemon's tick awaits this whole function, so unbounded work here delays PR
+  // evaluation, heartbeats and alerts rather than merely arriving late itself.
+  const cascaded = cascadeDeadLetter(db, { deadlineAt: passDeadlineAt, now });
+  for (const c of cascaded)
+    log(`  outbox: ${c.kind} #${c.id} DEAD-LETTERED — the effect it depends on (#${c.depends_on}) ended ${c.parent_status}`);
+  // Said out loud, because a queue waiting on an edge and an idle queue produce
+  // the same pending count, and only one of them is worth looking at.
+  const waiting = blockedOnDependency(db);
+  if (waiting.length)
+    log(`  outbox: ${waiting.length} effect(s) waiting on a dependency that has not finished`);
 
   const done = [];
   let outOfTime = false;

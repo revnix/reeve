@@ -606,33 +606,66 @@ export function leaseOutbox(db, { worker, leaseSeconds = 300, kinds = null }) {
  * stopped without a result; only the reason differs, and a child cares about the
  * result rather than about why there is none.
  */
-export function cascadeDeadLetter(db) {
+export function cascadeDeadLetter(db, { batch = 100, deadlineAt = Infinity, now = () => Date.now() } = {}) {
+  if (db.isTransaction)
+    throw new Error("cascadeDeadLetter: opens its own transaction per batch; it must not be called inside one");
   const cascaded = [];
   // Bounded rather than `while (true)`: a cycle is impossible through `enqueue`,
   // which requires the parent to exist before the child, but a bound costs
   // nothing and a queue that never drains because two rows point at each other
   // is not a failure worth risking on an argument.
   for (let depth = 0; depth < 32; depth++) {
+    // The PASS budget bounds this too, and it has to.
+    //
+    // The drainer awaits this before it leases anything, and the daemon's tick
+    // awaits the drainer -- so an unbounded cascade over a large dependent tree
+    // runs past the advertised budget and delays evaluation, heartbeats and
+    // alerts. A bound the work inside it cannot see is not a bound; this file
+    // already learned that about the delivery loop.
+    //
+    // Checked BEFORE each batch rather than after, so the budget is spent deciding
+    // not to start. Whatever is left stays pending and the next pass continues it:
+    // the cascade is idempotent, because it only ever selects rows that are still
+    // `pending` under a parent that is already terminal.
+    // The bounded SELECT comes FIRST, and the clock is consulted only when there
+    // is work. Reading `now()` unconditionally made this a consumer of the
+    // caller's clock even on an empty queue, which is almost every pass -- and in
+    // a test driving a synthetic clock it spent the pass budget before the drainer
+    // had leased anything, so a row that should have been leased never was. Work
+    // the budget is meant to bound must not be charged for deciding there is none.
     const rows = db.prepare(`
       SELECT o.id, o.kind, o.depends_on, p.status AS parent_status
       FROM outbox o JOIN outbox p ON p.id = o.depends_on
-      WHERE o.status='pending' AND p.status IN ('dead_letter','failed')`).all();
+      WHERE o.status='pending' AND p.status IN ('dead_letter','failed')
+      LIMIT ?`).all(batch);
     if (!rows.length) break;
-    const mark = db.prepare(`
-      UPDATE outbox SET status='dead_letter', last_error=?, updated_at=unixepoch()
-      WHERE id=? AND status='pending'`);
-    for (const r of rows) {
-      const why = `the effect this one depends on (#${r.depends_on}) ended ${r.parent_status}; its result will never exist`;
-      mark.run(why, r.id);
-      // The SAME op `settleOutbox` and `recoverOutbox` emit, because this is the
-      // same transition arriving by a third route. Without it the event trail has
-      // no record of a real status change and stops agreeing with the projection
-      // it is supposed to explain -- and a dead letter is precisely the transition
-      // someone reads the trail to understand.
-      emit(db, { actor: "drainer", op: "outbox.dead_letter",
-                 payload: { id: r.id, kind: r.kind, cascadedFrom: r.depends_on, error: why } });
-      cascaded.push(r);
-    }
+    // Checked before the batch is written, so the budget is spent deciding not to
+    // start. Whatever is left stays pending and the next pass continues it.
+    if (now() >= deadlineAt) break;
+    // ONE TRANSACTION per batch, so a status change and the event explaining it
+    // commit together or not at all.
+    //
+    // They were separate autocommit statements: a crash between them left a
+    // dead-lettered row with no immutable event, which is the exact divergence
+    // between projection and trail that emitting the event was meant to close.
+    // Writing the event was necessary and was not sufficient.
+    tx(db, () => {
+      const mark = db.prepare(`
+        UPDATE outbox SET status='dead_letter', last_error=?, updated_at=unixepoch()
+        WHERE id=? AND status='pending'`);
+      for (const r of rows) {
+        const why = `the effect this one depends on (#${r.depends_on}) ended ${r.parent_status}; its result will never exist`;
+        mark.run(why, r.id);
+        // The SAME op `settleOutbox` and `recoverOutbox` emit, because this is the
+        // same transition arriving by a third route. Without it the event trail has
+        // no record of a real status change and stops agreeing with the projection
+        // it is supposed to explain -- and a dead letter is precisely the transition
+        // someone reads the trail to understand.
+        emit(db, { actor: "drainer", op: "outbox.dead_letter",
+                   payload: { id: r.id, kind: r.kind, cascadedFrom: r.depends_on, error: why } });
+        cascaded.push(r);
+      }
+    });
   }
   return cascaded;
 }

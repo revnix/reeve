@@ -144,8 +144,15 @@ existed since `src/checkout.mjs` replaced them.
     drift=0; n=0
     while IFS= read -r -d '' p; do
       n=$((n + 1))
-      a=$(git --literal-pathspecs ls-tree "$squash" -- "$p")
-      b=$(git --literal-pathspecs ls-tree "$main"   -- "$p")
+      # CHECK BOTH STATUSES. An ls-tree that FAILS -- a partial clone that cannot
+      # lazily fetch a nested tree, say -- yields an empty string, and an empty
+      # string equals an empty string. Two failed reads, or one failure against a
+      # legitimate deletion, would compare EQUAL and print the clean line. A path
+      # that could not be read is unverified, never matching.
+      a=$(git --literal-pathspecs ls-tree "$squash" -- "$p") \
+        || { echo "UNREADABLE: could not read $p at the merge"; exit 23; }
+      b=$(git --literal-pathspecs ls-tree "$main"   -- "$p") \
+        || { echo "UNREADABLE: could not read $p on main"; exit 23; }
       [ "$a" = "$b" ] || { echo "DRIFTED: $p"; drift=1; }
     done < "$list"
     [ "$n" -gt 0 ] || { echo "UNREADABLE: enumerated zero paths"; exit 23; }
@@ -277,7 +284,12 @@ forbidden it; without this the protocol is circular, and the only ways out are p
 with an incomplete territory boundary or working out of order. Read the plan tasks in the PR
 package you are claiming, take their `**Files:**` union, and write that into the claim.
 
-**⛔ GATE: no EDITS to implementation files, no branch, no code, until the claim is pushed.**
+**⛔ GATE: no EDITS to implementation files, no branch, no code, until the claim PR has MERGED.**
+**Pushed is not enough**, and this document says so forty lines above: a commit on a branch is
+not on `main`, and `main` is where peers look. Two lanes can each push a claim branch for the
+same task, each see nothing on `main`, and both start — the exact failure the protocol exists to
+prevent. Waiting for the merge makes the losing claim PR **conflict** instead, which is the
+signal. The claim PR is one file and reviews in a minute; that wait is the price of the property.
 Reading is always permitted — reading is how the claim is written.
 
 ### Phase 1: Understand
@@ -400,9 +412,20 @@ briefly claiming nothing, and the later push makes any verdict you already asked
    any major issues"* + *"Reviewed commit: <sha>"*); findings arrive as **review** objects.
    *"Something went wrong"* and *"You have reached your usage limits"* are **refusals, not
    passes** — and the reviewer refused **57% of requests** in one measured week.
-6. **Check the verdict's `commit_id` against the current head.** A verdict at an older head is
-   **stale** and says nothing about what you just pushed. Corollary: **commit the tracker and
-   any docs BEFORE requesting review**, or your own push makes the verdict you asked for stale.
+6. **Bind every verdict to a commit — by TWO different routes, because the two shapes carry it
+   differently.** A verdict that cannot be bound to the current head is **stale** and says
+   nothing about what you just pushed.
+
+   - a **review object** carries `commit_id`. Compare it to the head.
+   - a **clean pass is an issue comment and has NO `commit_id` field at all.** Its sha is in the
+     body text, `Reviewed commit: <sha>`, usually abbreviated. Parse it and compare by prefix.
+
+   Checking only `commit_id` therefore leaves every clean pass permanently unbindable — the one
+   verdict shape you are waiting for. reeve's own `classifyObservation` already resolves it this
+   way; do the same rather than inventing a third rule.
+
+   Corollary: **commit the tracker and any docs BEFORE requesting review**, or your own push
+   makes the verdict you asked for stale.
 7. For each finding: **verify the claim against the source before acting.** Bots are wrong often
    enough that taking one at face value has produced real defects here. Then fix it properly,
    assert every text patch's anchor actually matched (**a bad anchor means nothing was

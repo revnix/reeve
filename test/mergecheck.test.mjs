@@ -1,5 +1,4 @@
-// Whether a pull request's content reached main, and the answers that are not
-// each other.
+// Is a merged pull request's content still on main?
 //
 // Why this is tested at all: the checks it replaces were ancestry, which this
 // repository's squash merges make permanently false, and a subject-line grep,
@@ -11,8 +10,8 @@
 // involved, and the classification can be driven into states a real merge would
 // take days to produce.
 
-import { classifyFiles, verdictFor, pathsOf, exitFor,
-         FILE_STATE, VERDICT, EXIT, ABSENT, UNREAD } from "../src/mergecheck.mjs";
+import { classifyFiles, verdictFor, pathsOf, safePath, exitFor,
+         FILE_STATE, VERDICT, EXIT, ABSENT } from "../src/mergecheck.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -20,8 +19,8 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
 
-// A fixture tree as a table: trees[rev][path] = "<mode> <id>", absent means the
-// revision was read and holds no such path.
+// A fixture tree as a table: trees[rev][path] = "<mode> <id>". A path absent
+// from a listed revision means the revision was read and holds no such path.
 const fixture = (trees) => (rev, path) => {
   const t = trees[rev] ?? {};
   if (!Object.hasOwn(t, path)) return ABSENT;
@@ -31,152 +30,138 @@ const fixture = (trees) => (rev, path) => {
 const H = "head", M = "origin/main", S = "squash";
 const F = "100644", X = "100755", L = "120000";
 
-// --- a clean squash merge ----------------------------------------------------
+// --- THE CASE THAT FORCED THE REDESIGN --------------------------------------
+// Main touches a pull request's file after the branch diverges. The squash
+// correctly combines both edits, so the merge's tree differs from the HEAD's
+// tree even though the pull request's change landed perfectly.
+//
+// MEASURED on a real git fixture -- a branch editing line 1, a main editing
+// line 3, a GitHub-style squash -- the head-based comparison returned
+// MISSING / NOT ON MAIN over content that was demonstrably present. A false
+// negative in the COMMON case, in a tool built to prevent false readings.
 {
-  const entryAt = fixture({ [H]: { "a.mjs": `${F} b1`, "b.mjs": `${F} b2` },
-                            [S]: { "a.mjs": `${F} b1`, "b.mjs": `${F} b2` },
-                            [M]: { "a.mjs": `${F} b1`, "b.mjs": `${F} b2` } });
-  const files = classifyFiles(["a.mjs", "b.mjs"], { head: H, main: M, squash: S, entryAt });
+  const entryAt = fixture({ [H]: { "f.txt": `${F} pr-only` },        // the branch's tree
+                            [S]: { "f.txt": `${F} pr-plus-main` },   // both edits, folded
+                            [M]: { "f.txt": `${F} pr-plus-main` } });// and still there
+  const files = classifyFiles(["f.txt"], { squash: S, main: M, head: H, entryAt });
   const v = verdictFor(files);
-  check(files.every(f => f.state === FILE_STATE.matches), "every path matches when the content arrived");
-  check(v.verdict === VERDICT.merged && exitFor(v.verdict) === EXIT.ok,
-    "the verdict is MERGED BY CONTENT and exits 0", v.verdict);
+  check(files[0].state === FILE_STATE.intact,
+    "a merge whose base moved reads as INTACT, not as missing", files[0].state);
+  check(v.verdict === VERDICT.intact && exitFor(v.verdict) === EXIT.ok,
+    "so the verdict is MERGED, AND INTACT ON MAIN, exit 0", v.verdict);
+  check(files[0].headDiffersFromMerge === true,
+    "the head does differ from the merge here, and that is recorded", String(files[0].headDiffersFromMerge));
+  check(/cannot tell them apart/.test(v.why),
+    "but it is reported as an observation with both causes named, never as the verdict", v.why);
 }
 
-// --- the lost push: a fix committed to the branch AFTER the merge -------------
-// Not hypothetical. It happened here: a review round was pushed to a branch
-// whose pull request had already merged, the push succeeded, main never saw it,
-// and nothing errored anywhere.
-{
-  const entryAt = fixture({ [H]: { "a.mjs": `${F} round4` },
-                            [S]: { "a.mjs": `${F} round3` },
-                            [M]: { "a.mjs": `${F} round3` } });
-  const v = verdictFor(classifyFiles(["a.mjs"], { head: H, main: M, squash: S, entryAt }));
-  check(v.verdict === VERDICT.absent && exitFor(v.verdict) === EXIT.no,
-    "a fix pushed after the merge is NOT ON MAIN, exit 31", v.verdict);
-  check(/pushed to the branch AFTER/.test(v.why), "and the message names the cause that produces it");
-  // THE MESSAGE MUST NOT OVERCLAIM. MISSING establishes that main differs from
-  // the head and that the squash did not match the head. It never compares main
-  // WITH the squash -- and in this very fixture they are IDENTICAL, both holding
-  // round3 while the head has moved to round4. An earlier message said the path
-  // "matches neither the head nor the squash commit", which is false here, in a
-  // tool whose whole purpose is not saying more than it measured.
-  check(!/match neither/.test(v.why),
-    "and it does not claim a main-versus-squash comparison it never made", v.why);
-  check(/differ from the pull request head/.test(v.why),
-    "it reports only the comparison it actually established", v.why);
-}
-
-// --- merged, then main moved on ----------------------------------------------
+// --- main moved after the merge ----------------------------------------------
 {
   const entryAt = fixture({ [H]: { "a.mjs": `${F} mine` },
                             [S]: { "a.mjs": `${F} mine` },
                             [M]: { "a.mjs": `${F} someone-else` } });
-  const v = verdictFor(classifyFiles(["a.mjs"], { head: H, main: M, squash: S, entryAt }));
-  check(v.verdict === VERDICT.moved && exitFor(v.verdict) === EXIT.drifted,
-    "content that arrived and was then changed is MERGED, THEN MOVED, exit 32", v.verdict);
-  check(/human decides/.test(v.why), "and it refuses to guess which of the two it is");
-}
-
-// --- A DELETION THAT ARRIVED AND WAS UNDONE IS DRIFT, NOT ABSENCE ------------
-// The defect that made ABSENT and UNREAD separate symbols. With both collapsed
-// into `null`, the squash comparison was guarded by a non-null test, this case
-// fell through to MISSING, and the tool reported NOT ON MAIN over a deletion
-// that had landed correctly.
-{
-  const entryAt = fixture({ [H]: {},                              // deleted by the PR
-                            [S]: {},                              // and the deletion merged
-                            [M]: { "gone.mjs": `${F} restored` } }); // then main put it back
-  const files = classifyFiles(["gone.mjs"], { head: H, main: M, squash: S, entryAt });
-  check(files[0].state === FILE_STATE.drifted,
-    "a deletion that merged and was later undone reads as DRIFTED", files[0].state);
-  check(verdictFor(files).verdict === VERDICT.moved,
-    "so the verdict is MERGED, THEN MOVED rather than NOT ON MAIN");
-  // The control: a deletion that never arrived must still be MISSING, or the
-  // fix above would have made every deletion look like drift.
-  const never = fixture({ [H]: {}, [S]: { "gone.mjs": `${F} still-here` }, [M]: { "gone.mjs": `${F} still-here` } });
-  check(classifyFiles(["gone.mjs"], { head: H, main: M, squash: S, entryAt: never })[0].state === FILE_STATE.missing,
-    "control: a deletion that never merged is still MISSING");
+  const v = verdictFor(classifyFiles(["a.mjs"], { squash: S, main: M, head: H, entryAt }));
+  check(v.verdict === VERDICT.drifted && exitFor(v.verdict) === EXIT.drifted,
+    "content changed after the merge is MERGED, THEN CHANGED ON MAIN, exit 32", v.verdict);
+  check(/human decides/.test(v.why), "and it refuses to guess whether that was a follow-up or an overwrite");
 }
 
 // --- MODE IS PART OF THE ENTRY ----------------------------------------------
-// `git rev-parse <rev>:<path>` returns the blob, and mode lives in the tree. A
-// pull request that only sets the executable bit shares its blob id with the
-// version that never got it, so a blob-only check certifies a script that is no
-// longer executable.
+// `git rev-parse <rev>:<path>` returns the blob, and mode lives in the tree, so
+// a lost executable bit shares its blob id with the version that never had one.
 {
-  const entryAt = fixture({ [H]: { "run.sh": `${X} same-blob` },
-                            [S]: { "run.sh": `${X} same-blob` },
-                            [M]: { "run.sh": `${F} same-blob` } }); // bit lost
-  const files = classifyFiles(["run.sh"], { head: H, main: M, squash: S, entryAt });
-  check(files[0].state === FILE_STATE.drifted,
-    "an executable bit that did not survive is caught even though the blob matches", files[0].state);
-  const sym = fixture({ [H]: { "p": `${L} same-blob` }, [S]: { "p": `${L} same-blob` }, [M]: { "p": `${F} same-blob` } });
-  check(classifyFiles(["p"], { head: H, main: M, squash: S, entryAt: sym })[0].state === FILE_STATE.drifted,
+  const bit = fixture({ [S]: { "run.sh": `${X} same-blob` }, [M]: { "run.sh": `${F} same-blob` } });
+  check(classifyFiles(["run.sh"], { squash: S, main: M, entryAt: bit })[0].state === FILE_STATE.drifted,
+    "an executable bit lost after the merge is caught even though the blob matches");
+  const sym = fixture({ [S]: { p: `${L} same-blob` }, [M]: { p: `${F} same-blob` } });
+  check(classifyFiles(["p"], { squash: S, main: M, entryAt: sym })[0].state === FILE_STATE.drifted,
     "and so is a symlink that became a regular file with the same payload");
-  // The control: identical mode AND id must still match, or the comparison is
-  // simply broken rather than stricter.
-  const ok = fixture({ [H]: { "run.sh": `${X} b` }, [S]: { "run.sh": `${X} b` }, [M]: { "run.sh": `${X} b` } });
-  check(classifyFiles(["run.sh"], { head: H, main: M, squash: S, entryAt: ok })[0].state === FILE_STATE.matches,
-    "control: an entry matching in both mode and id still reads as MATCHES");
+  // The control: matching in BOTH mode and id must still be INTACT, or the
+  // comparison is broken rather than stricter.
+  const ok = fixture({ [S]: { "run.sh": `${X} b` }, [M]: { "run.sh": `${X} b` } });
+  check(classifyFiles(["run.sh"], { squash: S, main: M, entryAt: ok })[0].state === FILE_STATE.intact,
+    "control: an entry matching in both mode and id is INTACT");
 }
 
-// --- renames carry two paths -------------------------------------------------
+// --- a deletion that merged --------------------------------------------------
 {
-  const files = [{ filename: "new/a.mjs", previous_filename: "old/a.mjs" },
-                 { filename: "b.mjs" },
-                 { filename: "same.mjs", previous_filename: "same.mjs" }];
-  const paths = pathsOf(files);
-  check(paths.includes("new/a.mjs") && paths.includes("old/a.mjs"),
-    "a rename contributes BOTH its destination and its source", JSON.stringify(paths));
-  check(paths.filter(p => p === "same.mjs").length === 1,
-    "and a previous_filename equal to the filename is not counted twice", JSON.stringify(paths));
-  // Four, not three: the rename contributes two paths and the other two entries
-  // one each. This assertion said three on the first pass and the test caught the
-  // arithmetic -- which is the whole reason the count is asserted rather than
-  // just the membership.
-  check(paths.length === 4, "so three entries including one rename yield four distinct paths", JSON.stringify(paths));
+  const kept = fixture({ [S]: {}, [M]: {} });   // merged as a deletion, still gone
+  const f1 = classifyFiles(["gone.mjs"], { squash: S, main: M, entryAt: kept });
+  check(f1[0].state === FILE_STATE.gone, "a deletion that merged and stayed reads as REMOVED", f1[0].state);
+  check(verdictFor(f1).verdict === VERDICT.intact, "and a pull request that only deletes verifies");
+
+  const undone = fixture({ [S]: {}, [M]: { "gone.mjs": `${F} restored` } });
+  const f2 = classifyFiles(["gone.mjs"], { squash: S, main: M, entryAt: undone });
+  check(f2[0].state === FILE_STATE.drifted,
+    "a deletion that merged and was later undone is DRIFTED, not absence", f2[0].state);
 }
 
-// --- MISSING outranks DRIFTED ------------------------------------------------
+// --- head divergence is an observation, never a verdict ----------------------
+// A head differing from the squash has TWO causes -- a commit pushed after the
+// merge, or a base that moved before it -- and tree entries cannot distinguish
+// them. Reporting either as fact would be the overclaiming this tool exists to
+// avoid.
 {
-  const entryAt = fixture({ [H]: { "gone.mjs": `${F} x`, "moved.mjs": `${F} y` },
-                            [S]: { "gone.mjs": `${F} OTHER`, "moved.mjs": `${F} y` },
-                            [M]: { "gone.mjs": `${F} OTHER`, "moved.mjs": `${F} later` } });
-  const v = verdictFor(classifyFiles(["gone.mjs", "moved.mjs"], { head: H, main: M, squash: S, entryAt }));
-  check(v.verdict === VERDICT.absent, "one path that never arrived outranks another that merely moved", v.verdict);
-  check(v.counts.missing === 1 && v.counts.drifted === 1,
-    "and both are still counted, so the report does not hide the second", JSON.stringify(v.counts));
+  const entryAt = fixture({ [H]: { "a.mjs": `${F} round4` },   // pushed after the merge
+                            [S]: { "a.mjs": `${F} round3` },
+                            [M]: { "a.mjs": `${F} round3` } });
+  const files = classifyFiles(["a.mjs"], { squash: S, main: M, head: H, entryAt });
+  const v = verdictFor(files);
+  check(v.verdict === VERDICT.intact,
+    "a commit pushed after the merge does not make the MERGE unsound", v.verdict);
+  check(files[0].headDiffersFromMerge === true && v.counts.headDiverged === 1,
+    "the divergence is counted", JSON.stringify(v.counts));
+  check(/pushed to the branch AFTER it merged/.test(v.why) && /main having moved before the merge/.test(v.why),
+    "and BOTH readings are named, so neither is asserted", v.why);
+  // Without a head, no divergence may be claimed either way.
+  const noHead = classifyFiles(["a.mjs"], { squash: S, main: M, entryAt });
+  check(noHead[0].headDiffersFromMerge === null,
+    "with no head read, divergence is null rather than false", String(noHead[0].headDiffersFromMerge));
+  check(!/differ between the branch head/.test(verdictFor(noHead).why),
+    "and the note is omitted rather than claiming the head agreed");
 }
 
 // --- an empty set is NOT a pass ----------------------------------------------
 {
   const v = verdictFor([]);
   check(v.verdict === VERDICT.unreadable && exitFor(v.verdict) === EXIT.unreadable,
-    "a pull request with no paths is UNREADABLE, exit 23, not merged", v.verdict);
+    "a pull request with no paths is UNREADABLE, exit 23, not intact", v.verdict);
   check(/not a pass/.test(v.why), "and says so rather than reporting all-clear over nothing");
-  const entryAt = fixture({ [H]: { a: `${F} 1` }, [S]: { a: `${F} 1` }, [M]: { a: `${F} 1` } });
-  check(verdictFor(classifyFiles(["a"], { head: H, main: M, squash: S, entryAt })).verdict === VERDICT.merged,
-    "control: one matching path over the same code path does report merged");
+  const entryAt = fixture({ [S]: { a: `${F} 1` }, [M]: { a: `${F} 1` } });
+  check(verdictFor(classifyFiles(["a"], { squash: S, main: M, entryAt })).verdict === VERDICT.intact,
+    "control: one matching path over the same code path does verify");
 }
 
-// --- a deletion on both sides is consistent ----------------------------------
+// --- renames carry two paths -------------------------------------------------
 {
-  const entryAt = fixture({ [H]: {}, [S]: {}, [M]: {} });
-  const files = classifyFiles(["removed.mjs"], { head: H, main: M, squash: S, entryAt });
-  check(files[0].state === FILE_STATE.deleted,
-    "a path absent from head and from main alike is consistent, not missing", files[0].state);
-  check(verdictFor(files).verdict === VERDICT.merged, "so a pull request that only deletes verifies");
+  const paths = pathsOf([{ filename: "new/a.mjs", previous_filename: "old/a.mjs" },
+                         { filename: "b.mjs" },
+                         { filename: "same.mjs", previous_filename: "same.mjs" }]);
+  check(paths.includes("new/a.mjs") && paths.includes("old/a.mjs"),
+    "a rename contributes BOTH its destination and its source", JSON.stringify(paths));
+  check(paths.filter(p => p === "same.mjs").length === 1,
+    "and a previous_filename equal to the filename is not counted twice");
+  // Four, not three: the rename contributes two and the others one each. This
+  // said three on the first pass and the test caught the arithmetic, which is
+  // why the count is asserted and not only the membership.
+  check(paths.length === 4, "so three entries including one rename yield four paths", JSON.stringify(paths));
 }
 
-// --- no squash commit: drift cannot be told from absence ---------------------
+// --- a filename is attacker-supplied ----------------------------------------
+// On any repository taking outside contributions a contributor chooses these
+// bytes. A carriage return or an ANSI escape lets them overwrite the verdict
+// line or forge one that reads as success -- making the report itself the false
+// reassurance the tool exists to remove.
 {
-  const entryAt = fixture({ [H]: { "a.mjs": `${F} mine` }, [M]: { "a.mjs": `${F} other` } });
-  const files = classifyFiles(["a.mjs"], { head: H, main: M, squash: UNREAD, entryAt });
-  check(files[0].state === FILE_STATE.missing,
-    "with no squash commit, a difference degrades to MISSING, the answer that prompts a look", files[0].state);
-  check(files[0].squash === "unread",
-    "and the report says the squash side was never read, rather than calling it absent", files[0].squash);
+  const CR = String.fromCharCode(13), LF = String.fromCharCode(10), ESC = String.fromCharCode(27);
+  const evil = "ok.txt" + CR + LF + VERDICT.intact + "  revnix/reeve#99" + ESC + "[2K";
+  const out = safePath(evil);
+  check(!new RegExp("[" + CR + LF + ESC + "]").test(out),
+    "no control character survives safePath, so a forged verdict line cannot be printed", JSON.stringify(out));
+  check(out.includes("\\x0d") && out.includes("\\x1b"),
+    "they become visible escapes rather than vanishing", JSON.stringify(out));
+  check(safePath("src/a-b_c.mjs") === "src/a-b_c.mjs",
+    "control: an ordinary path is returned unchanged", safePath("src/a-b_c.mjs"));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

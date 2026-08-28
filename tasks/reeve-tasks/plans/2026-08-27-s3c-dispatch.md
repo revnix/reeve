@@ -33,7 +33,7 @@ S3-A and S3-B must be merged first, in that order. These are the exact names thi
 
 | from | name | shape |
 |---|---|---|
-| S3-A `src/build/capabilities.mjs` | `capabilitiesOf(profile)` | *derived* — `-> { "builder.capabilities.observe": boolean, …, "builder.capabilities.mergeBuilderPr": boolean }`, keyed by the **literal strings `capabilityFor` emits** (*measured*: `src/build/outbox.mjs:306-323`). Task 9 reads `observe` only |
+| S3-A `src/build/capabilities.mjs` | `capabilitiesFrom(profile)` | *derived* — `-> { "builder.capabilities.observe": boolean, …, "builder.capabilities.mergeBuilderPr": boolean }`, keyed by the **literal strings `capabilityFor` emits** (*measured*: `src/build/outbox.mjs:306-323`). Task 9 reads `observe` only |
 | S3-A `src/profile/schema.mjs` | `FIELDS` | *derived* — grows `builder.budgets.<ACTION> = {budgetMinutes, maxTurns, model, effort, maxBudgetUsd, maxAttempts}` for `BUILD_SIZE\|BUILD_RESEARCH\|BUILD_DESIGN`, `builder.maxConcurrentTasks`, `builder.provider.{concurrencyLimit, guardianReserved, cooldownSeconds, preemptAtBoundary}`. *measured* at `16cd880`: `builder.capabilities.*` ×5 at `src/profile/schema.mjs:230-234` and `builder.network.research.allowedDomains` at `:263` already exist |
 | S3-A `src/build/registry.mjs` | `registryProjects(registry)` | *derived* — `-> {projects: [{name, nwo, repoPath, profilePath}], error}`. Task 9 reads `repoPath`; a malformed entry is an **error**, never a dropped row |
 | S3-B `src/paths.mjs` | `taskPathFor(home, taskId)` | *derived* — `-> <home>/tasks/<bt>`; this plan derives the run-file paths under it in `runPathsFor` (Task 1) rather than consuming a second path helper |
@@ -1604,7 +1604,7 @@ gh pr comment --body "@codex review"
 - Modify: `src/build/loop.mjs` (`buildTick`; the `for (const project of projects)` loop)
 
 **Interfaces:**
-- Consumes: `capabilitiesOf` (S3-A `src/build/capabilities.mjs`); `liveRuns` (Task 1); `nextPhase` (S2-B `src/build/phases.mjs:169`); `refreshGateState`, `isSameProcess`, `resolveRepoId` — all three already imported by `src/build/loop.mjs:10,18,24`.
+- Consumes: `capabilitiesFrom` (S3-A `src/build/capabilities.mjs`); `liveRuns` (Task 1); `nextPhase` (S2-B `src/build/phases.mjs:169`); `refreshGateState`, `isSameProcess`, `resolveRepoId` — all three already imported by `src/build/loop.mjs:10,18,24`.
 - Produces:
   - `eligibleTasks(db, {now, limit, jitter}) -> [{task, phase, generation, slice, depth, startedAt}]` — non-terminal tasks with no live run, oldest-waiting first, with a jitter applied to the ordering of equal timestamps.
   - `buildTick(ctx)` returns `{refreshed, rows, skipped, considered, dispatched, refused}`. `refused` carries `{task, reason}` for every task that was eligible and did not run.
@@ -1702,7 +1702,7 @@ Expected: `Cannot find module '.../src/build/eligible.mjs'`.
 
 **On the broken implementation** — the shape to guard is a gate read from `ctx.profile` **inside** the dispatch helper, after `applyTransition` has moved the task into the phase whose worker is about to be refused. It is the natural place to put it, because that is where the profile is already in scope. Under it, `and no transition was attempted` and `and the task has not moved` go red, while `and NOT dispatched, because observe is off` stays **green** — which is why the transition counter exists at all: the visible symptom is identical.
 
-**The stub loop for this task**: (1) control — `$N test/build-tick.test.mjs` green. (2) Stub applied: move the `capabilitiesOf(profile)["builder.capabilities.observe"]` read from `buildTick`'s per-task block into the dispatch helper; confirm with `grep -n "builder.capabilities.observe" src/build/loop.mjs` printing nothing. (3) Re-run: `and no transition was attempted` red; `and NOT dispatched`, `CONTROL: with observe on…` and the eligibility block green. (4) `cp` back, re-run green.
+**The stub loop for this task**: (1) control — `$N test/build-tick.test.mjs` green. (2) Stub applied: move the `capabilitiesFrom(profile)["builder.capabilities.observe"]` read from `buildTick`'s per-task block into the dispatch helper; confirm with `grep -n "builder.capabilities.observe" src/build/loop.mjs` printing nothing. (3) Re-run: `and no transition was attempted` red; `and NOT dispatched`, `CONTROL: with observe on…` and the eligibility block green. (4) `cp` back, re-run green.
 
 - [ ] **Step 3: Implement**
 

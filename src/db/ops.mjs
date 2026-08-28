@@ -63,6 +63,28 @@ const ADDED_COLUMNS = [
   ["outbox", "depends_on", "INTEGER REFERENCES outbox(id)"],
 ];
 
+/**
+ * Indexes over columns that ADDED_COLUMNS adds.
+ *
+ * These cannot live in schema.sql. `open()` executes that file BEFORE adding
+ * columns, and it has to: the file is what creates a table the columns are then
+ * added to. But `CREATE TABLE IF NOT EXISTS` does nothing to a table that already
+ * exists, so on a store whose outbox predates the column, an index in schema.sql
+ * naming that column throws at open() -- on precisely the databases holding real
+ * history, and on none of the fresh ones every test builds.
+ *
+ * That is not a hypothetical. It was found by opening a COPY of the live store,
+ * after a full suite of 5,298 assertions had passed against fresh databases that
+ * could not exhibit it. The same trap is already documented in `reshapeTables`.
+ */
+const ADDED_INDEXES = [
+  `CREATE INDEX IF NOT EXISTS outbox_depends ON outbox(depends_on) WHERE depends_on IS NOT NULL`,
+];
+
+function addMissingIndexes(db) {
+  for (const sql of ADDED_INDEXES) db.exec(sql);
+}
+
 function addMissingColumns(db) {
   for (const [table, column, decl] of ADDED_COLUMNS) {
     let names;
@@ -120,6 +142,8 @@ export function open(path) {
   reshapeTables(db);
   db.exec(readFileSync(new URL("./schema.sql", import.meta.url), "utf8"));
   addMissingColumns(db);
+  // AFTER the columns, never before. See ADDED_INDEXES.
+  addMissingIndexes(db);
   return db;
 }
 

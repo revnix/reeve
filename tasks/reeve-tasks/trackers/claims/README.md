@@ -5,7 +5,13 @@ lanes editing the same file, or opening PRs against the same task, is the failur
 exists to prevent — and it is the same failure reeve's own territory leases prevent for builder
 tasks, so this protocol is modelled on them deliberately.
 
-**Read this before starting anything. Then read `../MASTER.md` to see what is already held.**
+**Read this before starting anything. Then read the claim files in THIS directory, on a freshly
+fetched `origin/main`, to see what is already held.**
+
+**This directory is the only authoritative record of what is held.** `../MASTER.md` is a
+convenience summary and is **never** what decides: a new claim is published as a PR containing
+only its own claim file, so it cannot appear in `MASTER.md` at all, and a lane that checks only
+there sees a claimed task as free. Read the files; the top-level `state:` of each is the answer.
 
 ---
 
@@ -129,7 +135,11 @@ over — but **takeover is recorded, never silent**:
    task as free or ambiguously owned — which is the duplicate work this protocol exists to stop,
    arriving through the procedure meant to prevent it.
 3. Publish it as a claim-only PR, like every other transition.
-4. Say so in `../MASTER.md`'s *In flight* table.
+4. **Then**, in a separate commit, mirror it into `../MASTER.md`'s *In flight* table — a courtesy
+   summary for a human reading one screen, never the record a lane acts on. It is a separate
+   commit because rule "one file per claim PR" admits no second file, and a mirror that forced
+   its way into the claim PR would reintroduce the conflicts this design removes. **If the mirror
+   is skipped the claim still stands**; if the claim file is skipped, nothing has been claimed.
 
 Twenty-four hours is a **convention, not a measurement**. It is the number at which a lane that
 has genuinely stopped is more likely than a lane that is thinking. If it turns out to be wrong,

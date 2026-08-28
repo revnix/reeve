@@ -53,8 +53,8 @@ A stage is MERGED only when every row of its Verify table names a file that exis
 
 | what | who | where |
 |---|---|---|
-| The foundation — this commit | this lane | `reeve#58`, in review |
-| The merge verifier, split out of #58 | this lane | `reeve#60`, in review |
+| The foundation — this commit | this lane | `reeve#58`, in review — **6 codex review objects, 42 threads**; the latest round's 6 findings are fixed in this commit |
+| The merge verifier, split out of #58 | this lane | `reeve#60`, in review — **3 codex review objects, 11 threads**; the latest round's 4 findings are being fixed there |
 | The six S3 stage plans — **written, not yet in a PR** | this lane | branch `docs/s3-foundation`; they land one at a time (decision 17) |
 
 **S3's eleven documents are complete.** Six plans (14,167 lines, 78 tasks), a master plan, an
@@ -111,11 +111,11 @@ Claims are one file each under `claims/`. **Read `claims/README.md` before start
 
 | ruling | date | why it is closed |
 |---|---|---|
-| **S3 splits into six plan documents**, at most three or four plan tasks each | 2026-08-27 | The three S2 *plan* PRs produced 561 of 1,282 findings (43.8% of every finding this repo's review has ever produced). PR#12 was one file, 213 findings, 15 rounds. |
+| **S3 splits into six plan documents**, at most three or four **PRs** each | 2026-08-27 (cap unit corrected 2026-08-28) | The three S2 *plan* PRs produced 561 of 1,282 findings (43.8% of every finding this repo's review has ever produced). PR#12 was one file, 213 findings, 15 rounds. **The unit is PRs, and it moved twice** — "lines", then "plan tasks", which is arithmetically impossible against the committed decomposition of **78 tasks across 6 documents** (3–4 tasks each allows 24). A PR holds several tasks; S3's 78 are 16 PRs. Reasoning in `../MASTER-PLAN.md` §B.1. |
 | **The master plan is roadmap + authoring spec in ONE file** | 2026-08-27 | So they cannot drift apart. |
 | **`docs/TRACKER.md` is untouched as the historical record**; per-stage trackers hold live state | 2026-08-27 | 10 of its 20 unchecked boxes sit on merged work; the format, not the file, was the defect. |
 | **Issue #50 lands before S3's dispatcher** | 2026-08-27 | S3's T8 is the second call site that makes #50's own acceptance test writable. |
-| **The test suite's dead network is fixed in a standalone PR before T1** | 2026-08-27 | 550.1s → 159.8s measured with a control; it is the instrument S3 is measured with sixteen times. |
+| **The test suite's dead network is fixed in a standalone PR before T1** | 2026-08-27 | 550.1s → **159.8s** measured with a control; it is the instrument S3 is measured with sixteen times. **That 159.8s is the ceiling a whole-suite `gh` shim reached, and it is not what shipped:** `reeve#57` stubbed the two files carrying 84.5% of the calls and delivered **550s → 303s**. Budget against **303s**; the remaining gap is the other nine files, and `hub-backup-restore` is real SQLite work, not network. |
 | **`specRepo` and `gateDefinitionPaths` are provisioned now** (Option A) | 2026-08-27 | Splitting `SNAPSHOT_FIELDS` re-opens the shape it was consolidated to close. F1 named the repos; now blocked on **F5**, their creation. |
 | **The builder always shares the guardian's hub** | 2026-08-27 | So an absent hub on a builder PR is the merge authority being gone, not an ordinary machine. |
 | **Stay headless**; `--json` becomes a contract, not a courtesy | 2026-08-27 | `src/dash.mjs` records why there is no server: a previous stack *"spent weeks serving unauthenticated admin to the LAN."* A future GUI is a second renderer over the same read model and must argue against that decision explicitly, not forget it. |

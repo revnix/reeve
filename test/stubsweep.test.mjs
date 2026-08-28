@@ -209,5 +209,66 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
     "and the uncommitted work is still there afterwards");
 }
 
+// --- a killed run must not leave the tree broken -------------------------------
+{
+  // The docblock CLAIMED a killed run cannot leave a stub behind. Taking a
+  // snapshot is what makes that possible; it is not what makes it true. Without
+  // handlers, a Ctrl-C or a cancelled workflow exits between writing the stub and
+  // restoring it, leaving a deliberately broken production file in the tree — and
+  // the next sweep then refuses because the tree is dirty, which reads as the
+  // guard working when it is really the wreckage of the last run.
+  //
+  // Driven by sending a REAL signal, and synchronised on a marker file rather than
+  // on a sleep, so it is not a timing race.
+  const root = mkdtempSync(join(tmpdir(), "sweep-sig-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  const SOURCE = `export const guard = true;\nexport function f() { return guard ? "ok" : "broken"; }\n`;
+  writeFileSync(join(root, "src", "thing.mjs"), SOURCE);
+  // OUTSIDE the repository. Kept inside, the marker is an untracked file, and the
+  // final assertion — that the tree is clean — would fail on the test's own
+  // artefact while reporting it as the sweep's wreckage.
+  const marker = join(mkdtempSync(join(tmpdir(), "sweep-marker-")), "started");
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { appendFileSync } from "node:fs";\n` +
+    `import { f } from "../src/thing.mjs";\n` +
+    `appendFileSync(${JSON.stringify(marker)}, "run\\n");\n` +
+    `console.log(f() === "ok" ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
+    // Blocks the thread, so the runner is genuinely mid-test when the signal lands.
+    `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000);\n` +
+    `process.exit(f() === "ok" ? 0 : 1);\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "remove the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const child = spawnSync(process.execPath, ["-e", `
+    const { spawn } = require("node:child_process");
+    const { readFileSync, existsSync } = require("node:fs");
+    const p = spawn(process.execPath, [${JSON.stringify(RUNNER)}], {
+      cwd: ${JSON.stringify(root)},
+      env: { ...process.env, STUB_SWEEP_ROOT: ${JSON.stringify(root)},
+             STUB_MANIFEST: ${JSON.stringify(join(root, "test", "stub-manifest.mjs"))} },
+      stdio: "ignore" });
+    // Wait until the SECOND run has begun: the first is the unstubbed control, so
+    // only the second has a stub on disk to lose.
+    const waitForStubbedRun = setInterval(() => {
+      const runs = existsSync(${JSON.stringify(marker)})
+        ? readFileSync(${JSON.stringify(marker)}, "utf8").split("\\n").filter(Boolean).length : 0;
+      if (runs >= 2) { clearInterval(waitForStubbedRun); p.kill("SIGTERM"); }
+    }, 50);
+    p.on("exit", () => { clearInterval(waitForStubbedRun); process.exit(0); });
+  `], { encoding: "utf8", timeout: 60_000 });
+
+  check(child.status === 0, "control: the harness ran and killed the sweep mid-stub", String(child.stderr).slice(0, 200));
+  const afterKill = readFileSync(join(root, "src", "thing.mjs"), "utf8");
+  check(afterKill === SOURCE,
+    "a sweep killed mid-stub restores the source before exiting", JSON.stringify(afterKill));
+  check(execFileSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8" }).trim() === "",
+    "so the tree is clean and the NEXT sweep is not blocked by the last one's wreckage");
+}
+
 console.log(fail ? `\nFAILED ${fail}` : "\nok");
 process.exit(fail ? 1 : 0);

@@ -577,6 +577,30 @@ MEASURED conventions:
    *applied* → the **right** assertion red → restore verified **by file copy, never
    `git checkout`**. `git checkout` restores to the last *commit*, silently discarding
    uncommitted work; this has cost real lines in this repository.
+
+   **Check 2 is proven by a HASH CHANGE, not by a grep** — ruled 2026-08-28, on measurement.
+   Every stub loop records the file's digest before the edit and asserts it differs after:
+
+   ```bash
+   before=$(shasum -a 256 <file> | cut -d' ' -f1)
+   # apply the stub
+   after=$(shasum -a 256 <file> | cut -d' ' -f1)
+   [ "$before" != "$after" ] || { echo "the stub was NOT applied; the loop below is vacuous"; exit 1; }
+   ```
+
+   **Why a grep is the wrong instrument here.** MEASURED on S3-A: **three of its "stub verified
+   applied" checks matched identically whether or not the stub had been applied**, so check 2 was
+   *assumed* rather than measured — and an executor who forgets to save the edit then sees no red
+   at check 3 and cannot tell whether the property is untested or the stub never landed. That
+   ambiguity is precisely what the four-check loop exists to remove, so a check that reintroduces
+   it is worse than no check. **A hash cannot be inert**: it either changed or it did not, and
+   there is no way to write the comparison wrongly. It is also identical in every task, so it
+   stops being something an author invents per stub — which is what produced three bad ones out
+   of a handful.
+
+   The specific grep **stays, as a second check**, because a hash proves the file changed and not
+   that the *intended* change was made. State it as a count with its transition (`1 → 0`), never
+   as a bare match.
 6. ***A stub that produces no failures means the property is UNTESTED.*** Not "the code is
    right".
 7. **Every absence claim carries a positive control**, and any claim about a set prints a

@@ -306,6 +306,25 @@ export function retryableFrom(err = "") {
  */
 export const UNGATED_BY_REVIEW_ACTIONS = Object.freeze(new Set());
 
+/**
+ * The handlers a drainer may use, given whether review actions are permitted.
+ *
+ * A FUNCTION rather than a filter expression at the call site, because the call
+ * site was where the rule went wrong and a rule written at its only call site is
+ * indistinguishable from a rule nobody stated. Here it can be exercised directly:
+ * a test asserting the exemption set is empty proves the DECLARATION and nothing
+ * about whether anything reads it, which is how the first version of this shipped
+ * with the daemon still using its own inline allowlist.
+ *
+ * Expressed as a filter over handlers rather than a condition around the drain, so
+ * a kind reeve may not perform is unleaseable rather than merely skipped — the
+ * drainer never takes the row, and the "pending with no handler" count says so.
+ */
+export function permittedHandlers(handlers, reviewActionsAllowed) {
+  return Object.fromEntries(Object.entries(handlers ?? {})
+    .filter(([kind]) => UNGATED_BY_REVIEW_ACTIONS.has(kind) ? true : Boolean(reviewActionsAllowed)));
+}
+
 /** Every kind this build can perform. A kind absent here is never leased. */
 export const HANDLERS = Object.freeze({
   "gh.pr.comment": ghPrComment,

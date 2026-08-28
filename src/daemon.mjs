@@ -35,7 +35,7 @@ import { buildAlert, notify, printable } from "./notify.mjs";
 import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects } from "./db/ops.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
 import { drainOutbox } from "./outbox/drain.mjs";
-import { HANDLERS, UNGATED_BY_REVIEW_ACTIONS } from "./outbox/effects.mjs";
+import { HANDLERS, permittedHandlers } from "./outbox/effects.mjs";
 import { writeDash } from "./dash.mjs";
 import { snapshot, snapshotAll } from "./backup.mjs";
 import { selfAudit } from "./selfaudit.mjs";
@@ -1165,8 +1165,7 @@ export async function tick(ctx) {
     // arrived unprotected. The exemption list lives beside the handlers in
     // src/outbox/effects.mjs so adding one and deciding whether the switch governs
     // it are the same edit.
-    const permitted = Object.fromEntries(Object.entries(ctx.handlers ?? HANDLERS)
-      .filter(([kind]) => UNGATED_BY_REVIEW_ACTIONS.has(kind) ? true : reviewActionsOn(profile)));
+    const permitted = permittedHandlers(ctx.handlers ?? HANDLERS, reviewActionsOn(profile));
     // BEFORE the drain, on every path. A request the profile no longer asks for
     // must not be posted by a tick that happens to be unable to evaluate the pull
     // request it belongs to.

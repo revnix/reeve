@@ -20,8 +20,9 @@ existed and its squash SHA (`0d31350`) carries no number. Verified 2026-08-27 by
 Any other pre-convention PR would be invisible the same way; the count above (38) against 42
 merged PRs is the measure of how many.
 
-**Last verified:** 2026-08-28, `main` = **`36b4107`**. It moved twice during the S3 planning
-session (`c500cfe` → `16cd880` → `36b4107`); #54 was workflow-only so no source anchor moved.
+**Last verified:** 2026-08-28, `main` = **`4730b44`**. It has moved seven times since the S3
+planning session began (`c500cfe` → `16cd880` → `36b4107` → `a529096` → `281655a` → `45efacf` →
+`a136836` → `aaa558a` → `4730b44`); #54 was workflow-only so no source anchor moved.
 **`revnix/reeve` is PUBLIC** since 2026-08-27 — a closed founder decision, see `s3.md`.
 
 ---
@@ -53,12 +54,22 @@ A stage is MERGED only when every row of its Verify table names a file that exis
 
 | what | who | where |
 |---|---|---|
-| The foundation — this commit | this lane | `reeve#58`, in review — **10 codex review objects, 78 threads**; findings per round 6 → 9 → 13 → **5**, tapering after the brief was demoted from normative. CI green. |
-| The merge verifier, split out of #58 | this lane | `reeve#60`, in review — **7 codex review objects, 25 threads**; findings per round 4 → 3 → 3 → 3. CI green. |
 | The six S3 stage plans — **written, not yet in a PR** | this lane | branch `docs/s3-foundation`; they land one at a time (decision 17) |
 
+**The foundation is MERGED.** Nothing of this lane's is in flight.
+
+| PR | what | squash | rounds | findings | verified |
+|---|---|---|---|---|---|
+| `reeve#57` | the test suite's dead network | `89c4af6` | 1 | 1 | by content |
+| `reeve#58` | the planning foundation — roadmap, authoring spec, trackers, prompt | `a136836` | 10 | **33** (6 → 9 → 13 → 5) | `verify-merge.mjs`, 13 paths INTACT |
+| `reeve#60` | the merge verifier | `aaa558a` | 7 | **13** (4 → 3 → 3 → 3) | `verify-merge.mjs`, 3 paths INTACT |
+
+**`node scripts/verify-merge.mjs <pr>` is live on `main`** as of `aaa558a`, and its first real use
+was verifying its own merge. It reports exit **0** for both #58 and #60. The by-hand fallback in
+`../IMPLEMENTATION-PROMPT.md` rule 11 remains for checkouts that do not have it.
+
 **S3's eleven documents are complete.** Six plans (14,167 lines, 78 tasks), a master plan, an
-implementation prompt and five trackers.
+implementation prompt and five trackers. **The plans are still the only part not on `main`.**
 
 **P1 is DONE** — `reeve#57` merged as `89c4af6`, verified by content; the suite went 550s → 303s
 and `test/offline-tests.test.mjs` guards the relapse. Its claim is RELEASED.

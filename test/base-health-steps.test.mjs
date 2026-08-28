@@ -104,6 +104,37 @@ const stepsBy = map => (_nwo, id) => (id in map ? map[id] : true);
   check(r.level === "UNKNOWN", "control: an unreadable run list is UNKNOWN as before", r.level);
 }
 
+// ── a base with NO usable result is broken however it got there ─────────────
+//
+// Splitting "failed" from "executed nothing" made each test homogeneous, so a
+// sample of five real failures and five that never ran — ten of ten with no usable
+// measurement in it — fell through both and reported DEGRADED. The implementation
+// this replaced called the same all-failure history BROKEN, so classifying the
+// causes more precisely made the base look HEALTHIER: a refinement that lost the
+// coarser truth it refined.
+{
+  const mixed = checkBaseHealth(NWO, "ci.yml", "main", {
+    ...list([["failure", "1"], ["failure", "2"], ["failure", "3"], ["failure", "4"]]),
+    steps: stepsBy({ "1": true, "2": true, "3": false, "4": false }),
+  });
+  check(mixed.level === "BROKEN",
+    "two real failures and two that never ran is BROKEN, not degraded", mixed.level);
+  check(/no completed run in this sample produced a usable result/.test(mixed.lines.join(" ")),
+    "and says the thing that is true of BOTH causes rather than picking one",
+    JSON.stringify(mixed.lines));
+  check(!/every PR inherits|nothing on this branch has been measured/.test(mixed.lines.join(" ")),
+    "control: without claiming either homogeneous story, neither of which is true here");
+
+  // Control: one usable result is the difference between broken and degraded, so
+  // the union is not simply making everything broken.
+  const oneGood = checkBaseHealth(NWO, "ci.yml", "main", {
+    ...list([["failure", "1"], ["failure", "2"], ["success", "3"]]),
+    steps: stepsBy({ "1": true, "2": false }),
+  });
+  check(oneGood.level === "DEGRADED",
+    "control: a single usable run is still the line between degraded and broken", oneGood.level);
+}
+
 // ── the denominator counts only runs that have ANSWERED ─────────────────────
 //
 // `gh run list` returns queued and in-progress runs with an empty conclusion, and

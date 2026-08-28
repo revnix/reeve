@@ -388,7 +388,13 @@ Each task below is **one PR**. Plan-document assignment and line budget are reco
 
 **Builds.** `reeve build measure-provider` (§11.2 `:697` names it as the writer of `provider_state.concurrency_limit`, `guardian_reserved`, `measured_at`). The measurement harness that runs a real scout task end to end and records V1–V6. Six documents under `docs/measured/` in the house format (§3.3).
 
-**Files.** `bin/reeve`, `src/build/measure.mjs` (new), `docs/measured/2026-XX-XX-{scout-task-end-to-end, phase-budgets, alias-to-model-resolution, sandbox-under-fanout, json-schema-reliability, subscription-pool}.md`, `docs/TRACKER.md`.
+**Files.** `bin/reeve`, `src/build/measure.mjs` (new), `docs/measured/2026-XX-XX-{scout-task-end-to-end, phase-budgets, alias-to-model-resolution, sandbox-under-fanout, json-schema-reliability, subscription-pool}.md`, **`tasks/reeve-tasks/trackers/s3.md`**.
+
+> **CORRECTED 2026-08-28.** This list said `docs/TRACKER.md`. That file is the **historical
+> record** and both the implementation prompt and the master tracker forbid editing it — and the
+> S3 tracker points plan authors at this §2.2 as the specification for every task, so the stale
+> entry would have reintroduced **the second live tracker the new hierarchy exists to eliminate**.
+> T16's results go in `trackers/s3.md` §3 and in the measured documents.
 
 **Verify (this is §14's own Verify list).**
 - **V1** — one real scout task, filed by the founder against a real project, runs FILED → SIZING → RESEARCH → DESIGN and stops at SPEC_DRAFT with three artifacts on disk, three shas in `phase_event`, three `phase_run` rows with contract snapshots, and **zero** GitHub effects.

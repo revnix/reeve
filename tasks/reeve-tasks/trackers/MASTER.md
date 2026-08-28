@@ -65,7 +65,9 @@ and `test/offline-tests.test.mjs` guards the relapse. Its claim is RELEASED.
 
 **The next action is P2 — issue `reeve#50`**, extracting the guardian's provider/hub session out
 of `tick()`. It is unclaimed. The design is written and reviewed
-(`../ISSUE-50-SESSION-DESIGN.md`); measured on `a529096`, `tick()` is **2,282 lines** and has
+(**not in this commit** — it lands with the S3 plan family; until then the design is the body of
+issue `reeve#50` itself, which states the six rules and the acceptance test). Measured on
+`a529096`, `tick()` is **2,282 lines** and has
 grown 14% since the issue naming it was filed. **T1 does not start until P2 merges.**
 
 Claims are one file each under `claims/`. **Read `claims/README.md` before starting anything.**

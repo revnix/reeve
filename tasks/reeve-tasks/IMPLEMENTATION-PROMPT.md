@@ -212,8 +212,13 @@ of reasoning substitutes for it.
 
 ### Phase 2: Implement — one task, in the plan's steps
 
-1. Branch from the task's stated base:
-   `git worktree add -b <branch> ~/Work/Products/reeve-wt/<name> <base>`.
+1. Branch from **`origin/main`**, never from local `main`:
+   `git fetch origin --quiet && git worktree add -b <branch> ~/Work/Products/reeve-wt/<name> origin/main`.
+   **Local `main` may be behind, and this workflow forbids `git pull` in the live checkout** — so
+   an executor can verify a dependency merged on the remote and then branch from a `main` that
+   does not contain it, silently omitting the very thing they just checked for. If you want to be
+   certain, branch from the dependency's **verified squash SHA** instead: it is in the tracker's
+   `Merge` column and cannot be stale by construction.
    A fresh worktree **cannot commit until `node_modules` exists** — husky needs it. Budget the
    install.
 2. **Write the failing test first.** **The plan does not contain the test body** — it names the

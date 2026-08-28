@@ -379,8 +379,16 @@ MEASURED over 40 merged PRs, 1,282 review threads and 273 review rounds, on 2026
    against the line number, the S3 family came out at 1,677–1,957 lines per document, and
    **every one of those lines is house-style content, not padding.**
 
-   **So the rule is: at most three or four plan tasks per document, and never thin a task to
-   fit a line count.** The lever is *fewer tasks per document*; it is never *shorter tasks*.
+   **So the rule is: at most three or four PRs per document, and never thin a task to fit a line
+   count.** The lever is *fewer PRs per document*; it is never *shorter tasks*.
+
+   **CORRECTED AGAIN 2026-08-28.** The first correction said *three or four plan TASKS* per
+   document, and that is arithmetically impossible against the decomposition already committed:
+   **S3 is 78 plan tasks across 6 documents**, and 3-4 tasks each allows **at most 24**. The same
+   section calls an eleven-task, 1,900-line document correct. A PR holds several tasks — S3's 78
+   tasks are 16 PRs — so **the PR is the unit that makes the arithmetic work**, and it is also the
+   unit a reviewer actually experiences. Recorded rather than quietly re-edited, because this is
+   the second correction of one rule and the next author should see that it moved twice.
    Thinning the controls is the failure mode this repository has actually measured — the
    worst-converging PR in the corpus took 66 findings over 15 rounds with no taper, and every
    one of them was a control that was not there. A document that needs 1,900 lines to carry
@@ -788,9 +796,9 @@ text into agreement.**
    plain-English context → options with plain-English pros and cons and a concrete example in
    this codebase → an honest recommendation with reasoning → one clear line stating what needs
    deciding. Record the answers in the stage tracker §4 before writing any plan.
-5. **Write the plan family**, **at most three or four plan tasks per document** (§B.1.2 — the
-   cap's unit is TASKS, not lines, and a task is never thinned to fit a line count), in dependency
-   order, all from one style reference so the family does not drift.
+5. **Write the plan family**, **at most three or four PRs per document** (§B.1.2), each PR
+   holding as many plan tasks as its changed-line budget allows, in dependency order, all from one
+   style reference so the family does not drift.
 6. **Create the stage tracker** from the template, with the Verify table pre-seeded from step 1
    and every row naming the task that will satisfy it.
 7. **Land ONE plan document, execute its tasks, then revise and land the next.** Not the family

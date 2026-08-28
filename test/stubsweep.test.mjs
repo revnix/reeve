@@ -275,6 +275,27 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   check(crash.exit === 1, "a stub that makes the test CRASH fails the sweep", `exit=${crash.exit}`);
   check(/CRASHED/.test(crash.out), "and is reported as CRASHED rather than as a failing assertion", crash.out.slice(-300));
 
+  // 4b. A control that already fails stops the entry BEFORE production files are
+  //     touched. classify would return UNRUNNABLE whatever happened next, so
+  //     stubbing and waiting out a second timeout buys nothing and runs
+  //     deliberately broken code for no reading.
+  writeFileSync(join(root, "src", "thing.mjs"), `export function safe(v) { return "always broken"; }\n`);
+  writeManifest([{ name: "control-fails", why: "irrelevant; the control is already red", test: "test/thing.test.mjs",
+                   expectRed: "an object is refused",
+                   edits: [{ file: "src/thing.mjs", find: "always broken", replace: "still broken" }] }]);
+  commit();
+  const beforeControl = readFileSync(join(root, "src", "thing.mjs"), "utf8");
+  const badControl = run();
+  check(badControl.exit === 1, "an entry whose control already fails does not pass the sweep", `exit=${badControl.exit}`);
+  check(/UNRUNNABLE/.test(badControl.out), "and is UNRUNNABLE", badControl.out.slice(-260));
+  check(readFileSync(join(root, "src", "thing.mjs"), "utf8") === beforeControl,
+    "and the production file was never stubbed, because the reading was already known");
+
+  // Put the working source back for the remaining cases.
+  writeFileSync(join(root, "src", "thing.mjs"),
+    `export function safe(v) {\n  if (typeof v === "object") throw new Error("not a scalar");\n  return String(v);\n}\n`);
+  commit();
+
   // 5. A rotted anchor is refused rather than silently skipped.
   writeManifest([{ name: "rotted", why: "an anchor that no longer exists", test: "test/thing.test.mjs",
                    expectRed: "an object is refused",

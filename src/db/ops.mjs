@@ -615,66 +615,61 @@ export function cascadeDeadLetter(db, { batch = 100, deadlineAt = Infinity, now 
   // nothing and a queue that never drains because two rows point at each other
   // is not a failure worth risking on an argument.
   for (let depth = 0; depth < 32; depth++) {
-    // The PASS budget bounds this too, and it has to.
-    //
-    // The drainer awaits this before it leases anything, and the daemon's tick
-    // awaits the drainer -- so an unbounded cascade over a large dependent tree
-    // runs past the advertised budget and delays evaluation, heartbeats and
-    // alerts. A bound the work inside it cannot see is not a bound; this file
-    // already learned that about the delivery loop.
-    //
-    // Checked BEFORE each batch rather than after, so the budget is spent deciding
-    // not to start. Whatever is left stays pending and the next pass continues it:
-    // the cascade is idempotent, because it only ever selects rows that are still
-    // `pending` under a parent that is already terminal.
-    // The bounded SELECT comes FIRST, and the clock is consulted only when there
-    // is work. Reading `now()` unconditionally made this a consumer of the
-    // caller's clock even on an empty queue, which is almost every pass -- and in
-    // a test driving a synthetic clock it spent the pass budget before the drainer
-    // had leased anything, so a row that should have been leased never was. Work
-    // the budget is meant to bound must not be charged for deciding there is none.
-    const rows = db.prepare(`
-      SELECT o.id, o.kind, o.depends_on, p.status AS parent_status
-      FROM outbox o JOIN outbox p ON p.id = o.depends_on
-      WHERE o.status='pending' AND p.status IN ('dead_letter','failed')
-      LIMIT ?`).all(batch);
-    if (!rows.length) break;
-    // Checked before the batch is written, so the budget is spent deciding not to
-    // start. Whatever is left stays pending and the next pass continues it.
+    // A cheap UNLOCKED look first, purely to decide whether to open a write
+    // transaction at all. Without it every drain pass would take the write lock to
+    // discover there is nothing to do, on a queue that is empty almost always.
+    if (!db.prepare(`
+      SELECT 1 FROM outbox o JOIN outbox p ON p.id = o.depends_on
+      WHERE o.status='pending' AND p.status IN ('dead_letter','failed') LIMIT 1`).get()) break;
+
+    // The clock is consulted only once there is work. Reading it unconditionally
+    // made this a consumer of the caller's clock on every empty pass, and in the
+    // drain test's synthetic counter that spent the pass budget before the drainer
+    // had leased anything. Work a budget bounds must not be charged for deciding
+    // there is none.
     if (now() >= deadlineAt) break;
-    // ONE TRANSACTION per batch, so a status change and the event explaining it
-    // commit together or not at all.
+
+    // SELECTED INSIDE THE WRITE TRANSACTION, which is what actually closes the
+    // race rather than merely detecting it.
     //
-    // They were separate autocommit statements: a crash between them left a
-    // dead-lettered row with no immutable event, which is the exact divergence
-    // between projection and trail that emitting the event was meant to close.
-    // Writing the event was necessary and was not sufficient.
+    // Selecting outside meant two drainers could pick the same pending child
+    // before either committed; the loser's UPDATE matched nothing and would still
+    // have emitted a second `outbox.dead_letter` for one transition. An immutable
+    // trail carrying two events for one status change is worse than one carrying
+    // none, because it reads as two things having happened.
+    //
+    // `tx` is BEGIN IMMEDIATE, so the lock is taken before this read and no other
+    // writer can move these rows between selecting and updating them. The
+    // `changes` test below is kept as well, but it is now defence in depth rather
+    // than the mechanism: it is not reachable while the select and the update
+    // share this transaction, and it is deliberately NOT asserted by a test that
+    // would have to pass for some other reason.
+    let wrote = 0;
     tx(db, () => {
+      const rows = db.prepare(`
+        SELECT o.id, o.kind, o.depends_on, p.status AS parent_status
+        FROM outbox o JOIN outbox p ON p.id = o.depends_on
+        WHERE o.status='pending' AND p.status IN ('dead_letter','failed')
+        LIMIT ?`).all(batch);
       const mark = db.prepare(`
         UPDATE outbox SET status='dead_letter', last_error=?, updated_at=unixepoch()
         WHERE id=? AND status='pending'`);
       for (const r of rows) {
         const why = `the effect this one depends on (#${r.depends_on}) ended ${r.parent_status}; its result will never exist`;
-        // ONLY the transaction that actually moved the row may speak for it.
-        //
-        // The batch is selected outside this transaction, so two drainers can pick
-        // the same pending child before either commits. The second one's UPDATE
-        // matches nothing -- the guard is `AND status='pending'` -- and without
-        // this test it would still emit a second `outbox.dead_letter` for one
-        // transition and report the row as cascaded. An immutable trail with two
-        // events for one status change is worse than one with none, because it
-        // reads as two things having happened.
         if (mark.run(why, r.id).changes !== 1) continue;
         // The SAME op `settleOutbox` and `recoverOutbox` emit, because this is the
         // same transition arriving by a third route. Without it the event trail has
         // no record of a real status change and stops agreeing with the projection
         // it is supposed to explain -- and a dead letter is precisely the transition
-        // someone reads the trail to understand.
+        // someone reads the trail to understand. In this transaction with the
+        // update, so a failure between them cannot leave one without the other.
         emit(db, { actor: "drainer", op: "outbox.dead_letter",
                    payload: { id: r.id, kind: r.kind, cascadedFrom: r.depends_on, error: why } });
         cascaded.push(r);
+        wrote++;
       }
     });
+    if (!wrote) break;
   }
   return cascaded;
 }

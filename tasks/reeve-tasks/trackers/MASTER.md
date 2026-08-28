@@ -61,19 +61,37 @@ A stage is MERGED only when every row of its Verify table names a file that exis
 
 | what | who | where |
 |---|---|---|
+| The close-out itself | this lane | `reeve#62`, in review — the PR containing this line. It is what the watcher is following. |
+| The P2 claim | this lane | `reeve#64`, in review — one file; **P2 does not start until it merges** (`claims/README.md`) |
 | The six S3 stage plans — **written, not yet in a PR** | this lane | branch `docs/s3-foundation`; they land one at a time (decision 17) |
 
-**The foundation is MERGED.** Nothing of this lane's is in flight.
+**The three FOUNDATION PRs are merged** — #57, #58, #60. This lane is not idle: the rows above are
+open. A close-out that declares nothing in flight while it is itself an open PR is a tracker
+disagreeing with the reason it exists.
 
 | PR | what | squash | rounds | findings | verified |
 |---|---|---|---|---|---|
 | `reeve#57` | the test suite's dead network | `89c4af6` | 1 | 1 | by content |
-| `reeve#58` | the planning foundation — roadmap, authoring spec, trackers, prompt | `a136836` | 10 | **33** (6 → 9 → 13 → 5) | `verify-merge.mjs`, 13 paths INTACT |
-| `reeve#60` | the merge verifier | `aaa558a` | 7 | **13** (4 → 3 → 3 → 3) | `verify-merge.mjs`, 3 paths INTACT |
+| `reeve#58` | the planning foundation — roadmap, authoring spec, trackers, prompt | `a136836` | 10 | **33** (6 → 9 → 13 → 5) | 13/13 INTACT **at `4730b44`**; exit 32 once `reeve#62` lands, correctly — see below |
+| `reeve#60` | the merge verifier | `aaa558a` | 7 | **13** (4 → 3 → 3 → 3) | 3/3 INTACT **at `4730b44`**; no tracker work touches its paths |
 
 **`node scripts/verify-merge.mjs <pr>` is live on `main`** as of `aaa558a`, and its first real use
-was verifying its own merge. It reports exit **0** for both #58 and #60. The by-hand fallback in
-`../IMPLEMENTATION-PROMPT.md` rule 11 remains for checkouts that do not have it.
+was verifying its own merge.
+
+**Those two verifications are anchored at `main` = `4730b44`, and #58's expires when this PR
+merges.** `verify-merge.mjs 58` reported 13 of 13 INTACT *at that commit*. This close-out edits
+`trackers/MASTER.md` and `trackers/s3.md`, which are **2 of those same 13 paths**, so the moment it
+lands the answer becomes **`MERGED, THEN CHANGED ON MAIN`, exit 32** — and that is the correct
+answer, not a regression: the content arrived and something changed it afterwards. The something is
+this file.
+
+**This is what the verdict means, and why it is not "did it merge".** A drifted result asks a human
+whether the change was a legitimate follow-up or an overwrite; here it is a follow-up, recorded
+here. Do not "fix" a future exit 32 on #58 by editing this row — re-read it as the tool intends.
+#60's paths are untouched by any tracker work, so it stays exit 0.
+
+The by-hand fallback in `../IMPLEMENTATION-PROMPT.md` rule 11 remains for checkouts that do not
+have the script, with the reduced capability recorded in `s3.md` §0.
 
 **S3's eleven documents are complete.** Six plans (14,167 lines, 78 tasks), a master plan, an
 implementation prompt and five trackers. **The plans are still the only part not on `main`.**

@@ -217,17 +217,36 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
       // and a future change to one would not visibly break the other.
       let args;
       try {
-        const parent = job.depends_on == null ? null
-          : db.prepare("SELECT status, result FROM outbox WHERE id=?").get(job.depends_on);
-        if (job.depends_on != null && parent?.status !== "done")
-          throw new DependencyResolutionError(
-            `the dependency #${job.depends_on} is ${parent ? parent.status : "missing"}, not done`);
-        let parentResult = null;
-        if (parent?.result != null) {
-          try { parentResult = JSON.parse(parent.result); }
-          catch { throw new DependencyResolutionError(`the dependency #${job.depends_on} recorded a result that is not JSON`); }
+        args = JSON.parse(job.args);
+        // ONLY a row with an edge is resolved, and that is what keeps this change
+        // inert for everything already in the queue.
+        //
+        // Running every leased row through resolution looked harmless and was not:
+        // an ordinary comment whose text happens to contain `${dep.…}` -- a review
+        // trigger quoting an example, a finding quoting this very module -- has no
+        // parent, so resolution raised "no dependency" and TERMINALLY dead-lettered
+        // a delivery that was previously fine. A change that alters existing
+        // deliveries is not inert, whatever its producer does.
+        //
+        // Gating on the edge rather than adding an escape also means there is no
+        // escaping syntax to learn, and no second way to write a body.
+        if (job.depends_on != null) {
+          const parent = db.prepare("SELECT status, result FROM outbox WHERE id=?").get(job.depends_on);
+          // Unreachable through `leaseOutbox`, which will not hand over a row whose
+          // parent is unfinished. Asserted anyway: the guard and this read are
+          // different statements, so a change to one would not visibly break the
+          // other, and the failure it would produce is a substitution against a
+          // result that is not final.
+          if (parent?.status !== "done")
+            throw new DependencyResolutionError(
+              `the dependency #${job.depends_on} is ${parent ? parent.status : "missing"}, not done`);
+          let parentResult = null;
+          if (parent.result != null) {
+            try { parentResult = JSON.parse(parent.result); }
+            catch { throw new DependencyResolutionError(`the dependency #${job.depends_on} recorded a result that is not JSON`); }
+          }
+          args = resolveDependencyArgs(args, parentResult);
         }
-        args = resolveDependencyArgs(JSON.parse(job.args), parentResult);
       } catch (err) {
         // TERMINAL, and deliberately so. The parent is finished, so its result is
         // final: a retry asks a settled question again and spends a delivery

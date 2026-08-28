@@ -471,12 +471,76 @@ export function supersedeEffects(db, { prefix, keep }) {
                            WHERE status IN ('pending','dead_letter')
                              AND idem_key LIKE ? ESCAPE '\\'`).all(esc + "%")
                  .filter(r => !spare.has(r.idem_key));
+
+  // DEPENDENTS, and this is not tidiness -- without it the DELETE above throws.
+  //
+  // `PRAGMA foreign_keys = ON` is set by schema.sql, which open() executes, so the
+  // edge is ENFORCED in the product. Deleting a row another row still points at
+  // raises SQLITE_CONSTRAINT_FOREIGNKEY, which rolls back the whole reconciliation
+  // -- and because reconciliation runs every tick, that is not one lost cleanup
+  // but a tick that fails again on the same rows for ever.
+  //
+  // (The `sqlite3` CLI reports `foreign_keys = 0` on the same file, which is what
+  // makes this easy to get wrong: the pragma is per-CONNECTION, and the CLI never
+  // runs schema.sql. Only a connection opened by open() answers for the product.)
+  //
+  // Retiring a parent retires its descendants, because the descendant's work is
+  // meaningless once the parent's is: a reply naming an issue that will never be
+  // created has nothing to say. But a family is retired only when ALL of it can
+  // be, and three things stop it:
+  //
+  //   · a descendant a drainer is mid-delivery on -- the same reason inflight rows
+  //     are excluded above; deleting it leaves the drainer settling into nothing;
+  //   · a descendant in `keep`, which is the caller saying it is still wanted;
+  //   · a descendant already gone, which cannot be true here but is cheap to state.
+  //
+  // A blocked family is LEFT QUEUED rather than partially deleted. It is retried
+  // on the next tick, by which time the inflight delivery has settled.
+  const childrenOf = db.prepare(`SELECT id, idem_key, kind, status FROM outbox WHERE depends_on = ?`);
+  const family = id => {
+    const out = [];
+    const stack = [id];
+    // Bounded for the same reason cascadeDeadLetter is: a cycle cannot be built
+    // through enqueue, and a queue that never drains is not worth risking on that.
+    for (let guard = 0; stack.length && guard < 1024; guard++) {
+      const kids = childrenOf.all(stack.pop());
+      for (const k of kids) { out.push(k); stack.push(k.id); }
+    }
+    return out;
+  };
+
+  const deletable = [];
   for (const r of rows) {
+    const kin = family(r.id);
+    const blocker = kin.find(k => k.status === "inflight" || spare.has(k.idem_key));
+    if (blocker) {
+      emit(db, { actor: "daemon", op: "outbox.supersede_deferred",
+                 payload: { id: r.id, key: r.idem_key,
+                            because: blocker.status === "inflight" ? "a dependent effect is being delivered" : "a dependent effect is still wanted",
+                            dependent: blocker.idem_key } });
+      continue;
+    }
+    // Descendants FIRST, so a parent is never deleted while something points at it.
+    // `family` pushes in breadth order, so reversing gives deepest-first.
+    deletable.push(...kin.reverse(), r);
+  }
+
+  // One row can be reached twice -- as its own candidate and as another's
+  // descendant -- and deleting it twice is harmless but emits two events saying
+  // different things about the same transition.
+  const seen = new Set();
+  for (const r of deletable) {
+    if (seen.has(r.id)) continue;
+    seen.add(r.id);
     db.prepare(`DELETE FROM outbox WHERE id=? AND status IN ('pending','dead_letter')`).run(r.id);
     emit(db, { actor: "daemon", op: "outbox.superseded",
                payload: { id: r.id, kind: r.kind, was: r.status, key: r.idem_key, kept: [...spare] } });
   }
-  return rows.length;
+  // What was actually retired, not what was considered. `rows.length` counted
+  // candidates, so a family deferred because a drainer held one of its members
+  // would have been reported as superseded -- a caller logging this number would
+  // then say cleanup happened on a tick where it was correctly postponed.
+  return seen.size;
 }
 
 export function leaseOutbox(db, { worker, leaseSeconds = 300, kinds = null }) {
@@ -558,7 +622,15 @@ export function cascadeDeadLetter(db) {
       UPDATE outbox SET status='dead_letter', last_error=?, updated_at=unixepoch()
       WHERE id=? AND status='pending'`);
     for (const r of rows) {
-      mark.run(`the effect this one depends on (#${r.depends_on}) ended ${r.parent_status}; its result will never exist`, r.id);
+      const why = `the effect this one depends on (#${r.depends_on}) ended ${r.parent_status}; its result will never exist`;
+      mark.run(why, r.id);
+      // The SAME op `settleOutbox` and `recoverOutbox` emit, because this is the
+      // same transition arriving by a third route. Without it the event trail has
+      // no record of a real status change and stops agreeing with the projection
+      // it is supposed to explain -- and a dead letter is precisely the transition
+      // someone reads the trail to understand.
+      emit(db, { actor: "drainer", op: "outbox.dead_letter",
+                 payload: { id: r.id, kind: r.kind, cascadedFrom: r.depends_on, error: why } });
       cascaded.push(r);
     }
   }

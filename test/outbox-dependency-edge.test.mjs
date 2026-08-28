@@ -12,7 +12,7 @@
 // never leased and never fails looks exactly like an idle queue; a token that
 // resolves to nothing and gets posted anyway puts "see #" on a real pull request.
 // Both are asserted directly, and both are stubbed back out below.
-import { open, tx, enqueue, leaseOutbox, settleOutbox,
+import { open, tx, enqueue, leaseOutbox, settleOutbox, supersedeEffects,
          cascadeDeadLetter, blockedOnDependency } from "../src/db/ops.mjs";
 import { drainOutbox } from "../src/outbox/drain.mjs";
 import { resolveDependencyArgs, needsDependency, DependencyResolutionError } from "../src/outbox/depends.mjs";
@@ -208,6 +208,112 @@ const fresh = tag => open(join(mkdtempSync(join(tmpdir(), `reeve-dep-${tag}-`)),
   // The whole point: a broken body must not reach GitHub even once.
   check(!delivered.some(b => b.includes("#undefined") || b.includes("${dep.") || b === "moved to #"),
     "and no half-substituted body was ever handed to a handler", JSON.stringify(delivered));
+}
+
+// --- a row with NO edge is not touched by any of this --------------------------
+{
+  // The claim this change makes is that it is inert until something enqueues a
+  // dependent effect. That claim was FALSE in the first revision: every leased row
+  // went through resolution, so an ordinary body quoting a token -- a review
+  // trigger with an example in it, a finding quoting this module -- had no parent,
+  // raised "no dependency", and was terminally dead-lettered. A change that alters
+  // existing deliveries is not inert.
+  const db = fresh("inert");
+  tx(db, () => enqueue(db, { idemKey: "literal", kind: "gh.pr.comment",
+    args: { nwo: "o/r", pr: 1, body: "write it as ${dep.number} in the example" } }));
+
+  const delivered = [];
+  const handlers = { "gh.pr.comment": args => { delivered.push(args.body); return { ok: true, result: {} }; } };
+  await drainOutbox({ db, handlers, api: () => ({ ok: true, out: "" }), max: 5, budgetMs: 600_000 });
+
+  check(delivered.length === 1, "a row with no edge is still delivered", JSON.stringify(delivered));
+  check(delivered[0] === "write it as ${dep.number} in the example",
+    "and its literal token text reaches the handler untouched", delivered[0]);
+  check(db.prepare("SELECT status FROM outbox WHERE idem_key='literal'").get().status === "done",
+    "and it is done, not dead-lettered");
+}
+
+// --- an object cannot be interpolated into text --------------------------------
+{
+  // `String({})` is "[object Object]" and `String([1,2])` is "1,2". Both deliver
+  // without complaint, which is the visibly-broken comment this module exists to
+  // refuse arriving through the one path that was not checking it.
+  for (const [what, v] of [["an object", { number: 3 }], ["an array", [1, 2]]]) {
+    const e = threw(() => resolveDependencyArgs({ b: "see #${dep.issue}" }, { issue: v }));
+    check(e instanceof DependencyResolutionError, `${what} is refused, not stringified`, String(e));
+    check(!/object Object|^1,2$/.test(String(e?.message ?? "")) && /cannot be interpolated/.test(String(e?.message)),
+      `and the error says why rather than showing the mangled value`, String(e?.message));
+  }
+  // CONTROL: the scalar inside it still resolves, so the guard rejects the shape
+  // rather than the path.
+  check(resolveDependencyArgs({ b: "see #${dep.issue.number}" }, { issue: { number: 3 } }).b === "see #3",
+    "control: naming a scalar inside the object still works");
+}
+
+// --- a cascaded dead letter reaches the event trail ----------------------------
+{
+  const db = fresh("cascade-event");
+  const mk = (key, dependsOn = null) => tx(db, () => enqueue(db, {
+    idemKey: key, kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: key }, dependsOn }));
+  const a = mk("a"); const b = mk("b", a);
+  const lease = leaseOutbox(db, { worker: "t", kinds: ["gh.pr.comment"] });
+  settleOutbox(db, { id: a, leaseToken: lease.lease_token, ok: false, retryable: false, error: "no" });
+
+  const before = db.prepare("SELECT count(*) n FROM event WHERE op='outbox.dead_letter'").get().n;
+  cascadeDeadLetter(db);
+  const after = db.prepare("SELECT count(*) n FROM event WHERE op='outbox.dead_letter'").get().n;
+  check(after === before + 1,
+    "a cascaded dead letter emits the SAME event a settled one does", `${before} -> ${after}`);
+  const ev = db.prepare(`SELECT payload FROM event WHERE op='outbox.dead_letter' ORDER BY seq DESC LIMIT 1`).get();
+  check(String(ev.payload).includes(String(b)), "and the event names the row that died", String(ev.payload).slice(0, 160));
+  check(/cascadedFrom/.test(String(ev.payload)), "and records that it died because its parent did", String(ev.payload).slice(0, 160));
+}
+
+// --- superseding a parent must not be blocked by its own child -----------------
+{
+  // The foreign key is ENFORCED -- schema.sql sets PRAGMA foreign_keys = ON and
+  // open() executes it -- so deleting a row another still points at throws and
+  // rolls the whole reconciliation back. Reconciliation runs every tick, so that
+  // is not one lost cleanup but a tick that fails on the same rows for ever.
+  const db = fresh("supersede");
+  const mk = (key, dependsOn = null) => tx(db, () => enqueue(db, {
+    idemKey: key, kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: key }, dependsOn }));
+
+  const p1 = mk("o/r#1:create"); mk("o/r#1:reply", p1);
+  const e = threw(() => tx(db, () => supersedeEffects(db, { prefix: "o/r#1:", keep: new Set() })));
+  check(e === null, "superseding a parent with a live dependent does not throw", String(e));
+  check(db.prepare("SELECT count(*) n FROM outbox").get().n === 0,
+    "and the dependent is retired with it, since its work is now meaningless");
+
+  // A dependent the caller still WANTS blocks the retirement instead of being
+  // destroyed. Deleting it would throw; deleting the parent anyway would strand it.
+  const p2 = mk("o/r#2:create"); mk("o/r#2:reply", p2);
+  const kept = new Set(["o/r#2:reply"]);
+  const e2 = threw(() => tx(db, () => supersedeEffects(db, { prefix: "o/r#2:", keep: kept })));
+  check(e2 === null, "a spared dependent does not make reconciliation throw either", String(e2));
+  check(db.prepare("SELECT count(*) n FROM outbox WHERE idem_key='o/r#2:create'").get().n === 1,
+    "the parent is LEFT QUEUED rather than deleted out from under a wanted child");
+  check(db.prepare("SELECT count(*) n FROM outbox WHERE idem_key='o/r#2:reply'").get().n === 1,
+    "and the wanted child still exists");
+  check(db.prepare("SELECT count(*) n FROM event WHERE op='outbox.supersede_deferred'").get().n === 1,
+    "and the deferral is recorded rather than being silent");
+
+  // A drainer mid-delivery on a dependent blocks it for the same reason inflight
+  // rows have always been excluded.
+  // Its OWN store. The block above deliberately LEAVES a deferred parent pending,
+  // so leasing here took that one instead -- which the control caught, and which is
+  // exactly what a control is for.
+  const db3 = fresh("supersede-inflight");
+  const mk3 = (key, dependsOn = null) => tx(db3, () => enqueue(db3, {
+    idemKey: key, kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: key }, dependsOn }));
+  const p3 = mk3("o/r#3:create"); mk3("o/r#3:reply", p3);
+  const l3 = leaseOutbox(db3, { worker: "t", kinds: ["gh.pr.comment"] });
+  check(l3?.idem_key === "o/r#3:create", "control: the parent is what got leased", String(l3?.idem_key));
+  db3.exec(`UPDATE outbox SET status='inflight' WHERE idem_key='o/r#3:reply'`);
+  const n3 = tx(db3, () => supersedeEffects(db3, { prefix: "o/r#3:", keep: new Set() }));
+  check(db3.prepare("SELECT count(*) n FROM outbox WHERE idem_key='o/r#3:create'").get().n === 1,
+    "an inflight dependent defers the family rather than deleting under a drainer");
+  check(n3 === 0, "and the count reports what was RETIRED, not what was considered", String(n3));
 }
 
 // --- a store whose outbox PREDATES the column must still open ------------------

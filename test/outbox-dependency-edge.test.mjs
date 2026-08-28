@@ -400,6 +400,33 @@ const fresh = tag => open(join(mkdtempSync(join(tmpdir(), `reeve-dep-${tag}-`)),
     String(db.prepare("SELECT count(*) n FROM event WHERE op='outbox.dead_letter'").get().n));
 }
 
+// --- and the DRAINER actually hands its deadline down --------------------------
+{
+  // A correct bound that nothing is plugged into is the failure to look for. The
+  // budget check inside the cascade can be perfect while the drainer calls it
+  // without a deadline, and every test of the mechanism still passes.
+  const db = fresh("wired");
+  const parent = tx(db, () => enqueue(db, {
+    idemKey: "p", kind: "gh.pr.comment", args: { nwo: "o/r", pr: 1, body: "p" } }));
+  for (let i = 0; i < 5; i++)
+    tx(db, () => enqueue(db, { idemKey: `c${i}`, kind: "gh.pr.comment",
+      args: { nwo: "o/r", pr: 1, body: `c${i}` }, dependsOn: parent }));
+  const l = leaseOutbox(db, { worker: "t", kinds: ["gh.pr.comment"] });
+  settleOutbox(db, { id: parent, leaseToken: l.lease_token, ok: false, retryable: false, error: "no" });
+  check(db.prepare("SELECT count(*) n FROM outbox WHERE status='pending'").get().n === 5,
+    "control: five descendants are pending under a dead parent");
+
+  // A clock that has already run past the pass deadline by the time the cascade
+  // is reached. If the drainer passes its deadline down, nothing cascades.
+  let t = 0;
+  await drainOutbox({ db, handlers: { "gh.pr.comment": () => ({ ok: true, result: {} }) },
+                      api: () => ({ ok: true, out: "" }), max: 1, budgetMs: 1,
+                      now: () => (t += 1000) });
+  check(db.prepare("SELECT count(*) n FROM outbox WHERE status='pending'").get().n === 5,
+    "the drainer's own deadline reaches the cascade, so a spent pass cascades nothing",
+    String(db.prepare("SELECT count(*) n FROM outbox WHERE status='pending'").get().n));
+}
+
 // --- a store whose outbox PREDATES the column must still open ------------------
 {
   // Built rather than mocked, because the defect this guards is invisible to a

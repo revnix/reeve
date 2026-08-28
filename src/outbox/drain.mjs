@@ -22,7 +22,8 @@
  *  · It never leases a kind it cannot perform, and it SAYS how many such rows are
  *    waiting. A row nothing can deliver looks exactly like an empty queue.
  */
-import { leaseOutbox, settleOutbox, recoverOutbox, pendingWithNoHandler } from "../db/ops.mjs";
+import { leaseOutbox, settleOutbox, recoverOutbox, pendingWithNoHandler, cascadeDeadLetter, blockedOnDependency } from "../db/ops.mjs";
+import { resolveDependencyArgs, DependencyResolutionError } from "./depends.mjs";
 
 /**
  * Resolves to a retryable failure once `seconds` have passed. Never rejects.
@@ -136,6 +137,7 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
   for (const d of recovered.deadLettered ?? [])
     log(`  outbox: ${d.kind} #${d.id} DEAD-LETTERED — ${d.attempts} lease(s) and never once settled; its drainer is crashing`);
 
+
   // ONE absolute instant for the pass, computed once and never re-derived.
   //
   // It used to be re-derived per iteration as `Date.now() + leftInPass`, where
@@ -152,6 +154,23 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
   // applied to the quantity being spent -- reserving a fraction of a number the
   // budget has no relation to reserves the wrong thing.
   const floorMs = Math.max(1, budgetMs * SETTLE_RESERVE);
+
+  // Failed forward BEFORE leasing, for the same reason recovery runs first: a
+  // child whose parent died is resolved in this pass rather than sitting pending
+  // through it. It cannot be done on the lease path, because the whole point is
+  // that these rows are never leased.
+  // The SAME absolute instant the deliveries are bounded by, so the cascade cannot
+  // spend a budget it is not accounted against. It runs before any lease, and the
+  // daemon's tick awaits this whole function, so unbounded work here delays PR
+  // evaluation, heartbeats and alerts rather than merely arriving late itself.
+  const cascaded = cascadeDeadLetter(db, { deadlineAt: passDeadlineAt, now });
+  for (const c of cascaded)
+    log(`  outbox: ${c.kind} #${c.id} DEAD-LETTERED — the effect it depends on (#${c.depends_on}) ended ${c.parent_status}`);
+  // Said out loud, because a queue waiting on an edge and an idle queue produce
+  // the same pending count, and only one of them is worth looking at.
+  const waiting = blockedOnDependency(db);
+  if (waiting.length)
+    log(`  outbox: ${waiting.length} effect(s) waiting on a dependency that has not finished`);
 
   const done = [];
   let outOfTime = false;
@@ -194,7 +213,62 @@ export async function drainOutbox({ db, log = () => {}, handlers, api, actor = n
 
     let outcome;
     try {
-      const args = JSON.parse(job.args);
+      // Read at DELIVERY time, not at enqueue time. The child's stored args hold a
+      // token where the parent's value goes; see src/outbox/depends.mjs for why
+      // that indirection has to exist at all.
+      //
+      // The row is only leasable when the parent is `done`, so this read cannot
+      // find an unfinished parent -- but it is written to fail loudly rather than
+      // to assume it, because the guard and the read are in different statements
+      // and a future change to one would not visibly break the other.
+      let args;
+      try {
+        args = JSON.parse(job.args);
+        // ONLY a row with an edge is resolved, and that is what keeps this change
+        // inert for everything already in the queue.
+        //
+        // Running every leased row through resolution looked harmless and was not:
+        // an ordinary comment whose text happens to contain `${dep.…}` -- a review
+        // trigger quoting an example, a finding quoting this very module -- has no
+        // parent, so resolution raised "no dependency" and TERMINALLY dead-lettered
+        // a delivery that was previously fine. A change that alters existing
+        // deliveries is not inert, whatever its producer does.
+        //
+        // Gating on the edge rather than adding an escape also means there is no
+        // escaping syntax to learn, and no second way to write a body.
+        if (job.depends_on != null) {
+          const parent = db.prepare("SELECT status, result FROM outbox WHERE id=?").get(job.depends_on);
+          // Unreachable through `leaseOutbox`, which will not hand over a row whose
+          // parent is unfinished. Asserted anyway: the guard and this read are
+          // different statements, so a change to one would not visibly break the
+          // other, and the failure it would produce is a substitution against a
+          // result that is not final.
+          if (parent?.status !== "done")
+            throw new DependencyResolutionError(
+              `the dependency #${job.depends_on} is ${parent ? parent.status : "missing"}, not done`);
+          let parentResult = null;
+          if (parent.result != null) {
+            try { parentResult = JSON.parse(parent.result); }
+            catch { throw new DependencyResolutionError(`the dependency #${job.depends_on} recorded a result that is not JSON`); }
+          }
+          args = resolveDependencyArgs(args, parentResult);
+        }
+      } catch (err) {
+        // TERMINAL, and deliberately so. The parent is finished, so its result is
+        // final: a retry asks a settled question again and spends a delivery
+        // budget doing it. This is a producer/handler disagreement about shape,
+        // and it needs a person rather than another pass.
+        if (err instanceof DependencyResolutionError) {
+          // TERMINAL, and the attempt REFUNDED. The handler was never invoked, so
+          // charging a delivery would make the row and its event report an attempt
+          // that never happened. The fence stays bumped because the lease did.
+          settleOutbox(db, { id: job.id, leaseToken: job.lease_token, ok: false,
+                             retryable: false, unattempted: true, error: err.message });
+          log(`  outbox: ${job.kind} #${job.id} DEAD-LETTERED — ${err.message}`);
+          continue;
+        }
+        throw err;
+      }
       // A handler is awaited whether or not it is async, so one of each composes.
       // `attempt` reaches the handler because idempotency depends on it: only a
       // retry can find a previous delivery, and a first attempt that looked would

@@ -934,6 +934,53 @@ export function effectsFor({ nwo, e, decision, profile, execute }) {
  * A named function rather than a line inside `tick`, because a rule buried in a
  * branch of a 2000-line loop is a rule nothing can test. Pure, so it can be.
  */
+/**
+ * The identity of a findings-repair problem: WHICH findings are open.
+ *
+ * Keyed by the SET rather than by revision, matching how the CI cap is keyed by
+ * cause. Fixing one changes the set, which is a different problem and earns a
+ * fresh budget; changing nothing leaves the same set, which does not.
+ *
+ * Sorted, so the identity does not depend on the order a projection happened to
+ * return. Null for an empty set, because "nothing is open" is not a problem to be
+ * capped and a fingerprint over nothing would collide with every other empty case.
+ */
+export function findingsFingerprint(items, ledgerIds) {
+  const ids = [
+    // Only findings that can GATE. `gates === false` marks one that is neither
+    // dispatched nor blocking — an advisory reviewer's body finding — and letting
+    // it into the identity meant advisory churn reset the brake's budget against
+    // an unchanged problem. Undefined counts as gating, so a caller that does not
+    // mark items keeps the previous behaviour rather than silently narrowing.
+    ...(items ?? []).filter(t => t?.gates !== false).map(t => String(t?.id ?? "")),
+    // LEDGER BLOCKERS COUNT TOO. `FIX_FINDINGS` is selected by the `findings`
+    // clause as well as the thread ones, and when a ledger blocker is the only
+    // reason there are no review findings at all — so a key built from review
+    // threads alone was null, `attemptKey` recorded nothing, and the brake never
+    // engaged for the one kind of repair that has no GitHub state to change.
+    ...(ledgerIds ?? []).map(id => `ledger:${String(id ?? "")}`),
+  ].filter(Boolean).sort();
+  return ids.length ? `findings:${sha256(ids.join("\n")).slice(0, 16)}` : null;
+}
+
+/**
+ * What identifies the attempt this decision is about to spend, or null for a
+ * decision that spends nothing.
+ *
+ * One function rather than a conditional per action, because the two were drifting
+ * apart: FIX_CI had a budget from the day it was written and FIX_FINDINGS had none
+ * at all, and nothing in either call site said the other should exist. Asking
+ * "what identifies this attempt" in one place makes a missing answer visible.
+ *
+ * The caller decides WHETHER to spend — an attempt that never started is not an
+ * attempt — and this decides WHAT would be spent.
+ */
+export function attemptKey(decision, ciFingerprint, threadDetails, ledgerIds) {
+  if (decision?.action === "FIX_CI") return ciFingerprint || null;
+  if (decision?.action === "FIX_FINDINGS") return findingsFingerprint(threadDetails, ledgerIds);
+  return null;
+}
+
 export function dispatchable(decision, threadDetails) {
   const items = threadDetails ?? [];
   return decision?.bodyFindings ? items : items.filter(t => t?.anchor !== "body");
@@ -1887,9 +1934,16 @@ export async function tick(ctx) {
     let cause = null, fp = null;
     if (red) ({ cause, fp } = resolveFailureCause(nwo, e.checks, ctx.resolveCause ?? rootCause));
 
+    // The findings-repair budget, read from the store like the CI one beside it
+    // rather than from a map rebuilt empty on every tick.
+    const ffp = findingsFingerprint(e.threadDetails, e.ledgerBlockerIds);
     const decision = nextAction(e, profile, {
       now: now(),
       unknownSince: unknownSince(db, pr),
+      findingsFingerprint: ffp,
+      // Guarded the same way as the CI count: an unreadable store must not grant a
+      // free retry, so it reads as exhausted rather than as zero.
+      findingsAttempts: ffp ? attemptsFor(db, nwo, pr, ffp, logPath) : 0,
       // From the store, not from a map rebuilt empty on every tick.
       fingerprint: fp,
       // Guarded: an unreadable store must not take down the whole tick, and a
@@ -1897,6 +1951,13 @@ export async function tick(ctx) {
       // than grant a free retry.
       fixAttempts: fp ? new Map([[fp, attemptsFor(db, nwo, pr, fp, logPath)]]) : new Map(),
     });
+
+    // ONE KEY for the whole attempt: the count read before, the write after, and
+    // every refund in between. They were three separate expressions and only two
+    // of them knew about findings, so a transient failure BEFORE the worker ran
+    // spent a findings attempt that nothing gave back — and with the default cap
+    // of one, the next tick escalated instead of retrying.
+    const spendKey = attemptKey(decision, fp, e.threadDetails, e.ledgerBlockerIds);
 
     // Posting a comment launches no worker and hands no credential to one, so it
     // is decided and made durable HERE -- not below, where dispatch is gated on
@@ -1934,7 +1995,7 @@ export async function tick(ctx) {
     // Carried on the entry rather than left in this block's scope: the dispatch
     // loop below is a SEPARATE block, and reaching for these there threw a
     // ReferenceError on every FIX_CI the moment --execute was on.
-    decisions.push({ e, decision, cause, fp });
+    decisions.push({ e, decision, cause, fp, spendKey });
     log(logPath, "  " + describe(e, decision));
 
     // Republish on every tick: a verdict is bound to a revision, so when the head
@@ -1952,7 +2013,18 @@ export async function tick(ctx) {
       // nothing survived anything, and a founder reading that goes looking for a
       // bad fix that was never made. The reason it gave is carried on the ledger
       // row for exactly this moment.
-      const note = fp ? fixAttemptNote(db, nwo, pr, fp) : null;
+      // Looked up under EITHER identity, because a findings repair has one too.
+      //
+      // The blocker was stored and read under the CI fingerprint alone, so a
+      // FIX_FINDINGS worker that reported `needsHuman` had its reason recorded
+      // nowhere this branch could find it. The useful "#PR: needs a human —
+      // <reason>" escalation raised on the worker's own tick was then replaced on
+      // the next complete tick by the generic capped cause, and announcement
+      // reconciliation reported the original as cleared. The reason a person is
+      // needed is the whole content of the escalation; losing it to a rename is
+      // worse than not having capped at all.
+      const note = (fp ? fixAttemptNote(db, nwo, pr, fp) : null)
+                ?? (ffp ? fixAttemptNote(db, nwo, pr, ffp) : null);
       raise(note ? `#${pr}: needs a human — ${note}` : `#${pr}: ${decision.why}`);
     }
   }
@@ -2211,7 +2283,7 @@ export async function tick(ctx) {
     let started = 0;
 
     const PREP_BACKOFF = (ctx.prepBackoff ??= new Map());   // pr -> { until, failures }
-    for (const { e, decision, cause, fp } of decisions) {
+    for (const { e, decision, cause, fp, spendKey } of decisions) {
       // Already handled at decision time, in the same transaction as the decision.
       // Nothing to dispatch: reeve posts it.
       // The same condition the producer uses. If they disagree, a disarmed run
@@ -2363,7 +2435,7 @@ export async function tick(ctx) {
       // guardian pid, which the expiry reaper preserves for ever. Nothing
       // reclaims it if the next tick decides differently about this PR.
       try {
-        if (run.ok && decision.action === "FIX_CI" && fp) (ctx.recordFixAttempt ?? recordFixAttempt)(db, nwo, e.pr, fp, e.head);
+        if (run.ok && spendKey) (ctx.recordFixAttempt ?? recordFixAttempt)(db, nwo, e.pr, spendKey, e.head);
       } catch (err) {
         if (prLease) { releaseWithRetry(prRunRef, prLease); prLease = null; }
         // AND RETIRE THE RUN, because nothing else ever will.
@@ -2412,7 +2484,7 @@ export async function tick(ctx) {
           try {
             if (decision.action === "FIX_CI" && fp
                 && attemptsFor(db, nwo, e.pr, fp, logPath) > attemptsBefore)
-              refundFixAttempt(db, nwo, e.pr, fp);
+              if (spendKey) refundFixAttempt(db, nwo, e.pr, spendKey);
           } catch (e2) {
             log(logPath, `  #${e.pr}: the fix attempt could not be refunded — ${e2.message}`);
           }
@@ -2710,7 +2782,7 @@ export async function tick(ctx) {
         // spent above is refunded: this failure is reeve's, not the fix's.
         r = { outcome: OUTCOMES.FAILED, why: `could not prepare the worker: ${err.message}`, ms: 0, cost: null, sessionId: null };
         prepFailed = true;
-        if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+        if (spendKey) { try { refundFixAttempt(db, nwo, e.pr, spendKey); } catch { /* the run still closes */ } }
         const prev = PREP_BACKOFF.get(prepKey)?.failures ?? 0;
         PREP_BACKOFF.set(prepKey, { failures: prev + 1, until: Date.now() + Math.min(PREP_BACKOFF_CAP_MS, PREP_BACKOFF_BASE_MS * 2 ** prev) });
         raise(`#${e.pr}: the worker could not be prepared; reeve is backing off`);
@@ -2749,7 +2821,7 @@ export async function tick(ctx) {
         // attempt is given back as well.
         if (r?.outcome === OUTCOMES.UNBOUND && /cancel/.test(r?.why ?? "")) {
           r = { ...r, outcome: OUTCOMES.CANCELLED, why: r.why };
-          if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+          if (spendKey) { try { refundFixAttempt(db, nwo, e.pr, spendKey); } catch { /* the run still closes */ } }
         }
         // Pre-execution outcomes are classified BEFORE the recorder and the
         // finish, so a recorder that fails cannot rewrite them into a spent
@@ -2759,7 +2831,7 @@ export async function tick(ctx) {
         // lease and refuse the PR on every tick with nobody told.
         if (r?.outcome === OUTCOMES.UNBOUND) {
           prepFailed = true;
-          if (decision.action === "FIX_CI" && fp) { try { refundFixAttempt(db, nwo, e.pr, fp); } catch { /* the run still closes */ } }
+          if (spendKey) { try { refundFixAttempt(db, nwo, e.pr, spendKey); } catch { /* the run still closes */ } }
           const prev = PREP_BACKOFF.get(prepKey)?.failures ?? 0;
           PREP_BACKOFF.set(prepKey, { failures: prev + 1, until: Date.now() + Math.min(PREP_BACKOFF_CAP_MS, PREP_BACKOFF_BASE_MS * 2 ** prev) });
           raise(`#${e.pr}: the worker could not be prepared; reeve is backing off`);
@@ -2878,7 +2950,9 @@ export async function tick(ctx) {
 
       // Attached now rather than at dispatch: the reason only exists once the
       // worker has spoken, and it is what the retry cap will quote when it fires.
-      if (decision.action === "FIX_CI" && fp) noteFixAttempt(db, nwo, e.pr, fp, statedBlocker(r.report));
+      // Stored under the SAME key the attempt was spent against, whichever repair
+      // it was. Two identities, one place to look them up.
+      if (spendKey) noteFixAttempt(db, nwo, e.pr, spendKey, statedBlocker(r.report));
 
       if (r.outcome === OUTCOMES.OK) {
         // The worker cannot commit its own work. Its sandbox denies Bash writes

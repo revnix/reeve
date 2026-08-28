@@ -12,10 +12,26 @@
 //   not looking. That is absence rendered as success, in the one place built to
 //   decide whether absence has been ruled out.
 import { compare, record, streak, divergences } from "../src/review/shadow.mjs";
+import { observe } from "../src/review/ingest.mjs";
 import { open } from "../src/db/ops.mjs";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// The snapshot `observe()` hands the daemon, built the way the daemon builds it.
+const observedSnapshot = () => {
+  const page = JSON.stringify({ data: { repository: { pullRequest: {
+    reviewThreads: { totalCount: 1, pageInfo: { hasNextPage: false },
+                     nodes: [{ id: "T1", isResolved: false, isOutdated: false, path: "a.ts", line: 1,
+                               comments: { nodes: [{ databaseId: 1, author: { login: "codex" },
+                                                     body: "x", createdAt: "2026-08-21T00:00:00Z" }] } }] } } } } });
+  return observe("o/r", 1, { gh: args => args[0] === "graphql"
+    ? { ok: true, out: page }
+    : { ok: true, out: /pulls\/1\/reviews/.test(String(args[0]))
+        ? JSON.stringify([{ id: 9, user: { login: "codex" }, state: "COMMENTED",
+                            commit_id: "a".repeat(40), body: "b", submitted_at: "2026-08-21T00:00:00Z" }])
+        : "[]" } }).threads;
+};
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -201,5 +217,55 @@ const db = open(join(dir, "s.db"));
 
 db.close();
 rmSync(dir, { recursive: true, force: true });
+
+// ── the REVIEW surface, which nothing compared while only threads could gate ──
+//
+// A review body can hold a pull request now. A body posted between the fold and
+// the evaluation that reads it leaves the thread counts agreeing, the projection
+// fresh by every clock, and its body facts a tick out of date — the same shape
+// the thread comparison exists for, on a surface it never covered.
+{
+  const base = { readable: true, total: 3, unresolved: 1 };
+  const proj = { readable: true, total: 3, open: 1, resolved: 2 };
+
+  const same = compare({ ...base, reviewTotal: 7 }, { ...proj, reviewTotal: 7 });
+  check(same.comparable && same.agree,
+    "matching review counts agree, so the new check does not break agreement", same.why ?? "");
+
+  const moved = compare({ ...base, reviewTotal: 8 }, { ...proj, reviewTotal: 7 });
+  check(moved.comparable && !moved.agree,
+    "a review posted since the fold is a DISAGREEMENT, not a fresh projection", JSON.stringify(moved));
+  check(/review count differs/.test(moved.why ?? ""),
+    "and it says which surface moved, not merely that something did", moved.why ?? "");
+
+  // Compared only when BOTH sides report it, so a caller that does not read the
+  // review surface is unaffected rather than silently incomparable.
+  const oneSided = compare({ ...base }, { ...proj, reviewTotal: 7 });
+  check(oneSided.comparable && oneSided.agree,
+    "control: a live read without the review surface still compares on threads alone",
+    oneSided.why ?? "");
+  const otherSide = compare({ ...base, reviewTotal: 7 }, { ...proj });
+  check(otherSide.comparable && otherSide.agree,
+    "control: and so does a projection without it", otherSide.why ?? "");
+
+  // AND THE SNAPSHOT THE DAEMON ACTUALLY PASSES CARRIES IT. `compare` skipping
+  // when either side is absent is right for a caller that does not read the review
+  // surface, and wrong for the daily shadow: it would keep reporting agreement on
+  // threads alone while the fold missed review bodies entirely, and the streak
+  // would say so.
+  const snap = observedSnapshot();
+  check(snap.reviewTotal !== undefined,
+    "observe()'s own snapshot reports the review count, so the shadow can compare it",
+    JSON.stringify(Object.keys(snap)));
+
+  // The residual, asserted so it is a decision rather than a surprise: counts
+  // cannot see a body EDITED in place, which changes no count. Catching that
+  // exactly means hashing every review body every tick.
+  const edited = compare({ ...base, reviewTotal: 7 }, { ...proj, reviewTotal: 7 });
+  check(edited.agree,
+    "known residual: an in-place edit changes no count and is NOT caught here");
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
+
 process.exit(fail ? 1 : 0);

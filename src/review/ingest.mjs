@@ -183,7 +183,17 @@ export function observe(nwo, pr, io = {}) {
   // (Codex #6-[1].)
   const threadsSeen = out.filter(o => o.kind === "review_thread");
   const threads = { readable: total !== null && seen >= total, total,
-                    unresolved: threadsSeen.filter(o => !o.payload?.is_resolved).length, seen };
+                    unresolved: threadsSeen.filter(o => !o.payload?.is_resolved).length, seen,
+                    // THE REVIEW SURFACE TRAVELS WITH THE SNAPSHOT.
+                    //
+                    // `compare` skips the review check when either side is absent,
+                    // which is right for a caller that does not read that surface
+                    // and wrong here: the daily shadow would keep reporting
+                    // agreement on threads alone while the fold missed review
+                    // bodies entirely, and the streak would say so. An absence
+                    // read as agreement is the shape this whole projection exists
+                    // to stop.
+                    reviewTotal: out.filter(o => o.kind === "review").length };
 
   // Reactions on the PR issue: Codex's push-triggered clean pass, and its "eyes"
   // review-in-progress marker.

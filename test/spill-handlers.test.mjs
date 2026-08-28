@@ -9,7 +9,8 @@
 // reached for `gh` itself would pass every behavioural test here and still bypass
 // the outbox entirely, which is the one failure the outbox exists to prevent.
 import { ghIssueCreate, ghThreadResolve, HANDLERS, markerFor,
-         UNGATED_BY_REVIEW_ACTIONS, permittedHandlers } from "../src/outbox/effects.mjs";
+         UNGATED_BY_REVIEW_ACTIONS, isUngatedByReviewActions,
+         permittedHandlers } from "../src/outbox/effects.mjs";
 import { open, tx, enqueue } from "../src/db/ops.mjs";
 import { drainOutbox } from "../src/outbox/drain.mjs";
 import { DatabaseSync } from "node:sqlite";
@@ -75,21 +76,24 @@ const recorder = (replies = []) => {
   // `state=all`, because an issue somebody already closed still exists and
   // re-filing it is the duplicate this prevents.
   const { api, calls } = recorder([
-    { when: a => a.includes("--paginate"), then: { ok: true, out: "77" } },
+    { when: a => a.some(x => String(x).includes("repos/o/r/issues")), then: { ok: true, out: "77" } },
   ]);
   const r = ghIssueCreate({ nwo: "o/r", title: "t", body: "b" },
                           { api, idemKey: "k", actor: "reeve[bot]" });
   check(r.ok && r.result.number === 77 && r.result.alreadyThere === true,
     "an issue already carrying the marker is adopted rather than filed again", JSON.stringify(r));
   check(!calls.some(a => a.includes("POST")), "and nothing was posted", JSON.stringify(calls));
-  const look = calls.find(a => a.includes("--paginate"));
+  const look = calls.find(a => a.some(x => String(x).includes("repos/o/r/issues")));
   check(look.includes("state=all"), "the search covers CLOSED issues too", JSON.stringify(look));
+  check(look.includes("sort=created") && look.includes("direction=desc") && !look.includes("--paginate"),
+    "and it is BOUNDED and newest-first rather than walking the whole issue history",
+    JSON.stringify(look));
   check(look.some(x => String(x).includes("reeve[bot]")),
     "and it checks the AUTHOR, so a planted marker cannot make reeve settle having filed nothing");
 
   // An unreadable check is not evidence that no issue exists — but findings never
   // filed are findings nobody acts on, so it files. Same ruling as gh.pr.comment.
-  const blind = recorder([{ when: a => a.includes("--paginate"), then: { ok: false, err: "timeout" } },
+  const blind = recorder([{ when: a => a.some(x => String(x).includes("repos/o/r/issues")), then: { ok: false, err: "timeout" } },
                           { when: a => a.includes("POST"), then: { ok: true, out: JSON.stringify({ number: 9 }) } }]);
   const r2 = ghIssueCreate({ nwo: "o/r", title: "t", body: "b" },
                            { api: blind.api, idemKey: "k", actor: "reeve[bot]" });
@@ -99,14 +103,14 @@ const recorder = (replies = []) => {
 
 // --- reconciling may confirm, never act ----------------------------------------
 {
-  const definite = recorder([{ when: a => a.includes("--paginate"), then: { ok: true, out: "" } }]);
+  const definite = recorder([{ when: a => a.some(x => String(x).includes("repos/o/r/issues")), then: { ok: true, out: "" } }]);
   const r = ghIssueCreate({ nwo: "o/r", title: "t", body: "b" },
                           { api: definite.api, idemKey: "k", actor: "reeve[bot]", reconcileOnly: true });
   check(!r.ok && r.retryable === false,
     "a definite 'no such issue' with the budget spent is terminal", JSON.stringify(r));
   check(!definite.calls.some(a => a.includes("POST")), "and it filed nothing");
 
-  const unreadable = recorder([{ when: a => a.includes("--paginate"), then: { ok: false, err: "500" } }]);
+  const unreadable = recorder([{ when: a => a.some(x => String(x).includes("repos/o/r/issues")), then: { ok: false, err: "500" } }]);
   const r2 = ghIssueCreate({ nwo: "o/r", title: "t", body: "b" },
                            { api: unreadable.api, idemKey: "k", actor: "reeve[bot]", reconcileOnly: true });
   check(!r2.ok && r2.retryable === true,
@@ -206,6 +210,42 @@ const recorder = (replies = []) => {
     "while the constraint really was widened");
   check(db2.prepare("SELECT count(*) n FROM sqlite_master WHERE name='_reshape_outbox'").get().n === 0,
     "and the staging table is gone");
+  // Indexes follow a rename and KEEP their names, so the staged table would hold
+  // `outbox_due` hostage and schema.sql's IF NOT EXISTS would quietly do nothing —
+  // leaving the rebuilt table unindexed on exactly the stores that were upgraded.
+  for (const idx of ["outbox_due", "outbox_inflight"])
+    check(db2.prepare("SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?").get(idx)?.tbl_name === "outbox",
+      `${idx} belongs to the rebuilt table, not to the staging one`,
+      JSON.stringify(db2.prepare("SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?").get(idx)));
+
+  // AN INTERRUPTED REBUILD IS RECOVERED, not discarded. The rename autocommits, so
+  // a process dying before the copy leaves the rows in staging and no real table.
+  // Recreating an empty one and dropping staging on top would destroy every queued
+  // and delivered effect — the worst outcome this table can have.
+  const dir3 = mkdtempSync(join(tmpdir(), "reeve-spill-crash-"));
+  const path3 = join(dir3, "crash.db");
+  const raw3 = new DatabaseSync(path3);
+  raw3.exec(`CREATE TABLE _reshape_outbox (
+               id INTEGER PRIMARY KEY, idem_key TEXT NOT NULL UNIQUE,
+               kind TEXT NOT NULL, run_id TEXT, args TEXT NOT NULL,
+               status TEXT NOT NULL DEFAULT 'pending',
+               attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 8,
+               not_before INTEGER NOT NULL DEFAULT 0, lease_expires_at INTEGER NOT NULL DEFAULT 0,
+               result TEXT, last_error TEXT,
+               created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL) STRICT`);
+  raw3.exec(`INSERT INTO _reshape_outbox(id,idem_key,kind,args,status,created_at,updated_at)
+             VALUES(4,'survivor','gh.pr.comment','{}','pending',1,2)`);
+  raw3.close();
+  check(true, "control: a store is left mid-rebuild, with its rows only in staging");
+
+  const db3 = open(path3);
+  check(db3.prepare("SELECT count(*) n FROM outbox").get().n === 1,
+    "an interrupted rebuild is RECOVERED on the next open rather than discarded",
+    String(db3.prepare("SELECT count(*) n FROM outbox").get().n));
+  check(db3.prepare("SELECT idem_key, status FROM outbox WHERE id=4").get()?.idem_key === "survivor",
+    "with the row intact");
+  check(db3.prepare("SELECT count(*) n FROM sqlite_master WHERE name='_reshape_outbox'").get().n === 0,
+    "and the staging table cleaned up afterwards");
   // The queued row is still queued: a rebuild must not deliver or discard it.
   check(db2.prepare("SELECT status FROM outbox WHERE id=8").get().status === "pending",
     "a pending effect is still pending afterwards, neither delivered nor lost");
@@ -223,7 +263,7 @@ const recorder = (replies = []) => {
   // adds, so a handler added later is covered by this test without anyone
   // remembering to extend it.
   for (const kind of Object.keys(HANDLERS))
-    check(!UNGATED_BY_REVIEW_ACTIONS.has(kind),
+    check(!isUngatedByReviewActions(kind),
       `${kind} is governed by the review switch`, kind);
 
   // Double duty, and the second is the important one.
@@ -234,9 +274,17 @@ const recorder = (replies = []) => {
   // As an ASSERTION it makes the first exemption argue for itself. An empty set is
   // the strongest statement this file can make, and it is also the easiest thing to
   // quietly add one entry to; a diff that turns this red cannot be read past.
-  check(UNGATED_BY_REVIEW_ACTIONS.size === 0,
+  check(UNGATED_BY_REVIEW_ACTIONS.length === 0,
     "the exemption list is EMPTY — adding to it must fail this and be argued for",
-    String(UNGATED_BY_REVIEW_ACTIONS.size));
+    String(UNGATED_BY_REVIEW_ACTIONS.length));
+
+  // A frozen Set is not immutable: `Object.freeze` leaves `.add()` working, so any
+  // importer could grant an exemption at run time from anywhere in the process. An
+  // exemption must be a source-level decision a reviewer sees.
+  let mutated = false;
+  try { UNGATED_BY_REVIEW_ACTIONS.push("gh.issue.create"); mutated = true; } catch { /* frozen */ }
+  check(!mutated && !isUngatedByReviewActions("gh.issue.create"),
+    "and it cannot be added to at run time", String(mutated));
 
   // And the BEHAVIOUR, not only the declaration. Asserting the exemption set is
   // empty proves what is declared and nothing about whether anything reads it —

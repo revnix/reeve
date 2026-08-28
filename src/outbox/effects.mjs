@@ -192,8 +192,21 @@ export function ghIssueCreate(args, { api, idemKey, actor = null, reconcileOnly 
     // `state=all`, because a spill issue someone has already closed is still an
     // issue that exists, and re-filing it would be the duplicate this prevents.
     // Filtered in the --jq so a forged marker never reaches this code.
-    const seen = api(["--paginate", "-X", "GET", `repos/${nwo}/issues`,
-                      "-F", "per_page=100", "-f", "state=all",
+    // BOUNDED, and sorted so the bound is the useful end.
+    //
+    // `--paginate` over every open and closed issue makes each delivery walk the
+    // repository's entire history — on a busy repository that is hundreds of
+    // requests before a single POST, on the path that runs on every attempt.
+    //
+    // Newest first and two pages, because the thing being looked for is an issue
+    // THIS effect filed, and an effect is retried within its lease and its backoff
+    // rather than months later. The residual is named rather than hidden: an issue
+    // pushed past 200 by a flood of newer ones would not be found, and the failure
+    // that produces is a duplicate issue — the same failure an unreadable check
+    // produces, and the one this file has already ruled is the better direction.
+    const seen = api(["-X", "GET", `repos/${nwo}/issues`,
+                      "-F", "per_page=100", "-F", "page=1", "-f", "state=all",
+                      "-f", "sort=created", "-f", "direction=desc",
                       "--jq", `.[] | select(.user.login == "${actor}") | select(.body // "" | contains("${marker}")) | .number`]);
     if (seen.ok) {
       answered = true;
@@ -304,7 +317,21 @@ export function retryableFrom(err = "") {
  * Empty today, and that is correct rather than a placeholder: every effect reeve
  * currently performs is a review action.
  */
-export const UNGATED_BY_REVIEW_ACTIONS = Object.freeze(new Set());
+const UNGATED = Object.freeze([]);
+
+/**
+ * Whether the review switch leaves this kind alone.
+ *
+ * A FUNCTION over a frozen array, not a frozen Set. `Object.freeze` does not
+ * freeze a Set's entries — any importer can still call `.add()`, and the gate
+ * would then permit that kind with the switch off, from anywhere in the process.
+ * An exemption has to be a source-level decision that a reviewer sees, not
+ * something a module can grant itself at run time.
+ */
+export function isUngatedByReviewActions(kind) { return UNGATED.includes(kind); }
+
+/** The exemptions, as data, for a test that asserts there are none. */
+export const UNGATED_BY_REVIEW_ACTIONS = UNGATED;
 
 /**
  * The handlers a drainer may use, given whether review actions are permitted.
@@ -322,7 +349,7 @@ export const UNGATED_BY_REVIEW_ACTIONS = Object.freeze(new Set());
  */
 export function permittedHandlers(handlers, reviewActionsAllowed) {
   return Object.fromEntries(Object.entries(handlers ?? {})
-    .filter(([kind]) => UNGATED_BY_REVIEW_ACTIONS.has(kind) ? true : Boolean(reviewActionsAllowed)));
+    .filter(([kind]) => isUngatedByReviewActions(kind) ? true : Boolean(reviewActionsAllowed)));
 }
 
 /** Every kind this build can perform. A kind absent here is never leased. */

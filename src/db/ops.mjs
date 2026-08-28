@@ -154,6 +154,26 @@ const RESHAPED = [
 function reshapeTables(db) {
   const staged = [];
   for (const { table, requires, requiresSql } of RESHAPED) {
+    // RECOVERY FIRST, before the "table does not exist" bail-out, because that is
+    // exactly the state an interrupted rebuild leaves behind: the rows are in
+    // staging and the real table is gone. Checking `table_info` first meant the
+    // orphan was never noticed, schema.sql created a fresh empty table, and the
+    // rows sat in a staging table nothing would ever look at again.
+    const staging = `_reshape_${table}`;
+    if (requiresSql) {
+      const orphan = db.prepare(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(staging);
+      if (orphan) {
+        staged.push({ table, staging,
+                      columns: db.prepare(`PRAGMA table_info(${staging})`).all().map(c => c.name) });
+        // If the real table exists it is the empty one a previous partial recovery
+        // created; dropping it lets schema.sql rebuild it in the right shape.
+        const real = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table);
+        if (real && db.prepare(`SELECT count(*) n FROM ${table}`).get().n === 0) db.exec(`DROP TABLE ${table}`);
+        continue;
+      }
+    }
+
     let cols;
     try { cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name); }
     catch { continue; }
@@ -165,9 +185,21 @@ function reshapeTables(db) {
       // Renamed rather than dropped, and the rows are carried over below. Indexes
       // attached to the old table follow the rename, so they are dropped with the
       // staging table afterwards; schema.sql and ADDED_INDEXES rebuild the real ones.
-      const staging = `_reshape_${table}`;
-      db.exec(`DROP TABLE IF EXISTS ${staging}`);
+      // The rename AUTOCOMMITS, so a process dying between it and `finishReshape`
+      // leaves the rows in staging with no real table. That state is recovered at
+      // the top of this loop rather than treated as rubbish: recreating an empty
+      // table and dropping staging on top would discard every queued and delivered
+      // effect, which is the worst outcome this table can have.
       db.exec(`ALTER TABLE ${table} RENAME TO ${staging}`);
+      // INDEXES FOLLOW A RENAME AND KEEP THEIR NAMES. So `outbox_due` and friends
+      // now belong to the staging table while still occupying their names, and
+      // schema.sql's `CREATE INDEX IF NOT EXISTS outbox_due` finds the name taken
+      // and does nothing — leaving the rebuilt table with no indexes at all, on
+      // exactly the stores that were upgraded. Dropped here so the names are free
+      // before the schema runs.
+      for (const { name } of db.prepare(
+             `SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL`).all(staging))
+        db.exec(`DROP INDEX IF EXISTS ${name}`);
       staged.push({ table, staging, columns: cols });
       continue;
     }

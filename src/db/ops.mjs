@@ -114,14 +114,117 @@ function addMissingColumns(db) {
  */
 const RESHAPED = [
   { table: "inbox", requires: "content_hash" },
+  // A widened CHECK, which is a SHAPE change and not a column one.
+  //
+  // ALTER TABLE cannot touch a CHECK constraint, and `CREATE TABLE IF NOT EXISTS`
+  // does nothing to a table that exists — so a store created before this kind
+  // existed keeps the old constraint, and the failure appears at the first INSERT
+  // of the new kind. Measured rather than assumed: an insert of an unlisted kind
+  // fails with `CHECK constraint failed: kind IN (...)`, SQLITE_CONSTRAINT (19).
+  //
+  // Loud rather than silent, which is better than the alternative — but it fires
+  // inside the daemon on the first spill, not when the migration ran, and by then
+  // the decision that produced the effect is already durable.
+  //
+  // Its rows are COPIED, not refused, and that is not a convenience. A widening
+  // cannot invalidate an existing row, and `settleOutbox` marks a delivered effect
+  // `done` and never deletes it — so any store that has ever delivered anything
+  // holds rows for ever. Refusing on a row count made "drain the queue and retry"
+  // impossible to satisfy, and the daemon would simply never open again.
+  //
+  // Keyed on the table's own SQL because there is no column to look for.
+  { table: "outbox", requiresSql: "gh.issue.create" },
 ];
 
+/**
+ * Rename-aside, so the rows can be carried across after schema.sql rebuilds.
+ *
+ * Returns the tables it staged. A CHECK WIDENING cannot invalidate an existing
+ * row — every kind the old list allowed is in the new one — so the rows are
+ * COPIED rather than refused. That distinction matters more than it looks:
+ * `settleOutbox` marks a delivered effect `done` and never deletes it, so any
+ * store that has ever delivered anything holds rows for ever. Refusing on a raw
+ * count therefore made "drain the queue and retry" impossible to satisfy, and the
+ * daemon would never open again after the upgrade.
+ *
+ * A key change is different and still refuses: rewriting rows under a UNIQUE
+ * constraint they were never checked against loses whatever the key was added to
+ * distinguish, and that is a migration to think about rather than to invent here.
+ */
+/**
+ * Free the index names a renamed table is still holding.
+ *
+ * INDEXES FOLLOW A RENAME AND KEEP THEIR NAMES, so `outbox_due` and friends belong
+ * to the staging table while still occupying their names — and schema.sql's
+ * `CREATE INDEX IF NOT EXISTS outbox_due` then finds the name taken and does
+ * nothing, leaving the rebuilt table with no indexes at all on exactly the stores
+ * that were upgraded.
+ *
+ * Called from BOTH the rename path and the crash-recovery path. It used to live
+ * only in the former, so a process dying between the rename and this loop left the
+ * names held, and the recovered table came back unindexed.
+ */
+function stageOrphanIndexes(db, staging) {
+  for (const { name } of db.prepare(
+         `SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL`).all(staging))
+    db.exec(`DROP INDEX IF EXISTS ${name}`);
+}
+
 function reshapeTables(db) {
-  for (const { table, requires } of RESHAPED) {
+  const staged = [];
+  for (const { table, requires, requiresSql } of RESHAPED) {
+    // RECOVERY FIRST, before the "table does not exist" bail-out, because that is
+    // exactly the state an interrupted rebuild leaves behind: the rows are in
+    // staging and the real table is gone. Checking `table_info` first meant the
+    // orphan was never noticed, schema.sql created a fresh empty table, and the
+    // rows sat in a staging table nothing would ever look at again.
+    const staging = `_reshape_${table}`;
+    if (requiresSql) {
+      const orphan = db.prepare(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(staging);
+      if (orphan) {
+        // A staging table means a rebuild was interrupted, and there are TWO
+        // windows it can have stopped in, because the rename, the copy and the
+        // drop each autocommit separately:
+        //
+        //   · after the rename, before the copy — the real table is absent or was
+        //     recreated empty by a later open();
+        //   · after the copy, before the drop — the real table is populated and
+        //     already holds these rows.
+        //
+        // Both are handled by the same route: stage it, and let the copy be
+        // idempotent. Reading the real table's row count to decide would get the
+        // second window wrong — it looks exactly like a healthy table.
+        stageOrphanIndexes(db, staging);
+        staged.push({ table, staging,
+                      columns: db.prepare(`PRAGMA table_info(${staging})`).all().map(c => c.name) });
+        const real = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`).get(table);
+        if (real && db.prepare(`SELECT count(*) n FROM ${table}`).get().n === 0) db.exec(`DROP TABLE ${table}`);
+        continue;
+      }
+    }
+
     let cols;
     try { cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name); }
     catch { continue; }
-    if (!cols.length || cols.includes(requires)) continue;   // absent or already right
+    if (!cols.length) continue;                              // the table does not exist yet
+    if (requires && cols.includes(requires)) continue;       // already the new shape
+    if (requiresSql) {
+      const ddl = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`).get(table)?.sql ?? "";
+      if (ddl.includes(requiresSql)) continue;               // already the new shape
+      // Renamed rather than dropped, and the rows are carried over below. Indexes
+      // attached to the old table follow the rename, so they are dropped with the
+      // staging table afterwards; schema.sql and ADDED_INDEXES rebuild the real ones.
+      // The rename AUTOCOMMITS, so a process dying between it and `finishReshape`
+      // leaves the rows in staging with no real table. That state is recovered at
+      // the top of this loop rather than treated as rubbish: recreating an empty
+      // table and dropping staging on top would discard every queued and delivered
+      // effect, which is the worst outcome this table can have.
+      db.exec(`ALTER TABLE ${table} RENAME TO ${staging}`);
+      stageOrphanIndexes(db, staging);
+      staged.push({ table, staging, columns: cols });
+      continue;
+    }
     const n = db.prepare(`SELECT COUNT(*) n FROM ${table}`).get().n;
     if (n > 0) {
       throw new Error(
@@ -135,15 +238,47 @@ function reshapeTables(db) {
     // before anything gets a chance to fix it.
     db.exec(`DROP TABLE ${table}`);
   }
+  return staged;
+}
+
+/**
+ * Carry the staged rows into the rebuilt table.
+ *
+ * Only the columns both shapes have, because that is the whole set for a CHECK
+ * widening and is the safe subset otherwise: a column the new table added is
+ * exactly a column the old rows have no value for, and its default is the truth
+ * about them. Ids are preserved so `depends_on` still points where it did.
+ */
+function finishReshape(db, staged) {
+  for (const { table, staging, columns } of staged) {
+    const now = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+    const shared = columns.filter(c => now.includes(c));
+    if (shared.length) {
+      const list = shared.join(",");
+      // OR IGNORE, because this statement and the DROP below autocommit separately.
+      // A process dying between them leaves a populated table beside a staging one,
+      // and a plain INSERT then fails on the duplicate ids and unique keys at every
+      // subsequent startup — a database that can never be opened again, which is a
+      // worse outcome than the crash it is recovering from.
+      //
+      // Safe rather than merely convenient: ids are preserved, so a row already
+      // copied conflicts with itself and nothing else. No other writer can be
+      // running, because this is open() and nothing holds the database yet.
+      db.exec(`INSERT OR IGNORE INTO ${table}(${list}) SELECT ${list} FROM ${staging}`);
+    }
+    db.exec(`DROP TABLE ${staging}`);
+  }
 }
 
 export function open(path) {
   const db = new DatabaseSync(path, { timeout: 10000 });
-  reshapeTables(db);
+  const staged = reshapeTables(db);
   db.exec(readFileSync(new URL("./schema.sql", import.meta.url), "utf8"));
   addMissingColumns(db);
   // AFTER the columns, never before. See ADDED_INDEXES.
   addMissingIndexes(db);
+  // AFTER the table exists and has every column, since this writes into it.
+  finishReshape(db, staged);
   return db;
 }
 

@@ -496,7 +496,15 @@ const fresh = tag => open(join(mkdtempSync(join(tmpdir(), `reeve-dep-${tag}-`)),
   raw.exec(`CREATE TABLE outbox (
               id INTEGER PRIMARY KEY,
               idem_key TEXT NOT NULL UNIQUE,
-              kind TEXT NOT NULL,
+              -- The CURRENT kind list, on purpose. This block is about the missing
+              -- COLUMN, and the two migrations are independent: without the modern
+              -- CHECK here the fixture also trips the constraint rebuild, which
+              -- correctly REFUSES because this table holds a row — and the block
+              -- would then fail for a reason it is not about. The constraint
+              -- rebuild has its own coverage in test/spill-handlers.test.mjs.
+              kind TEXT NOT NULL CHECK (kind IN
+                ('git.push','gh.pr.create','gh.pr.comment','gh.pr.merge',
+                 'gh.issue.create','gh.thread.resolve','notify')),
               run_id TEXT,
               args TEXT NOT NULL,
               status TEXT NOT NULL DEFAULT 'pending',

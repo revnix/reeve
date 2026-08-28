@@ -161,6 +161,125 @@ export function ghPrComment(args, { api, idemKey, actor = null, reconcileOnly = 
 }
 
 /**
+ * Create an issue. AT-LEAST-ONCE, with the same best-effort deduplication.
+ *
+ * This is the first half of a spill: the round cap is reached, the remaining
+ * findings have to go somewhere a person will see, and the replies that name the
+ * issue depend on its number. See src/outbox/depends.mjs for why that ordering
+ * forces two rows rather than one handler.
+ *
+ * A duplicate ISSUE is a worse nuisance than a duplicate comment — someone has to
+ * close it — but the choice is the same one this file already made and for the
+ * same reason: findings that were never filed are findings nobody will act on, and
+ * an unreadable dedup check is not evidence that no issue exists.
+ *
+ * The marker is invisible in rendered Markdown, so the issue body carries its own
+ * identity without showing it. The AUTHOR is checked alongside it, because the key
+ * is derived from public values and anyone who can open an issue could otherwise
+ * plant the marker and cause reeve to settle `done` having filed nothing.
+ */
+export function ghIssueCreate(args, { api, idemKey, actor = null, reconcileOnly = false }) {
+  const { nwo, title, body, labels = [] } = args;
+  if (!nwo || !title || !body)
+    return { ok: false, retryable: false, error: `gh.issue.create needs nwo, title and body; got ${JSON.stringify(args)}` };
+  const marker = markerFor(idemKey);
+
+  // Whether GitHub actually ANSWERED, as distinct from whether it said no. On the
+  // delivery path both read as "no issue found" and both lead to creating one; the
+  // reconciling path turns on the difference exactly.
+  let answered = false;
+  if (actor) {
+    // `state=all`, because a spill issue someone has already closed is still an
+    // issue that exists, and re-filing it would be the duplicate this prevents.
+    // Filtered in the --jq so a forged marker never reaches this code.
+    // BOUNDED, and sorted so the bound is the useful end.
+    //
+    // `--paginate` over every open and closed issue makes each delivery walk the
+    // repository's entire history — on a busy repository that is hundreds of
+    // requests before a single POST, on the path that runs on every attempt.
+    //
+    // Newest first and two pages, because the thing being looked for is an issue
+    // THIS effect filed, and an effect is retried within its lease and its backoff
+    // rather than months later. The residual is named rather than hidden: an issue
+    // pushed past 200 by a flood of newer ones would not be found, and the failure
+    // that produces is a duplicate issue — the same failure an unreadable check
+    // produces, and the one this file has already ruled is the better direction.
+    const seen = api(["-X", "GET", `repos/${nwo}/issues`,
+                      "-F", "per_page=100", "-F", "page=1", "-f", "state=all",
+                      "-f", "sort=created", "-f", "direction=desc",
+                      "--jq", `.[] | select(.user.login == "${actor}") | select(.body // "" | contains("${marker}")) | .number`]);
+    if (seen.ok) {
+      answered = true;
+      const ns = String(seen.out || "").split("\n").map(s => s.trim()).filter(Boolean);
+      if (ns.length) return { ok: true, result: { number: Number(ns[0]), alreadyThere: true } };
+    }
+  }
+
+  if (reconcileOnly)
+    return answered
+      ? { ok: false, retryable: false,
+          error: "the delivery budget is spent and GitHub reports no issue carrying this effect's marker; not filing" }
+      : { ok: false, retryable: true,
+          error: "the delivery budget is spent and the marker could not be READ, so whether an issue was filed is unknown; not filing" };
+
+  const call = ["-X", "POST", `repos/${nwo}/issues`,
+                "-f", `title=${title}`, "-f", `body=${body}\n\n${marker}`];
+  for (const l of labels) call.push("-f", `labels[]=${l}`);
+  const r = api(call);
+  if (!r.ok) return { ok: false, retryable: retryableFrom(r.err), error: r.err };
+  let number = null;
+  try { number = JSON.parse(r.out).number ?? null; } catch { /* filed; parsing is the convenience */ }
+  // The NUMBER is the whole point of this effect: the dependent replies substitute
+  // it. A create that succeeded but whose response could not be parsed leaves the
+  // dependents with nothing to name, and they would dead-letter on an unresolvable
+  // token — which is correct but obscure. Said here instead.
+  if (number == null)
+    return { ok: false, retryable: true,
+             error: "the issue was filed but its number could not be read from the response, and dependent effects need it" };
+  return { ok: true, result: { number, alreadyThere: false } };
+}
+
+/**
+ * Resolve a review thread.
+ *
+ * Naturally idempotent, and that is why it carries no marker: resolving a thread
+ * that is already resolved is not a second effect, it is the same state. So the
+ * state is READ first and an already-resolved thread settles `ok` without a write.
+ *
+ * That read is not an optimisation. `resolveReviewThread` on a thread nobody may
+ * resolve fails, and without the read a spill whose threads a human had already
+ * tidied would dead-letter — summoning a person to look at work that is done.
+ */
+export function ghThreadResolve(args, { api, reconcileOnly = false }) {
+  // `api` is invoked as `gh api <args>` — the "api" word is supplied by the caller
+  // in src/github/app.mjs, not here. Passing it again produces `gh api api graphql`,
+  // which fails at run time and in no test that mocks the seam.
+  const { threadId } = args;
+  if (!threadId)
+    return { ok: false, retryable: false, error: `gh.thread.resolve needs threadId; got ${JSON.stringify(args)}` };
+
+  const read = api(["graphql", "-f",
+    `query=query($id:ID!){ node(id:$id) { ... on PullRequestReviewThread { isResolved } } }`,
+    "-f", `id=${threadId}`, "--jq", ".data.node.isResolved"]);
+  if (read.ok && String(read.out).trim() === "true")
+    return { ok: true, result: { resolved: true, alreadyThere: true } };
+
+  // A reconciling attempt may CONFIRM, never act. Reaching here means the thread
+  // did not read as resolved, so resolving now would act on an attempt the budget
+  // had already refused.
+  if (reconcileOnly)
+    return read.ok
+      ? { ok: false, retryable: false, error: "the delivery budget is spent and the thread reads as unresolved; not resolving" }
+      : { ok: false, retryable: true, error: "the delivery budget is spent and the thread's state could not be READ; not resolving" };
+
+  const r = api(["graphql", "-f",
+    `query=mutation($id:ID!){ resolveReviewThread(input:{threadId:$id}) { thread { isResolved } } }`,
+    "-f", `id=${threadId}`]);
+  if (!r.ok) return { ok: false, retryable: retryableFrom(r.err), error: r.err };
+  return { ok: true, result: { resolved: true, alreadyThere: false } };
+}
+
+/**
  * Whether a GitHub failure is worth trying again.
  *
  * Retrying is the default, because an unrecognised error is more often transient
@@ -180,5 +299,62 @@ export function retryableFrom(err = "") {
   return true;
 }
 
+/**
+ * Kinds the review switch does NOT gate, declared as an exemption list.
+ *
+ * The gate used to be written the other way round — a list of kinds that ARE
+ * gated, with everything else permitted — and that is fail-open by construction:
+ * adding a handler silently added an ungated externally-visible effect. It was
+ * found exactly that way. `gh.issue.create` was added to HANDLERS, became
+ * drainable, and took the unconditional branch, so an operator turning the review
+ * switch off would still have had a spill issue filed on their repository from a
+ * row queued earlier.
+ *
+ * Declared HERE, beside the handlers, so adding a handler and deciding whether the
+ * switch governs it are the same edit rather than two, the second of which is in
+ * another file and easy to miss.
+ *
+ * Empty today, and that is correct rather than a placeholder: every effect reeve
+ * currently performs is a review action.
+ */
+const UNGATED = Object.freeze([]);
+
+/**
+ * Whether the review switch leaves this kind alone.
+ *
+ * A FUNCTION over a frozen array, not a frozen Set. `Object.freeze` does not
+ * freeze a Set's entries — any importer can still call `.add()`, and the gate
+ * would then permit that kind with the switch off, from anywhere in the process.
+ * An exemption has to be a source-level decision that a reviewer sees, not
+ * something a module can grant itself at run time.
+ */
+export function isUngatedByReviewActions(kind) { return UNGATED.includes(kind); }
+
+/** The exemptions, as data, for a test that asserts there are none. */
+export const UNGATED_BY_REVIEW_ACTIONS = UNGATED;
+
+/**
+ * The handlers a drainer may use, given whether review actions are permitted.
+ *
+ * A FUNCTION rather than a filter expression at the call site, because the call
+ * site was where the rule went wrong and a rule written at its only call site is
+ * indistinguishable from a rule nobody stated. Here it can be exercised directly:
+ * a test asserting the exemption set is empty proves the DECLARATION and nothing
+ * about whether anything reads it, which is how the first version of this shipped
+ * with the daemon still using its own inline allowlist.
+ *
+ * Expressed as a filter over handlers rather than a condition around the drain, so
+ * a kind reeve may not perform is unleaseable rather than merely skipped — the
+ * drainer never takes the row, and the "pending with no handler" count says so.
+ */
+export function permittedHandlers(handlers, reviewActionsAllowed) {
+  return Object.fromEntries(Object.entries(handlers ?? {})
+    .filter(([kind]) => isUngatedByReviewActions(kind) ? true : Boolean(reviewActionsAllowed)));
+}
+
 /** Every kind this build can perform. A kind absent here is never leased. */
-export const HANDLERS = Object.freeze({ "gh.pr.comment": ghPrComment });
+export const HANDLERS = Object.freeze({
+  "gh.pr.comment": ghPrComment,
+  "gh.issue.create": ghIssueCreate,
+  "gh.thread.resolve": ghThreadResolve,
+});

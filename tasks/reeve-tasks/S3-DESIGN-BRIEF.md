@@ -345,7 +345,12 @@ Each task below is **one PR**. Plan-document assignment and line budget are reco
 
 **Files.** `bin/reeve`, `src/build/show.mjs` (new), `src/build/why.mjs` (new), `test/task-show.test.mjs` (new), `test/cli-flags.test.mjs` (append).
 
-**Consumes from S2.** `hubAccess`/`openHub` read path; `phase_event`, `phase_run`, `hub_event`, `provider_lease`, `escalation` tables; `openPrs(db, taskId, {kind})` `prs.mjs:37` (returns nothing in S3 — assert it).
+**Consumes from S2.** **A privileged read-only `DatabaseSync`, NOT `hubAccess`** — corrected
+2026-08-28, and recorded as D31 in `trackers/s3.md`. `hubAccess` returns `openHubAsGuest`, whose
+`ALLOWED` map admits only `provider_lease`, `provider_state`, `pr_hold` and `maintenance_lock`,
+so it DENIES `phase_event`, `phase_run`, `hub_event` and `escalation` — every table `list`, `show`
+and `why` exist to read. Following the guest path makes those commands fail on ordinary task
+history. The read path also covers `phase_event`, `phase_run`, `hub_event`, `provider_lease`, `escalation` tables; `openPrs(db, taskId, {kind})` `prs.mjs:37` (returns nothing in S3 — assert it).
 
 **Verify.** `WAITING_FOR_CAPABILITY` is derived, and turning `observe` off changes it without any write. `WAITING_FOR_QUOTA` reads a real `provider_lease` row with `status='queued'`. `why` renders a task that never dispatched (no `phase_run`) **without throwing** — absence is rendered as absence, not as an empty success. **Every UNKNOWN renders as UNKNOWN** (§11.6 `:738`). `--json` output validated against a schema with a `format_version`; the human text is explicitly **not** a stable interface.
 
@@ -362,7 +367,10 @@ Each task below is **one PR**. Plan-document assignment and line budget are reco
 
 **Consumes from S2.** T13's `show`/`why` derivations — **one data structure, two renderers**; the dash must compute nothing `show --json` cannot see.
 
-**Verify.** The HTML and the JSON derive from one value (assert by rendering both from one fixture object and comparing the facts). Age-in-state comes from `phase_event`, not from `updated_at` (the measured `updated_at`-is-not-a-change-signal class). Switch state is read live from the profile, not from a stored copy.
+**Verify.** **TEXT and JSON, not HTML** — corrected 2026-08-28, recorded as D37 in
+`trackers/s3.md`. The stage is headless by closed decision 7, so requiring an HTML renderer here
+would have an executor build or test a server-facing surface that decision forbids. The CLI's
+human-text rendering and the JSON derive from one value (assert by rendering both from one fixture object and comparing the facts). Age-in-state comes from `phase_event`, not from `updated_at` (the measured `updated_at`-is-not-a-change-signal class). Switch state is read live from the profile, not from a stored copy.
 
 **Depends on.** T13. **Blocks:** nothing.
 

@@ -114,28 +114,40 @@ existed since `src/checkout.mjs` replaced them.
 
     ```bash
     #!/bin/bash
-    squash=$(gh pr view <pr> --json mergeCommit --jq .mergeCommit.oid) || exit 23
-    # A FETCH THAT FAILED MUST NOT BECOME A VERDICT. Unchained, the next line
-    # resolves a CACHED origin/main, and the loop then prints no DRIFTED paths --
-    # a network or auth failure reading exactly like a clean verification.
-    git fetch origin refs/heads/main:refs/remotes/origin/main --quiet \
-      || { echo "UNREADABLE: could not refresh origin; refusing to classify against stale refs"; exit 23; }
-    # PIN it. origin/main is MUTABLE: left as a name, every ls-tree below
-    # re-resolves it, and a concurrent fetch can serve some paths from the old
-    # main and some from the new.
+    # RUN before it was written here, against a merged-and-intact pull request
+    # (exit 0), a merged-and-drifted one (exit 32) and an UNMERGED one (exit 23).
+    # The version this replaces printed "MERGED, AND INTACT ON MAIN" and exited 0
+    # on the unmerged one -- measured, not supposed.
+    set -o pipefail
+    squash=$(gh pr view <pr> --json state,mergeCommit --jq 'select(.state=="MERGED")|.mergeCommit.oid // empty')
+    [ -n "$squash" ] || { echo "UNREADABLE: not merged, or it reports no merge commit"; exit 23; }
+    git rev-parse --verify --quiet "${squash}^{commit}" >/dev/null \
+      || { echo "UNREADABLE: squash $squash is not readable in this checkout"; exit 23; }
+    git fetch origin "+refs/heads/main:refs/remotes/origin/main" --quiet \
+      || { echo "UNREADABLE: could not refresh origin"; exit 23; }
     main=$(git rev-parse "origin/main^{commit}") || exit 23
-    drift=0
-    # -z and `read -d ''`, NOT `for p in $(...)`. A filename may contain a space,
-    # a tab or a newline, and word splitting would iterate FRAGMENTS -- absent
-    # from both revisions, so both ls-tree reads come back empty and EQUAL, and a
-    # path that really had drifted reports clean. Filenames are attacker-supplied.
-    # Process substitution, not a pipe, so `drift` survives the loop.
+
+    # A TEMP FILE, not a process substitution and not a variable. Feeding the loop
+    # from `< <(git ...)` hides the producer's status -- bash does not propagate
+    # it, so a failed diff-tree runs the body ZERO times and falls straight
+    # through to the clean line. A command substitution cannot be used either:
+    # bash variables cannot hold NUL, so `-z` output loses its delimiters.
+    list=$(mktemp) || exit 23
+    trap 'rm -f "$list"' EXIT
+    git --literal-pathspecs diff-tree --no-commit-id --no-renames --name-only -r -z "$squash" > "$list" \
+      || { echo "UNREADABLE: could not enumerate the merge's paths"; exit 23; }
+    [ -s "$list" ] || { echo "UNREADABLE: the merge names zero paths; an empty set is not a pass"; exit 23; }
+
+    drift=0; n=0
     while IFS= read -r -d '' p; do
+      n=$((n + 1))
       a=$(git --literal-pathspecs ls-tree "$squash" -- "$p")
       b=$(git --literal-pathspecs ls-tree "$main"   -- "$p")
       [ "$a" = "$b" ] || { echo "DRIFTED: $p"; drift=1; }
-    done < <(git --literal-pathspecs diff-tree --no-commit-id --no-renames --name-only -r -z "$squash")
-    [ "$drift" -eq 0 ] && echo "MERGED, AND INTACT ON MAIN" || exit 32
+    done < "$list"
+    [ "$n" -gt 0 ] || { echo "UNREADABLE: enumerated zero paths"; exit 23; }
+    [ "$drift" -eq 0 ] || exit 32
+    echo "MERGED, AND INTACT ON MAIN ($n paths)"
     ```
 
     **`--literal-pathspecs`**, because a filename is attacker-supplied and git reads a path
@@ -216,19 +228,32 @@ Follow the phases in order. Each gate is completed before the next phase starts.
    situation it exists for.
 
    ```bash
-   git fetch origin refs/heads/main:refs/remotes/origin/main --quiet
-   for f in $(git ls-tree --name-only origin/main tasks/reeve-tasks/trackers/claims/); do
-     case "$f" in */README.md) continue;; esac
-     echo "== $f"; git show "origin/main:$f" | sed -n '1,12p'   # header is authoritative
-   done
+   # CHAIN IT. Unchained, a network or auth failure falls through to a CACHED
+   # origin/main -- and a claim another lane published since that cache was
+   # written is then invisible, so two lanes start the same task. This is the
+   # discovery read the whole protocol rests on; a stale answer here is worse
+   # than no answer. The `+` forces the update, or a rewritten main is a
+   # non-fast-forward that git refuses.
+   git fetch origin "+refs/heads/main:refs/remotes/origin/main" --quiet \
+     || { echo "COULD NOT READ THE CLAIMS -- do not treat this as 'nothing is claimed'"; exit 1; }
+   git ls-tree --name-only -z origin/main tasks/reeve-tasks/trackers/claims/ \
+     | while IFS= read -r -d '' f; do
+         case "$f" in */README.md) continue;; esac
+         echo "== $f"; git show "origin/main:$f" | sed -n '1,12p'   # header is authoritative
+       done
    ```
 
-   The **top-level `state:`** is the answer — `HELD` · `RELEASED` · `TAKEN OVER` — and the blocks
-   below it are history. **If the loop lists no files, say so as "I could not read the claims",
+   The **top-level `state:`** is the answer — **`HELD` or `RELEASED`, those two only** — and the
+   blocks below it are history. **`TAKEN OVER` is a history state and never an authoritative
+   header**: it marks the *outgoing* holder's archived block, and an incoming lane sets the header
+   to `HELD` in its own name. A file whose header reads `TAKEN OVER` publishes no active holder,
+   which is the ambiguous ownership the takeover procedure exists to prevent. **If the loop lists no files, say so as "I could not read the claims",
    not as "nothing is claimed"**: an empty listing and an unreadable one look identical here.
-   Then read the stage tracker (`tasks/reeve-tasks/trackers/s3.md`) and
-   `tasks/reeve-tasks/trackers/MASTER.md` for live state and context — they summarise, they do
-   not decide.
+   Then read **the stage tracker named by your task** — the `<tracker file>` on line 5, not a
+   fixed path — and `tasks/reeve-tasks/trackers/MASTER.md`, for live state and context. They
+   summarise; they do not decide. **This prompt serves every stage**, so hard-coding S3's tracker
+   would send an S4–S12 executor past their own stage's claims, blockers, defaults and decisions
+   and into unrelated S3 state.
 3. Confirm the task's **dependencies are MERGED**, by content — not "the PR is open", not "it
    was approved".
 4. **Publish the claim where the protocol says peers look, which is `main`.** Write
@@ -309,9 +334,17 @@ downstream tasks, so a package marked built early is a dependency that is not th
    each one:
 
    ```bash
+   missing=0
    for dep in <dep-squash-sha>...; do
-     git merge-base --is-ancestor "$dep" "$base" || echo "BASE OMITS $dep"
+     # NOT `|| echo`. That turns a failing command into a SUCCEEDING one, the
+     # loop exits 0, and a wrapper checking the status proceeds on exactly the
+     # incomplete base this guard exists to prevent -- the false green rule 6
+     # warns about, reproduced inside the guard added to stop it.
+     if ! git merge-base --is-ancestor "$dep" "$base"; then
+       echo "BASE OMITS $dep"; missing=1
+     fi
    done
+   [ "$missing" -eq 0 ] || { echo "do NOT branch from $base"; exit 1; }
    ```
 
    **Ancestry is the right test here and it does not contradict rule 11.** Rule 11 forbids
@@ -405,9 +438,23 @@ When, and only when, the founder grants this specific PR:
    characters, not one row per finding.
 3. Add any **durable finding** — a lesson about plans or designs being wrong — to §5.
 4. Add any decision taken during the task to §4, with its date and reason.
-5. **Publish the tracker, once, with every close-out edit in it.** Steps 1 to 4 all write the
-   same file, so open **one tracker-only PR** carrying the STATE change, the defect-log rows, the
-   durable findings and the decisions together — one file, nothing else, reviews in a minute.
+5. **Publish the tracker, once, with every close-out edit in it — from a NEW branch cut from a
+   freshly fetched `origin/main`, never from the feature worktree.**
+
+   ```bash
+   git fetch origin "+refs/heads/main:refs/remotes/origin/main" --quiet || exit 1
+   git worktree add -b chore/<stage>-<task>-close-out ~/Work/Products/reeve-wt/<name>-closeout origin/main
+   ```
+
+   **The feature branch cannot carry this.** Rule 11's whole point is that a squash makes the
+   feature head a NON-ancestor of `main` — so a PR opened from that branch after the merge
+   re-presents the feature's entire diff against the new `main` rather than one tracker file. The
+   "one file, reviews in a minute" property is lost, the close-out stalls, and every other lane
+   goes on reading `BUILT` on work that merged.
+
+   Steps 1 to 4 all write the same file, so that branch carries **one tracker-only PR** with the
+   STATE change, the defect-log rows, the durable findings and the decisions together — one file,
+   nothing else, reviews in a minute.
    **Publishing after step 1 would leave steps 2 to 4 in your checkout only**, and the workflow
    says to follow the phases in order, so they would never be published at all. Until this merges,
    every other lane reads `BUILT` on work that is done — precisely the 10-of-20 defect the
@@ -430,10 +477,25 @@ dead    = jobs with status=completed AND conclusion NOT IN (skipped,cancelled) A
 ran     = jobs with steps > 0
 pending = jobs with status != completed
 
-dead > 0     -> OUTAGE: nothing ran; the conclusion says nothing about the code
-ran  > 0     -> REAL RESULT: read the diff
-pending > 0  -> says nothing YET
+THE COUNTERS ARE NOT MUTUALLY EXCLUSIVE. A workflow can hold a finished job and
+a running one at the same moment, so these are tested IN ORDER and the first
+match wins:
+
+pending > 0  -> INCOMPLETE: says nothing YET, whatever the finished jobs say
+dead > 0     -> OUTAGE: something completed without executing; conclusions say nothing
+ran  > 0     -> REAL RESULT: read the conclusions
 otherwise    -> all skipped: says nothing
+
+**`pending` FIRST, and this is routine rather than theoretical.** `ci.yml`'s
+`CI Gate` needs `Test`, so between `Test` finishing with steps and the gate
+completing, `ran > 0` and `pending > 0` are BOTH true. Taking `ran` there reports
+a REAL RESULT over a suite that has not finished -- at the Phase 4 merge gate,
+which is the one place this is read to decide something irreversible.
+
+**And steps do not come from the check-runs endpoint.** It returns `steps: []`
+for every Actions job, so counting steps there marks a green suite `dead`.
+MEASURED: two jobs, both `success`, `steps` 0 via `commits/<sha>/check-runs` and
+3 and 9 via `actions/jobs/<id>`. Read the steps from the jobs endpoint.
 ```
 
 `jobs_with_steps == 0` is **one step short** and took three revisions to get right; its second

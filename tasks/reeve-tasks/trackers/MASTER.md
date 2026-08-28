@@ -53,8 +53,8 @@ A stage is MERGED only when every row of its Verify table names a file that exis
 
 | what | who | where |
 |---|---|---|
-| The foundation — this commit | this lane | `reeve#58`, in review — **6 codex review objects, 42 threads**; the latest round's 6 findings are fixed in this commit |
-| The merge verifier, split out of #58 | this lane | `reeve#60`, in review — **3 codex review objects, 11 threads**; the latest round's 4 findings are being fixed there |
+| The foundation — this commit | this lane | `reeve#58`, in review — **8 codex review objects, 60 threads**; the latest round's 9 findings are fixed in this commit. CI green. |
+| The merge verifier, split out of #58 | this lane | `reeve#60`, in review — **5 codex review objects, 19 threads, 0 unresolved**. CI green, review pending at head. |
 | The six S3 stage plans — **written, not yet in a PR** | this lane | branch `docs/s3-foundation`; they land one at a time (decision 17) |
 
 **S3's eleven documents are complete.** Six plans (14,167 lines, 78 tasks), a master plan, an

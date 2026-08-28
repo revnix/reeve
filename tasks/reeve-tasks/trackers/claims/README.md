@@ -90,7 +90,13 @@ pr:         —
 <anything another lane needs to know before touching an adjacent file>
 ```
 
-`state` is one of exactly three words: **HELD · RELEASED · TAKEN OVER.**
+The top-level `state` is one of exactly **two** words: **HELD · RELEASED.**
+
+**`TAKEN OVER` is a history state and never appears in the header.** It marks the *outgoing*
+holder's archived block under a `## Taken over <date>` heading; the incoming lane sets the
+top-level `state` to `HELD` in its own name. A header reading `TAKEN OVER` publishes **no active
+holder**, so a third lane reading `main` sees the task as free or ambiguously owned — the exact
+duplicate work the takeover procedure below exists to prevent, arriving through the enum instead.
 
 ### Every state change reaches `main` the same way, or it has not happened
 

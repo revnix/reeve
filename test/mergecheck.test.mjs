@@ -227,15 +227,30 @@ const F = "100644", X = "100755", L = "120000";
 
   const entryAt = fixture({ [S]: { "a.mjs": `${F} x` }, [M]: { "a.mjs": `${F} x` } });
   const files = classifyFiles(["a.mjs"], { squash: S, main: M, entryAt });
+  // AN UNCOVERED PATH REFUSES THE PASS. The exit code is the verdict to anything
+  // consuming this in a script, and prose is invisible to `verify-merge && merge`.
+  // A rebase merge names only its last commit, so the earlier commits' paths sit
+  // in branchOnly having never been compared -- exit 0 there is a pass over work
+  // nothing checked.
   const v = verdictFor(files, { branchOnly: extra });
-  check(v.verdict === VERDICT.intact && exitFor(v.verdict) === EXIT.ok,
-    "an uncovered path does NOT change the verdict -- it was not part of the merge", v.verdict);
+  check(v.verdict === VERDICT.unreadable && exitFor(v.verdict) === EXIT.unreadable,
+    "an uncovered path REFUSES the pass rather than exiting 0 with a note", v.verdict);
   check(/NOT COVERED BY THE VERDICT ABOVE/.test(v.why) && v.why.includes("late.mjs"),
-    "but it is named, loudly, so 'not covered' cannot be read as 'covered'", v.why);
+    "and the uncovered path is still named", v.why);
   check(/rebase merge names only its LAST commit/.test(v.why),
     "and the reading under which it is NOT benign is named too");
   check(!/NOT COVERED BY THE VERDICT ABOVE/.test(verdictFor(files).why),
     "control: with no branch-only paths the section is absent, not empty");
+  check(verdictFor(files).verdict === VERDICT.intact,
+    "control: the SAME files with no uncovered paths do verify, so the refusal is the uncovered path and not the fixture");
+
+  // ...unless a rebase merge has been ruled out at the repository level, which is
+  // the only thing that can distinguish a squash from a rebase tip.
+  const proven = verdictFor(files, { branchOnly: extra, squashProven: true });
+  check(proven.verdict === VERDICT.intact && exitFor(proven.verdict) === EXIT.ok,
+    "with rebase merges disabled on the repository, an uncovered path is a late push and verifies", proven.verdict);
+  check(/NOT COVERED BY THE VERDICT ABOVE/.test(proven.why),
+    "and is still reported, because a late push is worth seeing even when benign");
 }
 
 // A cross-check that could not run says so, and does not become a verdict.
@@ -243,12 +258,26 @@ const F = "100644", X = "100755", L = "120000";
   const entryAt = fixture({ [S]: { a: `${F} 1` }, [M]: { a: `${F} 1` } });
   const files = classifyFiles(["a"], { squash: S, main: M, entryAt });
   const v = verdictFor(files, { crossCheck: "rate limited" });
-  check(v.verdict === VERDICT.intact,
-    "a failed cross-check leaves the verdict intact -- it is computed from the merge's own diff, read locally", v.verdict);
+  check(v.verdict === VERDICT.unreadable && exitFor(v.verdict) === EXIT.unreadable,
+    "a failed cross-check REFUSES the pass -- it is the only read that would reveal an uncovered path", v.verdict);
   check(/could not be completed \(rate limited\)/.test(v.why),
     "and the failure is reported with its reason rather than passing silently", v.why);
   check(!/could not be completed/.test(verdictFor(files).why),
     "control: a complete cross-check adds no such note");
+  check(verdictFor(files).verdict === VERDICT.intact,
+    "control: the same files with a complete cross-check do verify");
+  check(verdictFor(files, { crossCheck: "rate limited", squashProven: true }).verdict === VERDICT.intact,
+    "with rebase merges ruled out, a failed cross-check no longer withholds the pass");
+
+  // A DRIFTED verdict is NOT withheld: it already exits non-zero and sends a
+  // human to look, and swapping it for UNREADABLE would lose a concrete finding.
+  const drifted = classifyFiles(["a"], {
+    squash: S, main: M,
+    entryAt: fixture({ [S]: { a: `${F} 1` }, [M]: { a: `${F} 2` } }),
+  });
+  const dv = verdictFor(drifted, { branchOnly: ["late.mjs"], crossCheck: "rate limited" });
+  check(dv.verdict === VERDICT.drifted && exitFor(dv.verdict) === EXIT.drifted,
+    "an uncovered path does NOT downgrade a DRIFTED finding to UNREADABLE", dv.verdict);
 }
 
 // An empty merge diff is UNREADABLE, and names which read was empty.
@@ -258,6 +287,35 @@ const F = "100644", X = "100755", L = "120000";
     "a merge whose diff names zero paths is UNREADABLE, not intact", v.verdict);
   check(/merge commit's own diff/.test(v.why),
     "and names the merge diff as the empty read, not the API list", v.why);
+}
+
+
+// --- REPLACEMENT OBJECTS ------------------------------------------------------
+// A refs/replace/* entry transparently substitutes a different object for the
+// one an OID names, and fetching does not clear them. A replacement tree that
+// matched main would verify an object that is NOT the squash GitHub reported.
+{
+  const calls = [];
+  const G = gitFacts((args) => { calls.push(args); return ""; });
+  G.pinMain(); G.parentsOf("s"); G.mergePaths("s"); G.entryAt("s", "f");
+  check(calls.every(a => a.includes("--no-replace-objects")),
+    "every git call disables replacement objects, so a local git-replace cannot forge a match",
+    JSON.stringify(calls.map(a => a.slice(0, 2))));
+}
+
+// --- A PATH MAY BEGIN WITH WHITESPACE ----------------------------------------
+// The -z output must not be trimmed: a leading space belongs to the FIRST path,
+// and stripping it sends the lookup after a different name -- absent from both
+// revisions, so it classifies REMOVED, which is a PASSING state.
+{
+  const G = gitFacts(() => " leading.mjs\u0000second.mjs\u0000");
+  const got = G.mergePaths("sha");
+  check(got[0] === " leading.mjs",
+    "a path beginning with a space survives enumeration byte-for-byte", JSON.stringify(got));
+  check(got.length === 2, "and the rest of the list is unaffected", JSON.stringify(got));
+  // The scalar reads still trim, or a trailing newline would become part of a sha.
+  check(gitFacts(() => "abc123\n").pinMain() === "abc123",
+    "while a scalar read is still trimmed, so a trailing newline never enters a revision id");
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

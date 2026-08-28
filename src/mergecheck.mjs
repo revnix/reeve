@@ -96,7 +96,7 @@ export function classifyFiles(paths, { squash, main, head = UNREAD, entryAt }) {
  * read that saw nothing, and answering "all intact" over nothing is how a
  * narrowing check reports success.
  */
-export function verdictFor(files, { branchOnly = [], crossCheck = "complete" } = {}) {
+export function verdictFor(files, { branchOnly = [], crossCheck = "complete", squashProven = false } = {}) {
   if (files.length === 0) {
     return { verdict: VERDICT.unreadable, counts: { intact: 0, drifted: 0, gone: 0, headDiverged: 0 },
              why: "the merge commit's own diff names zero paths, so there is nothing to compare. An empty set is not a pass." };
@@ -135,6 +135,25 @@ export function verdictFor(files, { branchOnly = [], crossCheck = "complete" } =
     return { verdict: VERDICT.drifted, counts,
              why: `${counts.drifted} of ${files.length} path(s) on main differ from what the merge produced. The content arrived and something changed it since.\n` +
                   `That may be a legitimate follow-up or someone overwriting the work. This cannot tell which, and a human decides.${note2}` };
+  }
+  // A PASS IS THE ONLY DANGEROUS VERDICT, so it is the only one this blocks.
+  // DRIFTED already exits non-zero and sends a human to look; withholding it in
+  // favour of UNREADABLE would lose a concrete finding to an uncertainty.
+  //
+  // Why a note is not enough here: the exit code IS the verdict to anything that
+  // consumes this in a script, and prose is invisible to `verify-merge && merge`.
+  // If a rebase merge named only its last commit, the earlier commits' paths are
+  // in branchOnly and were never compared -- exit 0 would report a pass over
+  // work nothing checked. Same for a cross-check that could not run: it is the
+  // only thing that would have revealed such paths at all.
+  if (!squashProven && (branchOnly.length > 0 || crossCheck !== "complete")) {
+    return { verdict: VERDICT.unreadable, counts,
+             why: `every path this merge produced is intact on main, but the merge cannot be shown to cover the whole pull request, so this is NOT a pass.\n` +
+                  (branchOnly.length > 0
+                    ? `${branchOnly.length} path(s) the pull request touches are absent from the merge commit's diff and were never compared.\n`
+                    : `the cross-check that would reveal such paths could not be completed.\n`) +
+                  `A squash merge carries the whole branch; a REBASE merge names only its last commit, and this repository permits rebase merges, so the two cannot be told apart from here.\n` +
+                  `Disable rebase merges on the repository, or check the uncovered paths by hand.${note2}` };
   }
   return { verdict: VERDICT.intact, counts,
            why: `All ${files.length} path(s) on main are exactly what the merge produced, mode included.\n` +
@@ -189,12 +208,17 @@ export function gitFacts(run) {
   // attacker-supplied, and git reads a leading `:` as pathspec magic, so
   // `:(literal):foo` would send a lookup after `:foo` instead. It also disables
   // wildcards, so a filename containing `*` cannot match some other file.
-  const g = (...args) => run(["--literal-pathspecs", ...args]);
+  // `--no-replace-objects` too: a `refs/replace/*` entry -- one left behind by
+  // `git replace` during history inspection, say -- transparently substitutes a
+  // different object for the one an OID names, and fetching does not clear them.
+  // A replacement tree that happens to match main would produce a clean verdict
+  // over an object that is NOT the squash GitHub reported.
+  const g = (...args) => run(["--literal-pathspecs", "--no-replace-objects", ...args]);
   return {
     // Resolved to an object id, because `origin/main` is MUTABLE: left as a
     // name, each lookup re-resolves it and a concurrent fetch can serve some
     // paths from the old main and some from the new.
-    pinMain: () => g("rev-parse", "origin/main^{commit}"),
+    pinMain: () => g("rev-parse", "origin/main^{commit}").trim(),
     // Through `g` like every other read, so "every git call this makes carries
     // --literal-pathspecs" is one uniform invariant a test can assert, rather
     // than a per-call judgement that rots the first time a call is added.
@@ -203,6 +227,10 @@ export function gitFacts(run) {
     // source side -- `diff.renames` is a repository setting, and this must not
     // depend on it. `-z` because a filename may contain a newline, which git
     // would otherwise quote into a different string.
+    // NOT trimmed: a filename may BEGIN with a space or a tab, and trimming the
+    // -z output strips that byte off the FIRST path, sending the lookup after a
+    // different name -- absent from both revisions, so it classifies REMOVED,
+    // which is a passing state, over a path that may have drifted.
     mergePaths: (rev) =>
       g("diff-tree", "--no-commit-id", "--no-renames", "--name-only", "-r", "-z", rev)
         .split("\0").filter(Boolean),

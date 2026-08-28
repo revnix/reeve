@@ -10,7 +10,7 @@
 // that exercises it, and a manifest. That is what lets the real cleanliness guard
 // stay strict, rather than being loosened to make itself testable.
 import { applyEdit, validateManifest, classify, summarise, failedAssertions, describeMiss,
-         reportedAnyAssertion, CAUGHT, NOT_CAUGHT, WRONG_RED, CRASHED, UNRUNNABLE }
+         reportedAnyAssertion, CAUGHT, NOT_CAUGHT, WRONG_RED, CRASHED, UNRUNNABLE, TIMED_OUT_EXIT }
   from "../src/stubsweep.mjs";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -46,6 +46,51 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // regex metacharacters.
   check(applyEdit("if (a.b) x", { find: "a.b", replace: "q" }) === "if (q) x",
     "anchors are literal, so dots and brackets in source do not behave as patterns");
+}
+
+// --- an anchor that overlaps itself is still ambiguous --------------------------
+{
+  // Advancing past a match by its own length skips overlapping occurrences, so a
+  // repeated anchor reads as unique and gets applied to the first of several — the
+  // precise ambiguity the count exists to refuse.
+  const e = threw(() => applyEdit("aaa", { find: "aa", replace: "X" }));
+  check(e && /appears 2 time/.test(e.message),
+    "an anchor occurring at overlapping offsets is refused, not applied to the first",
+    String(e?.message));
+  const twice = threw(() => applyEdit("abab", { find: "ab", replace: "X" }));
+  check(twice && /appears 2 time/.test(twice.message), "control: a plainly repeated anchor is refused too");
+}
+
+// --- a trailing newline is a terminator, not a line -----------------------------
+{
+  // `"a\nb\n"` is two lines. Splitting yields three segments because the last is
+  // the empty string after the final terminator, and the inflated count also
+  // pushed anchors past the threshold that enables the move hint.
+  const src = "a\nb\nc\n";
+  const m = String(threw(() => applyEdit(src, { find: "a\nZ\n", replace: "x" }))?.message ?? "");
+  check(/of 2/.test(m), "a two-line anchor ending in a newline reports two lines, not three", m.split("\n")[1]);
+}
+
+// --- the move hint needs exactly ONE completed line ------------------------------
+{
+  // Zero completed lines means the divergence is INSIDE the first line, which is an
+  // edit. Calling that a move collapses the two cases the hint exists to separate.
+  const edited = String(threw(() => applyEdit("alphaZ\nbeta\ngamma\n",
+    { find: "alphaY\nbeta\ngamma", replace: "x" }))?.message ?? "");
+  check(!/moved rather than changed/.test(edited),
+    "an anchor diverging inside its FIRST line is not called a move", edited.split("\n")[1]);
+}
+
+// --- a timed-out run is not a verdict -------------------------------------------
+{
+  // A test that prints the expected FAIL line and then hangs exits non-zero with
+  // matching output, which would otherwise read as CAUGHT. The run never finished,
+  // so what it would have reported is unknown.
+  const v = classify({ controlExit: 0, hashChanged: true, restored: true, expectRed: "the guard holds",
+                       stubExit: TIMED_OUT_EXIT, stubOutput: "PASS  a\nFAIL  the guard holds\n" });
+  check(v.verdict === UNRUNNABLE,
+    "a run killed for exceeding its time limit is UNRUNNABLE even when the output matches", JSON.stringify(v));
+  check(/never completed/.test(v.why), "and says the run never completed", v.why);
 }
 
 // --- a rotted anchor says WHERE it stopped matching -----------------------------

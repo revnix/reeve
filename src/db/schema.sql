@@ -180,9 +180,12 @@ CREATE TABLE IF NOT EXISTS outbox (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS outbox_due ON outbox(not_before, id) WHERE status='pending';
 CREATE INDEX IF NOT EXISTS outbox_inflight ON outbox(lease_expires_at) WHERE status='inflight';
--- Read on every lease, to answer "is this row's parent finished". Partial, because
--- a row that waits for nothing never asks the question.
-CREATE INDEX IF NOT EXISTS outbox_depends ON outbox(depends_on) WHERE depends_on IS NOT NULL;
+-- `outbox_depends` is NOT here, and that is deliberate. It indexes a column that
+-- ADDED_COLUMNS adds, and this file is executed BEFORE those columns exist -- so
+-- on a database whose outbox predates the column, CREATE TABLE IF NOT EXISTS is a
+-- no-op, the column is still absent, and creating the index here throws at open()
+-- on exactly the stores that carry real history. It lives in ADDED_INDEXES in
+-- ops.mjs, which runs after the column is in place.
 
 -- ---------------------------------------------------------------- inbox
 -- Facts observed from the outside world (GitHub). Dedup by external id so a

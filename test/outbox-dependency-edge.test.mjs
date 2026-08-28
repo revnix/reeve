@@ -16,6 +16,7 @@ import { open, tx, enqueue, leaseOutbox, settleOutbox,
          cascadeDeadLetter, blockedOnDependency } from "../src/db/ops.mjs";
 import { drainOutbox } from "../src/outbox/drain.mjs";
 import { resolveDependencyArgs, needsDependency, DependencyResolutionError } from "../src/outbox/depends.mjs";
+import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -207,6 +208,54 @@ const fresh = tag => open(join(mkdtempSync(join(tmpdir(), `reeve-dep-${tag}-`)),
   // The whole point: a broken body must not reach GitHub even once.
   check(!delivered.some(b => b.includes("#undefined") || b.includes("${dep.") || b === "moved to #"),
     "and no half-substituted body was ever handed to a handler", JSON.stringify(delivered));
+}
+
+// --- a store whose outbox PREDATES the column must still open ------------------
+{
+  // Built rather than mocked, because the defect this guards is invisible to a
+  // fresh database and every other database in this suite is fresh.
+  //
+  // `open()` executes schema.sql BEFORE adding columns. On an existing table
+  // CREATE TABLE IF NOT EXISTS does nothing, so an index in schema.sql naming a
+  // not-yet-added column throws -- on exactly the stores that hold real history.
+  // It was found by opening a copy of the live store AFTER this suite was green,
+  // which is the only reason it is not still in the branch.
+  const dir = mkdtempSync(join(tmpdir(), "reeve-dep-old-"));
+  const path = join(dir, "old.db");
+  const raw = new DatabaseSync(path);
+  raw.exec(`CREATE TABLE outbox (
+              id INTEGER PRIMARY KEY,
+              idem_key TEXT NOT NULL UNIQUE,
+              kind TEXT NOT NULL,
+              run_id TEXT,
+              args TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              attempts INTEGER NOT NULL DEFAULT 0,
+              max_attempts INTEGER NOT NULL DEFAULT 8,
+              not_before INTEGER NOT NULL DEFAULT 0,
+              lease_expires_at INTEGER NOT NULL DEFAULT 0,
+              result TEXT, last_error TEXT,
+              created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL) STRICT`);
+  raw.exec(`INSERT INTO outbox(idem_key,kind,args,created_at,updated_at)
+            VALUES('legacy','gh.pr.comment','{}',0,0)`);
+  const before = raw.prepare("SELECT count(*) n FROM pragma_table_info('outbox') WHERE name='depends_on'").get().n;
+  raw.close();
+  // CONTROL: the tree really is the old shape, and really does hold a row. A
+  // fixture that already had the column would pass this block without testing it.
+  check(before === 0, "control: the fixture's outbox genuinely lacks the column", String(before));
+
+  const e = threw(() => {
+    const db = open(path);
+    const cols = db.prepare("SELECT name FROM pragma_table_info('outbox')").all().map(c => c.name);
+    check(cols.includes("depends_on"), "the column is added to a table that predates it");
+    check(db.prepare("SELECT count(*) n FROM sqlite_master WHERE type='index' AND name='outbox_depends'").get().n === 1,
+      "and its index is created AFTER the column, not before");
+    check(db.prepare("SELECT count(*) n FROM outbox").get().n === 1, "and the existing row survives");
+    check(db.prepare("SELECT depends_on FROM outbox WHERE idem_key='legacy'").get().depends_on === null,
+      "with null meaning what it should: this row waited for nothing");
+    open(path);   // reopening must be idempotent, since every daemon start does it
+  });
+  check(e === null, "opening a store whose outbox predates the column does not throw", String(e));
 }
 
 console.log(fail ? `\nFAILED ${fail}` : "\nok");

@@ -70,6 +70,23 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
 
   check(describeMiss(source, "  const guard = true;\n  return guard;").length > 0,
     "control: describeMiss returns something even for a near-complete match");
+
+  // A MOVED block and an EDITED line both produce a short prefix, and they need
+  // different repairs. Diverging at anchor line 1 of several is a move; diverging
+  // at the last line is an edit.
+  const moved = String(threw(() => applyEdit(source,
+    { find: "  const guard = true;\n  const extra = 1;\n  return guard;", replace: "x" }))?.message ?? "");
+  check(/anchor line 2 of 3/.test(moved),
+    "the divergence is reported as a position IN THE ANCHOR, not only a character count", moved.split("\n")[1]);
+  check(/moved rather than changed/.test(moved),
+    "and a first-line-only match is called out as a move", moved);
+
+  const edited = String(threw(() => applyEdit(source,
+    { find: "function f() {\n  const guard = true;\n  return nothing;", replace: "x" }))?.message ?? "");
+  check(/anchor line 3 of 3/.test(edited),
+    "control: diverging at the LAST anchor line is reported as such, not as a move", edited.split("\n")[1]);
+  check(!/moved rather than changed/.test(edited),
+    "and is NOT called a move", edited);
 }
 
 // --- a manifest that cannot produce a reading is refused ------------------------

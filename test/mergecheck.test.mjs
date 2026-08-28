@@ -55,6 +55,16 @@ const F = "100644", X = "100755", L = "120000";
   check(v.verdict === VERDICT.absent && exitFor(v.verdict) === EXIT.no,
     "a fix pushed after the merge is NOT ON MAIN, exit 31", v.verdict);
   check(/pushed to the branch AFTER/.test(v.why), "and the message names the cause that produces it");
+  // THE MESSAGE MUST NOT OVERCLAIM. MISSING establishes that main differs from
+  // the head and that the squash did not match the head. It never compares main
+  // WITH the squash -- and in this very fixture they are IDENTICAL, both holding
+  // round3 while the head has moved to round4. An earlier message said the path
+  // "matches neither the head nor the squash commit", which is false here, in a
+  // tool whose whole purpose is not saying more than it measured.
+  check(!/match neither/.test(v.why),
+    "and it does not claim a main-versus-squash comparison it never made", v.why);
+  check(/differ from the pull request head/.test(v.why),
+    "it reports only the comparison it actually established", v.why);
 }
 
 // --- merged, then main moved on ----------------------------------------------

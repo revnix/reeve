@@ -19,6 +19,18 @@
  * repaired by moving the assertion rather than by changing the code — which is the
  * evidence that this file should exist.
  */
+// NOT HERE, deliberately: the byte budget on retained assertion lines.
+//
+// It prevents an out-of-memory, not a wrong reading. With the budget and without
+// it the verdict is identical — the only difference is how much is held, and the
+// failure it guards is the process dying, which a test would have to actually
+// provoke to observe. A stub of it therefore comes back NOT_CAUGHT, correctly, and
+// the honest response is to leave it unmanifested rather than to bend a test until
+// it appears covered.
+//
+// The same reasoning applies to reaping a worker from a normally-exited test; see
+// test/stubsweep.test.mjs, where the limit is written down instead of asserted.
+
 export const STUBS = [
   {
     name: "lease-gate",
@@ -166,5 +178,145 @@ export const STUBS = [
     edits: [{ file: "src/stubsweep.mjs",
               find: `  if (stubExit === TIMED_OUT_EXIT)\n    return { verdict: UNRUNNABLE,\n             why: "the test was killed for exceeding its time limit, so the run never completed — " +\n                  "whatever it printed first is not a verdict" };\n`,
               replace: "" }],
+  },
+  {
+    name: "assertion-delimiter",
+    why: "treat any line starting with FAIL as an assertion, so a crash printing FAILURE: <text> reads as CAUGHT",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "lines beginning with FAIL but lacking the two-space delimiter are not assertions",
+    edits: [{ file: "src/stubsweep.mjs",
+              find: "const ASSERTION = /^(PASS|FAIL) {2}(.+)$/;",
+              replace: "const ASSERTION = /^(PASS|FAIL)\\s*(.*)$/;" }],
+  },
+  {
+    name: "expectred-type",
+    why: "accept a truthy non-string expectRed, so `[]` coerces to \"\" and matches every failing assertion",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "expectRed as an array is refused",
+    edits: [{ file: "src/stubsweep.mjs",
+              find: `    if (typeof e.expectRed !== "string" || !e.expectRed.trim())`,
+              replace: "    if (!e.expectRed)" }],
+  },
+  {
+    name: "path-containment",
+    why: "let a manifest edit resolve outside the repository, where the cleanliness guard cannot see it",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "resolving outside the repository is refused outright",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "for (const e of manifest)\n  for (const ed of e.edits) {\n    const real = contained(ed.file);",
+              replace: "for (const e of [])\n  for (const ed of e.edits) {\n    const real = contained(ed.file);" }],
+  },
+  {
+    name: "side-effect-check",
+    why: "stop rechecking the tree, so a stubbed test's litter passes unnoticed and later entries run against it",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "a stub whose test litters the repository does not pass the sweep",
+    // Reports a CLEAN reading in the shape the code now expects, rather than a
+    // bare string. A stub whose replacement no longer type-checks against the
+    // surrounding code breaks a different assertion and reads as WRONG_RED — which
+    // is the sweep telling you the manifest has rotted, not that the guard failed.
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "  const after = treeState();",
+              replace: "  const after = { tracked: \"\", ignored: beforeStub.ignored };" }],
+  },
+  {
+    name: "keep-verdict-lines",
+    why: "discard assertion lines with the output tail, so a noisy failure reads as CRASHED",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "a named assertion still counts when the failure buries it",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: '              output: kept.length ? `${kept.join("\\n")}\\n${body}` : body });',
+              replace: "              output: body });" }],
+  },
+  {
+    // BOTH defences at once, and deliberately so.
+    //
+    // The process group and the descendant sweep are redundant BY DESIGN: either
+    // alone kills a helper the test spawned. Removing one therefore changes
+    // nothing observable, and an entry stubbing only `detached` came back
+    // NOT_CAUGHT — correctly, because the property still held.
+    //
+    // The honest stub for a redundant pair is a compound one. Removing both must
+    // break it, or neither is load-bearing and the entry proves nothing about
+    // either.
+    name: "process-tree-kill",
+    why: "remove BOTH the process group and the descendant sweep, so a helper the test spawned outlives it and acts on a restored tree",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "the helper the STUBBED test spawned was killed with it",
+    edits: [
+      { file: "scripts/stub-sweep.mjs",
+        find: "  const child = spawn(process.execPath, [join(ROOT, file)], { cwd: ROOT, detached: true });",
+        replace: "  const child = spawn(process.execPath, [join(ROOT, file)], { cwd: ROOT });" },
+      { file: "scripts/stub-sweep.mjs",
+        find: "  for (const pid of stragglers) {\n    try { process.kill(pid, \"SIGKILL\"); } catch { /* already gone, or not ours */ }\n  }",
+        replace: "" },
+    ],
+  },
+  {
+    name: "manifest-url-safe",
+    why: "import the manifest by raw path, which breaks on a win32 drive letter and on any path holding a URL fragment character",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "still loads and runs",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "(await import(pathToFileURL(manifestPath).href))",
+              replace: "(await import(manifestPath))" }],
+  },
+  {
+    name: "git-dir-excluded",
+    why: "allow an edit inside .git, where a failed restore is invisible to the cleanliness guard",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "inside the git directory is refused outright",
+    // BOTH halves. The resolved directory and the literal `.git` pointer are
+    // redundant for an ordinary repository — either alone refuses `.git/config` —
+    // so removing one changes nothing observable and the entry reads NOT_CAUGHT
+    // correctly. The honest stub removes the whole condition.
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "    if (real === GIT_DIR || real.startsWith(GIT_DIR + sep) ||\n        real === GIT_POINTER || real.startsWith(GIT_POINTER + sep))",
+              replace: "    if (false)" }],
+  },
+  {
+    name: "ignored-artifacts",
+    why: "compare only tracked files, so an ignored cache the control run creates is invisible",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "an ignored artifact left by the control run voids the reading",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "  if (beforeStub === null || beforeStub.tracked !== \"\" || beforeStub.ignored !== atEntry.ignored) {",
+              replace: "  if (beforeStub === null || beforeStub.tracked !== \"\") {" }],
+  },
+  {
+    name: "real-git-dir",
+    why: "assume `<root>/.git` is the metadata directory, which is only a pointer file in a worktree or separate-git-dir repository",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "an edit inside a SEPARATE git directory is refused",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: '  GIT_DIR = realpathSync(\n    execFileSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: ROOT, encoding: "utf8" }).trim());',
+              replace: '  GIT_DIR = join(REAL_ROOT, ".git");' }],
+  },
+  {
+    name: "inert-raw-body",
+    why: "classify the raw interleaved capture, where a line neither stream emitted can name the expected assertion",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "an assertion forged by interleaving does not pass the sweep",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: '    const raw = (dropped ? `[${dropped} earlier byte(s) dropped]\\n${out}` : out)\n      .split("\\n").map(l => `  ${l}`).join("\\n");\n    const body = raw;',
+              replace: '    const body = dropped ? `[${dropped} earlier byte(s) dropped]\\n${out}` : out;' }],
+  },
+  {
+    name: "ignored-fingerprint",
+    why: "compare ignored artifacts by PATH only, so a control run overwriting one in place is invisible",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "an ignored artifact the control OVERWROTE voids the reading",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: '        return `${l} ${createHash("sha256").update(readFileSync(abs)).digest("hex").slice(0, 16)}`;',
+              replace: "        return l;" }],
+  },
+  {
+    name: "named-line-reserved",
+    why: "let unrelated failures fill the retention budget so the named assertion is crowded out and the entry reads WRONG_RED",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "the named assertion is kept even when 21,000 other failures fill the budget",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "      if (expectRed && !namedKept && ASSERTION_LINE.test(l) && l.includes(expectRed)) {",
+              replace: "      if (false) {" }],
   },
 ];

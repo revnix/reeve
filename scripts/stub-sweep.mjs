@@ -29,12 +29,12 @@
  *  · it proves a stub landed by a HASH CHANGE rather than by re-reading the file
  *    for the anchor. Confirmation greps have been measured inert here.
  */
-import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync, realpathSync, statSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve, dirname, basename, sep } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdit, validateManifest, classify, summarise, CAUGHT, UNRUNNABLE, TIMED_OUT_EXIT } from "../src/stubsweep.mjs";
 
 // Overridable so the runner can be pointed at a throwaway repository built by its
@@ -68,15 +68,86 @@ if (dirty)
 // Without it the only way to check that this tool FAILS on an uncaught stub would
 // be to break the repository on purpose and look — which is to say, no way at all.
 // An instrument that cannot be shown to fail is the exact shape it exists to find.
+const KILL_STRATEGY = process.platform === "win32" ? "taskkill"
+                    : (process.platform === "darwin" || process.platform === "linux") ? "posix"
+                    : null;
+
+// REFUSED, not attempted. A sweep that cannot stop what it spawns can leave a
+// worker running against a restored tree — and the tree looks correct afterwards,
+// which is the one outcome worse than failing loudly.
+if (!KILL_STRATEGY)
+  die(2, `stub-sweep: no way to terminate a test's process tree on ${process.platform}.\n` +
+         "POSIX uses a process group and taskkill covers Windows; this platform has neither,\n" +
+         "so a stubbed test could outlive the sweep and act on a restored tree. Refusing to run.");
+
 const manifestPath = process.env.STUB_MANIFEST
   ? resolve(process.env.STUB_MANIFEST)
   : join(ROOT, "test", "stub-manifest.mjs");
 let manifest;
 try {
-  manifest = validateManifest((await import(manifestPath)).STUBS);
+  // A FILE URL, not a path. On win32 `resolve()` yields `C:\\repo\\...`, and
+  // `import()` reads `c:` as an unsupported URL scheme — so the taskkill branch
+  // above would be reached and the sweep would still refuse to start, for a reason
+  // that has nothing to do with what it was checking.
+  manifest = validateManifest((await import(pathToFileURL(manifestPath).href)).STUBS);
 } catch (err) {
   die(2, `stub-sweep: the manifest is not usable: ${err.message}`);
 }
+
+// EVERY TARGET MUST RESOLVE INSIDE THE REPOSITORY, checked before anything is
+// written and by REAL path, not by string.
+//
+// `join(ROOT, file)` happily produces a path outside the tree when the entry
+// contains `..`, and an in-repository symlink reaches outside without any `..` at
+// all. The runner would then snapshot, deliberately modify and restore a file the
+// git cleanliness guard cannot see — so a malformed manifest damages a sibling
+// project and nothing in the sweep's own safety net notices.
+//
+// `realpathSync` on the ROOT too, because a repository reached through a symlinked
+// parent would otherwise fail its own containment test.
+const REAL_ROOT = realpathSync(ROOT);
+const contained = file => {
+  const target = join(ROOT, file);
+  // The FILE may not exist yet in a malformed manifest; resolving its directory is
+  // enough to answer where it would be written.
+  let real;
+  try { real = realpathSync(target); }
+  catch { try { real = join(realpathSync(dirname(target)), basename(target)); } catch { return null; } }
+  return real === REAL_ROOT || real.startsWith(REAL_ROOT + sep) ? real : null;
+};
+// The REAL git directory, asked for rather than assumed.
+//
+// `.git` is a pointer FILE in a worktree and in any repository using a separate
+// git directory — measured here: it is 63 bytes, and the metadata lives
+// elsewhere. Hard-coding `<root>/.git` therefore excludes a pointer and leaves
+// the actual metadata unprotected whenever it sits under an ignored path inside
+// the root, where `git status` cannot see a failed restore either.
+//
+// Both are excluded: the resolved directory, and the literal `.git` entry, which
+// is still worth refusing because rewriting the pointer redirects the repository.
+let GIT_DIR;
+try {
+  GIT_DIR = realpathSync(
+    execFileSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: ROOT, encoding: "utf8" }).trim());
+} catch {
+  die(2, "stub-sweep: cannot resolve the git directory, so it cannot be excluded from editable targets.");
+}
+const GIT_POINTER = join(REAL_ROOT, ".git");
+for (const e of manifest)
+  for (const ed of e.edits) {
+    const real = contained(ed.file);
+    if (!real)
+      die(2, `stub-sweep: ${e.name}: "${ed.file}" resolves outside the repository.\n` +
+             "A manifest may only edit files inside the tree the cleanliness guard can see.");
+    // INSIDE the root but INVISIBLE to the guard. `git status` does not report
+    // changes to `.git/config`, `.git/index` or anything else under the git
+    // directory, so an edit there would be applied, restored and never checked —
+    // and a failed restore would corrupt the repository silently.
+    if (real === GIT_DIR || real.startsWith(GIT_DIR + sep) ||
+        real === GIT_POINTER || real.startsWith(GIT_POINTER + sep))
+      die(2, `stub-sweep: ${e.name}: "${ed.file}" is inside the git directory (${GIT_DIR}).\n` +
+             "Changes there are invisible to `git status`, so the cleanliness guard could not see a failed restore.");
+  }
 
 const wanted = process.argv.slice(2);
 const entries = wanted.length ? manifest.filter(e => wanted.includes(e.name)) : manifest;
@@ -99,8 +170,106 @@ if (wanted.length && entries.length !== wanted.length) {
 // side effects after the sweep has reported that it finished.
 let activeChild = null;
 
-const runTest = file => new Promise(resolve => {
-  const child = spawn(process.execPath, [join(ROOT, file)], { cwd: ROOT });
+/**
+ * Every descendant of a pid, collected BEFORE anything is killed.
+ *
+ * The process group covers the ordinary case, and it does not cover a descendant
+ * that started a group of its own — a helper spawned with `detached: true` leaves
+ * the group and survives a signal aimed at it. So the tree is walked as well.
+ *
+ * Collected first because the links vanish with the parent: once it dies its
+ * children are reparented and `pgrep -P` can no longer find them from here.
+ *
+ * Best effort, and named as such. `pgrep` exists on macOS and Linux and not on
+ * Windows, so this is a second net rather than the mechanism — the group kill
+ * remains the thing that does the work.
+ */
+const descendantsOf = pid => {
+  const found = [];
+  const walk = p => {
+    let out = "";
+    try { out = execFileSync("pgrep", ["-P", String(p)], { encoding: "utf8" }); }
+    catch { return; }               // no children, or no pgrep on this platform
+    for (const line of out.split("\n")) {
+      const kid = Number(line.trim());
+      if (Number.isInteger(kid) && kid > 0 && !found.includes(kid)) { found.push(kid); walk(kid); }
+    }
+  };
+  walk(pid);
+  return found;
+};
+
+/**
+ * Kill a test and everything it started — by a strategy this PLATFORM supports.
+ *
+ * The POSIX mechanism does not exist on Windows. `detached` there means a separate
+ * console rather than a process group, negative-pid signalling is not supported at
+ * all, and `pgrep` is absent — so neither the mechanism nor the net is available,
+ * and a best-effort attempt would leave a worker alive on a restored tree while
+ * reporting success. That is the failure this whole runner exists to prevent,
+ * arriving on a different axis: the tree looks correct afterwards.
+ *
+ * So the platform matrix is explicit and FAILS CLOSED. `taskkill /T /F` walks the
+ * tree itself on Windows; POSIX uses the group plus the descendant sweep; anything
+ * else refuses at start-up rather than running with no way to stop what it spawns.
+ *
+ * Raised by the session building the provider-session extraction, whose harness
+ * spawns real workers and hits the same wall.
+ */
+
+/**
+ * WHAT THIS DOES NOT DO, because the boundary matters more than the effort.
+ *
+ * It ends a test the sweep is still holding — on a signal or a timeout — so the
+ * tree is never left stubbed. It does NOT supervise what a test spawns.
+ *
+ * A worker started by a test that then exits NORMALLY survives, and cannot
+ * reliably be stopped from here. Measured rather than assumed: after the child
+ * exits, `process.kill(-pgid)` returns ESRCH and `pgrep -g <pgid>` finds nothing;
+ * sampling `pgrep -P` while the child lives DOES return the worker's real pid, and
+ * `process.kill(<that pid>, "SIGKILL")` then returns ESRCH anyway while the worker
+ * demonstrably survives and writes seconds later. That last reading is unexplained,
+ * and a guarantee built on a mechanism nobody understands is worse than no
+ * guarantee, because it invites reliance.
+ *
+ * A sampling loop was written and removed. It cost a `pgrep` every 50ms of every
+ * test run — thousands of process spawns per sweep, paid in CI on every push — to
+ * deliver a property it could not keep. Applying a stub, reading a verdict and
+ * restoring the tree is this tool's job; process supervision belongs to whoever
+ * wrote the test, or to a sandbox.
+ *
+ * The tree checks remain the backstop, and their limit is honest too: they read
+ * after the test exits, so a worker writing later is outside what a synchronous
+ * sweep can see.
+ */
+const killTree = child => {
+  if (!child?.pid) return;
+  if (KILL_STRATEGY === "taskkill") {
+    // `/T` is the tree and `/F` is forceful. taskkill walks the descendants
+    // itself, so there is no separate straggler pass to do.
+    try { execFileSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore" }); }
+    catch { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
+    return;
+  }
+  // Collected BEFORE anything dies: the links vanish with the parent.
+  const stragglers = descendantsOf(child.pid);
+  try { process.kill(-child.pid, "SIGKILL"); }
+  catch { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
+  // Anything that left the group by starting one of its own. Sent after the group
+  // kill, so the ordinary case costs one signal and this is only cleanup.
+  for (const pid of stragglers) {
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone, or not ours */ }
+  }
+};
+
+const runTest = (file, expectRed = null) => new Promise(resolve => {
+  // DETACHED, so the child leads its own process GROUP.
+  //
+  // Killing the direct pid leaves anything it spawned alive — and a helper that
+  // outlives the sweep keeps producing side effects against a tree that has since
+  // been restored, with no timer left anywhere to stop it. A group can be killed
+  // whole, which is the only way to end work we did not start ourselves.
+  const child = spawn(process.execPath, [join(ROOT, file)], { cwd: ROOT, detached: true });
   activeChild = child;
   // BOUNDED. A deliberately broken test that logs continuously would otherwise
   // grow one unbounded string for as long as the timeout allows, and exhausting
@@ -111,13 +280,78 @@ const runTest = file => new Promise(resolve => {
   const CAP = 1 << 20;   // 1 MiB of tail is far more than any verdict needs
   let out = "";
   let dropped = 0;
-  const take = d => {
+  // ASSERTION LINES ARE KEPT SEPARATELY, and this is not belt-and-braces.
+  //
+  // A test that prints its named FAIL and THEN emits a megabyte of diagnostics
+  // would have had the evidence scrolled out of the tail — and the entry would be
+  // reported CRASHED or WRONG_RED, failing the sweep even though the assertion did
+  // catch the stub. The verdict must not depend on how noisy the failure was.
+  //
+  // Bounded too, so a test printing a million assertion lines cannot exhaust the
+  // heap through this route instead.
+  const ASSERTION_LINE = /^(PASS|FAIL) {2}(.+)$/;
+  const MAX_ASSERTION_LINES = 20_000;
+  // A BYTE BUDGET as well as a count. `MAX_LINE` truncates only the incomplete
+  // tail, so twenty thousand COMPLETE 64 KiB failure lines are each retained whole
+  // — over a gigabyte, and the heap goes before the restore handlers run. Which
+  // leaves the stub on disk: the same failure the cap exists to prevent, now
+  // arriving through the list that was added to preserve evidence from it.
+  const MAX_ASSERTION_BYTES = 4 << 20;   // 4 MiB of failure names is far past useful
+  let keptBytes = 0;
+  // A LINE HAS A MAXIMUM LENGTH. Without one, a test emitting a long diagnostic
+  // with no newline grows the incomplete-line buffer for ever — it never reaches
+  // the split, so the `out` cap never sees it, and the heap goes before the timer
+  // or the restore handlers run. Which leaves the stub on disk: the exact failure
+  // the cap was added to prevent, arriving through the buffer that implements it.
+  const MAX_LINE = 1 << 16;
+  // FAIL lines ONLY spend the budget. A large suite printing twenty thousand
+  // passing assertions before the relevant failure would otherwise exhaust the
+  // budget on PASS lines, and the named FAIL — the one thing this exists to
+  // preserve — would still scroll out of the tail.
+  const kept = [];
+  let namedKept = false;
+  // ONE BUFFER PER STREAM. A shared one splices stderr into a stdout assertion
+  // split across chunks: `FAIL  guard` + `diagnostic\n` + ` holds\n` retains a
+  // line that never existed, and the assertion that did is lost.
+  const partial = { out: "", err: "" };
+  const take = which => d => {
+    const merged = partial[which] + d;
+    const lines = merged.split("\n");
+    let tail = lines.pop() ?? "";
+    // A line longer than the maximum is TRUNCATED rather than buffered. It cannot
+    // be an assertion — the protocol's names are short — and keeping the head is
+    // more useful than keeping nothing.
+    if (tail.length > MAX_LINE) tail = tail.slice(0, MAX_LINE);
+    partial[which] = tail;
+    // BRACED. This loop had a single-statement body, so adding a second block
+    // silently placed it OUTSIDE the loop, where the line variable does not exist.
+    for (const l of lines) {
+      // THE NAMED ASSERTION IS NEVER CROWDED OUT. Twenty thousand unrelated
+      // failures before it would otherwise fill the budget, the raw tail would
+      // scroll past it, and the entry would read WRONG_RED for a stub the named
+      // assertion did catch. Its own line is kept outside the budget, once.
+      if (expectRed && !namedKept && ASSERTION_LINE.test(l) && l.includes(expectRed)) {
+        kept.push(l.length > MAX_LINE ? l.slice(0, MAX_LINE) : l);
+        namedKept = true;
+        continue;
+      }
+      if (kept.length < MAX_ASSERTION_LINES && keptBytes < MAX_ASSERTION_BYTES) {
+        const m = ASSERTION_LINE.exec(l);
+        // Truncated individually too: an assertion NAME is short, so a 64 KiB line
+        // beginning `FAIL  ` is a diagnostic wearing the protocol's prefix.
+        if (m && m[1] === "FAIL") {
+          const line = l.length > MAX_LINE ? l.slice(0, MAX_LINE) : l;
+          kept.push(line);
+          keptBytes += line.length;
+        }
+      }
+    }
     out += d;
     if (out.length > CAP) { dropped += out.length - CAP; out = out.slice(-CAP); }
   };
-  child.stdout.on("data", take);
-  child.stderr.on("data", take);
-  const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, 600_000);
+  child.stdout.on("data", take("out"));
+  child.stderr.on("data", take("err"));
+  const timer = setTimeout(() => { timedOut = true; killTree(child); }, 600_000);
   let timedOut = false;
   child.on("close", (code, signal) => {
     clearTimeout(timer);
@@ -125,8 +359,40 @@ const runTest = file => new Promise(resolve => {
     // "timed out" and "failed an assertion" are different readings and only one of
     // them is evidence.
     activeChild = null;
+    for (const tail of [partial.out, partial.err]) {
+      const m = tail && ASSERTION_LINE.exec(tail);
+      if (m && m[1] === "FAIL" && kept.length < MAX_ASSERTION_LINES && keptBytes < MAX_ASSERTION_BYTES) {
+        kept.push(tail);
+        keptBytes += tail.length;
+      }
+    }
+    // The kept assertions come FIRST, so they survive whatever the tail lost. The
+    // classifier reads whole lines, so prepending them changes nothing it can see
+    // except that the evidence is present.
+    // THE RAW BODY IS MADE INERT, not merely deprioritised.
+    //
+    // It is the two streams interleaved as they arrived, so a line can appear in
+    // it that neither stream ever emitted: stdout writes `FAIL  wrong assertion`
+    // with no newline, stderr writes ` target expected\n`, and the concatenation
+    // reads as one forged assertion naming the expected text. The classifier would
+    // then report CAUGHT for a run whose real assertions say otherwise.
+    //
+    // Indenting every raw line by two spaces means none of them can match the
+    // assertion protocol's `^(PASS|FAIL) {2}` anchor, so the raw text survives for
+    // a human to read while being unclassifiable. The reconstructed per-stream
+    // lines, prepended unindented, are the only thing the classifier can see.
+    const raw = (dropped ? `[${dropped} earlier byte(s) dropped]\n${out}` : out)
+      .split("\n").map(l => `  ${l}`).join("\n");
+    const body = raw;
+    // ALWAYS prepended, not only when the tail overflowed.
+    //
+    // `out` is the two streams interleaved as they arrived, so an assertion split
+    // across stdout chunks with a stderr line landing between them appears there
+    // spliced and broken — a line that never existed, while the one that did is
+    // absent. The per-stream reconstruction is the correct reading whether or not
+    // anything was dropped, so it is the one the classifier gets.
     resolve({ exit: timedOut || code === null ? TIMED_OUT_EXIT : code,
-              output: dropped ? `[${dropped} earlier byte(s) dropped]\n${out}` : out });
+              output: kept.length ? `${kept.join("\n")}\n${body}` : body });
   });
 });
 
@@ -187,7 +453,9 @@ for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     // The CHILD first. It is holding the stubbed tree open, and killing it after
     // restoring would let it run on against files that no longer match what it
     // was started with.
-    if (activeChild) { try { activeChild.kill("SIGKILL"); } catch { /* already gone */ } }
+    // The group AND anything that left it. Wrapped, so a failure here cannot stop
+    // the restore below — a stubbed tree left behind is worse than a stray process.
+    try { killTree(activeChild); } catch { /* the restore matters more */ }
     restoreActive();
     console.error(`\nstub-sweep: ${sig} — the tree was restored before exiting.`);
     // The conventional 128+n, so a caller can tell a signal from a verdict.
@@ -201,10 +469,82 @@ process.on("uncaughtException", err => {
   process.exit(2);
 });
 
+/**
+ * Is the tree clean? Returns "" for clean, the porcelain text for dirty, and NULL
+ * for could-not-tell.
+ *
+ * The third case is the point. Swallowing a failed `git status` into the empty
+ * string makes "the tree is clean" and "I could not find out" the same answer —
+ * and a stubbed test that damaged repository metadata is precisely the case where
+ * the check fails, so the one reading that most needs to be believed is the one
+ * that silently becomes a pass.
+ */
+const treeState = () => {
+  // `--ignored` as well, and the two halves are read differently.
+  //
+  // A control run that creates an IGNORED cache — a build artifact, a database,
+  // anything in .gitignore — which the stubbed run then consumes and removes is
+  // invisible to a plain `git status`: clean before, clean after, and the stub
+  // reported CAUGHT for a run that would not have been caught from a genuinely
+  // untouched tree. This repository ignores exactly that kind of artifact.
+  //
+  // Tracked entries must be ABSENT. Ignored entries only have to be UNCHANGED —
+  // requiring none would fail on `node_modules` every time, which is not dirt.
+  // `--ignored` collapses whole directories to one line, so this stays cheap.
+  try {
+    const raw = execFileSync("git", ["status", "--porcelain", "--ignored"],
+                             { cwd: ROOT, encoding: "utf8" });
+    const lines = raw.split("\n").filter(Boolean);
+    // IGNORED ENTRIES ARE FINGERPRINTED, not merely listed.
+    //
+    // A path list cannot see a control run OVERWRITING an ignored artifact that
+    // already existed: all three readings carry the same `!! path`, so the stub is
+    // applied to altered state and can read CAUGHT for a run that would not have
+    // been caught from the untouched tree.
+    //
+    // FILES are hashed. DIRECTORIES are not: `--ignored` collapses `node_modules`
+    // to one line, and walking it would cost more than the whole sweep. That is a
+    // stated limit rather than a hidden one — an ignored artifact created inside an
+    // already-ignored DIRECTORY is not detected, and if that ever matters the
+    // answer is to name the file in .gitignore rather than its parent.
+    const ignored = lines.filter(l => l.startsWith("!!")).sort().map(l => {
+      const rel = l.slice(3).trim();
+      const abs = join(ROOT, rel);
+      try {
+        const st = statSync(abs);
+        if (st.isDirectory()) return `${l} <dir, not fingerprinted>`;
+        return `${l} ${createHash("sha256").update(readFileSync(abs)).digest("hex").slice(0, 16)}`;
+      } catch {
+        return `${l} <unreadable>`;
+      }
+    }).join("\n");
+    return {
+      tracked: lines.filter(l => !l.startsWith("!!")).join("\n"),
+      ignored,
+    };
+  } catch { return null; }
+};
+
 const results = [];
 for (const entry of entries) {
   const files = [...new Set(entry.edits.map(e => join(ROOT, e.file)))];
-  const control = await runTest(entry.test);
+
+  // Read BEFORE the control as well, so a change the CONTROL makes is visible.
+  //
+  // Two readings could only compare the stubbed run against the post-control tree,
+  // which makes an artifact the control created part of the baseline — and that is
+  // exactly the case: a control run that leaves an ignored cache changes what the
+  // stubbed run does, and comparing only the later pair calls it unchanged.
+  const atEntry = treeState();
+  if (atEntry === null) {
+    const why = "the repository's state could not be read before this entry, so nothing after it would be verified";
+    results.push({ name: entry.name, reintroduces: entry.why, verdict: UNRUNNABLE, why });
+    console.log(`FAIL ${entry.name.padEnd(28)} ${UNRUNNABLE}`);
+    console.log(`       ${why}`);
+    break;
+  }
+
+  const control = await runTest(entry.test, entry.expectRed);
 
   // STOP HERE if the control already fails. `classify` would return UNRUNNABLE
   // whatever happens next, so stubbing production files and waiting out a second
@@ -222,6 +562,31 @@ for (const entry of entries) {
     console.log(`       reintroduces: ${entry.why}`);
     console.log(`       ${why}`);
     continue;
+  }
+
+  // CLEAN AFTER THE CONTROL, BEFORE THE STUB. This window and not another.
+  //
+  // The start-up guard proved the tree was clean when the SWEEP began, which is a
+  // different claim from "clean when this stub was applied". A control run that
+  // leaves an untracked cache changes what the stubbed run does — and if the
+  // stubbed run then consumes and deletes it, the post-entry check sees a clean
+  // tree and reports CAUGHT for a stub that would not have been caught from a
+  // genuinely clean start.
+  //
+  // Checking before the control instead would have missed exactly that: the
+  // control is what makes the mess.
+  const beforeStub = treeState();
+  if (beforeStub === null || beforeStub.tracked !== "" || beforeStub.ignored !== atEntry.ignored) {
+    const why = beforeStub === null
+      ? "the repository's state could not be read after the control run, so this reading would be unverified"
+      : beforeStub.tracked !== ""
+      ? `the control run left the tree dirty, so the stub would not be applied to a clean tree:\n${beforeStub.tracked}`
+      : `the control run changed an IGNORED artifact, which a plain status call cannot see:\n` +
+        `  before: ${atEntry.ignored || "(none)"}\n  after:  ${beforeStub.ignored || "(none)"}`;
+    results.push({ name: entry.name, reintroduces: entry.why, verdict: UNRUNNABLE, why });
+    console.log(`FAIL ${entry.name.padEnd(28)} ${UNRUNNABLE}`);
+    console.log(`       ${why}`);
+    break;   // the tree is not what anyone intended; later readings are void too
   }
 
   // Snapshot BEFORE touching anything, and restore from these copies. A run killed
@@ -272,7 +637,7 @@ for (const entry of entries) {
     continue;
   }
 
-  const stub = await runTest(entry.test);
+  const stub = await runTest(entry.test, entry.expectRed);
 
   // THE FILE MUST STILL BE THE STUB WE WROTE.
   //
@@ -312,6 +677,41 @@ for (const entry of entries) {
 
   const verdict = classify({ controlExit: control.exit, stubExit: stub.exit, stubOutput: stub.output,
                              hashChanged, restored, expectRed: entry.expectRed });
+
+  // THE WHOLE TREE, rechecked after every entry.
+  //
+  // The startup guard proves the tree was clean when the sweep began; it cannot see
+  // what deliberately broken code did while it ran. A stubbed test that writes a
+  // file, or modifies one outside the manifest's targets, leaves the repository
+  // dirty — and the entry would still report CAUGHT and exit 0, while every
+  // FOLLOWING entry runs against a tree nobody intended.
+  //
+  // Reported as UNRUNNABLE rather than as a failure of the stub: the reading itself
+  // is void, because the code under test was not the code in the manifest.
+  const after = treeState();
+  if (after === null) {
+    // COULD NOT TELL is not clean. A stubbed test that damaged repository metadata
+    // is exactly the case where this read fails, so treating the failure as a pass
+    // hands the benefit of the doubt to the one situation least entitled to it.
+    const why = "the repository's state could not be read after the stubbed run, so this reading is unverified";
+    results.push({ name: entry.name, reintroduces: entry.why, verdict: UNRUNNABLE, why });
+    console.log(`FAIL ${entry.name.padEnd(28)} ${UNRUNNABLE}`);
+    console.log(`       ${why}`);
+    break;
+  }
+  // Tracked dirt, OR a change to what is ignored. The second is the case a plain
+  // `git status` cannot see, and it is compared against the reading taken just
+  // before the stub rather than against emptiness.
+  const ignoredChanged = after.ignored !== beforeStub.ignored;
+  if (after.tracked || ignoredChanged) {
+    console.error(`stub-sweep: ${entry.name} left the repository dirty; the stubbed test had side effects.`);
+    console.error(after.tracked || `ignored artifacts changed:\n  before: ${beforeStub.ignored}\n  after:  ${after.ignored}`);
+    results.push({ name: entry.name, reintroduces: entry.why, verdict: UNRUNNABLE,
+                   why: "the stubbed test modified the repository outside its manifest targets, " +
+                        "so this reading is void and later entries would run against a different tree" });
+    console.log(`FAIL ${entry.name.padEnd(28)} ${UNRUNNABLE}`);
+    break;   // stop: every later reading is now suspect
+  }
 
   results.push({ name: entry.name, reintroduces: entry.why, ...verdict });
   const mark = verdict.verdict === CAUGHT ? "ok  " : "FAIL";

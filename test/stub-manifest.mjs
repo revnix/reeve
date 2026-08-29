@@ -441,7 +441,7 @@ export const STUBS = [
             { file: "src/stubsweep.mjs",
               find: "  const namedFailed = observed\n    ? observed.namedFailSeen\n    : failures.some(f => f.includes(expectRed));",
               replace: "  const namedFailed = failures.some(f => f.includes(expectRed));" }],
-  },,
+  },
   {
     name: "derive-skips-absent",
     why: "count objects whose current row is a tombstone, which is the original defect with extra rows",

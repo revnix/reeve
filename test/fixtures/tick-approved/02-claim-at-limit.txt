@@ -1,6 +1,7 @@
 == 1 SEAM LOG
 hub	[]
 hub	[]
+reapProvider	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"isAlive":"<fn>"}]
 openPrs	["o/r",20]
 evaluate	[{"nwo":"o/r","pr":42,"profile":{"identity":{"key":"o/r","defaultBranch":"main","worktreeRoot":"<tmp>","checkout":"<tmp>"},"authority":{"policy":"propose_and_merge"},"rounds":{"softCap":5,"hardCap":10,"maxFixAttemptsPerFinding":1},"ci":{"provider":"github-actions","requiredChecks":[]},"watch":{"maxWorkers":5,"workerBudgetMinutes":1,"maxTurns":5}},"db":"<DatabaseSync>"}]
 observe	["o/r",42]
@@ -8,6 +9,7 @@ evaluate	[{"nwo":"o/r","pr":42,"profile":{"identity":{"key":"o/r","defaultBranch
 resolveCause	["o/r",{"name":"unit","id":"1"}]
 publish	[{"nwo":"o/r","verdict":{"state":"BLOCK","summary":"ci is red","clauses":[{"id":"ci","state":"BLOCK","detail":"failing: unit"},{"id":"base","state":"PASS","detail":""},{"id":"review","state":"PASS","detail":""},{"id":"rounds","state":"PASS","detail":""},{"id":"threads","state":"PASS","detail":""},{"id":"findings","state":"PASS","detail":""},{"id":"mergeable","state":"PASS","detail":""},{"id":"cleared","state":"PASS","detail":""},{"id":"bodyFindings","state":"PASS","detail":""},{"id":"bodyReadable","state":"PASS","detail":""}]},"shadow":true}]
 hub	[]
+queuedRequests	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"repoId":7}]
 capacity	[{"maxWorkers":5,"running":0}]
 hub	[]
 hub	[]
@@ -32,7 +34,7 @@ reeve has no notification channel, so escalations reach a log only
 <ts> shadow: 0 consecutive day(s) agreeing over 0 comparison(s)
 
 == 4 RESULT
-{"halted":false,"unreadable":null,"decisions":[null]}
+{"halted":false,"unreadable":null,"decisions":["FIX_CI"]}
 
 == 5 CARRIED
 providerRetry: 

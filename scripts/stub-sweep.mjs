@@ -34,7 +34,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname, basename, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdit, validateManifest, classify, summarise, CAUGHT, UNRUNNABLE, TIMED_OUT_EXIT } from "../src/stubsweep.mjs";
 
 // Overridable so the runner can be pointed at a throwaway repository built by its
@@ -85,7 +85,11 @@ const manifestPath = process.env.STUB_MANIFEST
   : join(ROOT, "test", "stub-manifest.mjs");
 let manifest;
 try {
-  manifest = validateManifest((await import(manifestPath)).STUBS);
+  // A FILE URL, not a path. On win32 `resolve()` yields `C:\\repo\\...`, and
+  // `import()` reads `c:` as an unsupported URL scheme — so the taskkill branch
+  // above would be reached and the sweep would still refuse to start, for a reason
+  // that has nothing to do with what it was checking.
+  manifest = validateManifest((await import(pathToFileURL(manifestPath).href)).STUBS);
 } catch (err) {
   die(2, `stub-sweep: the manifest is not usable: ${err.message}`);
 }
@@ -111,11 +115,21 @@ const contained = file => {
   catch { try { real = join(realpathSync(dirname(target)), basename(target)); } catch { return null; } }
   return real === REAL_ROOT || real.startsWith(REAL_ROOT + sep) ? real : null;
 };
+const GIT_DIR = join(REAL_ROOT, ".git");
 for (const e of manifest)
-  for (const ed of e.edits)
-    if (!contained(ed.file))
+  for (const ed of e.edits) {
+    const real = contained(ed.file);
+    if (!real)
       die(2, `stub-sweep: ${e.name}: "${ed.file}" resolves outside the repository.\n` +
              "A manifest may only edit files inside the tree the cleanliness guard can see.");
+    // INSIDE the root but INVISIBLE to the guard. `git status` does not report
+    // changes to `.git/config`, `.git/index` or anything else under the git
+    // directory, so an edit there would be applied, restored and never checked —
+    // and a failed restore would corrupt the repository silently.
+    if (real === GIT_DIR || real.startsWith(GIT_DIR + sep))
+      die(2, `stub-sweep: ${e.name}: "${ed.file}" is inside the git directory.\n` +
+             "Changes there are invisible to `git status`, so the cleanliness guard could not see a failed restore.");
+  }
 
 const wanted = process.argv.slice(2);
 const entries = wanted.length ? manifest.filter(e => wanted.includes(e.name)) : manifest;
@@ -234,6 +248,13 @@ const runTest = file => new Promise(resolve => {
   // heap through this route instead.
   const ASSERTION_LINE = /^(PASS|FAIL) {2}(.+)$/;
   const MAX_ASSERTION_LINES = 20_000;
+  // A BYTE BUDGET as well as a count. `MAX_LINE` truncates only the incomplete
+  // tail, so twenty thousand COMPLETE 64 KiB failure lines are each retained whole
+  // — over a gigabyte, and the heap goes before the restore handlers run. Which
+  // leaves the stub on disk: the same failure the cap exists to prevent, now
+  // arriving through the list that was added to preserve evidence from it.
+  const MAX_ASSERTION_BYTES = 4 << 20;   // 4 MiB of failure names is far past useful
+  let keptBytes = 0;
   // A LINE HAS A MAXIMUM LENGTH. Without one, a test emitting a long diagnostic
   // with no newline grows the incomplete-line buffer for ever — it never reaches
   // the split, so the `out` cap never sees it, and the heap goes before the timer
@@ -259,9 +280,15 @@ const runTest = file => new Promise(resolve => {
     if (tail.length > MAX_LINE) tail = tail.slice(0, MAX_LINE);
     partial[which] = tail;
     for (const l of lines)
-      if (kept.length < MAX_ASSERTION_LINES) {
+      if (kept.length < MAX_ASSERTION_LINES && keptBytes < MAX_ASSERTION_BYTES) {
         const m = ASSERTION_LINE.exec(l);
-        if (m && m[1] === "FAIL") kept.push(l);
+        // Truncated individually too: an assertion NAME is short, so a 64 KiB line
+        // beginning `FAIL  ` is a diagnostic wearing the protocol's prefix.
+        if (m && m[1] === "FAIL") {
+          const line = l.length > MAX_LINE ? l.slice(0, MAX_LINE) : l;
+          kept.push(line);
+          keptBytes += line.length;
+        }
       }
     out += d;
     if (out.length > CAP) { dropped += out.length - CAP; out = out.slice(-CAP); }
@@ -272,20 +299,41 @@ const runTest = file => new Promise(resolve => {
   let timedOut = false;
   child.on("close", (code, signal) => {
     clearTimeout(timer);
+    // REAPED even on a clean exit. A test that spawns an unreferenced background
+    // worker and then returns 0 leaves it running — the sweep restores the source,
+    // sees a clean tree, reports CAUGHT, and the worker modifies the repository
+    // afterwards. Every guard here reads the tree BEFORE that happens, so nothing
+    // would ever notice.
+    //
+    // The group id is the exited child's pid, and the group outlives its leader
+    // while members remain, so this reaches them. Silent when the group is already
+    // empty, which is the ordinary case.
+    try { if (KILL_STRATEGY === "taskkill") killTree(child); else process.kill(-child.pid, "SIGKILL"); }
+    catch { /* no group left, which is what we want */ }
     // A killed child is reported as its own thing rather than coerced, because
     // "timed out" and "failed an assertion" are different readings and only one of
     // them is evidence.
     activeChild = null;
     for (const tail of [partial.out, partial.err]) {
       const m = tail && ASSERTION_LINE.exec(tail);
-      if (m && m[1] === "FAIL" && kept.length < MAX_ASSERTION_LINES) kept.push(tail);
+      if (m && m[1] === "FAIL" && kept.length < MAX_ASSERTION_LINES && keptBytes < MAX_ASSERTION_BYTES) {
+        kept.push(tail);
+        keptBytes += tail.length;
+      }
     }
     // The kept assertions come FIRST, so they survive whatever the tail lost. The
     // classifier reads whole lines, so prepending them changes nothing it can see
     // except that the evidence is present.
     const body = dropped ? `[${dropped} earlier byte(s) dropped]\n${out}` : out;
+    // ALWAYS prepended, not only when the tail overflowed.
+    //
+    // `out` is the two streams interleaved as they arrived, so an assertion split
+    // across stdout chunks with a stderr line landing between them appears there
+    // spliced and broken — a line that never existed, while the one that did is
+    // absent. The per-stream reconstruction is the correct reading whether or not
+    // anything was dropped, so it is the one the classifier gets.
     resolve({ exit: timedOut || code === null ? TIMED_OUT_EXIT : code,
-              output: dropped ? `${kept.join("\n")}\n${body}` : body });
+              output: kept.length ? `${kept.join("\n")}\n${body}` : body });
   });
 });
 
@@ -373,8 +421,26 @@ process.on("uncaughtException", err => {
  * that silently becomes a pass.
  */
 const treeState = () => {
-  try { return execFileSync("git", ["status", "--porcelain"], { cwd: ROOT, encoding: "utf8" }).trim(); }
-  catch { return null; }
+  // `--ignored` as well, and the two halves are read differently.
+  //
+  // A control run that creates an IGNORED cache — a build artifact, a database,
+  // anything in .gitignore — which the stubbed run then consumes and removes is
+  // invisible to a plain `git status`: clean before, clean after, and the stub
+  // reported CAUGHT for a run that would not have been caught from a genuinely
+  // untouched tree. This repository ignores exactly that kind of artifact.
+  //
+  // Tracked entries must be ABSENT. Ignored entries only have to be UNCHANGED —
+  // requiring none would fail on `node_modules` every time, which is not dirt.
+  // `--ignored` collapses whole directories to one line, so this stays cheap.
+  try {
+    const raw = execFileSync("git", ["status", "--porcelain", "--ignored"],
+                             { cwd: ROOT, encoding: "utf8" });
+    const lines = raw.split("\n").filter(Boolean);
+    return {
+      tracked: lines.filter(l => !l.startsWith("!!")).join("\n"),
+      ignored: lines.filter(l => l.startsWith("!!")).sort().join("\n"),
+    };
+  } catch { return null; }
 };
 
 const results = [];
@@ -413,10 +479,10 @@ for (const entry of entries) {
   // Checking before the control instead would have missed exactly that: the
   // control is what makes the mess.
   const beforeStub = treeState();
-  if (beforeStub === null || beforeStub !== "") {
+  if (beforeStub === null || beforeStub.tracked !== "") {
     const why = beforeStub === null
       ? "the repository's state could not be read after the control run, so this reading would be unverified"
-      : `the control run left the tree dirty, so the stub would not be applied to a clean tree:\n${beforeStub}`;
+      : `the control run left the tree dirty, so the stub would not be applied to a clean tree:\n${beforeStub.tracked}`;
     results.push({ name: entry.name, reintroduces: entry.why, verdict: UNRUNNABLE, why });
     console.log(`FAIL ${entry.name.padEnd(28)} ${UNRUNNABLE}`);
     console.log(`       ${why}`);
@@ -533,9 +599,13 @@ for (const entry of entries) {
     console.log(`       ${why}`);
     break;
   }
-  if (after) {
+  // Tracked dirt, OR a change to what is ignored. The second is the case a plain
+  // `git status` cannot see, and it is compared against the reading taken just
+  // before the stub rather than against emptiness.
+  const ignoredChanged = after.ignored !== beforeStub.ignored;
+  if (after.tracked || ignoredChanged) {
     console.error(`stub-sweep: ${entry.name} left the repository dirty; the stubbed test had side effects.`);
-    console.error(after);
+    console.error(after.tracked || `ignored artifacts changed:\n  before: ${beforeStub.ignored}\n  after:  ${after.ignored}`);
     results.push({ name: entry.name, reintroduces: entry.why, verdict: UNRUNNABLE,
                    why: "the stubbed test modified the repository outside its manifest targets, " +
                         "so this reading is void and later entries would run against a different tree" });

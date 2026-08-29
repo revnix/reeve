@@ -1008,10 +1008,18 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { writeSync } from "node:fs";\n` +
     `import { guard } from "../src/thing.mjs";\n` +
-    `if (!guard) { for (let i = 0; i < 21000; i++) console.log("FAIL  unrelated failure " + i); }\n` +
-    `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
-    `if (!guard) { const noise = "x".repeat(64 * 1024); for (let i = 0; i < 40; i++) console.log(noise); }\n` +
+    // SYNCHRONOUS, and looping on the byte count. `console.log` to a PIPE is
+    // asynchronous, so the child can exit with part of the flood still queued: the
+    // budget then never fills, the named line is retained anyway, and the stub for
+    // this entry stays green. MEASURED as the difference between macOS (caught) and
+    // the Ubuntu runner (NOT_CAUGHT) on identical code. `writeSync` can also do a
+    // PARTIAL write on a pipe, so a single call is not enough either.
+    `const put = s => { const b = Buffer.from(s); let o = 0; while (o < b.length) o += writeSync(1, b, o, b.length - o); };\n` +
+    `if (!guard) { let n = ""; for (let i = 0; i < 21000; i++) n += "FAIL  unrelated failure " + i + "\\n"; put(n); }\n` +
+    `put((guard ? "PASS  the guard holds" : "FAIL  the guard holds") + "\\n");\n` +
+    `if (!guard) { const noise = "x".repeat(64 * 1024) + "\\n"; for (let i = 0; i < 40; i++) put(noise); }\n` +
     `process.exitCode = guard ? 0 : 1;\n`);
   writeFileSync(join(root, "test", "stub-manifest.mjs"),
     `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
@@ -1197,14 +1205,19 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { writeSync } from "node:fs";\n` +
     `import { guard } from "../src/thing.mjs";\n` +
+    // Synchronous and partial-write-safe, for the reason stated on the crowd-out
+    // fixture above: an asynchronous flood can be cut short by the child exiting,
+    // and then the budget this fixture depends on filling never fills.
+    `const put = s => { const b = Buffer.from(s); let o = 0; while (o < b.length) o += writeSync(1, b, o, b.length - o); };\n` +
     `if (guard) { console.log("PASS  the guard holds"); process.exitCode = 0; }\n` +
     `else {\n` +
     // A PASS naming the expected text FIRST, then enough unrelated failures to
     // exhaust the retention budget, then the real named failure LAST.
-    `  console.log("PASS  the guard holds under load");\n` +
-    `  for (let i = 0; i < 21000; i++) console.log("FAIL  unrelated " + i);\n` +
-    `  console.log("FAIL  the guard holds");\n` +
+    `  put("PASS  the guard holds under load\\n");\n` +
+    `  let n = ""; for (let i = 0; i < 21000; i++) n += "FAIL  unrelated " + i + "\\n"; put(n);\n` +
+    `  put("FAIL  the guard holds\\n");\n` +
     `  process.exitCode = 1;\n}\n`);
   writeFileSync(join(root, "test", "stub-manifest.mjs"),
     `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
@@ -1234,12 +1247,17 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   writeFileSync(join(root, "test", "thing.test.mjs"),
     `import { writeSync } from "node:fs";\n` +
     `import { guard } from "../src/thing.mjs";\n` +
+    // Synchronous and partial-write-safe. THIS is the fixture the Ubuntu runner
+    // caught: with an asynchronous flood the child exited before the budget filled,
+    // the named line was retained after all, and the entry read NOT_CAUGHT on Linux
+    // while reading CAUGHT on macOS from identical code.
+    `const put = s => { const b = Buffer.from(s); let o = 0; while (o < b.length) o += writeSync(1, b, o, b.length - o); };\n` +
     `if (guard) { console.log("PASS  the guard holds"); process.exitCode = 0; }\n` +
     `else {\n` +
-    `  for (let i = 0; i < 21000; i++) console.log("FAIL  unrelated " + i);\n` +
+    `  let n = ""; for (let i = 0; i < 21000; i++) n += "FAIL  unrelated " + i + "\\n"; put(n);\n` +
     // NO trailing newline: this line only ever exists in `partial` and reaches the
     // classifier through the close handler or not at all.
-    `  writeSync(1, "FAIL  the guard holds");\n` +
+    `  put("FAIL  the guard holds");\n` +
     `  process.exitCode = 1;\n}\n`);
   writeFileSync(join(root, "test", "stub-manifest.mjs"),
     `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +

@@ -210,6 +210,50 @@ export function observe(nwo, pr, io = {}) {
   return { ok: !incomplete || out.length > 0, observations: out, incomplete, threads };
 }
 
+/**
+ * A DELETION IS A FACT, so it goes in the log rather than becoming a column.
+ *
+ * GitHub deletes review threads, and nothing in an append-only inbox could say so:
+ * `inbox_current` records which GENERATION an object is on, never that it stopped
+ * existing. So a deleted thread kept its last payload for ever, and if that payload
+ * said resolved it was counted in BOTH the total and the resolved count -- which is
+ * exactly the divergence the shadow reported, one extra thread and that one
+ * resolved.
+ *
+ * A tombstone is an ordinary row for the same object at the next generation. The
+ * pointer moves to it, `derivePr` skips objects whose CURRENT row is one, and a
+ * reappearance needs no special case at all: a normal observation supersedes it the
+ * way any edit supersedes the text before it.
+ *
+ * Chosen over a presence column on `inbox_current` for two reasons that survived
+ * the audit. That table has no `kind`, so a marker on it cannot tell which SURFACE
+ * an observation covered, and a threads-only read could mark reviews absent. And it
+ * would need a migration through ADDED_COLUMNS and ADDED_INDEXES -- the machinery
+ * whose ordering broke `open()` on every store that had history. `inbox.kind` has no
+ * CHECK constraint, so this needs no schema change on any existing store.
+ */
+export const ABSENT = { absent: true };
+
+/** Is the CURRENT payload of an object a tombstone rather than content? */
+export function isAbsent(payload) {
+  if (payload === null || payload === undefined) return false;
+  let p = payload;
+  if (typeof p === "string") { try { p = JSON.parse(p); } catch { return false; } }
+  return p !== null && typeof p === "object" && p.absent === true;
+}
+
+/**
+ * How many objects may vanish from ONE complete read before it is disbelieved.
+ *
+ * A read that says it saw everything and then misses most of what was there is far
+ * more likely to be a broken read than mass deletion -- the live store holds
+ * thousands of threads. Refusing keeps the CONSERVATIVE direction: the projection
+ * goes on over-counting, which is what it does today and which costs nothing, rather
+ * than dropping threads that gate a merge. The floor exists so a pull request with
+ * two threads is not governed entirely by the ratio.
+ */
+const ABSENCE_FLOOR = 3;
+
 /** The content hash an edit changes and a re-poll does not. */
 export function hashOf(payload) {
   return createHash("sha256").update(canonical(payload)).digest("hex").slice(0, 32);
@@ -226,7 +270,8 @@ export function hashOf(payload) {
  * fold reading a review whose thread is not there yet -- which is exactly the
  * intra-tick race the single-snapshot rule exists to prevent.
  */
-export function ingest(db, nwo, pr, observations, { at = Math.floor(Date.now() / 1000) } = {}) {
+export function ingest(db, nwo, pr, observations,
+                       { at = Math.floor(Date.now() / 1000), completeKinds = [] } = {}) {
   const existing = db.prepare(
     `SELECT source, external_id, content_hash, generation FROM inbox WHERE pr_number = ?`).all(pr);
   const byObject = new Map();      // source|external_id -> {hashes:Set, maxGen}
@@ -259,7 +304,10 @@ export function ingest(db, nwo, pr, observations, { at = Math.floor(Date.now() /
        generation   = excluded.generation,
        observed_at  = excluded.observed_at`);
 
-  let inserted = 0, generations = 0, unchanged = 0, repointed = 0;
+  let inserted = 0, generations = 0, unchanged = 0, repointed = 0, absent = 0;
+  // Reported rather than thrown: a refused absence is a READING to look at, not a
+  // failure to ingest, and the observations themselves landed fine.
+  const absenceRefused = [];
   db.exec("BEGIN IMMEDIATE");
   try {
     for (const o of observations) {
@@ -289,10 +337,80 @@ export function ingest(db, nwo, pr, observations, { at = Math.floor(Date.now() /
                         genByHash: new Map([...(e?.genByHash ?? []), [hash, generation]]),
                         maxGen: generation });
     }
+
+    // ABSENCE, and ONLY where a completeness signal licenses concluding it.
+    //
+    // `completeKinds` names the surfaces this observation read WHOLE. Today that is
+    // `review_thread` alone, because `observe` computes `total !== null && seen >=
+    // total` for threads and for nothing else. Reviews, comments and reactions never
+    // get a tombstone, because nothing tells us a read of them was complete, and an
+    // absence concluded from a partial read erases live objects.
+    for (const kind of completeKinds) {
+      const seenNow = new Set(observations.filter(o => o.kind === kind)
+                                          .map(o => `${o.source}|${o.external_id}`));
+      const present = db.prepare(
+        `SELECT c.source, c.external_id, c.observed_at, i.payload
+           FROM inbox_current c
+           JOIN inbox i ON i.pr_number = c.pr_number AND i.source = c.source
+                       AND i.external_id = c.external_id AND i.content_hash = c.content_hash
+          WHERE c.pr_number = ? AND i.kind = ?`).all(pr, kind);
+      // TWO CONSECUTIVE COMPLETE READS, both missing it, before anything is
+      // tombstoned. One complete-looking read that misses three threads would
+      // otherwise erase three threads that gate a merge, and the bulk refusal below
+      // does not catch a small miss. The cost is one tick of latency on a real
+      // deletion; the benefit is that no single reading can erase anything.
+      //
+      // It also answers a subtler hazard: two reads in flight, the OLDER landing
+      // last. That read's misses cannot tombstone anything, because the newer read
+      // has already moved those objects' observed_at to at-or-after the previous
+      // complete mark -- a stale-but-well-formed value arriving late, which is the
+      // frozen-headRefOid shape one layer in.
+      const prev = db.prepare(
+        `SELECT complete_at FROM surface_read WHERE pr_number = ? AND kind = ?`).get(pr, kind);
+      const missedBefore = r => prev !== undefined && r.observed_at < prev.complete_at;
+      const missing = present.filter(r => !seenNow.has(`${r.source}|${r.external_id}`)
+                                          && !isAbsent(r.payload)
+                                          && missedBefore(r));
+      // The threshold is a JUDGEMENT and says so, rather than presenting itself as a
+      // measurement: nothing has measured how many threads legitimately vanish at
+      // once. It is defence in depth behind the two-read rule above, and the refusal
+      // records the numbers so a later reader can argue with it from data.
+      const cap = Math.max(ABSENCE_FLOOR, Math.floor(present.length / 2));
+      const refuse = missing.length > cap;
+      if (refuse) absenceRefused.push({ kind, missing: missing.length, present: present.length, cap });
+      for (const r of refuse ? [] : missing) {
+        const k = `${r.source}|${r.external_id}`;
+        const e = byObject.get(k);
+        const hash = hashOf(ABSENT);
+        // A SECOND disappearance stores no second row -- the hash is already there,
+        // exactly as a reverted body stores no third row -- so the pointer is what
+        // carries the fact, and it moves either way.
+        if (e?.hashes.has(hash)) {
+          point.run(pr, r.source, r.external_id, hash, e.genByHash?.get(hash) ?? e.maxGen, at);
+        } else {
+          const generation = (e?.maxGen ?? 0) + 1;
+          insert.run(r.source, r.external_id, pr, null, kind,
+                     canonical(ABSENT), hash, generation, at, null, null);
+          point.run(pr, r.source, r.external_id, hash, generation, at);
+          byObject.set(k, { hashes: new Set([...(e?.hashes ?? []), hash]),
+                            genByHash: new Map([...(e?.genByHash ?? []), [hash, generation]]),
+                            maxGen: generation });
+        }
+        absent++;
+      }
+      // The mark moves LAST, and only for a read that was whole. A refused bulk
+      // absence still moves it: the read happened and was complete, and not moving
+      // it would make the next read compare against a mark older than reality.
+      db.prepare(
+        `INSERT INTO surface_read (pr_number, kind, complete_at) VALUES (?,?,?)
+         ON CONFLICT(pr_number, kind) DO UPDATE SET complete_at = excluded.complete_at`)
+        .run(pr, kind, at);
+    }
     db.exec("COMMIT");
   } catch (err) { try { db.exec("ROLLBACK"); } catch {} throw err; }
 
-  return { inserted, generations, unchanged, repointed, total: observations.length };
+  return { inserted, generations, unchanged, repointed, absent, absenceRefused,
+           total: observations.length };
 }
 
 /**

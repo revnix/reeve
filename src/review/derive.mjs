@@ -26,6 +26,7 @@
 
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { isAbsent } from "./ingest.mjs";
 
 export const SEVERITIES = ["critical", "major", "minor", "nit", "unknown"];
 
@@ -200,6 +201,10 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
     `SELECT external_id, payload, observed_at FROM inbox
       WHERE pr_number = ? AND kind = 'review_thread' ORDER BY generation`).all(pr)) {
     if (resolvedSince.has(r.external_id)) continue;
+    // A tombstone carries no `is_resolved`, so it would fall through harmlessly --
+    // skipped explicitly anyway, because "harmless by accident" is how a later payload
+    // shape change turns a deletion into a resolution.
+    if (isAbsent(r.payload)) continue;
     let p; try { p = JSON.parse(r.payload); } catch { continue; }
     if (p?.is_resolved) resolvedSince.set(r.external_id, r.observed_at);
   }
@@ -239,6 +244,14 @@ export function derivePr(db, nwo, pr, profile, { at = Math.floor(Date.now() / 10
   const bodyAuthors = new Set();
   let bodyComplete = true;
   for (const r of rows) {
+    // AN OBJECT WHOSE CURRENT ROW IS A TOMBSTONE NO LONGER EXISTS.
+    //
+    // Without this the fold counted every external_id ever seen, so a thread deleted
+    // on GitHub kept its last payload for ever -- and a payload saying resolved was
+    // counted in the total AND in the resolved count, which is the divergence the
+    // shadow reported. Skipped rather than filtered out of the query, so the row
+    // stays visible to anything reading the log itself.
+    if (isAbsent(r.payload)) continue;
     const o = { kind: r.kind, payload: JSON.parse(r.payload) };
     const rev = roster.get(r.source) ?? null;
 

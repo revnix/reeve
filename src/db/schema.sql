@@ -359,6 +359,22 @@ CREATE INDEX IF NOT EXISTS body_finding_pr
 -- Upserted on EVERY observation, including one whose payload was already stored.
 -- That is the whole point: the write that was being skipped is the one that
 -- carries the information.
+-- When a SURFACE was last read WHOLE, per pull request and kind.
+--
+-- An absence may only be concluded from two consecutive complete reads that both
+-- missed the object, and this is what makes "the previous complete read" a fact
+-- rather than a memory. An object seen by that read has an inbox_current.observed_at
+-- at or after this timestamp; one that was already missing then does not.
+--
+-- A NEW TABLE, not a column: `CREATE TABLE IF NOT EXISTS` is applied by open() on
+-- every store, whereas adding a column goes through ADDED_COLUMNS and ADDED_INDEXES
+-- -- the ordering that broke open() on every store with history.
+CREATE TABLE IF NOT EXISTS surface_read (
+  pr_number   INTEGER NOT NULL,
+  kind        TEXT NOT NULL,
+  complete_at INTEGER NOT NULL,
+  PRIMARY KEY (pr_number, kind)) STRICT;
+
 CREATE TABLE IF NOT EXISTS inbox_current (
   pr_number    INTEGER NOT NULL,
   source       TEXT NOT NULL,

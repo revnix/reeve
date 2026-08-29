@@ -1801,7 +1801,13 @@ export async function tick(ctx) {
       if (moved) {
         try {
           const seen = (ctx.observe ?? observe)(nwo, pr);
-          const w = (ctx.ingest ?? ingest)(db, nwo, pr, seen.observations, { at: now() });
+          // COMPLETENESS TRAVELS WITH THE OBSERVATIONS, so ingest may conclude an
+          // object is gone only for a surface this read saw whole. `threads.readable`
+          // is `total !== null && seen >= total` from the SAME paginated read, so it
+          // is not a comparison across two moments. Threads are the only surface with
+          // such a signal, so they are the only surface that can ever be tombstoned.
+          const w = (ctx.ingest ?? ingest)(db, nwo, pr, seen.observations,
+            { at: now(), completeKinds: seen.threads?.readable ? ["review_thread"] : [] });
           // AFTER the ingest, not before it. An ingest that throws leaves the
           // projection built from the PREVIOUS inbox, so an observation that
           // never reached the database is not a reading of the same moment —

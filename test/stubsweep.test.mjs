@@ -871,10 +871,10 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // newline, stderr writes ` the guard holds\n`, and the concatenation reads as one
   // assertion naming the expected text. Classifying that would report CAUGHT for a
   // run whose real assertions say otherwise.
-  const root = mkdtempSync(join(tmpdir(), "sweep-forge-"));
-  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
-  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
-  writeFileSync(join(root, "test", "thing.test.mjs"),
+  // Written ONCE and used TWICE: for the tree the sweep runs over, and for the
+  // control below. Two copies of these writes drift, and a drifted control attests
+  // to a fixture that is no longer the one under test.
+  const FORGING_TEST =
     `import { writeSync } from "node:fs";\n` +
     `import { guard } from "../src/thing.mjs";\n` +
     `if (guard) { console.log("PASS  the guard holds"); process.exitCode = 0; }\n` +
@@ -887,7 +887,44 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
     `  writeSync(1, "FAIL  wrong assertion"); pause();\n` +
     `  writeSync(2, " the guard holds\\n"); pause();\n` +
     `  writeSync(1, "\\n"); pause();\n` +
-    `  process.exitCode = 1;\n}\n`);
+    `  process.exitCode = 1;\n}\n`;
+
+  // CONTROL, and it is load-bearing rather than decorative. MEASURED on this
+  // machine: when the forging does NOT happen the runner reports the same
+  // WRONG_RED and exits 1, so BOTH assertions at the end of this block pass just
+  // as green over a fixture that never exhibited the defect. Nothing in the
+  // outcome separates the two cases, which is what made the pass meaningless
+  // until the forging itself was established.
+  {
+    const c = mkdtempSync(join(tmpdir(), "sweep-forge-control-"));
+    mkdirSync(join(c, "src")); mkdirSync(join(c, "test"));
+    writeFileSync(join(c, "src", "thing.mjs"), `export const guard = false;\n`);
+    writeFileSync(join(c, "test", "thing.test.mjs"), FORGING_TEST);
+    // The merge has to be the RUNNER's merge: two async data handlers appending to
+    // one buffer in arrival order. spawnSync hands back the streams already
+    // separated and can never show an interleave, so a probe built on it would
+    // answer a different question and report NOT_FORGED however the writes landed.
+    writeFileSync(join(c, "probe.mjs"),
+      `import { spawn } from "node:child_process";\n` +
+      `const ch = spawn(process.execPath, ["test/thing.test.mjs"], { stdio: ["ignore", "pipe", "pipe"] });\n` +
+      `let merged = "";\n` +
+      `ch.stdout.on("data", b => { merged += b; });\n` +
+      `ch.stderr.on("data", b => { merged += b; });\n` +
+      // No process.exit: it does not flush a pending write, and a probe whose
+      // verdict never arrives reads exactly like a probe that said NOT_FORGED.
+      `ch.on("close", () => { process.stdout.write(\n` +
+      `  merged.split("\\n").includes("FAIL  wrong assertion the guard holds") ? "FORGED\\n" : "NOT_FORGED\\n"); });\n`);
+    const p = spawnSync(process.execPath, ["probe.mjs"], { cwd: c, encoding: "utf8" });
+    check(/^FORGED$/m.test(p.stdout ?? ""),
+      "control: the fixture really does forge a line neither stream emitted",
+      `probe said ${JSON.stringify((p.stdout ?? "").trim())}; NOT_FORGED means the writes stopped ` +
+      `interleaving and the two assertions below prove nothing, whatever they report`);
+  }
+
+  const root = mkdtempSync(join(tmpdir(), "sweep-forge-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"), FORGING_TEST);
   writeFileSync(join(root, "test", "stub-manifest.mjs"),
     `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
     `  expectRed: "the guard holds",\n` +

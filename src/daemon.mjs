@@ -29,6 +29,7 @@ import { canaryIdFor, netListener, instrumentHash } from "./canary.mjs";
 import { claimProvider, releaseProvider, bindProviderLease, noteRateLimit, heartbeatProvider,
          reapProviderLeases, cancelQueued, queuedGuardianRequests } from "./provider.mjs";
 import { openHold } from "./build/holds.mjs";
+import { hubSession, NO_HUB } from "./build/hubsession.mjs";
 import { resolveRepoId } from "./build/repoid.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
@@ -1388,63 +1389,6 @@ export async function tick(ctx) {
    * still passes what it passes. Centralising the arguments would change what
    * the scheduler is asked, and this step is meant to change nothing at all.
    */
-  // A VALUE NO SCHEDULER CAN RETURN, so "there was no scheduler" is never
-  // mistaken for something the scheduler said.
-  const NO_HUB = Symbol("no-hub");
-  const hubSession = ({ getter, onFault, overrides }) => {
-    const now = () => (typeof getter === "function" ? getter() : { hub: getter ?? null, why: null });
-    let faultSaid = false;
-    // SAID ONCE, wherever the reading came from. A caller that reads the hub
-    // itself -- because it needs to tell an ABSENT hub from an unreadable one --
-    // must still be able to report the fault under the same once-only rule, or
-    // that rule holds at every site but one.
-    const sayFault = (why) => { if (why && !faultSaid) { faultSaid = true; onFault(why); } };
-    const handle = (fallback) => {
-      const a = now();
-      sayFault(a.why);
-      return a.why ? fallback(a.why) : a.hub;
-    };
-    /**
-     * Perform ONE scheduler operation on a CURRENT handle.
-     *
-     * This is what makes the rules unskippable rather than merely gathered. A
-     * session that hands a handle back leaves every caller free to keep it, and
-     * "adding a new call site must not be able to skip a rule" is a convention
-     * again -- the thing #50 exists to stop it being.
-     *
-     * The handle is acquired here, used once, and never returned, so a stale
-     * handle is not something a new site can obtain by accident; it would have
-     * to be smuggled out deliberately.
-     *
-     * `whenAbsent` is the caller's own answer to "there is no scheduler right
-     * now", and those answers are NOT interchangeable: housekeeping skips, a
-     * release DEFERS and carries its obligation to the next tick, a claim fails
-     * open and says so. The session owns the handle; the policy stays beside the
-     * operation it governs.
-     *
-     * `overrides` is read at CALL time, not at construction, because the daemon
-     * has always resolved these as `(ctx.NAME ?? fallback)` and a test that
-     * replaces a seam must still be honoured.
-     */
-    const perform = (name, fallbackFn, args, whenAbsent) => {
-      const h = handle(() => null);
-      if (!h) return whenAbsent === undefined ? undefined : whenAbsent();
-      return (overrides?.[name] ?? fallbackFn)(h, args);
-    };
-    return {
-      // The raw reading, for the two callers that need to tell an ABSENT hub
-      // from an unreadable one -- a fact the handle alone cannot carry.
-      read: now,
-      // For the callers that read directly: the once-only report, unbundled.
-      sayFault,
-      // IS THERE A SCHEDULER? For the sites that ask only that. It takes the
-      // same reading at the same moment an operation would, and answers yes or
-      // no WITHOUT handing the handle back -- so asking the question cannot
-      // leave a handle in scope for a later line to use.
-      available: () => Boolean(handle(() => null)),
-      perform,
-    };
-  };
   const session = hubSession({
     overrides: ctx,
     getter: ctx.hub,

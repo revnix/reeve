@@ -33,7 +33,7 @@
 // TO APPROVE A CHANGE:  REEVE_APPROVE=1 node test/characterise-tick.test.mjs
 // Approving is a deliberate act and the diff is the thing a reviewer reads.
 
-import { run, CLAIM_TOKEN } from "./fixtures/tick-harness.mjs";
+import { run, CLAIM_TOKEN, SCHEDULER_SEAMS } from "./fixtures/tick-harness.mjs";
 // DERIVED, not restated. A scenario that hard-coded "rate_limited" would keep
 // naming an outcome the supervisor had since renamed, and the branch it is meant
 // to reach would simply stop being taken.
@@ -41,6 +41,7 @@ import { OUTCOMES } from "../src/supervisor.mjs";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APPROVED = join(HERE, "fixtures", "tick-approved");
@@ -57,6 +58,12 @@ const check = (ok, name, detail) => {
 // on one machine cannot match on another -- MEASURED: six scenarios failed in CI
 // against artifacts approved locally, with no change to the tick at all.
 const NODE_PATH_RE = /(?:\/[^\s"',)\]]*)?\bnode\/?[^\s"',)\]]*\/bin\/node\b|\/[^\s"',)\]]*\/bin\/node\b/g;
+
+// The temporary root this run actually uses, in every form it can appear in.
+const reEscape = (v) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const TMP_FORMS = [...new Set([tmpdir(), JSON.stringify(tmpdir()).slice(1, -1)])]
+  .sort((a, b) => b.length - a.length);   // longest first, or a prefix wins
+const TMP_RE = new RegExp(`(?:/private)?(?:${TMP_FORMS.map(reEscape).join("|")})[^\\s"'),\\]]*`, "g");
 
 /**
  * Redaction, by MEASURED provenance rather than by name.
@@ -89,11 +96,21 @@ const NODE_PATH_RE = /(?:\/[^\s"',)\]]*)?\bnode\/?[^\s"',)\]]*\/bin\/node\b|\/[^
  * A pattern is only ever as narrow as its reason. `"id"` is not a reason;
  * "this value came from the clock" is.
  */
+const EPOCH_RE = /"(observedAt|expiresAt)"\s*:\s*(\d+)/g;
+
 const REDACTIONS = [
   { name: "iso timestamp", kind: "varies",
     apply: (s) => s.replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, "<ts>") },
-  { name: "temp directory", kind: "varies",
-    apply: (s) => s.replace(/\/(?:private\/)?(?:var|tmp)\/[^\s"'),\]]*/g, "<tmp>") },
+  // DERIVED FROM `os.tmpdir()`, not from the two Unix roots it usually sits
+  // under. `TMPDIR` moves it anywhere, and Windows puts it somewhere else again:
+  // REPRODUCED with `TMPDIR=$HOME/.reeve-tmp-probe`, every scenario mismatched
+  // its approved signature and BOTH determinism controls failed, with no change
+  // to the tick. A pattern naming `/var` and `/tmp` was describing this machine.
+  //
+  // Two forms, because artifacts embed these paths inside JSON strings and a
+  // Windows separator is doubled there. On macOS the realpath gains a `/private`
+  // prefix the environment variable does not carry.
+  { name: "temp directory", kind: "varies", apply: (s) => s.replace(TMP_RE, "<tmp>") },
   // Generated per dispatch as a base36 clock reading joined to a random suffix.
   { name: "run id", kind: "varies",
     apply: (s) => s.replace(/"runId"\s*:\s*"[^"]*"/g, '"runId":"<runId>"') },
@@ -106,10 +123,21 @@ const REDACTIONS = [
   // the clock and nothing else. Whole seconds, so two runs in one second record
   // the same number -- which is why this is proved by where the value came from
   // rather than by differencing.
+  // RE-ORIGINED, NOT ERASED. Replacing both stamps with one token hides the
+  // RELATIONSHIP between them, which is the behaviour: a note re-derived from
+  // the retry time rather than the observation looks newer than a rate limit
+  // seen after it, and then overwrites it. Only the origin is the clock; the
+  // offsets from it are the contract, so they stay on the page.
   { name: "cooldown wall clock", kind: "provenance",
-    apply: (s) => s.replace(/"(observedAt|expiresAt)"\s*:\s*\d+/g, '"$1":<epoch>'),
-    cameFromTheHost: (t) => [...t.matchAll(/"(?:observedAt|expiresAt)"\s*:\s*(\d+)/g)]
-      .some((m) => Math.abs(Number(m[1]) - Date.now() / 1000) < 3600) },
+    apply: (s) => {
+      const eps = [...s.matchAll(EPOCH_RE)].map((m) => Number(m[2]));
+      if (!eps.length) return s;
+      const t0 = Math.min(...eps);
+      return s.replace(EPOCH_RE, (_, k, v) =>
+        `"${k}":<t0${Number(v) === t0 ? "" : `+${Number(v) - t0}`}>`);
+    },
+    cameFromTheHost: (t) => [...t.matchAll(EPOCH_RE)]
+      .some((m) => Math.abs(Number(m[2]) - Date.now() / 1000) < 3600) },
 
   // MEASURED: six scenarios failed in CI against artifacts approved locally,
   // with no change to the tick at all. `spawnWorker` records an allow-rule
@@ -120,8 +148,14 @@ const REDACTIONS = [
 
   // `providerClaim` is handed `pid: process.pid`, constant within a run and
   // different in every other process that ever compares these artifacts.
+  //
+  // MATCHED BY VALUE, not by key. A fixture can hand a seam a pid of its own --
+  // the bind path is given one -- and that number is behaviour, chosen by the
+  // scenario and identical everywhere. Blanking every `"pid"` would hide it for
+  // the sake of the one that is really the host's, which is the same mistake as
+  // blanking every `"id"`.
   { name: "process id", kind: "provenance",
-    apply: (s) => s.replace(/"pid"\s*:\s*\d+/g, '"pid":<pid>'),
+    apply: (s) => s.replace(new RegExp(`"pid"\\s*:\\s*${process.pid}\\b`, "g"), '"pid":<pid>'),
     cameFromTheHost: (t) => new RegExp(`"pid"\\s*:\\s*${process.pid}\\b`).test(t) },
 ];
 
@@ -156,6 +190,13 @@ const argsOf = (args) => {
   catch (e) { return `<unserialisable: ${e?.code ?? e?.message}>`; }
 };
 
+/** A carried map as its key line, then one indented line per stored identity. */
+const carriedLines = (name, map, red) => {
+  const entries = [...(map?.entries?.() ?? [])].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return [`${name}: ${entries.map(([k]) => k).join(",")}`,
+          ...entries.map(([k, v]) => `  ${k}\t${red(JSON.stringify(v))}`)];
+};
+
 const serialise = ({ seams, esc, log, r, ctx }, red = redact) => [
   "== 1 SEAM LOG",
   seams.map(({ op, args }) => `${op}\t${red(argsOf(args))}`).join("\n"),
@@ -182,15 +223,36 @@ const serialise = ({ seams, esc, log, r, ctx }, red = redact) => [
   })),
   "",
   "== 5 CARRIED",
-  `providerRetry: ${[...(ctx.providerRetry?.keys?.() ?? [])].sort().join(",")}`,
-  `cooldownRetry: ${[...(ctx.cooldownRetry?.keys?.() ?? [])].sort().join(",")}`,
+  // THE VALUE, NOT ONLY THE KEY. A deferred release is retried against the
+  // IDENTITY stored beside its key, and a retry whose identity has lost its
+  // token is refused as `no-identity`, discarded, and leaves the lease consuming
+  // capacity until it expires. Recording only the key left that entirely
+  // invisible: the key is unchanged in exactly that case.
+  ...carriedLines("providerRetry", ctx.providerRetry, red),
+  ...carriedLines("cooldownRetry", ctx.cooldownRetry, red),
   "",
 ].join("\n");
+
+/**
+ * A scenario's options, fresh.
+ *
+ * Most are a plain object, but one needs state that must not survive into a
+ * second run: the heartbeat scenario waits on a promise that is resolved by the
+ * first beat, and a promise reused across runs is already resolved, so the
+ * second run would record no heartbeat at all and still look like the first.
+ */
+const optionsOf = (o) => (typeof o === "function" ? o() : o);
 
 // ── The scenarios ────────────────────────────────────────────────────────────
 // Each is reachable through the fixture's existing seams. Scenarios 7 and 8 are
 // the two EARLY EXITS and must be present: without them a move can reorder
 // housekeeping past an exit and every other artifact stays green.
+// What a previous tick left owed. A distinct pull request and lease id from
+// anything this tick takes, so a release of THIS is never confusable with a
+// release of the one the tick claims for itself.
+const CARRIED_RELEASE = [["o/r#41:FIX_CI",
+  { owner: "guardian", repoId: 7, runRef: "o/r#41:FIX_CI", id: 9, token: "tok-carried-9" }]];
+
 const SCENARIOS = [
   ["01-happy-path", {}],
   ["02-claim-at-limit", { claim: () => ({ ok: false, reason: "at-limit" }) }],
@@ -214,6 +276,62 @@ const SCENARIOS = [
     noteRateLimit: () => ({ ok: false, reason: "maintenance" }),
     release: () => ({ ok: false, reason: "maintenance" }),
   }],
+
+  // ── A RELEASE THIS TICK INHERITED ───────────────────────────────────────────
+  //
+  // These two are a CONTROL AND A PROBE, and they are only meaningful as a pair.
+  // Both owe the same release from a previous tick; they differ in one thing,
+  // whether the tick's FIRST hub read faults. Every other scenario starts a tick
+  // owing nothing, which leaves the whole retry half of the scheduler -- and the
+  // gate deciding whether an inherited release is attempted at all -- outside
+  // the signature entirely.
+  //
+  // The gate consults the hub handle read once at the top of the tick, while
+  // `releaseWithRetry` deliberately re-asks for a fresh one ("FRESH, not the
+  // tick's opening snapshot"). So a hub that faults on the first read and is
+  // healthy afterwards strands the inherited release for the whole tick, while a
+  // release taken and given back within the same tick succeeds against the very
+  // same hub. Recording both is what makes that difference visible.
+  ["11-carried-release-hub-healthy", { carriedReleases: CARRIED_RELEASE }],
+  ["12-carried-release-first-read-faults", {
+    carriedReleases: CARRIED_RELEASE,
+    hubGetter: (() => { let n = 0; return (g) => (n++ === 0 ? { hub: null, why: "busy" } : { hub: g, why: null }); })(),
+  }],
+
+  // ── The remaining scheduler seams ───────────────────────────────────────────
+  //
+  // Reaching a seam is not optional decoration. Three of the six the harness
+  // installs appeared in NO artifact, so the extraction could have removed or
+  // reordered all three and every byte-for-byte signature would have stayed
+  // green -- the coverage control below now fails rather than letting that
+  // happen quietly again.
+
+  // A queued request for work this tick did not ask for is WITHDRAWN.
+  ["13-withdraw-a-request-not-asked-for", { queuedRequests: () => [{ run_ref: "o/r#99:FIX_CI" }] }],
+
+  // A worker that announces itself is BOUND to the lease, and one that outlives
+  // an interval is HEARTBEATED. A thunk, because the promise below must be fresh
+  // per run: reused, it is already resolved and the run records no beat.
+  ["14-worker-binds-and-heartbeats", () => {
+    let sawBeat;
+    const beaten = new Promise((resolve) => { sawBeat = resolve; });
+    return {
+      // Long enough that the worker returning on the first beat cannot race a
+      // second one into the log, which would make the artifact depend on timing.
+      heartbeatMs: 60,
+      // Without this the real rebind answers `bound: 0` against a stubbed claim
+      // that wrote no row, the daemon calls that a preparation failure, and the
+      // run ends before a single beat -- under a name promising heartbeats.
+      // MEASURED: exactly that, until the coverage control above refused it.
+      providerBind: () => ({ ok: true, bound: 1 }),
+      providerHeartbeat: () => { sawBeat(); return { ok: true }; },
+      spawnWorker: async (a) => {
+        a.onSpawn?.({ pid: 4242, lstart: "worker-start" });
+        await beaten;
+        return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" };
+      },
+    };
+  }],
 ];
 
 if (!existsSync(APPROVED)) mkdirSync(APPROVED, { recursive: true });
@@ -229,7 +347,7 @@ for (const [name, opts] of SCENARIOS) {
   const seams = [];
   let out;
   try {
-    out = await run({ ...opts, seams });
+    out = await run({ ...optionsOf(opts), seams });
   } catch (e) {
     check(false, `${name}: the tick ran`, String(e?.message ?? e));
     continue;
@@ -387,17 +505,64 @@ check(pairs.length === 2 && pairs[0][1].done !== pairs[1][1].done,
   check(hostish.length === 0,
     "no artifact embeds an absolute host path, so they compare on a machine that is not this one",
     hostish.join(", "));
-  // A pid is not a path, so the check above cannot see it. ASSERTED BY SHAPE,
-  // not against `process.pid`: artifacts are approved in one process and
-  // compared in another, so a check for THIS process's id would never match the
-  // leaked one and would pass on every real leak. What makes this absence
-  // non-vacuous is the provenance control above -- it proves a numeric pid IS
-  // present before redaction, so finding none here means it was removed rather
-  // than never written.
-  const pidLeak = files.filter((f) => /"pid"\s*:\s*\d/.test(readFileSync(f, "utf8")));
-  check(pidLeak.length === 0,
-    "and none carries an unredacted process id, which no other process could ever match",
-    pidLeak.join(", "));
+  // A pid is not a path, so the check above cannot see it -- and it cannot be
+  // asserted by ABSENCE either, in two different ways. Against `process.pid`:
+  // artifacts are approved in one process and compared in another, so a check
+  // for THIS process's id never matches the leaked one and passes on every real
+  // leak. Against the SHAPE `"pid":<digits>`: a fixture may legitimately hand a
+  // seam a pid of its own, and the bind path does, so shape alone cannot tell a
+  // leak from behaviour.
+  //
+  // Asserted positively instead. Every artifact that records a claim must show
+  // the claim's pid REPLACED, because the claim is handed `process.pid` and
+  // nothing else. A redaction that stopped firing fails here; a fixture's own
+  // pid is untouched and irrelevant.
+  const claiming = files.filter((f) => /^providerClaim\t/m.test(readFileSync(f, "utf8")));
+  const unmasked = claiming.filter((f) => !/"pid":<pid>/.test(readFileSync(f, "utf8")));
+  check(claiming.length > 0 && unmasked.length === 0,
+    "and every artifact recording a claim shows its pid replaced, since the claim is handed this process's",
+    `${claiming.length} artifact(s) record a claim; unmasked: ${unmasked.join(", ") || "none"}`);
+}
+
+// 9. EVERY SCHEDULER SEAM THE HARNESS INSTALLS IS REACHED BY SOME SCENARIO.
+//    DERIVED from the harness's own list, never a copy of it: a hand-written
+//    roster here would not grow when a seam is added, and the new seam would go
+//    unwatched behind a green control. A seam that appears in no artifact is a
+//    scheduler operation the extraction may remove or reorder freely.
+{
+  const logs = SCENARIOS.map(([n]) => join(APPROVED, `${n}.txt`)).filter((f) => existsSync(f))
+    .map((f) => readFileSync(f, "utf8"));
+  for (const seam of SCHEDULER_SEAMS) {
+    const re = new RegExp(`^${seam}\\t`, "m");
+    check(logs.some((t) => re.test(t)), `some scenario reaches the ${seam} seam, so a move cannot drop it unseen`);
+  }
+}
+
+// 10. THE CARRIED PAIR IS A CONTROL AND A PROBE, and neither half means anything
+//    alone. They owe the same inherited release and differ in ONE thing --
+//    whether the tick's first hub read faults -- so their carried state must
+//    differ. If a change ever made them agree they would be two copies of one
+//    scenario, both green, and the gate they exist to watch would be unwatched
+//    again.
+{
+  const read = (n) => { const f = join(APPROVED, `${n}.txt`);
+    return existsSync(f) ? readFileSync(f, "utf8") : ""; };
+  const healthy = read("11-carried-release-hub-healthy");
+  const faulted = read("12-carried-release-first-read-faults");
+  const carried = (t) => (t.match(/^providerRetry: .*/m) ?? [""])[0];
+  check(carried(healthy) === "providerRetry: " && carried(faulted) === "providerRetry: o/r#41:FIX_CI",
+    "a hub that faults on the tick's FIRST read strands an inherited release, where a healthy one gives it back",
+    `healthy=${JSON.stringify(carried(healthy))}  faulted=${JSON.stringify(carried(faulted))}`);
+  // THE HUB WAS USABLE THROUGHOUT, and that is what makes the stranding a defect
+  // rather than an outage. The same tick took a lease of its own and gave it back
+  // against the very same hub, in the very same run.
+  check(/providerRelease\t.*"runRef":"o\/r#42:FIX_CI"/.test(faulted),
+    "control: and that same tick still released the lease it took itself, so the hub was reachable all along");
+  // And the healthy half really does perform BOTH, or "gives it back" above is
+  // being read from a scenario that never had two to give.
+  check((healthy.match(/^providerRelease\t/gm) ?? []).length === 2,
+    "control: and the healthy half performs both releases, so the comparison has two sides",
+    `${(healthy.match(/^providerRelease\t/gm) ?? []).length} release(s) recorded`);
 }
 
 if (approvedWritten) console.log(`\n${approvedWritten} artifact(s) written. Review the diff; they are the record.`);

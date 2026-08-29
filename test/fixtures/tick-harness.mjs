@@ -41,6 +41,21 @@ export const HEAD = "b".repeat(40);
 // assert the release carries the token the claim issued rather than merely
 // carrying one.
 export const CLAIM_TOKEN = "tok-fixture-1";
+
+// The scheduler seams the daemon reaches for when `ctx` does not carry them.
+// AT MODULE SCOPE so callers can assert coverage against the list the harness
+// really installs: a hand-written copy of these names in a test would drift the
+// moment one is added, and the artifact would stay green over a seam nothing
+// watches.
+const FALLBACKS = {
+  reapProvider: provider.reapProviderLeases,
+  cancelQueued: provider.cancelQueued,
+  providerBind: provider.bindProviderLease,
+  providerHeartbeat: provider.heartbeatProvider,
+  noteRateLimit: provider.noteRateLimit,
+  queuedRequests: queuedGuardianRequests,
+};
+export const SCHEDULER_SEAMS = Object.freeze(Object.keys(FALLBACKS));
 const cl = (id, state, detail = "") => ({ id, state, detail });
 export const EVAL = {
   ok: true, pr: 42, state: "open", head: HEAD, title: "t", headRef: "f", baseRef: "main",
@@ -55,6 +70,7 @@ export const EVAL = {
 export const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false, hubGetter,
                     heartbeatMs, providerHeartbeat, spawnWorker, capacity,
                     queuedRequests, cancelQueued, measureContainment, noteRateLimit,
+                    carriedReleases, carriedCooldowns, providerBind,
                     resolveRepoIdFn, project, keepDir = false, seams = null,
                     haltMarker, openPrs, queuedNow } = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "reeve-prov-"));
@@ -76,6 +92,14 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
       watch: { maxWorkers: 5, workerBudgetMinutes: 1, maxTurns: 5 },
     },
     hub: hubGetter ? () => hubGetter(guest) : () => ({ hub: guest, why: null }), repoId, lstart: "boot-1",
+    // OBLIGATIONS A PREVIOUS TICK LEFT BEHIND. `tick()` reads these as
+    // `(ctx.providerRetry ??= new Map())`, so a fixture that never sets them
+    // starts every tick with nothing owed -- and the whole retry half of the
+    // scheduler, including the gate that decides whether a carried release is
+    // even attempted, is then unreachable. A signature taken only from ticks
+    // that owe nothing cannot see a change to what happens when one does.
+    ...(carriedReleases ? { providerRetry: new Map(carriedReleases) } : {}),
+    ...(carriedCooldowns ? { cooldownRetry: new Map(carriedCooldowns) } : {}),
     // Injected so the repository-id read can be OBSERVED. The daemon consults
     // `ctx.resolveRepoId` only when `repoId` is null, so a test that wants to
     // watch the call must pass both.
@@ -123,6 +147,12 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     // note to the next tick -- a scenario cannot reach that branch without
     // saying so here.
     ...(noteRateLimit ? { noteRateLimit } : {}),
+    // The rebind onto the worker. Injectable because the real one answers
+    // `bound: 0` against this fixture -- `providerClaim` is stubbed and writes no
+    // row, so there is nothing to rebind -- and the daemon treats a zero-row
+    // rebind as a preparation failure and ends the run. A scenario that wants to
+    // watch what happens AFTER the worker starts has to get past it.
+    ...(providerBind ? { providerBind } : {}),
     oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
     resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
     prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
@@ -142,14 +172,6 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     // shows no reaper and no queue read at all, and a move that reorders or drops
     // that housekeeping leaves the signature green. MEASURED: before this, the
     // happy-path artifact contained zero reaper and zero queue calls.
-    const FALLBACKS = {
-      reapProvider: provider.reapProviderLeases,
-      cancelQueued: provider.cancelQueued,
-      providerBind: provider.bindProviderLease,
-      providerHeartbeat: provider.heartbeatProvider,
-      noteRateLimit: provider.noteRateLimit,
-      queuedRequests: queuedGuardianRequests,
-    };
     for (const [op, fn] of Object.entries(FALLBACKS)) {
       // LOUD, because the failure it catches is silent. A fallback that is not a
       // function installs nothing, the wrapper below skips it, the daemon reaches

@@ -12,7 +12,7 @@
 import { applyEdit, validateManifest, classify, summarise, failedAssertions, describeMiss,
          reportedAnyAssertion, CAUGHT, NOT_CAUGHT, WRONG_RED, CRASHED, UNRUNNABLE, TIMED_OUT_EXIT }
   from "../src/stubsweep.mjs";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -820,6 +820,153 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // the test exits, so a worker that writes later is outside what a synchronous
   // sweep can see. Anyone extending this should know that before relying on it.
   check(true, "documented: a worker outliving a normally-completed test is NOT reaped reliably");
+}
+
+// --- a SEPARATE git directory inside the tree is excluded ----------------------
+{
+  // `.git` is a pointer FILE in a worktree or a separate-git-dir repository —
+  // measured on this machine at 63 bytes. Hard-coding `<root>/.git` therefore
+  // guards a pointer while the real metadata sits elsewhere, and when that
+  // elsewhere is an IGNORED path inside the tree, `git status` cannot see a failed
+  // restore there either.
+  const root = mkdtempSync(join(tmpdir(), "sweep-sepgit-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"), `console.log("PASS  the guard holds");\nprocess.exitCode = 0;\n`);
+  writeFileSync(join(root, ".gitignore"), ".meta/\n");
+  // The manifest is written BEFORE the commit. Written after, it is untracked, the
+  // runner refuses for a DIRTY TREE, and the exit code is 2 either way — so the
+  // first assertion passes for a reason that has nothing to do with git metadata.
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "meta", why: "edit the real git metadata", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: ".meta/config", find: "[core]", replace: "[cxre]" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+  // Move the metadata under an IGNORED path inside the tree and leave a pointer,
+  // which is exactly the shape `git init --separate-git-dir` produces.
+  execFileSync("mv", [join(root, ".git"), join(root, ".meta")]);
+  writeFileSync(join(root, ".git"), `gitdir: ${join(root, ".meta")}\n`);
+  check(execFileSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: root, encoding: "utf8" }).trim()
+          === realpathSync(join(root, ".meta")),
+    "control: the fixture really does keep its metadata outside `.git`");
+  check(execFileSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8" }).trim() === "",
+    "control: and its tree is clean, so a refusal cannot be about dirtiness");
+  const cfgBefore = readFileSync(join(root, ".meta", "config"), "utf8");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 2, "an edit inside a SEPARATE git directory is refused", `exit=${r.status}\n        ${out.slice(-260)}`);
+  check(/git directory/.test(out), "and says so", out.slice(-240));
+  check(readFileSync(join(root, ".meta", "config"), "utf8") === cfgBefore,
+    "and the real metadata is untouched");
+}
+
+// --- a line forged by INTERLEAVING cannot be classified -------------------------
+{
+  // The raw capture is the two streams as they arrived, so a line can appear in it
+  // that neither stream emitted: stdout writes `FAIL  wrong assertion` with no
+  // newline, stderr writes ` the guard holds\n`, and the concatenation reads as one
+  // assertion naming the expected text. Classifying that would report CAUGHT for a
+  // run whose real assertions say otherwise.
+  const root = mkdtempSync(join(tmpdir(), "sweep-forge-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { writeSync } from "node:fs";\n` +
+    `import { guard } from "../src/thing.mjs";\n` +
+    `if (guard) { console.log("PASS  the guard holds"); process.exitCode = 0; }\n` +
+    `else {\n` +
+    // Synchronous fd writes, so the ORDER reaching the parent is the order written.
+    `  writeSync(1, "FAIL  wrong assertion");\n` +
+    `  writeSync(2, " the guard holds\\n");\n` +
+    `  writeSync(1, "\\n");\n` +
+    `  process.exitCode = 1;\n}\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 1,
+    "an assertion forged by interleaving does not pass the sweep", `exit=${r.status}\n        ${out.slice(-300)}`);
+  check(!/CAUGHT/.test(out.split("\n")[0] ?? ""),
+    "and the entry is not reported CAUGHT on a line neither stream emitted", out.slice(0, 200));
+}
+
+// --- an OVERWRITTEN ignored artifact is still a side effect ---------------------
+{
+  // A path list cannot see a control run overwriting an ignored file that already
+  // existed: all readings carry the same `!! path`, so the stub is applied to
+  // altered state and can read CAUGHT for a run that would not have been caught
+  // from the untouched tree.
+  const root = mkdtempSync(join(tmpdir(), "sweep-overwrite-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, ".gitignore"), "*.cache\n");
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  // The artifact EXISTS before the sweep starts, so its path is in every reading.
+  writeFileSync(join(root, "src", "build.cache"), "original\n");
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { writeFileSync } from "node:fs";\n` +
+    `import { guard } from "../src/thing.mjs";\n` +
+    `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
+    // The CONTROL run rewrites its CONTENTS. The path never changes.
+    `if (guard) writeFileSync(new URL("../src/build.cache", import.meta.url).pathname, "rewritten\\n");\n` +
+    `process.exitCode = guard ? 0 : 1;\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  check(execFileSync("git", ["status", "--porcelain", "--ignored"], { cwd: root, encoding: "utf8" })
+          .includes("build.cache"),
+    "control: the artifact is ignored and present in every reading, which is the whole problem");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 1, "an ignored artifact the control OVERWROTE voids the reading", `exit=${r.status}`);
+  check(/UNRUNNABLE/.test(out), "and it is reported UNRUNNABLE", out.slice(-320));
+}
+
+// --- the named assertion survives a budget filled by other failures -------------
+{
+  // Twenty thousand unrelated failures before the named one would otherwise fill
+  // the retention budget, and the raw tail would scroll past it — so the entry
+  // reads WRONG_RED for a stub the named assertion did catch.
+  const root = mkdtempSync(join(tmpdir(), "sweep-crowd-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { guard } from "../src/thing.mjs";\n` +
+    `if (!guard) { for (let i = 0; i < 21000; i++) console.log("FAIL  unrelated failure " + i); }\n` +
+    `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
+    `if (!guard) { const noise = "x".repeat(64 * 1024); for (let i = 0; i < 40; i++) console.log(noise); }\n` +
+    `process.exitCode = guard ? 0 : 1;\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8", maxBuffer: 1 << 28,
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 0,
+    "the named assertion is kept even when 21,000 other failures fill the budget", `exit=${r.status}\n        ${out.slice(-300)}`);
+  check(/CAUGHT/.test(out), "and the verdict is CAUGHT rather than WRONG_RED", out.slice(-260));
 }
 
 // --- a target DELETED during a run is not resurrected ---------------------------

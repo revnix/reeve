@@ -1073,5 +1073,180 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   check(r.status === 1, "while the entry itself fails the sweep", String(r.status));
 }
 
+// --- an ignored path git C-QUOTES is still fingerprinted ------------------------
+{
+  // Porcelain v1 quotes any path holding a space, a quote, a backslash or a
+  // non-ASCII byte. Reading the quoted form as a filesystem path makes the stat
+  // fail, so the entry fingerprints `<unreadable>` in EVERY reading and a control
+  // run that OVERWRITES it changes nothing the sweep can see -- which is the exact
+  // hole fingerprinting was added to close, reopened for any awkward name.
+  const root = mkdtempSync(join(tmpdir(), "sweep-quoted-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  // The control run OVERWRITES an artifact that already exists, so the path set is
+  // identical across readings and only the content differs.
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { writeFileSync } from "node:fs";\n` +
+    `import { guard } from "../src/thing.mjs";\n` +
+    `writeFileSync(new URL("../my cache.tmp", import.meta.url), guard ? "control" : "stubbed");\n` +
+    `if (guard) { console.log("PASS  the guard holds"); process.exitCode = 0; }\n` +
+    `else { console.log("FAIL  the guard holds"); process.exitCode = 1; }\n`);
+  writeFileSync(join(root, ".gitignore"), "my cache.tmp\n");
+  writeFileSync(join(root, "my cache.tmp"), "pre-existing");
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+  // CONTROL: the name must actually be one git quotes, or this fixture is testing
+  // the ordinary path and would pass with the parser unchanged.
+  const porcelain = git("status", "--porcelain", "--ignored");
+  check(/!! "my cache\.tmp"/.test(porcelain),
+    "control: git really does C-quote this ignored name in the human-readable form",
+    JSON.stringify(porcelain));
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 1, "an ignored artifact with a QUOTED name still voids the reading",
+    `exit=${r.status}\n        ${out.slice(-300)}`);
+  check(/ignored/i.test(out), "and says the ignored artifact is why", out.slice(-260));
+}
+
+// --- an ignored SYMLINK is fingerprinted by its target text, not followed --------
+{
+  // `stat` follows the link, so an ignored symlink pointing at a fifo or a
+  // character device would be READ -- and a read of `/dev/random` does not return.
+  // Hashing the link TEXT detects retargeting without ever opening what it names.
+  // The two targets hold IDENTICAL CONTENT and differ only in PATH. Following the
+  // link and hashing what it points at therefore reads the same bytes before and
+  // after the control run retargets it, and the retarget is invisible; hashing the
+  // link TEXT sees it. That is what makes this fixture discriminating rather than
+  // merely green -- content-hashing cannot pass it.
+  const root = mkdtempSync(join(tmpdir(), "sweep-link-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "a.bin"), "identical");
+  writeFileSync(join(root, "src", "b.bin"), "identical");
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { symlinkSync, unlinkSync } from "node:fs";\n` +
+    `import { fileURLToPath } from "node:url";\n` +
+    `import { join, dirname } from "node:path";\n` +
+    `import { guard } from "../src/thing.mjs";\n` +
+    `const root = dirname(dirname(fileURLToPath(import.meta.url)));\n` +
+    `unlinkSync(join(root, "link.tmp"));\n` +
+    `symlinkSync(join(root, "src", guard ? "b.bin" : "a.bin"), join(root, "link.tmp"));\n` +
+    `if (guard) { console.log("PASS  the guard holds"); process.exitCode = 0; }\n` +
+    `else { console.log("FAIL  the guard holds"); process.exitCode = 1; }\n`);
+  writeFileSync(join(root, ".gitignore"), "link.tmp\n");
+  execFileSync("ln", ["-s", join(root, "src", "a.bin"), join(root, "link.tmp")]);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+  // CONTROL: the two targets really are byte-identical, so a content hash cannot
+  // tell them apart and only the link text can.
+  check(readFileSync(join(root, "src", "a.bin"), "utf8") === readFileSync(join(root, "src", "b.bin"), "utf8"),
+    "control: the symlink's two targets are byte-identical");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 1, "an ignored symlink RETARGETED by the control run voids the reading",
+    `exit=${r.status}\n        ${out.slice(-300)}`);
+  void createHash;
+}
+
+// --- a PASS naming the expected text does not spend the reservation --------------
+{
+  // `ASSERTION` matches PASS as well as FAIL. A passing assertion whose name
+  // contains the expected text used to set `namedKept`, spending the slot reserved
+  // for the FAIL; unrelated failures then filled the budget and the real named
+  // failure scrolled out, so the entry read WRONG_RED for a stub it had caught.
+  const root = mkdtempSync(join(tmpdir(), "sweep-passfirst-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { guard } from "../src/thing.mjs";\n` +
+    `if (guard) { console.log("PASS  the guard holds"); process.exitCode = 0; }\n` +
+    `else {\n` +
+    // A PASS naming the expected text FIRST, then enough unrelated failures to
+    // exhaust the retention budget, then the real named failure LAST.
+    `  console.log("PASS  the guard holds under load");\n` +
+    `  for (let i = 0; i < 21000; i++) console.log("FAIL  unrelated " + i);\n` +
+    `  console.log("FAIL  the guard holds");\n` +
+    `  process.exitCode = 1;\n}\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 0 && /CAUGHT/.test(out),
+    "a PASS naming the expected text does not crowd out the named FAIL",
+    `exit=${r.status}\n        ${out.slice(0, 300)}`);
+}
+
+// --- the named FAIL arriving LAST and unterminated is still counted --------------
+{
+  // The close-time tails were handled by a second copy of the rules that carried
+  // the budget but not the named reservation, so an expected FAIL written without a
+  // trailing newline, after earlier failures had filled the budget, was discarded.
+  // The raw body is deliberately inert, so nothing else could see it either.
+  const root = mkdtempSync(join(tmpdir(), "sweep-tail-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { writeSync } from "node:fs";\n` +
+    `import { guard } from "../src/thing.mjs";\n` +
+    `if (guard) { console.log("PASS  the guard holds"); process.exitCode = 0; }\n` +
+    `else {\n` +
+    `  for (let i = 0; i < 21000; i++) console.log("FAIL  unrelated " + i);\n` +
+    // NO trailing newline: this line only ever exists in `partial` and reaches the
+    // classifier through the close handler or not at all.
+    `  writeSync(1, "FAIL  the guard holds");\n` +
+    `  process.exitCode = 1;\n}\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 0 && /CAUGHT/.test(out),
+    "an unterminated named FAIL after the budget fills is still counted",
+    `exit=${r.status}\n        ${out.slice(0, 300)}`);
+}
+
+// --- a run reporting only PASSes is WRONG_RED, not CRASHED -----------------------
+{
+  // Only FAIL lines are retained, and the raw body is inert, so a run that printed
+  // passing assertions and then exited non-zero had nothing retained to prove an
+  // assertion had run at all. Asking the retention buffer that question answered a
+  // question about RETENTION and called a run that reported results a crash.
+  check(classify({ controlExit: 0, stubExit: 1, hashChanged: true, restored: true,
+                   expectRed: "the guard holds",
+                   observed: { anyAssertionSeen: true, namedFailSeen: false, failures: [] } }).verdict === WRONG_RED,
+    "a stubbed run reporting only PASSes is WRONG_RED rather than CRASHED");
+  check(classify({ controlExit: 0, stubExit: 1, hashChanged: true, restored: true,
+                   expectRed: "the guard holds",
+                   observed: { anyAssertionSeen: false, namedFailSeen: false, failures: [] } }).verdict === CRASHED,
+    "control: a run reporting NOTHING is still CRASHED, so the two are not merged");
+}
+
 console.log(fail ? `\nFAILED ${fail}` : "\nok");
 process.exit(fail ? 1 : 0);

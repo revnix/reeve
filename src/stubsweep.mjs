@@ -220,7 +220,22 @@ export function reportedAnyAssertion(output) {
  * test can fail for that reason. Anything else tells us it cannot, and that is a
  * failure of the sweep rather than a pass.
  */
-export function classify({ controlExit, stubExit, stubOutput = "", hashChanged, restored, expectRed }) {
+/**
+ * `observed` is the VERDICT's evidence; `stubOutput` is only the human's.
+ *
+ * Three separate defects came from deriving the verdict by re-reading a retained
+ * buffer: a PASS line naming the expected text consumed the reservation meant for
+ * the FAIL, an unterminated final FAIL after budget exhaustion was discarded, and a
+ * run reporting only PASSes was called CRASHED because nothing retained proved an
+ * assertion had run. All three are the same defect -- a buffer that EVICTS decided
+ * the verdict -- so the verdict no longer reads the buffer at all.
+ *
+ * The caller counts what it sees as each line arrives, where every line passes
+ * exactly once and nothing can be evicted. When `observed` is absent the old text
+ * parsing still applies, because a caller holding only output is answering a
+ * weaker question and should not be forced to lie about having counted.
+ */
+export function classify({ controlExit, stubExit, stubOutput = "", hashChanged, restored, expectRed, observed = null }) {
   if (controlExit !== 0)
     return { verdict: UNRUNNABLE,
              why: `the test does not pass before stubbing (exit ${controlExit}), so nothing it reports afterwards means anything` };
@@ -251,12 +266,20 @@ export function classify({ controlExit, stubExit, stubOutput = "", hashChanged, 
              why: "the test was killed for exceeding its time limit, so the run never completed — " +
                   "whatever it printed first is not a verdict" };
 
-  const failures = failedAssertions(stubOutput);
-  if (!reportedAnyAssertion(stubOutput))
+  const failures = observed ? observed.failures : failedAssertions(stubOutput);
+  const anyAssertion = observed ? observed.anyAssertionSeen : reportedAnyAssertion(stubOutput);
+  // COUNTED AT INGESTION when the caller counted. A PASS line is an assertion
+  // result even though no PASS line is ever retained, so asking the buffer whether
+  // an assertion ran answers a question about RETENTION and reports the run as a
+  // crash on the strength of it.
+  const namedFailed = observed
+    ? observed.namedFailSeen
+    : failures.some(f => f.includes(expectRed));
+  if (!anyAssertion)
     return { verdict: CRASHED,
              why: `the test exited ${stubExit} without reporting a single assertion, so it died rather than failed; ` +
                   "a runner reading only the exit code would have called this a pass" };
-  if (!failures.some(f => f.includes(expectRed)))
+  if (!namedFailed)
     return { verdict: WRONG_RED,
              why: `something failed, but not the named assertion — the property is still unmeasured. Failed: ` +
                   failures.map(f => JSON.stringify(f)).join(", ") };

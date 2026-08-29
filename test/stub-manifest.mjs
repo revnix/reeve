@@ -266,8 +266,12 @@ export const STUBS = [
     why: "allow an edit inside .git, where a failed restore is invisible to the cleanliness guard",
     test: "test/stubsweep.test.mjs",
     expectRed: "inside the git directory is refused outright",
+    // BOTH halves. The resolved directory and the literal `.git` pointer are
+    // redundant for an ordinary repository — either alone refuses `.git/config` —
+    // so removing one changes nothing observable and the entry reads NOT_CAUGHT
+    // correctly. The honest stub removes the whole condition.
     edits: [{ file: "scripts/stub-sweep.mjs",
-              find: "    if (real === GIT_DIR || real.startsWith(GIT_DIR + sep))",
+              find: "    if (real === GIT_DIR || real.startsWith(GIT_DIR + sep) ||\n        real === GIT_POINTER || real.startsWith(GIT_POINTER + sep))",
               replace: "    if (false)" }],
   },
   {

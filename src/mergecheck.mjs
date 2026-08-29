@@ -210,16 +210,41 @@ export function summaryLine({ verdict, repo, pr, squash, mergedHead, branchNow, 
   if (squash) bits.push(`squash=${String(squash).slice(0, 7)}`);
   if (mergedHead) bits.push(`merged-head=${String(mergedHead).slice(0, 7)}`);
 
-  // `branchRead` is a three-way answer and each arm says something different.
-  if (branchRead === "gone") return bits.join("  ") + "  branch=deleted";
+  // FOUR STATES, and "not applicable" is not "could not read".
+  //
+  // This line is printed by EVERY exit -- usage errors, unreadable metadata, and
+  // NOT MERGED among them -- and none of those attempts a branch read at all.
+  // Treating an absent value as a failed read made `verify-merge.mjs` with no
+  // arguments warn about a branch, and told the reader of an OPEN pull request
+  // that it was unknown whether the branch had moved "past this merge" when
+  // there is no merge. An omitted status is silence, not doubt.
+  if (branchRead === undefined || branchRead === null || branchRead === "n/a") {
+    return bits.join("  ");
+  }
+
+  // A DELETED BRANCH IS NOT EVIDENCE THAT IT NEVER MOVED. Merge at A, push an
+  // unmerged commit B, delete the branch: the ref is empty and B is lost, which
+  // is exactly the case this warning exists for. The current ref cannot recover
+  // that history, so deletion is UNKNOWN rather than reassurance.
+  if (branchRead === "gone") {
+    return bits.join("  ")
+      + "  branch=deleted  *** the branch is gone, so whether it advanced before deletion is UNKNOWN ***";
+  }
   if (branchRead !== "read") {
     return bits.join("  ")
-      + "  branch=UNREAD  *** could not read the branch, so whether it moved past this merge is UNKNOWN ***";
+      + "  branch=UNREAD  *** the branch could not be read, so whether it moved is UNKNOWN ***";
   }
-  const moved = branchNow && mergedHead && String(branchNow) !== String(mergedHead);
+
+  const differs = branchNow && mergedHead && String(branchNow) !== String(mergedHead);
   bits.push(`branch-now=${String(branchNow).slice(0, 7)}`);
-  return bits.join("  ") + (moved
-    ? "  *** THE BRANCH HAS MOVED PAST THIS MERGE. Commits pushed after it merged are NOT on main and are NOT covered by this verdict. ***"
+  // WHAT THIS DOES AND DOES NOT SAY. Unequal tips prove the ref points somewhere
+  // else. They do NOT prove the difference is forward commits, nor that those
+  // commits are absent from main -- the branch may have been force-reset, or its
+  // work may already have landed through another merge or a cherry-pick. Stating
+  // "NOT on main" would be the overclaiming this tool exists to avoid, on the
+  // line hardest to skim past.
+  return bits.join("  ") + (differs
+    ? "  *** THE BRANCH TIP DIFFERS FROM WHAT MERGED. Whether that difference reached main is NOT established here -- check it. ***"
     : "");
 }
 

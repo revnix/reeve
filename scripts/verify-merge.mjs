@@ -97,7 +97,8 @@ const run = () => {
   let meta;
   try {
     meta = JSON.parse(sh("gh", ["pr", "view", pr, "--repo", ghRepo, "--json",
-                                "state,mergedAt,mergeCommit,headRefOid,headRefName,baseRefName,changedFiles"]));
+                                "state,mergedAt,mergeCommit,headRefOid,headRefName,baseRefName,changedFiles," +
+                                "isCrossRepository,headRepository,headRepositoryOwner"]));
   } catch (e) {
     return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [], why: `could not read ${ghRepo}#${pr}: ${first(e)}` }, EXIT.unreadable);
   }
@@ -278,13 +279,29 @@ const run = () => {
   // Three answers, not two: read, deleted, or unreadable. A deleted branch
   // cannot have moved; an unreadable one is UNKNOWN and says so.
   let branchNow = null, branchRead = "unreadable";
-  if (!meta.headRefName) branchRead = "unreadable";
-  else {
+  // THE HEAD BRANCH MAY NOT BE IN THIS REPOSITORY. For a cross-repository pull
+  // request `headRefName` names a branch in the CONTRIBUTOR'S FORK, while
+  // `origin` is the base -- so asking origin for it reads either nothing, and
+  // calls a live fork branch deleted, or an unrelated branch of the same name.
+  //
+  // Asked through the API against the head repository by name, which is correct
+  // for a fork and is also unambiguous about refs: `git ls-remote` matches on
+  // the tail, so a tag literally named `refs/heads/<branch>` satisfies a query
+  // for that branch and its object is compared instead (reproduced by review).
+  // `git/ref/heads/<branch>` cannot match a tag.
+  const headOwner = meta.headRepositoryOwner?.login ?? originNwo.split("/")[0];
+  const headRepo = meta.headRepository?.name ?? originNwo.split("/")[1];
+  if (meta.headRefName && headOwner && headRepo) {
     try {
-      const out = sh("git", ["ls-remote", "origin", `refs/heads/${meta.headRefName}`]).trim();
-      if (out === "") { branchRead = "gone"; }
-      else { branchNow = out.split(/\s+/)[0]; branchRead = "read"; }
-    } catch { branchRead = "unreadable"; }
+      const ref = JSON.parse(sh("gh", ["api", "--hostname", originHost,
+        `repos/${headOwner}/${headRepo}/git/ref/heads/${meta.headRefName}`]));
+      branchNow = ref?.object?.sha ?? null;
+      branchRead = branchNow ? "read" : "unreadable";
+    } catch (e) {
+      // A 404 is the branch being GONE; anything else is a failure to read, and
+      // the two must not collapse -- one is a fact, the other is an absence of one.
+      branchRead = /404|Not Found/i.test(String(e?.stderr ?? e?.message ?? "")) ? "gone" : "unreadable";
+    }
   }
 
   emit({ repo: ghRepo, pr, verdict, squash, main: mainOid, base: meta.baseRefName ?? null,

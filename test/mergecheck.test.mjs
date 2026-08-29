@@ -483,10 +483,17 @@ const F = "100644", X = "100755", L = "120000";
   const moved = summaryLine({ ...base, mergedHead: "9232d4abbb", branchNow: "4e5df36ccc", branchRead: "read" });
   check(moved.includes("merged-head=9232d4a") && moved.includes("branch-now=4e5df36"),
     "both shas are on the verdict line, so neither has to be held in memory", moved);
-  check(/THE BRANCH HAS MOVED PAST THIS MERGE/.test(moved),
-    "and a branch that moved past the merge is flagged IN the line nobody skips, not in a note", moved);
-  check(/NOT on main/.test(moved),
-    "and the flag says what that means rather than only that it happened");
+  check(/THE BRANCH TIP DIFFERS FROM WHAT MERGED/.test(moved),
+    "and a tip that differs from what merged is flagged IN the line nobody skips, not in a note", moved);
+  // WHAT IT MUST NOT SAY. Unequal tips prove the ref points elsewhere. They do
+  // NOT prove the difference is forward commits, nor that those commits are
+  // absent from main -- a force-reset, a cherry-pick or a second merge all
+  // produce the same inequality. Claiming "NOT on main" would be overclaiming on
+  // the line least likely to be read sceptically.
+  check(/NOT established here/.test(moved),
+    "and it says the difference is UNVERIFIED rather than claiming the commits are missing", moved);
+  check(!/NOT on main/.test(moved),
+    "control: and it does NOT assert those commits are absent from main, which it cannot know", moved);
 
   // The control that makes the assertion above mean something.
   const same = summaryLine({ ...base, mergedHead: "9232d4abbb", branchNow: "9232d4abbb", branchRead: "read" });
@@ -495,10 +502,25 @@ const F = "100644", X = "100755", L = "120000";
   check(same.includes("branch-now=9232d4a"),
     "but it is still named, so the reader sees the comparison that was made", same);
 
-  // A deleted branch cannot have moved. That is an answer, not an absence.
+  // A DELETED BRANCH IS NOT REASSURANCE. Merge at A, push an unmerged commit B,
+  // delete the branch: the ref is empty and B is lost -- which is exactly the
+  // case this warning exists for. The current ref cannot recover that history.
   const gone = summaryLine({ ...base, mergedHead: "9232d4abbb", branchRead: "gone" });
-  check(gone.includes("branch=deleted") && !/MOVED PAST|UNKNOWN/.test(gone),
-    "a deleted branch reports deleted -- it cannot carry a commit the merge missed", gone);
+  check(gone.includes("branch=deleted") && /UNKNOWN/.test(gone),
+    "a deleted branch is UNKNOWN, not evidence that it never advanced", gone);
+  check(!/DIFFERS FROM WHAT MERGED/.test(gone),
+    "control: and it does not claim a difference it cannot see");
+
+  // NOT APPLICABLE IS SILENCE, NOT DOUBT. This line is printed by every exit --
+  // usage errors, unreadable metadata, NOT MERGED -- and none of those attempts
+  // a branch read. An absent status once made `verify-merge.mjs` with no
+  // arguments warn about a branch, and told the reader of an OPEN pull request
+  // that it was unknown whether the branch had moved past a merge that does not
+  // exist.
+  for (const [label, arg] of [["omitted", {}], ["explicit n/a", { branchRead: "n/a" }]]) {
+    const na = summaryLine({ ...base, verdict: "USAGE", ...arg });
+    check(!/branch/i.test(na), `a ${label} branch status prints nothing about the branch`, na);
+  }
 
   // AND AN UNREAD BRANCH SAYS SO. Silence here is indistinguishable from
   // agreement, which is the failure this whole tool exists to remove.
@@ -511,7 +533,7 @@ const F = "100644", X = "100755", L = "120000";
   // The flag rides on the verdict, whatever the verdict is.
   const drifted = summaryLine({ ...base, verdict: VERDICT.drifted,
     mergedHead: "9232d4abbb", branchNow: "4e5df36ccc", branchRead: "read" });
-  check(drifted.startsWith(VERDICT.drifted) && /MOVED PAST/.test(drifted),
+  check(drifted.startsWith(VERDICT.drifted) && /DIFFERS FROM WHAT MERGED/.test(drifted),
     "a DRIFTED verdict carries the same warning -- the two facts are independent", drifted);
 }
 

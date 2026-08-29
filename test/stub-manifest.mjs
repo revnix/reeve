@@ -319,4 +319,20 @@ export const STUBS = [
               find: "      if (expectRed && !namedKept && ASSERTION_LINE.test(l) && l.includes(expectRed)) {",
               replace: "      if (false) {" }],
   },
+  {
+    // The only entry here that stubs a FIXTURE rather than the runner, and it is
+    // the entry this whole sweep exists for. MEASURED: with the pauses removed the
+    // two stdout writes coalesce into one data event, the forged line never reaches
+    // the parent, and the runner returns the SAME WRONG_RED and the SAME exit 1 it
+    // returns when the forging does happen. Both of the forged-line assertions
+    // therefore stay green over a tree that cannot exhibit the defect. Only the
+    // control separates them, so the control has to be shown to fail.
+    name: "forging-control",
+    why: "remove the pauses, so the fixture stops forging the line and its assertions pass for a second reason",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "control: the fixture really does forge a line neither stream emitted",
+    edits: [{ file: "test/stubsweep.test.mjs",
+              find: "    `  const pause = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);\\n` +",
+              replace: "    `  const pause = () => {};\\n` +" }],
+  },
 ];

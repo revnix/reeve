@@ -1273,5 +1273,40 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
     "control: a run reporting NOTHING is still CRASHED, so the two are not merged");
 }
 
+// --- only-passes, END TO END, is the one case the counters alone can decide ------
+{
+  // The direct `classify` case above proves the ternary. It cannot prove the RUNNER
+  // ever supplies counters, because it passes its own -- and that gap shipped: the
+  // counting path was computed for every line and never put on the resolved run, so
+  // the classifier silently fell back to text and nothing failed.
+  //
+  // This is the fixture where the two paths DISAGREE end to end. No FAIL line is
+  // ever printed, so nothing is retained and the raw body is inert: reading the text
+  // finds no assertion at all and calls the run CRASHED, while the counters know a
+  // PASS was reported and call it WRONG_RED. Every other fixture here agrees under
+  // both paths, which is exactly why they all stayed green while the seam was dead.
+  const root = tmpRoot("sweep-onlypass-");
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { guard } from "../src/thing.mjs";\n` +
+    `if (guard) { console.log("PASS  the guard holds"); process.exitCode = 0; }\n` +
+    `else { console.log("PASS  something unrelated passed"); process.exitCode = 1; }\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(/WRONG_RED/.test(out) && !/CRASHED/.test(out),
+    "the runner's own counters reach the verdict: only-passes is WRONG_RED, not CRASHED",
+    out.slice(0, 400));
+}
+
 console.log(fail ? `\nFAILED ${fail}` : "\nok");
 process.exit(fail ? 1 : 0);

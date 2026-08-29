@@ -33,12 +33,12 @@
 // TO APPROVE A CHANGE:  REEVE_APPROVE=1 node test/characterise-tick.test.mjs
 // Approving is a deliberate act and the diff is the thing a reviewer reads.
 
-import { run, CLAIM_TOKEN, SCHEDULER_SEAMS } from "./fixtures/tick-harness.mjs";
+import { run, CLAIM_TOKEN, SCHEDULER_SEAMS, SCHEDULER_FALLBACKS } from "./fixtures/tick-harness.mjs";
 // DERIVED, not restated. A scenario that hard-coded "rate_limited" would keep
 // naming an outcome the supervisor had since renamed, and the branch it is meant
 // to reach would simply stop being taken.
 import { OUTCOMES } from "../src/supervisor.mjs";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, mkdtempSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -170,6 +170,21 @@ const REDACTIONS = [
     },
     cameFromTheHost: (t) => [...t.matchAll(EPOCH_RE)]
       .some((m) => Math.abs(Number(m[2]) - Date.now() / 1000) < 3600) },
+
+  // THE LAST BACKUP'S CLOCK. `measureContainment` is handed the whole `ctx`,
+  // which carries `lastBackupAt` -- a stamp written during the tick, so it
+  // differs on every run. FOUND by the artifact comparison on the run after the
+  // scenario that first reached this seam was approved: the scenario was
+  // non-deterministic from the moment it existed, and the determinism control
+  // could not see it because that control runs a different pair of scenarios.
+  //
+  // Its OWN pattern rather than the cooldown's, though both are clocks. Sharing
+  // the cooldown's origin would express this stamp as a distance from a rate
+  // limit it has nothing to do with -- deterministic, and meaningless.
+  { name: "last backup clock", kind: "provenance",
+    apply: (s) => s.replace(/"lastBackupAt"\s*:\s*\d+/g, '"lastBackupAt":<epoch>'),
+    cameFromTheHost: (t) => [...t.matchAll(/"lastBackupAt"\s*:\s*(\d+)/g)]
+      .some((m) => Math.abs(Number(m[1]) - Date.now() / 1000) < 3600) },
 
   // MEASURED: six scenarios failed in CI against artifacts approved locally,
   // with no change to the tick at all. `spawnWorker` records an allow-rule
@@ -316,6 +331,11 @@ const optionsOf = (o) => (typeof o === "function" ? o() : o);
 // What a previous tick left owed. A distinct pull request and lease id from
 // anything this tick takes, so a release of THIS is never confusable with a
 // release of the one the tick claims for itself.
+// An EXISTING file, because `halted()` is an existence check. Under the
+// temporary root, so the redactor normalises it like every other fixture path.
+const HALT_MARKER = join(mkdtempSync(join(tmpdir(), "reeve-halt-")), "HALT");
+writeFileSync(HALT_MARKER, "");
+
 const CARRIED_RELEASE = [["o/r#41:FIX_CI",
   { owner: "guardian", repoId: 7, runRef: "o/r#41:FIX_CI", id: 9, token: "tok-carried-9" }]];
 
@@ -375,6 +395,75 @@ const SCENARIOS = [
   // A queued request for work this tick did not ask for is WITHDRAWN.
   ["13-withdraw-a-request-not-asked-for", { queuedRequests: () => [{ run_ref: "o/r#99:FIX_CI" }] }],
 
+  // AND ONE IT DOES INTEND IS SERVED, so the canary is not blocked behind it.
+  // These two differ in the run reference alone: `#99` is not something this
+  // tick asks for, `#42` is. Scenario 13 covered only the withdrawal, and the
+  // serve path -- a claim AND the release that follows it -- was the one
+  // operation of the twelve that nothing would have noticed losing.
+  ["18-serve-a-queued-request-this-tick-wants", {
+    queuedRequests: () => [{ run_ref: "o/r#42:FIX_CI" }],
+  }],
+
+  // ── The paths no artifact was watching ──────────────────────────────────────
+  //
+  // MEASURED, by handing each hub accessor a WRONG handle and recording which
+  // artifacts moved: four of the fourteen sites moved NONE. The halt path, the
+  // canary's two, and the builder-hold read were outside the signature
+  // entirely, so "the artifacts stay byte-identical" said nothing about them and
+  // a rewrite could have pointed any of them anywhere.
+  //
+  // Two of the three levers needed to reach them were INERT -- `haltMarker` was
+  // a declared option the harness never placed in ctx, and `openPrs` sat beside
+  // a hardcoded literal that ignored it. An option that reaches nothing is worse
+  // than an absent one: it reads as coverage.
+
+  // The halt switch, which stops the tick and withdraws this guardian's queued
+  // requests on the way out.
+  ["15-halted-at-the-marker", { haltMarker: HALT_MARKER,
+                                queuedRequests: () => [{ run_ref: "o/r#42:FIX_CI" }] }],
+
+  // The canary runs only when containment could NOT be measured, which is what
+  // `containmentThrows` produces. It claims and rebinds a lease of its own.
+  // `containmentThrows` empties `ctx.containment`, which is what makes the tick
+  // MEASURE it -- and the canary claims a lease of its own to do that. The
+  // measurement must come back CLOSED or the tick refuses to dispatch and the
+  // canary's own hub reads are never reached, which is exactly what the first
+  // version of this scenario did.
+  ["16-canary-claims-before-dispatch", {
+    containmentThrows: true,
+    // DRIVES THE CALLBACKS the real measurement drives. The canary's CLAIM
+    // happens in `beforeSpawn` and its REBIND in `onSpawn`, so an override that
+    // returns a verdict without calling them reaches neither of the two sites
+    // this scenario exists to cover -- and its artifact then contains a single
+    // claim for the pull request and no bind at all, while the name says
+    // otherwise. MEASURED: exactly that, until it was pointed out.
+    measureContainment: async (_ctx, _profile, _nwo, _logPath, { beforeSpawn, onSpawn } = {}) => {
+      const gate = await beforeSpawn?.();
+      if (gate && gate.ok === false)
+        return { credentialRead: "open", why: `the canary was refused: ${gate.why ?? "?"}`, canary: { ran: false } };
+      onSpawn?.({ pid: 4243, lstart: "canary-start" });
+      return { credentialRead: "closed", why: "measured in the fixture",
+               canary: { ran: true, evidence: { outcome: "ok" } } };
+    },
+    providerBind: () => ({ ok: true, bound: 1 }),
+  }],
+
+  // AN INHERITED RELEASE AGAINST A HUB THAT IS NEVER READABLE. The deferral path
+  // reads the hub ITSELF -- it has to tell an ABSENT hub, where there is no
+  // lease to give back, from an UNREADABLE one, where the obligation must be
+  // carried -- and it reports that fault under the same once-only rule as every
+  // other reader.
+  //
+  // MEASURED: nothing here reached that branch. The whole provider-lease suite
+  // did, and it is what caught a ReferenceError this signature ran straight
+  // past: `04-hub-unreadable-always` never carries an obligation, and
+  // `12-carried-release-first-read-faults` has a hub that recovers before the
+  // release. It takes both at once.
+  ["17-carried-release-hub-never-readable", {
+    carriedReleases: CARRIED_RELEASE,
+    hubGetter: () => ({ hub: null, why: "busy" }),
+  }],
+
   // A worker that announces itself is BOUND to the lease, and one that outlives
   // an interval is HEARTBEATED. A thunk, because the promise below must be fresh
   // per run: reused, it is already resolved and the run records no beat.
@@ -393,8 +482,23 @@ const SCENARIOS = [
       providerHeartbeat: () => { sawBeat(); return { ok: true }; },
       spawnWorker: async (a) => {
         a.onSpawn?.({ pid: 4242, lstart: "worker-start" });
-        await beaten;
-        return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" };
+        // BOUNDED, and the bound is VISIBLE. `await beaten` alone hangs for ever
+        // if no beat arrives -- which is exactly what happens when the heartbeat
+        // operation is removed, so the scenario that exists to watch that
+        // operation would hang rather than fail. MEASURED: a coverage sweep
+        // stalled here and produced no result at all for the last three sites.
+        //
+        // A test that hangs is worse than one that fails: it reports nothing, and
+        // "no answer yet" is indistinguishable from "still working". The race
+        // turns a missing beat into a DIFFERENT recorded outcome, which the
+        // artifact then shows.
+        const beat = await Promise.race([
+          beaten.then(() => "beaten"),
+          new Promise((r) => setTimeout(() => r("no-beat"), 5000)),
+        ]);
+        return beat === "beaten"
+          ? { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }
+          : { outcome: "failed", why: "no provider heartbeat arrived", ms: 1, cost: 0, sessionId: "s" };
       },
     };
   }],
@@ -656,6 +760,44 @@ check(pairs.length === 2 && pairs[0][1].done !== pairs[1][1].done,
   const alone = redact(deferred, {});
   check(/"observedAt":<t0>/.test(alone),
     "control: and re-origined alone it reads as t0, which is why one origin is required", alone);
+}
+
+// 8e. EVERY FALLBACK IS THE FUNCTION THE DAEMON WOULD HAVE REACHED FOR.
+//
+//     A fallback that is merely A function satisfies a `typeof` guard and can
+//     still be the wrong one. MEASURED: `containment.mjs` exports
+//     `measureContainment`, while the daemon's fallback at that seam is
+//     `measuredContainment` -- a different function, defined in daemon.mjs, with
+//     a different signature. It imported cleanly, passed the guard, and crashed
+//     the tick on a path no scenario here reaches.
+//
+//     DERIVED FROM THE DAEMON'S OWN SOURCE. It resolves each seam as
+//     `(ctx.NAME ?? FALLBACK)`, so the pairs can be read rather than restated;
+//     a list maintained here would drift the moment one changed.
+{
+  const daemonSrc = readFileSync(join(HERE, "..", "src", "daemon.mjs"), "utf8");
+  // TWO FORMS, because the resolution mechanism moved. A seam is resolved either
+  // inline as `(ctx.NAME ?? FALLBACK)` or through the session as
+  // `session.perform("NAME", FALLBACK, ...)`, which is what makes the handle
+  // unobtainable at the call site. Reading only the first form made this control
+  // fail the moment a site moved -- correctly, since it could no longer see the
+  // seam, but the fix is to read the new form too rather than to stop asking.
+  const resolved = new Map();
+  for (const m of daemonSrc.matchAll(/\(\s*ctx\.(\w+)\s*\?\?\s*(\w+)\s*\)/g)) resolved.set(m[1], m[2]);
+  for (const m of daemonSrc.matchAll(/session\.perform\(\s*"(\w+)"\s*,\s*(\w+)\s*,/g)) resolved.set(m[1], m[2]);
+  check(resolved.size > 0, "control: the daemon's seam resolutions are readable at all", `${resolved.size} found`);
+  // AND BOTH FORMS ARE REALLY IN USE, or one half of this reader is dead weight
+  // that would hide a seam resolved the way it no longer looks for.
+  check(/session\.perform\(\s*"/.test(daemonSrc),
+    "control: and the session-performed form is present, so reading for it is not dead weight");
+  for (const seam of SCHEDULER_SEAMS) {
+    const want = resolved.get(seam);
+    check(!!want, `the daemon really resolves ${seam} as (ctx.${seam} ?? ...), so installing it means something`);
+    if (!want) continue;
+    check(SCHEDULER_FALLBACKS[seam]?.name === want,
+      `and the harness's ${seam} fallback IS ${want}, not another function of a similar name`,
+      `harness installs ${SCHEDULER_FALLBACKS[seam]?.name ?? "nothing"}`);
+  }
 }
 
 // 9. EVERY SCHEDULER SEAM THE HARNESS INSTALLS IS REACHED BY SOME SCENARIO.

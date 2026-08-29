@@ -12,7 +12,13 @@
 //   `seams`     an array that records every scheduler seam call in order, as
 //               {op, args}. Recorded by WRAPPING the seams here, never in src/.
 
-import { tick } from "../../src/daemon.mjs";
+// FROM THE SAME MODULE THE DAEMON RESOLVES IT FROM. `containment.mjs` exports a
+// `measureContainment`, and the daemon's fallback here is `measuredContainment`
+// -- a different function, defined in daemon.mjs, with a different signature.
+// Importing the similarly-named one type-checked, satisfied a `typeof fn ===
+// "function"` guard, and crashed the tick. The control below now derives these
+// pairs from the daemon's own source.
+import { tick, measuredContainment } from "../../src/daemon.mjs";
 import { open } from "../../src/db/ops.mjs";
 import { openHub } from "../../src/build/hubdb.mjs";
 import { openHubAsGuest } from "../../src/build/hubguest.mjs";
@@ -29,6 +35,7 @@ import { openHubAsGuest } from "../../src/build/hubguest.mjs";
 // covered five seams and covered four. A namespace cannot collide.
 import * as provider from "../../src/provider.mjs";
 import { queuedGuardianRequests } from "../../src/build/providerdb.mjs";
+
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -54,8 +61,15 @@ const FALLBACKS = {
   providerHeartbeat: provider.heartbeatProvider,
   noteRateLimit: provider.noteRateLimit,
   queuedRequests: queuedGuardianRequests,
+  // MEASURED to be missing: the canary scenario reached the real
+  // `measureContainment` through the daemon's own fallback, so the call decided
+  // whether the tick dispatched at all and appeared in no artifact.
+  measureContainment: measuredContainment,
 };
 export const SCHEDULER_SEAMS = Object.freeze(Object.keys(FALLBACKS));
+// The functions too, so a caller can check each is the one the daemon would
+// have reached for -- not merely that it is a function.
+export const SCHEDULER_FALLBACKS = Object.freeze({ ...FALLBACKS });
 const cl = (id, state, detail = "") => ({ id, state, detail });
 export const EVAL = {
   ok: true, pr: 42, state: "open", head: HEAD, title: "t", headRef: "f", baseRef: "main",
@@ -72,7 +86,7 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                     queuedRequests, cancelQueued, measureContainment, noteRateLimit,
                     carriedReleases, carriedCooldowns, providerBind,
                     resolveRepoIdFn, project, keepDir = false, seams = null,
-                    haltMarker, openPrs, queuedNow } = {}) => {
+                    haltMarker, openPrs } = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "reeve-prov-"));
   const hubPath = join(dir, "hub.db");
   openHub(hubPath).close();
@@ -100,6 +114,12 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     // that owe nothing cannot see a change to what happens when one does.
     ...(carriedReleases ? { providerRetry: new Map(carriedReleases) } : {}),
     ...(carriedCooldowns ? { cooldownRetry: new Map(carriedCooldowns) } : {}),
+    // THE HALT MARKER. `tick()` consults `ctx.haltMarker` at four points and
+    // stops at whichever it reaches first, and the halt path withdraws this
+    // guardian's queued requests on the way out. It was a declared parameter
+    // that was never placed in ctx, so no caller could reach any of it: the
+    // whole halt path was unreachable through this harness.
+    ...(haltMarker ? { haltMarker } : {}),
     // Injected so the repository-id read can be OBSERVED. The daemon consults
     // `ctx.resolveRepoId` only when `repoId` is null, so a test that wants to
     // watch the call must pass both.
@@ -125,7 +145,11 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
                                       owner: asked.owner, repoId: asked.repoId, runRef: asked.runRef })))(a);
     },
     providerRelease: (db, a) => { releases.push(a); return (release ?? (() => ({ ok: true })))(a); },
-    openPrs: () => [42],
+    // OVERRIDABLE. This was written as a fixed literal beside a `openPrs`
+    // PARAMETER that nothing then read, so a caller could pass one and the tick
+    // would still list the same single pull request. An option that reaches
+    // nothing is worse than no option: it reads as coverage.
+    openPrs: openPrs ?? (() => [42]),
     // `observe` reaches the network, and unstubbed it dominated this file's runtime:
     // four `gh api` round trips per tick against `o/r`, which does not exist, so
     // every one waited for a 404. The value below is what the real call ALREADY

@@ -29,7 +29,7 @@
  *  · it proves a stub landed by a HASH CHANGE rather than by re-reading the file
  *    for the anchor. Confirmation greps have been measured inert here.
  */
-import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync, realpathSync } from "node:fs";
+import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync, realpathSync, statSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -115,7 +115,24 @@ const contained = file => {
   catch { try { real = join(realpathSync(dirname(target)), basename(target)); } catch { return null; } }
   return real === REAL_ROOT || real.startsWith(REAL_ROOT + sep) ? real : null;
 };
-const GIT_DIR = join(REAL_ROOT, ".git");
+// The REAL git directory, asked for rather than assumed.
+//
+// `.git` is a pointer FILE in a worktree and in any repository using a separate
+// git directory — measured here: it is 63 bytes, and the metadata lives
+// elsewhere. Hard-coding `<root>/.git` therefore excludes a pointer and leaves
+// the actual metadata unprotected whenever it sits under an ignored path inside
+// the root, where `git status` cannot see a failed restore either.
+//
+// Both are excluded: the resolved directory, and the literal `.git` entry, which
+// is still worth refusing because rewriting the pointer redirects the repository.
+let GIT_DIR;
+try {
+  GIT_DIR = realpathSync(
+    execFileSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: ROOT, encoding: "utf8" }).trim());
+} catch {
+  die(2, "stub-sweep: cannot resolve the git directory, so it cannot be excluded from editable targets.");
+}
+const GIT_POINTER = join(REAL_ROOT, ".git");
 for (const e of manifest)
   for (const ed of e.edits) {
     const real = contained(ed.file);
@@ -126,8 +143,9 @@ for (const e of manifest)
     // changes to `.git/config`, `.git/index` or anything else under the git
     // directory, so an edit there would be applied, restored and never checked —
     // and a failed restore would corrupt the repository silently.
-    if (real === GIT_DIR || real.startsWith(GIT_DIR + sep))
-      die(2, `stub-sweep: ${e.name}: "${ed.file}" is inside the git directory.\n` +
+    if (real === GIT_DIR || real.startsWith(GIT_DIR + sep) ||
+        real === GIT_POINTER || real.startsWith(GIT_POINTER + sep))
+      die(2, `stub-sweep: ${e.name}: "${ed.file}" is inside the git directory (${GIT_DIR}).\n` +
              "Changes there are invisible to `git status`, so the cleanliness guard could not see a failed restore.");
   }
 
@@ -244,7 +262,7 @@ const killTree = child => {
   }
 };
 
-const runTest = file => new Promise(resolve => {
+const runTest = (file, expectRed = null) => new Promise(resolve => {
   // DETACHED, so the child leads its own process GROUP.
   //
   // Killing the direct pid leaves anything it spawned alive — and a helper that
@@ -291,6 +309,7 @@ const runTest = file => new Promise(resolve => {
   // budget on PASS lines, and the named FAIL — the one thing this exists to
   // preserve — would still scroll out of the tail.
   const kept = [];
+  let namedKept = false;
   // ONE BUFFER PER STREAM. A shared one splices stderr into a stdout assertion
   // split across chunks: `FAIL  guard` + `diagnostic\n` + ` holds\n` retains a
   // line that never existed, and the assertion that did is lost.
@@ -305,6 +324,15 @@ const runTest = file => new Promise(resolve => {
     if (tail.length > MAX_LINE) tail = tail.slice(0, MAX_LINE);
     partial[which] = tail;
     for (const l of lines)
+      // THE NAMED ASSERTION IS NEVER CROWDED OUT. Twenty thousand unrelated
+      // failures before it would otherwise fill the budget, the raw tail would
+      // scroll past it, and the entry would read WRONG_RED for a stub the named
+      // assertion did catch. Its own line is kept outside the budget, once.
+      if (expectRed && !namedKept && ASSERTION_LINE.test(l) && l.includes(expectRed)) {
+        kept.push(l.length > MAX_LINE ? l.slice(0, MAX_LINE) : l);
+        namedKept = true;
+        continue;
+      }
       if (kept.length < MAX_ASSERTION_LINES && keptBytes < MAX_ASSERTION_BYTES) {
         const m = ASSERTION_LINE.exec(l);
         // Truncated individually too: an assertion NAME is short, so a 64 KiB line
@@ -338,7 +366,21 @@ const runTest = file => new Promise(resolve => {
     // The kept assertions come FIRST, so they survive whatever the tail lost. The
     // classifier reads whole lines, so prepending them changes nothing it can see
     // except that the evidence is present.
-    const body = dropped ? `[${dropped} earlier byte(s) dropped]\n${out}` : out;
+    // THE RAW BODY IS MADE INERT, not merely deprioritised.
+    //
+    // It is the two streams interleaved as they arrived, so a line can appear in
+    // it that neither stream ever emitted: stdout writes `FAIL  wrong assertion`
+    // with no newline, stderr writes ` target expected\n`, and the concatenation
+    // reads as one forged assertion naming the expected text. The classifier would
+    // then report CAUGHT for a run whose real assertions say otherwise.
+    //
+    // Indenting every raw line by two spaces means none of them can match the
+    // assertion protocol's `^(PASS|FAIL) {2}` anchor, so the raw text survives for
+    // a human to read while being unclassifiable. The reconstructed per-stream
+    // lines, prepended unindented, are the only thing the classifier can see.
+    const raw = (dropped ? `[${dropped} earlier byte(s) dropped]\n${out}` : out)
+      .split("\n").map(l => `  ${l}`).join("\n");
+    const body = raw;
     // ALWAYS prepended, not only when the tail overflowed.
     //
     // `out` is the two streams interleaved as they arrived, so an assertion split
@@ -450,9 +492,32 @@ const treeState = () => {
     const raw = execFileSync("git", ["status", "--porcelain", "--ignored"],
                              { cwd: ROOT, encoding: "utf8" });
     const lines = raw.split("\n").filter(Boolean);
+    // IGNORED ENTRIES ARE FINGERPRINTED, not merely listed.
+    //
+    // A path list cannot see a control run OVERWRITING an ignored artifact that
+    // already existed: all three readings carry the same `!! path`, so the stub is
+    // applied to altered state and can read CAUGHT for a run that would not have
+    // been caught from the untouched tree.
+    //
+    // FILES are hashed. DIRECTORIES are not: `--ignored` collapses `node_modules`
+    // to one line, and walking it would cost more than the whole sweep. That is a
+    // stated limit rather than a hidden one — an ignored artifact created inside an
+    // already-ignored DIRECTORY is not detected, and if that ever matters the
+    // answer is to name the file in .gitignore rather than its parent.
+    const ignored = lines.filter(l => l.startsWith("!!")).sort().map(l => {
+      const rel = l.slice(3).trim();
+      const abs = join(ROOT, rel);
+      try {
+        const st = statSync(abs);
+        if (st.isDirectory()) return `${l} <dir, not fingerprinted>`;
+        return `${l} ${createHash("sha256").update(readFileSync(abs)).digest("hex").slice(0, 16)}`;
+      } catch {
+        return `${l} <unreadable>`;
+      }
+    }).join("\n");
     return {
       tracked: lines.filter(l => !l.startsWith("!!")).join("\n"),
-      ignored: lines.filter(l => l.startsWith("!!")).sort().join("\n"),
+      ignored,
     };
   } catch { return null; }
 };
@@ -476,7 +541,7 @@ for (const entry of entries) {
     break;
   }
 
-  const control = await runTest(entry.test);
+  const control = await runTest(entry.test, entry.expectRed);
 
   // STOP HERE if the control already fails. `classify` would return UNRUNNABLE
   // whatever happens next, so stubbing production files and waiting out a second
@@ -569,7 +634,7 @@ for (const entry of entries) {
     continue;
   }
 
-  const stub = await runTest(entry.test);
+  const stub = await runTest(entry.test, entry.expectRed);
 
   // THE FILE MUST STILL BE THE STUB WE WROTE.
   //

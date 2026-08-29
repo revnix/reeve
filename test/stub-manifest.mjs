@@ -363,9 +363,9 @@ export const STUBS = [
     edits: [{ file: "scripts/stub-sweep.mjs",
               find: '["status", "--porcelain", "-z", "--ignored"]',
               replace: '["status", "--porcelain", "--ignored"]' },
-            { file: "scripts/stub-sweep.mjs",
-              find: 'const fields = String(raw).split("\\0");',
-              replace: 'const fields = String(raw).split("\\n");' }],
+            { file: "src/stubsweep.mjs",
+              find: "      if (i === buf.length || buf[i] === 0) {",
+              replace: "      if (i === buf.length || buf[i] === 0x0a) {" }],
   },
   {
     name: "porcelain-bytes",

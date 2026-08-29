@@ -672,31 +672,51 @@ check(pairs.length === 2 && pairs[0][1].done !== pairs[1][1].done,
   }
 }
 
-// 10. THE CARRIED PAIR IS A CONTROL AND A PROBE, and neither half means anything
-//    alone. They owe the same inherited release and differ in ONE thing --
-//    whether the tick's first hub read faults -- so their carried state must
-//    differ. If a change ever made them agree they would be two copies of one
-//    scenario, both green, and the gate they exist to watch would be unwatched
-//    again.
+// 10. THE CARRIED PAIR: A FAULT ON THE TICK'S FIRST HUB READ COSTS NOTHING.
+//
+//    These two owe the same inherited release and differ in exactly one thing:
+//    whether the tick's first hub read faults. Both must DISCHARGE it.
+//
+//    THIS ASSERTION MOVED WITH A FIX, deliberately. It previously required the
+//    faulted half to STRAND the release, because that is what the tick did: the
+//    release retry was gated on the handle read at the top of the tick, while
+//    the release path itself re-asks for a fresh one. Removing that gate is the
+//    behaviour change this pair was built to make visible, and an approved
+//    signature exists precisely so a change like it cannot pass unnoticed --
+//    the artifact moved, this line moved, and both are in the diff.
+//
+//    What keeps the pair a pair is no longer the carried state, which now agrees.
+//    It is that the faulted half REPORTS its fault: without that the two are
+//    copies of one scenario, both green, and nothing is being probed.
 {
   const read = (n) => { const f = join(APPROVED, `${n}.txt`);
     return existsSync(f) ? readFileSync(f, "utf8") : ""; };
   const healthy = read("11-carried-release-hub-healthy");
   const faulted = read("12-carried-release-first-read-faults");
   const carried = (t) => (t.match(/^providerRetry: .*/m) ?? [""])[0];
-  check(carried(healthy) === "providerRetry: " && carried(faulted) === "providerRetry: o/r#41:FIX_CI",
-    "a hub that faults on the tick's FIRST read strands an inherited release, where a healthy one gives it back",
+  check(carried(healthy) === "providerRetry: " && carried(faulted) === "providerRetry: ",
+    "a fault on the tick's FIRST hub read no longer costs the inherited release -- both halves discharge it",
     `healthy=${JSON.stringify(carried(healthy))}  faulted=${JSON.stringify(carried(faulted))}`);
-  // THE HUB WAS USABLE THROUGHOUT, and that is what makes the stranding a defect
-  // rather than an outage. The same tick took a lease of its own and gave it back
-  // against the very same hub, in the very same run.
-  check(/providerRelease\t.*"runRef":"o\/r#42:FIX_CI"/.test(faulted),
-    "control: and that same tick still released the lease it took itself, so the hub was reachable all along");
-  // And the healthy half really does perform BOTH, or "gives it back" above is
-  // being read from a scenario that never had two to give.
-  check((healthy.match(/^providerRelease\t/gm) ?? []).length === 2,
-    "control: and the healthy half performs both releases, so the comparison has two sides",
-    `${(healthy.match(/^providerRelease\t/gm) ?? []).length} release(s) recorded`);
+
+  // VACUITY, both directions. The fault has to have HAPPENED, or the faulted
+  // half is just the healthy one under another name and the line above is
+  // reporting a success nothing was at risk in.
+  check(/guardian:hub:unreadable/.test(faulted) && /hub: busy/.test(faulted),
+    "control: and the faulted half really did fault, and said so rather than failing silently");
+  check(!/guardian:hub:unreadable/.test(healthy),
+    "control: while the healthy half has nothing to report, so the pair still differs in the one thing it varies");
+
+  // BOTH releases in BOTH halves, or "discharge" is being read from a scenario
+  // that never had two to discharge.
+  for (const [label, t] of [["healthy", healthy], ["faulted", faulted]]) {
+    check((t.match(/^providerRelease\t/gm) ?? []).length === 2,
+      `control: the ${label} half performs both releases, the inherited one and the lease it took itself`,
+      `${(t.match(/^providerRelease\t/gm) ?? []).length} release(s) recorded`);
+  }
+  // And the inherited one is released with the identity it was carrying, not
+  // merely released: a retry that has lost its token is refused `no-identity`.
+  check(/providerRelease\t.*"runRef":"o\/r#41:FIX_CI","id":9,"token":"tok-carried-9"/.test(faulted),
+    "and the inherited release carries the identity it was stored with, which is what the next tick would need");
 }
 
 if (approvedWritten) console.log(`\n${approvedWritten} artifact(s) written. Review the diff; they are the record.`);

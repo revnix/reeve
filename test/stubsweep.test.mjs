@@ -147,6 +147,13 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
     ["a missing expectRed", [{ name: "n", why: "w", test: "t", edits: [{ file: "f", find: "a", replace: "b" }] }], /expectRed/],
     ["no edits", [{ name: "n", why: "w", test: "t", expectRed: "e", edits: [] }], /at least one edit/],
     ["an edit that changes nothing", [{ name: "n", why: "w", test: "t", expectRed: "e", edits: [{ file: "f", find: "a", replace: "a" }] }], /itself/],
+    // A truthy non-string reaches `join` in the runner and throws a raw TypeError
+    // before the uncaughtException handler is installed — the process then dies
+    // with status 1 and a stack trace, indistinguishable from a stub that was not
+    // caught, when it is really a malformed manifest.
+    ["a non-string edit path", [{ name: "n", why: "w", test: "t", expectRed: "e", edits: [{ file: ["f"], find: "a", replace: "b" }] }], /non-empty string "file"/],
+    ["a numeric edit path", [{ name: "n", why: "w", test: "t", expectRed: "e", edits: [{ file: 7, find: "a", replace: "b" }] }], /non-empty string "file"/],
+    ["a blank edit path", [{ name: "n", why: "w", test: "t", expectRed: "e", edits: [{ file: "   ", find: "a", replace: "b" }] }], /non-empty string "file"/],
   ];
   for (const [what, m, re] of cases) {
     const e = threw(() => validateManifest(m));
@@ -410,6 +417,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
   git("add", "-A"); git("commit", "-q", "-m", "fixture");
 
+  const runnerLog = join(markerDir, "runner.log");
   const child = spawnSync(process.execPath, ["-e", `
     const { spawn } = require("node:child_process");
     const { readFileSync, existsSync } = require("node:fs");
@@ -417,7 +425,12 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
       cwd: ${JSON.stringify(root)},
       env: { ...process.env, STUB_SWEEP_ROOT: ${JSON.stringify(root)},
              STUB_MANIFEST: ${JSON.stringify(join(root, "test", "stub-manifest.mjs"))} },
-      stdio: "ignore" });
+      // CAPTURED, not discarded. When this block failed I could not tell why,
+      // because the one process that knew had its output sent to /dev/null.
+      stdio: ["ignore", "pipe", "pipe"] });
+    let runnerOut = "";
+    p.stdout.on("data", d => { runnerOut += d; });
+    p.stderr.on("data", d => { runnerOut += d; });
     // Wait until the SECOND run has begun: the first is the unstubbed control, so
     // only the second has a stub on disk to lose.
     const waitForStubbedRun = setInterval(() => {
@@ -435,10 +448,20 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
       // created, so there was nothing for the group kill to prove.
       if (runs >= 2 && helpers >= 2) { clearInterval(waitForStubbedRun); p.kill("SIGTERM"); }
     }, 50);
-    p.on("exit", () => { clearInterval(waitForStubbedRun); process.exit(0); });
-  `], { encoding: "utf8", timeout: 60_000 });
+    p.on("exit", () => {
+      clearInterval(waitForStubbedRun);
+      // argv[1], not argv[2]. With \`node -e "code" arg\` there is no script path in
+      // argv, so the first extra argument lands at index 1 — reading index 2 gave
+      // undefined and threw INSIDE the exit handler, which is why this block could
+      // not say what the runner did.
+      require("node:fs").writeFileSync(process.argv[1], runnerOut);
+      process.exit(0);
+    });
+  `, runnerLog], { encoding: "utf8", timeout: 60_000 });
 
-  check(child.status === 0, "control: the harness ran and killed the sweep mid-stub", String(child.stderr).slice(0, 200));
+  const runnerSaid = existsSync(runnerLog) ? readFileSync(runnerLog, "utf8") : "(no output captured)";
+  check(child.status === 0, "control: the harness ran and killed the sweep mid-stub",
+    `${String(child.stderr).slice(0, 200)}\n        runner said: ${runnerSaid.slice(0, 400)}`);
   const afterKill = readFileSync(join(root, "src", "thing.mjs"), "utf8");
   check(afterKill === SOURCE,
     "a sweep killed mid-stub restores the source before exiting", JSON.stringify(afterKill));
@@ -454,7 +477,8 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   const log = readFileSync(marker, "utf8").split("\n").filter(Boolean);
   const starts = log.filter(l => l === "run").length;
   const finishes = log.filter(l => l === "finished").length;
-  check(starts === 2, "control: the stubbed run really did begin", JSON.stringify(log));
+  check(starts === 2, "control: the stubbed run really did begin",
+    `${JSON.stringify(log)}\n        runner said: ${runnerSaid.slice(0, 500)}`);
   check(finishes === starts - 1,
     "and the test process was killed rather than left running after the sweep exited",
     `${starts} started, ${finishes} finished`);
@@ -579,6 +603,104 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   check(r.status === 0,
     "a named assertion still counts when the failure buries it under 1.5 MiB of noise", `exit=${r.status}`);
   check(/CAUGHT/.test(out), "and the verdict is CAUGHT rather than CRASHED", out.slice(-300));
+}
+
+// --- a control run that dirties the tree voids the reading ----------------------
+{
+  // The start-up guard proves the tree was clean when the SWEEP began. It does not
+  // prove it was clean when THIS stub was applied — and a control run that leaves
+  // an untracked cache changes what the stubbed run does. If the stubbed run then
+  // consumes and deletes it, the post-entry check sees a clean tree and reports
+  // CAUGHT for a stub that would not have been caught from a clean start.
+  const root = mkdtempSync(join(tmpdir(), "sweep-precheck-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  // The test litters on the PASSING (control) run and tidies up on the failing one.
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { writeFileSync, rmSync, existsSync } from "node:fs";\n` +
+    `import { guard } from "../src/thing.mjs";\n` +
+    `const cache = new URL("../src/cache.tmp", import.meta.url).pathname;\n` +
+    `if (guard) writeFileSync(cache, "cached\\n");\n` +
+    `else if (existsSync(cache)) rmSync(cache);\n` +
+    `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
+    `process.exitCode = guard ? 0 : 1;\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 1, "a control run that dirties the tree does not yield a passing sweep", `exit=${r.status}`);
+  check(/UNRUNNABLE/.test(out), "and the reading is void rather than CAUGHT", out.slice(-320));
+  check(/control run left the tree dirty/.test(out), "and says the control was what made the mess", out.slice(-320));
+}
+
+// --- only FAIL lines spend the assertion budget ---------------------------------
+{
+  // A suite printing many passing assertions before the relevant failure would
+  // otherwise exhaust the budget on PASS lines, and the named FAIL — the one thing
+  // the retention exists to preserve — still scrolls out of the capped tail.
+  const root = mkdtempSync(join(tmpdir(), "sweep-budget-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { guard } from "../src/thing.mjs";\n` +
+    `if (!guard) { for (let i = 0; i < 25000; i++) console.log("PASS  filler " + i); }\n` +
+    `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
+    `if (!guard) { const noise = "x".repeat(64 * 1024); for (let i = 0; i < 32; i++) console.log(noise); }\n` +
+    `process.exitCode = guard ? 0 : 1;\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8", maxBuffer: 1 << 28,
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 0,
+    "25,000 passing assertions before the failure do not crowd the named FAIL out", `exit=${r.status}`);
+  check(/CAUGHT/.test(out), "and the verdict is CAUGHT", out.slice(-320));
+}
+
+// --- an endless line without a newline cannot exhaust the heap ------------------
+{
+  // `partial` holds an incomplete line until a newline arrives. Unbounded, a test
+  // emitting a long diagnostic with no newline grows it for ever — it never
+  // reaches the split, so the output cap never sees it, and the heap goes before
+  // the timer or the restore handlers run. Which leaves the stub on disk: the very
+  // failure the cap exists to prevent, arriving through the buffer that implements it.
+  const root = mkdtempSync(join(tmpdir(), "sweep-noline-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  const SOURCE = `export const guard = true;\n`;
+  writeFileSync(join(root, "src", "thing.mjs"), SOURCE);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { guard } from "../src/thing.mjs";\n` +
+    `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
+    // No newlines at all: 32 MiB of one line.
+    `if (!guard) { const chunk = "y".repeat(1 << 20); for (let i = 0; i < 32; i++) process.stdout.write(chunk); }\n` +
+    `process.exitCode = guard ? 0 : 1;\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8", maxBuffer: 1 << 28,
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 0, "32 MiB with no newline is survived and the stub still caught", `exit=${r.status}`);
+  check(readFileSync(join(root, "src", "thing.mjs"), "utf8") === SOURCE,
+    "and the source is restored, rather than left stubbed by a runner that died");
 }
 
 // --- a target DELETED during a run is not resurrected ---------------------------

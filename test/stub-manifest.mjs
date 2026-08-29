@@ -200,8 +200,8 @@ export const STUBS = [
     test: "test/stubsweep.test.mjs",
     expectRed: "a stub whose test litters the repository does not pass the sweep",
     edits: [{ file: "scripts/stub-sweep.mjs",
-              find: `  try { after = execFileSync("git", ["status", "--porcelain"], { cwd: ROOT, encoding: "utf8" }).trim(); }`,
-              replace: '  try { after = ""; }' }],
+              find: "  const after = treeState();",
+              replace: '  const after = "";' }],
   },
   {
     name: "keep-verdict-lines",
@@ -213,12 +213,27 @@ export const STUBS = [
               replace: "              output: body });" }],
   },
   {
-    name: "process-group",
-    why: "kill only the direct test pid, so a helper it spawned outlives the sweep and acts on a restored tree",
+    // BOTH defences at once, and deliberately so.
+    //
+    // The process group and the descendant sweep are redundant BY DESIGN: either
+    // alone kills a helper the test spawned. Removing one therefore changes
+    // nothing observable, and an entry stubbing only `detached` came back
+    // NOT_CAUGHT — correctly, because the property still held.
+    //
+    // The honest stub for a redundant pair is a compound one. Removing both must
+    // break it, or neither is load-bearing and the entry proves nothing about
+    // either.
+    name: "process-tree-kill",
+    why: "remove BOTH the process group and the descendant sweep, so a helper the test spawned outlives it and acts on a restored tree",
     test: "test/stubsweep.test.mjs",
     expectRed: "the helper the STUBBED test spawned was killed with it",
-    edits: [{ file: "scripts/stub-sweep.mjs",
-              find: "  const child = spawn(process.execPath, [join(ROOT, file)], { cwd: ROOT, detached: true });",
-              replace: "  const child = spawn(process.execPath, [join(ROOT, file)], { cwd: ROOT });" }],
+    edits: [
+      { file: "scripts/stub-sweep.mjs",
+        find: "  const child = spawn(process.execPath, [join(ROOT, file)], { cwd: ROOT, detached: true });",
+        replace: "  const child = spawn(process.execPath, [join(ROOT, file)], { cwd: ROOT });" },
+      { file: "scripts/stub-sweep.mjs",
+        find: "  for (const pid of stragglers) {\n    try { process.kill(pid, \"SIGKILL\"); } catch { /* already gone, or not ours */ }\n  }",
+        replace: "" },
+    ],
   },
 ];

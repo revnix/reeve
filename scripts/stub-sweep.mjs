@@ -323,7 +323,9 @@ const runTest = (file, expectRed = null) => new Promise(resolve => {
     // more useful than keeping nothing.
     if (tail.length > MAX_LINE) tail = tail.slice(0, MAX_LINE);
     partial[which] = tail;
-    for (const l of lines)
+    // BRACED. This loop had a single-statement body, so adding a second block
+    // silently placed it OUTSIDE the loop, where the line variable does not exist.
+    for (const l of lines) {
       // THE NAMED ASSERTION IS NEVER CROWDED OUT. Twenty thousand unrelated
       // failures before it would otherwise fill the budget, the raw tail would
       // scroll past it, and the entry would read WRONG_RED for a stub the named
@@ -343,6 +345,7 @@ const runTest = (file, expectRed = null) => new Promise(resolve => {
           keptBytes += line.length;
         }
       }
+    }
     out += d;
     if (out.length > CAP) { dropped += out.length - CAP; out = out.slice(-CAP); }
   };

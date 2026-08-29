@@ -1,0 +1,39 @@
+== 1 SEAM LOG
+hub	[]
+hub	[]
+reapProvider	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"isAlive":"<fn>"}]
+openPrs	["o/r",20]
+evaluate	[{"nwo":"o/r","pr":42,"profile":{"identity":{"key":"o/r","defaultBranch":"main","worktreeRoot":"<tmp>","checkout":"<tmp>"},"authority":{"policy":"propose_and_merge"},"rounds":{"softCap":5,"hardCap":10,"maxFixAttemptsPerFinding":1},"ci":{"provider":"github-actions","requiredChecks":[]},"watch":{"maxWorkers":5,"workerBudgetMinutes":1,"maxTurns":5}},"db":"<DatabaseSync>"}]
+observe	["o/r",42]
+evaluate	[{"nwo":"o/r","pr":42,"profile":{"identity":{"key":"o/r","defaultBranch":"main","worktreeRoot":"<tmp>","checkout":"<tmp>"},"authority":{"policy":"propose_and_merge"},"rounds":{"softCap":5,"hardCap":10,"maxFixAttemptsPerFinding":1},"ci":{"provider":"github-actions","requiredChecks":[]},"watch":{"maxWorkers":5,"workerBudgetMinutes":1,"maxTurns":5}},"db":"<DatabaseSync>","anchor":{"ok":true,"head":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","headRef":"f","updatedAt":null},"hold":null,"io":{"foldPrecedesEvaluation":true}}]
+resolveCause	["o/r",{"name":"unit","id":"1"}]
+publish	[{"nwo":"o/r","verdict":{"state":"BLOCK","summary":"ci is red","clauses":[{"id":"ci","state":"BLOCK","detail":"failing: unit"},{"id":"base","state":"PASS","detail":""},{"id":"review","state":"PASS","detail":""},{"id":"rounds","state":"PASS","detail":""},{"id":"threads","state":"PASS","detail":""},{"id":"findings","state":"PASS","detail":""},{"id":"mergeable","state":"PASS","detail":""},{"id":"cleared","state":"PASS","detail":""},{"id":"bodyFindings","state":"PASS","detail":""},{"id":"bodyReadable","state":"PASS","detail":""}]},"shadow":true}]
+capacity	[{"maxWorkers":5,"running":0}]
+hub	[]
+
+== 2 ESCALATIONS
+reeve has never backed up o/r
+reeve has no notification channel, so escalations reach a log only
+the repository numeric id is unknown; provider leases cannot be scoped
+
+== 3 LOG FILE
+<ts> tick: o/r — 1 open PR(s)
+<ts>   #42: review projection not readable — the observation behind this projection was incomplete
+<ts>   #42 BLOCK   FIX_CI          failing: unit
+<ts> execute: capacity allows 5 worker(s) (load 0.00, 10 perf cores)
+<ts>   #42: NOT dispatching — the repository id is unknown, so a provider lease cannot be scoped
+<ts> backup FAILED: no state store found to snapshot
+<ts> self: BROKEN reeve has never backed up o/r — nothing under <tmp>
+<ts> self: DEGRADED reeve has no notification channel, so escalations reach a log only — set notify.provider, notify.url and notify.topic in the profile
+<ts> NEEDS YOU: the repository numeric id is unknown; provider leases cannot be scoped
+<ts> NEEDS YOU: reeve has never backed up o/r
+<ts> NEEDS YOU: reeve has no notification channel, so escalations reach a log only
+<ts> did NOT push: no notify channel configured
+<ts> shadow: 0 consecutive day(s) agreeing over 0 comparison(s)
+
+== 4 RESULT
+{"halted":false,"unreadable":null,"decisions":["FIX_CI"]}
+
+== 5 CARRIED
+providerRetry: 
+cooldownRetry: 

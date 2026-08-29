@@ -11,7 +11,7 @@
 // take days to produce.
 
 import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, safePath, exitFor,
-         displayPath, toByteString, crossCheckState, parseArgs,
+         displayPath, toByteString, crossCheckState, parseArgs, summaryLine,
          FILE_STATE, VERDICT, EXIT, ABSENT } from "../src/mergecheck.mjs";
 
 let fail = 0;
@@ -463,6 +463,56 @@ const F = "100644", X = "100755", L = "120000";
     squash: S, main: M, entryAt: fixture({ [S]: { a: `${F} 1` }, [M]: { a: `${F} 2` } }),
   }));
   check(/SCOPE:/.test(drifted.why), "and a DRIFTED verdict carries the same scope statement");
+}
+
+
+// --- THE VERDICT LINE NAMES WHERE THE BRANCH IS NOW ---------------------------
+// MEASURED IN USE, on reeve#63: it merged at head 9232d4a while the branch went
+// on to 4e5df36, and six commits pushed after the merge never reached main. This
+// tool answered MERGED, AND INTACT ON MAIN -- TRUE, since it compares main
+// against the squash -- and printed its divergence note, which was read as
+// decoration. A clean verdict is persuasive enough that a warning beside it does
+// not survive a skim. What caught it was an unrelated COUNT.
+//
+// `headRefOid` is FROZEN at the moment of merge, so printing it alone is worse
+// than printing nothing: it looks current and is not. The live branch tip is
+// read separately and the two are shown together.
+{
+  const base = { verdict: VERDICT.intact, repo: "o/r", pr: "63", squash: "5ca49dcaaa" };
+
+  const moved = summaryLine({ ...base, mergedHead: "9232d4abbb", branchNow: "4e5df36ccc", branchRead: "read" });
+  check(moved.includes("merged-head=9232d4a") && moved.includes("branch-now=4e5df36"),
+    "both shas are on the verdict line, so neither has to be held in memory", moved);
+  check(/THE BRANCH HAS MOVED PAST THIS MERGE/.test(moved),
+    "and a branch that moved past the merge is flagged IN the line nobody skips, not in a note", moved);
+  check(/NOT on main/.test(moved),
+    "and the flag says what that means rather than only that it happened");
+
+  // The control that makes the assertion above mean something.
+  const same = summaryLine({ ...base, mergedHead: "9232d4abbb", branchNow: "9232d4abbb", branchRead: "read" });
+  check(!/MOVED PAST/.test(same),
+    "control: a branch still at the merged head is NOT flagged", same);
+  check(same.includes("branch-now=9232d4a"),
+    "but it is still named, so the reader sees the comparison that was made", same);
+
+  // A deleted branch cannot have moved. That is an answer, not an absence.
+  const gone = summaryLine({ ...base, mergedHead: "9232d4abbb", branchRead: "gone" });
+  check(gone.includes("branch=deleted") && !/MOVED PAST|UNKNOWN/.test(gone),
+    "a deleted branch reports deleted -- it cannot carry a commit the merge missed", gone);
+
+  // AND AN UNREAD BRANCH SAYS SO. Silence here is indistinguishable from
+  // agreement, which is the failure this whole tool exists to remove.
+  const unread = summaryLine({ ...base, mergedHead: "9232d4abbb", branchRead: "unreadable" });
+  check(/branch=UNREAD/.test(unread) && /UNKNOWN/.test(unread),
+    "an unreadable branch is UNKNOWN, never quietly treated as unmoved", unread);
+  check(!/MOVED PAST/.test(unread),
+    "and it does not claim movement it could not observe");
+
+  // The flag rides on the verdict, whatever the verdict is.
+  const drifted = summaryLine({ ...base, verdict: VERDICT.drifted,
+    mergedHead: "9232d4abbb", branchNow: "4e5df36ccc", branchRead: "read" });
+  check(drifted.startsWith(VERDICT.drifted) && /MOVED PAST/.test(drifted),
+    "a DRIFTED verdict carries the same warning -- the two facts are independent", drifted);
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

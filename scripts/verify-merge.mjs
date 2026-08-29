@@ -14,7 +14,7 @@
 
 import { execFileSync } from "node:child_process";
 import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, displayPath, toByteString,
-         crossCheckState, parseArgs, exitFor, EXIT, VERDICT, ABSENT } from "../src/mergecheck.mjs";
+         crossCheckState, parseArgs, summaryLine, exitFor, EXIT, VERDICT, ABSENT } from "../src/mergecheck.mjs";
 
 // execFileSync defaults to a 1 MiB stdout buffer and THROWS ENOBUFS past it.
 // The pull-request files endpoint carries a URL trio and often patch text per
@@ -37,7 +37,7 @@ const emit = (doc, code) => {
   const shown = (doc.files ?? []).map(f => ({ ...f, path: displayPath(f.path) }));
   if (json) console.log(JSON.stringify({ ...doc, files: shown }, null, 2));
   else {
-    console.log(`${doc.verdict}  ${doc.repo ?? "?"}#${doc.pr ?? "?"}${doc.squash ? `  squash=${doc.squash.slice(0, 7)}` : ""}`);
+    console.log(summaryLine(doc));
     // displayPath, not the raw name: a filename is attacker-supplied on any
     // repository taking outside contributions, and a carriage return or an ANSI
     // escape in one can overwrite the verdict line above or forge a new one.
@@ -97,7 +97,7 @@ const run = () => {
   let meta;
   try {
     meta = JSON.parse(sh("gh", ["pr", "view", pr, "--repo", ghRepo, "--json",
-                                "state,mergedAt,mergeCommit,headRefOid,baseRefName,changedFiles"]));
+                                "state,mergedAt,mergeCommit,headRefOid,headRefName,baseRefName,changedFiles"]));
   } catch (e) {
     return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, files: [], why: `could not read ${ghRepo}#${pr}: ${first(e)}` }, EXIT.unreadable);
   }
@@ -268,8 +268,29 @@ const run = () => {
   // byte-strings so no byte is lost in comparison, but that is a transport, not
   // a name: serialised straight to JSON, `café.txt` reads as `cafÃ©.txt` and the
   // structured report names a file that does not exist.
+  // WHERE IS THE BRANCH NOW? `headRefOid` is FROZEN at the moment of merge, so
+  // it cannot reveal a commit pushed afterwards -- and that is exactly the case
+  // this reports on. MEASURED on reeve#63: GitHub reported headRefOid 9232d4a
+  // while `refs/heads/feat/stub-sweep` stood at 4e5df36, six commits later, none
+  // of them on main. The frozen value looks current and is not, which makes
+  // printing it alone worse than printing nothing.
+  //
+  // Three answers, not two: read, deleted, or unreadable. A deleted branch
+  // cannot have moved; an unreadable one is UNKNOWN and says so.
+  let branchNow = null, branchRead = "unreadable";
+  if (!meta.headRefName) branchRead = "unreadable";
+  else {
+    try {
+      const out = sh("git", ["ls-remote", "origin", `refs/heads/${meta.headRefName}`]).trim();
+      if (out === "") { branchRead = "gone"; }
+      else { branchNow = out.split(/\s+/)[0]; branchRead = "read"; }
+    } catch { branchRead = "unreadable"; }
+  }
+
   emit({ repo: ghRepo, pr, verdict, squash, main: mainOid, base: meta.baseRefName ?? null,
-         headRead: headRev !== null, crossCheck, branchOnly: branchOnly.map(displayPath),
+         mergedHead: meta.headRefOid ?? null, branchNow, branchRead,
+         head: headRev, headRead: headRev !== null,
+         crossCheck, branchOnly: branchOnly.map(displayPath),
          counts, files: classified, why },
        exitFor(verdict));
 };

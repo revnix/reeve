@@ -13,7 +13,7 @@
 import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, safePath, exitFor,
          displayPath, toByteString, crossCheckState, parseArgs, summaryLine,
          FILE_STATE, VERDICT, EXIT, ABSENT,
-         refPath, branchStateFrom, headRepoOf } from "../src/mergecheck.mjs";
+         refPath, branchStateFrom, headRepoOf, localRefState, scopeOfLocal } from "../src/mergecheck.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -627,6 +627,54 @@ const F = "100644", X = "100755", L = "120000";
   // Control: and a malformed origin is still not guessed at.
   check(headRepoOf({ isCrossRepository: false }, "not-a-nwo") === null,
     "control: and an origin that is not owner/name yields nothing rather than half a name");
+}
+
+// ── What THIS CLONE holds that the remote does not ──────────────────────────
+{
+  // MEASURED, on a real merge: a lane held a push deliberately so as not to
+  // strand a review that was running, its pull request merged while the push was
+  // held, and `branch-now == merged-head` was true throughout. Every other read
+  // in this file has the remote as its universe, so that commit was not
+  // unproven, it was INVISIBLE -- and the verdict read as "nothing of mine is
+  // outstanding" while measuring something narrower.
+  check(localRefState("7bc22f8", "237d468") === "differs",
+    "a local tip the remote does not have is reported, not passed over");
+  check(localRefState("237d468", "237d468") === "same",
+    "and a local tip that matches the remote is quiet");
+
+  // THE THIRD STATE IS THE POINT. An absent local branch is not evidence of an
+  // empty one: this clone may simply never have had it. Silence there would be
+  // the same false reassurance one layer out.
+  for (const [label, local, remote] of [["no local branch", null, "237d468"],
+                                        ["an unreadable local tip", "", "237d468"],
+                                        ["no remote tip to compare against", "7bc22f8", null]]) {
+    check(localRefState(local, remote) === "unchecked", `${label} is UNCHECKED, never "same"`);
+  }
+
+  // AND THE VERDICT SAYS SO IN WORDS, on every answer.
+  check(/never pushed|holds at least one commit/.test(scopeOfLocal("differs")),
+    "the scope names the held commit", scopeOfLocal("differs"));
+  check(/not evidence/.test(scopeOfLocal("unchecked")),
+    "and says an unchecked local side is NOT evidence of nothing outstanding", scopeOfLocal("unchecked"));
+  // WORDED TO THE MEASUREMENT, not past it. Uncommitted work in a worktree is a
+  // third way to have something outstanding and this read cannot see it, so the
+  // clean sentence stops at commits.
+  check(/IN COMMITS/.test(scopeOfLocal("same")),
+    "and the clean case is qualified to COMMITS, since uncommitted work is invisible here",
+    scopeOfLocal("same"));
+  check(!/nothing is outstanding\.|nothing outstanding\./.test(scopeOfLocal("same")),
+    "control: and it never says plainly that nothing is outstanding, which it cannot know");
+
+  // The warning belongs in the line nobody skips; the other two states are a
+  // SCOPE and would be noise there.
+  const base = { verdict: VERDICT.intact, repo: "o/r", pr: 1, squash: "abc1234",
+                 mergedHead: "9232d4a", branchNow: "9232d4a", branchRead: "read" };
+  check(/THIS CLONE HOLDS A COMMIT/.test(summaryLine({ ...base, localRef: "differs" })),
+    "a held commit is flagged IN the summary line", summaryLine({ ...base, localRef: "differs" }));
+  for (const st of ["same", "unchecked", undefined]) {
+    check(!/CLONE/.test(summaryLine({ ...base, localRef: st })),
+      `and a ${st ?? "missing"} local state adds nothing to that line`, summaryLine({ ...base, localRef: st }));
+  }
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

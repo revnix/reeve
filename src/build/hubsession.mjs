@@ -78,7 +78,19 @@ export const hubSession = ({ getter, onFault, overrides }) => {
     if (!h) return whenAbsent === undefined ? undefined : whenAbsent();
     return (overrides?.[name] ?? fallbackFn)(h, args);
   };
-  return {
+  // FROZEN, because the guarantee is about what a CALLER cannot do.
+  //
+  // Everything above is enforced by construction: a call site cannot hold a
+  // stale handle because it is never handed one. That reasoning survives only
+  // while the surface is the surface -- `session.perform = (...) => raw` would
+  // reinstate the whole defect class in one line, from anywhere holding a
+  // reference, and nothing else here would notice.
+  //
+  // Freezing does not stop a determined caller reaching the closure; nothing in
+  // JavaScript does. It stops the ACCIDENT: the debugging patch left in, the
+  // well-meant wrapper, the test double installed on a shared object. Those are
+  // what actually happen.
+  return Object.freeze({
     // The raw reading, for the two callers that need to tell an ABSENT hub
     // from an unreadable one -- a fact the handle alone cannot carry.
     read: now,
@@ -90,5 +102,5 @@ export const hubSession = ({ getter, onFault, overrides }) => {
     // leave a handle in scope for a later line to use.
     available: () => Boolean(handle(() => null)),
     perform,
-  };
+  });
 };

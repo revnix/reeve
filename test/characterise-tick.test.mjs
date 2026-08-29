@@ -53,17 +53,33 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
 
-// THE INTERPRETER PATH IS PART OF THE HOST, not of the behaviour. `spawnWorker`
-// records an allow-rule naming the running node binary, so an artifact captured
-// on one machine cannot match on another -- MEASURED: six scenarios failed in CI
-// against artifacts approved locally, with no change to the tick at all.
-const NODE_PATH_RE = /(?:\/[^\s"',)\]]*)?\bnode\/?[^\s"',)\]]*\/bin\/node\b|\/[^\s"',)\]]*\/bin\/node\b/g;
-
-// The temporary root this run actually uses, in every form it can appear in.
+// HOST PATHS, DERIVED FROM THE RUNNING PROCESS rather than described.
+//
+// Both of these were once written as shapes -- `/tmp` or `/var` for the
+// temporary root, "ends in /bin/node" for the interpreter -- and a shape is a
+// description of THIS machine. `TMPDIR` moves one anywhere; Windows gives the
+// other a form like `C:\Program Files\nodejs\node.exe`, which has a space in
+// it, no `/bin/`, and separators that are doubled when it lands inside a JSON
+// string. Neither shape matches there, so the artifacts mismatch and the
+// controls that police the redaction fail with them.
+//
+// Two forms each, because these paths appear both bare (in the log's prose) and
+// inside JSON strings (in seam arguments), and the two differ wherever a
+// separator needs escaping. Longest first, or a shorter form wins as a prefix
+// of a longer one.
 const reEscape = (v) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const TMP_FORMS = [...new Set([tmpdir(), JSON.stringify(tmpdir()).slice(1, -1)])]
-  .sort((a, b) => b.length - a.length);   // longest first, or a prefix wins
-const TMP_RE = new RegExp(`(?:/private)?(?:${TMP_FORMS.map(reEscape).join("|")})[^\\s"'),\\]]*`, "g");
+const pathForms = (p) => [...new Set([p, JSON.stringify(p).slice(1, -1)])]
+  .sort((a, b) => b.length - a.length).map(reEscape).join("|");
+
+// The realpath of the temporary root gains a `/private` prefix on macOS that the
+// environment variable does not carry, and the fixture's directories sit under
+// it, so the trailing run of path characters is part of the match.
+const TMP_RE = new RegExp(`(?:/private)?(?:${pathForms(tmpdir())})[^\\s"'),\\]]*`, "g");
+
+// MEASURED against every scenario: the only interpreter path any artifact
+// contains IS `process.execPath`, so matching it exactly loses nothing and
+// removes the guesswork about what a node binary's path looks like.
+const NODE_PATH_RE = new RegExp(pathForms(process.execPath), "g");
 
 /**
  * Redaction, by MEASURED provenance rather than by name.
@@ -98,6 +114,16 @@ const TMP_RE = new RegExp(`(?:/private)?(?:${TMP_FORMS.map(reEscape).join("|")})
  */
 const EPOCH_RE = /"(observedAt|expiresAt)"\s*:\s*(\d+)/g;
 
+/** A stamp's distance from the artifact's origin. Signed, so a stamp BEFORE the
+ *  origin is visible rather than silently clamped. */
+const offsetOf = (v, t0) => (v === t0 ? "" : `${v < t0 ? "-" : "+"}${Math.abs(v - t0)}`);
+
+/** The earliest stamp anywhere in the artifact, or null if it carries none. */
+const originOf = (parts) => {
+  const eps = parts.flatMap((p) => [...String(p).matchAll(EPOCH_RE)].map((m) => Number(m[2])));
+  return eps.length ? Math.min(...eps) : null;
+};
+
 const REDACTIONS = [
   { name: "iso timestamp", kind: "varies",
     apply: (s) => s.replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, "<ts>") },
@@ -128,13 +154,19 @@ const REDACTIONS = [
   // the retry time rather than the observation looks newer than a rate limit
   // seen after it, and then overwrites it. Only the origin is the clock; the
   // offsets from it are the contract, so they stay on the page.
+  // ONE ORIGIN FOR THE WHOLE ARTIFACT, passed in. Computed per section, each
+  // section chose its own minimum -- so moving BOTH deferred stamps forward
+  // together left their offsets from each other unchanged, the artifact
+  // identical and the suite green, while the next tick would extend the cooldown
+  // from an observation that has not happened yet and overwrite genuinely newer
+  // metadata. A shared origin is what makes the attempted stamps and the
+  // deferred ones comparable, which is the whole reason for keeping them.
   { name: "cooldown wall clock", kind: "provenance",
-    apply: (s) => {
+    apply: (s, origin) => {
       const eps = [...s.matchAll(EPOCH_RE)].map((m) => Number(m[2]));
       if (!eps.length) return s;
-      const t0 = Math.min(...eps);
-      return s.replace(EPOCH_RE, (_, k, v) =>
-        `"${k}":<t0${Number(v) === t0 ? "" : `+${Number(v) - t0}`}>`);
+      const t0 = origin ?? Math.min(...eps);
+      return s.replace(EPOCH_RE, (_, k, v) => `"${k}":<t0${offsetOf(Number(v), t0)}>`);
     },
     cameFromTheHost: (t) => [...t.matchAll(EPOCH_RE)]
       .some((m) => Math.abs(Number(m[2]) - Date.now() / 1000) < 3600) },
@@ -149,22 +181,35 @@ const REDACTIONS = [
   // `providerClaim` is handed `pid: process.pid`, constant within a run and
   // different in every other process that ever compares these artifacts.
   //
-  // MATCHED BY VALUE, not by key. A fixture can hand a seam a pid of its own --
-  // the bind path is given one -- and that number is behaviour, chosen by the
-  // scenario and identical everywhere. Blanking every `"pid"` would hide it for
-  // the sake of the one that is really the host's, which is the same mistake as
-  // blanking every `"id"`.
+  // SCOPED TO THE CLAIM, not matched by key and not matched by value either.
+  //
+  //   By KEY blanks a fixture's own pid: the bind path is handed 4242, which is
+  //   behaviour, chosen by the scenario and identical on every machine.
+  //   By VALUE still collides. The day this process is itself assigned 4242 the
+  //   replacement swallows the fixture's pid too, the artifact mismatches for no
+  //   reason but the host's process table, and the worker pid silently stops
+  //   being checked at the same time.
+  //
+  // MEASURED: `"pid":<process.pid>` appears on the `providerClaim` seam line and
+  // nowhere else, so the claim's arguments are the exact scope.
   { name: "process id", kind: "provenance",
-    apply: (s) => s.replace(new RegExp(`"pid"\\s*:\\s*${process.pid}\\b`, "g"), '"pid":<pid>'),
-    cameFromTheHost: (t) => new RegExp(`"pid"\\s*:\\s*${process.pid}\\b`).test(t) },
+    apply: (s) => s.split("\n").map((line) => (line.startsWith("providerClaim\t")
+      ? line.replace(new RegExp(`"pid"\\s*:\\s*${process.pid}\\b`, "g"), '"pid":<pid>')
+      : line)).join("\n"),
+    cameFromTheHost: (t) => t.split("\n").some((line) => line.startsWith("providerClaim\t")
+      && new RegExp(`"pid"\\s*:\\s*${process.pid}\\b`).test(line)) },
 ];
 
-/** Apply every redaction, or every one but `skip` -- the per-pattern control. */
-const redact = (s, skip = null) =>
-  REDACTIONS.reduce((acc, r) => (r.name === skip ? acc : r.apply(acc)), String(s));
-
-/** No redaction at all: the raw text the controls measure against. */
-const raw = (s) => String(s);
+/**
+ * Apply every redaction.
+ *
+ * `skip` omits one, which is how the per-pattern control proves a pattern is
+ * load-bearing. `origin` fixes the cooldown's zero point for a whole artifact;
+ * omitted, each string re-derives it locally, which is right when the caller IS
+ * passing a whole artifact.
+ */
+const redact = (s, { skip = null, origin = null } = {}) =>
+  REDACTIONS.reduce((acc, r) => (r.name === skip ? acc : r.apply(acc, origin)), String(s));
 
 /**
  * Seam arguments, safely.
@@ -191,27 +236,26 @@ const argsOf = (args) => {
 };
 
 /** A carried map as its key line, then one indented line per stored identity. */
-const carriedLines = (name, map, red) => {
+const carriedLines = (name, map) => {
   const entries = [...(map?.entries?.() ?? [])].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   return [`${name}: ${entries.map(([k]) => k).join(",")}`,
-          ...entries.map(([k, v]) => `  ${k}\t${red(JSON.stringify(v))}`)];
+          ...entries.map(([k, v]) => `  ${k}\t${JSON.stringify(v)}`)];
 };
 
-const serialise = ({ seams, esc, log, r, ctx }, red = redact) => [
-  "== 1 SEAM LOG",
-  seams.map(({ op, args }) => `${op}\t${red(argsOf(args))}`).join("\n"),
-  "",
-  "== 2 ESCALATIONS",
-  // REDACTED TOO. An escalation KEY can carry a temp path -- the
-  // checkout-tampered one names the preserved checkout -- so the key varies per
-  // run. Sorting after redaction, or the order follows the unredacted text.
-  red([...(r.escalations?.keys?.() ?? [])].map(red).sort().join("\n")),
-  "",
-  "== 3 LOG FILE",
-  red(log).trimEnd(),
-  "",
-  "== 4 RESULT",
-  red(JSON.stringify({
+/**
+ * The artifact.
+ *
+ * BUILT RAW FIRST, then redacted as a whole. Two reasons, both measured:
+ * the cooldown's origin has to be chosen once across every section, and the
+ * process-id redaction is scoped to the `providerClaim` line, which only exists
+ * once the seam log is assembled -- redacting each seam's arguments on their own
+ * left no line for it to recognise.
+ */
+const serialise = ({ seams, esc, log, r, ctx }, plain = false) => {
+  const seamLog = seams.map(({ op, args }) => `${op}\t${argsOf(args)}`).join("\n");
+  const escKeys = [...(r.escalations?.keys?.() ?? [])];
+  const logText = String(log).trimEnd();
+  const result = JSON.stringify({
     halted: r.halted ?? null,
     unreadable: r.unreadable ?? null,
     // NESTED. tick() stores `{ e, decision, cause, fp, spendKey }`, so reading
@@ -220,18 +264,40 @@ const serialise = ({ seams, esc, log, r, ctx }, red = redact) => [
     // asserts at least one scenario names a real action, so this cannot regress
     // to nulls silently.
     decisions: (r.decisions ?? []).map((d) => d?.decision?.action ?? d?.action ?? null),
-  })),
-  "",
-  "== 5 CARRIED",
+  });
   // THE VALUE, NOT ONLY THE KEY. A deferred release is retried against the
   // IDENTITY stored beside its key, and a retry whose identity has lost its
   // token is refused as `no-identity`, discarded, and leaves the lease consuming
-  // capacity until it expires. Recording only the key left that entirely
-  // invisible: the key is unchanged in exactly that case.
-  ...carriedLines("providerRetry", ctx.providerRetry, red),
-  ...carriedLines("cooldownRetry", ctx.cooldownRetry, red),
-  "",
-].join("\n");
+  // capacity until it expires. Recording only the key left that invisible: the
+  // key is unchanged in exactly that case.
+  const held = carriedLines("providerRetry", ctx.providerRetry);
+  const cooling = carriedLines("cooldownRetry", ctx.cooldownRetry);
+
+  const origin = plain ? null : originOf([seamLog, ...escKeys, logText, result, ...held, ...cooling]);
+  const red = plain ? String : (v) => redact(v, { origin });
+
+  return [
+    "== 1 SEAM LOG",
+    red(seamLog),
+    "",
+    "== 2 ESCALATIONS",
+    // REDACTED PER KEY, then sorted: an escalation key can carry a temp path --
+    // the checkout-tampered one names the preserved checkout -- so sorting the
+    // unredacted text would order them by a value that varies.
+    escKeys.map(red).sort().join("\n"),
+    "",
+    "== 3 LOG FILE",
+    red(logText),
+    "",
+    "== 4 RESULT",
+    red(result),
+    "",
+    "== 5 CARRIED",
+    ...held.map(red),
+    ...cooling.map(red),
+    "",
+  ].join("\n");
+};
 
 /**
  * A scenario's options, fresh.
@@ -353,7 +419,7 @@ for (const [name, opts] of SCENARIOS) {
     continue;
   }
   const actual = serialise({ ...out, seams });
-  rawRuns.push(serialise({ ...out, seams }, raw));
+  rawRuns.push(serialise({ ...out, seams }, true));
   const file = join(APPROVED, `${name}.txt`);
 
   if (!existsSync(file) && !APPROVE) {
@@ -404,7 +470,7 @@ for (const name of PAIRED) {
   for (let i = 0; i < 2; i++) {
     const seams = [];
     const out = await run({ ...entry[1], seams });
-    two.push({ done: serialise({ ...out, seams }), raw: serialise({ ...out, seams }, raw) });
+    two.push({ done: serialise({ ...out, seams }), raw: serialise({ ...out, seams }, true) });
   }
   pairs.push([name, two[0], two[1]]);
   rawRuns.push(two[0].raw);
@@ -435,7 +501,7 @@ for (const { name: pname, apply } of REDACTIONS) {
 //    token, the run reference and the head the worker was sent at.
 for (const { name: pname, kind, cameFromTheHost } of REDACTIONS) {
   if (kind === "varies") {
-    const bearing = pairs.some(([, a, b]) => redact(a.raw, pname) !== redact(b.raw, pname));
+    const bearing = pairs.some(([, a, b]) => redact(a.raw, { skip: pname }) !== redact(b.raw, { skip: pname }));
     check(bearing, `control: without the ${pname} redaction two runs differ, so it normalises variance rather than hiding behaviour`);
   } else {
     // The provenance half. `.some` over actual matches, so a text with no
@@ -522,6 +588,74 @@ check(pairs.length === 2 && pairs[0][1].done !== pairs[1][1].done,
   check(claiming.length > 0 && unmasked.length === 0,
     "and every artifact recording a claim shows its pid replaced, since the claim is handed this process's",
     `${claiming.length} artifact(s) record a claim; unmasked: ${unmasked.join(", ") || "none"}`);
+}
+
+// 8b. THE HOST-PATH PATTERNS ARE DERIVED, AND THE DERIVATION HANDLES SHAPES THIS
+//     MACHINE DOES NOT HAVE. The suite cannot run on Windows here, so the
+//     artifacts prove nothing about it; what CAN be established is that the
+//     construction covers a Windows interpreter path -- a space in it, no
+//     `/bin/`, and separators that are doubled inside a JSON string. Asserted on
+//     the builder directly, which is the part that would be wrong.
+{
+  const WIN = "C:\\Program Files\\nodejs\\node.exe";
+  const winRe = new RegExp(pathForms(WIN), "g");
+  check(winRe.test(`"bin":"${JSON.stringify(WIN).slice(1, -1)}"`),
+    "the interpreter pattern matches a Windows path as it appears INSIDE a JSON string");
+  check(new RegExp(pathForms(WIN), "g").test(`spawning ${WIN} --version`),
+    "and as it appears bare in the log's prose");
+  // The control: the shape this replaced could match NEITHER, which is why the
+  // artifacts and the redaction controls both failed there.
+  const OLD = /(?:\/[^\s"',)\]]*)?\bnode\/?[^\s"',)\]]*\/bin\/node\b|\/[^\s"',)\]]*\/bin\/node\b/g;
+  check(!OLD.test(`"bin":"${JSON.stringify(WIN).slice(1, -1)}"`),
+    "control: and the ends-in-/bin/node shape it replaced matches neither, so this is not a no-op");
+  // And it still matches THIS host's, or the derivation would be untested where
+  // it actually runs.
+  check(new RegExp(pathForms(process.execPath), "g").test(process.execPath),
+    "control: and the same construction matches this host's interpreter");
+}
+
+// 8c. THE PROCESS-ID REDACTION TOUCHES THE CLAIM AND NOTHING ELSE. A fixture
+//     hands the bind path a pid of its own, and the day this process is assigned
+//     that same number a value-only match would swallow it -- the artifact would
+//     mismatch for no reason but the host's process table, and the worker pid
+//     would quietly stop being checked. Asserted on a line pair carrying the
+//     SAME number under both seams, which is that collision exactly, without
+//     needing to be assigned any particular pid.
+{
+  const pat = REDACTIONS.find((r) => r.name === "process id");
+  const pair = `providerClaim\t[{"pid":${process.pid}}]\nproviderBind\t[{"pid":${process.pid}}]`;
+  const [claimLine, bindLine] = pat.apply(pair, null).split("\n");
+  check(claimLine.includes('"pid":<pid>'), "the claim's pid is replaced", claimLine);
+  check(bindLine.includes(`"pid":${process.pid}`),
+    "and a seam that is not the claim keeps the same number, which is the collision case", bindLine);
+  // And the fixture's own worker pid survives into the artifact it belongs to.
+  const bind = existsSync(join(APPROVED, "14-worker-binds-and-heartbeats.txt"))
+    ? readFileSync(join(APPROVED, "14-worker-binds-and-heartbeats.txt"), "utf8")
+      .split("\n").find((l) => l.startsWith("providerBind\t")) : null;
+  check(!!bind && /"pid":4242\b/.test(bind),
+    "and the scenario's worker pid is on the page, where a refactor that stopped passing it would show",
+    bind ?? "no providerBind seam recorded");
+}
+
+// 8d. THE COOLDOWN'S ORIGIN IS ONE ORIGIN FOR THE WHOLE ARTIFACT. Per section,
+//     each chose its own minimum, so stamps moved together within one section
+//     kept their offsets and vanished. Asserted on the redactor directly,
+//     because the fixture's two sections legitimately agree today: the defect is
+//     only visible once they diverge.
+{
+  const attempted = `noteRateLimit\t[{"observedAt":1000,"expiresAt":1600}]`;
+  const deferred = `  k\t{"observedAt":1100,"expiresAt":1700}`;
+  const origin = originOf([attempted, deferred]);
+  const [a, d] = [attempted, deferred].map((x) => redact(x, { origin }));
+  check(/"observedAt":<t0>/.test(a) && /"expiresAt":<t0\+600>/.test(a),
+    "the earliest stamp anywhere is the origin", a);
+  check(/"observedAt":<t0\+100>/.test(d) && /"expiresAt":<t0\+700>/.test(d),
+    "and a section stamped later shows its distance from that same origin, not from its own", d);
+  // The control: redacted independently, the deferred pair is indistinguishable
+  // from the attempted one, which is the bug.
+  const alone = redact(deferred, {});
+  check(/"observedAt":<t0>/.test(alone),
+    "control: and re-origined alone it reads as t0, which is why one origin is required", alone);
 }
 
 // 9. EVERY SCHEDULER SEAM THE HARNESS INSTALLS IS REACHED BY SOME SCENARIO.

@@ -58,7 +58,18 @@ const check = (ok, name, detail) => {
 // Every key whose value is generated per run. One list, asserted below.
 const GENERATED = ["token", "lstart", "sessionId", "runRef", "runId"];
 
+// THE INTERPRETER PATH IS PART OF THE HOST, not of the behaviour. `spawnWorker`
+// records an allow-rule naming the running node binary, so an artifact captured
+// on one machine cannot match on another -- MEASURED: six scenarios failed in CI
+// against artifacts approved locally, with no change to the tick at all.
+//
+// The determinism check below runs the same scenario twice in ONE process, so it
+// proves reproducibility and says nothing about portability. This is the half it
+// cannot see, which is why the path is redacted rather than merely noticed.
+const NODE_PATH_RE = /(?:\/[^\s"',)\]]*)?\bnode\/?[^\s"',)\]]*\/bin\/node\b|\/[^\s"',)\]]*\/bin\/node\b/g;
+
 const redact = (s) => String(s)
+  .replace(NODE_PATH_RE, "<node>")
   .replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, "<ts>")
   .replace(/\/(?:private\/)?(?:var|tmp)\/[^\s"'),\]]*/g, "<tmp>")
   .replace(/"pid"\s*:\s*\d+/g, '"pid":<pid>')
@@ -119,7 +130,12 @@ const serialise = ({ seams, esc, log, r, ctx }) => [
   redact(JSON.stringify({
     halted: r.halted ?? null,
     unreadable: r.unreadable ?? null,
-    decisions: (r.decisions ?? []).map((d) => d?.action ?? null),
+    // NESTED. tick() stores `{ e, decision, cause, fp, spendKey }`, so reading
+    // `d.action` yields null for every entry and the field records
+    // `"decisions":[null]` -- populated-looking and vacuous. The control below
+    // asserts at least one scenario names a real action, so this cannot regress
+    // to nulls silently.
+    decisions: (r.decisions ?? []).map((d) => d?.decision?.action ?? d?.action ?? null),
   })),
   "",
   "== 5 CARRIED",
@@ -183,7 +199,17 @@ for (const [name, opts] of SCENARIOS) {
   const actual = serialise({ ...out, seams });
   const file = join(APPROVED, `${name}.txt`);
 
-  if (APPROVE || !existsSync(file)) {
+  if (!existsSync(file) && !APPROVE) {
+    // A MISSING BASELINE IS A FAILURE, not an invitation. Regenerating it would
+    // let a refactor delete a baseline and have CI bless the new output as if it
+    // had been approved -- the deliberate step this file exists to require,
+    // skipped by deleting a file.
+    check(false, `${name}: has an approved signature`,
+      `${file} is missing. If this scenario is new or deliberately changed, run:\n` +
+      "        REEVE_APPROVE=1 node test/characterise-tick.test.mjs");
+    continue;
+  }
+  if (APPROVE) {
     writeFileSync(file, actual);
     approvedWritten++;
     console.log(`APPROVED  ${name}`);
@@ -223,6 +249,33 @@ for (const [name, opts] of SCENARIOS) {
   const other = serialise({ ...(await run({ seams: s2, claim: () => ({ ok: false, reason: "at-limit" }) })), seams: s2 });
   check(base !== other,
     "control: two different scenarios produce different artifacts, so equality means something");
+}
+
+// THE RESULT FIELD MUST NOT BE VACUOUS. It recorded `"decisions":[null]` for
+// every scenario because the action is nested one level deeper than it was read
+// from -- a field that looks populated and measures nothing. Asserted against
+// the artifacts themselves, so it cannot regress to nulls silently.
+{
+  const withAction = SCENARIOS
+    .map(([n]) => join(APPROVED, `${n}.txt`))
+    .filter((f) => existsSync(f))
+    .filter((f) => /"decisions":\[(?!null)[^\]]/.test(readFileSync(f, "utf8")));
+  check(withAction.length > 0,
+    "at least one artifact records a REAL decision action, so the result field is not vacuous",
+    `${withAction.length} of ${SCENARIOS.length} artifacts name an action`);
+}
+
+// AND THE ARTIFACTS MUST BE PORTABLE, not merely reproducible. The determinism
+// check runs one process twice and cannot see host dependence; six scenarios
+// once failed in CI against artifacts approved locally, with no behaviour change.
+{
+  const hostish = SCENARIOS
+    .map(([n]) => join(APPROVED, `${n}.txt`))
+    .filter((f) => existsSync(f))
+    .filter((f) => /\/(?:Users|home|root|opt)\//.test(readFileSync(f, "utf8")));
+  check(hostish.length === 0,
+    "no artifact embeds an absolute host path, so they compare on a machine that is not this one",
+    hostish.join(", "));
 }
 
 if (approvedWritten) console.log(`\n${approvedWritten} artifact(s) written. Review the diff; they are the record.`);

@@ -16,6 +16,12 @@ import { tick } from "../../src/daemon.mjs";
 import { open } from "../../src/db/ops.mjs";
 import { openHub } from "../../src/build/hubdb.mjs";
 import { openHubAsGuest } from "../../src/build/hubguest.mjs";
+// The scheduler fallbacks the daemon reaches for when ctx does not carry them.
+// They are imported HERE so the harness can put a recording wrapper in ctx --
+// otherwise `(ctx.reapProvider ?? reapProviderLeases)` runs the real one and the
+// call never appears in the signature.
+import { reapProviderLeases, cancelQueued, bindProviderLease, heartbeatProvider } from "../../src/provider.mjs";
+import { queuedGuardianRequests } from "../../src/build/providerdb.mjs";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -101,6 +107,22 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     // first version of this listed nine invented names, of which exactly one
     // (`hub`) existed, so the log recorded six getter calls and nothing else and
     // still looked like a populated artifact.
+    // FIRST, give ctx the seams the daemon would otherwise reach past it for.
+    // `tick()` resolves each as `(ctx.NAME ?? fallback)`, so a seam ABSENT from
+    // ctx runs the production fallback and is never recorded -- the artifact then
+    // shows no reaper and no queue read at all, and a move that reorders or drops
+    // that housekeeping leaves the signature green. MEASURED: before this, the
+    // happy-path artifact contained zero reaper and zero queue calls.
+    const FALLBACKS = {
+      reapProvider: reapProviderLeases,
+      cancelQueued,
+      providerBind: bindProviderLease,
+      providerHeartbeat: heartbeatProvider,
+      queuedRequests: queuedGuardianRequests,
+    };
+    for (const [op, fn] of Object.entries(FALLBACKS)) {
+      if (typeof ctx[op] !== "function") ctx[op] = fn;
+    }
     for (const [op, inner] of Object.entries(ctx)) {
       if (typeof inner !== "function") continue;
       ctx[op] = (...args) => { seams.push({ op, args }); return inner(...args); };

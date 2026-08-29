@@ -96,7 +96,7 @@ export function classifyFiles(paths, { squash, main, head = UNREAD, entryAt }) {
  * read that saw nothing, and answering "all intact" over nothing is how a
  * narrowing check reports success.
  */
-export function verdictFor(files, { branchOnly = [], crossCheck = "complete" } = {}) {
+export function verdictFor(files, { branchOnly = [], crossCheck = "complete", localRef = "unchecked" } = {}) {
   if (files.length === 0) {
     return { verdict: VERDICT.unreadable, counts: { intact: 0, drifted: 0, gone: 0, headDiverged: 0 },
              why: "the merge commit's own diff names zero paths, so there is nothing to compare. An empty set is not a pass." };
@@ -141,7 +141,8 @@ export function verdictFor(files, { branchOnly = [], crossCheck = "complete" } =
   const scope =
     `\n\nSCOPE: this verifies the content of the MERGE COMMIT. It does not establish that the merge commit represents the whole pull request.\n` +
     `A squash carries the whole branch; a REBASE merge names only its LAST commit, and its earlier commits are separate commits on main that this does not check.\n` +
-    `Nothing readable after the fact distinguishes them -- merge settings, commit counts and file lists are all present state, and this is a question about a past merge.`;
+    `Nothing readable after the fact distinguishes them -- merge settings, commit counts and file lists are all present state, and this is a question about a past merge.\n` +
+    scopeOfLocal(localRef);
   const note2 = note + uncovered + incomplete + scope;
   if (counts.drifted > 0) {
     return { verdict: VERDICT.drifted, counts,
@@ -205,7 +206,7 @@ export const EXIT = Object.freeze({
  * no divergence check at all, and silence there is indistinguishable from
  * agreement -- the failure this whole tool exists to remove.
  */
-export function summaryLine({ verdict, repo, pr, squash, mergedHead, branchNow, branchRead }) {
+export function summaryLine({ verdict, repo, pr, squash, mergedHead, branchNow, branchRead, localRef }) {
   const bits = [`${verdict}  ${repo ?? "?"}#${pr ?? "?"}`];
   if (squash) bits.push(`squash=${String(squash).slice(0, 7)}`);
   if (mergedHead) bits.push(`merged-head=${String(mergedHead).slice(0, 7)}`);
@@ -243,9 +244,16 @@ export function summaryLine({ verdict, repo, pr, squash, mergedHead, branchNow, 
   // work may already have landed through another merge or a cherry-pick. Stating
   // "NOT on main" would be the overclaiming this tool exists to avoid, on the
   // line hardest to skim past.
+  // A LOCAL COMMIT THE REMOTE HAS NEVER SEEN. Actionable, and the case a reader
+  // is most likely to have got wrong, so it goes in the line nobody skips. The
+  // other two states are a SCOPE, not an event, and scopes belong in the scope
+  // paragraph where they are printed without competing with a verdict.
+  const heldNote = localRef === "held"
+    ? "  *** THIS CLONE HOLDS A COMMIT ON THAT BRANCH THAT THE REMOTE DOES NOT. It was never pushed, so nothing here can say whether it matters. ***"
+    : "";
   return bits.join("  ") + (differs
     ? "  *** THE BRANCH TIP DIFFERS FROM WHAT MERGED. Whether that difference reached main is NOT established here -- check it. ***"
-    : "");
+    : "") + heldNote;
 }
 
 /**
@@ -262,6 +270,56 @@ export function summaryLine({ verdict, repo, pr, squash, mergedHead, branchNow, 
  */
 export function refPath(name) {
   return String(name).split("/").map(encodeURIComponent).join("/");
+}
+
+/**
+ * Whether THIS CLONE holds work on the branch that the remote does not.
+ *
+ * WHY THIS EXISTS. Every other read here has the remote as its universe, so a
+ * commit that was never pushed is not merely unproven -- it is INVISIBLE. The
+ * verdict then answers "the branch is fully landed" while the honest answer is
+ * "the branch is fully landed AND there are commits sitting on a disk". A reader
+ * takes the first for the second, which is a wider claim than anything measured.
+ *
+ * MEASURED, on a real merge: a lane held a push deliberately so as not to strand
+ * a review that was running, the pull request merged while it was held, and
+ * `branch-now == merged-head` was true the whole time. Nothing in the verdict
+ * could have distinguished that from having nothing left to do.
+ *
+ * TAKES A COUNT, NOT TWO TIPS. Unequal tips do not mean the local side holds
+ * anything: a clone that has simply not fetched is BEHIND, every one of its
+ * commits already on the remote, and comparing tips calls that held work. That
+ * is the same mistake as reading an unequal branch tip as "commits missing from
+ * main", one layer out -- an inequality read as a particular cause. MEASURED
+ * here: a local ref two commits behind main has unequal tips and contributes
+ * ZERO commits the remote lacks.
+ *
+ * The sound question is how many commits the local tip contributes that are not
+ * reachable from the remote tip, which `git rev-list --count <remote>..<local>`
+ * answers. `null` means it could not be computed -- an absent branch, or a
+ * remote object this clone has never fetched -- and that is UNCHECKED, because
+ * an unanswerable question is not a negative answer.
+ */
+export function localRefState(ahead) {
+  if (ahead === null || ahead === undefined || Number.isNaN(Number(ahead))) return "unchecked";
+  return Number(ahead) > 0 ? "held" : "contained";
+}
+
+/**
+ * Whether the local refs are even the right universe to ask.
+ *
+ * For a cross-repository pull request `branchNow` was read from the
+ * CONTRIBUTOR'S FORK, while `refs/heads/<name>` in this checkout belongs to
+ * whatever repository this clone is. A branch of the same name here is an
+ * unrelated branch, and comparing them produces the loudest warning the tool has
+ * over two things that were never the same branch.
+ *
+ * So the local half is asked only when this clone IS the head repository.
+ * Anything else is unchecked, and says so.
+ */
+export function localRefApplies(headRepoIds, originNwo) {
+  if (!headRepoIds?.owner || !headRepoIds?.repo || !originNwo) return false;
+  return `${headRepoIds.owner}/${headRepoIds.repo}`.toLowerCase() === String(originNwo).toLowerCase();
 }
 
 /**
@@ -327,6 +385,21 @@ export function branchStateFrom(refs, headRefName) {
   const exact = refs.find((r) => r?.ref === `refs/heads/${headRefName}`);
   const branchNow = exact?.object?.sha ?? null;
   return { branchNow, branchRead: branchNow ? "read" : "gone" };
+}
+
+/**
+ * What the local half of the answer covers, said plainly on every verdict.
+ *
+ * "same" is deliberately worded as IN COMMITS. Uncommitted work in a worktree is
+ * a third way to have something outstanding, and this read cannot see it -- so
+ * the sentence stops where the measurement does.
+ */
+export function scopeOfLocal(localRef) {
+  if (localRef === "contained")
+    return "Every commit on its local branch is reachable from the remote tip, so nothing is outstanding IN COMMITS -- uncommitted work in a worktree is not visible to any of this, and a branch merely BEHIND the remote reads the same way.";
+  if (localRef === "held")
+    return "Its local branch contributes at least one commit that is not reachable from the remote tip, flagged above.";
+  return "The LOCAL side was not checked: this clone is not the head repository, has no such branch, or could not reach the remote commit to compare against. That is not evidence that nothing is outstanding.";
 }
 
 export function exitFor(verdict) {

@@ -1382,10 +1382,12 @@ export async function tick(ctx) {
     }
     return a.why ? onFault(a.why) : a.hub;
   };
-  // A hub that EXISTS and cannot be opened is not a hub that is absent. The first
-  // is an outage the founder must hear about; the second is an ordinary machine
-  // with no builder on it.
-  const hub = hubOr(() => null);
+  // READ ONCE, HERE, so a hub that EXISTS and cannot be opened is reported as the
+  // outage it is rather than passing for an ordinary machine with no builder on
+  // it. The result is deliberately NOT retained: every later user re-asks, because
+  // a restore can replace the hub file at any point during a tick and a handle
+  // taken at the top stops describing the scheduler the moment it does.
+  hubOr(() => null);
 
   // RESOLVED OUTSIDE THE GUEST CONNECTION. `repoIdFromHub` reads `task`, which is
   // not on the guardian's allowlist -- section 13 gives it the provider scheduler
@@ -1535,7 +1537,17 @@ export async function tick(ctx) {
     for (const [key, note] of [...pendingCooldowns]) noteCooldownWithRetry(key, note);
   }
 
-  if (hub && pendingReleases.size) {
+  // NOT GATED ON THE TICK'S OPENING SNAPSHOT. `releaseWithRetry` re-asks with
+  // `hubNow()` -- its own comment says "FRESH, not the tick's opening snapshot" --
+  // and then handles an absent hub, an unreadable one and a refusal separately.
+  // Consulting a handle read hundreds of lines earlier could only overrule that
+  // with staler information, and it did: a hub that faulted on the tick's FIRST
+  // read stranded every inherited release for the whole tick, while releases
+  // taken and given back within the same tick succeeded against the same hub. A
+  // pre-bind lease sits on the guardian's always-alive pid, so the liveness-aware
+  // reaper preserves it and the slot is held against the global limit until it
+  // expires.
+  if (pendingReleases.size) {
     for (const [key, identity] of [...pendingReleases]) releaseWithRetry(key, identity);
   }
 

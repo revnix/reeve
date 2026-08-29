@@ -13,7 +13,7 @@
 import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, safePath, exitFor,
          displayPath, toByteString, crossCheckState, parseArgs, summaryLine,
          FILE_STATE, VERDICT, EXIT, ABSENT,
-         refPath, branchStateFrom, headRepoOf } from "../src/mergecheck.mjs";
+         refPath, branchStateFrom, headRepoOf, localRefState, localRefApplies, scopeOfLocal } from "../src/mergecheck.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -627,6 +627,81 @@ const F = "100644", X = "100755", L = "120000";
   // Control: and a malformed origin is still not guessed at.
   check(headRepoOf({ isCrossRepository: false }, "not-a-nwo") === null,
     "control: and an origin that is not owner/name yields nothing rather than half a name");
+}
+
+// ── What THIS CLONE holds that the remote does not ──────────────────────────
+{
+  // MEASURED, on a real merge: a lane held a push deliberately so as not to
+  // strand a review that was running, its pull request merged while the push was
+  // held, and `branch-now == merged-head` was true throughout. Every other read
+  // in this file has the remote as its universe, so that commit was not
+  // unproven, it was INVISIBLE.
+  check(localRefState(1) === "held", "a local commit the remote cannot reach is reported, not passed over");
+  check(localRefState(3) === "held", "and so are several");
+  check(localRefState(0) === "contained", "and a branch contributing nothing is quiet");
+
+  // COUNTED, NOT COMPARED. This is the correction that matters: unequal tips do
+  // NOT mean the local side holds anything. A clone that has simply not fetched
+  // is BEHIND -- every one of its commits already on the remote -- and comparing
+  // tips calls that held work. It is the same error as reading an unequal branch
+  // tip as "commits missing from main", one layer out: an inequality read as one
+  // particular cause. MEASURED against this repository: a local ref two commits
+  // behind main has unequal tips and contributes ZERO commits the remote lacks.
+  check(localRefState(0) !== "held",
+    "control: a branch merely BEHIND the remote holds nothing, though its tip differs");
+
+  // AN UNANSWERABLE QUESTION IS NOT A NEGATIVE ANSWER. No branch, or a remote
+  // commit this clone has never fetched, leaves the count uncomputable.
+  for (const [label, v] of [["an absent branch", null], ["an uncomputed count", undefined],
+                            ["a count that did not parse", NaN], ["a non-numeric answer", "no"]]) {
+    check(localRefState(v) === "unchecked", `${label} is UNCHECKED, never "contained"`);
+  }
+
+  // AND THE LOCAL REFS MUST BE THE RIGHT UNIVERSE AT ALL. For a fork pull
+  // request the remote tip came from the CONTRIBUTOR'S repository while
+  // `refs/heads/<name>` here belongs to this clone, so a same-named branch is an
+  // unrelated branch -- and comparing them fires the loudest warning the tool has
+  // over two things that were never the same branch.
+  check(localRefApplies({ owner: "revnix", repo: "reeve" }, "revnix/reeve") === true,
+    "the local half is asked when this clone IS the head repository");
+  check(localRefApplies({ owner: "revnix", repo: "reeve" }, "RevNix/Reeve") === true,
+    "and repository names are matched without regard to case");
+  check(localRefApplies({ owner: "someone", repo: "reeve" }, "revnix/reeve") === false,
+    "and NOT asked for a fork, whose branch of the same name is a different branch");
+  for (const [label, ids, nwo] of [["no head identity", null, "revnix/reeve"],
+                                   ["half a head identity", { owner: "revnix" }, "revnix/reeve"],
+                                   ["no origin", { owner: "revnix", repo: "reeve" }, null]]) {
+    check(localRefApplies(ids, nwo) === false, `and not asked with ${label}`);
+  }
+
+  // AND THE VERDICT SAYS SO IN WORDS, on every answer.
+  check(/not reachable from the remote tip/.test(scopeOfLocal("held")),
+    "the scope names what a held commit is", scopeOfLocal("held"));
+  check(/not evidence/.test(scopeOfLocal("unchecked")),
+    "and says an unchecked local side is NOT evidence of nothing outstanding", scopeOfLocal("unchecked"));
+  // WORDED TO THE MEASUREMENT, not past it. Uncommitted work in a worktree is a
+  // third way to have something outstanding and this read cannot see it, so the
+  // clean sentence stops at commits -- and names the BEHIND case, which reads the
+  // same way and is the one a reader would otherwise misattribute.
+  check(/IN COMMITS/.test(scopeOfLocal("contained")),
+    "and the clean case is qualified to COMMITS, since uncommitted work is invisible here",
+    scopeOfLocal("contained"));
+  check(/BEHIND/.test(scopeOfLocal("contained")),
+    "and says that a branch behind the remote reads the same way, so a clean answer is not read as up to date",
+    scopeOfLocal("contained"));
+  check(!/nothing is outstanding\.|nothing outstanding\./.test(scopeOfLocal("contained")),
+    "control: and it never says plainly that nothing is outstanding, which it cannot know");
+
+  // The warning belongs in the line nobody skips; the other two states are a
+  // SCOPE and would be noise there.
+  const base = { verdict: VERDICT.intact, repo: "o/r", pr: 1, squash: "abc1234",
+                 mergedHead: "9232d4a", branchNow: "9232d4a", branchRead: "read" };
+  check(/THIS CLONE HOLDS A COMMIT/.test(summaryLine({ ...base, localRef: "held" })),
+    "a held commit is flagged IN the summary line", summaryLine({ ...base, localRef: "held" }));
+  for (const st of ["contained", "unchecked", undefined]) {
+    check(!/CLONE/.test(summaryLine({ ...base, localRef: st })),
+      `and a ${st ?? "missing"} local state adds nothing to that line`, summaryLine({ ...base, localRef: st }));
+  }
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

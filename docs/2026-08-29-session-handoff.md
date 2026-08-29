@@ -94,7 +94,7 @@ the prose is stale. That includes this section.
 | codex is a **blocking** reviewer | changed 2026-08-26 |
 | the docs guard's review status | **out of the review rotation** since 2026-08-26. It stays in CI |
 | the founder's merge rule | merge on CI green AND zero open threads, and **each merge needs its own grant** — a grant does not carry to the next pull request, and it does not override the rule |
-| the R-01 merge authority | **CLOSED 2026-08-29.** Both layers are set; §5 records what was applied, why, and how to revert |
+| the R-01 merge authority | **PARTLY done.** The ruleset layer holds a required-checks rule and a narrowed admin bypass. `enforce_admins` was enabled 2026-08-29 and DISABLED again the same day on the founder's instruction, so the admin identity is exempt and the gate is decorative again by design. §5 has what is applied and what reversing it costs |
 | the R-03 merge shape | **undecided.** The enquiry was done 2026-08-22 |
 | the second project | `rextaihq/rext-backend` — **not started** |
 | the ntfy read user | **not created.** Needs shell on the founder's server |
@@ -277,7 +277,10 @@ back rather than by trusting the write.
 `required_status_checks` rule, and its `OrganizationAdmin` bypass was narrowed
 from `always` to `pull_request`.
 
-**Branch protection** gained `enforce_admins`.
+**Branch protection** gained `enforce_admins`, and then had it removed again the
+same day on the founder's instruction (§0). That switch is the whole of the
+admin exemption: on means no exemption, off means the admin identity is exempt.
+There is no third position — "enforced but I am exempt" IS the off state.
 
 **Why that required check and not a better one.** The substantive jobs are
 PATH-CONDITIONAL — a pull request touching nothing they watch runs neither — so
@@ -399,8 +402,10 @@ next capability trustworthy.
 2. **A real dispatch on a real repository** — see §0 for what has actually been
    proven. In this project a dispatch once found what roughly 640 green tests
    missed. It needs arming, which is the founder's call.
-3. **The merge-refusal capability**, after a shadow week. R-01 is now closed
-   (§0), so it finally has somewhere to stand.
+3. **The merge-refusal capability**, after a shadow week. It can only stand as a
+   required status check that the actuator cannot bypass, so R-01's remaining
+   switch (§0) gates it. Do not build it while that switch is off; raise it with
+   the founder first.
 4. **The tidying** (§6), which is cheap and can batch.
 
 **A stop line is worth naming.** This kind of tooling expands for ever if allowed

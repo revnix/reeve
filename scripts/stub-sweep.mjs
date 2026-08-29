@@ -296,20 +296,31 @@ const runTest = file => new Promise(resolve => {
   child.stdout.on("data", take("out"));
   child.stderr.on("data", take("err"));
   const timer = setTimeout(() => { timedOut = true; killTree(child); }, 600_000);
+  // SAMPLED WHILE IT RUNS, because after it exits there is nothing left to ask.
+  //
+  // Measured on this build: once the child exits, `process.kill(-pgid)` returns
+  // ESRCH and `pgrep -g <pgid>` finds nothing — the group is gone even though a
+  // worker it spawned is still alive. So a test that spawns something and then
+  // exits NORMALLY leaves it running, and every kill path here fires only on a
+  // signal or a timeout. The sweep would restore the source, see a clean tree and
+  // report CAUGHT while that worker was still able to write.
+  //
+  // The residual is pid reuse between the last sample and the kill. It is narrow —
+  // the window is one poll interval — and the alternative is leaving a worker
+  // alive on a restored tree, which this whole file exists to prevent.
+  const seenDescendants = new Set();
+  const sampler = setInterval(() => {
+    for (const pid of descendantsOf(child.pid)) seenDescendants.add(pid);
+  }, 250);
   let timedOut = false;
   child.on("close", (code, signal) => {
     clearTimeout(timer);
-    // REAPED even on a clean exit. A test that spawns an unreferenced background
-    // worker and then returns 0 leaves it running — the sweep restores the source,
-    // sees a clean tree, reports CAUGHT, and the worker modifies the repository
-    // afterwards. Every guard here reads the tree BEFORE that happens, so nothing
-    // would ever notice.
-    //
-    // The group id is the exited child's pid, and the group outlives its leader
-    // while members remain, so this reaches them. Silent when the group is already
-    // empty, which is the ordinary case.
-    try { if (KILL_STRATEGY === "taskkill") killTree(child); else process.kill(-child.pid, "SIGKILL"); }
-    catch { /* no group left, which is what we want */ }
+    clearInterval(sampler);
+    // REAPED even on a clean exit, from the pids sampled while the child lived.
+    // The group is already gone by now; these are the only handles that remain.
+    for (const pid of seenDescendants) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* already gone, which is the ordinary case */ }
+    }
     // A killed child is reported as its own thing rather than coerced, because
     // "timed out" and "failed an assertion" are different readings and only one of
     // them is evidence.
@@ -447,6 +458,21 @@ const results = [];
 for (const entry of entries) {
   const files = [...new Set(entry.edits.map(e => join(ROOT, e.file)))];
 
+  // Read BEFORE the control as well, so a change the CONTROL makes is visible.
+  //
+  // Two readings could only compare the stubbed run against the post-control tree,
+  // which makes an artifact the control created part of the baseline — and that is
+  // exactly the case: a control run that leaves an ignored cache changes what the
+  // stubbed run does, and comparing only the later pair calls it unchanged.
+  const atEntry = treeState();
+  if (atEntry === null) {
+    const why = "the repository's state could not be read before this entry, so nothing after it would be verified";
+    results.push({ name: entry.name, reintroduces: entry.why, verdict: UNRUNNABLE, why });
+    console.log(`FAIL ${entry.name.padEnd(28)} ${UNRUNNABLE}`);
+    console.log(`       ${why}`);
+    break;
+  }
+
   const control = await runTest(entry.test);
 
   // STOP HERE if the control already fails. `classify` would return UNRUNNABLE
@@ -479,10 +505,13 @@ for (const entry of entries) {
   // Checking before the control instead would have missed exactly that: the
   // control is what makes the mess.
   const beforeStub = treeState();
-  if (beforeStub === null || beforeStub.tracked !== "") {
+  if (beforeStub === null || beforeStub.tracked !== "" || beforeStub.ignored !== atEntry.ignored) {
     const why = beforeStub === null
       ? "the repository's state could not be read after the control run, so this reading would be unverified"
-      : `the control run left the tree dirty, so the stub would not be applied to a clean tree:\n${beforeStub.tracked}`;
+      : beforeStub.tracked !== ""
+      ? `the control run left the tree dirty, so the stub would not be applied to a clean tree:\n${beforeStub.tracked}`
+      : `the control run changed an IGNORED artifact, which a plain status call cannot see:\n` +
+        `  before: ${atEntry.ignored || "(none)"}\n  after:  ${beforeStub.ignored || "(none)"}`;
     results.push({ name: entry.name, reintroduces: entry.why, verdict: UNRUNNABLE, why });
     console.log(`FAIL ${entry.name.padEnd(28)} ${UNRUNNABLE}`);
     console.log(`       ${why}`);

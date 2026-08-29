@@ -163,7 +163,12 @@ export function validateManifest(entries) {
     if (!Array.isArray(e.edits) || e.edits.length === 0)
       throw new Error(`${where}: needs at least one edit`);
     for (const [j, ed] of e.edits.entries()) {
-      if (!ed?.file) throw new Error(`${where}: edit ${j} needs a file`);
+      // A STRING, by type. A truthy non-string reaches `join` in the runner and
+      // throws a raw TypeError before the uncaughtException handler is installed,
+      // so the process dies with status 1 and a stack trace — indistinguishable
+      // from a stub that was not caught, when it is really a malformed manifest.
+      if (typeof ed?.file !== "string" || !ed.file.trim())
+        throw new Error(`${where}: edit ${j} needs a non-empty string "file"`);
       if (typeof ed.find !== "string" || !ed.find)
         throw new Error(`${where}: edit ${j} needs a non-empty anchor`);
       if (typeof ed.replace !== "string")

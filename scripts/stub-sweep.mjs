@@ -68,6 +68,18 @@ if (dirty)
 // Without it the only way to check that this tool FAILS on an uncaught stub would
 // be to break the repository on purpose and look — which is to say, no way at all.
 // An instrument that cannot be shown to fail is the exact shape it exists to find.
+const KILL_STRATEGY = process.platform === "win32" ? "taskkill"
+                    : (process.platform === "darwin" || process.platform === "linux") ? "posix"
+                    : null;
+
+// REFUSED, not attempted. A sweep that cannot stop what it spawns can leave a
+// worker running against a restored tree — and the tree looks correct afterwards,
+// which is the one outcome worse than failing loudly.
+if (!KILL_STRATEGY)
+  die(2, `stub-sweep: no way to terminate a test's process tree on ${process.platform}.\n` +
+         "POSIX uses a process group and taskkill covers Windows; this platform has neither,\n" +
+         "so a stubbed test could outlive the sweep and act on a restored tree. Refusing to run.");
+
 const manifestPath = process.env.STUB_MANIFEST
   ? resolve(process.env.STUB_MANIFEST)
   : join(ROOT, "test", "stub-manifest.mjs");
@@ -126,6 +138,73 @@ if (wanted.length && entries.length !== wanted.length) {
 // side effects after the sweep has reported that it finished.
 let activeChild = null;
 
+/**
+ * Every descendant of a pid, collected BEFORE anything is killed.
+ *
+ * The process group covers the ordinary case, and it does not cover a descendant
+ * that started a group of its own — a helper spawned with `detached: true` leaves
+ * the group and survives a signal aimed at it. So the tree is walked as well.
+ *
+ * Collected first because the links vanish with the parent: once it dies its
+ * children are reparented and `pgrep -P` can no longer find them from here.
+ *
+ * Best effort, and named as such. `pgrep` exists on macOS and Linux and not on
+ * Windows, so this is a second net rather than the mechanism — the group kill
+ * remains the thing that does the work.
+ */
+const descendantsOf = pid => {
+  const found = [];
+  const walk = p => {
+    let out = "";
+    try { out = execFileSync("pgrep", ["-P", String(p)], { encoding: "utf8" }); }
+    catch { return; }               // no children, or no pgrep on this platform
+    for (const line of out.split("\n")) {
+      const kid = Number(line.trim());
+      if (Number.isInteger(kid) && kid > 0 && !found.includes(kid)) { found.push(kid); walk(kid); }
+    }
+  };
+  walk(pid);
+  return found;
+};
+
+/**
+ * Kill a test and everything it started — by a strategy this PLATFORM supports.
+ *
+ * The POSIX mechanism does not exist on Windows. `detached` there means a separate
+ * console rather than a process group, negative-pid signalling is not supported at
+ * all, and `pgrep` is absent — so neither the mechanism nor the net is available,
+ * and a best-effort attempt would leave a worker alive on a restored tree while
+ * reporting success. That is the failure this whole runner exists to prevent,
+ * arriving on a different axis: the tree looks correct afterwards.
+ *
+ * So the platform matrix is explicit and FAILS CLOSED. `taskkill /T /F` walks the
+ * tree itself on Windows; POSIX uses the group plus the descendant sweep; anything
+ * else refuses at start-up rather than running with no way to stop what it spawns.
+ *
+ * Raised by the session building the provider-session extraction, whose harness
+ * spawns real workers and hits the same wall.
+ */
+
+const killTree = child => {
+  if (!child?.pid) return;
+  if (KILL_STRATEGY === "taskkill") {
+    // `/T` is the tree and `/F` is forceful. taskkill walks the descendants
+    // itself, so there is no separate straggler pass to do.
+    try { execFileSync("taskkill", ["/T", "/F", "/PID", String(child.pid)], { stdio: "ignore" }); }
+    catch { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
+    return;
+  }
+  // Collected BEFORE anything dies: the links vanish with the parent.
+  const stragglers = descendantsOf(child.pid);
+  try { process.kill(-child.pid, "SIGKILL"); }
+  catch { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
+  // Anything that left the group by starting one of its own. Sent after the group
+  // kill, so the ordinary case costs one signal and this is only cleanup.
+  for (const pid of stragglers) {
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone, or not ours */ }
+  }
+};
+
 const runTest = file => new Promise(resolve => {
   // DETACHED, so the child leads its own process GROUP.
   //
@@ -155,23 +234,41 @@ const runTest = file => new Promise(resolve => {
   // heap through this route instead.
   const ASSERTION_LINE = /^(PASS|FAIL) {2}(.+)$/;
   const MAX_ASSERTION_LINES = 20_000;
+  // A LINE HAS A MAXIMUM LENGTH. Without one, a test emitting a long diagnostic
+  // with no newline grows the incomplete-line buffer for ever — it never reaches
+  // the split, so the `out` cap never sees it, and the heap goes before the timer
+  // or the restore handlers run. Which leaves the stub on disk: the exact failure
+  // the cap was added to prevent, arriving through the buffer that implements it.
+  const MAX_LINE = 1 << 16;
+  // FAIL lines ONLY spend the budget. A large suite printing twenty thousand
+  // passing assertions before the relevant failure would otherwise exhaust the
+  // budget on PASS lines, and the named FAIL — the one thing this exists to
+  // preserve — would still scroll out of the tail.
   const kept = [];
-  let partial = "";
-  const take = d => {
-    const lines = (partial + d).split("\n");
-    partial = lines.pop() ?? "";     // an incomplete final line waits for more
+  // ONE BUFFER PER STREAM. A shared one splices stderr into a stdout assertion
+  // split across chunks: `FAIL  guard` + `diagnostic\n` + ` holds\n` retains a
+  // line that never existed, and the assertion that did is lost.
+  const partial = { out: "", err: "" };
+  const take = which => d => {
+    const merged = partial[which] + d;
+    const lines = merged.split("\n");
+    let tail = lines.pop() ?? "";
+    // A line longer than the maximum is TRUNCATED rather than buffered. It cannot
+    // be an assertion — the protocol's names are short — and keeping the head is
+    // more useful than keeping nothing.
+    if (tail.length > MAX_LINE) tail = tail.slice(0, MAX_LINE);
+    partial[which] = tail;
     for (const l of lines)
-      if (ASSERTION_LINE.test(l) && kept.length < MAX_ASSERTION_LINES) kept.push(l);
+      if (kept.length < MAX_ASSERTION_LINES) {
+        const m = ASSERTION_LINE.exec(l);
+        if (m && m[1] === "FAIL") kept.push(l);
+      }
     out += d;
     if (out.length > CAP) { dropped += out.length - CAP; out = out.slice(-CAP); }
   };
-  child.stdout.on("data", take);
-  child.stderr.on("data", take);
-  const timer = setTimeout(() => {
-    timedOut = true;
-    try { process.kill(-child.pid, "SIGKILL"); }
-    catch { try { child.kill("SIGKILL"); } catch { /* already gone */ } }
-  }, 600_000);
+  child.stdout.on("data", take("out"));
+  child.stderr.on("data", take("err"));
+  const timer = setTimeout(() => { timedOut = true; killTree(child); }, 600_000);
   let timedOut = false;
   child.on("close", (code, signal) => {
     clearTimeout(timer);
@@ -179,7 +276,10 @@ const runTest = file => new Promise(resolve => {
     // "timed out" and "failed an assertion" are different readings and only one of
     // them is evidence.
     activeChild = null;
-    if (partial && ASSERTION_LINE.test(partial) && kept.length < MAX_ASSERTION_LINES) kept.push(partial);
+    for (const tail of [partial.out, partial.err]) {
+      const m = tail && ASSERTION_LINE.exec(tail);
+      if (m && m[1] === "FAIL" && kept.length < MAX_ASSERTION_LINES) kept.push(tail);
+    }
     // The kept assertions come FIRST, so they survive whatever the tail lost. The
     // classifier reads whole lines, so prepending them changes nothing it can see
     // except that the evidence is present.
@@ -246,13 +346,9 @@ for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     // The CHILD first. It is holding the stubbed tree open, and killing it after
     // restoring would let it run on against files that no longer match what it
     // was started with.
-    // The GROUP, by negative pid. Falls back to the direct child if the group is
-    // already gone, so a race cannot leave the handler throwing instead of
-    // restoring the tree.
-    if (activeChild?.pid) {
-      try { process.kill(-activeChild.pid, "SIGKILL"); }
-      catch { try { activeChild.kill("SIGKILL"); } catch { /* already gone */ } }
-    }
+    // The group AND anything that left it. Wrapped, so a failure here cannot stop
+    // the restore below — a stubbed tree left behind is worse than a stray process.
+    try { killTree(activeChild); } catch { /* the restore matters more */ }
     restoreActive();
     console.error(`\nstub-sweep: ${sig} — the tree was restored before exiting.`);
     // The conventional 128+n, so a caller can tell a signal from a verdict.
@@ -266,9 +362,25 @@ process.on("uncaughtException", err => {
   process.exit(2);
 });
 
+/**
+ * Is the tree clean? Returns "" for clean, the porcelain text for dirty, and NULL
+ * for could-not-tell.
+ *
+ * The third case is the point. Swallowing a failed `git status` into the empty
+ * string makes "the tree is clean" and "I could not find out" the same answer —
+ * and a stubbed test that damaged repository metadata is precisely the case where
+ * the check fails, so the one reading that most needs to be believed is the one
+ * that silently becomes a pass.
+ */
+const treeState = () => {
+  try { return execFileSync("git", ["status", "--porcelain"], { cwd: ROOT, encoding: "utf8" }).trim(); }
+  catch { return null; }
+};
+
 const results = [];
 for (const entry of entries) {
   const files = [...new Set(entry.edits.map(e => join(ROOT, e.file)))];
+
   const control = await runTest(entry.test);
 
   // STOP HERE if the control already fails. `classify` would return UNRUNNABLE
@@ -287,6 +399,28 @@ for (const entry of entries) {
     console.log(`       reintroduces: ${entry.why}`);
     console.log(`       ${why}`);
     continue;
+  }
+
+  // CLEAN AFTER THE CONTROL, BEFORE THE STUB. This window and not another.
+  //
+  // The start-up guard proved the tree was clean when the SWEEP began, which is a
+  // different claim from "clean when this stub was applied". A control run that
+  // leaves an untracked cache changes what the stubbed run does — and if the
+  // stubbed run then consumes and deletes it, the post-entry check sees a clean
+  // tree and reports CAUGHT for a stub that would not have been caught from a
+  // genuinely clean start.
+  //
+  // Checking before the control instead would have missed exactly that: the
+  // control is what makes the mess.
+  const beforeStub = treeState();
+  if (beforeStub === null || beforeStub !== "") {
+    const why = beforeStub === null
+      ? "the repository's state could not be read after the control run, so this reading would be unverified"
+      : `the control run left the tree dirty, so the stub would not be applied to a clean tree:\n${beforeStub}`;
+    results.push({ name: entry.name, reintroduces: entry.why, verdict: UNRUNNABLE, why });
+    console.log(`FAIL ${entry.name.padEnd(28)} ${UNRUNNABLE}`);
+    console.log(`       ${why}`);
+    break;   // the tree is not what anyone intended; later readings are void too
   }
 
   // Snapshot BEFORE touching anything, and restore from these copies. A run killed
@@ -388,9 +522,17 @@ for (const entry of entries) {
   //
   // Reported as UNRUNNABLE rather than as a failure of the stub: the reading itself
   // is void, because the code under test was not the code in the manifest.
-  let after = "";
-  try { after = execFileSync("git", ["status", "--porcelain"], { cwd: ROOT, encoding: "utf8" }).trim(); }
-  catch { after = ""; }
+  const after = treeState();
+  if (after === null) {
+    // COULD NOT TELL is not clean. A stubbed test that damaged repository metadata
+    // is exactly the case where this read fails, so treating the failure as a pass
+    // hands the benefit of the doubt to the one situation least entitled to it.
+    const why = "the repository's state could not be read after the stubbed run, so this reading is unverified";
+    results.push({ name: entry.name, reintroduces: entry.why, verdict: UNRUNNABLE, why });
+    console.log(`FAIL ${entry.name.padEnd(28)} ${UNRUNNABLE}`);
+    console.log(`       ${why}`);
+    break;
+  }
   if (after) {
     console.error(`stub-sweep: ${entry.name} left the repository dirty; the stubbed test had side effects.`);
     console.error(after);

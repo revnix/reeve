@@ -815,8 +815,16 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
     `import { guard } from "../src/thing.mjs";\n` +
     `spawn(process.execPath, [${JSON.stringify(helper)}, ${JSON.stringify(marker)}], { stdio: "ignore" });\n` +
     `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
-    // Exits IMMEDIATELY and normally: no signal, no timeout, nothing that would
-    // have triggered the kill paths.
+    // Runs for a short but REALISTIC time and then exits normally — no signal, no
+    // timeout, nothing that would have triggered the kill paths.
+    //
+    // Not instantaneous, and that is a deliberate statement about what is being
+    // asserted. A child that exits faster than the first sample can escape
+    // observation entirely: once it is reaped, `kill(-pgid)` returns ESRCH and
+    // `pgrep -g` finds nothing, both measured. The guarantee is that descendants
+    // observed while the test ran are reaped, and this asserts that guarantee
+    // rather than one the runner cannot keep.
+    `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);\n` +
     `process.exitCode = guard ? 0 : 1;\n`);
   writeFileSync(join(root, "test", "stub-manifest.mjs"),
     `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +

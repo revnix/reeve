@@ -305,13 +305,26 @@ const runTest = file => new Promise(resolve => {
   // signal or a timeout. The sweep would restore the source, see a clean tree and
   // report CAUGHT while that worker was still able to write.
   //
-  // The residual is pid reuse between the last sample and the kill. It is narrow —
-  // the window is one poll interval — and the alternative is leaving a worker
-  // alive on a restored tree, which this whole file exists to prevent.
+  // TWO residuals, both named rather than papered over.
+  //
+  // Pid reuse between the last sample and the kill. Narrow — one poll interval —
+  // and the alternative is leaving a worker alive on a restored tree.
+  //
+  // And a child that exits faster than the first sample. A test that spawns
+  // something and returns within a few milliseconds can escape every observation,
+  // and there is no synchronous way to ask a dead process what it started: once it
+  // is reaped, `kill(-pgid)` returns ESRCH and `pgrep -g` finds nothing, both
+  // measured on this build. What is guaranteed is that descendants OBSERVED while
+  // the test ran are reaped — not that no descendant can ever escape. The tree
+  // checks remain the backstop for anything that does, and they read before such a
+  // worker would write, which is exactly why this is stated and not implied.
   const seenDescendants = new Set();
-  const sampler = setInterval(() => {
-    for (const pid of descendantsOf(child.pid)) seenDescendants.add(pid);
-  }, 250);
+  const sample = () => { for (const pid of descendantsOf(child.pid)) seenDescendants.add(pid); };
+  const sampler = setInterval(sample, 50);
+  // One more the instant it exits. `exit` fires before `close`, and on a child
+  // short-lived enough to have escaped every interval this is the only sample
+  // that will ever see anything.
+  child.on("exit", sample);
   let timedOut = false;
   child.on("close", (code, signal) => {
     clearTimeout(timer);

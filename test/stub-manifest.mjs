@@ -361,6 +361,22 @@ export const STUBS = [
               replace: "  if (false) {" }],
   },
   {
+    // SINGLE-PURPOSE, and that is the whole point of it. This exact regression
+    // shipped: `observed` was computed correctly and never put on the resolved run,
+    // so `classify` took its documented fallback and the counting path was inert.
+    // The suite stayed green -- both paths return the same verdict when the new one
+    // is unused -- and two COMPOUND entries reported CAUGHT for the other half of
+    // their stub, which is what hid it. A compound stub cannot say which defence
+    // carried the entry, so a seam whose wiring is unproven needs one of these.
+    name: "observed-reaches-the-verdict",
+    why: "compute the counters and never hand them to the classifier, which is the inert-seam regression this file already shipped once",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "the named assertion is counted even when 21,000 other failures fill the budget",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "              observed,\n",
+              replace: "" }],
+  },
+  {
     name: "verdict-from-observed",
     why: "derive the verdict by re-reading the retained buffer, so what a run REPORTED and what SURVIVED retention become the same question",
     test: "test/stubsweep.test.mjs",

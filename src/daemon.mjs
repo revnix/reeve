@@ -1357,37 +1357,69 @@ export async function tick(ctx) {
   // database nobody else can see and the restored hub admits work past the limit
   // at the same time. The getter compares the file's identity and reopens; it is
   // a stat and a comparison, so asking often is cheap.
-  const hubNow = () => (typeof ctx.hub === "function" ? ctx.hub() : { hub: ctx.hub ?? null, why: null });
-  // Reported ONCE per tick even though it is asked many times: an outage is one
-  // cause, and raising it per operation would turn a standing failure into a
-  // stream of alerts that each retire the last.
-  let hubFaultSaid = false;
   let projectFaultSaid = false;
-  // A scheduler mutation gets a CURRENT handle or nothing.
-  //
-  // `?? hub` was written as a safety fallback and WAS the defect: when the
-  // getter reports the hub unreadable or replaced, falling back to the handle
-  // taken at the top of the tick is exactly the stale-inode write the getter
-  // exists to prevent -- the claim reserves capacity in an unlinked database
-  // while the restored scheduler admits its own. There is no safe old handle;
-  // there is a current one or none. Four sites had it, not the two I counted:
-  // both claims and both binds.
-  const claimHub = () => hubOr(() => null);
-  const hubOr = (onFault) => {
-    const a = hubNow();
-    if (a.why && !hubFaultSaid) {
-      hubFaultSaid = true;
-      log(logPath, `hub: ${a.why}`);
-      raise("guardian:hub:unreadable");
-    }
-    return a.why ? onFault(a.why) : a.hub;
+
+  /**
+   * THE SESSION THAT OWNS THE HUB RULES.
+   *
+   * The rules were previously three helpers and a flag, applied by whoever
+   * remembered to. That is the shape every finding in this area has had: a rule
+   * that must hold at N call sites, applied at N-1. Twenty-two sites reach the
+   * hub or the provider scheduler in this function, and the point of gathering
+   * them is that **a new call site cannot skip a rule by being written
+   * elsewhere** -- there is no raw handle in scope to reach for.
+   *
+   * Three rules, and they are the whole of it:
+   *
+   *   FRESH, ALWAYS.   `restoreHub` replaces the hub file mid-tick, so a handle
+   *                    taken earlier can be an unlinked inode: a claim then
+   *                    reserves capacity in a database nobody else can see while
+   *                    the restored scheduler admits its own. There is no safe
+   *                    old handle. The getter is a stat and a comparison, so
+   *                    asking often is cheap.
+   *   NO HANDLE, NO OPERATION.  `?? hub` was written as a safety fallback and
+   *                    WAS the defect. There is a current handle or there is
+   *                    none.
+   *   SAID ONCE.       An outage is one cause. Raising it per operation turns a
+   *                    standing failure into a stream of alerts that each retire
+   *                    the last.
+   *
+   * The session owns the HANDLE, deliberately not the arguments: each caller
+   * still passes what it passes. Centralising the arguments would change what
+   * the scheduler is asked, and this step is meant to change nothing at all.
+   */
+  const hubSession = ({ getter, onFault, isAlive }) => {
+    const now = () => (typeof getter === "function" ? getter() : { hub: getter ?? null, why: null });
+    let faultSaid = false;
+    const handle = (fallback) => {
+      const a = now();
+      if (a.why && !faultSaid) { faultSaid = true; onFault(a.why); }
+      return a.why ? fallback(a.why) : a.hub;
+    };
+    return {
+      // The raw reading, for the two callers that need to tell an ABSENT hub
+      // from an unreadable one -- a fact the handle alone cannot carry.
+      read: now,
+      // A current handle, or null. Every mutation below goes through this.
+      hub: () => handle(() => null),
+      // ...and with a caller's own answer for the fault, which the deferral
+      // paths need in order to carry an obligation to the next tick.
+      hubOr: (fallback) => handle(fallback),
+      isAlive,
+    };
   };
+  const session = hubSession({
+    getter: ctx.hub,
+    // Reported ONCE per tick even though the hub is asked many times.
+    onFault: (why) => { log(logPath, `hub: ${why}`); raise("guardian:hub:unreadable"); },
+    isAlive: isSameProcess,
+  });
   // READ ONCE, HERE, so a hub that EXISTS and cannot be opened is reported as the
   // outage it is rather than passing for an ordinary machine with no builder on
   // it. The result is deliberately NOT retained: every later user re-asks, because
   // a restore can replace the hub file at any point during a tick and a handle
   // taken at the top stops describing the scheduler the moment it does.
-  hubOr(() => null);
+  session.hubOr(() => null);
 
   // RESOLVED OUTSIDE THE GUEST CONNECTION. `repoIdFromHub` reads `task`, which is
   // not on the guardian's allowlist -- section 13 gives it the provider scheduler
@@ -1443,7 +1475,7 @@ export async function tick(ctx) {
   const releaseWithRetry = (key, identity) => {
     // FRESH, not the tick's opening snapshot: a release is the operation most
     // likely to run long after the hub was first opened.
-    const a = hubNow();
+    const a = session.read();
     // RETAINED, NOT DROPPED. This early return handled the exception path and
     // the maintenance refusal and then threw the identity away on the third
     // route out -- a hub that is momentarily unreadable between the claim and
@@ -1515,7 +1547,7 @@ export async function tick(ctx) {
     const send = { signature: stamped.signature, cooldownSeconds: left,
                    observedAt: stamped.observedAt ?? null, expiresAt: stamped.expiresAt };
 
-    const h = hubOr(() => null);
+    const h = session.hubOr(() => null);
     if (!h) { pendingCooldowns.set(key, stamped); return; }
     let r;
     try {
@@ -1538,7 +1570,7 @@ export async function tick(ctx) {
   }
 
   // NOT GATED ON THE TICK'S OPENING SNAPSHOT. `releaseWithRetry` re-asks with
-  // `hubNow()` -- its own comment says "FRESH, not the tick's opening snapshot" --
+  // `session.read()` -- its own comment says "FRESH, not the tick's opening snapshot" --
   // and then handles an absent hub, an unreadable one and a refusal separately.
   // Consulting a handle read hundreds of lines earlier could only overrule that
   // with staler information, and it did: a hub that faulted on the tick's FIRST
@@ -1586,7 +1618,7 @@ export async function tick(ctx) {
   // `claimProvider` refused every builder admission while it did. The builder
   // never reaps at all, so nothing else was coming.
   {
-    const h = hubOr(() => null);
+    const h = session.hubOr(() => null);
     if (h) {
       try {
         const rp = (ctx.reapProvider ?? reapProviderLeases)(h, { isAlive: isSameProcess });
@@ -1641,7 +1673,7 @@ export async function tick(ctx) {
    */
   const haltStop = (why) => {
     log(logPath, why);
-    const h = claimHub();
+    const h = session.hub();
     if (h && repoId != null) {
       for (const row of readQueuedNow(h)) {
         try {
@@ -1889,7 +1921,7 @@ export async function tick(ctx) {
     // unreadable is a reading that says so.
     let hold = null;
     if (builderPr) {
-      const access = hubNow();
+      const access = session.read();
       if (access.why) hold = { readable: false, why: access.why };
       // NO HUB IS NOT "NOT ASKED", HERE, and the scoping is what makes that safe.
       //
@@ -2096,7 +2128,7 @@ export async function tick(ctx) {
   // revision and named as a follow-up; that was the wrong call, because the row
   // it leaves behind blocks the other lane.
   if (execute && repoId != null) {
-    const h = hubOr(() => null);
+    const h = session.hubOr(() => null);
     if (h) {
       try {
         // THE CANARY ONLY IF THIS TICK WILL ATTEMPT IT. Treating its run ref as
@@ -2201,7 +2233,7 @@ export async function tick(ctx) {
   let canaryLease = null;
   if (execute && wanted.length && !containment) {
     const canaryBeforeSpawn = async () => {
-        const h = claimHub();
+        const h = session.hub();
         // NO HUB IS NO SCHEDULER, and that answer comes FIRST.
         //
         // Asking for the repository id before asking whether a scheduler exists
@@ -2256,7 +2288,7 @@ export async function tick(ctx) {
       // An unbound canary lease is not.
     const canaryOnSpawn = ({ pid, lstart }) => {
         if (!canaryLease) return;
-        const b = (ctx.providerBind ?? bindProviderLease)(claimHub(),
+        const b = (ctx.providerBind ?? bindProviderLease)(session.hub(),
           { ...canaryLease, pid, lstart, isAlive: isSameProcess });
         if (b?.ok === false)
           throw new Error(`the canary's provider lease could not be rebound: ${b.reason}`);
@@ -2395,7 +2427,7 @@ export async function tick(ctx) {
       // asymmetry last round and judged it acceptable; it is not, and "the guard
       // and the operation must ask the same question at the same moment" is the
       // rule I had already applied everywhere else.
-      if (claimHub()) {
+      if (session.hub()) {
         if (repoId == null) {
           // FAIL CLOSED, the same as the canary: a lease that cannot be scoped
           // is invisible to the live-request index, so the guardian would insert
@@ -2412,7 +2444,7 @@ export async function tick(ctx) {
         // working one.
         try {
           askedFor.add(prRunRef);
-          got = (ctx.providerClaim ?? claimProvider)(claimHub(), {
+          got = (ctx.providerClaim ?? claimProvider)(session.hub(), {
             owner: "guardian", repoId, runRef: prRunRef,
             pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
         } catch (err) {
@@ -2564,7 +2596,7 @@ export async function tick(ctx) {
         // stops being renewed still ends when the process does.
         if (prLease) {
           try {
-            const h = hubOr(() => null);
+            const h = session.hubOr(() => null);
             if (h) {
               const phb = (ctx.providerHeartbeat ?? heartbeatProvider)(h, { ...prLease, isAlive: isSameProcess });
               // A ZERO-ROW RENEWAL IS LEASE LOSS, and the result was discarded.
@@ -2788,7 +2820,7 @@ export async function tick(ctx) {
             // a success, and zero rebound is indistinguishable in effect from not
             // having called it.
             if (prLease) {
-              const b = (ctx.providerBind ?? bindProviderLease)(claimHub(), { ...prLease, pid, lstart, isAlive: isSameProcess });
+              const b = (ctx.providerBind ?? bindProviderLease)(session.hub(), { ...prLease, pid, lstart, isAlive: isSameProcess });
               if (b?.ok === false)
                 throw new Error(`the provider lease could not be rebound to the worker: ${b.reason}`);
               if (b?.bound !== 1)
@@ -3133,7 +3165,7 @@ export async function tick(ctx) {
   // A pull request this tick could not READ is still exempt: absence there means
   // unknown, not unwanted, and only a positive evaluation may withdraw one.
   if (execute && repoId != null && queuedNow.length) {
-    const h = claimHub();
+    const h = session.hub();
     if (h) {
       const unread = [...unreadable].map(pr => `${nwo}#${pr}:`);
       // EVERYTHING THIS TICK STILL WANTS BUT NEVER GOT TO ASK FOR.

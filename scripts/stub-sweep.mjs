@@ -478,7 +478,14 @@ const runTest = (file, expectRed = null) => new Promise(resolve => {
     // spliced and broken — a line that never existed, while the one that did is
     // absent. The per-stream reconstruction is the correct reading whether or not
     // anything was dropped, so it is the one the classifier gets.
+    // `observed` TRAVELS WITH THE RUN. Leaving it off resolved cleanly, handed
+    // `classify` an undefined it is documented to fall back from, and made the whole
+    // counting path inert while every one of its own unit assertions still passed --
+    // the seam existed and nothing was plugged into it. What found it was a stub on
+    // the counter reading NOT_CAUGHT; the suite could not have, because both paths
+    // return the same verdict when the new one is unused.
     resolve({ exit: timedOut || code === null ? TIMED_OUT_EXIT : code,
+              observed,
               output: kept.length ? `${kept.join("\n")}\n${body}` : body });
   });
 });

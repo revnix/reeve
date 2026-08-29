@@ -740,9 +740,20 @@ check(pairs.length === 2 && pairs[0][1].done !== pairs[1][1].done,
 //     a list maintained here would drift the moment one changed.
 {
   const daemonSrc = readFileSync(join(HERE, "..", "src", "daemon.mjs"), "utf8");
+  // TWO FORMS, because the resolution mechanism moved. A seam is resolved either
+  // inline as `(ctx.NAME ?? FALLBACK)` or through the session as
+  // `session.perform("NAME", FALLBACK, ...)`, which is what makes the handle
+  // unobtainable at the call site. Reading only the first form made this control
+  // fail the moment a site moved -- correctly, since it could no longer see the
+  // seam, but the fix is to read the new form too rather than to stop asking.
   const resolved = new Map();
   for (const m of daemonSrc.matchAll(/\(\s*ctx\.(\w+)\s*\?\?\s*(\w+)\s*\)/g)) resolved.set(m[1], m[2]);
-  check(resolved.size > 0, "control: the daemon's (ctx.X ?? Y) seams are readable at all", `${resolved.size} found`);
+  for (const m of daemonSrc.matchAll(/session\.perform\(\s*"(\w+)"\s*,\s*(\w+)\s*,/g)) resolved.set(m[1], m[2]);
+  check(resolved.size > 0, "control: the daemon's seam resolutions are readable at all", `${resolved.size} found`);
+  // AND BOTH FORMS ARE REALLY IN USE, or one half of this reader is dead weight
+  // that would hide a seam resolved the way it no longer looks for.
+  check(/session\.perform\(\s*"/.test(daemonSrc),
+    "control: and the session-performed form is present, so reading for it is not dead weight");
   for (const seam of SCHEDULER_SEAMS) {
     const want = resolved.get(seam);
     check(!!want, `the daemon really resolves ${seam} as (ctx.${seam} ?? ...), so installing it means something`);

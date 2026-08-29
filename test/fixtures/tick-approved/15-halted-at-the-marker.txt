@@ -4,6 +4,7 @@ hub	[]
 reapProvider	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"isAlive":"<fn>"}]
 hub	[]
 queuedRequests	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"repoId":7}]
+hub	[]
 cancelQueued	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"o/r#42:FIX_CI","isAlive":"<fn>"}]
 
 == 2 ESCALATIONS

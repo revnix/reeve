@@ -15,7 +15,7 @@
 import { execFileSync } from "node:child_process";
 import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, displayPath, toByteString,
          crossCheckState, parseArgs, summaryLine, exitFor, refPath, branchStateFrom, headRepoOf,
-         localRefState,
+         localRefState, localRefApplies,
          EXIT, VERDICT, ABSENT } from "../src/mergecheck.mjs";
 
 // execFileSync defaults to a 1 MiB stdout buffer and THROWS ENOBUFS past it.
@@ -303,13 +303,30 @@ const run = () => {
       // universe, so a commit never pushed is invisible rather than unproven --
       // and the verdict then reads as "nothing of mine is outstanding" when it
       // measured something narrower. Refs are shared across worktrees, so the
-      // branch need not be checked out here. A failure to read is UNCHECKED, and
-      // says so, because an absent branch is not evidence of an empty one.
-      let localTip = null;
-      try { localTip = sh("git", ["rev-parse", "--verify", "--quiet",
-                                  `refs/heads/${meta.headRefName}`]).trim() || null; }
-      catch { localTip = null; }
-      localRef = localRefState(localTip, branchNow);
+      // branch need not be checked out here.
+      //
+      // ONLY WHEN THIS CLONE IS THE HEAD REPOSITORY. `branchNow` came from the
+      // contributor's fork; `refs/heads/<name>` here belongs to whatever this
+      // clone is, and for a fork pull request those are unrelated branches that
+      // happen to share a name.
+      //
+      // COUNTED, NOT COMPARED. Unequal tips do not mean anything is held: a
+      // clone that has not fetched is BEHIND, with every commit already on the
+      // remote. `rev-list --count <remote>..<local>` answers the question that
+      // was actually being asked, and throws -- correctly UNCHECKED -- when the
+      // remote commit is not in this object store.
+      let ahead = null;
+      if (localRefApplies(headRepoIds, originNwo) && branchNow) {
+        try {
+          const localTip = sh("git", ["rev-parse", "--verify", "--quiet",
+                                      `refs/heads/${meta.headRefName}`]).trim();
+          if (localTip) {
+            ahead = Number(sh("git", ["rev-list", "--count",
+                                      `${branchNow}..${localTip}`]).trim());
+          }
+        } catch { ahead = null; }
+      }
+      localRef = localRefState(ahead);
     } catch {
       // There is no 404 left to interpret: the only route to `gone` is a
       // listing that succeeded, so anything that throws is unread and says so.

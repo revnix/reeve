@@ -203,8 +203,8 @@ export const STUBS = [
     test: "test/stubsweep.test.mjs",
     expectRed: "resolving outside the repository is refused outright",
     edits: [{ file: "scripts/stub-sweep.mjs",
-              find: "for (const e of manifest)\n  for (const ed of e.edits)\n    if (!contained(ed.file))",
-              replace: "for (const e of [])\n  for (const ed of e.edits)\n    if (!contained(ed.file))" }],
+              find: "for (const e of manifest)\n  for (const ed of e.edits) {\n    const real = contained(ed.file);",
+              replace: "for (const e of [])\n  for (const ed of e.edits) {\n    const real = contained(ed.file);" }],
   },
   {
     name: "side-effect-check",
@@ -225,7 +225,7 @@ export const STUBS = [
     test: "test/stubsweep.test.mjs",
     expectRed: "a named assertion still counts when the failure buries it",
     edits: [{ file: "scripts/stub-sweep.mjs",
-              find: '              output: dropped ? `${kept.join("\\n")}\\n${body}` : body });',
+              find: '              output: kept.length ? `${kept.join("\\n")}\\n${body}` : body });',
               replace: "              output: body });" }],
   },
   {

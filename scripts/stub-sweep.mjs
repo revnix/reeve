@@ -199,6 +199,31 @@ const descendantsOf = pid => {
  * spawns real workers and hits the same wall.
  */
 
+/**
+ * WHAT THIS DOES NOT DO, because the boundary matters more than the effort.
+ *
+ * It ends a test the sweep is still holding — on a signal or a timeout — so the
+ * tree is never left stubbed. It does NOT supervise what a test spawns.
+ *
+ * A worker started by a test that then exits NORMALLY survives, and cannot
+ * reliably be stopped from here. Measured rather than assumed: after the child
+ * exits, `process.kill(-pgid)` returns ESRCH and `pgrep -g <pgid>` finds nothing;
+ * sampling `pgrep -P` while the child lives DOES return the worker's real pid, and
+ * `process.kill(<that pid>, "SIGKILL")` then returns ESRCH anyway while the worker
+ * demonstrably survives and writes seconds later. That last reading is unexplained,
+ * and a guarantee built on a mechanism nobody understands is worse than no
+ * guarantee, because it invites reliance.
+ *
+ * A sampling loop was written and removed. It cost a `pgrep` every 50ms of every
+ * test run — thousands of process spawns per sweep, paid in CI on every push — to
+ * deliver a property it could not keep. Applying a stub, reading a verdict and
+ * restoring the tree is this tool's job; process supervision belongs to whoever
+ * wrote the test, or to a sandbox.
+ *
+ * The tree checks remain the backstop, and their limit is honest too: they read
+ * after the test exits, so a worker writing later is outside what a synchronous
+ * sweep can see.
+ */
 const killTree = child => {
   if (!child?.pid) return;
   if (KILL_STRATEGY === "taskkill") {
@@ -296,44 +321,9 @@ const runTest = file => new Promise(resolve => {
   child.stdout.on("data", take("out"));
   child.stderr.on("data", take("err"));
   const timer = setTimeout(() => { timedOut = true; killTree(child); }, 600_000);
-  // SAMPLED WHILE IT RUNS, because after it exits there is nothing left to ask.
-  //
-  // Measured on this build: once the child exits, `process.kill(-pgid)` returns
-  // ESRCH and `pgrep -g <pgid>` finds nothing — the group is gone even though a
-  // worker it spawned is still alive. So a test that spawns something and then
-  // exits NORMALLY leaves it running, and every kill path here fires only on a
-  // signal or a timeout. The sweep would restore the source, see a clean tree and
-  // report CAUGHT while that worker was still able to write.
-  //
-  // TWO residuals, both named rather than papered over.
-  //
-  // Pid reuse between the last sample and the kill. Narrow — one poll interval —
-  // and the alternative is leaving a worker alive on a restored tree.
-  //
-  // And a child that exits faster than the first sample. A test that spawns
-  // something and returns within a few milliseconds can escape every observation,
-  // and there is no synchronous way to ask a dead process what it started: once it
-  // is reaped, `kill(-pgid)` returns ESRCH and `pgrep -g` finds nothing, both
-  // measured on this build. What is guaranteed is that descendants OBSERVED while
-  // the test ran are reaped — not that no descendant can ever escape. The tree
-  // checks remain the backstop for anything that does, and they read before such a
-  // worker would write, which is exactly why this is stated and not implied.
-  const seenDescendants = new Set();
-  const sample = () => { for (const pid of descendantsOf(child.pid)) seenDescendants.add(pid); };
-  const sampler = setInterval(sample, 50);
-  // One more the instant it exits. `exit` fires before `close`, and on a child
-  // short-lived enough to have escaped every interval this is the only sample
-  // that will ever see anything.
-  child.on("exit", sample);
   let timedOut = false;
   child.on("close", (code, signal) => {
     clearTimeout(timer);
-    clearInterval(sampler);
-    // REAPED even on a clean exit, from the pids sampled while the child lived.
-    // The group is already gone by now; these are the only handles that remain.
-    for (const pid of seenDescendants) {
-      try { process.kill(pid, "SIGKILL"); } catch { /* already gone, which is the ordinary case */ }
-    }
     // A killed child is reported as its own thing rather than coerced, because
     // "timed out" and "failed an assertion" are different readings and only one of
     // them is evidence.

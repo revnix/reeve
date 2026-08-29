@@ -551,8 +551,11 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
     `import { writeFileSync } from "node:fs";\n` +
     `import { guard } from "../src/thing.mjs";\n` +
     `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
-    // A file the manifest never named, inside the repository.
-    `writeFileSync(new URL("../src/litter.mjs", import.meta.url).pathname, "// left behind\\n");\n` +
+    // ONLY on the stubbed run. Littering on both meant the CONTROL run dirtied the
+    // tree, the pre-stub check caught it, and this block passed on a verdict it
+    // does not name — a stub of the post-run check left it green. The post-run
+    // check is what this block is about, so only the stubbed run may litter.
+    `if (!guard) writeFileSync(new URL("../src/litter.mjs", import.meta.url).pathname, "// left behind\\n");\n` +
     `process.exit(guard ? 0 : 1);\n`);
   writeFileSync(join(root, "test", "stub-manifest.mjs"),
     `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +

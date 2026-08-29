@@ -706,6 +706,137 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
     "and the source is restored, rather than left stubbed by a runner that died");
 }
 
+// --- a manifest path that is not URL-safe still imports -------------------------
+{
+  // On win32 `resolve()` yields `C:\repo\...` and `import()` reads `c:` as an
+  // unsupported scheme. The same class is reachable on POSIX: a `#` in a directory
+  // name is a URL FRAGMENT, so importing the raw path silently addresses a
+  // different file — or none. `pathToFileURL` encodes both.
+  const root = mkdtempSync(join(tmpdir(), "sweep-url#frag-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { guard } from "../src/thing.mjs";\n` +
+    `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
+    `process.exitCode = guard ? 0 : 1;\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  check(root.includes("#"), "control: the fixture's path really does contain a URL fragment character", root);
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 0, "a manifest under a path that is not URL-safe still loads and runs", `exit=${r.status}\n        ${out.slice(-260)}`);
+  check(/CAUGHT/.test(out), "and the stub is caught", out.slice(-200));
+}
+
+// --- an edit inside the git directory is refused --------------------------------
+{
+  // Inside the root, so containment accepts it — and invisible to `git status`, so
+  // a failed restore there would corrupt the repository with nothing noticing.
+  const root = mkdtempSync(join(tmpdir(), "sweep-gitdir-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"), `console.log("PASS  the guard holds");\nprocess.exitCode = 0;\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "meta", why: "edit git metadata", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: ".git/config", find: "[core]", replace: "[cxre]" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+  const cfgBefore = readFileSync(join(root, ".git", "config"), "utf8");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(r.status === 2, "an edit inside the git directory is refused outright", `exit=${r.status}`);
+  check(/git directory/.test(out), "and says why", out.slice(-240));
+  check(readFileSync(join(root, ".git", "config"), "utf8") === cfgBefore,
+    "and the git metadata is untouched");
+}
+
+// --- an IGNORED artifact the control creates is still a side effect -------------
+{
+  // `git status --porcelain` reports clean both times when the artifact is
+  // gitignored, so the stub reads as CAUGHT for a run that would not have been
+  // caught from an untouched tree. This repository ignores exactly that kind of file.
+  const root = mkdtempSync(join(tmpdir(), "sweep-ignored-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, ".gitignore"), "*.cache\n");
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { writeFileSync } from "node:fs";\n` +
+    `import { guard } from "../src/thing.mjs";\n` +
+    `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
+    // The CONTROL run leaves an ignored artifact behind.
+    `if (guard) writeFileSync(new URL("../src/build.cache", import.meta.url).pathname, "x\\n");\n` +
+    `process.exitCode = guard ? 0 : 1;\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(existsSync(join(root, "src", "build.cache")),
+    "control: the control run really did leave an ignored artifact");
+  check(execFileSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8" }).trim() === "",
+    "control: and a plain `git status` calls that tree clean, which is the whole problem");
+  check(r.status === 1, "an ignored artifact left by the control run voids the reading", `exit=${r.status}`);
+  check(/UNRUNNABLE/.test(out), "and it is reported UNRUNNABLE", out.slice(-320));
+}
+
+// --- a background worker cannot outlive a NORMALLY completed test ---------------
+{
+  // A test that spawns an unreferenced worker and returns 0 leaves it running. The
+  // sweep restores the source, sees a clean tree and reports CAUGHT — and the
+  // worker modifies the repository afterwards, when every guard has already read.
+  const markerDir = mkdtempSync(join(tmpdir(), "sweep-reap-"));
+  const marker = join(markerDir, "worker");
+  const helper = join(markerDir, "worker.mjs");
+  writeFileSync(helper,
+    `import { appendFileSync } from "node:fs";\n` +
+    `setTimeout(() => appendFileSync(process.argv[2], "worker-ran\\n"), 2500);\n`);
+  const root = mkdtempSync(join(tmpdir(), "sweep-reaproot-"));
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { spawn } from "node:child_process";\n` +
+    `import { guard } from "../src/thing.mjs";\n` +
+    `spawn(process.execPath, [${JSON.stringify(helper)}, ${JSON.stringify(marker)}], { stdio: "ignore" });\n` +
+    `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
+    // Exits IMMEDIATELY and normally: no signal, no timeout, nothing that would
+    // have triggered the kill paths.
+    `process.exitCode = guard ? 0 : 1;\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  // Past the worker's own delay, so its absence means it was reaped rather than
+  // merely not yet arrived.
+  execFileSync(process.execPath, ["-e", "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4000)"]);
+  const ran = existsSync(marker) ? readFileSync(marker, "utf8") : "";
+  check(!ran.includes("worker-ran"),
+    "a worker spawned by a normally-completed test is reaped, not left to act on the restored tree",
+    JSON.stringify(ran));
+}
+
 // --- a target DELETED during a run is not resurrected ---------------------------
 {
   // `sha` throws ENOENT on a file the test removed, the exception handler runs the

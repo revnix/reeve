@@ -15,6 +15,7 @@
 import { execFileSync } from "node:child_process";
 import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, displayPath, toByteString,
          crossCheckState, parseArgs, summaryLine, exitFor, refPath, branchStateFrom, headRepoOf,
+         localRefState,
          EXIT, VERDICT, ABSENT } from "../src/mergecheck.mjs";
 
 // execFileSync defaults to a 1 MiB stdout buffer and THROWS ENOBUFS past it.
@@ -264,12 +265,6 @@ const run = () => {
   } catch (e) {
     return emit({ repo: ghRepo, pr, verdict: VERDICT.unreadable, squash, files: [], why: first(e) }, EXIT.unreadable);
   }
-  const branchOnly = branchOnlyPaths(apiPaths, mergePaths);
-  const { verdict, counts, why } = verdictFor(classified, { branchOnly, crossCheck });
-  // DECODE AT THE OUTPUT BOUNDARY. Paths are carried internally as latin1
-  // byte-strings so no byte is lost in comparison, but that is a transport, not
-  // a name: serialised straight to JSON, `café.txt` reads as `cafÃ©.txt` and the
-  // structured report names a file that does not exist.
   // WHERE IS THE BRANCH NOW? `headRefOid` is FROZEN at the moment of merge, so
   // it cannot reveal a commit pushed afterwards -- and that is exactly the case
   // this reports on. MEASURED on reeve#63: GitHub reported headRefOid 9232d4a
@@ -279,7 +274,7 @@ const run = () => {
   //
   // Three answers, not two: read, deleted, or unreadable. Every one of them is
   // reached from a POSITIVE reading -- see the listing below.
-  let branchNow = null, branchRead = "unreadable";
+  let branchNow = null, branchRead = "unreadable", localRef = "unchecked";
   // THE HEAD BRANCH MAY NOT BE IN THIS REPOSITORY. For a cross-repository pull
   // request `headRefName` names a branch in the CONTRIBUTOR'S FORK, while
   // `origin` is the base -- so asking origin for it reads either nothing, and
@@ -304,6 +299,17 @@ const run = () => {
       const refs = JSON.parse(sh("gh", ["api", "--hostname", originHost,
         `repos/${refPath(headOwner)}/${refPath(headRepo)}/git/matching-refs/heads/${refPath(meta.headRefName)}`]));
       ({ branchNow, branchRead } = branchStateFrom(refs, meta.headRefName));
+      // AND WHAT THIS CLONE HOLDS. Every read above has the remote as its
+      // universe, so a commit never pushed is invisible rather than unproven --
+      // and the verdict then reads as "nothing of mine is outstanding" when it
+      // measured something narrower. Refs are shared across worktrees, so the
+      // branch need not be checked out here. A failure to read is UNCHECKED, and
+      // says so, because an absent branch is not evidence of an empty one.
+      let localTip = null;
+      try { localTip = sh("git", ["rev-parse", "--verify", "--quiet",
+                                  `refs/heads/${meta.headRefName}`]).trim() || null; }
+      catch { localTip = null; }
+      localRef = localRefState(localTip, branchNow);
     } catch {
       // There is no 404 left to interpret: the only route to `gone` is a
       // listing that succeeded, so anything that throws is unread and says so.
@@ -311,8 +317,17 @@ const run = () => {
     }
   }
 
+  const branchOnly = branchOnlyPaths(apiPaths, mergePaths);
+  // AFTER the branch and local reads, because the verdict's SCOPE paragraph now
+  // states what the local side covered. Computing it first and describing it
+  // afterwards would let the description drift from the reading.
+  const { verdict, counts, why } = verdictFor(classified, { branchOnly, crossCheck, localRef });
+  // DECODE AT THE OUTPUT BOUNDARY. Paths are carried internally as latin1
+  // byte-strings so no byte is lost in comparison, but that is a transport, not
+  // a name: serialised straight to JSON, `café.txt` reads as `cafÃ©.txt` and the
+  // structured report names a file that does not exist.
   emit({ repo: ghRepo, pr, verdict, squash, main: mainOid, base: meta.baseRefName ?? null,
-         mergedHead: meta.headRefOid ?? null, branchNow, branchRead,
+         mergedHead: meta.headRefOid ?? null, branchNow, branchRead, localRef,
          head: headRev, headRead: headRev !== null,
          crossCheck, branchOnly: branchOnly.map(displayPath),
          counts, files: classified, why },

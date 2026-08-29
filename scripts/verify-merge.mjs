@@ -14,7 +14,7 @@
 
 import { execFileSync } from "node:child_process";
 import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, displayPath, toByteString,
-         crossCheckState, parseArgs, summaryLine, exitFor, refPath, branchStateFrom,
+         crossCheckState, parseArgs, summaryLine, exitFor, refPath, branchStateFrom, headRepoOf,
          EXIT, VERDICT, ABSENT } from "../src/mergecheck.mjs";
 
 // execFileSync defaults to a 1 MiB stdout buffer and THROWS ENOBUFS past it.
@@ -290,9 +290,12 @@ const run = () => {
   // the tail, so a tag literally named `refs/heads/<branch>` satisfies a query
   // for that branch and its object is compared instead (reproduced by review).
   // A ref listing under `heads/` cannot match a tag at all.
-  const headOwner = meta.headRepositoryOwner?.login ?? originNwo.split("/")[0];
-  const headRepo = meta.headRepository?.name ?? originNwo.split("/")[1];
-  if (meta.headRefName && headOwner && headRepo) {
+  // NOT `?? origin`. A missing head identity means a fork that is gone or not
+  // being reported, and the base repository is a different repository -- see
+  // headRepoOf, which allows the fallback only where it is a fact.
+  const headRepoIds = headRepoOf(meta, originNwo);
+  if (meta.headRefName && headRepoIds) {
+    const { owner: headOwner, repo: headRepo } = headRepoIds;
     // BOTH READS LIVE IN `src/mergecheck.mjs`, where they can be tested. The
     // classification is the part that was wrong -- a 404 read as a fact about
     // the branch -- and a decision made inline in this shell is a decision no

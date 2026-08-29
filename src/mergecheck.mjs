@@ -265,6 +265,36 @@ export function refPath(name) {
 }
 
 /**
+ * Which repository holds the pull request's head branch.
+ *
+ * The head fields are NULLABLE: a deleted fork, or one whose identity GitHub no
+ * longer returns, leaves `headRepositoryOwner` and `headRepository` empty.
+ * Falling back to the base repository there is not a smaller answer, it is a
+ * DIFFERENT question -- a branch of the same name in the base gets read as
+ * though it were the pull request's, and if it happens to sit at the merged sha
+ * the summary reports a branch that was read and has not moved. The one case
+ * that fallback is meant to help is the one where it invents an answer.
+ *
+ * So the fallback is allowed only where it is a fact rather than a guess: when
+ * the pull request is known NOT to be cross-repository, the head IS the base.
+ * `isCrossRepository` true with no head identity is unreadable, and so is an
+ * unread `isCrossRepository` -- not knowing whether the fallback is safe is not
+ * a licence to take it.
+ *
+ * @returns {{owner: string, repo: string} | null}  null means: do not ask.
+ */
+export function headRepoOf(meta, originNwo) {
+  const owner = meta?.headRepositoryOwner?.login ?? null;
+  const repo = meta?.headRepository?.name ?? null;
+  if (owner && repo) return { owner, repo };
+  if (meta?.isCrossRepository === false) {
+    const [o, r] = String(originNwo ?? "").split("/");
+    return o && r ? { owner: o, repo: r } : null;
+  }
+  return null;
+}
+
+/**
  * Where the branch is now, from a REF LISTING rather than a ref fetch.
  *
  * `git/ref/heads/<branch>` answers 404 both for a branch that is absent and for

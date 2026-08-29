@@ -30,13 +30,14 @@
  *    for the anchor. Confirmation greps have been measured inert here.
  */
 import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync, realpathSync,
-         lstatSync, readlinkSync, openSync, readSync, closeSync } from "node:fs";
+         lstatSync, readlinkSync, openSync, readSync, closeSync, fstatSync, constants } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname, basename, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { applyEdit, validateManifest, classify, summarise, CAUGHT, UNRUNNABLE, TIMED_OUT_EXIT } from "../src/stubsweep.mjs";
+import { applyEdit, validateManifest, classify, summarise, parsePorcelainZ, fingerprint,
+         CAUGHT, UNRUNNABLE, TIMED_OUT_EXIT } from "../src/stubsweep.mjs";
 
 // Overridable so the runner can be pointed at a throwaway repository built by its
 // own test. The cleanliness guard then applies to THAT tree, so the real one is
@@ -50,71 +51,6 @@ const sha = p => createHash("sha256").update(readFileSync(p)).digest("hex");
 // AT THE TOP, with the other constants, because both of these are read by a guard.
 // Both use-before-declaration bugs shipped in this file went into guards, for the
 // structural reason that a guard is added early and its helper written later.
-const HASH_CHUNK = 1 << 20;
-
-/**
- * Porcelain `-z` into `{xy, path, line}`, which the human-readable form cannot give.
- *
- * A rename or copy carries its SOURCE as the NEXT NUL field rather than on the same
- * one. Consuming it here stops it being read as an entry in its own right, which
- * would put a path into `tracked` that git never reported as a change and refuse a
- * clean tree.
- */
-function parsePorcelainZ(raw) {
-  const fields = String(raw).split("\0");
-  const out = [];
-  for (let i = 0; i < fields.length; i++) {
-    const f = fields[i];
-    if (!f) continue;
-    const xy = f.slice(0, 2);
-    const path = f.slice(3);
-    if (xy[0] === "R" || xy[0] === "C") i++;
-    out.push({ xy, path, line: `${xy} ${path}` });
-  }
-  return out;
-}
-
-/**
- * One ignored entry's fingerprint, without ever reading a file whole and without
- * ever following a link.
- *
- * `lstat`, not `stat`: an ignored SYMLINK to a fifo or a character device would
- * otherwise be opened and read, and a read of `/dev/random` does not return. The
- * link's TARGET is hashed instead, so retargeting it is still detected while
- * whatever it points at is never touched.
- *
- * Regular files are hashed in fixed chunks. This repository ignores `*.db`,
- * `*.db-wal` and `*.db-shm`, and reeve's own state databases are exactly that, so
- * reading one whole into a Buffer costs its full size -- three readings per entry,
- * on every entry in the manifest.
- */
-function fingerprint(abs) {
-  let st;
-  try { st = lstatSync(abs); } catch { return "<unreadable>"; }
-  if (st.isSymbolicLink()) {
-    try {
-      return `<symlink> ${createHash("sha256").update(readlinkSync(abs)).digest("hex").slice(0, 16)}`;
-    } catch { return "<symlink, unreadable>"; }
-  }
-  // DIRECTORIES are not walked: `--ignored` collapses `node_modules` to one line,
-  // and walking it would cost more than the whole sweep. Stated, not hidden -- an
-  // artifact created inside an already-ignored directory is not detected, and the
-  // answer to that is to name the file in .gitignore rather than its parent.
-  if (st.isDirectory()) return "<dir, not fingerprinted>";
-  if (!st.isFile()) return "<not a regular file>";
-  const h = createHash("sha256");
-  let fd;
-  try { fd = openSync(abs, "r"); } catch { return "<unreadable>"; }
-  try {
-    const buf = Buffer.allocUnsafe(HASH_CHUNK);
-    for (;;) {
-      const n = readSync(fd, buf, 0, HASH_CHUNK, null);
-      if (n <= 0) break;
-      h.update(buf.subarray(0, n));
-    }
-  } catch { return "<unreadable>"; } finally { closeSync(fd); }
-  return h.digest("hex").slice(0, 16);
-}
 
 function die(code, msg) { console.error(msg); process.exit(code); }
 
@@ -592,8 +528,10 @@ const treeState = () => {
     // fingerprints as `<unreadable>` in EVERY reading, and a control run
     // overwriting that file is invisible exactly as it was before fingerprinting.
     // `-z` emits raw bytes with NUL terminators, so there is no quoting to undo.
+    // NO `encoding`, so this comes back as a Buffer. Decoding here would undo the
+    // whole point of asking for `-z`; see `parsePorcelainZ`.
     const raw = execFileSync("git", ["status", "--porcelain", "-z", "--ignored"],
-                             { cwd: ROOT, encoding: "utf8" });
+                             { cwd: ROOT, maxBuffer: 1 << 28 });
     const lines = parsePorcelainZ(raw);
     // IGNORED ENTRIES ARE FINGERPRINTED, not merely listed.
     //
@@ -605,9 +543,13 @@ const treeState = () => {
     // What a fingerprint IS, and the directory limit it carries, is stated once at
     // `fingerprint` rather than restated here. A second copy drifts from the first,
     // and the drifted copy is the one somebody reads.
+    // The absolute path is BUILT AS BYTES too. `join` would coerce the path to a
+    // string and put the replacement characters back, which is the defect this
+    // whole route exists to avoid.
+    const abs = p => Buffer.concat([Buffer.from(ROOT + sep), p]);
     const ignored = lines.filter(e => e.xy === "!!")
-      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
-      .map(e => `${e.line} ${fingerprint(join(ROOT, e.path))}`).join("\n");
+      .sort((a, b) => Buffer.compare(a.path, b.path))
+      .map(e => `${e.line} ${fingerprint(abs(e.path))}`).join("\n");
     return {
       tracked: lines.filter(e => e.xy !== "!!").map(e => e.line).join("\n"),
       ignored,

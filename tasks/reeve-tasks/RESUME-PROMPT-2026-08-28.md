@@ -1,5 +1,12 @@
 # Resume prompt — paste the block below into a fresh session
 
+> ## ⚠ SUPERSEDED 2026-08-29 by `RESUME-PROMPT-2026-08-29.md`
+>
+> Read the newer one. This is kept for the history it records, not as instructions.
+> Its repository state is stale: `main` has moved, the S3 foundation has MERGED, and
+> issue #50's extraction is under way with PR-0 already on main.
+
+
 Everything between the rules is the prompt. It assumes nothing about what you remember.
 
 ---

@@ -11,8 +11,9 @@
 // take days to produce.
 
 import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, safePath, exitFor,
-         displayPath, toByteString, crossCheckState, parseArgs,
-         FILE_STATE, VERDICT, EXIT, ABSENT } from "../src/mergecheck.mjs";
+         displayPath, toByteString, crossCheckState, parseArgs, summaryLine,
+         FILE_STATE, VERDICT, EXIT, ABSENT,
+         refPath, branchStateFrom, headRepoOf } from "../src/mergecheck.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -463,6 +464,169 @@ const F = "100644", X = "100755", L = "120000";
     squash: S, main: M, entryAt: fixture({ [S]: { a: `${F} 1` }, [M]: { a: `${F} 2` } }),
   }));
   check(/SCOPE:/.test(drifted.why), "and a DRIFTED verdict carries the same scope statement");
+}
+
+
+// --- THE VERDICT LINE NAMES WHERE THE BRANCH IS NOW ---------------------------
+// MEASURED IN USE, on reeve#63: it merged at head 9232d4a while the branch went
+// on to 4e5df36, and six commits pushed after the merge never reached main. This
+// tool answered MERGED, AND INTACT ON MAIN -- TRUE, since it compares main
+// against the squash -- and printed its divergence note, which was read as
+// decoration. A clean verdict is persuasive enough that a warning beside it does
+// not survive a skim. What caught it was an unrelated COUNT.
+//
+// `headRefOid` is FROZEN at the moment of merge, so printing it alone is worse
+// than printing nothing: it looks current and is not. The live branch tip is
+// read separately and the two are shown together.
+{
+  const base = { verdict: VERDICT.intact, repo: "o/r", pr: "63", squash: "5ca49dcaaa" };
+
+  const moved = summaryLine({ ...base, mergedHead: "9232d4abbb", branchNow: "4e5df36ccc", branchRead: "read" });
+  check(moved.includes("merged-head=9232d4a") && moved.includes("branch-now=4e5df36"),
+    "both shas are on the verdict line, so neither has to be held in memory", moved);
+  check(/THE BRANCH TIP DIFFERS FROM WHAT MERGED/.test(moved),
+    "and a tip that differs from what merged is flagged IN the line nobody skips, not in a note", moved);
+  // WHAT IT MUST NOT SAY. Unequal tips prove the ref points elsewhere. They do
+  // NOT prove the difference is forward commits, nor that those commits are
+  // absent from main -- a force-reset, a cherry-pick or a second merge all
+  // produce the same inequality. Claiming "NOT on main" would be overclaiming on
+  // the line least likely to be read sceptically.
+  check(/NOT established here/.test(moved),
+    "and it says the difference is UNVERIFIED rather than claiming the commits are missing", moved);
+  check(!/NOT on main/.test(moved),
+    "control: and it does NOT assert those commits are absent from main, which it cannot know", moved);
+
+  // The control that makes the assertion above mean something.
+  const same = summaryLine({ ...base, mergedHead: "9232d4abbb", branchNow: "9232d4abbb", branchRead: "read" });
+  check(!/MOVED PAST/.test(same),
+    "control: a branch still at the merged head is NOT flagged", same);
+  check(same.includes("branch-now=9232d4a"),
+    "but it is still named, so the reader sees the comparison that was made", same);
+
+  // A DELETED BRANCH IS NOT REASSURANCE. Merge at A, push an unmerged commit B,
+  // delete the branch: the ref is empty and B is lost -- which is exactly the
+  // case this warning exists for. The current ref cannot recover that history.
+  const gone = summaryLine({ ...base, mergedHead: "9232d4abbb", branchRead: "gone" });
+  check(gone.includes("branch=deleted") && /UNKNOWN/.test(gone),
+    "a deleted branch is UNKNOWN, not evidence that it never advanced", gone);
+  check(!/DIFFERS FROM WHAT MERGED/.test(gone),
+    "control: and it does not claim a difference it cannot see");
+
+  // NOT APPLICABLE IS SILENCE, NOT DOUBT. This line is printed by every exit --
+  // usage errors, unreadable metadata, NOT MERGED -- and none of those attempts
+  // a branch read. An absent status once made `verify-merge.mjs` with no
+  // arguments warn about a branch, and told the reader of an OPEN pull request
+  // that it was unknown whether the branch had moved past a merge that does not
+  // exist.
+  for (const [label, arg] of [["omitted", {}], ["explicit n/a", { branchRead: "n/a" }]]) {
+    const na = summaryLine({ ...base, verdict: "USAGE", ...arg });
+    check(!/branch/i.test(na), `a ${label} branch status prints nothing about the branch`, na);
+  }
+
+  // AND AN UNREAD BRANCH SAYS SO. Silence here is indistinguishable from
+  // agreement, which is the failure this whole tool exists to remove.
+  const unread = summaryLine({ ...base, mergedHead: "9232d4abbb", branchRead: "unreadable" });
+  check(/branch=UNREAD/.test(unread) && /UNKNOWN/.test(unread),
+    "an unreadable branch is UNKNOWN, never quietly treated as unmoved", unread);
+  check(!/MOVED PAST/.test(unread),
+    "and it does not claim movement it could not observe");
+
+  // The flag rides on the verdict, whatever the verdict is.
+  const drifted = summaryLine({ ...base, verdict: VERDICT.drifted,
+    mergedHead: "9232d4abbb", branchNow: "4e5df36ccc", branchRead: "read" });
+  check(drifted.startsWith(VERDICT.drifted) && /DIFFERS FROM WHAT MERGED/.test(drifted),
+    "a DRIFTED verdict carries the same warning -- the two facts are independent", drifted);
+}
+
+// ── Where the branch is now ─────────────────────────────────────────────────
+{
+  // A URL PATH, NOT A NAME. A `#` truncates the request at the fragment and the
+  // endpoint then answers about a PREFIX. REPRODUCED against revnix/reeve:
+  // `matching-refs/heads/fix#zzz` returned the thirty refs under `heads/fix/`,
+  // any one of which could have been compared as though it were the branch.
+  check(refPath("topic#part") === "topic%23part",
+    "a branch name is encoded for the URL, so a fragment cannot truncate the request", refPath("topic#part"));
+  // A bare `%` is not an escape, and gh rejects the URL before sending it -- so
+  // the read fails rather than answering wrongly, but it still fails.
+  check(refPath("topic%part") === "topic%25part",
+    "and a stray percent becomes a literal one rather than an invalid escape", refPath("topic%part"));
+  // THE SLASHES ARE REAL. Encoding the name whole would send `feat%2Fthing` and
+  // address nothing.
+  check(refPath("feat/verdict-names-its-head") === "feat/verdict-names-its-head",
+    "and an ordinary branch path is untouched, because its slashes are separators", refPath("feat/verdict-names-its-head"));
+  check(refPath("a b") === "a%20b", "and a space is encoded", refPath("a b"));
+
+  const listing = (ref, sha) => [{ ref, object: { sha } }];
+
+  const read = branchStateFrom(listing("refs/heads/feat/x", "4e5df36ccc"), "feat/x");
+  check(read.branchRead === "read" && read.branchNow === "4e5df36ccc",
+    "a listing containing the ref names the tip", JSON.stringify(read));
+
+  // GONE IS A POSITIVE READING. The listing succeeded and the ref is not in it.
+  const gone = branchStateFrom([], "feat/x");
+  check(gone.branchRead === "gone" && gone.branchNow === null,
+    "a listing that succeeded without the ref is the branch being GONE", JSON.stringify(gone));
+
+  // AND A FAILED CALL IS NOT A DELETED BRANCH. `git/ref` answers 404 both for an
+  // absent ref and for a repository the token cannot read -- private forks and
+  // fine-grained credentials produce the second, with a byte-identical body --
+  // so a 404 read as `gone` states a fact about the branch on the strength of an
+  // answer that may be about the credential, and does it on the one path where
+  // that suppresses a warning. There is no 404 to interpret here: only a
+  // successful listing reaches `gone`.
+  for (const [label, bad] of [["a failed call", null], ["an undefined body", undefined],
+                              ["an error object", { message: "Not Found" }], ["a bare string", "Not Found"]]) {
+    const r = branchStateFrom(bad, "feat/x");
+    check(r.branchRead === "unreadable", `${label} is UNREADABLE, never a deleted branch`, JSON.stringify(r));
+  }
+
+  // MATCHED IN FULL, because the endpoint matches by prefix: `heads/fix` returns
+  // every `refs/heads/fix/*`. Comparing loosely would read a sibling branch's
+  // tip as this branch's.
+  const sibling = branchStateFrom(listing("refs/heads/feat/x-longer", "deadbeef11"), "feat/x");
+  check(sibling.branchRead === "gone" && sibling.branchNow === null,
+    "a listing holding only a longer sibling is not this branch", JSON.stringify(sibling));
+  // Control: the same listing DOES answer for the branch it really names, so the
+  // check above is not passing merely because nothing ever matches.
+  check(branchStateFrom(listing("refs/heads/feat/x-longer", "deadbeef11"), "feat/x-longer").branchRead === "read",
+    "control: and that same listing does answer for the branch it names");
+}
+
+// ── Which repository holds the head branch ──────────────────────────────────
+{
+  const fork = { headRepositoryOwner: { login: "someone" }, headRepository: { name: "reeve" },
+                 isCrossRepository: true };
+  const got = headRepoOf(fork, "revnix/reeve");
+  check(got?.owner === "someone" && got?.repo === "reeve",
+    "a fork that reports its identity is asked in the fork", JSON.stringify(got));
+
+  // THE DANGEROUS CASE. A deleted fork leaves these null, and falling back to
+  // the base asks a DIFFERENT repository: a branch of the same name there is
+  // then read as this pull request's, and if it happens to sit at the merged sha
+  // the summary says the branch was read and has not moved. The fallback
+  // invents an answer in exactly the case it exists to cover.
+  check(headRepoOf({ isCrossRepository: true, headRepositoryOwner: null, headRepository: null },
+                   "revnix/reeve") === null,
+    "a cross-repository pull request with no head identity is NOT asked against the base");
+  for (const [label, half] of [["no owner", { headRepository: { name: "reeve" } }],
+                               ["no repository", { headRepositoryOwner: { login: "someone" } }]]) {
+    check(headRepoOf({ isCrossRepository: true, ...half }, "revnix/reeve") === null,
+      `and neither is one reporting ${label}`);
+  }
+
+  // NOT KNOWING IS NOT A LICENCE. If `isCrossRepository` could not be read, we
+  // do not know whether the base is the right place to ask.
+  check(headRepoOf({ headRepositoryOwner: null, headRepository: null }, "revnix/reeve") === null,
+    "and an UNREAD isCrossRepository does not permit the fallback either");
+
+  // The fallback is allowed where it is a fact rather than a guess.
+  const same = headRepoOf({ isCrossRepository: false, headRepositoryOwner: null, headRepository: null },
+                          "revnix/reeve");
+  check(same?.owner === "revnix" && same?.repo === "reeve",
+    "a same-repository pull request falls back to origin, where the head IS the base", JSON.stringify(same));
+  // Control: and a malformed origin is still not guessed at.
+  check(headRepoOf({ isCrossRepository: false }, "not-a-nwo") === null,
+    "control: and an origin that is not owner/name yields nothing rather than half a name");
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

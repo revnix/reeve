@@ -184,6 +184,151 @@ export const EXIT = Object.freeze({
   drifted: 32,      // it merged, and main has moved since
 });
 
+/**
+ * The one-line summary.
+ *
+ * IT NAMES THE HEAD, and it says when the branch has moved past the merge.
+ *
+ * MEASURED IN USE: a pull request merged at one head while its branch had
+ * advanced to another; six commits pushed after that head never reached main.
+ * This tool answered MERGED, AND INTACT ON MAIN, which was TRUE -- it compares
+ * main against the squash, which is the question it takes -- and it printed the
+ * divergence note. The note was read as decoration, because a clean verdict is
+ * persuasive enough that a warning beside it does not survive a skim. What
+ * caught it was an unrelated COUNT.
+ *
+ * A caveat that only works on an already-suspicious reader is not doing the
+ * job, so the fact moves into the line nobody skips. Two shas on screen beat
+ * one on screen and one in memory.
+ *
+ * AND AN UNREAD HEAD SAYS SO. If `pull/<n>/head` could not be fetched there is
+ * no divergence check at all, and silence there is indistinguishable from
+ * agreement -- the failure this whole tool exists to remove.
+ */
+export function summaryLine({ verdict, repo, pr, squash, mergedHead, branchNow, branchRead }) {
+  const bits = [`${verdict}  ${repo ?? "?"}#${pr ?? "?"}`];
+  if (squash) bits.push(`squash=${String(squash).slice(0, 7)}`);
+  if (mergedHead) bits.push(`merged-head=${String(mergedHead).slice(0, 7)}`);
+
+  // FOUR STATES, and "not applicable" is not "could not read".
+  //
+  // This line is printed by EVERY exit -- usage errors, unreadable metadata, and
+  // NOT MERGED among them -- and none of those attempts a branch read at all.
+  // Treating an absent value as a failed read made `verify-merge.mjs` with no
+  // arguments warn about a branch, and told the reader of an OPEN pull request
+  // that it was unknown whether the branch had moved "past this merge" when
+  // there is no merge. An omitted status is silence, not doubt.
+  if (branchRead === undefined || branchRead === null || branchRead === "n/a") {
+    return bits.join("  ");
+  }
+
+  // A DELETED BRANCH IS NOT EVIDENCE THAT IT NEVER MOVED. Merge at A, push an
+  // unmerged commit B, delete the branch: the ref is empty and B is lost, which
+  // is exactly the case this warning exists for. The current ref cannot recover
+  // that history, so deletion is UNKNOWN rather than reassurance.
+  if (branchRead === "gone") {
+    return bits.join("  ")
+      + "  branch=deleted  *** the branch is gone, so whether it advanced before deletion is UNKNOWN ***";
+  }
+  if (branchRead !== "read") {
+    return bits.join("  ")
+      + "  branch=UNREAD  *** the branch could not be read, so whether it moved is UNKNOWN ***";
+  }
+
+  const differs = branchNow && mergedHead && String(branchNow) !== String(mergedHead);
+  bits.push(`branch-now=${String(branchNow).slice(0, 7)}`);
+  // WHAT THIS DOES AND DOES NOT SAY. Unequal tips prove the ref points somewhere
+  // else. They do NOT prove the difference is forward commits, nor that those
+  // commits are absent from main -- the branch may have been force-reset, or its
+  // work may already have landed through another merge or a cherry-pick. Stating
+  // "NOT on main" would be the overclaiming this tool exists to avoid, on the
+  // line hardest to skim past.
+  return bits.join("  ") + (differs
+    ? "  *** THE BRANCH TIP DIFFERS FROM WHAT MERGED. Whether that difference reached main is NOT established here -- check it. ***"
+    : "");
+}
+
+/**
+ * A branch name as one URL path component per segment.
+ *
+ * A branch name is bound only by git's rules, and this is a URL path. A `#`
+ * truncates the path at the fragment, so the request asks about a PREFIX
+ * instead: REPRODUCED against `revnix/reeve`, asking for `heads/fix#zzz`
+ * answered with the thirty refs under `heads/fix/`. A bare `%` is rejected as
+ * an invalid escape before any request leaves.
+ *
+ * Encoded per SEGMENT rather than whole, because the slashes in `feat/thing`
+ * are real separators the endpoint needs.
+ */
+export function refPath(name) {
+  return String(name).split("/").map(encodeURIComponent).join("/");
+}
+
+/**
+ * Which repository holds the pull request's head branch.
+ *
+ * The head fields are NULLABLE: a deleted fork, or one whose identity GitHub no
+ * longer returns, leaves `headRepositoryOwner` and `headRepository` empty.
+ * Falling back to the base repository there is not a smaller answer, it is a
+ * DIFFERENT question -- a branch of the same name in the base gets read as
+ * though it were the pull request's, and if it happens to sit at the merged sha
+ * the summary reports a branch that was read and has not moved. The one case
+ * that fallback is meant to help is the one where it invents an answer.
+ *
+ * So the fallback is allowed only where it is a fact rather than a guess: when
+ * the pull request is known NOT to be cross-repository, the head IS the base.
+ * `isCrossRepository` true with no head identity is unreadable, and so is an
+ * unread `isCrossRepository` -- not knowing whether the fallback is safe is not
+ * a licence to take it.
+ *
+ * @returns {{owner: string, repo: string} | null}  null means: do not ask.
+ */
+export function headRepoOf(meta, originNwo) {
+  const owner = meta?.headRepositoryOwner?.login ?? null;
+  const repo = meta?.headRepository?.name ?? null;
+  if (owner && repo) return { owner, repo };
+  if (meta?.isCrossRepository === false) {
+    const [o, r] = String(originNwo ?? "").split("/");
+    return o && r ? { owner: o, repo: r } : null;
+  }
+  return null;
+}
+
+/**
+ * Where the branch is now, from a REF LISTING rather than a ref fetch.
+ *
+ * `git/ref/heads/<branch>` answers 404 both for a branch that is absent and for
+ * a repository the token cannot read -- private forks and fine-grained
+ * credentials produce the second -- and the two bodies are identical (measured).
+ * Reading "deleted" from that 404 states a fact about the BRANCH on the strength
+ * of an answer that may be about the CREDENTIAL, and it does so on the one path
+ * where the answer is used to suppress a warning.
+ *
+ * `matching-refs` answers 200 with an array whenever the ref namespace is
+ * readable, including when nothing matches. So:
+ *
+ *   a listing containing the ref   -> read, and it names the tip
+ *   a listing without it           -> gone, on POSITIVE evidence of a read
+ *   anything else                  -> unreadable
+ *
+ * The ambiguity is removed rather than narrowed, which is why this is not a
+ * tighter test on the 404 body.
+ *
+ * `matching-refs` matches by PREFIX, so `heads/fix` returns every
+ * `refs/heads/fix/*`. The ref is therefore compared IN FULL, against the
+ * unencoded name the API echoes back -- which also means that a name whose
+ * encoding was somehow skipped answers `gone` rather than comparing a stranger's
+ * tip.
+ *
+ * @param refs  the parsed response, or null/undefined if the call failed.
+ */
+export function branchStateFrom(refs, headRefName) {
+  if (!Array.isArray(refs)) return { branchNow: null, branchRead: "unreadable" };
+  const exact = refs.find((r) => r?.ref === `refs/heads/${headRefName}`);
+  const branchNow = exact?.object?.sha ?? null;
+  return { branchNow, branchRead: branchNow ? "read" : "gone" };
+}
+
 export function exitFor(verdict) {
   if (verdict === VERDICT.intact) return EXIT.ok;
   if (verdict === VERDICT.drifted) return EXIT.drifted;

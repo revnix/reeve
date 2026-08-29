@@ -24,6 +24,13 @@
  */
 
 /** The named assertion failed. The only outcome that proves anything. */
+import { createHash } from "node:crypto";
+import { lstatSync, readlinkSync, openSync, readSync, closeSync, fstatSync, constants } from "node:fs";
+
+// At the TOP: this is read by a guard, and a guard goes in early while its constant
+// goes in late, which is how both temporal-dead-zone bugs in this lineage happened.
+const HASH_CHUNK = 1 << 20;
+
 export const CAUGHT = "CAUGHT";
 /** The suite stayed green with the defect back in: the property is untested. */
 export const NOT_CAUGHT = "NOT_CAUGHT";
@@ -303,4 +310,110 @@ export function summarise(results) {
     caught: results.filter(r => r.verdict === CAUGHT).length,
     problems: bad,
   };
+}
+
+/**
+ * Porcelain `-z` into `{xy, path, line}`, which the human-readable form cannot give.
+ *
+ * A rename or copy carries its SOURCE as the NEXT NUL field rather than on the same
+ * one. Consuming it here stops it being read as an entry in its own right, which
+ * would put a path into `tracked` that git never reported as a change and refuse a
+ * clean tree.
+ */
+export function parsePorcelainZ(raw) {
+  // BYTES, never a decoded string. `-z` emits filenames verbatim, and decoding as
+  // UTF-8 replaces every undecodable byte with U+FFFD -- so a POSIX name that is not
+  // valid UTF-8 becomes a path that does not exist, fingerprints `<unreadable>` in
+  // every reading, and a control run can overwrite the real file invisibly. That is
+  // the SAME outcome as the C-quoting defect this parser was written to fix, one
+  // layer further down: the first fix stopped git from mangling the name and this
+  // one stops us from mangling it ourselves.
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw), "binary");
+  const fields = [];
+  let start = 0;
+  for (let i = 0; i <= buf.length; i++) {
+    if (i === buf.length || buf[i] === 0) { if (i > start) fields.push(buf.subarray(start, i)); start = i + 1; }
+  }
+  const out = [];
+  for (let i = 0; i < fields.length; i++) {
+    const f = fields[i];
+    // The status letters are ASCII by the format's own definition, so decoding those
+    // two bytes is safe; the PATH after them is kept as bytes.
+    const xy = f.subarray(0, 2).toString("latin1");
+    const path = f.subarray(3);
+    if (xy[0] === "R" || xy[0] === "C") i++;
+    out.push({ xy, path, line: `${xy} ${displayPath(path)}` });
+  }
+  return out;
+}
+
+/**
+ * A path for HUMANS and for comparison, which must stay injective over bytes.
+ *
+ * Two different names that both decode to the same replacement characters would
+ * otherwise compare equal, and the reading would not notice one being swapped for
+ * the other. Cleanly decodable names print as themselves; anything else carries a
+ * hash of its actual bytes, so the comparison distinguishes them even though the
+ * printed form cannot.
+ */
+export function displayPath(pathBuf) {
+  const s = pathBuf.toString("utf8");
+  return Buffer.from(s, "utf8").equals(pathBuf)
+    ? s
+    : `${s} <bytes ${createHash("sha256").update(pathBuf).digest("hex").slice(0, 16)}>`;
+}
+
+/**
+ * One ignored entry's fingerprint, without ever reading a file whole and without
+ * ever following a link.
+ *
+ * `lstat`, not `stat`: an ignored SYMLINK to a fifo or a character device would
+ * otherwise be opened and read, and a read of `/dev/random` does not return. The
+ * link's TARGET is hashed instead, so retargeting it is still detected while
+ * whatever it points at is never touched.
+ *
+ * Regular files are hashed in fixed chunks. This repository ignores `*.db`,
+ * `*.db-wal` and `*.db-shm`, and reeve's own state databases are exactly that, so
+ * reading one whole into a Buffer costs its full size -- three readings per entry,
+ * on every entry in the manifest.
+ */
+export function fingerprint(abs) {
+  let st;
+  try { st = lstatSync(abs); } catch { return "<unreadable>"; }
+  if (st.isSymbolicLink()) {
+    try {
+      return `<symlink> ${createHash("sha256").update(readlinkSync(abs)).digest("hex").slice(0, 16)}`;
+    } catch { return "<symlink, unreadable>"; }
+  }
+  // DIRECTORIES are not walked: `--ignored` collapses `node_modules` to one line,
+  // and walking it would cost more than the whole sweep. Stated, not hidden -- an
+  // artifact created inside an already-ignored directory is not detected, and the
+  // answer to that is to name the file in .gitignore rather than its parent.
+  if (st.isDirectory()) return "<dir, not fingerprinted>";
+  if (!st.isFile()) return "<not a regular file>";
+  const h = createHash("sha256");
+  let fd;
+  // O_NOFOLLOW, and then FSTAT THE DESCRIPTOR. The lstat above describes the path a
+  // moment ago; between that call and this one another process can replace the file
+  // with a symlink, and a plain open follows it -- so the no-follow guarantee held
+  // for the check and not for the read. A lingering test worker swapping the path
+  // could redirect this synchronous read at a fifo, which never returns, and the
+  // sweep would hang before its own timeout or its restore could run.
+  //
+  // O_NOFOLLOW does not exist on Windows, so it degrades to zero there and the
+  // fstat below is what carries the guarantee. That is stated rather than assumed:
+  // reeve has to run on macOS, Windows and Ubuntu.
+  const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
+  try { fd = openSync(abs, constants.O_RDONLY | NOFOLLOW); } catch { return "<unreadable>"; }
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile()) return "<not a regular file>";
+    const buf = Buffer.allocUnsafe(HASH_CHUNK);
+    for (;;) {
+      const n = readSync(fd, buf, 0, HASH_CHUNK, null);
+      if (n <= 0) break;
+      h.update(buf.subarray(0, n));
+    }
+  } catch { return "<unreadable>"; } finally { closeSync(fd); }
+  return h.digest("hex").slice(0, 16);
 }

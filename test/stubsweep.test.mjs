@@ -879,10 +879,14 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
     `import { guard } from "../src/thing.mjs";\n` +
     `if (guard) { console.log("PASS  the guard holds"); process.exitCode = 0; }\n` +
     `else {\n` +
-    // Synchronous fd writes, so the ORDER reaching the parent is the order written.
-    `  writeSync(1, "FAIL  wrong assertion");\n` +
-    `  writeSync(2, " the guard holds\\n");\n` +
-    `  writeSync(1, "\\n");\n` +
+    // Synchronous fd writes, PAUSED between them. Without the pauses the two stdout
+    // writes coalesce into one data event before stderr's arrives, no interleaving
+    // reaches the parent, and the fixture cannot exhibit the defect it exists for —
+    // which is exactly what the first version did, passing under a stub of the fix.
+    `  const pause = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);\n` +
+    `  writeSync(1, "FAIL  wrong assertion"); pause();\n` +
+    `  writeSync(2, " the guard holds\\n"); pause();\n` +
+    `  writeSync(1, "\\n"); pause();\n` +
     `  process.exitCode = 1;\n}\n`);
   writeFileSync(join(root, "test", "stub-manifest.mjs"),
     `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +

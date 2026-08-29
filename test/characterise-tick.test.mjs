@@ -395,6 +395,15 @@ const SCENARIOS = [
   // A queued request for work this tick did not ask for is WITHDRAWN.
   ["13-withdraw-a-request-not-asked-for", { queuedRequests: () => [{ run_ref: "o/r#99:FIX_CI" }] }],
 
+  // AND ONE IT DOES INTEND IS SERVED, so the canary is not blocked behind it.
+  // These two differ in the run reference alone: `#99` is not something this
+  // tick asks for, `#42` is. Scenario 13 covered only the withdrawal, and the
+  // serve path -- a claim AND the release that follows it -- was the one
+  // operation of the twelve that nothing would have noticed losing.
+  ["18-serve-a-queued-request-this-tick-wants", {
+    queuedRequests: () => [{ run_ref: "o/r#42:FIX_CI" }],
+  }],
+
   // ── The paths no artifact was watching ──────────────────────────────────────
   //
   // MEASURED, by handing each hub accessor a WRONG handle and recording which
@@ -422,8 +431,20 @@ const SCENARIOS = [
   // version of this scenario did.
   ["16-canary-claims-before-dispatch", {
     containmentThrows: true,
-    measureContainment: async () => ({ credentialRead: "closed", why: "measured in the fixture",
-                                       canary: { ran: true, evidence: { outcome: "ok" } } }),
+    // DRIVES THE CALLBACKS the real measurement drives. The canary's CLAIM
+    // happens in `beforeSpawn` and its REBIND in `onSpawn`, so an override that
+    // returns a verdict without calling them reaches neither of the two sites
+    // this scenario exists to cover -- and its artifact then contains a single
+    // claim for the pull request and no bind at all, while the name says
+    // otherwise. MEASURED: exactly that, until it was pointed out.
+    measureContainment: async (_ctx, _profile, _nwo, _logPath, { beforeSpawn, onSpawn } = {}) => {
+      const gate = await beforeSpawn?.();
+      if (gate && gate.ok === false)
+        return { credentialRead: "open", why: `the canary was refused: ${gate.why ?? "?"}`, canary: { ran: false } };
+      onSpawn?.({ pid: 4243, lstart: "canary-start" });
+      return { credentialRead: "closed", why: "measured in the fixture",
+               canary: { ran: true, evidence: { outcome: "ok" } } };
+    },
     providerBind: () => ({ ok: true, bound: 1 }),
   }],
 
@@ -461,8 +482,23 @@ const SCENARIOS = [
       providerHeartbeat: () => { sawBeat(); return { ok: true }; },
       spawnWorker: async (a) => {
         a.onSpawn?.({ pid: 4242, lstart: "worker-start" });
-        await beaten;
-        return { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" };
+        // BOUNDED, and the bound is VISIBLE. `await beaten` alone hangs for ever
+        // if no beat arrives -- which is exactly what happens when the heartbeat
+        // operation is removed, so the scenario that exists to watch that
+        // operation would hang rather than fail. MEASURED: a coverage sweep
+        // stalled here and produced no result at all for the last three sites.
+        //
+        // A test that hangs is worse than one that fails: it reports nothing, and
+        // "no answer yet" is indistinguishable from "still working". The race
+        // turns a missing beat into a DIFFERENT recorded outcome, which the
+        // artifact then shows.
+        const beat = await Promise.race([
+          beaten.then(() => "beaten"),
+          new Promise((r) => setTimeout(() => r("no-beat"), 5000)),
+        ]);
+        return beat === "beaten"
+          ? { outcome: "ok", why: "done", ms: 1, cost: 0, sessionId: "s" }
+          : { outcome: "failed", why: "no provider heartbeat arrived", ms: 1, cost: 0, sessionId: "s" };
       },
     };
   }],

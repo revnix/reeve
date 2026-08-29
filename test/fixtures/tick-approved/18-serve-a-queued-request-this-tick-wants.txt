@@ -11,15 +11,11 @@ publish	[{"nwo":"o/r","verdict":{"state":"BLOCK","summary":"ci is red","clauses"
 hub	[]
 hub	[]
 queuedRequests	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"repoId":7}]
-measureContainment	[{"nwo":"o/r","db":"<DatabaseSync>","logPath":"<tmp>","execute":true,"shadow":true,"running":0,"containment":null,"keychain":{"measured":true,"items":[],"why":null},"claudeBin":"/bin/sh","cliVersion":"test","capacity":"<fn>","profile":{"identity":{"key":"o/r","defaultBranch":"main","worktreeRoot":"<tmp>","checkout":"<tmp>"},"authority":{"policy":"propose_and_merge"},"rounds":{"softCap":5,"hardCap":10,"maxFixAttemptsPerFinding":1},"ci":{"provider":"github-actions","requiredChecks":[]},"watch":{"maxWorkers":5,"workerBudgetMinutes":1,"maxTurns":5}},"hub":"<fn>","repoId":7,"lstart":"boot-1","providerClaim":"<fn>","providerRelease":"<fn>","openPrs":"<fn>","observe":"<fn>","evaluate":"<fn>","publish":"<fn>","spawnWorker":"<fn>","measureContainment":"<fn>","providerBind":"<fn>","oauthToken":"<fn>","resolveCause":"<fn>","prepareCheckout":"<fn>","reapProvider":"<fn>","cancelQueued":"<fn>","providerHeartbeat":"<fn>","noteRateLimit":"<fn>","queuedRequests":"<fn>","providerRetry":"<Map>","cooldownRetry":"<Map>","ingestComplete":"<Map>","prepBackoff":"<Map>","lastBackupAt":<epoch>},{"identity":{"key":"o/r","defaultBranch":"main","worktreeRoot":"<tmp>","checkout":"<tmp>"},"authority":{"policy":"propose_and_merge"},"rounds":{"softCap":5,"hardCap":10,"maxFixAttemptsPerFinding":1},"ci":{"provider":"github-actions","requiredChecks":[]},"watch":{"maxWorkers":5,"workerBudgetMinutes":1,"maxTurns":5}},"o/r","<tmp>",{"beforeSpawn":"<fn>","onSpawn":"<fn>"}]
+hub	[]
+providerClaim	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"o/r#42:FIX_CI","pid":<pid>,"lstart":"boot-1","isAlive":"<fn>"}]
 hub	[]
 hub	[]
-providerClaim	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"canary:o/r","pid":<pid>,"lstart":"boot-1","isAlive":"<fn>"}]
-hub	[]
-providerBind	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"canary:o/r","id":1,"token":"tok-fixture-1","pid":4243,"lstart":"canary-start","isAlive":"<fn>"}]
-hub	[]
-hub	[]
-providerRelease	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"canary:o/r","id":1,"token":"tok-fixture-1","isAlive":"<fn>"}]
+providerRelease	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"o/r#42:FIX_CI","id":1,"token":"tok-fixture-1","isAlive":"<fn>"}]
 capacity	[{"maxWorkers":5,"running":0}]
 hub	[]
 hub	[]
@@ -30,6 +26,7 @@ spawnWorker	[{"bin":"/bin/sh","args":["-p","You are repairing one CI failure on 
 hub	[]
 hub	[]
 providerRelease	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"o/r#42:FIX_CI","id":2,"token":"tok-fixture-1","isAlive":"<fn>"}]
+hub	[]
 
 == 2 ESCALATIONS
 #42: the worker changed its checkout's git configuration; the checkout is preserved at <tmp> for inspection
@@ -41,6 +38,7 @@ reeve has no notification channel, so escalations reach a log only
 <ts> tick: o/r — 1 open PR(s)
 <ts>   #42: review projection not readable — the observation behind this projection was incomplete
 <ts>   #42 BLOCK   FIX_CI          failing: unit
+<ts> provider: served the queue head (o/r#42:FIX_CI) so the canary is not blocked behind it
 <ts> execute: capacity allows 5 worker(s) (load 0.00, 10 perf cores)
 <ts>   #42: dispatching FIX_CI (run <ref>, attempt 1)
 <ts>   #42: checkout ready at <tmp>

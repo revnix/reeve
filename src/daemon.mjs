@@ -1538,7 +1538,11 @@ export async function tick(ctx) {
     // actually did, and takes the rest of the tick with it. Cleanup must not be
     // able to destroy the outcome it exists to record.
     try {
-      r = session.perform("providerRelease", releaseProvider, { ...identity, isAlive: isSameProcess });
+      r = session.perform("providerRelease", releaseProvider, { ...identity, isAlive: isSameProcess },
+        () => { pendingReleases.set(key, identity);
+                log(logPath, `provider: release deferred — the hub could not be reached; retrying next tick (${key})`);
+                return NO_HUB; });
+      if (r === NO_HUB) return;
     } catch (err) {
       pendingReleases.set(key, identity);
       log(logPath, `provider: release THREW — ${err.message}; retrying next tick (${key})`);
@@ -1659,7 +1663,9 @@ export async function tick(ctx) {
   {
     {
       try {
-        const rp = session.perform("reapProvider", reapProviderLeases, { isAlive: isSameProcess });
+        // Housekeeping SKIPS with no scheduler: there are no leases to reap.
+        const rp = session.perform("reapProvider", reapProviderLeases, { isAlive: isSameProcess },
+                                   () => undefined);
         if (rp?.reaped) log(logPath, `provider: reaped ${rp.reaped} expired lease(s) whose holder is gone`);
       } catch (err) {
         // Housekeeping must never take the tick with it.
@@ -1714,8 +1720,11 @@ export async function tick(ctx) {
     if (repoId != null) {
       for (const row of readQueuedNow()) {
         try {
+          // A SHAPED REFUSAL, so the line below names the real reason instead of
+          // reporting `undefined` as the scheduler's answer.
           const c = session.perform("cancelQueued", cancelQueued, {
-            owner: "guardian", repoId, runRef: row.run_ref, isAlive: isSameProcess });
+            owner: "guardian", repoId, runRef: row.run_ref, isAlive: isSameProcess },
+            () => ({ ok: false, reason: "the hub went away while withdrawing" }));
           if (c?.ok) log(logPath, `provider: withdrew a queued request while halted (${row.run_ref})`);
           else log(logPath, `provider: could not withdraw ${row.run_ref} — ${c?.reason}`);
         } catch (err) {
@@ -2231,9 +2240,12 @@ export async function tick(ctx) {
           // it queued, and then the honest question is the one the sweep already
           // asks: did the dispatch path actually ask for this work? If it did, it
           // marks `askedFor` itself; if it did not, the row should go.
+          // Not serving the head is the right answer with no scheduler: the
+          // queue lives in the hub that is not there.
           const got = session.perform("providerClaim", claimProvider, {
             owner: "guardian", repoId, runRef: head.run_ref,
-            pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
+            pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess },
+            () => undefined);
           if (got?.ok) {
             log(logPath, `provider: served the queue head (${head.run_ref}) so the canary is not blocked behind it`);
             releaseWithRetry(head.run_ref, { owner: "guardian", repoId, runRef: head.run_ref,
@@ -2295,7 +2307,11 @@ export async function tick(ctx) {
         try {
           got = session.perform("providerClaim", claimProvider, {
             owner: "guardian", repoId, runRef: `canary:${nwo}`,
-            pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
+            pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess },
+            () => { raise("the provider scheduler is unreadable; dispatching unscheduled");
+                    log(logPath, `execute: provider unreadable, running the containment canary unscheduled: the hub went away between the check and the claim`);
+                    return NO_HUB; });
+          if (got === NO_HUB) return { ok: true };
           askedFor.add(`canary:${nwo}`);
         } catch (err) {
           raise("the provider scheduler is unreadable; dispatching unscheduled");
@@ -2324,8 +2340,12 @@ export async function tick(ctx) {
       // An unbound canary lease is not.
     const canaryOnSpawn = ({ pid, lstart }) => {
         if (!canaryLease) return;
+        // NAMED, not inferred. Without this the throw below reports "matched no
+        // row(s)" -- a fact about the query -- when the truth is that there was
+        // no scheduler to ask.
         const b = session.perform("providerBind", bindProviderLease,
-          { ...canaryLease, pid, lstart, isAlive: isSameProcess });
+          { ...canaryLease, pid, lstart, isAlive: isSameProcess },
+          () => ({ ok: false, reason: "the hub went away before the canary's lease could be rebound" }));
         if (b?.ok === false)
           throw new Error(`the canary's provider lease could not be rebound: ${b.reason}`);
         if (b?.bound !== 1)
@@ -2482,7 +2502,10 @@ export async function tick(ctx) {
           askedFor.add(prRunRef);
           got = session.perform("providerClaim", claimProvider, {
             owner: "guardian", repoId, runRef: prRunRef,
-            pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess });
+            pid: process.pid, lstart: ctx.lstart, isAlive: isSameProcess },
+            () => { raise("the provider scheduler is unreadable; dispatching unscheduled");
+                    log(logPath, `  #${e.pr}: provider unreadable, dispatching unscheduled: the hub went away between the check and the claim`);
+                    return { ok: true, id: null }; });
         } catch (err) {
           raise("the provider scheduler is unreadable; dispatching unscheduled");
           log(logPath, `  #${e.pr}: provider unreadable, dispatching unscheduled: ${err.message}`);
@@ -2633,8 +2656,11 @@ export async function tick(ctx) {
         if (prLease) {
           try {
             {
+              // A renewal that could not be attempted is NOT lease loss: only
+              // `ok && beat === 0` is, and undefined is neither.
               const phb = session.perform("providerHeartbeat", heartbeatProvider,
-                                          { ...prLease, isAlive: isSameProcess });
+                                          { ...prLease, isAlive: isSameProcess },
+                                          () => undefined);
               // A ZERO-ROW RENEWAL IS LEASE LOSS, and the result was discarded.
               //
               // `heartbeatProvider` answers `{ ok: true, beat: 0 }` when the
@@ -2856,7 +2882,9 @@ export async function tick(ctx) {
             // a success, and zero rebound is indistinguishable in effect from not
             // having called it.
             if (prLease) {
-              const b = session.perform("providerBind", bindProviderLease, { ...prLease, pid, lstart, isAlive: isSameProcess });
+              const b = session.perform("providerBind", bindProviderLease,
+                { ...prLease, pid, lstart, isAlive: isSameProcess },
+                () => ({ ok: false, reason: "the hub went away before the lease could be rebound" }));
               if (b?.ok === false)
                 throw new Error(`the provider lease could not be rebound to the worker: ${b.reason}`);
               if (b?.bound !== 1)
@@ -3230,7 +3258,8 @@ export async function tick(ctx) {
         }
         try {
           const c = session.perform("cancelQueued", cancelQueued, {
-            owner: "guardian", repoId, runRef: row.run_ref, isAlive: isSameProcess });
+            owner: "guardian", repoId, runRef: row.run_ref, isAlive: isSameProcess },
+            () => ({ ok: false, reason: "the hub went away while cancelling" }));
           if (c?.ok) log(logPath, `provider: cancelled a queued request this tick never asked for (${row.run_ref})`);
           else log(logPath, `provider: could not cancel ${row.run_ref} — ${c?.reason}`);
         } catch (err) {

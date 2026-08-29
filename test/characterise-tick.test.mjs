@@ -33,7 +33,7 @@
 // TO APPROVE A CHANGE:  REEVE_APPROVE=1 node test/characterise-tick.test.mjs
 // Approving is a deliberate act and the diff is the thing a reviewer reads.
 
-import { run, CLAIM_TOKEN, SCHEDULER_SEAMS } from "./fixtures/tick-harness.mjs";
+import { run, CLAIM_TOKEN, SCHEDULER_SEAMS, SCHEDULER_FALLBACKS } from "./fixtures/tick-harness.mjs";
 // DERIVED, not restated. A scenario that hard-coded "rate_limited" would keep
 // naming an outcome the supervisor had since renamed, and the branch it is meant
 // to reach would simply stop being taken.
@@ -427,6 +427,22 @@ const SCENARIOS = [
     providerBind: () => ({ ok: true, bound: 1 }),
   }],
 
+  // AN INHERITED RELEASE AGAINST A HUB THAT IS NEVER READABLE. The deferral path
+  // reads the hub ITSELF -- it has to tell an ABSENT hub, where there is no
+  // lease to give back, from an UNREADABLE one, where the obligation must be
+  // carried -- and it reports that fault under the same once-only rule as every
+  // other reader.
+  //
+  // MEASURED: nothing here reached that branch. The whole provider-lease suite
+  // did, and it is what caught a ReferenceError this signature ran straight
+  // past: `04-hub-unreadable-always` never carries an obligation, and
+  // `12-carried-release-first-read-faults` has a hub that recovers before the
+  // release. It takes both at once.
+  ["17-carried-release-hub-never-readable", {
+    carriedReleases: CARRIED_RELEASE,
+    hubGetter: () => ({ hub: null, why: "busy" }),
+  }],
+
   // A worker that announces itself is BOUND to the lease, and one that outlives
   // an interval is HEARTBEATED. A thunk, because the promise below must be fresh
   // per run: reused, it is already resolved and the run records no beat.
@@ -708,6 +724,33 @@ check(pairs.length === 2 && pairs[0][1].done !== pairs[1][1].done,
   const alone = redact(deferred, {});
   check(/"observedAt":<t0>/.test(alone),
     "control: and re-origined alone it reads as t0, which is why one origin is required", alone);
+}
+
+// 8e. EVERY FALLBACK IS THE FUNCTION THE DAEMON WOULD HAVE REACHED FOR.
+//
+//     A fallback that is merely A function satisfies a `typeof` guard and can
+//     still be the wrong one. MEASURED: `containment.mjs` exports
+//     `measureContainment`, while the daemon's fallback at that seam is
+//     `measuredContainment` -- a different function, defined in daemon.mjs, with
+//     a different signature. It imported cleanly, passed the guard, and crashed
+//     the tick on a path no scenario here reaches.
+//
+//     DERIVED FROM THE DAEMON'S OWN SOURCE. It resolves each seam as
+//     `(ctx.NAME ?? FALLBACK)`, so the pairs can be read rather than restated;
+//     a list maintained here would drift the moment one changed.
+{
+  const daemonSrc = readFileSync(join(HERE, "..", "src", "daemon.mjs"), "utf8");
+  const resolved = new Map();
+  for (const m of daemonSrc.matchAll(/\(\s*ctx\.(\w+)\s*\?\?\s*(\w+)\s*\)/g)) resolved.set(m[1], m[2]);
+  check(resolved.size > 0, "control: the daemon's (ctx.X ?? Y) seams are readable at all", `${resolved.size} found`);
+  for (const seam of SCHEDULER_SEAMS) {
+    const want = resolved.get(seam);
+    check(!!want, `the daemon really resolves ${seam} as (ctx.${seam} ?? ...), so installing it means something`);
+    if (!want) continue;
+    check(SCHEDULER_FALLBACKS[seam]?.name === want,
+      `and the harness's ${seam} fallback IS ${want}, not another function of a similar name`,
+      `harness installs ${SCHEDULER_FALLBACKS[seam]?.name ?? "nothing"}`);
+  }
 }
 
 // 9. EVERY SCHEDULER SEAM THE HARNESS INSTALLS IS REACHED BY SOME SCENARIO.

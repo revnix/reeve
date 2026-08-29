@@ -12,7 +12,13 @@
 //   `seams`     an array that records every scheduler seam call in order, as
 //               {op, args}. Recorded by WRAPPING the seams here, never in src/.
 
-import { tick } from "../../src/daemon.mjs";
+// FROM THE SAME MODULE THE DAEMON RESOLVES IT FROM. `containment.mjs` exports a
+// `measureContainment`, and the daemon's fallback here is `measuredContainment`
+// -- a different function, defined in daemon.mjs, with a different signature.
+// Importing the similarly-named one type-checked, satisfied a `typeof fn ===
+// "function"` guard, and crashed the tick. The control below now derives these
+// pairs from the daemon's own source.
+import { tick, measuredContainment } from "../../src/daemon.mjs";
 import { open } from "../../src/db/ops.mjs";
 import { openHub } from "../../src/build/hubdb.mjs";
 import { openHubAsGuest } from "../../src/build/hubguest.mjs";
@@ -29,7 +35,7 @@ import { openHubAsGuest } from "../../src/build/hubguest.mjs";
 // covered five seams and covered four. A namespace cannot collide.
 import * as provider from "../../src/provider.mjs";
 import { queuedGuardianRequests } from "../../src/build/providerdb.mjs";
-import { measureContainment as measureContainmentReal } from "../../src/containment.mjs";
+
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -58,9 +64,12 @@ const FALLBACKS = {
   // MEASURED to be missing: the canary scenario reached the real
   // `measureContainment` through the daemon's own fallback, so the call decided
   // whether the tick dispatched at all and appeared in no artifact.
-  measureContainment: measureContainmentReal,
+  measureContainment: measuredContainment,
 };
 export const SCHEDULER_SEAMS = Object.freeze(Object.keys(FALLBACKS));
+// The functions too, so a caller can check each is the one the daemon would
+// have reached for -- not merely that it is a function.
+export const SCHEDULER_FALLBACKS = Object.freeze({ ...FALLBACKS });
 const cl = (id, state, detail = "") => ({ id, state, detail });
 export const EVAL = {
   ok: true, pr: 42, state: "open", head: HEAD, title: "t", headRef: "f", baseRef: "main",

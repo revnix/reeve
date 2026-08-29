@@ -1391,15 +1391,22 @@ export async function tick(ctx) {
   const hubSession = ({ getter, onFault, isAlive }) => {
     const now = () => (typeof getter === "function" ? getter() : { hub: getter ?? null, why: null });
     let faultSaid = false;
+    // SAID ONCE, wherever the reading came from. A caller that reads the hub
+    // itself -- because it needs to tell an ABSENT hub from an unreadable one --
+    // must still be able to report the fault under the same once-only rule, or
+    // that rule holds at every site but one.
+    const sayFault = (why) => { if (why && !faultSaid) { faultSaid = true; onFault(why); } };
     const handle = (fallback) => {
       const a = now();
-      if (a.why && !faultSaid) { faultSaid = true; onFault(a.why); }
+      sayFault(a.why);
       return a.why ? fallback(a.why) : a.hub;
     };
     return {
       // The raw reading, for the two callers that need to tell an ABSENT hub
       // from an unreadable one -- a fact the handle alone cannot carry.
       read: now,
+      // For the callers that read directly: the once-only report, unbundled.
+      sayFault,
       // A current handle, or null. Every mutation below goes through this.
       hub: () => handle(() => null),
       // ...and with a caller's own answer for the fault, which the deferral
@@ -1488,7 +1495,7 @@ export async function tick(ctx) {
     if (!a.hub) {
       if (a.why) {
         pendingReleases.set(key, identity);
-        if (!hubFaultSaid) { hubFaultSaid = true; log(logPath, `hub: ${a.why}`); raise("guardian:hub:unreadable"); }
+        session.sayFault(a.why);
         log(logPath, `provider: release deferred — the hub could not be reached; retrying next tick (${key})`);
       }
       return;

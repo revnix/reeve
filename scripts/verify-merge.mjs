@@ -14,7 +14,8 @@
 
 import { execFileSync } from "node:child_process";
 import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, displayPath, toByteString,
-         crossCheckState, parseArgs, summaryLine, exitFor, EXIT, VERDICT, ABSENT } from "../src/mergecheck.mjs";
+         crossCheckState, parseArgs, summaryLine, exitFor, refPath, branchStateFrom,
+         EXIT, VERDICT, ABSENT } from "../src/mergecheck.mjs";
 
 // execFileSync defaults to a 1 MiB stdout buffer and THROWS ENOBUFS past it.
 // The pull-request files endpoint carries a URL trio and often patch text per
@@ -276,8 +277,8 @@ const run = () => {
   // of them on main. The frozen value looks current and is not, which makes
   // printing it alone worse than printing nothing.
   //
-  // Three answers, not two: read, deleted, or unreadable. A deleted branch
-  // cannot have moved; an unreadable one is UNKNOWN and says so.
+  // Three answers, not two: read, deleted, or unreadable. Every one of them is
+  // reached from a POSITIVE reading -- see the listing below.
   let branchNow = null, branchRead = "unreadable";
   // THE HEAD BRANCH MAY NOT BE IN THIS REPOSITORY. For a cross-repository pull
   // request `headRefName` names a branch in the CONTRIBUTOR'S FORK, while
@@ -288,19 +289,22 @@ const run = () => {
   // for a fork and is also unambiguous about refs: `git ls-remote` matches on
   // the tail, so a tag literally named `refs/heads/<branch>` satisfies a query
   // for that branch and its object is compared instead (reproduced by review).
-  // `git/ref/heads/<branch>` cannot match a tag.
+  // A ref listing under `heads/` cannot match a tag at all.
   const headOwner = meta.headRepositoryOwner?.login ?? originNwo.split("/")[0];
   const headRepo = meta.headRepository?.name ?? originNwo.split("/")[1];
   if (meta.headRefName && headOwner && headRepo) {
+    // BOTH READS LIVE IN `src/mergecheck.mjs`, where they can be tested. The
+    // classification is the part that was wrong -- a 404 read as a fact about
+    // the branch -- and a decision made inline in this shell is a decision no
+    // test can reach.
     try {
-      const ref = JSON.parse(sh("gh", ["api", "--hostname", originHost,
-        `repos/${headOwner}/${headRepo}/git/ref/heads/${meta.headRefName}`]));
-      branchNow = ref?.object?.sha ?? null;
-      branchRead = branchNow ? "read" : "unreadable";
-    } catch (e) {
-      // A 404 is the branch being GONE; anything else is a failure to read, and
-      // the two must not collapse -- one is a fact, the other is an absence of one.
-      branchRead = /404|Not Found/i.test(String(e?.stderr ?? e?.message ?? "")) ? "gone" : "unreadable";
+      const refs = JSON.parse(sh("gh", ["api", "--hostname", originHost,
+        `repos/${refPath(headOwner)}/${refPath(headRepo)}/git/matching-refs/heads/${refPath(meta.headRefName)}`]));
+      ({ branchNow, branchRead } = branchStateFrom(refs, meta.headRefName));
+    } catch {
+      // There is no 404 left to interpret: the only route to `gone` is a
+      // listing that succeeded, so anything that throws is unread and says so.
+      branchRead = "unreadable";
     }
   }
 

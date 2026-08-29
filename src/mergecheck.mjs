@@ -248,6 +248,57 @@ export function summaryLine({ verdict, repo, pr, squash, mergedHead, branchNow, 
     : "");
 }
 
+/**
+ * A branch name as one URL path component per segment.
+ *
+ * A branch name is bound only by git's rules, and this is a URL path. A `#`
+ * truncates the path at the fragment, so the request asks about a PREFIX
+ * instead: REPRODUCED against `revnix/reeve`, asking for `heads/fix#zzz`
+ * answered with the thirty refs under `heads/fix/`. A bare `%` is rejected as
+ * an invalid escape before any request leaves.
+ *
+ * Encoded per SEGMENT rather than whole, because the slashes in `feat/thing`
+ * are real separators the endpoint needs.
+ */
+export function refPath(name) {
+  return String(name).split("/").map(encodeURIComponent).join("/");
+}
+
+/**
+ * Where the branch is now, from a REF LISTING rather than a ref fetch.
+ *
+ * `git/ref/heads/<branch>` answers 404 both for a branch that is absent and for
+ * a repository the token cannot read -- private forks and fine-grained
+ * credentials produce the second -- and the two bodies are identical (measured).
+ * Reading "deleted" from that 404 states a fact about the BRANCH on the strength
+ * of an answer that may be about the CREDENTIAL, and it does so on the one path
+ * where the answer is used to suppress a warning.
+ *
+ * `matching-refs` answers 200 with an array whenever the ref namespace is
+ * readable, including when nothing matches. So:
+ *
+ *   a listing containing the ref   -> read, and it names the tip
+ *   a listing without it           -> gone, on POSITIVE evidence of a read
+ *   anything else                  -> unreadable
+ *
+ * The ambiguity is removed rather than narrowed, which is why this is not a
+ * tighter test on the 404 body.
+ *
+ * `matching-refs` matches by PREFIX, so `heads/fix` returns every
+ * `refs/heads/fix/*`. The ref is therefore compared IN FULL, against the
+ * unencoded name the API echoes back -- which also means that a name whose
+ * encoding was somehow skipped answers `gone` rather than comparing a stranger's
+ * tip.
+ *
+ * @param refs  the parsed response, or null/undefined if the call failed.
+ */
+export function branchStateFrom(refs, headRefName) {
+  if (!Array.isArray(refs)) return { branchNow: null, branchRead: "unreadable" };
+  const exact = refs.find((r) => r?.ref === `refs/heads/${headRefName}`);
+  const branchNow = exact?.object?.sha ?? null;
+  return { branchNow, branchRead: branchNow ? "read" : "gone" };
+}
+
 export function exitFor(verdict) {
   if (verdict === VERDICT.intact) return EXIT.ok;
   if (verdict === VERDICT.drifted) return EXIT.drifted;

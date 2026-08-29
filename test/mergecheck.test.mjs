@@ -13,7 +13,7 @@
 import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, safePath, exitFor,
          displayPath, toByteString, crossCheckState, parseArgs, summaryLine,
          FILE_STATE, VERDICT, EXIT, ABSENT,
-         refPath, branchStateFrom } from "../src/mergecheck.mjs";
+         refPath, branchStateFrom, headRepoOf } from "../src/mergecheck.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -590,6 +590,43 @@ const F = "100644", X = "100755", L = "120000";
   // check above is not passing merely because nothing ever matches.
   check(branchStateFrom(listing("refs/heads/feat/x-longer", "deadbeef11"), "feat/x-longer").branchRead === "read",
     "control: and that same listing does answer for the branch it names");
+}
+
+// ── Which repository holds the head branch ──────────────────────────────────
+{
+  const fork = { headRepositoryOwner: { login: "someone" }, headRepository: { name: "reeve" },
+                 isCrossRepository: true };
+  const got = headRepoOf(fork, "revnix/reeve");
+  check(got?.owner === "someone" && got?.repo === "reeve",
+    "a fork that reports its identity is asked in the fork", JSON.stringify(got));
+
+  // THE DANGEROUS CASE. A deleted fork leaves these null, and falling back to
+  // the base asks a DIFFERENT repository: a branch of the same name there is
+  // then read as this pull request's, and if it happens to sit at the merged sha
+  // the summary says the branch was read and has not moved. The fallback
+  // invents an answer in exactly the case it exists to cover.
+  check(headRepoOf({ isCrossRepository: true, headRepositoryOwner: null, headRepository: null },
+                   "revnix/reeve") === null,
+    "a cross-repository pull request with no head identity is NOT asked against the base");
+  for (const [label, half] of [["no owner", { headRepository: { name: "reeve" } }],
+                               ["no repository", { headRepositoryOwner: { login: "someone" } }]]) {
+    check(headRepoOf({ isCrossRepository: true, ...half }, "revnix/reeve") === null,
+      `and neither is one reporting ${label}`);
+  }
+
+  // NOT KNOWING IS NOT A LICENCE. If `isCrossRepository` could not be read, we
+  // do not know whether the base is the right place to ask.
+  check(headRepoOf({ headRepositoryOwner: null, headRepository: null }, "revnix/reeve") === null,
+    "and an UNREAD isCrossRepository does not permit the fallback either");
+
+  // The fallback is allowed where it is a fact rather than a guess.
+  const same = headRepoOf({ isCrossRepository: false, headRepositoryOwner: null, headRepository: null },
+                          "revnix/reeve");
+  check(same?.owner === "revnix" && same?.repo === "reeve",
+    "a same-repository pull request falls back to origin, where the head IS the base", JSON.stringify(same));
+  // Control: and a malformed origin is still not guessed at.
+  check(headRepoOf({ isCrossRepository: false }, "not-a-nwo") === null,
+    "control: and an origin that is not owner/name yields nothing rather than half a name");
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

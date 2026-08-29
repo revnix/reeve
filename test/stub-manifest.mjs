@@ -293,13 +293,21 @@ export const STUBS = [
               replace: '  GIT_DIR = join(REAL_ROOT, ".git");' }],
   },
   {
+    // COMPOUND, and it BECAME compound. Making the raw body inert used to be the
+    // only thing stopping a forged line from being classified; the verdict now
+    // comes from counters taken per stream, which a forged line never enters, so
+    // the two defences are redundant and removing either alone correctly changes
+    // nothing. The entry read NOT_CAUGHT honestly until it removed both.
     name: "inert-raw-body",
-    why: "classify the raw interleaved capture, where a line neither stream emitted can name the expected assertion",
+    why: "classify the raw interleaved capture AND read the verdict back out of it, where a line neither stream emitted can name the expected assertion",
     test: "test/stubsweep.test.mjs",
     expectRed: "an assertion forged by interleaving does not pass the sweep",
     edits: [{ file: "scripts/stub-sweep.mjs",
               find: '    const raw = (dropped ? `[${dropped} earlier byte(s) dropped]\\n${out}` : out)\n      .split("\\n").map(l => `  ${l}`).join("\\n");\n    const body = raw;',
-              replace: '    const body = dropped ? `[${dropped} earlier byte(s) dropped]\\n${out}` : out;' }],
+              replace: '    const body = dropped ? `[${dropped} earlier byte(s) dropped]\\n${out}` : out;' },
+            { file: "scripts/stub-sweep.mjs",
+              find: "              observed,\n",
+              replace: "" }],
   },
   {
     name: "ignored-fingerprint",
@@ -371,7 +379,7 @@ export const STUBS = [
     name: "observed-reaches-the-verdict",
     why: "compute the counters and never hand them to the classifier, which is the inert-seam regression this file already shipped once",
     test: "test/stubsweep.test.mjs",
-    expectRed: "the named assertion is counted even when 21,000 other failures fill the budget",
+    expectRed: "the runner's own counters reach the verdict: only-passes is WRONG_RED, not CRASHED",
     edits: [{ file: "scripts/stub-sweep.mjs",
               find: "              observed,\n",
               replace: "" }],

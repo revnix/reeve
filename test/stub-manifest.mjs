@@ -364,8 +364,8 @@ export const STUBS = [
               find: '["status", "--porcelain", "-z", "--ignored"]',
               replace: '["status", "--porcelain", "--ignored"]' },
             { file: "src/stubsweep.mjs",
-              find: "      if (i === buf.length || buf[i] === 0) {",
-              replace: "      if (i === buf.length || buf[i] === 0x0a) {" }],
+              find: "    if (i === buf.length || buf[i] === 0) { if (i > start) fields.push(buf.subarray(start, i)); start = i + 1; }",
+              replace: "    if (i === buf.length || buf[i] === 0x0a) { if (i > start) fields.push(buf.subarray(start, i)); start = i + 1; }" }],
   },
   {
     name: "porcelain-bytes",

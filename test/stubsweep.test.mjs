@@ -12,7 +12,7 @@
 import { applyEdit, validateManifest, classify, summarise, failedAssertions, describeMiss,
          reportedAnyAssertion, CAUGHT, NOT_CAUGHT, WRONG_RED, CRASHED, UNRUNNABLE, TIMED_OUT_EXIT }
   from "../src/stubsweep.mjs";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync, rmSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -25,6 +25,25 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail !== undefined) console.log("        " + detail); fail++; }
 };
 const threw = fn => { try { fn(); return null; } catch (e) { return e; } };
+
+// FIXTURES CLEAN UP AFTER THEMSELVES.
+//
+// Each block builds a throwaway git repository, and the sweep runs this file twice
+// per manifest entry -- 24 directories a run, about 1,600 a sweep. Left behind they
+// had reached 7,445 directories and 13 GB of temp on this machine, MEASURED, which
+// is litter in a shared location by exactly the argument this tool makes about
+// ignored artifacts.
+//
+// Registered rather than removed per block, because a block that fails an assertion
+// still has to leave the machine as it found it, and `process.exit` at the end of
+// this file runs exit handlers.
+const TEMPS = [];
+const tmpRoot = prefix => { const d = mkdtempSync(join(tmpdir(), prefix)); TEMPS.push(d); return d; };
+process.on("exit", () => {
+  // Best effort, and deliberately silent: a fixture that cannot be removed must not
+  // turn a green suite red, and must not mask the verdict this file exists to give.
+  for (const d of TEMPS) { try { rmSync(d, { recursive: true, force: true }); } catch { /* leave it */ } }
+});
 const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import.meta.url)));
 
 // --- applying an edit refuses anything ambiguous -------------------------------
@@ -246,7 +265,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
 // --- end to end: the runner must be able to come back non-zero -----------------
 {
   // A throwaway repository, so the real cleanliness guard stays strict.
-  const root = mkdtempSync(join(tmpdir(), "sweep-e2e-"));
+  const root = tmpRoot("sweep-e2e-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"),
     `export function safe(v) {\n  if (typeof v === "object") throw new Error("not a scalar");\n  return String(v);\n}\n`);
@@ -368,14 +387,14 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   //
   // Driven by sending a REAL signal, and synchronised on a marker file rather than
   // on a sleep, so it is not a timing race.
-  const root = mkdtempSync(join(tmpdir(), "sweep-sig-"));
+  const root = tmpRoot("sweep-sig-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   const SOURCE = `export const guard = true;\nexport function f() { return guard ? "ok" : "broken"; }\n`;
   writeFileSync(join(root, "src", "thing.mjs"), SOURCE);
   // OUTSIDE the repository. Kept inside, the marker is an untracked file, and the
   // final assertion — that the tree is clean — would fail on the test's own
   // artefact while reporting it as the sweep's wreckage.
-  const markerDir = mkdtempSync(join(tmpdir(), "sweep-marker-"));
+  const markerDir = tmpRoot("sweep-marker-");
   const marker = join(markerDir, "started");
   // Outside the fixture repository, so neither file shows as untracked and makes
   // the clean-tree assertion fail on the test's own artefacts.
@@ -512,12 +531,12 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // `join(ROOT, file)` happily produces a path outside the tree when the entry
   // contains `..`, and the runner would snapshot, modify and restore a file the
   // git guard cannot see — damaging a sibling project with nothing noticing.
-  const root = mkdtempSync(join(tmpdir(), "sweep-escape-"));
+  const root = tmpRoot("sweep-escape-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const a = 1;\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"), `console.log("PASS  the guard holds");\nprocess.exit(0);\n`);
   // A real sibling, outside the repository, that must be left alone.
-  const outsideDir = mkdtempSync(join(tmpdir(), "sweep-sibling-"));
+  const outsideDir = tmpRoot("sweep-sibling-");
   const outside = join(outsideDir, "victim.mjs");
   const VICTIM = `export const untouched = true;\n`;
   writeFileSync(outside, VICTIM);
@@ -544,7 +563,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // The startup guard proves the tree was clean when the sweep began. It cannot see
   // what deliberately broken code did while it ran, and the entry would otherwise
   // report CAUGHT and exit 0 with the repository dirty.
-  const root = mkdtempSync(join(tmpdir(), "sweep-side-"));
+  const root = tmpRoot("sweep-side-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"),
@@ -579,7 +598,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // A test that prints its named FAIL and then a megabyte of noise would have had
   // the evidence scrolled out of the capped tail, and the entry reported CRASHED —
   // failing the sweep even though the assertion did catch the stub.
-  const root = mkdtempSync(join(tmpdir(), "sweep-flood-"));
+  const root = tmpRoot("sweep-flood-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"),
@@ -615,7 +634,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // an untracked cache changes what the stubbed run does. If the stubbed run then
   // consumes and deletes it, the post-entry check sees a clean tree and reports
   // CAUGHT for a stub that would not have been caught from a clean start.
-  const root = mkdtempSync(join(tmpdir(), "sweep-precheck-"));
+  const root = tmpRoot("sweep-precheck-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   // The test litters on the PASSING (control) run and tidies up on the failing one.
@@ -648,7 +667,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // A suite printing many passing assertions before the relevant failure would
   // otherwise exhaust the budget on PASS lines, and the named FAIL — the one thing
   // the retention exists to preserve — still scrolls out of the capped tail.
-  const root = mkdtempSync(join(tmpdir(), "sweep-budget-"));
+  const root = tmpRoot("sweep-budget-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"),
@@ -680,7 +699,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // reaches the split, so the output cap never sees it, and the heap goes before
   // the timer or the restore handlers run. Which leaves the stub on disk: the very
   // failure the cap exists to prevent, arriving through the buffer that implements it.
-  const root = mkdtempSync(join(tmpdir(), "sweep-noline-"));
+  const root = tmpRoot("sweep-noline-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   const SOURCE = `export const guard = true;\n`;
   writeFileSync(join(root, "src", "thing.mjs"), SOURCE);
@@ -712,7 +731,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // unsupported scheme. The same class is reachable on POSIX: a `#` in a directory
   // name is a URL FRAGMENT, so importing the raw path silently addresses a
   // different file — or none. `pathToFileURL` encodes both.
-  const root = mkdtempSync(join(tmpdir(), "sweep-url#frag-"));
+  const root = tmpRoot("sweep-url#frag-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"),
@@ -739,7 +758,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
 {
   // Inside the root, so containment accepts it — and invisible to `git status`, so
   // a failed restore there would corrupt the repository with nothing noticing.
-  const root = mkdtempSync(join(tmpdir(), "sweep-gitdir-"));
+  const root = tmpRoot("sweep-gitdir-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"), `console.log("PASS  the guard holds");\nprocess.exitCode = 0;\n`);
@@ -766,7 +785,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // `git status --porcelain` reports clean both times when the artifact is
   // gitignored, so the stub reads as CAUGHT for a run that would not have been
   // caught from an untouched tree. This repository ignores exactly that kind of file.
-  const root = mkdtempSync(join(tmpdir(), "sweep-ignored-"));
+  const root = tmpRoot("sweep-ignored-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, ".gitignore"), "*.cache\n");
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
@@ -829,7 +848,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // guards a pointer while the real metadata sits elsewhere, and when that
   // elsewhere is an IGNORED path inside the tree, `git status` cannot see a failed
   // restore there either.
-  const root = mkdtempSync(join(tmpdir(), "sweep-sepgit-"));
+  const root = tmpRoot("sweep-sepgit-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"), `console.log("PASS  the guard holds");\nprocess.exitCode = 0;\n`);
@@ -896,7 +915,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // outcome separates the two cases, which is what made the pass meaningless
   // until the forging itself was established.
   {
-    const c = mkdtempSync(join(tmpdir(), "sweep-forge-control-"));
+    const c = tmpRoot("sweep-forge-control-");
     mkdirSync(join(c, "src")); mkdirSync(join(c, "test"));
     writeFileSync(join(c, "src", "thing.mjs"), `export const guard = false;\n`);
     writeFileSync(join(c, "test", "thing.test.mjs"), FORGING_TEST);
@@ -921,7 +940,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
       `interleaving and the two assertions below prove nothing, whatever they report`);
   }
 
-  const root = mkdtempSync(join(tmpdir(), "sweep-forge-"));
+  const root = tmpRoot("sweep-forge-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"), FORGING_TEST);
@@ -948,7 +967,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // existed: all readings carry the same `!! path`, so the stub is applied to
   // altered state and can read CAUGHT for a run that would not have been caught
   // from the untouched tree.
-  const root = mkdtempSync(join(tmpdir(), "sweep-overwrite-"));
+  const root = tmpRoot("sweep-overwrite-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, ".gitignore"), "*.cache\n");
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
@@ -985,7 +1004,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // Twenty thousand unrelated failures before the named one would otherwise fill
   // the retention budget, and the raw tail would scroll past it — so the entry
   // reads WRONG_RED for a stub the named assertion did catch.
-  const root = mkdtempSync(join(tmpdir(), "sweep-crowd-"));
+  const root = tmpRoot("sweep-crowd-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"),
@@ -1006,7 +1025,13 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
     env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
   const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
   check(r.status === 0,
-    "the named assertion is kept even when 21,000 other failures fill the budget", `exit=${r.status}\n        ${out.slice(-300)}`);
+    // "COUNTED", not "kept". What makes this true is no longer that the line
+    // survives retention -- it is that the failure was counted as it arrived. The
+    // old wording described the mechanism that USED to carry it, and an assertion
+    // whose name describes the wrong mechanism sends the next reader to the wrong
+    // code when it breaks.
+    "the named assertion is counted even when 21,000 other failures fill the budget",
+    `exit=${r.status}\n        ${out.slice(-300)}`);
   check(/CAUGHT/.test(out), "and the verdict is CAUGHT rather than WRONG_RED", out.slice(-260));
 }
 
@@ -1015,7 +1040,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // `sha` throws ENOENT on a file the test removed, the exception handler runs the
   // emergency restore, and the snapshot recreates it — silently undoing a deletion
   // somebody meant. What we cannot recognise as our own stub is not ours to replace.
-  const root = mkdtempSync(join(tmpdir(), "sweep-del-"));
+  const root = tmpRoot("sweep-del-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"),
@@ -1047,7 +1072,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // With two files and a bad anchor in the second, the first was already written
   // when the apply threw. `stubbedHashes` was never populated, so every file
   // compared as meddled and the written one was left stubbed with the tree dirty.
-  const root = mkdtempSync(join(tmpdir(), "sweep-partial-"));
+  const root = tmpRoot("sweep-partial-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   const A = `export const a = 1;\n`;
   writeFileSync(join(root, "src", "a.mjs"), A);
@@ -1080,7 +1105,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // fail, so the entry fingerprints `<unreadable>` in EVERY reading and a control
   // run that OVERWRITES it changes nothing the sweep can see -- which is the exact
   // hole fingerprinting was added to close, reopened for any awkward name.
-  const root = mkdtempSync(join(tmpdir(), "sweep-quoted-"));
+  const root = tmpRoot("sweep-quoted-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   // The control run OVERWRITES an artifact that already exists, so the path set is
@@ -1125,7 +1150,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // after the control run retargets it, and the retarget is invisible; hashing the
   // link TEXT sees it. That is what makes this fixture discriminating rather than
   // merely green -- content-hashing cannot pass it.
-  const root = mkdtempSync(join(tmpdir(), "sweep-link-"));
+  const root = tmpRoot("sweep-link-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "a.bin"), "identical");
   writeFileSync(join(root, "src", "b.bin"), "identical");
@@ -1168,7 +1193,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // contains the expected text used to set `namedKept`, spending the slot reserved
   // for the FAIL; unrelated failures then filled the budget and the real named
   // failure scrolled out, so the entry read WRONG_RED for a stub it had caught.
-  const root = mkdtempSync(join(tmpdir(), "sweep-passfirst-"));
+  const root = tmpRoot("sweep-passfirst-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"),
@@ -1203,7 +1228,7 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   // the budget but not the named reservation, so an expected FAIL written without a
   // trailing newline, after earlier failures had filled the budget, was discarded.
   // The raw body is deliberately inert, so nothing else could see it either.
-  const root = mkdtempSync(join(tmpdir(), "sweep-tail-"));
+  const root = tmpRoot("sweep-tail-");
   mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
   writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
   writeFileSync(join(root, "test", "thing.test.mjs"),

@@ -307,17 +307,17 @@ export const STUBS = [
     test: "test/stubsweep.test.mjs",
     expectRed: "an ignored artifact the control OVERWROTE voids the reading",
     edits: [{ file: "scripts/stub-sweep.mjs",
-              find: '        return `${l} ${createHash("sha256").update(readFileSync(abs)).digest("hex").slice(0, 16)}`;',
-              replace: "        return l;" }],
+              find: '  return h.digest("hex").slice(0, 16);',
+              replace: '  return "same";' }],
   },
   {
     name: "named-line-reserved",
     why: "let unrelated failures fill the retention budget so the named assertion is crowded out and the entry reads WRONG_RED",
     test: "test/stubsweep.test.mjs",
-    expectRed: "the named assertion is kept even when 21,000 other failures fill the budget",
+    expectRed: "the named assertion is counted even when 21,000 other failures fill the budget",
     edits: [{ file: "scripts/stub-sweep.mjs",
-              find: "      if (expectRed && !namedKept && ASSERTION_LINE.test(l) && l.includes(expectRed)) {",
-              replace: "      if (false) {" }],
+              find: "    if (isNamed) observed.namedFailSeen = true;",
+              replace: "    if (false) observed.namedFailSeen = true;" }],
   },
   {
     // The only entry here that stubs a FIXTURE rather than the runner, and it is

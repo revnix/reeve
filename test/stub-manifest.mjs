@@ -199,9 +199,13 @@ export const STUBS = [
     why: "stop rechecking the tree, so a stubbed test's litter passes unnoticed and later entries run against it",
     test: "test/stubsweep.test.mjs",
     expectRed: "a stub whose test litters the repository does not pass the sweep",
+    // Reports a CLEAN reading in the shape the code now expects, rather than a
+    // bare string. A stub whose replacement no longer type-checks against the
+    // surrounding code breaks a different assertion and reads as WRONG_RED — which
+    // is the sweep telling you the manifest has rotted, not that the guard failed.
     edits: [{ file: "scripts/stub-sweep.mjs",
               find: "  const after = treeState();",
-              replace: '  const after = "";' }],
+              replace: "  const after = { tracked: \"\", ignored: beforeStub.ignored };" }],
   },
   {
     name: "keep-verdict-lines",

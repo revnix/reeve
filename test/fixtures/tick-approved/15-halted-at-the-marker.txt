@@ -1,0 +1,21 @@
+== 1 SEAM LOG
+hub	[]
+hub	[]
+reapProvider	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"isAlive":"<fn>"}]
+hub	[]
+queuedRequests	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"repoId":7}]
+cancelQueued	[{"prepare":"<fn>","exec":"<fn>","close":"<fn>"},{"owner":"guardian","repoId":7,"runRef":"o/r#42:FIX_CI","isAlive":"<fn>"}]
+
+== 2 ESCALATIONS
+
+
+== 3 LOG FILE
+<ts> HALTED: <tmp> exists — no work will be started; releasing this guardian's scheduler claims and finishing what it already owed
+<ts> provider: withdrew a queued request while halted (o/r#42:FIX_CI)
+
+== 4 RESULT
+{"halted":true,"unreadable":null,"decisions":[]}
+
+== 5 CARRIED
+providerRetry: 
+cooldownRetry: 

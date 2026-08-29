@@ -12,7 +12,8 @@
 
 import { classifyFiles, verdictFor, pathsOf, branchOnlyPaths, gitFacts, safePath, exitFor,
          displayPath, toByteString, crossCheckState, parseArgs, summaryLine,
-         FILE_STATE, VERDICT, EXIT, ABSENT } from "../src/mergecheck.mjs";
+         FILE_STATE, VERDICT, EXIT, ABSENT,
+         refPath, branchStateFrom } from "../src/mergecheck.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -535,6 +536,60 @@ const F = "100644", X = "100755", L = "120000";
     mergedHead: "9232d4abbb", branchNow: "4e5df36ccc", branchRead: "read" });
   check(drifted.startsWith(VERDICT.drifted) && /DIFFERS FROM WHAT MERGED/.test(drifted),
     "a DRIFTED verdict carries the same warning -- the two facts are independent", drifted);
+}
+
+// ── Where the branch is now ─────────────────────────────────────────────────
+{
+  // A URL PATH, NOT A NAME. A `#` truncates the request at the fragment and the
+  // endpoint then answers about a PREFIX. REPRODUCED against revnix/reeve:
+  // `matching-refs/heads/fix#zzz` returned the thirty refs under `heads/fix/`,
+  // any one of which could have been compared as though it were the branch.
+  check(refPath("topic#part") === "topic%23part",
+    "a branch name is encoded for the URL, so a fragment cannot truncate the request", refPath("topic#part"));
+  // A bare `%` is not an escape, and gh rejects the URL before sending it -- so
+  // the read fails rather than answering wrongly, but it still fails.
+  check(refPath("topic%part") === "topic%25part",
+    "and a stray percent becomes a literal one rather than an invalid escape", refPath("topic%part"));
+  // THE SLASHES ARE REAL. Encoding the name whole would send `feat%2Fthing` and
+  // address nothing.
+  check(refPath("feat/verdict-names-its-head") === "feat/verdict-names-its-head",
+    "and an ordinary branch path is untouched, because its slashes are separators", refPath("feat/verdict-names-its-head"));
+  check(refPath("a b") === "a%20b", "and a space is encoded", refPath("a b"));
+
+  const listing = (ref, sha) => [{ ref, object: { sha } }];
+
+  const read = branchStateFrom(listing("refs/heads/feat/x", "4e5df36ccc"), "feat/x");
+  check(read.branchRead === "read" && read.branchNow === "4e5df36ccc",
+    "a listing containing the ref names the tip", JSON.stringify(read));
+
+  // GONE IS A POSITIVE READING. The listing succeeded and the ref is not in it.
+  const gone = branchStateFrom([], "feat/x");
+  check(gone.branchRead === "gone" && gone.branchNow === null,
+    "a listing that succeeded without the ref is the branch being GONE", JSON.stringify(gone));
+
+  // AND A FAILED CALL IS NOT A DELETED BRANCH. `git/ref` answers 404 both for an
+  // absent ref and for a repository the token cannot read -- private forks and
+  // fine-grained credentials produce the second, with a byte-identical body --
+  // so a 404 read as `gone` states a fact about the branch on the strength of an
+  // answer that may be about the credential, and does it on the one path where
+  // that suppresses a warning. There is no 404 to interpret here: only a
+  // successful listing reaches `gone`.
+  for (const [label, bad] of [["a failed call", null], ["an undefined body", undefined],
+                              ["an error object", { message: "Not Found" }], ["a bare string", "Not Found"]]) {
+    const r = branchStateFrom(bad, "feat/x");
+    check(r.branchRead === "unreadable", `${label} is UNREADABLE, never a deleted branch`, JSON.stringify(r));
+  }
+
+  // MATCHED IN FULL, because the endpoint matches by prefix: `heads/fix` returns
+  // every `refs/heads/fix/*`. Comparing loosely would read a sibling branch's
+  // tip as this branch's.
+  const sibling = branchStateFrom(listing("refs/heads/feat/x-longer", "deadbeef11"), "feat/x");
+  check(sibling.branchRead === "gone" && sibling.branchNow === null,
+    "a listing holding only a longer sibling is not this branch", JSON.stringify(sibling));
+  // Control: the same listing DOES answer for the branch it really names, so the
+  // check above is not passing merely because nothing ever matches.
+  check(branchStateFrom(listing("refs/heads/feat/x-longer", "deadbeef11"), "feat/x-longer").branchRead === "read",
+    "control: and that same listing does answer for the branch it names");
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

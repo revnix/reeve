@@ -100,6 +100,8 @@ the prose is stale. That includes this section.
 | the ntfy read user | **not created.** Needs shell on the founder's server |
 | what a real dispatch has proven | **nothing under the current contract.** The 2026-08-24 proof was a toy fixture |
 | the CI cost decision | **open, and it is the founder's.** §6 has three options and a recommendation |
+| the shadow agreement streak | **RESET on 2026-08-29** by a real divergence, from four days to zero. §9 has the diagnosis and why it is not merely a bug |
+| the projection's deletion gap | **diagnosed, NOT fixed.** §9. It is new work in this lane and needs the founder's go-ahead before it starts |
 | the peer session's lane | issue #50, the provider/hub session extraction. PR-0 merged; PR-1 in flight. They have committed to saying the moment it lands or is dropped |
 
 **Change them HERE and nowhere else**; elsewhere, write "see §0". That is enforced
@@ -131,6 +133,10 @@ effects reeve performs itself, with the `kind` CHECK widened through a table
 rebuild that carries rows across rather than refusing.
 
 Plus the merge-authority work in §5, and a docs commit recording it.
+
+**Since then, on 2026-08-29:** three further review rounds on the sweep pull
+request, which is still open (§0). §10 says exactly where it stands and what a
+resumed session should do with it.
 
 ---
 
@@ -414,6 +420,139 @@ of done; after that the guardian should go into maintenance and be touched when 
 fails, not when something could be better.
 
 **One caution about the evidence.** The move from shadow to enforcing is meant to
-rest on the shadow agreement streak reeve records itself. That streak measures the
-projection against a live read, and it should not be read as proving the review
-surface agrees.
+rest on the agreement streak reeve records itself (§0). It measures the projection
+against a live read, and it should not be read as proving the review surface
+agrees — §9 is what happens when it disagrees, and why that is the instrument
+working rather than failing.
+
+---
+
+## 9. The shadow divergence — diagnosed, not fixed
+
+The agreement streak reset (§0). This is what happened and why it matters more
+than one wrong number.
+
+### 9.1 What the daemon recorded
+
+```
+#1325: SHADOW DIVERGENCE — thread count differs: live 25, derived 26;
+                           resolved differs: live 18, derived 19
+```
+
+One extra thread in the projection, and that extra one counted as resolved.
+
+### 9.2 The cause, established by reading the code rather than guessing
+
+`derivePr` builds its view from EVERY `external_id` ever recorded in `inbox` for
+that pull request. `inbox_current` records which GENERATION an object is on — the
+Git blobs-and-refs split described in the 2026-08-28 handoff §4 — but there is no
+way to record that an object **no longer exists**.
+
+So when a thread disappears from GitHub, which a deleted review comment does, the
+projection keeps it for ever. Its last stored payload said `is_resolved: true`, so
+it is counted in `total` AND in `resolved`. That is exactly the shape observed:
+one extra, and resolved.
+
+`src/review/shadow.mjs` is correct, and its own comment predicted this: *"a
+mismatch means ingest lost one or invented one."* It invented one.
+
+### 9.3 Why the fix is not a small patch
+
+`observe()` already computes completeness — `readable: total !== null && seen >=
+total`. An absent object may only be treated as deleted when the read was
+COMPLETE. In a truncated read, absence is not deletion, and acting on it would
+erase live threads from the projection.
+
+That is the never-read-absence rule with unusually high stakes: get it wrong and
+the projection silently drops threads that gate a merge. The shape to build is a
+presence marker on `inbox_current`, written only for a readable observation, with
+`derivePr` excluding absent rows — the append-only `inbox` untouched.
+
+### 9.4 Why it was not started
+
+Three reasons, all of which a resumed session should weigh again rather than
+inherit:
+
+- it is new work rather than a review round, and the founder's priority order puts
+  open pull requests first;
+- the failure mode of a wrong fix is severe, so it wants the full stub-sweep
+  treatment rather than a quick patch;
+- and **it is not urgent**: reeve is unarmed (§0), so nothing acts on the
+  projection today. What it blocks is ARMING — §8's item 2 and 3 both rest on the
+  streak being trustworthy evidence, and it is not while this stands.
+
+Fixing it does not restore the streak. It starts a fresh one from a correct
+baseline, which is the honest outcome and worth saying out loud before anyone
+reads a short streak as a regression.
+
+---
+
+## 10. The sweep pull request, and what a resumed session should do with it
+
+It is open (§0), it is this lane's, and its branch lives in the worktree
+`~/Work/Products/reeve-wt/sweep`. Authorship cannot identify it — every pull
+request is pushed as the founder — so identify it by the FILES it touches:
+`scripts/stub-sweep.mjs`, `src/stubsweep.mjs`, `test/stub-manifest.mjs`,
+`test/stubsweep.test.mjs`. The peer session has committed to staying out of all
+four.
+
+### 10.1 Why it exists at all
+
+An earlier sweep pull request merged at a head its branch had already moved past,
+so six fixes were answered on the pull request and never landed. This one carries
+them plus everything since. It takes the manifest from fourteen entries back to
+twenty-seven.
+
+### 10.2 What round three fixed
+
+Four findings, three of them P1:
+
+- **The real git directory is resolved, not assumed.** `.git` is a 63-byte POINTER
+  FILE in a worktree or a separate-git-dir repository — measured on this machine —
+  so a hard-coded `<root>/.git` guards a pointer while the metadata sits
+  elsewhere. Resolved through `git rev-parse --absolute-git-dir`, and the literal
+  pointer is refused too, because rewriting it redirects the repository.
+- **A line forged by INTERLEAVING can no longer be classified.** The raw capture is
+  two streams as they arrived, so stdout writing `FAIL  wrong assertion` unterminated
+  and stderr writing ` the guard holds\n` concatenates into an assertion neither
+  stream emitted. Every raw line is indented, so none of them can match the
+  protocol's anchor; only the per-stream reconstruction is classifiable.
+- **Ignored artifacts are fingerprinted by content**, not listed by path, because a
+  control run overwriting an existing ignored cache leaves every path reading
+  identical. Files are hashed; DIRECTORIES are not, and that limit is stated in the
+  source rather than hidden — an artifact created inside an already-ignored
+  directory is not detected.
+- **The named assertion is reserved outside the retention budget**, so twenty
+  thousand unrelated failures before it cannot crowd it out and make the entry read
+  `WRONG_RED` for a stub it did catch.
+
+### 10.3 The part worth reading before touching it
+
+**All four fixes were initially UNVERIFIED.** Every stub left the suite green. The
+fixes were written, reviewed by eye, and proved nothing — the sweep caught it only
+because it was run before pushing.
+
+Then TWO of the four tests written to close that gap could not exhibit their
+defect either:
+
+- the separate-git-dir fixture wrote its manifest AFTER committing, so the runner
+  refused for a DIRTY TREE rather than for git metadata. Both refusals exit 2, so
+  the first assertion passed on entirely the wrong cause; only a second assertion
+  on WHY it refused caught it;
+- and the forged-line fixture's two stdout writes coalesced into one data event
+  before stderr's arrived, so no interleaving ever reached the parent. Pauses
+  between the writes were needed to make the condition happen at all.
+
+All four are now caught, each against a tree that can genuinely exhibit its defect,
+and all four are in the manifest.
+
+### 10.4 The rule that fell out of it
+
+**When several causes share one observable outcome, assert the cause and not the
+outcome.** Exit code 2 meant both "refused for git metadata" and "refused because
+the tree was dirty". Nothing but a second assertion on the reason separated them.
+
+That belongs with §7's family, and it is the sixth instance in this pull request
+lineage. The pattern in WHERE they land is now unambiguous: it is almost always
+the FIXTURE, not the assertion. The assertion states the right property; the tree
+it runs against cannot produce the condition.

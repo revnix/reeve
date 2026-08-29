@@ -220,13 +220,21 @@ export const STUBS = [
               replace: "  const after = { tracked: \"\", ignored: beforeStub.ignored };" }],
   },
   {
+    // COMPOUND, and it BECAME compound, like `inert-raw-body`. Prepending the kept
+    // assertions used to be the only thing keeping a buried failure reachable; the
+    // verdict now comes from counters that never consult the tail, so prepending is
+    // the HUMAN's evidence rather than the verdict's and removing it alone correctly
+    // changes nothing. Both halves, or the entry reports NOT_CAUGHT honestly.
     name: "keep-verdict-lines",
-    why: "discard assertion lines with the output tail, so a noisy failure reads as CRASHED",
+    why: "discard assertion lines with the output tail AND read the verdict back out of that tail, so a noisy failure reads as CRASHED",
     test: "test/stubsweep.test.mjs",
     expectRed: "a named assertion still counts when the failure buries it",
     edits: [{ file: "scripts/stub-sweep.mjs",
               find: '              output: kept.length ? `${kept.join("\\n")}\\n${body}` : body });',
-              replace: "              output: body });" }],
+              replace: "              output: body });" },
+            { file: "scripts/stub-sweep.mjs",
+              find: "              observed,\n",
+              replace: "" }],
   },
   {
     // BOTH defences at once, and deliberately so.
@@ -293,13 +301,21 @@ export const STUBS = [
               replace: '  GIT_DIR = join(REAL_ROOT, ".git");' }],
   },
   {
+    // COMPOUND, and it BECAME compound. Making the raw body inert used to be the
+    // only thing stopping a forged line from being classified; the verdict now
+    // comes from counters taken per stream, which a forged line never enters, so
+    // the two defences are redundant and removing either alone correctly changes
+    // nothing. The entry read NOT_CAUGHT honestly until it removed both.
     name: "inert-raw-body",
-    why: "classify the raw interleaved capture, where a line neither stream emitted can name the expected assertion",
+    why: "classify the raw interleaved capture AND read the verdict back out of it, where a line neither stream emitted can name the expected assertion",
     test: "test/stubsweep.test.mjs",
     expectRed: "an assertion forged by interleaving does not pass the sweep",
     edits: [{ file: "scripts/stub-sweep.mjs",
               find: '    const raw = (dropped ? `[${dropped} earlier byte(s) dropped]\\n${out}` : out)\n      .split("\\n").map(l => `  ${l}`).join("\\n");\n    const body = raw;',
-              replace: '    const body = dropped ? `[${dropped} earlier byte(s) dropped]\\n${out}` : out;' }],
+              replace: '    const body = dropped ? `[${dropped} earlier byte(s) dropped]\\n${out}` : out;' },
+            { file: "scripts/stub-sweep.mjs",
+              find: "              observed,\n",
+              replace: "" }],
   },
   {
     name: "ignored-fingerprint",
@@ -307,17 +323,17 @@ export const STUBS = [
     test: "test/stubsweep.test.mjs",
     expectRed: "an ignored artifact the control OVERWROTE voids the reading",
     edits: [{ file: "scripts/stub-sweep.mjs",
-              find: '        return `${l} ${createHash("sha256").update(readFileSync(abs)).digest("hex").slice(0, 16)}`;',
-              replace: "        return l;" }],
+              find: '  return h.digest("hex").slice(0, 16);',
+              replace: '  return "same";' }],
   },
   {
     name: "named-line-reserved",
     why: "let unrelated failures fill the retention budget so the named assertion is crowded out and the entry reads WRONG_RED",
     test: "test/stubsweep.test.mjs",
-    expectRed: "the named assertion is kept even when 21,000 other failures fill the budget",
+    expectRed: "the named assertion is counted even when 21,000 other failures fill the budget",
     edits: [{ file: "scripts/stub-sweep.mjs",
-              find: "      if (expectRed && !namedKept && ASSERTION_LINE.test(l) && l.includes(expectRed)) {",
-              replace: "      if (false) {" }],
+              find: "    if (isNamed) observed.namedFailSeen = true;",
+              replace: "    if (false) observed.namedFailSeen = true;" }],
   },
   {
     // The only entry here that stubs a FIXTURE rather than the runner, and it is
@@ -334,5 +350,96 @@ export const STUBS = [
     edits: [{ file: "test/stubsweep.test.mjs",
               find: "    `  const pause = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);\\n` +",
               replace: "    `  const pause = () => {};\\n` +" }],
+  },
+  {
+    // BOTH halves, because they are one mechanism: asking git for `-z` and reading
+    // NUL-separated fields. Reverting only the flag leaves the parser splitting a
+    // newline-delimited blob on NUL and reading one enormous field, which fails for
+    // a reason that has nothing to do with quoting.
+    name: "porcelain-z",
+    why: "read the human-readable porcelain form, where a path holding a space is C-QUOTED and the quoted string is not the path",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "an ignored artifact with a QUOTED name still voids the reading",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: '["status", "--porcelain", "-z", "--ignored"]',
+              replace: '["status", "--porcelain", "--ignored"]' },
+            { file: "scripts/stub-sweep.mjs",
+              find: 'const fields = String(raw).split("\\0");',
+              replace: 'const fields = String(raw).split("\\n");' }],
+  },
+  {
+    name: "symlink-by-target-text",
+    why: "stop hashing an ignored symlink's target text, so every symlink fingerprints as one constant and retargeting it is invisible",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "an ignored symlink RETARGETED by the control run voids the reading",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "  if (st.isSymbolicLink()) {",
+              replace: "  if (false) {" }],
+  },
+  {
+    // SINGLE-PURPOSE, and that is the whole point of it. This exact regression
+    // shipped: `observed` was computed correctly and never put on the resolved run,
+    // so `classify` took its documented fallback and the counting path was inert.
+    // The suite stayed green -- both paths return the same verdict when the new one
+    // is unused -- and two COMPOUND entries reported CAUGHT for the other half of
+    // their stub, which is what hid it. A compound stub cannot say which defence
+    // carried the entry, so a seam whose wiring is unproven needs one of these.
+    name: "observed-reaches-the-verdict",
+    why: "compute the counters and never hand them to the classifier, which is the inert-seam regression this file already shipped once",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "the runner's own counters reach the verdict: only-passes is WRONG_RED, not CRASHED",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "              observed,\n",
+              replace: "" }],
+  },
+  {
+    name: "verdict-from-observed",
+    why: "derive the verdict by re-reading the retained buffer, so what a run REPORTED and what SURVIVED retention become the same question",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "a stubbed run reporting only PASSes is WRONG_RED rather than CRASHED",
+    edits: [{ file: "src/stubsweep.mjs",
+              find: "  const anyAssertion = observed ? observed.anyAssertionSeen : reportedAnyAssertion(stubOutput);",
+              replace: "  const anyAssertion = reportedAnyAssertion(stubOutput);" }],
+  },
+  {
+    // COMPOUND, and it has to be. Two independent defences stop a PASS from
+    // crowding out the named FAIL: ingestion keys the reservation on FAIL, and the
+    // verdict does not read the retention buffer at all. Removing either alone
+    // changes nothing observable, and the entry would read NOT_CAUGHT correctly.
+    name: "pass-cannot-spend-the-reservation",
+    why: "let a PASS naming the expected text spend the reserved slot, AND let the verdict be read back out of the buffer that then evicts the real failure",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "a PASS naming the expected text does not crowd out the named FAIL",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: '    if (m[1] !== "FAIL") return;',
+              replace: '    if (m[1] !== "FAIL") { if (expectRed && m[2].trim().includes(expectRed)) namedKept = true; return; }' },
+            { file: "src/stubsweep.mjs",
+              find: "  const failures = observed ? observed.failures : failedAssertions(stubOutput);",
+              replace: "  const failures = failedAssertions(stubOutput);" },
+            { file: "src/stubsweep.mjs",
+              find: "  const namedFailed = observed\n    ? observed.namedFailSeen\n    : failures.some(f => f.includes(expectRed));",
+              replace: "  const namedFailed = failures.some(f => f.includes(expectRed));" }],
+  },
+  {
+    // COMPOUND for the same reason: the tails going through the one ingestion site,
+    // and the verdict not being read back out of the buffer, are both sufficient.
+    name: "tails-go-through-ingest",
+    why: "give the close-time tails their own copy of the rules again — the budget without the named reservation — AND read the verdict back out of the buffer",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "an unterminated named FAIL after the budget fills is still counted",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "    for (const tail of [partial.out, partial.err]) if (tail) ingest(tail);",
+              replace: "    for (const tail of [partial.out, partial.err]) {\n" +
+                       "      const m = tail && ASSERTION_LINE.exec(tail);\n" +
+                       "      if (m && m[1] === \"FAIL\" && kept.length < MAX_ASSERTION_LINES && keptBytes < MAX_ASSERTION_BYTES) {\n" +
+                       "        kept.push(tail); keptBytes += tail.length;\n" +
+                       "      }\n" +
+                       "    }" },
+            { file: "src/stubsweep.mjs",
+              find: "  const failures = observed ? observed.failures : failedAssertions(stubOutput);",
+              replace: "  const failures = failedAssertions(stubOutput);" },
+            { file: "src/stubsweep.mjs",
+              find: "  const namedFailed = observed\n    ? observed.namedFailSeen\n    : failures.some(f => f.includes(expectRed));",
+              replace: "  const namedFailed = failures.some(f => f.includes(expectRed));" }],
   },
 ];

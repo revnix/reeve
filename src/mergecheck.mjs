@@ -248,12 +248,12 @@ export function summaryLine({ verdict, repo, pr, squash, mergedHead, branchNow, 
   // is most likely to have got wrong, so it goes in the line nobody skips. The
   // other two states are a SCOPE, not an event, and scopes belong in the scope
   // paragraph where they are printed without competing with a verdict.
-  const held = localRef === "differs"
+  const heldNote = localRef === "held"
     ? "  *** THIS CLONE HOLDS A COMMIT ON THAT BRANCH THAT THE REMOTE DOES NOT. It was never pushed, so nothing here can say whether it matters. ***"
     : "";
   return bits.join("  ") + (differs
     ? "  *** THE BRANCH TIP DIFFERS FROM WHAT MERGED. Whether that difference reached main is NOT established here -- check it. ***"
-    : "") + held;
+    : "") + heldNote;
 }
 
 /**
@@ -286,16 +286,40 @@ export function refPath(name) {
  * `branch-now == merged-head` was true the whole time. Nothing in the verdict
  * could have distinguished that from having nothing left to do.
  *
- * Git refs are shared across worktrees, so this is readable even when the branch
- * is checked out somewhere else entirely.
+ * TAKES A COUNT, NOT TWO TIPS. Unequal tips do not mean the local side holds
+ * anything: a clone that has simply not fetched is BEHIND, every one of its
+ * commits already on the remote, and comparing tips calls that held work. That
+ * is the same mistake as reading an unequal branch tip as "commits missing from
+ * main", one layer out -- an inequality read as a particular cause. MEASURED
+ * here: a local ref two commits behind main has unequal tips and contributes
+ * ZERO commits the remote lacks.
  *
- * Three states, and the third is the point: an ABSENT local ref is not evidence
- * of nothing outstanding. It means this clone was not asked, or does not have
- * the branch, and saying so is the difference between a scope and a silence.
+ * The sound question is how many commits the local tip contributes that are not
+ * reachable from the remote tip, which `git rev-list --count <remote>..<local>`
+ * answers. `null` means it could not be computed -- an absent branch, or a
+ * remote object this clone has never fetched -- and that is UNCHECKED, because
+ * an unanswerable question is not a negative answer.
  */
-export function localRefState(localTip, remoteTip) {
-  if (!localTip || !remoteTip) return "unchecked";
-  return localTip === remoteTip ? "same" : "differs";
+export function localRefState(ahead) {
+  if (ahead === null || ahead === undefined || Number.isNaN(Number(ahead))) return "unchecked";
+  return Number(ahead) > 0 ? "held" : "contained";
+}
+
+/**
+ * Whether the local refs are even the right universe to ask.
+ *
+ * For a cross-repository pull request `branchNow` was read from the
+ * CONTRIBUTOR'S FORK, while `refs/heads/<name>` in this checkout belongs to
+ * whatever repository this clone is. A branch of the same name here is an
+ * unrelated branch, and comparing them produces the loudest warning the tool has
+ * over two things that were never the same branch.
+ *
+ * So the local half is asked only when this clone IS the head repository.
+ * Anything else is unchecked, and says so.
+ */
+export function localRefApplies(headRepoIds, originNwo) {
+  if (!headRepoIds?.owner || !headRepoIds?.repo || !originNwo) return false;
+  return `${headRepoIds.owner}/${headRepoIds.repo}`.toLowerCase() === String(originNwo).toLowerCase();
 }
 
 /**
@@ -371,11 +395,11 @@ export function branchStateFrom(refs, headRefName) {
  * the sentence stops where the measurement does.
  */
 export function scopeOfLocal(localRef) {
-  if (localRef === "same")
-    return "Its local branch matches the remote, so nothing is outstanding IN COMMITS -- uncommitted work in a worktree is not visible to any of this.";
-  if (localRef === "differs")
-    return "Its local branch holds at least one commit the remote does not, flagged above.";
-  return "The LOCAL side was not checked: this clone has no such branch, or its tip could not be read. That is not evidence that nothing is outstanding.";
+  if (localRef === "contained")
+    return "Every commit on its local branch is reachable from the remote tip, so nothing is outstanding IN COMMITS -- uncommitted work in a worktree is not visible to any of this, and a branch merely BEHIND the remote reads the same way.";
+  if (localRef === "held")
+    return "Its local branch contributes at least one commit that is not reachable from the remote tip, flagged above.";
+  return "The LOCAL side was not checked: this clone is not the head repository, has no such branch, or could not reach the remote commit to compare against. That is not evidence that nothing is outstanding.";
 }
 
 export function exitFor(verdict) {

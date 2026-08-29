@@ -220,13 +220,21 @@ export const STUBS = [
               replace: "  const after = { tracked: \"\", ignored: beforeStub.ignored };" }],
   },
   {
+    // COMPOUND, and it BECAME compound, like `inert-raw-body`. Prepending the kept
+    // assertions used to be the only thing keeping a buried failure reachable; the
+    // verdict now comes from counters that never consult the tail, so prepending is
+    // the HUMAN's evidence rather than the verdict's and removing it alone correctly
+    // changes nothing. Both halves, or the entry reports NOT_CAUGHT honestly.
     name: "keep-verdict-lines",
-    why: "discard assertion lines with the output tail, so a noisy failure reads as CRASHED",
+    why: "discard assertion lines with the output tail AND read the verdict back out of that tail, so a noisy failure reads as CRASHED",
     test: "test/stubsweep.test.mjs",
     expectRed: "a named assertion still counts when the failure buries it",
     edits: [{ file: "scripts/stub-sweep.mjs",
               find: '              output: kept.length ? `${kept.join("\\n")}\\n${body}` : body });',
-              replace: "              output: body });" }],
+              replace: "              output: body });" },
+            { file: "scripts/stub-sweep.mjs",
+              find: "              observed,\n",
+              replace: "" }],
   },
   {
     // BOTH defences at once, and deliberately so.

@@ -20,7 +20,14 @@ import { openHubAsGuest } from "../../src/build/hubguest.mjs";
 // They are imported HERE so the harness can put a recording wrapper in ctx --
 // otherwise `(ctx.reapProvider ?? reapProviderLeases)` runs the real one and the
 // call never appears in the signature.
-import { reapProviderLeases, cancelQueued, bindProviderLease, heartbeatProvider } from "../../src/provider.mjs";
+// A NAMESPACE, not named bindings. `run()` takes options named after the seams
+// it overrides, so a named import shares its identifier with a parameter and the
+// parameter WINS inside the function -- silently, because the result is
+// `undefined` rather than an error. MEASURED: `FALLBACKS.cancelQueued` resolved
+// to the (absent) parameter, so that seam was never installed and every tick ran
+// the production function unrecorded, while the block below looked like it
+// covered five seams and covered four. A namespace cannot collide.
+import * as provider from "../../src/provider.mjs";
 import { queuedGuardianRequests } from "../../src/build/providerdb.mjs";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -30,6 +37,10 @@ import { CLAUSE_IDS } from "../../src/verdict.mjs";
 // The fixture's evaluation payload. It lives HERE because run() closes over it;
 // leaving it in the suite would make the harness depend on its importer.
 export const HEAD = "b".repeat(40);
+// The incarnation token the default claim hands back. Exported so a caller can
+// assert the release carries the token the claim issued rather than merely
+// carrying one.
+export const CLAIM_TOKEN = "tok-fixture-1";
 const cl = (id, state, detail = "") => ({ id, state, detail });
 export const EVAL = {
   ok: true, pr: 42, state: "open", head: HEAD, title: "t", headRef: "f", baseRef: "main",
@@ -43,7 +54,7 @@ export const EVAL = {
 
 export const run = async ({ hub, repoId = 7, claim, release, containmentThrows = false, hubGetter,
                     heartbeatMs, providerHeartbeat, spawnWorker, capacity,
-                    queuedRequests, cancelQueued, measureContainment,
+                    queuedRequests, cancelQueued, measureContainment, noteRateLimit,
                     resolveRepoIdFn, project, keepDir = false, seams = null,
                     haltMarker, openPrs, queuedNow } = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "reeve-prov-"));
@@ -75,7 +86,20 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     // vacuous. Production always has a project; the test that asserts over the
     // connection must too.
     ...(project ? { project } : {}),
-    providerClaim: (db, a) => { claims.push(a); return (claim ?? (() => ({ ok: true, id: claims.length })))(a); },
+    // PRODUCTION'S SHAPE, not a truncation of it. `claimProvider` answers
+    // { ok, id, token, owner, repoId, runRef }, and the TOKEN is the fence that
+    // stops a release issued before a restore from deleting a lease that has
+    // since been reused by someone else. A default answering only { ok, id }
+    // made the daemon carry `token: got.token ?? null` into every release, so a
+    // recorded release read `"token":null` and dropping the token from the
+    // release path changed nothing observable. It is a fixed string rather than
+    // a generated one because the fixture is built fresh per run: the value is
+    // behaviour to be compared, not noise to be normalised.
+    providerClaim: (db, a) => {
+      claims.push(a);
+      return (claim ?? ((asked) => ({ ok: true, id: claims.length, token: CLAIM_TOKEN,
+                                      owner: asked.owner, repoId: asked.repoId, runRef: asked.runRef })))(a);
+    },
     providerRelease: (db, a) => { releases.push(a); return (release ?? (() => ({ ok: true })))(a); },
     openPrs: () => [42],
     // `observe` reaches the network, and unstubbed it dominated this file's runtime:
@@ -94,6 +118,11 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     ...(queuedRequests ? { queuedRequests } : {}),
     ...(cancelQueued ? { cancelQueued } : {}),
     ...(measureContainment ? { measureContainment } : {}),
+    // The cooldown recorder. Injectable because it REFUSES rather than throws
+    // while a restore holds the hub, and a refusal is the branch that carries the
+    // note to the next tick -- a scenario cannot reach that branch without
+    // saying so here.
+    ...(noteRateLimit ? { noteRateLimit } : {}),
     oauthToken: () => ({ ok: true, token: "sk-ant-oat01-test-token-not-a-real-credential", why: null }),
     resolveCause: () => ({ ok: true, job: "unit", step: "t", cause: [{ where: "x:1", message: "boom" }] }),
     prepareCheckout: () => ({ ok: true, path: dir, why: null, deps: { ok: true, cow: false } }),
@@ -114,13 +143,21 @@ export const run = async ({ hub, repoId = 7, claim, release, containmentThrows =
     // that housekeeping leaves the signature green. MEASURED: before this, the
     // happy-path artifact contained zero reaper and zero queue calls.
     const FALLBACKS = {
-      reapProvider: reapProviderLeases,
-      cancelQueued,
-      providerBind: bindProviderLease,
-      providerHeartbeat: heartbeatProvider,
+      reapProvider: provider.reapProviderLeases,
+      cancelQueued: provider.cancelQueued,
+      providerBind: provider.bindProviderLease,
+      providerHeartbeat: provider.heartbeatProvider,
+      noteRateLimit: provider.noteRateLimit,
       queuedRequests: queuedGuardianRequests,
     };
     for (const [op, fn] of Object.entries(FALLBACKS)) {
+      // LOUD, because the failure it catches is silent. A fallback that is not a
+      // function installs nothing, the wrapper below skips it, the daemon reaches
+      // past ctx to the production import, and the seam simply never appears --
+      // an artifact missing a whole seam looks exactly like a scenario that did
+      // not reach it.
+      if (typeof fn !== "function")
+        throw new Error(`tick-harness: no fallback for the "${op}" seam (got ${typeof fn}); it would run unrecorded`);
       if (typeof ctx[op] !== "function") ctx[op] = fn;
     }
     for (const [op, inner] of Object.entries(ctx)) {

@@ -38,7 +38,7 @@ import { run, CLAIM_TOKEN, SCHEDULER_SEAMS } from "./fixtures/tick-harness.mjs";
 // naming an outcome the supervisor had since renamed, and the branch it is meant
 // to reach would simply stop being taken.
 import { OUTCOMES } from "../src/supervisor.mjs";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, mkdtempSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -170,6 +170,21 @@ const REDACTIONS = [
     },
     cameFromTheHost: (t) => [...t.matchAll(EPOCH_RE)]
       .some((m) => Math.abs(Number(m[2]) - Date.now() / 1000) < 3600) },
+
+  // THE LAST BACKUP'S CLOCK. `measureContainment` is handed the whole `ctx`,
+  // which carries `lastBackupAt` -- a stamp written during the tick, so it
+  // differs on every run. FOUND by the artifact comparison on the run after the
+  // scenario that first reached this seam was approved: the scenario was
+  // non-deterministic from the moment it existed, and the determinism control
+  // could not see it because that control runs a different pair of scenarios.
+  //
+  // Its OWN pattern rather than the cooldown's, though both are clocks. Sharing
+  // the cooldown's origin would express this stamp as a distance from a rate
+  // limit it has nothing to do with -- deterministic, and meaningless.
+  { name: "last backup clock", kind: "provenance",
+    apply: (s) => s.replace(/"lastBackupAt"\s*:\s*\d+/g, '"lastBackupAt":<epoch>'),
+    cameFromTheHost: (t) => [...t.matchAll(/"lastBackupAt"\s*:\s*(\d+)/g)]
+      .some((m) => Math.abs(Number(m[1]) - Date.now() / 1000) < 3600) },
 
   // MEASURED: six scenarios failed in CI against artifacts approved locally,
   // with no change to the tick at all. `spawnWorker` records an allow-rule
@@ -316,6 +331,11 @@ const optionsOf = (o) => (typeof o === "function" ? o() : o);
 // What a previous tick left owed. A distinct pull request and lease id from
 // anything this tick takes, so a release of THIS is never confusable with a
 // release of the one the tick claims for itself.
+// An EXISTING file, because `halted()` is an existence check. Under the
+// temporary root, so the redactor normalises it like every other fixture path.
+const HALT_MARKER = join(mkdtempSync(join(tmpdir(), "reeve-halt-")), "HALT");
+writeFileSync(HALT_MARKER, "");
+
 const CARRIED_RELEASE = [["o/r#41:FIX_CI",
   { owner: "guardian", repoId: 7, runRef: "o/r#41:FIX_CI", id: 9, token: "tok-carried-9" }]];
 
@@ -374,6 +394,38 @@ const SCENARIOS = [
 
   // A queued request for work this tick did not ask for is WITHDRAWN.
   ["13-withdraw-a-request-not-asked-for", { queuedRequests: () => [{ run_ref: "o/r#99:FIX_CI" }] }],
+
+  // ── The paths no artifact was watching ──────────────────────────────────────
+  //
+  // MEASURED, by handing each hub accessor a WRONG handle and recording which
+  // artifacts moved: four of the fourteen sites moved NONE. The halt path, the
+  // canary's two, and the builder-hold read were outside the signature
+  // entirely, so "the artifacts stay byte-identical" said nothing about them and
+  // a rewrite could have pointed any of them anywhere.
+  //
+  // Two of the three levers needed to reach them were INERT -- `haltMarker` was
+  // a declared option the harness never placed in ctx, and `openPrs` sat beside
+  // a hardcoded literal that ignored it. An option that reaches nothing is worse
+  // than an absent one: it reads as coverage.
+
+  // The halt switch, which stops the tick and withdraws this guardian's queued
+  // requests on the way out.
+  ["15-halted-at-the-marker", { haltMarker: HALT_MARKER,
+                                queuedRequests: () => [{ run_ref: "o/r#42:FIX_CI" }] }],
+
+  // The canary runs only when containment could NOT be measured, which is what
+  // `containmentThrows` produces. It claims and rebinds a lease of its own.
+  // `containmentThrows` empties `ctx.containment`, which is what makes the tick
+  // MEASURE it -- and the canary claims a lease of its own to do that. The
+  // measurement must come back CLOSED or the tick refuses to dispatch and the
+  // canary's own hub reads are never reached, which is exactly what the first
+  // version of this scenario did.
+  ["16-canary-claims-before-dispatch", {
+    containmentThrows: true,
+    measureContainment: async () => ({ credentialRead: "closed", why: "measured in the fixture",
+                                       canary: { ran: true, evidence: { outcome: "ok" } } }),
+    providerBind: () => ({ ok: true, bound: 1 }),
+  }],
 
   // A worker that announces itself is BOUND to the lease, and one that outlives
   // an interval is HEARTBEATED. A thunk, because the promise below must be fresh

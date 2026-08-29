@@ -184,6 +184,45 @@ export const EXIT = Object.freeze({
   drifted: 32,      // it merged, and main has moved since
 });
 
+/**
+ * The one-line summary.
+ *
+ * IT NAMES THE HEAD, and it says when the branch has moved past the merge.
+ *
+ * MEASURED IN USE: a pull request merged at one head while its branch had
+ * advanced to another; six commits pushed after that head never reached main.
+ * This tool answered MERGED, AND INTACT ON MAIN, which was TRUE -- it compares
+ * main against the squash, which is the question it takes -- and it printed the
+ * divergence note. The note was read as decoration, because a clean verdict is
+ * persuasive enough that a warning beside it does not survive a skim. What
+ * caught it was an unrelated COUNT.
+ *
+ * A caveat that only works on an already-suspicious reader is not doing the
+ * job, so the fact moves into the line nobody skips. Two shas on screen beat
+ * one on screen and one in memory.
+ *
+ * AND AN UNREAD HEAD SAYS SO. If `pull/<n>/head` could not be fetched there is
+ * no divergence check at all, and silence there is indistinguishable from
+ * agreement -- the failure this whole tool exists to remove.
+ */
+export function summaryLine({ verdict, repo, pr, squash, mergedHead, branchNow, branchRead }) {
+  const bits = [`${verdict}  ${repo ?? "?"}#${pr ?? "?"}`];
+  if (squash) bits.push(`squash=${String(squash).slice(0, 7)}`);
+  if (mergedHead) bits.push(`merged-head=${String(mergedHead).slice(0, 7)}`);
+
+  // `branchRead` is a three-way answer and each arm says something different.
+  if (branchRead === "gone") return bits.join("  ") + "  branch=deleted";
+  if (branchRead !== "read") {
+    return bits.join("  ")
+      + "  branch=UNREAD  *** could not read the branch, so whether it moved past this merge is UNKNOWN ***";
+  }
+  const moved = branchNow && mergedHead && String(branchNow) !== String(mergedHead);
+  bits.push(`branch-now=${String(branchNow).slice(0, 7)}`);
+  return bits.join("  ") + (moved
+    ? "  *** THE BRANCH HAS MOVED PAST THIS MERGE. Commits pushed after it merged are NOT on main and are NOT covered by this verdict. ***"
+    : "");
+}
+
 export function exitFor(verdict) {
   if (verdict === VERDICT.intact) return EXIT.ok;
   if (verdict === VERDICT.drifted) return EXIT.drifted;

@@ -29,7 +29,8 @@
  *  · it proves a stub landed by a HASH CHANGE rather than by re-reading the file
  *    for the anchor. Confirmation greps have been measured inert here.
  */
-import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync, realpathSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync, realpathSync,
+         lstatSync, readlinkSync, openSync, readSync, closeSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -45,6 +46,75 @@ const ROOT = process.env.STUB_SWEEP_ROOT
   ? resolve(process.env.STUB_SWEEP_ROOT)
   : resolve(fileURLToPath(new URL("..", import.meta.url)));
 const sha = p => createHash("sha256").update(readFileSync(p)).digest("hex");
+
+// AT THE TOP, with the other constants, because both of these are read by a guard.
+// Both use-before-declaration bugs shipped in this file went into guards, for the
+// structural reason that a guard is added early and its helper written later.
+const HASH_CHUNK = 1 << 20;
+
+/**
+ * Porcelain `-z` into `{xy, path, line}`, which the human-readable form cannot give.
+ *
+ * A rename or copy carries its SOURCE as the NEXT NUL field rather than on the same
+ * one. Consuming it here stops it being read as an entry in its own right, which
+ * would put a path into `tracked` that git never reported as a change and refuse a
+ * clean tree.
+ */
+function parsePorcelainZ(raw) {
+  const fields = String(raw).split("\0");
+  const out = [];
+  for (let i = 0; i < fields.length; i++) {
+    const f = fields[i];
+    if (!f) continue;
+    const xy = f.slice(0, 2);
+    const path = f.slice(3);
+    if (xy[0] === "R" || xy[0] === "C") i++;
+    out.push({ xy, path, line: `${xy} ${path}` });
+  }
+  return out;
+}
+
+/**
+ * One ignored entry's fingerprint, without ever reading a file whole and without
+ * ever following a link.
+ *
+ * `lstat`, not `stat`: an ignored SYMLINK to a fifo or a character device would
+ * otherwise be opened and read, and a read of `/dev/random` does not return. The
+ * link's TARGET is hashed instead, so retargeting it is still detected while
+ * whatever it points at is never touched.
+ *
+ * Regular files are hashed in fixed chunks. This repository ignores `*.db`,
+ * `*.db-wal` and `*.db-shm`, and reeve's own state databases are exactly that, so
+ * reading one whole into a Buffer costs its full size -- three readings per entry,
+ * on every entry in the manifest.
+ */
+function fingerprint(abs) {
+  let st;
+  try { st = lstatSync(abs); } catch { return "<unreadable>"; }
+  if (st.isSymbolicLink()) {
+    try {
+      return `<symlink> ${createHash("sha256").update(readlinkSync(abs)).digest("hex").slice(0, 16)}`;
+    } catch { return "<symlink, unreadable>"; }
+  }
+  // DIRECTORIES are not walked: `--ignored` collapses `node_modules` to one line,
+  // and walking it would cost more than the whole sweep. Stated, not hidden -- an
+  // artifact created inside an already-ignored directory is not detected, and the
+  // answer to that is to name the file in .gitignore rather than its parent.
+  if (st.isDirectory()) return "<dir, not fingerprinted>";
+  if (!st.isFile()) return "<not a regular file>";
+  const h = createHash("sha256");
+  let fd;
+  try { fd = openSync(abs, "r"); } catch { return "<unreadable>"; }
+  try {
+    const buf = Buffer.allocUnsafe(HASH_CHUNK);
+    for (;;) {
+      const n = readSync(fd, buf, 0, HASH_CHUNK, null);
+      if (n <= 0) break;
+      h.update(buf.subarray(0, n));
+    }
+  } catch { return "<unreadable>"; } finally { closeSync(fd); }
+  return h.digest("hex").slice(0, 16);
+}
 
 function die(code, msg) { console.error(msg); process.exit(code); }
 
@@ -310,6 +380,44 @@ const runTest = (file, expectRed = null) => new Promise(resolve => {
   // preserve — would still scroll out of the tail.
   const kept = [];
   let namedKept = false;
+  // THE VERDICT'S EVIDENCE, counted as each line arrives and never evicted.
+  //
+  // `kept` is a RETENTION buffer with a budget, so anything derived from it is a
+  // statement about what survived rather than about what the run reported. Three
+  // separate defects came from that single confusion. These three fields are the
+  // verdict's inputs; `kept` is only what a human reads afterwards.
+  const observed = { anyAssertionSeen: false, namedFailSeen: false, failures: [] };
+  // Enough failures to diagnose a WRONG_RED and not enough to matter. The named
+  // failure's PRESENCE is recorded separately, so this bound cannot change a verdict.
+  const MAX_REPORTED_FAILURES = 50;
+  // ONE INGESTION SITE for both the streaming path and the close-time tails.
+  // The rules -- truncation, the named reservation, the budget, FAIL-only
+  // retention -- were applied at two places and each received a different subset,
+  // which is where three of one review round's findings came from. A rule added
+  // here now lands everywhere by construction rather than by remembering.
+  const ingest = raw => {
+    const l = raw.length > MAX_LINE ? raw.slice(0, MAX_LINE) : raw;
+    const m = ASSERTION_LINE.exec(l);
+    if (!m) return;
+    // A PASS IS AN ASSERTION RESULT. Counting it is what stops a run that reported
+    // only passes, then exited non-zero, from being read as a crash -- and it is
+    // counted without being retained, because the budget is for evidence a human
+    // reads and not for the verdict.
+    observed.anyAssertionSeen = true;
+    if (m[1] !== "FAIL") return;
+    const name = m[2].trim();
+    // KEYED ON FAIL, not on the line matching the protocol at all. A passing
+    // assertion whose name contains the expected text used to consume the slot
+    // reserved for the failure, and the failure then scrolled out of the tail.
+    const isNamed = Boolean(expectRed) && name.includes(expectRed);
+    if (isNamed) observed.namedFailSeen = true;
+    if (observed.failures.length < MAX_REPORTED_FAILURES) observed.failures.push(name);
+    if (isNamed && !namedKept) { kept.push(l); namedKept = true; return; }
+    if (kept.length < MAX_ASSERTION_LINES && keptBytes < MAX_ASSERTION_BYTES) {
+      kept.push(l);
+      keptBytes += l.length;
+    }
+  };
   // ONE BUFFER PER STREAM. A shared one splices stderr into a stdout assertion
   // split across chunks: `FAIL  guard` + `diagnostic\n` + ` holds\n` retains a
   // line that never existed, and the assertion that did is lost.
@@ -325,27 +433,7 @@ const runTest = (file, expectRed = null) => new Promise(resolve => {
     partial[which] = tail;
     // BRACED. This loop had a single-statement body, so adding a second block
     // silently placed it OUTSIDE the loop, where the line variable does not exist.
-    for (const l of lines) {
-      // THE NAMED ASSERTION IS NEVER CROWDED OUT. Twenty thousand unrelated
-      // failures before it would otherwise fill the budget, the raw tail would
-      // scroll past it, and the entry would read WRONG_RED for a stub the named
-      // assertion did catch. Its own line is kept outside the budget, once.
-      if (expectRed && !namedKept && ASSERTION_LINE.test(l) && l.includes(expectRed)) {
-        kept.push(l.length > MAX_LINE ? l.slice(0, MAX_LINE) : l);
-        namedKept = true;
-        continue;
-      }
-      if (kept.length < MAX_ASSERTION_LINES && keptBytes < MAX_ASSERTION_BYTES) {
-        const m = ASSERTION_LINE.exec(l);
-        // Truncated individually too: an assertion NAME is short, so a 64 KiB line
-        // beginning `FAIL  ` is a diagnostic wearing the protocol's prefix.
-        if (m && m[1] === "FAIL") {
-          const line = l.length > MAX_LINE ? l.slice(0, MAX_LINE) : l;
-          kept.push(line);
-          keptBytes += line.length;
-        }
-      }
-    }
+    for (const l of lines) ingest(l);
     out += d;
     if (out.length > CAP) { dropped += out.length - CAP; out = out.slice(-CAP); }
   };
@@ -359,13 +447,12 @@ const runTest = (file, expectRed = null) => new Promise(resolve => {
     // "timed out" and "failed an assertion" are different readings and only one of
     // them is evidence.
     activeChild = null;
-    for (const tail of [partial.out, partial.err]) {
-      const m = tail && ASSERTION_LINE.exec(tail);
-      if (m && m[1] === "FAIL" && kept.length < MAX_ASSERTION_LINES && keptBytes < MAX_ASSERTION_BYTES) {
-        kept.push(tail);
-        keptBytes += tail.length;
-      }
-    }
+    // THE SAME INGESTION as every other line. These tails used to be handled by a
+    // second copy of the rules that had the budget but not the named reservation,
+    // so an expected FAIL arriving last and unterminated was discarded once earlier
+    // failures had filled the budget -- and, the raw body being deliberately inert,
+    // the run then read WRONG_RED for a stub whose named assertion had fired.
+    for (const tail of [partial.out, partial.err]) if (tail) ingest(tail);
     // The kept assertions come FIRST, so they survive whatever the tail lost. The
     // classifier reads whole lines, so prepending them changes nothing it can see
     // except that the evidence is present.
@@ -492,9 +579,15 @@ const treeState = () => {
   // requiring none would fail on `node_modules` every time, which is not dirt.
   // `--ignored` collapses whole directories to one line, so this stays cheap.
   try {
-    const raw = execFileSync("git", ["status", "--porcelain", "--ignored"],
+    // `-z`, NOT the human-readable form. Porcelain v1 C-QUOTES any path holding a
+    // space, quote, backslash or non-ASCII byte -- `!! "foo cache"` -- and the
+    // quoted string is not the filesystem path. The stat then fails, the entry
+    // fingerprints as `<unreadable>` in EVERY reading, and a control run
+    // overwriting that file is invisible exactly as it was before fingerprinting.
+    // `-z` emits raw bytes with NUL terminators, so there is no quoting to undo.
+    const raw = execFileSync("git", ["status", "--porcelain", "-z", "--ignored"],
                              { cwd: ROOT, encoding: "utf8" });
-    const lines = raw.split("\n").filter(Boolean);
+    const lines = parsePorcelainZ(raw);
     // IGNORED ENTRIES ARE FINGERPRINTED, not merely listed.
     //
     // A path list cannot see a control run OVERWRITING an ignored artifact that
@@ -502,24 +595,14 @@ const treeState = () => {
     // applied to altered state and can read CAUGHT for a run that would not have
     // been caught from the untouched tree.
     //
-    // FILES are hashed. DIRECTORIES are not: `--ignored` collapses `node_modules`
-    // to one line, and walking it would cost more than the whole sweep. That is a
-    // stated limit rather than a hidden one — an ignored artifact created inside an
-    // already-ignored DIRECTORY is not detected, and if that ever matters the
-    // answer is to name the file in .gitignore rather than its parent.
-    const ignored = lines.filter(l => l.startsWith("!!")).sort().map(l => {
-      const rel = l.slice(3).trim();
-      const abs = join(ROOT, rel);
-      try {
-        const st = statSync(abs);
-        if (st.isDirectory()) return `${l} <dir, not fingerprinted>`;
-        return `${l} ${createHash("sha256").update(readFileSync(abs)).digest("hex").slice(0, 16)}`;
-      } catch {
-        return `${l} <unreadable>`;
-      }
-    }).join("\n");
+    // What a fingerprint IS, and the directory limit it carries, is stated once at
+    // `fingerprint` rather than restated here. A second copy drifts from the first,
+    // and the drifted copy is the one somebody reads.
+    const ignored = lines.filter(e => e.xy === "!!")
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+      .map(e => `${e.line} ${fingerprint(join(ROOT, e.path))}`).join("\n");
     return {
-      tracked: lines.filter(l => !l.startsWith("!!")).join("\n"),
+      tracked: lines.filter(e => e.xy !== "!!").map(e => e.line).join("\n"),
       ignored,
     };
   } catch { return null; }
@@ -675,7 +758,11 @@ for (const entry of entries) {
   // from a tree it knows is wrong.
   if (restored) { active = null; rmSync(snapDir, { recursive: true, force: true }); }
 
+  // `observed` is what the STUBBED run reported, counted line by line as it arrived.
+  // `stubOutput` still goes with it, but only so the human-facing text has something
+  // to quote; nothing in the verdict is derived from it any more.
   const verdict = classify({ controlExit: control.exit, stubExit: stub.exit, stubOutput: stub.output,
+                             observed: stub.observed,
                              hashChanged, restored, expectRed: entry.expectRed });
 
   // THE WHOLE TREE, rechecked after every entry.

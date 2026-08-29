@@ -335,4 +335,79 @@ export const STUBS = [
               find: "    `  const pause = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);\\n` +",
               replace: "    `  const pause = () => {};\\n` +" }],
   },
+  {
+    // BOTH halves, because they are one mechanism: asking git for `-z` and reading
+    // NUL-separated fields. Reverting only the flag leaves the parser splitting a
+    // newline-delimited blob on NUL and reading one enormous field, which fails for
+    // a reason that has nothing to do with quoting.
+    name: "porcelain-z",
+    why: "read the human-readable porcelain form, where a path holding a space is C-QUOTED and the quoted string is not the path",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "an ignored artifact with a QUOTED name still voids the reading",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: '["status", "--porcelain", "-z", "--ignored"]',
+              replace: '["status", "--porcelain", "--ignored"]' },
+            { file: "scripts/stub-sweep.mjs",
+              find: 'const fields = String(raw).split("\\0");',
+              replace: 'const fields = String(raw).split("\\n");' }],
+  },
+  {
+    name: "symlink-by-target-text",
+    why: "stop hashing an ignored symlink's target text, so every symlink fingerprints as one constant and retargeting it is invisible",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "an ignored symlink RETARGETED by the control run voids the reading",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "  if (st.isSymbolicLink()) {",
+              replace: "  if (false) {" }],
+  },
+  {
+    name: "verdict-from-observed",
+    why: "derive the verdict by re-reading the retained buffer, so what a run REPORTED and what SURVIVED retention become the same question",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "a stubbed run reporting only PASSes is WRONG_RED rather than CRASHED",
+    edits: [{ file: "src/stubsweep.mjs",
+              find: "  const anyAssertion = observed ? observed.anyAssertionSeen : reportedAnyAssertion(stubOutput);",
+              replace: "  const anyAssertion = reportedAnyAssertion(stubOutput);" }],
+  },
+  {
+    // COMPOUND, and it has to be. Two independent defences stop a PASS from
+    // crowding out the named FAIL: ingestion keys the reservation on FAIL, and the
+    // verdict does not read the retention buffer at all. Removing either alone
+    // changes nothing observable, and the entry would read NOT_CAUGHT correctly.
+    name: "pass-cannot-spend-the-reservation",
+    why: "let a PASS naming the expected text spend the reserved slot, AND let the verdict be read back out of the buffer that then evicts the real failure",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "a PASS naming the expected text does not crowd out the named FAIL",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: '    if (m[1] !== "FAIL") return;',
+              replace: '    if (m[1] !== "FAIL") { if (expectRed && m[2].trim().includes(expectRed)) namedKept = true; return; }' },
+            { file: "src/stubsweep.mjs",
+              find: "  const failures = observed ? observed.failures : failedAssertions(stubOutput);",
+              replace: "  const failures = failedAssertions(stubOutput);" },
+            { file: "src/stubsweep.mjs",
+              find: "  const namedFailed = observed\n    ? observed.namedFailSeen\n    : failures.some(f => f.includes(expectRed));",
+              replace: "  const namedFailed = failures.some(f => f.includes(expectRed));" }],
+  },
+  {
+    // COMPOUND for the same reason: the tails going through the one ingestion site,
+    // and the verdict not being read back out of the buffer, are both sufficient.
+    name: "tails-go-through-ingest",
+    why: "give the close-time tails their own copy of the rules again — the budget without the named reservation — AND read the verdict back out of the buffer",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "an unterminated named FAIL after the budget fills is still counted",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "    for (const tail of [partial.out, partial.err]) if (tail) ingest(tail);",
+              replace: "    for (const tail of [partial.out, partial.err]) {\n" +
+                       "      const m = tail && ASSERTION_LINE.exec(tail);\n" +
+                       "      if (m && m[1] === \"FAIL\" && kept.length < MAX_ASSERTION_LINES && keptBytes < MAX_ASSERTION_BYTES) {\n" +
+                       "        kept.push(tail); keptBytes += tail.length;\n" +
+                       "      }\n" +
+                       "    }" },
+            { file: "src/stubsweep.mjs",
+              find: "  const failures = observed ? observed.failures : failedAssertions(stubOutput);",
+              replace: "  const failures = failedAssertions(stubOutput);" },
+            { file: "src/stubsweep.mjs",
+              find: "  const namedFailed = observed\n    ? observed.namedFailSeen\n    : failures.some(f => f.includes(expectRed));",
+              replace: "  const namedFailed = failures.some(f => f.includes(expectRed));" }],
+  },
 ];

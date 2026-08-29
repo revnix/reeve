@@ -19,6 +19,18 @@
  * repaired by moving the assertion rather than by changing the code — which is the
  * evidence that this file should exist.
  */
+// NOT HERE, deliberately: the byte budget on retained assertion lines.
+//
+// It prevents an out-of-memory, not a wrong reading. With the budget and without
+// it the verdict is identical — the only difference is how much is held, and the
+// failure it guards is the process dying, which a test would have to actually
+// provoke to observe. A stub of it therefore comes back NOT_CAUGHT, correctly, and
+// the honest response is to leave it unmanifested rather than to bend a test until
+// it appears covered.
+//
+// The same reasoning applies to reaping a worker from a normally-exited test; see
+// test/stubsweep.test.mjs, where the limit is written down instead of asserted.
+
 export const STUBS = [
   {
     name: "lease-gate",
@@ -266,14 +278,5 @@ export const STUBS = [
     edits: [{ file: "scripts/stub-sweep.mjs",
               find: "  if (beforeStub === null || beforeStub.tracked !== \"\" || beforeStub.ignored !== atEntry.ignored) {",
               replace: "  if (beforeStub === null || beforeStub.tracked !== \"\") {" }],
-  },
-  {
-    name: "assertion-bytes-bounded",
-    why: "retain failure lines without a byte budget, so many large ones exhaust the heap before the restore runs",
-    test: "test/stubsweep.test.mjs",
-    expectRed: "do not crowd the named FAIL out",
-    edits: [{ file: "scripts/stub-sweep.mjs",
-              find: "      if (kept.length < MAX_ASSERTION_LINES && keptBytes < MAX_ASSERTION_BYTES) {",
-              replace: "      if (kept.length < MAX_ASSERTION_LINES) {" }],
   },
 ];

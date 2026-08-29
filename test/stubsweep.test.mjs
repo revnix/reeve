@@ -18,7 +18,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve, basename } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -46,6 +46,7 @@ process.on("exit", () => {
   for (const d of TEMPS) { try { rmSync(d, { recursive: true, force: true }); } catch { /* leave it */ } }
 });
 const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import.meta.url)));
+const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.url)));
 
 // --- applying an edit refuses anything ambiguous -------------------------------
 {
@@ -1383,13 +1384,32 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   const made = spawnSync("mkfifo", [fifo], { encoding: "utf8" });
   check(made.status === 0, "control: mkfifo is available, so this case can be built at all", made.stderr);
   if (made.status === 0) {
-    const started = Date.now();
-    const got = fingerprint(fifo);
-    // `open` on a fifo for reading BLOCKS until a writer appears, so reaching the
-    // open at all would hang here rather than return a marker.
-    check(got === "<not a regular file>" && Date.now() - started < 5_000,
+    // IN A CHILD, WITH A TIMEOUT, and the bound is the whole point.
+    //
+    // The first version called `fingerprint` in process and then checked elapsed
+    // time. `open` on a fifo blocks in the SYSTEM CALL until a writer appears, so
+    // with the guard removed the check would never evaluate at all: the test hangs
+    // instead of failing, and a hang reports nothing while looking like work still
+    // in progress. No care taken inside the test can bound that -- the bound has to
+    // be outside the process doing the blocking.
+    const probe = spawnSync(process.execPath, ["-e",
+      `import(${JSON.stringify(pathToFileURL(LIB).href)})` +
+      `.then(m => process.stdout.write(String(m.fingerprint(process.argv[1]))))`,
+      fifo], { encoding: "utf8", timeout: 15_000 });
+    check(probe.signal === null && probe.stdout === "<not a regular file>",
       "a fifo fingerprints as a marker instead of blocking on its open",
-      `got ${JSON.stringify(got)} in ${Date.now() - started}ms`);
+      `signal=${probe.signal} stdout=${JSON.stringify(probe.stdout)} stderr=${String(probe.stderr).slice(0, 200)}`);
+    // CONTROL: the probe mechanism itself reports a real answer for a real file, so
+    // the assertion above cannot be satisfied by the probe simply never working.
+    const reg = join(root, "plain.txt");
+    writeFileSync(reg, "content");
+    const ok = spawnSync(process.execPath, ["-e",
+      `import(${JSON.stringify(pathToFileURL(LIB).href)})` +
+      `.then(m => process.stdout.write(String(m.fingerprint(process.argv[1]))))`,
+      reg], { encoding: "utf8", timeout: 15_000 });
+    check(ok.signal === null && /^[0-9a-f]{16}$/.test(ok.stdout ?? ""),
+      "control: the same probe returns a real fingerprint for a regular file",
+      `stdout=${JSON.stringify(ok.stdout)} stderr=${String(ok.stderr).slice(0, 200)}`);
   }
 }
 

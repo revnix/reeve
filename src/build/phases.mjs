@@ -21,6 +21,30 @@ export const ACTIVE = Object.freeze([
 export const SLICE_SCOPED = Object.freeze(
   ["IMPLEMENTING","IMPL_PR_OPEN","VERDICT_WAIT","SLICE_MERGED"]);
 
+// The phases a worker is DISPATCHED for, and the action name each is dispatched
+// under. Two vocabularies for the same three things, and they do not match by
+// rule: `SIZING` dispatches as `BUILD_SIZE`, not `BUILD_SIZING`. A
+// `BUILD_${phase}` derivation is therefore wrong for one of the three -- the
+// kind of near-miss that makes a "derived" list quietly incorrect for exactly
+// one entry, which is worse than an honest map.
+//
+// So the mapping is written out, and the half that CAN be checked is: the test
+// asserts every KEY here is a real phase from ACTIVE, so a typo does not become
+// a fourth valid-looking action nobody dispatches.
+//
+// IT LIVES HERE because two places need it and neither should own it. The
+// profile schema validates `builder.budgets`, whose keys are these action names
+// and which must refuse one that has no phase; the dispatcher reaches them at
+// `sandboxFor` and `promptFor`. Declared in either of those, the other would
+// write the same three strings again -- and a second inventory of three names
+// that agree today is the defect this codebase keeps finding.
+export const BUILD_ACTION_FOR = Object.freeze({
+  SIZING:   "BUILD_SIZE",
+  RESEARCH: "BUILD_RESEARCH",
+  DESIGN:   "BUILD_DESIGN",
+});
+export const BUILD_ACTIONS = Object.freeze(Object.values(BUILD_ACTION_FOR));
+
 /**
  * Is this transition ABOUT a slice, rather than merely happening during one?
  *

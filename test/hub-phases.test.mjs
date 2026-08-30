@@ -8,7 +8,7 @@
 // Totality is the property that matters. A machine with a hole does not fail
 // loudly at the hole -- it returns undefined, the caller reads that as "no
 // transition", and the task sits in a state forever with nothing reporting it.
-import { PHASES, ACTIVE, HELD, DRAINING, TERMINAL, NON_TERMINAL, nextPhase } from "../src/build/phases.mjs";
+import { PHASES, ACTIVE, HELD, DRAINING, TERMINAL, NON_TERMINAL, nextPhase, BUILD_ACTION_FOR, BUILD_ACTIONS } from "../src/build/phases.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -518,6 +518,42 @@ const EVIDENCE = [
   check(ok.ok === true, "control: a real identity is accepted", JSON.stringify(ok));
   check(ok.escalate === "bt:1:dependency-upgrade",
     "control: and is what the transition escalates under", String(ok.escalate));
+}
+
+// ── The phase-to-action map ────────────────────────────────────────────────
+//
+// Two vocabularies for the same three things, and they do NOT match by rule:
+// `SIZING` dispatches as `BUILD_SIZE`, not `BUILD_SIZING`. A `BUILD_${phase}`
+// derivation would be correct for two of three and wrong for the one nobody
+// would think to check -- worse than an honest map, because it looks principled.
+//
+// So the mapping is written out and the half that CAN be checked is checked,
+// in BOTH directions: a key that is not a phase, and a value that is not in the
+// exported list. The first catches a typo'd phase; without the second, a fourth
+// entry added to one and not the other goes unnoticed.
+{
+  check(Object.keys(BUILD_ACTION_FOR).length > 0,
+    "control: the phase-to-action map is populated -- both checks below are vacuous otherwise",
+    `${Object.keys(BUILD_ACTION_FOR).length}`);
+
+  const notPhases = Object.keys(BUILD_ACTION_FOR).filter(p => !ACTIVE.includes(p));
+  check(notPhases.length === 0,
+    "every phase the map names is a real phase from ACTIVE",
+    notPhases.join(", "));
+
+  const missing = Object.values(BUILD_ACTION_FOR).filter(a => !BUILD_ACTIONS.includes(a));
+  const extra = BUILD_ACTIONS.filter(a => !Object.values(BUILD_ACTION_FOR).includes(a));
+  check(missing.length === 0 && extra.length === 0,
+    "and BUILD_ACTIONS is exactly the map's values, so neither can gain an entry alone",
+    `missing=${missing.join(",") || "none"} extra=${extra.join(",") || "none"}`);
+
+  // The near-miss itself, named. If someone later "simplifies" this into a
+  // template, this is the assertion that stops them.
+  check(BUILD_ACTION_FOR.SIZING === "BUILD_SIZE",
+    "SIZING dispatches as BUILD_SIZE -- not BUILD_SIZING, which is why this is a map and not a rule",
+    BUILD_ACTION_FOR.SIZING);
+  check(!ACTIVE.includes("BUILD_SIZING") && !BUILD_ACTIONS.includes("BUILD_SIZING"),
+    "control: and BUILD_SIZING exists nowhere, so the naive derivation really would be wrong");
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

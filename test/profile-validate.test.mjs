@@ -288,5 +288,49 @@ expectOk("control: the same profile without ci.flakePatterns", clone(base));
   if (known.length) { console.log("        still declared:", known.join(", ")); fail++; }
 }
 
+// ── builder.budgets ─────────────────────────────────────────────────────────
+//
+// ONE KEY, NOT EIGHTEEN. `validate`'s unknown-key sweep waves through any leaf
+// beneath a declared key, so declaring `builder.budgets.BUILD_SIZE.budgetMinutes`
+// and its siblings would make `builder.budgets.BUILD_NOPE.budgetMinutes` a leaf
+// under a known prefix and accept it. The action names and the field names are
+// refused INSIDE the validator or they are not refused at all -- which is why
+// every refusal below is about something the sweep structurally cannot see.
+const withBudget = (b) => { const p = clone(base); p.builder = { ...(p.builder ?? {}), budgets: b }; return p; };
+
+expectOk("a per-action budget for every phase action",
+  withBudget({ BUILD_SIZE:     { budgetMinutes: 8,  maxTurns: 15, model: "sonnet", effort: "low" },
+               BUILD_RESEARCH: { budgetMinutes: 60, maxTurns: 60, model: "fable", effort: "high",
+                                 maxBudgetUsd: 4.5, maxAttempts: 3 },
+               BUILD_DESIGN:   { budgetMinutes: 60, maxTurns: 60 } }));
+expectOk("a budget naming only some of the actions", withBudget({ BUILD_SIZE: { budgetMinutes: 8 } }));
+
+expectRefusal("a budget for an action that has no phase",
+  withBudget({ BUILD_NOPE: { budgetMinutes: 8 } }), /BUILD_NOPE is not one of/);
+
+// ZERO IS REFUSED, NOT DEFAULTED, and each of these is a different way of
+// writing a decision as a setting.
+expectRefusal("zero attempts, which is an off switch nobody chose",
+  withBudget({ BUILD_SIZE: { maxAttempts: 0 } }), /BUILD_SIZE\.maxAttempts must be a positive integer/);
+expectRefusal("zero budget minutes, which kills the worker at spawn",
+  withBudget({ BUILD_SIZE: { budgetMinutes: 0 } }), /BUILD_SIZE\.budgetMinutes must be a positive integer/);
+expectRefusal("zero turns",
+  withBudget({ BUILD_SIZE: { maxTurns: 0 } }), /BUILD_SIZE\.maxTurns must be a positive integer/);
+
+// A MISSPELLED FIELD would be read as ABSENT by whatever consumes it, falling
+// back to a default nobody chose -- and the sweep cannot see it.
+expectRefusal("a misspelled budget field",
+  withBudget({ BUILD_SIZE: { budgtMinutes: 8 } }), /BUILD_SIZE\.budgtMinutes is not one of/);
+
+// MONEY IS NOT AN INTEGER. A budget of 4.5 dollars is ordinary; refusing it
+// because the other five fields are integers would be a rule applied by shape
+// rather than by meaning.
+expectOk("a fractional dollar budget", withBudget({ BUILD_SIZE: { maxBudgetUsd: 4.5 } }));
+expectRefusal("a negative dollar budget",
+  withBudget({ BUILD_SIZE: { maxBudgetUsd: -1 } }), /BUILD_SIZE\.maxBudgetUsd must be a positive number/);
+expectRefusal("a budget that is not an object",
+  withBudget({ BUILD_SIZE: 8 }), /BUILD_SIZE must be an object/);
+expectRefusal("budgets that are not an object", withBudget([]), /builder\.budgets must be an object/);
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

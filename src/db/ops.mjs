@@ -571,9 +571,12 @@ export function outboxIdFor(db, idemKey) {
  */
 export function enqueueWithDependants(db, parent, dependants = []) {
   const parentId = enqueue(db, parent) ?? outboxIdFor(db, parent.idemKey);
-  // A parent that neither inserted nor exists means the insert was refused for a
-  // reason this cannot see. Enqueuing the children anyway is exactly the silent
-  // orphan case, so it refuses instead.
+  // UNREACHABLE BY CONSTRUCTION, and kept anyway. `enqueue` returns null only on a
+  // key conflict, which means the row exists, so the lookup finds it -- the only way
+  // here is another process deleting that row between the two reads. It has no
+  // manifest entry for exactly that reason: a stub cannot be shown to reach it, and
+  // an entry that cannot go red for the right reason is worse than none. Stated
+  // rather than pretended at.
   if (parentId == null)
     throw new Error(`enqueueWithDependants: no outbox row for parent ${parent.idemKey}, so its dependants would orphan`);
   const ids = [];

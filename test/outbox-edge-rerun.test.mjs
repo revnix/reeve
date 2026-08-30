@@ -69,19 +69,19 @@ const child = n => ({ idemKey: `spill:1:comment:${n}`, kind: "gh.pr.comment",
     String(naive));
 }
 
-// --- a parent that neither inserted nor exists refuses, rather than orphaning ------
+// --- the children carry the edge, which is what a re-run must rebuild -----------
 {
+  // The refusal branch in enqueueWithDependants is deliberately NOT asserted here.
+  // Its fixture used a kind the CHECK constraint rejects, so the insert threw before
+  // the branch was reached and the test passed on SQLite's refusal rather than on the
+  // guard's -- the sweep reported NOT_CAUGHT, which is how I found out. The branch is
+  // unreachable by construction and says so in the source.
   const db = fresh();
-  // A kind the CHECK constraint rejects: the insert throws, so there is no row and
-  // no id, and enqueuing the children anyway is exactly the silent orphan.
-  let err = null;
-  try {
-    tx(db, () => enqueueWithDependants(db, { ...parent, kind: "gh.not.a.kind" }, [child(1)]));
-  } catch (e) { err = e; }
-  check(err !== null, "a parent that cannot be enqueued refuses rather than orphaning its children",
-    String(err?.message).slice(0, 120));
-  const orphans = db.prepare("SELECT COUNT(*) n FROM outbox WHERE depends_on IS NULL AND kind='gh.pr.comment'").get().n;
-  check(orphans === 0, "and no child was written with no dependency", String(orphans));
+  const { parentId } = tx(db, () => enqueueWithDependants(db, parent, [child(1)]));
+  const row = db.prepare("SELECT depends_on FROM outbox WHERE kind='gh.pr.comment'").get();
+  check(row.depends_on === parentId,
+    "a child is written with the parent's id, not with no dependency at all",
+    JSON.stringify(row));
 }
 
 console.log(fail ? `\nFAILED ${fail}` : "\nok");

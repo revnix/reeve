@@ -296,9 +296,24 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
   //
   // So the id is resolved from the hub, and this block passes the production
   // shape verbatim.
-  check(/\{ name, nwo: p\.nwo \}/.test(cli),
-    "fixture: registryProjects really does yield only a name and an nwo",
-    (cli.match(/Object\.entries\(reg\)[^\n]*/) ?? ["(not found)"])[0]);
+  // ASSERTED BY CALLING THE PRODUCER, not by grepping its source.
+  //
+  // This read `bin/reeve` for the literal `{ name, nwo: p.nwo }`, which stopped
+  // being true the moment the loader moved into `src/build/registryio.mjs` and
+  // grew the two path fields -- a text scan of one file standing in for a
+  // property of another. The property is what matters: THE FIXTURE MUST NOT BE
+  // RICHER THAN PRODUCTION, so it is compared against a row the real parser
+  // actually produces.
+  const { parseRegistry } = await import("../src/build/registryio.mjs");
+  const produced = parseRegistry(
+    JSON.stringify({ nextly: { nwo: "o/r", repoPath: "/p", profilePath: "/f" } }), "/x").projects[0];
+  const producedKeys = Object.keys(produced ?? {}).sort();
+  check(producedKeys.length > 0,
+    "control: the registry parser really produced a row, so the comparison below is not vacuous",
+    JSON.stringify(producedKeys));
+  check(!producedKeys.includes("repoId"),
+    "the registry supplies NO repoId, which is the whole reason the tick must resolve it from the hub",
+    JSON.stringify(producedKeys));
   {
     const db2 = openHub(join(dir, "g-prod.db"));
     // The snapshot `resolveSnapshot` would have taken through the API client;
@@ -309,7 +324,17 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
                        gateDefinitionHash: "g", registryVersion: 3, founderUserId: 4242 };
     admitResolved(db2, admitted, { id: "bt:prod", project: "nextly", title: "t",
                            claims: [normalizeClaim("packages/x")] });
-    const tick = await buildTick({ hub: db2, projects: [{ name: "nextly", nwo: "o/r" }] });
+    // The fixture is checked against the producer rather than trusted: a project
+    // carrying a key the registry never supplies is a fixture richer than
+    // production, and that is exactly what hid this defect before -- every real
+    // project reached the no-id guard and was skipped on every heartbeat while
+    // the wiring and the behaviour both looked proved.
+    const fixtureProject = { name: "nextly", nwo: "o/r" };
+    const richer = Object.keys(fixtureProject).filter((k) => !producedKeys.includes(k));
+    check(richer.length === 0,
+      "fixture: the project handed to buildTick carries no key the registry does not supply",
+      richer.join(", "));
+    const tick = await buildTick({ hub: db2, projects: [fixtureProject] });
     check(tick.refreshed === 1 && tick.skipped.length === 0,
       "a registry-shaped project is refreshed, not skipped", JSON.stringify(tick));
     const row = db2.prepare("SELECT repo_id, nwo_snapshot FROM repo_gate_state").get();

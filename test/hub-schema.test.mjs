@@ -490,7 +490,7 @@ import { hubEvent, migrationPlan } from "../src/build/hubdb.mjs";
   // requirement actually contain anything". An empty shape agrees with every
   // snapshot, and snapshot validation would accept a blank file.
   {
-    const shape = shapeAt(HUB_SCHEMA_VERSION);
+    const shape = shapeAt(HUB_SCHEMA_VERSION).tables;
     check(Object.keys(shape).length > 0,
       "control: the derived shape for the current version is non-empty",
       `${Object.keys(shape).length} table(s)`);

@@ -12,9 +12,12 @@
 // `parseRegistry` is PURE -- text in, rows out -- so every rule below is
 // testable without a filesystem. `loadRegistry` is the only part that reads.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, lstatSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { hubPathFor } from "../paths.mjs";
+import { resolveRepoIdAt } from "./repoid.mjs";
 
 /**
  * A content fingerprint, used as `registry.version`.
@@ -156,4 +159,84 @@ export function loadRegistry(home) {
   } catch (e) {
     return { projects: [], registry: { version: 0, projects: Object.create(null) }, error: `${path}: ${e.message}` };
   }
+}
+
+/**
+ * The `io` object `resolveSnapshot` takes, built for one registry entry.
+ *
+ * NINE MEMBERS, NOT EIGHT. The brief's specification lists eight and omits
+ * `lsTree`. Measured: `resolveClaims` makes it a PRECONDITION rather than an
+ * enhancement -- `src/build/registry.mjs:152` refuses outright when it is not a
+ * function, with its own comment recording why. `io.lsTree?.()` made a missing
+ * capability read as "nothing is tracked", so every ENOENT became "does not
+ * exist yet" and an uninitialised submodule was admitted. An eight-member io
+ * refuses every filing.
+ *
+ * The surface is not copied from the brief. It is the nine names
+ * `resolveSnapshot` actually reads, and the test asserts that by scanning for
+ * them rather than by listing them here a second time.
+ *
+ * WHAT IS LOCAL AND WHAT IS INJECTED. `profileHash`, `defaultBranch`,
+ * `visibility` and `founderUserId` come from the profile file the entry names --
+ * the profile already carries `identity.defaultBranch`, `identity.visibility`
+ * and `builder.founder.userId` -- so none of them is a network call. `lstat` and
+ * `lsTree` are the filesystem and the checkout's git index. `repoId` goes
+ * through `resolveRepoIdAt`, which asks the HUB first and falls back only to an
+ * injected `fetchRepoId`; S3-A injects none, so a project the hub has never
+ * admitted a task for yields `null` rather than reaching the network.
+ *
+ * `specRepoId` and `gateDefinitionHash` resolve `null` BY CONSTRUCTION. They are
+ * F1's, and until the founder names the spec repositories and the gate
+ * definition paths there is nothing to read. `missingSnapshotFields` then names
+ * them and the filing is refused with both field names in it. That refusal is
+ * the correct state, and it is what makes the block visible rather than silent.
+ */
+export function registryIo(home, project, entry, { fetchRepoId = null, git = execFileSync, connect = null } = {}) {
+  // Read ONCE per io, not once per lookup: four members read the same file, and
+  // four reads could disagree if the profile changed between them -- a snapshot
+  // assembled from two different profiles is not a snapshot of either.
+  let profile = null;
+  let profileText = null;
+  const loadProfile = () => {
+    if (profile !== null) return profile;
+    try {
+      profileText = readFileSync(entry.profilePath, "utf8");
+      profile = JSON.parse(profileText);
+    } catch { profile = {}; profileText = null; }
+    return profile;
+  };
+  const at = (path) => path.split(".").reduce((o, k) => (o == null ? undefined : o[k]), loadProfile());
+
+  return {
+    // `{ name, nwo }`, NOT the bare project name. `repoIdFromHub` reads
+    // `project?.name` and `resolveRepoId` reads `project?.nwo`, so a string here
+    // makes both undefined and the lookup returns `null` for every project --
+    // which is the ORDINARY answer meaning "no id is known", so it is
+    // indistinguishable from a project the hub has never admitted. Every filing
+    // would then be refused for a missing repoId, fail-closed and therefore
+    // silent. Caught by Task 9's positive control, not by reading this line.
+    repoId: async () => resolveRepoIdAt(hubPathFor(home), { name: project, nwo: entry.nwo },
+                                        { fetchRepoId, ...(connect ? { connect } : {}) }),
+    // The hash is of the profile's BYTES, not of a re-serialisation: the point is
+    // to detect that the file changed, and re-serialising normalises away the
+    // very differences that would tell you it did.
+    profileHash: async () => (loadProfile(), profileText === null ? null
+      : createHash("sha256").update(profileText).digest("hex")),
+    defaultBranch: async () => at("identity.defaultBranch") ?? null,
+    visibility: async () => at("identity.visibility") ?? null,
+    founderUserId: async () => at("builder.founder.userId") ?? null,
+    specRepoId: async () => null,
+    gateDefinitionHash: async () => null,
+    lstat: (path) => lstatSync(path),
+    // `git ls-tree` against the checkout, returning the entry or null. A path
+    // that is not tracked is a null, and the caller distinguishes that from a
+    // failure to ASK -- which is the distinction the `?.()` version destroyed.
+    lsTree: (repoPath, path) => {
+      const out = String(git("git", ["-C", repoPath, "ls-tree", "HEAD", "--", path],
+                             { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })).trim();
+      if (!out) return null;
+      const [mode] = out.split(/\s+/);
+      return { mode };
+    },
+  };
 }

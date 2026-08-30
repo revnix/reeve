@@ -47,7 +47,10 @@ const q = `query { repository(owner:"${owner}", name:"${name}") { pullRequest(nu
   state headRefOid headRefName isCrossRepository
   headRepositoryOwner { login } headRepository { name }
   reviewThreads(first:100) { totalCount nodes { id isResolved path
-    comments(first:1) { nodes { author { login } body } } } } } } }`;
+    comments(first:1) { nodes { author { login } body } } } }
+  commits(last:1) { nodes { commit { statusCheckRollup { contexts(first:100) { nodes {
+    ... on CheckRun { name conclusion status }
+    ... on StatusContext { context state } } } } } } } } } }`;
 const doc = ghJson(["api", "graphql", "-f", `query=${q}`]);
 const meta = doc?.data?.repository?.pullRequest ?? null;
 if (!meta) { console.error(`premerge: could not read ${nwo}#${pr}`); process.exit(2); }
@@ -68,9 +71,14 @@ if (ids) {
   ({ branchNow, branchRead } = branchStateFrom(refs, meta.headRefName));
 }
 
+// The rollup hangs off the head COMMIT, and an absent rollup is not an empty one:
+// `nodes: null` reaches checkState as unreadable rather than as "no checks", which
+// are different facts and must not share an answer.
+const rollup = meta.commits?.nodes?.[0]?.commit?.statusCheckRollup ?? null;
 const verdict = gate({
   head: { prHead: meta.headRefOid, branchNow, branchRead },
   threads: meta.reviewThreads,
+  checks: { nodes: rollup ? (rollup.contexts?.nodes ?? null) : [] },
 });
 
 console.log(`${verdict.state}  ${nwo}#${pr}  head=${String(meta.headRefOid).slice(0, 7)} branch=${branchNow ? String(branchNow).slice(0, 7) : branchRead}`);

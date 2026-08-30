@@ -8,6 +8,12 @@
 // field refuses the profile rather than falling back to a default, because a
 // silently-defaulted profile is how a gate ends up judging the wrong thing.
 
+// THE ACTION NAMES COME FROM THE PHASES, not from a list here. `builder.budgets`
+// is keyed by them and the dispatcher reaches the same three strings, so a copy
+// in this file would be one half of a second inventory. `phases.mjs` imports
+// nothing itself, so this edge pulls in no graph.
+import { BUILD_ACTIONS } from "../build/phases.mjs";
+
 export const SCHEMA_VERSION = 1;
 
 /** Command state. A command that is declared but broken must not read as present. */
@@ -63,6 +69,47 @@ const oneOf = list => v => (list.includes(v) ? null : `must be one of ${list.joi
 // Every profile written before this check set worktreeRoot relatively, and under
 // launchd "../nextly-worktrees" resolved from the daemon's WorkingDirectory to a
 // directory that does not exist.
+/**
+ * `builder.budgets`, validated whole.
+ *
+ * EVERY NUMBER IS A POSITIVE INTEGER, and zero is refused rather than defaulted.
+ * `maxAttempts: 0` is an off switch nobody chose -- a phase that may never be
+ * attempted, written as a budget instead of as a decision -- and
+ * `budgetMinutes: 0` kills the worker at spawn, which reads to an operator as a
+ * crashing runner rather than as a setting. `maxBudgetUsd` is the exception: it
+ * is money, so a positive finite NUMBER rather than an integer.
+ *
+ * FIELD NAMES ARE CLOSED, for the same reason the action names are: the sweep in
+ * `validate` cannot see beneath `builder.budgets`, so a misspelled field would
+ * be accepted and then read as absent by whatever consumes it -- silently
+ * falling back to a default nobody chose.
+ */
+const BUDGET_INTS = Object.freeze(["budgetMinutes", "maxTurns", "maxAttempts"]);
+const BUDGET_STRS = Object.freeze(["model", "effort"]);
+const BUDGET_NUMS = Object.freeze(["maxBudgetUsd"]);
+const BUDGET_FIELDS = Object.freeze([...BUDGET_INTS, ...BUDGET_STRS, ...BUDGET_NUMS]);
+
+const BUDGETS = (v) => {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return "must be an object";
+  for (const [action, spec] of Object.entries(v)) {
+    if (!BUILD_ACTIONS.includes(action))
+      return `${action} is not one of ${BUILD_ACTIONS.join(", ")}`;
+    if (typeof spec !== "object" || spec === null || Array.isArray(spec))
+      return `${action} must be an object`;
+    for (const [field, value] of Object.entries(spec)) {
+      if (!BUDGET_FIELDS.includes(field))
+        return `${action}.${field} is not one of ${BUDGET_FIELDS.join(", ")}`;
+      if (BUDGET_INTS.includes(field) && !(Number.isInteger(value) && value > 0))
+        return `${action}.${field} must be a positive integer`;
+      if (BUDGET_NUMS.includes(field) && !(typeof value === "number" && Number.isFinite(value) && value > 0))
+        return `${action}.${field} must be a positive number`;
+      if (BUDGET_STRS.includes(field) && !(typeof value === "string" && value.length))
+        return `${action}.${field} must be a non-empty string`;
+    }
+  }
+  return null;
+};
+
 const isAbsPath = v => (typeof v === "string" && v.startsWith("/")
   ? null
   : "must be an absolute path: a relative one resolves against whatever directory the daemon was started in");
@@ -242,6 +289,16 @@ export const FIELDS = {
   // external truth was never confirmed, so it must not be reachable before the
   // reconcilers have had a window at all.
   "builder.cancel.drainMinutes":         [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
+  // Per-action budgets for the phases a worker is dispatched for.
+  //
+  // ONE KEY, NOT EIGHTEEN, and that is a property of the validator rather than a
+  // style choice. `validate`'s unknown-key sweep waves through any leaf beneath a
+  // declared key -- `[...known].some(k => p.startsWith(k + "."))` -- so declaring
+  // `builder.budgets.BUILD_SIZE.budgetMinutes` and its siblings would make
+  // `builder.budgets.BUILD_NOPE.budgetMinutes` a leaf under a known prefix and
+  // accept it silently. The action names and the field names are refused INSIDE
+  // this validator or they are not refused at all.
+  "builder.budgets":                     [false, BUDGETS],
   // Cap on a worker's durable stdout/stderr files. Read by both daemons.
   "worker.maxOutputBytes":               [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
   // How a dispatched worker is isolated from the founder's account. "none"

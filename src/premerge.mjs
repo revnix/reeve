@@ -99,17 +99,35 @@ export function headState({ prHead, branchNow, branchRead } = {}) {
  * make. The gate is about whether to merge NOW, and a zero-step success is a
  * different investigation.
  */
-export function checkState({ nodes } = {}) {
+export function checkState({ nodes, totalCount = null } = {}) {
   if (!Array.isArray(nodes))
     return { state: UNKNOWN, failing: [], why: "the check rollup could not be read" };
+  // THE SAME COMPLETENESS RULE AS THREADS, which this did not have. A rollup with
+  // more than one page returns its first page silently, and a hundred passing checks
+  // beside one omitted pending one read as CLEAR -- the gate defeated by the shape it
+  // was built to catch, on the connection added last.
+  if (totalCount !== null && nodes.length !== totalCount)
+    return { state: UNKNOWN, failing: [],
+             why: `only ${nodes.length} of ${totalCount} checks were fetched, so "all succeeded" would be about a page` };
   const runs = nodes.filter(Boolean);
   if (runs.length === 0)
     return { state: UNKNOWN, failing: [],
              why: "no checks ran at all, and nothing failing is not the same as something passing" };
+  // A CheckRun reports a null conclusion while it runs; a legacy StatusContext has
+  // no conclusion at all and reports progress in `state`, where PENDING and EXPECTED
+  // are non-empty. Reading "has a value" as "finished" therefore cleared the gate for
+  // a pull request whose only status was still pending -- the exact thing this
+  // refuses for a CheckRun, passing through the other shape.
+  //
+  // So SUCCESS is named POSITIVELY and everything else is not-success. A state this
+  // does not recognise lands in unfinished rather than in clear, which is the
+  // direction that cannot silently pass.
   const norm = r => String(r.conclusion ?? r.state ?? "").toUpperCase();
-  const unfinished = runs.filter(r => !norm(r));
-  const failing = runs.filter(r => ["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "ERROR", "STARTUP_FAILURE"]
-                                     .includes(norm(r)));
+  const PASSED = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
+  const FAILED = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED",
+                          "ERROR", "STARTUP_FAILURE"]);
+  const failing = runs.filter(r => FAILED.has(norm(r)));
+  const unfinished = runs.filter(r => !FAILED.has(norm(r)) && !PASSED.has(norm(r)));
   if (failing.length)
     return { state: REFUSE, failing,
              why: `${failing.length} check(s) failed: ${failing.map(r => r.name ?? r.context ?? "?").join(", ")}` };

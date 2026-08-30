@@ -505,4 +505,22 @@ export const STUBS = [
               find: "  if (branchRead !== \"read\")",
               replace: "  if (false)" }],
   },
+  {
+    name: "premerge-pending-status-is-not-clear",
+    why: "read a legacy status context's PENDING state as finished, which is how a pending pull request reported CLEAR",
+    test: "test/premerge.test.mjs",
+    expectRed: "a legacy status in PENDING is UNKNOWN, not clear",
+    edits: [{ file: "src/premerge.mjs",
+              find: "  const unfinished = runs.filter(r => !FAILED.has(norm(r)) && !PASSED.has(norm(r)));",
+              replace: "  const unfinished = runs.filter(r => !norm(r));" }],
+  },
+  {
+    name: "premerge-rollup-completeness",
+    why: "drop the completeness check on the check rollup, so a first page of passes reads as all of them",
+    test: "test/premerge.test.mjs",
+    expectRed: "a truncated check rollup is UNKNOWN, not clear",
+    edits: [{ file: "src/premerge.mjs",
+              find: "  if (totalCount !== null && nodes.length !== totalCount)",
+              replace: "  if (false)" }],
+  },
 ];

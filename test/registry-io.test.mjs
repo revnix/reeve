@@ -275,5 +275,35 @@ check(parse({}).error === null && parse({}).projects.length === 0,
   }
   rmSync(dir, { recursive: true, force: true });
 }
+
+// ── both halves of the entry contract, frozen ──────────────────────────────
+//
+// They fail DIFFERENTLY, which is why one freeze cannot stand for both. A row
+// field added without a snapshot field is a value nothing consumes; a snapshot
+// field added without a row field is an admission that can never complete.
+// Neither freeze can see the other's half.
+{
+  const { readFileSync } = await import("node:fs");
+  const { SNAPSHOT_FIELDS } = await import("../src/build/phases.mjs");
+  const frozen = JSON.parse(readFileSync(
+    new URL("./fixtures/registry-entry-v1.json", import.meta.url), "utf8"));
+
+  // CONTROL: the fixture carries both halves, non-empty. A freeze read from a
+  // file that failed to parse into what was expected compares two empty lists
+  // and agrees with everything.
+  check(Array.isArray(frozen.row_fields) && frozen.row_fields.length > 0 &&
+        Array.isArray(frozen.snapshot_fields) && frozen.snapshot_fields.length > 0,
+    "control: the freeze fixture carries both halves, non-empty",
+    JSON.stringify({ row: frozen.row_fields?.length, snap: frozen.snapshot_fields?.length }));
+
+  const row = parseRegistry(JSON.stringify(
+    { p: { nwo: "o/r", repoPath: "/r", profilePath: "/f" } }), "/x").projects[0];
+  check(Object.keys(row).sort().join(",") === frozen.row_fields.join(","),
+    "freeze: a registry row carries exactly the fields it was frozen with",
+    `${Object.keys(row).sort().join(",")} vs ${frozen.row_fields.join(",")}`);
+  check([...SNAPSHOT_FIELDS].sort().join(",") === frozen.snapshot_fields.join(","),
+    "freeze: and SNAPSHOT_FIELDS is unchanged, which is the other half",
+    `${[...SNAPSHOT_FIELDS].sort().join(",")} vs ${frozen.snapshot_fields.join(",")}`);
+}
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

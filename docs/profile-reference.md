@@ -5,7 +5,7 @@ GENERATED from `src/profile/schema.mjs`. Do not edit by hand: run
 `test/profile-validate.test.mjs` fails while it is stale, and
 `node scripts/profile-reference.mjs --check` reports staleness without writing.
 
-69 keys. 30 carry a description.
+76 keys. 35 carry a description.
 
 `requirement` is what an operator must AUTHOR, not the validator's raw flag:
 the loader applies defaults before validating, so a `defaulted` key may be
@@ -61,6 +61,13 @@ else to put it, which is the point.
 | `builder.founder.login` | optional | a non-empty string |
 | `builder.cancel.drainMinutes` | defaulted | a positive integer |
 | `builder.budgets` | optional | an object of per-action budgets, keyed by build action |
+| `builder.maxConcurrentTasks` | defaulted | a positive integer |
+| `builder.budget.maxPackages` | defaulted | a positive integer |
+| `builder.lease.starvedHours` | defaulted | a positive integer |
+| `builder.provider.concurrencyLimit` | defaulted | a positive integer |
+| `builder.provider.guardianReserved` | defaulted | an integer of zero or more |
+| `builder.provider.cooldownSeconds` | defaulted | a positive integer |
+| `builder.provider.preemptAtBoundary` | defaulted | true or false |
 | `worker.maxOutputBytes` | defaulted | a positive integer |
 | `worker.isolation` | defaulted | one of none, scratch-home, dedicated-user |
 | `worker.dependencyPaths` | optional | a list of a relative path inside the checkout |
@@ -195,6 +202,36 @@ How long a cancelling task's effects get to reconcile before `cancel --force` be
 
 Per-action budgets for the phases a worker is dispatched for.  ONE KEY, NOT EIGHTEEN, and that is a property of the validator rather than a style choice. `validate`'s unknown-key sweep waves through any leaf beneath a declared key -- `[...known].some(k => p.startsWith(k + "."))` -- so declaring `builder.budgets.BUILD_SIZE.budgetMinutes` and its siblings would make `builder.budgets.BUILD_NOPE.budgetMinutes` a leaf under a known prefix and accept it silently. The action names and the field names are refused INSIDE this validator or they are not refused at all.
 
+### `builder.maxConcurrentTasks`
+
+**defaulted**
+
+How many builder tasks may hold a worker at once (section 10.3). One worker per task is a separate, non-configurable rule.
+
+### `builder.budget.maxPackages`
+
+**defaulted**
+
+Section 5's deterministic floor: territory spanning more packages than this forces `standard` depth and at least two slices. Singular `budget`; the plural `builder.budgets` above is section 4.1's per-action knobs.
+
+### `builder.lease.starvedHours`
+
+**defaulted**
+
+Section 10.2: how long one task's territory lease may go on producing skips before `bt:<id>:lease:starved` fires on the HOLDING task.
+
+### `builder.provider.concurrencyLimit`
+
+**defaulted**
+
+Section 10.4's scheduler. Whether headless and interactive usage draw from one pool is account-specific and is MEASURED before it is chosen; the defaults are the design's stated interim values and carry no measurement date until a real run writes one.
+
+### `builder.provider.guardianReserved`
+
+**defaulted**
+
+Zero is legal: it means the guardian takes its chances with the builder. At or ABOVE the limit is refused by a cross-field rule, because the admission test is "held leases below limit MINUS reserved".
+
 ### `worker.maxOutputBytes`
 
 **defaulted**
@@ -323,10 +360,20 @@ why the two differ: the defaults are per project kind.
     "hardCap": 10,
     "maxFixAttemptsPerFinding": 1
   },
-  "watch": {
-    "staleSeconds": 900
-  },
   "builder": {
+    "maxConcurrentTasks": 2,
+    "budget": {
+      "maxPackages": 2
+    },
+    "lease": {
+      "starvedHours": 24
+    },
+    "provider": {
+      "concurrencyLimit": 2,
+      "guardianReserved": 1,
+      "cooldownSeconds": 300,
+      "preemptAtBoundary": true
+    },
     "capabilities": {
       "observe": false,
       "draftSpec": false,
@@ -341,6 +388,9 @@ why the two differ: the defaults are per project kind.
   "worker": {
     "maxOutputBytes": 67108864,
     "isolation": "none"
+  },
+  "watch": {
+    "staleSeconds": 900
   }
 }
 ```
@@ -392,10 +442,20 @@ why the two differ: the defaults are per project kind.
     "hardCap": 5,
     "maxFixAttemptsPerFinding": 1
   },
-  "watch": {
-    "staleSeconds": 900
-  },
   "builder": {
+    "maxConcurrentTasks": 2,
+    "budget": {
+      "maxPackages": 2
+    },
+    "lease": {
+      "starvedHours": 24
+    },
+    "provider": {
+      "concurrencyLimit": 2,
+      "guardianReserved": 1,
+      "cooldownSeconds": 300,
+      "preemptAtBoundary": true
+    },
     "capabilities": {
       "observe": false,
       "draftSpec": false,
@@ -410,6 +470,9 @@ why the two differ: the defaults are per project kind.
   "worker": {
     "maxOutputBytes": 67108864,
     "isolation": "none"
+  },
+  "watch": {
+    "staleSeconds": 900
   }
 }
 ```

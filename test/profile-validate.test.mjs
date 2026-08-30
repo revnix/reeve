@@ -397,8 +397,13 @@ expectRefusal("budgets that are not an object", withBudget([]), /builder\.budget
   // 30 since the misplaced watcher comment moved to the key it describes:
   // `watch.reviewActions` had no detail at all while its warning was attributed
   // to `notify.provider`.
-  const pinned = documented === 30;
-  console.log(`${pinned ? "PASS" : "FAIL"}  control: 29 of the declared keys carry a description`);
+  // ONE NUMBER, NAMED. The check said 30 while the label said 29, because an
+  // earlier edit updated the comparison and missed the string inside the
+  // template literal -- two places holding one fact, and the one a reader sees
+  // was the wrong one. The label is derived from the constant now.
+  const PINNED_DOCUMENTED = 35;
+  const pinned = documented === PINNED_DOCUMENTED;
+  console.log(`${pinned ? "PASS" : "FAIL"}  control: ${PINNED_DOCUMENTED} of the declared keys carry a description`);
   if (!pinned) {
     console.log(`        ${documented} do. If you added or removed one, update this number`);
     console.log("        and regenerate docs/profile-reference.md in the same commit.");
@@ -812,6 +817,101 @@ expectRefusal("budgets that are not an object", withBudget([]), /builder\.budget
     console.log("        A key's prose or its required-ness changed. Regenerate both halves.");
     fail++;
   }
+}
+
+// ── the scheduling knobs, and their defaults ─────────────────────────────────
+const withBuilder = (b) => { const p = clone(base); p.builder = b; return p; };
+
+expectOk("the four scheduler knobs, the concurrency cap, the package floor and the starve window",
+  withBuilder({ maxConcurrentTasks: 3, budget: { maxPackages: 4 }, lease: { starvedHours: 12 },
+                provider: { concurrencyLimit: 4, guardianReserved: 0, cooldownSeconds: 30,
+                            preemptAtBoundary: false } }));
+expectRefusal("zero concurrent tasks", withBuilder({ maxConcurrentTasks: 0 }),
+  /builder\.maxConcurrentTasks must be a positive integer/);
+expectRefusal("a negative reservation", withBuilder({ provider: { guardianReserved: -1 } }),
+  /builder\.provider\.guardianReserved must be a non-negative integer/);
+// Asserted on the REASON, not just the key name. Before the key was declared
+// this same case was refused as `unknown key`, so a bare key-name pattern went
+// green while the validator did not exist at all.
+expectRefusal("a truthy string where a boolean switch belongs",
+  withBuilder({ provider: { preemptAtBoundary: "true" } }),
+  /builder\.provider\.preemptAtBoundary must be a boolean/);
+
+// Section 10.4's admission rule admits a builder request only when held leases
+// are below `concurrencyLimit` MINUS `guardianReserved`. Reserving the whole
+// pool is therefore a silent, permanent off switch for the builder that reads
+// as a tuning choice -- so it is refused where it can still be explained.
+expectRefusal("a reservation that leaves the builder no slot at all",
+  withBuilder({ provider: { concurrencyLimit: 2, guardianReserved: 2 } }),
+  /guardianReserved \(2\) must be less than builder\.provider\.concurrencyLimit \(2\)/);
+expectOk("control: a reservation that leaves exactly one slot",
+  withBuilder({ provider: { concurrencyLimit: 2, guardianReserved: 1 } }));
+
+// The container guard: an array or a string here would take the defaults as
+// named properties, validate, and serialize to nothing.
+expectRefusal("builder.provider as an array", withBuilder({ provider: [] }),
+  /builder\.provider must be an object/);
+expectRefusal("builder.budget as an array", withBuilder({ budget: [] }),
+  /builder\.budget must be an object/);
+expectRefusal("builder.lease as an array", withBuilder({ lease: [] }),
+  /builder\.lease must be an object/);
+
+// ── the defaults reach a profile that sets none of them ──────────────────────
+{
+  const check = (ok, name, detail) => {
+    console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+    if (!ok) { if (detail) console.log("        " + detail); fail++; }
+  };
+  const d = withDefaults(clone(base));
+  for (const [path, want] of [["maxConcurrentTasks", 2], ["budget.maxPackages", 2],
+                              ["lease.starvedHours", 24], ["provider.concurrencyLimit", 2],
+                              ["provider.guardianReserved", 1], ["provider.cooldownSeconds", 300],
+                              ["provider.preemptAtBoundary", true]]) {
+    const got = path.split(".").reduce((o, k) => (o == null ? undefined : o[k]), d.builder);
+    check(got === want, `defaults: builder.${path} is ${want}`, `got ${JSON.stringify(got)}`);
+  }
+  // CONTROL: an explicit value is NEVER overridden by the default.
+  const explicit = withDefaults(withBuilder({ maxConcurrentTasks: 7 }));
+  check(explicit.builder.maxConcurrentTasks === 7, "defaults: an explicit value wins",
+    JSON.stringify(explicit.builder.maxConcurrentTasks));
+  // And the defaulted profile is itself valid, or the defaults have invented a
+  // profile the validator would refuse.
+  expectOk("control: the defaulted profile validates", clone(base));
+
+  // CONTROL: the shipped defaults SATISFY the cross-field rule. A default pair
+  // that refused itself would make every bare profile invalid, which is the
+  // opposite failure and one the rule above cannot see.
+  check(d.builder.provider.guardianReserved < d.builder.provider.concurrencyLimit,
+    "control: the default reservation leaves the builder a slot",
+    `${d.builder.provider.guardianReserved} of ${d.builder.provider.concurrencyLimit}`);
+}
+
+// ── the generated profile writes builder and worker in a declared position ───
+//
+// A declared key with no default AND no position is a key that reaches one
+// machine: `commitPattern` was in FIELDS and appeared zero times in init.mjs, so
+// every freshly initialised profile gave the reviewer no way to bind a clean
+// pass to a revision, and the live profile had it only because someone added it
+// by hand.
+{
+  const check = (ok, name, detail) => {
+    console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+    if (!ok) { if (detail) console.log("        " + detail); fail++; }
+  };
+  const { canonical } = await import("../src/init.mjs");
+  const order = Object.keys(canonical(withDefaults(withBuilder({ maxConcurrentTasks: 2 }))));
+  check(order.indexOf("builder") >= 0 && order.indexOf("worker") >= 0 &&
+        order.indexOf("builder") < order.indexOf("watch"),
+    "init: builder and worker have a declared position", "order was: " + order.join(","));
+
+  // CONTROL: `canonical` really orders by ORDER rather than by insertion, so the
+  // assertion above is about the declaration and not about the object it was
+  // handed. Built with `watch` FIRST; a pass-through would keep it there.
+  const scrambled = canonical({ watch: { intervalSeconds: 1 }, project: { kind: "product" },
+                                schemaVersion: 1 });
+  const ks = Object.keys(scrambled);
+  check(ks.indexOf("schemaVersion") < ks.indexOf("watch"),
+    "control: canonical orders by the declaration, not by insertion", ks.join(","));
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

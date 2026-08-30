@@ -35,6 +35,45 @@ export const UNREVIEWED = "UNREVIEWED";
 export const UNKNOWN = "UNKNOWN";
 
 /**
+ * ONE completeness rule, for every connection this gate reads.
+ *
+ * A GraphQL connection returns a page and says nothing about it being the whole set.
+ * Comparing `totalCount` against the nodes actually fetched is the only signal that
+ * a list is complete, and reading a truncated page as the whole thing is how "zero
+ * unresolved" and "all checks succeeded" become lies.
+ *
+ * WHY A SHARED FUNCTION AND NOT A THIRD COPY. This rule has now been missed three
+ * times, each time on the connection added LAST -- threads had it, checks were added
+ * without it and the comment repairing that says so, and then the reviews connection
+ * was added without it in the very change that quotes the comment. Three instances of
+ * one shape is evidence about the design, not about anyone's memory. A new connection
+ * cannot now be read without going through this, and the test enumerates the callers
+ * so that a fourth cannot be added quietly.
+ *
+ * `totalCount` of null means the caller did not ASK for it, which is itself an
+ * incomplete read rather than a complete one.
+ *
+ * `threadState` and `reviewState` go through this. `checkState` still carries its own
+ * copy, and its copy is LOOSER: it treats a missing totalCount as complete rather
+ * than as unknown. That is a real difference and not a stylistic one, so it is not
+ * being smuggled into a change about a different connection -- thirteen existing
+ * assertions call it without a totalCount, and tightening it means deciding what they
+ * should assert instead. It is named here so the next reader finds one rule and one
+ * exception rather than three rules that happen to agree.
+ */
+export function completeness({ nodes, totalCount, what }) {
+  if (!Array.isArray(nodes))
+    return { ok: false, state: UNKNOWN, why: `the ${what} could not be read` };
+  if (typeof totalCount !== "number")
+    return { ok: false, state: UNKNOWN,
+             why: `the ${what} listing carried no totalCount, so whether it is complete is unknown` };
+  if (nodes.length !== totalCount)
+    return { ok: false, state: UNKNOWN,
+             why: `only ${nodes.length} of ${totalCount} ${what} were fetched, so a verdict would be about a page rather than the pull request` };
+  return { ok: true };
+}
+
+/**
  * Thread state from ONE listing.
  *
  * `totalCount` against the number of nodes actually fetched is the completeness
@@ -96,9 +135,53 @@ export function mergeabilityState({ mergeable, mergeStateStatus } = {}) {
  * dismisses stale reviews. Null means no review is REQUIRED, which is not the same as
  * one having been given, so it is UNREVIEWED rather than clear.
  */
-export function reviewState({ reviewDecision } = {}) {
+export function reviewState({ reviewDecision, reviews = null, reviewsTotal = null,
+                              head = null } = {}) {
   const d = String(reviewDecision ?? "").toUpperCase();
-  if (d === "APPROVED") return { state: CLEAR, why: "GitHub reports the review as APPROVED" };
+  if (d === "APPROVED") {
+    // THE AGGREGATE IS NOT HEAD-BOUND unless the repository dismisses stale
+    // approvals, and most do not. An approval on head A survives an unreviewed head
+    // B, so mapping APPROVED straight to CLEAR clears a revision nobody looked at --
+    // and the caveat I had written in this comment documented that hole rather than
+    // closing it, which reads as though the case had been handled.
+    //
+    // So the aggregate answers only WAS A REVIEW GIVEN AT ALL, and whether it covers
+    // this revision comes from the approving review's own commit. Whether an approver
+    // QUALIFIES under branch protection or CODEOWNERS is not re-derived here: that is
+    // what `reviewDecision` and `mergeStateStatus` already answer, and re-deriving
+    // the unbounded question is the mistake four earlier rounds each found one more
+    // input to. This check is strictly ADDITIONAL to GitHub's, never a substitute.
+    if (!head)
+      return { state: UNKNOWN,
+               why: "GitHub reports APPROVED, but the head being merged could not be read, and an approval is not head-bound unless the repository dismisses stale reviews" };
+    // COMPLETENESS IS CHECKED ON THE WHOLE LISTING, BEFORE FILTERING. `totalCount`
+    // counts every opinionated review, approvals and change-requests alike, so
+    // comparing it against a list already narrowed to approvals would report
+    // truncation on any pull request where somebody requested changes -- a false
+    // refusal produced by the completeness rule itself.
+    const complete = completeness({ nodes: reviews, totalCount: reviewsTotal,
+                                    what: "opinionated reviews" });
+    if (!complete.ok)
+      return { state: complete.state,
+               why: `GitHub reports APPROVED, but ${complete.why}, so an approval of this head could be on a page that was not read` };
+    const approvals = reviews.filter(r => String(r?.state).toUpperCase() === "APPROVED");
+    // A REVIEW WHOSE COMMIT IS NULL IS AN UNREADABLE FACT, not an approval elsewhere.
+    // `commit` is nullable, so an APPROVED review can arrive with nothing to compare
+    // against -- and treating that as "approved on some earlier commit" reports an
+    // incomplete read as a finding, which sends automation to ask for another review
+    // rather than to say the read failed.
+    const unreadable = approvals.filter(a => !a?.commit?.oid);
+    if (unreadable.length)
+      return { state: UNKNOWN,
+               why: `GitHub reports APPROVED, but ${unreadable.length} of ${approvals.length} approving review(s) carry no resolvable commit, so which revision was approved was not established` };
+    const atHead = approvals.filter(a => a.commit.oid === head);
+    if (atHead.length)
+      return { state: CLEAR,
+               why: `approved at this head by ${atHead.map(a => a.author?.login ?? "?").join(", ")}` };
+    const elsewhere = approvals.map(a => String(a.commit.oid).slice(0, 7)).join(", ");
+    return { state: UNREVIEWED,
+             why: `GitHub reports APPROVED, but every approval is on an earlier commit (${elsewhere}), not on the head being merged` };
+  }
   if (d === "CHANGES_REQUESTED") return { state: REFUSE, why: "GitHub reports CHANGES_REQUESTED" };
   if (d === "REVIEW_REQUIRED")
     return { state: UNREVIEWED, why: "GitHub reports REVIEW_REQUIRED, so nobody has approved this state" };
@@ -115,11 +198,8 @@ export function reviewState({ reviewDecision } = {}) {
  * resolving their own comment could read as a review.
  */
 export function threadState({ totalCount, nodes } = {}) {
-  if (!Array.isArray(nodes) || typeof totalCount !== "number")
-    return { state: UNKNOWN, unresolved: [], why: "the thread listing could not be read at all" };
-  if (nodes.length !== totalCount)
-    return { state: UNKNOWN, unresolved: [],
-             why: `only ${nodes.length} of ${totalCount} threads were fetched, so "none unresolved" would be about a page rather than the pull request` };
+  const complete = completeness({ nodes, totalCount, what: "review threads" });
+  if (!complete.ok) return { state: complete.state, unresolved: [], why: complete.why };
   const unresolved = nodes.filter(n => !n?.isResolved);
   return unresolved.length
     ? { state: REFUSE, unresolved, why: `${unresolved.length} of ${totalCount} thread(s) are unresolved` }

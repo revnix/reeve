@@ -1467,6 +1467,54 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
     `forEach visited ${withHole.filter(() => true).length} of ${withHole.length}`);
 }
 
+// ── the ratio must not count an entry that cannot run ──────────────────────────
+//
+// An entry whose anchor no longer matches is reported UNRUNNABLE and guards nothing,
+// while still being one of the manifest's entries. Counting entries alone therefore
+// overstates coverage by exactly the thing this tool exists to prevent, and it was not
+// hypothetical: a refactor moved the code an anchor named and that entry sat
+// unrunnable on the default branch until a review found it.
+{
+  // DERIVED FROM coverage(), never hand-built. A literal shaped by hand is a second
+  // description of the producer's return, and it diverges the moment the producer
+  // gains a field -- which is precisely what happened here: the hand-built object had
+  // no provenCovered, so the line crashed on a shape coverage() never returns.
+  const c = coverage(
+    [{ test: "test/x.test.mjs" }, { test: "test/y.test.mjs" }],
+    ["test/x.test.mjs", "test/y.test.mjs", "test/z.test.mjs"],
+    ["test/z.test.mjs"]);
+  check(/only 1 PROVEN/.test(coverageLine(c, 1)),
+    "the ratio says how many entries were PROVEN when that is fewer than exist",
+    coverageLine(c, 1));
+  check(!/PROVEN/.test(coverageLine(c, 2)),
+    "control: and stays quiet when every entry ran, so the line does not cry wolf on a healthy manifest",
+    coverageLine(c, 2));
+  check(!/PROVEN/.test(coverageLine(c, null)),
+    "control: a SUBSET run reports no proven count at all, because it knows nothing about the entries it did not attempt",
+    coverageLine(c, null));
+
+  // AND THE FILE COUNT FOLLOWS THE SAME RULE. Fixing the entry count alone left the
+  // more visible number still wrong: a file whose only entry is unrunnable has no
+  // working guard, and counting it as covered overstates at the file level exactly as
+  // counting the entry overstates at the entry level.
+  const files = ["test/a.test.mjs", "test/b.test.mjs", "test/c.test.mjs"];
+  const two = [{ test: "test/a.test.mjs" }, { test: "test/b.test.mjs" }];
+  const oneDead = coverage(two, files, ["test/c.test.mjs"], [two[0]]);
+  check(oneDead.provenCovered.length === 1 && oneDead.covered.length === 2,
+    "a file whose only entry could not run is NAMED but not PROVEN",
+    JSON.stringify({ named: oneDead.covered, proven: oneDead.provenCovered }));
+  check(/1 of 3 test file\(s\) PROVEN \(2 named\)/.test(coverageLine(oneDead, 1)),
+    "and the line reports both numbers rather than the flattering one",
+    coverageLine(oneDead, 1));
+
+  const allLive = coverage(two, files, ["test/c.test.mjs"], two);
+  check(!/PROVEN/.test(coverageLine(allLive, 2)),
+    "control: when every entry ran, the line says neither PROVEN nor named, so a healthy manifest reads plainly",
+    coverageLine(allLive, 2));
+  check(coverage(two, files, ["test/c.test.mjs"]).provenCovered === null,
+    "control: a run that cannot say which entries ran reports no proven file set at all, rather than guessing zero");
+}
+
 // ── coverage() itself, on synthetic input ──────────────────────────────────────
 //
 // SEPARATE FROM THE REPOSITORY-WIDE CHECK BELOW, and both are needed. That check

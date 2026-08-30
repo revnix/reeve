@@ -461,8 +461,15 @@ export function fingerprint(abs) {
  * neither, and an orphan is the failure -- a test file nobody has shown can fail,
  * and that nobody declared.
  */
-export function coverage(entries, testFiles, grandfathered = []) {
+export function coverage(entries, testFiles, grandfathered = [], proven = null) {
   const named = new Set((entries ?? []).map(e => e?.test).filter(Boolean));
+  // FILES WITH A PROVEN GUARD, when the run can say. A file whose only entry is
+  // UNRUNNABLE has no working guard, so counting it as covered overstates at the
+  // FILE level exactly as counting the entry overstates at the entry level. Fixing
+  // one and not the other left the more visible number still wrong.
+  const provenNamed = proven === null
+    ? null
+    : new Set(proven.map(e => e?.test).filter(Boolean));
   const spared = new Set(grandfathered);
   const files = [...new Set(testFiles ?? [])].sort();
   const covered = files.filter(f => named.has(f));
@@ -472,7 +479,8 @@ export function coverage(entries, testFiles, grandfathered = []) {
   // required to correct is a list that silently becomes a blanket exemption.
   const stale = [...spared].filter(f => named.has(f) || !files.includes(f)).sort();
   return { files, covered, orphans, stale, spared: [...spared].sort(),
-           entries: (entries ?? []).length };
+           entries: (entries ?? []).length,
+           provenCovered: provenNamed === null ? null : files.filter(f => provenNamed.has(f)) };
 }
 
 /**
@@ -481,9 +489,23 @@ export function coverage(entries, testFiles, grandfathered = []) {
  * Printed on every run because the ratio was the thing nobody had seen. A number
  * that only exists inside a function cannot embarrass anyone into fixing it.
  */
-export function coverageLine(c) {
-  return `${c.entries} entr${c.entries === 1 ? "y" : "ies"} over ${c.covered.length} of ` +
-         `${c.files.length} test file(s); ${c.spared.length} grandfathered`;
+export function coverageLine(c, proven = null) {
+  // `proven` is how many entries actually RAN and were caught, when the run covered
+  // the whole manifest. Counting entries alone overstates coverage by exactly the
+  // thing this tool exists to prevent: an entry whose anchor no longer matches is
+  // reported UNRUNNABLE and guards nothing, while still being counted as a guard.
+  // That was not hypothetical -- one entry sat unrunnable on the default branch from
+  // the moment a refactor moved the code its anchor named.
+  const head = proven === null || proven === c.entries
+    ? `${c.entries} entr${c.entries === 1 ? "y" : "ies"}`
+    : `${c.entries} entr${c.entries === 1 ? "y" : "ies"} of which only ${proven} PROVEN`;
+  // The FILE count follows the same rule. When the run knows which entries actually
+  // ran, the files reported as covered are the ones with a proven guard, not the ones
+  // merely named by an entry.
+  const files = c.provenCovered == null || c.provenCovered.length === c.covered.length
+    ? `${c.covered.length} of ${c.files.length} test file(s)`
+    : `${c.provenCovered.length} of ${c.files.length} test file(s) PROVEN (${c.covered.length} named)`;
+  return `${head} over ${files}; ${c.spared.length} grandfathered`;
 }
 
 /**

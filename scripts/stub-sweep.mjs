@@ -29,7 +29,7 @@
  *  · it proves a stub landed by a HASH CHANGE rather than by re-reading the file
  *    for the anchor. Confirmation greps have been measured inert here.
  */
-import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync, realpathSync,
+import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync, realpathSync, statSync,
          lstatSync, readlinkSync, openSync, readSync, closeSync, fstatSync, constants, readdirSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -39,7 +39,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdit, validateManifest, classify, summarise, parsePorcelainZ, fingerprint,
          CAUGHT, UNRUNNABLE, TIMED_OUT_EXIT,
          coverage, coverageLine, changedFiles, grandfatherGate,
-         listGrowth } from "../src/stubsweep.mjs";
+         listGrowth, unresolvedAnchors } from "../src/stubsweep.mjs";
 
 // Overridable so the runner can be pointed at a throwaway repository built by its
 // own test. The cleanliness guard then applies to THAT tree, so the real one is
@@ -161,6 +161,8 @@ if (!process.env.STUB_SWEEP_ROOT && process.env.STUB_SWEEP_NO_DIFF !== "1") {
   if (!changed.ok)
     die(2, `stub-sweep: ${changed.why}\n` +
            "Set STUB_SWEEP_NO_DIFF=1 only if this tree genuinely has no base to compare against.");
+
+
   const gate = grandfatherGate({ changed: changed.files, grandfathered });
   if (!gate.ok) die(2, `stub-sweep: ${gate.why}`);
 
@@ -267,6 +269,92 @@ for (const e of manifest)
       die(2, `stub-sweep: ${e.name}: "${ed.file}" is inside the git directory (${GIT_DIR}).\n` +
              "Changes there are invisible to `git status`, so the cleanliness guard could not see a failed restore.");
   }
+
+// --- every anchor must resolve BEFORE any test is run ------------------------
+//
+// AFTER containment and OUTSIDE the diff block, and both placements are the fix for a
+// mistake rather than a preference.
+//
+// After containment, because this reads file contents: a malformed path resolving to
+// an external FIFO or a huge file would block or exhaust the sweep before the guard
+// above could refuse it. Containment must decide what may be opened before anything
+// opens it.
+//
+// Outside the diff block, because the first wiring of this put it INSIDE, so every
+// fixture-driven run and every legitimately baseless local run skipped the preflight
+// entirely and discovered a rotted anchor during the twenty-minute loop -- the exact
+// behaviour it exists to prevent, in the change that claimed to prevent it.
+//
+// TWO SPELLINGS REACHING ONE FILE ARE REFUSED rather than modelled. The runner groups
+// by the first TEXTUAL target and applies that target's edits together, so interleaved
+// edits through an alias and a real path run in an order this preflight would have to
+// reproduce exactly to stay faithful. Refusing the ambiguity is simpler than modelling
+// it, and a manifest naming one file two ways is worth refusing on its own terms.
+{
+  const realOf = new Map();
+  for (const e of manifest) {
+    const seen = new Map();
+    for (const ed of e.edits) {
+      // DEVICE AND INODE, which IS filesystem identity. The progression here was
+      // normalize, then realpath, then this, and each step was a review round finding
+      // an aliasing mechanism the previous one missed -- `./f`, `/f`, a symlink, and
+      // finally a HARD LINK, which realpath does not collapse because both names are
+      // equally real. There is nothing past dev+ino: two names sharing them ARE one
+      // file, and two names not sharing them are not. This ends the family rather
+      // than answering one more spelling of it.
+      //
+      // A file that cannot be stat'd falls back to its path, so a missing file is
+      // still REPORTED by the anchor check below rather than throwing here.
+      const abs = join(ROOT, ed.file);
+      // ONLY a missing file falls back. A bare catch here hid a ReferenceError for an
+      // unimported `statSync` and made this whole identity check inert for EVERY file
+      // while still printing a plausible result -- the exact shape this pull request
+      // exists to remove, inside the change that removes it. A programming error must
+      // not be indistinguishable from a file that is not there.
+      let real;
+      try { const st = statSync(abs); real = `${st.dev}:${st.ino}`; }
+      catch (e) {
+        // ENOENT and ENOTDIR mean "not there", which the anchor check below reports
+        // properly. Any OTHER filesystem error -- ELOOP on a self-referential
+        // symlink, EACCES, ENAMETOOLONG -- is a target this sweep cannot read, and
+        // that is a REFUSAL rather than a crash: the exit contract reserves 1 for a
+        // sweep that ran and 2 for one that would not start, and a rethrow here
+        // escapes before the uncaughtException handler is installed, exiting 1 with a
+        // stack trace.
+        //
+        // A programming error still surfaces, because it carries no `code`.
+        if (e?.code && e.code !== "ENOENT" && e.code !== "ENOTDIR")
+          die(2, `stub-sweep: ${e.name}: "${ed.file}" cannot be read (${e.code}).\n` +
+                 "A manifest may only name targets this sweep can open, and refusing is the\n" +
+                 "honest answer to one it cannot.");
+        if (!e?.code) throw e;
+        real = abs;
+      }
+      const prior = seen.get(real);
+      if (prior && prior !== ed.file)
+        die(2, `stub-sweep: ${e.name}: "${prior}" and "${ed.file}" name the same file.\n` +
+               "The runner groups by the textual target, so two spellings of one file make the\n" +
+               "order edits are applied in ambiguous. Name it one way.");
+      seen.set(real, ed.file);
+      realOf.set(ed.file, real);
+    }
+  }
+  // The KEY is filesystem identity; the READER needs a path. They are different
+  // things now, so the reader maps back rather than being handed the key.
+  const pathOf = new Map([...realOf].map(([file]) => [realOf.get(file), join(ROOT, file)]));
+  const rotted = unresolvedAnchors(manifest, {
+    key: f => realOf.get(f) ?? join(ROOT, f),
+    read: k => readFileSync(pathOf.get(k) ?? k, "utf8"),
+  });
+  if (rotted.length)
+    die(2, "stub-sweep: these anchors resolve nowhere, so their stubs cannot be placed:\n" +
+           // The PATH, never the identity key. Keying by device and inode is right and
+    // `16777229:263943751` tells a reader nothing, so the message maps back to the
+    // name they wrote in the manifest.
+    rotted.map(r => `  ${r.name} -> ${pathOf.get(r.file) ?? r.file}\n    ${String(r.why).split("\n")[0]}`).join("\n") +
+           "\n\nRe-anchor them to the text as it now stands. This check costs milliseconds and\n" +
+           "runs before any test so a rotted anchor does not cost twenty minutes to discover.");
+}
 
 const wanted = process.argv.slice(2);
 const entries = wanted.length ? manifest.filter(e => wanted.includes(e.name)) : manifest;

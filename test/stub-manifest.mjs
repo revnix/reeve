@@ -132,7 +132,6 @@ export const GRANDFATHERED = [
   "test/provider-queue-order.test.mjs",
   "test/provider-scheduler.test.mjs",
   "test/reconciler.test.mjs",
-  "test/registry-io.test.mjs",
   "test/repair-message.test.mjs",
   "test/repo-id-lookup.test.mjs",
   "test/required-evidence.test.mjs",
@@ -822,5 +821,14 @@ export const STUBS = [
     edits: [{ file: "src/stubsweep.mjs",
               find: "  const added = (after ?? []).filter(f => !was.has(f));",
               replace: "  const added = [];" }],
+  },
+  {
+    name: "registryio-nonzero-git-exit-is-not-no-entry",
+    why: "accept a nonzero git exit as an answer, so a checkout git refuses to read -- dubious ownership, a corrupt or locked index, exit 128 -- comes back as empty stdout, parses to `null`, and the caller admits the claim without ever establishing whether the index records a symlink or a submodule. `ls-files` exits 0 when nothing matches, so a nonzero status never means \"no entry\"; it always means the question could not be asked, and answering it as absence is fail-OPEN on the one probe that guards the admission path",
+    test: "test/registry-io.test.mjs",
+    expectRed: "git failing with exit 128 refuses, rather than reading as \"nothing is tracked\"",
+    edits: [{ file: "src/build/registryio.mjs",
+              find: "      if (res.status !== 0 || res.signal)",
+              replace: "      if (false)" }],
   },
 ];

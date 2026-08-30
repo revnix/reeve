@@ -140,7 +140,12 @@ export function readArtifact({ dir, phase, expectSha }) {
 // research is at least one file:line citation per claim. Prose between the lists
 // is context, not a claim, and is not asked to cite.
 const CLAIM = /^\s*(?:[-*]|\d+\.)\s+\S/;
-const CITATION = /[\w./-]+:\d+/;
+// A CITATION IS A PATH AND A LINE, not any token with a colon in it.
+// `[\w./-]+:\d+` matched `12:30` and `issue:42` as readily as
+// `src/build/hubaccess.mjs:170`, so a claim mentioning a time or a ticket read
+// as sourced. The token must therefore carry the shape of a file: either a
+// separator, or a name with an extension immediately before the colon.
+const CITATION = /(?:[\w.-]*\/[\w./-]*|[\w-]+\.[A-Za-z][\w]{0,5}):\d+/;
 // A URL's PORT is not a file citation, and research is full of URLs. `[\w./-]+:\d+`
 // matches `localhost:3000` exactly as it matches `src/x.mjs:170`, so a claim
 // supported by a link read as supported by a source line -- the gate accepting
@@ -191,8 +196,22 @@ export function reviewArtifact({ phase, dir, expect }) {
       if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
         findings.push(`sizing.json is ${Array.isArray(parsed) ? "an array" : JSON.stringify(parsed)}, ` +
                       `not an object; valid JSON is not a sizing`);
-      else if (typeof parsed.depth !== "string" || !parsed.depth.trim())
-        findings.push("sizing.json carries no depth, which is the one field the phase machine reads from it");
+      else {
+        // THE CONTRACT IS WRITTEN DOWN, so it is enforced rather than guessed.
+        // I declined this once on the grounds that requiring fields would encode
+        // what the sizing phase is merely EXPECTED to emit -- and that was wrong:
+        // the design states the shape, so these are the artifact's terms and not
+        // an assumption about a task nobody has written yet.
+        //
+        // The depth VALUE is still not re-checked here. The transition owns that
+        // vocabulary and refuses an unknown depth durably; a copy of the list in
+        // this file would be a second inventory of it.
+        for (const field of ["depth", "est_files", "est_weighted_files", "est_packages",
+                             "est_slices", "risk_paths_touched", "rationale"])
+          if (!(field in parsed)) findings.push(`sizing.json omits ${field}`);
+        if ("depth" in parsed && (typeof parsed.depth !== "string" || !parsed.depth.trim()))
+          findings.push("sizing.json's depth is not a name; it is the field the phase machine reads");
+      }
     }
   }
   if (phase === "RESEARCH") {
@@ -236,8 +255,16 @@ export function reviewArtifact({ phase, dir, expect }) {
       const heading = lines[starts[k]].trim();
       const next = sections.find(i => i > starts[k]) ?? lines.length;
       const body = lines.slice(starts[k] + 1, next).join("\n");
-      for (const need of ["Files:", "Packages:", "Tests:", "Done when:"])
-        if (!body.includes(need)) findings.push(`${heading} has no ${need} line`);
+      for (const need of ["Files:", "Packages:", "Tests:", "Done when:"]) {
+        // THE LABEL IS NOT THE ANSWER. `includes` passed on the bare scaffold, so
+        // a slice carrying the four headings and nothing after them advanced as
+        // though it named its files, its tests and its done condition. What the
+        // gate is for is the values.
+        const line = body.split("\n").find(l => l.trim().startsWith(need));
+        if (!line) findings.push(`${heading} has no ${need} line`);
+        else if (!line.slice(line.indexOf(need) + need.length).trim())
+          findings.push(`${heading} has a ${need} line with nothing after it`);
+      }
     }
     if (expect.depth === "trivial" && !/^##\s+Measured context\b/m.test(text))
       findings.push("at trivial depth design.md stands in for the absent research and needs a Measured context section");

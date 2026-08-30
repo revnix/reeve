@@ -113,5 +113,19 @@ export function artifactPathFor(home, taskId, phase) {
 export function runPathFor(home, taskId, { generation, phase, slice, attempt, stream }) {
   if (![generation, slice, attempt].every(Number.isInteger) || !phase || !stream)
     throw new Error("a run path needs generation, phase, slice, attempt and stream; none is optional");
+  // EVERY COMPONENT IS A SEGMENT, not just the task id. The id was sanitised and
+  // the rest were only checked for presence, so a phase or stream carrying a
+  // separator escaped the task tree entirely -- `phase: "x/../../../../escape"`
+  // resolved to a file directly under the reeve home. Same defect as the one
+  // `safe` exists to prevent, in the same function, on the arguments beside it.
+  //
+  // These THROW rather than being sanitised. A task id arrives from a command
+  // line and a person can typo it; a phase and a stream are chosen by this
+  // codebase, so a separator in one is a wiring error, and quietly rewriting it
+  // would hide the bug and produce a file nobody can find by name.
+  for (const [name, value] of [["phase", phase], ["stream", stream]])
+    if (String(value) !== safe(value))
+      throw new Error(`a run path's ${name} must be a single path segment; ` +
+                      `${JSON.stringify(String(value))} is not, and would place the file outside the task's tree`);
   return join(taskPathFor(home, taskId), "runs", `g${generation}-${phase}-s${slice}-a${attempt}.${stream}`);
 }

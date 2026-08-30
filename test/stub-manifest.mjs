@@ -976,9 +976,9 @@ export const STUBS = [
     name: "reviewdiff-refuses-an-artifact-phase",
     why: "let a report phase fall through into the diff gate, on the argument that nothing calls reviewDiff with a phase name. It then arrives with an empty file list and is refused as \"the worker produced an empty diff\" -- a refusal that reads as the worker's fault and is the gate's, so an operator debugs a worker that did exactly what it was asked. The guard is derived from the artifact-phase map rather than listing the three names, so a fourth report phase is covered without anyone remembering",
     test: "test/artifact.test.mjs",
-    expectRed: "reviewDiff throws when handed an artifact phase",
+    expectRed: "reviewDiff refuses the dispatch name BUILD_RESEARCH",
     edits: [{ file: "src/sandbox.mjs",
-              find: "  if (action !== null && Object.hasOwn(ARTIFACT_FILE, action))",
+              find: "  if (action !== null && (BUILD_ACTIONS.includes(action) || Object.hasOwn(ARTIFACT_FILE, action)))",
               replace: "  if (false)" }],
   },
   {
@@ -989,5 +989,14 @@ export const STUBS = [
     edits: [{ file: "src/paths.mjs",
               find: "`g${generation}-${phase}-s${slice}-a${attempt}.${stream}`",
               replace: "`g${generation}-${phase}-s${slice}.${stream}`" }],
+  },
+  {
+    name: "reviewdiff-guard-matches-the-dispatch-vocabulary",
+    why: "key the guard on PHASE names only, which is the form that shipped and could never fire: reviewDiff receives `decision.action`, and a report phase is dispatched under a BUILD_ name. The guard then looks correct, is covered by a green test that passes it phase names, and is unreachable from every real caller -- a fixture written to match the implementation rather than production. Both vocabularies are refused now, and phases.mjs records why neither can be derived from the other: SIZING dispatches as BUILD_SIZE, not BUILD_SIZING",
+    test: "test/artifact.test.mjs",
+    expectRed: "reviewDiff refuses the dispatch name BUILD_SIZE",
+    edits: [{ file: "src/sandbox.mjs",
+              find: "  if (action !== null && (BUILD_ACTIONS.includes(action) || Object.hasOwn(ARTIFACT_FILE, action)))",
+              replace: "  if (action !== null && Object.hasOwn(ARTIFACT_FILE, action))" }],
   },
 ];

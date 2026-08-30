@@ -13,6 +13,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
 import { ARTIFACT_FILE } from "../src/paths.mjs";
+import { BUILD_ACTION_FOR, BUILD_ACTIONS } from "../src/build/phases.mjs";
 import { openHub } from "../src/build/hubdb.mjs";
 import { applyTransition } from "../src/build/transition.mjs";
 import { isSameProcess, readStart } from "../src/supervisor.mjs";
@@ -214,16 +215,33 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   check(b !== null, "and reviewArtifact throws when handed a diff phase", String(b));
   check(/reviewDiff/.test(String(b)), "and names its sibling too", String(b));
 
-  // EVERY artifact phase, not the one that happened to be tested. The guard is
-  // derived from the phase map, so this asserts the derivation rather than one
-  // branch of it -- a fourth report phase added later is covered without anyone
-  // remembering to come back here.
+  // THE NAMES CALLERS ACTUALLY PASS, which is the assertion that was missing.
+  // `reviewDiff` receives `decision.action`, and a report phase is dispatched
+  // under a BUILD_ name. Asserting only the PHASE names tested the guard against
+  // a vocabulary no caller uses: correct-looking, green, and unreachable.
+  //
+  // Both vocabularies are looped, and both come from the module that declares
+  // them, so a fourth report phase is covered without anyone returning here.
+  for (const action of BUILD_ACTIONS) {
+    let t = null;
+    try { reviewDiff({ files: ["packages/x/a.ts"], profile: {}, lane: null, action }); }
+    catch (e) { t = String(e.message); }
+    check(t !== null, `reviewDiff refuses the dispatch name ${action}`, String(t));
+  }
   for (const phase of Object.keys(ARTIFACT_FILE)) {
     let t = null;
     try { reviewDiff({ files: ["packages/x/a.ts"], profile: {}, lane: null, action: phase }); }
     catch (e) { t = String(e.message); }
-    check(t !== null, `reviewDiff refuses ${phase} too, because the guard is derived`, String(t));
+    check(t !== null, `reviewDiff refuses the phase name ${phase} too`, String(t));
   }
+  // AND THE TWO VOCABULARIES REALLY DIFFER, so the loops above are not one loop
+  // written twice. phases.mjs records that SIZING dispatches as BUILD_SIZE, not
+  // BUILD_SIZING, which is why neither list can be derived from the other.
+  check(BUILD_ACTION_FOR.SIZING === "BUILD_SIZE",
+    "control: the dispatch name is not the phase name with a prefix", BUILD_ACTION_FOR.SIZING);
+  check(BUILD_ACTIONS.every(a => !Object.hasOwn(ARTIFACT_FILE, a)),
+    "control: and no dispatch name is a phase name, so covering one is not covering both",
+    BUILD_ACTIONS.join(","));
 
   // CONTROL: the guardian's own actions still go through unchanged. This asserts
   // that reviewDiff RETURNS rather than that it returns ok -- what the new guard
@@ -255,6 +273,54 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   catch (e) { missing = String(e.message); }
   check(missing !== null && /expect/.test(missing),
     "and refuses a call that omits `expect` rather than defaulting it", String(missing));
+}
+
+// ── The gate reports the digest of what IT read ────────────────────────────
+//
+// An artifact replaced between the write and the gate -- by a recovered attempt,
+// or a concurrent one -- was validated here and then recorded under the earlier
+// write's sha, so the transition bound to bytes this gate never saw.
+{
+  const adir = join(dir, "gatesha");
+  const first = writeArtifact({ dir: adir, phase: "RESEARCH",
+    bytes: Buffer.from("# research\n\n- a claim (src/x.mjs:1)\n") });
+  const replaced = writeArtifact({ dir: adir, phase: "RESEARCH",
+    bytes: Buffer.from("# research\n\n- a different claim (src/y.mjs:2)\n") });
+  check(first.sha256 !== replaced.sha256, "control: the replacement really has a different sha");
+
+  const gate = reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+  check(gate.ok === true, "control: the replacement passes the gate", JSON.stringify(gate.findings));
+  check(gate.sha256 === replaced.sha256,
+    "the gate reports the sha of the bytes it reviewed, not the earlier write's",
+    `${gate.sha256} vs replaced ${replaced.sha256} / first ${first.sha256}`);
+
+  // AND ON THE REFUSAL PATH TOO, because a refusal that cannot say which bytes
+  // it refused cannot be acted on.
+  writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from("# research\n\n- uncited\n") });
+  const bad = reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+  check(bad.ok === false && typeof bad.sha256 === "string" && bad.sha256.length === 64,
+    "and a refusal names the sha it refused", JSON.stringify({ ok: bad.ok, sha: bad.sha256 }));
+}
+
+// ── A failed write leaves no temporary behind ──────────────────────────────
+//
+// A full disk is the ordinary case. The partial file used to survive, and every
+// retry minted another randomly named one -- so the failures consumed the space
+// needed to recover, turning a transient full disk into a permanent one.
+{
+  const adir = join(dir, "failedwrite");
+  let threw = null;
+  // A Proxy that reports a huge length makes writeSync throw on a real buffer,
+  // which is the shape of a write that fails partway rather than a fabricated
+  // error thrown before any file was created.
+  try {
+    writeArtifact({ dir: adir, phase: "DESIGN",
+      bytes: new Proxy(Buffer.from("x"), { get: (t, k) => k === "length" ? 1e9 : Reflect.get(t, k) }) });
+  } catch (e) { threw = String(e.message); }
+  check(threw !== null, "control: the write really failed", String(threw));
+  const left = (() => { try { return readdirSync(adir); } catch { return []; } })();
+  check(!left.some(f => f.includes(".tmp-")),
+    "a failed write leaves no temporary file behind", left.join(",") || "(directory empty)");
 }
 
 db.close();

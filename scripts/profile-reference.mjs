@@ -122,12 +122,22 @@ const put = (o, path, v) => {
  */
 export function requirementOf(key) {
   const [required] = FIELDS[key];
-  if (!required) return "optional";
   if (key === "project.kind") return "required";   // the probe below authors it
+  // THE DEFAULT PROBE RUNS FOR OPTIONAL FIELDS TOO, and skipping it was a real
+  // defect. `watch.staleSeconds` carries a false required flag AND a universal
+  // default of 900, so an early return labelled it `optional` directly above its
+  // own description reading "Defaulted rather than optional" -- the generated
+  // document contradicting itself on the same row. Capability switches, round
+  // limits and worker defaults are all in that group.
+  //
+  // The operator-facing question is not which flag the schema carries. It is:
+  // must I write this, may I omit it and still get a value, or may I omit it and
+  // have nothing? `defaulted` is the middle answer, and it is true of a key
+  // whatever its raw flag says.
   const kinds = PROJECT_KIND.filter((kind) => at(withDefaults({ project: { kind } }), key) !== undefined);
   if (kinds.length === PROJECT_KIND.length) return "defaulted";
   if (kinds.length) return `defaulted for ${kinds.join(", ")}`;
-  return "required";
+  return required ? "required" : "optional";
 }
 
 /**
@@ -156,6 +166,12 @@ const EXAMPLE_SEED = Object.freeze({
   "merge.method": MERGE_METHOD[0],
   "merge.enforcement": ENFORCEMENT[0],
 });
+
+/** The key paths the example seed authors. Exported so the test can compare this
+ *  set against `mustAuthor()` in BOTH directions -- a stale entry left behind
+ *  when a key gains a default would otherwise sit in every example, overriding
+ *  that default, while the document claims the value came from `withDefaults`. */
+export const EXAMPLE_SEED_KEYS = Object.freeze(Object.keys(EXAMPLE_SEED));
 
 /** The keys an operator must author: required, and supplied by no kind's defaults. */
 export function mustAuthor() {

@@ -487,12 +487,13 @@ expectRefusal("budgets that are not an object", withBudget([]), /builder\.budget
 // omits it. Reporting the flag labelled `authority.profileLocation` "required"
 // and misstated the contract: every profile may omit it, and both kinds get one.
 {
-  const { requirementOf, mustAuthor, exampleFor, profileReference } =
+  const { requirementOf, mustAuthor, exampleFor, profileReference, EXAMPLE_SEED_KEYS } =
     await import("../scripts/profile-reference.mjs");
   const { PROJECT_KIND, withDefaults, validate } = await import("../src/profile/schema.mjs");
   // This file reports with `expectOk`/`expectRefusal` and a bare `fail++`; the
   // assertions below are not refusal cases, so they get a local reporter in the
   // same shape rather than a second global one.
+  const at = (o, path) => path.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
   const check = (ok, name, detail) => {
     console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
     if (!ok) { if (detail) console.log("        " + detail); fail++; }
@@ -518,7 +519,19 @@ expectRefusal("budgets that are not an object", withBudget([]), /builder\.budget
   check(requirementOf("identity.key") === "required",
     "control: a key with no default is still reported as `required`", requirementOf("identity.key"));
   check(requirementOf("identity.prHost") === "optional",
-    "control: and an unflagged key is optional", requirementOf("identity.prHost"));
+    "control: and an unflagged key with no default is optional", requirementOf("identity.prHost"));
+  // AN OPTIONAL KEY THAT THE DEFAULTS SUPPLY. `watch.staleSeconds` carries a
+  // false required flag and a universal default of 900, so an early return on
+  // the flag labelled it `optional` directly above its own description reading
+  // "Defaulted rather than optional" -- the document contradicting itself.
+  check(FIELDS["watch.staleSeconds"][0] === false,
+    "control: watch.staleSeconds IS flagged optional in FIELDS");
+  check(requirementOf("watch.staleSeconds") === "defaulted",
+    "an OPTIONAL key the defaults supply is reported as `defaulted`, not `optional`",
+    requirementOf("watch.staleSeconds"));
+  check(at(withDefaults({ project: { kind: "product" } }), "watch.staleSeconds") === 900,
+    "control: and every profile really does receive that value",
+    String(at(withDefaults({ project: { kind: "product" } }), "watch.staleSeconds")));
 
   // ── the examples, which are the other half of §11.6 ────────────────────────
   //
@@ -541,18 +554,38 @@ expectRefusal("budgets that are not an object", withBudget([]), /builder\.budget
   // string, not what a plausible string looks like -- so the risk is a new
   // required key landing with no sample and the example quietly failing to
   // validate. This fails first, and says which key.
+  //
+  // COMPARED IN BOTH DIRECTIONS, against the SEED's own key paths rather than
+  // the example's top-level keys. Checking only "every must-author key reaches
+  // the example" misses the other failure entirely: when a key stops being
+  // must-author -- it becomes optional, or gains a default -- its seed entry
+  // stays valid and keeps OVERRIDING that default in every generated example,
+  // while the document says the value came from `withDefaults()`. Nothing goes
+  // red, because a stale seed entry is still a legal profile value.
   {
-    const seeded = Object.keys(exampleFor("product"));
     const need = mustAuthor();
-    const example = exampleFor("product");
-    const at = (o, path) => path.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
-    const unseeded = need.filter((k) => at(example, k) === undefined);
+    const seed = EXAMPLE_SEED_KEYS;
+    const unseeded = need.filter((k) => !seed.includes(k));
+    const stale    = seed.filter((k) => !need.includes(k));
+
     check(unseeded.length === 0,
       "every key an operator must author has a sample value in the example seed",
       unseeded.length ? `no sample for: ${unseeded.join(", ")} — add one in scripts/profile-reference.mjs` : "");
-    check(need.length > 0 && seeded.length > 0,
-      "control: the must-author set and the example are both non-empty",
-      `mustAuthor=${need.length} exampleTopLevel=${seeded.length}`);
+    check(stale.length === 0,
+      "and the seed authors NOTHING an operator would not have to author",
+      stale.length ? `${stale.join(", ")} no longer needs authoring — remove it from EXAMPLE_SEED, ` +
+                     `or the example overrides a default while claiming it came from withDefaults()` : "");
+    check(need.length > 0 && seed.length > 0,
+      "control: both sets are non-empty, so the two comparisons above are not vacuous",
+      `mustAuthor=${need.length} seed=${seed.length}`);
+
+    // AND THE SEED REALLY REACHES THE EXAMPLE. Comparing two key lists says
+    // nothing about the object that is actually emitted.
+    const example = exampleFor("product");
+    const at = (o, path) => path.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
+    const absent = seed.filter((k) => at(example, k) === undefined);
+    check(absent.length === 0,
+      "control: every seeded key is present in the generated example", absent.join(", "));
   }
 }
 

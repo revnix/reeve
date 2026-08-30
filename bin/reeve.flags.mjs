@@ -99,5 +99,6 @@ export const ERROR_KINDS = Object.freeze([
   "project_unknown",
   "hub_absent",
   "hub_unreadable",
+  "hub_incompatible",
   "store_absent",
 ]);

@@ -28,10 +28,23 @@ export function whyModel(db, taskId, { now }) {
     `SELECT seq, at, op, from_phase, to_phase, from_generation, to_generation, slice,
             artifact_sha, detail
        FROM phase_event WHERE task = ? ORDER BY seq`).all(taskId);
+  // `generation` IS SELECTED, because `phase_run`'s primary key is
+  // (task, generation, phase, slice, attempt). Without it a redesign or a
+  // regenerate produces two rows with the same phase, slice and attempt and
+  // nothing to tell a consumer which contract epoch produced either -- and
+  // ordering by time does not restore an identity the projection dropped.
   const runs = db.prepare(
-    `SELECT phase, slice, attempt, status, started_at, outcome, model_id, cli_version, effort,
-            max_turns, max_budget_usd, snapshot_hash, contract_drift
-       FROM phase_run WHERE task = ? ORDER BY started_at, attempt`).all(taskId);
+    `SELECT generation, phase, slice, attempt, status, started_at, outcome, model_id, cli_version,
+            effort, max_turns, max_budget_usd, snapshot_hash, contract_drift
+       FROM phase_run WHERE task = ? ORDER BY generation, started_at, attempt`).all(taskId);
+  // EVERY hold, cleared ones included, and this is why `why` does not reuse
+  // `evidenceFor`'s list. That one filters to `cleared_at IS NULL` because
+  // `show` answers "what is stopping this task NOW". A lineage that drops a
+  // cleared hold erases the reason and the time a human actually stopped the
+  // task, and renders "no human has stopped this task" about a task a human
+  // stopped and then released.
+  const holds = db.prepare(
+    `SELECT reason, detail, at, cleared_at FROM hold_reason WHERE task = ? ORDER BY at`).all(taskId);
   const drain = db.prepare(
     `SELECT outbox_id, recorded_at, settled_at, forced, last_known
        FROM task_drain WHERE task = ? ORDER BY outbox_id`).all(taskId);
@@ -44,13 +57,24 @@ export function whyModel(db, taskId, { now }) {
        FROM provider_lease WHERE owner = 'builder' ORDER BY requested_at DESC`)
     .all().find(r => isRunRefOf(r.run_ref, taskId)) ?? null;
 
-  // The floors that fired at SIZING, read from the transition that recorded them.
-  // The model proposes a depth and code disposes the floors, so the lineage shows
-  // WHICH FLOOR FIRED rather than what the model said it wanted.
-  const sizing = events.find(e => e.op === "sizing.decided");
-  let floors = [];
-  try { floors = JSON.parse(sizing?.detail ?? "{}")?.floors ?? []; } catch { floors = []; }
-  if (!Array.isArray(floors)) floors = [];
+  // THE FLOORS ARE NOT RECORDED ANYWHERE YET, and this says so rather than
+  // reporting that none fired.
+  //
+  // The model proposes a depth and code disposes the floors, so the lineage
+  // wants to show WHICH FLOOR FIRED. But no writer persists them: `git grep
+  // floors -- src` finds only the dry-run plan, which computes them for a
+  // filing that has not happened and stores nothing, and the sizing transition
+  // records the chosen depth as a `sizing.recorded` hub event whose
+  // `phase_event.detail` carries no floors at all. An earlier version of this
+  // reader searched for a `sizing.decided` op that NOTHING WRITES, so every real
+  // task rendered "floors fired: none recorded" -- a positive claim about a
+  // question never asked, and green in a test only because the test inserted the
+  // otherwise-unproduced row itself.
+  //
+  // So: absent until a producer exists, and `absent` is the honest word. Wiring
+  // this to the real writer belongs with the task that adds the writer, which is
+  // the only place the shape can be confirmed rather than guessed.
+  const floors = [];
 
   // Gate rounds, each paired with whether a Codex clean pass exists AT THAT HEAD.
   // Pairing at the head is the whole content of the section: a clean pass on an
@@ -67,7 +91,7 @@ export function whyModel(db, taskId, { now }) {
     task: row.id, project: row.project, phase: row.phase, generation: row.generation,
     depth: orUnknown(row.depth),
     floors, events, runs, lease, drain, gate,
-    holds: ev.holds, escalations: ev.escalations, prs: ev.openPrs,
+    holds, escalations: ev.escalations, prs: ev.openPrs,
     unknown: [], absent: [],
   };
   if (model.depth === UNKNOWN) model.unknown.push("depth");
@@ -76,7 +100,7 @@ export function whyModel(db, taskId, { now }) {
   // phase: a task can reach RESEARCH by adoption and still carry no run of its
   // own, and a phase-based guess would report rows that are not there.
   const rows = {
-    events, runs, drain, gate, holds: ev.holds,
+    events, runs, drain, gate, holds,
     prs: ev.openPrs, escalations: ev.escalations,
     lease: lease ? [lease] : [],
   };
@@ -87,7 +111,9 @@ export function whyModel(db, taskId, { now }) {
 /** THE HUMAN TEXT IS NOT A STABLE INTERFACE. Parse `--json`, never this. */
 export function renderWhy(m) {
   const out = [`${m.task}  ${m.phase}  gen ${m.generation}  depth ${m.depth}`];
-  out.push(m.floors.length ? `  floors fired: ${m.floors.join(", ")}` : "  floors fired: none recorded");
+  out.push(m.floors.length
+    ? `  floors fired: ${m.floors.join(", ")}`
+    : `  floors fired: ${UNKNOWN} (no writer records them yet)`);
 
   out.push("", "  transitions");
   if (m.absent.includes("events")) out.push("    no phase_event rows: this task has never transitioned");
@@ -105,7 +131,10 @@ export function renderWhy(m) {
 
   out.push("", "  holds");
   if (m.absent.includes("holds")) out.push("    no hold_reason rows: no human has stopped this task");
-  else for (const h of m.holds) out.push(`    ${h.reason}  since ${h.at}${h.detail ? `  ${h.detail}` : ""}`);
+  else for (const h of m.holds)
+    out.push(`    ${h.reason}  since ${h.at}` +
+             (h.cleared_at ? `  cleared ${h.cleared_at}` : "  STANDING") +
+             (h.detail ? `  ${h.detail}` : ""));
 
   out.push("", "  gate rounds");
   if (m.absent.includes("gate")) out.push("    no gate_request rows: review has never been asked for");
@@ -114,8 +143,12 @@ export function renderWhy(m) {
              `  founder ${g.founder_acked ? "acked" : "not yet"}`);
 
   out.push("", "  provider lease");
+  // NOT "never asked for a slot". A successful release DELETES the row, so an
+  // ordinary task with completed runs has no lease here precisely BECAUSE it
+  // held one and gave it back. `provider_lease` records what is live, not what
+  // happened, and a lineage must not assert history it cannot read.
   out.push(m.absent.includes("lease")
-    ? "    no provider_lease row: this task has never asked for a slot"
+    ? "    no current provider_lease row (a released lease is deleted, so this is not evidence either way)"
     : `    ${m.lease.owner} ${m.lease.status}  ref ${m.lease.run_ref}  requested ${m.lease.requested_at}` +
       (m.lease.preempt_requested ? "  PREEMPT REQUESTED" : ""));
 

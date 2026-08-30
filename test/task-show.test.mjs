@@ -13,13 +13,16 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { lstatSync } from "node:fs";
 
-import { openHub } from "../src/build/hubdb.mjs";
+import { openHub, HUB_SCHEMA_VERSION, completedVersion } from "../src/build/hubdb.mjs";
+import { DatabaseSync } from "node:sqlite";
 import { fileTask } from "../src/build/taskfile.mjs";
 import { isSameProcess, readStart } from "../src/supervisor.mjs";
 import { CAPABILITY_NAMES, capabilitiesFrom } from "../src/build/capabilities.mjs";
+import { validate, withDefaults } from "../src/profile/schema.mjs";
+import { HELD } from "../src/build/phases.mjs";
 import {
   READ_FORMAT_VERSION, WAITING, NEEDS_SWITCH, UNKNOWN, envelope,
-  switchesFrom, switchesResolver, builderRunRef, isRunRefOf,
+  switchesFrom, switchesResolver, builderRunRef, isRunRefOf, inSnapshot,
   waitingFor, evidenceFor, taskShow, taskList, renderShow, renderList,
 } from "../src/build/show.mjs";
 import { whyModel, renderWhy, SECTIONS } from "../src/build/why.mjs";
@@ -50,7 +53,20 @@ mkdirSync(join(HOME, "state"), { recursive: true });
 
 // Two projects, so a switch map applied to the whole list rather than per project
 // is a thing this file can SEE. With one project the two designs are identical.
-const profileFor = (key, caps) => ({ identity: { key }, builder: { capabilities: caps } });
+// A profile the SCHEMA ACCEPTS, not merely one that parses. The reader validates
+// and identity-binds before reporting switches, so a fixture that skips the
+// required keys would exercise the failure path while claiming to test the
+// success one -- and every switch would read UNKNOWN for a reason the test never
+// meant to create.
+const profileFor = (key, caps) => ({
+  schemaVersion: 1, project: { kind: "product" },
+  identity: { key, defaultBranch: "main", visibility: "private" },
+  authority: { permission: "admin", policy: "propose_and_merge", profileLocation: "committed" },
+  state: { mode: "in-repo" },
+  units: [{ id: "root", root: ".", language: "typescript", packageManager: "pnpm" }],
+  ci: { provider: "github-actions" }, merge: { method: "squash", enforcement: "enforced" },
+  builder: { capabilities: caps },
+});
 const pathA = join(repo, "profile-a.json");
 const pathB = join(repo, "profile-b.json");
 const writeProfiles = (aCaps, bCaps) => {
@@ -69,10 +85,10 @@ const entries = {
   alpha: { nwo: "o/a", repoPath: repo, profilePath: pathA },
   beta:  { nwo: "o/b", repoPath: repo, profilePath: pathB },
 };
-const readProfile = (p) => JSON.parse(readFileSync(p, "utf8"));
+const readProfile = (p) => withDefaults(JSON.parse(readFileSync(p, "utf8")));
 // A fresh resolver per call: it MEMOISES, which is the point, so a test that
 // changes a profile on disk must not read a cached answer from before the change.
-const resolver = () => switchesResolver(entries, readProfile);
+const resolver = () => switchesResolver(entries, readProfile, { validate });
 
 const registry = { version: 1, projects: entries };
 const io = {
@@ -291,11 +307,25 @@ const filed = {};
   // The control that separates "S3 writes no gate_request" from "the derivation
   // is a hard-coded false". Without it the assertion above passes on a function
   // returning the empty set for everything.
-  db.prepare(`INSERT INTO gate_request(task,spec_repo_id,spec_pr,head_sha,round,task_generation,requested_at)
-              VALUES(?,2,7,'headA',0,1,?)`).run(filed.gate, NOW - 300);
-  const gated = taskShow(db, filed.gate, { now: NOW, switchesFor: resolver() });
+  //
+  // THE OPEN SPEC PULL REQUEST IS WHAT ESTABLISHES THE CURRENT HEAD. Migration 2
+  // dropped `task.spec_head`, so `task_pr` is where the head under review lives,
+  // and a gate wait that is not scoped to it stays outstanding for ever across
+  // every revision the task ever made.
+  const specPr = (head) => db.prepare(
+    `INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+     VALUES(?, 'spec', NULL, NULL, 3, 11, ?, ?)`).run(filed.gate, head, NOW - 400);
+  const rehead = (head) => db.prepare("UPDATE task_pr SET head_sha = ? WHERE task = ?").run(head, filed.gate);
+  const gateReq = (head, round, gen) => db.prepare(
+    `INSERT INTO gate_request(task,spec_repo_id,spec_pr,head_sha,round,task_generation,requested_at)
+     VALUES(?,2,7,?,?,?,?)`).run(filed.gate, head, round, gen, NOW - 300 + round);
+  const show = () => taskShow(db, filed.gate, { now: NOW, switchesFor: resolver() });
+
+  specPr("headA");
+  gateReq("headA", 0, 1);
+  const gated = show();
   check(gated.waiting.all.includes("WAITING_FOR_CODEX"),
-    "control: an open gate_request DOES produce WAITING_FOR_CODEX, so the derivation is live",
+    "control: an open gate_request at the CURRENT head DOES produce WAITING_FOR_CODEX, so the derivation is live",
     JSON.stringify(gated.waiting));
 
   // And it is answered by a Codex clean pass AT THAT HEAD -- the one row that
@@ -304,38 +334,121 @@ const filed = {};
                                    kind,verdict,observed_at,source_id,task_generation)
               VALUES(?,2,7,'headA',9,'bot','codex_clean','clean',?, 'src-a',1)`)
     .run(filed.gate, NOW - 200);
-  check(!taskShow(db, filed.gate, { now: NOW, switchesFor: resolver() }).waiting.all.includes("WAITING_FOR_CODEX"),
+  check(!show().waiting.all.includes("WAITING_FOR_CODEX"),
     "a codex_clean approval at that head clears the wait");
 
-  // A REVISION reopens it. The pairing is per head, so an answer about an older
-  // head must not read as an answer about the head under review now.
-  db.prepare(`INSERT INTO gate_request(task,spec_repo_id,spec_pr,head_sha,round,task_generation,requested_at)
-              VALUES(?,2,7,'headB',1,1,?)`).run(filed.gate, NOW - 100);
-  check(taskShow(db, filed.gate, { now: NOW, switchesFor: resolver() }).waiting.all.includes("WAITING_FOR_CODEX"),
+  // A REVISION at a new head reopens it, and the OLD head's unanswered request
+  // does not keep it open by itself.
+  rehead("headB");
+  gateReq("headB", 1, 1);
+  check(show().waiting.all.includes("WAITING_FOR_CODEX"),
     "and a second round at a NEW head reopens it: the pairing is per head, not per task");
 
-  // WAITING_FOR_NOTICE, with the same per-head property.
+  // THE FINDING THIS SCOPING EXISTS FOR. Codex asked for changes on headB and
+  // never cleaned it; the task revises to headC, which has no request yet. A
+  // check that asks "is ANY historical request unanswered" answers yes for ever
+  // -- long after the task has moved on, and even once it has left the gate.
+  rehead("headC");
+  const stale = show();
+  check(!stale.waiting.all.includes("WAITING_FOR_CODEX"),
+    "an unanswered request at a SUPERSEDED head does not keep the wait open",
+    JSON.stringify(stale.waiting));
+  gateReq("headC", 2, 1);
+  check(show().waiting.all.includes("WAITING_FOR_CODEX"),
+    "control: and a request AT the new head does, so the scoping did not simply disable it");
+
+  // A REGENERATE resets the contract, so a request recorded under an older
+  // generation is not a question about the task as it now is.
+  db.prepare("UPDATE task SET generation = 2 WHERE id = ?").run(filed.gate);
+  check(!show().waiting.all.includes("WAITING_FOR_CODEX"),
+    "a request recorded under an older generation is not a question about this one");
+  rehead("headE");
+  gateReq("headE", 3, 2);
+  check(show().waiting.all.includes("WAITING_FOR_CODEX"),
+    "control: a request at the current head AND generation still opens it");
+  db.prepare("UPDATE task SET generation = 1 WHERE id = ?").run(filed.gate);
+  rehead("headC");
+
+  // ── WAITING_FOR_NOTICE, scoped the same way ────────────────────────────────
   setPhase(filed.gate, "SPEC_PR_OPEN");
   db.prepare(`INSERT INTO notice_receipt(task,head_sha,clean_source_id,channel,kind,delivered_at)
-              VALUES(?,'headB','src-1','post','delivered',?)`).run(filed.gate, NOW - 50);
-  check(taskShow(db, filed.gate, { now: NOW, switchesFor: resolver() }).waiting.all.includes("WAITING_FOR_NOTICE"),
-    "a delivered notice with no acknowledgement is WAITING_FOR_NOTICE");
+              VALUES(?,'headC','src-1','post','delivered',?)`).run(filed.gate, NOW - 50);
+  check(show().waiting.all.includes("WAITING_FOR_NOTICE"),
+    "a delivered notice at the current head with no acknowledgement is WAITING_FOR_NOTICE");
   db.prepare(`INSERT INTO notice_receipt(task,head_sha,clean_source_id,channel,kind,delivered_at)
-              VALUES(?,'headB','src-2','cli','founder_ack',?)`).run(filed.gate, NOW - 10);
-  check(!taskShow(db, filed.gate, { now: NOW, switchesFor: resolver() }).waiting.all.includes("WAITING_FOR_NOTICE"),
+              VALUES(?,'headC','src-2','cli','founder_ack',?)`).run(filed.gate, NOW - 10);
+  check(!show().waiting.all.includes("WAITING_FOR_NOTICE"),
     "and an acknowledgement AT THAT HEAD clears it");
+
+  // The founder answered headC by requesting changes rather than acknowledging,
+  // and the push of headD voids that window. A task-wide predicate reports the
+  // old delivery as outstanding for the rest of the task's life.
+  rehead("headD");
+  db.prepare("DELETE FROM notice_receipt WHERE task = ? AND clean_source_id = 'src-2'").run(filed.gate);
+  const superseded = show();
+  check(!superseded.waiting.all.includes("WAITING_FOR_NOTICE"),
+    "a delivery at a SUPERSEDED head is not an outstanding notice: the new push voided its window",
+    JSON.stringify(superseded.waiting));
   db.prepare(`INSERT INTO notice_receipt(task,head_sha,clean_source_id,channel,kind,delivered_at)
-              VALUES(?,'headC','src-3','post','delivered',?)`).run(filed.gate, NOW - 5);
-  check(taskShow(db, filed.gate, { now: NOW, switchesFor: resolver() }).waiting.all.includes("WAITING_FOR_NOTICE"),
-    "while a delivery at a LATER head is unanswered again: a task-wide check would call this acknowledged");
+              VALUES(?,'headD','src-3','post','delivered',?)`).run(filed.gate, NOW - 5);
+  check(show().waiting.all.includes("WAITING_FOR_NOTICE"),
+    "control: a delivery AT the new head is, so the scoping did not simply disable it");
+
+  // With no open spec PR there is no head under review, so neither gate wait can
+  // be outstanding -- which is the true answer rather than a missing one.
+  db.prepare("UPDATE task_pr SET merged_sha = 'merged' WHERE task = ?").run(filed.gate);
+  const noHead = show();
+  check(!noHead.waiting.all.includes("WAITING_FOR_CODEX") &&
+        !noHead.waiting.all.includes("WAITING_FOR_NOTICE"),
+    "once the spec PR is no longer open there is no head under review, and neither gate wait stands",
+    JSON.stringify(noHead.waiting));
+  db.prepare("DELETE FROM task_pr WHERE task = ?").run(filed.gate);
+  db.prepare("DELETE FROM notice_receipt WHERE task = ?").run(filed.gate);
+  db.prepare("DELETE FROM gate_request WHERE task = ?").run(filed.gate);
 
   // WAITING_FOR_GUARDIAN is the phase, because the guardian's verdicts live in a
   // store the hub deliberately cannot read.
-  check(!taskShow(db, filed.gate, { now: NOW, switchesFor: resolver() }).waiting.all.includes("WAITING_FOR_GUARDIAN"),
+  check(!show().waiting.all.includes("WAITING_FOR_GUARDIAN"),
     "control: a task that is not in VERDICT_WAIT is not waiting for the guardian");
   setPhase(filed.gate, "VERDICT_WAIT");
-  check(taskShow(db, filed.gate, { now: NOW, switchesFor: resolver() }).waiting.all.includes("WAITING_FOR_GUARDIAN"),
-    "and a task in VERDICT_WAIT is");
+  check(show().waiting.all.includes("WAITING_FOR_GUARDIAN"), "and a task in VERDICT_WAIT is");
+
+  // VERDICT_WAIT's next gated effect is the MERGE, not the publish. Under the
+  // ordinary staged configuration -- publishPr on, mergeBuilderPr off -- naming
+  // publishPr reports no capability wait although merge actuation is exactly what
+  // is switched off.
+  const staged = { ...ALL_ON, mergeBuilderPr: false };
+  const vw = taskShow(db, filed.gate, { now: NOW, switchesFor: () => staged });
+  check(vw.waiting.capability === "mergeBuilderPr" &&
+        vw.waiting.all.includes("WAITING_FOR_CAPABILITY"),
+    "VERDICT_WAIT names mergeBuilderPr, the switch that actually blocks it",
+    JSON.stringify(vw.waiting));
+  check(!taskShow(db, filed.gate, { now: NOW, switchesFor: () => ({ ...ALL_ON, publishPr: false }) })
+          .waiting.all.includes("WAITING_FOR_CAPABILITY"),
+    "control: and publishPr being off does not, because publishing already happened");
+}
+
+// ── a held phase is a founder wait even with no hold_reason row ──────────────
+//
+// Retry exhaustion and the gate revision cap move a task straight to ESCALATED
+// and write NO hold_reason row, yet ESCALATED's only exit is founder action. A
+// check that named only BLOCKED rendered those tasks as waiting for nobody.
+{
+  check(HELD.includes("BLOCKED") && HELD.includes("ESCALATED"),
+    "control: the declared held set is the two phases this depends on", HELD.join(","));
+  for (const phase of HELD) {
+    setPhase(filed.gate, phase);
+    const m = taskShow(db, filed.gate, { now: NOW, switchesFor: resolver() });
+    check(m.waiting.all.includes("WAITING_FOR_FOUNDER"),
+      `a task in ${phase} waits for the founder even with no hold_reason row`,
+      JSON.stringify(m.waiting));
+    check(db.prepare("SELECT count(*) c FROM hold_reason WHERE task = ?").get(filed.gate).c === 0,
+      `control: and there really is no hold_reason row for ${phase}`);
+  }
+  setPhase(filed.gate, "SIZING");
+  check(!taskShow(db, filed.gate, { now: NOW, switchesFor: resolver() })
+          .waiting.all.includes("WAITING_FOR_FOUNDER"),
+    "control: an ordinary phase with no hold does not");
 }
 
 // ── precedence is declared once, and every match is reported ─────────────────
@@ -452,17 +565,52 @@ const filed = {};
   check(grown.absent.includes("runs"),
     "while runs, which still has no rows, stays absent", JSON.stringify(grown.absent));
 
-  // The floors come out of the transition that recorded them, and a detail that
-  // is not the shape expected leaves them empty rather than throwing.
-  db.prepare(`INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
-              VALUES(?,?,?,?,?,?,?,?)`)
-    .run(fresh, NOW - 20, "sizing.decided", "SIZING", "SIZING", 1, 1,
-         JSON.stringify({ floors: ["maxPackages"] }));
-  check(whyModel(db, fresh, { now: NOW }).floors.join(",") === "maxPackages",
-    "the floors that fired are read from the transition that recorded them");
-  db.prepare("UPDATE phase_event SET detail='not json' WHERE task = ? AND op='sizing.decided'").run(fresh);
-  check(whyModel(db, fresh, { now: NOW }).floors.length === 0,
-    "control: an unparseable detail yields no floors rather than a crash");
+  // THE FLOORS HAVE NO PRODUCER YET, and `why` says UNKNOWN rather than claiming
+  // none fired. An earlier version searched phase_event for a `sizing.decided`
+  // op; nothing writes it, so every real task rendered "none recorded" -- a
+  // positive claim about a question never asked -- and the test went green only
+  // because it inserted that otherwise-unproduced row itself. A fixture that
+  // describes a system which does not exist cannot exhibit the defect it is
+  // written for.
+  {
+    const SRC = readFileSync(new URL("../src/build/why.mjs", import.meta.url), "utf8");
+    check(!/e\.op === "sizing\.decided"/.test(SRC),
+      "why does not read an op nothing writes",
+      (SRC.match(/.*sizing\.decided.*/) ?? [""])[0].slice(0, 120));
+    // COUNTER-CONTROL: the extraction can find that shape in a literal it has
+    // never seen, so the absence above is a real absence and not a dead regex.
+    check(/e\.op === "sizing\.decided"/.test('if (e.op === "sizing.decided") {}'),
+      "counter-control: the same pattern still matches a literal containing it");
+
+    check(whyModel(db, fresh, { now: NOW }).floors.length === 0,
+      "and the model reports no floors");
+    check(/floors fired: UNKNOWN/.test(renderWhy(whyModel(db, fresh, { now: NOW }))),
+      "and the render says UNKNOWN, not `none recorded`",
+      renderWhy(whyModel(db, fresh, { now: NOW })).slice(0, 200));
+  }
+
+  // ── the lineage keeps what a projection would drop ────────────────────────
+  //
+  // A cleared hold is history a founder needs; `evidenceFor` filters it out
+  // because `show` answers "what is stopping this NOW", and reusing that list as
+  // the lineage renders "no human has stopped this task" about a task a human
+  // stopped and then released.
+  db.prepare("INSERT INTO hold_reason(task,reason,detail,at,cleared_at) VALUES(?,?,?,?,?)")
+    .run(fresh, "blocked_founder", "waiting on a decision", NOW - 900, NOW - 800);
+  const withHold = whyModel(db, fresh, { now: NOW });
+  check(withHold.holds.length === 1 && withHold.holds[0].cleared_at === NOW - 800,
+    "why keeps a CLEARED hold, with the moment it was cleared", JSON.stringify(withHold.holds));
+  check(!withHold.absent.includes("holds"),
+    "so the holds section is not absent for a task that was once held",
+    JSON.stringify(withHold.absent));
+  check(/cleared /.test(renderWhy(withHold)),
+    "and the render says it was cleared rather than dropping it",
+    renderWhy(withHold).slice(0, 600));
+  // CONTROL: `show` still answers the present-tense question with the active
+  // list only, or the two readers have been collapsed into one wrong one.
+  check(taskShow(db, fresh, { now: NOW, switchesFor: resolver() }).waiting.all
+          .includes("WAITING_FOR_FOUNDER") === false,
+    "control: and a cleared hold is NOT a current founder wait in show");
   filed.fresh = fresh;
 }
 
@@ -516,6 +664,106 @@ const filed = {};
   const text = renderWhy(withPr);
   check(!/\bundefined\b/.test(text), "the why render never prints undefined", text.slice(0, 600));
   filed.full = full;
+}
+
+
+// ── a projection must not drop an identity the key carries ──────────────────
+{
+  const m = whyModel(db, filed.full, { now: NOW });
+  check(m.runs.every(r => typeof r.generation === "number"),
+    "every phase_run row in the lineage carries its generation", JSON.stringify(m.runs.map(r => r.generation)));
+
+  // `phase_run`'s key is (task, generation, phase, slice, attempt). After a
+  // regenerate two rows share phase, slice and attempt, and without the
+  // generation a consumer cannot tell which contract epoch produced either --
+  // an identity no ordering restores.
+  db.prepare(`INSERT INTO phase_run(task,generation,phase,slice,attempt,status,pid,lstart,started_at,
+                                    heartbeat_at,lease_expires_at,out_path,err_path)
+              VALUES(?,2,'SIZING',0,1,'succeeded',322,'L',?,?,?,'/o','/e')`)
+    .run(filed.full, NOW - 800, NOW - 780, NOW - 500);
+  const two = whyModel(db, filed.full, { now: NOW }).runs
+    .filter(r => r.phase === "SIZING" && r.slice === 0 && r.attempt === 1);
+  check(two.length === 2, "control: two runs really do share phase, slice and attempt", JSON.stringify(two.map(r => r.generation)));
+  check(new Set(two.map(r => r.generation)).size === 2,
+    "and the generation is what tells them apart", JSON.stringify(two.map(r => r.generation)));
+  db.prepare("DELETE FROM phase_run WHERE task = ? AND generation = 2").run(filed.full);
+}
+
+// ── absence of a lease is not evidence a slot was never asked for ───────────
+//
+// A successful release DELETES the row, so an ordinary task with completed runs
+// has no lease precisely BECAUSE it held one and gave it back. A lineage must not
+// assert history it cannot read.
+{
+  const noLease = whyModel(db, filed.fresh, { now: NOW });
+  check(noLease.absent.includes("lease"), "control: the fresh task has no provider lease row", JSON.stringify(noLease.absent));
+  const text = renderWhy(noLease);
+  check(!/never asked for a slot/.test(text),
+    "why does not claim a task never asked for a slot", (text.match(/.*provider_lease.*/) ?? [""])[0]);
+  check(/not evidence either way/.test(text),
+    "and says the absence is not evidence either way", (text.match(/.*provider_lease.*/) ?? [""])[0]);
+}
+
+// ── a profile is validated and identity-bound before its switches are read ──
+//
+// Two failures hide in a profile that PARSES: a schema-invalid value, and a
+// registry entry pointing at another project's perfectly valid profile.
+{
+  const bad = join(dir, "invalid.json");
+  writeFileSync(bad, JSON.stringify({ ...profileFor("o/a", ALL_ON), schemaVersion: 99 }) + "\n");
+  const r1 = switchesResolver({ alpha: { nwo: "o/a", profilePath: bad } }, readProfile, { validate });
+  check(r1("alpha") === null,
+    "a profile the schema refuses reports UNKNOWN, not every switch off", JSON.stringify(r1("alpha")));
+
+  // Without validation the SAME file answers `off` for every switch, which reads
+  // as a decision the founder made rather than a file that is broken. This is the
+  // control that the assertion above is about validation and not about the file
+  // being unreadable.
+  const r2 = switchesResolver({ alpha: { nwo: "o/a", profilePath: bad } }, readProfile);
+  check(r2("alpha") !== null && r2("alpha").observe === true,
+    "control: unvalidated, that same file is read and answers with switches",
+    JSON.stringify(r2("alpha")));
+
+  // A valid profile that names a DIFFERENT repository is not this project's.
+  const r3 = switchesResolver({ alpha: { nwo: "o/somewhere-else", profilePath: pathA } },
+                              readProfile, { validate });
+  check(r3("alpha") === null,
+    "a profile whose identity.key names another repository is not this project's", JSON.stringify(r3("alpha")));
+  const r4 = switchesResolver({ alpha: { nwo: "o/a", profilePath: pathA } }, readProfile, { validate });
+  check(r4("alpha")?.observe === true,
+    "control: the same file under its OWN nwo resolves, so the refusal is the identity check",
+    JSON.stringify(r4("alpha")));
+
+  // MEMOISED, which is the point of the resolver, and asserted because a
+  // resolver that re-reads on every row turns one listing into N file reads.
+  let reads = 0;
+  const counting = switchesResolver({ alpha: entries.alpha },
+    (p) => { reads++; return readProfile(p); }, { validate });
+  counting("alpha"); counting("alpha"); counting("alpha");
+  check(reads === 1, `the resolver reads each project's profile once (${reads})`, String(reads));
+}
+
+// ── the read runs against one snapshot ──────────────────────────────────────
+{
+  let began = 0, committed = 0;
+  const spy = {
+    exec: (sql) => { if (/^BEGIN/.test(sql)) began++; if (/^COMMIT/.test(sql)) committed++; },
+  };
+  const out = inSnapshot(spy, () => "the answer");
+  check(out === "the answer", "inSnapshot returns what the read returned", String(out));
+  check(began === 1 && committed === 1, `and opens exactly one transaction around it (${began}/${committed})`);
+
+  // A store that refuses to begin one still gets ANSWERED. A snapshot is better
+  // than none, and none is better than refusing to answer at all.
+  const refusing = { exec: () => { throw new Error("cannot begin"); } };
+  let threw = null, val = null;
+  try { val = inSnapshot(refusing, () => "answered anyway"); } catch (e) { threw = e; }
+  check(threw === null && val === "answered anyway",
+    "and a store that cannot begin one is answered without it", String(threw?.message));
+
+  // It really is a transaction on the live connection, not a no-op.
+  const inside = inSnapshot(db, () => taskShow(db, filed.full, { now: NOW, switchesFor: resolver() }));
+  check(inside?.id === filed.full, "and a real read through it returns the model", String(inside?.id));
 }
 
 // ── the CLI: compute -> data -> render ───────────────────────────────────────
@@ -600,6 +848,60 @@ const filed = {};
   check(events > 0, "control: the count is not zero, so the comparison had something to compare",
     String(events));
   check3.close();
+
+
+  // ── an incompatible hub is a typed refusal, not a stack trace ─────────────
+  //
+  // A version-1 hub OPENS PERFECTLY and has no `task_pr` -- migration 2 creates
+  // it -- so every route here would reach `openPrs` and die on `no such table`,
+  // which is the uncaught trace this whole surface exists to replace. A hub
+  // NEWER than the binary must be refused too: `openHub` refuses it explicitly,
+  // and a reader that quietly proceeds where the privileged opener stops is
+  // guessing at a shape it does not know.
+  {
+    const old = join(dir, "oldhub", ".reeve");
+    mkdirSync(join(old, "state"), { recursive: true });
+    const oldDb = new DatabaseSync(join(old, "state", "hub.db"));
+    oldDb.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, at INTEGER NOT NULL)");
+    oldDb.exec("INSERT INTO schema_version(version, at) VALUES (1, 1)");
+    oldDb.close();
+    check(completedVersion(join(old, "state", "hub.db")) === 1,
+      "control: the fixture really is a version-1 hub, and it opens",
+      String(completedVersion(join(old, "state", "hub.db"))));
+    check(HUB_SCHEMA_VERSION > 1,
+      `control: this binary speaks a later version (${HUB_SCHEMA_VERSION}), so the gate has something to refuse`);
+
+    const r = spawnSync(process.execPath, [BIN, "task", "list", "--home", old, "--json"],
+      { encoding: "utf8", timeout: 60_000 });
+    const j = parse(r.stdout ?? "");
+    check(j?.ok === false && j?.kind === "hub_incompatible",
+      "a hub older than this binary is a typed refusal", ((r.stdout ?? "") + (r.stderr ?? "")).slice(0, 300));
+    check(!/no such table/.test((r.stdout ?? "") + (r.stderr ?? "")),
+      "and never the `no such table: task_pr` the unguarded read produced",
+      ((r.stdout ?? "") + (r.stderr ?? "")).slice(0, 300));
+    check(r.status === 1, "exiting refused", `rc=${r.status}`);
+    check(/schema version 1/.test(j?.message ?? "") && new RegExp(`version ${HUB_SCHEMA_VERSION}`).test(j?.message ?? ""),
+      "naming both versions, so an operator knows which end is behind", String(j?.message));
+
+    // NEWER than the binary, which is the other direction and a different remedy.
+    const ahead = join(dir, "newhub", ".reeve");
+    mkdirSync(join(ahead, "state"), { recursive: true });
+    const aheadDb = new DatabaseSync(join(ahead, "state", "hub.db"));
+    aheadDb.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, at INTEGER NOT NULL)");
+    aheadDb.prepare("INSERT INTO schema_version(version, at) VALUES (?, 1)").run(HUB_SCHEMA_VERSION + 1);
+    aheadDb.close();
+    const a = spawnSync(process.execPath, [BIN, "task", "list", "--home", ahead, "--json"],
+      { encoding: "utf8", timeout: 60_000 });
+    const aj = parse(a.stdout ?? "");
+    check(aj?.kind === "hub_incompatible" && /upgrade reeve/.test(aj?.message ?? ""),
+      "a hub newer than this binary is refused too, and says to upgrade reeve rather than the store",
+      String(aj?.message));
+
+    // CONTROL: the gate is about the VERSION. The real hub, at the current
+    // version, still answers -- or the refusal above is just a broken route.
+    check(parse(cli("task", "list", "--json").stdout)?.kind === "task.list",
+      "control: a hub at the current version still answers");
+  }
 
   // A machine with no builder has no hub, and an open error whose text is a
   // sqlite message is not an answer to "what are my tasks".

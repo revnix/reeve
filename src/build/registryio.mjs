@@ -333,6 +333,23 @@ export function registryIo(home, project, entry, { fetchRepoId = null, spawn = s
                         { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
       const truncated = res.error?.code === "ENOBUFS";
       if (res.error && !truncated) throw res.error;
+      // A NONZERO EXIT IS A FAILURE, AND spawnSync DOES NOT THROW ON ONE.
+      //
+      // `execFileSync` threw here; `spawnSync` sets `status` and leaves `error`
+      // UNSET, so git refusing the checkout -- dubious ownership, an unreadable
+      // or corrupt index, exit 128 -- came back as empty stdout, parsed to
+      // `null`, and the claim was admitted without establishing whether the
+      // index records a symlink or a submodule. Fail-OPEN, introduced by the
+      // change that fixed the previous finding.
+      //
+      // `ls-files` exits 0 when nothing matches, so a nonzero status never means
+      // "no entry"; it always means the question could not be asked.
+      if (res.status !== 0 || res.signal)
+        throw new Error(
+          `git could not read the index of ${repoPath} ` +
+          `(${res.signal ? `killed by ${res.signal}` : `exit ${res.status}`})` +
+          `${res.stderr ? `: ${String(res.stderr).trim().split("\n")[0]}` : ""}. ` +
+          `Refusing rather than admitting: whether ${path} is a symlink or a submodule was not established.`);
       const out = String(res.stdout ?? "");
 
       // EVERY MATCHING STAGE, not the first. An unresolved merge puts the same

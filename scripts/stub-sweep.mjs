@@ -30,14 +30,15 @@
  *    for the anchor. Confirmation greps have been measured inert here.
  */
 import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync, realpathSync,
-         lstatSync, readlinkSync, openSync, readSync, closeSync, fstatSync, constants } from "node:fs";
+         lstatSync, readlinkSync, openSync, readSync, closeSync, fstatSync, constants, readdirSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname, basename, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdit, validateManifest, classify, summarise, parsePorcelainZ, fingerprint,
-         CAUGHT, UNRUNNABLE, TIMED_OUT_EXIT } from "../src/stubsweep.mjs";
+         CAUGHT, UNRUNNABLE, TIMED_OUT_EXIT,
+         coverage, coverageLine, changedFiles, grandfatherGate } from "../src/stubsweep.mjs";
 
 // Overridable so the runner can be pointed at a throwaway repository built by its
 // own test. The cleanliness guard then applies to THAT tree, so the real one is
@@ -89,15 +90,78 @@ if (!KILL_STRATEGY)
 const manifestPath = process.env.STUB_MANIFEST
   ? resolve(process.env.STUB_MANIFEST)
   : join(ROOT, "test", "stub-manifest.mjs");
-let manifest;
+let manifest, grandfathered;
 try {
   // A FILE URL, not a path. On win32 `resolve()` yields `C:\\repo\\...`, and
   // `import()` reads `c:` as an unsupported URL scheme — so the taskkill branch
   // above would be reached and the sweep would still refuse to start, for a reason
   // that has nothing to do with what it was checking.
-  manifest = validateManifest((await import(pathToFileURL(manifestPath).href)).STUBS);
+  const mod = await import(pathToFileURL(manifestPath).href);
+  manifest = validateManifest(mod.STUBS);
+  // From the SAME module object as STUBS, never a second import: the two lists are
+  // read together on every path below, and two imports is two chances to read them
+  // from different files.
+  grandfathered = Array.isArray(mod.GRANDFATHERED) ? mod.GRANDFATHERED : [];
 } catch (err) {
   die(2, `stub-sweep: the manifest is not usable: ${err.message}`);
+}
+
+// --- a grandfathered file loses its grandfathering the moment it is edited -----
+//
+// BELOW the manifest load, not above it, because this reads `grandfathered`. Three
+// temporal-dead-zone bugs have shipped in this repository and `node --check` cannot
+// see one; the first draft of this block sat after the clean-tree check and would
+// have been the fourth.
+//
+// The debt list is not an exemption list. A file on it is tolerated only while
+// nobody touches it, because an untouched test is not accruing risk -- the risk
+// arrives with the edit, and so does the demand to prove the test can fail. The
+// demand therefore lands on the person who already has the file open and knows which
+// of its assertions is load-bearing. A deadline would pick files at random, and pick
+// them when nobody was looking; the reflex on a deadline is to push it out, which is
+// re-grandfathering with extra steps.
+// SKIPPED WHEN DRIVEN AGAINST A FIXTURE, and that is not an escape hatch. A tree
+// reached through STUB_SWEEP_ROOT is a synthetic repository built by a test: it has
+// no default branch, no base, and no grandfather list to be edited. Asking it what
+// changed is asking a question its tree cannot answer, and refusing would break the
+// sweep's own tests rather than protect anything.
+//
+// STUB_SWEEP_NO_DIFF is the separate case: THIS repository, genuinely without a base
+// to compare against. Two names because they are two different facts, not one fact
+// spelled twice -- collapsing them would mean a fixture run and a baseless run could
+// not be told apart in the output.
+if (!process.env.STUB_SWEEP_ROOT && process.env.STUB_SWEEP_NO_DIFF !== "1") {
+  const git = args => {
+    try { return { ok: true, out: execFileSync("git", args, { cwd: ROOT, encoding: "utf8" }) }; }
+    catch (err) { return { ok: false, err: String(err.stderr ?? err.message).trim().split("\n")[0] }; }
+  };
+  // The MERGE BASE against the default branch, not HEAD~1: a branch of several
+  // commits must be judged on everything it changed, not on its last commit.
+  const baseRef = process.env.STUB_SWEEP_BASE || "origin/main";
+  const mb = git(["merge-base", baseRef, "HEAD"]);
+  const base = mb.ok ? mb.out.trim() : null;
+  // A BASE THAT IS HEAD CAN ONLY PRODUCE AN EMPTY DIFF, and in CI that is always a
+  // misconfiguration rather than a quiet branch. On a push to the default branch the
+  // checkout sets HEAD and origin/main to the SAME commit, so the merge base is HEAD
+  // and every direct commit to main -- including one editing a grandfathered file, or
+  // adding a new test straight to the list -- sails through a gate that reports
+  // success. The workflow supplies the push event's previous commit for exactly this,
+  // and this refusal is what stops that configuration being load-bearing.
+  //
+  // Locally it is benign: standing on a branch with nothing to compare is an ordinary
+  // state, not an error, so the refusal is limited to the environment where the sweep
+  // is a gate rather than a tool.
+  const headSha = git(["rev-parse", "HEAD"]);
+  if (process.env.GITHUB_ACTIONS === "true" && base && headSha.ok && base === headSha.out.trim())
+    die(2, "stub-sweep: the diff base resolves to HEAD itself, so the change set is empty and this gate\n" +
+           "would pass without measuring anything. On a push to the default branch, pass the event's\n" +
+           "previous commit as STUB_SWEEP_BASE rather than comparing the checkout to origin/main.");
+  const changed = changedFiles({ base, head: "HEAD", run: git });
+  if (!changed.ok)
+    die(2, `stub-sweep: ${changed.why}\n` +
+           "Set STUB_SWEEP_NO_DIFF=1 only if this tree genuinely has no base to compare against.");
+  const gate = grandfatherGate({ changed: changed.files, grandfathered });
+  if (!gate.ok) die(2, `stub-sweep: ${gate.why}`);
 }
 
 // EVERY TARGET MUST RESOLVE INSIDE THE REPOSITORY, checked before anything is
@@ -760,6 +824,16 @@ for (const entry of entries) {
 
 const s = summarise(results);
 console.log(`\n${s.caught}/${s.total} stub(s) caught by the assertion they name.`);
+// THE RATIO, on every run. Measured 2026-08-30: 48 entries over 3 of 106 test files,
+// 26 of them on the sweep's own test -- and nobody had ever seen that number, because
+// the output answered "did every entry hold" and everyone let that stand in for "is
+// this instrument broad". A number that exists only inside a function cannot prompt
+// anyone to fix it.
+{
+  const testFiles = readdirSync(join(ROOT, "test"))
+    .filter(f => f.endsWith(".test.mjs")).map(f => "test/" + f);
+  console.log(coverageLine(coverage(manifest, testFiles, grandfathered)));
+}
 if (!s.ok) {
   console.log("\nA stub that is not caught means the assertion it names cannot fail for that reason.");
   console.log("That is a test reporting success regardless of the code, which is the whole point of this sweep.");

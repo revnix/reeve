@@ -16,6 +16,7 @@ import { enqueueEffect, leaseEffect, settleEffect, recoverEffects,
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { capabilitiesFrom, CAPABILITY_KEYS, CAPABILITY_NAMES } from "../src/build/capabilities.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -26,13 +27,21 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-outbox-"));
 
 // Every capability on, so a block that is not ABOUT capabilities is not gated by
 // one. The capability block below turns them off one at a time.
-const allOn = {
-  "builder.capabilities.observe": true,
-  "builder.capabilities.draftSpec": true,
-  "builder.capabilities.implementLocal": true,
-  "builder.capabilities.publishPr": true,
-  "builder.capabilities.mergeBuilderPr": true,
-};
+//
+// DERIVED, not written out. These five strings used to be retyped here beside
+// the five the outbox gates on, and `leaseEffect` refuses anything whose
+// capability is not exactly `true` -- so a typo in one read as "capability off",
+// which is fail-closed and therefore invisible. Nothing went red; the suite
+// passed for a reason unrelated to what it checks. A sixth switch added to the
+// schema would have been silently ungated here too.
+const allOn = capabilitiesFrom({ builder: { capabilities:
+  Object.fromEntries(CAPABILITY_NAMES.map((n) => [n, true])) } });
+// The count is the control: an import that silently yielded nothing would make
+// every `capabilities: allOn` below mean "no capabilities at all", and each of
+// those assertions would pass for the wrong reason.
+check(Object.keys(allOn).length === CAPABILITY_KEYS.length && CAPABILITY_KEYS.length > 0,
+  "control: the derived capability map is populated, so `allOn` really means all on",
+  `${Object.keys(allOn).length} of ${CAPABILITY_KEYS.length}`);
 
 // A task, plus a RUN of phase_event rows for its fences to reference.
 // `outbox.fence` is `NOT NULL REFERENCES phase_event(seq)`, so an enqueue with

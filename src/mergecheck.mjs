@@ -588,9 +588,12 @@ export function displayPath(byteStr) {
   const asUtf8 = buf.toString("utf8");
   const roundTrips = Buffer.from(asUtf8, "utf8").equals(buf);
   if (roundTrips) return safePath(asUtf8);
-  return [...buf].map(b => (b >= 0x20 && b < 0x7f)
-    ? String.fromCharCode(b)
-    : "\\x" + b.toString(16).padStart(2, "0")).join("");
+  // THE SAME DISJOINTNESS, on the non-UTF-8 branch. A byte 0x5c is a literal
+  // backslash and must be doubled here too, or this branch reintroduces the
+  // collision the branch above just closed.
+  return [...buf].map(b => (b === 0x5c ? "\\\\"
+    : (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b)
+    : "\\x" + b.toString(16).padStart(2, "0"))).join("");
 }
 
 /**
@@ -612,8 +615,28 @@ export function toByteString(s) {
  * output is left alone, because a consumer parses it rather than reading it.
  */
 export function safePath(path) {
+  // THE ESCAPE ALPHABET MUST BE DISJOINT FROM THE INPUT ALPHABET.
+  //
+  // Escaping control bytes to `\xNN` while leaving the BACKSLASH alone means the
+  // output can be spelled by a valid input: a file literally named `b\x01.t` --
+  // four ordinary characters -- renders identically to one containing byte 0x01.
+  // MEASURED before this fix: 3 of 3 adversarial pairs collided.
+  //
+  // That matters here because of what this is FOR. The caller's comment says a
+  // filename is attacker-supplied on any repository taking outside
+  // contributions; under that framing an attacker can craft a name that renders
+  // exactly as the escaped form of a different one, in the very output a person
+  // reads to decide whether a merge carried what it should. An escape a crafted
+  // input can imitate is not doing the job claimed for it.
+  //
+  // The backslash goes FIRST. Escaping it after the control bytes would also
+  // escape the backslashes this function just produced, turning `\x01` into
+  // `\\x01` and mangling every legitimate escape.
+  //
   // C0 is \u0000-\u001f, DEL is \u007f, C1 is \u0080-\u009f. Written as escapes
   // rather than literals so the pattern survives being copied through a shell.
-  return String(path).replace(/[\u0000-\u001f\u007f-\u009f]/g,
-    (c) => "\\x" + c.codePointAt(0).toString(16).padStart(2, "0"));
+  return String(path)
+    .replace(/\\/g, "\\\\")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g,
+      (c) => "\\x" + c.codePointAt(0).toString(16).padStart(2, "0"));
 }

@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { hubPathFor } from "../paths.mjs";
 import { resolveRepoIdAt } from "./repoid.mjs";
+import { validate, withDefaults } from "../profile/schema.mjs";
 
 /**
  * A content fingerprint, used as `registry.version`.
@@ -34,7 +35,17 @@ import { resolveRepoIdAt } from "./repoid.mjs";
 const canonical = (v) =>
   Array.isArray(v) ? v.map(canonical)
   : v && typeof v === "object"
-    ? Object.keys(v).sort().reduce((o, k) => (o[k] = canonical(v[k]), o), {})
+    // NULL-PROTOTYPE ACCUMULATOR. `JSON.parse` creates an OWN property for a
+    // `"__proto__"` key, so a project named that is really in the registry --
+    // and assigning it into a plain object here invoked the inherited setter
+    // instead, dropping it from the fingerprint. An empty registry and a
+    // `__proto__`-only registry then hashed identically, so every change to
+    // that project's paths or repository was invisible to the drift check.
+    //
+    // The projects map below was already null-prototype. This accumulator was
+    // the same class and I missed it: fixing one site of a class is not fixing
+    // the class.
+    ? Object.keys(v).sort().reduce((o, k) => (o[k] = canonical(v[k]), o), Object.create(null))
     : v;
 
 const versionOf = (reg) =>
@@ -196,13 +207,30 @@ export function registryIo(home, project, entry, { fetchRepoId = null, git = exe
   // four reads could disagree if the profile changed between them -- a snapshot
   // assembled from two different profiles is not a snapshot of either.
   let profile = null;
-  let profileText = null;
+  let profileBytes = null;
+  let profileOk = false;
   const loadProfile = () => {
     if (profile !== null) return profile;
+    profile = {};
     try {
-      profileText = readFileSync(entry.profilePath, "utf8");
-      profile = JSON.parse(profileText);
-    } catch { profile = {}; profileText = null; }
+      // THE BYTES ARE READ AS BYTES. Decoding to utf8 first replaces malformed
+      // sequences with U+FFFD before the hash sees them, so `0x80` and `0x81`
+      // inside a JSON string produce the SAME digest while the text still
+      // parses -- a profile change invisible to drift detection, under a
+      // comment claiming the hash was of the file's bytes. It is now.
+      profileBytes = readFileSync(entry.profilePath);
+      const parsed = JSON.parse(profileBytes.toString("utf8"));
+      // VALIDATED, AND BOUND TO THIS ENTRY. An unvalidated profile at a path the
+      // registry names could belong to ANOTHER repository, and `resolveSnapshot`
+      // would then combine repository A's id and nwo with repository B's default
+      // branch and founder id. `missingSnapshotFields` only checks for nulls, so
+      // compatible-looking values would be admitted and incompatible ones would
+      // surface later as SQLite constraint errors, far from the cause.
+      const r = validate(withDefaults(parsed));
+      const key = parsed?.identity?.key ?? null;
+      if (r.ok && key === entry.nwo) { profile = parsed; profileOk = true; }
+      else { profileBytes = null; }
+    } catch { profileBytes = null; }
     return profile;
   };
   const at = (path) => path.split(".").reduce((o, k) => (o == null ? undefined : o[k]), loadProfile());
@@ -220,19 +248,23 @@ export function registryIo(home, project, entry, { fetchRepoId = null, git = exe
     // The hash is of the profile's BYTES, not of a re-serialisation: the point is
     // to detect that the file changed, and re-serialising normalises away the
     // very differences that would tell you it did.
-    profileHash: async () => (loadProfile(), profileText === null ? null
-      : createHash("sha256").update(profileText).digest("hex")),
+    profileHash: async () => (loadProfile(), profileBytes === null ? null
+      : createHash("sha256").update(profileBytes).digest("hex")),
     defaultBranch: async () => at("identity.defaultBranch") ?? null,
     visibility: async () => at("identity.visibility") ?? null,
     founderUserId: async () => at("builder.founder.userId") ?? null,
     specRepoId: async () => null,
     gateDefinitionHash: async () => null,
     lstat: (path) => lstatSync(path),
-    // `git ls-tree` against the checkout, returning the entry or null. A path
-    // that is not tracked is a null, and the caller distinguishes that from a
-    // failure to ASK -- which is the distinction the `?.()` version destroyed.
+    // THE INDEX, NOT `HEAD`. `ls-tree` takes a tree-ish, so a gitlink that is
+    // STAGED but not yet committed returns no entry -- and an initialised
+    // submodule lstats as an ordinary directory, so `resolveClaims` would admit
+    // territory inside another repository. `ls-files --stage` documents itself
+    // as showing staged contents, which is the state the checkout is actually
+    // in. The same gap hid a staged mode-120000 entry whose worktree link was
+    // absent.
     lsTree: (repoPath, path) => {
-      const out = String(git("git", ["-C", repoPath, "ls-tree", "HEAD", "--", path],
+      const out = String(git("git", ["-C", repoPath, "ls-files", "--stage", "--", path],
                              { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })).trim();
       if (!out) return null;
       const [mode] = out.split(/\s+/);

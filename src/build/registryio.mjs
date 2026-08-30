@@ -208,6 +208,14 @@ export function parseRegistry(text, path) {
 export const titleHash = (title) =>
   createHash("sha256").update(String(title).trim().replace(/\s+/g, " ").toLowerCase()).digest("hex");
 
+// The filing's TEXT, title and body together. `titleHash` is the collision key
+// and deliberately normalizes spacing and case so near twins collide; this one
+// does not, because its job is the opposite -- to record exactly what was filed,
+// so a task re-filed with the same title and a different body is distinguishable
+// from one filed twice.
+export const filingTextHash = (title, body) =>
+  createHash("sha256").update(`${String(title ?? "")}\n${String(body ?? "")}`).digest("hex");
+
 /** Read and parse `<home>/projects.json`. The only function here that touches disk. */
 export function loadRegistry(home) {
   const path = join(home, "projects.json");

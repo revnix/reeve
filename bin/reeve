@@ -334,7 +334,11 @@ const ARGS = (() => {
     // message for the same refusal, and a property already measured and tested
     // (test/hub-doctor.test.mjs). The refusals this check exists for are a
     // token that IS a flag, and a token that is absent.
-    const looksLikeFlag = v => v.startsWith("-") && !/^-?\d+(\.\d+)?$/.test(v);
+    // A BARE `-` IS A VALUE, not a flag. It is the universal stdin sentinel and
+    // `--body-file -` advertises it, but every token starting with `-` was
+    // classified as a flag, so the documented form was refused by the parser
+    // before any route could read it.
+    const looksLikeFlag = v => v.startsWith("-") && v !== "-" && !/^-?\d+(\.\d+)?$/.test(v);
     const v = argv[i + 1];
     // AN EMPTY VALUE IS A MISSING VALUE. `reeve --home "$SCRATCH"` with the
     // variable unset hands over `""`, and `resolve("")` is the CURRENT
@@ -457,6 +461,25 @@ function loadProfile(nwo) {
     return { path: p, ...profile };
   }
   return null;
+}
+
+// `--dry-run` IS NOT GLOBAL, and the flag table cannot express that. Every flag
+// here is accepted by every command, so `reeve restore --dry-run` parsed cleanly
+// and restore never read it: the flag whose entire promise is "write nothing"
+// was silently ignored by the most destructive command in the CLI, and the
+// operator who typed it got a real restore and a success.
+//
+// An allow-list refuses rather than proceeding, and it is checked once rather
+// than per route, because a per-route check is a rule that depends on the next
+// author remembering it. A command that grows a dry run adds itself here; one
+// that has not implemented it cannot pretend to have.
+const DRY_RUN_COMMANDS = new Set(["task"]);
+if (flag("dry-run") && !DRY_RUN_COMMANDS.has(cmd)) {
+  console.error(`reeve: --dry-run is not implemented by \`${cmd ?? "(no command)"}\`, and it is refused ` +
+                `rather than ignored: a command that accepts it and writes anyway is worse than one that ` +
+                `never took the flag.`);
+  console.error(`-> commands that implement it: ${[...DRY_RUN_COMMANDS].join(", ")}`);
+  process.exit(1);
 }
 
 switch (cmd) {
@@ -1102,8 +1125,22 @@ switch (cmd) {
       console.error(`-> known projects: ${Object.keys(registry.projects).join(", ") || "(none)"}`);
       process.exit(1);
     }
-    const profile = loadProfile(entry.nwo);
-    if (!profile) { console.error(`reeve task: no profile for ${entry.nwo}`); process.exit(1); }
+    // THE PROJECT'S OWN PROFILE, read from the path the registry names. The
+    // shared `loadProfile` checks `./.ops/profile.json` FIRST, whatever nwo it is
+    // given, so filing against one project from inside a different project's
+    // checkout would report that checkout's switches as the target's -- and the
+    // dry run's whole job is to say what is true of the project being filed
+    // against. `resolveSnapshot` hashes this same file, so reading anything else
+    // here would also disagree with the hash the task records.
+    let profile = null;
+    try { profile = withDefaults(JSON.parse(readFileSync(entry.profilePath, "utf8"))); }
+    catch (e) { console.error(`reeve task: ${entry.profilePath}: ${e.message}`); process.exit(1); }
+    const pv = validate(profile);
+    if (!pv.ok) {
+      console.error(`reeve task: ${entry.profilePath} is invalid`);
+      for (const e of pv.errors) console.error("  error:", e);
+      process.exit(1);
+    }
 
     // BARE NAMES, read through the validated reader. `capabilitiesFrom` returns
     // full dotted keys and omits any the profile never declared, so a plan
@@ -1117,10 +1154,37 @@ switch (cmd) {
     // Repeatable, already: the argv walk pushes every occurrence of a valued
     // flag and `all` returns the list. `--territory-file` appends to the same
     // list rather than replacing it, so the two flags compose.
-    const fromFile = opt("territory-file")
-      ? readFileSync(opt("territory-file"), "utf8").split("\n").map(s => s.trim()).filter(Boolean) : [];
+    // A BLANK LINE IS REFUSED, not dropped and not guessed at. An empty claim is
+    // the repository ROOT, which conflicts with every other task in the project,
+    // and a trailing newline is indistinguishable from a line someone meant. So
+    // dropping blanks silently discards a root claim, and keeping them silently
+    // creates one. Only the person who wrote the file knows which, and the flag
+    // form says it unambiguously.
+    let fromFile = [];
+    if (opt("territory-file")) {
+      let text;
+      try { text = readFileSync(opt("territory-file"), "utf8"); }
+      catch (e) { console.error(`reeve task: ${opt("territory-file")}: ${e.message}`); process.exit(1); }
+      const lines = text.split("\n");
+      // The final newline is punctuation, not a line: a file ending "a\n" is one claim.
+      if (lines.length && lines[lines.length - 1] === "") lines.pop();
+      const blank = lines.findIndex(l => l.trim() === "");
+      if (blank !== -1) {
+        console.error(`reeve task: ${opt("territory-file")} line ${blank + 1} is blank, and a blank claim ` +
+                      `is the repository ROOT, which conflicts with every other task in the project.`);
+        console.error(`-> remove the line, or pass --territory "" if the repository root is what you meant`);
+        process.exit(1);
+      }
+      fromFile = lines.map(l => l.trim());
+    }
 
-    const db = openHub(hubPathFor(HOME));
+    // A DRY RUN DOES NOT CREATE THE STORE. `openHub` makes the directory, creates
+    // the file and runs migrations, so the command that promises to write nothing
+    // was creating a hub on a fresh home and MIGRATING an older one before it
+    // reached its no-write branch. With no store there are no live leases, which
+    // is the true answer rather than a missing one.
+    const hubPath = hubPathFor(HOME);
+    const db = (flag("dry-run") && !existsSync(hubPath)) ? null : openHub(hubPath);
     const r = await fileTask({
       db, registry, project, title: opt("title"),
       territory: [...all("territory"), ...fromFile],
@@ -1129,15 +1193,32 @@ switch (cmd) {
       depth: opt("depth"), priority: opt("priority") ?? "p2",
       idempotencyKey: opt("idempotency-key"), anyway: flag("anyway"),
       dryRun: flag("dry-run"), switches,
-      io: registryIo(HOME, project, entry, {}), isAlive: isSameProcess,
+      // WITH A FETCHER. `resolveRepoIdAt` asks the hub first and falls back to
+      // this; without it a project the hub has never admitted a task for resolves
+      // to null, admission refuses for an incomplete snapshot, and the FIRST
+      // filing for every project is impossible -- the one filing every project
+      // must be able to make.
+      io: registryIo(HOME, project, entry, { fetchRepoId: repoIdFromGitHub }),
+      isAlive: isSameProcess,
       pid: process.pid, lstart: readStart(process.pid),
     });
-    db.close();
+    db?.close();
     if (flag("json")) console.log(JSON.stringify(r, null, 2));
     else if (!r.ok) console.error(`reeve task: ${r.refusal}`);
-    else if (r.dryRun) console.log(`would file in ${r.plan.project}: ` +
-      `${r.plan.territory.map(t => t.path || "(repository root)").join(", ")}` +
-      (r.plan.conflicts.length ? `\nconflicts:\n  ${r.plan.conflicts.join("\n  ")}` : ""));
+    else if (r.dryRun) {
+      // EVERYTHING THE PLAN COMPUTED. Printing a subset makes --json the only way
+      // to see the profile hash, the floors and the switches, which is exactly
+      // backwards: the operator reading a dry run before committing to it is the
+      // one who needs them.
+      const p = r.plan;
+      console.log(`would file in ${p.project} (${p.nwo})`);
+      console.log(`  territory:  ${p.territory.map(t => t.path || "(repository root)").join(", ")}`);
+      console.log(`  profile:    ${p.profileHash ?? "(unresolved)"}`);
+      console.log(`  switches:   ${Object.entries(p.switches).map(([k, v]) => `${k}=${v}`).join(" ") || "(none)"}`);
+      if (p.floors.length) console.log(`  floors:\n    ${p.floors.join("\n    ")}`);
+      console.log(p.conflicts.length ? `  conflicts:\n    ${p.conflicts.join("\n    ")}`
+                                     : `  conflicts:  none`);
+    }
     else console.log(`${r.task} FILED${r.replayed ? " (already filed; nothing was done)" : ""}`);
     process.exit(r.ok ? 0 : 1);
   }

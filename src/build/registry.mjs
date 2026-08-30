@@ -303,16 +303,26 @@ export function admitTask(db, snapshot, filing, { isAlive = () => true } = {}) {
     }
 
     db.prepare(
+      // DEPTH, PRIORITY AND PROVENANCE ARE PART OF THE FILING, not decoration.
+      // They were validated by the caller and then dropped here, so `--depth deep`
+      // and `--priority p1` were accepted, reported as filed, and stored as NULL
+      // and the 'p2' default -- the founder's stated urgency silently discarded
+      // at the one moment it is recorded. `text_hash` and `filed_via` are the
+      // columns that distinguish a filing typed by a person from one imported by
+      // a machine, and nothing had ever written them.
       `INSERT INTO task(id, project, repo_id, nwo_snapshot, title, body, phase, generation,
-                        source_kind, source_key, idempotency_key,
+                        source_kind, source_key, idempotency_key, depth, priority,
+                        text_hash, filed_via,
                         repo_path, profile_path, profile_hash, default_branch, visibility,
                         spec_repo_id, gate_definition_hash, registry_version, founder_user_id,
                         created_at, updated_at)
-       VALUES(?,?,?,?,?,?,'FILED',1,?,?,?,?,?,?,?,?,?,?,?,?,unixepoch(),unixepoch())`)
+       VALUES(?,?,?,?,?,?,'FILED',1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,unixepoch(),unixepoch())`)
       .run(filing.id, filing.project, snapshot.repoId, snapshot.nwo, filing.title,
            filing.body ?? null, filing.sourceKind ?? "founder",
            filing.sourceKey ?? filing.idempotencyKey ?? filing.id,
            filing.idempotencyKey ?? null,
+           filing.depth ?? null, filing.priority ?? "p2",
+           filing.textHash ?? null, filing.filedVia ?? null,
            snapshot.repoPath, snapshot.profilePath, snapshot.profileHash,
            snapshot.defaultBranch, snapshot.visibility, snapshot.specRepoId,
            snapshot.gateDefinitionHash, snapshot.registryVersion, snapshot.founderUserId);
@@ -348,8 +358,13 @@ export function admitTask(db, snapshot, filing, { isAlive = () => true } = {}) {
       // so admission proceeded and the primary key aborted the whole filing.
       // Reachable after any daemon outage or missed renewal, and it surfaced as
       // an uncaught database error rather than a reasoned refusal.
+      // THE DEADLINE TRAVELS WITH THE PIN. `grantLease` stamps `pinnedUntil` on
+      // the claim at the first grant and reads it back at every later one, so a
+      // pin passed without one is a pin with no expiry -- territory held until
+      // somebody notices, which is not what `--pin-territory 48h` promises.
       const granted = grantLease(db, { project: filing.project, claim, taskId: filing.id,
-                                       at, pinned: !!filing.pinTerritory });
+                                       at, pinned: !!filing.pinTerritory,
+                                       pinnedUntil: filing.pinnedUntil ?? undefined });
       // And the GRANT's event: `territory_lease` is in COMPARISON_SET, so an
       // ungranted event means a post-snapshot admission loses its lease at
       // replay and the task runs with territory nothing records it holding.

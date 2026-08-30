@@ -21,7 +21,13 @@ export function writeArtifact({ dir, phase, bytes }) {
   // the artifact directory persists the file and the directory's contents while
   // leaving the directory's own entry unflushed -- a crash then loses the whole
   // tree, after `writeArtifact` reported it durable.
-  const fresh = !existsSync(dir);
+  // EVERY ancestor this call creates, not just the one. `mkdirSync` with
+  // `recursive` can create a whole chain -- tasks/<id>/artifacts on the first
+  // artifact of the first task -- and each new directory is an entry in ITS
+  // parent. Syncing only the deepest one leaves the entries that name it
+  // unflushed, so a crash removes the tree the artifact was reported durable in.
+  const fresh = [];
+  for (let d = dir; !existsSync(d) && d !== dirname(d); d = dirname(d)) fresh.push(d);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, name);
   const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
@@ -54,10 +60,11 @@ export function writeArtifact({ dir, phase, bytes }) {
   // and the artifact is durable only in the sense that its bytes were.
   const dfd = openSync(dir, "r");
   try { fsyncSync(dfd); } finally { closeSync(dfd); }
-  // AND ITS PARENT, when this call created the directory. Persisting a
+  // AND THE PARENT OF EVERY DIRECTORY THIS CALL CREATED. Persisting a
   // directory's contents does not persist the fact that the directory exists.
-  if (fresh) {
-    const pfd = openSync(dirname(dir), "r");
+  // `fresh` runs deepest-first, so the parents are synced from the inside out.
+  for (const made of fresh) {
+    const pfd = openSync(dirname(made), "r");
     try { fsyncSync(pfd); } finally { closeSync(pfd); }
   }
   return { path, sha256: sha(bytes), bytes: bytes.length };
@@ -86,6 +93,14 @@ export function readArtifact({ dir, phase, expectSha }) {
 // is context, not a claim, and is not asked to cite.
 const CLAIM = /^\s*(?:[-*]|\d+\.)\s+\S/;
 const CITATION = /[\w./-]+:\d+/;
+// A URL's PORT is not a file citation, and research is full of URLs. `[\w./-]+:\d+`
+// matches `localhost:3000` exactly as it matches `src/x.mjs:170`, so a claim
+// supported by a link read as supported by a source line -- the gate accepting
+// precisely the unsupported claims it exists to reject. URLs are removed before
+// the test rather than excluded inside it, because a pattern that has to
+// describe what a URL is not becomes a second, worse URL parser.
+const URLS = /\b[a-z][a-z0-9+.-]*:\/\/\S+/gi;
+const withoutUrls = (line) => line.replace(URLS, " ");
 
 /**
  * The gate for a report phase's product. The SIBLING of `reviewDiff`, never a
@@ -114,7 +129,23 @@ export function reviewArtifact({ phase, dir, expect }) {
 
   const findings = [];
   if (phase === "SIZING") {
-    try { JSON.parse(text); } catch (e) { findings.push(`sizing.json does not parse: ${e.message}`); }
+    // PARSING IS NOT ENOUGH. `null`, `[]` and `{}` are all valid JSON and none is
+    // a sizing, so the phase advanced on an artifact carrying no decision.
+    //
+    // What is asserted here is the SHAPE its consumer reads, and nothing more:
+    // the transition refuses a SIZING report whose depth is not one of the known
+    // depths, and it owns that vocabulary. Repeating the list here would be a
+    // second inventory of it, and the two would agree until one changed.
+    let parsed = null, ok = true;
+    try { parsed = JSON.parse(text); }
+    catch (e) { ok = false; findings.push(`sizing.json does not parse: ${e.message}`); }
+    if (ok) {
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+        findings.push(`sizing.json is ${Array.isArray(parsed) ? "an array" : JSON.stringify(parsed)}, ` +
+                      `not an object; valid JSON is not a sizing`);
+      else if (typeof parsed.depth !== "string" || !parsed.depth.trim())
+        findings.push("sizing.json carries no depth, which is the one field the phase machine reads from it");
+    }
   }
   if (phase === "RESEARCH") {
     if (expect.depth === "trivial")
@@ -124,14 +155,35 @@ export function reviewArtifact({ phase, dir, expect }) {
     // carries a citation, so an artifact with nine cited claims and one bare
     // assertion reads as clean -- and the bare one is the claim that needed
     // checking.
-    for (const line of text.split("\n"))
-      if (CLAIM.test(line) && !CITATION.test(line)) findings.push(`no file:line citation: ${line.trim()}`);
+    let claims = 0;
+    for (const line of text.split("\n")) {
+      if (!CLAIM.test(line)) continue;
+      claims++;
+      if (!CITATION.test(withoutUrls(line))) findings.push(`no file:line citation: ${line.trim()}`);
+    }
+    // ABSENCE MUST NOT SATISFY THE RULE. With no claims the loop runs zero times
+    // and every claim is trivially cited, so an empty artifact -- or one that is
+    // all headings and prose -- passed a gate whose whole subject is the claims
+    // it does not contain. "Nothing to check" is not "checked".
+    if (claims === 0)
+      findings.push("no claims at all: RESEARCH must produce findings, and an artifact with none " +
+                    "satisfies the citation rule only because there is nothing to cite");
   }
   if (phase === "DESIGN") {
-    const slices = text.split("\n").filter(l => /^##\s+Slice\b/.test(l));
-    if (!slices.length) findings.push("design.md carries no ordered slice list");
-    for (const need of ["Files:", "Packages:", "Tests:", "Done when:"])
-      if (!text.includes(need)) findings.push(`every slice needs a ${need} line and none was found`);
+    // PER SLICE, not per document -- the same distinction the citation check
+    // above makes, and it was missing here. A whole-document `includes` passes as
+    // soon as ONE slice carries each label, so a design whose first slice is
+    // complete and whose second is an empty heading read as clean, and the phase
+    // advanced with a slice that names no files, no tests and no done condition.
+    const lines = text.split("\n");
+    const starts = lines.map((l, i) => (/^##\s+Slice\b/.test(l) ? i : -1)).filter(i => i !== -1);
+    if (!starts.length) findings.push("design.md carries no ordered slice list");
+    for (let k = 0; k < starts.length; k++) {
+      const heading = lines[starts[k]].trim();
+      const body = lines.slice(starts[k] + 1, k + 1 < starts.length ? starts[k + 1] : lines.length).join("\n");
+      for (const need of ["Files:", "Packages:", "Tests:", "Done when:"])
+        if (!body.includes(need)) findings.push(`${heading} has no ${need} line`);
+    }
     if (expect.depth === "trivial" && !/^##\s+Measured context\b/m.test(text))
       findings.push("at trivial depth design.md stands in for the absent research and needs a Measured context section");
   }

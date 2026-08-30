@@ -323,6 +323,111 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
     "a failed write leaves no temporary file behind", left.join(",") || "(directory empty)");
 }
 
+// ── Absence must not satisfy a rule about presence ─────────────────────────
+//
+// With no claims the citation loop runs zero times, so every claim is trivially
+// cited and an artifact that is all headings and prose passed a gate whose whole
+// subject is the claims it does not contain. "Nothing to check" is not "checked",
+// and it is the shape this repository keeps finding.
+{
+  const adir = join(dir, "minima");
+  const gate = (body, phase = "RESEARCH") => {
+    writeArtifact({ dir: adir, phase, bytes: Buffer.from(body) });
+    return reviewArtifact({ phase, dir: adir, expect: { depth: "standard" } });
+  };
+  const empty = gate("# research\n\nprose, and no list items at all.\n");
+  check(empty.ok === false, "a research artifact with NO claims is refused", JSON.stringify(empty.findings));
+  check(/no claims at all/.test(empty.findings.join(" ")),
+    "and says the rule was satisfied only because there was nothing to cite", empty.findings.join(" "));
+
+  // CONTROL: one cited claim still passes, so the refusal is about absence
+  // rather than about the gate having become stricter everywhere.
+  const one = gate("# research\n\n- a claim (src/x.mjs:12)\n");
+  check(one.ok === true, "control: a single cited claim still passes", JSON.stringify(one.findings));
+}
+
+// ── A URL's port is not a file citation ────────────────────────────────────
+//
+// Research is full of links, and `[\w./-]+:\d+` matches localhost:3000 exactly as
+// it matches src/x.mjs:170 -- so the gate accepted precisely the unsupported
+// claims it exists to reject.
+{
+  const adir = join(dir, "urls");
+  const gate = (body) => {
+    writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
+    return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+  };
+  for (const url of ["http://localhost:3000", "https://example.com:8080", "ftp://host:21/x"]) {
+    const r = gate(`# research\n\n- an unsupported claim ${url}\n`);
+    check(r.ok === false, `a claim supported only by ${url} is refused`, JSON.stringify(r.findings));
+  }
+  // CONTROLS, and they are what stop this becoming "URLs are banned": a claim
+  // that carries BOTH a link and a real citation passes, and a bare citation
+  // still passes.
+  const both = gate("# research\n\n- a claim (src/x.mjs:12), see http://localhost:3000\n");
+  check(both.ok === true, "control: a claim with a citation AND a URL passes", JSON.stringify(both.findings));
+  const bare = gate("# research\n\n- a claim (src/build/hubaccess.mjs:170)\n");
+  check(bare.ok === true, "control: and a bare file:line citation still passes", JSON.stringify(bare.findings));
+}
+
+// ── Valid JSON is not a sizing ─────────────────────────────────────────────
+{
+  const adir = join(dir, "sizing");
+  const gate = (body) => {
+    writeArtifact({ dir: adir, phase: "SIZING", bytes: Buffer.from(body) });
+    return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
+  };
+  for (const [label, body] of [["null", "null"], ["an array", "[]"], ["a scalar", "7"],
+                               ["an empty object", "{}"]]) {
+    const r = gate(body);
+    check(r.ok === false, `sizing.json that is ${label} is refused`, JSON.stringify(r.findings));
+  }
+  check(gate("{ not json").ok === false, "and one that does not parse is still refused");
+  // CONTROL: an object carrying a depth passes. The DEPTH VOCABULARY is not
+  // re-checked here -- the transition owns it and refuses an unknown depth
+  // durably, so repeating the list would be a second inventory of it.
+  const good = gate(JSON.stringify({ depth: "standard", slices: 2, rationale: "x" }));
+  check(good.ok === true, "control: an object carrying a depth passes", JSON.stringify(good.findings));
+}
+
+// ── Every slice, not the document ──────────────────────────────────────────
+//
+// The same per-unit distinction the citation check makes, which was missing
+// here: a whole-document `includes` passes as soon as ONE slice carries each
+// label, so a complete first slice made an empty second slice invisible.
+{
+  const adir = join(dir, "slices");
+  const gate = (body) => {
+    writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
+    return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+  };
+  const complete = "## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n";
+  const bad = gate(`# design\n\n${complete}\n## Slice 2\n`);
+  check(bad.ok === false, "a second slice missing everything is refused", JSON.stringify(bad.findings));
+  check(bad.findings.some(f => /Slice 2/.test(f)),
+    "and the finding names WHICH slice, not the document", JSON.stringify(bad.findings));
+  check(!bad.findings.some(f => /Slice 1/.test(f)),
+    "and does not blame the slice that was complete", JSON.stringify(bad.findings));
+
+  const good = gate(`# design\n\n${complete}\n## Slice 2\nFiles: e\nPackages: f\nTests: g\nDone when: h\n`);
+  check(good.ok === true, "control: two complete slices pass", JSON.stringify(good.findings));
+}
+
+// ── A deep tree is created and readable ────────────────────────────────────
+//
+// `mkdirSync` with `recursive` can create a whole chain, and each new directory
+// is an entry in ITS parent. What is assertable here is that the write succeeds
+// and reads back through every new level; that the fsyncs make the chain survive
+// a power loss is the platform's guarantee, which this code asks for and does
+// not prove -- stated rather than implied, as with the interrupted-write drill.
+{
+  const deep = join(dir, "a", "b", "c", "d", "artifacts");
+  const w = writeArtifact({ dir: deep, phase: "DESIGN", bytes: Buffer.from("# design\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n") });
+  check(existsSync(w.path), "an artifact written into a chain of new directories exists", w.path);
+  const back = readArtifact({ dir: deep, phase: "DESIGN", expectSha: w.sha256 });
+  check(back.ok === true, "and reads back with the sha it was written under", JSON.stringify(back.why));
+}
+
 db.close();
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

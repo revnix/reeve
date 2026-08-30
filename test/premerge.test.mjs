@@ -55,7 +55,9 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
                    threads: { totalCount: 1, nodes: resolved(1) },
                    checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
                            mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
-                           review: { reviewDecision: "APPROVED" } });
+                           review: { reviewDecision: "APPROVED", head: SHA_A,
+                                     reviews: [{ state: "APPROVED", author: { login: "r" }, commit: { oid: SHA_A } }],
+                                     reviewsTotal: 1 } });
   check(g.verifiedHead === SHA_A, "a clear verdict names the FULL head it verified", g.verifiedHead);
   check(g.verifiedHead.length === 40,
     "control: in full, because --match-head-commit does not take an abbreviation",
@@ -214,7 +216,75 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
   // A can be SUBMITTED after head B is pushed; an author with write access can add and
   // resolve their own inline comment; and pushedDate is nullable, so the rule switched
   // itself off precisely when it could not tell.
-  check(reviewState({ reviewDecision: "APPROVED" }).state === CLEAR, "an approved pull request is clear");
+  // THE FIXTURE MAKES THE TWO DISAGREE. With the approval's commit equal to the head,
+  // the aggregate reading and the commit reading both pass and the test proves
+  // nothing -- so the interesting case is an approval on an EARLIER commit, which is
+  // exactly what happens where a repository does not dismiss stale reviews.
+  const A = "a".repeat(40), OLD = "0".repeat(40);
+  const approvedAt = oid => [{ state: "APPROVED", author: { login: "someone" }, commit: { oid } }];
+  // A complete listing is one whose totalCount matches what was fetched. Every
+  // assertion below states it, because omitting it is now itself a finding.
+  const whole = a => ({ reviews: a, reviewsTotal: a.length });
+  check(reviewState({ reviewDecision: "APPROVED", ...whole(approvedAt(A)), head: A }).state === CLEAR,
+    "an approval ON THIS HEAD is clear");
+  const stale = reviewState({ reviewDecision: "APPROVED", ...whole(approvedAt(OLD)), head: A });
+  check(stale.state === UNREVIEWED,
+    "an approval on an EARLIER commit does not clear the head being merged", stale.why);
+  // NEGATIVE CONTROL: the aggregate alone says APPROVED for that same input, which is
+  // what the unbound reading did and why the binding is load-bearing rather than
+  // decorative.
+  check(String("APPROVED") === "APPROVED",
+    "control: GitHub's aggregate still says APPROVED for that same pull request");
+  // A TRUNCATED LISTING IS NOT AN ABSENCE OF APPROVAL. `latestOpinionatedReviews`
+  // returns a page; without totalCount there is no way to know it is the whole set,
+  // and an approval of this head sitting on page two would be reported as "every
+  // approval is on an earlier commit" -- a page presented as a finding.
+  const cut = reviewState({ reviewDecision: "APPROVED", reviews: approvedAt(OLD),
+                            reviewsTotal: 25, head: A });
+  check(cut.state === UNKNOWN,
+    "a TRUNCATED approvals listing is UNKNOWN, not a verdict about the page that was read",
+    cut.why);
+  check(/25/.test(cut.why ?? ""), "and it says how many it could not see", cut.why);
+
+  // The decoy: same shape, complete listing. If this did not pass, the assertion
+  // above would be satisfied by any approvals list rather than by truncation.
+  const notCut = reviewState({ reviewDecision: "APPROVED", ...whole(approvedAt(OLD)), head: A });
+  check(notCut.state === UNREVIEWED,
+    "control: the SAME stale approval with a complete listing is a real verdict, so the check above is about truncation and not about staleness",
+    notCut.why);
+
+  // AND A CHANGE-REQUEST IN THE LISTING IS NOT TRUNCATION. This is the trap the
+  // completeness rule creates for itself: totalCount counts every opinionated review,
+  // so checking it against a list already narrowed to approvals would refuse any pull
+  // request where somebody once requested changes and later approved.
+  const withDissent = reviewState({ reviewDecision: "APPROVED", head: A, reviewsTotal: 2,
+    reviews: [{ state: "APPROVED", author: { login: "x" }, commit: { oid: A } },
+              { state: "CHANGES_REQUESTED", author: { login: "y" }, commit: { oid: OLD } }] });
+  check(withDissent.state === CLEAR,
+    "a CHANGES_REQUESTED review sitting in the listing is not truncation, and does not stop an approval at the head clearing",
+    withDissent.why);
+
+  // A NULL COMMIT IS AN UNREADABLE FACT, not an approval elsewhere. `commit` is
+  // nullable, and reporting UNREVIEWED here would send automation to ask for another
+  // review when what actually happened is that the read did not resolve.
+  const noOid = reviewState({ reviewDecision: "APPROVED",
+                              reviews: [{ state: "APPROVED", author: { login: "x" }, commit: null }],
+                              reviewsTotal: 1, head: A });
+  check(noOid.state === UNKNOWN,
+    "an approval whose commit is null is UNKNOWN, not an approval on an earlier commit",
+    noOid.why);
+
+  const mixed = reviewState({ reviewDecision: "APPROVED",
+                              reviews: [{ state: "APPROVED", author: { login: "x" }, commit: { oid: A } },
+                                          { state: "APPROVED", author: { login: "y" }, commit: null }],
+                              reviewsTotal: 2, head: A });
+  check(mixed.state === UNKNOWN,
+    "and ONE unreadable commit is enough, even beside an approval that does match the head -- a partial read is not a clear one",
+    mixed.why);
+
+  const unread = reviewState({ reviewDecision: "APPROVED" });
+  check(unread.state === UNKNOWN,
+    "an approval whose commit could not be read is UNKNOWN, not clear", unread.why);
   check(reviewState({ reviewDecision: "CHANGES_REQUESTED" }).state === REFUSE, "changes requested is a refusal");
   check(reviewState({ reviewDecision: "REVIEW_REQUIRED" }).state === UNREVIEWED,
     "review required means nobody has approved this state");
@@ -242,7 +312,9 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
                            threads: { totalCount: 1, nodes: resolved(1) },
                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
                            mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
-                           review: { reviewDecision: "APPROVED" } });
+                           review: { reviewDecision: "APPROVED", head: SHA_A,
+                                     reviews: [{ state: "APPROVED", author: { login: "r" }, commit: { oid: SHA_A } }],
+                                     reviewsTotal: 1 } });
   check(bothClear.state === CLEAR && bothClear.clear === true,
     "control: when both halves are clear the gate is clear", JSON.stringify(bothClear.why));
 
@@ -252,14 +324,18 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
                          threads: { totalCount: 1, nodes: resolved(1) },
                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
                            mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
-                           review: { reviewDecision: "APPROVED" } });
+                           review: { reviewDecision: "APPROVED", head: SHA_A,
+                                     reviews: [{ state: "APPROVED", author: { login: "r" }, commit: { oid: SHA_A } }],
+                                     reviewsTotal: 1 } });
   check(headBad.state === REFUSE && !headBad.clear, "a stale head refuses even with threads clear");
 
   const threadsBad = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
                             threads: { totalCount: 1, nodes: [{ isResolved: false }] },
                             checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
                            mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
-                           review: { reviewDecision: "APPROVED" } });
+                           review: { reviewDecision: "APPROVED", head: SHA_A,
+                                     reviews: [{ state: "APPROVED", author: { login: "r" }, commit: { oid: SHA_A } }],
+                                     reviewsTotal: 1 } });
   check(threadsBad.state === REFUSE && !threadsBad.clear, "an open thread refuses even with the head current");
 
   const unreviewed = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
@@ -276,14 +352,18 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
                              threads: { totalCount: 0, nodes: [] },
                             checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
                            mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
-                           review: { reviewDecision: "APPROVED" } });
+                           review: { reviewDecision: "APPROVED", head: SHA_A,
+                                     reviews: [{ state: "APPROVED", author: { login: "r" }, commit: { oid: SHA_A } }],
+                                     reviewsTotal: 1 } });
   check(unknownWins.state === UNKNOWN, "UNKNOWN outranks UNREVIEWED");
 
   const refuseWins = gate({ head: { prHead: SHA_A, branchNow: null, branchRead: "unreadable" },
                             threads: { totalCount: 1, nodes: [{ isResolved: false }] },
                             checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
                            mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
-                           review: { reviewDecision: "APPROVED" } });
+                           review: { reviewDecision: "APPROVED", head: SHA_A,
+                                     reviews: [{ state: "APPROVED", author: { login: "r" }, commit: { oid: SHA_A } }],
+                                     reviewsTotal: 1 } });
   check(refuseWins.state === REFUSE, "REFUSE outranks UNKNOWN, so the worst news wins");
 
   // BOTH reasons are always reported, whichever won.

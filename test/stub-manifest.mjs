@@ -532,4 +532,22 @@ export const STUBS = [
               find: "                          \"ERROR\", \"STARTUP_FAILURE\", \"STALE\"]);",
               replace: "                          \"ERROR\", \"STARTUP_FAILURE\"]);" }],
   },
+  {
+    name: "premerge-binds-the-verified-head",
+    why: "drop the verified head, so a caller cannot bind the merge to the commit the gate actually checked",
+    test: "test/premerge.test.mjs",
+    expectRed: "a clear verdict names the FULL head it verified",
+    edits: [{ file: "src/premerge.mjs",
+              find: "           verifiedHead: head?.prHead ?? null,",
+              replace: "           verifiedHead: null," }],
+  },
+  {
+    name: "premerge-tip-difference-does-not-overclaim",
+    why: "restore the claim that a tip difference loses commits, which is false when a branch was force-reset backward to an ancestor",
+    test: "test/premerge.test.mjs",
+    expectRed: "the tip difference does not claim anything is lost",
+    edits: [{ file: "src/premerge.mjs",
+              find: "                \"whether that difference loses anything is NOT established here \u2014 \" +",
+              replace: "                \"commits on the branch would not be carried \u2014 \" +" }],
+  },
 ];

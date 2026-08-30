@@ -115,7 +115,17 @@ function main() {
   });
 
   console.log(`${verdict.state}  ${nwo}#${pr}  head=${String(meta.headRefOid).slice(0, 7)} branch=${branchNow ? String(branchNow).slice(0, 7) : branchRead}`);
-  for (const line of verdict.why) console.log(`  ${line}`);
+  // The FULL head, and the flag that binds a merge to it. A gate that says CLEAR and
+  // leaves the caller to merge whatever is there by then has moved the race rather
+  // than removed it: a push landing in between makes this verdict describe a commit
+  // that is no longer the one being merged.
+  if (verdict.clear)
+    console.log(`  verified head: ${verdict.verifiedHead}\n` +
+                `  merge bound to it with: gh pr merge ${pr} --repo ${nwo} --match-head-commit ${verdict.verifiedHead}`);
+  // ESCAPED TOO. These reasons embed check names, and a check run created by a
+  // contributor-controlled fork workflow names itself. Escaping the thread fields
+  // below and printing these raw left the same hole one line higher up.
+  for (const line of verdict.why) console.log(`  ${safePath(line)}`);
   for (const t of verdict.threads.unresolved ?? []) {
     const c = t.comments?.nodes?.[0];
     // ESCAPED, because a path and a body on an outside-contributor pull request are

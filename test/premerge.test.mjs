@@ -44,6 +44,33 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
     "control: 'gone' and 'unreadable' give different reasons, so a reader can tell them apart");
 }
 
+// --- the verdict binds to the head it verified ------------------------------------
+{
+  // `premerge && gh pr merge` has a window: a push can land between the read and the
+  // merge, so a CLEAR about head A can be followed by GitHub merging head B. A gate
+  // that returns success without giving the caller the means to close that window
+  // has MOVED the race rather than removed it.
+  const g = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
+                   threads: { totalCount: 1, nodes: resolved(1) },
+                   checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] } });
+  check(g.verifiedHead === SHA_A, "a clear verdict names the FULL head it verified", g.verifiedHead);
+  check(g.verifiedHead.length === 40,
+    "control: in full, because --match-head-commit does not take an abbreviation",
+    String(g.verifiedHead?.length));
+}
+
+// --- the tip difference says only what it measured --------------------------------
+{
+  // A branch force-reset BACKWARD to an ancestor differs from the head while the head
+  // still carries everything reachable from it. Claiming commits "would not be
+  // carried" sends an operator looking for work that is not lost.
+  const moved = headState({ prHead: SHA_A, branchNow: SHA_B, branchRead: "read" });
+  check(!/would not be carried|are missing|omit/i.test(moved.why),
+    "the tip difference does not claim anything is lost", moved.why);
+  check(/NOT established/i.test(moved.why) && /git log/.test(moved.why),
+    "and it names the check a person can run to find out", moved.why);
+}
+
 // --- threads ---------------------------------------------------------------------
 {
   check(threadState({ totalCount: 3, nodes: resolved(3) }).state === CLEAR,

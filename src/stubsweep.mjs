@@ -357,10 +357,18 @@ export function parsePorcelainZ(raw) {
  * printed form cannot.
  */
 export function displayPath(pathBuf) {
+  // TWO DISJOINT NAMESPACES, because the previous form was not injective and said it
+  // was. It returned `<decoded> <bytes HASH>` for an undecodable name -- and a
+  // perfectly valid filename can BE that text, so a control run could swap one for
+  // the other and both the line and the fingerprint would match.
+  //
+  // `u:` carries a name that survives a UTF-8 round trip, `x:` carries the raw bytes
+  // in hex. Two different byte sequences cannot collide: both decodable means the
+  // decoded strings differ, both undecodable means the hex differs, and one of each
+  // differs in the prefix. Readability survives for the ordinary case, which is every
+  // case anyone will actually look at.
   const s = pathBuf.toString("utf8");
-  return Buffer.from(s, "utf8").equals(pathBuf)
-    ? s
-    : `${s} <bytes ${createHash("sha256").update(pathBuf).digest("hex").slice(0, 16)}>`;
+  return Buffer.from(s, "utf8").equals(pathBuf) ? `u:${s}` : `x:${pathBuf.toString("hex")}`;
 }
 
 /**

@@ -82,6 +82,64 @@ that reaches them starts by testing the claim rather than discovering it.
   `reviewArtifact`, computing the artifact sha, or converting the inherited `{ok, why,
   findings}` into the `{ok, refusal, findings, sha}` the assertions above it require.
 
+## Second review round: what the plans build but never wire, and what they measure but never run
+
+The first round found names that disagree between plans. This round found something different
+and worse: **steps that produce a thing nothing calls, and measurements that run a command
+nobody writes.** Recorded with the same rule as above -- verified where verification was
+possible today, and marked as an argument where it was not.
+
+### Verified
+
+| plan | the defect | measured |
+|---|---|---|
+| S3-E | The builder announcer is defined and never wired. `builderAnnounce` appears 18 times in S3-E; `loop.mjs` appears **once**, and that mention is about `isAlive`, not about calling it. No task adds it to the builder loop or the `build run` route, so every builder escalation is durable, visible in the hub, and delivered to nobody | `grep -c builderAnnounce` = 18, `grep -c loop.mjs` = 1 in S3-E |
+| S3-F | V6 runs `reeve build measure-pool`, and **no task creates that subcommand**. The string appears exactly once across all six plans -- the invocation itself -- and zero times in `src` or `bin` | 1 occurrence in S3-F at `:1456`, 0 in `src`/`bin` |
+| S3-E | The `admitTask` fail-open premise that the table above corrects for S3-B **is repeated verbatim in S3-E `:85`**. `assertWritable` throws when the predicate reports the holder ALIVE, so `() => true` refuses rather than admits; it never reaps a dead holder and wedges the hub read-only instead | `assertWritable`, `src/build/locks.mjs:156-165` |
+
+**The reviewer's own claim needed narrowing on the first of these**, and the correction matters
+more than the finding. It says a repo-wide search finds `announce` only in tests. That is
+false: the guardian's announcer is called at `src/daemon.mjs:1608` and `:3244`. What is true is
+narrower -- the **builder** announcer S3-E introduces is never wired. A finding recorded as
+stated would have sent someone to fix a call site that already exists.
+
+### Arguments, recorded unverified
+
+Each needs code that does not exist yet. They are listed so the task that reaches them starts
+by testing the claim.
+
+- **S3-F, P1.** The budget extractor labels contract ceilings as measured usage: `max_turns` is
+  the configured cap and `max_budget_usd` the spending cap, so V2 would report the guesses back
+  as if they were measurements -- a measurement whose instrument returns its own input.
+- **S3-E, P1.** `builderAnnounceable` writes `announced_count = count` *before* `announce`
+  attempts delivery, so a channel that declines once marks the escalation announced and it is
+  never retried.
+- **S3-B (PR-B2).** `writeArtifact` ignores `writeSync`'s return value; a short write is then
+  fsynced, renamed, and reported with a sha and a byte count for a file that is incomplete.
+- **S3-C.** Canonicalising run evidence with `Object.keys(v)` as a JSON replacer whitelists only
+  top-level keys and silently drops every nested one.
+- **S3-C.** If `runWorker` rejects rather than returning an outcome, the `finally` clears the
+  heartbeat but never settles the run row.
+- **S3-C.** The unique-violation regex matches `index 'one_live_run'`; SQLite reports the
+  constrained columns instead, so the branch never fires.
+- **S3-D.** The done-condition regex accepts any fenced block, so a slice carrying a
+  configuration snippet and no `Done when` reports a machine-checkable done-condition.
+- **S3-F.** A `phase_run` fixture inserts rows for a task the database has no parent row for,
+  against a declared foreign key.
+- **S3-F.** An empty outbox is treated as missing evidence, though a scout run that enqueues no
+  effects is exactly what S3 requires.
+- **S3-F.** V5 promises three `build_design.json` runs; only the twenty `build_size.json` runs
+  are launched.
+- **S3-E.** Under `--json` a declined notification prints two JSON documents, so a consumer
+  parsing stdout gets a syntax error rather than a refusal.
+
+**What this round says about the plans as a whole.** Two review passes have now produced
+twenty-one findings across six documents, and the yield did not fall between them. That is not
+a count of mistakes so much as evidence about the documents: they were written in one sitting,
+against each other rather than against the code, and never executed. Treat every remaining
+plan's consumed-name table and every "produces" clause as unverified until the task that
+consumes it runs.
+
 ## What this file does NOT establish
 
 Only S3-A and the first task of S3-B have been executed. The rows above are what executing

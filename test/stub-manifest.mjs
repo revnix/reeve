@@ -840,4 +840,13 @@ export const STUBS = [
               find: "  if (!Array.isArray(territory) || territory.length === 0)",
               replace: "  if (!Array.isArray(territory) || territory.filter(t => String(t).trim()).length === 0)" }],
   },
+  {
+    name: "taskfile-refusal-leaves-nothing",
+    why: "catch admitTask's refusal OUTSIDE its transaction and re-insert a bare task row so the operator \"has something to look at\" -- the shape an author reaches for when a refusal loses the title the founder typed. The refusal is still returned and still names the blocking task, so every message assertion stays green, while the hub gains a task holding no territory, blocking nothing, and reading as FILED in every later view. A refusal that is RETURNED and a refusal that CHANGED NOTHING are two different facts",
+    test: "test/task-file.test.mjs",
+    expectRed: "and the task-row COUNT is unchanged",
+    edits: [{ file: "src/build/taskfile.mjs",
+              find: "  if (!r.ok) return { ok: false, refusal: r.refusal };",
+              replace: "  if (!r.ok) { db.prepare(\"INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,generation,source_kind,source_key,repo_path,profile_path,profile_hash,default_branch,visibility,registry_version,created_at,updated_at) VALUES(?,?,?,?,?,'FILED',1,'founder',?,?,?,?,?,?,?,unixepoch(),unixepoch())\").run(id, project, snapshot.repoId, snapshot.nwo, title, id, snapshot.repoPath, snapshot.profilePath, snapshot.profileHash, snapshot.defaultBranch, snapshot.visibility, snapshot.registryVersion); return { ok: false, refusal: r.refusal }; }" }],
+  },
 ];

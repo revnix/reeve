@@ -536,3 +536,27 @@ export function grandfatherGate({ changed, grandfathered }) {
     "each file's assertions can fail, then remove it from GRANDFATHERED in\n" +
     "test/stub-manifest.mjs." };
 }
+
+/**
+ * Did the frozen list GROW, or did coverage shrink?
+ *
+ * PURE, and separate from the edit rule because they catch different moves. The edit
+ * rule refuses touching a listed file. It says nothing about a change that removes a
+ * test's STUBS entry and adds that test to the list instead: the file itself is never
+ * edited, so the intersection sees only the manifest in the diff and passes, while
+ * the list grows and measured coverage falls. The rule was described as a ratchet
+ * from the start and only the edit half was built.
+ *
+ * Growth is the thing refused, not size. Removing names is how the debt is paid, so a
+ * shorter list is the desired direction and passes silently.
+ */
+export function listGrowth({ before, after }) {
+  const was = new Set(before ?? []);
+  const added = (after ?? []).filter(f => !was.has(f));
+  if (!added.length) return { ok: true, added: [], why: null };
+  return { ok: false, added, why:
+    "these test files were ADDED to GRANDFATHERED:\n" +
+    added.map(f => `  ${f}`).join("\n") + "\n\n" +
+    "The list is frozen debt, not an exemption list. A file with no stub arrives with\n" +
+    "one or it does not arrive; a file that already had one does not get to give it up." };
+}

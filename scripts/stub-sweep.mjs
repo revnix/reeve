@@ -38,7 +38,8 @@ import { join, resolve, dirname, basename, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdit, validateManifest, classify, summarise, parsePorcelainZ, fingerprint,
          CAUGHT, UNRUNNABLE, TIMED_OUT_EXIT,
-         coverage, coverageLine, changedFiles, grandfatherGate } from "../src/stubsweep.mjs";
+         coverage, coverageLine, changedFiles, grandfatherGate,
+         listGrowth } from "../src/stubsweep.mjs";
 
 // Overridable so the runner can be pointed at a throwaway repository built by its
 // own test. The cleanliness guard then applies to THAT tree, so the real one is
@@ -162,6 +163,48 @@ if (!process.env.STUB_SWEEP_ROOT && process.env.STUB_SWEEP_NO_DIFF !== "1") {
            "Set STUB_SWEEP_NO_DIFF=1 only if this tree genuinely has no base to compare against.");
   const gate = grandfatherGate({ changed: changed.files, grandfathered });
   if (!gate.ok) die(2, `stub-sweep: ${gate.why}`);
+
+  // THE OTHER HALF OF THE RATCHET. The edit rule refuses touching a listed file and
+  // says nothing about a change that drops a test's entry and adds the test to the
+  // list instead -- the file is never edited, the diff shows only the manifest, and
+  // the list grows while coverage falls. Read the list AS IT WAS at the base and
+  // refuse additions.
+  //
+  // Only when the manifest is in the diff, so the ordinary run pays nothing.
+  if (changed.files.includes("test/stub-manifest.mjs")) {
+    const was = git(["show", `${base}:test/stub-manifest.mjs`]);
+    if (!was.ok)
+      die(2, `stub-sweep: the manifest could not be read at the base commit, so whether GRANDFATHERED grew is unknown: ${was.err}`);
+    // Parsed rather than imported: importing arbitrary source from another revision
+    // executes it, and this runs in the daemon's own repository.
+    const block = /export const GRANDFATHERED = \[([\s\S]*?)\];/.exec(was.out);
+    // ABSENT AND UNREADABLE ARE DIFFERENT ANSWERS. A base that never declared the list
+    // is the one-time introduction below. A base that declares one this pattern cannot
+    // read -- a wrapped `Object.freeze`, a different terminator, a reformat -- is an
+    // unknown, and treating it as absent would skip the growth check silently and for
+    // ever after, which is the same "measuring nothing" shape this gate exists to
+    // catch. So the IDENTIFIER decides which case it is, and the pattern only reads
+    // the contents.
+    if (!block && /export const GRANDFATHERED\b/.test(was.out))
+      die(2, "stub-sweep: the base commit declares GRANDFATHERED but its contents could not be read,\n" +
+             "so whether the list grew is unknown. Refusing rather than skipping the check: an\n" +
+             "unreadable prior list would disable this gate permanently and silently.");
+    // NO LIST AT THE BASE MEANS THIS CHANGE INTRODUCES IT, and the initial freeze is
+    // by definition not growth: there is no earlier list for it to have grown from.
+    // Refusing here would mean the change that adds the ratchet cannot pass the
+    // ratchet, which is the shape where a guard has to land before its own subject
+    // exists. Every later revision has a list at the base, so this branch is taken
+    // exactly once in the repository's life.
+    //
+    // Deleting the list to escape the check is not an opening: `coverage()` reads
+    // GRANDFATHERED, and without it every grandfathered file reads as an orphan and
+    // the gate fails on that instead.
+    if (block) {
+      const before = [...block[1].matchAll(/"([^"]+)"/g)].map(m => m[1]);
+      const growth = listGrowth({ before, after: grandfathered });
+      if (!growth.ok) die(2, `stub-sweep: ${growth.why}`);
+    }
+  }
 }
 
 // EVERY TARGET MUST RESOLVE INSIDE THE REPOSITORY, checked before anything is

@@ -1353,6 +1353,19 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
   check(displayPath(name) !== displayPath(other),
     "two different undecodable names do not collapse to the same reading",
     `${displayPath(name)} vs ${displayPath(other)}`);
+  // THE CRAFTED COLLISION. The earlier form rendered an undecodable name as
+  // `<decoded> <bytes HASH>`, and a perfectly valid filename can BE that text -- so a
+  // control run swapping one for the other left the line AND the fingerprint
+  // identical. This builds exactly that adversarial pair rather than asserting
+  // injectivity in general, which is a property no example can establish.
+  const oldForm = `${name.toString("utf8")} <bytes ${
+    createHash("sha256").update(name).digest("hex").slice(0, 16)}>`;
+  const impostor = Buffer.from(oldForm, "utf8");
+  check(Buffer.from(oldForm, "utf8").equals(impostor) && !impostor.equals(name),
+    "control: the impostor is a VALID utf-8 filename and a different byte sequence");
+  check(displayPath(name) !== displayPath(impostor),
+    "a valid filename spelling out the encoded form of another does not collide with it",
+    `${displayPath(name)} vs ${displayPath(impostor)}`);
 }
 
 // --- a fifo named as an ignored file never blocks the sweep ---------------------

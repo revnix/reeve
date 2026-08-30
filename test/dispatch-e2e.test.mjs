@@ -209,7 +209,16 @@ check(spawned.length === 1, "a worker was dispatched for the red PR", `spawned=$
   // Actions whose prompts need GitHub effects a worker cannot perform (gh is
   // shimmed; effects are reeve's) are refused at the seam, not launched.
   const dsrc = readFileSync(new URL("../src/daemon.mjs", import.meta.url), "utf8");
-  check(UNBUILT_ACTIONS.REQUEST_REVIEW && UNBUILT_ACTIONS.SPILL, "REQUEST_REVIEW and SPILL are declared unbuilt with a reason", JSON.stringify(UNBUILT_ACTIONS));
+  check(UNBUILT_ACTIONS.REQUEST_REVIEW, "REQUEST_REVIEW is declared unbuilt with a reason", JSON.stringify(UNBUILT_ACTIONS));
+  // SPILL LEFT THIS LIST when reeve began performing it: the daemon enqueues the
+  // issue, the replies and the resolves itself rather than asking a worker. Asserted
+  // as an ABSENCE with its reason rather than deleted, because a line quietly removed
+  // is indistinguishable from one nobody replaced -- and the pairing with
+  // REQUEST_REVIEW above is what shows the list still has entries and the check has
+  // not simply been switched off.
+  check(!UNBUILT_ACTIONS.SPILL, "and SPILL has left it, because reeve performs that effect now", JSON.stringify(UNBUILT_ACTIONS));
+  check(/spillEffects\(\{/.test(dsrc),
+    "control: the daemon really does produce the spill's effects, so the absence above is wiring and not a deletion");
   check(/UNBUILT_ACTIONS\[decision\.action\]/.test(dsrc), "and the daemon refuses them at dispatch", "");
   check(/WORKER_ACTIONS\.includes\(d\.decision\.action\)/.test(dsrc), "and the containment refusal filters by that list", "");
   ctx4.db.close();

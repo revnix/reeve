@@ -568,4 +568,13 @@ export const STUBS = [
               find: "  return { state: UNREVIEWED,\n           why: \"GitHub reports no review decision, which means none is REQUIRED rather than that one was given\" };",
               replace: "  return { state: CLEAR,\n           why: \"GitHub reports no review decision\" };" }],
   },
+  {
+    name: "outbox-edge-survives-a-rerun",
+    why: "write the dependants with no dependency at all, which is the orphan: they drain at once and their token has no parent to read",
+    test: "test/outbox-edge-rerun.test.mjs",
+    expectRed: "a child is written with the parent's id, not with no dependency at all",
+    edits: [{ file: "src/db/ops.mjs",
+              find: "  for (const child of dependants) ids.push(enqueue(db, { ...child, dependsOn: parentId }));",
+              replace: "  for (const child of dependants) ids.push(enqueue(db, { ...child, dependsOn: null }));" }],
+  },
 ];

@@ -28,8 +28,20 @@ const factN = db.prepare(`INSERT INTO fact(node_id,evidence,observed_at,source) 
 
 
 const legacyOwner = new Map();
+// NULL-PROTOTYPE, because these two counters are keyed by UNTRUSTED INPUT: `kind`
+// and `status` are whatever the legacy JSONL happens to carry, not values from
+// KIND or STATUS -- a value only reaches a counter BECAUSE it is not one of those.
+// On a plain object `o["__proto__"] = n` invokes the inherited setter, so the key
+// never appears and the count is silently lost; `o["constructor"]` and every other
+// Object.prototype name read back as the inherited function, so `(o[k]||0)+1`
+// stringifies it and the report prints `"constructor": "function Object() { [native
+// code] }1"`. That is worse than losing the count, because a human reading the
+// report to decide whether a legacy import dropped anything gets a value they
+// cannot interpret and may not register as wrong.
+const counters = () => Object.create(null);
 const report = { lines: raw.length, nodes:0, edges:0, facts:0, notes:0, claims:0,
-                 statusChanges:0, coercedStatus:{}, unknownKind:{}, danglingEdge:[], skipped:0 };
+                 statusChanges:0, coercedStatus:counters(), unknownKind:counters(),
+                 danglingEdge:[], skipped:0 };
 
 db.exec("BEGIN IMMEDIATE");
 for (const [i,line] of raw.entries()) {

@@ -577,4 +577,22 @@ export const STUBS = [
               find: "  for (const child of dependants) ids.push(enqueue(db, { ...child, dependsOn: parentId }));",
               replace: "  for (const child of dependants) ids.push(enqueue(db, { ...child, dependsOn: null }));" }],
   },
+  {
+    name: "migration-counter-absence",
+    why: "key the legacy counters by a plain object, so a `__proto__` kind or status hits the inherited setter and its count vanishes from the report entirely",
+    test: "test/migration-counters.test.mjs",
+    expectRed: "an unknown kind named '__proto__' is PRESENT in unknownKind",
+    edits: [{ file: "src/db/migrate.mjs",
+              find: "                 statusChanges:0, coercedStatus:counters(), unknownKind:counters(),",
+              replace: "                 statusChanges:0, coercedStatus:{}, unknownKind:{}," }],
+  },
+  {
+    name: "migration-counter-garbage",
+    why: "the same defect's OTHER half, which the presence assertion cannot see: `constructor` DOES become an own property, so only its VALUE reveals that the count is a stringified inherited function",
+    test: "test/migration-counters.test.mjs",
+    expectRed: "'constructor' counts to the NUMBER 1 in unknownKind, not a stringified inherited function",
+    edits: [{ file: "src/db/migrate.mjs",
+              find: "                 statusChanges:0, coercedStatus:counters(), unknownKind:counters(),",
+              replace: "                 statusChanges:0, coercedStatus:{}, unknownKind:{}," }],
+  },
 ];

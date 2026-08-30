@@ -332,5 +332,487 @@ expectRefusal("a budget that is not an object",
   withBudget({ BUILD_SIZE: 8 }), /BUILD_SIZE must be an object/);
 expectRefusal("budgets that are not an object", withBudget([]), /builder\.budgets must be an object/);
 
+// ── the generated reference ──────────────────────────────────────────────────
+//
+// A stale generated file is a lie a reader cannot detect: it looks exactly like
+// a fresh one. So the test regenerates and compares, and names the command.
+//
+// EQUALITY ALONE PROVES NOTHING HERE, and that is the whole difficulty. The
+// committed file and the fresh one come from the SAME generator, so a generator
+// that reads nothing produces a document of empty cells that matches a committed
+// document of empty cells, and this check goes green over a reference that
+// documents the schema not at all. Every control below exists because some
+// version of this generator passed the equality check while being wrong.
+{
+  const { profileReference, noteFor, fieldsBounds, rowsFor } =
+    await import("../scripts/profile-reference.mjs");
+  const { readFileSync } = await import("node:fs");
+  const { execFileSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+
+  const SRC    = readFileSync(new URL("../src/profile/schema.mjs", import.meta.url), "utf8");
+  const fresh  = profileReference();
+  const onDisk = readFileSync(new URL("../docs/profile-reference.md", import.meta.url), "utf8");
+
+  const current = onDisk === fresh;
+  console.log(`${current ? "PASS" : "FAIL"}  docs: profile-reference.md is current`);
+  if (!current) { console.log("        run: node scripts/profile-reference.mjs"); fail++; }
+
+  // CONTROL: the comparison is not two empty documents agreeing. The generator
+  // must carry this PR's keys and a real count.
+  //
+  // The two keys named here are the ones THIS lane landed -- `builder.budgets`
+  // (#81) and a capability switch (#80) -- so the control is anchored to keys
+  // that exist. The plan specified `builder.provider.concurrencyLimit`, which no
+  // task has added yet; a control naming an absent key fails for a reason that
+  // has nothing to do with the generator, and the tempting repair is to delete
+  // the control.
+  const carries = fresh.includes("`builder.budgets`") &&
+                  fresh.includes("`builder.capabilities.observe`") &&
+                  new RegExp(`^${Object.keys(FIELDS).length} keys\\.`, "m").test(fresh);
+  console.log(`${carries ? "PASS" : "FAIL"}  control: the reference names the new keys and counts them`);
+  if (!carries) fail++;
+
+  // CONTROL: prose written ABOVE a key reaches it. `builder.budgets` carries a
+  // comment block above its declaration.
+  const above = noteFor(SRC, "builder.budgets");
+  const gotAbove = /ONE KEY, NOT EIGHTEEN/.test(above ?? "");
+  console.log(`${gotAbove ? "PASS" : "FAIL"}  control: a key's comment BLOCK reaches its entry`);
+  if (!gotAbove) { console.log(`        got: ${JSON.stringify((above ?? "").slice(0, 60))}`); fail++; }
+
+  // CONTROL: prose written BESIDE a key reaches it too. Thirteen keys are
+  // documented only by a trailing comment, and the first version of this
+  // generator read the block form alone -- rendering all thirteen empty while
+  // every assertion above stayed green, because the committed file was produced
+  // by the same blind reader.
+  const beside = noteFor(SRC, "identity.key");
+  const gotBeside = /owner\/repo from the REMOTE/.test(beside ?? "");
+  console.log(`${gotBeside ? "PASS" : "FAIL"}  control: a key's TRAILING comment reaches its entry`);
+  if (!gotBeside) { console.log(`        got: ${JSON.stringify((beside ?? "").slice(0, 60))}`); fail++; }
+
+  // CONTROL: coverage is pinned, in the idiom the capability keys already use.
+  // It fails when a description is LOST, and equally when one is added -- and
+  // updating the number is how the person adding it acknowledges the change.
+  const documented = rowsFor(SRC).filter((r) => r.note !== "").length;
+  // 30 since the misplaced watcher comment moved to the key it describes:
+  // `watch.reviewActions` had no detail at all while its warning was attributed
+  // to `notify.provider`.
+  const pinned = documented === 30;
+  console.log(`${pinned ? "PASS" : "FAIL"}  control: 29 of the declared keys carry a description`);
+  if (!pinned) {
+    console.log(`        ${documented} do. If you added or removed one, update this number`);
+    console.log("        and regenerate docs/profile-reference.md in the same commit.");
+    fail++;
+  }
+
+  // ── THE DUPLICATE-KEY TRAP ────────────────────────────────────────────────
+  //
+  // Key strings are NOT unique in schema.mjs: `builder.capabilities.observe` is
+  // declared in `FIELDS` and seeded again in `UNIVERSAL_DEFAULTS`. A whole-file
+  // "first match" lookup -- which is what this generator was first specified to
+  // do -- lands on the right one today only because `FIELDS` happens to be
+  // declared earlier in the file.
+  //
+  // Reorder those two declarations and every duplicated key silently takes its
+  // prose from the wrong block. NOTHING GOES RED: the committed file and a fresh
+  // generation are wrong in the same way, so the equality check above passes.
+  //
+  // THE FIXTURE PUTS THE DECOY FIRST, so it can actually exhibit the defect. A
+  // fixture built from the real file in its current order would pass under both
+  // the bounded and the unbounded reader and would prove nothing.
+  {
+    const decoyFirst = [
+      "const UNIVERSAL_DEFAULTS = {",
+      "  // DECOY PROSE that belongs to the defaults block, not to the schema.",
+      '  "builder.capabilities.observe": false,',
+      "};",
+      "",
+      "export const FIELDS = {",
+      "  // THE REAL PROSE, above the declaration inside FIELDS.",
+      '  "builder.capabilities.observe":        [false, isBool],',
+      "};",
+    ].join("\n");
+
+    const [lo, hi] = fieldsBounds(decoyFirst.split("\n"));
+    const bounded = hi >= lo;
+    console.log(`${bounded ? "PASS" : "FAIL"}  control: the FIELDS block is located and non-empty`);
+    if (!bounded) fail++;
+
+    const picked = noteFor(decoyFirst, "builder.capabilities.observe");
+    const right = /THE REAL PROSE/.test(picked ?? "");
+    console.log(`${right ? "PASS" : "FAIL"}  a key declared TWICE takes its prose from FIELDS, not from the defaults`);
+    if (!right) { console.log(`        got: ${JSON.stringify(picked)}`); fail++; }
+
+    // NEGATIVE CONTROL: the fixture really can tell the two readers apart. An
+    // unbounded first-match reader must get the DECOY from this same input --
+    // otherwise the assertion above would pass for a reader with the bug, and
+    // would be measuring nothing.
+    const naive = (() => {
+      const lines = decoyFirst.split("\n");
+      const at = lines.findIndex((l) => /^\s*"?builder\.capabilities\.observe"?\s*:/.test(l));
+      const m = lines[at - 1].match(/^\s*\/\/ ?(.*)$/);
+      return m ? m[1] : "";
+    })();
+    const discriminates = /DECOY/.test(naive);
+    console.log(`${discriminates ? "PASS" : "FAIL"}  negative control: an unbounded reader takes the DECOY from that same fixture`);
+    if (!discriminates) { console.log(`        got: ${JSON.stringify(naive)}`); fail++; }
+  }
+
+  // CONTROL: every declared key was actually FOUND in the FIELDS block. A key
+  // the reader cannot locate must be an error, never an empty cell -- an empty
+  // cell is indistinguishable from "documented nowhere yet".
+  let threw = null;
+  try { rowsFor(SRC.replace(/^\s*"?identity\.key"?\s*:.*$/m, "")); } catch (e) { threw = e; }
+  console.log(`${threw ? "PASS" : "FAIL"}  a declared key missing from the source THROWS rather than rendering blank`);
+  if (!threw) fail++;
+
+  // `--check` answers without writing, the shape gofmt/terraform-docs settled on.
+  let checkOk = false;
+  try {
+    // fileURLToPath, NOT `.pathname`. A checkout whose path contains a space
+    // arrives percent-encoded, so `.pathname` hands node
+    // `/tmp/reeve%20space/scripts/...`, which does not exist -- and the test
+    // fails for a reason that has nothing to do with staleness. The generator
+    // already decodes; this did not.
+    execFileSync(process.execPath,
+      [fileURLToPath(new URL("../scripts/profile-reference.mjs", import.meta.url)), "--check"],
+      { stdio: "pipe" });
+    checkOk = true;
+  } catch { checkOk = false; }
+  console.log(`${checkOk ? "PASS" : "FAIL"}  --check exits 0 while the committed file is current`);
+  if (!checkOk) fail++;
+}
+
+// ── requirement is what an operator must AUTHOR ──────────────────────────────
+//
+// NOT the raw `FIELDS` flag. `bin/reeve` calls `withDefaults(raw)` and only then
+// `validate(profile)`, so a key the defaults supply is accepted when a profile
+// omits it. Reporting the flag labelled `authority.profileLocation` "required"
+// and misstated the contract: every profile may omit it, and both kinds get one.
+{
+  const { requirementOf, mustAuthor, exampleFor, profileReference, EXAMPLE_SEED_KEYS,
+          composedKeys } = await import("../scripts/profile-reference.mjs");
+  const { PROJECT_KIND, withDefaults, validate } = await import("../src/profile/schema.mjs");
+  // This file reports with `expectOk`/`expectRefusal` and a bare `fail++`; the
+  // assertions below are not refusal cases, so they get a local reporter in the
+  // same shape rather than a second global one.
+  const at = (o, path) => path.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
+  const check = (ok, name, detail) => {
+    console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+    if (!ok) { if (detail) console.log("        " + detail); fail++; }
+  };
+  const fresh = profileReference();
+
+  check(FIELDS["authority.profileLocation"][0] === true,
+    "control: authority.profileLocation IS flagged required in FIELDS",
+    "if this flips, the case below stops being the interesting one");
+  check(requirementOf("authority.profileLocation") === "defaulted",
+    "a required key the defaults supply is reported as `defaulted`, not `required`",
+    requirementOf("authority.profileLocation"));
+  // AND IT REALLY IS ACCEPTED WITHOUT IT -- asserted through the loader's own
+  // order rather than by restating which keys have defaults.
+  for (const kind of PROJECT_KIND) {
+    const omitted = exampleFor(kind);
+    delete omitted.authority.profileLocation;
+    const r = validate(withDefaults(omitted));
+    check(r.ok === true,
+      `control: a ${kind} profile omitting authority.profileLocation is accepted by the loader's order`,
+      JSON.stringify(r.errors?.slice(0, 2)));
+  }
+  check(requirementOf("identity.key") === "required",
+    "control: a key with no default is still reported as `required`", requirementOf("identity.key"));
+  check(requirementOf("identity.prHost") === "optional",
+    "control: and an unflagged key with no default is optional", requirementOf("identity.prHost"));
+  // AN OPTIONAL KEY THAT THE DEFAULTS SUPPLY. `watch.staleSeconds` carries a
+  // false required flag and a universal default of 900, so an early return on
+  // the flag labelled it `optional` directly above its own description reading
+  // "Defaulted rather than optional" -- the document contradicting itself.
+  check(FIELDS["watch.staleSeconds"][0] === false,
+    "control: watch.staleSeconds IS flagged optional in FIELDS");
+  check(requirementOf("watch.staleSeconds") === "defaulted",
+    "an OPTIONAL key the defaults supply is reported as `defaulted`, not `optional`",
+    requirementOf("watch.staleSeconds"));
+  check(at(withDefaults({ project: { kind: "product" } }), "watch.staleSeconds") === 900,
+    "control: and every profile really does receive that value",
+    String(at(withDefaults({ project: { kind: "product" } }), "watch.staleSeconds")));
+
+  // ── the examples, which are the other half of §11.6 ────────────────────────
+  //
+  // "documentation AND examples generated from the validator". An example an
+  // operator copies is worse than none if it does not validate, so each is run
+  // through `validate()` rather than eyeballed.
+  for (const kind of PROJECT_KIND) {
+    const r = validate(exampleFor(kind));
+    check(r.ok === true, `the generated ${kind} example is accepted by the validator`,
+      JSON.stringify(r.errors?.slice(0, 3)));
+    check((r.warnings ?? []).length === 0,
+      `and the ${kind} example raises no warnings, so it does not model what the validator advises against`,
+      JSON.stringify(r.warnings));
+    check(fresh.includes(JSON.stringify(exampleFor(kind), null, 2)),
+      `and the ${kind} example in the document is that same object`);
+  }
+
+  // THE SEED IS PINNED TO THE DERIVED SET, BOTH DIRECTIONS. Sample values are
+  // the one thing here that cannot be derived -- the schema says a key must be a
+  // string, not what a plausible string looks like -- so the risk is a new
+  // required key landing with no sample and the example quietly failing to
+  // validate. This fails first, and says which key.
+  //
+  // COMPARED IN BOTH DIRECTIONS, against the SEED's own key paths rather than
+  // the example's top-level keys. Checking only "every must-author key reaches
+  // the example" misses the other failure entirely: when a key stops being
+  // must-author -- it becomes optional, or gains a default -- its seed entry
+  // stays valid and keeps OVERRIDING that default in every generated example,
+  // while the document says the value came from `withDefaults()`. Nothing goes
+  // red, because a stale seed entry is still a legal profile value.
+  {
+    const need = mustAuthor();
+    const seed = EXAMPLE_SEED_KEYS;
+    const composed = composedKeys();
+    // A must-author key is covered either by the seed or by `compose`, which
+    // derives it from the project kind. Derived by differencing rather than
+    // listed, so the two stay in step without either restating the other.
+    const unseeded = need.filter((k) => !seed.includes(k) && !composed.includes(k));
+    const stale    = seed.filter((k) => !need.includes(k));
+
+    check(composed.length > 0,
+      "control: `compose` really does fill some must-author key, so the exemption is not a hole",
+      composed.join(", "));
+    check(unseeded.length === 0,
+      "every key an operator must author is seeded or composed",
+      unseeded.length ? `no sample for: ${unseeded.join(", ")} — add one in scripts/profile-reference.mjs` : "");
+    check(stale.length === 0,
+      "and the seed authors NOTHING an operator would not have to author",
+      stale.length ? `${stale.join(", ")} no longer needs authoring — remove it from EXAMPLE_SEED, ` +
+                     `or the example overrides a default while claiming it came from withDefaults()` : "");
+    check(need.length > 0 && seed.length > 0,
+      "control: both sets are non-empty, so the two comparisons above are not vacuous",
+      `mustAuthor=${need.length} seed=${seed.length}`);
+
+    // AND THE SEED REALLY REACHES THE EXAMPLE. Comparing two key lists says
+    // nothing about the object that is actually emitted.
+    const example = exampleFor("product");
+    const at = (o, path) => path.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
+    const absent = seed.filter((k) => at(example, k) === undefined);
+    check(absent.length === 0,
+      "control: every seeded key is present in the generated example", absent.join(", "));
+  }
+}
+
+// ── the example is what `reeve init` writes ──────────────────────────────────
+//
+// NOT a plausible profile assembled here. `reeve init` derives `state.mode` and
+// `authority.profileLocation` from the project kind and the repository's
+// visibility, so a seed picking the first enum member globally gave both kinds
+// `in-repo` -- a validator-valid profile that contradicts the file `reeve init`
+// writes for the same project, which is worse than no example because it looks
+// authoritative.
+//
+// The example is composed by the same exported function `reeve init` uses. These
+// assertions therefore check the RULE is being followed, not that this file
+// remembers it.
+{
+  const { exampleFor } = await import("../scripts/profile-reference.mjs");
+  const { compose } = await import("../src/init.mjs");
+  const check = (ok, name, detail) => {
+    console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+    if (!ok) { if (detail) console.log("        " + detail); fail++; }
+  };
+  const at = (o, path) => path.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
+
+  const client  = exampleFor("client");
+  const product = exampleFor("product");
+
+  check(client.state.mode === "hub",
+    "the client example takes state.mode `hub` from the composer, not the first enum member",
+    client.state.mode);
+  check(client.authority.profileLocation === "sidecar",
+    "and a client profile is a sidecar, because a client repo carries no agent artifacts",
+    client.authority.profileLocation);
+  check(product.state.mode === "in-repo" && product.authority.profileLocation === "committed",
+    "while a private product example gets in-repo and committed",
+    `${product.state.mode} / ${product.authority.profileLocation}`);
+  check(client.state.mode !== product.state.mode,
+    "control: the two kinds really do differ, so a single global seed could not have produced both");
+
+  // CONTROL: the seed answers everything `compose` would otherwise ask. An
+  // unanswered question means the example is missing a value an operator must
+  // supply, and it would silently ship incomplete.
+  const authored = { project: { kind: "product" }, identity: {}, authority: {}, state: {} };
+  const put = (o, path, v) => { const ps = path.split("."); let c = o;
+    for (const k of ps.slice(0, -1)) c = (c[k] ??= {}); c[ps.at(-1)] = v; return o; };
+  const { EXAMPLE_SEED_KEYS: seedKeys } = await import("../scripts/profile-reference.mjs");
+  for (const k of seedKeys) put(authored, k, at(exampleFor("product"), k));
+  const { unanswered } = compose(authored, [], {});
+  check(unanswered.length === 0,
+    "control: the seed leaves `compose` nothing to ask, so the example is complete",
+    unanswered.map((q) => q.field).join(", "));
+}
+
+// ── every key states what it accepts ─────────────────────────────────────────
+//
+// Read off each validator, which now carries its own description, so the type
+// and enum a key allows are never a second list beside `schema.mjs`. Without
+// this an operator could not tell from the reference that
+// `identity.visibility` takes only `public` or `private`.
+{
+  const { profileReference } = await import("../scripts/profile-reference.mjs");
+  const fresh = profileReference();
+  const check = (ok, name, detail) => {
+    console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+    if (!ok) { if (detail) console.log("        " + detail); fail++; }
+  };
+  const at = (o, path) => path.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
+  const undescribed = Object.entries(FIELDS).filter(([, [, v]]) => !v?.describe).map(([k]) => k);
+  check(undescribed.length === 0,
+    "every declared key's validator describes what it accepts",
+    undescribed.length ? `${undescribed.join(", ")} — wrap the validator in describe()` : "");
+  check(FIELDS["identity.visibility"][1].describe === "one of public, private",
+    "control: an enum validator names its members",
+    FIELDS["identity.visibility"][1].describe);
+  check(/one of public, private/.test(fresh),
+    "and that description reaches the generated reference");
+  // CONTROL: it is not one blanket sentence repeated. Distinct descriptions are
+  // what make the column worth reading.
+  const distinct = new Set(Object.values(FIELDS).map(([, v]) => v.describe)).size;
+  check(distinct > 5, "control: the descriptions are distinct, not one sentence repeated", String(distinct));
+}
+
+// ── a description states the EFFECTIVE contract ──────────────────────────────
+//
+// A true statement about a field's own check can be a false one about what the
+// loader accepts. `schemaVersion` was described as "an integer" while `validate`
+// refuses every value but one, so the reference advertised values that fail at
+// load time -- which is worse than saying nothing, because an operator acts on it.
+{
+  const { profileReference } = await import("../scripts/profile-reference.mjs");
+  const { SCHEMA_VERSION, validate, withDefaults } = await import("../src/profile/schema.mjs");
+  const fresh = profileReference();
+  const check = (ok, name, detail) => {
+    console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+    if (!ok) { if (detail) console.log("        " + detail); fail++; }
+  };
+
+  check(FIELDS.schemaVersion[1].describe === `exactly ${SCHEMA_VERSION}`,
+    "schemaVersion is described as the one value the loader accepts, not as `an integer`",
+    FIELDS.schemaVersion[1].describe);
+  // CONTROL: the field's OWN validator now refuses a wrong version, so the
+  // description is a statement about this check rather than about a rule
+  // enforced somewhere the reference cannot see.
+  check(FIELDS.schemaVersion[1](SCHEMA_VERSION + 1) !== null,
+    "control: and the field's validator itself refuses another integer");
+  check(FIELDS.schemaVersion[1](SCHEMA_VERSION) === null,
+    "control: while accepting the right one");
+
+  // NESTED VALIDATORS. `a list of values` hid a real restriction behind a
+  // sentence that looked like documentation, so an operator writes an absolute
+  // path or a full URL and the loader rejects it.
+  check(/relative path inside the checkout/.test(FIELDS["worker.dependencyPaths"][1].describe),
+    "a list's ELEMENT restriction reaches the description",
+    FIELDS["worker.dependencyPaths"][1].describe);
+  check(/bare domain name/.test(FIELDS["builder.network.research.allowedDomains"][1].describe),
+    "and so does the allowed-domains restriction",
+    FIELDS["builder.network.research.allowedDomains"][1].describe);
+  check(!/a list of values/.test(fresh),
+    "no key is documented as `a list of values`, which describes nothing");
+
+  // AND IT CANNOT SILENTLY RECUR: `isArr` refuses an undescribed inner at module
+  // load. This is the guard rather than the count, because the count only
+  // notices what someone remembered to look at -- it found a third case
+  // (`lanes`) that no review had named.
+  {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("../src/profile/schema.mjs", import.meta.url), "utf8");
+    check(/isArr needs a described inner validator/.test(src),
+      "isArr REFUSES an undescribed inner validator, so the gap cannot be shipped");
+  }
+}
+
+// ── a comment belongs to the key it sits above ───────────────────────────────
+//
+// `noteFor` takes the contiguous `//` run above a declaration, so a run that
+// describes a GROUP is attributed to whichever key follows it. That happened:
+// the watcher-group preface and the `watch.reviewActions` warning sat above
+// `notify.provider`, and the reference said the notification provider was "OFF
+// until review ingest exists" while `watch.reviewActions` had no detail at all.
+//
+// The repair was in the SOURCE -- the comments now sit above the keys they
+// describe -- because a heuristic that guesses topic boundaries in prose would
+// keep producing this. These assertions pin the attribution so the comments
+// cannot drift back.
+{
+  const { noteFor } = await import("../scripts/profile-reference.mjs");
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../src/profile/schema.mjs", import.meta.url), "utf8");
+  const check = (ok, name, detail) => {
+    console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+    if (!ok) { if (detail) console.log("        " + detail); fail++; }
+  };
+
+  const provider = noteFor(src, "notify.provider") ?? "";
+  const review   = noteFor(src, "watch.reviewActions") ?? "";
+
+  check(!/review ingest/.test(provider),
+    "notify.provider's description does not carry another key's warning",
+    provider.slice(0, 90));
+  check(/escalation/.test(provider),
+    "control: and it does carry its own", provider.slice(0, 90));
+  check(/review ingest/.test(review),
+    "watch.reviewActions carries the warning that is actually about it",
+    review.slice(0, 90));
+  check(review.length > 0 && provider.length > 0,
+    "control: both keys are documented at all, so neither check passes by absence",
+    `provider=${provider.length} review=${review.length}`);
+}
+
+// ── the declared key set, frozen ─────────────────────────────────────────────
+//
+// Nothing reads this fixture to make a decision; it is not a second inventory
+// the code consults. It exists so that adding a key is a DELIBERATE act with a
+// diff, rather than a line that lands in `FIELDS` and nowhere else -- which is
+// measured behaviour in this repository, not a hypothetical, and it reached
+// exactly one machine.
+//
+// It freezes BOTH halves: the key set, and a hash of the rendered reference. The
+// key set alone would not notice a key whose PROSE changed, and the hash alone
+// would not say WHICH key moved.
+{
+  const { readFileSync } = await import("node:fs");
+  const { createHash } = await import("node:crypto");
+  const { profileReference } = await import("../scripts/profile-reference.mjs");
+
+  const frozen = JSON.parse(readFileSync(
+    new URL("./fixtures/profile-fields-v1.json", import.meta.url), "utf8"));
+  const now = Object.keys(FIELDS).sort();
+
+  // CONTROL: the fixture really carries a key set. An empty or unparsed one
+  // would make both comparisons below pass vacuously -- the same nothing-shaped
+  // failure a derived-but-empty set produces.
+  const loaded = Array.isArray(frozen.keys) && frozen.keys.length === frozen.count
+                 && frozen.count > 0;
+  console.log(`${loaded ? "PASS" : "FAIL"}  control: the freeze fixture carries a non-empty, self-consistent key set`);
+  if (!loaded) { console.log(`        keys=${frozen.keys?.length} count=${frozen.count}`); fail++; }
+
+  const added   = now.filter((k) => !frozen.keys.includes(k));
+  const removed = frozen.keys.filter((k) => !now.includes(k));
+  const same = added.length === 0 && removed.length === 0;
+  console.log(`${same ? "PASS" : "FAIL"}  freeze: the declared key set is unchanged`);
+  if (!same) {
+    console.log(`        added: ${added.join(",") || "(none)"} | removed: ${removed.join(",") || "(none)"}`);
+    console.log("        If this change is intended, regenerate test/fixtures/profile-fields-v1.json");
+    console.log("        AND docs/profile-reference.md in the same commit.");
+    fail++;
+  }
+
+  const shaNow = createHash("sha256").update(profileReference()).digest("hex");
+  const shaSame = shaNow === frozen.reference_sha256;
+  console.log(`${shaSame ? "PASS" : "FAIL"}  freeze: the rendered reference is unchanged`);
+  if (!shaSame) {
+    console.log(`        frozen ${frozen.reference_sha256?.slice(0, 12)} vs now ${shaNow.slice(0, 12)}`);
+    console.log("        A key's prose or its required-ness changed. Regenerate both halves.");
+    fail++;
+  }
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

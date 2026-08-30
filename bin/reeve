@@ -1152,7 +1152,7 @@ switch (cmd) {
     // text is not an answer to "what are my tasks".
     if (sub === "list" || sub === "show" || sub === "why") {
       const { taskShow, taskList, renderShow, renderList, envelope,
-              switchesResolver, projectsWithTasks } = await import("../src/build/show.mjs");
+              switchesResolver, projectsWithTasks, inSnapshot } = await import("../src/build/show.mjs");
       const { whyModel, renderWhy } = await import("../src/build/why.mjs");
       const { loadRegistry } = await import("../src/build/registryio.mjs");
 
@@ -1161,6 +1161,30 @@ switch (cmd) {
         fail("hub_absent",
              `reeve task ${sub}: no builder hub at ${hub}. Nothing has been filed on this machine.`,
              { exit: EXITS.refused });
+      // THE SCHEMA VERSION, BEFORE THE CONNECTION. A version-1 hub opens
+      // perfectly and has no `task_pr` -- migration 2 creates it -- so every one
+      // of these routes would reach `openPrs` and die on `no such table`, which
+      // is the uncaught stack trace this whole surface exists to replace. An
+      // interrupted migration reads as version 0 and fails the same way. And a
+      // hub NEWER than this binary must be refused rather than read: `openHub`
+      // refuses it explicitly, and a read that quietly proceeds where the
+      // privileged opener would stop is a reader guessing at a shape it does not
+      // know.
+      //
+      // The read cannot fix any of this. Migrating is a write, and these routes
+      // hold no lease.
+      const at = completedVersion(hub);
+      if (at !== HUB_SCHEMA_VERSION)
+        fail("hub_incompatible",
+             `reeve task ${sub}: the hub at ${hub} is at schema version ${at}, and this reeve ` +
+             `speaks version ${HUB_SCHEMA_VERSION}.\n` +
+             (at === 0
+               ? `-> it is unreadable or was never migrated; \`reeve build status\` reports on it`
+               : at < HUB_SCHEMA_VERSION
+                 ? `-> a reader may not migrate it: run a command that writes, such as \`reeve build run\``
+                 : `-> this reeve is older than the store; upgrade reeve rather than downgrading the hub`),
+             { exit: EXITS.refused });
+
       let db = null;
       try { db = new DatabaseSync(hub, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS }); }
       catch (e) {
@@ -1189,9 +1213,16 @@ switch (cmd) {
         // "nobody has set these" looks exactly like "this file has a typo in it".
         // stderr, so stdout stays a whole JSON document.
         if (reg.error) console.error(`reeve task ${sub}: ${reg.error}; capability switches will read ${"UNKNOWN"}`);
+        // VALIDATED and identity-bound, not merely parsed: an invalid
+        // `observe: "true"` would otherwise report `observe=off`, which reads as
+        // a decision rather than a broken file, and a registry entry pointing at
+        // another project's profile would report that project's switches here.
         const switchesFor = switchesResolver(reg.registry.projects,
-          (path) => withDefaults(JSON.parse(readFileSync(path, "utf8"))));
+          (path) => withDefaults(JSON.parse(readFileSync(path, "utf8"))), { validate });
 
+        // ONE SNAPSHOT for the whole command, so a listing is a moment the hub
+        // actually had rather than a row-by-row walk across a live builder's
+        // writes.
         if (sub === "list") {
           const want = opt("project");
           // A --project that names nothing ANYWHERE is a refusal, not an empty
@@ -1207,7 +1238,7 @@ switch (cmd) {
                    `-> known projects: ${[...known].sort().join(", ") || "(none)"}`,
                    { exit: EXITS.refused });
           }
-          const models = taskList(db, { now, switchesFor, project: want });
+          const models = inSnapshot(db, () => taskList(db, { now, switchesFor, project: want }));
           console.log(flag("json")
             ? JSON.stringify(envelope("task.list", models), null, 2)
             : renderList(models));
@@ -1216,9 +1247,9 @@ switch (cmd) {
 
         const id = positionals[1];
         if (!id) fail("usage", `usage: reeve task ${sub} <task-id>`, { exit: EXITS.misuse });
-        const model = sub === "show"
+        const model = inSnapshot(db, () => (sub === "show"
           ? taskShow(db, id, { now, switchesFor })
-          : whyModel(db, id, { now });
+          : whyModel(db, id, { now })));
         if (!model) fail("task_not_found", `reeve task ${sub}: no task ${id}`, { exit: EXITS.refused });
         console.log(flag("json")
           ? JSON.stringify(envelope(`task.${sub}`, model), null, 2)

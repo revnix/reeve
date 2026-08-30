@@ -10,6 +10,7 @@
 // off, and the operator would wait for a dispatch that cannot happen.
 
 import { CAPABILITY_NAMES, capabilityOn } from "./capabilities.mjs";
+import { HELD } from "./phases.mjs";
 import { openPrs } from "./prs.mjs";
 
 /** The envelope every read surface in this family emits. One version, not three. */
@@ -74,7 +75,13 @@ export const NEEDS_SWITCH = Object.freeze({
   RESEARCH: "observe", DESIGN: "observe",
   SPEC_DRAFT: "draftSpec", SPEC_PR_OPEN: "draftSpec", GATE: "draftSpec",
   APPROVED: "implementLocal", IMPLEMENTING: "implementLocal",
-  IMPL_PR_OPEN: "publishPr", VERDICT_WAIT: "publishPr",
+  IMPL_PR_OPEN: "publishPr",
+  // VERDICT_WAIT's implementation PR is already published; the next gated effect
+  // is `gh.pr.merge`, which `capabilityFor` guards with `mergeBuilderPr`. Naming
+  // `publishPr` here reports no wait under the ordinary staged configuration
+  // (publishPr on, mergeBuilderPr off) even though merge actuation is exactly
+  // what is disabled -- and names a switch for work that has already happened.
+  VERDICT_WAIT: "mergeBuilderPr",
   SLICE_MERGED: "mergeBuilderPr", FINALIZING: "mergeBuilderPr",
 });
 
@@ -121,19 +128,74 @@ export function switchesFrom(profile) {
  * question that was never asked is the collapse this module refuses everywhere
  * else.
  */
-export function switchesResolver(entries, readProfile) {
+export function switchesResolver(entries, readProfile, { validate = null } = {}) {
   const seen = new Map();
   return (project) => {
     if (seen.has(project)) return seen.get(project);
-    let out = null;
-    const entry = entries?.[project];
-    if (entry?.profilePath) {
-      try { out = switchesFrom(readProfile(entry.profilePath)); }
-      catch { out = null; }
-    }
-    seen.set(project, out);
-    return out;
+    seen.set(project, resolveOne(entries?.[project], readProfile, validate));
+    return seen.get(project);
   };
+}
+
+/**
+ * One project's switches, or null, with every reason for null treated alike.
+ *
+ * VALIDATED AND IDENTITY-BOUND, not merely parsed. Two failures hide in a
+ * profile that parses:
+ *
+ *   - `builder.capabilities.observe: "true"` is a STRING. The schema refuses it,
+ *     but `capabilityOn` compares against `true` and answers `false` -- so an
+ *     invalid profile reports `observe=off`, which reads as a decision the
+ *     founder made rather than a file that is broken.
+ *   - a registry entry whose `profilePath` points at ANOTHER project's profile
+ *     validates perfectly. It is a valid profile; it is just not this one, and
+ *     its switches would be reported under this project's name.
+ *
+ * Both become null, which the read model renders as UNKNOWN. Answering "off" for
+ * a question that was never successfully asked is the collapse this module
+ * refuses everywhere else.
+ *
+ * `reeve task file` performs these same three checks inline and EXITS on each,
+ * because a filing must refuse rather than proceed on an unknown. That is a
+ * second statement of one rule and it should become one; the two differ only in
+ * what they do with the answer, so the predicate is what wants sharing.
+ */
+function resolveOne(entry, readProfile, validate) {
+  if (!entry?.profilePath) return null;
+  let profile = null;
+  try { profile = readProfile(entry.profilePath); } catch { return null; }
+  if (validate) {
+    let ok = false;
+    try { ok = validate(profile)?.ok === true; } catch { return null; }
+    if (!ok) return null;
+  }
+  // A profile that names a different repository is not this project's profile,
+  // however well formed it is. Absent is allowed: not every profile declares one.
+  const declared = profile?.identity?.key;
+  if (declared && entry.nwo && declared !== entry.nwo) return null;
+  try { return switchesFrom(profile); } catch { return null; }
+}
+
+/**
+ * Run a read against ONE SQLite snapshot.
+ *
+ * Every statement here runs in autocommit, so each `get`/`all` can observe a
+ * different moment. With a live builder transitioning a task between the task-row
+ * read and the evidence queries, one model could carry the old phase beside new
+ * holds, runs or leases -- and `task list` could mix moments across rows, which
+ * is a listing no single instant of the hub ever looked like.
+ *
+ * DEFERRED, not `BEGIN IMMEDIATE`. The repository's rule that a write must never
+ * follow a deferred read is about connections that can write; this one is opened
+ * `readOnly`, so no write can follow and there is no upgrade to deadlock on.
+ * Failure to begin is not fatal: a snapshot is better than no snapshot, and no
+ * snapshot is still better than refusing to answer.
+ */
+export function inSnapshot(db, fn) {
+  let began = false;
+  try { db.exec("BEGIN"); began = true; } catch { /* answer without one */ }
+  try { return fn(); }
+  finally { if (began) { try { db.exec("COMMIT"); } catch { /* read-only: nothing to undo */ } } }
 }
 
 /**
@@ -186,7 +248,7 @@ export function evidenceFor(db, taskId, { now }) {
     // same head. Grouped by head, because a task revises: an older head having
     // been answered says nothing about the head under review now.
     gateRequests: db.prepare(
-      `SELECT head_sha, round, requested_at FROM gate_request
+      `SELECT head_sha, round, task_generation, requested_at FROM gate_request
         WHERE task = ? ORDER BY requested_at`).all(taskId),
     codexClean: db.prepare(
       `SELECT head_sha FROM approval WHERE task = ? AND kind = 'codex_clean'`).all(taskId),
@@ -224,10 +286,16 @@ export function waitingFor(row, ev) {
   const all = [];
   let since = null, capability = null, capabilityKnown = true;
 
-  // A human must act. `hold_reason` is the durable record; BLOCKED is the phase
-  // a task rests in while one stands, and either alone is enough -- a hold
-  // written without the phase move is still a hold.
-  if (ev.holds.length || row.phase === "BLOCKED") {
+  // A human must act. `hold_reason` is the durable record, and `HELD` is the
+  // phases a task rests in while one stands; either alone is enough, because a
+  // hold written without the phase move is still a hold.
+  //
+  // HELD IS IMPORTED, not restated. It is `["BLOCKED","ESCALATED"]`, and naming
+  // only BLOCKED here missed every task that retry exhaustion or the gate
+  // revision cap moved straight to ESCALATED -- transitions that write no
+  // `hold_reason` row at all, so such a task rendered with no founder wait and
+  // read as needing nobody, which is the opposite of true.
+  if (ev.holds.length || HELD.includes(row.phase)) {
     all.push("WAITING_FOR_FOUNDER");
     since = ev.holds[0]?.at ?? null;
   }
@@ -246,19 +314,36 @@ export function waitingFor(row, ev) {
     }
   }
 
-  // A notice was delivered at some head and that same head has no acknowledgement
-  // yet. PER HEAD: an ack of an older head is not an ack of this one, and a
-  // task-wide `some(delivered) && !some(ack)` reports a revised task as answered.
-  const acked = new Set(ev.notices.filter(n => n.kind === "founder_ack").map(n => n.head_sha));
-  if (ev.notices.some(n => n.kind === "delivered" && !acked.has(n.head_sha)))
-    all.push("WAITING_FOR_NOTICE");
+  // THE CURRENT HEAD, and nothing else. Both gate waits below are scoped to it.
+  //
+  // A task REVISES. Codex requests changes on head A, the task pushes head B, and
+  // A never receives a clean pass -- so a check that asks "is any historical
+  // request unanswered" answers yes for ever, long after B was answered and even
+  // after the task has left the gate entirely. The same argument holds for a
+  // notice delivered at A that the founder answered by requesting changes: the
+  // push of B voids A's window rather than leaving it open.
+  //
+  // The head comes from the OPEN SPEC PULL REQUEST, because migration 2 dropped
+  // `task.spec_head` and `task.spec_pr` and moved both onto `task_pr`. With no
+  // open spec PR there is no head under review, and neither wait can be
+  // outstanding -- which is the true answer, not a missing one.
+  const specPr = ev.openPrs.find(p => p.kind === "spec") ?? null;
+  const head = specPr?.head_sha ?? null;
 
-  // Asked for review at a head that carries no Codex clean pass. S3 writes
-  // neither table, so both are empty here -- but the query is real, so a row
-  // written by a later stage is seen the day it appears rather than the day
-  // somebody remembers this derivation exists.
-  const clean = new Set(ev.codexClean.map(a => a.head_sha));
-  if (ev.gateRequests.some(g => !clean.has(g.head_sha))) all.push("WAITING_FOR_CODEX");
+  if (head !== null) {
+    const acked = ev.notices.some(n => n.kind === "founder_ack" && n.head_sha === head);
+    if (ev.notices.some(n => n.kind === "delivered" && n.head_sha === head) && !acked)
+      all.push("WAITING_FOR_NOTICE");
+
+    // Asked for review AT THIS HEAD, for THIS generation, with no Codex clean
+    // pass at that head. A regenerate resets the contract, so a request recorded
+    // under an older generation is not a question about the task as it now is.
+    const clean = new Set(ev.codexClean.map(a => a.head_sha));
+    if (ev.gateRequests.some(g => g.head_sha === head &&
+                                  g.task_generation === row.generation &&
+                                  !clean.has(g.head_sha)))
+      all.push("WAITING_FOR_CODEX");
+  }
 
   // The guardian owes this task a verdict. Its verdicts live in the guardian's
   // own per-repo store, which the hub deliberately cannot read, so the phase IS

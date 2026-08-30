@@ -11,7 +11,8 @@
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openHub } from "../src/build/hubdb.mjs";
+import { openHub, hubTx } from "../src/build/hubdb.mjs";
+import { acquireMaintenanceLock } from "../src/build/locks.mjs";
 import { isSameProcess, readStart } from "../src/supervisor.mjs";
 import { fileTask, pinSeconds, TERRITORY_GRAMMAR } from "../src/build/taskfile.mjs";
 
@@ -200,6 +201,99 @@ const base = (db, over = {}) => ({
   }
   check(/48h/.test(String(pinSeconds("48").refusal)),
     "and the refusal shows the grammar it wanted", pinSeconds("48").refusal);
+}
+
+// ── Network first, transaction second ────────────────────────────────────────
+//
+// Asserted as a property of the DATABASE rather than as a claim about call
+// order. node:sqlite throws on a nested BEGIN, so a hubTx that succeeds from
+// inside the io proves no transaction was open while the network half ran. A
+// test that merely recorded the order of two callbacks would pass against an
+// implementation that opened the transaction first and did its I/O inside it.
+{
+  const db = store();
+  let nested = null;
+  const r = await fileTask(base(db, { title: "network first",
+    io: mkIo({ repoId: async () => { try { hubTx(db, () => 1); nested = "open"; }
+                                     catch (e) { nested = String(e.message); } return 42; } }) }));
+  check(r.ok === true, "the filing succeeds", JSON.stringify(r));
+  check(nested === "open",
+    "and no transaction was open while the network reads ran", String(nested));
+  db.close();
+}
+
+// ── The lease exists for the duration and is gone afterwards, on BOTH paths ──
+{
+  const db = store();
+  const ok = await fileTask(base(db, { title: "leases and releases" }));
+  check(ok.ok === true, "a successful filing returns", JSON.stringify(ok));
+  check(writers(db) === 0, "and leaves no writer lease behind", String(writers(db)));
+
+  const bad = await fileTask(base(db, { title: "refused, still releases", territory: ["packages/x"] }));
+  check(bad.ok === false, "control: the second filing is refused as a conflict", JSON.stringify(bad));
+  check(writers(db) === 0,
+    "and a REFUSED filing leaves no writer lease behind either", String(writers(db)));
+  db.close();
+}
+
+// ── A live restore makes the hub read-only ───────────────────────────────────
+//
+// The filing must say so rather than write into a file that is being replaced.
+{
+  const db = store();
+  const held = acquireMaintenanceLock(db,
+    { pid: process.pid, lstart: readStart(process.pid), isAlive: isSameProcess });
+  check(held.ok === true, "control: the maintenance lock was actually taken", JSON.stringify(held));
+  const r = await fileTask(base(db, { title: "during a restore" }));
+  check(r.ok === false, "a filing during a live restore is refused", JSON.stringify(r));
+  check(/restore is in progress/.test(String(r.refusal)),
+    "and the refusal names the restore, not a generic failure", r.refusal);
+  check(tasks(db) === 0, "and nothing was written", String(tasks(db)));
+  check(writers(db) === 0, "and no writer lease was left behind", String(writers(db)));
+  db.close();
+}
+
+// ── Liveness is never defaulted ──────────────────────────────────────────────
+//
+// A production path that omits it fails OPEN: the filing above would have been
+// admitted during the restore.
+{
+  const db = store();
+  const { isAlive, ...noLiveness } = base(db, { title: "no predicate" });
+  let threw = null;
+  try { await fileTask(noLiveness); } catch (e) { threw = String(e.message); }
+  check(threw !== null && /liveness/.test(threw),
+    "fileTask throws rather than defaulting isAlive", String(threw));
+  check(tasks(db) === 0, "and wrote nothing on the way to throwing", String(tasks(db)));
+  db.close();
+}
+
+// ── The restore refusal is keyed on the holder being ALIVE, not on a row ─────
+//
+// `assertWritable` throws exactly when the predicate says the holder is alive,
+// and REAPS the row when it says the holder is dead. Without this control the
+// refusal above would also pass against an implementation that refused whenever
+// a maintenance_lock row existed at all -- which would wedge the hub read-only
+// after any crashed restore, permanently, with no way to file anything.
+//
+// This is also what makes the missing-predicate throw more than tidiness:
+// neither default is safe. `() => true` never reaps and never recovers;
+// `() => false` reaps a live restore and admits into a file being replaced.
+{
+  const db = store();
+  const stale = acquireMaintenanceLock(db,
+    { pid: 999999, lstart: "a-start-no-live-process-has", isAlive: isSameProcess });
+  check(stale.ok === true, "control: a lock held by a DEAD holder was recorded",
+    JSON.stringify(stale));
+  check(db.prepare("SELECT count(*) c FROM maintenance_lock").get().c === 1,
+    "control: and the row is really there before the filing runs");
+
+  const r = await fileTask(base(db, { title: "after a crashed restore" }));
+  check(r.ok === true, "a filing proceeds once the dead holder's lock is reaped",
+    JSON.stringify(r));
+  check(db.prepare("SELECT count(*) c FROM maintenance_lock").get().c === 0,
+    "and the stale lock is gone rather than blocking every future write");
+  db.close();
 }
 
 rmSync(dir, { recursive: true, force: true });

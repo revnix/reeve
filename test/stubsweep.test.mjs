@@ -11,9 +11,10 @@
 // stay strict, rather than being loosened to make itself testable.
 import { applyEdit, validateManifest, classify, summarise, failedAssertions, describeMiss,
          parsePorcelainZ, displayPath, fingerprint,
-         reportedAnyAssertion, CAUGHT, NOT_CAUGHT, WRONG_RED, CRASHED, UNRUNNABLE, TIMED_OUT_EXIT }
+         reportedAnyAssertion, CAUGHT, NOT_CAUGHT, WRONG_RED, CRASHED, UNRUNNABLE, TIMED_OUT_EXIT,
+         coverage, coverageLine, changedFiles, grandfatherGate, listGrowth }
   from "../src/stubsweep.mjs";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, realpathSync, rmSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -1464,6 +1465,160 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
   for (let i = 0; i < withHole.length; i++) if (!(i in withHole)) seen++;
   check(seen === 1, "control: an indexed loop detects a hole that forEach skips",
     `forEach visited ${withHole.filter(() => true).length} of ${withHole.length}`);
+}
+
+// ── coverage() itself, on synthetic input ──────────────────────────────────────
+//
+// SEPARATE FROM THE REPOSITORY-WIDE CHECK BELOW, and both are needed. That check
+// asserts the repository currently has no orphans, which is a statement about the
+// tree; its value is already zero when things are healthy, so breaking the detector
+// cannot move it and a stub of the code comes back NOT_CAUGHT. Only synthetic input
+// where the answer is NON-ZERO can show the detector works at all.
+//
+// This is the fixture problem in miniature: an assertion whose expected value equals
+// the value a broken implementation returns is unfalsifiable, however true it is.
+{
+  const files = ["test/a.test.mjs", "test/b.test.mjs", "test/c.test.mjs"];
+
+  const c = coverage([{ test: "test/a.test.mjs" }], files, ["test/b.test.mjs"]);
+  check(c.orphans.length === 1 && c.orphans[0] === "test/c.test.mjs",
+    "coverage() NAMES a test file that has neither an entry nor a place on the list",
+    JSON.stringify(c.orphans));
+  check(c.covered.length === 1 && c.stale.length === 0,
+    "and counts the covered one without inventing staleness", JSON.stringify(c));
+
+  // A file that is BOTH covered and grandfathered is stale: the list has not caught
+  // up with the manifest, and left alone it becomes an exemption nobody granted.
+  const rot = coverage([{ test: "test/b.test.mjs" }], files, ["test/b.test.mjs"]);
+  check(rot.stale.length === 1 && rot.stale[0] === "test/b.test.mjs",
+    "coverage() reports a grandfathered file that has SINCE gained an entry",
+    JSON.stringify(rot.stale));
+
+  // And one that has stopped existing, which is the other way a list rots.
+  const gone = coverage([], files, ["test/deleted.test.mjs"]);
+  check(gone.stale.length === 1 && gone.stale[0] === "test/deleted.test.mjs",
+    "and one that no longer exists at all", JSON.stringify(gone.stale));
+
+  check(coverage([], files, files).orphans.length === 0,
+    "control: a fully grandfathered set has no orphans, so the orphan check is about coverage and not about the list being non-empty");
+}
+
+// ── the manifest must speak for every test file ────────────────────────────────
+//
+// Measured 2026-08-30, before this gate existed: 48 entries covering 3 of 106 test
+// files, 26 of them on the sweep's own test. The REQUIRED job whose entire claim is
+// "these tests can fail" was answering that for three percent of the suite, and
+// every file added since had joined the untested majority without anyone deciding
+// to let it.
+{
+  const { STUBS, GRANDFATHERED } = await import("./stub-manifest.mjs");
+  const HERE = fileURLToPath(new URL(".", import.meta.url));
+  const testFiles = readdirSync(HERE).filter(f => f.endsWith(".test.mjs")).map(f => "test/" + f);
+
+  check(testFiles.length > 10,
+    `control: ${testFiles.length} test file(s) found, so the assertions below are not vacuous`);
+
+  const cov = coverage(STUBS, testFiles, GRANDFATHERED);
+  console.log(`      ${coverageLine(cov)}`);
+
+  check(cov.orphans.length === 0,
+    "every test file is either named by a manifest entry or listed in GRANDFATHERED",
+    cov.orphans.join("\n        ") +
+    "\n        a NEW test file is not grandfathered: add an entry proving one of its assertions can fail");
+
+  check(cov.stale.length === 0,
+    "nothing in GRANDFATHERED has since gained an entry or stopped existing",
+    cov.stale.join("\n        ") +
+    "\n        remove it from the list; a list nobody must correct becomes a blanket exemption");
+}
+
+// ── an unresolvable diff base REFUSES; it never reads as no changes ────────────
+//
+// THE THIRD CASE IS THE ONE THAT MATTERS. Both CI jobs check out at depth 1, where
+// there is no history and no merge base. A diff against a base that cannot be
+// resolved does not error -- it yields nothing, an empty change set intersects an
+// empty list, and the gate passes. Green, fast, measuring nothing. A control with
+// only the two obvious cases would pass on exactly the configuration we run today,
+// which is a control that cannot exhibit the defect it is written for.
+{
+  const ok = changedFiles({ base: "abc", head: "def",
+                            run: () => ({ ok: true, out: "test/a.test.mjs\nsrc/b.mjs\n" }) });
+  check(ok.ok && ok.files.length === 2, "a readable diff yields the files it names",
+    JSON.stringify(ok.files));
+
+  const none = changedFiles({ base: "abc", head: "def", run: () => ({ ok: true, out: "" }) });
+  check(none.ok && none.files.length === 0,
+    "control: a genuinely EMPTY diff is a success with no files, which is why the case below must not look like it");
+
+  const noBase = changedFiles({ base: null, head: "def", run: () => { throw new Error("must not run"); } });
+  check(noBase.ok === false && noBase.files.length === 0,
+    "an unresolvable base REFUSES rather than reporting an empty diff, which would pass");
+  check(/fetch-depth: 0/.test(noBase.why ?? ""),
+    "and the refusal names the knob, because the symptom is a red gate over a clean diff",
+    noBase.why);
+
+  const broke = changedFiles({ base: "abc", head: "def", run: () => ({ ok: false, err: "bad object" }) });
+  check(broke.ok === false && /bad object/.test(broke.why ?? ""),
+    "a diff that fails to run refuses too, and says what git said", broke.why);
+}
+
+// ── and the list may only ever shrink ──────────────────────────────────────────
+//
+// The OTHER half of the ratchet, and it was missing until review found it. The edit
+// rule refuses touching a listed file; it says nothing about a change that removes a
+// test's STUBS entry and adds that test to the list instead. The file itself is never
+// edited, so the diff shows only the manifest, the edit rule passes, and the list
+// grows while measured coverage falls. Described as a ratchet from the start, built
+// as half of one.
+{
+  const grew = listGrowth({ before: ["test/a.test.mjs"], after: ["test/a.test.mjs", "test/b.test.mjs"] });
+  check(grew.ok === false && grew.added.length === 1 && grew.added[0] === "test/b.test.mjs",
+    "a name ADDED to the frozen list is refused, and named", JSON.stringify(grew.added));
+  check(/frozen debt/.test(grew.why ?? ""), "and the refusal says what the list is for", grew.why);
+
+  // Shrinking is the POINT, so it must pass in silence. Without this the assertion
+  // above would be satisfied by a check that refused every change to the list,
+  // including the ones that pay the debt down.
+  check(listGrowth({ before: ["test/a.test.mjs", "test/b.test.mjs"], after: ["test/a.test.mjs"] }).ok === true,
+    "control: REMOVING a name passes, because that is how the debt is paid");
+  check(listGrowth({ before: ["test/a.test.mjs"], after: ["test/a.test.mjs"] }).ok === true,
+    "control: an unchanged list passes, so the rule is about growth and not about touching the file");
+  check(listGrowth({ before: [], after: [] }).ok === true,
+    "control: a fully paid-down list is not a special case");
+}
+
+// ── grandfathering ends at the first edit ──────────────────────────────────────
+//
+// Tested HERE rather than through a fixture repository, and that is the point. The
+// runner skips this mechanism entirely when driven against a synthetic tree, because
+// such a tree has no base to diff against -- so the seam that lets every other part
+// of the sweep be tested cannot reach this one. A decision that can only be wired and
+// never shown to fire is the shape this whole tool exists to find.
+{
+  const list = ["test/a.test.mjs", "test/b.test.mjs"];
+
+  const hit = grandfatherGate({ changed: ["src/x.mjs", "test/b.test.mjs"], grandfathered: list });
+  check(hit.ok === false && hit.touched.length === 1 && hit.touched[0] === "test/b.test.mjs",
+    "editing a grandfathered test file REFUSES, and names the file",
+    JSON.stringify(hit.touched));
+  check(/GRANDFATHERED/.test(hit.why ?? "") && /stub-manifest/.test(hit.why ?? ""),
+    "and the refusal says what to do and where", hit.why);
+
+  // The decoy: a change that touches a test file NOT on the list, and source files.
+  // Without this, the assertion above would be satisfied by a gate that refuses
+  // everything, which is a gate nobody can work with and which nobody would keep.
+  const miss = grandfatherGate({ changed: ["src/x.mjs", "test/covered.test.mjs"], grandfathered: list });
+  check(miss.ok === true && miss.touched.length === 0,
+    "control: a change touching only files NOT on the list passes, so the rule is about the list and not about editing tests",
+    JSON.stringify(miss));
+
+  check(grandfatherGate({ changed: ["test/a.test.mjs"], grandfathered: [] }).ok === true,
+    "control: an EMPTY grandfather list refuses nothing, so a fully paid-down repository is not blocked");
+
+  const many = grandfatherGate({ changed: list, grandfathered: list });
+  check(many.ok === false && many.touched.length === 2,
+    "every touched file is reported, not just the first, so one run tells you the whole bill",
+    JSON.stringify(many.touched));
 }
 
 console.log(fail ? `\nFAILED ${fail}` : "\nok");

@@ -38,6 +38,18 @@ const ghPages = (args) => {
 function main() {
   const argv = process.argv.slice(2);
   const pr = argv.find(a => /^\d+$/.test(a));
+    // UNKNOWN OPTIONS ARE REFUSED. `--repos owner/name` was previously ignored whole:
+  // the numeric argument still parsed, both unexpected tokens were dropped, and the
+  // gate answered confidently about the current checkout instead. A gate that guesses
+  // which repository it was asked about is worse than one that will not start.
+  const KNOWN = new Set(["--repo"]);
+  const unknown = argv.filter((a, i) =>
+    a.startsWith("--") ? !KNOWN.has(a) : !/^\d+$/.test(a) && argv[i - 1] !== "--repo");
+  if (unknown.length) {
+    console.error(`premerge: unrecognised argument(s): ${unknown.join(" ")}`);
+    console.error("usage: node scripts/premerge.mjs <pr> [--repo owner/name]");
+    { process.exitCode = EXIT.usage; return; }
+  }
   const repoAt = argv.indexOf("--repo");
   // `--repo` WITH NO VALUE is a usage error, not a fallback. Taking the checkout
   // instead means an automation typo gates a different repository and returns a
@@ -90,12 +102,16 @@ function main() {
     { process.exitCode = EXIT.absent; return; }
   }
 
-  // WHEN THIS HEAD ARRIVED, so a resolution given about an earlier revision is not
-  // counted as evidence about this one. pushedDate is null for some commits, so
-  // committedDate is the fallback and an unreadable date disables the rule rather
-  // than guessing at it.
+  // WHEN THIS HEAD ARRIVED -- and ONLY pushedDate can answer that.
+  //
+  // committedDate was the fallback here and it is the wrong clock: a commit authored
+  // locally BEFORE a thread was resolved and pushed only afterwards carries an older
+  // committedDate, so the historical thread satisfies the comparison and an unreviewed
+  // head clears. That is the exact hole this rule exists to close, reopened by its own
+  // fallback. When pushedDate is absent there is no answer, so the rule disables
+  // itself -- which the gate already handles, and which is honest rather than lenient.
   const headCommit = meta.commits?.nodes?.[0]?.commit ?? null;
-  const headPushedAt = Date.parse(headCommit?.pushedDate ?? headCommit?.committedDate ?? "") || null;
+  const headPushedAt = Date.parse(headCommit?.pushedDate ?? "") || null;
 
   // The head repository, refused rather than guessed when it cannot be established.
   const ids = headRepoOf(meta, nwo);
@@ -130,7 +146,7 @@ function main() {
   // that is no longer the one being merged.
   if (verdict.clear)
     console.log(`  verified head: ${verdict.verifiedHead}\n` +
-                `  merge bound to it with: gh pr merge ${pr} --repo ${nwo}${host && host !== "github.com" ? ` --hostname ${host}` : ""}` +
+                `  merge bound to it with: gh pr merge ${pr} --repo ${host && host !== "github.com" ? `${host}/` : ""}${nwo}` +
                 ` --match-head-commit ${verdict.verifiedHead}`);
   // ESCAPED TOO. These reasons embed check names, and a check run created by a
   // contributor-controlled fork workflow names itself. Escaping the thread fields

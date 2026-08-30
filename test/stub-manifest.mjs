@@ -568,4 +568,13 @@ export const STUBS = [
               find: "  if (!unresolved.length && headPushedAt) {",
               replace: "  if (false) {" }],
   },
+  {
+    name: "premerge-transient-merge-state",
+    why: "let an unresolved merge state fall through to REFUSE, reporting an asynchronous transient as an actionable blocker",
+    test: "test/premerge.test.mjs",
+    expectRed: "a resolved mergeable with an unresolved merge state is a transient, not a refusal",
+    edits: [{ file: "src/premerge.mjs",
+              find: "  if (status === \"UNKNOWN\")",
+              replace: "  if (false)" }],
+  },
 ];

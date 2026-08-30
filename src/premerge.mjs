@@ -69,6 +69,12 @@ export function mergeabilityState({ mergeable, mergeStateStatus } = {}) {
   const status = String(mergeStateStatus ?? "").toUpperCase();
   if (!status) return { state: UNKNOWN, why: "the merge state could not be read" };
   if (ok.has(status)) return { state: CLEAR, why: `GitHub reports the merge state as ${status}` };
+  // UNKNOWN is GitHub STILL COMPUTING, exactly as it is for `mergeable`, and it
+  // reaches this function even once mergeable has resolved. Falling through to REFUSE
+  // reported an asynchronous transient as an actionable blocker, which a caller
+  // keying on the exit codes would go and try to fix.
+  if (status === "UNKNOWN")
+    return { state: UNKNOWN, why: "GitHub has not finished computing the merge state; it does this asynchronously" };
   return { state: REFUSE, why: `GitHub reports the merge state as ${status}, which does not permit a merge` };
 }
 

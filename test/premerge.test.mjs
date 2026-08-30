@@ -120,6 +120,20 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
     "an unrecognised conclusion is UNKNOWN rather than treated as success");
 }
 
+// --- a terminal conclusion is not an unfinished one -------------------------------
+{
+  // STALE is terminal: the run will never complete. Reporting it as "has not
+  // finished" tells automation to wait for something that will not arrive, so a
+  // caller keying on the verdict codes retries for ever. The distinction that
+  // matters is not success-versus-failure but whether anything further will happen.
+  const stale = checkState({ nodes: [{ name: "j", conclusion: "STALE" }] });
+  check(stale.state === REFUSE, "a STALE check run is refused, not reported as unfinished", stale.why);
+  // CONTROL: an actually-unfinished run is still UNKNOWN, so this is about
+  // terminality and not about widening the failure set until nothing is unfinished.
+  check(checkState({ nodes: [{ name: "j", conclusion: null, status: "IN_PROGRESS" }] }).state === UNKNOWN,
+    "control: a genuinely running check is still UNKNOWN");
+}
+
 // --- the rollup gets the same completeness rule as the threads --------------------
 {
   // This rule was applied to threads and not to checks: the connection added last

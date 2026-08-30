@@ -378,5 +378,61 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
   check(true, "no non-clear verdict reports clear:true");
 }
 
+// ── what this gate deliberately does NOT decide ────────────────────────────
+//
+// A review finding asked the head binding to also establish that the approver
+// SATISFIES branch protection or CODEOWNERS. The scenario is real and is
+// reproduced below: a qualifying reviewer approves an old commit, stale
+// approvals are not dismissed so `reviewDecision` stays APPROVED, a second
+// reviewer approves the head, and this returns CLEAR without any qualifying
+// approval of the current revision.
+//
+// It is not implemented, and that is a decision rather than an omission.
+// Deciding who qualifies means re-deriving what `reviewDecision` and
+// `mergeStateStatus` already compute -- the unbounded question that four
+// earlier rounds each found one more input to, and the reason the first
+// pre-merge gate was closed rather than fixed.
+//
+// THE ARGUMENT THAT MAKES THAT SAFE IS ASSERTED HERE RATHER THAN STATED IN A
+// COMMENT, because this file already records what a comment is worth: an
+// earlier caveat "documented that hole rather than closing it, which reads as
+// though the case had been handled". A scope boundary nobody checks decays the
+// same way. What has to hold is that the head binding is strictly ADDITIONAL --
+// it can only ever narrow what clears, never widen it.
+{
+  const HEAD = "h".repeat(40);
+  const OLD  = "0".repeat(40);
+  const approvalsOnly = (...oids) =>
+    oids.map((oid, i) => ({ state: "APPROVED", commit: { oid }, author: { login: `r${i}` } }));
+
+  // The finding's own scenario, recorded as KNOWN and accepted.
+  const mixed = reviewState({ reviewDecision: "APPROVED", head: HEAD,
+                              reviews: approvalsOnly(OLD, HEAD), reviewsTotal: 2 });
+  check(mixed.state === CLEAR,
+    "an approval at the head clears, whoever gave it -- qualification is GitHub's answer, not this gate's",
+    JSON.stringify(mixed));
+
+  // AND THE PROPERTY THAT MAKES THAT SAFE: nothing clears without an approval
+  // at the head, so this gate's CLEAR set is a strict subset of the set that
+  // trusting APPROVED alone would clear. It cannot admit anything GitHub's own
+  // answer would not have admitted.
+  for (const [label, reviews, total] of [
+    ["only an older approval", approvalsOnly(OLD), 1],
+    ["no approvals listed",    [], 0],
+  ]) {
+    const r = reviewState({ reviewDecision: "APPROVED", head: HEAD, reviews, reviewsTotal: total });
+    check(r.state !== CLEAR,
+      `APPROVED with ${label} does not clear, so the binding only ever narrows`, JSON.stringify(r));
+  }
+
+  // CONTROL: the aggregate really was the whole answer before the binding, or
+  // "strictly narrower" is a claim about nothing. Every case above carries
+  // reviewDecision APPROVED, which is the state that used to map to CLEAR.
+  check(mixed.state === CLEAR && reviewState({ reviewDecision: "APPROVED", head: HEAD,
+        reviews: approvalsOnly(OLD), reviewsTotal: 1 }).state === UNREVIEWED,
+    "control: the same APPROVED aggregate now yields CLEAR or UNREVIEWED depending only on the head");
+}
+
+
 console.log(fail ? `\nFAILED ${fail}` : "\nok");
 process.exit(fail ? 1 : 0);

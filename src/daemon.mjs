@@ -1394,6 +1394,17 @@ export async function tick(ctx) {
     getter: ctx.hub,
     // Reported ONCE per tick even though the hub is asked many times.
     onFault: (why) => { log(logPath, `hub: ${why}`); raise("guardian:hub:unreadable"); },
+    log: (msg) => log(logPath, msg),
+    raise,
+    isAlive: isSameProcess,
+    // ON `ctx`, DELIBERATELY. A deferred release or cooldown must survive the
+    // tick that deferred it, and `ctx` is what `run` carries between ticks; the
+    // session is built fresh for each one.
+    retries: { releases: (ctx.providerRetry ??= new Map()),
+               cooldowns: (ctx.cooldownRetry ??= new Map()) },
+    // The operations themselves stay the caller's, so this module still imports
+    // nothing and a test can drive it with no database at all.
+    ops: { providerRelease: releaseProvider, noteRateLimit },
   });
   // READ ONCE, HERE, so a hub that EXISTS and cannot be opened is reported as the
   // outage it is rather than passing for an ordinary machine with no builder on
@@ -1452,123 +1463,13 @@ export async function tick(ctx) {
   // and SQLite reuses the integer key, so an id-keyed retry deletes whatever
   // inherited it -- an unrelated live lease, and the limit is breached by the
   // very bookkeeping meant to protect it.
-  const pendingReleases = (ctx.providerRetry ??= new Map());
-  const releaseWithRetry = (key, identity) => {
-    // FRESH, not the tick's opening snapshot: a release is the operation most
-    // likely to run long after the hub was first opened.
-    const a = session.read();
-    // RETAINED, NOT DROPPED. This early return handled the exception path and
-    // the maintenance refusal and then threw the identity away on the third
-    // route out -- a hub that is momentarily unreadable between the claim and
-    // the cleanup. A pre-bind lease is still attached to the guardian's own
-    // always-alive pid, so even past its expiry the liveness-aware reaper keeps
-    // it and the slot is lost for good.
-    //
-    // Only a hub that is genuinely ABSENT drops it: there is no scheduler, so
-    // there is no lease and nothing to give back.
-    if (!a.hub) {
-      if (a.why) {
-        pendingReleases.set(key, identity);
-        session.sayFault(a.why);
-        log(logPath, `provider: release deferred — the hub could not be reached; retrying next tick (${key})`);
-      }
-      return;
-    }
-    const h = a.hub;
-    let r;
-    // A THROW IS NOT A REFUSAL, and only the refusal was handled. On the worker
-    // path this runs at the top of the `finally`, so an exception here skips the
-    // result recording and `finishRun` below it, masks whatever the worker
-    // actually did, and takes the rest of the tick with it. Cleanup must not be
-    // able to destroy the outcome it exists to record.
-    try {
-      r = session.perform("providerRelease", releaseProvider, { ...identity, isAlive: isSameProcess },
-        () => { pendingReleases.set(key, identity);
-                log(logPath, `provider: release deferred — the hub could not be reached; retrying next tick (${key})`);
-                return NO_HUB; });
-      if (r === NO_HUB) return;
-    } catch (err) {
-      pendingReleases.set(key, identity);
-      log(logPath, `provider: release THREW — ${err.message}; retrying next tick (${key})`);
-      raise("the provider scheduler is unreadable; dispatching unscheduled");
-      return;
-    }
-    if (r?.ok === false && r.reason === "maintenance") {
-      pendingReleases.set(key, identity);
-      log(logPath, `provider: release deferred — a restore holds the hub; retrying next tick (${key})`);
-    } else {
-      pendingReleases.delete(key);
-    }
-  };
-  // AND THE SAME TREATMENT FOR THE COOLDOWN. `noteRateLimit` REFUSES rather than
-  // throws while a restore holds `maintenance_lock`, and handling only the
-  // exception lost the refusal silently -- so a rate limit hit during a restore
-  // was never recorded, the release was retried, and admissions resumed straight
-  // back into the exhausted window the moment the restore finished. A refusal is
-  // a result to inspect, and it is the same shape as the one two lines above.
-  const pendingCooldowns = (ctx.cooldownRetry ??= new Map());
-  const noteCooldownWithRetry = (key, note) => {
-    // THE WINDOW STARTED WHEN THE 429 WAS SEEN, not when we managed to record it.
-    //
-    // A deferred note that only carries a DURATION restarts the whole cooldown
-    // at retry time, so an outage longer than the cooldown recovers and then
-    // imposes a fresh ten-minute block on every builder and guardian admission
-    // for a window that had already passed. The absolute expiry is stamped at
-    // observation and carried; the retry asks for whatever is left of it.
-    //
-    // AND THE OBSERVATION TIME IS CARRIED TOO, not just the expiry. `recordRateLimit`
-    // keeps whichever metadata is latest by timestamp, so a note re-derived from
-    // the RETRY time looks newer than a 429 seen after it -- and the older
-    // signature then overwrites the newer one, leaving doctor naming the wrong
-    // throttling cause. Both facts are stamped once, at observation, and neither
-    // is re-derived from the other.
-    const nowSec = Math.floor(Date.now() / 1000);
-    const stamped = note.expiresAt != null ? note
-      : { ...note, observedAt: nowSec, expiresAt: nowSec + (note.cooldownSeconds ?? 0) };
-    const left = stamped.expiresAt - nowSec;
-    // Already elapsed while we could not write it. Recording a zero or negative
-    // cooldown would be recording a fact that has stopped being true.
-    if (left <= 0) { pendingCooldowns.delete(key); return; }
-    const send = { signature: stamped.signature, cooldownSeconds: left,
-                   observedAt: stamped.observedAt ?? null, expiresAt: stamped.expiresAt };
-
-    let r;
-    try {
-      // DEFERRED, not skipped, when there is no scheduler to record it on: the
-      // window started when the 429 was seen and the obligation outlives this tick.
-      r = session.perform("noteRateLimit", noteRateLimit, { ...send, isAlive: isSameProcess },
-                          () => { pendingCooldowns.set(key, stamped); return NO_HUB; });
-      if (r === NO_HUB) return;
-    } catch (err) {
-      pendingCooldowns.set(key, stamped);
-      log(logPath, `provider: could not record the rate limit — ${err.message}; retrying next tick`);
-      raise("the provider scheduler is unreadable; dispatching unscheduled");
-      return;
-    }
-    if (r?.ok === false && r.reason === "maintenance") {
-      pendingCooldowns.set(key, stamped);
-      log(logPath, `provider: cooldown deferred — a restore holds the hub; retrying next tick (${key})`);
-    } else {
-      pendingCooldowns.delete(key);
-    }
-  };
-  if (pendingCooldowns.size) {
-    for (const [key, note] of [...pendingCooldowns]) noteCooldownWithRetry(key, note);
-  }
-
-  // NOT GATED ON THE TICK'S OPENING SNAPSHOT. `releaseWithRetry` re-asks with
-  // `session.read()` -- its own comment says "FRESH, not the tick's opening snapshot" --
-  // and then handles an absent hub, an unreadable one and a refusal separately.
-  // Consulting a handle read hundreds of lines earlier could only overrule that
-  // with staler information, and it did: a hub that faulted on the tick's FIRST
-  // read stranded every inherited release for the whole tick, while releases
-  // taken and given back within the same tick succeeded against the same hub. A
-  // pre-bind lease sits on the guardian's always-alive pid, so the liveness-aware
-  // reaper preserves it and the slot is held against the global limit until it
-  // expires.
-  if (pendingReleases.size) {
-    for (const [key, identity] of [...pendingReleases]) releaseWithRetry(key, identity);
-  }
+  // The two obligations that outlive a tick, and their replay, now belong to the
+  // session -- see src/build/hubsession.mjs. These names stay because a dozen
+  // call sites read them, and renaming those in the same change as moving the
+  // rules would put two edits in one diff.
+  const releaseWithRetry = (key, identity) => session.release(key, identity);
+  const noteCooldownWithRetry = (key, note) => session.noteCooldown(key, note);
+  session.drainRetries();
 
   // ── the scheduler's own housekeeping, before ANYTHING can end the tick ────
   //

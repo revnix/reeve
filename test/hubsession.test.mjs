@@ -136,5 +136,122 @@ const recording = (why = null) => {
   check(used[0] === handle, "a plain handle passed as the getter is used directly");
 }
 
+// ── The two obligations that outlive a tick ────────────────────────────────
+//
+// A release and a cooldown are the only scheduler operations whose FAILURE must
+// be remembered. Everything else is fire-and-forget. These are driven directly
+// here rather than through a whole tick, which is what the issue asked for:
+// through a tick, each of these branches needs a scenario, and three of them
+// need a hub that changes state mid-run.
+
+const session = (opts = {}) => {
+  const retries = { releases: new Map(), cooldowns: new Map() };
+  const logged = [], raised = [];
+  const s = hubSession({
+    getter: opts.getter ?? (() => ({ hub: { db: true }, why: null })),
+    onFault: () => {}, overrides: opts.overrides ?? {},
+    log: (m) => logged.push(m), raise: (m) => raised.push(m),
+    isAlive: () => true, retries,
+    ops: { providerRelease: opts.release ?? (() => ({ ok: true })),
+           noteRateLimit: opts.note ?? (() => ({ ok: true })) },
+  });
+  return { s, retries, logged, raised };
+};
+const IDENT = { owner: "guardian", repoId: 7, runRef: "o/r#1", id: 4, token: "tok" };
+
+// ── A release: three routes out, and all three must RETAIN ─────────────────
+{
+  // ABSENT is the one exception: no scheduler means no lease and nothing owed.
+  const absent = session({ getter: () => ({ hub: null, why: null }) });
+  absent.s.release("k", IDENT);
+  check(absent.retries.releases.size === 0,
+    "an ABSENT hub owes nothing -- there is no scheduler, so there is no lease to give back");
+
+  // UNREADABLE is not absent, and this is the distinction a handle cannot carry.
+  const unreadable = session({ getter: () => ({ hub: null, why: "busy" }) });
+  unreadable.s.release("k", IDENT);
+  check(unreadable.retries.releases.get("k") === IDENT,
+    "an UNREADABLE hub keeps the obligation, with the identity it was given");
+
+  // A REFUSAL is the scheduler working, and it must not be read as done.
+  const refused = session({ release: () => ({ ok: false, reason: "maintenance" }) });
+  refused.s.release("k", IDENT);
+  check(refused.retries.releases.get("k") === IDENT, "a maintenance refusal defers, it does not discard");
+
+  // A THROW is not a refusal, and only the refusal used to be handled.
+  const threw = session({ release: () => { throw new Error("disk image malformed"); } });
+  threw.s.release("k", IDENT);
+  check(threw.retries.releases.get("k") === IDENT, "a THROW defers too, which is the route that once dropped it");
+  check(threw.raised.length === 1, "and it says so, because dispatching unscheduled is what it causes");
+
+  // And success clears it, or every release would be retried for ever.
+  const ok = session();
+  ok.retries.releases.set("k", IDENT);
+  ok.s.release("k", IDENT);
+  check(ok.retries.releases.size === 0, "control: a release that succeeds clears the obligation");
+}
+
+// ── A cooldown: the window started when the 429 was SEEN ───────────────────
+{
+  const nowSec = Math.floor(Date.now() / 1000);
+  const sent = [];
+  const c = session({ note: (h, a) => { sent.push(a); return { ok: false, reason: "maintenance" }; } });
+  c.s.noteCooldown("c", { signature: "claude", cooldownSeconds: 600 });
+  const held = c.retries.cooldowns.get("c");
+
+  check(held?.expiresAt >= nowSec + 600, "a deferred cooldown carries an ABSOLUTE expiry, not a duration",
+    JSON.stringify(held));
+  check(held?.observedAt != null, "and the OBSERVATION time, so a later retry cannot look newer than a real 429");
+
+  // THE RETRY ASKS FOR WHAT IS LEFT, not for the whole window again. An outage
+  // longer than the cooldown would otherwise recover and then impose a fresh
+  // block for a window that had already passed.
+  const c2 = session({ note: (h, a) => { sent.push(a); return { ok: true }; } });
+  c2.s.noteCooldown("c", { signature: "claude", cooldownSeconds: 600,
+                           observedAt: nowSec - 500, expiresAt: nowSec + 100 });
+  const asked = sent[sent.length - 1];
+  check(asked.cooldownSeconds <= 100 && asked.cooldownSeconds > 0,
+    "a retry asks for the REMAINING window, not the original duration", `asked for ${asked.cooldownSeconds}s`);
+  check(asked.observedAt === nowSec - 500, "and carries the original observation time unchanged");
+
+  // A window that elapsed while we could not write it is not a fact any more.
+  //
+  // ASSERTED ON THE RECORDER, not on the map. Checking only that the map ends
+  // empty cannot fail: without the guard the note is still sent, the recorder
+  // answers ok, and the success path deletes the key -- the same empty map by a
+  // different route. MEASURED: with the guard removed, that assertion stayed
+  // green. The property is that a dead cooldown is never WRITTEN.
+  const writes = [];
+  const gone = session({ note: (h, a) => { writes.push(a); return { ok: true }; } });
+  gone.retries.cooldowns.set("c", { signature: "claude", cooldownSeconds: 600, expiresAt: nowSec - 1 });
+  gone.s.noteCooldown("c", { signature: "claude", cooldownSeconds: 600, expiresAt: nowSec - 1 });
+  check(writes.length === 0,
+    "a cooldown whose window has passed is dropped, never written as a fact that stopped being true",
+    `${writes.length} write(s): ${JSON.stringify(writes)}`);
+  check(gone.retries.cooldowns.size === 0, "and it stops being carried");
+  // Control: the same fixture DOES write a cooldown that is still live, so the
+  // assertion above is not passing because nothing ever writes.
+  const live = session({ note: (h, a) => { writes.push(a); return { ok: true }; } });
+  live.s.noteCooldown("c", { signature: "claude", cooldownSeconds: 600 });
+  check(writes.length === 1, "control: a live cooldown IS written, so silence above means something",
+    `${writes.length} write(s)`);
+}
+
+// ── The replay order is the point ──────────────────────────────────────────
+{
+  const order = [];
+  const d = session({ release: () => { order.push("release"); return { ok: true }; },
+                      note: () => { order.push("cooldown"); return { ok: true }; } });
+  d.retries.releases.set("r", IDENT);
+  d.retries.cooldowns.set("c", { signature: "claude", cooldownSeconds: 600 });
+  d.s.drainRetries();
+
+  check(order.length === 2, "control: the drain really replayed both", JSON.stringify(order));
+  check(order[0] === "cooldown",
+    "COOLDOWNS replay before releases: a cooldown declares the window exhausted, a release hands a slot back, " +
+    "and returning capacity first lets a tick in between spend what is about to be declared unusable",
+    JSON.stringify(order));
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exitCode = fail ? 1 : 0;

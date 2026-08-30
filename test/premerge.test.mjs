@@ -8,7 +8,7 @@
 // The assertions below are mostly about the states that are NOT clear, because
 // "clear" is the easy one and the dangerous failure is a summary line that reads as
 // a pass while carrying a reason not to merge.
-import { gate, headState, threadState, CLEAR, REFUSE, UNREVIEWED, UNKNOWN }
+import { gate, headState, threadState, checkState, CLEAR, REFUSE, UNREVIEWED, UNKNOWN }
   from "../src/premerge.mjs";
 
 let fail = 0;
@@ -70,39 +70,75 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
     "a null node list is UNKNOWN, not clear");
 }
 
+// --- checks -----------------------------------------------------------------------
+{
+  const ok = n => Array.from({ length: n }, (_, i) => ({ name: `job${i}`, conclusion: "SUCCESS" }));
+  check(checkState({ nodes: ok(3) }).state === CLEAR, "all checks succeeded is clear");
+
+  const failed = checkState({ nodes: [...ok(2), { name: "Stub sweep", conclusion: "FAILURE" }] });
+  check(failed.state === REFUSE && /Stub sweep/.test(failed.why),
+    "a failing check is refused, and named", failed.why);
+
+  // THE WINDOW THIS EXISTS FOR. A pull request merged on this repository while its
+  // checks were still pending, so nothing about that commit was established.
+  const pending = checkState({ nodes: [...ok(1), { name: "Test", conclusion: null, state: null }] });
+  check(pending.state === UNKNOWN, "an unfinished check is UNKNOWN, not clear", pending.why);
+
+  // Same shape as an empty thread list: nothing failing is not something passing.
+  const none = checkState({ nodes: [] });
+  check(none.state === UNKNOWN, "no checks at all is UNKNOWN, not clear", none.why);
+  check(checkState({}).state === UNKNOWN, "an unreadable rollup is UNKNOWN, not clear");
+
+  // CONTROL: the three not-clear reasons are distinguishable, or a reader cannot
+  // tell "still running" from "never ran" from "could not read".
+  const reasons = new Set([pending.why, none.why, checkState({}).why]);
+  check(reasons.size === 3, "control: unfinished, absent and unreadable give three different reasons",
+    JSON.stringify([...reasons]));
+
+  for (const conclusion of ["TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"])
+    check(checkState({ nodes: [{ name: "j", conclusion }] }).state === REFUSE,
+      `a ${conclusion} check is refused rather than treated as merely not-success`);
+}
+
 // --- the combined verdict never rounds up ----------------------------------------
 {
   const bothClear = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
-                           threads: { totalCount: 1, nodes: resolved(1) } });
+                           threads: { totalCount: 1, nodes: resolved(1) },
+                           checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] } });
   check(bothClear.state === CLEAR && bothClear.clear === true,
     "control: when both halves are clear the gate is clear", JSON.stringify(bothClear.why));
 
   // Each half is checked for dominance separately, because a gate that only reports
   // the FIRST problem gets one fixed and is surprised by the other.
   const headBad = gate({ head: { prHead: SHA_A, branchNow: SHA_B, branchRead: "read" },
-                         threads: { totalCount: 1, nodes: resolved(1) } });
+                         threads: { totalCount: 1, nodes: resolved(1) },
+                           checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] } });
   check(headBad.state === REFUSE && !headBad.clear, "a stale head refuses even with threads clear");
 
   const threadsBad = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
-                            threads: { totalCount: 1, nodes: [{ isResolved: false }] } });
+                            threads: { totalCount: 1, nodes: [{ isResolved: false }] },
+                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] } });
   check(threadsBad.state === REFUSE && !threadsBad.clear, "an open thread refuses even with the head current");
 
   const unreviewed = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
-                            threads: { totalCount: 0, nodes: [] } });
+                            threads: { totalCount: 0, nodes: [] },
+                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] } });
   check(unreviewed.state === UNREVIEWED && !unreviewed.clear,
     "an unreviewed pull request is not clear even with a current head", JSON.stringify(unreviewed.why));
 
   // UNKNOWN outranks UNREVIEWED: not knowing is worse than knowing nobody looked.
   const unknownWins = gate({ head: { prHead: SHA_A, branchNow: null, branchRead: "unreadable" },
-                             threads: { totalCount: 0, nodes: [] } });
+                             threads: { totalCount: 0, nodes: [] },
+                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] } });
   check(unknownWins.state === UNKNOWN, "UNKNOWN outranks UNREVIEWED");
 
   const refuseWins = gate({ head: { prHead: SHA_A, branchNow: null, branchRead: "unreadable" },
-                            threads: { totalCount: 1, nodes: [{ isResolved: false }] } });
+                            threads: { totalCount: 1, nodes: [{ isResolved: false }] },
+                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] } });
   check(refuseWins.state === REFUSE, "REFUSE outranks UNKNOWN, so the worst news wins");
 
   // BOTH reasons are always reported, whichever won.
-  check(refuseWins.why.length === 2 && refuseWins.why.some(w => w.startsWith(UNKNOWN))
+  check(refuseWins.why.length === 3 && refuseWins.why.some(w => w.startsWith(UNKNOWN))
         && refuseWins.why.some(w => w.startsWith(REFUSE)),
     "and both halves are reported, not only the one that decided the verdict",
     JSON.stringify(refuseWins.why));

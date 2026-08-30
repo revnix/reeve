@@ -81,6 +81,45 @@ export function headState({ prHead, branchNow, branchRead } = {}) {
 }
 
 /**
+ * CI state from the rollup on the pull request's HEAD.
+ *
+ * Three distinct not-clear answers, and collapsing any of them into a pass is how a
+ * merge lands on unfinished evidence -- which happened on this repository the same
+ * day this gate was written.
+ *
+ *   no checks at all      a repository with no CI, or checks that never started.
+ *                         "Nothing failed" is not "something passed".
+ *   anything unfinished   a conclusion does not exist yet. Pending is the state a
+ *                         merge button is most likely to be pressed during.
+ *   anything failed       refuse, and name what.
+ *
+ * A LIMIT, stated rather than hidden: a successful conclusion is taken at face
+ * value here. A job whose runner never started reports a conclusion with ZERO
+ * steps, and telling those apart needs a per-job call this deliberately does not
+ * make. The gate is about whether to merge NOW, and a zero-step success is a
+ * different investigation.
+ */
+export function checkState({ nodes } = {}) {
+  if (!Array.isArray(nodes))
+    return { state: UNKNOWN, failing: [], why: "the check rollup could not be read" };
+  const runs = nodes.filter(Boolean);
+  if (runs.length === 0)
+    return { state: UNKNOWN, failing: [],
+             why: "no checks ran at all, and nothing failing is not the same as something passing" };
+  const norm = r => String(r.conclusion ?? r.state ?? "").toUpperCase();
+  const unfinished = runs.filter(r => !norm(r));
+  const failing = runs.filter(r => ["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "ERROR", "STARTUP_FAILURE"]
+                                     .includes(norm(r)));
+  if (failing.length)
+    return { state: REFUSE, failing,
+             why: `${failing.length} check(s) failed: ${failing.map(r => r.name ?? r.context ?? "?").join(", ")}` };
+  if (unfinished.length)
+    return { state: UNKNOWN, failing: [],
+             why: `${unfinished.length} of ${runs.length} check(s) have not finished, so nothing about this commit is established yet` };
+  return { state: CLEAR, failing: [], why: `all ${runs.length} check(s) succeeded` };
+}
+
+/**
  * The combined answer, and it never rounds up.
  *
  * REFUSE beats UNKNOWN beats UNREVIEWED beats CLEAR: the worst news wins, so no
@@ -88,11 +127,11 @@ export function headState({ prHead, branchNow, branchRead } = {}) {
  * reasons are always reported, because knowing only the first means fixing it and
  * being surprised by the second.
  */
-export function gate({ head, threads } = {}) {
-  const parts = [headState(head), threadState(threads)];
+export function gate({ head, threads, checks } = {}) {
+  const parts = [headState(head), threadState(threads), checkState(checks)];
   const rank = { [REFUSE]: 3, [UNKNOWN]: 2, [UNREVIEWED]: 1, [CLEAR]: 0 };
   const state = parts.reduce((w, p) => (rank[p.state] > rank[w] ? p.state : w), CLEAR);
-  return { state, head: parts[0], threads: parts[1],
+  return { state, head: parts[0], threads: parts[1], checks: parts[2],
            clear: state === CLEAR,
            why: parts.map(p => `${p.state}: ${p.why}`) };
 }

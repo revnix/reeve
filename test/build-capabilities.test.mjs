@@ -89,19 +89,52 @@ const check = (ok, name, detail) => {
   const all = capabilitiesFrom({ builder: { capabilities: Object.fromEntries(
     CAPABILITY_NAMES.map((n) => [n, true])) } });
   check(CAPABILITY_KEYS.every((k) => all[k] === true), "a profile with every switch on maps them all to true");
+  check(Object.keys(all).length === CAPABILITY_KEYS.length,
+    "control: and a profile declaring every switch produces every key, so absence below is about the PROFILE",
+    `${Object.keys(all).length} of ${CAPABILITY_KEYS.length}`);
 
-  // EVERY KEY IS PRESENT even when the profile omits it, because `leaseEffect`
-  // tells an ABSENT capability from an explicitly false one and writes a
-  // different `last_error` for each. That difference is the only thing an
-  // operator has to distinguish "never enabled" from "turned off".
+  // ── ABSENCE IS PRESERVED, and this is the assertion that was wrong ─────────
+  //
+  // The first version of this file asserted that a bare profile carries EVERY
+  // key AND that every one of them is `false`. Those two together pin the
+  // collapse rather than the distinction: `leaseEffect` reads
+  // `capabilities[cap] === undefined` to choose between "is not set; every
+  // builder capability defaults to off" and "is off", so filling absent keys
+  // with `false` makes an operator read a decision that was never made.
+  //
+  // Asserted through leaseEffect's OWN predicate, not a restatement of it.
+  const K = "builder.capabilities.publishPr";
   const bare = capabilitiesFrom({});
-  check(CAPABILITY_KEYS.every((k) => k in bare),
-    "a bare profile still carries every key, so the absent-vs-off distinction survives",
+  const declaredOff = capabilitiesFrom({ builder: { capabilities: { publishPr: false } } });
+  const declaredOn = capabilitiesFrom({ builder: { capabilities: { publishPr: true } } });
+
+  check(bare[K] === undefined, "a capability the profile OMITS is absent from the map, not false",
     JSON.stringify(bare));
-  check(CAPABILITY_KEYS.every((k) => bare[k] === false), "and every one of them is false");
+  check(declaredOff[K] === false, "one the profile DECLARES false is present as false",
+    JSON.stringify(declaredOff));
+  check((bare[K] === undefined) !== (declaredOff[K] === undefined),
+    "so leaseEffect's `=== undefined` test tells them apart -- the only signal an operator has " +
+    "to distinguish 'never enabled' from 'turned off'");
+
+  // AND BOTH STILL REFUSE. The distinction is about the DIAGNOSTIC, not the
+  // decision: `leaseEffect` gates on `!== true`, and absent and false are both
+  // correctly "not enabled". A fix that preserved absence by making it pass
+  // would be far worse than the bug it replaced.
+  check(bare[K] !== true && declaredOff[K] !== true,
+    "control: and both are still refused, because the gate is `!== true`");
+  check(declaredOn[K] === true, "control: while a declared-true capability is enabled");
+
+  // Both diagnostics really are in the outbox, recovered from its source rather
+  // than retyped -- without this the assertion above is about a distinction that
+  // might no longer exist downstream.
+  const outboxSrc = readFileSync(join(HERE, "..", "src", "build", "outbox.mjs"), "utf8");
+  check(/is not set; every builder capability defaults to off/.test(outboxSrc)
+        && /\$\{cap\} is off/.test(outboxSrc),
+    "control: the outbox really writes two different diagnostics, so the distinction has a consumer");
 
   // NOT COERCED. The schema refuses a truthy string; a profile that arrived with
-  // one anyway must not have it silently become enabled.
+  // one anyway must not have it silently become enabled. It is DECLARED, so it
+  // appears -- as false.
   const truthy = capabilitiesFrom({ builder: { capabilities: { observe: "yes" } } });
   check(truthy["builder.capabilities.observe"] === false,
     "a truthy STRING is not coerced to on -- it is refused, which is what the validator does too");

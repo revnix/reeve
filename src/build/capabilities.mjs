@@ -44,21 +44,38 @@ export const CAPABILITY_NAMES = Object.freeze(
 /**
  * This profile's setting for every switch, as the map `leaseEffect` expects.
  *
- * EVERY key is present, including the ones the profile does not mention, and
- * absent means `false`. That is not a convenience: `leaseEffect` distinguishes
- * an absent capability ("is not set; every builder capability defaults to off")
- * from an explicitly false one, and a map missing keys would report the wrong
- * one of those in the row's `last_error` -- which is the only thing an operator
- * has to tell "the founder never enabled this" from "the founder turned it off".
+ * ABSENCE IS PRESERVED, and this is the whole subtlety of the function.
+ *
+ * `leaseEffect` reads the map twice for different purposes. It refuses unless
+ * the value is exactly `true` -- so absent and false behave identically for the
+ * REFUSAL, which is correct, both are "not enabled". But it then writes a
+ * different `last_error` for each:
+ *
+ *     capabilities[cap] === undefined  ->  "is not set; every builder
+ *                                           capability defaults to off"
+ *     otherwise                        ->  "is off"
+ *
+ * and that line is the only thing an operator has to tell "the founder never
+ * enabled this" from "the founder turned it off". Filling every key with
+ * `false` collapses those two into one, and an operator reading `is off`
+ * concludes a decision was made that never was.
+ *
+ * An earlier version of this function did exactly that, with a comment claiming
+ * the opposite -- and a test that asserted every key was present AND false,
+ * which pins the collapse rather than the distinction. So: a key the profile
+ * DECLARES appears with its boolean; a key it omits does not appear at all.
  *
  * A non-boolean is NOT coerced. The schema refuses a truthy string at
  * validation; a profile that reached here with one anyway must not have it
- * silently become `true`.
+ * silently become `true` -- it is a declared key, so it appears, as `false`.
  */
 export function capabilitiesFrom(profile) {
   const set = profile?.builder?.capabilities ?? {};
   const out = {};
-  for (const key of CAPABILITY_KEYS) out[key] = set[key.slice(PREFIX.length)] === true;
+  for (const key of CAPABILITY_KEYS) {
+    const name = key.slice(PREFIX.length);
+    if (name in set) out[key] = set[name] === true;
+  }
   return Object.freeze(out);
 }
 

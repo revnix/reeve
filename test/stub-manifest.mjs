@@ -523,4 +523,13 @@ export const STUBS = [
               find: "  if (totalCount !== null && nodes.length !== totalCount)",
               replace: "  if (false)" }],
   },
+  {
+    name: "premerge-stale-is-terminal",
+    why: "put STALE back among the unfinished, so a run that will never complete reads as one still running and a caller retries for ever",
+    test: "test/premerge.test.mjs",
+    expectRed: "a STALE check run is refused, not reported as unfinished",
+    edits: [{ file: "src/premerge.mjs",
+              find: "                          \"ERROR\", \"STARTUP_FAILURE\", \"STALE\"]);",
+              replace: "                          \"ERROR\", \"STARTUP_FAILURE\"]);" }],
+  },
 ];

@@ -124,8 +124,13 @@ export function checkState({ nodes, totalCount = null } = {}) {
   // direction that cannot silently pass.
   const norm = r => String(r.conclusion ?? r.state ?? "").toUpperCase();
   const PASSED = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
+  // STALE is TERMINAL. It belongs with the failures rather than with the unfinished:
+  // a stale run never completes, so reporting "has not finished" tells automation to
+  // wait for something that will not arrive, and a retry loop never ends. The
+  // distinction that matters here is not success-versus-failure but whether anything
+  // further will happen.
   const FAILED = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED",
-                          "ERROR", "STARTUP_FAILURE"]);
+                          "ERROR", "STARTUP_FAILURE", "STALE"]);
   const failing = runs.filter(r => FAILED.has(norm(r)));
   const unfinished = runs.filter(r => !FAILED.has(norm(r)) && !PASSED.has(norm(r)));
   if (failing.length)

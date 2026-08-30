@@ -704,5 +704,70 @@ const F = "100644", X = "100755", L = "120000";
   }
 }
 
+// ── The escape alphabet is disjoint from the input alphabet ─────────────────
+//
+// An escape whose output a valid input can SPELL is not an escape. `safePath`
+// rendered control bytes as `\xNN` and left the backslash alone, so a file
+// literally named `b\x01.t` -- four ordinary characters -- displayed exactly as
+// one containing byte 0x01.
+//
+// It matters because of what this output is FOR: `verify-merge` says in terms
+// that a filename is attacker-supplied on any repository taking outside
+// contributions, and this is the list a person reads to decide whether a merge
+// carried what it should. A crafted name that renders as another's escaped form
+// is a forged line in that list.
+//
+// ASSERTED ON CRAFTED PAIRS, not on injectivity. No finite set of examples can
+// establish that an encoding is injective; what a test CAN do is take the exact
+// shape the defect had -- the literal that spells the other's escape -- and
+// require the two to differ.
+{
+  const fromBytes = (bytes) => displayPath(Buffer.from(bytes).toString("latin1"));
+  const PAIRS = [
+    ["a control byte", [0x62, 0x01, 0x2e, 0x74], "b\\x01.t"],
+    ["a high byte", [0x62, 0xff, 0x2e, 0x74], "b\\xff.t"],
+    ["a newline", [0x62, 0x0a, 0x2e, 0x74], "b\\x0a.t"],
+    ["DEL", [0x62, 0x7f, 0x2e, 0x74], "b\\x7f.t"],
+  ];
+  for (const [label, bytes, spelled] of PAIRS) {
+    const encoded = fromBytes(bytes), literal = displayPath(spelled);
+    check(encoded !== literal,
+      `a name containing ${label} does not render as the name that SPELLS its escape`,
+      `both rendered ${JSON.stringify(encoded)}`);
+  }
+  // AND THE SAME PAIR INSIDE THE NON-UTF-8 BRANCH. Every pair above crosses
+  // BETWEEN the two branches -- the crafted literal is plain ASCII and takes the
+  // round-tripping path while its byte twin does not -- so they compare two
+  // different encoders and say nothing about either one alone. MEASURED:
+  // removing the backslash escape from the non-UTF-8 branch left all of them
+  // green. Both operands need a high byte to stay on that branch.
+  {
+    const spelled = fromBytes([0x5c, 0x78, 0x30, 0x31, 0xff]);  // the four chars \x01, then byte 0xff
+    const actual = fromBytes([0x01, 0xff]);                     // byte 0x01, then byte 0xff
+    check(spelled !== actual,
+      "within the non-UTF-8 branch, a name spelling an escape does not render as the byte it escapes",
+      `both rendered ${JSON.stringify(actual)}`);
+    // Control: both really did take that branch, or this is the cross-branch
+    // comparison again under a new name.
+    check(/\\x/.test(actual) && actual.includes("\\xff"),
+      "control: and both operands really took the non-UTF-8 branch", JSON.stringify(actual));
+  }
+
+  // CONTROLS, both directions. Without the first, the assertions above pass for
+  // a function that returns a fresh value every call; without the second, for
+  // one that mangles every path it is given.
+  check(displayPath("a.txt") !== displayPath("b.txt"),
+    "control: two plainly different names still differ, so the check is not trivially true");
+  check(displayPath("src/daemon.mjs") === "src/daemon.mjs",
+    "control: and an ordinary path is returned unchanged", displayPath("src/daemon.mjs"));
+
+  // THE BACKSLASH IS ESCAPED FIRST. Escaping it after the control bytes would
+  // also escape the backslashes this function had just produced, turning a
+  // legitimate `\x01` into `\\x01` and mangling every escape it emits.
+  check(safePath("a\\b") === "a\\\\b", "a literal backslash is doubled", safePath("a\\b"));
+  check(safePath("a\u0001b") === "a\\x01b",
+    "and a control byte still renders as a single escape, not a doubled one", safePath("a\u0001b"));
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

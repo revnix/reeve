@@ -332,5 +332,196 @@ expectRefusal("a budget that is not an object",
   withBudget({ BUILD_SIZE: 8 }), /BUILD_SIZE must be an object/);
 expectRefusal("budgets that are not an object", withBudget([]), /builder\.budgets must be an object/);
 
+// ── the generated reference ──────────────────────────────────────────────────
+//
+// A stale generated file is a lie a reader cannot detect: it looks exactly like
+// a fresh one. So the test regenerates and compares, and names the command.
+//
+// EQUALITY ALONE PROVES NOTHING HERE, and that is the whole difficulty. The
+// committed file and the fresh one come from the SAME generator, so a generator
+// that reads nothing produces a document of empty cells that matches a committed
+// document of empty cells, and this check goes green over a reference that
+// documents the schema not at all. Every control below exists because some
+// version of this generator passed the equality check while being wrong.
+{
+  const { profileReference, noteFor, fieldsBounds, rowsFor } =
+    await import("../scripts/profile-reference.mjs");
+  const { readFileSync } = await import("node:fs");
+  const { execFileSync } = await import("node:child_process");
+
+  const SRC    = readFileSync(new URL("../src/profile/schema.mjs", import.meta.url), "utf8");
+  const fresh  = profileReference();
+  const onDisk = readFileSync(new URL("../docs/profile-reference.md", import.meta.url), "utf8");
+
+  const current = onDisk === fresh;
+  console.log(`${current ? "PASS" : "FAIL"}  docs: profile-reference.md is current`);
+  if (!current) { console.log("        run: node scripts/profile-reference.mjs"); fail++; }
+
+  // CONTROL: the comparison is not two empty documents agreeing. The generator
+  // must carry this PR's keys and a real count.
+  //
+  // The two keys named here are the ones THIS lane landed -- `builder.budgets`
+  // (#81) and a capability switch (#80) -- so the control is anchored to keys
+  // that exist. The plan specified `builder.provider.concurrencyLimit`, which no
+  // task has added yet; a control naming an absent key fails for a reason that
+  // has nothing to do with the generator, and the tempting repair is to delete
+  // the control.
+  const carries = fresh.includes("`builder.budgets`") &&
+                  fresh.includes("`builder.capabilities.observe`") &&
+                  new RegExp(`^${Object.keys(FIELDS).length} keys\\.`, "m").test(fresh);
+  console.log(`${carries ? "PASS" : "FAIL"}  control: the reference names the new keys and counts them`);
+  if (!carries) fail++;
+
+  // CONTROL: prose written ABOVE a key reaches it. `builder.budgets` carries a
+  // comment block above its declaration.
+  const above = noteFor(SRC, "builder.budgets");
+  const gotAbove = /ONE KEY, NOT EIGHTEEN/.test(above ?? "");
+  console.log(`${gotAbove ? "PASS" : "FAIL"}  control: a key's comment BLOCK reaches its entry`);
+  if (!gotAbove) { console.log(`        got: ${JSON.stringify((above ?? "").slice(0, 60))}`); fail++; }
+
+  // CONTROL: prose written BESIDE a key reaches it too. Thirteen keys are
+  // documented only by a trailing comment, and the first version of this
+  // generator read the block form alone -- rendering all thirteen empty while
+  // every assertion above stayed green, because the committed file was produced
+  // by the same blind reader.
+  const beside = noteFor(SRC, "identity.key");
+  const gotBeside = /owner\/repo from the REMOTE/.test(beside ?? "");
+  console.log(`${gotBeside ? "PASS" : "FAIL"}  control: a key's TRAILING comment reaches its entry`);
+  if (!gotBeside) { console.log(`        got: ${JSON.stringify((beside ?? "").slice(0, 60))}`); fail++; }
+
+  // CONTROL: coverage is pinned, in the idiom the capability keys already use.
+  // It fails when a description is LOST, and equally when one is added -- and
+  // updating the number is how the person adding it acknowledges the change.
+  const documented = rowsFor(SRC).filter((r) => r.note !== "").length;
+  const pinned = documented === 29;
+  console.log(`${pinned ? "PASS" : "FAIL"}  control: 29 of the declared keys carry a description`);
+  if (!pinned) {
+    console.log(`        ${documented} do. If you added or removed one, update this number`);
+    console.log("        and regenerate docs/profile-reference.md in the same commit.");
+    fail++;
+  }
+
+  // ── THE DUPLICATE-KEY TRAP ────────────────────────────────────────────────
+  //
+  // Key strings are NOT unique in schema.mjs: `builder.capabilities.observe` is
+  // declared in `FIELDS` and seeded again in `UNIVERSAL_DEFAULTS`. A whole-file
+  // "first match" lookup -- which is what this generator was first specified to
+  // do -- lands on the right one today only because `FIELDS` happens to be
+  // declared earlier in the file.
+  //
+  // Reorder those two declarations and every duplicated key silently takes its
+  // prose from the wrong block. NOTHING GOES RED: the committed file and a fresh
+  // generation are wrong in the same way, so the equality check above passes.
+  //
+  // THE FIXTURE PUTS THE DECOY FIRST, so it can actually exhibit the defect. A
+  // fixture built from the real file in its current order would pass under both
+  // the bounded and the unbounded reader and would prove nothing.
+  {
+    const decoyFirst = [
+      "const UNIVERSAL_DEFAULTS = {",
+      "  // DECOY PROSE that belongs to the defaults block, not to the schema.",
+      '  "builder.capabilities.observe": false,',
+      "};",
+      "",
+      "export const FIELDS = {",
+      "  // THE REAL PROSE, above the declaration inside FIELDS.",
+      '  "builder.capabilities.observe":        [false, isBool],',
+      "};",
+    ].join("\n");
+
+    const [lo, hi] = fieldsBounds(decoyFirst.split("\n"));
+    const bounded = hi >= lo;
+    console.log(`${bounded ? "PASS" : "FAIL"}  control: the FIELDS block is located and non-empty`);
+    if (!bounded) fail++;
+
+    const picked = noteFor(decoyFirst, "builder.capabilities.observe");
+    const right = /THE REAL PROSE/.test(picked ?? "");
+    console.log(`${right ? "PASS" : "FAIL"}  a key declared TWICE takes its prose from FIELDS, not from the defaults`);
+    if (!right) { console.log(`        got: ${JSON.stringify(picked)}`); fail++; }
+
+    // NEGATIVE CONTROL: the fixture really can tell the two readers apart. An
+    // unbounded first-match reader must get the DECOY from this same input --
+    // otherwise the assertion above would pass for a reader with the bug, and
+    // would be measuring nothing.
+    const naive = (() => {
+      const lines = decoyFirst.split("\n");
+      const at = lines.findIndex((l) => /^\s*"?builder\.capabilities\.observe"?\s*:/.test(l));
+      const m = lines[at - 1].match(/^\s*\/\/ ?(.*)$/);
+      return m ? m[1] : "";
+    })();
+    const discriminates = /DECOY/.test(naive);
+    console.log(`${discriminates ? "PASS" : "FAIL"}  negative control: an unbounded reader takes the DECOY from that same fixture`);
+    if (!discriminates) { console.log(`        got: ${JSON.stringify(naive)}`); fail++; }
+  }
+
+  // CONTROL: every declared key was actually FOUND in the FIELDS block. A key
+  // the reader cannot locate must be an error, never an empty cell -- an empty
+  // cell is indistinguishable from "documented nowhere yet".
+  let threw = null;
+  try { rowsFor(SRC.replace(/^\s*"?identity\.key"?\s*:.*$/m, "")); } catch (e) { threw = e; }
+  console.log(`${threw ? "PASS" : "FAIL"}  a declared key missing from the source THROWS rather than rendering blank`);
+  if (!threw) fail++;
+
+  // `--check` answers without writing, the shape gofmt/terraform-docs settled on.
+  let checkOk = false;
+  try {
+    execFileSync(process.execPath,
+      [new URL("../scripts/profile-reference.mjs", import.meta.url).pathname, "--check"],
+      { stdio: "pipe" });
+    checkOk = true;
+  } catch { checkOk = false; }
+  console.log(`${checkOk ? "PASS" : "FAIL"}  --check exits 0 while the committed file is current`);
+  if (!checkOk) fail++;
+}
+
+// ── the declared key set, frozen ─────────────────────────────────────────────
+//
+// Nothing reads this fixture to make a decision; it is not a second inventory
+// the code consults. It exists so that adding a key is a DELIBERATE act with a
+// diff, rather than a line that lands in `FIELDS` and nowhere else -- which is
+// measured behaviour in this repository, not a hypothetical, and it reached
+// exactly one machine.
+//
+// It freezes BOTH halves: the key set, and a hash of the rendered reference. The
+// key set alone would not notice a key whose PROSE changed, and the hash alone
+// would not say WHICH key moved.
+{
+  const { readFileSync } = await import("node:fs");
+  const { createHash } = await import("node:crypto");
+  const { profileReference } = await import("../scripts/profile-reference.mjs");
+
+  const frozen = JSON.parse(readFileSync(
+    new URL("./fixtures/profile-fields-v1.json", import.meta.url), "utf8"));
+  const now = Object.keys(FIELDS).sort();
+
+  // CONTROL: the fixture really carries a key set. An empty or unparsed one
+  // would make both comparisons below pass vacuously -- the same nothing-shaped
+  // failure a derived-but-empty set produces.
+  const loaded = Array.isArray(frozen.keys) && frozen.keys.length === frozen.count
+                 && frozen.count > 0;
+  console.log(`${loaded ? "PASS" : "FAIL"}  control: the freeze fixture carries a non-empty, self-consistent key set`);
+  if (!loaded) { console.log(`        keys=${frozen.keys?.length} count=${frozen.count}`); fail++; }
+
+  const added   = now.filter((k) => !frozen.keys.includes(k));
+  const removed = frozen.keys.filter((k) => !now.includes(k));
+  const same = added.length === 0 && removed.length === 0;
+  console.log(`${same ? "PASS" : "FAIL"}  freeze: the declared key set is unchanged`);
+  if (!same) {
+    console.log(`        added: ${added.join(",") || "(none)"} | removed: ${removed.join(",") || "(none)"}`);
+    console.log("        If this change is intended, regenerate test/fixtures/profile-fields-v1.json");
+    console.log("        AND docs/profile-reference.md in the same commit.");
+    fail++;
+  }
+
+  const shaNow = createHash("sha256").update(profileReference()).digest("hex");
+  const shaSame = shaNow === frozen.reference_sha256;
+  console.log(`${shaSame ? "PASS" : "FAIL"}  freeze: the rendered reference is unchanged`);
+  if (!shaSame) {
+    console.log(`        frozen ${frozen.reference_sha256?.slice(0, 12)} vs now ${shaNow.slice(0, 12)}`);
+    console.log("        A key's prose or its required-ness changed. Regenerate both halves.");
+    fail++;
+  }
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

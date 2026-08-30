@@ -41,6 +41,30 @@ const damaged = (name, damage) => {
   try { return schemaDefectsAt(probe, HUB_SCHEMA_VERSION); } finally { probe.close(); }
 };
 
+/**
+ * Rebuild `table` with its DDL transformed, preserving its indexes.
+ *
+ * The shape a hand-repaired or partially-restored store actually arrives in.
+ * BOTH the transform and its effect are asserted: a `replace` whose anchor
+ * missed writes nothing and raises nothing, and the fixture would then rebuild
+ * the table unchanged -- reporting no defect, which reads as the CHECK failing
+ * when it is the FIXTURE that failed.
+ */
+const rebuild = (db, table, transform) => {
+  const ddl = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+                .get(table).sql;
+  const idx = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL")
+                .all(table).map(r => r.sql);
+  const changed = transform(ddl);
+  if (changed === ddl) throw new Error(`fixture: the transform of ${table} changed nothing`);
+  const named = changed.replace(new RegExp(`CREATE TABLE (IF NOT EXISTS )?"?${table}"?`), `CREATE TABLE ${table}_new`);
+  if (!named.includes(`${table}_new`)) throw new Error(`fixture: could not rename ${table} in its DDL`);
+  db.exec(named);
+  db.exec(`DROP TABLE ${table}`);
+  db.exec(`ALTER TABLE ${table}_new RENAME TO ${table}`);
+  for (const sql of idx) db.exec(sql);
+};
+
 // ── THE CONTROL COMES FIRST ──────────────────────────────────────────────────
 //
 // An intact store must produce NO defects. Without this every assertion below is
@@ -176,6 +200,81 @@ const damaged = (name, damage) => {
   check(clean.length === 0,
     "control: the pristine store is STILL clean after every fixture ran, so the copies were copies",
     clean.slice(0, 3).join("; "));
+}
+
+// ── class 6: a LOST COLUMN DEFAULT ───────────────────────────────────────────
+//
+// `task.priority` is `NOT NULL DEFAULT 'p2'` and callers omit it. A snapshot
+// that lost the default keeps every existing row valid and passes a deep
+// integrity check, then fails the first ordinary insert with a NOT NULL
+// violation -- after being certified as restorable.
+{
+  const d = damaged("no-default", (db) =>
+    rebuild(db, "task", (ddl) => ddl.replace(" DEFAULT 'p2'", "")));
+  check(d.some(s => s === "task.priority defaults to nothing, want 'p2'"),
+    "a snapshot that LOST a column default is refused, naming the default it wants",
+    d.slice(0, 3).join("; "));
+}
+
+// ── class 7: a CHANGED PARTIAL-INDEX PREDICATE ───────────────────────────────
+//
+// `one_live_run` is UNIQUE on phase_run(task) WHERE status IN ('live','adopted').
+// Recreated with a different WHERE it keeps its name AND its uniqueness flag,
+// so a comparison of those two alone sees nothing -- while the single-live-run
+// invariant it exists to enforce is simply gone.
+{
+  const d = damaged("wrong-predicate", (db) => {
+    db.exec("DROP INDEX one_live_run");
+    db.exec("CREATE UNIQUE INDEX one_live_run ON phase_run(task) WHERE status = 'never'");
+  });
+  check(d.some(s => s.startsWith("index one_live_run on phase_run is filtered by status = 'never'")),
+    "an index whose PREDICATE changed is refused, though its name and uniqueness are intact",
+    d.slice(0, 3).join("; "));
+}
+
+// ── class 8: a TIGHTENED NULLABLE COLUMN ─────────────────────────────────────
+//
+// Not an extra: it REFUSES writes the code performs. `task.body` is bound as
+// `filing.body ?? null`, so a column tightened to NOT NULL breaks ordinary task
+// filing after the snapshot is restored.
+{
+  const d = damaged("tightened", (db) =>
+    rebuild(db, "task", (ddl) => ddl.replace("body           TEXT,", "body           TEXT NOT NULL,")));
+  check(d.some(s => s === "task.body is NOT NULL, want nullable"),
+    "a snapshot that made a nullable column NOT NULL is refused",
+    d.slice(0, 3).join("; "));
+}
+
+// ── class 9: an EXTRA FOREIGN KEY ────────────────────────────────────────────
+//
+// THE ONE PLACE "extra is harmless" DOES NOT HOLD, and it is worth being exact
+// about why. An extra column carries data nobody reads. An extra CONSTRAINT
+// rejects writes the code performs -- and it does so only once a row exists, so
+// `foreign_key_check` over an empty table reports nothing wrong and the
+// scheduler's first ordinary insert fails after restore.
+{
+  const d = damaged("extra-fk", (db) => {
+    db.exec("CREATE TABLE reserved_ref (id INTEGER PRIMARY KEY) STRICT");
+    rebuild(db, "provider_state", (ddl) =>
+      ddl.replace("guardian_reserved INTEGER NOT NULL,",
+                  "guardian_reserved INTEGER NOT NULL REFERENCES reserved_ref(id),"));
+  });
+  check(d.some(s => s.includes("is not in this schema and can refuse writes")),
+    "a snapshot carrying an EXTRA foreign key is refused, unlike an extra column",
+    d.slice(0, 3).join("; "));
+}
+
+// ── class 10: WITHOUT ROWID DROPPED ──────────────────────────────────────────
+//
+// Invisible to every other check: same columns, same indexes, same constraints.
+// Only the storage changes, from a primary-key table to a rowid table plus a
+// separate PK index, against a schema that states the invariant deliberately.
+{
+  const d = damaged("rowid", (db) =>
+    rebuild(db, "task_territory", (ddl) => ddl.replace(") STRICT, WITHOUT ROWID", ") STRICT")));
+  check(d.some(s => s === "table task_territory is a rowid table, want WITHOUT ROWID"),
+    "a WITHOUT ROWID table rebuilt as a rowid table is refused",
+    d.slice(0, 3).join("; "));
 }
 
 // ── extra is not a defect ────────────────────────────────────────────────────

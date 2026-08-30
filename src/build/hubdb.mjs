@@ -727,18 +727,28 @@ function scratchAt(version) {
  */
 export function shapeOf(db) {
   const tables = {};
-  const strictOf = new Map(
-    db.prepare(`SELECT name, strict FROM pragma_table_list WHERE schema = 'main' AND type = 'table'`)
-      .all().map(r => [r.name, Number(r.strict) === 1]));
+  // `wr` is WITHOUT ROWID. Thirteen hub tables declare it, and rebuilding one
+  // without it is invisible to every other check: the columns, indexes and
+  // constraints are identical, and only the storage changes -- a primary-key
+  // table becomes a rowid table plus a separate PK index.
+  const propsOf = new Map(
+    db.prepare(`SELECT name, strict, wr FROM pragma_table_list WHERE schema = 'main' AND type = 'table'`)
+      .all().map(r => [r.name, { strict: Number(r.strict) === 1, withoutRowid: Number(r.wr) === 1 }]));
   const names = db.prepare(
     `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
     .all().map(r => r.name);
 
   for (const t of names) {
     const columns = {};
-    for (const c of db.prepare(`SELECT name, type, "notnull", pk FROM pragma_table_info(?)`).all(t))
+    // `dflt_value` is part of the writable contract, not decoration. `task.priority`
+    // is `NOT NULL DEFAULT 'p2'` and callers omit it; a snapshot that lost the
+    // default keeps every row valid and passes an integrity check, then fails the
+    // first ordinary insert with a NOT NULL violation after being restored.
+    for (const c of db.prepare(
+      `SELECT name, type, "notnull", pk, dflt_value FROM pragma_table_info(?)`).all(t))
       columns[c.name] = { type: String(c.type ?? "").toUpperCase(),
-                          notNull: Number(c.notnull) === 1, pk: Number(c.pk) > 0 };
+                          notNull: Number(c.notnull) === 1, pk: Number(c.pk) > 0,
+                          dflt: c.dflt_value == null ? null : String(c.dflt_value) };
 
     const indexes = {};
     for (const i of db.prepare(`SELECT name, "unique", origin FROM pragma_index_list(?)`).all(t)) {
@@ -749,9 +759,18 @@ export function shapeOf(db) {
       // and the number is positional -- so dropping an unrelated constraint
       // renumbers the survivors and a name-keyed comparison reports a defect
       // where the schema is identical.
+      // THE PREDICATE OF A PARTIAL INDEX IS PART OF WHAT IT ENFORCES.
+      // `one_live_run` is `UNIQUE ON phase_run(task) WHERE status IN
+      // ('live','adopted')`. Recreated with a different WHERE it keeps its name
+      // and its uniqueness flag and stops enforcing the single-live-run
+      // invariant entirely. Taken from the WHERE clause specifically rather than
+      // by comparing whole DDL, so authoring format cannot raise a false defect.
+      const ddl = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
+                    .get(i.name)?.sql ?? null;
+      const where = ddl ? (ddl.match(/\bWHERE\b([\s\S]*)$/i)?.[1] ?? "").replace(/\s+/g, " ").trim() : "";
       const key = i.origin === "c" ? `name:${i.name}` : `cols:${cols.join(",")}`;
       indexes[key] = { unique: Number(i.unique) === 1, columns: cols, explicit: i.origin === "c",
-                       name: i.name };
+                       name: i.name, where };
     }
 
     const foreignKeys = {};
@@ -760,7 +779,9 @@ export function shapeOf(db) {
       foreignKeys[`${f.from}->${f.table}.${f.to}`] =
         { onDelete: f.on_delete, onUpdate: f.on_update };
 
-    tables[t] = { columns, indexes, foreignKeys, strict: strictOf.get(t) === true };
+    const props = propsOf.get(t) ?? { strict: false, withoutRowid: false };
+    tables[t] = { columns, indexes, foreignKeys, strict: props.strict,
+                  withoutRowid: props.withoutRowid };
   }
   return tables;
 }
@@ -833,25 +854,57 @@ export function schemaDefectsAt(db, version) {
       const h = haveTable.columns[c];
       if (!h) { bad.push(`${t}.${c} is missing`); continue; }
       if (h.type !== w.type) bad.push(`${t}.${c} is ${h.type || "untyped"}, want ${w.type}`);
+      // NULLABILITY IS COMPARED BOTH WAYS. A snapshot that made an expected
+      // nullable column NOT NULL is not carrying something extra -- it REJECTS
+      // writes the code performs. `task.body` is bound as `filing.body ?? null`,
+      // so a tightened column fails ordinary task filing after restore.
       if (w.notNull && !h.notNull) bad.push(`${t}.${c} is nullable, want NOT NULL`);
+      if (!w.notNull && h.notNull) bad.push(`${t}.${c} is NOT NULL, want nullable`);
       if (w.pk && !h.pk) bad.push(`${t}.${c} is not part of the primary key, want it to be`);
+      // THE DEFAULT IS PART OF THE WRITABLE CONTRACT. Losing `DEFAULT 'p2'` on
+      // `task.priority` leaves every existing row valid and every integrity
+      // check clean, and breaks the first insert that omits the column.
+      if (h.dflt !== w.dflt)
+        bad.push(`${t}.${c} defaults to ${h.dflt ?? "nothing"}, want ${w.dflt ?? "no default"}`);
     }
 
     for (const [key, w] of Object.entries(wantTable.indexes)) {
       const h = haveTable.indexes[key];
       const label = w.explicit ? `index ${w.name} on ${t}` : `${t}(${w.columns.join(", ")})`;
       if (!h) { bad.push(`${label} is missing`); continue; }
-      if (w.unique && !h.unique) bad.push(`${label} is not UNIQUE, want UNIQUE`);
+      if (w.unique !== h.unique)
+        bad.push(`${label} is ${h.unique ? "UNIQUE" : "not UNIQUE"}, want ${w.unique ? "UNIQUE" : "not UNIQUE"}`);
+      // COLUMNS AND PREDICATE, not just the name. An index keeps its identity
+      // while enforcing something else entirely: same name, same uniqueness,
+      // different columns or a different WHERE.
+      if (w.columns.join(",") !== h.columns.join(","))
+        bad.push(`${label} covers (${h.columns.join(", ")}), want (${w.columns.join(", ")})`);
+      if (w.where !== h.where)
+        bad.push(`${label} is filtered by ${h.where || "nothing"}, want ${w.where || "no filter"}`);
     }
 
+    // FOREIGN KEYS ARE COMPARED AS A SET, IN BOTH DIRECTIONS -- the one place
+    // "extra is harmless" does not hold. An extra column carries data nobody
+    // reads; an extra CONSTRAINT rejects writes the code performs, and it does
+    // so only once a row exists, so `foreign_key_check` on an empty table
+    // reports nothing wrong.
     for (const [key, w] of Object.entries(wantTable.foreignKeys)) {
       const h = haveTable.foreignKeys[key];
       if (!h) { bad.push(`foreign key ${t}.${key} is missing`); continue; }
       if (h.onDelete !== w.onDelete)
         bad.push(`foreign key ${t}.${key} is ON DELETE ${h.onDelete}, want ${w.onDelete}`);
+      if (h.onUpdate !== w.onUpdate)
+        bad.push(`foreign key ${t}.${key} is ON UPDATE ${h.onUpdate}, want ${w.onUpdate}`);
     }
+    for (const key of Object.keys(haveTable.foreignKeys))
+      if (!(key in wantTable.foreignKeys))
+        bad.push(`foreign key ${t}.${key} is not in this schema and can refuse writes`);
 
     if (wantTable.strict && !haveTable.strict) bad.push(`table ${t} is not STRICT`);
+    // WITHOUT ROWID is a storage invariant the schema states deliberately.
+    if (wantTable.withoutRowid !== haveTable.withoutRowid)
+      bad.push(`table ${t} is ${haveTable.withoutRowid ? "WITHOUT ROWID" : "a rowid table"}, ` +
+               `want ${wantTable.withoutRowid ? "WITHOUT ROWID" : "a rowid table"}`);
   }
   return bad;
 }

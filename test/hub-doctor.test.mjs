@@ -545,9 +545,15 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   // bound: a rule that rejected the 77-character case by rejecting hyphens, or by
   // counting characters one too strictly, would fail here. The longest legal
   // login shape has to keep working.
-  writeFileSync(reg, JSON.stringify({ prod: { nwo: "o/orphan" }, dotted: { nwo: "owner/repo.js" },
-                                      hyphened: { nwo: "octo-example/my-repo" },
-                                      longest: { nwo: Array(20).fill("a").join("-") + "/repo" } }));
+  // EVERY ENTRY CARRIES THE TWO PATHS. `resolveSnapshot` reads `repoPath` and
+  // `profilePath`, so an entry without them is a row it cannot complete and the
+  // registry now refuses it -- which means "well-formed" is a wider requirement
+  // than it was, and these controls have to satisfy the wider one or they stop
+  // being controls and start being the failure they exist to rule out.
+  const paths = { repoPath: "/repo", profilePath: "/p.json" };
+  writeFileSync(reg, JSON.stringify({ prod: { nwo: "o/orphan", ...paths }, dotted: { nwo: "owner/repo.js", ...paths },
+                                      hyphened: { nwo: "octo-example/my-repo", ...paths },
+                                      longest: { nwo: Array(20).fill("a").join("-") + "/repo", ...paths } }));
   const dotted = idsOf(run("builder", "doctor", "--json").stdout);
   check(dotted !== null && !dotted.includes("H-7"),
     "control: a repository name containing dots is still a name", JSON.stringify(dotted));
@@ -555,7 +561,7 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubdoctor-"));
   // CONTROL: a WELL-FORMED registry is not reported as an error, so the
   // assertion above is about the malformed entry rather than about H-7 always
   // firing.
-  writeFileSync(reg, JSON.stringify({ prod: { nwo: "o/orphan" } }));
+  writeFileSync(reg, JSON.stringify({ prod: { nwo: "o/orphan", repoPath: "/repo", profilePath: "/p.json" } }));
   const good = run("builder", "doctor", "--json");
   const goodIds = idsOf(good.stdout);
   check(goodIds !== null && !goodIds.includes("H-7"),

@@ -32,7 +32,7 @@ else to put it, which is the point.
 | `authority.permission` | required | — |
 | `authority.policy` | required | — |
 | `authority.profileLocation` | defaulted | — |
-| `authority.forbiddenActions` | optional | — |
+| `authority.forbiddenActions` | defaulted for client | — |
 | `state.mode` | required | — |
 | `state.location` | optional | — |
 | `units` | required | — |
@@ -45,24 +45,24 @@ else to put it, which is the point.
 | `merge.deleteBranch` | optional | — |
 | `merge.enforcement` | required | — |
 | `reviewers` | optional | — |
-| `rounds.softCap` | optional | — |
-| `rounds.hardCap` | optional | — |
-| `rounds.maxFixAttemptsPerFinding` | optional | — |
+| `rounds.softCap` | defaulted | — |
+| `rounds.hardCap` | defaulted | — |
+| `rounds.maxFixAttemptsPerFinding` | defaulted | — |
 | `risk.sensitivePaths` | optional | yes |
 | `risk.quarantinePaths` | optional | yes |
 | `risk.forbiddenCommands` | optional | yes |
 | `risk.testPaths` | optional | yes |
-| `builder.capabilities.observe` | optional | yes |
-| `builder.capabilities.draftSpec` | optional | — |
-| `builder.capabilities.implementLocal` | optional | — |
-| `builder.capabilities.publishPr` | optional | — |
-| `builder.capabilities.mergeBuilderPr` | optional | — |
+| `builder.capabilities.observe` | defaulted | yes |
+| `builder.capabilities.draftSpec` | defaulted | — |
+| `builder.capabilities.implementLocal` | defaulted | — |
+| `builder.capabilities.publishPr` | defaulted | — |
+| `builder.capabilities.mergeBuilderPr` | defaulted | — |
 | `builder.founder.userId` | optional | yes |
 | `builder.founder.login` | optional | — |
-| `builder.cancel.drainMinutes` | optional | yes |
+| `builder.cancel.drainMinutes` | defaulted | yes |
 | `builder.budgets` | optional | yes |
-| `worker.maxOutputBytes` | optional | yes |
-| `worker.isolation` | optional | yes |
+| `worker.maxOutputBytes` | defaulted | yes |
+| `worker.isolation` | defaulted | yes |
 | `worker.dependencyPaths` | optional | yes |
 | `builder.network.research.allowedDomains` | optional | yes |
 | `notify.provider` | optional | yes |
@@ -77,7 +77,7 @@ else to put it, which is the point.
 | `watch.workerBudgetMinutes` | optional | — |
 | `watch.maxTurns` | optional | — |
 | `watch.unknownEscalateSeconds` | optional | — |
-| `watch.staleSeconds` | optional | yes |
+| `watch.staleSeconds` | defaulted | yes |
 | `watch.intervalSeconds` | optional | — |
 | `tools.codeHealth` | optional | yes |
 | `measured.review.window` | optional | yes |
@@ -173,7 +173,7 @@ Where this project's tests live, when the built-in globs do not fit it. A repair
 
 ### `builder.capabilities.observe`
 
-**optional**
+**defaulted**
 
 The builder's capability switches. Authority is never inferred from the repository fields above: the live nextly profile already carries authority.policy=propose_and_merge, so that key cannot gate anything new. Five independent booleans, every one false until the rollout stage that proves it turns it on. A truthy string is refused, not coerced.
 
@@ -185,7 +185,7 @@ The founder's GitHub identity, by immutable numeric id with the login as a snaps
 
 ### `builder.cancel.drainMinutes`
 
-**optional**
+**defaulted**
 
 How long a cancelling task's effects get to reconcile before `cancel --force` becomes available. A forced cancel is the one terminal transition whose external truth was never confirmed, so it must not be reachable before the reconcilers have had a window at all.
 
@@ -197,13 +197,13 @@ Per-action budgets for the phases a worker is dispatched for.  ONE KEY, NOT EIGH
 
 ### `worker.maxOutputBytes`
 
-**optional**
+**defaulted**
 
 Cap on a worker's durable stdout/stderr files. Read by both daemons.
 
 ### `worker.isolation`
 
-**optional**
+**defaulted**
 
 How a dispatched worker is isolated from the founder's account. "none" (default) means a shared account and a linked worktree: a worker could read a keychain credential the probe does not know about, or plant a hook in the checkout's shared git dir. "dedicated-user" asserts the founder has set up a separate OS user (its own empty keychain) and per-run standalone clones; ONLY then does a passing canary plus an empty keychain close dispatch.
 
@@ -233,7 +233,7 @@ A native notification on the machine reeve runs on, alongside the phone rather t
 
 ### `watch.staleSeconds`
 
-**optional**
+**defaulted**
 
 How old evidence may be before a clause refuses to answer from it. Defaulted rather than optional: an unset staleness bound is an INFINITE one, and a gate that will answer from evidence of any age is not a freshness gate.
 

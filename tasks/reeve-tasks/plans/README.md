@@ -140,6 +140,26 @@ against each other rather than against the code, and never executed. Treat every
 plan's consumed-name table and every "produces" clause as unverified until the task that
 consumes it runs.
 
+## Third review round: a plan contradicting its own consumed table
+
+| plan | the defect | measured |
+|---|---|---|
+| S3-F | Reads flags as `flags.json`. `bin/reeve` exposes `flag(name)`, `opt(name)` and `all(name)`; there is **no `flags` binding**, so every such read is a ReferenceError before the route runs | `const flags` count in `bin/reeve` = **0**; `flags.`/`flags[` in S3-F = 7 |
+| S3-E | A `task list`/`show`/`why` line reads a capability by its bare name. **S3-E's own consumed table at `:36` documents the dotted form correctly, and even records the measurement proving it** -- so the document contradicts itself rather than merely disagreeing with S3-A | S3-E `:36` vs the cited line |
+| S3-F | V1 files against something other than the registry **project name**, which is the key S3-B's route indexes `registry.projects` by | S3-B route, `bin/reeve` |
+
+**The S3-E row is the one that changes how these documents should be read.** Until now every
+finding was a plan disagreeing with the code or with another plan. This is a plan disagreeing
+with **itself**: the consumed table states the dotted form, gives the measurement behind it,
+and then a task in the same document reads the bare name. A reader who checks the table before
+writing the code would still be sent wrong by the code beside it. Checking a plan's table is
+therefore not sufficient; the snippets have to be checked against the table too.
+
+Recorded unverified, needing code that does not exist: a reservation equal to the measured
+limit is accepted though admission would refuse it; escalation keys outside the declared
+identity set are accepted; a `JSON.parse` result is inspected without being guarded against
+null; and an acceptance check's failing exit status is lost through a shell pipeline.
+
 ## What this file does NOT establish
 
 Only S3-A and the first task of S3-B have been executed. The rows above are what executing

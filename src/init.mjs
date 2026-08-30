@@ -38,7 +38,8 @@ export function profilePath(nwo, location, home = resolveHome()) {
 
 /** Stable key order, so a rewrite produces a readable diff rather than a reshuffle. */
 const ORDER = ["schemaVersion", "project", "identity", "authority", "state", "units",
-               "lanes", "ci", "merge", "reviewers", "rounds", "risk", "tools", "watch"];
+               "lanes", "ci", "merge", "reviewers", "rounds", "risk", "tools",
+               "builder", "worker", "watch"];
 export function canonical(profile) {
   const out = {};
   for (const k of ORDER) if (profile[k] !== undefined) out[k] = profile[k];

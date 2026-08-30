@@ -6,6 +6,7 @@
     "authority.permission",
     "authority.policy",
     "authority.profileLocation",
+    "builder.budget.maxPackages",
     "builder.budgets",
     "builder.cancel.drainMinutes",
     "builder.capabilities.draftSpec",
@@ -15,7 +16,13 @@
     "builder.capabilities.publishPr",
     "builder.founder.login",
     "builder.founder.userId",
+    "builder.lease.starvedHours",
+    "builder.maxConcurrentTasks",
     "builder.network.research.allowedDomains",
+    "builder.provider.concurrencyLimit",
+    "builder.provider.cooldownSeconds",
+    "builder.provider.guardianReserved",
+    "builder.provider.preemptAtBoundary",
     "ci.appSlug",
     "ci.provider",
     "ci.requiredChecks",
@@ -72,7 +79,7 @@
     "worker.isolation",
     "worker.maxOutputBytes"
   ],
-  "count": 69,
-  "reference_sha256": "6aabf379b5591312a4c56e8d43c2d1dcd5c0ce75adfa1e391a4309b6e534eb3e",
+  "count": 76,
+  "reference_sha256": "c61a18a759fb68fbf6f98794e085eefb372f61e6bc9d989fc1e863724c16ca36",
   "note": "a new key is deliberate: add it, regenerate the reference, and update both halves here"
 }

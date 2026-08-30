@@ -339,20 +339,73 @@ check(parse({}).error === null && parse({}).projects.length === 0,
   //
   // Decoding to utf8 first replaces malformed sequences with U+FFFD before the
   // hash sees them, so two different files hash the same while both still parse.
+  //
+  // THE FIRST VERSION OF THIS BLOCK PROVED NOTHING. Both fixtures were
+  // schema-invalid, so validation made both hashes `null`, and the assertion
+  // accepted `(null, null)` explicitly -- it would have stayed green if hashing
+  // were deleted outright. The profiles below are VALID and differ only in one
+  // byte inside a permitted string field, and both hashes are required to be
+  // non-null as well as different.
   const mk = (name, bytes) => { const f = join(dir, name); writeFileSync(f, bytes); return f; };
-  const body = (b) => Buffer.concat([
-    Buffer.from(`{"schemaVersion":1,"identity":{"key":"o/r","defaultBranch":"main","visibility":"private","note":"`),
-    Buffer.from([b]), Buffer.from(`"}}`)]);
-  const p80 = mk("p80.json", body(0x80));
-  const p81 = mk("p81.json", body(0x81));
-  const hashOf = async (f) => (await registryIo(dir, "p", { nwo: "o/r", repoPath: dir, profilePath: f })
-                                 .profileHash(f));
+  const validBytes = (b) => Buffer.concat([
+    Buffer.from(`{"schemaVersion":1,"project":{"kind":"product"},` +
+      `"identity":{"key":"o/r","defaultBranch":"`), Buffer.from([b]),
+    Buffer.from(`","visibility":"private"},` +
+      `"authority":{"permission":"admin","policy":"owner"},"state":{"mode":"in-repo"},` +
+      `"units":[{"id":"u","root":".","language":"ts"}],"ci":{"provider":"github-actions"},` +
+      `"merge":{"method":"squash","enforcement":"enforced"}}`)]);
+  const p80 = mk("p80.json", validBytes(0x80));
+  const p81 = mk("p81.json", validBytes(0x81));
+  const hashOf = async (f) => registryIo(dir, "p", { nwo: "o/r", repoPath: dir, profilePath: f })
+                                .profileHash(f);
   const h80 = await hashOf(p80), h81 = await hashOf(p81);
-  // CONTROL: both files really do still parse, or they differ for a duller reason.
-  const parses = (f) => { try { JSON.parse(require("node:fs").readFileSync(f, "utf8")); return true; }
-                          catch { return false; } };
-  check(h80 !== h81 || (h80 === null && h81 === null),
-    "two profiles differing only in a malformed byte do not share a hash", `${h80} vs ${h81}`);
+
+  // CONTROL FIRST: both profiles are actually ACCEPTED, or two nulls would
+  // agree with each other and the assertion below would be about nothing.
+  check(h80 !== null && h81 !== null,
+    "control: both byte-fixtures are valid profiles and DO hash, so the comparison is real",
+    JSON.stringify([h80, h81]));
+  check(h80 !== h81,
+    "two profiles differing only in a malformed byte do not share a hash",
+    `${h80} vs ${h81}`);
+  // CONTROL: they really do differ only in that byte -- same length, one byte apart.
+  check(validBytes(0x80).length === validBytes(0x81).length,
+    "control: the two files differ in exactly one byte, not in their shape");
+
+  // ── an absolute path is whatever the PLATFORM says it is ─────────────────
+  //
+  // `startsWith("/")` is POSIX-only, so on Windows every ordinary entry --
+  // `C:\repos\app`, or a UNC path -- was rejected as malformed and no project
+  // could be discovered at all. These are FILESYSTEM paths, not claim paths:
+  // claims are slash-separated on every platform by rule, a repoPath is not.
+  {
+    const { isAbsolute } = await import("node:path");
+    const entry = (rp) => ({ nextly: { nwo: "o/r", repoPath: rp, profilePath: rp } });
+    const posix = parseRegistry(JSON.stringify(entry("/repo")), "/x");
+    check(posix.error === null, "control: a POSIX absolute path is still accepted", String(posix.error));
+
+    // WHAT CAN AND CANNOT BE CHECKED FROM HERE, stated rather than fudged.
+    //
+    // On a POSIX runner `C:\repos\app` genuinely is NOT absolute, so the parse
+    // correctly refuses it and there is no behavioural difference to observe.
+    // Round-tripping a Windows path would therefore pass on this machine for
+    // the wrong reason and hide the regression on the only platform it matters
+    // on. The checkable fact is which PREDICATE the module uses.
+    //
+    // Asserted on the import, not on a text search for the old expression: my
+    // first attempt grepped for `startsWith` and matched the COMMENT explaining
+    // why it was wrong -- a source-text instrument tripping on prose, which is
+    // the same fragility that broke a gate-state assertion on a pure move
+    // earlier today.
+    const src = (await import("node:fs")).readFileSync(
+      new URL("../src/build/registryio.mjs", import.meta.url), "utf8");
+    check(/import \{[^}]*\bisAbsolute\b[^}]*\} from "node:path"/.test(src),
+      "the module imports node:path's isAbsolute, which is the platform-aware predicate");
+    check(isAbsolute("/repo") === true && isAbsolute("repo") === false,
+      "control: that predicate answers correctly for the cases this runner CAN exercise");
+    check(parseRegistry(JSON.stringify(entry("repo")), "/x").error !== null,
+      "control: and a relative path is still refused, so the rule did not simply go away");
+  }
 
   // ── the probe reads the INDEX, not HEAD ──────────────────────────────────
   //
@@ -369,6 +422,27 @@ check(parse({}).error === null && parse({}).projects.length === 0,
     check(!asked?.includes("ls-tree") && !asked?.includes("HEAD"),
       "and no longer asks a tree-ish, which cannot see a staged gitlink", JSON.stringify(asked));
     check(got?.mode === "160000", "control: it still reads the mode out of the answer", JSON.stringify(got));
+
+    // ONE ROW PER TRACKED DESCENDANT. Probing an ordinary directory lists
+    // everything beneath it, and taking the FIRST row's mode reported the
+    // directory as whatever its first child happened to be -- a tracked symlink
+    // under `packages` made `packages` look like mode 120000 and would refuse an
+    // unrelated claim under `packages/normal`.
+    const many = registryIo(dir, "p", { nwo: "o/r", repoPath: "/repo", profilePath: "/f" },
+      { git: () => "120000 aaa 0\tpackages/a-link\n100644 bbb 0\tpackages/normal/x.ts" });
+    check(many.lsTree("/repo", "packages") === null,
+      "a DIRECTORY whose first tracked child is a symlink is not itself reported as one",
+      JSON.stringify(many.lsTree("/repo", "packages")));
+    check(many.lsTree("/repo", "packages/a-link")?.mode === "120000",
+      "control: while the symlink itself still answers with its own mode",
+      JSON.stringify(many.lsTree("/repo", "packages/a-link")));
+
+    // PATHSPEC MAGIC. A tracked name beginning with `:` is read as magic rather
+    // than as a path, so a symlink called `:(literal)link` returned no entry and
+    // resolveClaims admitted it as untracked.
+    check(asked?.[0] === "--literal-pathspecs",
+      "`--literal-pathspecs` is passed BEFORE the subcommand, so a `:`-leading name is a path",
+      JSON.stringify(asked));
   }
 
   // ── the profile is VALIDATED and BOUND to the entry ──────────────────────

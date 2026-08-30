@@ -10,6 +10,7 @@
 // that exercises it, and a manifest. That is what lets the real cleanliness guard
 // stay strict, rather than being loosened to make itself testable.
 import { applyEdit, validateManifest, classify, summarise, failedAssertions, describeMiss,
+         parsePorcelainZ, displayPath, fingerprint,
          reportedAnyAssertion, CAUGHT, NOT_CAUGHT, WRONG_RED, CRASHED, UNRUNNABLE, TIMED_OUT_EXIT }
   from "../src/stubsweep.mjs";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync, rmSync } from "node:fs";
@@ -17,7 +18,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve, basename } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -45,6 +46,7 @@ process.on("exit", () => {
   for (const d of TEMPS) { try { rmSync(d, { recursive: true, force: true }); } catch { /* leave it */ } }
 });
 const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import.meta.url)));
+const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.url)));
 
 // --- applying an edit refuses anything ambiguous -------------------------------
 {
@@ -1324,6 +1326,105 @@ const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import
   check(/WRONG_RED/.test(out) && !/CRASHED/.test(out),
     "the runner's own counters reach the verdict: only-passes is WRONG_RED, not CRASHED",
     out.slice(0, 400));
+}
+
+// --- porcelain bytes survive the parser, including undecodable ones -------------
+{
+  // AT THE PARSER, not through the filesystem, and that is a stated boundary rather
+  // than a convenience: APFS and HFS+ REJECT a filename that is not valid UTF-8, so
+  // this fixture cannot be built on the machine this is usually run on. It can be
+  // built on the Linux runner. Rather than write a test that silently does nothing
+  // on macOS -- a skip that reads as a pass, which is the failure this whole file
+  // exists to prevent -- the property is asserted where it is platform-independent:
+  // the bytes git emitted must be the bytes handed to the filesystem call.
+  const name = Buffer.from([0x62, 0x61, 0x64, 0xff, 0xfe, 0x2e, 0x74, 0x6d, 0x70]); // "bad\xff\xfe.tmp"
+  const raw = Buffer.concat([Buffer.from("!! "), name, Buffer.from([0])]);
+  const parsed = parsePorcelainZ(raw);
+  check(parsed.length === 1 && Buffer.isBuffer(parsed[0].path) && parsed[0].path.equals(name),
+    "an undecodable ignored path reaches the filesystem call as its original bytes",
+    JSON.stringify(parsed.map(p => ({ xy: p.xy, path: [...(p.path ?? [])] }))));
+  // CONTROL: decoding is genuinely lossy for these bytes, so the assertion above is
+  // not satisfied by the bytes happening to round-trip.
+  check(!Buffer.from(name.toString("utf8"), "utf8").equals(name),
+    "control: this name really is destroyed by a UTF-8 round trip");
+  // And two different undecodable names must not compare equal after display, or a
+  // reading could not tell one being swapped for the other.
+  const other = Buffer.from([0x62, 0x61, 0x64, 0xfe, 0xff, 0x2e, 0x74, 0x6d, 0x70]);
+  check(displayPath(name) !== displayPath(other),
+    "two different undecodable names do not collapse to the same reading",
+    `${displayPath(name)} vs ${displayPath(other)}`);
+}
+
+// --- a fifo named as an ignored file never blocks the sweep ---------------------
+{
+  // `open` on a FIFO for reading blocks until a writer appears, so a fingerprint
+  // that reached the open would hang until the runner's own 600s timeout -- long
+  // after any useful verdict, and with the tree still stubbed.
+  //
+  // NOT in the manifest, deliberately, and this is the reason: the honest stub is to
+  // remove the regular-file guard, and that stub HANGS rather than failing, so the
+  // entry would report UNRUNNABLE after ten minutes instead of CAUGHT. A guard whose
+  // removal cannot be measured safely is stated here instead of pretended at.
+  // The first version of this ran the whole sweep over a tree holding a fifo, and
+  // its control FAILED -- which was the useful part. MEASURED on git 2.50.1: a fifo
+  // is not reported by `git status --porcelain --ignored` AT ALL, only the regular
+  // ignored file beside it is. So a fifo cannot arrive through that route, the run
+  // never reached the fingerprint, and the timing assertion was passing on a tree
+  // that could not exhibit anything.
+  //
+  // That also sharpens what the guard is FOR. `fingerprint` can only meet a
+  // non-regular file two ways: a symlink, which git does report and which is hashed
+  // by its target text without being followed; or a regular file that git reported
+  // and that something replaces between the lstat and the open. The second is a
+  // race, and it is not reproducible on demand -- so the guard against it is stated
+  // here and in the source rather than pretended at with a manifest entry. The half
+  // that IS deterministic is asserted directly.
+  const root = tmpRoot("sweep-fifo-");
+  const fifo = join(root, "pipe.tmp");
+  // POSIX ONLY, and NOT silently. `mkfifo` does not exist on Windows, where this
+  // project supports running the suite, so the control asserting it works made the
+  // whole file fail there before exercising anything. A platform gate that prints
+  // PASS would be worse -- that is a skip wearing a pass, which is the shape this
+  // file exists to catch -- so the unsupported platform gets its own line saying the
+  // case could not be built, and the guard's state there is stated in the source:
+  // untested, because the fixture cannot exist.
+  const made = process.platform === "win32"
+    ? { status: null, stderr: "mkfifo is POSIX-only" }
+    : spawnSync("mkfifo", [fifo], { encoding: "utf8" });
+  if (process.platform === "win32") {
+    console.log("SKIP  a fifo fingerprints as a marker instead of blocking on its open " +
+                "(POSIX only: mkfifo does not exist on Windows)");
+  } else {
+    check(made.status === 0, "control: mkfifo is available, so this case can be built at all", made.stderr);
+  }
+  if (made.status === 0) {
+    // IN A CHILD, WITH A TIMEOUT, and the bound is the whole point.
+    //
+    // The first version called `fingerprint` in process and then checked elapsed
+    // time. `open` on a fifo blocks in the SYSTEM CALL until a writer appears, so
+    // with the guard removed the check would never evaluate at all: the test hangs
+    // instead of failing, and a hang reports nothing while looking like work still
+    // in progress. No care taken inside the test can bound that -- the bound has to
+    // be outside the process doing the blocking.
+    const probe = spawnSync(process.execPath, ["-e",
+      `import(${JSON.stringify(pathToFileURL(LIB).href)})` +
+      `.then(m => process.stdout.write(String(m.fingerprint(process.argv[1]))))`,
+      fifo], { encoding: "utf8", timeout: 15_000 });
+    check(probe.signal === null && probe.stdout === "<not a regular file>",
+      "a fifo fingerprints as a marker instead of blocking on its open",
+      `signal=${probe.signal} stdout=${JSON.stringify(probe.stdout)} stderr=${String(probe.stderr).slice(0, 200)}`);
+    // CONTROL: the probe mechanism itself reports a real answer for a real file, so
+    // the assertion above cannot be satisfied by the probe simply never working.
+    const reg = join(root, "plain.txt");
+    writeFileSync(reg, "content");
+    const ok = spawnSync(process.execPath, ["-e",
+      `import(${JSON.stringify(pathToFileURL(LIB).href)})` +
+      `.then(m => process.stdout.write(String(m.fingerprint(process.argv[1]))))`,
+      reg], { encoding: "utf8", timeout: 15_000 });
+    check(ok.signal === null && /^[0-9a-f]{16}$/.test(ok.stdout ?? ""),
+      "control: the same probe returns a real fingerprint for a regular file",
+      `stdout=${JSON.stringify(ok.stdout)} stderr=${String(ok.stderr).slice(0, 200)}`);
+  }
 }
 
 console.log(fail ? `\nFAILED ${fail}` : "\nok");

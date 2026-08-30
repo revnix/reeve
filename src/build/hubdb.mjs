@@ -752,16 +752,27 @@ export function shapeOf(db) {
     // is `NOT NULL DEFAULT 'p2'` and callers omit it; a snapshot that lost the
     // default keeps every row valid and passes an integrity check, then fails the
     // first ordinary insert with a NOT NULL violation after being restored.
+    // `table_xinfo`, NOT `table_info`: the latter omits GENERATED columns
+    // entirely, so a snapshot could carry a generated NOT NULL column that
+    // refuses ordinary inserts while reading as having no extra columns at all.
+    // `hidden` is 0 for an ordinary column, 2 for VIRTUAL and 3 for STORED.
     for (const c of db.prepare(
-      `SELECT name, type, "notnull", pk, dflt_value FROM pragma_table_info(?)`).all(t))
+      `SELECT name, type, "notnull", pk, dflt_value, hidden FROM pragma_table_xinfo(?)`).all(t))
       columns[c.name] = { type: String(c.type ?? "").toUpperCase(),
                           notNull: Number(c.notnull) === 1, pk: Number(c.pk) > 0,
-                          dflt: c.dflt_value == null ? null : String(c.dflt_value) };
+                          dflt: c.dflt_value == null ? null : String(c.dflt_value),
+                          generated: Number(c.hidden) > 1 };
 
     const indexes = {};
     for (const i of db.prepare(`SELECT name, "unique", origin FROM pragma_index_list(?)`).all(t)) {
-      const cols = db.prepare(`SELECT name FROM pragma_index_info(?) ORDER BY seqno`)
-                     .all(i.name).map(r => r.name);
+      // `index_xinfo` carries the COLLATION and sort order of each key;
+      // `index_info` discards both. An index recreated as
+      // `... (idempotency_key COLLATE NOCASE)` keeps its name, column,
+      // uniqueness and predicate, and silently imposes stricter uniqueness --
+      // two keys differing only by case stop being distinct.
+      const cols = db.prepare(
+        `SELECT name, coll, desc FROM pragma_index_xinfo(?) WHERE key = 1 ORDER BY seqno`)
+        .all(i.name).map(r => `${r.name} ${String(r.coll ?? "BINARY").toUpperCase()}${Number(r.desc) ? " DESC" : ""}`);
       // AN IMPLICIT INDEX IS KEYED BY ITS COLUMNS, NOT ITS NAME. SQLite names the
       // indexes it creates for PRIMARY KEY and UNIQUE `sqlite_autoindex_<table>_<n>`,
       // and the number is positional -- so dropping an unrelated constraint
@@ -778,7 +789,7 @@ export function shapeOf(db) {
       const where = ddl ? (ddl.match(/\bWHERE\b([\s\S]*)$/i)?.[1] ?? "").replace(/\s+/g, " ").trim() : "";
       const key = i.origin === "c" ? `name:${i.name}` : `cols:${cols.join(",")}`;
       indexes[key] = { unique: Number(i.unique) === 1, columns: cols, explicit: i.origin === "c",
-                       name: i.name, where };
+                       name: i.name, where, ddl: ddl ?? null };
     }
 
     const foreignKeys = {};
@@ -789,7 +800,8 @@ export function shapeOf(db) {
 
     const props = propsOf.get(t) ?? { strict: false, withoutRowid: false };
     tables[t] = { columns, indexes, foreignKeys, strict: props.strict,
-                  withoutRowid: props.withoutRowid, checks: checksOf(db, t) };
+                  withoutRowid: props.withoutRowid, checks: checksOf(db, t),
+                  ddl: ddlOf(db, "table", t) };
   }
   return { tables, triggers };
 }
@@ -808,22 +820,86 @@ export function shapeOf(db) {
  * leaves existing rows valid and every integrity check clean, then refuses the
  * ordinary insert that relies on the `'p2'` default.
  */
+function ddlOf(db, type, name) {
+  return db.prepare("SELECT sql FROM sqlite_master WHERE type = ? AND name = ?")
+           .get(type, name)?.sql ?? null;
+}
+
+/**
+ * Split DDL into (text, isCode) runs, so a parenthesis inside a STRING LITERAL
+ * is never read as syntax.
+ *
+ * The first version of the CHECK scanner counted every `(` and `)`. A constraint
+ * containing `'(('` left the depth counter positive through the table's closing
+ * parenthesis, so that constraint was silently dropped -- and dropping it made
+ * the remaining checks compare equal, certifying a snapshot that refuses
+ * ordinary writes. A scanner that loses its place must not also lose the
+ * evidence that it did.
+ */
+function codeRuns(sql) {
+  const runs = [];
+  let i = 0, start = 0;
+  while (i < sql.length) {
+    const c = sql[i];
+    if (c === "'" || c === '"' || c === "`") {
+      runs.push({ text: sql.slice(start, i), code: true });
+      const quote = c;
+      let j = i + 1;
+      // Doubled quotes escape themselves in SQL; there is no backslash escape.
+      while (j < sql.length) {
+        if (sql[j] === quote && sql[j + 1] === quote) { j += 2; continue; }
+        if (sql[j] === quote) break;
+        j++;
+      }
+      runs.push({ text: sql.slice(i, j + 1), code: false });
+      i = start = j + 1;
+      continue;
+    }
+    if (c === "-" && sql[i + 1] === "-") {
+      runs.push({ text: sql.slice(start, i), code: true });
+      const j = sql.indexOf("\n", i);
+      const end = j === -1 ? sql.length : j;
+      runs.push({ text: sql.slice(i, end), code: false });
+      i = start = end;
+      continue;
+    }
+    i++;
+  }
+  runs.push({ text: sql.slice(start), code: true });
+  return runs;
+}
+
+/** A parenthesis-depth map over the DDL that ignores literals and comments. */
+function isCodeAt(sql) {
+  const flags = new Array(sql.length).fill(false);
+  let at = 0;
+  for (const run of codeRuns(sql)) {
+    for (let k = 0; k < run.text.length; k++) flags[at + k] = run.code;
+    at += run.text.length;
+  }
+  return flags;
+}
+
 function checksOf(db, table) {
-  const ddl = db.prepare(
-    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)?.sql ?? "";
+  const ddl = ddlOf(db, "table", table) ?? "";
+  const code = isCodeAt(ddl);
   const out = [];
   const re = /\bCHECK\s*\(/gi;
   let m;
   while ((m = re.exec(ddl))) {
+    if (!code[m.index]) continue;            // the keyword itself was inside a literal
     let depth = 1, i = m.index + m[0].length;
     for (; i < ddl.length && depth > 0; i++) {
+      if (!code[i]) continue;                 // parens inside literals are text
       if (ddl[i] === "(") depth++;
       else if (ddl[i] === ")") depth--;
     }
-    // An unbalanced tail means the scan lost its place; recording a truncated
-    // constraint would compare two different wrong things.
-    if (depth !== 0) continue;
-    out.push(ddl.slice(m.index + m[0].length, i - 1).replace(/\s+/g, " ").trim());
+    // A constraint whose parentheses do not balance is RECORDED, not skipped.
+    // Skipping it made the remaining checks compare equal and certified the
+    // snapshot -- the scanner's own failure read as agreement.
+    out.push(depth === 0
+      ? ddl.slice(m.index + m[0].length, i - 1).replace(/\s+/g, " ").trim()
+      : `UNPARSED: ${ddl.slice(m.index, Math.min(ddl.length, m.index + 80)).replace(/\s+/g, " ")}`);
   }
   return out.sort();
 }
@@ -954,6 +1030,42 @@ export function schemaDefectsAt(db, version) {
       const removed = wantTable.checks.filter((c) => !haveTable.checks.includes(c));
       if (added.length)   bad.push(`table ${t} adds CHECK (${added[0]}), which can refuse writes`);
       if (removed.length) bad.push(`table ${t} is missing CHECK (${removed[0]})`);
+    }
+
+    // ── THE BACKSTOP ─────────────────────────────────────────────────────────
+    //
+    // Everything above reads SPECIFIC properties, and that list is an open
+    // enumeration of SQLite features: generated columns, key collation, ON
+    // CONFLICT policies, and CHECK text each hid there in turn, and each
+    // certified a snapshot that refuses ordinary writes. Closing the COMPARISON
+    // did not close the READER.
+    //
+    // So the definitions are compared as text as well. This is complete by
+    // construction -- anything nobody has thought to read is still caught --
+    // and it is safe here for a reason I got wrong the first time: a snapshot
+    // and the scratch store are both produced by EXECUTING THE SAME MIGRATION
+    // SOURCE, so their stored DDL is byte-identical. Measured: two
+    // independently created hubs agree on all 58 objects. The earlier argument
+    // against comparing text came from a fixture that wrote the same table two
+    // ways by hand, which is not how either store is ever built.
+    //
+    // The specific checks above are what stays: they name the defect. This only
+    // says THAT something differs, which is the right trade for completeness.
+    //
+    // It is skipped for an object carrying a PERMITTED extra, because an extra
+    // nullable column or non-unique index legitimately changes the text, and
+    // refusing those would break restoring a newer binary's snapshot.
+    const extraCols = Object.keys(haveTable.columns).filter((c) => !(c in wantTable.columns));
+    const extraIdx  = Object.keys(haveTable.indexes).filter((k) => !(k in wantTable.indexes));
+    if (!extraCols.length && !extraIdx.length &&
+        wantTable.ddl != null && haveTable.ddl != null && wantTable.ddl !== haveTable.ddl)
+      bad.push(`table ${t}'s definition differs from this schema in a way the ` +
+               `property checks do not name -- compare its CREATE statement`);
+
+    for (const [key, w] of Object.entries(wantTable.indexes)) {
+      const h = haveTable.indexes[key];
+      if (h && w.ddl != null && h.ddl != null && w.ddl !== h.ddl)
+        bad.push(`index ${w.name} on ${t} is defined differently from this schema`);
     }
 
     if (wantTable.strict && !haveTable.strict) bad.push(`table ${t} is not STRICT`);

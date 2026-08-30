@@ -308,7 +308,7 @@ const rebuild = (db, table, transform) => {
 {
   const d = damaged("extra-unique", (db) =>
     db.exec("CREATE UNIQUE INDEX surprise_unique ON task(project)"));
-  check(d.some(s => s.startsWith("unique index surprise_unique on task(project) is not in this schema")),
+  check(d.some(s => s.startsWith("unique index surprise_unique on task(project BINARY) is not in this schema")),
     "an EXTRA unique index is refused, because it rejects writes this schema permits",
     d.slice(0, 3).join("; "));
 
@@ -357,6 +357,80 @@ const rebuild = (db, table, transform) => {
     e.slice(0, 3).join("; "));
 }
 
+// ── class 15: a GENERATED column ─────────────────────────────────────────────
+//
+// `pragma_table_info` omits generated columns entirely, so a snapshot could
+// carry one that refuses ordinary inserts while reading as having no extra
+// columns at all -- invisible to the extra-column rule AND to the text
+// backstop's exemption for it. Read through `table_xinfo` now.
+{
+  const d = damaged("generated", (db) =>
+    db.exec("ALTER TABLE provider_state ADD COLUMN surprise INTEGER " +
+            "GENERATED ALWAYS AS (CASE WHEN guardian_reserved = 1 THEN NULL ELSE 1 END) VIRTUAL NOT NULL"));
+  check(d.length > 0,
+    "a snapshot carrying a GENERATED NOT NULL column is refused, though table_info cannot see it",
+    d.slice(0, 3).join("; "));
+  check(d.some(s => s.includes("surprise")),
+    "and the offending column is NAMED", d.slice(0, 3).join("; "));
+}
+
+// ── class 16: an index key's COLLATION ───────────────────────────────────────
+//
+// `pragma_index_info` discards collation. `task_idem` recreated as
+// `(idempotency_key COLLATE NOCASE)` keeps its name, its column, its uniqueness
+// and its predicate, and silently imposes stricter uniqueness: two keys
+// differing only by case stop being distinct, and the second insert fails.
+{
+  const d = damaged("collation", (db) => {
+    db.exec("DROP INDEX task_idem");
+    db.exec("CREATE UNIQUE INDEX task_idem ON task(idempotency_key COLLATE NOCASE) " +
+            "WHERE idempotency_key IS NOT NULL");
+  });
+  check(d.length > 0,
+    "an index whose key COLLATION changed is refused, though name, column, uniqueness and predicate match",
+    d.slice(0, 3).join("; "));
+  check(d.some(s => s.includes("task_idem")), "and the index is NAMED", d.slice(0, 3).join("; "));
+}
+
+// ── class 17: a CHECK containing a parenthesis inside a STRING ───────────────
+//
+// The scanner counted every parenthesis as syntax, so `'(('` left its depth
+// counter positive through the table's closing parenthesis. The constraint was
+// dropped, and dropping it made the REMAINING checks compare equal -- the
+// scanner's own failure reading as agreement, which is the worst way for an
+// instrument to fail.
+{
+  const d = damaged("check-in-string", (db) =>
+    rebuild(db, "task", (ddl) =>
+      ddl.replace("  UNIQUE (source_kind, source_key)",
+                  "  CHECK (priority = 'p1' OR title = '(('),\n  UNIQUE (source_kind, source_key)")));
+  check(d.length > 0,
+    "a CHECK containing a parenthesis inside a string literal is still SEEN, not skipped",
+    d.slice(0, 3).join("; "));
+  check(d.some(s => s.includes("adds CHECK")),
+    "and it is reported as an added constraint", d.slice(0, 3).join("; "));
+}
+
+// ── class 18: a constraint's ON CONFLICT policy ──────────────────────────────
+//
+// No pragma exposes it. Every column, index, foreign key, CHECK and table
+// property stays identical, so only the text backstop catches this -- which is
+// the case the backstop exists for. A plain insert then REPLACES an existing
+// task sharing a source identity, deleting an authority-bearing row and its
+// dependent state rather than refusing the duplicate.
+{
+  const d = damaged("on-conflict", (db) =>
+    rebuild(db, "task", (ddl) =>
+      ddl.replace("UNIQUE (source_kind, source_key)",
+                  "UNIQUE (source_kind, source_key) ON CONFLICT REPLACE")));
+  check(d.length > 0,
+    "a changed ON CONFLICT policy is refused, though no pragma reports it",
+    d.slice(0, 3).join("; "));
+  check(d.some(s => s.includes("definition differs")),
+    "and the backstop is what names it, since the property checks cannot",
+    d.slice(0, 3).join("; "));
+}
+
 // ── extra is not a defect ────────────────────────────────────────────────────
 //
 // One-directional deliberately. A snapshot taken by a NEWER binary carries more
@@ -390,8 +464,25 @@ const rebuild = (db, table, transform) => {
   check(sqlOf(alter).replace(/\s+/g, " ") !== sqlOf(fresh).replace(/\s+/g, " "),
     "control: the same logical table written two ways really does store different DDL text",
     `${JSON.stringify(sqlOf(alter))} vs ${JSON.stringify(sqlOf(fresh))}`);
-  check(JSON.stringify(shapeOf(alter)) === JSON.stringify(shapeOf(fresh)),
-    "yet the STRUCTURAL shape of the two is identical, which is why the text is not compared");
+  // AND THE STRUCTURAL PROPERTIES STILL AGREE. This is why the property checks
+  // are the ones that NAME a defect: they are immune to how the DDL was
+  // written, so their messages can be trusted.
+  const structural = (d) => {
+    const t = shapeOf(d).tables.t;
+    return JSON.stringify({ columns: t.columns, indexes: t.indexes, checks: t.checks,
+                            strict: t.strict, withoutRowid: t.withoutRowid,
+                            foreignKeys: t.foreignKeys });
+  };
+  check(structural(alter) === structural(fresh),
+    "yet every structural property of the two is identical, which is why those checks name the defects");
+
+  // THE TEXT BACKSTOP IS A DIFFERENT INSTRUMENT WITH A DIFFERENT PRECONDITION.
+  // It is complete -- it catches what no pragma exposes -- and it is sound only
+  // between stores built from the SAME migration source, which is the case it
+  // is applied to. Two hand-written spellings are exactly the case it would get
+  // wrong, so the limit is asserted here rather than assumed.
+  check(shapeOf(alter).tables.t.ddl !== shapeOf(fresh).tables.t.ddl,
+    "while their DDL differs, so the text backstop is sound only between stores built the same way");
   alter.close(); fresh.close();
 }
 

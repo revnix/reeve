@@ -30,6 +30,7 @@ import { writeFileSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { resolveHome, DEFAULT_HOME } from "./home.mjs";
+import { ARTIFACT_FILE } from "./paths.mjs";
 
 /**
  * Read-only git. A fixer has to see what it is changing, and none of these can
@@ -854,6 +855,20 @@ const matchesAny = (file, globs) => (globs ?? []).some(g => toRe(g).test(file));
  * and pushing nothing as though it were a repair is absence read as success.
  */
 export function reviewDiff({ files, profile, lane = null, action = null }) {
+  // THE SIBLING'S PHASES ARE NOT THIS FUNCTION'S. A report phase produces an
+  // artifact and no diff, so it would arrive here with an empty file list and be
+  // refused as "the worker produced an empty diff" -- a refusal that reads as the
+  // worker's fault and is the gate's. Throwing is deliberate: reaching this
+  // function with an artifact phase is a wiring error at the dispatch seam, not
+  // an operator condition, and an operator cannot act on it.
+  //
+  // The phase set is DERIVED from the one place that declares which phases
+  // produce an artifact. Listing the three names here would be a second
+  // inventory of that map, and it would agree with it right up until a fourth
+  // report phase was added -- at which point this guard would silently stop
+  // covering the new one.
+  if (action !== null && Object.hasOwn(ARTIFACT_FILE, action))
+    throw new Error(`${action} produces an artifact, not a diff; reviewArtifact is its gate`);
   const risk = profile?.risk ?? {};
   // null is "could not ask git", which is not the same as "nothing changed" and
   // must not be reported as it. Both refuse; only one of them is the worker's fault.

@@ -766,6 +766,150 @@ const filed = {};
   check(inside?.id === filed.full, "and a real read through it returns the model", String(inside?.id));
 }
 
+
+// ── the headline's age is the headline's own ────────────────────────────────
+//
+// A single `since` filled by whichever branch happened to run first reported the
+// quota request's moment while `first` named a founder hold. Anything measuring
+// "how long has this been waiting" then got the age of a different condition, and
+// got it silently, because both are plausible integers.
+{
+  const m = taskShow(db, filed.both, { now: NOW, switchesFor: resolver() });
+  check(m.waiting.first === "WAITING_FOR_FOUNDER" && m.waiting.all.includes("WAITING_FOR_QUOTA"),
+    "control: this task has a founder hold AND a queued lease", JSON.stringify(m.waiting));
+  check(m.waiting.since === NOW - 600,
+    "`since` is the FOUNDER hold's moment, the wait the headline names",
+    `${m.waiting.since} (hold at ${NOW - 600}, lease at ${NOW - 30})`);
+  check(m.waiting.since !== NOW - 30,
+    "and not the queued lease's, which is a different condition", String(m.waiting.since));
+
+  // THE CASE THAT EXHIBITS THE DEFECT, and the fixture has to carry BOTH halves
+  // or the two implementations agree. A queued lease beside a HIGHER-priority
+  // wait is where the old code borrowed the lease's moment for a headline that
+  // was not the lease: with only a founder hold, or only a lease, the broken and
+  // the correct answer are the same integer.
+  db.prepare(`INSERT INTO provider_lease(owner,repo_id,run_ref,pid,lstart,status,requested_at,expires_at)
+              VALUES('builder',1,?,997,'L','queued',?,?)`)
+    .run(builderRunRef(filed.cap, "FILED"), NOW - 42, NOW + 300);
+  const capOff = taskShow(db, filed.cap, { now: NOW,
+    switchesFor: () => ({ ...ALL_ON, observe: false }) });
+  check(capOff.waiting.first === "WAITING_FOR_CAPABILITY" &&
+        capOff.waiting.all.includes("WAITING_FOR_QUOTA"),
+    "control: the capability wait outranks a queued lease that is also standing",
+    JSON.stringify(capOff.waiting));
+  check(capOff.waiting.since === null,
+    "a switch being off is a state, not an event, so `since` is null rather than the lease's moment",
+    `${capOff.waiting.since} (the lease was requested at ${NOW - 42})`);
+  check(capOff.waiting.since !== NOW - 42,
+    "and specifically not the queued lease's, which is what the headline is NOT",
+    String(capOff.waiting.since));
+
+  // And a wait that DOES have a moment reports its own, not the lease's.
+  const codex = taskShow(db, filed.cap, { now: NOW, switchesFor: resolver() });
+  check(codex.waiting.first === "WAITING_FOR_QUOTA" && codex.waiting.since === NOW - 42,
+    "control: once the switch is on, the lease IS the headline and `since` is its moment",
+    JSON.stringify(codex.waiting));
+  db.prepare("DELETE FROM provider_lease WHERE run_ref = ?").run(builderRunRef(filed.cap, "FILED"));
+}
+
+// ── the overview must not render UNKNOWN as `not waiting` ───────────────────
+{
+  const blind = taskList(db, { now: NOW, switchesFor: switchesResolver({}, readProfile) });
+  const text = renderList(blind);
+  check(blind.every(m => m.waiting.capability_known === false || m.waiting.first !== null),
+    "control: every row in this listing has an unreadable capability",
+    JSON.stringify(blind.map(m => m.waiting.capability_known)));
+  check(/UNKNOWN/.test(text),
+    "the list prints UNKNOWN where the capability could not be read", text.split("\n")[0]);
+  check(!/ - /.test(text),
+    "and never a dash, which is what a task known NOT to be waiting prints", text.split("\n")[0]);
+
+  // CONTROL: a readable listing still prints the dash, or the change is a blanket
+  // relabel rather than a distinction.
+  const seen = renderList(taskList(db, { now: NOW, switchesFor: resolver() }));
+  check(/ - /.test(seen), "control: a readable listing still prints a dash for a task that waits for nothing",
+    (seen.split("\n").find(l => / - /.test(l)) ?? "").slice(0, 80));
+}
+
+// ── a drifted run must not read as current ─────────────────────────────────
+{
+  const drifted = (await file({ title: "a drifted run", territory: ["packages/d"] })).task;
+  setPhase(drifted, "RESEARCH");
+  db.prepare(`INSERT INTO phase_run(task,generation,phase,slice,attempt,status,pid,lstart,started_at,
+                                    heartbeat_at,lease_expires_at,out_path,err_path,contract_drift)
+              VALUES(?,1,'RESEARCH',0,1,'live',400,'L',?,?,?,'/o','/e',?)`)
+    .run(drifted, NOW - 100, NOW - 10, NOW + 600, JSON.stringify({ model_id: "asked for y" }));
+  const m = taskShow(db, drifted, { now: NOW, switchesFor: resolver() });
+  check(m.running !== null, "control: the task has a live run", JSON.stringify(m.running));
+  check(m.running.drift !== null && /model_id/.test(String(m.running.drift)),
+    "show reports the run's contract drift rather than dropping the column",
+    JSON.stringify(m.running.drift));
+
+  // CONTROL: a run with no drift says null, or the field is not reporting drift
+  // so much as reporting that a run exists.
+  db.prepare("UPDATE phase_run SET contract_drift = NULL WHERE task = ?").run(drifted);
+  check(taskShow(db, drifted, { now: NOW, switchesFor: resolver() }).running.drift === null,
+    "control: and a run whose contract matched says null");
+  db.prepare("DELETE FROM phase_run WHERE task = ?").run(drifted);
+}
+
+// ── the lineage carries the WHOLE contract snapshot ────────────────────────
+//
+// These columns define the sandbox and the prompt a run actually executed under.
+// A lineage carrying only the model and the budget cannot answer "what exactly
+// ran", which is the question `why` exists for.
+{
+  const CONTRACT = ["argv_hash", "prompt_hash", "settings_hash", "tools_hash", "agents_hash",
+                    "canary_id", "snapshot_hash", "model_id", "cli_version", "effort",
+                    "max_turns", "max_budget_usd"];
+  db.prepare(`UPDATE phase_run SET argv_hash='av', prompt_hash='pr', settings_hash='se',
+                                   tools_hash='to', agents_hash='ag', canary_id='ca'
+              WHERE task = ? AND generation = 1`).run(filed.full);
+  const r = whyModel(db, filed.full, { now: NOW }).runs[0];
+  const missing = CONTRACT.filter(c => !(c in r));
+  check(missing.length === 0, "every contract-snapshot column reaches the lineage",
+    `missing: ${missing.join(", ")}`);
+  check(r.argv_hash === "av" && r.canary_id === "ca",
+    "and carries the values, not merely the keys", JSON.stringify(r));
+
+  // The columns are DERIVED from the table rather than retyped, so a column added
+  // to phase_run's contract family is visible here the day it is added.
+  const declared = db.prepare("SELECT name FROM pragma_table_info('phase_run')").all().map(x => x.name);
+  const absent = CONTRACT.filter(c => !declared.includes(c));
+  check(absent.length === 0, "control: every column this asserts is one phase_run really declares",
+    `not columns: ${absent.join(", ")}`);
+}
+
+// ── a founder approval is founder evidence ─────────────────────────────────
+{
+  const fa = (await file({ title: "an approved round", territory: ["packages/a2"] })).task;
+  db.prepare(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+              VALUES(?, 'spec', NULL, NULL, 5, 21, 'headZ', ?)`).run(fa, NOW - 300);
+  db.prepare(`INSERT INTO gate_request(task,spec_repo_id,spec_pr,head_sha,round,task_generation,requested_at)
+              VALUES(?,5,21,'headZ',0,1,?)`).run(fa, NOW - 250);
+
+  const before = whyModel(db, fa, { now: NOW }).gate[0];
+  check(before.founder_acked === false && before.founder_evidence === null,
+    "control: with no approval and no receipt the round reads `not yet`", JSON.stringify(before));
+
+  db.prepare(`INSERT INTO approval(task,spec_repo_id,spec_pr,head_sha,actor_id,actor_login_snapshot,
+                                   kind,verdict,observed_at,source_id,task_generation)
+              VALUES(?,5,21,'headZ',9,'mobeenabdullah','founder_review','approve',?, 'rev-77',1)`)
+    .run(fa, NOW - 100);
+  const after = whyModel(db, fa, { now: NOW }).gate[0];
+  check(after.founder_acked === true,
+    "a founder_review approval answers the round, with no notice receipt anywhere",
+    JSON.stringify(after));
+  check(after.founder_evidence?.kind === "founder_review" &&
+        after.founder_evidence?.source_id === "rev-77" &&
+        after.founder_evidence?.actor === "mobeenabdullah",
+    "and the lineage names WHICH evidence and where it came from", JSON.stringify(after.founder_evidence));
+  check(/founder_review/.test(renderWhy(whyModel(db, fa, { now: NOW }))) &&
+        /rev-77/.test(renderWhy(whyModel(db, fa, { now: NOW }))),
+    "and the render says so rather than a bare `acked`",
+    renderWhy(whyModel(db, fa, { now: NOW })).slice(0, 700));
+}
+
 // ── the CLI: compute -> data -> render ───────────────────────────────────────
 //
 // The JSON is the interface; the text is not, and it says so in its own comments

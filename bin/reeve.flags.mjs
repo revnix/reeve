@@ -45,7 +45,12 @@ export const APPLIES = Object.freeze({
   // this CLI's table is accepted by every command, so `reeve restore --dry-run`
   // parsed cleanly and restore never read it. The flag whose entire promise is
   // "write nothing" was silently ignored by the most destructive command here.
-  "dry-run": Object.freeze(["task"]),
+  // SUBCOMMAND-QUALIFIED, and it has to be. `task file` implements `--dry-run`;
+  // `task list`, `task show` and `task why` are readers that never look at it, so
+  // a route-level entry accepted it there and did nothing -- recreating, inside
+  // the gate built to prevent it, exactly the accepted-and-inert flag it exists
+  // to refuse. An entry containing a space names `<command> <subcommand>`.
+  "dry-run": Object.freeze(["task file"]),
 });
 
 /**
@@ -55,14 +60,27 @@ export const APPLIES = Object.freeze({
  * as a branch. `cmd` may be undefined -- `reeve --json` with no command at all --
  * and that is a usage error the caller already answers, so it is not this one.
  */
-export function inapplicable(cmd, flags) {
+export function inapplicable(cmd, flags, sub = null) {
   if (!cmd) return null;
   // Sorted, so the refusal an operator sees does not depend on the order they
   // happened to type two inapplicable flags in.
   for (const name of [...flags].sort()) {
     const allowed = APPLIES[name];
-    if (!allowed || allowed.includes(cmd)) continue;
-    return { flag: name, cmd, allowed: [...allowed] };
+    if (!allowed) continue;
+    if (allowed.includes(cmd)) continue;
+    if (sub && allowed.includes(`${cmd} ${sub}`)) continue;
+    // A SUBCOMMAND-QUALIFIED ENTRY WITH NO SUBCOMMAND TYPED IS NOT DECIDED HERE.
+    // `reeve task --dry-run` names no subcommand, so the flag cannot yet be
+    // called inapplicable -- and the route is about to refuse the missing
+    // subcommand anyway. Answering the flag first would report the wrong error
+    // for the wrong reason.
+    const qualified = allowed.some(a => a.startsWith(`${cmd} `));
+    if (!sub && qualified) continue;
+    // NAME THE SUBCOMMAND ONLY WHERE ONE IS MEANT. `positionals[0]` is a
+    // subcommand for the routes that have them and an ARGUMENT for the rest --
+    // `reeve why 1 o/r` would otherwise be refused as `why 1`, naming a pull
+    // request number as though it were a verb.
+    return { flag: name, cmd: qualified ? `${cmd} ${sub}` : cmd, allowed: [...allowed] };
   }
   return null;
 }

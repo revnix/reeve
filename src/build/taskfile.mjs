@@ -8,7 +8,7 @@ import { normalizeClaim, resolveSnapshot, admitTask } from "./registry.mjs";
 import { readStart } from "../supervisor.mjs";
 import { withWriterLease } from "./locks.mjs";
 import { liveLeases, firstConflict, conflictRefusal } from "./territory.mjs";
-import { titleHash } from "./registryio.mjs";
+import { titleHash, filingTextHash } from "./registryio.mjs";
 
 const DEPTHS = ["trivial", "standard", "deep"];
 const PRIORITIES = ["p1", "p2"];
@@ -85,16 +85,28 @@ export function pinSeconds(raw) {
  * value of the flag is telling the founder what the real transaction would hit.
  */
 export function dryRunPlan({ project, snapshot, claims, held, switches }) {
+  // DEDUPLICATED, because admission is. `packages/x` and `packages/./x`
+  // normalize to one claim and `admitTask` collapses them, so a plan that
+  // counted both would report two claims and two identical conflicts for
+  // territory that resolves to one -- a preview that does not describe the
+  // transaction it is previewing.
+  const seen = new Set();
+  const unique = (claims ?? []).filter(c => {
+    const key = `${c.kind}\u0000${c.path}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
   return {
     project, nwo: snapshot.nwo, profileHash: snapshot.profileHash,
-    territory: claims.map(c => ({ kind: c.kind, path: c.path })),
-    conflicts: claims.map(c => { const l = firstConflict(c, held, null); return l ? conflictRefusal(c, l) : null; })
+    territory: unique.map(c => ({ kind: c.kind, path: c.path })),
+    conflicts: unique.map(c => { const l = firstConflict(c, held, null); return l ? conflictRefusal(c, l) : null; })
                      .filter(Boolean),
     // The classifier has not run, so no floor can have fired yet. The list is
     // the floors that WOULD apply to this territory, which is what the founder
     // is asking; an empty array here means none of them can, not that none were
     // considered.
-    floors: claims.length > 1 ? ["territory spans more than one claim; sizing floors are evaluated after SIZING"] : [],
+    floors: unique.length > 1 ? ["territory spans more than one claim; sizing floors are evaluated after SIZING"] : [],
     switches,
   };
 }
@@ -109,7 +121,7 @@ export function dryRunPlan({ project, snapshot, claims, held, switches }) {
 export async function fileTask({ db, registry, project, title, territory,
                                  body = null, depth = null, priority = "p2",
                                  idempotencyKey = null, anyway = false, dryRun = false,
-                                 switches = {}, io, isAlive,
+                                 pinSeconds = null, switches = {}, io, isAlive,
                                  pid = process.pid, lstart = readStart(process.pid) }) {
   // NO DEFAULT, and a throw rather than a fallback, because NEITHER default is
   // safe and the choice is not this function's to make. `assertWritable` throws
@@ -138,7 +150,10 @@ export async function fileTask({ db, registry, project, title, territory,
   // would still take and release the writer lease in its own committed
   // transactions outside the rollback, and restore would see a writer that a
   // dry run should never have created.
-  const held = liveLeases(db, project);
+  // A DRY RUN MAY HAVE NO STORE. The route declines to create one, so there are
+  // no leases to read and no conflicts to report -- which is the true answer for
+  // a home where nothing has ever been filed, not a missing one.
+  const held = db ? liveLeases(db, project) : [];
   if (dryRun) return { ok: true, dryRun: true,
     plan: dryRunPlan({ project, snapshot, claims: filing.claims, held, switches }) };
 
@@ -150,8 +165,12 @@ export async function fileTask({ db, registry, project, title, territory,
   try {
     const r = withWriterLease(db,
       { command: "reeve task file", pid, lstart, isAlive },
-      () => admitTask(db, snapshot, { id, project, title, body,
-        sourceKind: "founder", sourceKey, idempotencyKey }, { isAlive }));
+      () => admitTask(db, snapshot, { id, project, title, body, depth, priority,
+        sourceKind: "founder", sourceKey, idempotencyKey,
+        textHash: filingTextHash(title, body), filedVia: "cli",
+        pinTerritory: pinSeconds != null,
+        pinnedUntil: pinSeconds != null ? Math.trunc(Date.now() / 1000) + pinSeconds : undefined },
+        { isAlive }));
     if (!r.ok) return { ok: false, refusal: r.refusal };
     // The evidence id is the seq of the row `admitTask` appended for THIS task,
     // read back rather than guessed: `hubEvent` returns the seq inside the

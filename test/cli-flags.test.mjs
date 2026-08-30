@@ -551,6 +551,49 @@ check(existsSync(join(repo, ".git")),
     "and the suggestion now reaches the new flag", bad.out.split("\n")[0]);
 }
 
+// ── `--dry-run` is scoped to the commands that implement it ─────────────────
+//
+// Every flag in this CLI's table is accepted by every command, so a flag whose
+// entire promise is "write nothing" was parsed cleanly by `restore` -- which
+// never reads it and restores for real. Refusing is the only safe direction: a
+// command that accepts the flag and writes anyway is worse than one that never
+// took it.
+{
+  const r = run("restore", "--dry-run", "--from", "/nonexistent");
+  check(/--dry-run is not implemented by/.test(r.out),
+    "a destructive command REFUSES --dry-run rather than ignoring it", r.out.split("\n")[0]);
+  check(/restore/.test(r.out), "and names the command that cannot honour it", r.out.split("\n")[0]);
+  check(!/unknown flag/.test(r.out),
+    "and it is a scope refusal, not the parser failing to know the flag", r.out.split("\n")[0]);
+
+  // CONTROL: the command that DOES implement it still gets through, so the
+  // refusal above is about scope rather than about the flag being disabled.
+  const t = run("task", "--dry-run");
+  check(/reeve task:/.test(t.out) && !/--dry-run is not implemented/.test(t.out),
+    "control: the command that implements it still reaches its own body", t.out.split("\n")[0]);
+}
+
+// ── A bare `-` is a value, not a flag ───────────────────────────────────────
+//
+// `--body-file -` is documented and is the universal stdin sentinel, but every
+// token beginning with `-` was classified as a flag, so the parser refused the
+// documented form before any route could read stdin.
+{
+  const r = run("task", "file", "--body-file", "-");
+  check(!/expects a value/.test(r.out),
+    "--body-file - is accepted as a value rather than refused as a flag", r.out.split("\n")[0]);
+  check(!/Got the flag -/.test(r.out), "and is not reported as a flag", r.out.split("\n")[0]);
+
+  // CONTROL: a real flag in a value position is STILL refused, so the change
+  // admits exactly `-` rather than widening the parser.
+  const bad = run("task", "file", "--title", "--territory");
+  check(/expects a value/.test(bad.out),
+    "control: a real flag in a value position is still refused", bad.out.split("\n")[0]);
+  const neg = run("task", "file", "--title", "-x");
+  check(/expects a value/.test(neg.out),
+    "control: and so is a token that merely starts with a dash", neg.out.split("\n")[0]);
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

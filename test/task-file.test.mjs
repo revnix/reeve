@@ -442,6 +442,98 @@ const base = (db, over = {}) => ({
   db.close();
 }
 
+// ── What the founder typed is what the row records ──────────────────────────
+//
+// `normalizeFiling` validated `--depth` and `--priority` and then nothing
+// carried them to the INSERT, so a filing was accepted, reported as filed, and
+// stored with depth NULL and the schema's 'p2' default. The founder's stated
+// urgency was discarded at the one moment it is recorded, and no assertion
+// anywhere could see it: every message was correct.
+{
+  const db = store();
+  const r = await fileTask(base(db, { title: "deep and urgent", depth: "deep", priority: "p1" }));
+  check(r.ok === true, "control: a filing with a depth and a priority is admitted", JSON.stringify(r));
+  const row = db.prepare("SELECT depth, priority, text_hash, filed_via FROM task WHERE id=?").get(r.task);
+  check(row?.depth === "deep", "the requested depth is stored", JSON.stringify(row));
+  check(row?.priority === "p1", "and so is the requested priority", JSON.stringify(row));
+
+  // PROVENANCE. These columns distinguish a filing a person typed from one a
+  // machine imported, and nothing had ever written them.
+  check(typeof row?.text_hash === "string" && row.text_hash.length === 64,
+    "the filing's text hash is recorded", String(row?.text_hash));
+  check(row?.filed_via === "cli", "and how it was filed", String(row?.filed_via));
+
+  // AND THE DEFAULT IS STILL THE DEFAULT, so the assertions above are about the
+  // values travelling rather than about the columns merely being writable.
+  const d = await fileTask(base(db, { title: "ordinary", territory: ["packages/y"] }));
+  const drow = db.prepare("SELECT depth, priority FROM task WHERE id=?").get(d.task);
+  check(drow?.depth === null && drow?.priority === "p2",
+    "control: a filing that states neither still gets NULL and p2", JSON.stringify(drow));
+  db.close();
+}
+
+// ── A pin is a deadline, and the deadline reaches the lease ─────────────────
+//
+// `--pin-territory 48h` parsed, validated, and then went nowhere: the grant was
+// an ordinary unpinned lease and the command exited 0. A pin with no expiry is
+// territory held until somebody notices.
+{
+  const db = store();
+  const before = Math.trunc(Date.now() / 1000);
+  const r = await fileTask(base(db, { title: "pinned", pinSeconds: 48 * 3600 }));
+  check(r.ok === true, "control: a pinned filing is admitted", JSON.stringify(r));
+  const t = db.prepare("SELECT pinned, pinned_until FROM task_territory WHERE task=?").get(r.task);
+  check(t?.pinned === 1, "the claim is recorded as pinned", JSON.stringify(t));
+  // THE CLAIM OWNS THE DEADLINE. `grantLease` stamps it there on the first grant
+  // and reads it back on every later one, so that is where the promise lives.
+  check(typeof t?.pinned_until === "number" && t.pinned_until >= before + 48 * 3600,
+    "and carries the deadline the duration asked for, not merely a flag",
+    `${t?.pinned_until} vs >= ${before + 48 * 3600}`);
+  const l = db.prepare("SELECT pinned_until FROM territory_lease WHERE task=?").get(r.task);
+  check(l?.pinned_until === t?.pinned_until,
+    "and the lease agrees with it rather than minting its own",
+    `${l?.pinned_until} vs ${t?.pinned_until}`);
+
+  // CONTROL: an unpinned filing is not pinned, so the assertions above are about
+  // the pin travelling rather than about every lease looking pinned.
+  const u = await fileTask(base(db, { title: "unpinned", territory: ["packages/y"] }));
+  const ut = db.prepare("SELECT pinned, pinned_until FROM task_territory WHERE task=?").get(u.task);
+  const ul = db.prepare("SELECT pinned_until FROM territory_lease WHERE task=?").get(u.task);
+  check(!ut?.pinned && ut?.pinned_until == null && ul?.pinned_until == null,
+    "control: a filing with no pin gets an ordinary lease and no deadline",
+    `${JSON.stringify(ut)} ${JSON.stringify(ul)}`);
+  db.close();
+}
+
+// ── The plan deduplicates, because admission does ───────────────────────────
+{
+  const db = store();
+  const r = await fileTask(base(db, { title: "aliased dry run", dryRun: true,
+                                      territory: ["packages/x", "packages/./x"] }));
+  check(r.ok === true && r.dryRun === true, "control: the aliased dry run returns a plan",
+    JSON.stringify(r));
+  check(r.plan?.territory?.length === 1,
+    "two claims that normalize to one are counted once", JSON.stringify(r.plan?.territory));
+  check(r.plan?.floors?.length === 0,
+    "and the multi-claim floor does not fire on what is really one claim",
+    JSON.stringify(r.plan?.floors));
+  db.close();
+}
+
+// ── A dry run needs no store at all ─────────────────────────────────────────
+//
+// The route declines to create one on a fresh home, so `fileTask` has to answer
+// without it rather than throwing. No store means no live leases, which is the
+// true answer rather than a missing one.
+{
+  const r = await fileTask(base(null, { title: "no store", dryRun: true }));
+  check(r.ok === true && r.dryRun === true, "a dry run with no database returns a plan",
+    JSON.stringify(r));
+  check(r.plan?.conflicts?.length === 0,
+    "and reports no conflicts, because there are no leases to conflict with",
+    JSON.stringify(r.plan?.conflicts));
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

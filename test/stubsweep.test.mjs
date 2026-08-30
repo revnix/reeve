@@ -45,6 +45,7 @@ process.on("exit", () => {
   // turn a green suite red, and must not mask the verdict this file exists to give.
   for (const d of TEMPS) { try { rmSync(d, { recursive: true, force: true }); } catch { /* leave it */ } }
 });
+const { STUBS } = await import("./stub-manifest.mjs");
 const RUNNER = resolve(fileURLToPath(new URL("../scripts/stub-sweep.mjs", import.meta.url)));
 const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.url)));
 
@@ -1438,6 +1439,31 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
       "control: the same probe returns a real fingerprint for a regular file",
       `stdout=${JSON.stringify(ok.stdout)} stderr=${String(ok.stderr).slice(0, 200)}`);
   }
+}
+
+// --- the manifest itself is well formed ------------------------------------------
+{
+  // TWICE now an append has left `},` followed by a bare `,`, which is an array
+  // ELISION rather than a syntax error: `node --check` accepts it and the array
+  // carries an `undefined` at that index. The sweep's validator catches it and
+  // refuses to run -- twenty minutes later. This is the same check, in a second.
+  //
+  // Counted with an INDEXED loop, because a hole is invisible to forEach, map and
+  // filter: the obvious way to look for this cannot see it.
+  const holes = [];
+  for (let i = 0; i < STUBS.length; i++) if (!(i in STUBS)) holes.push(i);
+  check(holes.length === 0, "the manifest has no array holes", `holes at ${holes.join(", ")}`);
+  const unnamed = [];
+  for (let i = 0; i < STUBS.length; i++) if (i in STUBS && !STUBS[i]?.name) unnamed.push(i);
+  check(unnamed.length === 0, "and every entry is named", `unnamed at ${unnamed.join(", ")}`);
+  // CONTROL: the check can see a hole at all. A literal elision here would be
+  // flagged by lint, so it is built rather than written.
+  const withHole = [1, 2, 3];
+  delete withHole[1];
+  let seen = 0;
+  for (let i = 0; i < withHole.length; i++) if (!(i in withHole)) seen++;
+  check(seen === 1, "control: an indexed loop detects a hole that forEach skips",
+    `forEach visited ${withHole.filter(() => true).length} of ${withHole.length}`);
 }
 
 console.log(fail ? `\nFAILED ${fail}` : "\nok");

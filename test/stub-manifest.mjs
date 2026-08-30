@@ -928,6 +928,39 @@ export const STUBS = [
               replace: "    if (false) {" }],
   },
   {
+    name: "read-model-matches-the-run-ref-the-dispatcher-writes",
+    why: "match a builder provider lease on the bare task id. The dispatcher claims a slot under `<task>:<phase>`, because two phases of one task would otherwise collide in the live-request unique index -- so an equality on the task id finds nothing, WAITING_FOR_QUOTA becomes a substate the code can compute and can never show, and an operator watching a task sit behind capacity is told it is waiting for nothing at all. This is the shape the plan for this work carried, and its own fixture inserted the bare form, so its test would have passed against a lease shaped the way the test wrote it and failed against one shaped the way the writer writes it",
+    test: "test/task-show.test.mjs",
+    expectRed: "a queued builder lease written the way the dispatcher writes it is WAITING_FOR_QUOTA",
+    edits: [{
+      file: "src/build/show.mjs",
+      find: "          AND (run_ref = ? OR substr(run_ref, 1, ?) = ?)",
+      replace: "          AND (run_ref = ? OR substr(run_ref, 1, ?) = run_ref || ?)",
+    }],
+  },
+  {
+    name: "read-model-reads-the-capability-switch",
+    why: "stop the capability derivation from reading the switch at all. The six waiting substates are DERIVED on every read precisely so that turning a switch off changes the answer with no write; a branch that ignores the switch keeps reporting `a worker is coming` for a task nothing can dispatch, and no write happens at read time, so a no-write assertion alone cannot see it",
+    test: "test/task-show.test.mjs",
+    expectRed: "turning observe off makes the same row read WAITING_FOR_CAPABILITY",
+    edits: [{
+      file: "src/build/show.mjs",
+      find: "      if (ev.switches[need] !== true) { all.push(\"WAITING_FOR_CAPABILITY\"); capability = need; }",
+      replace: "      if (false) { all.push(\"WAITING_FOR_CAPABILITY\"); capability = need; }",
+    }],
+  },
+  {
+    name: "read-model-reports-a-section-with-no-rows-as-absent",
+    why: "let a section with no rows render as an empty success. `why` on a task that never dispatched has no runs, no lease and no PR, and the failure that matters is not a throw -- a throw is loud -- but an empty render that reads as `nothing went wrong`, which is byte-for-byte what a healthy task with nothing to report produces",
+    test: "test/task-show.test.mjs",
+    expectRed: "runs is reported ABSENT, not as an empty success",
+    edits: [{
+      file: "src/build/why.mjs",
+      find: "  for (const section of SECTIONS) if (!rows[section].length) model.absent.push(section);",
+      replace: "  for (const section of SECTIONS) if (!rows[section].length && section !== \"runs\") model.absent.push(section);",
+    }],
+  },
+  {
     name: "cli-task-reaches-its-own-body",
     why: "stop the `task` label from matching, so the command falls past its own body. This CLI's case labels share fall-through blocks and `task` sits directly above `build` -- the position that captured status, statusline and dash for a full day when `shadow` landed there. A route that does not reach its body does not error in an obvious way; it runs the NEXT command's body against the operator's arguments, which is how a read command became a write one",
     test: "test/cli-routing.test.mjs",

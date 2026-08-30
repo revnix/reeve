@@ -63,6 +63,20 @@ export function detectLanguage(dir) {
  * one repo and `typecheck` in five others, so a core that greps one name reports
  * the other as absent.
  */
+// A lookup table built from PARSED JSON, keyed by strings the file chooses.
+//
+// `deps[tool]` was a plain object literal and `tool` comes from a script BODY,
+// so a script reading `constructor lint .` found `Object` on the prototype,
+// `!deps[tool]` was false, and the "runs a tool that is not a dependency" check
+// silently skipped -- the one case it exists to report. `toString` and
+// `valueOf` do the same.
+//
+// `scripts` is not exposed today, because no INTENT name collides with
+// `Object.prototype`. It is built the same way anyway: that non-collision is a
+// fact someone would have to re-verify every time an intent is added, and
+// nothing would tell them if they got it wrong.
+const fromJson = (...objects) => Object.assign(Object.create(null), ...objects);
+
 const INTENTS = {
   lint:      ["lint", "lint:check", "eslint", "ruff", "check:lint", "biome:check"],
   typecheck: ["typecheck", "check-types", "type-check", "tsc", "types", "mypy"],
@@ -76,7 +90,7 @@ export function detectCommands(dir, language, packageManager) {
 
   if (language === "typescript") {
     const pkg = readJson(join(dir, "package.json"));
-    const scripts = pkg?.scripts ?? {};
+    const scripts = fromJson(pkg?.scripts);
     for (const [intent, names] of Object.entries(INTENTS)) {
       const hit = names.find(n => scripts[n]);
       if (!hit) { out[intent] = { cmd: null, state: "absent" }; continue; }
@@ -85,7 +99,7 @@ export function detectCommands(dir, language, packageManager) {
       // A declared script whose tool is not a dependency is BROKEN, not present.
       const body = scripts[hit];
       const tool = String(body).trim().split(/\s+/)[0];
-      const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+      const deps = fromJson(pkg.dependencies, pkg.devDependencies);
       const localBin = existsSync(join(dir, "node_modules", ".bin", tool));
       if (!deps[tool] && !localBin && !/^(node|tsc|pnpm|npm|yarn|turbo|nx)$/.test(tool)) {
         out[intent].state = "broken";

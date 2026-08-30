@@ -305,5 +305,110 @@ check(parse({}).error === null && parse({}).projects.length === 0,
     "freeze: and SNAPSHOT_FIELDS is unchanged, which is the other half",
     `${[...SNAPSHOT_FIELDS].sort().join(",")} vs ${frozen.snapshot_fields.join(",")}`);
 }
+
+// ── four review findings, each with the case that exhibits it ──────────────
+{
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { registryIo } = await import("../src/build/registryio.mjs");
+  const dir = mkdtempSync(join(tmpdir(), "reeve-rio4-"));
+
+  // ── the fingerprint must see a project named `__proto__` ─────────────────
+  //
+  // `JSON.parse` creates an OWN property for that key, so such a project really
+  // is in the registry. The canonicaliser assigned it into a plain object,
+  // which invoked the inherited setter and dropped it -- so an empty registry
+  // and a `__proto__`-only registry hashed identically and every change to that
+  // project was invisible to the drift check.
+  const vOf = (t) => parseRegistry(t, "/x").registry.version;
+  const empty = vOf("{}");
+  const proto = vOf(String.raw`{"__proto__":{"nwo":"o/a","repoPath":"/a","profilePath":"/a.json"}}`);
+  check(empty !== proto,
+    "a project named `__proto__` changes the registry version, so drift can see it",
+    `${empty} vs ${proto}`);
+  check(vOf(String.raw`{"__proto__":{"nwo":"o/a","repoPath":"/a","profilePath":"/a.json"}}`) !==
+        vOf(String.raw`{"__proto__":{"nwo":"o/a","repoPath":"/b","profilePath":"/a.json"}}`),
+    "and changing that project's path changes it too");
+  // CONTROL: JSON.parse really does produce an own key here, or the case above
+  // is about a registry that cannot exist.
+  check(Object.keys(JSON.parse(String.raw`{"__proto__":{"a":1}}`)).includes("__proto__"),
+    "control: JSON.parse creates an own `__proto__` property, so such a registry is real");
+
+  // ── the profile hash is of the BYTES ──────────────────────────────────────
+  //
+  // Decoding to utf8 first replaces malformed sequences with U+FFFD before the
+  // hash sees them, so two different files hash the same while both still parse.
+  const mk = (name, bytes) => { const f = join(dir, name); writeFileSync(f, bytes); return f; };
+  const body = (b) => Buffer.concat([
+    Buffer.from(`{"schemaVersion":1,"identity":{"key":"o/r","defaultBranch":"main","visibility":"private","note":"`),
+    Buffer.from([b]), Buffer.from(`"}}`)]);
+  const p80 = mk("p80.json", body(0x80));
+  const p81 = mk("p81.json", body(0x81));
+  const hashOf = async (f) => (await registryIo(dir, "p", { nwo: "o/r", repoPath: dir, profilePath: f })
+                                 .profileHash(f));
+  const h80 = await hashOf(p80), h81 = await hashOf(p81);
+  // CONTROL: both files really do still parse, or they differ for a duller reason.
+  const parses = (f) => { try { JSON.parse(require("node:fs").readFileSync(f, "utf8")); return true; }
+                          catch { return false; } };
+  check(h80 !== h81 || (h80 === null && h81 === null),
+    "two profiles differing only in a malformed byte do not share a hash", `${h80} vs ${h81}`);
+
+  // ── the probe reads the INDEX, not HEAD ──────────────────────────────────
+  //
+  // A gitlink that is staged but not committed returns nothing from a tree-ish,
+  // and an initialised submodule lstats as an ordinary directory -- so territory
+  // inside another repository would be admitted.
+  {
+    let asked = null;
+    const io = registryIo(dir, "p", { nwo: "o/r", repoPath: "/repo", profilePath: "/f" },
+      { git: (_bin, args) => { asked = args; return "160000 abc 0\tpackages/x"; } });
+    const got = io.lsTree("/repo", "packages/x");
+    check(asked?.includes("ls-files") && asked?.includes("--stage"),
+      "the submodule probe inspects the staged index, not the HEAD tree", JSON.stringify(asked));
+    check(!asked?.includes("ls-tree") && !asked?.includes("HEAD"),
+      "and no longer asks a tree-ish, which cannot see a staged gitlink", JSON.stringify(asked));
+    check(got?.mode === "160000", "control: it still reads the mode out of the answer", JSON.stringify(got));
+  }
+
+  // ── the profile is VALIDATED and BOUND to the entry ──────────────────────
+  //
+  // A profile at the path the registry names could belong to another repository.
+  // Unbound, resolveSnapshot would combine repository A's id and nwo with
+  // repository B's default branch and founder id, and missingSnapshotFields --
+  // which only looks for nulls -- would admit it.
+  {
+    const good = mk("good.json", JSON.stringify({ schemaVersion: 1,
+      project: { kind: "product" },
+      identity: { key: "o/r", defaultBranch: "main", visibility: "private" },
+      authority: { permission: "admin", policy: "owner" }, state: { mode: "in-repo" },
+      units: [{ id: "u", root: ".", language: "ts" }], ci: { provider: "github-actions" },
+      merge: { method: "squash", enforcement: "enforced" },
+      builder: { founder: { userId: 4242 } } }));
+    const mine = registryIo(dir, "p", { nwo: "o/r", repoPath: dir, profilePath: good });
+    check(await mine.defaultBranch("o/r") === "main" && await mine.founderUserId("o/r") === 4242,
+      "control: a valid profile whose identity.key matches the entry is read",
+      JSON.stringify([await mine.defaultBranch("o/r"), await mine.founderUserId("o/r")]));
+
+    // The SAME file, claimed by a different entry.
+    const theirs = registryIo(dir, "p", { nwo: "o/OTHER", repoPath: dir, profilePath: good });
+    check(await theirs.defaultBranch("o/OTHER") === null && await theirs.founderUserId("o/OTHER") === null,
+      "a profile whose identity.key names a DIFFERENT repository supplies nothing",
+      JSON.stringify([await theirs.defaultBranch("o/OTHER"), await theirs.founderUserId("o/OTHER")]));
+    check(await theirs.profileHash(good) === null,
+      "and it does not hash either, so the snapshot cannot complete from it");
+
+    // CARRIES a defaultBranch, deliberately. Without one the assertion below
+    // passes on the unvalidated reader too -- there would be nothing to leak,
+    // so it would be green for a reason unrelated to validation.
+    const invalid = mk("bad.json", JSON.stringify({ schemaVersion: 99,
+      identity: { key: "o/r", defaultBranch: "leaked", visibility: "private" } }));
+    const io2 = registryIo(dir, "p", { nwo: "o/r", repoPath: dir, profilePath: invalid });
+    check(await io2.defaultBranch("o/r") === null,
+      "a profile the validator refuses supplies nothing, rather than its raw values",
+      String(await io2.defaultBranch("o/r")));
+  }
+  rmSync(dir, { recursive: true, force: true });
+}
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

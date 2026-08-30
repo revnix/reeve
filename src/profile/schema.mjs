@@ -70,15 +70,31 @@ const isInt = describe(v => (Number.isInteger(v) ? null : "must be an integer"),
                        "an integer");
 // Written out three times inline before this: the same predicate, three chances
 // to spell it differently, and no way for the reference to describe any of them.
+// `validate` refuses any schemaVersion but this one, so "an integer" was a true
+// statement about the field's own check and a false one about what the loader
+// accepts. Both read the same constant, so there is no second inventory here --
+// only one place that failed to SAY what it enforced.
+const isSchemaVersion = describe(
+  v => (v === SCHEMA_VERSION ? null : `must be ${SCHEMA_VERSION}`),
+  `exactly ${SCHEMA_VERSION}`);
 const isPosInt = describe(v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer"),
                           "a positive integer");
 const isNum = describe(v => (typeof v === "number" && Number.isFinite(v) ? null : "must be a finite number"),
                        "a number");
-const isArr = inner => describe(v => {
-  if (!Array.isArray(v)) return "must be an array";
-  for (const [i, x] of v.entries()) { const e = inner(x); if (e) return `[${i}] ${e}`; }
-  return null;
-}, `a list of ${inner.describe ?? "values"}`);
+const isArr = inner => {
+  // REFUSED AT MODULE LOAD, not defaulted to "values". An undescribed inner
+  // validator produced `a list of values` in the generated reference -- a
+  // sentence that hides a real restriction while looking like documentation, so
+  // an operator writes an absolute path or a full URL and the loader rejects it.
+  // A missing description is now impossible to ship rather than merely unlikely.
+  if (!inner.describe)
+    throw new Error("isArr needs a described inner validator: wrap it in describe(fn, text)");
+  return describe(v => {
+    if (!Array.isArray(v)) return "must be an array";
+    for (const [i, x] of v.entries()) { const e = inner(x); if (e) return `[${i}] ${e}`; }
+    return null;
+  }, `a list of ${inner.describe}`);
+};
 const oneOf = list => describe(
   v => (list.includes(v) ? null : `must be one of ${list.join(" | ")}`),
   `one of ${list.join(", ")}`, { values: Object.freeze([...list]) });
@@ -158,7 +174,7 @@ const UNIT = describe(v => {
   return null;
 }, "an object with id, root and language");
 
-const REVIEWER = v => {
+const REVIEWER = describe(v => {
   if (typeof v !== "object" || v === null) return "must be an object";
   for (const k of ["login", "kind"]) { const e = isStr(v[k]); if (e) return `${k} ${e}`; }
   const e = oneOf(REVIEWER_KIND)(v.kind); if (e) return `kind ${e}`;
@@ -218,9 +234,9 @@ const REVIEWER = v => {
     }
   }
   return null;
-};
+}, "an object describing a reviewer");
 
-const LANE = v => {
+const LANE = describe(v => {
   if (typeof v !== "object" || v === null) return "must be an object";
   const e = isStr(v.id); if (e) return `id ${e}`;
   // Territories are GLOBS, not regexes. The previous system used regexes over
@@ -231,10 +247,10 @@ const LANE = v => {
   // construction. Boolean only -- a truthy accident must not relax a risk rule.
   if (v.sensitiveOk !== undefined) { const b = isBool(v.sensitiveOk); if (b) return `sensitiveOk ${b}`; }
   return null;
-};
+}, "an object describing a lane, with id and territory");
 
 export const FIELDS = {
-  schemaVersion:            [true,  isInt],
+  schemaVersion:            [true,  isSchemaVersion],
   "project.kind":           [true,  oneOf(PROJECT_KIND)],
   "identity.key":           [true,  isStr],            // owner/repo from the REMOTE, never the path
   "identity.prHost":        [false, isStr],            // 4re: PRs and the checkout are different repos
@@ -330,20 +346,18 @@ export const FIELDS = {
   // A worker has no network and no home cache, so a project whose dependencies
   // this cannot infer from its languages has no other way to be given them --
   // and an override the loader REJECTS is not an override at all. (Codex #5-[9].)
-  "worker.dependencyPaths":              [false, isArr(v => (typeof v === "string" && v.length && !v.startsWith("/") && !v.split("/").includes("..")
-                                                    ? null : "must be a relative path inside the checkout"))],
+  "worker.dependencyPaths":              [false, isArr(describe(
+    v => (typeof v === "string" && v.length && !v.startsWith("/") && !v.split("/").includes("..")
+      ? null : "must be a relative path inside the checkout"),
+    "a relative path inside the checkout"))],
   // The only network a worker's shell may reach, and only for research: the OS
   // sandbox denies every domain for every other action. A bare host name, no
   // scheme, no path: the runtime matches domains, and "https://x" matches nothing.
-  "builder.network.research.allowedDomains": [false, isArr(v => (typeof v === "string" && /^[A-Za-z0-9*.-]+$/.test(v) ? null : "must be a bare domain name (wildcards as *.example.com)"))],
+  "builder.network.research.allowedDomains": [false, isArr(describe(
+    v => (typeof v === "string" && /^[A-Za-z0-9*.-]+$/.test(v)
+      ? null : "must be a bare domain name (wildcards as *.example.com)"),
+    "a bare domain name, no scheme and no path (wildcards as *.example.com)"))],
 
-  // Read by the daemon and the watcher. Declared here because the validator
-  // refused a profile using them and `reeve doctor` exited before doing anything:
-  // code that reads undeclared config is config that drifts from its schema
-  // unnoticed. See daemon.mjs (maxWorkers, workerBudgetMinutes, maxTurns) and
-  // watcher.mjs (unknownEscalateSeconds).
-  // OFF until review ingest exists. With it on, reeve can dispatch review actions
-  // whose data model is incomplete -- see the gate in watcher.mjs.
   // Where an escalation goes when nobody is watching the log. Only escalations
   // are ever sent: an over-pushing channel gets muted, and a muted channel is
   // worse than none.
@@ -357,6 +371,14 @@ export const FIELDS = {
   // blocked by a remote server nobody can log into, which is the state the ntfy
   // READ credential has been in since the beginning.
   "notify.desktop":        [false, isBool],
+  // Read by the daemon and the watcher. Declared here because the validator
+  // refused a profile using them and `reeve doctor` exited before doing anything:
+  // code that reads undeclared config is config that drifts from its schema
+  // unnoticed. See daemon.mjs (maxWorkers, workerBudgetMinutes, maxTurns) and
+  // watcher.mjs (unknownEscalateSeconds).
+  //
+  // OFF until review ingest exists. With it on, reeve can dispatch review actions
+  // whose data model is incomplete -- see the gate in watcher.mjs.
   "watch.reviewActions":   [false, isBool],
   "watch.backupIntervalSeconds": [false, isInt],
   "watch.maxOpenPrs":      [false, isInt],

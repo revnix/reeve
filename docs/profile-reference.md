@@ -5,7 +5,7 @@ GENERATED from `src/profile/schema.mjs`. Do not edit by hand: run
 `test/profile-validate.test.mjs` fails while it is stale, and
 `node scripts/profile-reference.mjs --check` reports staleness without writing.
 
-69 keys. 29 carry a description.
+69 keys. 30 carry a description.
 
 `requirement` is what an operator must AUTHOR, not the validator's raw flag:
 the loader applies defaults before validating, so a `defaulted` key may be
@@ -19,7 +19,7 @@ else to put it, which is the point.
 
 | key | requirement | accepts |
 |---|---|---|
-| `schemaVersion` | required | an integer |
+| `schemaVersion` | required | exactly 1 |
 | `project.kind` | required | one of product, client |
 | `identity.key` | required | a non-empty string |
 | `identity.prHost` | optional | a non-empty string |
@@ -36,7 +36,7 @@ else to put it, which is the point.
 | `state.mode` | required | one of in-repo, sibling, hub |
 | `state.location` | optional | a non-empty string |
 | `units` | required | a list of an object with id, root and language |
-| `lanes` | optional | a list of values |
+| `lanes` | optional | a list of an object describing a lane, with id and territory |
 | `ci.appSlug` | optional | a non-empty string |
 | `ci.provider` | required | a non-empty string |
 | `ci.requiredChecks` | optional | a list of a non-empty string |
@@ -44,7 +44,7 @@ else to put it, which is the point.
 | `merge.method` | required | one of squash, merge, rebase |
 | `merge.deleteBranch` | optional | true or false |
 | `merge.enforcement` | required | one of enforced, attested |
-| `reviewers` | optional | a list of values |
+| `reviewers` | optional | a list of an object describing a reviewer |
 | `rounds.softCap` | defaulted | an integer |
 | `rounds.hardCap` | defaulted | an integer |
 | `rounds.maxFixAttemptsPerFinding` | defaulted | an integer |
@@ -63,8 +63,8 @@ else to put it, which is the point.
 | `builder.budgets` | optional | an object of per-action budgets, keyed by build action |
 | `worker.maxOutputBytes` | defaulted | a positive integer |
 | `worker.isolation` | defaulted | one of none, scratch-home, dedicated-user |
-| `worker.dependencyPaths` | optional | a list of values |
-| `builder.network.research.allowedDomains` | optional | a list of values |
+| `worker.dependencyPaths` | optional | a list of a relative path inside the checkout |
+| `builder.network.research.allowedDomains` | optional | a list of a bare domain name, no scheme and no path (wildcards as *.example.com) |
 | `notify.provider` | optional | one of ntfy, none |
 | `notify.url` | optional | a non-empty string |
 | `notify.topic` | optional | a non-empty string |
@@ -223,13 +223,19 @@ The only network a worker's shell may reach, and only for research: the OS sandb
 
 **optional**
 
-Read by the daemon and the watcher. Declared here because the validator refused a profile using them and `reeve doctor` exited before doing anything: code that reads undeclared config is config that drifts from its schema unnoticed. See daemon.mjs (maxWorkers, workerBudgetMinutes, maxTurns) and watcher.mjs (unknownEscalateSeconds). OFF until review ingest exists. With it on, reeve can dispatch review actions whose data model is incomplete -- see the gate in watcher.mjs. Where an escalation goes when nobody is watching the log. Only escalations are ever sent: an over-pushing channel gets muted, and a muted channel is worse than none.
+Where an escalation goes when nobody is watching the log. Only escalations are ever sent: an over-pushing channel gets muted, and a muted channel is worse than none.
 
 ### `notify.desktop`
 
 **optional**
 
 A native notification on the machine reeve runs on, alongside the phone rather than instead of it. The two exist for different moments: the phone for when nobody is at the desk, this for when somebody is. It also cannot be blocked by a remote server nobody can log into, which is the state the ntfy READ credential has been in since the beginning.
+
+### `watch.reviewActions`
+
+**optional**
+
+Read by the daemon and the watcher. Declared here because the validator refused a profile using them and `reeve doctor` exited before doing anything: code that reads undeclared config is config that drifts from its schema unnoticed. See daemon.mjs (maxWorkers, workerBudgetMinutes, maxTurns) and watcher.mjs (unknownEscalateSeconds).  OFF until review ingest exists. With it on, reeve can dispatch review actions whose data model is incomplete -- see the gate in watcher.mjs.
 
 ### `watch.staleSeconds`
 

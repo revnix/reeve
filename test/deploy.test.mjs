@@ -9,13 +9,14 @@
 // assertions about THIS machine are skipped elsewhere, and they are reported as
 // SKIP rather than passed, because a check that quietly narrows its input is
 // answering a smaller question than the one it claims.
+import { fileURLToPath } from "node:url";
 import { readFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { homedir, platform } from "node:os";
 import { statePathFor } from "../src/paths.mjs";
 import { join } from "node:path";
 
-const PLIST = new URL("../deploy/com.revnix.reeve.plist", import.meta.url).pathname;
+const PLIST = fileURLToPath(new URL("../deploy/com.revnix.reeve.plist", import.meta.url));
 const HOME = homedir();
 // Overridable so the non-darwin branch is exercised here rather than discovered
 // on the runner, which is how the plutil ENOENT was found the first time.

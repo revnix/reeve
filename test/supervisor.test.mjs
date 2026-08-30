@@ -150,7 +150,10 @@ check("an unknown system subtype does not break parsing",
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
   const supScript = join(mkdtempSync(join(tmpdir(), "reeve-sup-")), "sup.mjs");
-  const modPath = new URL("../src/supervisor.mjs", import.meta.url).pathname;
+  // `.href` for the same reason as provider-scheduler: this is an import specifier
+  // in generated source, not a path. JSON.stringify would escape the backslashes
+  // faithfully and still leave a `C:` specifier node ESM refuses.
+  const modPath = new URL("../src/supervisor.mjs", import.meta.url).href;
   writeFileSync(supScript, [
     'import { runWorker } from ' + JSON.stringify(modPath) + ';',
     'runWorker({ bin: "/bin/sh", args: ["-c", "sleep 120"], budgetMs: 60000, env: { PATH: "/usr/bin:/bin" }, outPath: ' + JSON.stringify(supScript + ".out") + ', errPath: ' + JSON.stringify(supScript + ".err") + ',',

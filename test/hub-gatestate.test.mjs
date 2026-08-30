@@ -296,9 +296,24 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
   //
   // So the id is resolved from the hub, and this block passes the production
   // shape verbatim.
-  check(/\{ name, nwo: p\.nwo \}/.test(cli),
-    "fixture: registryProjects really does yield only a name and an nwo",
-    (cli.match(/Object\.entries\(reg\)[^\n]*/) ?? ["(not found)"])[0]);
+  // ASSERTED BY CALLING THE PRODUCER, not by grepping its source.
+  //
+  // This read `bin/reeve` for the literal `{ name, nwo: p.nwo }`, which stopped
+  // being true the moment the loader moved into `src/build/registryio.mjs` and
+  // grew the two path fields -- a text scan of one file standing in for a
+  // property of another. The property is what matters: THE FIXTURE MUST NOT BE
+  // RICHER THAN PRODUCTION, so it is compared against a row the real parser
+  // actually produces.
+  const { parseRegistry } = await import("../src/build/registryio.mjs");
+  const produced = parseRegistry(
+    JSON.stringify({ nextly: { nwo: "o/r", repoPath: "/p", profilePath: "/f" } }), "/x").projects[0];
+  const producedKeys = Object.keys(produced ?? {}).sort();
+  check(producedKeys.length > 0,
+    "control: the registry parser really produced a row, so the comparison below is not vacuous",
+    JSON.stringify(producedKeys));
+  check(!producedKeys.includes("repoId"),
+    "the registry supplies NO repoId, which is the whole reason the tick must resolve it from the hub",
+    JSON.stringify(producedKeys));
   {
     const db2 = openHub(join(dir, "g-prod.db"));
     // The snapshot `resolveSnapshot` would have taken through the API client;
@@ -309,7 +324,17 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
                        gateDefinitionHash: "g", registryVersion: 3, founderUserId: 4242 };
     admitResolved(db2, admitted, { id: "bt:prod", project: "nextly", title: "t",
                            claims: [normalizeClaim("packages/x")] });
-    const tick = await buildTick({ hub: db2, projects: [{ name: "nextly", nwo: "o/r" }] });
+    // The fixture is checked against the producer rather than trusted: a project
+    // carrying a key the registry never supplies is a fixture richer than
+    // production, and that is exactly what hid this defect before -- every real
+    // project reached the no-id guard and was skipped on every heartbeat while
+    // the wiring and the behaviour both looked proved.
+    const fixtureProject = { name: "nextly", nwo: "o/r" };
+    const richer = Object.keys(fixtureProject).filter((k) => !producedKeys.includes(k));
+    check(richer.length === 0,
+      "fixture: the project handed to buildTick carries no key the registry does not supply",
+      richer.join(", "));
+    const tick = await buildTick({ hub: db2, projects: [fixtureProject] });
     check(tick.refreshed === 1 && tick.skipped.length === 0,
       "a registry-shaped project is refreshed, not skipped", JSON.stringify(tick));
     const row = db2.prepare("SELECT repo_id, nwo_snapshot FROM repo_gate_state").get();
@@ -648,6 +673,56 @@ const ok = { ruleset: { required_status_checks: [{ context: "ops/merge-policy", 
     "control: the exact expected set still passes with no diff", JSON.stringify(clean));
   db.close();
 }
+
+// ── the tick, fed by the LOADER rather than by a literal ────────────────────
+//
+// The block above already proves a registry-shaped project is refreshed. It
+// does so with a HAND-WRITTEN `{ name, nwo }`, and a fixture richer or poorer
+// than production is exactly what let the original defect survive every
+// assertion: every registered project reached the no-id guard and was skipped
+// on every heartbeat while the wiring and the behaviour both read as proved.
+//
+// So this feeds the tick the loader's REAL output, parsed from registry text by
+// the same function `bin/reeve` calls.
+{
+  const { parseRegistry } = await import("../src/build/registryio.mjs");
+  const db3 = openHub(join(dir, "g-loader.db"));
+  const reg = parseRegistry(JSON.stringify(
+    { nextly: { nwo: "o/r", repoPath: "/repo", profilePath: "/p.json" } }), "/x/projects.json");
+  check(reg.error === null, "control: the fixture registry parses", String(reg.error));
+
+  const admitted = { repoId: 1, nwo: "o/r", repoPath: "/repo", profilePath: "/p.json", profileHash: "h",
+                     defaultBranch: "main", visibility: "private", specRepoId: 9,
+                     gateDefinitionHash: "g", registryVersion: reg.registry.version, founderUserId: 4242 };
+  admitResolved(db3, admitted, { id: "bt:loader", project: "nextly", title: "t",
+                                 claims: [normalizeClaim("packages/x")] });
+
+  const tick = await buildTick({ hub: db3, projects: reg.projects });
+  check(tick.refreshed === 1 && tick.skipped.length === 0,
+    "the loader's own rows are refreshed, not skipped", JSON.stringify(tick));
+  const row = db3.prepare("SELECT repo_id, nwo_snapshot FROM repo_gate_state").get();
+  check(row?.repo_id === 1, "and the row is keyed on the id the hub recorded at admission",
+    JSON.stringify(row));
+
+  // The loader's row carries two fields the tick does not read. Asserting it is
+  // UNBOTHERED by them is the difference between "production's shape works" and
+  // "a narrower shape works and production was never tried".
+  check(Object.keys(reg.projects[0]).length === 4,
+    "control: and those rows really do carry four fields, not two", JSON.stringify(reg.projects[0]));
+
+  // A project the loader lists and the hub has never seen is still skipped, or
+  // "resolves the id" has quietly become "invents one".
+  const two = parseRegistry(JSON.stringify(
+    { nextly: { nwo: "o/r", repoPath: "/repo", profilePath: "/p.json" },
+      other:  { nwo: "o/never", repoPath: "/repo2", profilePath: "/p2.json" } }), "/x/projects.json");
+  check(two.error === null && two.projects.length === 2,
+    "control: the two-project registry parses, so the mixed case is really mixed", String(two.error));
+  const mixed = await buildTick({ hub: db3, projects: two.projects });
+  check(mixed.refreshed === 1 && mixed.skipped.includes("other"),
+    "control: an unknown project is skipped and NAMED, not fabricated", JSON.stringify(mixed));
+  db3.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

@@ -97,6 +97,7 @@ function main() {
   // gate disagreeing with itself.
   const q = `query { repository(owner:"${owner}", name:"${name}") { pullRequest(number:${pr}) {
     state headRefOid headRefName isCrossRepository mergeable mergeStateStatus reviewDecision
+  latestOpinionatedReviews(first:50) { totalCount nodes { state author { login } commit { oid } } }
     headRepositoryOwner { login } headRepository { name }
     reviewThreads(first:100) { totalCount nodes { id isResolved path
       comments(first:1) { nodes { author { login } body createdAt } } } }
@@ -138,7 +139,13 @@ function main() {
   const verdict = gate({
     head: { prHead: meta.headRefOid, branchNow, branchRead },
     threads: meta.reviewThreads,
-    review: { reviewDecision: meta.reviewDecision },
+    // The approving reviews THEMSELVES, so the binding is read rather than assumed.
+    // The WHOLE opinionated-review listing, unfiltered, with its totalCount. Filtering
+    // to approvals here would hand the completeness check a list that can never match
+    // totalCount whenever anyone requested changes.
+    review: { reviewDecision: meta.reviewDecision, head: meta.headRefOid,
+              reviews: meta.latestOpinionatedReviews?.nodes ?? null,
+              reviewsTotal: meta.latestOpinionatedReviews?.totalCount ?? null },
     mergeability: { mergeable: meta.mergeable, mergeStateStatus: meta.mergeStateStatus },
     checks: { nodes: rollup ? (rollup.contexts?.nodes ?? null) : [],
               totalCount: rollup ? (rollup.contexts?.totalCount ?? null) : 0 },

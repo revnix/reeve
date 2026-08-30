@@ -106,7 +106,21 @@ jobs:
     name: Stub sweep
     runs-on: ubuntu-latest
     steps:
+      # `fetch-depth: 0`, and the sweep FAILS without it rather than passing.
+      #
+      # The default is a single commit: no history, no default branch, no merge base.
+      # The sweep refuses to grandfather a test file you are editing, and to know
+      # which files those are it needs a diff -- and a diff against a base that
+      # cannot be resolved does not error. It yields NOTHING. An empty change set
+      # intersects an empty grandfather list and the check passes: green, fast, and
+      # measuring nothing, which is the precise failure the sweep exists to catch,
+      # arriving through the checkout configuration rather than through the logic.
+      #
+      # So the refusal is deliberate and it names this line, because the symptom
+      # otherwise is a red gate over a diff that looks perfectly clean.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: '24'
@@ -120,6 +134,20 @@ jobs:
       - name: Break the code on purpose and check the tests notice
         env:
           TZ: UTC
+          # THE BASE TO DIFF AGAINST, and it differs by event for a reason.
+          #
+          # On a pull request the base branch's tip is the right comparison. On a PUSH
+          # to the default branch the checkout puts HEAD and origin/main at the same
+          # commit, so a merge base against origin/main IS HEAD, the change set comes
+          # out empty, and the grandfathering gate passes without looking at anything.
+          # A direct commit to main could then edit a grandfathered test, or add a new
+          # test straight to the list, unopposed.
+          #
+          # `github.event.before` is the commit the branch was at, which is the diff a
+          # person would draw by hand. The sweep refuses outright if the base still
+          # resolves to HEAD, so this value being wrong fails loudly rather than
+          # silently disabling the gate.
+          STUB_SWEEP_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: node scripts/stub-sweep.mjs
 
   gate:

@@ -31,6 +31,144 @@
 // The same reasoning applies to reaping a worker from a normally-exited test; see
 // test/stubsweep.test.mjs, where the limit is written down instead of asserted.
 
+/**
+ * FROZEN DEBT: test files that predate the rule that every test file carries a stub.
+ *
+ * NOT AN EXEMPTION LIST, and the difference is enforced. A file here loses its place
+ * the moment anyone MODIFIES it: the gate intersects a change with this list and
+ * refuses, so the demand to prove a test can fail arrives in front of the person who
+ * already has the file open and knows which assertion is load-bearing.
+ *
+ * That shape was chosen over a deadline and over a plain ratchet for one reason:
+ * paying down a list is a separate act of virtue, it competes with real work, and it
+ * loses. A calendar picks files at random and picks them when nobody is looking at
+ * them; an edit picks exactly the file someone is already holding. A file nobody
+ * touches costs nothing, and that is correct rather than a compromise -- an untouched
+ * test is not accruing risk. The risk arrives with the edit, and so does the demand.
+ *
+ * NOTHING MAY BE ADDED HERE. A new test file has no history to be grandfathered by,
+ * so it arrives with an entry in STUBS or it does not arrive. Growth is visible in
+ * the diff, which is the point: re-grandfathering cannot be done quietly.
+ *
+ * The list is checked for ROT as well as for growth. A name that has since gained a
+ * STUBS entry, or that no longer exists, must be removed -- a list nobody is required
+ * to correct becomes a blanket exemption without anyone deciding to grant one.
+ *
+ * ONE OPERATIONAL NOTE, learned the hard way. This list freezes the tree as it stood
+ * when it was written, and CI judges a pull request MERGED INTO the default branch --
+ * so any test file that lands on main between generating this and merging it arrives
+ * as an orphan and turns the gate red. That is the rule working rather than failing:
+ * a file that appeared after the freeze genuinely has no claim to be grandfathered.
+ * It does mean a long-lived branch carrying this list must re-check it against main
+ * before merging, and the failure names the file, so the cost is one line.
+ */
+export const GRANDFATHERED = [
+  "test/backup.test.mjs",
+  "test/base-health-steps.test.mjs",
+  "test/baseline.test.mjs",
+  "test/build-capabilities.test.mjs",
+  "test/canary.test.mjs",
+  "test/cause-identity.test.mjs",
+  "test/characterise-tick.test.mjs",
+  "test/check-accounting.test.mjs",
+  "test/checkout-root.test.mjs",
+  "test/checkout.test.mjs",
+  "test/checkpoint-lease.test.mjs",
+  "test/ci-rootcause.test.mjs",
+  "test/clean-merge.test.mjs",
+  "test/cli-flags.test.mjs",
+  "test/cli-routing.test.mjs",
+  "test/containment.test.mjs",
+  "test/denial-policy.test.mjs",
+  "test/deploy.test.mjs",
+  "test/dispatch-e2e.test.mjs",
+  "test/docs-state-is-single-sourced.test.mjs",
+  "test/doctor-body-detector.test.mjs",
+  "test/doctor-containment.test.mjs",
+  "test/doctor-signatures.test.mjs",
+  "test/doctor-state.test.mjs",
+  "test/durable-run.test.mjs",
+  "test/effects-capability.test.mjs",
+  "test/escalation-dedup.test.mjs",
+  "test/escape.test.mjs",
+  "test/flake-dispatch.test.mjs",
+  "test/fold-before-evaluate.test.mjs",
+  "test/freshness.test.mjs",
+  "test/gitguard.test.mjs",
+  "test/guardian-hub-access.test.mjs",
+  "test/guardian-hub-allowlist.test.mjs",
+  "test/guardian-provider-lease.test.mjs",
+  "test/hub-backup-restore.test.mjs",
+  "test/hub-crosscheck.test.mjs",
+  "test/hub-derived-schema.test.mjs",
+  "test/hub-doctor.test.mjs",
+  "test/hub-drills.test.mjs",
+  "test/hub-gatestate.test.mjs",
+  "test/hub-locks.test.mjs",
+  "test/hub-outbox.test.mjs",
+  "test/hub-phases.test.mjs",
+  "test/hub-registry.test.mjs",
+  "test/hub-schema.test.mjs",
+  "test/hub-transition.test.mjs",
+  "test/hubsession-acceptance.test.mjs",
+  "test/hubsession.test.mjs",
+  "test/inherited.test.mjs",
+  "test/init.test.mjs",
+  "test/lease-expiry.test.mjs",
+  "test/lifecycle.test.mjs",
+  "test/log-dedup.test.mjs",
+  "test/mergecheck.test.mjs",
+  "test/missing-required.test.mjs",
+  "test/node-floor-is-one-fact.test.mjs",
+  "test/notify.test.mjs",
+  "test/offline-tests.test.mjs",
+  "test/outbox-drain.test.mjs",
+  "test/outbox-fencing.test.mjs",
+  "test/policy-self-exclusion.test.mjs",
+  "test/profile-detect.test.mjs",
+  "test/profile-validate.test.mjs",
+  "test/prompt-sandbox-agreement.test.mjs",
+  "test/prompt-study.test.mjs",
+  "test/provider-queue-order.test.mjs",
+  "test/provider-scheduler.test.mjs",
+  "test/reconciler.test.mjs",
+  "test/registry-io.test.mjs",
+  "test/repair-message.test.mjs",
+  "test/repo-id-lookup.test.mjs",
+  "test/required-evidence.test.mjs",
+  "test/retry-brake.test.mjs",
+  "test/review-body-findings.test.mjs",
+  "test/review-derive.test.mjs",
+  "test/review-facts-wire.test.mjs",
+  "test/review-gate.test.mjs",
+  "test/review-ingest.test.mjs",
+  "test/review-request-effect.test.mjs",
+  "test/review-shadow.test.mjs",
+  "test/reviewer-refusal-shapes.test.mjs",
+  "test/reviewer-status.test.mjs",
+  "test/sandbox.test.mjs",
+  "test/schema-is-one-file.test.mjs",
+  "test/schema-migration.test.mjs",
+  "test/selfaudit.test.mjs",
+  "test/settlement-persistence.test.mjs",
+  "test/shadow-same-moment.test.mjs",
+  "test/spill-handlers.test.mjs",
+  "test/state-paths.test.mjs",
+  "test/status-vocabulary.test.mjs",
+  "test/status.test.mjs",
+  "test/supervisor-contract.test.mjs",
+  "test/supervisor.test.mjs",
+  "test/uncommitted-baseline.test.mjs",
+  "test/verdict.test.mjs",
+  "test/watcher.test.mjs",
+  "test/worker-args.test.mjs",
+  "test/worker-contract.test.mjs",
+  "test/worker-report.test.mjs",
+  "test/worker-tool-boundary.test.mjs",
+  "test/workerenv.test.mjs",
+  "test/zero-agrees-with-the-code.test.mjs",
+];
+
 export const STUBS = [
   {
     name: "lease-gate",
@@ -639,5 +777,41 @@ export const STUBS = [
     edits: [{ file: "src/premerge.mjs",
               find: "    const complete = completeness({ nodes: reviews, totalCount: reviewsTotal,",
               replace: "    const complete = completeness({ nodes: reviews.filter(r => String(r?.state).toUpperCase() === \"APPROVED\"), totalCount: reviewsTotal," }],
+  },
+  {
+    name: "sweep-covers-every-test-file",
+    why: "let a test file be neither named by an entry nor listed as frozen debt, which is how 103 of 106 files came to have no stub while the required job claimed the tests could fail. NAMED AGAINST THE SYNTHETIC ASSERTION, not the repository-wide one: that one asserts the current tree has zero orphans, and a value already at zero cannot be moved by breaking the detector, so a stub of it comes back NOT_CAUGHT however true the assertion is",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "coverage() NAMES a test file that has neither an entry nor a place on the list",
+    edits: [{ file: "src/stubsweep.mjs",
+              find: "  const orphans = files.filter(f => !named.has(f) && !spared.has(f));",
+              replace: "  const orphans = [];" }],
+  },
+  {
+    name: "sweep-grandfather-list-cannot-rot",
+    why: "stop noticing that a grandfathered file has gained an entry or stopped existing, so the list quietly becomes a blanket exemption nobody granted",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "coverage() reports a grandfathered file that has SINCE gained an entry",
+    edits: [{ file: "src/stubsweep.mjs",
+              find: "  const stale = [...spared].filter(f => named.has(f) || !files.includes(f)).sort();",
+              replace: "  const stale = [];" }],
+  },
+  {
+    name: "sweep-unresolvable-base-is-not-an-empty-diff",
+    why: "return an empty file list when the base cannot be resolved instead of refusing, which is how a depth-1 checkout makes the gate pass while measuring nothing",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "an unresolvable base REFUSES rather than reporting an empty diff, which would pass",
+    edits: [{ file: "src/stubsweep.mjs",
+              find: "  if (!base) return { ok: false, files: [], why:",
+              replace: "  if (!base) return { ok: true, files: [], why:" }],
+  },
+  {
+    name: "sweep-grandfathering-ends-at-the-first-edit",
+    why: "let a grandfathered file be edited without demanding a stub, which removes the only mechanism that ever pays the debt down",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "editing a grandfathered test file REFUSES, and names the file",
+    edits: [{ file: "src/stubsweep.mjs",
+              find: "  const touched = (changed ?? []).filter(f => spared.has(f));",
+              replace: "  const touched = [];" }],
   },
 ];

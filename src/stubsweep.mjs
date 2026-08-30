@@ -442,3 +442,121 @@ export function fingerprint(abs) {
   } catch { return "<unreadable>"; } finally { closeSync(fd); }
   return h.digest("hex").slice(0, 16);
 }
+
+/**
+ * Which test files the manifest actually speaks for, and which are only tolerated.
+ *
+ * PURE, and separated from both readers on purpose. The gate in
+ * `test/stubsweep.test.mjs` and the ratio line in `scripts/stub-sweep.mjs` are two
+ * consumers of ONE fact. Computing it twice is how two numbers that must agree
+ * begin disagreeing, and this repository has paid for that shape more than once.
+ *
+ * WHY A GATE EXISTS AT ALL. Measured 2026-08-30: 48 entries covering 3 of 106 test
+ * files, and 26 of the 48 were on the sweep's own test. So the REQUIRED job whose
+ * whole claim is "these tests can fail" was answering that for three percent of the
+ * suite, and every file added since had quietly joined the untested majority.
+ *
+ * `covered` is a file some entry names. `grandfathered` is the frozen debt: files
+ * that predate the rule and are tolerated until someone touches them. `orphans` are
+ * neither, and an orphan is the failure -- a test file nobody has shown can fail,
+ * and that nobody declared.
+ */
+export function coverage(entries, testFiles, grandfathered = []) {
+  const named = new Set((entries ?? []).map(e => e?.test).filter(Boolean));
+  const spared = new Set(grandfathered);
+  const files = [...new Set(testFiles ?? [])].sort();
+  const covered = files.filter(f => named.has(f));
+  const orphans = files.filter(f => !named.has(f) && !spared.has(f));
+  // A grandfathered file that has SINCE gained an entry, or that no longer exists.
+  // Both mean the list is describing a tree that has moved on, and a list nobody is
+  // required to correct is a list that silently becomes a blanket exemption.
+  const stale = [...spared].filter(f => named.has(f) || !files.includes(f)).sort();
+  return { files, covered, orphans, stale, spared: [...spared].sort(),
+           entries: (entries ?? []).length };
+}
+
+/**
+ * The debt, in one line, for whoever is looking at the output rather than the code.
+ *
+ * Printed on every run because the ratio was the thing nobody had seen. A number
+ * that only exists inside a function cannot embarrass anyone into fixing it.
+ */
+export function coverageLine(c) {
+  return `${c.entries} entr${c.entries === 1 ? "y" : "ies"} over ${c.covered.length} of ` +
+         `${c.files.length} test file(s); ${c.spared.length} grandfathered`;
+}
+
+/**
+ * The files a change touches, or a REFUSAL saying why they could not be read.
+ *
+ * NEVER an empty list on failure, and that is the whole point. Both CI jobs check
+ * out at depth 1, where there is no history and no merge base -- and a diff against
+ * a base that cannot be resolved does not error, it yields NOTHING. An empty change
+ * set intersects an empty grandfather list and the gate passes: green, fast, and
+ * measuring nothing. That is the exact failure this gate exists to catch, arriving
+ * through the checkout configuration rather than through the logic.
+ *
+ * So an unresolvable base is a REFUSAL, never a pass, for the same reason reeve
+ * treats a cancelled check as uninformative rather than as success. The message
+ * names the knob, because whoever hits it is looking at a red gate and a clean diff
+ * with no obvious cause.
+ */
+export function changedFiles({ base, head, run }) {
+  if (!base) return { ok: false, files: [], why:
+    "the base commit could not be resolved, so which files changed is unknown; " +
+    "this is a refusal rather than an empty diff because an empty diff would PASS. " +
+    "In CI the sweep gate needs `fetch-depth: 0` on its checkout step" };
+  const r = run(["diff", "--name-only", `${base}...${head}`]);
+  if (!r || r.ok === false) return { ok: false, files: [], why:
+    `the diff from ${base} to ${head} could not be read: ${r?.err ?? "no output"}` };
+  return { ok: true, files: String(r.out ?? "").split("\n").filter(Boolean), why: null };
+}
+
+/**
+ * Does this change touch a test file that is only tolerated while untouched?
+ *
+ * PURE, and separated from the runner deliberately. The runner skips this whole
+ * mechanism when driven against a synthetic fixture, because a fixture repository has
+ * no base to diff against -- which means the mechanism CANNOT be exercised through
+ * that seam. An instrument that can only be wired and never shown to fire is the
+ * exact shape the sweep exists to find, so the decision lives here where a test can
+ * reach it without a repository at all.
+ *
+ * The refusal names each file and says what to do, because the person who trips this
+ * is mid-edit on a file they did not know was on a list.
+ */
+export function grandfatherGate({ changed, grandfathered }) {
+  const spared = new Set(grandfathered ?? []);
+  const touched = (changed ?? []).filter(f => spared.has(f));
+  if (!touched.length) return { ok: true, touched: [], why: null };
+  return { ok: false, touched, why:
+    "these test files are GRANDFATHERED and you are editing them:\n" +
+    touched.map(f => `  ${f}`).join("\n") + "\n\n" +
+    "Grandfathering covers files nobody touches. Add a manifest entry proving one of\n" +
+    "each file's assertions can fail, then remove it from GRANDFATHERED in\n" +
+    "test/stub-manifest.mjs." };
+}
+
+/**
+ * Did the frozen list GROW, or did coverage shrink?
+ *
+ * PURE, and separate from the edit rule because they catch different moves. The edit
+ * rule refuses touching a listed file. It says nothing about a change that removes a
+ * test's STUBS entry and adds that test to the list instead: the file itself is never
+ * edited, so the intersection sees only the manifest in the diff and passes, while
+ * the list grows and measured coverage falls. The rule was described as a ratchet
+ * from the start and only the edit half was built.
+ *
+ * Growth is the thing refused, not size. Removing names is how the debt is paid, so a
+ * shorter list is the desired direction and passes silently.
+ */
+export function listGrowth({ before, after }) {
+  const was = new Set(before ?? []);
+  const added = (after ?? []).filter(f => !was.has(f));
+  if (!added.length) return { ok: true, added: [], why: null };
+  return { ok: false, added, why:
+    "these test files were ADDED to GRANDFATHERED:\n" +
+    added.map(f => `  ${f}`).join("\n") + "\n\n" +
+    "The list is frozen debt, not an exemption list. A file with no stub arrives with\n" +
+    "one or it does not arrive; a file that already had one does not get to give it up." };
+}

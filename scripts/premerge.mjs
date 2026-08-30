@@ -20,24 +20,46 @@
  * how a fourth inventory appears that agrees only today.
  */
 import { execFileSync } from "node:child_process";
-import { refPath, headRepoOf, branchStateFrom } from "../src/mergecheck.mjs";
+import { refPath, headRepoOf, branchStateFrom, safePath, EXIT } from "../src/mergecheck.mjs";
 import { gate, CLEAR, REFUSE, UNREVIEWED, UNKNOWN } from "../src/premerge.mjs";
 
 const MAXBUF = 64 << 20;
 const gh = (args) => execFileSync("gh", args,
   { encoding: "utf8", maxBuffer: MAXBUF, stdio: ["ignore", "pipe", "pipe"] });
 const ghJson = (args) => { try { return JSON.parse(gh(args)); } catch { return null; } };
+/** Every page of a --paginate response, flattened. Null means the read failed. */
+const ghPages = (args) => {
+  try {
+    const out = gh(args).split("\n").filter(Boolean).map(l => JSON.parse(l));
+    return out.flat();
+  } catch { return null; }
+};
 
 const argv = process.argv.slice(2);
 const pr = argv.find(a => /^\d+$/.test(a));
 const repoAt = argv.indexOf("--repo");
+// `--repo` WITH NO VALUE is a usage error, not a fallback. Taking the checkout
+// instead means an automation typo gates a different repository and returns a
+// confident verdict about the wrong pull request.
+if (repoAt >= 0 && (argv[repoAt + 1] === undefined || argv[repoAt + 1].startsWith("--"))) {
+  console.error("premerge: --repo needs a value like owner/name");
+  process.exit(EXIT.usage);
+}
 const repo = repoAt >= 0 ? argv[repoAt + 1] : null;
 if (!pr) {
   console.error("usage: node scripts/premerge.mjs <pr> [--repo owner/name]");
-  process.exit(2);
+  process.exit(EXIT.usage);
 }
-const nwo = repo ?? (ghJson(["repo", "view", "--json", "nameWithOwner"])?.nameWithOwner ?? null);
-if (!nwo) { console.error("premerge: cannot determine the repository"); process.exit(2); }
+// THE HOST TRAVELS WITH THE REPOSITORY. `gh repo view` resolves an Enterprise
+// remote and returns only `nameWithOwner`; a later `gh api` without --hostname then
+// defaults to github.com and can read an unrelated pull request of the same number
+// on a different host, returning a confident verdict about it.
+const view = repo ? null : ghJson(["repo", "view", "--json", "nameWithOwner,url"]);
+const nwo = repo ?? view?.nameWithOwner ?? null;
+const host = process.env.GH_HOST
+  ?? (() => { try { return view?.url ? new URL(view.url).hostname : null; } catch { return null; } })();
+const hostArgs = host && host !== "github.com" ? ["--hostname", host] : [];
+if (!nwo) { console.error("premerge: cannot determine the repository"); process.exit(EXIT.usage); }
 const [owner, name] = nwo.split("/");
 
 // One GraphQL read for the head and the threads, so both describe the same moment.
@@ -48,25 +70,30 @@ const q = `query { repository(owner:"${owner}", name:"${name}") { pullRequest(nu
   headRepositoryOwner { login } headRepository { name }
   reviewThreads(first:100) { totalCount nodes { id isResolved path
     comments(first:1) { nodes { author { login } body } } } }
-  commits(last:1) { nodes { commit { statusCheckRollup { contexts(first:100) { nodes {
+  commits(last:1) { nodes { commit { statusCheckRollup { contexts(first:100) { totalCount nodes {
     ... on CheckRun { name conclusion status }
     ... on StatusContext { context state } } } } } } } } } }`;
-const doc = ghJson(["api", "graphql", "-f", `query=${q}`]);
+const doc = ghJson(["api", "graphql", ...hostArgs, "-f", `query=${q}`]);
 const meta = doc?.data?.repository?.pullRequest ?? null;
-if (!meta) { console.error(`premerge: could not read ${nwo}#${pr}`); process.exit(2); }
+if (!meta) { console.error(`premerge: could not read ${nwo}#${pr}`); process.exit(31); }
 
 if (meta.state !== "OPEN") {
   // Not a refusal: there is no merge to gate. Said plainly rather than as CLEAR,
   // because "already merged" is not "safe to merge".
   console.log(`premerge: ${nwo}#${pr} is ${meta.state}, so there is nothing to gate`);
-  process.exit(3);
+  process.exit(EXIT.absent);
 }
 
 // The head repository, refused rather than guessed when it cannot be established.
 const ids = headRepoOf(meta, nwo);
 let branchNow = null, branchRead = "unreadable";
 if (ids) {
-  const refs = ghJson(["api", "--paginate",
+  // ONE DOCUMENT PER PAGE, parsed per page. `gh api --paginate` concatenates the
+  // page documents rather than merging them, so a single JSON.parse rejects a
+  // multi-page answer and a perfectly readable branch reads as `unreadable` -- the
+  // gate then cannot clear, ever, for a branch whose name prefixes enough others.
+  // Same handling as verify-merge, rather than a second approach to one problem.
+  const refs = ghPages(["api", "--paginate", ...hostArgs,
     `repos/${refPath(ids.owner)}/${refPath(ids.repo)}/git/matching-refs/heads/${refPath(meta.headRefName)}`]);
   ({ branchNow, branchRead } = branchStateFrom(refs, meta.headRefName));
 }
@@ -78,15 +105,24 @@ const rollup = meta.commits?.nodes?.[0]?.commit?.statusCheckRollup ?? null;
 const verdict = gate({
   head: { prHead: meta.headRefOid, branchNow, branchRead },
   threads: meta.reviewThreads,
-  checks: { nodes: rollup ? (rollup.contexts?.nodes ?? null) : [] },
+  checks: { nodes: rollup ? (rollup.contexts?.nodes ?? null) : [],
+            totalCount: rollup ? (rollup.contexts?.totalCount ?? null) : 0 },
 });
 
 console.log(`${verdict.state}  ${nwo}#${pr}  head=${String(meta.headRefOid).slice(0, 7)} branch=${branchNow ? String(branchNow).slice(0, 7) : branchRead}`);
 for (const line of verdict.why) console.log(`  ${line}`);
 for (const t of verdict.threads.unresolved ?? []) {
   const c = t.comments?.nodes?.[0];
-  console.log(`  open: ${t.path ?? "(no path)"} [${c?.author?.login ?? "?"}] ` +
-              `${String(c?.body ?? "").replace(/\s+/g, " ").slice(0, 90)}`);
+  // ESCAPED, because a path and a body on an outside-contributor pull request are
+  // attacker-supplied, and an ANSI or OSC sequence printed here can erase or rewrite
+  // the verdict lines above it. safePath is the repository's own escaper rather than
+  // a second one, and it is applied to the AUTHOR too -- a login is likelier to be
+  // trusted by a reader precisely because it looks like a name.
+  console.log(`  open: ${safePath(t.path ?? "(no path)")} [${safePath(c?.author?.login ?? "?")}] ` +
+              `${safePath(String(c?.body ?? "").replace(/\s+/g, " ").slice(0, 90))}`);
 }
-// Distinct codes, so a caller can tell WHY it is not clear without parsing text.
-process.exit({ [CLEAR]: 0, [REFUSE]: 1, [UNKNOWN]: 4, [UNREVIEWED]: 5 }[verdict.state] ?? 1);
+// REEVE'S OWN 15-125 BAND, which this repository already defines and this did not
+// use. Node reserves 1 and 3-14 -- a rethrowing uncaughtException exits 7, an
+// unsettled top-level await exits 13 -- so a caller distinguishing outcomes by exit
+// status could not tell a deliberate REFUSE from an ordinary crash.
+process.exit({ [CLEAR]: EXIT.ok, [REFUSE]: 30, [UNKNOWN]: 31, [UNREVIEWED]: 32 }[verdict.state] ?? 30);

@@ -100,6 +100,38 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
       `a ${conclusion} check is refused rather than treated as merely not-success`);
 }
 
+// --- a legacy status context reports progress in `state`, not `conclusion` --------
+{
+  // THE ONE THAT CLEARED THE GATE. A StatusContext has no conclusion at all and
+  // reports PENDING or EXPECTED in `state`. Reading "has a value" as "finished" put
+  // it in neither the unfinished set nor the failing set, so a pull request whose
+  // only status was still pending was reported CLEAR with "all checks succeeded" --
+  // the gate defeated through the shape it did not enumerate.
+  for (const state of ["PENDING", "EXPECTED"]) {
+    const r = checkState({ nodes: [{ context: "ci/legacy", state }] });
+    check(r.state === UNKNOWN, `a legacy status in ${state} is UNKNOWN, not clear`, r.why);
+  }
+  check(checkState({ nodes: [{ context: "ci/legacy", state: "FAILURE" }] }).state === REFUSE,
+    "a legacy status in FAILURE is refused");
+  check(checkState({ nodes: [{ context: "ci/legacy", state: "SUCCESS" }] }).state === CLEAR,
+    "control: a legacy status in SUCCESS is clear, so the shape is understood and not merely rejected");
+  // SUCCESS is named positively, so a state nobody anticipated cannot pass.
+  check(checkState({ nodes: [{ name: "j", conclusion: "SOME_FUTURE_STATE" }] }).state === UNKNOWN,
+    "an unrecognised conclusion is UNKNOWN rather than treated as success");
+}
+
+// --- the rollup gets the same completeness rule as the threads --------------------
+{
+  // This rule was applied to threads and not to checks: the connection added last
+  // did not inherit it. A hundred passing checks beside one omitted pending one read
+  // as CLEAR, which is the gate defeated by its own missing check.
+  const ok = n => Array.from({ length: n }, (_, i) => ({ name: `job${i}`, conclusion: "SUCCESS" }));
+  const capped = checkState({ nodes: ok(100), totalCount: 120 });
+  check(capped.state === UNKNOWN, "a truncated check rollup is UNKNOWN, not clear", capped.why);
+  check(checkState({ nodes: ok(3), totalCount: 3 }).state === CLEAR,
+    "control: a complete rollup still clears, so the check is about truncation and not about counting at all");
+}
+
 // --- the combined verdict never rounds up ----------------------------------------
 {
   const bothClear = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },

@@ -10,6 +10,7 @@
 import { statePathFor, dashPathFor, legacyStatePathFor,
          taskPathFor, artifactPathFor, runPathFor } from "../src/paths.mjs";
 import { join, resolve, relative, isAbsolute } from "node:path";
+import { readFileSync } from "node:fs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -108,6 +109,48 @@ const HOME = "/home/x/.reeve";
     try { runPathFor(HOME, id, run); } catch (e) { t = String(e.message); }
     check(t !== null, `a run path without ${missing} throws rather than naming a file`, String(t));
   }
+}
+
+// ── The path layout is FROZEN, in both of its halves ───────────────────────
+//
+// They fail differently. The ARTIFACT name is what S3-D writes and S3-E renders.
+// The RUN file name is how a surviving worker's transcript is found again after
+// a crash -- and a run path that loses its attempt number overwrites the
+// previous attempt, which is exactly what made two of three runs vanish from a
+// measured comparison and forced a figure to be withdrawn. A freeze covering
+// only the artifact half stays green through that.
+{
+  const frozen = JSON.parse(readFileSync(new URL("./fixtures/artifact-paths-v1.json", import.meta.url), "utf8"));
+  const fid = "bt:01JABCDEFGHJKMNPQRSTVWXYZ0";
+  const rel = (p) => p.slice(HOME.length);
+  check(rel(artifactPathFor(HOME, fid, "RESEARCH")) === frozen.artifact,
+    "the artifact path shape is frozen",
+    `${rel(artifactPathFor(HOME, fid, "RESEARCH"))} vs ${frozen.artifact}`);
+  const runArgs = { generation: 2, phase: "RESEARCH", slice: 0, attempt: 1, stream: "out" };
+  check(rel(runPathFor(HOME, fid, runArgs)) === frozen.run,
+    "and so is the run path, which is how a surviving worker's transcript is found",
+    `${rel(runPathFor(HOME, fid, runArgs))} vs ${frozen.run}`);
+  check(frozen.version === 1, "and the fixture records which shape it froze", String(frozen.version));
+
+  // AND THE ATTEMPT IS PART OF IT. Asserted separately from the string compare,
+  // because a frozen string tells a later reader THAT it changed and not which
+  // field went missing -- and this is the field whose loss is silent.
+  // COMPARED TO EACH OTHER, not to the frozen string. Against the frozen string
+  // this passes under the very defect it names: drop the attempt from the
+  // template and attempt 2's path still differs from a frozen name that HAS one.
+  // The property is that two attempts do not collide, so the two attempts are
+  // what must be compared.
+  const a1 = runPathFor(HOME, fid, { ...runArgs, attempt: 1 });
+  const a2 = runPathFor(HOME, fid, { ...runArgs, attempt: 2 });
+  check(a1 !== a2,
+    "and a different attempt is a different file, so one attempt cannot overwrite another",
+    `${rel(a1)} vs ${rel(a2)}`);
+  const s0 = runPathFor(HOME, fid, { ...runArgs, slice: 0 });
+  const s1 = runPathFor(HOME, fid, { ...runArgs, slice: 1 });
+  check(s0 !== s1, "and so is a different slice", `${rel(s0)} vs ${rel(s1)}`);
+  const g1 = runPathFor(HOME, fid, { ...runArgs, generation: 1 });
+  const g2 = runPathFor(HOME, fid, { ...runArgs, generation: 2 });
+  check(g1 !== g2, "and a different generation", `${rel(g1)} vs ${rel(g2)}`);
 }
 
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

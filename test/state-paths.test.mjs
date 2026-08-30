@@ -153,5 +153,29 @@ const HOME = "/home/x/.reeve";
   check(g1 !== g2, "and a different generation", `${rel(g1)} vs ${rel(g2)}`);
 }
 
+// ── Every run-path component is a segment, not just the task id ───────────
+//
+// The id was sanitised and the rest were only checked for presence, so a phase
+// or stream carrying a separator escaped the task tree entirely. Same defect as
+// the one `safe` exists to prevent, in the same function, on the arguments
+// beside it.
+{
+  const id = "bt:01JABCDEFGHJKMNPQRSTVWXYZ0";
+  const tree = resolve(taskPathFor(HOME, id));
+  const base = { generation: 1, phase: "RESEARCH", slice: 0, attempt: 1, stream: "out" };
+  for (const bad of [{ phase: "x/../../../../escape" }, { stream: "../../../../etc/passwd" },
+                     { phase: "a/b" }, { stream: "a/b" }, { phase: ".." }]) {
+    let threw = null, got = null;
+    try { got = runPathFor(HOME, id, { ...base, ...bad }); } catch (e) { threw = String(e.message); }
+    check(threw !== null,
+      `a run path refuses ${JSON.stringify(bad)} rather than placing the file outside the tree`,
+      got ? `produced ${got}` : String(threw));
+  }
+  // CONTROL: an ordinary run path is unaffected, and lands inside the tree.
+  const ok = runPathFor(HOME, id, base);
+  check(relative(tree, resolve(ok)) === join("runs", "g1-RESEARCH-s0-a1.out"),
+    "control: an ordinary run path still resolves inside the task's tree", relative(tree, resolve(ok)));
+}
+
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

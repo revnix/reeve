@@ -383,11 +383,15 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
     check(r.ok === false, `sizing.json that is ${label} is refused`, JSON.stringify(r.findings));
   }
   check(gate("{ not json").ok === false, "and one that does not parse is still refused");
-  // CONTROL: an object carrying a depth passes. The DEPTH VOCABULARY is not
-  // re-checked here -- the transition owns it and refuses an unknown depth
-  // durably, so repeating the list would be a second inventory of it.
-  const good = gate(JSON.stringify({ depth: "standard", slices: 2, rationale: "x" }));
-  check(good.ok === true, "control: an object carrying a depth passes", JSON.stringify(good.findings));
+  // CONTROL: an object carrying the whole documented contract passes. This
+  // assertion previously required only a depth, which encoded a position I got
+  // wrong -- I argued that requiring the other fields would be guessing at what
+  // the sizing phase emits, when the design states the shape. The DEPTH VALUE is
+  // still not re-checked here: the transition owns that vocabulary and refuses
+  // an unknown depth durably, so a copy of the list would be a second inventory.
+  const good = gate(JSON.stringify({ depth: "standard", est_files: 3, est_weighted_files: 4,
+    est_packages: 1, est_slices: 2, risk_paths_touched: [], rationale: "x" }));
+  check(good.ok === true, "control: an object carrying the full contract passes", JSON.stringify(good.findings));
 }
 
 // ── Every slice, not the document ──────────────────────────────────────────
@@ -504,6 +508,70 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const good = gate(`# design\n\n${one}\n## Slice 2\nFiles: e\nPackages: f\nTests: g\nDone when: h\n\n## Notes\nprose\n`);
   check(good.ok === true, "control: a trailing section after a complete slice is fine",
     JSON.stringify(good.findings));
+}
+
+// ── A citation is a PATH and a line, not any token with a colon ────────────
+//
+// `[\w./-]+:\d+` matched `12:30` and `issue:42` as readily as
+// `src/build/hubaccess.mjs:170`, so a claim mentioning a time or a ticket read
+// as sourced. The URL fix closed one leak in that pattern and left the rest --
+// the same shape, one round later.
+{
+  const adir = join(dir, "citeshape");
+  const g = (body) => {
+    writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
+    return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+  };
+  for (const token of ["12:30", "issue:42", "PR:103", "10:00"])
+    check(g(`# r\n\n- a claim, observed at ${token}\n`).ok === false,
+      `${token} is not a file citation`);
+  // CONTROLS: what a citation actually looks like must still pass, in both the
+  // pathed and the bare-filename form.
+  check(g("# r\n\n- a claim (src/build/hubaccess.mjs:170)\n").ok === true,
+    "control: a path with a line number still passes");
+  check(g("# r\n\n- a claim (hubaccess.mjs:170)\n").ok === true,
+    "control: and a bare filename with a line number");
+}
+
+// ── A label is not an answer ───────────────────────────────────────────────
+{
+  const adir = join(dir, "labelvalues");
+  const g = (body) => {
+    writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
+    return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+  };
+  const bare = g("# d\n\n## Slice 1\nFiles:\nPackages:\nTests:\nDone when:\n");
+  check(bare.ok === false, "a slice carrying the bare scaffold is refused", JSON.stringify(bare.findings));
+  check(bare.findings.some(f => /nothing after it/.test(f)),
+    "and says the label was there and the value was not", JSON.stringify(bare.findings));
+  check(g("# d\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n").ok === true,
+    "control: the same slice with values passes");
+}
+
+// ── The sizing contract, as the design writes it ───────────────────────────
+//
+// I declined this once, arguing that requiring fields would encode what the
+// sizing phase is merely EXPECTED to emit. That was wrong: the design states the
+// shape, so these are the artifact's terms rather than a guess about a task
+// nobody has written. The depth VALUE is still not re-checked here -- the
+// transition owns that vocabulary and refuses an unknown depth durably.
+{
+  const adir = join(dir, "sizingcontract");
+  const g = (o) => {
+    writeArtifact({ dir: adir, phase: "SIZING", bytes: Buffer.from(JSON.stringify(o)) });
+    return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
+  };
+  const full = { depth: "standard", est_files: 3, est_weighted_files: 4, est_packages: 1,
+                 est_slices: 2, risk_paths_touched: [], rationale: "because" };
+  check(g(full).ok === true, "control: the full contract passes", JSON.stringify(g(full).findings));
+  check(g({ depth: "standard" }).ok === false, "a sizing carrying only a depth is refused");
+  // EVERY field, not the one that happened to be tested.
+  for (const field of Object.keys(full)) {
+    const missing = { ...full }; delete missing[field];
+    const r = g(missing);
+    check(r.ok === false && r.findings.some(f => f.includes(field)),
+      `a sizing omitting ${field} is refused, and the finding names it`, JSON.stringify(r.findings));
+  }
 }
 
 db.close();

@@ -33,9 +33,16 @@ export function whyModel(db, taskId, { now }) {
   // regenerate produces two rows with the same phase, slice and attempt and
   // nothing to tell a consumer which contract epoch produced either -- and
   // ordering by time does not restore an identity the projection dropped.
+  // THE WHOLE CONTRACT SNAPSHOT. `argv_hash`, `prompt_hash`, `settings_hash`,
+  // `tools_hash`, `agents_hash` and `canary_id` are durable columns that define
+  // the sandbox and the prompt a run actually executed under. A lineage carrying
+  // only the model and the budget cannot answer "what exactly ran", which is the
+  // question `why` exists for -- and an operator auditing a bad run would have to
+  // open the database by hand to get the rest.
   const runs = db.prepare(
     `SELECT generation, phase, slice, attempt, status, started_at, outcome, model_id, cli_version,
-            effort, max_turns, max_budget_usd, snapshot_hash, contract_drift
+            effort, max_turns, max_budget_usd, snapshot_hash, contract_drift,
+            argv_hash, prompt_hash, settings_hash, tools_hash, agents_hash, canary_id
        FROM phase_run WHERE task = ? ORDER BY generation, started_at, attempt`).all(taskId);
   // EVERY hold, cleared ones included, and this is why `why` does not reuse
   // `evidenceFor`'s list. That one filters to `cleared_at IS NULL` because
@@ -79,12 +86,35 @@ export function whyModel(db, taskId, { now }) {
   // Gate rounds, each paired with whether a Codex clean pass exists AT THAT HEAD.
   // Pairing at the head is the whole content of the section: a clean pass on an
   // earlier head is not an answer about the head under review now.
+  // A FOUNDER APPROVAL IS FOUNDER EVIDENCE. `notice_receipt.kind='founder_ack'`
+  // is one way a founder answers a round; `approval` rows of kind
+  // `founder_review`, `founder_cli` and `founder_silence` are the others, and
+  // treating the acknowledgement as the only evidence rendered "founder not yet"
+  // about a round the founder had explicitly approved -- while omitting the
+  // source that proves it.
+  const founderApprovals = db.prepare(
+    `SELECT head_sha, kind, actor_login_snapshot, source_id, observed_at
+       FROM approval WHERE task = ? AND kind IN ('founder_review','founder_cli','founder_silence')
+      ORDER BY observed_at`).all(taskId);
+  const byHead = new Map();
+  for (const a of founderApprovals) if (!byHead.has(a.head_sha)) byHead.set(a.head_sha, a);
+
   const clean = new Set(ev.codexClean.map(a => a.head_sha));
   const acked = new Set(ev.notices.filter(n => n.kind === "founder_ack").map(n => n.head_sha));
-  const gate = ev.gateRequests.map(g => ({
-    head_sha: g.head_sha, round: g.round, requested_at: g.requested_at,
-    codex_clean: clean.has(g.head_sha), founder_acked: acked.has(g.head_sha),
-  }));
+  const gate = ev.gateRequests.map(g => {
+    const approval = byHead.get(g.head_sha) ?? null;
+    return {
+      head_sha: g.head_sha, round: g.round, requested_at: g.requested_at,
+      codex_clean: clean.has(g.head_sha),
+      founder_acked: acked.has(g.head_sha) || approval !== null,
+      // WHICH evidence, not merely that there was some. A silence approval and an
+      // explicit review are both "approved" and an operator auditing a merge
+      // needs to know which one, and where it came from.
+      founder_evidence: approval
+        ? { kind: approval.kind, actor: approval.actor_login_snapshot, source_id: approval.source_id }
+        : (acked.has(g.head_sha) ? { kind: "notice_ack", actor: null, source_id: null } : null),
+    };
+  });
 
   const model = {
     format_version: READ_FORMAT_VERSION,
@@ -140,7 +170,8 @@ export function renderWhy(m) {
   if (m.absent.includes("gate")) out.push("    no gate_request rows: review has never been asked for");
   else for (const g of m.gate)
     out.push(`    round ${g.round}  ${g.head_sha}  codex ${g.codex_clean ? "clean" : "not yet"}` +
-             `  founder ${g.founder_acked ? "acked" : "not yet"}`);
+             `  founder ${g.founder_acked ? (g.founder_evidence?.kind ?? "acked") : "not yet"}` +
+             (g.founder_evidence?.source_id ? `  source ${g.founder_evidence.source_id}` : ""));
 
   out.push("", "  provider lease");
   // NOT "never asked for a slot". A successful release DELETES the row, so an

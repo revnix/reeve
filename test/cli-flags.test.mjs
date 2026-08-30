@@ -582,14 +582,14 @@ check(existsSync(join(repo, ".git")),
   // copy, so the scoping this file already proved for `--dry-run` is asserted here
   // to be the SAME mechanism rather than a parallel one.
   const { APPLIES } = await import("../bin/reeve.flags.mjs");
-  check(Array.isArray(APPLIES["dry-run"]) && APPLIES["dry-run"].includes("task"),
+  check(Array.isArray(APPLIES["dry-run"]) && APPLIES["dry-run"].includes("task file"),
     "--dry-run is scoped by the same map as --json, not by a second allow-list",
     JSON.stringify(APPLIES));
   const BIN2 = readFileSync(new URL("../bin/reeve", import.meta.url), "utf8");
   check(!/DRY_RUN_COMMANDS/.test(BIN2),
     "and the allow-list it used to have its own copy of is gone",
     (BIN2.match(/.*DRY_RUN_COMMANDS.*/) ?? [""])[0]);
-  check(/inapplicable\(cmd, ARGS\.flags\)/.test(BIN2),
+  check(/\binapplicable\(\s*cmd\b/.test(BIN2),
     "counter-control: the extraction can find the gate that replaced it, so the absence above is real",
     (BIN2.match(/.*inapplicable\(cmd.*/) ?? [""])[0]);
 }
@@ -797,6 +797,46 @@ check(existsSync(join(repo, ".git")),
   const prose = run("statusline", "revnix/reeve");
   let proseParsed = false; try { JSON.parse(prose.stdout); proseParsed = true; } catch { /* expected */ }
   check(!proseParsed, "control: the same parse rejects a command that emits prose", prose.stdout.slice(0, 200));
+}
+
+
+// ── applicability is subcommand-aware where a subcommand is what differs ────
+//
+// `task file` implements --dry-run; `task list`, `task show` and `task why` are
+// readers that never look at it. A route-level entry accepted it there and did
+// nothing -- recreating, INSIDE the gate built to prevent it, exactly the
+// accepted-and-inert flag it exists to refuse.
+{
+  const { APPLIES, inapplicable } = await import("../bin/reeve.flags.mjs");
+  check(APPLIES["dry-run"].every(a => a.includes(" ")),
+    "--dry-run's scope names a subcommand, not a whole route", JSON.stringify(APPLIES["dry-run"]));
+
+  const listed = run("task", "list", "--dry-run");
+  check(listed.status === 2 && /--dry-run is not implemented by/.test(listed.out),
+    "a task READ subcommand refuses --dry-run rather than accepting it and doing nothing",
+    `rc=${listed.status} ${listed.out.split("\n")[0]}`);
+  check(/task list/.test(listed.out),
+    "and names the subcommand, not just the route", listed.out.split("\n")[0]);
+
+  // CONTROL: the subcommand that DOES implement it is untouched. Without this the
+  // change above is satisfied by banning the flag from `task` entirely.
+  const filed = run("task", "file", "--dry-run");
+  check(!/--dry-run is not implemented by/.test(filed.out),
+    "control: `task file` still reaches its own body with --dry-run", filed.out.split("\n")[0]);
+
+  // A route-qualified flag with NO subcommand typed is not decided by this gate:
+  // the route is about to refuse the missing subcommand, and answering the flag
+  // first would report the wrong error for the wrong reason.
+  const bare = run("task", "--dry-run");
+  check(/reeve task:/.test(bare.out) && !/--dry-run is not implemented/.test(bare.out),
+    "control: `reeve task --dry-run` still reports the missing subcommand, not the flag",
+    bare.out.split("\n")[0]);
+
+  // And a route whose entries are NOT subcommand-qualified still reports the bare
+  // route name: `positionals[0]` is an argument there, not a verb.
+  check(inapplicable("why", new Set(["json"]), "1")?.cmd === "why",
+    "a route with no qualified entry is named bare, so `reeve why 1` is not refused as `why 1`",
+    JSON.stringify(inapplicable("why", new Set(["json"]), "1")));
 }
 
 rmSync(dir, { recursive: true, force: true });

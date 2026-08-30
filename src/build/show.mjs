@@ -255,7 +255,8 @@ export function evidenceFor(db, taskId, { now }) {
     notices: db.prepare(
       `SELECT head_sha, kind, channel, delivered_at FROM notice_receipt WHERE task = ?`).all(taskId),
     liveRun: db.prepare(
-      `SELECT phase, slice, attempt, status, model_id, cli_version, started_at, heartbeat_at
+      `SELECT phase, slice, attempt, status, model_id, cli_version, started_at, heartbeat_at,
+              contract_drift
          FROM phase_run WHERE task = ? AND status IN ('live','adopted')
         ORDER BY started_at DESC LIMIT 1`).get(taskId) ?? null,
     lastRun: db.prepare(
@@ -284,7 +285,14 @@ export function evidenceFor(db, taskId, { now }) {
  */
 export function waitingFor(row, ev) {
   const all = [];
-  let since = null, capability = null, capabilityKnown = true;
+  // ONE TIMESTAMP PER WAIT, and the scalar below is the HEADLINE's own.
+  //
+  // A single `since` filled by whichever branch ran first reported the quota
+  // request's moment while `first` named a founder hold -- so anything measuring
+  // "how long has this been waiting" got the age of a different condition, and
+  // got it silently, because both are plausible integers.
+  const at = Object.create(null);
+  let capability = null, capabilityKnown = true;
 
   // A human must act. `hold_reason` is the durable record, and `HELD` is the
   // phases a task rests in while one stands; either alone is enough, because a
@@ -297,7 +305,7 @@ export function waitingFor(row, ev) {
   // read as needing nobody, which is the opposite of true.
   if (ev.holds.length || HELD.includes(row.phase)) {
     all.push("WAITING_FOR_FOUNDER");
-    since = ev.holds[0]?.at ?? null;
+    at.WAITING_FOR_FOUNDER = ev.holds[0]?.at ?? null;
   }
 
   const need = NEEDS_SWITCH[row.phase];
@@ -332,17 +340,23 @@ export function waitingFor(row, ev) {
 
   if (head !== null) {
     const acked = ev.notices.some(n => n.kind === "founder_ack" && n.head_sha === head);
-    if (ev.notices.some(n => n.kind === "delivered" && n.head_sha === head) && !acked)
+    const delivered = ev.notices.filter(n => n.kind === "delivered" && n.head_sha === head);
+    if (delivered.length && !acked) {
       all.push("WAITING_FOR_NOTICE");
+      at.WAITING_FOR_NOTICE = Math.min(...delivered.map(n => n.delivered_at));
+    }
 
     // Asked for review AT THIS HEAD, for THIS generation, with no Codex clean
     // pass at that head. A regenerate resets the contract, so a request recorded
     // under an older generation is not a question about the task as it now is.
     const clean = new Set(ev.codexClean.map(a => a.head_sha));
-    if (ev.gateRequests.some(g => g.head_sha === head &&
-                                  g.task_generation === row.generation &&
-                                  !clean.has(g.head_sha)))
+    const open = ev.gateRequests.filter(g => g.head_sha === head &&
+                                             g.task_generation === row.generation &&
+                                             !clean.has(g.head_sha));
+    if (open.length) {
       all.push("WAITING_FOR_CODEX");
+      at.WAITING_FOR_CODEX = Math.min(...open.map(g => g.requested_at));
+    }
   }
 
   // The guardian owes this task a verdict. Its verdicts live in the guardian's
@@ -351,9 +365,16 @@ export function waitingFor(row, ev) {
   // move out of it is what records the answer.
   if (row.phase === "VERDICT_WAIT") all.push("WAITING_FOR_GUARDIAN");
 
-  if (ev.queued) { all.push("WAITING_FOR_QUOTA"); since ??= ev.queued.requested_at; }
+  if (ev.queued) {
+    all.push("WAITING_FOR_QUOTA");
+    at.WAITING_FOR_QUOTA = ev.queued.requested_at;
+  }
 
   const first = WAITING.find(w => all.includes(w)) ?? null;
+  // The headline's OWN moment, or null where the condition has no timestamp to
+  // give -- a capability switch and a guardian verdict are states, not events,
+  // and inventing a moment for them would be worse than saying there is none.
+  const since = first === null ? null : (at[first] ?? null);
   return { first, all, since, capability, capability_known: capabilityKnown };
 }
 
@@ -377,9 +398,12 @@ export function taskShow(db, taskId, { now, switchesFor }) {
     cli_version: orUnknown(ev.liveRun?.cli_version ?? ev.lastRun?.cli_version),
     switches: ev.switches,
     waiting: waitingFor(row, ev),
+    // `drift` RIDES WITH THE RUN. A run whose frozen contract no longer matches
+    // the live environment is not a run an operator should read as current, and
+    // dropping the column here left `show` unable to say so at all.
     running: ev.liveRun
       ? { phase: ev.liveRun.phase, slice: ev.liveRun.slice, attempt: ev.liveRun.attempt,
-          since: ev.liveRun.started_at }
+          since: ev.liveRun.started_at, drift: ev.liveRun.contract_drift ?? null }
       : null,
     draining: row.phase === "CANCELLING" ? ev.draining : null,
     territory: ev.territory,
@@ -449,6 +473,11 @@ export function renderShow(m) {
 
 export function renderList(models) {
   if (!models.length) return "no tasks";
+  // UNKNOWN IS NOT A DASH. `-` is what a task known not to be waiting prints, and
+  // printing it for a task whose capability could not be read reports an
+  // unreadable decision as healthy -- in the one view an operator scans to decide
+  // where to look, and while `show` correctly says UNKNOWN about the same task.
+  const wait = (m) => m.waiting.first ?? (m.waiting.capability_known ? "-" : UNKNOWN);
   return models.map(m =>
-    `${m.id}  ${m.phase.padEnd(13)} ${(m.waiting.first ?? "-").padEnd(23)} ${m.title}`).join("\n");
+    `${m.id}  ${m.phase.padEnd(13)} ${wait(m).padEnd(23)} ${m.title}`).join("\n");
 }

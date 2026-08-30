@@ -1,3 +1,7 @@
+> **SUPERSEDED by the 2026-08-30 pair.** Its §0 says issue #50 is *under way*; #50 is
+> COMPLETE. Read `HANDOFF-2026-08-30.md` and `RESUME-PROMPT-2026-08-30.md` instead.
+> Kept because its findings sections are still accurate and are cited.
+
 # Resume prompt — paste the block below into a fresh session
 
 Everything between the rules is the prompt. It assumes nothing about what you remember.

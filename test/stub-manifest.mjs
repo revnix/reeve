@@ -550,4 +550,22 @@ export const STUBS = [
               find: "                \"whether that difference loses anything is NOT established here \u2014 \" +",
               replace: "                \"commits on the branch would not be carried \u2014 \" +" }],
   },
+  {
+    name: "premerge-delegates-mergeability",
+    why: "widen the permitted merge states so BLOCKED and DIRTY read as clear, which is the gate printing a merge command GitHub would refuse",
+    test: "test/premerge.test.mjs",
+    expectRed: "a merge state of BLOCKED is refused rather than reported clear",
+    edits: [{ file: "src/premerge.mjs",
+              find: "  const ok = new Set([\"CLEAN\", \"HAS_HOOKS\"]);",
+              replace: "  const ok = new Set([\"CLEAN\", \"HAS_HOOKS\", \"BLOCKED\", \"DIRTY\", \"DRAFT\", \"BEHIND\", \"UNSTABLE\"]);" }],
+  },
+  {
+    name: "premerge-review-bound-to-head",
+    why: "count a thread resolved before this head was pushed as evidence about it, which clears a revision nobody reviewed",
+    test: "test/premerge.test.mjs",
+    expectRed: "threads resolved before this head was pushed are not evidence about it",
+    edits: [{ file: "src/premerge.mjs",
+              find: "  if (!unresolved.length && headPushedAt) {",
+              replace: "  if (false) {" }],
+  },
 ];

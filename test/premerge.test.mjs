@@ -8,7 +8,8 @@
 // The assertions below are mostly about the states that are NOT clear, because
 // "clear" is the easy one and the dangerous failure is a summary line that reads as
 // a pass while carrying a reason not to merge.
-import { gate, headState, threadState, checkState, CLEAR, REFUSE, UNREVIEWED, UNKNOWN }
+import { gate, headState, threadState, checkState, mergeabilityState,
+         CLEAR, REFUSE, UNREVIEWED, UNKNOWN }
   from "../src/premerge.mjs";
 
 let fail = 0;
@@ -52,7 +53,8 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
   // has MOVED the race rather than removed it.
   const g = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
                    threads: { totalCount: 1, nodes: resolved(1) },
-                   checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] } });
+                   checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
+                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" } });
   check(g.verifiedHead === SHA_A, "a clear verdict names the FULL head it verified", g.verifiedHead);
   check(g.verifiedHead.length === 40,
     "control: in full, because --match-head-commit does not take an abbreviation",
@@ -173,11 +175,53 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
     "control: a complete rollup still clears, so the check is about truncation and not about counting at all");
 }
 
+// --- mergeability is GitHub's answer, not ours ------------------------------------
+{
+  // Four review rounds each found another input to "can this merge" that was not
+  // enumerated here, because the question is unbounded and GitHub already computes
+  // it. mergeStateStatus folds in branch protection, required reviews, conflicts,
+  // draft state and being behind the base -- none of which this could see.
+  check(mergeabilityState({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" }).state === CLEAR,
+    "a clean mergeable pull request is clear");
+  check(mergeabilityState({ mergeable: "MERGEABLE", mergeStateStatus: "HAS_HOOKS" }).state === CLEAR,
+    "control: HAS_HOOKS also permits a merge, so this is not a one-value allow-list");
+  for (const status of ["BLOCKED", "DIRTY", "DRAFT", "BEHIND", "UNSTABLE"])
+    check(mergeabilityState({ mergeable: "MERGEABLE", mergeStateStatus: status }).state === REFUSE,
+      `a merge state of ${status} is refused rather than reported clear`);
+  check(mergeabilityState({ mergeable: "CONFLICTING", mergeStateStatus: "DIRTY" }).state === REFUSE,
+    "a conflicting branch is refused");
+  // UNKNOWN is GitHub still computing, which is a transient rather than a defect.
+  check(mergeabilityState({ mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" }).state === UNKNOWN,
+    "mergeability GitHub has not computed yet is UNKNOWN, not clear");
+  check(mergeabilityState({}).state === UNKNOWN, "an unread mergeability is UNKNOWN, not clear");
+}
+
+// --- review evidence belongs to the head it was given about -----------------------
+{
+  // A thread resolved on head A stays resolved after an unreviewed head B is pushed,
+  // so counting it clears a revision nobody looked at. reeve already refuses a
+  // projection derived for a different revision; this is that rule, not a second
+  // implementation of it.
+  const T0 = Date.parse("2026-08-30T00:00:00Z");
+  const at = iso => ({ isResolved: true, comments: { nodes: [{ createdAt: iso }] } });
+  const old = threadState({ totalCount: 1, nodes: [at("2026-08-29T00:00:00Z")], headPushedAt: T0 });
+  check(old.state === UNREVIEWED,
+    "threads resolved before this head was pushed are not evidence about it", old.why);
+  const fresh = threadState({ totalCount: 1, nodes: [at("2026-08-30T01:00:00Z")], headPushedAt: T0 });
+  check(fresh.state === CLEAR,
+    "control: a thread resolved AFTER the head was pushed still clears, so this is about the bound revision");
+  // Without a readable push time there is nothing to compare, and guessing would be
+  // worse than the gap: the rule disables itself rather than inventing an answer.
+  check(threadState({ totalCount: 1, nodes: [at("2026-08-29T00:00:00Z")], headPushedAt: null }).state === CLEAR,
+    "control: with no readable push time the rule does not fire rather than guessing");
+}
+
 // --- the combined verdict never rounds up ----------------------------------------
 {
   const bothClear = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
                            threads: { totalCount: 1, nodes: resolved(1) },
-                           checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] } });
+                           checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
+                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" } });
   check(bothClear.state === CLEAR && bothClear.clear === true,
     "control: when both halves are clear the gate is clear", JSON.stringify(bothClear.why));
 
@@ -185,33 +229,38 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
   // the FIRST problem gets one fixed and is surprised by the other.
   const headBad = gate({ head: { prHead: SHA_A, branchNow: SHA_B, branchRead: "read" },
                          threads: { totalCount: 1, nodes: resolved(1) },
-                           checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] } });
+                           checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
+                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" } });
   check(headBad.state === REFUSE && !headBad.clear, "a stale head refuses even with threads clear");
 
   const threadsBad = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
                             threads: { totalCount: 1, nodes: [{ isResolved: false }] },
-                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] } });
+                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
+                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" } });
   check(threadsBad.state === REFUSE && !threadsBad.clear, "an open thread refuses even with the head current");
 
   const unreviewed = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
                             threads: { totalCount: 0, nodes: [] },
-                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] } });
+                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
+                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" } });
   check(unreviewed.state === UNREVIEWED && !unreviewed.clear,
     "an unreviewed pull request is not clear even with a current head", JSON.stringify(unreviewed.why));
 
   // UNKNOWN outranks UNREVIEWED: not knowing is worse than knowing nobody looked.
   const unknownWins = gate({ head: { prHead: SHA_A, branchNow: null, branchRead: "unreadable" },
                              threads: { totalCount: 0, nodes: [] },
-                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] } });
+                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
+                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" } });
   check(unknownWins.state === UNKNOWN, "UNKNOWN outranks UNREVIEWED");
 
   const refuseWins = gate({ head: { prHead: SHA_A, branchNow: null, branchRead: "unreadable" },
                             threads: { totalCount: 1, nodes: [{ isResolved: false }] },
-                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] } });
+                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
+                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" } });
   check(refuseWins.state === REFUSE, "REFUSE outranks UNKNOWN, so the worst news wins");
 
   // BOTH reasons are always reported, whichever won.
-  check(refuseWins.why.length === 3 && refuseWins.why.some(w => w.startsWith(UNKNOWN))
+  check(refuseWins.why.length === 4 && refuseWins.why.some(w => w.startsWith(UNKNOWN))
         && refuseWins.why.some(w => w.startsWith(REFUSE)),
     "and both halves are reported, not only the one that decided the verdict",
     JSON.stringify(refuseWins.why));

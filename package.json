@@ -11,9 +11,11 @@
     "node": ">=24.10.0"
   },
   "scripts": {
-    "test": "for f in test/*.test.mjs; do node \"$f\" || exit 1; done"
+    "test": "for f in test/*.test.mjs; do node \"$f\" || exit 1; done",
+    "lint": "eslint ."
   },
   "devDependencies": {
-    "@anthropic-ai/sandbox-runtime": "0.0.73"
+    "@anthropic-ai/sandbox-runtime": "0.0.73",
+    "eslint": "^10.9.1"
   }
 }

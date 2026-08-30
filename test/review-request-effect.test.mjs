@@ -7,6 +7,7 @@
 //
 // Two things have to hold: the gate is OFF unless a profile says otherwise, and a
 // repeated tick at one head must not ask twice while a NEW head must ask again.
+import { fileURLToPath } from "node:url";
 import { reviewActionsOn, effectsFor, deadLetterCause, finishedSubjects, runningCommit } from "../src/daemon.mjs";
 import { open, tx, enqueue, supersedeEffects, sha256 } from "../src/db/ops.mjs";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
@@ -437,7 +438,7 @@ const check = (ok, name, detail) => {
   // `git log -1 HEAD` in the checkout answers a different question, and answering
   // the wrong one reports a fix as deployed that is running nowhere. This is the
   // witness taken at the moment that decides.
-  const here = execFileSync("git", ["-C", new URL("..", import.meta.url).pathname,
+  const here = execFileSync("git", ["-C", fileURLToPath(new URL("..", import.meta.url)),
                                     "rev-parse", "--short", "HEAD"], { encoding: "utf8" }).trim();
   check(runningCommit() === here,
     "the daemon reads its commit from the tree its own modules came from",

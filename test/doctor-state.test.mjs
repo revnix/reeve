@@ -20,6 +20,7 @@
 //
 // The test drives the real entry point, because the defect was in the wiring
 // rather than in any function runDoctor could be handed.
+import { fileURLToPath } from "node:url";
 import { open } from "../src/db/ops.mjs";
 import { statePathFor } from "../src/paths.mjs";
 import { spawnSync } from "node:child_process";
@@ -69,7 +70,7 @@ mkdirSync(dirname(dbPath), { recursive: true });
 
 // gh is unreachable from here, so the network-bound checks degrade rather than
 // hang. That is deliberate: this test is about R-06 and nothing else.
-const bin = new URL("../bin/reeve", import.meta.url).pathname;
+const bin = fileURLToPath(new URL("../bin/reeve", import.meta.url));
 const r = spawnSync(process.execPath, [bin, "doctor", NWO, "--json"], {
   encoding: "utf8",
   env: { ...process.env, REEVE_HOME: home, PATH: join(home, "no-tools") },

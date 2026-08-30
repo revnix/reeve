@@ -19,7 +19,13 @@ const check = (ok, name, detail) => {
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
 const dir = mkdtempSync(join(tmpdir(), "reeve-provider-"));
-const SRC = new URL("../src", import.meta.url).pathname;
+// `.href`, not a filesystem path: this value is interpolated into the IMPORT
+// SPECIFIERS of a generated module below, and an import specifier is a URL. On
+// Windows a path would be `C:\\repo\\src` -- backslashes that the generated
+// source reads as escape sequences, behind a `C:` that node ESM does not accept
+// as a scheme. `.pathname` was wrong here for a different reason and `.href` is
+// right for both: it is already the form an import is resolved against.
+const SRC = new URL("../src", import.meta.url).href;
 
 const ALIVE = () => true, DEAD = () => false;
 

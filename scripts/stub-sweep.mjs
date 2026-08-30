@@ -177,7 +177,24 @@ if (!process.env.STUB_SWEEP_ROOT && process.env.STUB_SWEEP_NO_DIFF !== "1") {
       die(2, `stub-sweep: the manifest could not be read at the base commit, so whether GRANDFATHERED grew is unknown: ${was.err}`);
     // Parsed rather than imported: importing arbitrary source from another revision
     // executes it, and this runs in the daemon's own repository.
-    const block = /export const GRANDFATHERED = \[([\s\S]*?)\];/.exec(was.out);
+    // WHITESPACE-TOLERANT ON BOTH READS, and they must agree. Matching one exact
+    // spacing meant a reformat -- a newline after `const`, a tab, two spaces -- made
+    // the contents unreadable AND the presence check answer "absent", so the two
+    // failures cancelled and the gate silently reverted to treating the list as newly
+    // introduced. A guard whose two halves fail together cannot report the
+    // disagreement that makes it safe.
+    const block = /export\s+const\s+GRANDFATHERED\s*=\s*\[([\s\S]*?)\]\s*;?/.exec(was.out);
+    // ABSENT AND UNREADABLE ARE DIFFERENT ANSWERS. A base that never declared the list
+    // is the one-time introduction below. A base that declares one this pattern cannot
+    // read -- a wrapped `Object.freeze`, a different terminator, a reformat -- is an
+    // unknown, and treating it as absent would skip the growth check silently and for
+    // ever after, which is the same "measuring nothing" shape this gate exists to
+    // catch. So the IDENTIFIER decides which case it is, and the pattern only reads
+    // the contents.
+    if (!block && /export\s+const\s+GRANDFATHERED\b/.test(was.out))
+      die(2, "stub-sweep: the base commit declares GRANDFATHERED but its contents could not be read,\n" +
+             "so whether the list grew is unknown. Refusing rather than skipping the check: an\n" +
+             "unreadable prior list would disable this gate permanently and silently.");
     // NO LIST AT THE BASE MEANS THIS CHANGE INTRODUCES IT, and the initial freeze is
     // by definition not growth: there is no earlier list for it to have grown from.
     // Refusing here would mean the change that adds the ratchet cannot pass the

@@ -214,6 +214,23 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
   // worse than the gap: the rule disables itself rather than inventing an answer.
   check(threadState({ totalCount: 1, nodes: [at("2026-08-29T00:00:00Z")], headPushedAt: null }).state === CLEAR,
     "control: with no readable push time the rule does not fire rather than guessing");
+
+  // THE NEGATIVE CONTROL, and it is what makes the rule load-bearing rather than
+  // merely present. Everything above asserts the BOUND reader behaves correctly;
+  // none of it shows an UNBOUND reader would have got this input wrong, which is the
+  // difference between "my rule works" and "the rule is needed". So: the same input,
+  // read WITHOUT the binding, and an assertion that it really does clear.
+  //
+  // A neighbouring session hit the same gap in a duplicate-key reader and built the
+  // fixture decoy-first for exactly this reason. Constructed from data in a
+  // favourable order, both readers agree and the fixture proves nothing.
+  const unbound = threadState({ totalCount: 1, nodes: [at("2026-08-29T00:00:00Z")] });
+  check(unbound.state === CLEAR,
+    "control: reading the SAME threads without the head clears them, so the binding is what refuses",
+    unbound.why);
+  check(unbound.state !== old.state,
+    "control: and the two readers genuinely disagree on this input, so it can exhibit the defect",
+    `${unbound.state} vs ${old.state}`);
 }
 
 // --- the combined verdict never rounds up ----------------------------------------

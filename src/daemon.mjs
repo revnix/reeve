@@ -19,6 +19,7 @@ import { nextAction, describe, ACTIONS, ESCALATIONS } from "./watcher.mjs";
 import { reconcilePr } from "./github/reconciler.mjs";
 import { capacity, stayAwake, halted, runWorker, workerArgs, statedBlocker, isSameProcess, OUTCOMES } from "./supervisor.mjs";
 import { promptFor, WORKER_ACTIONS, UNBUILT_ACTIONS } from "./prompts.mjs";
+import { spillEffects } from "./outbox/spill.mjs";
 import { sandboxFor, writeSandbox, reviewDiff, validateSettings, validateToolGrant, scopeGrant, quarantineOsDenies, sourceCheckoutOf, siblingRootsOf } from "./sandbox.mjs";
 import { verifyConfig, GIT_NEUTRALISE, gitEnv } from "./gitguard.mjs";
 import { prepareRunCheckout, publishRunWork, releaseRunCheckout, dependencyPathsFor, commitRunWork, digestOf } from "./checkout.mjs";
@@ -33,7 +34,7 @@ import { hubSession, NO_HUB } from "./build/hubsession.mjs";
 import { resolveRepoId } from "./build/repoid.mjs";
 import { readState, noteTick, cleanMergeRate } from "./status.mjs";
 import { buildAlert, notify, printable } from "./notify.mjs";
-import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects } from "./db/ops.mjs";
+import { countFixAttempts, recordFixAttempt, fixAttemptNote, noteFixAttempt, refundFixAttempt, startRun, notePid, finishRun, heartbeat, LEASE_SECONDS, recordWorkerContract, noteWorkerResult, noteWorkerBinding, bindRun, cancelRequested, sha256, tx, enqueue, supersedeEffects, enqueueWithDependants } from "./db/ops.mjs";
 import { authenticate, apiAsInstallation } from "./github/app.mjs";
 import { drainOutbox } from "./outbox/drain.mjs";
 import { HANDLERS, permittedHandlers } from "./outbox/effects.mjs";
@@ -776,7 +777,7 @@ function openPrs(nwo, limit = 20) {   // bounded; the caller LOGS when the bound
  * Record what a tick decided, so the dashboard and `reeve why` can answer without
  * re-deriving anything, and so a restart knows how long a clause has been UNKNOWN.
  */
-function record(db, { pr, head, verdict, decision, effects = [], retire = new Map() }) {
+function record(db, { pr, head, verdict, decision, effects = [], retire = new Map(), spill = null }) {
   try {
     // ONE transaction, and that is the outbox's whole reason for existing. The
     // decision and the side effect it implies have to become durable together or
@@ -805,6 +806,15 @@ function record(db, { pr, head, verdict, decision, effects = [], retire = new Ma
       // carries the desired set even when it is empty, which is the case that
       // needed it.
       for (const [prefix, keep] of retire) dropped += supersedeEffects(db, { prefix, keep });
+      // THE SPILL, in this transaction and not another. Its dependants must be
+      // written with the parent's id, and `enqueueWithDependants` recovers that id
+      // when the parent already exists -- so a re-run rebuilds the same edge rather
+      // than orphaning the replies onto no dependency at all.
+      if (spill) {
+        const { childIds } = enqueueWithDependants(db, spill.parent, spill.dependants);
+        queued += 1 + childIds.filter(id => id !== null).length;
+        known += childIds.filter(id => id === null).length;
+      }
       for (const eff of effects) {
         // Withdraw what this one supersedes, in the SAME transaction. A transient
         // failure leaves a row pending on a backoff; if the pull request gets a new
@@ -1914,7 +1924,23 @@ export async function tick(ctx) {
       // how many were affected, and it never re-announced when that number grew.
       raise(`${login} blocks merges but declares no trigger comment, so reeve cannot request their review`);
     }
-    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire });
+    // SPILL IS AN EFFECT REEVE PERFORMS, not a worker prompt. Decided here beside
+    // REQUEST_REVIEW and for the same reason: it launches no worker and hands no
+    // credential to one, so gating it on worker containment would withhold it for a
+    // reason that has nothing to do with the pull request.
+    //
+    // Keyed on the FINDINGS fingerprint. On the head it would file a fresh issue at
+    // every push; on the pull request alone it would never file a second one after
+    // the findings changed.
+    const spill = decision.action === "SPILL"
+      ? spillEffects({ nwo, pr, head: e.head, findings: e.threadDetails ?? [],
+                       fingerprint: findingsFingerprint(e.threadDetails, e.ledgerBlockerIds) })
+      : null;
+    const decided = record(db, { pr, head: e.head, verdict: e.verdict, decision, effects, retire, spill });
+    if (spill && !decided.ok) {
+      log(logPath, `  #${pr}: SPILL — the decision and its ${1 + spill.dependants.length} effect(s) could NOT be recorded: ${decided.why}`);
+      raise(`#${pr}: the spill could not be made durable — ${decided.why}`);
+    }
     if (effects.length && !decided.ok) {
       log(logPath, `  #${pr}: REQUEST_REVIEW — the decision and its ${effects.length} effect(s) could NOT be recorded: ${decided.why}`);
       // Escalated, not merely logged. Nothing else covers this: no worker is

@@ -599,7 +599,7 @@ export const STUBS = [
     name: "pathname-off-a-file-url",
     why: "take `.pathname` off a file URL again, which yields a percent-encoded path that does not exist -- and fails as ENOENT or as a silently skipped existsSync, never as a decode that was missed",
     test: "test/source-is-text.test.mjs",
-    expectRed: "no source takes `.pathname` off a file URL",
+    expectRed: "no source reads `.pathname`",
     edits: [{ file: "test/deploy.test.mjs",
               find: "const PLIST = fileURLToPath(new URL(\"../deploy/com.revnix.reeve.plist\", import.meta.url));",
               replace: "const PLIST = new URL(\"../deploy/com.revnix.reeve.plist\", import.meta.url).pathname;" }],

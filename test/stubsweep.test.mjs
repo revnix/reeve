@@ -577,7 +577,7 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
     // tree, the pre-stub check caught it, and this block passed on a verdict it
     // does not name — a stub of the post-run check left it green. The post-run
     // check is what this block is about, so only the stubbed run may litter.
-    `if (!guard) writeFileSync(new URL("../src/litter.mjs", import.meta.url).pathname, "// left behind\\n");\n` +
+    `if (!guard) writeFileSync(new URL("../src/litter.mjs", import.meta.url), "// left behind\\n");\n` +
     `process.exit(guard ? 0 : 1);\n`);
   writeFileSync(join(root, "test", "stub-manifest.mjs"),
     `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
@@ -644,7 +644,7 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
   writeFileSync(join(root, "test", "thing.test.mjs"),
     `import { writeFileSync, rmSync, existsSync } from "node:fs";\n` +
     `import { guard } from "../src/thing.mjs";\n` +
-    `const cache = new URL("../src/cache.tmp", import.meta.url).pathname;\n` +
+    `const cache = new URL("../src/cache.tmp", import.meta.url);\n` +
     `if (guard) writeFileSync(cache, "cached\\n");\n` +
     `else if (existsSync(cache)) rmSync(cache);\n` +
     `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
@@ -797,7 +797,7 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
     `import { guard } from "../src/thing.mjs";\n` +
     `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
     // The CONTROL run leaves an ignored artifact behind.
-    `if (guard) writeFileSync(new URL("../src/build.cache", import.meta.url).pathname, "x\\n");\n` +
+    `if (guard) writeFileSync(new URL("../src/build.cache", import.meta.url), "x\\n");\n` +
     `process.exitCode = guard ? 0 : 1;\n`);
   writeFileSync(join(root, "test", "stub-manifest.mjs"),
     `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
@@ -981,7 +981,7 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
     `import { guard } from "../src/thing.mjs";\n` +
     `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
     // The CONTROL run rewrites its CONTENTS. The path never changes.
-    `if (guard) writeFileSync(new URL("../src/build.cache", import.meta.url).pathname, "rewritten\\n");\n` +
+    `if (guard) writeFileSync(new URL("../src/build.cache", import.meta.url), "rewritten\\n");\n` +
     `process.exitCode = guard ? 0 : 1;\n`);
   writeFileSync(join(root, "test", "stub-manifest.mjs"),
     `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
@@ -1060,7 +1060,7 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
     `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
     // Deletes its own source mid-run, which is the hostile version of a person
     // removing a file in the same window.
-    `rmSync(new URL("../src/thing.mjs", import.meta.url).pathname);\n` +
+    `rmSync(new URL("../src/thing.mjs", import.meta.url));\n` +
     `process.exit(guard ? 0 : 1);\n`);
   writeFileSync(join(root, "test", "stub-manifest.mjs"),
     `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +

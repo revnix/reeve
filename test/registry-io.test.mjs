@@ -120,5 +120,160 @@ check(parse({}).error === null && parse({}).projects.length === 0,
     `${seen.size} of 50`);
 }
 
+
+// ── the io's surface is DERIVED from what resolveSnapshot reads ─────────────
+//
+// NOT a list retyped here. The brief specifies eight members and omits
+// `lsTree`, and `resolveClaims` makes that one a PRECONDITION rather than an
+// enhancement: `registry.mjs` refuses outright when it is not a function,
+// because `io.lsTree?.()` made a missing capability read as "nothing is
+// tracked" and an uninitialised submodule was admitted. An eight-member io
+// refuses every filing, so a test that checked the brief's eight would have
+// passed over exactly that.
+{
+  const { registryIo } = await import("../src/build/registryio.mjs");
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../src/build/registry.mjs", import.meta.url), "utf8");
+  const needed = [...new Set([...src.matchAll(/io\.([a-zA-Z]+)/g)].map((m) => m[1]))].sort();
+
+  check(needed.length > 0,
+    "control: resolveSnapshot really reads members off io, so the comparison is not vacuous",
+    `${needed.length}: ${needed.join(", ")}`);
+  check(needed.includes("lsTree"),
+    "control: and lsTree is among them, which the brief's eight-member list omits");
+
+  const io = registryIo("/h", "p", { nwo: "o/r", repoPath: "/r", profilePath: "/f" });
+  const missing = needed.filter((n) => typeof io[n] !== "function");
+  check(missing.length === 0, "registryIo supplies every member resolveSnapshot reads",
+    missing.join(", "));
+
+  // AND NOT MORE. An io richer than the contract is the same defect as a
+  // fixture richer than production: it hides that a member was never needed,
+  // and the next reader cannot tell which ones carry weight.
+  const extra = Object.keys(io).filter((k) => !needed.includes(k));
+  check(extra.length === 0, "and supplies nothing it does not read", extra.join(", "));
+}
+
+// ── the two F1 fields resolve null BY CONSTRUCTION ─────────────────────────
+//
+// Until the founder names the spec repositories and the gate-definition paths
+// there is nothing to read. `missingSnapshotFields` then names both and the
+// filing is refused with the field names in it. That refusal is the CORRECT
+// state, and asserting it is what keeps the block visible instead of silent.
+{
+  const { registryIo } = await import("../src/build/registryio.mjs");
+  const io = registryIo("/h", "p", { nwo: "o/r", repoPath: "/r", profilePath: "/f" });
+  check(await io.specRepoId("o/r") === null, "specRepoId is null until F1 names the spec repositories");
+  check(await io.gateDefinitionHash("o/r") === null, "gateDefinitionHash is null until F1 names the paths");
+  // CONTROL: a member that SHOULD read something does not also answer null for
+  // the same reason, or "null by construction" would be indistinguishable from
+  // "every lookup is a stub".
+  check(typeof io.lstat === "function" && typeof io.repoId === "function",
+    "control: the members that do read are still functions, so null is a choice and not a gap");
+}
+
+// ── a profile that cannot be read does not invent values ───────────────────
+{
+  const { registryIo } = await import("../src/build/registryio.mjs");
+  const io = registryIo("/h", "p", { nwo: "o/r", repoPath: "/r", profilePath: "/nope.json" });
+  check(await io.profileHash("/nope.json") === null,
+    "an unreadable profile hashes to null, not to the hash of an empty string");
+  check(await io.defaultBranch("o/r") === null && await io.visibility("o/r") === null,
+    "and its fields are null rather than defaulted, so missingSnapshotFields can name them");
+}
+
+// ── resolving a snapshot writes nothing, and takes no lock ─────────────────
+//
+// THIS IS A NEGATIVE, and a negative asserted in passing beside the positive it
+// accompanies is the shape that has twice been satisfied here by an instrument
+// that could not see the thing. Watching for a write does not work either:
+// `resolveSnapshot` takes no db at all, so there is nothing to watch, and the
+// write that would matter happens inside `registryIo`'s hub lookup.
+//
+// So: two INDEPENDENT checks, and both are needed.
+{
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { openHub } = await import("../src/build/hubdb.mjs");
+  const { hubPathFor } = await import("../src/paths.mjs");
+  const { registryIo } = await import("../src/build/registryio.mjs");
+  const { resolveSnapshot, normalizeClaim } = await import("../src/build/registry.mjs");
+
+  const dir = mkdtempSync(join(tmpdir(), "reeve-regio-"));
+  const home = join(dir, "nw");    mkdirSync(join(home, "state"), { recursive: true });
+  const repo = join(dir, "nwrepo"); mkdirSync(join(repo, "packages", "x"), { recursive: true });
+  const prof = join(home, "np.json");
+  writeFileSync(prof, JSON.stringify({ schemaVersion: 1,
+    identity: { defaultBranch: "main", visibility: "private" },
+    builder: { founder: { userId: 4242 } } }));
+  const entry = { nwo: "o/r", repoPath: repo, profilePath: prof };
+  const registry = { version: 7, projects: { nextly: entry } };
+
+  const db = openHub(hubPathFor(home));
+  // A real admitted task, so the hub HAS an id to answer with. That is the
+  // positive control which makes "nothing changed" mean something.
+  db.prepare(
+    `INSERT INTO task(id, project, repo_id, nwo_snapshot, title, phase, generation,
+                      source_kind, source_key, repo_path, profile_path, profile_hash,
+                      default_branch, visibility, registry_version, created_at, updated_at)
+     VALUES('bt:n','nextly',77,'o/r','t','FILED',1,'founder','k','/r','/p','h','main','private',1,
+            unixepoch(),unixepoch())`).run();
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name);
+  const censusOf = (h) => JSON.stringify(Object.fromEntries(tables.map((t) =>
+    [t, h.prepare(`SELECT count(*) c FROM "${t}"`).get().c])));
+  const before = censusOf(db);
+  const seqBefore = db.prepare("SELECT COALESCE(max(seq), 0) s FROM hub_event").get().s;
+  db.close();
+
+  const io = registryIo(home, "nextly", entry, { git: () => "040000 tree abc\tpackages/x" });
+  const snap = await resolveSnapshot(registry, "nextly", [normalizeClaim("packages/x")], io);
+
+  // CHECK ONE: the state is unchanged -- with the read PROVEN, because "no row
+  // changed" is equally true of a lookup that never opened the hub.
+  const after = openHub(hubPathFor(home));
+  check(!snap.refusal && snap.repoId === 77,
+    "control: the snapshot really resolved, and carries the repo id the hub recorded",
+    JSON.stringify(snap).slice(0, 200));
+  check(censusOf(after) === before, "resolving a snapshot changed no row in any hub table",
+    `${before}\n        ${censusOf(after)}`);
+  check(after.prepare("SELECT COALESCE(max(seq), 0) s FROM hub_event").get().s === seqBefore,
+    "and appended no hub_event, which a row count alone would not notice if one replaced another");
+  check(after.prepare("SELECT count(*) c FROM writer_lease").get().c === 0 &&
+        after.prepare("SELECT count(*) c FROM maintenance_lock").get().c === 0,
+    "and took neither the writer lease nor the maintenance lock");
+  after.close();
+
+  // CHECK TWO: the CAPABILITY is removed. Independent of the state comparison,
+  // because a write that is made and rolled back leaves the census identical.
+  // The connection refuses `exec` outright and refuses any prepare whose SQL is
+  // not a plain SELECT, so if a snapshot comes back at all, nothing wrote.
+  {
+    const real = openHub(hubPathFor(home));
+    let attempted = null;
+    const readOnly = {
+      prepare: (sql) => {
+        if (!/^\s*SELECT\b/i.test(sql)) { attempted = sql; throw new Error(`refused a non-SELECT: ${sql}`); }
+        return real.prepare(sql);
+      },
+      exec: (sql) => { attempted = sql; throw new Error(`refused exec: ${sql}`); },
+      close: () => {},
+    };
+    const io2 = registryIo(home, "nextly", entry,
+      { git: () => "040000 tree abc\tpackages/x", connect: () => readOnly });
+    const snap2 = await resolveSnapshot(registry, "nextly", [normalizeClaim("packages/x")], io2);
+    check(!snap2.refusal, "a connection that refuses every write still resolves a snapshot",
+      JSON.stringify(snap2).slice(0, 160));
+    check(attempted === null, "and nothing was even ATTEMPTED against it", String(attempted));
+    // CONTROL: the refusing connection really would have caught a write. Without
+    // this, "nothing attempted" is equally true of a harness that was never used.
+    let caught = null;
+    try { readOnly.exec("INSERT INTO task DEFAULT VALUES"); } catch (e) { caught = e.message; }
+    check(caught !== null && /refused exec/.test(caught),
+      "control: that connection does refuse a write when one is made", String(caught));
+    real.close();
+  }
+  rmSync(dir, { recursive: true, force: true });
+}
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

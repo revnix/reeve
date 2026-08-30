@@ -1030,9 +1030,9 @@ export const STUBS = [
     name: "artifact-sizing-must-be-a-sizing",
     why: "accept any syntactically valid JSON as a sizing. `null`, `[]`, `7` and `{}` all parse, and none carries a decision -- so the task advances out of SIZING with nothing to size by, and the depth the phase machine reads is simply absent. Parsing proves the bytes are JSON, which is not the property the gate is for",
     test: "test/artifact.test.mjs",
-    expectRed: "sizing.json that is an empty object is refused",
+    expectRed: "sizing.json that is null is refused",
     edits: [{ file: "src/build/artifact.mjs",
-              find: "      if (parsed === null || typeof parsed !== \"object\" || Array.isArray(parsed))",
+              find: "      if (!isSizingObject)",
               replace: "      if (false)" }],
   },
   {

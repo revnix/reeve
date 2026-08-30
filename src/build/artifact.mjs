@@ -193,10 +193,17 @@ export function reviewArtifact({ phase, dir, expect }) {
     try { parsed = JSON.parse(text); }
     catch (e) { ok = false; findings.push(`sizing.json does not parse: ${e.message}`); }
     if (ok) {
-      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))
+      // THE SHAPE TEST AND THE FIELD LOOP ARE GUARDED SEPARATELY, not by one
+      // if/else. Chained, removing the shape test lets the field loop run on a
+      // non-object and `field in null` THROWS -- so the guard's absence crashes
+      // the gate instead of answering wrongly, and a crash cannot be told from a
+      // refusal by anything downstream. Guarded independently, a missing shape
+      // test produces a wrong ANSWER, which is a thing a test can see.
+      const isSizingObject = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+      if (!isSizingObject)
         findings.push(`sizing.json is ${Array.isArray(parsed) ? "an array" : JSON.stringify(parsed)}, ` +
                       `not an object; valid JSON is not a sizing`);
-      else {
+      if (isSizingObject) {
         // THE CONTRACT IS WRITTEN DOWN, so it is enforced rather than guessed.
         // I declined this once on the grounds that requiring fields would encode
         // what the sizing phase is merely EXPECTED to emit -- and that was wrong:

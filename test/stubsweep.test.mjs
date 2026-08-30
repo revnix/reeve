@@ -12,7 +12,7 @@
 import { applyEdit, validateManifest, classify, summarise, failedAssertions, describeMiss,
          parsePorcelainZ, displayPath, fingerprint,
          reportedAnyAssertion, CAUGHT, NOT_CAUGHT, WRONG_RED, CRASHED, UNRUNNABLE, TIMED_OUT_EXIT,
-         coverage, coverageLine, changedFiles, grandfatherGate }
+         coverage, coverageLine, changedFiles, grandfatherGate, listGrowth }
   from "../src/stubsweep.mjs";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, realpathSync, rmSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -1560,6 +1560,31 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
   const broke = changedFiles({ base: "abc", head: "def", run: () => ({ ok: false, err: "bad object" }) });
   check(broke.ok === false && /bad object/.test(broke.why ?? ""),
     "a diff that fails to run refuses too, and says what git said", broke.why);
+}
+
+// ── and the list may only ever shrink ──────────────────────────────────────────
+//
+// The OTHER half of the ratchet, and it was missing until review found it. The edit
+// rule refuses touching a listed file; it says nothing about a change that removes a
+// test's STUBS entry and adds that test to the list instead. The file itself is never
+// edited, so the diff shows only the manifest, the edit rule passes, and the list
+// grows while measured coverage falls. Described as a ratchet from the start, built
+// as half of one.
+{
+  const grew = listGrowth({ before: ["test/a.test.mjs"], after: ["test/a.test.mjs", "test/b.test.mjs"] });
+  check(grew.ok === false && grew.added.length === 1 && grew.added[0] === "test/b.test.mjs",
+    "a name ADDED to the frozen list is refused, and named", JSON.stringify(grew.added));
+  check(/frozen debt/.test(grew.why ?? ""), "and the refusal says what the list is for", grew.why);
+
+  // Shrinking is the POINT, so it must pass in silence. Without this the assertion
+  // above would be satisfied by a check that refused every change to the list,
+  // including the ones that pay the debt down.
+  check(listGrowth({ before: ["test/a.test.mjs", "test/b.test.mjs"], after: ["test/a.test.mjs"] }).ok === true,
+    "control: REMOVING a name passes, because that is how the debt is paid");
+  check(listGrowth({ before: ["test/a.test.mjs"], after: ["test/a.test.mjs"] }).ok === true,
+    "control: an unchanged list passes, so the rule is about growth and not about touching the file");
+  check(listGrowth({ before: [], after: [] }).ok === true,
+    "control: a fully paid-down list is not a special case");
 }
 
 // ── grandfathering ends at the first edit ──────────────────────────────────────

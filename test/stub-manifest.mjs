@@ -814,4 +814,13 @@ export const STUBS = [
               find: "  const touched = (changed ?? []).filter(f => spared.has(f));",
               replace: "  const touched = [];" }],
   },
+  {
+    name: "sweep-frozen-list-may-only-shrink",
+    why: "accept additions to GRANDFATHERED, so a change can drop a test's entry and add the test to the list instead -- the file is never edited, the edit rule sees only the manifest in the diff, and coverage falls while the gate reports success",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "a name ADDED to the frozen list is refused, and named",
+    edits: [{ file: "src/stubsweep.mjs",
+              find: "  const added = (after ?? []).filter(f => !was.has(f));",
+              replace: "  const added = [];" }],
+  },
 ];

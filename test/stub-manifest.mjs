@@ -831,4 +831,13 @@ export const STUBS = [
               find: "      if (res.status !== 0 || res.signal)",
               replace: "      if (false)" }],
   },
+  {
+    name: "taskfile-empty-claim-is-the-root",
+    why: "filter blank claims out of the territory list before counting it -- the shape an author reaches for first -- so a whitespace-only --territory reads as \"no territory declared\" and is refused by the grammar. The refusal looks correct, and the grammar assertions stay green, but the claim that conflicts with EVERYTHING in its project has quietly become a filing that conflicts with nothing. `normalizeClaim` returns the repository root for a blank claim deliberately; the absence of a territory claim must never read as the absence of conflict",
+    test: "test/task-file.test.mjs",
+    expectRed: "an empty claim is admitted as a claim, not dropped",
+    edits: [{ file: "src/build/taskfile.mjs",
+              find: "  if (!Array.isArray(territory) || territory.length === 0)",
+              replace: "  if (!Array.isArray(territory) || territory.filter(t => String(t).trim()).length === 0)" }],
+  },
 ];

@@ -300,23 +300,34 @@ const rebuild = (db, table, transform) => {
     d.slice(0, 3).join("; "));
 }
 
-// ── class 12: an EXTRA UNIQUE INDEX ──────────────────────────────────────────
+// ── class 12: an EXTRA INDEX, unique or not ──────────────────────────────────
 //
-// Worse than failing immediately: it lets the FIRST write through and refuses
-// the second, so the damage surfaces long after the restore that caused it.
-// An extra NON-unique index stays permitted -- it costs write time, not writes.
+// "Non-unique costs write time, not writes" was false. An EXPRESSION index is
+// evaluated on every insert that maintains it, so a perfectly non-unique index
+// over `json_extract(provider, '$.x')` refuses an ordinary provider value.
+//
+// Rather than deciding which extras are dangerous -- three rounds of narrowing
+// that got it wrong three different ways -- an extra is now a defect outright.
+// See the note on class 14 for why that is safe.
 {
-  const d = damaged("extra-unique", (db) =>
+  const unique = damaged("extra-unique", (db) =>
     db.exec("CREATE UNIQUE INDEX surprise_unique ON task(project)"));
-  check(d.some(s => s.startsWith("unique index surprise_unique on task(project BINARY) is not in this schema")),
-    "an EXTRA unique index is refused, because it rejects writes this schema permits",
-    d.slice(0, 3).join("; "));
+  check(unique.some(s => s.startsWith("index surprise_unique on task")),
+    "an extra UNIQUE index is refused", unique.slice(0, 2).join("; "));
 
-  const harmless = damaged("extra-plain-index", (db) =>
+  const plain = damaged("extra-plain-index", (db) =>
     db.exec("CREATE INDEX surprise_plain ON task(project)"));
-  check(harmless.length === 0,
-    "control: an extra NON-unique index is still permitted, so the rule is about refusal not novelty",
-    harmless.slice(0, 3).join("; "));
+  check(plain.some(s => s.startsWith("index surprise_plain on task")),
+    "and so is an extra NON-unique one, which the previous rule called harmless",
+    plain.slice(0, 2).join("; "));
+
+  // THE CASE THAT DISPROVED THE OLD RULE, kept as its own fixture: an index
+  // that is not unique and still refuses writes.
+  const expr = damaged("extra-expression-index", (db) =>
+    db.exec("CREATE INDEX surprise_expr ON provider_state(json_extract(provider, '$.x'))"));
+  check(expr.some(s => s.startsWith("index surprise_expr on provider_state")),
+    "including an EXPRESSION index, which runs on every insert that maintains it",
+    expr.slice(0, 2).join("; "));
 }
 
 // ── class 13: an UNEXPECTED TRIGGER ──────────────────────────────────────────
@@ -332,118 +343,125 @@ const rebuild = (db, table, transform) => {
     d.slice(0, 3).join("; "));
 }
 
-// ── class 14: an EXTRA NOT NULL COLUMN WITH NO DEFAULT ───────────────────────
+// ── class 14: an EXTRA COLUMN, whatever its shape ────────────────────────────
 //
-// The precise boundary of "extra is harmless". Every insert this code performs
-// omits a column the schema does not know about, so a NOT NULL column with no
-// default refuses all of them -- while the same column nullable, or defaulted,
-// is genuinely harmless. Both halves are asserted, because a rule that refused
-// every extra column would be the opposite mistake.
+// THE EXEMPTION IS GONE, and this is the substantive design change.
+//
+// It existed so a snapshot from a NEWER binary could still be restored. Such a
+// snapshot never reaches this comparison: `validateSnapshot` refuses
+// `version > expectVersion` first, and `openHub` refuses a store above its own
+// version. At a given version the shape is whatever the migrations produce --
+// exactly -- so there was never a legitimate extra to permit.
+//
+// Every attempt to classify one as harmless was wrong in a NEW way: NOT NULL
+// with no default; then a GENERATED column whose expression throws on ordinary
+// data; then a NULLABLE generated column doing the same; then a column a later
+// migration ADOPTS. "Can this extra refuse a write" is undecidable in general,
+// because SQLite runs arbitrary expressions during an insert. The question was
+// wrong, not the answers.
 {
-  const d = damaged("extra-notnull", (db) =>
+  const defaulted = damaged("extra-notnull-default", (db) =>
     db.exec("ALTER TABLE task ADD COLUMN required_by_future TEXT NOT NULL DEFAULT 'x'"));
-  check(d.length === 0,
-    "control: an extra NOT NULL column WITH a default is harmless, because inserts may omit it",
-    d.slice(0, 3).join("; "));
+  check(defaulted.some(s => s.startsWith("task.required_by_future is not in this schema")),
+    "an extra column is refused even when an insert could omit it",
+    defaulted.slice(0, 2).join("; "));
 
-  const e = damaged("extra-notnull-bare", (db) => {
-    // SQLite refuses ALTER ADD of a bare NOT NULL column, which is exactly the
-    // shape a rebuilt or hand-repaired store arrives in -- so it is rebuilt.
-    rebuild(db, "task", (ddl) =>
-      ddl.replace("  body           TEXT,", "  body           TEXT,\n  required_by_future TEXT NOT NULL,"));
-  });
-  check(e.some(s => s.startsWith("task.required_by_future is not in this schema and is NOT NULL with no default")),
-    "an extra NOT NULL column with NO default is refused, because every insert omits it",
-    e.slice(0, 3).join("; "));
+  // A NULLABLE GENERATED COLUMN. Omissible, and still fatal: the expression runs
+  // on every insert, and `json_extract` over a plain provider name throws.
+  const gen = damaged("extra-generated-nullable", (db) =>
+    db.exec("ALTER TABLE provider_state ADD COLUMN surprise TEXT " +
+            "GENERATED ALWAYS AS (json_extract(provider, '$.x')) VIRTUAL"));
+  check(gen.some(s => s.startsWith("provider_state.surprise is not in this schema")),
+    "including a NULLABLE generated column, which omissibility would have waved through",
+    gen.slice(0, 2).join("; "));
 }
 
-// ── class 15: a GENERATED column ─────────────────────────────────────────────
+// ── class 14b: an extra a LATER MIGRATION would adopt ────────────────────────
 //
-// `pragma_table_info` omits generated columns entirely, so a snapshot could
-// carry one that refuses ordinary inserts while reading as having no extra
-// columns at all -- invisible to the extra-column rule AND to the text
-// backstop's exemption for it. Read through `table_xinfo` now.
+// The subtlest of them. A version-2 snapshot carrying a nullable
+// `provider_lease.token INTEGER` has the right tables and columns for version 2.
+// On restore, migration 3's `hasColumn` guard sees the column already present,
+// skips its ALTER, and records version 3 -- so the store claims a shape it does
+// not have, and the first TEXT token hits a STRICT INTEGER column.
+//
+// Validated against version 2, which is the version the snapshot records.
 {
-  const d = damaged("generated", (db) =>
-    db.exec("ALTER TABLE provider_state ADD COLUMN surprise INTEGER " +
-            "GENERATED ALWAYS AS (CASE WHEN guardian_reserved = 1 THEN NULL ELSE 1 END) VIRTUAL NOT NULL"));
-  check(d.length > 0,
-    "a snapshot carrying a GENERATED NOT NULL column is refused, though table_info cannot see it",
+  const p = join(dir, "v2-adopted.db");
+  copyFileSync(pristine, p);
+  const db = new DatabaseSync(p);
+  db.exec("PRAGMA foreign_keys = OFF");
+  db.exec("ALTER TABLE provider_lease DROP COLUMN token");        // back to v2's shape
+  db.exec("ALTER TABLE provider_lease ADD COLUMN token INTEGER"); // the wrong-typed squatter
+  db.close();
+  const probe = new DatabaseSync(p, { readOnly: true });
+  const d = schemaDefectsAt(probe, 2);
+  probe.close();
+  check(d.some(s => s.includes("provider_lease.token")),
+    "a version-2 snapshot carrying the column migration 3 would ADOPT is refused",
     d.slice(0, 3).join("; "));
-  check(d.some(s => s.includes("surprise")),
-    "and the offending column is NAMED", d.slice(0, 3).join("; "));
+  // CONTROL: version 2 really does not declare that column, so the defect is
+  // about the SNAPSHOT rather than about asking the wrong version.
+  check(shapeAt(2).tables.provider_lease.columns.token === undefined,
+    "control: version 2's own shape has no provider_lease.token");
 }
 
-// ── class 16: an index key's COLLATION ───────────────────────────────────────
+// ── an extra TABLE is a defect too ───────────────────────────────────────────
 //
-// `pragma_index_info` discards collation. `task_idem` recreated as
-// `(idempotency_key COLLATE NOCASE)` keeps its name, its column, its uniqueness
-// and its predicate, and silently imposes stricter uniqueness: two keys
-// differing only by case stop being distinct, and the second insert fails.
+// The last thing the old rule permitted. A table nothing writes to still
+// carries triggers, constraints and a name a later migration may want, and at
+// this version the schema is exactly what the migrations produce.
 {
-  const d = damaged("collation", (db) => {
-    db.exec("DROP INDEX task_idem");
-    db.exec("CREATE UNIQUE INDEX task_idem ON task(idempotency_key COLLATE NOCASE) " +
-            "WHERE idempotency_key IS NOT NULL");
-  });
-  check(d.length > 0,
-    "an index whose key COLLATION changed is refused, though name, column, uniqueness and predicate match",
-    d.slice(0, 3).join("; "));
-  check(d.some(s => s.includes("task_idem")), "and the index is NAMED", d.slice(0, 3).join("; "));
+  const d = damaged("extra-table", (db) => db.exec("CREATE TABLE a_future_table (x TEXT) STRICT"));
+  check(d.some(s => s.startsWith("table a_future_table is not in this schema")),
+    "an extra TABLE is refused, naming it", d.slice(0, 2).join("; "));
 }
 
-// ── class 17: a CHECK containing a parenthesis inside a STRING ───────────────
+// ── a name that is also a prototype key ──────────────────────────────────────
 //
-// The scanner counted every parenthesis as syntax, so `'(('` left its depth
-// counter positive through the table's closing parenthesis. The constraint was
-// dropped, and dropping it made the REMAINING checks compare equal -- the
-// scanner's own failure reading as agreement, which is the worst way for an
-// instrument to fail.
+// `obj["__proto__"] = v` on a plain object invokes the inherited SETTER instead
+// of creating an enumerable property, so the entry vanishes and
+// `Object.entries` reports it is not there. A trigger with that name could
+// abort every task filing while the snapshot validated clean.
+//
+// Every name-keyed inventory in `shapeOf` is null-prototype now, not just the
+// one this was found in -- tables, columns, indexes, foreign keys and triggers
+// are all keyed by names a snapshot chooses.
 {
-  const d = damaged("check-in-string", (db) =>
-    rebuild(db, "task", (ddl) =>
-      ddl.replace("  UNIQUE (source_kind, source_key)",
-                  "  CHECK (priority = 'p1' OR title = '(('),\n  UNIQUE (source_kind, source_key)")));
-  check(d.length > 0,
-    "a CHECK containing a parenthesis inside a string literal is still SEEN, not skipped",
-    d.slice(0, 3).join("; "));
-  check(d.some(s => s.includes("adds CHECK")),
-    "and it is reported as an added constraint", d.slice(0, 3).join("; "));
+  const d = damaged("proto-trigger", (db) =>
+    db.exec('CREATE TRIGGER "__proto__" BEFORE INSERT ON task ' +
+            "BEGIN SELECT RAISE(ABORT, 'blocked'); END"));
+  check(d.some(s => s.includes("__proto__")),
+    "a trigger named `__proto__` is seen, not swallowed by the prototype setter",
+    d.slice(0, 2).join("; "));
+
+  // CONTROL: the inventory really is null-prototype, so the assertion above is
+  // about the READER rather than about this particular trigger name.
+  const shape = shapeAt(HUB_SCHEMA_VERSION);
+  check(Object.getPrototypeOf(shape.tables) === null &&
+        Object.getPrototypeOf(shape.triggers) === null &&
+        Object.getPrototypeOf(shape.tables.task.columns) === null &&
+        Object.getPrototypeOf(shape.tables.task.indexes) === null &&
+        Object.getPrototypeOf(shape.tables.task.foreignKeys) === null,
+    "control: every name-keyed inventory is null-prototype, so no snapshot name can reach a setter");
 }
 
-// ── class 18: a constraint's ON CONFLICT policy ──────────────────────────────
+// ── a version below 1 has no shape ───────────────────────────────────────────
 //
-// No pragma exposes it. Every column, index, foreign key, CHECK and table
-// property stays identical, so only the text backstop catches this -- which is
-// the case the backstop exists for. A plain insert then REPLACES an existing
-// task sharing a source identity, deleting an authority-bearing row and its
-// dependent state rather than refusing the duplicate.
+// `scratchAt(0)` runs no migration, so its shape is `schema_version` alone --
+// and a store carrying that one table satisfies every requirement derived from
+// it. The previous inventory rejected this because it had no entry for version
+// 0; deriving answered the question instead of refusing it.
 {
-  const d = damaged("on-conflict", (db) =>
-    rebuild(db, "task", (ddl) =>
-      ddl.replace("UNIQUE (source_kind, source_key)",
-                  "UNIQUE (source_kind, source_key) ON CONFLICT REPLACE")));
-  check(d.length > 0,
-    "a changed ON CONFLICT policy is refused, though no pragma reports it",
-    d.slice(0, 3).join("; "));
-  check(d.some(s => s.includes("definition differs")),
-    "and the backstop is what names it, since the property checks cannot",
-    d.slice(0, 3).join("; "));
-}
-
-// ── extra is not a defect ────────────────────────────────────────────────────
-//
-// One-directional deliberately. A snapshot taken by a NEWER binary carries more
-// than this version requires; refusing it would turn a restorable snapshot into
-// an unrecoverable one at the moment it is needed.
-{
-  const d = damaged("extra", (db) => {
-    db.exec("CREATE TABLE a_future_table (x TEXT) STRICT");
-    db.exec("ALTER TABLE task_territory ADD COLUMN a_future_column TEXT");
-  });
-  check(d.length === 0,
-    "a snapshot carrying EXTRA tables and columns is still usable at this version",
-    d.slice(0, 3).join("; "));
+  const probe = new DatabaseSync(pristine, { readOnly: true });
+  for (const v of [0, -1, 1.5]) {
+    const d = schemaDefectsAt(probe, v);
+    check(d.length > 0, `schema version ${v} is refused rather than answered`, d.join("; "));
+  }
+  // CONTROL: a real version still validates, so the guard refuses the impossible
+  // rather than everything.
+  check(schemaDefectsAt(probe, HUB_SCHEMA_VERSION).length === 0,
+    "control: and the current version is still accepted");
+  probe.close();
 }
 
 // ── the shape is read structurally, not as DDL text ──────────────────────────

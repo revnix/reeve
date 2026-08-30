@@ -511,6 +511,47 @@ import { hubEvent, migrationPlan } from "../src/build/hubdb.mjs";
   }
 }
 
+// ── a snapshot claiming a version the hub never had ──────────────────────────
+//
+// `schema_version` holding 0 (or a negative) passed every check: the row exists
+// so it is not "no version at all", there are no GAPS below it, and the table
+// requirement DERIVED from version 0 is `schema_version` alone -- which that
+// store has. A minimal `hub_event` then satisfied the marker query, so deep
+// validation certified a database missing every authority-bearing table.
+//
+// And the consequence is the bad one: `openHub` runs migration 1 over the
+// restored file and silently RECREATES those tables empty, so the hub comes
+// back looking healthy with no tasks, no approvals and no leases.
+//
+// The inventory this replaced rejected it only because it had no entry for
+// version 0. Deriving answered the question instead of refusing it, which is
+// the risk in deriving: a derivation always produces something.
+{
+  const bad = join(dir, "version-zero.db");
+  const db = new DatabaseSync(bad);
+  db.exec(`CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT`);
+  db.prepare("INSERT INTO schema_version(version, applied_at) VALUES(0, unixepoch())").run();
+  db.exec("CREATE TABLE hub_event (id INTEGER PRIMARY KEY) STRICT");
+  db.close();
+
+  const v = validateSnapshot(bad, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true });
+  check(v.ok === false && /schema version 0/.test(v.why ?? ""),
+    "a snapshot recording schema version 0 is refused, naming the version",
+    JSON.stringify(v));
+
+  // CONTROL: the fixture really does satisfy the checks that come BEFORE the
+  // version floor -- it has a version row, no gaps, and the hub_event marker.
+  // Without this the refusal above could be coming from any of them, and the
+  // floor would be untested.
+  const probe = new DatabaseSync(bad, { readOnly: true });
+  const rows = probe.prepare("SELECT version FROM schema_version").all().map(r => r.version);
+  const marker = probe.prepare("SELECT count(*) c FROM hub_event").get();
+  probe.close();
+  check(rows.length === 1 && rows[0] === 0 && marker.c === 0,
+    "control: the fixture has a version row and the hub_event marker, so it reaches the floor",
+    JSON.stringify({ rows, marker }));
+}
+
 rmSync(dir, { recursive: true, force: true });
 // ── migration 2 carries a REAL v1 hub forward ──────────────────────────────
 // An upgrade that runs on a fresh database proves only that its SQL parses. The

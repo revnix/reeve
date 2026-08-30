@@ -726,12 +726,18 @@ function scratchAt(version) {
  * reader to assume, because an unstated gap in a check reads as coverage.
  */
 export function shapeOf(db) {
-  const tables = {};
+  // NULL-PROTOTYPE, and every name-keyed map below is the same.
+  // A snapshot can contain an object literally named `__proto__`, and
+  // `obj["__proto__"] = v` on a plain object invokes the inherited SETTER
+  // instead of creating an enumerable property -- so the entry vanishes and
+  // `Object.entries` reports it is not there. A trigger with that name could
+  // abort every write while the snapshot validated clean.
+  const tables = Object.create(null);
   // TRIGGERS ARE PART OF THE SCHEMA AND CAN REFUSE A WRITE OUTRIGHT. A hub
   // carrying `CREATE TRIGGER ... BEFORE INSERT ON task BEGIN SELECT RAISE(ABORT,
   // ...); END` has identical tables, columns, indexes and constraints, passes a
   // deep integrity check, and rejects the first ordinary task filing.
-  const triggers = {};
+  const triggers = Object.create(null);
   for (const r of db.prepare(
     `SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'`).all())
     triggers[r.name] = { table: r.tbl_name, sql: String(r.sql ?? "").replace(/\s+/g, " ").trim() };
@@ -747,7 +753,7 @@ export function shapeOf(db) {
     .all().map(r => r.name);
 
   for (const t of names) {
-    const columns = {};
+    const columns = Object.create(null);
     // `dflt_value` is part of the writable contract, not decoration. `task.priority`
     // is `NOT NULL DEFAULT 'p2'` and callers omit it; a snapshot that lost the
     // default keeps every row valid and passes an integrity check, then fails the
@@ -763,7 +769,7 @@ export function shapeOf(db) {
                           dflt: c.dflt_value == null ? null : String(c.dflt_value),
                           generated: Number(c.hidden) > 1 };
 
-    const indexes = {};
+    const indexes = Object.create(null);
     for (const i of db.prepare(`SELECT name, "unique", origin FROM pragma_index_list(?)`).all(t)) {
       // `index_xinfo` carries the COLLATION and sort order of each key;
       // `index_info` discards both. An index recreated as
@@ -792,7 +798,7 @@ export function shapeOf(db) {
                        name: i.name, where, ddl: ddl ?? null };
     }
 
-    const foreignKeys = {};
+    const foreignKeys = Object.create(null);
     for (const f of db.prepare(
       `SELECT "table", "from", "to", on_delete, on_update FROM pragma_foreign_key_list(?)`).all(t))
       foreignKeys[`${f.from}->${f.table}.${f.to}`] =
@@ -959,7 +965,33 @@ export const SCHEDULER_MIN_HUB_VERSION = 3;
  * want TEXT` -- rather than reporting that the schema differs. That is the
  * property worth preserving from the inventories this replaces.
  */
+/**
+ * Is this a version the hub could actually be at?
+ *
+ * A VERSION BELOW 1 HAS NO SHAPE TO DERIVE. `scratchAt(0)` runs no migration, so
+ * its shape is `schema_version` alone -- and a store carrying that one table
+ * satisfies every requirement derived from it, certifying a database missing
+ * every authority-bearing hub table. `openHub` then runs migration 1 over the
+ * restored file and silently recreates them EMPTY, so the hub comes back looking
+ * healthy with nothing in it.
+ *
+ * The inventory this module replaced rejected that shape only because it had no
+ * entry for version 0. Deriving answered the question instead of refusing it,
+ * which is the standing risk in deriving: a derivation always produces
+ * something.
+ *
+ * ONE PREDICATE, TWO CALLERS. `validateSnapshot` refuses early so it can say
+ * plainly what is wrong; this module refuses so a direct caller cannot get a
+ * clean answer for a version that never existed. The RULE is here; the wording
+ * belongs to each site.
+ */
+export function isKnownVersion(version) {
+  return Number.isInteger(version) && version >= 1;
+}
+
 export function schemaDefectsAt(db, version) {
+  if (!isKnownVersion(version))
+    return [`schema version ${version} is not a version this hub has ever had`];
   const want = shapeAt(version);
   const have = shapeOf(db);
   const bad = [];
@@ -979,13 +1011,28 @@ export function schemaDefectsAt(db, version) {
         bad.push(`${t}.${c} defaults to ${h.dflt ?? "nothing"}, want ${w.dflt ?? "no default"}`);
     }
 
-    // AN EXTRA COLUMN IS ONLY HARMLESS IF AN INSERT CAN OMIT IT. `NOT NULL` with
-    // no default refuses every write the code performs, because every insert
-    // omits a column this schema does not know about.
-    for (const [c, h] of Object.entries(haveTable.columns))
-      if (!(c in wantTable.columns) && h.notNull && h.dflt === null)
-        bad.push(`${t}.${c} is not in this schema and is NOT NULL with no default, ` +
-                 `so every insert that omits it fails`);
+    // AN EXTRA COLUMN IS A DEFECT. FULL STOP.
+    //
+    // This was three rounds of narrowing an exemption that should never have
+    // existed. It was there so a snapshot from a NEWER binary could still be
+    // restored -- but such a snapshot never reaches this function.
+    // `validateSnapshot` refuses `version > expectVersion` before calling it,
+    // and `openHub` refuses a store above its own version. At a given version
+    // the shape is whatever the migrations produce, exactly.
+    //
+    // Every attempt to classify an extra as harmless was wrong in a new way:
+    // NOT NULL without a default, then a GENERATED column whose expression
+    // throws on ordinary data, then a nullable generated column doing the same,
+    // then a column a later migration ADOPTS -- migration 3 sees
+    // `provider_lease.token` already present, skips its ALTER, records version 3,
+    // and the first text token hits a STRICT INTEGER column.
+    //
+    // "Can this extra refuse a write" is undecidable in general; SQLite will run
+    // arbitrary expressions during an insert. The question was the wrong one.
+    for (const c of Object.keys(haveTable.columns))
+      if (!(c in wantTable.columns))
+        bad.push(`${t}.${c} is not in this schema; a snapshot at version ${version} ` +
+                 `must have exactly this version's shape`);
 
     for (const [key, w] of Object.entries(wantTable.indexes)) {
       const h = haveTable.indexes[key];
@@ -999,13 +1046,15 @@ export function schemaDefectsAt(db, version) {
         bad.push(`${label} is filtered by ${h.where || "nothing"}, want ${w.where || "no filter"}`);
     }
 
-    // AN EXTRA UNIQUE INDEX REFUSES WRITES; an extra non-unique one only costs
-    // write time. A unique index on `task(project)` lets the first task through
-    // and fails the second, which is worse than failing immediately.
+    // AN EXTRA INDEX IS A DEFECT, unique or not. "Non-unique costs write time,
+    // not writes" was false: an EXPRESSION index is evaluated on every insert
+    // that maintains it, so `ON provider_state(json_extract(provider, '$.x'))`
+    // refuses an ordinary non-JSON provider value while being perfectly
+    // non-unique.
     for (const [key, h] of Object.entries(haveTable.indexes))
-      if (!(key in wantTable.indexes) && h.unique)
-        bad.push(`unique index ${h.name} on ${t}(${h.columns.join(", ")}) is not in this schema ` +
-                 `and can refuse writes`);
+      if (!(key in wantTable.indexes))
+        bad.push(`index ${h.name} on ${t}(${h.columns.join(", ")}) is not in this schema; ` +
+                 `a snapshot at version ${version} must have exactly this version's shape`);
 
     for (const [key, w] of Object.entries(wantTable.foreignKeys)) {
       const h = haveTable.foreignKeys[key];
@@ -1055,10 +1104,10 @@ export function schemaDefectsAt(db, version) {
     // It is skipped for an object carrying a PERMITTED extra, because an extra
     // nullable column or non-unique index legitimately changes the text, and
     // refusing those would break restoring a newer binary's snapshot.
-    const extraCols = Object.keys(haveTable.columns).filter((c) => !(c in wantTable.columns));
-    const extraIdx  = Object.keys(haveTable.indexes).filter((k) => !(k in wantTable.indexes));
-    if (!extraCols.length && !extraIdx.length &&
-        wantTable.ddl != null && haveTable.ddl != null && wantTable.ddl !== haveTable.ddl)
+    // No exemption any more: the shapes must be equal, so the text must be too.
+    // The skip was itself a hole -- an extra column DISABLED the backstop for
+    // the whole table, so adding one hid every other textual difference.
+    if (wantTable.ddl != null && haveTable.ddl != null && wantTable.ddl !== haveTable.ddl)
       bad.push(`table ${t}'s definition differs from this schema in a way the ` +
                `property checks do not name -- compare its CREATE statement`);
 
@@ -1073,6 +1122,14 @@ export function schemaDefectsAt(db, version) {
       bad.push(`table ${t} is ${haveTable.withoutRowid ? "WITHOUT ROWID" : "a rowid table"}, ` +
                `want ${wantTable.withoutRowid ? "WITHOUT ROWID" : "a rowid table"}`);
   }
+
+  // AND AN EXTRA TABLE, for the same reason: at this version the schema is what
+  // the migrations produce. A table nothing writes to still carries triggers,
+  // constraints and a name a later migration may want.
+  for (const t of Object.keys(have.tables))
+    if (!(t in want.tables))
+      bad.push(`table ${t} is not in this schema; a snapshot at version ${version} ` +
+               `must have exactly this version's shape`);
 
   // TRIGGERS ARE COMPARED AS A WHOLE-SCHEMA SET, not per table, because a
   // trigger on an EXTRA table can still refuse a write to an expected one.

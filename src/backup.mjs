@@ -28,7 +28,7 @@ import { open as openStore, exportJsonl } from "./db/ops.mjs";
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
 // naming a module that does not exist yet breaks every import of this file.
 import { openHub, isOperational, faultKind, HUB_SCHEMA_VERSION, HUB_TABLES, tablesAt,
-         schemaDefectsAt, backfillPinDeadlines } from "./build/hubdb.mjs";
+         schemaDefectsAt, isKnownVersion, backfillPinDeadlines } from "./build/hubdb.mjs";
 // Task 9's additions. `restoreHub` takes the maintenance lock before it refuses,
 // enumerates live writers to name them, and replays the tail -- and it needs
 // `replayableKinds`/`NON_REPLAYED_KINDS` to refuse a tail exported by a NEWER
@@ -264,6 +264,14 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo", de
       // declared list. A migration that adds a table is covered the day it
       // lands. A version this binary does not know still falls back to the
       // current set rather than validating nothing.
+      // A VERSION BELOW 1 IS REFUSED BEFORE ANYTHING IS DERIVED FROM IT.
+      // `tablesAt(0)` requires only `schema_version`, so a store with that table
+      // plus a minimal `hub_event` satisfied the table check AND the marker
+      // query below -- and `openHub` then ran migration 1 over it and silently
+      // recreated every authority-bearing table EMPTY.
+      if (!isKnownVersion(version))
+        return { ok: false, why: `the snapshot records schema version ${version}, which is not a version this hub has ever had`,
+                 version, integrity };
       const required = version <= HUB_SCHEMA_VERSION ? tablesAt(version) : HUB_TABLES;
       const missing = required.filter(t => !present.has(t));
       if (missing.length)

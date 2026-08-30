@@ -14,7 +14,7 @@
 
 import { readFileSync, lstatSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { join, isAbsolute } from "node:path";
 import { execFileSync } from "node:child_process";
 import { hubPathFor } from "../paths.mjs";
 import { resolveRepoIdAt } from "./repoid.mjs";
@@ -137,7 +137,13 @@ export function parseRegistry(text, path) {
   // row it cannot complete, so admission would key on nothing. Absolute, because
   // a relative path resolves against whatever directory the daemon was started
   // in -- the same defect `identity.worktreeRoot` already carries a rule for.
-  const isAbs = (v) => typeof v === "string" && v.startsWith("/");
+  // PLATFORM-AWARE. `startsWith("/")` is POSIX-only, so on Windows every
+  // ordinary entry -- `C:\repos\app`, or a UNC path -- was rejected as
+  // malformed and no project could be discovered at all. These are FILESYSTEM
+  // paths, not claim paths: claims are slash-separated on every platform by
+  // rule, but a repoPath is whatever the operating system uses. reeve has to
+  // run on macOS, Windows and Ubuntu.
+  const isAbs = (v) => typeof v === "string" && v.length > 0 && isAbsolute(v);
   const bad = Object.entries(reg)
     .filter(([, v]) => !v || typeof v !== "object" || Array.isArray(v) ||
                        typeof v.nwo !== "string" || !NWO.test(v.nwo) ||
@@ -264,11 +270,30 @@ export function registryIo(home, project, entry, { fetchRepoId = null, git = exe
     // in. The same gap hid a staged mode-120000 entry whose worktree link was
     // absent.
     lsTree: (repoPath, path) => {
-      const out = String(git("git", ["-C", repoPath, "ls-files", "--stage", "--", path],
+      // `--literal-pathspecs` BEFORE the subcommand. A tracked name beginning
+      // with `:` is read as pathspec MAGIC rather than as a path, so a symlink
+      // called `:(literal)link` returned no entry and `resolveClaims` admitted
+      // it as untracked. `src/checkout.mjs` and `src/mergecheck.mjs` already
+      // carry this option for the same reason.
+      const out = String(git("git", ["--literal-pathspecs", "-C", repoPath,
+                                     "ls-files", "--stage", "--", path],
                              { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })).trim();
       if (!out) return null;
-      const [mode] = out.split(/\s+/);
-      return { mode };
+      // ONE ROW PER TRACKED DESCENDANT. Probing an ordinary directory lists
+      // everything beneath it, and taking the first row's mode reported the
+      // directory as whatever its first child happened to be -- a tracked
+      // symlink under `packages` made `packages` look like mode 120000 and
+      // refused an unrelated claim under `packages/normal`. A gitlink first in
+      // the listing did the same. So the entry whose PATH is exactly the one
+      // asked about is the only row that answers the question.
+      for (const line of out.split("\n")) {
+        const tab = line.indexOf("\t");
+        if (tab < 0) continue;
+        if (line.slice(tab + 1) !== path) continue;
+        const [mode] = line.slice(0, tab).split(/\s+/);
+        return { mode };
+      }
+      return null;
     },
   };
 }

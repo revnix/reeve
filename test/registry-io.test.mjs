@@ -226,7 +226,7 @@ check(parse({}).error === null && parse({}).projects.length === 0,
   const seqBefore = db.prepare("SELECT COALESCE(max(seq), 0) s FROM hub_event").get().s;
   db.close();
 
-  const io = registryIo(home, "nextly", entry, { git: () => "040000 tree abc\tpackages/x" });
+  const io = registryIo(home, "nextly", entry, { spawn: () => ({ stdout: "040000 abc 0\tpackages/x\u0000" }) });
   const snap = await resolveSnapshot(registry, "nextly", [normalizeClaim("packages/x")], io);
 
   // CHECK ONE: the state is unchanged -- with the read PROVEN, because "no row
@@ -260,7 +260,7 @@ check(parse({}).error === null && parse({}).projects.length === 0,
       close: () => {},
     };
     const io2 = registryIo(home, "nextly", entry,
-      { git: () => "040000 tree abc\tpackages/x", connect: () => readOnly });
+      { spawn: () => ({ stdout: "040000 abc 0\tpackages/x\u0000" }), connect: () => readOnly });
     const snap2 = await resolveSnapshot(registry, "nextly", [normalizeClaim("packages/x")], io2);
     check(!snap2.refusal, "a connection that refuses every write still resolves a snapshot",
       JSON.stringify(snap2).slice(0, 160));
@@ -415,7 +415,7 @@ check(parse({}).error === null && parse({}).projects.length === 0,
   {
     let asked = null;
     const io = registryIo(dir, "p", { nwo: "o/r", repoPath: "/repo", profilePath: "/f" },
-      { git: (_bin, args) => { asked = args; return "160000 abc 0\tpackages/x"; } });
+      { spawn: (_bin, args) => { asked = args; return { stdout: "160000 abc 0\tpackages/x\u0000" }; } });
     const got = io.lsTree("/repo", "packages/x");
     check(asked?.includes("ls-files") && asked?.includes("--stage"),
       "the submodule probe inspects the staged index, not the HEAD tree", JSON.stringify(asked));
@@ -433,7 +433,7 @@ check(parse({}).error === null && parse({}).projects.length === 0,
       // used newlines and went stale the moment the format changed -- the
       // suite caught it, which is what a fixture built to mimic a producer
       // costs you when the producer moves.
-      { git: () => "120000 aaa 0\tpackages/a-link\u0000100644 bbb 0\tpackages/normal/x.ts\u0000" });
+      { spawn: () => ({ stdout: "120000 aaa 0\tpackages/a-link\u0000100644 bbb 0\tpackages/normal/x.ts\u0000" }) });
     check(many.lsTree("/repo", "packages") === null,
       "a DIRECTORY whose first tracked child is a symlink is not itself reported as one",
       JSON.stringify(many.lsTree("/repo", "packages")));
@@ -498,7 +498,15 @@ check(parse({}).error === null && parse({}).projects.length === 0,
   const io = (out) => {
     let args = null;
     const r = registryIo("/h", "p", { nwo: "o/r", repoPath: "/r", profilePath: "/f" },
-      { git: (_b, a) => { args = a; if (out instanceof Error) throw out; return out; } });
+      { spawn: (_b, a) => { args = a; return out instanceof Error ? { stdout: "", error: out } : { stdout: out }; } });
+    return { probe: r, argv: () => args };
+  };
+  // Same harness, but taking the spawn RESULT directly, so a fixture can carry
+  // both partial stdout and an error -- which is exactly the truncated case.
+  const io2 = (res) => {
+    let args = null;
+    const r = registryIo("/h", "p", { nwo: "o/r", repoPath: "/r", profilePath: "/f" },
+      { spawn: (_b, a) => { args = a; return res; } });
     return { probe: r, argv: () => args };
   };
   const SEP = "\u0000";
@@ -522,22 +530,50 @@ check(parse({}).error === null && parse({}).projects.length === 0,
       "while the unquoted form does");
   }
 
-  // ── a buffer overflow is an ANSWER, not a crash ──────────────────────────
+  // ── a buffer overflow is NOT an answer ───────────────────────────────────
   //
-  // Probing an ancestor directory lists every tracked descendant, and
-  // execFileSync defaults to 1 MiB, so a large tree raised ENOBUFS -- uncaught
-  // by resolveClaims, aborting resolution for every claim beneath it. Overflow
-  // can only mean many rows; many rows means a directory prefix; a directory has
-  // no index entry of its own. So null is CORRECT there, not a fallback.
+  // THIS BLOCK PREVIOUSLY ASSERTED THE OPPOSITE, and the assertion was wrong
+  // because my reasoning was. I argued that overflow implies many rows, many
+  // rows implies a directory prefix, and a directory has no index entry of its
+  // own -- so `null` was "correct rather than a fallback". A DIRECTORY/FILE
+  // CONFLICT breaks the middle step: an unresolved merge can hold a dangerous
+  // stage-2 entry for `x` AND tens of thousands of stage-3 entries under `x/`.
+  //
+  // The probe now searches whatever was captured, and REFUSES if the exact
+  // entry was not found in a truncated read.
   {
-    const enobufs = Object.assign(new Error("stdout maxBuffer exceeded"), { code: "ENOBUFS" });
-    check(io(enobufs).probe.lsTree("/r", "packages") === null,
-      "an oversized listing answers `no entry of its own` rather than throwing");
+    const enob = { code: "ENOBUFS" };
+    const row = (m, st, pa) => `${m} aaa ${st}\t${pa}${SEP}`;
+
+    // The conflict shape itself: dangerous `x`, then many descendants.
+    const conflict = row("120000", "2", "x") + row("100644", "3", "x/a") + row("100644", "3", "x/b");
+    check(io2({ stdout: conflict, error: enob }).probe.lsTree("/r", "x")?.mode === "120000",
+      "a truncated read still finds the exact entry, because git sorts `x` before `x/...`",
+      JSON.stringify(io2({ stdout: conflict, error: enob }).probe.lsTree("/r", "x")));
+
+    // And when it is NOT in what was read, the probe refuses instead of
+    // concluding. Failing closed here is the whole point: `null` admitted a
+    // claim through a path the conflict may resolve into a symlink.
+    let refused = null;
+    try { io2({ stdout: row("100644", "3", "x/a"), error: enob }).probe.lsTree("/r", "x"); }
+    catch (e) { refused = e.message; }
+    check(refused !== null && /could not be established/.test(refused),
+      "a truncated read WITHOUT the exact entry refuses, rather than reporting `no entry`",
+      String(refused).slice(0, 80));
+
+    // CONTROL: a complete read with no entry is still a plain null, or the
+    // refusal above would be firing on every ordinary miss.
+    check(io2({ stdout: "", error: null }).probe.lsTree("/r", "x") === null,
+      "control: a COMPLETE read with no entry is still `no entry`");
+
+    // CONTROL: any other git failure still propagates, so this is not a
+    // blanket catch that would read a broken git as `nothing is tracked`.
     let threw = null;
-    try { io(Object.assign(new Error("git not found"), { code: "ENOENT" })).probe.lsTree("/r", "x"); }
+    try { io2({ stdout: "", error: Object.assign(new Error("git not found"), { code: "ENOENT" }) })
+            .probe.lsTree("/r", "x"); }
     catch (e) { threw = e.code; }
     check(threw === "ENOENT",
-      "control: any OTHER git failure still propagates, so this is not a blanket catch", String(threw));
+      "control: any OTHER git failure still propagates", String(threw));
   }
 
   // ── every stage of an unmerged entry ─────────────────────────────────────

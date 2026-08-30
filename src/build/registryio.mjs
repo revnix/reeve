@@ -17,7 +17,7 @@ import { createHash } from "node:crypto";
 import { join, posix as pathPosix, win32 as pathWin32 } from "node:path";
 const isAbsolutePosix = pathPosix.isAbsolute;
 const isAbsoluteWin32 = pathWin32.isAbsolute;
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { hubPathFor } from "../paths.mjs";
 import { resolveRepoIdAt } from "./repoid.mjs";
 import { validate, withDefaults } from "../profile/schema.mjs";
@@ -241,7 +241,7 @@ export function loadRegistry(home) {
  * them and the filing is refused with both field names in it. That refusal is
  * the correct state, and it is what makes the block visible rather than silent.
  */
-export function registryIo(home, project, entry, { fetchRepoId = null, git = execFileSync, connect = null } = {}) {
+export function registryIo(home, project, entry, { fetchRepoId = null, spawn = spawnSync, connect = null } = {}) {
   // Read ONCE per io, not once per lookup: four members read the same file, and
   // four reads could disagree if the profile changed between them -- a snapshot
   // assembled from two different profiles is not a snapshot of either.
@@ -309,37 +309,32 @@ export function registryIo(home, project, entry, { fetchRepoId = null, git = exe
       // it as untracked. `src/checkout.mjs` and `src/mergecheck.mjs` already
       // carry this option for the same reason.
       // `-z`: NUL-TERMINATED AND UNQUOTED. Git's default `core.quotePath` emits
-      // display output, so `módulo` comes back as `"m\303\263dulo"` and an exact
+      // display output, so a non-ASCII ancestor comes back quoted and an exact
       // comparison never matches -- the ancestor reads as untracked and the
-      // claim is admitted through it. `-z` is the machine-readable form.
+      // claim is admitted through it.
       //
-      // BOUNDED, AND THE OVERFLOW IS AN ANSWER RATHER THAN A FAILURE. Probing an
-      // ancestor DIRECTORY lists every tracked descendant, and `execFileSync`
-      // defaults to a 1 MiB buffer, so a large tree raised ENOBUFS -- which
-      // `resolveClaims` does not catch, aborting snapshot resolution for every
-      // claim beneath it. Overflow can only happen when many rows came back; many
-      // rows means the path is a directory prefix; and a directory has no index
-      // entry of its own. So `null` is the CORRECT answer there, not a fallback:
-      // a single row cannot exceed the buffer, since a path is at most a few
-      // thousand bytes.
-      let out;
-      try {
-        out = String(git("git", ["--literal-pathspecs", "-C", repoPath,
-                                 "ls-files", "--stage", "-z", "--", path],
-                         { encoding: "utf8", maxBuffer: 4 * 1024 * 1024,
-                           stdio: ["ignore", "pipe", "ignore"] }));
-      } catch (e) {
-        if (e?.code === "ENOBUFS") return null;
-        throw e;
-      }
-      if (!out) return null;
-      // ONE ROW PER TRACKED DESCENDANT. Probing an ordinary directory lists
-      // everything beneath it, and taking the first row's mode reported the
-      // directory as whatever its first child happened to be -- a tracked
-      // symlink under `packages` made `packages` look like mode 120000 and
-      // refused an unrelated claim under `packages/normal`. A gitlink first in
-      // the listing did the same. So the entry whose PATH is exactly the one
-      // asked about is the only row that answers the question.
+      // OVERFLOW IS NOT AN ANSWER, AND MY PREVIOUS ARGUMENT THAT IT WAS IS WRONG.
+      // I reasoned that overflow implies many rows, many rows implies a directory
+      // prefix, and a directory has no index entry of its own -- so `null` was
+      // "correct rather than a fallback". A DIRECTORY/FILE CONFLICT breaks the
+      // middle step: an unresolved merge can hold a dangerous stage-2 entry for
+      // `x` AND tens of thousands of stage-3 entries under `x/`. Overflow there
+      // says nothing about whether `x` itself is a symlink, and answering `null`
+      // admitted `x/new` through a path that resolution may turn into one.
+      //
+      // So the exact entry is searched for in whatever was captured -- git's
+      // index is byte-sorted and `x` sorts before `x/...`, so it is the FIRST
+      // row when it exists -- and if it was NOT found in a TRUNCATED read, the
+      // probe refuses rather than concluding. The ordering is an optimisation;
+      // it is not load-bearing for the safety conclusion, because the last time
+      // I called an argument of this shape airtight it was not.
+      const res = spawn("git", ["--literal-pathspecs", "-C", repoPath,
+                                "ls-files", "--stage", "-z", "--", path],
+                        { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
+      const truncated = res.error?.code === "ENOBUFS";
+      if (res.error && !truncated) throw res.error;
+      const out = String(res.stdout ?? "");
+
       // EVERY MATCHING STAGE, not the first. An unresolved merge puts the same
       // pathname in the index several times, and returning the first row missed
       // a later stage carrying 120000 or 160000 -- so a symlink or gitlink was
@@ -357,6 +352,12 @@ export function registryIo(home, project, entry, { fetchRepoId = null, git = exe
         if (DANGEROUS.has(mode)) return { mode };
         found ??= { mode };
       }
+      if (!found && truncated)
+        throw new Error(
+          `the index listing for ${path} exceeded the read buffer and no exact entry was found in ` +
+          `what was read, so whether it is a symlink or a submodule could not be established. ` +
+          `Refusing rather than admitting: an unresolved directory/file conflict can carry a ` +
+          `dangerous entry for ${path} alongside many entries beneath it.`);
       return found;
     },
   };

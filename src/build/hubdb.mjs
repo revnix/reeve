@@ -727,6 +727,14 @@ function scratchAt(version) {
  */
 export function shapeOf(db) {
   const tables = {};
+  // TRIGGERS ARE PART OF THE SCHEMA AND CAN REFUSE A WRITE OUTRIGHT. A hub
+  // carrying `CREATE TRIGGER ... BEFORE INSERT ON task BEGIN SELECT RAISE(ABORT,
+  // ...); END` has identical tables, columns, indexes and constraints, passes a
+  // deep integrity check, and rejects the first ordinary task filing.
+  const triggers = {};
+  for (const r of db.prepare(
+    `SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'`).all())
+    triggers[r.name] = { table: r.tbl_name, sql: String(r.sql ?? "").replace(/\s+/g, " ").trim() };
   // `wr` is WITHOUT ROWID. Thirteen hub tables declare it, and rebuilding one
   // without it is invisible to every other check: the columns, indexes and
   // constraints are identical, and only the storage changes -- a primary-key
@@ -781,9 +789,43 @@ export function shapeOf(db) {
 
     const props = propsOf.get(t) ?? { strict: false, withoutRowid: false };
     tables[t] = { columns, indexes, foreignKeys, strict: props.strict,
-                  withoutRowid: props.withoutRowid };
+                  withoutRowid: props.withoutRowid, checks: checksOf(db, t) };
   }
-  return tables;
+  return { tables, triggers };
+}
+
+/**
+ * The CHECK constraints on a table, as normalised text.
+ *
+ * SQLite exposes no structural pragma for CHECK, so this is the one place the
+ * DDL must be read -- and it is read NARROWLY: the balanced parenthesis group
+ * after each `CHECK` keyword, whitespace collapsed, rather than the whole
+ * statement. Comparing whole DDL is what this module exists to avoid, because
+ * authoring format differs between a fresh store and a rebuilt one and would
+ * raise a defect where the schema is identical.
+ *
+ * A tightened CHECK is not decoration: narrowing `task.priority` to `'p1'` alone
+ * leaves existing rows valid and every integrity check clean, then refuses the
+ * ordinary insert that relies on the `'p2'` default.
+ */
+function checksOf(db, table) {
+  const ddl = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)?.sql ?? "";
+  const out = [];
+  const re = /\bCHECK\s*\(/gi;
+  let m;
+  while ((m = re.exec(ddl))) {
+    let depth = 1, i = m.index + m[0].length;
+    for (; i < ddl.length && depth > 0; i++) {
+      if (ddl[i] === "(") depth++;
+      else if (ddl[i] === ")") depth--;
+    }
+    // An unbalanced tail means the scan lost its place; recording a truncated
+    // constraint would compare two different wrong things.
+    if (depth !== 0) continue;
+    out.push(ddl.slice(m.index + m[0].length, i - 1).replace(/\s+/g, " ").trim());
+  }
+  return out.sort();
 }
 
 // Building a scratch store runs every migration, so the shape for a version is
@@ -801,7 +843,7 @@ export function shapeAt(version) {
 
 /** The tables a snapshot at `version` must carry, derived by running the migrations. */
 export function tablesAt(version) {
-  return Object.freeze(Object.keys(shapeAt(version)).sort());
+  return Object.freeze(Object.keys(shapeAt(version).tables).sort());
 }
 
 /**
@@ -846,27 +888,28 @@ export function schemaDefectsAt(db, version) {
   const have = shapeOf(db);
   const bad = [];
 
-  for (const [t, wantTable] of Object.entries(want)) {
-    const haveTable = have[t];
+  for (const [t, wantTable] of Object.entries(want.tables)) {
+    const haveTable = have.tables[t];
     if (!haveTable) { bad.push(`table ${t} is missing`); continue; }
 
     for (const [c, w] of Object.entries(wantTable.columns)) {
       const h = haveTable.columns[c];
       if (!h) { bad.push(`${t}.${c} is missing`); continue; }
       if (h.type !== w.type) bad.push(`${t}.${c} is ${h.type || "untyped"}, want ${w.type}`);
-      // NULLABILITY IS COMPARED BOTH WAYS. A snapshot that made an expected
-      // nullable column NOT NULL is not carrying something extra -- it REJECTS
-      // writes the code performs. `task.body` is bound as `filing.body ?? null`,
-      // so a tightened column fails ordinary task filing after restore.
-      if (w.notNull && !h.notNull) bad.push(`${t}.${c} is nullable, want NOT NULL`);
-      if (!w.notNull && h.notNull) bad.push(`${t}.${c} is NOT NULL, want nullable`);
+      if (w.notNull !== h.notNull)
+        bad.push(`${t}.${c} is ${h.notNull ? "NOT NULL" : "nullable"}, want ${w.notNull ? "NOT NULL" : "nullable"}`);
       if (w.pk && !h.pk) bad.push(`${t}.${c} is not part of the primary key, want it to be`);
-      // THE DEFAULT IS PART OF THE WRITABLE CONTRACT. Losing `DEFAULT 'p2'` on
-      // `task.priority` leaves every existing row valid and every integrity
-      // check clean, and breaks the first insert that omits the column.
       if (h.dflt !== w.dflt)
         bad.push(`${t}.${c} defaults to ${h.dflt ?? "nothing"}, want ${w.dflt ?? "no default"}`);
     }
+
+    // AN EXTRA COLUMN IS ONLY HARMLESS IF AN INSERT CAN OMIT IT. `NOT NULL` with
+    // no default refuses every write the code performs, because every insert
+    // omits a column this schema does not know about.
+    for (const [c, h] of Object.entries(haveTable.columns))
+      if (!(c in wantTable.columns) && h.notNull && h.dflt === null)
+        bad.push(`${t}.${c} is not in this schema and is NOT NULL with no default, ` +
+                 `so every insert that omits it fails`);
 
     for (const [key, w] of Object.entries(wantTable.indexes)) {
       const h = haveTable.indexes[key];
@@ -874,20 +917,20 @@ export function schemaDefectsAt(db, version) {
       if (!h) { bad.push(`${label} is missing`); continue; }
       if (w.unique !== h.unique)
         bad.push(`${label} is ${h.unique ? "UNIQUE" : "not UNIQUE"}, want ${w.unique ? "UNIQUE" : "not UNIQUE"}`);
-      // COLUMNS AND PREDICATE, not just the name. An index keeps its identity
-      // while enforcing something else entirely: same name, same uniqueness,
-      // different columns or a different WHERE.
       if (w.columns.join(",") !== h.columns.join(","))
         bad.push(`${label} covers (${h.columns.join(", ")}), want (${w.columns.join(", ")})`);
       if (w.where !== h.where)
         bad.push(`${label} is filtered by ${h.where || "nothing"}, want ${w.where || "no filter"}`);
     }
 
-    // FOREIGN KEYS ARE COMPARED AS A SET, IN BOTH DIRECTIONS -- the one place
-    // "extra is harmless" does not hold. An extra column carries data nobody
-    // reads; an extra CONSTRAINT rejects writes the code performs, and it does
-    // so only once a row exists, so `foreign_key_check` on an empty table
-    // reports nothing wrong.
+    // AN EXTRA UNIQUE INDEX REFUSES WRITES; an extra non-unique one only costs
+    // write time. A unique index on `task(project)` lets the first task through
+    // and fails the second, which is worse than failing immediately.
+    for (const [key, h] of Object.entries(haveTable.indexes))
+      if (!(key in wantTable.indexes) && h.unique)
+        bad.push(`unique index ${h.name} on ${t}(${h.columns.join(", ")}) is not in this schema ` +
+                 `and can refuse writes`);
+
     for (const [key, w] of Object.entries(wantTable.foreignKeys)) {
       const h = haveTable.foreignKeys[key];
       if (!h) { bad.push(`foreign key ${t}.${key} is missing`); continue; }
@@ -900,12 +943,35 @@ export function schemaDefectsAt(db, version) {
       if (!(key in wantTable.foreignKeys))
         bad.push(`foreign key ${t}.${key} is not in this schema and can refuse writes`);
 
+    // CHECK CONSTRAINTS, BOTH WAYS. A tightened CHECK leaves existing rows valid
+    // and refuses new ones: narrowing `task.priority` to `'p1'` passes every
+    // integrity check on an empty hub and then rejects the ordinary insert that
+    // relies on the `'p2'` default.
+    const wantChecks = wantTable.checks.join(" ;; ");
+    const haveChecks = haveTable.checks.join(" ;; ");
+    if (wantChecks !== haveChecks) {
+      const added   = haveTable.checks.filter((c) => !wantTable.checks.includes(c));
+      const removed = wantTable.checks.filter((c) => !haveTable.checks.includes(c));
+      if (added.length)   bad.push(`table ${t} adds CHECK (${added[0]}), which can refuse writes`);
+      if (removed.length) bad.push(`table ${t} is missing CHECK (${removed[0]})`);
+    }
+
     if (wantTable.strict && !haveTable.strict) bad.push(`table ${t} is not STRICT`);
-    // WITHOUT ROWID is a storage invariant the schema states deliberately.
     if (wantTable.withoutRowid !== haveTable.withoutRowid)
       bad.push(`table ${t} is ${haveTable.withoutRowid ? "WITHOUT ROWID" : "a rowid table"}, ` +
                `want ${wantTable.withoutRowid ? "WITHOUT ROWID" : "a rowid table"}`);
   }
+
+  // TRIGGERS ARE COMPARED AS A WHOLE-SCHEMA SET, not per table, because a
+  // trigger on an EXTRA table can still refuse a write to an expected one.
+  for (const [name, h] of Object.entries(have.triggers)) {
+    const w = want.triggers[name];
+    if (!w) { bad.push(`trigger ${name} on ${h.table} is not in this schema and can refuse or alter writes`); continue; }
+    if (w.sql !== h.sql) bad.push(`trigger ${name} on ${h.table} does not match this schema`);
+  }
+  for (const name of Object.keys(want.triggers))
+    if (!(name in have.triggers)) bad.push(`trigger ${name} is missing`);
+
   return bad;
 }
 

@@ -400,7 +400,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
   // The list this replaced described only what a migration ADDS, so "no earlier
   // version declares it" was true of the declaration and said nothing about the
   // store: a column present since migration 1 would have read as absent.
-  const at = shapeAt(SCHEDULER_MIN_HUB_VERSION);
+  const at = shapeAt(SCHEDULER_MIN_HUB_VERSION).tables;
   check(at.provider_lease?.columns?.token != null,
     "the scheduler's floor is the version that introduces provider_lease.token",
     JSON.stringify({ floor: SCHEDULER_MIN_HUB_VERSION,
@@ -413,7 +413,7 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
   // This is now a question about the store the migrations build, so a column
   // created in migration 1 answers it correctly.
   const below = SCHEDULER_MIN_HUB_VERSION - 1;
-  const before = shapeAt(below);
+  const before = shapeAt(below).tables;
   check(before.provider_lease?.columns?.token == null,
     `and version ${below} does not have it, so the floor is not higher than it needs to be`,
     JSON.stringify(Object.keys(before.provider_lease?.columns ?? {})));

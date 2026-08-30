@@ -84,13 +84,21 @@ const rebuild = (db, table, transform) => {
   // requirement has to actually contain tables, columns, indexes and foreign
   // keys, or "no defects" means "nothing was looked at".
   const shape = shapeAt(HUB_SCHEMA_VERSION);
-  const tables  = Object.keys(shape).length;
-  const columns = Object.values(shape).reduce((n, t) => n + Object.keys(t.columns).length, 0);
-  const indexes = Object.values(shape).reduce((n, t) => n + Object.keys(t.indexes).length, 0);
-  const fks     = Object.values(shape).reduce((n, t) => n + Object.keys(t.foreignKeys).length, 0);
-  check(tables > 0 && columns > 0 && indexes > 0 && fks > 0,
-    "control: the derived requirement examines tables, columns, indexes AND foreign keys",
-    `tables=${tables} columns=${columns} indexes=${indexes} foreignKeys=${fks}`);
+  const T = shape.tables;
+  const tables  = Object.keys(T).length;
+  const columns = Object.values(T).reduce((n, t) => n + Object.keys(t.columns).length, 0);
+  const indexes = Object.values(T).reduce((n, t) => n + Object.keys(t.indexes).length, 0);
+  const fks     = Object.values(T).reduce((n, t) => n + Object.keys(t.foreignKeys).length, 0);
+  const checks  = Object.values(T).reduce((n, t) => n + t.checks.length, 0);
+  check(tables > 0 && columns > 0 && indexes > 0 && fks > 0 && checks > 0,
+    "control: the derived requirement examines tables, columns, indexes, foreign keys AND checks",
+    `tables=${tables} columns=${columns} indexes=${indexes} foreignKeys=${fks} checks=${checks}`);
+  // Triggers are compared too, and this hub declares NONE -- which makes the
+  // set-comparison meaningful rather than vacuous: any trigger at all is
+  // unexpected, and that is asserted by fixture below rather than assumed here.
+  check(Object.keys(shape.triggers).length === 0,
+    "control: the schema declares no triggers, so any trigger in a snapshot is unexpected",
+    JSON.stringify(Object.keys(shape.triggers)));
   check(tablesAt(HUB_SCHEMA_VERSION).length === tables,
     "control: and the table list agrees with the shape it is derived from");
 }
@@ -275,6 +283,78 @@ const rebuild = (db, table, transform) => {
   check(d.some(s => s === "table task_territory is a rowid table, want WITHOUT ROWID"),
     "a WITHOUT ROWID table rebuilt as a rowid table is refused",
     d.slice(0, 3).join("; "));
+}
+
+// ── class 11: a TIGHTENED CHECK ──────────────────────────────────────────────
+//
+// SQLite has no structural pragma for CHECK, so it is the one property read out
+// of the DDL -- narrowly, as the balanced group after each CHECK keyword.
+// Narrowing `task.priority` to `'p1'` leaves every existing row valid, passes
+// the deep integrity check on an empty hub, and then refuses the ordinary insert
+// that relies on the `'p2'` default.
+{
+  const d = damaged("tight-check", (db) =>
+    rebuild(db, "task", (ddl) => ddl.replace("priority IN ('p1','p2')", "priority IN ('p1')")));
+  check(d.some(s => s.includes("adds CHECK (priority IN ('p1'))")),
+    "a snapshot that TIGHTENED a CHECK is refused, naming the constraint it added",
+    d.slice(0, 3).join("; "));
+}
+
+// ── class 12: an EXTRA UNIQUE INDEX ──────────────────────────────────────────
+//
+// Worse than failing immediately: it lets the FIRST write through and refuses
+// the second, so the damage surfaces long after the restore that caused it.
+// An extra NON-unique index stays permitted -- it costs write time, not writes.
+{
+  const d = damaged("extra-unique", (db) =>
+    db.exec("CREATE UNIQUE INDEX surprise_unique ON task(project)"));
+  check(d.some(s => s.startsWith("unique index surprise_unique on task(project) is not in this schema")),
+    "an EXTRA unique index is refused, because it rejects writes this schema permits",
+    d.slice(0, 3).join("; "));
+
+  const harmless = damaged("extra-plain-index", (db) =>
+    db.exec("CREATE INDEX surprise_plain ON task(project)"));
+  check(harmless.length === 0,
+    "control: an extra NON-unique index is still permitted, so the rule is about refusal not novelty",
+    harmless.slice(0, 3).join("; "));
+}
+
+// ── class 13: an UNEXPECTED TRIGGER ──────────────────────────────────────────
+//
+// Identical tables, columns, indexes and constraints. A deep integrity check
+// sees nothing. The first ordinary task filing is refused outright.
+{
+  const d = damaged("trigger", (db) =>
+    db.exec("CREATE TRIGGER reject_tasks BEFORE INSERT ON task " +
+            "BEGIN SELECT RAISE(ABORT, 'blocked'); END"));
+  check(d.some(s => s.startsWith("trigger reject_tasks on task is not in this schema")),
+    "an unexpected TRIGGER is refused, though every table and column is intact",
+    d.slice(0, 3).join("; "));
+}
+
+// ── class 14: an EXTRA NOT NULL COLUMN WITH NO DEFAULT ───────────────────────
+//
+// The precise boundary of "extra is harmless". Every insert this code performs
+// omits a column the schema does not know about, so a NOT NULL column with no
+// default refuses all of them -- while the same column nullable, or defaulted,
+// is genuinely harmless. Both halves are asserted, because a rule that refused
+// every extra column would be the opposite mistake.
+{
+  const d = damaged("extra-notnull", (db) =>
+    db.exec("ALTER TABLE task ADD COLUMN required_by_future TEXT NOT NULL DEFAULT 'x'"));
+  check(d.length === 0,
+    "control: an extra NOT NULL column WITH a default is harmless, because inserts may omit it",
+    d.slice(0, 3).join("; "));
+
+  const e = damaged("extra-notnull-bare", (db) => {
+    // SQLite refuses ALTER ADD of a bare NOT NULL column, which is exactly the
+    // shape a rebuilt or hand-repaired store arrives in -- so it is rebuilt.
+    rebuild(db, "task", (ddl) =>
+      ddl.replace("  body           TEXT,", "  body           TEXT,\n  required_by_future TEXT NOT NULL,"));
+  });
+  check(e.some(s => s.startsWith("task.required_by_future is not in this schema and is NOT NULL with no default")),
+    "an extra NOT NULL column with NO default is refused, because every insert omits it",
+    e.slice(0, 3).join("; "));
 }
 
 // ── extra is not a defect ────────────────────────────────────────────────────

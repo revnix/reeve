@@ -775,7 +775,13 @@ check(pairs.length === 2 && pairs[0][1].done !== pairs[1][1].done,
 //     `(ctx.NAME ?? FALLBACK)`, so the pairs can be read rather than restated;
 //     a list maintained here would drift the moment one changed.
 {
-  const daemonSrc = readFileSync(join(HERE, "..", "src", "daemon.mjs"), "utf8");
+  // BOTH FILES. The seams are resolved wherever the code that performs them
+  // lives, and two of them moved into the session module when the release and
+  // cooldown mechanics did. Reading only `daemon.mjs` made this control fail the
+  // moment they moved -- correctly, since it could no longer see them, but the
+  // fix is to read where they went rather than to stop asking.
+  const daemonSrc = readFileSync(join(HERE, "..", "src", "daemon.mjs"), "utf8")
+    + "\n" + readFileSync(join(HERE, "..", "src", "build", "hubsession.mjs"), "utf8");
   // TWO FORMS, because the resolution mechanism moved. A seam is resolved either
   // inline as `(ctx.NAME ?? FALLBACK)` or through the session as
   // `session.perform("NAME", FALLBACK, ...)`, which is what makes the handle
@@ -785,6 +791,12 @@ check(pairs.length === 2 && pairs[0][1].done !== pairs[1][1].done,
   const resolved = new Map();
   for (const m of daemonSrc.matchAll(/\(\s*ctx\.(\w+)\s*\?\?\s*(\w+)\s*\)/g)) resolved.set(m[1], m[2]);
   for (const m of daemonSrc.matchAll(/session\.perform\(\s*"(\w+)"\s*,\s*(\w+)\s*,/g)) resolved.set(m[1], m[2]);
+  // ...and the module resolves its own two through `ops`, supplied by the caller
+  // so the module imports nothing. The NAME the caller binds is what must match.
+  for (const m of daemonSrc.matchAll(/ops:\s*\{([^}]*)\}/g))
+    for (const pair of m[1].matchAll(/(\w+)\s*:\s*(\w+)/g)) resolved.set(pair[1], pair[2]);
+  for (const m of daemonSrc.matchAll(/ops:\s*\{([^}]*)\}/g))
+    for (const bare of m[1].matchAll(/(?:^|,)\s*(\w+)\s*(?=,|$)/g)) resolved.set(bare[1], bare[1]);
   check(resolved.size > 0, "control: the daemon's seam resolutions are readable at all", `${resolved.size} found`);
   // AND BOTH FORMS ARE REALLY IN USE, or one half of this reader is dead weight
   // that would hide a seam resolved the way it no longer looks for.

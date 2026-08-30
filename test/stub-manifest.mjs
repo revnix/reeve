@@ -451,4 +451,22 @@ export const STUBS = [
               find: "  const namedFailed = observed\n    ? observed.namedFailSeen\n    : failures.some(f => f.includes(expectRed));",
               replace: "  const namedFailed = failures.some(f => f.includes(expectRed));" }],
   },
+  {
+    name: "outbox-edge-survives-a-rerun",
+    why: "drop the id lookup, so a re-run has only enqueue's null and the dependency edge cannot be rebuilt",
+    test: "test/outbox-edge-rerun.test.mjs",
+    expectRed: "a re-run finds the SAME parent rather than losing it",
+    edits: [{ file: "src/db/ops.mjs",
+              find: "  const parentId = enqueue(db, parent) ?? outboxIdFor(db, parent.idemKey);",
+              replace: "  const parentId = enqueue(db, parent);" }],
+  },
+  {
+    name: "outbox-refuses-to-orphan",
+    why: "enqueue dependants when the parent has no row, which is the silent orphan: no depends_on, drains at once, and the token has no parent to read",
+    test: "test/outbox-edge-rerun.test.mjs",
+    expectRed: "a parent that cannot be enqueued refuses rather than orphaning its children",
+    edits: [{ file: "src/db/ops.mjs",
+              find: "  if (parentId == null)",
+              replace: "  if (false)" }],
+  },
 ];

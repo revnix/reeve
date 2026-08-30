@@ -38,7 +38,7 @@
 // A VALUE NO SCHEDULER CAN RETURN, so "there was no scheduler" is never
 // mistaken for something the scheduler said.
 export const NO_HUB = Symbol("no-hub");
-export const hubSession = ({ getter, onFault, overrides }) => {
+export const hubSession = ({ getter, onFault, overrides, log, raise, isAlive, retries, ops }) => {
   const now = () => (typeof getter === "function" ? getter() : { hub: getter ?? null, why: null });
   let faultSaid = false;
   // SAID ONCE, wherever the reading came from. A caller that reads the hub
@@ -78,6 +78,129 @@ export const hubSession = ({ getter, onFault, overrides }) => {
     if (!h) return whenAbsent === undefined ? undefined : whenAbsent();
     return (overrides?.[name] ?? fallbackFn)(h, args);
   };
+  // ── THE TWO OBLIGATIONS THAT OUTLIVE A TICK ────────────────────────────────
+  //
+  // A release and a cooldown are the only scheduler operations whose failure
+  // must be REMEMBERED. Everything else is fire-and-forget: a reap that could
+  // not run is simply not run, and the next tick reaps. These two are not.
+  //
+  //   A LEASE NOT GIVEN BACK stays bound to the guardian's always-alive pid, so
+  //   the liveness-aware reaper preserves it and the slot is held against the
+  //   global limit until it expires. Dropping the obligation costs real capacity.
+  //
+  //   A COOLDOWN NOT RECORDED means the next tick admits work straight back into
+  //   an exhausted provider window -- and the builder, admitting against the same
+  //   `provider_state`, does too.
+  //
+  // They lived in the caller, next to each other, each with its own copy of
+  // "defer on a refusal, defer on a throw, delete on success". That is the rule
+  // this whole module exists to stop being a convention: the release had the
+  // retry and the cooldown did not, and nothing failed when one was missing.
+  //
+  // The maps are the CALLER'S, passed in, because they must survive the tick
+  // that created them -- the session is built fresh per tick and the obligation
+  // is not.
+
+  /** Defer, and say why. The one shape both obligations share. */
+  const defer = (map, key, value, why) => { map.set(key, value); log(why); };
+
+  /**
+   * Give a lease back, or carry the obligation to the next tick.
+   *
+   * THREE ROUTES OUT, and all three must retain. A hub that is momentarily
+   * UNREADABLE, an operation that REFUSES because a restore holds the hub, and
+   * one that THROWS are different events with the same consequence, and an
+   * earlier version handled two of the three -- the third dropped the identity
+   * and lost the slot for good.
+   *
+   * A hub that is genuinely ABSENT is the exception, and the only one: there is
+   * no scheduler, so there is no lease and nothing to give back.
+   */
+  const release = (key, identity) => {
+    const a = now();
+    if (!a.hub) {
+      // ABSENT drops it; UNREADABLE keeps it. `read` is what tells them apart,
+      // and a handle cannot: both are "no handle".
+      if (a.why) {
+        sayFault(a.why);
+        defer(retries.releases, key, identity,
+              `provider: release deferred — the hub could not be reached; retrying next tick (${key})`);
+      }
+      return;
+    }
+    let r;
+    try {
+      r = perform("providerRelease", ops.providerRelease, { ...identity, isAlive },
+                  () => { defer(retries.releases, key, identity,
+                                `provider: release deferred — the hub could not be reached; retrying next tick (${key})`);
+                          return NO_HUB; });
+      if (r === NO_HUB) return;
+    } catch (err) {
+      defer(retries.releases, key, identity,
+            `provider: release THREW — ${err.message}; retrying next tick (${key})`);
+      raise("the provider scheduler is unreadable; dispatching unscheduled");
+      return;
+    }
+    if (r?.ok === false && r.reason === "maintenance")
+      defer(retries.releases, key, identity,
+            `provider: release deferred — a restore holds the hub; retrying next tick (${key})`);
+    else retries.releases.delete(key);
+  };
+
+  /**
+   * Record a rate limit, or carry it.
+   *
+   * THE WINDOW STARTED WHEN THE 429 WAS SEEN, not when we managed to write it.
+   * A deferred note carrying only a DURATION restarts the whole cooldown at
+   * retry time, so an outage longer than the cooldown recovers and then imposes
+   * a fresh block on every admission for a window that had already passed. The
+   * absolute expiry is stamped once, at observation, and carried.
+   *
+   * AND THE OBSERVATION TIME TRAVELS WITH IT. `recordRateLimit` keeps whichever
+   * metadata is latest by timestamp, so a note re-derived from the RETRY time
+   * looks newer than a 429 seen after it, and the older signature overwrites the
+   * newer one. Both facts are stamped together and neither is re-derived.
+   */
+  const noteCooldown = (key, note) => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const stamped = note.expiresAt != null ? note
+      : { ...note, observedAt: nowSec, expiresAt: nowSec + (note.cooldownSeconds ?? 0) };
+    const left = stamped.expiresAt - nowSec;
+    // Already elapsed while we could not write it. Recording a zero or negative
+    // cooldown would be recording a fact that has stopped being true.
+    if (left <= 0) { retries.cooldowns.delete(key); return; }
+    const send = { signature: stamped.signature, cooldownSeconds: left,
+                   observedAt: stamped.observedAt ?? null, expiresAt: stamped.expiresAt };
+    let r;
+    try {
+      r = perform("noteRateLimit", ops.noteRateLimit, { ...send, isAlive },
+                  () => { retries.cooldowns.set(key, stamped); return NO_HUB; });
+      if (r === NO_HUB) return;
+    } catch (err) {
+      defer(retries.cooldowns, key, stamped,
+            `provider: could not record the rate limit — ${err.message}; retrying next tick`);
+      raise("the provider scheduler is unreadable; dispatching unscheduled");
+      return;
+    }
+    if (r?.ok === false && r.reason === "maintenance")
+      defer(retries.cooldowns, key, stamped,
+            `provider: cooldown deferred — a restore holds the hub; retrying next tick (${key})`);
+    else retries.cooldowns.delete(key);
+  };
+
+  /**
+   * Replay what earlier ticks could not finish.
+   *
+   * COOLDOWNS FIRST, and the order is the point: a cooldown records that the
+   * provider's window is exhausted, and a release hands a slot back. Replaying
+   * the releases first would return capacity that the cooldown is about to
+   * declare unusable, and a tick in between could spend it.
+   */
+  const drainRetries = () => {
+    for (const [key, note] of [...retries.cooldowns]) noteCooldown(key, note);
+    for (const [key, identity] of [...retries.releases]) release(key, identity);
+  };
+
   // FROZEN, because the guarantee is about what a CALLER cannot do.
   //
   // Everything above is enforced by construction: a call site cannot hold a
@@ -102,5 +225,8 @@ export const hubSession = ({ getter, onFault, overrides }) => {
     // leave a handle in scope for a later line to use.
     available: () => Boolean(handle(() => null)),
     perform,
+    release,
+    noteCooldown,
+    drainRetries,
   });
 };

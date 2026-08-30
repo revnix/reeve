@@ -6,11 +6,45 @@
 // in memory certifies what was INTENDED, not what survived.
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, readFileSync,
-         rmSync, existsSync } from "node:fs";
+         rmSync, existsSync, readdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { ARTIFACT_FILE } from "../paths.mjs";
 
 const sha = (buf) => createHash("sha256").update(buf).digest("hex");
+
+/**
+ * How old a temporary must be before another writer may remove it.
+ *
+ * A worker killed between the open and the rename leaves its temporary behind
+ * for ever: the rename is what publishes a file, so nothing else references it
+ * and nothing else was ever going to remove it. Repeated crashes therefore
+ * accumulate full-size artifacts in the tree, and the first symptom is a disk
+ * that is full for reasons nobody can find.
+ *
+ * AGE, not process identity. A pid is the obvious discriminator and it is wrong:
+ * pids are reused, so a live writer's temporary can carry a pid this process now
+ * believes is dead. An hour is far longer than any artifact write and far
+ * shorter than the time it takes an abandoned one to matter.
+ */
+const STALE_TMP_MS = 60 * 60 * 1000;
+
+/**
+ * Remove temporaries left by writers that never reached their rename.
+ *
+ * BEST EFFORT, and it never throws. Reaping is housekeeping; a failure to tidy
+ * must not fail the write that was asked for, and a caller cannot act on it.
+ */
+function reapStaleTemporaries(dir, name, now) {
+  try {
+    for (const entry of readdirSync(dir)) {
+      if (!entry.startsWith(`${name}.tmp-`)) continue;
+      const full = join(dir, entry);
+      try {
+        if (now - statSync(full).mtimeMs > STALE_TMP_MS) rmSync(full, { force: true });
+      } catch { /* raced with its owner, or already gone */ }
+    }
+  } catch { /* the directory is unreadable; the write below will say so */ }
+}
 
 /** tmp + fsync + rename + fsync of the directory. Every step, in that order. */
 export function writeArtifact({ dir, phase, bytes }) {
@@ -30,6 +64,7 @@ export function writeArtifact({ dir, phase, bytes }) {
   for (let d = dir; !existsSync(d) && d !== dirname(d); d = dirname(d)) fresh.push(d);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, name);
+  reapStaleTemporaries(dir, name, Date.now());
   const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
   const fd = openSync(tmp, "wx");
   try {
@@ -55,7 +90,20 @@ export function writeArtifact({ dir, phase, bytes }) {
     throw e;
   }
   closeSync(fd);
-  renameSync(tmp, path);
+  // THE RENAME IS INSIDE THE CLEANUP TOO. It was outside it, so a rename that
+  // failed -- the destination has become a directory, or the filesystem refuses
+  // the metadata update -- left a COMPLETE temporary behind, and every retry
+  // left another. That is the same defect as the failed-write case, in the same
+  // function, three lines further down: one site fixed and its sibling left.
+  //
+  // `force` makes the removal a no-op once the rename has succeeded, so the
+  // successful path pays nothing for this.
+  try {
+    renameSync(tmp, path);
+  } catch (e) {
+    try { rmSync(tmp, { force: true }); } catch { /* the rename failure is the real one */ }
+    throw e;
+  }
   // THE DIRECTORY TOO. Without it the rename itself may not survive a crash,
   // and the artifact is durable only in the sense that its bytes were.
   const dfd = openSync(dir, "r");
@@ -176,11 +224,18 @@ export function reviewArtifact({ phase, dir, expect }) {
     // complete and whose second is an empty heading read as clean, and the phase
     // advanced with a slice that names no files, no tests and no done condition.
     const lines = text.split("\n");
+    // A SLICE ENDS AT THE NEXT SECTION, of any kind -- not at the next SLICE.
+    // Bounding the last slice at end-of-file let a trailing section's labels be
+    // read as that slice's, so an empty final slice followed by a Notes section
+    // carrying the four labels passed. The heading that ends a slice is the next
+    // heading, whatever it is called.
+    const sections = lines.map((l, i) => (/^##\s+/.test(l) ? i : -1)).filter(i => i !== -1);
     const starts = lines.map((l, i) => (/^##\s+Slice\b/.test(l) ? i : -1)).filter(i => i !== -1);
     if (!starts.length) findings.push("design.md carries no ordered slice list");
     for (let k = 0; k < starts.length; k++) {
       const heading = lines[starts[k]].trim();
-      const body = lines.slice(starts[k] + 1, k + 1 < starts.length ? starts[k + 1] : lines.length).join("\n");
+      const next = sections.find(i => i > starts[k]) ?? lines.length;
+      const body = lines.slice(starts[k] + 1, next).join("\n");
       for (const need of ["Files:", "Packages:", "Tests:", "Done when:"])
         if (!body.includes(need)) findings.push(`${heading} has no ${need} line`);
     }

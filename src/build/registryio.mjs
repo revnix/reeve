@@ -14,7 +14,9 @@
 
 import { readFileSync, lstatSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, isAbsolute } from "node:path";
+import { join, posix as pathPosix, win32 as pathWin32 } from "node:path";
+const isAbsolutePosix = pathPosix.isAbsolute;
+const isAbsoluteWin32 = pathWin32.isAbsolute;
 import { execFileSync } from "node:child_process";
 import { hubPathFor } from "../paths.mjs";
 import { resolveRepoIdAt } from "./repoid.mjs";
@@ -59,6 +61,36 @@ const versionOf = (reg) =>
  * Returns `{ projects, registry, error }`. `bin/reeve` reads `.projects` and
  * `.error`; `resolveSnapshot` takes `.registry`.
  */
+/**
+ * Is this a path the daemon can resolve to the SAME place every time?
+ *
+ * PLATFORM IS A PARAMETER, not an ambient fact, so the Windows rule is testable
+ * from a POSIX runner. It was not: the check lived inline, and the only
+ * assertion available was a source-text search for the constant's name -- which
+ * still passed when the constant was defined and no longer used. An assertion
+ * that cannot fail for the right reason is not an assertion.
+ *
+ * `isAbsolute` is necessary and NOT sufficient on Windows. Both `\repo` and
+ * `/repo` are absolute there and both are rooted on the process's current DRIVE:
+ * measured with `path.win32.resolve`, the same `/repo` entry becomes `C:\repo`
+ * from a C-drive daemon and `D:\repo` from a D-drive one. The registry would
+ * then select a different checkout and profile depending on how the service was
+ * started, which is the instability this validation exists to prevent.
+ *
+ * A NUL byte passes every string check and then reaches `lstatSync`, which
+ * raises ERR_INVALID_ARG_VALUE rather than ENOENT. `resolveClaims` handles
+ * ENOENT only, so snapshot resolution THREW instead of returning a refusal.
+ */
+const DRIVE_OR_UNC = /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/]+[^\\/]+)/;
+
+export function isRootedPath(v, platform = process.platform) {
+  if (typeof v !== "string" || v.length === 0) return false;
+  if (v.includes("\0")) return false;
+  const abs = platform === "win32" ? isAbsoluteWin32(v) : isAbsolutePosix(v);
+  if (!abs) return false;
+  return platform !== "win32" || DRIVE_OR_UNC.test(v);
+}
+
 export function parseRegistry(text, path) {
   const fail = (why) => ({ projects: [], registry: { version: 0, projects: Object.create(null) }, error: `${path}: ${why}` });
   let reg;
@@ -143,7 +175,8 @@ export function parseRegistry(text, path) {
   // paths, not claim paths: claims are slash-separated on every platform by
   // rule, but a repoPath is whatever the operating system uses. reeve has to
   // run on macOS, Windows and Ubuntu.
-  const isAbs = (v) => typeof v === "string" && v.length > 0 && isAbsolute(v);
+  const isAbs = (v) => isRootedPath(v, process.platform);
+
   const bad = Object.entries(reg)
     .filter(([, v]) => !v || typeof v !== "object" || Array.isArray(v) ||
                        typeof v.nwo !== "string" || !NWO.test(v.nwo) ||
@@ -275,9 +308,30 @@ export function registryIo(home, project, entry, { fetchRepoId = null, git = exe
       // called `:(literal)link` returned no entry and `resolveClaims` admitted
       // it as untracked. `src/checkout.mjs` and `src/mergecheck.mjs` already
       // carry this option for the same reason.
-      const out = String(git("git", ["--literal-pathspecs", "-C", repoPath,
-                                     "ls-files", "--stage", "--", path],
-                             { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })).trim();
+      // `-z`: NUL-TERMINATED AND UNQUOTED. Git's default `core.quotePath` emits
+      // display output, so `módulo` comes back as `"m\303\263dulo"` and an exact
+      // comparison never matches -- the ancestor reads as untracked and the
+      // claim is admitted through it. `-z` is the machine-readable form.
+      //
+      // BOUNDED, AND THE OVERFLOW IS AN ANSWER RATHER THAN A FAILURE. Probing an
+      // ancestor DIRECTORY lists every tracked descendant, and `execFileSync`
+      // defaults to a 1 MiB buffer, so a large tree raised ENOBUFS -- which
+      // `resolveClaims` does not catch, aborting snapshot resolution for every
+      // claim beneath it. Overflow can only happen when many rows came back; many
+      // rows means the path is a directory prefix; and a directory has no index
+      // entry of its own. So `null` is the CORRECT answer there, not a fallback:
+      // a single row cannot exceed the buffer, since a path is at most a few
+      // thousand bytes.
+      let out;
+      try {
+        out = String(git("git", ["--literal-pathspecs", "-C", repoPath,
+                                 "ls-files", "--stage", "-z", "--", path],
+                         { encoding: "utf8", maxBuffer: 4 * 1024 * 1024,
+                           stdio: ["ignore", "pipe", "ignore"] }));
+      } catch (e) {
+        if (e?.code === "ENOBUFS") return null;
+        throw e;
+      }
       if (!out) return null;
       // ONE ROW PER TRACKED DESCENDANT. Probing an ordinary directory lists
       // everything beneath it, and taking the first row's mode reported the
@@ -286,14 +340,24 @@ export function registryIo(home, project, entry, { fetchRepoId = null, git = exe
       // refused an unrelated claim under `packages/normal`. A gitlink first in
       // the listing did the same. So the entry whose PATH is exactly the one
       // asked about is the only row that answers the question.
-      for (const line of out.split("\n")) {
+      // EVERY MATCHING STAGE, not the first. An unresolved merge puts the same
+      // pathname in the index several times, and returning the first row missed
+      // a later stage carrying 120000 or 160000 -- so a symlink or gitlink was
+      // ignored, the claim admitted, and resolving the conflict to that side
+      // turned granted territory into a traversal boundary. The most dangerous
+      // mode present is the answer, because any stage may become the resolution.
+      const DANGEROUS = new Set(["120000", "160000"]);
+      let found = null;
+      for (const line of out.split("\0")) {
+        if (!line) continue;
         const tab = line.indexOf("\t");
         if (tab < 0) continue;
         if (line.slice(tab + 1) !== path) continue;
         const [mode] = line.slice(0, tab).split(/\s+/);
-        return { mode };
+        if (DANGEROUS.has(mode)) return { mode };
+        found ??= { mode };
       }
-      return null;
+      return found;
     },
   };
 }

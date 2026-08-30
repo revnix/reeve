@@ -397,12 +397,12 @@ check(parse({}).error === null && parse({}).projects.length === 0,
     // why it was wrong -- a source-text instrument tripping on prose, which is
     // the same fragility that broke a gate-state assertion on a pure move
     // earlier today.
-    const src = (await import("node:fs")).readFileSync(
-      new URL("../src/build/registryio.mjs", import.meta.url), "utf8");
-    check(/import \{[^}]*\bisAbsolute\b[^}]*\} from "node:path"/.test(src),
-      "the module imports node:path's isAbsolute, which is the platform-aware predicate");
+    // The source-text assertion that stood here is retired: it searched for an
+    // import and went stale the moment the module imported `posix`/`win32`
+    // instead. The rule is exercised directly further down, against an injected
+    // platform, which is strictly better than any statement about the source.
     check(isAbsolute("/repo") === true && isAbsolute("repo") === false,
-      "control: that predicate answers correctly for the cases this runner CAN exercise");
+      "control: node:path answers correctly for the cases this runner can exercise");
     check(parseRegistry(JSON.stringify(entry("repo")), "/x").error !== null,
       "control: and a relative path is still refused, so the rule did not simply go away");
   }
@@ -429,7 +429,11 @@ check(parse({}).error === null && parse({}).projects.length === 0,
     // under `packages` made `packages` look like mode 120000 and would refuse an
     // unrelated claim under `packages/normal`.
     const many = registryIo(dir, "p", { nwo: "o/r", repoPath: "/repo", profilePath: "/f" },
-      { git: () => "120000 aaa 0\tpackages/a-link\n100644 bbb 0\tpackages/normal/x.ts" });
+      // NUL-SEPARATED, because the probe now asks git for `-z`. This fixture
+      // used newlines and went stale the moment the format changed -- the
+      // suite caught it, which is what a fixture built to mimic a producer
+      // costs you when the producer moves.
+      { git: () => "120000 aaa 0\tpackages/a-link\u0000100644 bbb 0\tpackages/normal/x.ts\u0000" });
     check(many.lsTree("/repo", "packages") === null,
       "a DIRECTORY whose first tracked child is a symlink is not itself reported as one",
       JSON.stringify(many.lsTree("/repo", "packages")));
@@ -483,6 +487,100 @@ check(parse({}).error === null && parse({}).projects.length === 0,
       String(await io2.defaultBranch("o/r")));
   }
   rmSync(dir, { recursive: true, force: true });
+}
+
+// ── five findings that arrived AFTER the pull request merged ───────────────
+//
+// Codex submitted them seven minutes past the merge, so they are findings
+// against `main` rather than against a branch, and nothing surfaces them again.
+{
+  const { registryIo, parseRegistry: parse2 } = await import("../src/build/registryio.mjs");
+  const io = (out) => {
+    let args = null;
+    const r = registryIo("/h", "p", { nwo: "o/r", repoPath: "/r", profilePath: "/f" },
+      { git: (_b, a) => { args = a; if (out instanceof Error) throw out; return out; } });
+    return { probe: r, argv: () => args };
+  };
+  const SEP = "\u0000";
+  const row = (mode, stage, path) => `${mode} aaa ${stage}\t${path}${SEP}`;
+
+  // ── the index is read in a MACHINE-READABLE form ─────────────────────────
+  //
+  // Git's default `core.quotePath` emits DISPLAY output, so a non-ASCII name
+  // comes back as a quoted escape sequence and an exact comparison never
+  // matches -- the ancestor reads as untracked and the claim is admitted.
+  {
+    const h = io("");
+    h.probe.lsTree("/r", "x");
+    check(h.argv()?.includes("-z"),
+      "the index probe asks for machine-readable, unquoted pathnames", JSON.stringify(h.argv()));
+    const quoted = io(row("100644", "0", String.raw`"m\303\263dulo"`));
+    check(quoted.probe.lsTree("/r", "m\u00f3dulo") === null,
+      "control: a QUOTED pathname does not match the real name, which is the defect");
+    const unquoted = io(row("100644", "0", "m\u00f3dulo"));
+    check(unquoted.probe.lsTree("/r", "m\u00f3dulo")?.mode === "100644",
+      "while the unquoted form does");
+  }
+
+  // ── a buffer overflow is an ANSWER, not a crash ──────────────────────────
+  //
+  // Probing an ancestor directory lists every tracked descendant, and
+  // execFileSync defaults to 1 MiB, so a large tree raised ENOBUFS -- uncaught
+  // by resolveClaims, aborting resolution for every claim beneath it. Overflow
+  // can only mean many rows; many rows means a directory prefix; a directory has
+  // no index entry of its own. So null is CORRECT there, not a fallback.
+  {
+    const enobufs = Object.assign(new Error("stdout maxBuffer exceeded"), { code: "ENOBUFS" });
+    check(io(enobufs).probe.lsTree("/r", "packages") === null,
+      "an oversized listing answers `no entry of its own` rather than throwing");
+    let threw = null;
+    try { io(Object.assign(new Error("git not found"), { code: "ENOENT" })).probe.lsTree("/r", "x"); }
+    catch (e) { threw = e.code; }
+    check(threw === "ENOENT",
+      "control: any OTHER git failure still propagates, so this is not a blanket catch", String(threw));
+  }
+
+  // ── every stage of an unmerged entry ─────────────────────────────────────
+  //
+  // An unresolved merge lists the same pathname several times. Returning the
+  // first row missed a later stage carrying 120000 or 160000, so the claim was
+  // admitted -- and resolving the conflict to that side then turned granted
+  // territory into a traversal boundary.
+  {
+    const stages = row("100644", "1", "x") + row("100644", "2", "x") + row("120000", "3", "x");
+    check(io(stages).probe.lsTree("/r", "x")?.mode === "120000",
+      "an unmerged entry answers with the DANGEROUS stage, not the first one",
+      JSON.stringify(io(stages).probe.lsTree("/r", "x")));
+    const plain = row("100644", "1", "x") + row("100644", "2", "x");
+    check(io(plain).probe.lsTree("/r", "x")?.mode === "100644",
+      "control: and one with no dangerous stage still answers normally");
+  }
+
+  // ── a path must be ROOTED and ADDRESSABLE ────────────────────────────────
+  {
+    const entry = (rp) => JSON.stringify({ p: { nwo: "o/r", repoPath: rp, profilePath: "/f" } });
+    check(parse2(entry(`/a${SEP}b`), "/x").error !== null,
+      "a zero byte in a path is refused while parsing, not at the first lstat");
+    check(parse2(entry("/ab"), "/x").error === null,
+      "control: the same path without it is accepted, so the rule is about the byte");
+    // THE WINDOWS RULE, EXERCISED FROM A POSIX RUNNER, because the platform is a
+    // parameter. The previous assertion here searched the source for the
+    // constant's name and still passed when the constant was defined and no
+    // longer used -- it could not fail for the right reason.
+    const { isRootedPath } = await import("../src/build/registryio.mjs");
+    check(isRootedPath("C:\\repos\\app", "win32") === true,
+      "on Windows a drive-qualified path is rooted");
+    check(isRootedPath("\\\\server\\share\\x", "win32") === true,
+      "and so is a UNC path");
+    check(isRootedPath("/repo", "win32") === false,
+      "but `/repo` is NOT, because on Windows it is rooted on the process's current DRIVE");
+    check(isRootedPath("\\repo", "win32") === false,
+      "and neither is a leading backslash, for the same reason");
+    // CONTROL: the same predicate still accepts the ordinary POSIX case, so the
+    // Windows rule did not simply refuse everything.
+    check(isRootedPath("/repo", "linux") === true && isRootedPath("repo", "linux") === false,
+      "control: and on POSIX the ordinary rule is unchanged");
+  }
 }
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

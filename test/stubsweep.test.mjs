@@ -1381,8 +1381,22 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
   // that IS deterministic is asserted directly.
   const root = tmpRoot("sweep-fifo-");
   const fifo = join(root, "pipe.tmp");
-  const made = spawnSync("mkfifo", [fifo], { encoding: "utf8" });
-  check(made.status === 0, "control: mkfifo is available, so this case can be built at all", made.stderr);
+  // POSIX ONLY, and NOT silently. `mkfifo` does not exist on Windows, where this
+  // project supports running the suite, so the control asserting it works made the
+  // whole file fail there before exercising anything. A platform gate that prints
+  // PASS would be worse -- that is a skip wearing a pass, which is the shape this
+  // file exists to catch -- so the unsupported platform gets its own line saying the
+  // case could not be built, and the guard's state there is stated in the source:
+  // untested, because the fixture cannot exist.
+  const made = process.platform === "win32"
+    ? { status: null, stderr: "mkfifo is POSIX-only" }
+    : spawnSync("mkfifo", [fifo], { encoding: "utf8" });
+  if (process.platform === "win32") {
+    console.log("SKIP  a fifo fingerprints as a marker instead of blocking on its open " +
+                "(POSIX only: mkfifo does not exist on Windows)");
+  } else {
+    check(made.status === 0, "control: mkfifo is available, so this case can be built at all", made.stderr);
+  }
   if (made.status === 0) {
     // IN A CHILD, WITH A TIMEOUT, and the bound is the whole point.
     //

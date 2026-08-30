@@ -393,21 +393,38 @@ export function fingerprint(abs) {
   if (!st.isFile()) return "<not a regular file>";
   const h = createHash("sha256");
   let fd;
-  // O_NOFOLLOW, and then FSTAT THE DESCRIPTOR. The lstat above describes the path a
-  // moment ago; between that call and this one another process can replace the file
-  // with a symlink, and a plain open follows it -- so the no-follow guarantee held
-  // for the check and not for the read. A lingering test worker swapping the path
-  // could redirect this synchronous read at a fifo, which never returns, and the
-  // sweep would hang before its own timeout or its restore could run.
+  // THE OPEN ITSELF MUST BE SAFE, because `lstat` describes the path a moment ago and
+  // anything can replace it before the open. TWO different races, needing two flags:
   //
-  // O_NOFOLLOW does not exist on Windows, so it degrades to zero there and the
-  // fstat below is what carries the guarantee. That is stated rather than assumed:
-  // reeve has to run on macOS, Windows and Ubuntu.
+  //   O_NOFOLLOW  the file is replaced by a SYMLINK. Without it the open follows the
+  //               link and the read is redirected.
+  //   O_NONBLOCK  the file is replaced by a FIFO, which is not a symlink, so
+  //               O_NOFOLLOW does nothing. Opening a fifo read-only BLOCKS until a
+  //               writer appears, so the descriptor never reaches the fstat below and
+  //               the sweep hangs with the tree still stubbed. Non-blocking makes the
+  //               open return so the check can happen at all. It has no effect on a
+  //               regular file's reads, which is the only case that gets that far.
+  //
+  // WINDOWS HAS NEITHER, and the earlier version of this comment claimed the fstat
+  // covered that. It does not: fstat describes what the descriptor POINTS AT, never
+  // how it was reached, so a symlink swapped in on Windows is followed and its
+  // regular target hashed silently. What is portable is comparing the identity of the
+  // file that was checked with the identity of the one that was opened -- a swap
+  // changes it. Where the platform cannot supply a usable identity the answer is a
+  // marker rather than a hash, because an unverifiable read is not evidence.
   const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
-  try { fd = openSync(abs, constants.O_RDONLY | NOFOLLOW); } catch { return "<unreadable>"; }
+  const NONBLOCK = constants.O_NONBLOCK ?? 0;
+  try { fd = openSync(abs, constants.O_RDONLY | NOFOLLOW | NONBLOCK); } catch { return "<unreadable>"; }
   try {
     const opened = fstatSync(fd);
     if (!opened.isFile()) return "<not a regular file>";
+    // The identity check, which is what stands in for O_NOFOLLOW where it is absent.
+    // On a platform that reports no inode there is nothing to compare, and saying so
+    // is better than hashing a file we cannot show is the one we checked.
+    if (!NOFOLLOW) {
+      if (!opened.ino || !st.ino) return "<unverifiable: no no-follow open on this platform>";
+      if (opened.ino !== st.ino || opened.dev !== st.dev) return "<replaced during the read>";
+    }
     const buf = Buffer.allocUnsafe(HASH_CHUNK);
     for (;;) {
       const n = readSync(fd, buf, 0, HASH_CHUNK, null);

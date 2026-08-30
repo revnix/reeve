@@ -8,7 +8,7 @@
 // The assertions below are mostly about the states that are NOT clear, because
 // "clear" is the easy one and the dangerous failure is a summary line that reads as
 // a pass while carrying a reason not to merge.
-import { gate, headState, threadState, checkState, mergeabilityState,
+import { gate, headState, threadState, checkState, mergeabilityState, reviewState,
          CLEAR, REFUSE, UNREVIEWED, UNKNOWN }
   from "../src/premerge.mjs";
 
@@ -54,7 +54,8 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
   const g = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
                    threads: { totalCount: 1, nodes: resolved(1) },
                    checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
-                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" } });
+                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
+                           review: { reviewDecision: "APPROVED" } });
   check(g.verifiedHead === SHA_A, "a clear verdict names the FULL head it verified", g.verifiedHead);
   check(g.verifiedHead.length === 40,
     "control: in full, because --match-head-commit does not take an abbreviation",
@@ -82,12 +83,16 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
   check(open.state === REFUSE && open.unresolved.length === 1,
     "an unresolved thread is refused, and named", open.why);
 
-  // THE STATE MOST LIKELY TO BE ARGUED AWAY. An empty list means both "reviewed and
-  // nothing raised" and "never reviewed", and merging on the second is not the same
-  // decision as merging on the first.
+  // AN EMPTY LIST IS NOT A REVIEW QUESTION ANY MORE. It used to be answered here,
+  // which is how an author resolving their own comment could read as a review: a
+  // thread count cannot tell who looked or at which head. That judgement moved to
+  // `reviewState`, which asks GitHub, and this reports the fact it can see.
   const none = threadState({ totalCount: 0, nodes: [] });
-  check(none.state === UNREVIEWED, "no threads at all is UNREVIEWED, not clear", none.why);
-  check(none.state !== CLEAR, "control: and it is specifically NOT the clear state");
+  check(none.state === CLEAR, "no threads raised is CLEAR here, because nothing is unresolved", none.why);
+  check(/no threads were raised/.test(none.why),
+    "control: and it says so plainly rather than implying a review happened", none.why);
+  check(reviewState({}).state === UNREVIEWED,
+    "control: while whether anyone REVIEWED is answered next door, and is UNREVIEWED");
 
   // A page cap makes a partial read look settled. This is the completeness signal.
   const capped = threadState({ totalCount: 120, nodes: resolved(100) });
@@ -203,61 +208,32 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
   check(mergeabilityState({}).state === UNKNOWN, "an unread mergeability is UNKNOWN, not clear");
 }
 
-// --- review evidence belongs to the head it was given about -----------------------
+// --- review presence is GitHub's answer, not a thread count -----------------------
 {
-  // A thread resolved on head A stays resolved after an unreviewed head B is pushed,
-  // so counting it clears a revision nobody looked at. reeve already refuses a
-  // projection derived for a different revision; this is that rule, not a second
-  // implementation of it.
-  const T0 = Date.parse("2026-08-30T00:00:00Z");
-  const at = iso => ({ isResolved: true, comments: { nodes: [{ createdAt: iso }] } });
-  const old = threadState({ totalCount: 1, nodes: [at("2026-08-29T00:00:00Z")], headPushedAt: T0 });
-  check(old.state === UNREVIEWED,
-    "threads resolved before this head was pushed are not evidence about it", old.why);
-  const fresh = threadState({ totalCount: 1, nodes: [at("2026-08-30T01:00:00Z")], headPushedAt: T0 });
-  check(fresh.state === CLEAR,
-    "control: a thread resolved AFTER the head was pushed still clears, so this is about the bound revision");
-  // Without a readable push time there is nothing to compare, and guessing would be
-  // worse than the gap: the rule disables itself rather than inventing an answer.
-  check(threadState({ totalCount: 1, nodes: [at("2026-08-29T00:00:00Z")], headPushedAt: null }).state === CLEAR,
-    "control: with no readable push time the rule does not fire rather than guessing");
-
-  // THE NEGATIVE CONTROL, and it is what makes the rule load-bearing rather than
-  // merely present. Everything above asserts the BOUND reader behaves correctly;
-  // none of it shows an UNBOUND reader would have got this input wrong, which is the
-  // difference between "my rule works" and "the rule is needed". So: the same input,
-  // read WITHOUT the binding, and an assertion that it really does clear.
-  //
-  // A neighbouring session hit the same gap in a duplicate-key reader and built the
-  // fixture decoy-first for exactly this reason. Constructed from data in a
-  // favourable order, both readers agree and the fixture proves nothing.
-  const unbound = threadState({ totalCount: 1, nodes: [at("2026-08-29T00:00:00Z")] });
-  check(unbound.state === CLEAR,
-    "control: reading the SAME threads without the head clears them, so the binding is what refuses",
-    unbound.why);
-  check(unbound.state !== old.state,
-    "control: and the two readers genuinely disagree on this input, so it can exhibit the defect",
-    `${unbound.state} vs ${old.state}`);
-}
-
-// --- the head clock must be when the head ARRIVED ---------------------------------
-{
-  // committedDate is when a commit was AUTHORED. A commit made locally before a
-  // thread was resolved and pushed only afterwards carries an older committedDate,
-  // so using it as the head's arrival time lets the historical thread satisfy the
-  // comparison and an unreviewed head clears. The fixture is built so the two clocks
-  // DISAGREE, because with them equal both readings pass and it proves nothing.
-  const authored  = Date.parse("2026-08-29T00:00:00Z");   // before the resolution
-  const resolved  = Date.parse("2026-08-29T12:00:00Z");
-  const pushed    = Date.parse("2026-08-30T00:00:00Z");   // after it
-  const nodes = [{ isResolved: true, comments: { nodes: [{ createdAt: new Date(resolved).toISOString() }] } }];
-  check(threadState({ totalCount: 1, nodes, headPushedAt: pushed }).state === UNREVIEWED,
-    "with the PUSH time, a thread resolved before the head arrived is not evidence");
-  // NEGATIVE CONTROL: the same input read with the AUTHOR time clears, which is what
-  // the committedDate fallback did. Without this the assertion above proves only that
-  // some timestamp works.
-  check(threadState({ totalCount: 1, nodes, headPushedAt: authored }).state === CLEAR,
-    "control: read with the AUTHOR time the same input clears, which is the defect the fallback had");
+  // Three findings in one round killed the timestamp model. A review anchored to head
+  // A can be SUBMITTED after head B is pushed; an author with write access can add and
+  // resolve their own inline comment; and pushedDate is nullable, so the rule switched
+  // itself off precisely when it could not tell.
+  check(reviewState({ reviewDecision: "APPROVED" }).state === CLEAR, "an approved pull request is clear");
+  check(reviewState({ reviewDecision: "CHANGES_REQUESTED" }).state === REFUSE, "changes requested is a refusal");
+  check(reviewState({ reviewDecision: "REVIEW_REQUIRED" }).state === UNREVIEWED,
+    "review required means nobody has approved this state");
+  // NULL IS THE TRAP. It is the ordinary answer where no review is required, and
+  // reading it as CLEAR makes "nobody is obliged to look" mean "somebody looked".
+  const none = reviewState({});
+  check(none.state === UNREVIEWED, "no review decision is UNREVIEWED, not clear", none.why);
+  check(/REQUIRED rather than/.test(none.why),
+    "control: and it says WHY, so nobody reads the absence as an approval", none.why);
+  // The self-approval case, which the thread count could not see at all.
+  const selfResolved = { totalCount: 1, nodes: [{ isResolved: true }] };
+  check(threadState(selfResolved).state === CLEAR,
+    "control: one resolved thread is CLEAR to threadState, which is why it cannot answer the review question");
+  check(gate({ head: { prHead: "a".repeat(40), branchNow: "a".repeat(40), branchRead: "read" },
+               threads: selfResolved,
+               checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
+               mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
+               review: {} }).state === UNREVIEWED,
+    "an author's own resolved comment does not clear the gate, because review is asked of GitHub");
 }
 
 // --- the combined verdict never rounds up ----------------------------------------
@@ -265,7 +241,8 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
   const bothClear = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
                            threads: { totalCount: 1, nodes: resolved(1) },
                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
-                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" } });
+                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
+                           review: { reviewDecision: "APPROVED" } });
   check(bothClear.state === CLEAR && bothClear.clear === true,
     "control: when both halves are clear the gate is clear", JSON.stringify(bothClear.why));
 
@@ -274,37 +251,43 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
   const headBad = gate({ head: { prHead: SHA_A, branchNow: SHA_B, branchRead: "read" },
                          threads: { totalCount: 1, nodes: resolved(1) },
                            checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
-                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" } });
+                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
+                           review: { reviewDecision: "APPROVED" } });
   check(headBad.state === REFUSE && !headBad.clear, "a stale head refuses even with threads clear");
 
   const threadsBad = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
                             threads: { totalCount: 1, nodes: [{ isResolved: false }] },
                             checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
-                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" } });
+                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
+                           review: { reviewDecision: "APPROVED" } });
   check(threadsBad.state === REFUSE && !threadsBad.clear, "an open thread refuses even with the head current");
 
   const unreviewed = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
                             threads: { totalCount: 0, nodes: [] },
                             checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
-                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" } });
+                            mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
+                            review: {} });
   check(unreviewed.state === UNREVIEWED && !unreviewed.clear,
-    "an unreviewed pull request is not clear even with a current head", JSON.stringify(unreviewed.why));
+    "a pull request nobody reviewed is not clear even with everything else green",
+    JSON.stringify(unreviewed.why));
 
   // UNKNOWN outranks UNREVIEWED: not knowing is worse than knowing nobody looked.
   const unknownWins = gate({ head: { prHead: SHA_A, branchNow: null, branchRead: "unreadable" },
                              threads: { totalCount: 0, nodes: [] },
                             checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
-                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" } });
+                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
+                           review: { reviewDecision: "APPROVED" } });
   check(unknownWins.state === UNKNOWN, "UNKNOWN outranks UNREVIEWED");
 
   const refuseWins = gate({ head: { prHead: SHA_A, branchNow: null, branchRead: "unreadable" },
                             threads: { totalCount: 1, nodes: [{ isResolved: false }] },
                             checks: { nodes: [{ name: "j", conclusion: "SUCCESS" }] },
-                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" } });
+                           mergeability: { mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" },
+                           review: { reviewDecision: "APPROVED" } });
   check(refuseWins.state === REFUSE, "REFUSE outranks UNKNOWN, so the worst news wins");
 
   // BOTH reasons are always reported, whichever won.
-  check(refuseWins.why.length === 4 && refuseWins.why.some(w => w.startsWith(UNKNOWN))
+  check(refuseWins.why.length === 5 && refuseWins.why.some(w => w.startsWith(UNKNOWN))
         && refuseWins.why.some(w => w.startsWith(REFUSE)),
     "and both halves are reported, not only the one that decided the verdict",
     JSON.stringify(refuseWins.why));

@@ -79,40 +79,52 @@ export function mergeabilityState({ mergeable, mergeStateStatus } = {}) {
 }
 
 /**
- * `headPushedAt` binds review evidence to the revision it was given about.
+ * Was this pull request REVIEWED, and does that answer belong to the current head?
  *
- * A thread resolved on head A stays resolved after an unreviewed head B is pushed,
- * so counting it clears a revision nobody looked at. reeve already holds this rule --
- * `reviewState` in src/review/derive.mjs refuses a projection derived for a DIFFERENT
- * REVISION, and its comment says it is the check a caller is most likely to skip
- * because the projection looks perfectly fresh without it. That function reads
- * reeve's own store and this gate reads GitHub live, so the RULE is reused here and
- * not the code; writing a second version of the rule is what would be worth avoiding.
+ * Three findings in one round showed a timestamp model cannot answer this, and they
+ * were one mistake: I delegated mergeability to GitHub and then went on re-deriving
+ * review state by hand, one layer in.
+ *
+ *   · a review anchored to head A can be SUBMITTED after head B is pushed, so its
+ *     comment is newer than B while reviewing A;
+ *   · an author with write access can add and resolve their own inline comment,
+ *     manufacturing one resolved thread with nobody else having looked;
+ *   · and `pushedDate` is nullable, so the rule disabled itself exactly when it could
+ *     not tell -- fail-OPEN wearing the words of caution.
+ *
+ * `reviewDecision` is GitHub's own answer and is head-aware wherever the repository
+ * dismisses stale reviews. Null means no review is REQUIRED, which is not the same as
+ * one having been given, so it is UNREVIEWED rather than clear.
  */
-export function threadState({ totalCount, nodes, headPushedAt = null } = {}) {
+export function reviewState({ reviewDecision } = {}) {
+  const d = String(reviewDecision ?? "").toUpperCase();
+  if (d === "APPROVED") return { state: CLEAR, why: "GitHub reports the review as APPROVED" };
+  if (d === "CHANGES_REQUESTED") return { state: REFUSE, why: "GitHub reports CHANGES_REQUESTED" };
+  if (d === "REVIEW_REQUIRED")
+    return { state: UNREVIEWED, why: "GitHub reports REVIEW_REQUIRED, so nobody has approved this state" };
+  return { state: UNREVIEWED,
+           why: "GitHub reports no review decision, which means none is REQUIRED rather than that one was given" };
+}
+
+/**
+ * Unresolved threads, which is a FACT rather than an inference.
+ *
+ * The half GitHub does not fold into `reviewDecision`: a thread can be open while a
+ * pull request is approved. Whose review counts, and which head it was about, is
+ * `reviewState`'s question -- answering it from a thread count is how an author
+ * resolving their own comment could read as a review.
+ */
+export function threadState({ totalCount, nodes } = {}) {
   if (!Array.isArray(nodes) || typeof totalCount !== "number")
     return { state: UNKNOWN, unresolved: [], why: "the thread listing could not be read at all" };
   if (nodes.length !== totalCount)
     return { state: UNKNOWN, unresolved: [],
              why: `only ${nodes.length} of ${totalCount} threads were fetched, so "none unresolved" would be about a page rather than the pull request` };
-  if (totalCount === 0)
-    return { state: UNREVIEWED, unresolved: [],
-             why: "no review threads exist, which is not the same as a review that raised nothing" };
   const unresolved = nodes.filter(n => !n?.isResolved);
-  // Evidence about an EARLIER revision is not evidence about this one. Only applied
-  // when the head's push time was actually read: without it there is nothing to
-  // compare against, and guessing would be worse than the gap it closes.
-  if (!unresolved.length && headPushedAt) {
-    const at = n => Date.parse(n?.comments?.nodes?.[0]?.createdAt ?? "") || 0;
-    const aboutThisHead = nodes.filter(n => at(n) >= headPushedAt);
-    if (!aboutThisHead.length)
-      return { state: UNREVIEWED, unresolved: [],
-               why: `all ${totalCount} thread(s) were resolved before this head was pushed, so none of them is evidence about the revision being merged` };
-  }
   return unresolved.length
-    ? { state: REFUSE, unresolved,
-        why: `${unresolved.length} of ${totalCount} thread(s) are unresolved` }
-    : { state: CLEAR, unresolved: [], why: `all ${totalCount} thread(s) are resolved` };
+    ? { state: REFUSE, unresolved, why: `${unresolved.length} of ${totalCount} thread(s) are unresolved` }
+    : { state: CLEAR, unresolved: [],
+        why: totalCount === 0 ? "no threads were raised" : `all ${totalCount} thread(s) are resolved` };
 }
 
 /**
@@ -216,8 +228,9 @@ export function checkState({ nodes, totalCount = null } = {}) {
  * reasons are always reported, because knowing only the first means fixing it and
  * being surprised by the second.
  */
-export function gate({ head, threads, checks, mergeability } = {}) {
-  const parts = [headState(head), threadState(threads), checkState(checks), mergeabilityState(mergeability)];
+export function gate({ head, threads, checks, mergeability, review } = {}) {
+  const parts = [headState(head), threadState(threads), checkState(checks),
+                 mergeabilityState(mergeability), reviewState(review)];
   const rank = { [REFUSE]: 3, [UNKNOWN]: 2, [UNREVIEWED]: 1, [CLEAR]: 0 };
   const state = parts.reduce((w, p) => (rank[p.state] > rank[w] ? p.state : w), CLEAR);
   // THE HEAD THIS VERDICT IS ABOUT, in full, so a caller can BIND the merge to it.
@@ -228,7 +241,7 @@ export function gate({ head, threads, checks, mergeability } = {}) {
   // has moved the race rather than removed it. `gh pr merge --match-head-commit SHA`
   // refuses when the head has moved, and this is the SHA to give it -- full, because
   // an abbreviation is not what that flag wants.
-  return { state, head: parts[0], threads: parts[1], checks: parts[2], mergeability: parts[3],
+  return { state, head: parts[0], threads: parts[1], checks: parts[2], mergeability: parts[3], review: parts[4],
            clear: state === CLEAR,
            verifiedHead: head?.prHead ?? null,
            why: parts.map(p => `${p.state}: ${p.why}`) };

@@ -560,15 +560,6 @@ export const STUBS = [
               replace: "  const ok = new Set([\"CLEAN\", \"HAS_HOOKS\", \"BLOCKED\", \"DIRTY\", \"DRAFT\", \"BEHIND\", \"UNSTABLE\"]);" }],
   },
   {
-    name: "premerge-review-bound-to-head",
-    why: "count a thread resolved before this head was pushed as evidence about it, which clears a revision nobody reviewed",
-    test: "test/premerge.test.mjs",
-    expectRed: "threads resolved before this head was pushed are not evidence about it",
-    edits: [{ file: "src/premerge.mjs",
-              find: "  if (!unresolved.length && headPushedAt) {",
-              replace: "  if (false) {" }],
-  },
-  {
     name: "premerge-transient-merge-state",
     why: "let an unresolved merge state fall through to REFUSE, reporting an asynchronous transient as an actionable blocker",
     test: "test/premerge.test.mjs",
@@ -576,5 +567,14 @@ export const STUBS = [
     edits: [{ file: "src/premerge.mjs",
               find: "  if (status === \"UNKNOWN\")",
               replace: "  if (false)" }],
+  },
+  {
+    name: "premerge-null-review-is-not-approval",
+    why: "let a null review decision fall through to clear, so 'no review is required' reads as 'somebody reviewed'",
+    test: "test/premerge.test.mjs",
+    expectRed: "no review decision is UNREVIEWED, not clear",
+    edits: [{ file: "src/premerge.mjs",
+              find: "    return { state: UNREVIEWED, why: \"GitHub reports REVIEW_REQUIRED, so nobody has approved this state\" };",
+              replace: "  return { state: CLEAR," }],
   },
 ];

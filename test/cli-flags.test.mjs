@@ -524,6 +524,99 @@ check(existsSync(join(repo, ".git")),
     "control: and the diagnosis and the remediation name the same file", r.lines.join(" | ").slice(0, 200));
 }
 
+// ── Every flag the task route reads is REGISTERED ────────────────────────────
+//
+// An unregistered flag is not ignored by this CLI, it is refused -- so a route
+// that reads `opt("title")` for a flag absent from FLAGS can never be given one,
+// and the failure is a did-you-mean suggestion that never names the route.
+{
+  const valued = ["project", "title", "territory", "territory-file", "body-file",
+                  "depth", "priority", "idempotency-key", "pin-territory"];
+  for (const f of valued) {
+    const r = run("task", "file", `--${f}`);
+    check(/expects a value/.test(r.out) && !/unknown flag/.test(r.out),
+      `--${f} is registered and takes a value`, r.out.split("\n")[0]);
+  }
+  for (const f of ["anyway", "dry-run"]) {
+    const r = run("task", "file", `--${f}=yes`);
+    check(/is a switch and takes no value/.test(r.out) && !/unknown flag/.test(r.out),
+      `--${f} is registered as a switch`, r.out.split("\n")[0]);
+  }
+  // CONTROL: the refusal machinery still refuses something that really is
+  // unknown, so the assertions above are not passing on a widened parser.
+  const bad = run("task", "file", "--terrritory", "packages/x");
+  check(/unknown flag --terrritory/.test(bad.out),
+    "control: a misspelled flag is still refused", bad.out.split("\n")[0]);
+  check(/did you mean --territory/.test(bad.out),
+    "and the suggestion now reaches the new flag", bad.out.split("\n")[0]);
+}
+
+// ── `--dry-run` is scoped to the commands that implement it ─────────────────
+//
+// Every flag in this CLI's table is accepted by every command, so a flag whose
+// entire promise is "write nothing" was parsed cleanly by `restore` -- which
+// never reads it and restores for real. Refusing is the only safe direction: a
+// command that accepts the flag and writes anyway is worse than one that never
+// took it.
+{
+  const r = run("restore", "--dry-run", "--from", "/nonexistent");
+  check(/--dry-run is not implemented by/.test(r.out),
+    "a destructive command REFUSES --dry-run rather than ignoring it", r.out.split("\n")[0]);
+  check(/restore/.test(r.out), "and names the command that cannot honour it", r.out.split("\n")[0]);
+  check(!/unknown flag/.test(r.out),
+    "and it is a scope refusal, not the parser failing to know the flag", r.out.split("\n")[0]);
+
+  // CONTROL: the command that DOES implement it still gets through, so the
+  // refusal above is about scope rather than about the flag being disabled.
+  const t = run("task", "--dry-run");
+  check(/reeve task:/.test(t.out) && !/--dry-run is not implemented/.test(t.out),
+    "control: the command that implements it still reaches its own body", t.out.split("\n")[0]);
+}
+
+// ── A bare `-` is a value, not a flag ───────────────────────────────────────
+//
+// `--body-file -` is documented and is the universal stdin sentinel, but every
+// token beginning with `-` was classified as a flag, so the parser refused the
+// documented form before any route could read stdin.
+{
+  const r = run("task", "file", "--body-file", "-");
+  check(!/expects a value/.test(r.out),
+    "--body-file - is accepted as a value rather than refused as a flag", r.out.split("\n")[0]);
+  check(!/Got the flag -/.test(r.out), "and is not reported as a flag", r.out.split("\n")[0]);
+
+  // CONTROL: a real flag in a value position is STILL refused, so the change
+  // admits exactly `-` rather than widening the parser.
+  const bad = run("task", "file", "--title", "--territory");
+  check(/expects a value/.test(bad.out),
+    "control: a real flag in a value position is still refused", bad.out.split("\n")[0]);
+  const neg = run("task", "file", "--title", "-x");
+  check(/expects a value/.test(neg.out),
+    "control: and so is a token that merely starts with a dash", neg.out.split("\n")[0]);
+}
+
+// ── An empty --territory is the repository root, and must be typeable ───────
+//
+// `normalizeClaim` supports the root claim deliberately, and the territory-file
+// refusal tells the founder to write it as `--territory ""` -- advice the parser
+// then refused, so the recommended remedy could not be typed at all.
+{
+  const r = run("task", "file", "--project", "p", "--title", "t", "--territory", "");
+  check(!/--territory expects a value/.test(r.out),
+    "--territory \"\" is accepted, because an empty claim is the repository root",
+    r.out.split("\n")[0]);
+
+  // CONTROLS: the allowance is for that flag alone. Everywhere else an empty
+  // value is still a missing one -- `--home ""` resolves to the CURRENT
+  // directory, which is how a command explicitly told to use another home
+  // silently used this one.
+  const h = run("--home", "", "task");
+  check(/--home expects a value/.test(h.out),
+    "control: an empty --home is still refused", h.out.split("\n")[0]);
+  const t = run("task", "file", "--title", "");
+  check(/--title expects a value/.test(t.out),
+    "control: and so is an empty --title", t.out.split("\n")[0]);
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

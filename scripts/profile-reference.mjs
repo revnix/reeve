@@ -11,8 +11,9 @@
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { FIELDS, PROJECT_KIND, STATE_MODE, MERGE_METHOD, ENFORCEMENT,
+import { FIELDS, PROJECT_KIND, MERGE_METHOD, ENFORCEMENT,
          SCHEMA_VERSION, withDefaults, validate } from "../src/profile/schema.mjs";
+import { compose } from "../src/init.mjs";
 
 const SCHEMA = new URL("../src/profile/schema.mjs", import.meta.url);
 const OUT    = new URL("../docs/profile-reference.md", import.meta.url);
@@ -93,7 +94,8 @@ export function rowsFor(source) {
     if (note === null)
       throw new Error(`profile-reference: \`${key}\` is declared in FIELDS but its ` +
         `declaration was not found inside the FIELDS block in schema.mjs`);
-    return { key, required: Boolean(required), requirement: requirementOf(key), note };
+    return { key, required: Boolean(required), requirement: requirementOf(key),
+             accepts: FIELDS[key][1]?.describe ?? "", note };
   });
 }
 
@@ -160,7 +162,7 @@ const EXAMPLE_SEED = Object.freeze({
   "identity.visibility": "private",
   "authority.permission": "admin",
   "authority.policy": "owner",
-  "state.mode": STATE_MODE[0],
+
   units: [{ id: "app", root: ".", language: "typescript" }],
   "ci.provider": "github-actions",
   "merge.method": MERGE_METHOD[0],
@@ -186,9 +188,30 @@ export function mustAuthor() {
  * test runs `validate()` over each one rather than eyeballing it.
  */
 export function exampleFor(kind) {
-  const authored = { project: { kind } };
+  // `state.mode` and `authority.profileLocation` are NOT seeded. `reeve init`
+  // derives both from the project kind and the repository's visibility -- a
+  // client project gets `hub` and `sidecar`, a private product `in-repo` and
+  // `committed` -- and an example that picked the first enum member would hand
+  // an operator a validator-valid profile that contradicts what `reeve init`
+  // writes for the same project.
+  //
+  // So the example is composed by the SAME function `reeve init` uses rather
+  // than by restating its rule here, which would be a second copy of a decision
+  // that has already moved once.
+  // `compose` already applies `withDefaults` and returns the CANONICAL form, so
+  // what comes back is exactly the file `reeve init` would write.
+  const authored = { project: { kind }, identity: {}, authority: {}, state: {} };
   for (const [key, value] of Object.entries(EXAMPLE_SEED)) put(authored, key, value);
-  return withDefaults(authored);
+  return compose(authored, [], {}).profile;
+}
+
+/** The keys `compose` fills in that the seed deliberately leaves out. Derived by
+ *  differencing, so the two stay in step without either restating the other. */
+export function composedKeys() {
+  const seeded = { project: { kind: PROJECT_KIND[0] }, identity: {}, authority: {}, state: {} };
+  for (const [key, value] of Object.entries(EXAMPLE_SEED)) put(seeded, key, value);
+  const filled = compose(structuredClone(seeded), [], {}).profile;
+  return mustAuthor().filter((k) => at(seeded, k) === undefined && at(filled, k) !== undefined);
 }
 
 export function profileReference(source = readFileSync(SCHEMA, "utf8")) {
@@ -206,10 +229,15 @@ export function profileReference(source = readFileSync(SCHEMA, "utf8")) {
   // documented key where a paragraph can be a paragraph. Nothing is truncated --
   // a generator that silently drops half a sentence is a document that lies by
   // omission, and the reader cannot tell.
+  // `accepts` comes off the validator itself, so the type and enum a key allows
+  // are never a second list beside `schema.mjs`. Every key carries one, which is
+  // why this column and not a detail section per key: an operator asking "what
+  // may I write here" gets an answer for all of them in one scannable place,
+  // and the sections below stay for the keys that have RATIONALE to give.
   const index = [
-    "| key | requirement | documented |",
+    "| key | requirement | accepts |",
     "|---|---|---|",
-    ...rows.map((r) => `| \`${r.key}\` | ${r.requirement} | ${r.note ? "yes" : "—"} |`),
+    ...rows.map((r) => `| \`${r.key}\` | ${r.requirement} | ${r.accepts.replace(/\|/g, "\\|")} |`),
   ];
 
   const detail = documented.flatMap((r) => [

@@ -55,16 +55,33 @@ export const WORKER_ISOLATION = ["none", "scratch-home", "dedicated-user"];
  * field: [required, validator, description]
  * Validators return null when valid, or a string explaining the refusal.
  */
-const isStr = v => (typeof v === "string" && v.length ? null : "must be a non-empty string");
-const isBool = v => (typeof v === "boolean" ? null : "must be a boolean");
-const isInt = v => (Number.isInteger(v) ? null : "must be an integer");
-const isNum = v => (typeof v === "number" && Number.isFinite(v) ? null : "must be a finite number");
-const isArr = inner => v => {
+// EACH VALIDATOR CARRIES ITS OWN DESCRIPTION, so the generated profile reference
+// can state what a key accepts without a second list of types and enums beside
+// this one. The constraint and the sentence describing it are the same object;
+// change the validator and the documentation follows, because there is nowhere
+// else for it to be written.
+const describe = (fn, text, extra = {}) => Object.assign(fn, { describe: text, ...extra });
+
+const isStr = describe(v => (typeof v === "string" && v.length ? null : "must be a non-empty string"),
+                       "a non-empty string");
+const isBool = describe(v => (typeof v === "boolean" ? null : "must be a boolean"),
+                        "true or false");
+const isInt = describe(v => (Number.isInteger(v) ? null : "must be an integer"),
+                       "an integer");
+// Written out three times inline before this: the same predicate, three chances
+// to spell it differently, and no way for the reference to describe any of them.
+const isPosInt = describe(v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer"),
+                          "a positive integer");
+const isNum = describe(v => (typeof v === "number" && Number.isFinite(v) ? null : "must be a finite number"),
+                       "a number");
+const isArr = inner => describe(v => {
   if (!Array.isArray(v)) return "must be an array";
   for (const [i, x] of v.entries()) { const e = inner(x); if (e) return `[${i}] ${e}`; }
   return null;
-};
-const oneOf = list => v => (list.includes(v) ? null : `must be one of ${list.join(" | ")}`);
+}, `a list of ${inner.describe ?? "values"}`);
+const oneOf = list => describe(
+  v => (list.includes(v) ? null : `must be one of ${list.join(" | ")}`),
+  `one of ${list.join(", ")}`, { values: Object.freeze([...list]) });
 // A path a daemon will hand to spawn() must not depend on who started the daemon.
 // Every profile written before this check set worktreeRoot relatively, and under
 // launchd "../nextly-worktrees" resolved from the daemon's WorkingDirectory to a
@@ -89,7 +106,7 @@ const BUDGET_STRS = Object.freeze(["model", "effort"]);
 const BUDGET_NUMS = Object.freeze(["maxBudgetUsd"]);
 const BUDGET_FIELDS = Object.freeze([...BUDGET_INTS, ...BUDGET_STRS, ...BUDGET_NUMS]);
 
-const BUDGETS = (v) => {
+const BUDGETS = describe((v) => {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return "must be an object";
   for (const [action, spec] of Object.entries(v)) {
     if (!BUILD_ACTIONS.includes(action))
@@ -108,11 +125,12 @@ const BUDGETS = (v) => {
     }
   }
   return null;
-};
+}, "an object of per-action budgets, keyed by build action");
 
-const isAbsPath = v => (typeof v === "string" && v.startsWith("/")
+const isAbsPath = describe(v => (typeof v === "string" && v.startsWith("/")
   ? null
-  : "must be an absolute path: a relative one resolves against whatever directory the daemon was started in");
+  : "must be an absolute path: a relative one resolves against whatever directory the daemon was started in"),
+  "an absolute path");
 const optional = f => v => (v === undefined || v === null ? null : f(v));
 
 const COMMAND = v => {
@@ -123,7 +141,7 @@ const COMMAND = v => {
   return null;
 };
 
-const UNIT = v => {
+const UNIT = describe(v => {
   if (typeof v !== "object" || v === null) return "must be an object";
   for (const k of ["id", "root", "language"]) { const e = isStr(v[k]); if (e) return `${k} ${e}`; }
   // packageManager is AUTO from the lockfile EXCEPT where two lockfiles disagree:
@@ -138,7 +156,7 @@ const UNIT = v => {
     for (const [name, c] of Object.entries(v.commands)) { const ce = COMMAND(c); if (ce) return `commands.${name} ${ce}`; }
   }
   return null;
-};
+}, "an object with id, root and language");
 
 const REVIEWER = v => {
   if (typeof v !== "object" || v === null) return "must be an object";
@@ -282,13 +300,13 @@ export const FIELDS = {
   // The founder's GitHub identity, by immutable numeric id with the login as a
   // snapshot: every founder-event rule (silence, overrides, approvals) matches
   // the id, and a renamed login must not silently become a stranger.
-  "builder.founder.userId":              [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
+  "builder.founder.userId":              [false, isPosInt],
   "builder.founder.login":               [false, isStr],
   // How long a cancelling task's effects get to reconcile before `cancel --force`
   // becomes available. A forced cancel is the one terminal transition whose
   // external truth was never confirmed, so it must not be reachable before the
   // reconcilers have had a window at all.
-  "builder.cancel.drainMinutes":         [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
+  "builder.cancel.drainMinutes":         [false, isPosInt],
   // Per-action budgets for the phases a worker is dispatched for.
   //
   // ONE KEY, NOT EIGHTEEN, and that is a property of the validator rather than a
@@ -300,7 +318,7 @@ export const FIELDS = {
   // this validator or they are not refused at all.
   "builder.budgets":                     [false, BUDGETS],
   // Cap on a worker's durable stdout/stderr files. Read by both daemons.
-  "worker.maxOutputBytes":               [false, v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer")],
+  "worker.maxOutputBytes":               [false, isPosInt],
   // How a dispatched worker is isolated from the founder's account. "none"
   // (default) means a shared account and a linked worktree: a worker could read
   // a keychain credential the probe does not know about, or plant a hook in the

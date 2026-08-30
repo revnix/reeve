@@ -325,7 +325,9 @@ const base = (db, over = {}) => ({
     "and the normalized territory", JSON.stringify(r.plan?.territory));
   check(r.plan?.conflicts?.length === 1 && /overlaps/.test(r.plan?.conflicts?.[0] ?? ""),
     "and the conflicts it would hit", JSON.stringify(r.plan?.conflicts));
-  check(Array.isArray(r.plan?.floors), "and the depth floors that would fire", JSON.stringify(r.plan?.floors));
+  check(Array.isArray(r.plan?.floors) && !r.plan.floors.some(f => /spans more than one claim/.test(f)),
+    "and the floors, which never claim a verdict claim COUNT cannot support",
+    JSON.stringify(r.plan?.floors));
   check(r.plan?.switches?.observe === false, "and the switches currently on", JSON.stringify(r.plan?.switches));
   db.close();
 }
@@ -514,8 +516,13 @@ const base = (db, over = {}) => ({
     JSON.stringify(r));
   check(r.plan?.territory?.length === 1,
     "two claims that normalize to one are counted once", JSON.stringify(r.plan?.territory));
-  check(r.plan?.floors?.length === 0,
-    "and the multi-claim floor does not fire on what is really one claim",
+  // AND THE FLOORS SAY THEY ARE NOT EVALUATED, rather than reporting none.
+  // Claim count was standing in for predicates it is not: a single claim inside
+  // a sensitive path got no floor, and two claims in one package that exceeds no
+  // threshold got one. An empty list would read as "no floor will fire", which
+  // is a claim nothing here can make before SIZING.
+  check(r.plan?.floors?.length === 1 && /not evaluated before SIZING/.test(r.plan.floors[0]),
+    "and the plan says floors are NOT EVALUATED rather than reporting none",
     JSON.stringify(r.plan?.floors));
   db.close();
 }
@@ -530,8 +537,110 @@ const base = (db, over = {}) => ({
   check(r.ok === true && r.dryRun === true, "a dry run with no database returns a plan",
     JSON.stringify(r));
   check(r.plan?.conflicts?.length === 0,
-    "and reports no conflicts, because there are no leases to conflict with",
+    "and with no store it reports no conflicts, because nothing is leased",
     JSON.stringify(r.plan?.conflicts));
+}
+
+// ── The replay image is the WHOLE row ───────────────────────────────────────
+//
+// A tail-only restore rebuilds a task from this payload. It was built from a
+// hand-kept column list, so every column added to `task` had to be remembered in
+// a second place -- and four were not, which meant a restored task lost the
+// founder's depth and priority and all of its provenance. Nothing goes red for
+// that: the row is present and the task replays.
+//
+// Derived from the TABLE rather than from a list here, because a list here would
+// be a third inventory of the same columns and would drift exactly as the second
+// one did.
+{
+  const db = store();
+  const r = await fileTask(base(db, { title: "the replay image", depth: "deep", priority: "p1" }));
+  check(r.ok === true, "control: the filing is admitted", JSON.stringify(r));
+  const cols = db.prepare("SELECT name FROM pragma_table_info('task')").all().map(x => x.name);
+  check(cols.length > 20, "control: the task table's columns are readable at all", String(cols.length));
+  const ev = db.prepare(
+    "SELECT payload FROM hub_event WHERE task=? AND kind='task.filed'").get(r.task);
+  const payload = JSON.parse(ev.payload);
+  const missing = cols.filter(c => !(c in payload));
+  check(missing.length === 0,
+    "the task.filed payload carries EVERY column of task, so a replay loses nothing",
+    missing.length ? `missing: ${missing.join(", ")}` : "");
+  check(payload.depth === "deep" && payload.priority === "p1",
+    "including the depth and priority the founder chose", JSON.stringify({ d: payload.depth, p: payload.priority }));
+  check(payload.filed_via === "cli" && typeof payload.text_hash === "string",
+    "and the provenance", JSON.stringify({ v: payload.filed_via, h: payload.text_hash }));
+  db.close();
+}
+
+// ── --anyway proceeds past a collision; it does not create one ──────────────
+//
+// Salting unconditionally left the canonical title hash UNCLAIMED, so a first
+// filing made with --anyway did not occupy it -- and a later filing of the
+// identical title WITHOUT --anyway was admitted in silence. The flag for
+// acknowledging a duplicate was what disabled detecting one.
+{
+  const db = store();
+  const a = await fileTask(base(db, { title: "solo twin", anyway: true }));
+  check(a.ok === true, "control: a first filing with --anyway is admitted", JSON.stringify(a));
+  const key = db.prepare("SELECT source_key FROM task WHERE id=?").get(a.task)?.source_key;
+  check(key != null && !key.includes(":"),
+    "and it takes the CANONICAL key, because there was no collision to proceed past", String(key));
+
+  const b = await fileTask(base(db, { title: "solo twin", territory: ["packages/y"] }));
+  check(b.ok === false,
+    "so a later identical title without --anyway still gets the near-twin refusal", JSON.stringify(b));
+
+  // AND --anyway STILL WORKS once there really is a twin.
+  const c = await fileTask(base(db, { title: "solo twin", territory: ["packages/y"], anyway: true }));
+  check(c.ok === true, "control: --anyway still admits past a real collision", JSON.stringify(c));
+  const ckey = db.prepare("SELECT source_key FROM task WHERE id=?").get(c.task)?.source_key;
+  check(ckey === `${key}:${c.task}`, "salting only then", String(ckey));
+  db.close();
+}
+
+// ── An idempotent retry is inert even when the checkout moved ───────────────
+//
+// The snapshot is rebuilt before admission resolves the key, and rebuilding
+// walks the checkout. A script re-running a filing that already succeeded, in a
+// tree where an ancestor of its territory has since become a symlink, was
+// refused rather than told the task it already holds. The key exists; the answer
+// is known; nothing about the checkout changes it.
+{
+  const db = store();
+  const a = await fileTask(base(db, { title: "retried across a change", idempotencyKey: "k-move" }));
+  check(a.ok === true, "control: the first filing is admitted", JSON.stringify(a));
+
+  // The world moves: the index now reports the claim's ancestor as a symlink,
+  // which resolveClaims refuses.
+  const hostile = mkIo({ lsTree: () => ({ mode: "120000" }) });
+  const poisoned = await fileTask(base(db, { title: "a NEW filing", territory: ["packages/x"], io: hostile }));
+  check(poisoned.ok === false && /symlink/.test(String(poisoned.refusal)),
+    "control: a new filing against that tree IS refused, so the io really is hostile",
+    JSON.stringify(poisoned));
+
+  const b = await fileTask(base(db, { title: "retried across a change",
+                                      idempotencyKey: "k-move", io: hostile }));
+  check(b.ok === true && b.task === a.task,
+    "but the retry returns the original task rather than the refusal", JSON.stringify(b));
+  check(b.replayed === true, "and says it was a replay", JSON.stringify(b));
+  db.close();
+}
+
+// ── The pin is visible in the plan ─────────────────────────────────────────
+//
+// This is what makes the wiring observable. The route parsed the duration,
+// validated it, refused a malformed one -- and then did not forward it, with
+// every message still correct. A plan that shows the pin fails visibly when
+// nothing carries it.
+{
+  const db = store();
+  const withPin = await fileTask(base(db, { title: "planned pin", dryRun: true, pinSeconds: 48 * 3600 }));
+  check(withPin.plan?.pin?.seconds === 48 * 3600,
+    "a dry run reports the pin it was given", JSON.stringify(withPin.plan?.pin));
+  const without = await fileTask(base(db, { title: "planned pin", dryRun: true }));
+  check(without.plan?.pin === null,
+    "control: and reports none when it was given none", JSON.stringify(without.plan?.pin));
+  db.close();
 }
 
 rmSync(dir, { recursive: true, force: true });

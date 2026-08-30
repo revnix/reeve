@@ -594,6 +594,29 @@ check(existsSync(join(repo, ".git")),
     "control: and so is a token that merely starts with a dash", neg.out.split("\n")[0]);
 }
 
+// ── An empty --territory is the repository root, and must be typeable ───────
+//
+// `normalizeClaim` supports the root claim deliberately, and the territory-file
+// refusal tells the founder to write it as `--territory ""` -- advice the parser
+// then refused, so the recommended remedy could not be typed at all.
+{
+  const r = run("task", "file", "--project", "p", "--title", "t", "--territory", "");
+  check(!/--territory expects a value/.test(r.out),
+    "--territory \"\" is accepted, because an empty claim is the repository root",
+    r.out.split("\n")[0]);
+
+  // CONTROLS: the allowance is for that flag alone. Everywhere else an empty
+  // value is still a missing one -- `--home ""` resolves to the CURRENT
+  // directory, which is how a command explicitly told to use another home
+  // silently used this one.
+  const h = run("--home", "", "task");
+  check(/--home expects a value/.test(h.out),
+    "control: an empty --home is still refused", h.out.split("\n")[0]);
+  const t = run("task", "file", "--title", "");
+  check(/--title expects a value/.test(t.out),
+    "control: and so is an empty --title", t.out.split("\n")[0]);
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

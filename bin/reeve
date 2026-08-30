@@ -346,7 +346,16 @@ const ARGS = (() => {
     // backed up, built or restored against `<cwd>/state` instead. An operator
     // who names a home and gets nothing has said something, and it is not "use
     // wherever I happen to be standing".
-    if (v === undefined || v === "") { errors.push(`reeve: --${name} expects a value: ${FLAGS[name].what}`); continue; }
+    // AN EMPTY VALUE IS MEANINGFUL FOR EXACTLY ONE FLAG. An empty territory claim
+    // is the repository ROOT, which `normalizeClaim` supports deliberately and
+    // which the territory-file refusal tells the founder to write as
+    // `--territory ""` -- advice the parser then refused, so the recommended
+    // remedy could not be typed. Everywhere else an empty value is still a
+    // missing one: `--home ""` resolves to the current directory, which is how a
+    // command explicitly told to use another home silently used this one.
+    const EMPTY_IS_A_VALUE = new Set(["territory"]);
+    if (v === undefined || (v === "" && !EMPTY_IS_A_VALUE.has(name))) {
+      errors.push(`reeve: --${name} expects a value: ${FLAGS[name].what}`); continue; }
     if (looksLikeFlag(v)) { errors.push(`reeve: --${name} expects a value: ${FLAGS[name].what}. Got the flag ${v}.`); continue; }
     i++;
     // Repeatable. `--set` is read as a LIST by `init`; every other valued flag
@@ -1135,6 +1144,20 @@ switch (cmd) {
     let profile = null;
     try { profile = withDefaults(JSON.parse(readFileSync(entry.profilePath, "utf8"))); }
     catch (e) { console.error(`reeve task: ${entry.profilePath}: ${e.message}`); process.exit(1); }
+    // AND IT MUST BE THAT PROJECT'S PROFILE. A registry entry whose profilePath
+    // points at another repository's profile validates perfectly -- it is a valid
+    // profile, just not this one -- and the dry run would then report a different
+    // project's switches under this project's name. `registryIo` rejects the
+    // mismatch separately and returns null facts, which admission refuses; but a
+    // dry run never reaches admission, so it is the one path where the mismatch
+    // is invisible.
+    const declared = profile?.identity?.key;
+    if (declared && declared !== entry.nwo) {
+      console.error(`reeve task: ${entry.profilePath} declares identity.key ${JSON.stringify(declared)}, ` +
+                    `but the registry entry for ${JSON.stringify(project)} names ${JSON.stringify(entry.nwo)}.`);
+      console.error(`-> the registry and the profile disagree about which repository this is; fix one of them`);
+      process.exit(1);
+    }
     const pv = validate(profile);
     if (!pv.ok) {
       console.error(`reeve task: ${entry.profilePath} is invalid`);
@@ -1184,7 +1207,25 @@ switch (cmd) {
     // reached its no-write branch. With no store there are no live leases, which
     // is the true answer rather than a missing one.
     const hubPath = hubPathFor(HOME);
-    const db = (flag("dry-run") && !existsSync(hubPath)) ? null : openHub(hubPath);
+    let db = null;
+    if (flag("dry-run")) {
+      // AN ABSENT HUB IS NOT THE ONLY WAY A DRY RUN WRITES. `openHub` applies
+      // forward migrations, so a preview against a hub older than this binary
+      // upgraded its schema before reaching the no-write branch -- a real,
+      // irreversible write performed by the command that promises none. Checking
+      // the recorded version costs a read-only open and no migration.
+      const at = completedVersion(hubPath);
+      if (at !== 0 && at !== HUB_SCHEMA_VERSION) {
+        console.error(`reeve task: the hub at ${hubPath} is at schema version ${at} and this binary ` +
+                      `expects ${HUB_SCHEMA_VERSION}. A dry run will not migrate it, because migrating ` +
+                      `is a write and this command promises none.`);
+        console.error(`-> run a command that writes (for example \`reeve task file\` without --dry-run) to migrate, then retry`);
+        process.exit(1);
+      }
+      if (at !== 0) db = openHub(hubPath);
+    } else {
+      db = openHub(hubPath);
+    }
     const r = await fileTask({
       db, registry, project, title: opt("title"),
       territory: [...all("territory"), ...fromFile],
@@ -1192,6 +1233,10 @@ switch (cmd) {
         ? readFileSync(opt("body-file") === "-" ? 0 : opt("body-file"), "utf8") : null,
       depth: opt("depth"), priority: opt("priority") ?? "p2",
       idempotencyKey: opt("idempotency-key"), anyway: flag("anyway"),
+      // FORWARDED. It was parsed, validated, refused when malformed -- and then
+      // never handed over, so `--pin-territory 48h` exited 0 with an ordinary
+      // lease and the territory it promised to hold could be released.
+      pinSeconds: pin,
       dryRun: flag("dry-run"), switches,
       // WITH A FETCHER. `resolveRepoIdAt` asks the hub first and falls back to
       // this; without it a project the hub has never admitted a task for resolves
@@ -1215,6 +1260,7 @@ switch (cmd) {
       console.log(`  territory:  ${p.territory.map(t => t.path || "(repository root)").join(", ")}`);
       console.log(`  profile:    ${p.profileHash ?? "(unresolved)"}`);
       console.log(`  switches:   ${Object.entries(p.switches).map(([k, v]) => `${k}=${v}`).join(" ") || "(none)"}`);
+      console.log(`  pin:        ${p.pin ? `${p.pin.seconds}s` : "none"}`);
       if (p.floors.length) console.log(`  floors:\n    ${p.floors.join("\n    ")}`);
       console.log(p.conflicts.length ? `  conflicts:\n    ${p.conflicts.join("\n    ")}`
                                      : `  conflicts:  none`);

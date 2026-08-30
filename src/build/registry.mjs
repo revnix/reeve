@@ -332,13 +332,20 @@ export function admitTask(db, snapshot, filing, { isAlive = () => true } = {}) {
     // `task(id)` -- so emitting the children first makes a replay of this very
     // admission fail on the constraint before the task exists. The order the
     // events are appended in IS the order they are restored in.
+    //
+    // THE IMAGE IS THE ROW, and it is taken with `*` rather than from a list
+    // kept by hand. The list here named twenty-two columns and the table has
+    // more; every column added to `task` had to be remembered in a second place,
+    // and `depth`, `priority`, `text_hash` and `filed_via` were not -- so a
+    // tail-only restore rebuilt the task with the founder's stated depth and
+    // priority replaced by NULL and the schema default, and its provenance gone.
+    // Nothing goes red for that: the row is present, the task replays, and only
+    // the fields nobody thought to enumerate are missing.
+    //
+    // A column list beside a table is a second inventory of the table, and this
+    // is the failure that inventory exists to have. `*` cannot drift from it.
     hubEvent(db, { kind: "task.filed", task: filing.id,
-      payload: db.prepare(
-        `SELECT id, project, repo_id, nwo_snapshot, title, body, phase, generation,
-                source_kind, source_key, idempotency_key, repo_path, profile_path, profile_hash,
-                default_branch, visibility, spec_repo_id, gate_definition_hash,
-                registry_version, founder_user_id, created_at, updated_at
-         FROM task WHERE id = ?`).get(filing.id) });
+      payload: db.prepare(`SELECT * FROM task WHERE id = ?`).get(filing.id) });
 
     for (const claim of claims) {
       db.prepare(

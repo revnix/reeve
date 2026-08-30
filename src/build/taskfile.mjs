@@ -62,6 +62,19 @@ export function mintTaskId(at = Date.now(), rnd = randomBytes(10)) {
   return `bt:${s}`;
 }
 
+// A pin is a DEADLINE, not a switch: `--pin-territory 48h`. `grantLease` stamps
+// the deadline on the claim at the first grant and reads it back at every later
+// one, so the value passed here is used exactly once and a wrong unit is a wrong
+// promise the founder cannot see. Hours and days only; a bare number is refused
+// rather than guessed at.
+const PIN = /^(\d+)([hd])$/;
+export function pinSeconds(raw) {
+  if (raw === null || raw === undefined) return null;
+  const m = PIN.exec(String(raw).trim());
+  if (!m) return { refusal: `--pin-territory takes a duration like 48h or 3d; got ${JSON.stringify(raw)}` };
+  return Number(m[1]) * (m[2] === "h" ? 3600 : 86400);
+}
+
 /**
  * File one task: grammar, then the network reads, then one admission.
  *

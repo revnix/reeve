@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openHub } from "../src/build/hubdb.mjs";
 import { isSameProcess, readStart } from "../src/supervisor.mjs";
-import { fileTask, TERRITORY_GRAMMAR } from "../src/build/taskfile.mjs";
+import { fileTask, pinSeconds, TERRITORY_GRAMMAR } from "../src/build/taskfile.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -53,6 +53,7 @@ let n = 0;
 const store = () => openHub(join(dir, `h${++n}.db`));
 const tasks   = (db) => db.prepare("SELECT count(*) c FROM task").get().c;
 const writers = (db) => db.prepare("SELECT count(*) c FROM writer_lease").get().c;
+const evseq   = (db) => db.prepare("SELECT COALESCE(MAX(seq),0) s FROM hub_event").get().s;
 
 const base = (db, over = {}) => ({
   db, registry, project: "nextly", title: "a scout task",
@@ -123,6 +124,82 @@ const base = (db, over = {}) => ({
     "naming the root task as the blocker", `${a.task} / ${b.refusal}`);
   check(tasks(db) === 1, "and the blocked filing inserted nothing", String(tasks(db)));
   db.close();
+}
+
+// ── A conflict is a refusal, not a queue ─────────────────────────────────────
+//
+// Founder filings are never queued behind a lease. What matters as much is that
+// the refused filing leaves NOTHING: `admitTask` writes the task row before it
+// grants leases, so a refusal that escaped the transaction would leave a task
+// with no territory, holding no lease and blocking nothing -- which reads as a
+// filed task in every later view.
+//
+// A refusal that is RETURNED and a refusal that CHANGED NOTHING are two
+// different facts, and only the count assertions can tell them apart.
+{
+  const db = store();
+  const a = await fileTask(base(db, { title: "holds packages/x" }));
+  check(a.ok === true, "the first filing is admitted", JSON.stringify(a));
+
+  const before = tasks(db), seqBefore = evseq(db);
+  const b = await fileTask(base(db, { title: "wants packages/x/deep", territory: ["packages/x/deep"] }));
+  check(b.ok === false, "an overlapping filing is refused", JSON.stringify(b));
+  check(typeof a.task === "string" && String(b.refusal ?? "").includes(a.task),
+    "and the refusal names the blocking task", `${a.task} / ${b.refusal}`);
+  check(/overlaps/.test(String(b.refusal)), "and says what overlapped what", b.refusal);
+  check(tasks(db) === before, "and the task-row COUNT is unchanged", `${tasks(db)} vs ${before}`);
+  check(evseq(db) === seqBefore, "and no hub_event was appended", `${evseq(db)} vs ${seqBefore}`);
+  check(db.prepare("SELECT count(*) c FROM territory_lease").get().c === 1,
+    "and exactly one lease still exists, the first task's");
+
+  // A DISJOINT claim in the same project is not a conflict. Without this the
+  // count assertions above would also pass against an implementation that
+  // refuses every second filing.
+  const c = await fileTask(base(db, { title: "wants packages/y", territory: ["packages/y"] }));
+  check(c.ok === true, "control: a disjoint claim in the same project is admitted", JSON.stringify(c));
+  check(tasks(db) === before + 1, "and it is the only thing that grew the table", String(tasks(db)));
+  db.close();
+}
+
+// ── The successful path's own control ────────────────────────────────────────
+//
+// One task, N territory rows, N leases, and the events, all from one call.
+{
+  const db = store();
+  const r = await fileTask(base(db, { title: "two claims", territory: ["packages/x", "packages/y"] }));
+  check(r.ok === true, "a filing with two claims is admitted", JSON.stringify(r));
+  check(db.prepare("SELECT count(*) c FROM task_territory WHERE task=?").get(r.task).c === 2,
+    "and writes one task_territory row per claim");
+  check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task=?").get(r.task).c === 2,
+    "and one territory_lease row per claim");
+  const kinds = db.prepare("SELECT kind FROM hub_event WHERE task=? ORDER BY seq").all(r.task).map(e => e.kind);
+  check(kinds[0] === "task.filed", "with the parent event first, so a replay can rebuild it", kinds.join(","));
+  check(kinds.filter(k => k === "task_territory.claimed").length === 2 &&
+        kinds.filter(k => k === "territory_lease.granted").length === 2,
+    "and a claimed and a granted event for each claim", kinds.join(","));
+  db.close();
+}
+
+// ── The pin duration ─────────────────────────────────────────────────────────
+//
+// Asserted here rather than left to the task that wires the flag: an exported
+// function with no caller and no test is indistinguishable from one that works.
+// A bare number is the whole point -- guessing its unit is a promise the founder
+// cannot see, so it is refused.
+{
+  check(pinSeconds(null) === null, "no --pin-territory is not a pin", String(pinSeconds(null)));
+  check(pinSeconds(undefined) === null, "and neither is an absent one", String(pinSeconds(undefined)));
+  check(pinSeconds("48h") === 48 * 3600, "48h is hours", String(pinSeconds("48h")));
+  check(pinSeconds("3d") === 3 * 86400, "3d is days", String(pinSeconds("3d")));
+  check(pinSeconds(" 12h ") === 12 * 3600, "and surrounding space is not a syntax error",
+    String(pinSeconds(" 12h ")));
+  for (const bad of ["48", "48m", "h", "-2h", "1.5d", ""]) {
+    const r = pinSeconds(bad);
+    check(r?.refusal !== undefined, `${JSON.stringify(bad)} is refused rather than guessed at`,
+      JSON.stringify(r));
+  }
+  check(/48h/.test(String(pinSeconds("48").refusal)),
+    "and the refusal shows the grammar it wanted", pinSeconds("48").refusal);
 }
 
 rmSync(dir, { recursive: true, force: true });

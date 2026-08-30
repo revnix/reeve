@@ -348,6 +348,7 @@ expectRefusal("budgets that are not an object", withBudget([]), /builder\.budget
     await import("../scripts/profile-reference.mjs");
   const { readFileSync } = await import("node:fs");
   const { execFileSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
 
   const SRC    = readFileSync(new URL("../src/profile/schema.mjs", import.meta.url), "utf8");
   const fresh  = profileReference();
@@ -465,13 +466,94 @@ expectRefusal("budgets that are not an object", withBudget([]), /builder\.budget
   // `--check` answers without writing, the shape gofmt/terraform-docs settled on.
   let checkOk = false;
   try {
+    // fileURLToPath, NOT `.pathname`. A checkout whose path contains a space
+    // arrives percent-encoded, so `.pathname` hands node
+    // `/tmp/reeve%20space/scripts/...`, which does not exist -- and the test
+    // fails for a reason that has nothing to do with staleness. The generator
+    // already decodes; this did not.
     execFileSync(process.execPath,
-      [new URL("../scripts/profile-reference.mjs", import.meta.url).pathname, "--check"],
+      [fileURLToPath(new URL("../scripts/profile-reference.mjs", import.meta.url)), "--check"],
       { stdio: "pipe" });
     checkOk = true;
   } catch { checkOk = false; }
   console.log(`${checkOk ? "PASS" : "FAIL"}  --check exits 0 while the committed file is current`);
   if (!checkOk) fail++;
+}
+
+// ── requirement is what an operator must AUTHOR ──────────────────────────────
+//
+// NOT the raw `FIELDS` flag. `bin/reeve` calls `withDefaults(raw)` and only then
+// `validate(profile)`, so a key the defaults supply is accepted when a profile
+// omits it. Reporting the flag labelled `authority.profileLocation` "required"
+// and misstated the contract: every profile may omit it, and both kinds get one.
+{
+  const { requirementOf, mustAuthor, exampleFor, profileReference } =
+    await import("../scripts/profile-reference.mjs");
+  const { PROJECT_KIND, withDefaults, validate } = await import("../src/profile/schema.mjs");
+  // This file reports with `expectOk`/`expectRefusal` and a bare `fail++`; the
+  // assertions below are not refusal cases, so they get a local reporter in the
+  // same shape rather than a second global one.
+  const check = (ok, name, detail) => {
+    console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+    if (!ok) { if (detail) console.log("        " + detail); fail++; }
+  };
+  const fresh = profileReference();
+
+  check(FIELDS["authority.profileLocation"][0] === true,
+    "control: authority.profileLocation IS flagged required in FIELDS",
+    "if this flips, the case below stops being the interesting one");
+  check(requirementOf("authority.profileLocation") === "defaulted",
+    "a required key the defaults supply is reported as `defaulted`, not `required`",
+    requirementOf("authority.profileLocation"));
+  // AND IT REALLY IS ACCEPTED WITHOUT IT -- asserted through the loader's own
+  // order rather than by restating which keys have defaults.
+  for (const kind of PROJECT_KIND) {
+    const omitted = exampleFor(kind);
+    delete omitted.authority.profileLocation;
+    const r = validate(withDefaults(omitted));
+    check(r.ok === true,
+      `control: a ${kind} profile omitting authority.profileLocation is accepted by the loader's order`,
+      JSON.stringify(r.errors?.slice(0, 2)));
+  }
+  check(requirementOf("identity.key") === "required",
+    "control: a key with no default is still reported as `required`", requirementOf("identity.key"));
+  check(requirementOf("identity.prHost") === "optional",
+    "control: and an unflagged key is optional", requirementOf("identity.prHost"));
+
+  // ── the examples, which are the other half of §11.6 ────────────────────────
+  //
+  // "documentation AND examples generated from the validator". An example an
+  // operator copies is worse than none if it does not validate, so each is run
+  // through `validate()` rather than eyeballed.
+  for (const kind of PROJECT_KIND) {
+    const r = validate(exampleFor(kind));
+    check(r.ok === true, `the generated ${kind} example is accepted by the validator`,
+      JSON.stringify(r.errors?.slice(0, 3)));
+    check((r.warnings ?? []).length === 0,
+      `and the ${kind} example raises no warnings, so it does not model what the validator advises against`,
+      JSON.stringify(r.warnings));
+    check(fresh.includes(JSON.stringify(exampleFor(kind), null, 2)),
+      `and the ${kind} example in the document is that same object`);
+  }
+
+  // THE SEED IS PINNED TO THE DERIVED SET, BOTH DIRECTIONS. Sample values are
+  // the one thing here that cannot be derived -- the schema says a key must be a
+  // string, not what a plausible string looks like -- so the risk is a new
+  // required key landing with no sample and the example quietly failing to
+  // validate. This fails first, and says which key.
+  {
+    const seeded = Object.keys(exampleFor("product"));
+    const need = mustAuthor();
+    const example = exampleFor("product");
+    const at = (o, path) => path.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
+    const unseeded = need.filter((k) => at(example, k) === undefined);
+    check(unseeded.length === 0,
+      "every key an operator must author has a sample value in the example seed",
+      unseeded.length ? `no sample for: ${unseeded.join(", ")} — add one in scripts/profile-reference.mjs` : "");
+    check(need.length > 0 && seeded.length > 0,
+      "control: the must-author set and the example are both non-empty",
+      `mustAuthor=${need.length} exampleTopLevel=${seeded.length}`);
+  }
 }
 
 // ── the declared key set, frozen ─────────────────────────────────────────────

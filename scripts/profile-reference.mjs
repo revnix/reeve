@@ -11,7 +11,8 @@
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { FIELDS } from "../src/profile/schema.mjs";
+import { FIELDS, PROJECT_KIND, STATE_MODE, MERGE_METHOD, ENFORCEMENT,
+         SCHEMA_VERSION, withDefaults, validate } from "../src/profile/schema.mjs";
 
 const SCHEMA = new URL("../src/profile/schema.mjs", import.meta.url);
 const OUT    = new URL("../docs/profile-reference.md", import.meta.url);
@@ -92,8 +93,86 @@ export function rowsFor(source) {
     if (note === null)
       throw new Error(`profile-reference: \`${key}\` is declared in FIELDS but its ` +
         `declaration was not found inside the FIELDS block in schema.mjs`);
-    return { key, required: Boolean(required), note };
+    return { key, required: Boolean(required), requirement: requirementOf(key), note };
   });
+}
+
+const at = (o, path) => path.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
+const put = (o, path, v) => {
+  const parts = path.split(".");
+  let cur = o;
+  for (const k of parts.slice(0, -1)) cur = (cur[k] ??= {});
+  cur[parts.at(-1)] = v;
+  return o;
+};
+
+/**
+ * What an operator must actually AUTHOR, which is not the same as `FIELDS`'
+ * required flag.
+ *
+ * The loader calls `withDefaults(raw)` BEFORE `validate(profile)`, so a key the
+ * defaults supply is accepted when a profile omits it. Reporting the raw flag
+ * labelled `authority.profileLocation` "required" and misstated the accepted
+ * configuration contract: every profile may omit it, and both project kinds get
+ * a value.
+ *
+ * DERIVED BY RUNNING `withDefaults`, per project kind, rather than by consulting
+ * `KIND_DEFAULTS` -- reading the defaults table would restate the mechanism, and
+ * the question is what the loader actually accepts, which is behaviour.
+ */
+export function requirementOf(key) {
+  const [required] = FIELDS[key];
+  if (!required) return "optional";
+  if (key === "project.kind") return "required";   // the probe below authors it
+  const kinds = PROJECT_KIND.filter((kind) => at(withDefaults({ project: { kind } }), key) !== undefined);
+  if (kinds.length === PROJECT_KIND.length) return "defaulted";
+  if (kinds.length) return `defaulted for ${kinds.join(", ")}`;
+  return "required";
+}
+
+/**
+ * Sample VALUES for the keys an operator must author. The one thing here that
+ * genuinely cannot be derived: the schema says a key must be a string, not what
+ * a plausible string looks like.
+ *
+ * It is kept honest by the test rather than by care: the seed's key set is
+ * asserted to equal the derived set of must-author keys exactly, in BOTH
+ * directions, so a new required key fails with an instruction to add a sample
+ * value rather than silently producing an example that no longer validates.
+ */
+const EXAMPLE_SEED = Object.freeze({
+  schemaVersion: SCHEMA_VERSION,
+  "identity.key": "acme/widget",
+  "identity.defaultBranch": "main",
+  // `private` deliberately: a COMMITTED profile in a public repo is warned
+  // about by the validator, and an example should not model the thing the
+  // validator advises against.
+  "identity.visibility": "private",
+  "authority.permission": "admin",
+  "authority.policy": "owner",
+  "state.mode": STATE_MODE[0],
+  units: [{ id: "app", root: ".", language: "typescript" }],
+  "ci.provider": "github-actions",
+  "merge.method": MERGE_METHOD[0],
+  "merge.enforcement": ENFORCEMENT[0],
+});
+
+/** The keys an operator must author: required, and supplied by no kind's defaults. */
+export function mustAuthor() {
+  return Object.keys(FIELDS).filter((k) => requirementOf(k) === "required" && k !== "project.kind");
+}
+
+/**
+ * A complete, VALID example profile for one project kind, with defaults applied.
+ *
+ * §11.6 requires documentation *and examples* generated from the validator. An
+ * example an operator copies is worse than none if it does not validate, so the
+ * test runs `validate()` over each one rather than eyeballing it.
+ */
+export function exampleFor(kind) {
+  const authored = { project: { kind } };
+  for (const [key, value] of Object.entries(EXAMPLE_SEED)) put(authored, key, value);
+  return withDefaults(authored);
 }
 
 export function profileReference(source = readFileSync(SCHEMA, "utf8")) {
@@ -112,16 +191,15 @@ export function profileReference(source = readFileSync(SCHEMA, "utf8")) {
   // a generator that silently drops half a sentence is a document that lies by
   // omission, and the reader cannot tell.
   const index = [
-    "| key | required | documented |",
+    "| key | requirement | documented |",
     "|---|---|---|",
-    ...rows.map((r) =>
-      `| \`${r.key}\` | ${r.required ? "required" : "optional"} | ${r.note ? "yes" : "—"} |`),
+    ...rows.map((r) => `| \`${r.key}\` | ${r.requirement} | ${r.note ? "yes" : "—"} |`),
   ];
 
   const detail = documented.flatMap((r) => [
     `### \`${r.key}\``,
     "",
-    `${r.required ? "**required**" : "**optional**"}`,
+    `**${r.requirement}**`,
     "",
     r.note,
     "",
@@ -137,6 +215,10 @@ export function profileReference(source = readFileSync(SCHEMA, "utf8")) {
     "",
     `${rows.length} keys. ${documented.length} carry a description.`,
     "",
+    "`requirement` is what an operator must AUTHOR, not the validator's raw flag:",
+    "the loader applies defaults before validating, so a `defaulted` key may be",
+    "omitted. Examples for every project kind are at the end.",
+    "",
     "A key with no description has no comment above or beside it in",
     "`src/profile/schema.mjs` yet. Write one there and regenerate; there is nowhere",
     "else to put it, which is the point.",
@@ -150,6 +232,23 @@ export function profileReference(source = readFileSync(SCHEMA, "utf8")) {
     "Only keys carrying a description appear below; the index above is complete.",
     "",
     ...detail,
+    "## Examples",
+    "",
+    "One per project kind, GENERATED by applying the validator's own defaults to the",
+    `${mustAuthor().length + 1} keys an operator must author. A test runs \`validate()\` over each, so an`,
+    "example here is one the loader accepts rather than one that merely looks right.",
+    "",
+    "Everything beyond those authored keys is what `withDefaults()` fills in, which is",
+    "why the two differ: the defaults are per project kind.",
+    "",
+    ...PROJECT_KIND.flatMap((kind) => [
+      `### \`${kind}\``,
+      "",
+      "```json",
+      JSON.stringify(exampleFor(kind), null, 2),
+      "```",
+      "",
+    ]),
   ].join("\n");
 }
 

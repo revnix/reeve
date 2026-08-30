@@ -394,7 +394,10 @@ expectRefusal("budgets that are not an object", withBudget([]), /builder\.budget
   // It fails when a description is LOST, and equally when one is added -- and
   // updating the number is how the person adding it acknowledges the change.
   const documented = rowsFor(SRC).filter((r) => r.note !== "").length;
-  const pinned = documented === 29;
+  // 30 since the misplaced watcher comment moved to the key it describes:
+  // `watch.reviewActions` had no detail at all while its warning was attributed
+  // to `notify.provider`.
+  const pinned = documented === 30;
   console.log(`${pinned ? "PASS" : "FAIL"}  control: 29 of the declared keys carry a description`);
   if (!pinned) {
     console.log(`        ${documented} do. If you added or removed one, update this number`);
@@ -673,6 +676,93 @@ expectRefusal("budgets that are not an object", withBudget([]), /builder\.budget
   // what make the column worth reading.
   const distinct = new Set(Object.values(FIELDS).map(([, v]) => v.describe)).size;
   check(distinct > 5, "control: the descriptions are distinct, not one sentence repeated", String(distinct));
+}
+
+// ── a description states the EFFECTIVE contract ──────────────────────────────
+//
+// A true statement about a field's own check can be a false one about what the
+// loader accepts. `schemaVersion` was described as "an integer" while `validate`
+// refuses every value but one, so the reference advertised values that fail at
+// load time -- which is worse than saying nothing, because an operator acts on it.
+{
+  const { profileReference } = await import("../scripts/profile-reference.mjs");
+  const { SCHEMA_VERSION, validate, withDefaults } = await import("../src/profile/schema.mjs");
+  const fresh = profileReference();
+  const check = (ok, name, detail) => {
+    console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+    if (!ok) { if (detail) console.log("        " + detail); fail++; }
+  };
+
+  check(FIELDS.schemaVersion[1].describe === `exactly ${SCHEMA_VERSION}`,
+    "schemaVersion is described as the one value the loader accepts, not as `an integer`",
+    FIELDS.schemaVersion[1].describe);
+  // CONTROL: the field's OWN validator now refuses a wrong version, so the
+  // description is a statement about this check rather than about a rule
+  // enforced somewhere the reference cannot see.
+  check(FIELDS.schemaVersion[1](SCHEMA_VERSION + 1) !== null,
+    "control: and the field's validator itself refuses another integer");
+  check(FIELDS.schemaVersion[1](SCHEMA_VERSION) === null,
+    "control: while accepting the right one");
+
+  // NESTED VALIDATORS. `a list of values` hid a real restriction behind a
+  // sentence that looked like documentation, so an operator writes an absolute
+  // path or a full URL and the loader rejects it.
+  check(/relative path inside the checkout/.test(FIELDS["worker.dependencyPaths"][1].describe),
+    "a list's ELEMENT restriction reaches the description",
+    FIELDS["worker.dependencyPaths"][1].describe);
+  check(/bare domain name/.test(FIELDS["builder.network.research.allowedDomains"][1].describe),
+    "and so does the allowed-domains restriction",
+    FIELDS["builder.network.research.allowedDomains"][1].describe);
+  check(!/a list of values/.test(fresh),
+    "no key is documented as `a list of values`, which describes nothing");
+
+  // AND IT CANNOT SILENTLY RECUR: `isArr` refuses an undescribed inner at module
+  // load. This is the guard rather than the count, because the count only
+  // notices what someone remembered to look at -- it found a third case
+  // (`lanes`) that no review had named.
+  {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("../src/profile/schema.mjs", import.meta.url), "utf8");
+    check(/isArr needs a described inner validator/.test(src),
+      "isArr REFUSES an undescribed inner validator, so the gap cannot be shipped");
+  }
+}
+
+// ── a comment belongs to the key it sits above ───────────────────────────────
+//
+// `noteFor` takes the contiguous `//` run above a declaration, so a run that
+// describes a GROUP is attributed to whichever key follows it. That happened:
+// the watcher-group preface and the `watch.reviewActions` warning sat above
+// `notify.provider`, and the reference said the notification provider was "OFF
+// until review ingest exists" while `watch.reviewActions` had no detail at all.
+//
+// The repair was in the SOURCE -- the comments now sit above the keys they
+// describe -- because a heuristic that guesses topic boundaries in prose would
+// keep producing this. These assertions pin the attribution so the comments
+// cannot drift back.
+{
+  const { noteFor } = await import("../scripts/profile-reference.mjs");
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../src/profile/schema.mjs", import.meta.url), "utf8");
+  const check = (ok, name, detail) => {
+    console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+    if (!ok) { if (detail) console.log("        " + detail); fail++; }
+  };
+
+  const provider = noteFor(src, "notify.provider") ?? "";
+  const review   = noteFor(src, "watch.reviewActions") ?? "";
+
+  check(!/review ingest/.test(provider),
+    "notify.provider's description does not carry another key's warning",
+    provider.slice(0, 90));
+  check(/escalation/.test(provider),
+    "control: and it does carry its own", provider.slice(0, 90));
+  check(/review ingest/.test(review),
+    "watch.reviewActions carries the warning that is actually about it",
+    review.slice(0, 90));
+  check(review.length > 0 && provider.length > 0,
+    "control: both keys are documented at all, so neither check passes by absence",
+    `provider=${provider.length} review=${review.length}`);
 }
 
 // ── the declared key set, frozen ─────────────────────────────────────────────

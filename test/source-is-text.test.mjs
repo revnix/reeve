@@ -8,7 +8,7 @@
 // reviewers are blind to.
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const tracked = execFileSync("git", ["-C", ROOT, "ls-files", "src", "bin", "test", "deploy"], { encoding: "utf8" })
@@ -79,7 +79,41 @@ check(asBinary.length === 0, "git treats every tracked source file as text",
 // the fix is often to delete `.pathname` and pass the URL. Where a string is
 // genuinely needed, `fileURLToPath` is the decoder.
 {
-  const RE = /new URL\([^)]*\)\s*\.pathname/;
+  // NOT anchored on `new URL(`, and that is the second repair to this rule rather
+  // than a preference. Requiring the constructor meant the character class had to
+  // stop at the first `)`, so an argument containing a call slipped through -- and it
+  // could never see the form where the URL is held in a variable first.
+  //
+  // The rule is simply: a `.pathname` read off ANYTHING. That is exact for nested
+  // parentheses without a parser, because it never looks inside them, and it catches
+  // the variable form for free. It is enforceable today because the repository has
+  // ZERO reads of `.pathname` in code -- every remaining mention is prose in a
+  // comment. A future legitimate use, on an http URL where `.pathname` is correct,
+  // will hit this and can be exempted deliberately and visibly, which is the right
+  // way round for a rule that is otherwise fail-closed.
+  //
+  // The character before the dot is what separates code from prose: an identifier or
+  // a closing parenthesis is code, and every mention in a comment here is preceded by
+  // a backtick.
+  //
+  // A NEWLINE MAY SIT BEFORE THE DOT, BUT A BARE SPACE MAY NOT, and the difference is
+  // load-bearing rather than fussy. A member access wraps onto the next line, so code
+  // can legitimately put whitespace there -- dropping that was a regression I
+  // introduced while widening the rule, and my own wrapped control could not expose
+  // it, because that control wrapped the ARGUMENTS and left the access adjacent. It
+  // exercised a different kind of wrapping than the one that broke.
+  //
+  // But allowing ANY whitespace made every sentence of the form "NOT .pathname" match,
+  // including the ones in this file explaining the rule. Wrapped code contains a
+  // newline; prose on one line does not. That is the whole distinction, and it is why
+  // the pattern asks for a line break rather than for whitespace.
+  //
+  // AND THE PROPERTY NAME MUST END. Without the boundary, `route.pathnamePrefix` and
+  // any other identifier merely BEGINNING with the word failed the repository-wide
+  // assertion while never reading `.pathname` at all -- a fail-closed rule is only
+  // tolerable while it is also correct, and a false red that blocks unrelated code is
+  // how a guard gets deleted rather than fixed.
+  const RE = /[\w)](?:\s*\n\s*)?\??\.pathname\b/;
   // The control is a DECOY as much as a positive: the first string must be caught
   // and the second must not. A rule that fires on the word `.pathname` would trip
   // on every comment explaining the rule, including this one, and the honest way
@@ -95,6 +129,28 @@ check(asBinary.length === 0, "git treats every tracked source file as text",
   check(RE.test(wrapped),
     "control: and catches it when the call is WRAPPED across lines, which is what a per-line scan missed",
     JSON.stringify(wrapped));
+  check(RE.test(`const p = new URL(resolveName(), import.meta.url)${DOT}pathname;`),
+    "control: and when an argument contains a CALL, which a pattern stopping at the first bracket could not see");
+  check(RE.test(`const u = new URL(x); const p = u${DOT}pathname;`),
+    "control: and when the URL is held in a VARIABLE first, which anchoring on the constructor could never see");
+  // The MEMBER ACCESS wrapping, which is a different wrap from the one above: there
+  // the arguments spanned lines and the access stayed adjacent; here the access
+  // itself is on the next line, so the character before the dot is whitespace.
+  const memberWrapped = [`new URL("../x", import.meta.url)`, `  ${DOT}pathname;`].join("\n");
+  check(RE.test(memberWrapped),
+    "control: and when the MEMBER ACCESS itself wraps onto the next line",
+    JSON.stringify(memberWrapped));
+  // OPTIONAL CHAINING reads the same property and returns the same percent-encoded
+  // path whenever the receiver is present, so the character before the dot has to
+  // allow the question mark as well as an identifier.
+  check(RE.test(`const path = url?${DOT}pathname;`),
+    "control: and when the read is OPTIONAL, which returns the same path whenever the receiver exists");
+  check(!RE.test(`const q = url?${DOT}pathnamePrefix;`),
+    "control: but an OPTIONAL read of a longer name is still not a match, so the boundary survives the chaining");
+  check(!RE.test(`const p = route${DOT}pathnamePrefix;`),
+    "control: and does NOT fire on an identifier that merely BEGINS with the word, which would be a false red blocking unrelated code");
+  check(!RE.test(`const q = url${DOT}pathnameEncoded;`),
+    "control: nor on another such identifier, so the boundary is about the property name and not about one spelling");
   check(!RE.test(`// fileURLToPath, NOT ${DOT}pathname, because a space arrives percent-encoded`),
     "control: and does NOT catch prose that merely names it, so the rule can be explained");
 
@@ -108,6 +164,19 @@ check(asBinary.length === 0, "git treats every tracked source file as text",
   // An exemption nobody exercises is one that has quietly become a blanket, and
   // the way to find out is to require that it still matters.
   const EXEMPT = "test/stub-manifest.mjs";
+  // CAPTURED FIXTURE DATA IS NOT SOURCE, and excluding it is not a weakening of the
+  // scope fix that removed the extension filter. That fix was right: the inventory
+  // decides what is in scope, and a suffix test was a second and narrower opinion
+  // that happened to delete the production CLI. But the inventory also carries
+  // reviewer bodies captured verbatim, and
+  // test/fixtures/reviewer-bodies-2026-08-22/PROVENANCE.md requires them written to
+  // disk unmodified, not retyped and not summarised.
+  //
+  // So a captured body that happens to contain this property name in ordinary prose
+  // would fail a repository-wide guard and COULD NOT BE REWORDED without invalidating
+  // the fixture. That is the one shape where over-firing is not merely noisy: there
+  // is no correct action available to whoever hits it.
+  const DATA = "test/fixtures/";
   // THE WHOLE FILE, not line by line. The character class already matches a newline,
   // so the pattern spans a wrapped call on its own -- but splitting the source first
   // meant no single line held the whole expression, so a call formatted across
@@ -125,19 +194,28 @@ check(asBinary.length === 0, "git treats every tracked source file as text",
   // line. This very comment was rewritten for that reason, which is also the
   // evidence that the scan reaches further than the line-based one did.
   const lineOf = (text, index) => text.slice(0, index).split("\n").length;
-  const offenders = [], exempted = [];
+  const offenders = [], exempted = []; let data = 0;
+  // EVERY tracked file, with no extension filter. `bin/reeve` is the production CLI
+  // entry point, is JavaScript, and has no extension -- so a suffix test skipped the
+  // single file where this defect would matter most while the assertion claimed to
+  // cover all tracked source. The inventory already decides what is in scope; a
+  // second, narrower opinion about scope was the bug.
   for (const rel of tracked) {
-    if (!/\.(mjs|js)$/.test(rel)) continue;
+    if (rel.startsWith(DATA)) { data++; continue; }
     const into = rel === EXEMPT ? exempted : offenders;
     const text = readFileSync(ROOT + rel, "utf8");
     for (const m of text.matchAll(new RegExp(RE.source, "g")))
       into.push(`${rel}:${lineOf(text, m.index)}`);
   }
+  check(data > 0,
+    `control: ${data} captured fixture file(s) were skipped, so the data exclusion is load-bearing rather than a dead branch`);
+  check(existsSync(ROOT + "test/fixtures/reviewer-bodies-2026-08-22/PROVENANCE.md"),
+    "control: and the provenance rule that justifies skipping them is still on disk, so the exclusion cites something real");
   check(exempted.length > 0,
     `control: ${EXEMPT} still contains the shape, so exempting it is load-bearing`,
     "if it no longer does, delete the exemption rather than leaving it to widen silently");
   check(offenders.length === 0,
-    "no source takes `.pathname` off a file URL, which yields a percent-encoded path that may not exist",
+    "no source reads `.pathname`, which yields a percent-encoded path that may not exist",
     offenders.join("\n        ") + "\n        pass the URL object to fs, or decode it with fileURLToPath");
 }
 

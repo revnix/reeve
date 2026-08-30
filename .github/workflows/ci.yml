@@ -64,6 +64,25 @@ jobs:
       # UTC — an ambient property of the hosted image, not a property of this
       # workflow. A self-hosted or differently-configured runner would have run
       # the same suite twice in one zone while still reporting two zones covered.
+      # THE FIRST INSTALL THIS WORKFLOW HAS EVER NEEDED, and that is a change worth
+      # naming rather than slipping in. The suite is written to run on bare node: the
+      # single devDependency is resolved inside a try/catch and its absence degrades
+      # rather than fails, so CI has never fetched anything. A linter cannot degrade
+      # that way -- it either runs or it does not -- so `eslint .` failed with
+      # "not found" on the first push, which is the honest cost of the rule.
+      #
+      # `npm ci` rather than `npm install`: it installs exactly the lockfile and fails
+      # if the lockfile and manifest disagree, so a dependency cannot drift in through
+      # a run that happened to resolve differently.
+      - name: Install
+        run: npm ci
+
+      # BEFORE the suite, because it is seconds against minutes and its failures are
+      # about code that should not have been written rather than behaviour that broke.
+      # A reader who sees the suite fail first will look for a behavioural cause.
+      - name: Lint
+        run: npm run lint
+
       - name: Run the suite
         env:
           TZ: UTC
@@ -124,6 +143,14 @@ jobs:
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
         with:
           node-version: '24'
+      # THE SWEEP NEEDS THE DEPENDENCIES TOO, and putting the install only in the
+      # other job was half a repair. This runner executes the test files the manifest
+      # names, one of which imports eslint to exercise the lint rule; without the
+      # install that import fails, the sweep classifies the entry UNRUNNABLE, and the
+      # job goes red for a missing package rather than for anything it measured.
+      - name: Install
+        run: npm ci
+
       # The sweep refuses a dirty tree, so this asserts the precondition rather
       # than discovering it as a confusing refusal further down.
       - name: The checkout must be clean

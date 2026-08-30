@@ -105,9 +105,10 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubaccess-"));
 // ── a version is a CLAIM; the columns are the evidence ────────────────────
 // A store can record the current version and have lost `provider_lease.token`.
 // The version gate accepts it, the guest opens, and the first claim throws --
-// and a throwing scheduler dispatches UNSCHEDULED. Same lesson as
-// `columnDefectsAt`: a version-only probe cannot see a column that is absent,
-// just as a name-only inventory could not see one that was wrong.
+// and a throwing scheduler dispatches UNSCHEDULED. Same lesson snapshot
+// validation's schema check was written for: a version-only probe cannot see a
+// column that is absent, just as a name-only inventory could not see one that
+// was wrong.
 {
   const p = join(dir, "hollow.db");
   openHub(p).close();
@@ -128,12 +129,16 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubaccess-"));
 }
 
 // ── the GUARDIAN's surface, not the whole hub and not only the last migration
-// Too narrow and too wide were the same mistake. `COLUMNS_AT` describes only
-// what later migrations ADD, so a hub missing a migration-1 column passed and
-// the first claim threw into the fail-open path. `TABLES_AT` is the whole hub,
-// so losing an unrelated builder table reported the SCHEDULER unusable and an
-// ordinary pull request was dispatched unscheduled. The surface is the guest
-// connection's own allowlist.
+// Too narrow and too wide were the same mistake. The column inventory described
+// only what later migrations ADD, so a hub missing a migration-1 column passed
+// and the first claim threw into the fail-open path. The table inventory was the
+// whole hub, so losing an unrelated builder table reported the SCHEDULER
+// unusable and an ordinary pull request was dispatched unscheduled. The surface
+// is the guest connection's own allowlist.
+//
+// (Snapshot validation has since stopped declaring either list and derives the
+// shape by running the migrations, which removes the ADD-only horizon there.
+// This surface stays narrow deliberately: it is a different question.)
 {
   // A table the guardian needs.
   const a = join(dir, "notable.db");
@@ -143,8 +148,9 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-hubaccess-"));
   check(ra.hub === null && /provider_state/.test(ra.why ?? ""),
     "a hub that has lost a scheduler TABLE does not open, and the refusal names it", JSON.stringify(ra));
 
-  // A BASELINE column, created in migration 1 -- the case COLUMNS_AT could not
-  // see, because it only describes what later migrations added.
+  // A BASELINE column, created in migration 1 -- the case the old column
+  // inventory could not see, because it only described what later migrations
+  // added.
   const b = join(dir, "nocol.db");
   openHub(b).close();
   const wb = new DatabaseSync(b); wb.exec("ALTER TABLE provider_state DROP COLUMN cooldown_until"); wb.close();

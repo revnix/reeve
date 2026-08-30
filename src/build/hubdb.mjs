@@ -23,6 +23,14 @@ import { createHash } from "node:crypto";
 // read it; two spellings of the same path is how they drift.
 const SCHEMA_PATH = new URL("./hub.sql", import.meta.url);
 
+// `schema_version` is created by `openHub` directly, BEFORE any migration runs --
+// migration 1 needs somewhere to record itself. The scratch builder below has to
+// create it the same way, so the DDL is spelled once here rather than twice.
+const SCHEMA_VERSION_DDL = `CREATE TABLE IF NOT EXISTS schema_version (
+  version    INTEGER PRIMARY KEY,
+  applied_at INTEGER NOT NULL
+) STRICT`;
+
 export const HUB_SCHEMA_VERSION = 3;
 
 /**
@@ -366,10 +374,7 @@ export function openHub(path, { skipIntegrity = false } = {}) {
     // run` printed a bare `database disk image is malformed` with none of the
     // recovery this guard exists to give. The guard has to reach as far as the
     // first read that can find damage, not stop at the first write.
-    db.exec(`CREATE TABLE IF NOT EXISTS schema_version (
-               version    INTEGER PRIMARY KEY,
-               applied_at INTEGER NOT NULL
-             ) STRICT`);
+    db.exec(SCHEMA_VERSION_DDL);
     db.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get();
   } catch (e) {
     closeHub();
@@ -666,48 +671,263 @@ export function migrationPlan() {
 }
 
 /**
- * The tables a snapshot at a given schema version is required to carry.
+ * A scratch hub, in memory, migrated to `version`.
  *
- * Migration 1's inventory is derived from `hub.sql`, plus `schema_version` --
- * which is NOT in that file and cannot be, because `openHub` creates it directly
- * before any migration runs, migration 1 needing somewhere to record itself.
- * hub.sql declares 31 tables and a live database has 32.
+ * THIS IS THE WHOLE IDEA. The tables, columns, indexes and constraints a version
+ * requires are not declared anywhere any more -- they are whatever running the
+ * migrations to that version actually produces. A migration that adds an index,
+ * a foreign key or a table is covered the day it lands, with nothing to
+ * remember and no list to update.
  *
- * **Every later migration adds its own entry**, built from the previous version
- * plus whatever it creates. That is the whole maintenance burden, and it is
- * mechanical.
+ * It replaces `TABLES_AT` and `COLUMNS_AT`, which were a restatement of what the
+ * migrations already said. A restatement drifts, and the drift is invisible
+ * exactly where it matters: `openHub` reads the version as completed, skips the
+ * migration, and the first write fails AFTER the snapshot was chosen for
+ * recovery.
+ *
+ * It applies the migrations the same way `openHub` does -- same `MIGRATIONS`
+ * array, same `SCHEMA_VERSION_DDL` -- without the transaction, race and
+ * corruption handling, which are about a file being shared and this store is
+ * private and discarded. Copying the apply loop's DECISIONS would be a second
+ * inventory of the migration order, so only the ceremony is dropped.
  */
-const V1 = Object.freeze([
-  "schema_version",
-  ...[...readFileSync(SCHEMA_PATH, "utf8")
-        .matchAll(/CREATE TABLE IF NOT EXISTS ([a-z_]+)\s*\(/g)].map(m => m[1]),
-]);
-// Migration 2 replaces `impl_pr` with `task_pr`: one table out, one in, so the
-// COUNT is unchanged and only the name moves. Built from V1 rather than restated,
-// which is what stops the two drifting.
-const V2 = Object.freeze([...V1.filter(t => t !== "impl_pr"), "task_pr"].sort());
-// Migration 3 adds COLUMNS only -- `task_territory.pinned_until` and
-// `provider_lease.token` -- so the table inventory is V2's, unchanged. Aliased
-// rather than restated for the same reason V2 is built from V1: two lists that
-// must agree are two lists that can disagree.
-const V3 = V2;
-export const TABLES_AT = Object.freeze({ 1: V1, 2: V2, 3: V3 });
+function scratchAt(version) {
+  const db = new DatabaseSync(":memory:");
+  db.exec("PRAGMA foreign_keys = ON");
+  db.exec(SCHEMA_VERSION_DDL);
+  for (const m of MIGRATIONS) {
+    if (m.version > version) break;
+    m.up(db);
+    db.prepare("INSERT INTO schema_version(version, applied_at) VALUES(?, unixepoch())").run(m.version);
+  }
+  return db;
+}
 
 /**
- * The COLUMNS a version requires beyond its table set.
+ * A store's structure, read STRUCTURALLY rather than as DDL text.
  *
- * A table-name inventory cannot describe migration 3, which adds no tables --
- * so a snapshot recording version 3 while missing the new columns passed
- * validation, including the deep one: `integrity_check` proves the FILE is
- * structurally sound, and the version check proved the TABLES were present, and
- * neither asks what shape those tables are. `openHub` then reads version 3 as
- * completed, skips the migration, and the first pin or provider query fails with
- * `no such column` -- after that snapshot had already been chosen for recovery,
- * which is the worst possible moment to discover it.
+ * NOT a comparison of `sqlite_master.sql`, and not a hash of it. Two databases
+ * with the same logical schema routinely carry different DDL text: `hub.sql`
+ * writes its tables across several lines, and the same table written on one line
+ * produces different stored text even after whitespace is collapsed. A text or
+ * fingerprint comparison reports "the schema differs" without saying HOW, at the
+ * one moment a readable answer matters most.
  *
- * Empty for versions 1 and 2 by construction: their table lists already imply
- * their columns, because those migrations created the tables.
+ * (The issue that asked for this named `ALTER TABLE ADD COLUMN` as the reason.
+ * Measured on SQLite 3.53, that is not it: an altered table and a freshly
+ * created one produce byte-identical DDL, with and without `NOT NULL DEFAULT`.
+ * The divergence that does occur is authoring format. The conclusion stands and
+ * the stated reason does not, which is worth writing down -- someone who
+ * measures only the ALTER case will conclude a text comparison is safe.)
+ *
+ * CHECK constraints are NOT covered. SQLite exposes no structural pragma for
+ * them, and recovering them from the DDL text would reintroduce exactly the
+ * text-parsing this function avoids. Said plainly here rather than left for a
+ * reader to assume, because an unstated gap in a check reads as coverage.
  */
+export function shapeOf(db) {
+  // NULL-PROTOTYPE, and every name-keyed map below is the same.
+  // A snapshot can contain an object literally named `__proto__`, and
+  // `obj["__proto__"] = v` on a plain object invokes the inherited SETTER
+  // instead of creating an enumerable property -- so the entry vanishes and
+  // `Object.entries` reports it is not there. A trigger with that name could
+  // abort every write while the snapshot validated clean.
+  const tables = Object.create(null);
+  // TRIGGERS ARE PART OF THE SCHEMA AND CAN REFUSE A WRITE OUTRIGHT. A hub
+  // carrying `CREATE TRIGGER ... BEFORE INSERT ON task BEGIN SELECT RAISE(ABORT,
+  // ...); END` has identical tables, columns, indexes and constraints, passes a
+  // deep integrity check, and rejects the first ordinary task filing.
+  const triggers = Object.create(null);
+  for (const r of db.prepare(
+    `SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger'`).all())
+    triggers[r.name] = { table: r.tbl_name, sql: String(r.sql ?? "").replace(/\s+/g, " ").trim() };
+  // `wr` is WITHOUT ROWID. Thirteen hub tables declare it, and rebuilding one
+  // without it is invisible to every other check: the columns, indexes and
+  // constraints are identical, and only the storage changes -- a primary-key
+  // table becomes a rowid table plus a separate PK index.
+  const propsOf = new Map(
+    db.prepare(`SELECT name, strict, wr FROM pragma_table_list WHERE schema = 'main' AND type = 'table'`)
+      .all().map(r => [r.name, { strict: Number(r.strict) === 1, withoutRowid: Number(r.wr) === 1 }]));
+  const names = db.prepare(
+    `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+    .all().map(r => r.name);
+
+  for (const t of names) {
+    const columns = Object.create(null);
+    // `dflt_value` is part of the writable contract, not decoration. `task.priority`
+    // is `NOT NULL DEFAULT 'p2'` and callers omit it; a snapshot that lost the
+    // default keeps every row valid and passes an integrity check, then fails the
+    // first ordinary insert with a NOT NULL violation after being restored.
+    // `table_xinfo`, NOT `table_info`: the latter omits GENERATED columns
+    // entirely, so a snapshot could carry a generated NOT NULL column that
+    // refuses ordinary inserts while reading as having no extra columns at all.
+    // `hidden` is 0 for an ordinary column, 2 for VIRTUAL and 3 for STORED.
+    for (const c of db.prepare(
+      `SELECT name, type, "notnull", pk, dflt_value, hidden FROM pragma_table_xinfo(?)`).all(t))
+      columns[c.name] = { type: String(c.type ?? "").toUpperCase(),
+                          notNull: Number(c.notnull) === 1, pk: Number(c.pk) > 0,
+                          dflt: c.dflt_value == null ? null : String(c.dflt_value),
+                          generated: Number(c.hidden) > 1 };
+
+    const indexes = Object.create(null);
+    for (const i of db.prepare(`SELECT name, "unique", origin FROM pragma_index_list(?)`).all(t)) {
+      // `index_xinfo` carries the COLLATION and sort order of each key;
+      // `index_info` discards both. An index recreated as
+      // `... (idempotency_key COLLATE NOCASE)` keeps its name, column,
+      // uniqueness and predicate, and silently imposes stricter uniqueness --
+      // two keys differing only by case stop being distinct.
+      const cols = db.prepare(
+        `SELECT name, coll, desc FROM pragma_index_xinfo(?) WHERE key = 1 ORDER BY seqno`)
+        .all(i.name).map(r => `${r.name} ${String(r.coll ?? "BINARY").toUpperCase()}${Number(r.desc) ? " DESC" : ""}`);
+      // AN IMPLICIT INDEX IS KEYED BY ITS COLUMNS, NOT ITS NAME. SQLite names the
+      // indexes it creates for PRIMARY KEY and UNIQUE `sqlite_autoindex_<table>_<n>`,
+      // and the number is positional -- so dropping an unrelated constraint
+      // renumbers the survivors and a name-keyed comparison reports a defect
+      // where the schema is identical.
+      // THE PREDICATE OF A PARTIAL INDEX IS PART OF WHAT IT ENFORCES.
+      // `one_live_run` is `UNIQUE ON phase_run(task) WHERE status IN
+      // ('live','adopted')`. Recreated with a different WHERE it keeps its name
+      // and its uniqueness flag and stops enforcing the single-live-run
+      // invariant entirely. Taken from the WHERE clause specifically rather than
+      // by comparing whole DDL, so authoring format cannot raise a false defect.
+      const ddl = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?")
+                    .get(i.name)?.sql ?? null;
+      const where = ddl ? (ddl.match(/\bWHERE\b([\s\S]*)$/i)?.[1] ?? "").replace(/\s+/g, " ").trim() : "";
+      const key = i.origin === "c" ? `name:${i.name}` : `cols:${cols.join(",")}`;
+      indexes[key] = { unique: Number(i.unique) === 1, columns: cols, explicit: i.origin === "c",
+                       name: i.name, where, ddl: ddl ?? null };
+    }
+
+    const foreignKeys = Object.create(null);
+    for (const f of db.prepare(
+      `SELECT "table", "from", "to", on_delete, on_update FROM pragma_foreign_key_list(?)`).all(t))
+      foreignKeys[`${f.from}->${f.table}.${f.to}`] =
+        { onDelete: f.on_delete, onUpdate: f.on_update };
+
+    const props = propsOf.get(t) ?? { strict: false, withoutRowid: false };
+    tables[t] = { columns, indexes, foreignKeys, strict: props.strict,
+                  withoutRowid: props.withoutRowid, checks: checksOf(db, t),
+                  ddl: ddlOf(db, "table", t) };
+  }
+  return { tables, triggers };
+}
+
+/**
+ * The CHECK constraints on a table, as normalised text.
+ *
+ * SQLite exposes no structural pragma for CHECK, so this is the one place the
+ * DDL must be read -- and it is read NARROWLY: the balanced parenthesis group
+ * after each `CHECK` keyword, whitespace collapsed, rather than the whole
+ * statement. Comparing whole DDL is what this module exists to avoid, because
+ * authoring format differs between a fresh store and a rebuilt one and would
+ * raise a defect where the schema is identical.
+ *
+ * A tightened CHECK is not decoration: narrowing `task.priority` to `'p1'` alone
+ * leaves existing rows valid and every integrity check clean, then refuses the
+ * ordinary insert that relies on the `'p2'` default.
+ */
+function ddlOf(db, type, name) {
+  return db.prepare("SELECT sql FROM sqlite_master WHERE type = ? AND name = ?")
+           .get(type, name)?.sql ?? null;
+}
+
+/**
+ * Split DDL into (text, isCode) runs, so a parenthesis inside a STRING LITERAL
+ * is never read as syntax.
+ *
+ * The first version of the CHECK scanner counted every `(` and `)`. A constraint
+ * containing `'(('` left the depth counter positive through the table's closing
+ * parenthesis, so that constraint was silently dropped -- and dropping it made
+ * the remaining checks compare equal, certifying a snapshot that refuses
+ * ordinary writes. A scanner that loses its place must not also lose the
+ * evidence that it did.
+ */
+function codeRuns(sql) {
+  const runs = [];
+  let i = 0, start = 0;
+  while (i < sql.length) {
+    const c = sql[i];
+    if (c === "'" || c === '"' || c === "`") {
+      runs.push({ text: sql.slice(start, i), code: true });
+      const quote = c;
+      let j = i + 1;
+      // Doubled quotes escape themselves in SQL; there is no backslash escape.
+      while (j < sql.length) {
+        if (sql[j] === quote && sql[j + 1] === quote) { j += 2; continue; }
+        if (sql[j] === quote) break;
+        j++;
+      }
+      runs.push({ text: sql.slice(i, j + 1), code: false });
+      i = start = j + 1;
+      continue;
+    }
+    if (c === "-" && sql[i + 1] === "-") {
+      runs.push({ text: sql.slice(start, i), code: true });
+      const j = sql.indexOf("\n", i);
+      const end = j === -1 ? sql.length : j;
+      runs.push({ text: sql.slice(i, end), code: false });
+      i = start = end;
+      continue;
+    }
+    i++;
+  }
+  runs.push({ text: sql.slice(start), code: true });
+  return runs;
+}
+
+/** A parenthesis-depth map over the DDL that ignores literals and comments. */
+function isCodeAt(sql) {
+  const flags = new Array(sql.length).fill(false);
+  let at = 0;
+  for (const run of codeRuns(sql)) {
+    for (let k = 0; k < run.text.length; k++) flags[at + k] = run.code;
+    at += run.text.length;
+  }
+  return flags;
+}
+
+function checksOf(db, table) {
+  const ddl = ddlOf(db, "table", table) ?? "";
+  const code = isCodeAt(ddl);
+  const out = [];
+  const re = /\bCHECK\s*\(/gi;
+  let m;
+  while ((m = re.exec(ddl))) {
+    if (!code[m.index]) continue;            // the keyword itself was inside a literal
+    let depth = 1, i = m.index + m[0].length;
+    for (; i < ddl.length && depth > 0; i++) {
+      if (!code[i]) continue;                 // parens inside literals are text
+      if (ddl[i] === "(") depth++;
+      else if (ddl[i] === ")") depth--;
+    }
+    // A constraint whose parentheses do not balance is RECORDED, not skipped.
+    // Skipping it made the remaining checks compare equal and certified the
+    // snapshot -- the scanner's own failure read as agreement.
+    out.push(depth === 0
+      ? ddl.slice(m.index + m[0].length, i - 1).replace(/\s+/g, " ").trim()
+      : `UNPARSED: ${ddl.slice(m.index, Math.min(ddl.length, m.index + 80)).replace(/\s+/g, " ")}`);
+  }
+  return out.sort();
+}
+
+// Building a scratch store runs every migration, so the shape for a version is
+// computed once per process rather than per snapshot examined.
+const SHAPE_CACHE = new Map();
+/** The structure the migrations produce at `version`. Exported so tests can ask
+ *  what a version REQUIRES without restating it. */
+export function shapeAt(version) {
+  if (!SHAPE_CACHE.has(version)) {
+    const db = scratchAt(version);
+    try { SHAPE_CACHE.set(version, shapeOf(db)); } finally { db.close(); }
+  }
+  return SHAPE_CACHE.get(version);
+}
+
+/** The tables a snapshot at `version` must carry, derived by running the migrations. */
+export function tablesAt(version) {
+  return Object.freeze(Object.keys(shapeAt(version).tables).sort());
+}
+
 /**
  * The lowest hub schema the PROVIDER SCHEDULER can be used against.
  *
@@ -718,62 +938,227 @@ export const TABLES_AT = Object.freeze({ 1: V1, 2: V2, 3: V3 });
  * outside the shared limit. "The hub opened" is therefore not the same question
  * as "the scheduler can be used", and only the second one gates dispatch.
  *
- * Checked against `COLUMNS_AT` rather than trusted: the test asserts this is the
- * version that introduces `provider_lease.token`, so moving the column without
- * moving this constant fails rather than drifting.
+ * Checked against the DERIVED shape rather than trusted: the test asserts this
+ * is the version that introduces `provider_lease.token`, so moving the column
+ * without moving this constant fails rather than drifting.
  */
 export const SCHEDULER_MIN_HUB_VERSION = 3;
 
-export const COLUMNS_AT = Object.freeze({
-  3: Object.freeze({
-    task_territory: Object.freeze({ pinned_until: "INTEGER" }),
-    provider_lease: Object.freeze({ token: "TEXT" }),
-  }),
-});
-
 /**
- * How a store's columns fail this version's requirements, one string each.
- * Empty means it satisfies them.
+ * How a store fails `version`'s requirements, one readable string each. Empty
+ * means it satisfies them.
+ *
+ * ONE-DIRECTIONAL, DELIBERATELY. Missing and wrong are defects; EXTRA tables,
+ * columns and indexes are not. A snapshot taken by a newer binary can carry more
+ * than this version requires and still restore correctly, and refusing it would
+ * turn a compatible snapshot into an unrecoverable one at the worst moment.
  *
  * NAMES ARE NOT ENOUGH, and the difference is not academic. Every hub table is
  * STRICT, so a column of the wrong declared type does not coerce -- it refuses
  * the write. A snapshot carrying `provider_lease.token INTEGER` has the column,
  * passes a name-only inventory, is selected for recovery, and then fails the
  * first `claimProvider` with `cannot store TEXT value in INTEGER column`. That
- * is the same failure mode as the missing column this function was written for,
- * arriving at the same worst moment, so it is the same check.
+ * is the same failure as the missing column, arriving at the same worst moment,
+ * so it is the same check.
+ *
+ * The message names the specific defect -- `provider_lease.token is INTEGER,
+ * want TEXT` -- rather than reporting that the schema differs. That is the
+ * property worth preserving from the inventories this replaces.
  */
-export function columnDefectsAt(db, version) {
-  const want = COLUMNS_AT[version];
-  if (!want) return [];
+/**
+ * Is this a version the hub could actually be at?
+ *
+ * A VERSION BELOW 1 HAS NO SHAPE TO DERIVE. `scratchAt(0)` runs no migration, so
+ * its shape is `schema_version` alone -- and a store carrying that one table
+ * satisfies every requirement derived from it, certifying a database missing
+ * every authority-bearing hub table. `openHub` then runs migration 1 over the
+ * restored file and silently recreates them EMPTY, so the hub comes back looking
+ * healthy with nothing in it.
+ *
+ * The inventory this module replaced rejected that shape only because it had no
+ * entry for version 0. Deriving answered the question instead of refusing it,
+ * which is the standing risk in deriving: a derivation always produces
+ * something.
+ *
+ * ONE PREDICATE, TWO CALLERS. `validateSnapshot` refuses early so it can say
+ * plainly what is wrong; this module refuses so a direct caller cannot get a
+ * clean answer for a version that never existed. The RULE is here; the wording
+ * belongs to each site.
+ */
+export function isKnownVersion(version) {
+  return Number.isInteger(version) && version >= 1;
+}
+
+export function schemaDefectsAt(db, version) {
+  if (!isKnownVersion(version))
+    return [`schema version ${version} is not a version this hub has ever had`];
+  const want = shapeAt(version);
+  const have = shapeOf(db);
   const bad = [];
-  for (const [table, cols] of Object.entries(want)) {
-    const have = new Map(db.prepare(`SELECT name, type FROM pragma_table_info(?)`).all(table)
-                           .map(r => [r.name, String(r.type ?? "").toUpperCase()]));
-    for (const [c, type] of Object.entries(cols)) {
-      if (!have.has(c)) { bad.push(`${table}.${c} is missing`); continue; }
-      const got = have.get(c);
-      if (got !== type.toUpperCase()) bad.push(`${table}.${c} is ${got || "untyped"}, want ${type}`);
+
+  for (const [t, wantTable] of Object.entries(want.tables)) {
+    const haveTable = have.tables[t];
+    if (!haveTable) { bad.push(`table ${t} is missing`); continue; }
+
+    for (const [c, w] of Object.entries(wantTable.columns)) {
+      const h = haveTable.columns[c];
+      if (!h) { bad.push(`${t}.${c} is missing`); continue; }
+      if (h.type !== w.type) bad.push(`${t}.${c} is ${h.type || "untyped"}, want ${w.type}`);
+      if (w.notNull !== h.notNull)
+        bad.push(`${t}.${c} is ${h.notNull ? "NOT NULL" : "nullable"}, want ${w.notNull ? "NOT NULL" : "nullable"}`);
+      if (w.pk && !h.pk) bad.push(`${t}.${c} is not part of the primary key, want it to be`);
+      if (h.dflt !== w.dflt)
+        bad.push(`${t}.${c} defaults to ${h.dflt ?? "nothing"}, want ${w.dflt ?? "no default"}`);
     }
+
+    // AN EXTRA COLUMN IS A DEFECT. FULL STOP.
+    //
+    // This was three rounds of narrowing an exemption that should never have
+    // existed. It was there so a snapshot from a NEWER binary could still be
+    // restored -- but such a snapshot never reaches this function.
+    // `validateSnapshot` refuses `version > expectVersion` before calling it,
+    // and `openHub` refuses a store above its own version. At a given version
+    // the shape is whatever the migrations produce, exactly.
+    //
+    // Every attempt to classify an extra as harmless was wrong in a new way:
+    // NOT NULL without a default, then a GENERATED column whose expression
+    // throws on ordinary data, then a nullable generated column doing the same,
+    // then a column a later migration ADOPTS -- migration 3 sees
+    // `provider_lease.token` already present, skips its ALTER, records version 3,
+    // and the first text token hits a STRICT INTEGER column.
+    //
+    // "Can this extra refuse a write" is undecidable in general; SQLite will run
+    // arbitrary expressions during an insert. The question was the wrong one.
+    for (const c of Object.keys(haveTable.columns))
+      if (!(c in wantTable.columns))
+        bad.push(`${t}.${c} is not in this schema; a snapshot at version ${version} ` +
+                 `must have exactly this version's shape`);
+
+    for (const [key, w] of Object.entries(wantTable.indexes)) {
+      const h = haveTable.indexes[key];
+      const label = w.explicit ? `index ${w.name} on ${t}` : `${t}(${w.columns.join(", ")})`;
+      if (!h) { bad.push(`${label} is missing`); continue; }
+      if (w.unique !== h.unique)
+        bad.push(`${label} is ${h.unique ? "UNIQUE" : "not UNIQUE"}, want ${w.unique ? "UNIQUE" : "not UNIQUE"}`);
+      if (w.columns.join(",") !== h.columns.join(","))
+        bad.push(`${label} covers (${h.columns.join(", ")}), want (${w.columns.join(", ")})`);
+      if (w.where !== h.where)
+        bad.push(`${label} is filtered by ${h.where || "nothing"}, want ${w.where || "no filter"}`);
+    }
+
+    // AN EXTRA INDEX IS A DEFECT, unique or not. "Non-unique costs write time,
+    // not writes" was false: an EXPRESSION index is evaluated on every insert
+    // that maintains it, so `ON provider_state(json_extract(provider, '$.x'))`
+    // refuses an ordinary non-JSON provider value while being perfectly
+    // non-unique.
+    for (const [key, h] of Object.entries(haveTable.indexes))
+      if (!(key in wantTable.indexes))
+        bad.push(`index ${h.name} on ${t}(${h.columns.join(", ")}) is not in this schema; ` +
+                 `a snapshot at version ${version} must have exactly this version's shape`);
+
+    for (const [key, w] of Object.entries(wantTable.foreignKeys)) {
+      const h = haveTable.foreignKeys[key];
+      if (!h) { bad.push(`foreign key ${t}.${key} is missing`); continue; }
+      if (h.onDelete !== w.onDelete)
+        bad.push(`foreign key ${t}.${key} is ON DELETE ${h.onDelete}, want ${w.onDelete}`);
+      if (h.onUpdate !== w.onUpdate)
+        bad.push(`foreign key ${t}.${key} is ON UPDATE ${h.onUpdate}, want ${w.onUpdate}`);
+    }
+    for (const key of Object.keys(haveTable.foreignKeys))
+      if (!(key in wantTable.foreignKeys))
+        bad.push(`foreign key ${t}.${key} is not in this schema and can refuse writes`);
+
+    // CHECK CONSTRAINTS, BOTH WAYS. A tightened CHECK leaves existing rows valid
+    // and refuses new ones: narrowing `task.priority` to `'p1'` passes every
+    // integrity check on an empty hub and then rejects the ordinary insert that
+    // relies on the `'p2'` default.
+    const wantChecks = wantTable.checks.join(" ;; ");
+    const haveChecks = haveTable.checks.join(" ;; ");
+    if (wantChecks !== haveChecks) {
+      const added   = haveTable.checks.filter((c) => !wantTable.checks.includes(c));
+      const removed = wantTable.checks.filter((c) => !haveTable.checks.includes(c));
+      if (added.length)   bad.push(`table ${t} adds CHECK (${added[0]}), which can refuse writes`);
+      if (removed.length) bad.push(`table ${t} is missing CHECK (${removed[0]})`);
+    }
+
+    // ── THE BACKSTOP ─────────────────────────────────────────────────────────
+    //
+    // Everything above reads SPECIFIC properties, and that list is an open
+    // enumeration of SQLite features: generated columns, key collation, ON
+    // CONFLICT policies, and CHECK text each hid there in turn, and each
+    // certified a snapshot that refuses ordinary writes. Closing the COMPARISON
+    // did not close the READER.
+    //
+    // So the definitions are compared as text as well. This is complete by
+    // construction -- anything nobody has thought to read is still caught --
+    // and it is safe here for a reason I got wrong the first time: a snapshot
+    // and the scratch store are both produced by EXECUTING THE SAME MIGRATION
+    // SOURCE, so their stored DDL is byte-identical. Measured: two
+    // independently created hubs agree on all 58 objects. The earlier argument
+    // against comparing text came from a fixture that wrote the same table two
+    // ways by hand, which is not how either store is ever built.
+    //
+    // The specific checks above are what stays: they name the defect. This only
+    // says THAT something differs, which is the right trade for completeness.
+    //
+    // It is skipped for an object carrying a PERMITTED extra, because an extra
+    // nullable column or non-unique index legitimately changes the text, and
+    // refusing those would break restoring a newer binary's snapshot.
+    // No exemption any more: the shapes must be equal, so the text must be too.
+    // The skip was itself a hole -- an extra column DISABLED the backstop for
+    // the whole table, so adding one hid every other textual difference.
+    if (wantTable.ddl != null && haveTable.ddl != null && wantTable.ddl !== haveTable.ddl)
+      bad.push(`table ${t}'s definition differs from this schema in a way the ` +
+               `property checks do not name -- compare its CREATE statement`);
+
+    for (const [key, w] of Object.entries(wantTable.indexes)) {
+      const h = haveTable.indexes[key];
+      if (h && w.ddl != null && h.ddl != null && w.ddl !== h.ddl)
+        bad.push(`index ${w.name} on ${t} is defined differently from this schema`);
+    }
+
+    if (wantTable.strict && !haveTable.strict) bad.push(`table ${t} is not STRICT`);
+    if (wantTable.withoutRowid !== haveTable.withoutRowid)
+      bad.push(`table ${t} is ${haveTable.withoutRowid ? "WITHOUT ROWID" : "a rowid table"}, ` +
+               `want ${wantTable.withoutRowid ? "WITHOUT ROWID" : "a rowid table"}`);
   }
+
+  // AND AN EXTRA TABLE, for the same reason: at this version the schema is what
+  // the migrations produce. A table nothing writes to still carries triggers,
+  // constraints and a name a later migration may want.
+  for (const t of Object.keys(have.tables))
+    if (!(t in want.tables))
+      bad.push(`table ${t} is not in this schema; a snapshot at version ${version} ` +
+               `must have exactly this version's shape`);
+
+  // TRIGGERS ARE COMPARED AS A WHOLE-SCHEMA SET, not per table, because a
+  // trigger on an EXTRA table can still refuse a write to an expected one.
+  for (const [name, h] of Object.entries(have.triggers)) {
+    const w = want.triggers[name];
+    if (!w) { bad.push(`trigger ${name} on ${h.table} is not in this schema and can refuse or alter writes`); continue; }
+    if (w.sql !== h.sql) bad.push(`trigger ${name} on ${h.table} does not match this schema`);
+  }
+  for (const name of Object.keys(want.triggers))
+    if (!(name in have.triggers)) bad.push(`trigger ${name} is missing`);
+
   return bad;
 }
 
 /**
- * The CURRENT schema's tables: what snapshot validation compares a
- * same-version snapshot against, and what Task 11 compares the live database to.
+ * The CURRENT schema's tables: what snapshot validation compares a same-version
+ * snapshot against, and what Task 11 compares the live database to.
  *
- * Derived from `TABLES_AT`, NOT from `hub.sql`. hub.sql is frozen as migration 1
- * by design and its freeze test enforces that, so a constant read straight from
- * it can never discover a table migration 2 creates -- it would sit at the v1
- * inventory forever, Task 11's live-set equality would fail the moment migration
- * 2 landed, and the fallback validation would omit exactly the new
- * authority-bearing table.
+ * Derived by running the migrations, NOT read from `hub.sql`. hub.sql is frozen
+ * as migration 1 by design and its freeze test enforces that, so a constant read
+ * straight from it can never discover a table migration 2 creates -- it would
+ * sit at the v1 inventory forever, Task 11's live-set equality would fail the
+ * moment migration 2 landed, and the fallback validation would omit exactly the
+ * new authority-bearing table.
  */
-export const HUB_TABLES = TABLES_AT[HUB_SCHEMA_VERSION];
-// LOUD, at module load. A migration added without its inventory would otherwise
-// make HUB_TABLES undefined, and every `HUB_TABLES.filter(...)` in the backup
-// path would throw somewhere far away from the omission that caused it.
-if (!HUB_TABLES)
-  throw new Error(`TABLES_AT has no inventory for schema version ${HUB_SCHEMA_VERSION}; ` +
-                  `every migration that adds a table adds its entry there`);
+export const HUB_TABLES = tablesAt(HUB_SCHEMA_VERSION);
+// LOUD, at module load. A version whose migrations produce nothing would make
+// every `HUB_TABLES.filter(...)` in the backup path answer empty, and a snapshot
+// missing every table would validate clean.
+if (!HUB_TABLES.length)
+  throw new Error(`the migrations produce no tables at schema version ${HUB_SCHEMA_VERSION}; ` +
+                  `snapshot validation would accept anything`);

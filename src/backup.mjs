@@ -23,12 +23,12 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, existsSync, copyFileSync, readdirSync, rmSync, writeFileSync, linkSync, renameSync, openSync, closeSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { open as openStore, exportJsonl } from "./db/ops.mjs";
-// Task 8's subset. `TABLES_AT` and `HUB_TABLES` are what a snapshot's table set
+// Task 8's subset. `tablesAt` and `HUB_TABLES` are what a snapshot's table set
 // is validated against; Task 9 adds the locks, replay and hubEvent imports when
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
 // naming a module that does not exist yet breaks every import of this file.
-import { openHub, isOperational, faultKind, HUB_SCHEMA_VERSION, HUB_TABLES, TABLES_AT,
-         columnDefectsAt, backfillPinDeadlines } from "./build/hubdb.mjs";
+import { openHub, isOperational, faultKind, HUB_SCHEMA_VERSION, HUB_TABLES, tablesAt,
+         schemaDefectsAt, isKnownVersion, backfillPinDeadlines } from "./build/hubdb.mjs";
 // Task 9's additions. `restoreHub` takes the maintenance lock before it refuses,
 // enumerates live writers to name them, and replays the tail -- and it needs
 // `replayableKinds`/`NON_REPLAYED_KINDS` to refuse a tail exported by a NEWER
@@ -260,7 +260,19 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo", de
                    : `the snapshot records version ${version} but is missing migration(s) ${gaps.join(", ")}` };
       if (expectVersion != null && version > expectVersion)
         return { ok: false, why: `snapshot is schema version ${version}; this binary knows ${expectVersion}`, version, integrity };
-      const required = TABLES_AT[version] ?? HUB_TABLES;
+      // DERIVED by running the migrations to this version, not looked up in a
+      // declared list. A migration that adds a table is covered the day it
+      // lands. A version this binary does not know still falls back to the
+      // current set rather than validating nothing.
+      // A VERSION BELOW 1 IS REFUSED BEFORE ANYTHING IS DERIVED FROM IT.
+      // `tablesAt(0)` requires only `schema_version`, so a store with that table
+      // plus a minimal `hub_event` satisfied the table check AND the marker
+      // query below -- and `openHub` then ran migration 1 over it and silently
+      // recreated every authority-bearing table EMPTY.
+      if (!isKnownVersion(version))
+        return { ok: false, why: `the snapshot records schema version ${version}, which is not a version this hub has ever had`,
+                 version, integrity };
+      const required = version <= HUB_SCHEMA_VERSION ? tablesAt(version) : HUB_TABLES;
       const missing = required.filter(t => !present.has(t));
       if (missing.length)
         return { ok: false, why: `snapshot at version ${version} is missing ${missing.length} table(s): ${missing.slice(0, 5).join(", ")}`,
@@ -274,9 +286,9 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo", de
       // query -- with `no such column` when the column is absent, and with a
       // STRICT type refusal when it is present at the wrong type -- after this
       // snapshot had been chosen for recovery.
-      const colDefects = columnDefectsAt(probe, version);
+      const colDefects = version <= HUB_SCHEMA_VERSION ? schemaDefectsAt(probe, version) : [];
       if (colDefects.length)
-        return { ok: false, why: `snapshot at version ${version} has ${colDefects.length} column defect(s): ${colDefects.slice(0, 5).join("; ")}`,
+        return { ok: false, why: `snapshot at version ${version} has ${colDefects.length} schema defect(s): ${colDefects.slice(0, 5).join("; ")}`,
                  version, integrity };
       // schema_version alone is too weak a marker: a physically valid SQLite file
       // carrying only that table passes, is retained as a usable backup, and is

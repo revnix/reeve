@@ -6,7 +6,7 @@
 // a newer store would read columns it does not know about as absent, and
 // absence is never read as success anywhere else in this system either.
 import { hubPathFor, statePathFor } from "../src/paths.mjs";
-import { openHub, hubTx, HUB_SCHEMA_VERSION, COLUMNS_AT } from "../src/build/hubdb.mjs";
+import { openHub, hubTx, HUB_SCHEMA_VERSION, shapeAt } from "../src/build/hubdb.mjs";
 import { validateSnapshot } from "../src/backup.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -445,7 +445,12 @@ import { hubEvent, migrationPlan } from "../src/build/hubdb.mjs";
   db.exec("ALTER TABLE task_territory DROP COLUMN pinned_until");
   db.close();
   const v = validateSnapshot(bad, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true });
-  check(v.ok === false && /column/i.test(v.why ?? ""),
+  // ASSERTED ON THE COLUMN NAME, not on the word "column" appearing. The
+  // previous form matched any message containing that word, so a refusal saying
+  // only "column defect(s)" satisfied a check whose own name promises the column
+  // is IDENTIFIED. Naming the specific defect is the DX property worth keeping,
+  // so it is the thing asserted.
+  check(v.ok === false && /task_territory\.pinned_until/.test(v.why ?? ""),
     "a version-3 snapshot missing a migration-3 column is refused, with the column named",
     JSON.stringify(v));
 
@@ -472,28 +477,79 @@ import { hubEvent, migrationPlan } from "../src/build/hubdb.mjs";
     "a version-3 snapshot with a migration-3 column at the WRONG TYPE is refused",
     JSON.stringify(tv));
 
-  // THE DECLARATION IS CHECKED AGAINST THE MIGRATION, not trusted.
+  // THERE IS NOTHING LEFT TO DRIFT, and this asserts the replacement is not
+  // vacuous instead.
   //
-  // COLUMNS_AT now restates the types migration 3's DDL declares, and a restated
-  // fact drifts the moment one side changes -- a validator that requires TEXT
-  // where the migration produces INTEGER would refuse every healthy snapshot,
-  // which is worse than the gap it closes. So the intact store above, which was
-  // built by running the migrations, is the authority: what it actually has is
-  // what COLUMNS_AT must say.
+  // What a version requires used to be a declared list restating the migrations'
+  // DDL, and the test here compared the two. Deriving the requirement by RUNNING
+  // the migrations removes the second copy, so a drift check is now a comparison
+  // of a thing with itself and would pass for any implementation, including one
+  // that derives nothing.
+  //
+  // So the question changes from "do the two agree" to "does the derived
+  // requirement actually contain anything". An empty shape agrees with every
+  // snapshot, and snapshot validation would accept a blank file.
   {
-    const live = openHub(good);
-    const drift = [];
-    for (const [table, cols] of Object.entries(COLUMNS_AT[HUB_SCHEMA_VERSION] ?? {})) {
-      const have = new Map(live.prepare("SELECT name, type FROM pragma_table_info(?)").all(table)
-                             .map(r => [r.name, String(r.type ?? "").toUpperCase()]));
-      for (const [c, want] of Object.entries(cols))
-        if (have.get(c) !== want.toUpperCase())
-          drift.push(`${table}.${c}: migration says ${have.get(c) ?? "absent"}, COLUMNS_AT says ${want}`);
-    }
-    live.close();
-    check(drift.length === 0,
-      "COLUMNS_AT describes the shape the migrations actually produce", drift.join("; "));
+    const shape = shapeAt(HUB_SCHEMA_VERSION).tables;
+    check(Object.keys(shape).length > 0,
+      "control: the derived shape for the current version is non-empty",
+      `${Object.keys(shape).length} table(s)`);
+    // The migration-3 columns specifically, since they are the ones no
+    // table-name inventory could ever describe and the reason this exists.
+    check(shape.provider_lease?.columns?.token?.type === "TEXT",
+      "the derived shape carries provider_lease.token as TEXT",
+      JSON.stringify(shape.provider_lease?.columns?.token));
+    check(shape.task_territory?.columns?.pinned_until?.type === "INTEGER",
+      "and task_territory.pinned_until as INTEGER",
+      JSON.stringify(shape.task_territory?.columns?.pinned_until));
+    // AND IT REACHES BEYOND COLUMNS. The lists this replaced could not describe
+    // an index or a foreign key at all, which is the gap the issue named.
+    const anyIndex = Object.values(shape).some(t => Object.keys(t.indexes).length > 0);
+    const anyFk    = Object.values(shape).some(t => Object.keys(t.foreignKeys).length > 0);
+    check(anyIndex, "the derived shape carries indexes, which no table-name inventory could");
+    check(anyFk,    "and foreign keys, likewise");
   }
+}
+
+// ── a snapshot claiming a version the hub never had ──────────────────────────
+//
+// `schema_version` holding 0 (or a negative) passed every check: the row exists
+// so it is not "no version at all", there are no GAPS below it, and the table
+// requirement DERIVED from version 0 is `schema_version` alone -- which that
+// store has. A minimal `hub_event` then satisfied the marker query, so deep
+// validation certified a database missing every authority-bearing table.
+//
+// And the consequence is the bad one: `openHub` runs migration 1 over the
+// restored file and silently RECREATES those tables empty, so the hub comes
+// back looking healthy with no tasks, no approvals and no leases.
+//
+// The inventory this replaced rejected it only because it had no entry for
+// version 0. Deriving answered the question instead of refusing it, which is
+// the risk in deriving: a derivation always produces something.
+{
+  const bad = join(dir, "version-zero.db");
+  const db = new DatabaseSync(bad);
+  db.exec(`CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL) STRICT`);
+  db.prepare("INSERT INTO schema_version(version, applied_at) VALUES(0, unixepoch())").run();
+  db.exec("CREATE TABLE hub_event (id INTEGER PRIMARY KEY) STRICT");
+  db.close();
+
+  const v = validateSnapshot(bad, { kind: "hub", expectVersion: HUB_SCHEMA_VERSION, deep: true });
+  check(v.ok === false && /schema version 0/.test(v.why ?? ""),
+    "a snapshot recording schema version 0 is refused, naming the version",
+    JSON.stringify(v));
+
+  // CONTROL: the fixture really does satisfy the checks that come BEFORE the
+  // version floor -- it has a version row, no gaps, and the hub_event marker.
+  // Without this the refusal above could be coming from any of them, and the
+  // floor would be untested.
+  const probe = new DatabaseSync(bad, { readOnly: true });
+  const rows = probe.prepare("SELECT version FROM schema_version").all().map(r => r.version);
+  const marker = probe.prepare("SELECT count(*) c FROM hub_event").get();
+  probe.close();
+  check(rows.length === 1 && rows[0] === 0 && marker.c === 0,
+    "control: the fixture has a version row and the hub_event marker, so it reaches the floor",
+    JSON.stringify({ rows, marker }));
 }
 
 rmSync(dir, { recursive: true, force: true });

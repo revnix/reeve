@@ -1,0 +1,117 @@
+// The gate that runs BEFORE a merge, and every way it must refuse to say "clear".
+//
+// It exists because three pull requests went wrong in three different ways in one
+// day: two merged at a head their branch had moved past (the second stranding two
+// review fixes), and one merged with a review finding still open. Every check we had
+// answered afterwards.
+//
+// The assertions below are mostly about the states that are NOT clear, because
+// "clear" is the easy one and the dangerous failure is a summary line that reads as
+// a pass while carrying a reason not to merge.
+import { gate, headState, threadState, CLEAR, REFUSE, UNREVIEWED, UNKNOWN }
+  from "../src/premerge.mjs";
+
+let fail = 0;
+const check = (ok, name, detail) => {
+  console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+  if (!ok) { if (detail !== undefined) console.log("        " + detail); fail++; }
+};
+
+const SHA_A = "a".repeat(40), SHA_B = "b".repeat(40);
+const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
+
+// --- head ------------------------------------------------------------------------
+{
+  check(headState({ prHead: SHA_A, branchNow: SHA_A, branchRead: "read" }).state === CLEAR,
+    "a head equal to the branch tip is clear");
+
+  const moved = headState({ prHead: SHA_A, branchNow: SHA_B, branchRead: "read" });
+  check(moved.state === REFUSE, "a head the branch has moved past is refused", moved.why);
+  // The WORDING is load-bearing and was corrected once already: unequal tips prove
+  // the merge would take an older commit, NOT that anything is missing from main.
+  check(!/missing from main|not on main/i.test(moved.why),
+    "and the refusal does not claim those commits are missing from the default branch", moved.why);
+
+  check(headState({ prHead: SHA_A, branchNow: null, branchRead: "unreadable" }).state === UNKNOWN,
+    "refs that could not be read are UNKNOWN, not clear");
+  check(headState({ prHead: SHA_A, branchNow: null, branchRead: "gone" }).state === UNKNOWN,
+    "a deleted head branch is UNKNOWN, not clear");
+  check(headState({ prHead: null, branchNow: SHA_A, branchRead: "read" }).state === UNKNOWN,
+    "an unreadable pull-request head is UNKNOWN, not clear");
+  // CONTROL: unreadable and gone are DIFFERENT facts and must not share one sentence.
+  check(headState({ prHead: SHA_A, branchNow: null, branchRead: "unreadable" }).why
+        !== headState({ prHead: SHA_A, branchNow: null, branchRead: "gone" }).why,
+    "control: 'gone' and 'unreadable' give different reasons, so a reader can tell them apart");
+}
+
+// --- threads ---------------------------------------------------------------------
+{
+  check(threadState({ totalCount: 3, nodes: resolved(3) }).state === CLEAR,
+    "every thread resolved is clear");
+
+  const open = threadState({ totalCount: 3, nodes: [...resolved(2), { isResolved: false }] });
+  check(open.state === REFUSE && open.unresolved.length === 1,
+    "an unresolved thread is refused, and named", open.why);
+
+  // THE STATE MOST LIKELY TO BE ARGUED AWAY. An empty list means both "reviewed and
+  // nothing raised" and "never reviewed", and merging on the second is not the same
+  // decision as merging on the first.
+  const none = threadState({ totalCount: 0, nodes: [] });
+  check(none.state === UNREVIEWED, "no threads at all is UNREVIEWED, not clear", none.why);
+  check(none.state !== CLEAR, "control: and it is specifically NOT the clear state");
+
+  // A page cap makes a partial read look settled. This is the completeness signal.
+  const capped = threadState({ totalCount: 120, nodes: resolved(100) });
+  check(capped.state === UNKNOWN,
+    "a truncated listing is UNKNOWN, because 'none unresolved' would be about a page", capped.why);
+
+  check(threadState({}).state === UNKNOWN, "an absent listing is UNKNOWN, not clear");
+  check(threadState({ totalCount: 2, nodes: null }).state === UNKNOWN,
+    "a null node list is UNKNOWN, not clear");
+}
+
+// --- the combined verdict never rounds up ----------------------------------------
+{
+  const bothClear = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
+                           threads: { totalCount: 1, nodes: resolved(1) } });
+  check(bothClear.state === CLEAR && bothClear.clear === true,
+    "control: when both halves are clear the gate is clear", JSON.stringify(bothClear.why));
+
+  // Each half is checked for dominance separately, because a gate that only reports
+  // the FIRST problem gets one fixed and is surprised by the other.
+  const headBad = gate({ head: { prHead: SHA_A, branchNow: SHA_B, branchRead: "read" },
+                         threads: { totalCount: 1, nodes: resolved(1) } });
+  check(headBad.state === REFUSE && !headBad.clear, "a stale head refuses even with threads clear");
+
+  const threadsBad = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
+                            threads: { totalCount: 1, nodes: [{ isResolved: false }] } });
+  check(threadsBad.state === REFUSE && !threadsBad.clear, "an open thread refuses even with the head current");
+
+  const unreviewed = gate({ head: { prHead: SHA_A, branchNow: SHA_A, branchRead: "read" },
+                            threads: { totalCount: 0, nodes: [] } });
+  check(unreviewed.state === UNREVIEWED && !unreviewed.clear,
+    "an unreviewed pull request is not clear even with a current head", JSON.stringify(unreviewed.why));
+
+  // UNKNOWN outranks UNREVIEWED: not knowing is worse than knowing nobody looked.
+  const unknownWins = gate({ head: { prHead: SHA_A, branchNow: null, branchRead: "unreadable" },
+                             threads: { totalCount: 0, nodes: [] } });
+  check(unknownWins.state === UNKNOWN, "UNKNOWN outranks UNREVIEWED");
+
+  const refuseWins = gate({ head: { prHead: SHA_A, branchNow: null, branchRead: "unreadable" },
+                            threads: { totalCount: 1, nodes: [{ isResolved: false }] } });
+  check(refuseWins.state === REFUSE, "REFUSE outranks UNKNOWN, so the worst news wins");
+
+  // BOTH reasons are always reported, whichever won.
+  check(refuseWins.why.length === 2 && refuseWins.why.some(w => w.startsWith(UNKNOWN))
+        && refuseWins.why.some(w => w.startsWith(REFUSE)),
+    "and both halves are reported, not only the one that decided the verdict",
+    JSON.stringify(refuseWins.why));
+
+  // The one thing no summary line may do.
+  for (const g of [headBad, threadsBad, unreviewed, unknownWins, refuseWins])
+    if (g.clear) { check(false, "a non-clear verdict never reports clear:true", g.state); break; }
+  check(true, "no non-clear verdict reports clear:true");
+}
+
+console.log(fail ? `\nFAILED ${fail}` : "\nok");
+process.exit(fail ? 1 : 0);

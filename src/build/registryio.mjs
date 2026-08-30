@@ -14,8 +14,10 @@
 
 import { readFileSync, lstatSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, isAbsolute } from "node:path";
-import { execFileSync } from "node:child_process";
+import { join, posix as pathPosix, win32 as pathWin32 } from "node:path";
+const isAbsolutePosix = pathPosix.isAbsolute;
+const isAbsoluteWin32 = pathWin32.isAbsolute;
+import { spawnSync } from "node:child_process";
 import { hubPathFor } from "../paths.mjs";
 import { resolveRepoIdAt } from "./repoid.mjs";
 import { validate, withDefaults } from "../profile/schema.mjs";
@@ -59,6 +61,36 @@ const versionOf = (reg) =>
  * Returns `{ projects, registry, error }`. `bin/reeve` reads `.projects` and
  * `.error`; `resolveSnapshot` takes `.registry`.
  */
+/**
+ * Is this a path the daemon can resolve to the SAME place every time?
+ *
+ * PLATFORM IS A PARAMETER, not an ambient fact, so the Windows rule is testable
+ * from a POSIX runner. It was not: the check lived inline, and the only
+ * assertion available was a source-text search for the constant's name -- which
+ * still passed when the constant was defined and no longer used. An assertion
+ * that cannot fail for the right reason is not an assertion.
+ *
+ * `isAbsolute` is necessary and NOT sufficient on Windows. Both `\repo` and
+ * `/repo` are absolute there and both are rooted on the process's current DRIVE:
+ * measured with `path.win32.resolve`, the same `/repo` entry becomes `C:\repo`
+ * from a C-drive daemon and `D:\repo` from a D-drive one. The registry would
+ * then select a different checkout and profile depending on how the service was
+ * started, which is the instability this validation exists to prevent.
+ *
+ * A NUL byte passes every string check and then reaches `lstatSync`, which
+ * raises ERR_INVALID_ARG_VALUE rather than ENOENT. `resolveClaims` handles
+ * ENOENT only, so snapshot resolution THREW instead of returning a refusal.
+ */
+const DRIVE_OR_UNC = /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/]+[^\\/]+)/;
+
+export function isRootedPath(v, platform = process.platform) {
+  if (typeof v !== "string" || v.length === 0) return false;
+  if (v.includes("\0")) return false;
+  const abs = platform === "win32" ? isAbsoluteWin32(v) : isAbsolutePosix(v);
+  if (!abs) return false;
+  return platform !== "win32" || DRIVE_OR_UNC.test(v);
+}
+
 export function parseRegistry(text, path) {
   const fail = (why) => ({ projects: [], registry: { version: 0, projects: Object.create(null) }, error: `${path}: ${why}` });
   let reg;
@@ -143,7 +175,8 @@ export function parseRegistry(text, path) {
   // paths, not claim paths: claims are slash-separated on every platform by
   // rule, but a repoPath is whatever the operating system uses. reeve has to
   // run on macOS, Windows and Ubuntu.
-  const isAbs = (v) => typeof v === "string" && v.length > 0 && isAbsolute(v);
+  const isAbs = (v) => isRootedPath(v, process.platform);
+
   const bad = Object.entries(reg)
     .filter(([, v]) => !v || typeof v !== "object" || Array.isArray(v) ||
                        typeof v.nwo !== "string" || !NWO.test(v.nwo) ||
@@ -208,7 +241,7 @@ export function loadRegistry(home) {
  * them and the filing is refused with both field names in it. That refusal is
  * the correct state, and it is what makes the block visible rather than silent.
  */
-export function registryIo(home, project, entry, { fetchRepoId = null, git = execFileSync, connect = null } = {}) {
+export function registryIo(home, project, entry, { fetchRepoId = null, spawn = spawnSync, connect = null } = {}) {
   // Read ONCE per io, not once per lookup: four members read the same file, and
   // four reads could disagree if the profile changed between them -- a snapshot
   // assembled from two different profiles is not a snapshot of either.
@@ -275,25 +308,74 @@ export function registryIo(home, project, entry, { fetchRepoId = null, git = exe
       // called `:(literal)link` returned no entry and `resolveClaims` admitted
       // it as untracked. `src/checkout.mjs` and `src/mergecheck.mjs` already
       // carry this option for the same reason.
-      const out = String(git("git", ["--literal-pathspecs", "-C", repoPath,
-                                     "ls-files", "--stage", "--", path],
-                             { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })).trim();
-      if (!out) return null;
-      // ONE ROW PER TRACKED DESCENDANT. Probing an ordinary directory lists
-      // everything beneath it, and taking the first row's mode reported the
-      // directory as whatever its first child happened to be -- a tracked
-      // symlink under `packages` made `packages` look like mode 120000 and
-      // refused an unrelated claim under `packages/normal`. A gitlink first in
-      // the listing did the same. So the entry whose PATH is exactly the one
-      // asked about is the only row that answers the question.
-      for (const line of out.split("\n")) {
+      // `-z`: NUL-TERMINATED AND UNQUOTED. Git's default `core.quotePath` emits
+      // display output, so a non-ASCII ancestor comes back quoted and an exact
+      // comparison never matches -- the ancestor reads as untracked and the
+      // claim is admitted through it.
+      //
+      // OVERFLOW IS NOT AN ANSWER, AND MY PREVIOUS ARGUMENT THAT IT WAS IS WRONG.
+      // I reasoned that overflow implies many rows, many rows implies a directory
+      // prefix, and a directory has no index entry of its own -- so `null` was
+      // "correct rather than a fallback". A DIRECTORY/FILE CONFLICT breaks the
+      // middle step: an unresolved merge can hold a dangerous stage-2 entry for
+      // `x` AND tens of thousands of stage-3 entries under `x/`. Overflow there
+      // says nothing about whether `x` itself is a symlink, and answering `null`
+      // admitted `x/new` through a path that resolution may turn into one.
+      //
+      // So the exact entry is searched for in whatever was captured -- git's
+      // index is byte-sorted and `x` sorts before `x/...`, so it is the FIRST
+      // row when it exists -- and if it was NOT found in a TRUNCATED read, the
+      // probe refuses rather than concluding. The ordering is an optimisation;
+      // it is not load-bearing for the safety conclusion, because the last time
+      // I called an argument of this shape airtight it was not.
+      const res = spawn("git", ["--literal-pathspecs", "-C", repoPath,
+                                "ls-files", "--stage", "-z", "--", path],
+                        { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
+      const truncated = res.error?.code === "ENOBUFS";
+      if (res.error && !truncated) throw res.error;
+      // A NONZERO EXIT IS A FAILURE, AND spawnSync DOES NOT THROW ON ONE.
+      //
+      // `execFileSync` threw here; `spawnSync` sets `status` and leaves `error`
+      // UNSET, so git refusing the checkout -- dubious ownership, an unreadable
+      // or corrupt index, exit 128 -- came back as empty stdout, parsed to
+      // `null`, and the claim was admitted without establishing whether the
+      // index records a symlink or a submodule. Fail-OPEN, introduced by the
+      // change that fixed the previous finding.
+      //
+      // `ls-files` exits 0 when nothing matches, so a nonzero status never means
+      // "no entry"; it always means the question could not be asked.
+      if (res.status !== 0 || res.signal)
+        throw new Error(
+          `git could not read the index of ${repoPath} ` +
+          `(${res.signal ? `killed by ${res.signal}` : `exit ${res.status}`})` +
+          `${res.stderr ? `: ${String(res.stderr).trim().split("\n")[0]}` : ""}. ` +
+          `Refusing rather than admitting: whether ${path} is a symlink or a submodule was not established.`);
+      const out = String(res.stdout ?? "");
+
+      // EVERY MATCHING STAGE, not the first. An unresolved merge puts the same
+      // pathname in the index several times, and returning the first row missed
+      // a later stage carrying 120000 or 160000 -- so a symlink or gitlink was
+      // ignored, the claim admitted, and resolving the conflict to that side
+      // turned granted territory into a traversal boundary. The most dangerous
+      // mode present is the answer, because any stage may become the resolution.
+      const DANGEROUS = new Set(["120000", "160000"]);
+      let found = null;
+      for (const line of out.split("\0")) {
+        if (!line) continue;
         const tab = line.indexOf("\t");
         if (tab < 0) continue;
         if (line.slice(tab + 1) !== path) continue;
         const [mode] = line.slice(0, tab).split(/\s+/);
-        return { mode };
+        if (DANGEROUS.has(mode)) return { mode };
+        found ??= { mode };
       }
-      return null;
+      if (!found && truncated)
+        throw new Error(
+          `the index listing for ${path} exceeded the read buffer and no exact entry was found in ` +
+          `what was read, so whether it is a symlink or a submodule could not be established. ` +
+          `Refusing rather than admitting: an unresolved directory/file conflict can carry a ` +
+          `dangerous entry for ${path} alongside many entries beneath it.`);
+      return found;
     },
   };
 }

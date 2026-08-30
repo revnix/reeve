@@ -65,7 +65,7 @@ the prose is stale. That includes this section.
 |---|---|
 | `--execute` is OFF **on purpose** | disarmed 2026-08-23 after a P0; re-arming is the founder's call |
 | the review switch is **ON** | `watch.reviewActions` enabled 2026-08-27 |
-| the durable-effect stages | **1, 2 and 4 have landed. 3 is BUILT and pushed but NOT merged** — see §5 for the branch. §3 describes what it does |
+| the durable-effect stages | **1, 2 and 4 have landed. 3 was never merged and is ABANDONED, not deferred** — its pull request was closed on the founder's decision rather than left to resume; §5 says why, and what survived it |
 | the repository is **PUBLIC** | made public 2026-08-27, exposure audited first |
 | codex is a **blocking** reviewer | changed 2026-08-26 |
 | the founder's merge rule | merge on CI green AND zero open threads, and **each merge needs its own grant** — a grant does not carry to the next pull request |
@@ -212,17 +212,33 @@ looked at.
 
 ---
 
-## 5. What is pushed and NOT yet a pull request
+## 5. Stage 3 was closed, and what survived it
 
-Two branches, both verified at the exact commit they are pushed at. **A resumed
-session that lists only pull requests will not see them.**
+**`feat/spill-durable-effects` is dead.** Do not resume it. The pull request was
+closed on 2026-08-30 rather than worked, for two reasons that are about whether it
+should exist rather than about how it was written.
 
-**`feat/spill-durable-effects`** — §3. Rebuilt on 2026-08-30 onto the default branch rather than rebased, because both
-had appended to the manifest's end across three commits; see §0 for the branch's state; the entry was re-derived against main's copy rather than copying mine
-over, so main's entries are preserved and mine is appended once.
+It could not have worked. The producer read `f.thread_id` and `f.body`; the
+projection at `src/review/derive.mjs` emits `id` and `excerpt`, so the thread filter
+matched nothing and every issue line would have been blank. Six thousand passing
+assertions did not catch it because the producer and its fixtures were written
+together and shared one invented vocabulary. They agreed with each other. Neither
+agreed with the projection. **The stub sweep cannot catch this class** — it proves
+an assertion can fail when the code breaks, and these assertions could.
 
-**`fix/approval-bound-to-head`** — §2.3. It answers the review finding described there; see §0. Was raised on
-2026-08-30.
+And it reopened a settled decision: §15a of the review-ingest design records SPILL
+staying off indefinitely, because round counts measure how often bots re-reviewed a
+push rather than whether reeve's fix loop is stuck. That reason still holds, so the
+trigger is the wrong one and a correct producer would only deliver it more reliably.
+**Do not rebuild SPILL without deciding the trigger first**, and decide it from
+reeve's own shadow data rather than from the round counter.
+
+What survived is `enqueueWithDependants` and `outboxIdFor`: enqueue an effect whose
+value only an earlier effect's delivery can supply, and rebuild that edge rather
+than a broken one on any re-run. Nothing about it is SPILL-specific.
+
+**`fix/approval-bound-to-head`** — §2.3. It answers the review finding described
+there; see §0. Was raised on 2026-08-30, still pushed and not yet opened.
 
 ---
 

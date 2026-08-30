@@ -16,7 +16,7 @@ import { openHub } from "../src/build/hubdb.mjs";
 import { openHubAsGuest } from "../src/build/hubguest.mjs";
 import { hubAccess } from "../src/build/hubaccess.mjs";
 import { resolveRepoId } from "../src/build/repoid.mjs";
-import { COLUMNS_AT, SCHEDULER_MIN_HUB_VERSION } from "../src/build/hubdb.mjs";
+import { shapeAt, SCHEDULER_MIN_HUB_VERSION } from "../src/build/hubdb.mjs";
 import { isBuilderPr } from "../src/pr.mjs";
 import { CLAUSE_IDS } from "../src/verdict.mjs";
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
@@ -396,19 +396,32 @@ import { run, HEAD, EVAL } from "./fixtures/tick-harness.mjs";
 // claim throws and the guardian's fail-open path runs model work outside the
 // shared limit, beside an older builder still using its own.
 {
-  const need = COLUMNS_AT[SCHEDULER_MIN_HUB_VERSION] ?? {};
-  check(need.provider_lease?.token != null,
+  // Asked of the MIGRATIONS, by running them, rather than of a declared list.
+  // The list this replaced described only what a migration ADDS, so "no earlier
+  // version declares it" was true of the declaration and said nothing about the
+  // store: a column present since migration 1 would have read as absent.
+  const at = shapeAt(SCHEDULER_MIN_HUB_VERSION);
+  check(at.provider_lease?.columns?.token != null,
     "the scheduler's floor is the version that introduces provider_lease.token",
-    JSON.stringify({ floor: SCHEDULER_MIN_HUB_VERSION, declares: Object.keys(need) }));
-  // Both directions: no EARLIER version may already declare it, or the floor is
-  // higher than it needs to be and refuses hubs that would have worked.
-  const earlier = Object.entries(COLUMNS_AT)
-    .filter(([v]) => Number(v) < SCHEDULER_MIN_HUB_VERSION)
-    .filter(([, cols]) => cols.provider_lease?.token != null)
-    .map(([v]) => v);
-  check(earlier.length === 0,
-    "and no earlier version declares it, so the floor is not higher than it needs to be",
-    earlier.join(","));
+    JSON.stringify({ floor: SCHEDULER_MIN_HUB_VERSION,
+                     columns: Object.keys(at.provider_lease?.columns ?? {}) }));
+  check(at.provider_lease?.columns?.token?.type === "TEXT",
+    "and it is TEXT, which is what every claim binds", JSON.stringify(at.provider_lease?.columns?.token));
+
+  // Both directions: the version BELOW the floor must not already have it, or
+  // the floor is higher than it needs to be and refuses hubs that would work.
+  // This is now a question about the store the migrations build, so a column
+  // created in migration 1 answers it correctly.
+  const below = SCHEDULER_MIN_HUB_VERSION - 1;
+  const before = shapeAt(below);
+  check(before.provider_lease?.columns?.token == null,
+    `and version ${below} does not have it, so the floor is not higher than it needs to be`,
+    JSON.stringify(Object.keys(before.provider_lease?.columns ?? {})));
+  // CONTROL: version `below` really does build a provider_lease table at all.
+  // Without this the assertion above passes when the table is simply absent,
+  // which would make it a statement about nothing.
+  check(before.provider_lease != null,
+    "control: the version below the floor does build provider_lease, so the check above is about the COLUMN");
 
   // The BEHAVIOUR of the floor -- that an older hub is refused, with a reason,
   // and that a current one still opens -- lives in

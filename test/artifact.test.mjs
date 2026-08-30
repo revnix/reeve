@@ -7,7 +7,7 @@
 // one; and the sha recorded must be the sha of the bytes that survived, not of
 // the buffer that was intended.
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, lstatSync,
-         readdirSync } from "node:fs";
+         readdirSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -426,6 +426,84 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   check(existsSync(w.path), "an artifact written into a chain of new directories exists", w.path);
   const back = readArtifact({ dir: deep, phase: "DESIGN", expectSha: w.sha256 });
   check(back.ok === true, "and reads back with the sha it was written under", JSON.stringify(back.why));
+}
+
+// ── A failed RENAME takes its temporary too ────────────────────────────────
+//
+// The cleanup covered the write and not the rename, three lines further down in
+// the same function: one site fixed and its sibling left. A rename that fails
+// after a successful write leaves a COMPLETE temporary, and every retry leaves
+// another -- worse than the partial-write case it was fixed alongside, because
+// each one is full size.
+{
+  const adir = join(dir, "renamefail");
+  // The destination is made a DIRECTORY, so the rename fails after the bytes are
+  // safely written -- which is the ordering this assertion is about.
+  mkdirSync(join(adir, "design.md"), { recursive: true });
+  let threw = null;
+  try { writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from("# design\n") }); }
+  catch (e) { threw = e.code ?? String(e.message); }
+  check(threw !== null, "control: the rename really failed", String(threw));
+  const left = readdirSync(adir).filter(f => f.includes(".tmp-"));
+  check(left.length === 0, "a failed rename leaves no temporary behind", left.join(","));
+}
+
+// ── Temporaries from killed writers are reaped, live ones are not ──────────
+//
+// The rename is what publishes a file, so a temporary is referenced by nothing
+// and nothing was ever going to remove it. A worker killed between the open and
+// the rename therefore leaves a full-size file for ever, and repeated crashes
+// fill the disk for a reason nobody can find.
+//
+// AGE, not process identity: pids are reused, so a live writer's temporary can
+// carry a pid this process believes is dead.
+{
+  const adir = join(dir, "reap");
+  const design = "# design\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n";
+  writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) });
+
+  const stale = join(adir, "design.md.tmp-99999-stale");
+  const live  = join(adir, "design.md.tmp-99998-live");
+  writeFileSync(stale, "left by a killed writer");
+  writeFileSync(live, "another writer, in flight right now");
+  const twoHoursAgo = (Date.now() - 2 * 60 * 60 * 1000) / 1000;
+  utimesSync(stale, twoHoursAgo, twoHoursAgo);
+
+  writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) });
+  const left = readdirSync(adir).filter(f => f.includes(".tmp-"));
+  check(!left.includes("design.md.tmp-99999-stale"),
+    "a temporary older than the threshold is reaped by the next write", left.join(","));
+  // THE CONTROL THAT MATTERS. A reaper that removed every temporary would delete
+  // a concurrent writer's file mid-write, which is far worse than the leak it
+  // fixes -- so the recent one must survive.
+  check(left.includes("design.md.tmp-99998-live"),
+    "and a RECENT one is left alone, because it may be a live writer's", left.join(","));
+
+  // And the artifact itself is unharmed by the reaping.
+  const back = readArtifact({ dir: adir, phase: "DESIGN",
+    expectSha: writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) }).sha256 });
+  check(back.ok === true, "control: and the artifact still reads back", JSON.stringify(back.why));
+}
+
+// ── A slice ends at the next SECTION, not the next slice ───────────────────
+{
+  const adir = join(dir, "trailing");
+  const gate = (body) => {
+    writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
+    return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+  };
+  const one = "## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n";
+  const bad = gate(`# design\n\n${one}\n## Slice 2\n\n## Notes\nFiles: x\nPackages: y\nTests: z\nDone when: w\n`);
+  check(bad.ok === false,
+    "an empty final slice does not inherit a trailing section's labels", JSON.stringify(bad.findings));
+  check(bad.findings.some(f => /Slice 2/.test(f)),
+    "and the finding names the empty slice", JSON.stringify(bad.findings));
+
+  // CONTROL: a trailing section after a COMPLETE final slice is still fine, so
+  // the bound did not make an ordinary document fail.
+  const good = gate(`# design\n\n${one}\n## Slice 2\nFiles: e\nPackages: f\nTests: g\nDone when: h\n\n## Notes\nprose\n`);
+  check(good.ok === true, "control: a trailing section after a complete slice is fine",
+    JSON.stringify(good.findings));
 }
 
 db.close();

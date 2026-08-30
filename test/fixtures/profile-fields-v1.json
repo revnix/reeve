@@ -73,6 +73,6 @@
     "worker.maxOutputBytes"
   ],
   "count": 69,
-  "reference_sha256": "005031b1d72dbf2a9f817e376429b0a1570ef07f45ada508ddf70346b5be45be",
+  "reference_sha256": "f62bf02cbc4088dc2a7e93d4b818e4edde52b06b340620d169fb70f19a6b0332",
   "note": "a new key is deliberate: add it, regenerate the reference, and update both halves here"
 }

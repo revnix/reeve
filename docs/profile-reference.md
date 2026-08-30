@@ -17,77 +17,77 @@ else to put it, which is the point.
 
 ## Index
 
-| key | requirement | documented |
+| key | requirement | accepts |
 |---|---|---|
-| `schemaVersion` | required | — |
-| `project.kind` | required | — |
-| `identity.key` | required | yes |
-| `identity.prHost` | optional | yes |
-| `identity.defaultBranch` | required | — |
-| `identity.baseBranch` | optional | yes |
-| `identity.visibility` | required | — |
-| `identity.checkout` | optional | yes |
-| `identity.worktreeRoot` | optional | — |
-| `identity.cloneStrategy` | optional | — |
-| `authority.permission` | required | — |
-| `authority.policy` | required | — |
-| `authority.profileLocation` | defaulted | — |
-| `authority.forbiddenActions` | defaulted for client | — |
-| `state.mode` | required | — |
-| `state.location` | optional | — |
-| `units` | required | — |
-| `lanes` | optional | — |
-| `ci.appSlug` | optional | yes |
-| `ci.provider` | required | yes |
-| `ci.requiredChecks` | optional | yes |
-| `ci.reviewerStatusContexts` | optional | yes |
-| `merge.method` | required | yes |
-| `merge.deleteBranch` | optional | — |
-| `merge.enforcement` | required | — |
-| `reviewers` | optional | — |
-| `rounds.softCap` | defaulted | — |
-| `rounds.hardCap` | defaulted | — |
-| `rounds.maxFixAttemptsPerFinding` | defaulted | — |
-| `risk.sensitivePaths` | optional | yes |
-| `risk.quarantinePaths` | optional | yes |
-| `risk.forbiddenCommands` | optional | yes |
-| `risk.testPaths` | optional | yes |
-| `builder.capabilities.observe` | defaulted | yes |
-| `builder.capabilities.draftSpec` | defaulted | — |
-| `builder.capabilities.implementLocal` | defaulted | — |
-| `builder.capabilities.publishPr` | defaulted | — |
-| `builder.capabilities.mergeBuilderPr` | defaulted | — |
-| `builder.founder.userId` | optional | yes |
-| `builder.founder.login` | optional | — |
-| `builder.cancel.drainMinutes` | defaulted | yes |
-| `builder.budgets` | optional | yes |
-| `worker.maxOutputBytes` | defaulted | yes |
-| `worker.isolation` | defaulted | yes |
-| `worker.dependencyPaths` | optional | yes |
-| `builder.network.research.allowedDomains` | optional | yes |
-| `notify.provider` | optional | yes |
-| `notify.url` | optional | — |
-| `notify.topic` | optional | — |
-| `notify.credentialFile` | optional | — |
-| `notify.desktop` | optional | yes |
-| `watch.reviewActions` | optional | — |
-| `watch.backupIntervalSeconds` | optional | — |
-| `watch.maxOpenPrs` | optional | — |
-| `watch.maxWorkers` | optional | — |
-| `watch.workerBudgetMinutes` | optional | — |
-| `watch.maxTurns` | optional | — |
-| `watch.unknownEscalateSeconds` | optional | — |
-| `watch.staleSeconds` | defaulted | yes |
-| `watch.intervalSeconds` | optional | — |
-| `tools.codeHealth` | optional | yes |
-| `measured.review.window` | optional | yes |
-| `measured.review.correctnessSharePct` | optional | — |
-| `measured.review.dataIntegritySharePct` | optional | — |
-| `measured.review.roundsSmall` | optional | yes |
-| `measured.review.roundsLarge` | optional | yes |
-| `measured.review.topCriticalReviewer` | optional | yes |
-| `measured.review.topCriticalCount` | optional | — |
-| `measured.review.totalCriticalCount` | optional | — |
+| `schemaVersion` | required | an integer |
+| `project.kind` | required | one of product, client |
+| `identity.key` | required | a non-empty string |
+| `identity.prHost` | optional | a non-empty string |
+| `identity.defaultBranch` | required | a non-empty string |
+| `identity.baseBranch` | optional | a non-empty string |
+| `identity.visibility` | required | one of public, private |
+| `identity.checkout` | optional | an absolute path |
+| `identity.worktreeRoot` | optional | an absolute path |
+| `identity.cloneStrategy` | optional | one of full, blobless, treeless, shallow |
+| `authority.permission` | required | one of admin, write, triage, read |
+| `authority.policy` | required | one of owner, propose_and_merge, propose_and_wait, propose_only |
+| `authority.profileLocation` | defaulted | one of committed, sidecar |
+| `authority.forbiddenActions` | defaulted for client | a list of a non-empty string |
+| `state.mode` | required | one of in-repo, sibling, hub |
+| `state.location` | optional | a non-empty string |
+| `units` | required | a list of an object with id, root and language |
+| `lanes` | optional | a list of values |
+| `ci.appSlug` | optional | a non-empty string |
+| `ci.provider` | required | a non-empty string |
+| `ci.requiredChecks` | optional | a list of a non-empty string |
+| `ci.reviewerStatusContexts` | optional | a list of a non-empty string |
+| `merge.method` | required | one of squash, merge, rebase |
+| `merge.deleteBranch` | optional | true or false |
+| `merge.enforcement` | required | one of enforced, attested |
+| `reviewers` | optional | a list of values |
+| `rounds.softCap` | defaulted | an integer |
+| `rounds.hardCap` | defaulted | an integer |
+| `rounds.maxFixAttemptsPerFinding` | defaulted | an integer |
+| `risk.sensitivePaths` | optional | a list of a non-empty string |
+| `risk.quarantinePaths` | optional | a list of a non-empty string |
+| `risk.forbiddenCommands` | optional | a list of a non-empty string |
+| `risk.testPaths` | optional | a list of a non-empty string |
+| `builder.capabilities.observe` | defaulted | true or false |
+| `builder.capabilities.draftSpec` | defaulted | true or false |
+| `builder.capabilities.implementLocal` | defaulted | true or false |
+| `builder.capabilities.publishPr` | defaulted | true or false |
+| `builder.capabilities.mergeBuilderPr` | defaulted | true or false |
+| `builder.founder.userId` | optional | a positive integer |
+| `builder.founder.login` | optional | a non-empty string |
+| `builder.cancel.drainMinutes` | defaulted | a positive integer |
+| `builder.budgets` | optional | an object of per-action budgets, keyed by build action |
+| `worker.maxOutputBytes` | defaulted | a positive integer |
+| `worker.isolation` | defaulted | one of none, scratch-home, dedicated-user |
+| `worker.dependencyPaths` | optional | a list of values |
+| `builder.network.research.allowedDomains` | optional | a list of values |
+| `notify.provider` | optional | one of ntfy, none |
+| `notify.url` | optional | a non-empty string |
+| `notify.topic` | optional | a non-empty string |
+| `notify.credentialFile` | optional | an absolute path |
+| `notify.desktop` | optional | true or false |
+| `watch.reviewActions` | optional | true or false |
+| `watch.backupIntervalSeconds` | optional | an integer |
+| `watch.maxOpenPrs` | optional | an integer |
+| `watch.maxWorkers` | optional | an integer |
+| `watch.workerBudgetMinutes` | optional | an integer |
+| `watch.maxTurns` | optional | an integer |
+| `watch.unknownEscalateSeconds` | optional | an integer |
+| `watch.staleSeconds` | defaulted | an integer |
+| `watch.intervalSeconds` | optional | an integer |
+| `tools.codeHealth` | optional | a list of a non-empty string |
+| `measured.review.window` | optional | a non-empty string |
+| `measured.review.correctnessSharePct` | optional | a number |
+| `measured.review.dataIntegritySharePct` | optional | a number |
+| `measured.review.roundsSmall` | optional | a number |
+| `measured.review.roundsLarge` | optional | a number |
+| `measured.review.topCriticalReviewer` | optional | a non-empty string |
+| `measured.review.topCriticalCount` | optional | an integer |
+| `measured.review.totalCriticalCount` | optional | an integer |
 
 ## Keys
 
@@ -280,10 +280,10 @@ why the two differ: the defaults are per project kind.
 
 ```json
 {
+  "schemaVersion": 1,
   "project": {
     "kind": "product"
   },
-  "schemaVersion": 1,
   "identity": {
     "key": "acme/widget",
     "defaultBranch": "main",
@@ -311,6 +311,12 @@ why the two differ: the defaults are per project kind.
     "method": "squash",
     "enforcement": "enforced"
   },
+  "reviewers": [],
+  "rounds": {
+    "softCap": 5,
+    "hardCap": 10,
+    "maxFixAttemptsPerFinding": 1
+  },
   "watch": {
     "staleSeconds": 900
   },
@@ -329,11 +335,6 @@ why the two differ: the defaults are per project kind.
   "worker": {
     "maxOutputBytes": 67108864,
     "isolation": "none"
-  },
-  "rounds": {
-    "softCap": 5,
-    "hardCap": 10,
-    "maxFixAttemptsPerFinding": 1
   }
 }
 ```
@@ -342,10 +343,10 @@ why the two differ: the defaults are per project kind.
 
 ```json
 {
+  "schemaVersion": 1,
   "project": {
     "kind": "client"
   },
-  "schemaVersion": 1,
   "identity": {
     "key": "acme/widget",
     "defaultBranch": "main",
@@ -363,7 +364,7 @@ why the two differ: the defaults are per project kind.
     ]
   },
   "state": {
-    "mode": "in-repo"
+    "mode": "hub"
   },
   "units": [
     {
@@ -378,6 +379,12 @@ why the two differ: the defaults are per project kind.
   "merge": {
     "method": "squash",
     "enforcement": "enforced"
+  },
+  "reviewers": [],
+  "rounds": {
+    "softCap": 3,
+    "hardCap": 5,
+    "maxFixAttemptsPerFinding": 1
   },
   "watch": {
     "staleSeconds": 900
@@ -397,11 +404,6 @@ why the two differ: the defaults are per project kind.
   "worker": {
     "maxOutputBytes": 67108864,
     "isolation": "none"
-  },
-  "rounds": {
-    "softCap": 3,
-    "hardCap": 5,
-    "maxFixAttemptsPerFinding": 1
   }
 }
 ```

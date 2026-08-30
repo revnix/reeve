@@ -487,8 +487,8 @@ expectRefusal("budgets that are not an object", withBudget([]), /builder\.budget
 // omits it. Reporting the flag labelled `authority.profileLocation` "required"
 // and misstated the contract: every profile may omit it, and both kinds get one.
 {
-  const { requirementOf, mustAuthor, exampleFor, profileReference, EXAMPLE_SEED_KEYS } =
-    await import("../scripts/profile-reference.mjs");
+  const { requirementOf, mustAuthor, exampleFor, profileReference, EXAMPLE_SEED_KEYS,
+          composedKeys } = await import("../scripts/profile-reference.mjs");
   const { PROJECT_KIND, withDefaults, validate } = await import("../src/profile/schema.mjs");
   // This file reports with `expectOk`/`expectRefusal` and a bare `fail++`; the
   // assertions below are not refusal cases, so they get a local reporter in the
@@ -565,11 +565,18 @@ expectRefusal("budgets that are not an object", withBudget([]), /builder\.budget
   {
     const need = mustAuthor();
     const seed = EXAMPLE_SEED_KEYS;
-    const unseeded = need.filter((k) => !seed.includes(k));
+    const composed = composedKeys();
+    // A must-author key is covered either by the seed or by `compose`, which
+    // derives it from the project kind. Derived by differencing rather than
+    // listed, so the two stay in step without either restating the other.
+    const unseeded = need.filter((k) => !seed.includes(k) && !composed.includes(k));
     const stale    = seed.filter((k) => !need.includes(k));
 
+    check(composed.length > 0,
+      "control: `compose` really does fill some must-author key, so the exemption is not a hole",
+      composed.join(", "));
     check(unseeded.length === 0,
-      "every key an operator must author has a sample value in the example seed",
+      "every key an operator must author is seeded or composed",
       unseeded.length ? `no sample for: ${unseeded.join(", ")} — add one in scripts/profile-reference.mjs` : "");
     check(stale.length === 0,
       "and the seed authors NOTHING an operator would not have to author",
@@ -587,6 +594,85 @@ expectRefusal("budgets that are not an object", withBudget([]), /builder\.budget
     check(absent.length === 0,
       "control: every seeded key is present in the generated example", absent.join(", "));
   }
+}
+
+// ── the example is what `reeve init` writes ──────────────────────────────────
+//
+// NOT a plausible profile assembled here. `reeve init` derives `state.mode` and
+// `authority.profileLocation` from the project kind and the repository's
+// visibility, so a seed picking the first enum member globally gave both kinds
+// `in-repo` -- a validator-valid profile that contradicts the file `reeve init`
+// writes for the same project, which is worse than no example because it looks
+// authoritative.
+//
+// The example is composed by the same exported function `reeve init` uses. These
+// assertions therefore check the RULE is being followed, not that this file
+// remembers it.
+{
+  const { exampleFor } = await import("../scripts/profile-reference.mjs");
+  const { compose } = await import("../src/init.mjs");
+  const check = (ok, name, detail) => {
+    console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+    if (!ok) { if (detail) console.log("        " + detail); fail++; }
+  };
+  const at = (o, path) => path.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
+
+  const client  = exampleFor("client");
+  const product = exampleFor("product");
+
+  check(client.state.mode === "hub",
+    "the client example takes state.mode `hub` from the composer, not the first enum member",
+    client.state.mode);
+  check(client.authority.profileLocation === "sidecar",
+    "and a client profile is a sidecar, because a client repo carries no agent artifacts",
+    client.authority.profileLocation);
+  check(product.state.mode === "in-repo" && product.authority.profileLocation === "committed",
+    "while a private product example gets in-repo and committed",
+    `${product.state.mode} / ${product.authority.profileLocation}`);
+  check(client.state.mode !== product.state.mode,
+    "control: the two kinds really do differ, so a single global seed could not have produced both");
+
+  // CONTROL: the seed answers everything `compose` would otherwise ask. An
+  // unanswered question means the example is missing a value an operator must
+  // supply, and it would silently ship incomplete.
+  const authored = { project: { kind: "product" }, identity: {}, authority: {}, state: {} };
+  const put = (o, path, v) => { const ps = path.split("."); let c = o;
+    for (const k of ps.slice(0, -1)) c = (c[k] ??= {}); c[ps.at(-1)] = v; return o; };
+  const { EXAMPLE_SEED_KEYS: seedKeys } = await import("../scripts/profile-reference.mjs");
+  for (const k of seedKeys) put(authored, k, at(exampleFor("product"), k));
+  const { unanswered } = compose(authored, [], {});
+  check(unanswered.length === 0,
+    "control: the seed leaves `compose` nothing to ask, so the example is complete",
+    unanswered.map((q) => q.field).join(", "));
+}
+
+// ── every key states what it accepts ─────────────────────────────────────────
+//
+// Read off each validator, which now carries its own description, so the type
+// and enum a key allows are never a second list beside `schema.mjs`. Without
+// this an operator could not tell from the reference that
+// `identity.visibility` takes only `public` or `private`.
+{
+  const { profileReference } = await import("../scripts/profile-reference.mjs");
+  const fresh = profileReference();
+  const check = (ok, name, detail) => {
+    console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
+    if (!ok) { if (detail) console.log("        " + detail); fail++; }
+  };
+  const at = (o, path) => path.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o);
+  const undescribed = Object.entries(FIELDS).filter(([, [, v]]) => !v?.describe).map(([k]) => k);
+  check(undescribed.length === 0,
+    "every declared key's validator describes what it accepts",
+    undescribed.length ? `${undescribed.join(", ")} — wrap the validator in describe()` : "");
+  check(FIELDS["identity.visibility"][1].describe === "one of public, private",
+    "control: an enum validator names its members",
+    FIELDS["identity.visibility"][1].describe);
+  check(/one of public, private/.test(fresh),
+    "and that description reaches the generated reference");
+  // CONTROL: it is not one blanket sentence repeated. Distinct descriptions are
+  // what make the column worth reading.
+  const distinct = new Set(Object.values(FIELDS).map(([, v]) => v.describe)).size;
+  check(distinct > 5, "control: the descriptions are distinct, not one sentence repeated", String(distinct));
 }
 
 // ── the declared key set, frozen ─────────────────────────────────────────────

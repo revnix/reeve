@@ -75,9 +75,17 @@ export function headState({ prHead, branchNow, branchRead } = {}) {
                : "the head repository's refs could not be read, which is not the same as the branch being absent" };
   if (prHead === branchNow)
     return { state: CLEAR, why: "the pull request's head is the branch tip" };
+  // WHAT IS KNOWN, and no more. This wording has now been corrected three times, in
+  // two tools, each time by weakening it. Unequal tips mean the merge takes a commit
+  // the branch does not currently point at -- they do NOT mean work is lost: a
+  // branch force-reset BACKWARD to an ancestor differs from the head while the head
+  // still carries everything reachable from it. Establishing which needs an ancestry
+  // read this deliberately does not make, so it says only what it measured and names
+  // the check a person can run.
   return { state: REFUSE,
-           why: `the merge would take ${String(prHead).slice(0, 7)} while the branch is at ${String(branchNow).slice(0, 7)} — ` +
-                "commits on the branch would not be carried" };
+           why: `the merge would take ${String(prHead).slice(0, 7)} while the branch is at ${String(branchNow).slice(0, 7)}; ` +
+                "whether that difference loses anything is NOT established here — " +
+                `check with: git log --oneline ${String(prHead).slice(0, 12)}..${String(branchNow).slice(0, 12)}` };
 }
 
 /**
@@ -154,7 +162,16 @@ export function gate({ head, threads, checks } = {}) {
   const parts = [headState(head), threadState(threads), checkState(checks)];
   const rank = { [REFUSE]: 3, [UNKNOWN]: 2, [UNREVIEWED]: 1, [CLEAR]: 0 };
   const state = parts.reduce((w, p) => (rank[p.state] > rank[w] ? p.state : w), CLEAR);
+  // THE HEAD THIS VERDICT IS ABOUT, in full, so a caller can BIND the merge to it.
+  //
+  // `premerge && gh pr merge` has a window: a push can land between the read and the
+  // merge, and the CLEAR then describes head A while GitHub merges head B. A gate
+  // that returns success without giving the caller the means to close that window
+  // has moved the race rather than removed it. `gh pr merge --match-head-commit SHA`
+  // refuses when the head has moved, and this is the SHA to give it -- full, because
+  // an abbreviation is not what that flag wants.
   return { state, head: parts[0], threads: parts[1], checks: parts[2],
            clear: state === CLEAR,
+           verifiedHead: head?.prHead ?? null,
            why: parts.map(p => `${p.state}: ${p.why}`) };
 }

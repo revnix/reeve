@@ -524,6 +524,33 @@ check(existsSync(join(repo, ".git")),
     "control: and the diagnosis and the remediation name the same file", r.lines.join(" | ").slice(0, 200));
 }
 
+// ── Every flag the task route reads is REGISTERED ────────────────────────────
+//
+// An unregistered flag is not ignored by this CLI, it is refused -- so a route
+// that reads `opt("title")` for a flag absent from FLAGS can never be given one,
+// and the failure is a did-you-mean suggestion that never names the route.
+{
+  const valued = ["project", "title", "territory", "territory-file", "body-file",
+                  "depth", "priority", "idempotency-key", "pin-territory"];
+  for (const f of valued) {
+    const r = run("task", "file", `--${f}`);
+    check(/expects a value/.test(r.out) && !/unknown flag/.test(r.out),
+      `--${f} is registered and takes a value`, r.out.split("\n")[0]);
+  }
+  for (const f of ["anyway", "dry-run"]) {
+    const r = run("task", "file", `--${f}=yes`);
+    check(/is a switch and takes no value/.test(r.out) && !/unknown flag/.test(r.out),
+      `--${f} is registered as a switch`, r.out.split("\n")[0]);
+  }
+  // CONTROL: the refusal machinery still refuses something that really is
+  // unknown, so the assertions above are not passing on a widened parser.
+  const bad = run("task", "file", "--terrritory", "packages/x");
+  check(/unknown flag --terrritory/.test(bad.out),
+    "control: a misspelled flag is still refused", bad.out.split("\n")[0]);
+  check(/did you mean --territory/.test(bad.out),
+    "and the suggestion now reaches the new flag", bad.out.split("\n")[0]);
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

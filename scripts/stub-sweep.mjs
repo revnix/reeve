@@ -881,7 +881,19 @@ console.log(`\n${s.caught}/${s.total} stub(s) caught by the assertion they name.
 {
   const testFiles = readdirSync(join(ROOT, "test"))
     .filter(f => f.endsWith(".test.mjs")).map(f => "test/" + f);
-  console.log(coverageLine(coverage(manifest, testFiles, grandfathered)));
+  // Only a run that covered the WHOLE manifest can say how many entries are proven;
+  // a subset run knows nothing about the ones it did not attempt, and reporting its
+  // count as the ratio would understate rather than overstate.
+  const whole = entries.length === manifest.length;
+  // The CAUGHT entries themselves, not just how many: the file-level count needs to
+  // know WHICH tests have a working guard, and a count cannot say that.
+  const provenEntries = whole
+    ? results.filter(r => r.verdict === CAUGHT)
+             .map(r => manifest.find(e => e.name === r.name))
+             .filter(Boolean)
+    : null;
+  console.log(coverageLine(coverage(manifest, testFiles, grandfathered, provenEntries),
+                           whole ? s.caught : null));
 }
 if (!s.ok) {
   console.log("\nA stub that is not caught means the assertion it names cannot fail for that reason.");

@@ -193,6 +193,13 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
   // UNKNOWN is GitHub still computing, which is a transient rather than a defect.
   check(mergeabilityState({ mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" }).state === UNKNOWN,
     "mergeability GitHub has not computed yet is UNKNOWN, not clear");
+  // The state reachable AFTER mergeable resolves: GitHub computes the two
+  // separately, so a resolved mergeable beside an unresolved status is ordinary and
+  // must not be reported as an actionable blocker.
+  check(mergeabilityState({ mergeable: "MERGEABLE", mergeStateStatus: "UNKNOWN" }).state === UNKNOWN,
+    "a resolved mergeable with an unresolved merge state is a transient, not a refusal");
+  check(mergeabilityState({ mergeable: "MERGEABLE", mergeStateStatus: "BLOCKED" }).state === REFUSE,
+    "control: a real blocker beside the same resolved mergeable still refuses");
   check(mergeabilityState({}).state === UNKNOWN, "an unread mergeability is UNKNOWN, not clear");
 }
 
@@ -231,6 +238,26 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
   check(unbound.state !== old.state,
     "control: and the two readers genuinely disagree on this input, so it can exhibit the defect",
     `${unbound.state} vs ${old.state}`);
+}
+
+// --- the head clock must be when the head ARRIVED ---------------------------------
+{
+  // committedDate is when a commit was AUTHORED. A commit made locally before a
+  // thread was resolved and pushed only afterwards carries an older committedDate,
+  // so using it as the head's arrival time lets the historical thread satisfy the
+  // comparison and an unreviewed head clears. The fixture is built so the two clocks
+  // DISAGREE, because with them equal both readings pass and it proves nothing.
+  const authored  = Date.parse("2026-08-29T00:00:00Z");   // before the resolution
+  const resolved  = Date.parse("2026-08-29T12:00:00Z");
+  const pushed    = Date.parse("2026-08-30T00:00:00Z");   // after it
+  const nodes = [{ isResolved: true, comments: { nodes: [{ createdAt: new Date(resolved).toISOString() }] } }];
+  check(threadState({ totalCount: 1, nodes, headPushedAt: pushed }).state === UNREVIEWED,
+    "with the PUSH time, a thread resolved before the head arrived is not evidence");
+  // NEGATIVE CONTROL: the same input read with the AUTHOR time clears, which is what
+  // the committedDate fallback did. Without this the assertion above proves only that
+  // some timestamp works.
+  check(threadState({ totalCount: 1, nodes, headPushedAt: authored }).state === CLEAR,
+    "control: read with the AUTHOR time the same input clears, which is the defect the fallback had");
 }
 
 // --- the combined verdict never rounds up ----------------------------------------

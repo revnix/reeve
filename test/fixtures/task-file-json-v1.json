@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "keys": [
+    "evidence_id",
+    "next",
+    "next_action",
+    "ok",
+    "prev",
+    "replayed",
+    "task"
+  ],
+  "next_keys": [
+    "generation",
+    "phase"
+  ],
+  "frozen_at": "2026-08-30",
+  "note": "section 11.6 mutating shape; a change here changes every task command"
+}

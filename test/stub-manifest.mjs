@@ -892,4 +892,13 @@ export const STUBS = [
               find: "  case \"task\": {",
               replace: "  case \"task-disabled\": {" }],
   },
+  {
+    name: "taskfile-next-sub-shape-is-frozen",
+    why: "collapse `next` from {phase, generation} to a bare phase string. Every mutating command in this system returns the same envelope and the commands written against it do not exist yet, so this is the change that breaks every future reader while breaking no current test: the KEY SET is untouched, so a freeze that checks only the envelope's keys stays green, and only an assertion over next's OWN keys can see it. The half a freeze already covers is not the half that needs the freeze",
+    test: "test/task-file.test.mjs",
+    expectRed: "and so is next's, which is the half a consumer reads a phase out of",
+    edits: [{ file: "src/build/taskfile.mjs",
+              find: "             next: { phase: \"FILED\", generation: 1 }, evidence_id: ev,",
+              replace: "             next: \"FILED\", evidence_id: ev," }],
+  },
 ];

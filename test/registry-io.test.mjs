@@ -226,7 +226,7 @@ check(parse({}).error === null && parse({}).projects.length === 0,
   const seqBefore = db.prepare("SELECT COALESCE(max(seq), 0) s FROM hub_event").get().s;
   db.close();
 
-  const io = registryIo(home, "nextly", entry, { spawn: () => ({ stdout: "040000 abc 0\tpackages/x\u0000" }) });
+  const io = registryIo(home, "nextly", entry, { spawn: () => ({ status: 0, stdout: "040000 abc 0\tpackages/x\u0000" }) });
   const snap = await resolveSnapshot(registry, "nextly", [normalizeClaim("packages/x")], io);
 
   // CHECK ONE: the state is unchanged -- with the read PROVEN, because "no row
@@ -260,7 +260,7 @@ check(parse({}).error === null && parse({}).projects.length === 0,
       close: () => {},
     };
     const io2 = registryIo(home, "nextly", entry,
-      { spawn: () => ({ stdout: "040000 abc 0\tpackages/x\u0000" }), connect: () => readOnly });
+      { spawn: () => ({ status: 0, stdout: "040000 abc 0\tpackages/x\u0000" }), connect: () => readOnly });
     const snap2 = await resolveSnapshot(registry, "nextly", [normalizeClaim("packages/x")], io2);
     check(!snap2.refusal, "a connection that refuses every write still resolves a snapshot",
       JSON.stringify(snap2).slice(0, 160));
@@ -415,7 +415,7 @@ check(parse({}).error === null && parse({}).projects.length === 0,
   {
     let asked = null;
     const io = registryIo(dir, "p", { nwo: "o/r", repoPath: "/repo", profilePath: "/f" },
-      { spawn: (_bin, args) => { asked = args; return { stdout: "160000 abc 0\tpackages/x\u0000" }; } });
+      { spawn: (_bin, args) => { asked = args; return { status: 0, stdout: "160000 abc 0\tpackages/x\u0000" }; } });
     const got = io.lsTree("/repo", "packages/x");
     check(asked?.includes("ls-files") && asked?.includes("--stage"),
       "the submodule probe inspects the staged index, not the HEAD tree", JSON.stringify(asked));
@@ -433,7 +433,7 @@ check(parse({}).error === null && parse({}).projects.length === 0,
       // used newlines and went stale the moment the format changed -- the
       // suite caught it, which is what a fixture built to mimic a producer
       // costs you when the producer moves.
-      { spawn: () => ({ stdout: "120000 aaa 0\tpackages/a-link\u0000100644 bbb 0\tpackages/normal/x.ts\u0000" }) });
+      { spawn: () => ({ status: 0, stdout: "120000 aaa 0\tpackages/a-link\u0000100644 bbb 0\tpackages/normal/x.ts\u0000" }) });
     check(many.lsTree("/repo", "packages") === null,
       "a DIRECTORY whose first tracked child is a symlink is not itself reported as one",
       JSON.stringify(many.lsTree("/repo", "packages")));
@@ -498,7 +498,7 @@ check(parse({}).error === null && parse({}).projects.length === 0,
   const io = (out) => {
     let args = null;
     const r = registryIo("/h", "p", { nwo: "o/r", repoPath: "/r", profilePath: "/f" },
-      { spawn: (_b, a) => { args = a; return out instanceof Error ? { stdout: "", error: out } : { stdout: out }; } });
+      { spawn: (_b, a) => { args = a; return out instanceof Error ? { status: 0, stdout: "", error: out } : { status: 0, stdout: out }; } });
     return { probe: r, argv: () => args };
   };
   // Same harness, but taking the spawn RESULT directly, so a fixture can carry
@@ -547,15 +547,15 @@ check(parse({}).error === null && parse({}).projects.length === 0,
 
     // The conflict shape itself: dangerous `x`, then many descendants.
     const conflict = row("120000", "2", "x") + row("100644", "3", "x/a") + row("100644", "3", "x/b");
-    check(io2({ stdout: conflict, error: enob }).probe.lsTree("/r", "x")?.mode === "120000",
+    check(io2({ status: 0, stdout: conflict, error: enob }).probe.lsTree("/r", "x")?.mode === "120000",
       "a truncated read still finds the exact entry, because git sorts `x` before `x/...`",
-      JSON.stringify(io2({ stdout: conflict, error: enob }).probe.lsTree("/r", "x")));
+      JSON.stringify(io2({ status: 0, stdout: conflict, error: enob }).probe.lsTree("/r", "x")));
 
     // And when it is NOT in what was read, the probe refuses instead of
     // concluding. Failing closed here is the whole point: `null` admitted a
     // claim through a path the conflict may resolve into a symlink.
     let refused = null;
-    try { io2({ stdout: row("100644", "3", "x/a"), error: enob }).probe.lsTree("/r", "x"); }
+    try { io2({ status: 0, stdout: row("100644", "3", "x/a"), error: enob }).probe.lsTree("/r", "x"); }
     catch (e) { refused = e.message; }
     check(refused !== null && /could not be established/.test(refused),
       "a truncated read WITHOUT the exact entry refuses, rather than reporting `no entry`",
@@ -563,17 +563,53 @@ check(parse({}).error === null && parse({}).projects.length === 0,
 
     // CONTROL: a complete read with no entry is still a plain null, or the
     // refusal above would be firing on every ordinary miss.
-    check(io2({ stdout: "", error: null }).probe.lsTree("/r", "x") === null,
+    check(io2({ status: 0, stdout: "", error: null }).probe.lsTree("/r", "x") === null,
       "control: a COMPLETE read with no entry is still `no entry`");
 
     // CONTROL: any other git failure still propagates, so this is not a
     // blanket catch that would read a broken git as `nothing is tracked`.
     let threw = null;
-    try { io2({ stdout: "", error: Object.assign(new Error("git not found"), { code: "ENOENT" }) })
+    try { io2({ status: 0, stdout: "", error: Object.assign(new Error("git not found"), { code: "ENOENT" }) })
             .probe.lsTree("/r", "x"); }
     catch (e) { threw = e.code; }
     check(threw === "ENOENT",
       "control: any OTHER git failure still propagates", String(threw));
+  }
+
+  // ── a nonzero git exit is a FAILURE, not an empty answer ─────────────────
+  //
+  // A REGRESSION INTRODUCED BY THE PREVIOUS FIX. `execFileSync` threw on a
+  // nonzero exit; `spawnSync` sets `status` and leaves `error` UNSET. So git
+  // refusing the checkout -- dubious ownership, an unreadable or corrupt index,
+  // exit 128 -- came back as empty stdout, parsed to `null`, and the claim was
+  // admitted without establishing whether the index records a symlink or a
+  // submodule. Fail-open, arriving through the change that closed the last one.
+  //
+  // `ls-files` exits 0 when nothing matches, so a nonzero status never means
+  // "no entry"; it always means the question could not be asked.
+  {
+    for (const [label, res] of [
+      ["exit 128", { status: 128, stdout: "", stderr: "fatal: detected dubious ownership" }],
+      ["a signal", { status: null, signal: "SIGKILL", stdout: "" }],
+    ]) {
+      let msg = null;
+      try { io2(res).probe.lsTree("/r", "x"); } catch (e) { msg = e.message; }
+      check(msg !== null && /could not read the index/.test(msg),
+        `git failing with ${label} refuses, rather than reading as "nothing is tracked"`,
+        String(msg).slice(0, 70));
+    }
+    // The refusal carries git's own first line, so an operator is told WHY
+    // rather than only that something failed.
+    let why = null;
+    try { io2({ status: 128, stdout: "", stderr: "fatal: detected dubious ownership" }).probe.lsTree("/r", "x"); }
+    catch (e) { why = e.message; }
+    check(/dubious ownership/.test(String(why)),
+      "and the refusal quotes git's own reason", String(why).slice(0, 90));
+
+    // CONTROL: status 0 with no output is still a plain `no entry`, or this
+    // refusal would fire on every ordinary miss and refuse every claim.
+    check(io2({ status: 0, stdout: "" }).probe.lsTree("/r", "x") === null,
+      "control: a SUCCESSFUL git with no matching entry is still `no entry`");
   }
 
   // ── every stage of an unmerged entry ─────────────────────────────────────

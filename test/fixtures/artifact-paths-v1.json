@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "artifact": "/tasks/bt-01JABCDEFGHJKMNPQRSTVWXYZ0/artifacts/research.md",
+  "run": "/tasks/bt-01JABCDEFGHJKMNPQRSTVWXYZ0/runs/g2-RESEARCH-s0-a1.out",
+  "frozen_at": "2026-08-31",
+  "note": "S3-C finds a surviving run by this name; a change here breaks adoption"
+}

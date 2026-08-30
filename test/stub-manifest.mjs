@@ -849,4 +849,22 @@ export const STUBS = [
               find: "  if (!r.ok) return { ok: false, refusal: r.refusal };",
               replace: "  if (!r.ok) { db.prepare(\"INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,generation,source_kind,source_key,repo_path,profile_path,profile_hash,default_branch,visibility,registry_version,created_at,updated_at) VALUES(?,?,?,?,?,'FILED',1,'founder',?,?,?,?,?,?,?,unixepoch(),unixepoch())\").run(id, project, snapshot.repoId, snapshot.nwo, title, id, snapshot.repoPath, snapshot.profilePath, snapshot.profileHash, snapshot.defaultBranch, snapshot.visibility, snapshot.registryVersion); return { ok: false, refusal: r.refusal }; }" }],
   },
+  {
+    name: "taskfile-liveness-is-never-defaulted",
+    why: "give the liveness predicate a default instead of refusing without one. assertWritable throws exactly when the predicate says the restore's holder is ALIVE, so `() => true` never reaps a lock whose holder is long dead and wedges the hub read-only for good, while `() => false` reaps a live restore and admits a filing into a file being replaced underneath it. One costs availability and the other costs the write; a default picks one silently on behalf of the only caller that could tell them apart",
+    test: "test/task-file.test.mjs",
+    expectRed: "fileTask throws rather than defaulting isAlive",
+    edits: [{ file: "src/build/taskfile.mjs",
+              find: "  if (typeof isAlive !== \"function\")",
+              replace: "  if (false)" }],
+  },
+  {
+    name: "taskfile-honours-the-predicate-it-is-given",
+    why: "accept the caller's liveness predicate and then not use it, passing `() => true` to the writer lease instead -- which reads EVERY recorded restore holder as alive, including one whose process died mid-restore. The filing is then refused with a correct-looking `a restore is in progress` message naming a pid that no longer exists, and it is refused for ever: nothing else reaps that row, so one crashed restore makes the hub permanently unwritable while every message about it reads as normal operation",
+    test: "test/task-file.test.mjs",
+    expectRed: "a filing proceeds once the dead holder's lock is reaped",
+    edits: [{ file: "src/build/taskfile.mjs",
+              find: "      { command: \"reeve task file\", pid, lstart, isAlive },",
+              replace: "      { command: \"reeve task file\", pid, lstart, isAlive: () => true }," }],
+  },
 ];

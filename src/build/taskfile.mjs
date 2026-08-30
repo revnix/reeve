@@ -6,6 +6,7 @@
 import { randomBytes } from "node:crypto";
 import { normalizeClaim, resolveSnapshot, admitTask } from "./registry.mjs";
 import { readStart } from "../supervisor.mjs";
+import { withWriterLease } from "./locks.mjs";
 
 const DEPTHS = ["trivial", "standard", "deep"];
 const PRIORITIES = ["p1", "p2"];
@@ -86,10 +87,14 @@ export async function fileTask({ db, registry, project, title, territory,
                                  body = null, depth = null, priority = "p2",
                                  idempotencyKey = null, io, isAlive,
                                  pid = process.pid, lstart = readStart(process.pid) }) {
-  // NO DEFAULT, and a throw rather than a fallback. `admitTask` defaults
-  // `isAlive` to `() => true`, which treats a live restore's holder as dead and
-  // admits a filing while the hub file is being replaced underneath it. The
-  // caller that owns a process is the caller that can answer the question.
+  // NO DEFAULT, and a throw rather than a fallback, because NEITHER default is
+  // safe and the choice is not this function's to make. `assertWritable` throws
+  // exactly when the predicate says the restore's holder is ALIVE, so `() => true`
+  // never reaps a lock whose holder is long dead and wedges the hub read-only for
+  // good, while `() => false` reaps a lock whose holder is still restoring and
+  // admits a filing into a file being replaced underneath it. One costs
+  // availability and the other costs the write; only the caller that owns a
+  // process can tell the two apart, so the caller answers or nothing proceeds.
   if (typeof isAlive !== "function")
     throw new Error("fileTask needs a liveness predicate; pass isSameProcess. A default here fails open.");
 
@@ -99,9 +104,26 @@ export async function fileTask({ db, registry, project, title, territory,
   const snapshot = await resolveSnapshot(registry, project, filing.claims, io);
   if (snapshot.refusal) return { ok: false, refusal: snapshot.refusal };
 
+  // THE LEASE COVERS THE WRITE, and the write only. `withWriterLease` inserts
+  // its row in one transaction, runs the callback outside any transaction, and
+  // deletes the row in a second -- so `admitTask`'s own BEGIN IMMEDIATE nests
+  // nothing. Restore reads `writer_lease` to decide whether a command is
+  // mid-write, and a lease taken across the network calls above would make a
+  // slow GitHub read look like an in-progress hub write for its whole duration.
   const id = mintTaskId();
-  const r = admitTask(db, snapshot, { id, project, title, body,
-    sourceKind: "founder", idempotencyKey }, { isAlive });
-  if (!r.ok) return { ok: false, refusal: r.refusal };
-  return { ok: true, task: r.taskId, replayed: r.replayed === true };
+  try {
+    const r = withWriterLease(db,
+      { command: "reeve task file", pid, lstart, isAlive },
+      () => admitTask(db, snapshot, { id, project, title, body,
+        sourceKind: "founder", idempotencyKey }, { isAlive }));
+    if (!r.ok) return { ok: false, refusal: r.refusal };
+    return { ok: true, task: r.taskId, replayed: r.replayed === true };
+  } catch (e) {
+    // `assertWritable` THROWS while a live restore holds the lock, and it is
+    // reached from two places inside this call. A throw here is an operator
+    // condition with a useful message, not a defect, so it is returned as the
+    // refusal it is; anything else is re-raised unchanged.
+    if (/restore is in progress/.test(String(e?.message))) return { ok: false, refusal: e.message };
+    throw e;
+  }
 }

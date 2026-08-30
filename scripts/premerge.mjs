@@ -42,6 +42,16 @@ function main() {
   // the numeric argument still parsed, both unexpected tokens were dropped, and the
   // gate answered confidently about the current checkout instead. A gate that guesses
   // which repository it was asked about is worse than one that will not start.
+  // DUPLICATES ARE REFUSED. Two PR numbers or two --repo pairs were both accepted and
+  // the FIRST silently won, so a wrapper that appended an argument gated a different
+  // pull request and answered confidently about it.
+  const nums = argv.filter(a => /^\d+$/.test(a));
+  const repos = argv.filter(a => a === "--repo");
+  if (nums.length > 1 || repos.length > 1) {
+    console.error(`premerge: repeated argument(s): ${nums.length > 1 ? `${nums.length} pull request numbers` : ""}` +
+                  `${nums.length > 1 && repos.length > 1 ? " and " : ""}${repos.length > 1 ? `${repos.length} --repo` : ""}`);
+    { process.exitCode = EXIT.usage; return; }
+  }
   const KNOWN = new Set(["--repo"]);
   const unknown = argv.filter((a, i) =>
     a.startsWith("--") ? !KNOWN.has(a) : !/^\d+$/.test(a) && argv[i - 1] !== "--repo");
@@ -74,7 +84,10 @@ function main() {
   const view = ghJson(["repo", "view", "--json", "nameWithOwner,url"]);
   const nwo = repo ?? view?.nameWithOwner ?? null;
   const host = process.env.GH_HOST
-    ?? (() => { try { return view?.url ? new URL(view.url).hostname : null; } catch { return null; } })();
+    // `host`, NOT `hostname`: hostname drops a non-default port, so an Enterprise
+  // instance on :8443 had both its reads sent to the default endpoint and the printed
+  // merge command named a host that is not where the repository lives.
+  ?? (() => { try { return view?.url ? new URL(view.url).host : null; } catch { return null; } })();
   const hostArgs = host && host !== "github.com" ? ["--hostname", host] : [];
   if (!nwo) { console.error("premerge: cannot determine the repository"); { process.exitCode = EXIT.usage; return; } }
   const [owner, name] = nwo.split("/");
@@ -83,7 +96,7 @@ function main() {
   // Two calls are two moments, and a pull request that moved between them reads as the
   // gate disagreeing with itself.
   const q = `query { repository(owner:"${owner}", name:"${name}") { pullRequest(number:${pr}) {
-    state headRefOid headRefName isCrossRepository mergeable mergeStateStatus
+    state headRefOid headRefName isCrossRepository mergeable mergeStateStatus reviewDecision
     headRepositoryOwner { login } headRepository { name }
     reviewThreads(first:100) { totalCount nodes { id isResolved path
       comments(first:1) { nodes { author { login } body createdAt } } } }
@@ -102,16 +115,7 @@ function main() {
     { process.exitCode = EXIT.absent; return; }
   }
 
-  // WHEN THIS HEAD ARRIVED -- and ONLY pushedDate can answer that.
-  //
-  // committedDate was the fallback here and it is the wrong clock: a commit authored
-  // locally BEFORE a thread was resolved and pushed only afterwards carries an older
-  // committedDate, so the historical thread satisfies the comparison and an unreviewed
-  // head clears. That is the exact hole this rule exists to close, reopened by its own
-  // fallback. When pushedDate is absent there is no answer, so the rule disables
-  // itself -- which the gate already handles, and which is honest rather than lenient.
   const headCommit = meta.commits?.nodes?.[0]?.commit ?? null;
-  const headPushedAt = Date.parse(headCommit?.pushedDate ?? "") || null;
 
   // The head repository, refused rather than guessed when it cannot be established.
   const ids = headRepoOf(meta, nwo);
@@ -133,7 +137,8 @@ function main() {
   const rollup = headCommit?.statusCheckRollup ?? null;
   const verdict = gate({
     head: { prHead: meta.headRefOid, branchNow, branchRead },
-    threads: { ...meta.reviewThreads, headPushedAt },
+    threads: meta.reviewThreads,
+    review: { reviewDecision: meta.reviewDecision },
     mergeability: { mergeable: meta.mergeable, mergeStateStatus: meta.mergeStateStatus },
     checks: { nodes: rollup ? (rollup.contexts?.nodes ?? null) : [],
               totalCount: rollup ? (rollup.contexts?.totalCount ?? null) : 0 },

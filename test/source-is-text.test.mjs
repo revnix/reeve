@@ -255,6 +255,12 @@ check(asBinary.length === 0, "git treats every tracked source file as text",
   // evidence that the scan reaches further than the line-based one did.
   const lineOf = (text, index) => text.slice(0, index).split("\n").length;
   const offenders = [], exempted = []; let data = 0;
+  // WHAT THE LOOP ACTUALLY OPENED. Recorded because a control built from the same
+  // filter the loop uses is true by construction: it re-states the filter instead of
+  // observing the scan, and would keep passing if the loop were later given a new
+  // exclusion. This is the only thing that can tell "the candidate is not exempt"
+  // from "the candidate was read".
+  const visited = [];
   // EVERY tracked file, with no extension filter. `bin/reeve` is the production CLI
   // entry point, is JavaScript, and has no extension -- so a suffix test skipped the
   // single file where this defect would matter most while the assertion claimed to
@@ -263,6 +269,7 @@ check(asBinary.length === 0, "git treats every tracked source file as text",
   for (const rel of tracked) {
     if (DATA.has(rel)) { data++; continue; }
     const into = rel === EXEMPT ? exempted : offenders;
+    visited.push(rel);
     const text = readFileSync(ROOT + rel, "utf8");
     for (const m of text.matchAll(new RegExp(RE.source, "g")))
       into.push(`${rel}:${lineOf(text, m.index)}`);
@@ -284,9 +291,12 @@ check(asBinary.length === 0, "git treats every tracked source file as text",
   const unexempt = tracked.filter(f => f.startsWith("test/fixtures/") && f.endsWith(".mjs") && !DATA.has(f));
   check(unexempt.length > 0,
     "control: at least one executable fixture module is not declared captured, so the assertion below has a subject");
-  check(unexempt.every(f => !DATA.has(f)),
-    `an executable fixture module that no provenance declares stays IN scope (${unexempt.join(", ")})`,
-    "the exclusion is about what is declared captured, not about where a file sits");
+  check(visited.length > 0,
+    `control: the scan opened ${visited.length} file(s), so what follows observes a loop that ran`);
+  check(unexempt.every(f => visited.includes(f)),
+    `an executable fixture module that no provenance declares was actually SCANNED (${unexempt.join(", ")})`,
+    "not merely absent from the exemption set: " +
+    unexempt.filter(f => !visited.includes(f)).join(", ") + " were skipped by the loop");
   check(exempted.length > 0,
     `control: ${EXEMPT} still contains the shape, so exempting it is load-bearing`,
     "if it no longer does, delete the exemption rather than leaving it to widen silently");

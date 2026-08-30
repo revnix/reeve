@@ -5,8 +5,9 @@
 // that are actually on disk. Both halves matter: a sha computed from the buffer
 // in memory certifies what was INTENDED, not what survived.
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, readFileSync,
+         rmSync, existsSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { ARTIFACT_FILE } from "../paths.mjs";
 
 const sha = (buf) => createHash("sha256").update(buf).digest("hex");
@@ -15,6 +16,12 @@ const sha = (buf) => createHash("sha256").update(buf).digest("hex");
 export function writeArtifact({ dir, phase, bytes }) {
   const name = ARTIFACT_FILE[phase];
   if (!name) throw new Error(`${phase} produces no artifact; use reviewDiff's path`);
+  // THE DIRECTORY MAY NOT EXIST YET, and whether it did decides what has to be
+  // fsynced. `mkdirSync` writes the new entry into the PARENT, so fsyncing only
+  // the artifact directory persists the file and the directory's contents while
+  // leaving the directory's own entry unflushed -- a crash then loses the whole
+  // tree, after `writeArtifact` reported it durable.
+  const fresh = !existsSync(dir);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, name);
   const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
@@ -32,12 +39,27 @@ export function writeArtifact({ dir, phase, bytes }) {
       off += n;
     }
     fsyncSync(fd);
-  } finally { closeSync(fd); }
+  } catch (e) {
+    // THE TEMPORARY GOES WITH THE FAILURE. A write that throws -- a full disk is
+    // the ordinary case -- left its partial file behind, and every retry minted
+    // another randomly named one. The space needed to recover is then consumed
+    // by the failures, which turns a transient full disk into a permanent one.
+    closeSync(fd);
+    try { rmSync(tmp, { force: true }); } catch { /* the throw above is the real failure */ }
+    throw e;
+  }
+  closeSync(fd);
   renameSync(tmp, path);
   // THE DIRECTORY TOO. Without it the rename itself may not survive a crash,
   // and the artifact is durable only in the sense that its bytes were.
   const dfd = openSync(dir, "r");
   try { fsyncSync(dfd); } finally { closeSync(dfd); }
+  // AND ITS PARENT, when this call created the directory. Persisting a
+  // directory's contents does not persist the fact that the directory exists.
+  if (fresh) {
+    const pfd = openSync(dirname(dir), "r");
+    try { fsyncSync(pfd); } finally { closeSync(pfd); }
+  }
   return { path, sha256: sha(bytes), bytes: bytes.length };
 }
 
@@ -79,9 +101,16 @@ export function reviewArtifact({ phase, dir, expect }) {
   if (!expect || typeof expect.depth !== "string")
     throw new Error("reviewArtifact needs `expect` with a depth; expectations adjust by depth and a default would pick one");
 
-  let text;
-  try { text = readFileSync(join(dir, ARTIFACT_FILE[phase]), "utf8"); }
-  catch (e) { return { ok: false, why: `${ARTIFACT_FILE[phase]} is not there: ${e.code ?? e.message}`, findings: [] }; }
+  // READ AS BYTES, so the digest below is of exactly what was reviewed. An
+  // artifact replaced between the write and this gate -- by a recovered attempt,
+  // or a concurrent one -- is validated here and then recorded under the earlier
+  // write's sha, so the transition binds to bytes this gate never saw.
+  let buf;
+  try { buf = readFileSync(join(dir, ARTIFACT_FILE[phase])); }
+  catch (e) { return { ok: false, why: `${ARTIFACT_FILE[phase]} is not there: ${e.code ?? e.message}`,
+                       findings: [], sha256: null }; }
+  const text = buf.toString("utf8");
+  const sha256 = sha(buf);
 
   const findings = [];
   if (phase === "SIZING") {
@@ -90,7 +119,7 @@ export function reviewArtifact({ phase, dir, expect }) {
   if (phase === "RESEARCH") {
     if (expect.depth === "trivial")
       return { ok: false, why: "RESEARCH is skipped at trivial depth; there is no research artifact to gate",
-               findings: [] };
+               findings: [], sha256 };
     // PER CLAIM, not per file. A whole-file test passes as soon as ANY line
     // carries a citation, so an artifact with nine cited claims and one bare
     // assertion reads as clean -- and the bare one is the claim that needed
@@ -107,6 +136,6 @@ export function reviewArtifact({ phase, dir, expect }) {
       findings.push("at trivial depth design.md stands in for the absent research and needs a Measured context section");
   }
   return findings.length
-    ? { ok: false, why: `${ARTIFACT_FILE[phase]} does not meet the minimum for ${phase}`, findings }
-    : { ok: true, why: null, findings: [] };
+    ? { ok: false, why: `${ARTIFACT_FILE[phase]} does not meet the minimum for ${phase}`, findings, sha256 }
+    : { ok: true, why: null, findings: [], sha256 };
 }

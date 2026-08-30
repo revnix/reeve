@@ -70,6 +70,22 @@ const run = (...args) => {
   check(c.code === 1, "and exits 1 rather than running", `exit=${c.code}`);
 }
 
+// ── `task` reaches its own body, and does not fall into `build` ──────────────
+//
+// The CLI's case labels share fall-through blocks, and `task` is inserted
+// directly above `build` -- the position that captured status, statusline and
+// dash for a full day when `shadow` landed there. Both directions are asserted.
+{
+  const t = run("task");
+  check(/reeve task:/.test(t.out), "task reaches its own body", t.out.slice(0, 160));
+  check(!/reeve build/.test(t.out) && !/builder tick/.test(t.out),
+    "and does not fall through into build", t.out.slice(0, 160));
+  check(t.code === 1, "and exits 1 without a subcommand", `exit=${t.code}`);
+
+  const b = run("build", "status");
+  check(!/reeve task:/.test(b.out), "and build still reaches its own body", b.out.slice(0, 160));
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

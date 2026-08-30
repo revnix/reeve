@@ -201,6 +201,13 @@ export function parseRegistry(text, path) {
   };
 }
 
+// The founder filing's source key. Normalized so two filings differing only in
+// spacing or case collide and the near-twin warning fires -- humans legitimately
+// re-file near-twins, and the collision is a warning plus --anyway, never a hard
+// refusal like the ledger's node id.
+export const titleHash = (title) =>
+  createHash("sha256").update(String(title).trim().replace(/\s+/g, " ").toLowerCase()).digest("hex");
+
 /** Read and parse `<home>/projects.json`. The only function here that touches disk. */
 export function loadRegistry(home) {
   const path = join(home, "projects.json");

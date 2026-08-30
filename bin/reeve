@@ -207,8 +207,19 @@ const FLAGS = {
   keep:           { value: true,  what: "how many snapshots to retain" },
   days:           { value: true,  what: "how many days to consider" },
   tail:           { value: true,  what: "a durable export-events file to replay" },
+  project:            { value: true,  what: "the registry project to file against" },
+  title:              { value: true,  what: "what the task is called" },
+  territory:          { value: true,  what: "a repository-relative path the task claims (repeatable)" },
+  "territory-file":   { value: true,  what: "a file of territory claims, one per line" },
+  "body-file":        { value: true,  what: "a file holding the task body, or - for stdin" },
+  depth:              { value: true,  what: "trivial, standard or deep" },
+  priority:           { value: true,  what: "p1 or p2" },
+  "idempotency-key":  { value: true,  what: "a key that makes a re-run of this command inert" },
+  "pin-territory":    { value: true,  what: "keep the territory while held, for a duration like 48h" },
 
   hub:            { value: false, what: "operate on the builder hub rather than a repository" },
+  anyway:         { value: false, what: "file a near-twin of an existing task anyway" },
+  "dry-run":      { value: false, what: "print what would happen and write nothing" },
   json:           { value: false, what: "machine-readable output" },
   force:          { value: false, what: "proceed past a refusal that is an operator judgement" },
   overwrite:      { value: false, what: "replace an existing file" },
@@ -1056,6 +1067,81 @@ switch (cmd) {
                : findings.some(f => f.severity === "warn") ? 3 : 0);
   }
 
+  case "task": {
+    const sub = positionals[0];
+    if (sub !== "file") {
+      console.error("reeve task: the only subcommand is `file`");
+      console.error('-> reeve task file --project <p> --title "..." --territory <path>');
+      process.exit(1);
+    }
+    const { fileTask, pinSeconds } = await import("../src/build/taskfile.mjs");
+    const { loadRegistry, registryIo } = await import("../src/build/registryio.mjs");
+    const { CAPABILITY_NAMES, capabilityOn } = await import("../src/build/capabilities.mjs");
+    const { openHub } = await import("../src/build/hubdb.mjs");
+
+    const reg = loadRegistry(HOME);
+    if (reg.error) { console.error(`reeve task: ${reg.error}`); process.exit(1); }
+    // `resolveSnapshot` wants `{version, projects: {<name>: entry}}`, and the
+    // loader ALREADY returns exactly that beside the array the doctor and the
+    // tick iterate. Rebuilding it from the array here would drop the version --
+    // which is one of the eleven facts admission requires, so every filing would
+    // be refused for an incomplete snapshot.
+    const registry = reg.registry;
+
+    const pin = pinSeconds(opt("pin-territory"));
+    if (pin?.refusal) { console.error(`reeve task: ${pin.refusal}`); process.exit(1); }
+
+    // `loadProfile` is keyed on the NWO, not on the home, so the project has to
+    // resolve in the registry before the switches can be read; a `--project`
+    // that names nothing is refused here rather than reaching `resolveSnapshot`
+    // with a profile of `null` already in hand.
+    const project = opt("project");
+    const entry = registry.projects[project];
+    if (!entry) {
+      console.error(`reeve task: ${JSON.stringify(project)} is not a project in the registry`);
+      console.error(`-> known projects: ${Object.keys(registry.projects).join(", ") || "(none)"}`);
+      process.exit(1);
+    }
+    const profile = loadProfile(entry.nwo);
+    if (!profile) { console.error(`reeve task: no profile for ${entry.nwo}`); process.exit(1); }
+
+    // BARE NAMES, read through the validated reader. `capabilitiesFrom` returns
+    // full dotted keys and omits any the profile never declared, so a plan
+    // printed from it would show `builder.capabilities.observe` and silently
+    // drop the switches that matter most -- the ones nobody has set yet.
+    // `capabilityOn` throws on a name the schema does not declare, so a typo
+    // here cannot read as "off".
+    const switches = Object.fromEntries(
+      CAPABILITY_NAMES.map(n => [n, capabilityOn(profile, n)]));
+
+    // Repeatable, already: the argv walk pushes every occurrence of a valued
+    // flag and `all` returns the list. `--territory-file` appends to the same
+    // list rather than replacing it, so the two flags compose.
+    const fromFile = opt("territory-file")
+      ? readFileSync(opt("territory-file"), "utf8").split("\n").map(s => s.trim()).filter(Boolean) : [];
+
+    const db = openHub(hubPathFor(HOME));
+    const r = await fileTask({
+      db, registry, project, title: opt("title"),
+      territory: [...all("territory"), ...fromFile],
+      body: opt("body-file")
+        ? readFileSync(opt("body-file") === "-" ? 0 : opt("body-file"), "utf8") : null,
+      depth: opt("depth"), priority: opt("priority") ?? "p2",
+      idempotencyKey: opt("idempotency-key"), anyway: flag("anyway"),
+      dryRun: flag("dry-run"), switches,
+      io: registryIo(HOME, project, entry, {}), isAlive: isSameProcess,
+      pid: process.pid, lstart: readStart(process.pid),
+    });
+    db.close();
+    if (flag("json")) console.log(JSON.stringify(r, null, 2));
+    else if (!r.ok) console.error(`reeve task: ${r.refusal}`);
+    else if (r.dryRun) console.log(`would file in ${r.plan.project}: ` +
+      `${r.plan.territory.map(t => t.path || "(repository root)").join(", ")}` +
+      (r.plan.conflicts.length ? `\nconflicts:\n  ${r.plan.conflicts.join("\n  ")}` : ""));
+    else console.log(`${r.task} FILED${r.replayed ? " (already filed; nothing was done)" : ""}`);
+    process.exit(r.ok ? 0 : 1);
+  }
+
   case "build": {
     // HOME is the value bin/reeve already resolved. An earlier draft called
     // `HOME`, which is not defined in this file, so every build run and build
@@ -1674,6 +1760,18 @@ function usage() {
       --hub                 restore the builder hub  (--tail <file> replays events after it)
   export-events --hub <file>
                         write the hub's event log as a replayable JSONL tail
+
+  task file             file a task, with its territory declared and leased
+      --project <p>         the registry project to file against
+      --title "..."         what the task is called
+      --territory <path>    a path the task claims; repeatable
+      --territory-file <f>  a file of claims, one per line; composes with --territory
+      --depth <d>           trivial, standard or deep
+      --priority <p>        p1 or p2  (default p2)
+      --pin-territory <d>   hold the territory for a duration like 48h or 3d
+      --idempotency-key <k> makes a re-run of this command inert
+      --anyway              file a near-twin of an existing task anyway
+      --dry-run             print what would happen and write nothing
 
   builder doctor        what is true about the builder hub  (--json)
   build run             the builder loop; one at a time, by lease  (--takeover)

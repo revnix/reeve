@@ -7,6 +7,8 @@ import { randomBytes } from "node:crypto";
 import { normalizeClaim, resolveSnapshot, admitTask } from "./registry.mjs";
 import { readStart } from "../supervisor.mjs";
 import { withWriterLease } from "./locks.mjs";
+import { liveLeases, firstConflict, conflictRefusal } from "./territory.mjs";
+import { titleHash } from "./registryio.mjs";
 
 const DEPTHS = ["trivial", "standard", "deep"];
 const PRIORITIES = ["p1", "p2"];
@@ -77,6 +79,27 @@ export function pinSeconds(raw) {
 }
 
 /**
+ * Everything `--dry-run` prints, computed with no write of any kind.
+ *
+ * It reads the live leases rather than reasoning about them, because the whole
+ * value of the flag is telling the founder what the real transaction would hit.
+ */
+export function dryRunPlan({ project, snapshot, claims, held, switches }) {
+  return {
+    project, nwo: snapshot.nwo, profileHash: snapshot.profileHash,
+    territory: claims.map(c => ({ kind: c.kind, path: c.path })),
+    conflicts: claims.map(c => { const l = firstConflict(c, held, null); return l ? conflictRefusal(c, l) : null; })
+                     .filter(Boolean),
+    // The classifier has not run, so no floor can have fired yet. The list is
+    // the floors that WOULD apply to this territory, which is what the founder
+    // is asking; an empty array here means none of them can, not that none were
+    // considered.
+    floors: claims.length > 1 ? ["territory spans more than one claim; sizing floors are evaluated after SIZING"] : [],
+    switches,
+  };
+}
+
+/**
  * File one task: grammar, then the network reads, then one admission.
  *
  * The ordering is load-bearing. A filing that cannot be admitted on its
@@ -85,7 +108,8 @@ export function pinSeconds(raw) {
  */
 export async function fileTask({ db, registry, project, title, territory,
                                  body = null, depth = null, priority = "p2",
-                                 idempotencyKey = null, io, isAlive,
+                                 idempotencyKey = null, anyway = false, dryRun = false,
+                                 switches = {}, io, isAlive,
                                  pid = process.pid, lstart = readStart(process.pid) }) {
   // NO DEFAULT, and a throw rather than a fallback, because NEITHER default is
   // safe and the choice is not this function's to make. `assertWritable` throws
@@ -110,20 +134,63 @@ export async function fileTask({ db, registry, project, title, territory,
   // nothing. Restore reads `writer_lease` to decide whether a command is
   // mid-write, and a lease taken across the network calls above would make a
   // slow GitHub read look like an in-progress hub write for its whole duration.
+  // READ, never write. A dry run that opened a transaction and rolled it back
+  // would still take and release the writer lease in its own committed
+  // transactions outside the rollback, and restore would see a writer that a
+  // dry run should never have created.
+  const held = liveLeases(db, project);
+  if (dryRun) return { ok: true, dryRun: true,
+    plan: dryRunPlan({ project, snapshot, claims: filing.claims, held, switches }) };
+
+  // --anyway coexists with UNIQUE(source_kind, source_key) by SALTING with the
+  // task's own id, so the near-twin admits, the constraint still holds, and the
+  // provenance records that the collision was seen and accepted.
   const id = mintTaskId();
+  const sourceKey = anyway ? `${titleHash(title)}:${id}` : titleHash(title);
   try {
     const r = withWriterLease(db,
       { command: "reeve task file", pid, lstart, isAlive },
       () => admitTask(db, snapshot, { id, project, title, body,
-        sourceKind: "founder", idempotencyKey }, { isAlive }));
+        sourceKind: "founder", sourceKey, idempotencyKey }, { isAlive }));
     if (!r.ok) return { ok: false, refusal: r.refusal };
-    return { ok: true, task: r.taskId, replayed: r.replayed === true };
+    // The evidence id is the seq of the row `admitTask` appended for THIS task,
+    // read back rather than guessed: `hubEvent` returns the seq inside the
+    // transaction and nothing carries it out, and MAX(seq) over the whole table
+    // would name a concurrent writer's row.
+    const ev = db.prepare(
+      "SELECT MAX(seq) s FROM hub_event WHERE task = ? AND kind = 'task.filed'").get(r.taskId).s;
+    return { ok: true, task: r.taskId, prev: null,
+             next: { phase: "FILED", generation: 1 }, evidence_id: ev,
+             next_action: "none: the builder tick takes FILED to SIZING with no further condition",
+             replayed: r.replayed === true };
   } catch (e) {
     // `assertWritable` THROWS while a live restore holds the lock, and it is
     // reached from two places inside this call. A throw here is an operator
     // condition with a useful message, not a defect, so it is returned as the
     // refusal it is; anything else is re-raised unchanged.
     if (/restore is in progress/.test(String(e?.message))) return { ok: false, refusal: e.message };
+
+    // THE NEAR TWIN, and the constraint is the authority rather than a SELECT
+    // taken first. `UNIQUE(source_kind, source_key)` is what actually decides,
+    // so reading the table before the insert would be a check-then-act race that
+    // two concurrent filings of the same title lose in exactly the way the
+    // constraint exists to prevent. The write is attempted, the database
+    // refuses, and the refusal is translated here into something the founder can
+    // act on -- a collision is a warning plus `--anyway`, never a dead end.
+    //
+    // The lookup names the task that already holds the key. It is best effort:
+    // if it comes back empty the refusal still explains itself and still tells
+    // the founder what to do, because a message that cannot name the twin is far
+    // better than a raw constraint error.
+    if (/UNIQUE constraint failed: task\.source_kind, task\.source_key/.test(String(e?.message))) {
+      const twin = db.prepare(
+        "SELECT id, title FROM task WHERE source_kind = 'founder' AND source_key = ?")
+        .get(titleHash(title));
+      return { ok: false, refusal:
+        `a task with this title was already filed${twin ? ` as ${twin.id} (${JSON.stringify(twin.title)})` : ""}. ` +
+        `Titles are compared with spacing and case normalized, so near twins collide on purpose. ` +
+        `Pass --anyway to file this one beside it, or give it a title that says how it differs` };
+    }
     throw e;
   }
 }

@@ -296,6 +296,127 @@ const base = (db, over = {}) => ({
   db.close();
 }
 
+// ── --dry-run writes NOTHING ─────────────────────────────────────────────────
+//
+// Both counters, because a plan that inserted no task but appended an event is
+// still a write, and the event log is what restore replays. The writer-lease
+// counter is here rather than only in the lease block for a specific reason: an
+// implementation that files inside a transaction and rolls it back leaves both
+// counts correct, and is caught by nothing except the lease it took and
+// released in its own committed transactions outside the rollback.
+{
+  const db = store();
+  await fileTask(base(db, { title: "already here" }));
+  const before = tasks(db), seqBefore = evseq(db);
+  // Every plan field is read defensively. Without a dry-run branch `plan` is
+  // undefined, and an unguarded read throws and takes the rest of the file with
+  // it -- 21 assertions that never run and, in the log, cannot be told from 21
+  // that passed.
+  const r = await fileTask(base(db, { title: "a dry run", territory: ["packages/x"], dryRun: true,
+                                      switches: { observe: false, publishPr: false } }));
+  check(r.ok === true && r.dryRun === true, "--dry-run returns a plan", JSON.stringify(r));
+  check(tasks(db) === before, "and inserts no task row", `${tasks(db)} vs ${before}`);
+  check(evseq(db) === seqBefore, "and appends no hub_event", `${evseq(db)} vs ${seqBefore}`);
+  check(writers(db) === 0, "and takes no writer lease", String(writers(db)));
+  check(r.plan?.project === "nextly" && r.plan?.nwo === "nextlyhq/nextly",
+    "the plan names the resolved project", JSON.stringify(r.plan));
+  check(r.plan?.profileHash === "ph-1", "and the profile hash it resolved", r.plan?.profileHash);
+  check(r.plan?.territory?.length === 1 && r.plan?.territory?.[0]?.path === "packages/x",
+    "and the normalized territory", JSON.stringify(r.plan?.territory));
+  check(r.plan?.conflicts?.length === 1 && /overlaps/.test(r.plan?.conflicts?.[0] ?? ""),
+    "and the conflicts it would hit", JSON.stringify(r.plan?.conflicts));
+  check(Array.isArray(r.plan?.floors), "and the depth floors that would fire", JSON.stringify(r.plan?.floors));
+  check(r.plan?.switches?.observe === false, "and the switches currently on", JSON.stringify(r.plan?.switches));
+  db.close();
+}
+
+// ── And a dry run whose territory is DISJOINT, so the counters can bite ──────
+//
+// The block above deliberately claims territory that is already held, because
+// it asserts what the plan says about conflicts. That makes its "inserts no task
+// row" assertion unable to fail: a dry run that wrongly filed would be refused
+// by the conflict and write nothing either way, so the counter agrees with a
+// correct implementation and a broken one alike.
+//
+// This one claims free territory. Here a dry run that wrongly filed WOULD
+// succeed, so the counters are the assertion rather than a restatement of the
+// conflict above.
+{
+  const db = store();
+  await fileTask(base(db, { title: "holds x only" }));
+  const before = tasks(db), seqBefore = evseq(db);
+  const r = await fileTask(base(db, { title: "a disjoint dry run", territory: ["packages/y"],
+                                      dryRun: true, switches: { observe: true } }));
+  check(r.ok === true && r.dryRun === true, "a dry run on free territory returns a plan",
+    JSON.stringify(r));
+  check(r.plan?.conflicts?.length === 0, "control: with no conflicts, so a filing WOULD have succeeded",
+    JSON.stringify(r.plan?.conflicts));
+  check(tasks(db) === before,
+    "and it still inserts no task row", `${tasks(db)} vs ${before}`);
+  check(evseq(db) === seqBefore,
+    "and still appends no hub_event", `${evseq(db)} vs ${seqBefore}`);
+  check(writers(db) === 0, "and still takes no writer lease", String(writers(db)));
+  db.close();
+}
+
+// ── A retried shell script must not file twice ───────────────────────────────
+{
+  const db = store();
+  const a = await fileTask(base(db, { title: "retried", idempotencyKey: "k-1" }));
+  const before = tasks(db), seqBefore = evseq(db);
+  const b = await fileTask(base(db, { title: "retried", idempotencyKey: "k-1" }));
+  check(b.ok === true && b.task === a.task, "the same idempotency key returns the same task id", `${a.task} vs ${b.task}`);
+  check(b.replayed === true, "and says so", JSON.stringify(b));
+  check(tasks(db) === before && evseq(db) === seqBefore,
+    "and performs nothing", `${tasks(db)}/${evseq(db)} vs ${before}/${seqBefore}`);
+  db.close();
+}
+
+// ── --anyway SALTS rather than bypassing the constraint ──────────────────────
+{
+  const db = store();
+  const a = await fileTask(base(db, { title: "near twin", territory: ["packages/x"] }));
+  check(a.ok === true, "control: the first of the near twins is admitted", JSON.stringify(a));
+  const dup = await fileTask(base(db, { title: "near twin", territory: ["packages/y"] }));
+  check(dup.ok === false, "a second filing with the same title is refused by default", JSON.stringify(dup));
+  const s = await fileTask(base(db, { title: "near twin", territory: ["packages/y"], anyway: true }));
+  check(s.ok === true, "--anyway admits the near twin", JSON.stringify(s));
+  const keys = db.prepare("SELECT id, source_key FROM task ORDER BY created_at, id").all();
+  check(keys.length === 2, "and there are exactly two tasks", JSON.stringify(keys));
+  const salted = keys.find(k => k.id === s.task)?.source_key;
+  check(salted === `${keys.find(k => k.id === a.task)?.source_key}:${s.task}`,
+    "whose source_key is <title-hash>:<its own id>", String(salted));
+
+  // A near twin differing only in SPACING AND CASE is the case the hash is
+  // normalized for; without this the refusal above could be about the exact
+  // string rather than about the title.
+  const spaced = await fileTask(base(db, { title: "  NEAR   Twin  ", territory: ["packages/y"] }));
+  check(spaced.ok === false,
+    "and a title differing only in spacing and case collides too", JSON.stringify(spaced));
+  db.close();
+}
+
+// ── The mutating shape is a CONTRACT ─────────────────────────────────────────
+//
+// Asserted by key set and types, never by a snapshot: a snapshot passes as long
+// as the bytes match and says nothing about what a consumer may rely on.
+{
+  const db = store();
+  const r = await fileTask(base(db, { title: "the json shape" }));
+  check(Object.keys(r).sort().join(",") === "evidence_id,next,next_action,ok,prev,replayed,task",
+    "the result carries exactly the standard mutating keys", Object.keys(r).sort().join(","));
+  check(r.prev === null, "prev is null for a filing, which has no previous state", JSON.stringify(r.prev));
+  check(r.next.phase === "FILED" && r.next.generation === 1, "next is the phase and generation", JSON.stringify(r.next));
+  check(Number.isInteger(r.evidence_id) && r.evidence_id > 0,
+    "evidence_id is the hub_event seq of the task.filed row", String(r.evidence_id));
+  const ev = db.prepare("SELECT kind, task FROM hub_event WHERE seq = ?").get(r.evidence_id);
+  check(ev?.kind === "task.filed" && ev?.task === r.task,
+    "and it resolves to that row", JSON.stringify(ev));
+  check(typeof r.next_action === "string" && r.next_action.length > 0,
+    "next_action is a non-empty string", String(r.next_action));
+  db.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

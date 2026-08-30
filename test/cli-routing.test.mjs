@@ -5,6 +5,7 @@
 // founder-facing commands all printed the shadow report and exited with its
 // code. No unit test could see it -- only running the binary routes through the
 // switch -- so this test runs the binary.
+import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,7 +24,7 @@ const dbPath = join(dir, "s.db");
 const { open } = await import("../src/db/ops.mjs");
 open(dbPath).close();
 
-const bin = new URL("../bin/reeve", import.meta.url).pathname;
+const bin = fileURLToPath(new URL("../bin/reeve", import.meta.url));
 const run = (...args) => {
   try {
     return { out: execFileSync(process.execPath, [bin, ...args, "--db", dbPath], { encoding: "utf8" }), code: 0 };

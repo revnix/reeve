@@ -535,6 +535,56 @@ export function enqueue(db, { idemKey, kind, runId = null, args, notBefore = 0, 
 }
 
 /**
+ * The outbox row id for an idempotency key, or null if there is none.
+ *
+ * `enqueue` returns null when the key is already held, which is correct and is what
+ * makes a double enqueue impossible. But it leaves a producer of DEPENDENT effects
+ * with nothing to attach children to on any second attempt -- a crash between ticks,
+ * a retry, a tick that runs again before delivery. The parent exists, its id is
+ * unavailable, and the choices are to skip the children or to enqueue them with no
+ * dependency at all.
+ *
+ * The second is the dangerous one and it is silent: a child with no `depends_on` is
+ * not held back, so it drains immediately and its `${dep.…}` token has no parent to
+ * read from. `resolveDependencyArgs` refuses it rather than posting a comment naming
+ * an issue that does not exist -- so nothing visibly breaks, and the spill simply
+ * never happens.
+ *
+ * `enqueue`'s own return is deliberately NOT changed to hand back the existing id.
+ * Callers distinguish "queued" from "already known" by that null, and overloading it
+ * would silently turn every existing counter into a different number.
+ */
+export function outboxIdFor(db, idemKey) {
+  const r = db.prepare("SELECT id FROM outbox WHERE idem_key = ?").get(idemKey);
+  return r ? r.id : null;
+}
+
+/**
+ * Enqueue a parent and its dependants together, so the edge survives a re-run.
+ *
+ * The parent's id comes from the insert when it is new and from the table when it is
+ * not, which is the whole point: the second attempt must rebuild the same edge rather
+ * than a broken one. Children are enqueued only once a parent id is in hand, so the
+ * failure mode above cannot be reached by forgetting.
+ *
+ * Inside the caller's transaction, like everything else that touches this table.
+ */
+export function enqueueWithDependants(db, parent, dependants = []) {
+  const parentId = enqueue(db, parent) ?? outboxIdFor(db, parent.idemKey);
+  // UNREACHABLE BY CONSTRUCTION, and kept anyway. `enqueue` returns null only on a
+  // key conflict, which means the row exists, so the lookup finds it -- the only way
+  // here is another process deleting that row between the two reads. It has no
+  // manifest entry for exactly that reason: a stub cannot be shown to reach it, and
+  // an entry that cannot go red for the right reason is worse than none. Stated
+  // rather than pretended at.
+  if (parentId == null)
+    throw new Error(`enqueueWithDependants: no outbox row for parent ${parent.idemKey}, so its dependants would orphan`);
+  const ids = [];
+  for (const child of dependants) ids.push(enqueue(db, { ...child, dependsOn: parentId }));
+  return { parentId, childIds: ids };
+}
+
+/**
  * Take the next due effect, and return the FENCE with it.
  *
  * `lease_token` is bumped in the same statement that takes the row, so a holder's

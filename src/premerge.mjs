@@ -41,7 +41,49 @@ export const UNKNOWN = "UNKNOWN";
  * signal: a page cap silently truncating the list would otherwise make a partial
  * read look clear, which is how "zero unresolved" becomes a lie.
  */
-export function threadState({ totalCount, nodes } = {}) {
+/**
+ * GitHub's own answer to "can this merge", which this gate had been re-deriving.
+ *
+ * Four rounds of review each found another input to that question I had not
+ * enumerated -- because the question is unbounded and GitHub already computes it.
+ * Asking it is not laziness: `mergeStateStatus` folds in branch protection, required
+ * reviews, conflicts, draft state and being behind the base, none of which this could
+ * see and all of which decide whether a merge is possible.
+ *
+ * So mergeability is DELEGATED, and this module keeps only what GitHub does not
+ * enforce: that the merge is bound to the head that was verified, and that review
+ * evidence belongs to that head rather than to an earlier one.
+ */
+export function mergeabilityState({ mergeable, mergeStateStatus } = {}) {
+  // MERGEABLE is GitHub's own tri-state and UNKNOWN means it is still computing.
+  // Treating "not MERGEABLE" as a refusal would report a transient as a defect.
+  if (mergeable === "CONFLICTING")
+    return { state: REFUSE, why: "GitHub reports the branch as conflicting" };
+  if (mergeable !== "MERGEABLE")
+    return { state: UNKNOWN,
+             why: `GitHub has not established mergeability (${mergeable ?? "unread"}); it computes this asynchronously` };
+  // CLEAN and HAS_HOOKS are the two states that permit a merge. UNSTABLE means a
+  // check failed and is caught by checkState with a better message, but it is named
+  // here so this function's answer does not depend on the other running.
+  const ok = new Set(["CLEAN", "HAS_HOOKS"]);
+  const status = String(mergeStateStatus ?? "").toUpperCase();
+  if (!status) return { state: UNKNOWN, why: "the merge state could not be read" };
+  if (ok.has(status)) return { state: CLEAR, why: `GitHub reports the merge state as ${status}` };
+  return { state: REFUSE, why: `GitHub reports the merge state as ${status}, which does not permit a merge` };
+}
+
+/**
+ * `headPushedAt` binds review evidence to the revision it was given about.
+ *
+ * A thread resolved on head A stays resolved after an unreviewed head B is pushed,
+ * so counting it clears a revision nobody looked at. reeve already holds this rule --
+ * `reviewState` in src/review/derive.mjs refuses a projection derived for a DIFFERENT
+ * REVISION, and its comment says it is the check a caller is most likely to skip
+ * because the projection looks perfectly fresh without it. That function reads
+ * reeve's own store and this gate reads GitHub live, so the RULE is reused here and
+ * not the code; writing a second version of the rule is what would be worth avoiding.
+ */
+export function threadState({ totalCount, nodes, headPushedAt = null } = {}) {
   if (!Array.isArray(nodes) || typeof totalCount !== "number")
     return { state: UNKNOWN, unresolved: [], why: "the thread listing could not be read at all" };
   if (nodes.length !== totalCount)
@@ -51,6 +93,16 @@ export function threadState({ totalCount, nodes } = {}) {
     return { state: UNREVIEWED, unresolved: [],
              why: "no review threads exist, which is not the same as a review that raised nothing" };
   const unresolved = nodes.filter(n => !n?.isResolved);
+  // Evidence about an EARLIER revision is not evidence about this one. Only applied
+  // when the head's push time was actually read: without it there is nothing to
+  // compare against, and guessing would be worse than the gap it closes.
+  if (!unresolved.length && headPushedAt) {
+    const at = n => Date.parse(n?.comments?.nodes?.[0]?.createdAt ?? "") || 0;
+    const aboutThisHead = nodes.filter(n => at(n) >= headPushedAt);
+    if (!aboutThisHead.length)
+      return { state: UNREVIEWED, unresolved: [],
+               why: `all ${totalCount} thread(s) were resolved before this head was pushed, so none of them is evidence about the revision being merged` };
+  }
   return unresolved.length
     ? { state: REFUSE, unresolved,
         why: `${unresolved.length} of ${totalCount} thread(s) are unresolved` }
@@ -158,8 +210,8 @@ export function checkState({ nodes, totalCount = null } = {}) {
  * reasons are always reported, because knowing only the first means fixing it and
  * being surprised by the second.
  */
-export function gate({ head, threads, checks } = {}) {
-  const parts = [headState(head), threadState(threads), checkState(checks)];
+export function gate({ head, threads, checks, mergeability } = {}) {
+  const parts = [headState(head), threadState(threads), checkState(checks), mergeabilityState(mergeability)];
   const rank = { [REFUSE]: 3, [UNKNOWN]: 2, [UNREVIEWED]: 1, [CLEAR]: 0 };
   const state = parts.reduce((w, p) => (rank[p.state] > rank[w] ? p.state : w), CLEAR);
   // THE HEAD THIS VERDICT IS ABOUT, in full, so a caller can BIND the merge to it.
@@ -170,7 +222,7 @@ export function gate({ head, threads, checks } = {}) {
   // has moved the race rather than removed it. `gh pr merge --match-head-commit SHA`
   // refuses when the head has moved, and this is the SHA to give it -- full, because
   // an abbreviation is not what that flag wants.
-  return { state, head: parts[0], threads: parts[1], checks: parts[2],
+  return { state, head: parts[0], threads: parts[1], checks: parts[2], mergeability: parts[3],
            clear: state === CLEAR,
            verifiedHead: head?.prHead ?? null,
            why: parts.map(p => `${p.state}: ${p.why}`) };

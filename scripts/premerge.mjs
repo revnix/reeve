@@ -71,11 +71,12 @@ function main() {
   // Two calls are two moments, and a pull request that moved between them reads as the
   // gate disagreeing with itself.
   const q = `query { repository(owner:"${owner}", name:"${name}") { pullRequest(number:${pr}) {
-    state headRefOid headRefName isCrossRepository
+    state headRefOid headRefName isCrossRepository mergeable mergeStateStatus
     headRepositoryOwner { login } headRepository { name }
     reviewThreads(first:100) { totalCount nodes { id isResolved path
-      comments(first:1) { nodes { author { login } body } } } }
-    commits(last:1) { nodes { commit { statusCheckRollup { contexts(first:100) { totalCount nodes {
+      comments(first:1) { nodes { author { login } body createdAt } } } }
+    commits(last:1) { nodes { commit { committedDate pushedDate
+    statusCheckRollup { contexts(first:100) { totalCount nodes {
       ... on CheckRun { name conclusion status }
       ... on StatusContext { context state } } } } } } } } } }`;
   const doc = ghJson(["api", "graphql", ...hostArgs, "-f", `query=${q}`]);
@@ -88,6 +89,13 @@ function main() {
     console.log(`premerge: ${nwo}#${pr} is ${meta.state}, so there is nothing to gate`);
     { process.exitCode = EXIT.absent; return; }
   }
+
+  // WHEN THIS HEAD ARRIVED, so a resolution given about an earlier revision is not
+  // counted as evidence about this one. pushedDate is null for some commits, so
+  // committedDate is the fallback and an unreadable date disables the rule rather
+  // than guessing at it.
+  const headCommit = meta.commits?.nodes?.[0]?.commit ?? null;
+  const headPushedAt = Date.parse(headCommit?.pushedDate ?? headCommit?.committedDate ?? "") || null;
 
   // The head repository, refused rather than guessed when it cannot be established.
   const ids = headRepoOf(meta, nwo);
@@ -106,10 +114,11 @@ function main() {
   // The rollup hangs off the head COMMIT, and an absent rollup is not an empty one:
   // `nodes: null` reaches checkState as unreadable rather than as "no checks", which
   // are different facts and must not share an answer.
-  const rollup = meta.commits?.nodes?.[0]?.commit?.statusCheckRollup ?? null;
+  const rollup = headCommit?.statusCheckRollup ?? null;
   const verdict = gate({
     head: { prHead: meta.headRefOid, branchNow, branchRead },
-    threads: meta.reviewThreads,
+    threads: { ...meta.reviewThreads, headPushedAt },
+    mergeability: { mergeable: meta.mergeable, mergeStateStatus: meta.mergeStateStatus },
     checks: { nodes: rollup ? (rollup.contexts?.nodes ?? null) : [],
               totalCount: rollup ? (rollup.contexts?.totalCount ?? null) : 0 },
   });
@@ -121,7 +130,8 @@ function main() {
   // that is no longer the one being merged.
   if (verdict.clear)
     console.log(`  verified head: ${verdict.verifiedHead}\n` +
-                `  merge bound to it with: gh pr merge ${pr} --repo ${nwo} --match-head-commit ${verdict.verifiedHead}`);
+                `  merge bound to it with: gh pr merge ${pr} --repo ${nwo}${host && host !== "github.com" ? ` --hostname ${host}` : ""}` +
+                ` --match-head-commit ${verdict.verifiedHead}`);
   // ESCAPED TOO. These reasons embed check names, and a check run created by a
   // contributor-controlled fork workflow names itself. Escaping the thread fields
   // below and printing these raw left the same hole one line higher up.

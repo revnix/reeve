@@ -77,6 +77,11 @@ const isInt = describe(v => (Number.isInteger(v) ? null : "must be an integer"),
 const isSchemaVersion = describe(
   v => (v === SCHEMA_VERSION ? null : `must be ${SCHEMA_VERSION}`),
   `exactly ${SCHEMA_VERSION}`);
+// Zero is a MEANINGFUL value for a reservation -- it means the guardian takes
+// its chances with the builder -- so it needs its own validator rather than
+// reusing the positive-integer one.
+const isNonNegInt = describe(v => (Number.isInteger(v) && v >= 0 ? null : "must be a non-negative integer"),
+                             "an integer of zero or more");
 const isPosInt = describe(v => (Number.isInteger(v) && v > 0 ? null : "must be a positive integer"),
                           "a positive integer");
 const isNum = describe(v => (typeof v === "number" && Number.isFinite(v) ? null : "must be a finite number"),
@@ -333,6 +338,27 @@ export const FIELDS = {
   // accept it silently. The action names and the field names are refused INSIDE
   // this validator or they are not refused at all.
   "builder.budgets":                     [false, BUDGETS],
+  // How many builder tasks may hold a worker at once (section 10.3). One worker
+  // per task is a separate, non-configurable rule.
+  "builder.maxConcurrentTasks":          [false, isPosInt],
+  // Section 5's deterministic floor: territory spanning more packages than this
+  // forces `standard` depth and at least two slices. Singular `budget`; the
+  // plural `builder.budgets` above is section 4.1's per-action knobs.
+  "builder.budget.maxPackages":          [false, isPosInt],
+  // Section 10.2: how long one task's territory lease may go on producing skips
+  // before `bt:<id>:lease:starved` fires on the HOLDING task.
+  "builder.lease.starvedHours":          [false, isPosInt],
+  // Section 10.4's scheduler. Whether headless and interactive usage draw from
+  // one pool is account-specific and is MEASURED before it is chosen; the
+  // defaults are the design's stated interim values and carry no measurement
+  // date until a real run writes one.
+  "builder.provider.concurrencyLimit":   [false, isPosInt],
+  // Zero is legal: it means the guardian takes its chances with the builder.
+  // At or ABOVE the limit is refused by a cross-field rule, because the
+  // admission test is "held leases below limit MINUS reserved".
+  "builder.provider.guardianReserved":   [false, isNonNegInt],
+  "builder.provider.cooldownSeconds":    [false, isPosInt],
+  "builder.provider.preemptAtBoundary":  [false, isBool],
   // Cap on a worker's durable stdout/stderr files. Read by both daemons.
   "worker.maxOutputBytes":               [false, isPosInt],
   // How a dispatched worker is isolated from the founder's account. "none"
@@ -461,7 +487,13 @@ export function validate(profile) {
 
   // A container that is not a plain object (an array, a string) would take
   // the defaults as named properties and validate, then serialize to nothing.
-  for (const c of ["builder", "builder.capabilities", "builder.cancel", "builder.founder", "builder.network", "builder.network.research", "worker"]) {
+  // `builder.budgets` is deliberately NOT here: it is a FIELDS key with its own
+  // validator, which already answers `must be an object`. These three are pure
+  // containers -- an array or a string would take the defaults as named
+  // properties, validate, and serialize to nothing.
+  for (const c of ["builder", "builder.budget", "builder.capabilities", "builder.cancel",
+                   "builder.founder", "builder.lease", "builder.network",
+                   "builder.network.research", "builder.provider", "worker"]) {
     const v = get(profile, c);
     if (v !== undefined && v !== null && (typeof v !== "object" || Array.isArray(v))) errors.push(`${c} must be an object`);
   }
@@ -500,6 +532,17 @@ export function validate(profile) {
   const hard = get(profile, "rounds.hardCap");
   if (soft != null && hard != null && hard < soft)
     errors.push(`rounds.hardCap (${hard}) must be >= rounds.softCap (${soft})`);
+
+  // A reservation at or above the limit admits no builder request, EVER: the
+  // admission rule is "held leases below limit MINUS reserved". That is a
+  // permanent off switch wearing the clothes of a tuning knob, and this is the
+  // only place it can still be explained to the operator -- afterwards it looks
+  // like a builder that simply never picks anything up.
+  const limit = get(profile, "builder.provider.concurrencyLimit");
+  const reserved = get(profile, "builder.provider.guardianReserved");
+  if (Number.isInteger(limit) && Number.isInteger(reserved) && reserved >= limit)
+    errors.push(`builder.provider.guardianReserved (${reserved}) must be less than ` +
+                `builder.provider.concurrencyLimit (${limit}), or no builder request is ever admitted`);
 
   // A blocking reviewer that cannot be probed cannot gate anything.
   for (const r of get(profile, "reviewers") ?? []) {
@@ -541,6 +584,15 @@ export function validate(profile) {
 const UNIVERSAL_DEFAULTS = {
   "watch.staleSeconds": 900,
   // Every capability is off until its rollout stage turns it on, explicitly.
+  "builder.maxConcurrentTasks": 2,
+  "builder.budget.maxPackages": 2,
+  "builder.lease.starvedHours": 24,
+  // Interim, from section 10.4: limit 2, reserved 1, until a measurement
+  // replaces them with a dated pair.
+  "builder.provider.concurrencyLimit": 2,
+  "builder.provider.guardianReserved": 1,
+  "builder.provider.cooldownSeconds": 300,
+  "builder.provider.preemptAtBoundary": true,
   "builder.capabilities.observe": false,
   "builder.capabilities.draftSpec": false,
   "builder.capabilities.implementLocal": false,

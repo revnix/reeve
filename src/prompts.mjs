@@ -535,7 +535,6 @@ export const WORKER_ACTIONS = Object.freeze(["FIX_CI", "FIX_FINDINGS", "REQUEST_
  */
 export const UNBUILT_ACTIONS = Object.freeze({
   REQUEST_REVIEW: "requesting a review is a GitHub effect reeve does not yet perform itself",
-  SPILL: "spilling findings to an issue is a GitHub effect reeve does not yet perform itself",
 });
 
 export function promptFor(decision, ctx) {

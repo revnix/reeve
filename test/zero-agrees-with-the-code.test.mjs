@@ -56,7 +56,14 @@ const WITNESSES = [
   // hundred characters was far too loose: a comment, an uncalled helper or a
   // nearby handler declaration would all have satisfied it, and the witness would
   // have claimed a stage §0 correctly denies.
-  [3, "SPILL onto the durable path", "src/daemon.mjs", /kind:\s*["']gh\.issue\.create["']/],
+  //
+  // MOVED, and deliberately still a producer witness. The effect declarations now
+  // live in `src/outbox/spill.mjs`, so the old regex would never match daemon.mjs
+  // again -- and pointing it at the new module instead would weaken it, because a
+  // module written ahead of the wiring would satisfy it. The CALL is the thing that
+  // can only be true once the daemon actually produces the effects, so the witness
+  // is the daemon calling the producer.
+  [3, "SPILL onto the durable path", "src/daemon.mjs", /spillEffects\(\{/],
   // Stage 4's witness is the PRODUCER too, for the same reason stage 3's is, and
   // it was moved here after the consumer's shape changed underneath it.
   //

@@ -89,7 +89,7 @@ the prose is stale. That includes this section.
 |---|---|
 | `--execute` is OFF **on purpose** | disarmed 2026-08-23 after a P0; re-arming is the founder's call, not a resumed session's |
 | the review switch is **ON** | `watch.reviewActions` enabled 2026-08-27 with a profile declaring how each reviewer's bodies carry findings, derived from 694 stored review bodies |
-| the durable-effect stages | **1, 2 and 4 have landed. 3 has not.** Stage 3 is the PRODUCER, so the groundwork under it landing does not land the stage; §3 says what remains |
+| the durable-effect stages | **all four have landed**, stage 3 on 2026-08-30. §3 describes what it does |
 | the repository is **PUBLIC** | made public 2026-08-27 to restore Actions minutes, exposure audited and accepted first |
 | codex is a **blocking** reviewer | changed 2026-08-26 |
 | the docs guard's review status | **out of the review rotation** since 2026-08-26. It stays in CI |
@@ -235,26 +235,40 @@ scheme — a fix for a platform the tool could not otherwise reach.
 
 ---
 
-## 3. Stage 3, and the one part that is left
+## 3. Stage 3 — what SPILL now does
 
-Parts one and two have landed (§0). **Part three is the PRODUCER**: the daemon's
-`decision.action === "SPILL"` branch, at roughly `src/daemon.mjs:2345`, currently
-builds a worker prompt and escalates because SPILL is in `UNBUILT_ACTIONS`. It
-must instead enqueue, in one transaction with the decision:
+Landed 2026-08-30; see §0 for the state of all four stages.
 
-- a `gh.issue.create` effect;
-- one `gh.pr.comment` per spilled thread, each depending on it and naming the
-  issue number through a `${dep.number}` token;
-- and a `gh.thread.resolve` per thread.
+When a pull request reaches its review-round cap with non-critical findings
+unresolved, the daemon's `decision.action === "SPILL"` branch enqueues, in the decision's
+own transaction:
 
-It is **written and HELD**, deliberately (§0). Rebasing a few lines inside one
-`else if` onto a large restructure is far cheaper than the reverse. Do not start
-it on silence; ask.
+- one `gh.issue.create` carrying every finding, with a permalink PINNED to the head
+  so it still resolves after the parent merges;
+- one `gh.pr.comment` per THREADED finding, each depending on the issue and naming
+  its number through a `${dep.number}` token resolved at delivery;
+- and one `gh.thread.resolve` per threaded finding.
 
-**The witness** `test/zero-agrees-with-the-code.test.mjs` looks for is
-`kind: "gh.issue.create"` in `src/daemon.mjs` — the producer, not the handler, so
-a handler added ahead of the wiring cannot make the tree claim a stage that has
-not landed.
+A finding stated in a review body has no thread: it is carried into the issue and
+given no reply and no resolve, because replying to it would be a comment posted at
+nothing.
+
+**Why two rows and not one compound handler.** `idem_key` is fixed at enqueue time,
+which is what makes a double enqueue impossible, while a reply must name an issue
+number that does not exist until the create has delivered. One handler would put
+both writes under one key and one retry budget, so re-running after a successful
+create and a failed reply would file a SECOND issue.
+
+**The prerequisite that was not in the original plan.** `enqueue` returns null when
+the key is already held, so on any re-run the parent's row id was unavailable and the
+edge could not be rebuilt — and a child written with no `depends_on` drains at once,
+finds no parent for its token, and is refused. Nothing visibly breaks and the spill
+never happens. `outboxIdFor` and `enqueueWithDependants` close that.
+
+**The witness** `test/zero-agrees-with-the-code.test.mjs` looks for is the daemon
+CALLING the producer, not an effect declaration: the declarations moved into
+`src/outbox/spill.mjs`, and pointing the witness at that module would let a module
+written ahead of the wiring satisfy it.
 
 ---
 

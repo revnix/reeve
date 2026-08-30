@@ -100,10 +100,13 @@ export function hubAccess(hubPath) {
       // THE GUARDIAN'S OWN SURFACE, and neither of the two inventories I reached
       // for first is that.
       //
-      // `COLUMNS_AT` describes only what later migrations ADD, so a hub missing
-      // a column created in migration 1 -- `provider_state.cooldown_until` --
-      // passed, and `claimProvider` threw into the fail-open path. `TABLES_AT`
-      // is the whole hub, so losing an unrelated builder projection like
+      // The column inventory described only what later migrations ADD, so a hub
+      // missing a column created in migration 1 -- `provider_state.cooldown_until`
+      // -- passed, and `claimProvider` threw into the fail-open path. (Snapshot
+      // validation no longer has that horizon: it derives the whole shape by
+      // running the migrations, so a baseline column is required like any other.
+      // The guardian's own surface below is still narrower on purpose.) The table
+      // inventory was the whole hub, so losing an unrelated builder projection like
       // `approval` reported the SCHEDULER unusable, and the resulting null hub
       // dispatched an ordinary pull request unscheduled. Too narrow and too wide
       // are the same mistake: reading an inventory as an answer to a question it
@@ -137,10 +140,10 @@ export function hubAccess(hubPath) {
           if (got !== want) defects.push(`${t}.${c} is ${got || "untyped"}, want ${want}`);
         }
       }
-      // `COLUMNS_AT` is deliberately NOT consulted here any more:
+      // The hub-wide schema requirement is deliberately NOT consulted here:
       // `task_territory.pinned_until` is the builder's, not the guardian's, and
       // `provider_lease.token` is already named by `LEASE_COLS` above. Snapshot
-      // validation still uses it -- that question IS about the whole hub.
+      // validation does use it -- that question IS about the whole hub.
       return { version, defects };
     });
     // Could not read is not "not migrated".
@@ -186,8 +189,8 @@ export function hubAccess(hubPath) {
     // a throwing scheduler by running model work UNSCHEDULED, which is the one
     // outcome this connection exists to prevent.
     //
-    // This is the same lesson `columnDefectsAt` was written for one PR ago -- a
-    // name-only inventory cannot see a column that is present and wrong, and a
+    // This is the same lesson snapshot validation's column check was written for
+    // -- a name-only inventory cannot see a column that is present and wrong, and a
     // version-only probe cannot see one that is absent. It is reused rather than
     // restated: every declared requirement at or below the store's version, so a
     // future migration's columns are covered the day they are declared.

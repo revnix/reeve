@@ -45,8 +45,9 @@ export const LEASE_COLS =
 /**
  * The shape the provider scheduler REQUIRES, table by table.
  *
- * A version number is a claim about shape and `COLUMNS_AT` describes only what
- * later migrations ADD -- so a current-version hub missing a column created in
+ * A version number is a claim about shape, and the column inventory that used to
+ * back it described only what later migrations ADD -- so a current-version hub
+ * missing a column created in
  * migration 1, `provider_state.cooldown_until` among them, satisfied both and
  * still threw on the first `providerState` read, into the guardian's fail-open
  * path. What the scheduler needs is what its own SQL names, and that is here.

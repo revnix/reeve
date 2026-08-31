@@ -125,11 +125,22 @@ export function whyModel(db, taskId, { now }) {
   for (const a of [...ev.codexClean].sort((x, y) => (y.observed_at ?? 0) - (x.observed_at ?? 0)))
     if (!cleanRows.has(a.head_sha)) cleanRows.set(a.head_sha, a);
   const clean = new Set(ev.codexClean.map(a => a.head_sha));
-  const acked = new Set(ev.notices.filter(n => n.kind === "founder_ack").map(n => n.head_sha));
+  // PAIRED TO THE GOVERNING CLEAN PASS, not to the head. `notice_receipt` keys
+  // each row by `clean_source_id`, and `show`'s waiting model was corrected to
+  // pair on it -- leaving this one collapsing by head meant a round could report
+  // `founder_acked: true` beside a `codex_evidence` naming a NEWER source the
+  // founder has never seen. The two halves of one answer, disagreeing.
+  const ackedSources = new Set(ev.notices
+    .filter(n => n.kind === "founder_ack").map(n => n.clean_source_id));
   const gate = ev.gateRequests.map(g => {
     const approval = byHead.get(g.head_sha) ?? null;
     // ANSWERED is not APPROVED. `changes_requested` is a founder verdict and it
     // closes nothing, so it must not read as an acknowledgement.
+    const witness = cleanRows.get(g.head_sha) ?? null;
+    // The acknowledgement must be OF the pass being rendered. With no clean pass
+    // at this head there is no source to acknowledge, so a notice ack cannot
+    // stand in for one.
+    const noticeAcked = witness !== null && ackedSources.has(witness.source_id);
     const approved = approval !== null && approval.verdict !== "changes_requested";
     return {
       head_sha: g.head_sha, round: g.round, requested_at: g.requested_at,
@@ -138,20 +149,20 @@ export function whyModel(db, taskId, { now }) {
       // the same identity loss as dropping `generation` from a phase run.
       task_generation: g.task_generation,
       codex_clean: clean.has(g.head_sha),
-      codex_evidence: cleanRows.get(g.head_sha)
-        ? { source_id: cleanRows.get(g.head_sha).source_id,
-            actor: cleanRows.get(g.head_sha).actor_login_snapshot,
-            observed_at: cleanRows.get(g.head_sha).observed_at }
+      codex_evidence: witness
+        ? { source_id: witness.source_id, actor: witness.actor_login_snapshot,
+            observed_at: witness.observed_at }
         : null,
-      founder_acked: acked.has(g.head_sha) || approved,
+      founder_acked: noticeAcked || approved,
       // WHICH evidence, not merely that there was some. A silence approval and an
       // explicit review are both "approved" and an operator auditing a merge
       // needs to know which one, and where it came from.
       founder_evidence: approval
         ? { kind: approval.kind, verdict: approval.verdict,
             actor: approval.actor_login_snapshot, source_id: approval.source_id }
-        : (acked.has(g.head_sha)
-            ? { kind: "notice_ack", verdict: "approve", actor: null, source_id: null }
+        : (noticeAcked
+            ? { kind: "notice_ack", verdict: "approve", actor: null,
+                source_id: witness.source_id }
             : null),
     };
   });
@@ -198,11 +209,18 @@ export function renderWhy(m) {
 
   out.push("", "  runs");
   if (m.absent.includes("runs")) out.push("    no phase_run rows: nothing has been dispatched for this task");
-  else for (const r of m.runs)
-    out.push(`    ${r.phase}/${r.slice} attempt ${r.attempt}  ${r.status}` +
-             `  model ${orUnknown(r.model_id)}  cli ${orUnknown(r.cli_version)}` +
-             `  snapshot ${orUnknown(r.snapshot_hash)}` +
-             (r.contract_drift ? `  DRIFT ${r.contract_drift}` : ""));
+  else for (const r of m.runs) {
+    out.push(`    gen ${r.generation}  ${r.phase}/${r.slice} attempt ${r.attempt}  ${r.status}` +
+             `  outcome ${orUnknown(r.outcome)}`);
+    out.push(`      model ${orUnknown(r.model_id)}  cli ${orUnknown(r.cli_version)}` +
+             `  effort ${orUnknown(r.effort)}` +
+             `  turns ${orUnknown(r.max_turns)}  budget ${orUnknown(r.max_budget_usd)}`);
+    out.push(`      snapshot ${orUnknown(r.snapshot_hash)}  argv ${orUnknown(r.argv_hash)}` +
+             `  prompt ${orUnknown(r.prompt_hash)}  settings ${orUnknown(r.settings_hash)}`);
+    out.push(`      tools ${orUnknown(r.tools_hash)}  agents ${orUnknown(r.agents_hash)}` +
+             `  canary ${orUnknown(r.canary_id)}`);
+    if (r.contract_drift) out.push(`      DRIFT ${r.contract_drift}`);
+  }
 
   out.push("", "  holds");
   if (m.absent.includes("holds")) out.push("    no hold_reason rows: no human has stopped this task");

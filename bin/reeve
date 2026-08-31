@@ -429,7 +429,7 @@ if (flag("help")) { usage(); process.exit(0); }
 // `positionals[0]` is the subcommand, and it is available here: the walk that
 // produced it runs above. A flag scoped to `task file` must not be accepted on
 // `task list`, which reads it not at all.
-const inert = inapplicable(cmd, ARGS.flags, positionals[0] ?? null);
+const inert = inapplicable(cmd, ARGS.flags, positionals[0] ?? null, ARGS.values.keys());
 if (inert)
   fail("flag_not_applicable",
        `reeve: --${inert.flag} is not implemented by \`${inert.cmd}\`, and it is refused ` +

@@ -1,0 +1,70 @@
+{
+  "format_version": 1,
+  "show_keys": [
+    "cli_version",
+    "created_at",
+    "depth",
+    "draining",
+    "escalations",
+    "generation",
+    "id",
+    "model",
+    "nwo",
+    "phase",
+    "priority",
+    "project",
+    "prs",
+    "running",
+    "switches",
+    "territory",
+    "title",
+    "unknown",
+    "waiting"
+  ],
+  "waiting_keys": [
+    "all",
+    "capability",
+    "capability_known",
+    "first",
+    "since"
+  ],
+  "why_keys": [
+    "absent",
+    "depth",
+    "drain",
+    "escalations",
+    "events",
+    "floors",
+    "format_version",
+    "gate",
+    "generation",
+    "holds",
+    "lease",
+    "phase",
+    "project",
+    "prs",
+    "runs",
+    "task",
+    "unknown"
+  ],
+  "waiting": [
+    "WAITING_FOR_FOUNDER",
+    "WAITING_FOR_CAPABILITY",
+    "WAITING_FOR_NOTICE",
+    "WAITING_FOR_CODEX",
+    "WAITING_FOR_GUARDIAN",
+    "WAITING_FOR_QUOTA"
+  ],
+  "sections": [
+    "events",
+    "runs",
+    "lease",
+    "drain",
+    "prs",
+    "escalations",
+    "holds",
+    "gate"
+  ],
+  "frozen_at": "2026-08-31",
+  "note": "additive fields need a new format_version; a removed or renamed key breaks a consumer silently"
+}

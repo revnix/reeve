@@ -46,5 +46,23 @@ export function openPrs(db, taskId, { kind = null } = {}) {
           ORDER BY repo_id, pr`).all(taskId, kind);
 }
 
+/**
+ * EVERY pull request this task has ever had, merged ones included.
+ *
+ * `openPrs` answers the present tense and is what the machine branches on. A
+ * LINEAGE is the past tense: a merged row keeps the number, the reviewed head and
+ * the merge sha, and dropping it erases the record of the very work that
+ * completed. The same split `why` and `show` already make over `hold_reason`.
+ *
+ * It lives here rather than in the caller because `test/hub-transition.test.mjs`
+ * asserts that nothing outside this file queries `task_pr` -- a shared helper
+ * nobody is required to use is a convention, and the eight findings that rule was
+ * written for were conventions.
+ */
+export function allPrs(db, taskId) {
+  return db.prepare(
+    `SELECT ${PR_COLS} FROM task_pr WHERE task = ? ORDER BY repo_id, pr`).all(taskId);
+}
+
 /** Does this task have anything open at all? The predicate the machine reads. */
 export const hasOpenPr = (db, taskId) => openPrs(db, taskId).length > 0;

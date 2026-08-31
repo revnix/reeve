@@ -31,7 +31,7 @@ const HELD_SQL = HELD.map(p => `'${p}'`).join(",");
 // "deletes a territory lease only when its task is terminal, or held with no
 // live pin". Written once, because the scan and the replacement asking the same
 // question differently is how this file's last three defects happened.
-const LEASE_IS_LIVE = `
+export const LEASE_IS_LIVE = `
   t.phase NOT IN (${TERMINAL_SQL})
   AND (t.phase NOT IN (${HELD_SQL})
        OR (l.pinned_until IS NOT NULL AND l.pinned_until > unixepoch()))`;

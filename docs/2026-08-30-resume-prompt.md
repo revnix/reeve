@@ -91,9 +91,9 @@ will read real drift as the expected one.
    times the answer was the same: the platform already computed what the code was
    re-deriving. Delegating removed an inventory; enumerating added a round.
 
-2. **Then §6's `.pathname` cleanup.** Small, mechanical, and the failure it removes
-   impersonates a different failure — which is why it is worth doing rather than
-   leaving.
+2. **That cleanup is DONE** and was replaced by a lint rule. This document is
+   SUPERSEDED — read `docs/2026-08-31-session-handoff.md`, whose §0 records it; the
+   handoff this prompt names does not. Do not redo the cleanup.
 
 3. **Then bring me the decisions in §6 and §8** with options and trade-offs. One is
    already written up with three options and a recommendation. Do not start the

@@ -11,6 +11,7 @@
 
 import { CAPABILITY_NAMES, capabilityOn } from "./capabilities.mjs";
 import { HELD } from "./phases.mjs";
+import { LEASE_IS_LIVE } from "./territory.mjs";
 import { openPrs } from "./prs.mjs";
 
 /** The envelope every read surface in this family emits. One version, not three. */
@@ -251,7 +252,8 @@ export function evidenceFor(db, taskId, { now, generation = null }) {
       `SELECT head_sha, round, task_generation, requested_at FROM gate_request
         WHERE task = ? ORDER BY requested_at`).all(taskId),
     codexClean: db.prepare(
-      `SELECT head_sha FROM approval WHERE task = ? AND kind = 'codex_clean'`).all(taskId),
+      `SELECT head_sha, source_id, actor_login_snapshot, observed_at
+         FROM approval WHERE task = ? AND kind = 'codex_clean'`).all(taskId),
     notices: db.prepare(
       `SELECT head_sha, kind, channel, delivered_at FROM notice_receipt WHERE task = ?`).all(taskId),
     liveRun: db.prepare(
@@ -271,9 +273,17 @@ export function evidenceFor(db, taskId, { now, generation = null }) {
         ORDER BY started_at DESC LIMIT 1`).get(taskId, generation) ?? null,
     draining: db.prepare(
       `SELECT count(*) c FROM task_drain WHERE task = ? AND settled_at IS NULL`).get(taskId).c,
+    // THE SAME PREDICATE THE REAPER USES, imported rather than restated. A pinned
+    // BLOCKED or ESCALATED task keeps its row past `pinned_until` because nothing
+    // sweeps it, but `liveLeases` has already stopped treating that row as
+    // excluding anyone -- a new filing may replace it. Rendering it unconditionally
+    // told an operator the task still holds territory another task can now take,
+    // which is the most confident kind of wrong answer this surface can give.
     territory: db.prepare(
-      `SELECT kind, path, expires_at, pinned_until FROM territory_lease
-        WHERE task = ? ORDER BY kind, path`).all(taskId),
+      `SELECT l.kind, l.path, l.expires_at, l.pinned_until
+         FROM territory_lease l JOIN task t ON t.id = l.task
+        WHERE l.task = ? AND ${LEASE_IS_LIVE}
+        ORDER BY l.kind, l.path`).all(taskId),
     openPrs: openPrs(db, taskId),
   };
 }
@@ -423,7 +433,11 @@ export function taskShow(db, taskId, { now, switchesFor }) {
   // string finds it inside a title too, and would then report a field as unknown
   // because somebody wrote UNKNOWN in the subject line.
   for (const k of ["depth", "model", "cli_version"]) if (model[k] === UNKNOWN) model.unknown.push(k);
-  if (!model.waiting.capability_known) model.unknown.push("switches");
+  // FROM THE VALUE, not from whether a decision needed it. A task in BLOCKED,
+  // DONE or CANCELLED needs no switch, so `capability_known` stays true — while
+  // `switches` is still null because the profile could not be read. Deriving the
+  // unknown list from the decision made the model contradict its own field.
+  if (ev.switches === null || ev.switches === undefined) model.unknown.push("switches");
   return model;
 }
 
@@ -466,8 +480,13 @@ export function renderShow(m) {
   lines.push(`  switches     ${m.switches
     ? Object.entries(m.switches).map(([k, v]) => `${k}=${v ? "on" : "off"}`).join(" ")
     : UNKNOWN}`);
-  if (m.running)
+  if (m.running) {
     lines.push(`  running      ${m.running.phase}/${m.running.slice} attempt ${m.running.attempt}`);
+    // DRIFT IS THE POINT OF READING THIS LINE. The JSON carried it and the text
+    // did not, so the default renderer — which is what an operator actually uses —
+    // showed a drifted run as an ordinary one.
+    if (m.running.drift) lines.push(`  DRIFT        ${m.running.drift}`);
+  }
   if (m.draining !== null) lines.push(`  draining     ${m.draining} row(s) still to settle`);
   for (const t of m.territory)
     lines.push(`  territory    ${t.kind} ${t.path}` +

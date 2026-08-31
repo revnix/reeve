@@ -1269,7 +1269,12 @@ switch (cmd) {
           // tasks. Known means the registry OR the hub: a project removed from
           // the registry since its tasks were filed still has tasks to show.
           if (want !== null) {
-            const known = new Set([...Object.keys(reg.registry.projects), ...projectsWithTasks(db)]);
+            // INSIDE the guard. This query reads `task` on the same possibly-broken
+            // store as the model queries, and sitting outside `queryFailed` it was
+            // the one path that still escaped as a stack trace.
+            let seen;
+            try { seen = projectsWithTasks(db); } catch (e) { queryFailed(e); }
+            const known = new Set([...Object.keys(reg.registry.projects), ...seen]);
             if (!known.has(want))
               fail("project_unknown",
                    `reeve task list: ${JSON.stringify(want)} is not a project this machine knows.\n` +

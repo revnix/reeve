@@ -30,6 +30,8 @@ import { writeFileSync, mkdirSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { resolveHome, DEFAULT_HOME } from "./home.mjs";
+import { ARTIFACT_FILE } from "./paths.mjs";
+import { BUILD_ACTIONS } from "./build/phases.mjs";
 
 /**
  * Read-only git. A fixer has to see what it is changing, and none of these can
@@ -854,6 +856,26 @@ const matchesAny = (file, globs) => (globs ?? []).some(g => toRe(g).test(file));
  * and pushing nothing as though it were a repair is absence read as success.
  */
 export function reviewDiff({ files, profile, lane = null, action = null }) {
+  // THE SIBLING'S PHASES ARE NOT THIS FUNCTION'S. A report phase produces an
+  // artifact and no diff, so it would arrive here with an empty file list and be
+  // refused as "the worker produced an empty diff" -- a refusal that reads as the
+  // worker's fault and is the gate's. Throwing is deliberate: reaching this
+  // function with an artifact phase is a wiring error at the dispatch seam, not
+  // an operator condition, and an operator cannot act on it.
+  //
+  // MATCHED ON THE ACTION NAMES CALLERS ACTUALLY PASS. `reviewDiff` receives
+  // `decision.action`, and a report phase is dispatched under a BUILD_ name --
+  // `BUILD_RESEARCH`, which this module already keys on at the network allowance
+  // below. Keying only on the PHASE names meant the guard could never fire for
+  // any real caller: correct-looking, tested, and unreachable.
+  //
+  // Both vocabularies are refused, and both are derived. `BUILD_ACTIONS` is the
+  // dispatch vocabulary and `ARTIFACT_FILE` the phase one; phases.mjs records
+  // why they cannot be derived from each other -- SIZING dispatches as
+  // BUILD_SIZE, not BUILD_SIZING, so a `BUILD_${phase}` rule is quietly wrong
+  // for exactly one of the three.
+  if (action !== null && (BUILD_ACTIONS.includes(action) || Object.hasOwn(ARTIFACT_FILE, action)))
+    throw new Error(`${action} produces an artifact, not a diff; reviewArtifact is its gate`);
   const risk = profile?.risk ?? {};
   // null is "could not ask git", which is not the same as "nothing changed" and
   // must not be reported as it. Both refuse; only one of them is the worker's fault.

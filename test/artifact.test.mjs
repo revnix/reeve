@@ -574,6 +574,80 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   }
 }
 
+// ── The artifact the PRODUCER is specified to write ────────────────────────
+//
+// This fixture is copied from the phase plan that will emit design.md, not
+// written to match this gate. That distinction is the whole point: every design
+// fixture in this file until now was written to fit the checker, so the checker
+// and its tests agreed with each other and disagreed with the artifact.
+//
+// Three disagreements, all found this way and all of which refused correct work:
+// the producer writes `## Slices` holding `### Slice 1: ...` where this gate
+// matched only `## Slice`; it labels the test plan `Test plan:` where this gate
+// wanted `Tests:`; and it puts `Done when:` alone with a fenced command beneath
+// it where this gate demanded a value on the same line.
+{
+  const documented = [
+    "# Design", "", "## Approach", "", "Do the thing.", "", "## Slices", "",
+    "### Slice 1: add the reader", "",
+    "- Files: `src/build/sizing.mjs` (1.0), `test/build-sizing.test.mjs` (0.5)",
+    "- Packages: `src/build`",
+    "- Test plan: append to `test/build-sizing.test.mjs`", "",
+    "Done when:", "", "```bash", "pnpm test -- test/build-sizing.test.mjs", "```", "",
+  ].join("\n");
+  const adir = join(dir, "documented");
+  writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(documented) });
+
+  // BOTH expect shapes. The phase helpers return the requirement set and carry
+  // no depth -- the depth is an INPUT to them -- so a gate demanding one throws
+  // before reading the artifact and refuses its own documented callers.
+  for (const [label, expect] of [["the helper's requirement set", { minCitationsPerClaim: 1, minClaims: 1 }],
+                                 ["a depth-carrying expect", { depth: "standard" }]]) {
+    let r = null, threw = null;
+    try { r = reviewArtifact({ phase: "DESIGN", dir: adir, expect }); } catch (e) { threw = String(e.message); }
+    check(threw === null, `reviewArtifact does not throw on ${label}`, String(threw));
+    check(r?.ok === true, `and accepts the documented design artifact with ${label}`,
+      JSON.stringify(r?.findings));
+  }
+
+  // AND IT STILL REFUSES, so accepting the producer's shape did not make the
+  // gate permissive. Each of these is the documented shape with one thing removed.
+  const g = (body) => {
+    const d2 = join(dir, `doc${Math.random().toString(36).slice(2, 8)}`);
+    writeArtifact({ dir: d2, phase: "DESIGN", bytes: Buffer.from(body) });
+    return reviewArtifact({ phase: "DESIGN", dir: d2, expect: { depth: "standard" } });
+  };
+  check(g(documented.replace(/- Files:[^\n]*\n/, "")).ok === false,
+    "control: the documented shape missing its Files line is refused");
+  check(g(documented.replace(/Done when:[\s\S]*$/, "")).ok === false,
+    "control: and missing its done condition");
+  check(g("# Design\n\n## Approach\n\nprose only\n").ok === false,
+    "control: and one with no slices at all");
+}
+
+// ── Every standard list marker is a claim ──────────────────────────────────
+//
+// `-`, `*` and `1.` were recognised; `+` and `1)` were not, so an uncited claim
+// written with either was not a claim at all and the citation rule never saw it.
+// A check that narrows its own input reports success on what it skipped.
+{
+  const adir = join(dir, "markers");
+  const g = (body) => {
+    writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
+    return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+  };
+  for (const marker of ["-", "*", "+", "1.", "1)"]) {
+    const r = g(`# r\n\n- a cited claim (src/x.mjs:1)\n${marker} an uncited claim\n`);
+    check(r.ok === false, `an uncited claim written with "${marker}" is seen and refused`,
+      JSON.stringify(r.findings));
+  }
+  // CONTROL: a cited claim in each marker still passes, so the markers were
+  // added to the CLAIM test rather than everything being refused.
+  for (const marker of ["+", "1)"])
+    check(g(`# r\n\n${marker} a cited claim (src/x.mjs:1)\n`).ok === true,
+      `control: a cited claim written with "${marker}" passes`);
+}
+
 db.close();
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

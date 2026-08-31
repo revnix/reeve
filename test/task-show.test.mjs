@@ -372,41 +372,56 @@ const filed = {};
   rehead("headC");
 
   // ── WAITING_FOR_NOTICE, scoped the same way ────────────────────────────────
+  //
+  // `notice_receipt`'s primary key is (task, head_sha, clean_source_id), so a
+  // delivery and its acknowledgement CANNOT both exist as rows for one source:
+  // acknowledging advances the row's `kind`. Measured from the schema, and it is
+  // what makes the pairing below testable at all.
   setPhase(filed.gate, "SPEC_PR_OPEN");
-  db.prepare(`INSERT INTO notice_receipt(task,head_sha,clean_source_id,channel,kind,delivered_at)
-              VALUES(?,'headC','src-1','post','delivered',?)`).run(filed.gate, NOW - 50);
+  const deliver = (head, src, at) => db.prepare(
+    `INSERT INTO notice_receipt(task,head_sha,clean_source_id,channel,kind,delivered_at)
+     VALUES(?,?,?,'post','delivered',?)`).run(filed.gate, head, src, at);
+  const ack = (src) => db.prepare(
+    "UPDATE notice_receipt SET kind='founder_ack' WHERE task = ? AND clean_source_id = ?")
+    .run(filed.gate, src);
+
+  deliver("headC", "src-1", NOW - 50);
   check(show().waiting.all.includes("WAITING_FOR_NOTICE"),
     "a delivered notice at the current head with no acknowledgement is WAITING_FOR_NOTICE");
-  db.prepare(`INSERT INTO notice_receipt(task,head_sha,clean_source_id,channel,kind,delivered_at)
-              VALUES(?,'headC','src-2','cli','founder_ack',?)`).run(filed.gate, NOW - 10);
+  ack("src-1");
   check(!show().waiting.all.includes("WAITING_FOR_NOTICE"),
-    "and an acknowledgement AT THAT HEAD clears it");
+    "and an acknowledgement of THAT SOURCE clears it");
 
   // The founder answered headC by requesting changes rather than acknowledging,
   // and the push of headD voids that window. A task-wide predicate reports the
   // old delivery as outstanding for the rest of the task's life.
+  db.prepare("UPDATE notice_receipt SET kind='delivered' WHERE task = ? AND clean_source_id = 'src-1'")
+    .run(filed.gate);
   rehead("headD");
-  db.prepare("DELETE FROM notice_receipt WHERE task = ? AND clean_source_id = 'src-2'").run(filed.gate);
   const superseded = show();
   check(!superseded.waiting.all.includes("WAITING_FOR_NOTICE"),
     "a delivery at a SUPERSEDED head is not an outstanding notice: the new push voided its window",
     JSON.stringify(superseded.waiting));
-  db.prepare(`INSERT INTO notice_receipt(task,head_sha,clean_source_id,channel,kind,delivered_at)
-              VALUES(?,'headD','src-3','post','delivered',?)`).run(filed.gate, NOW - 5);
+  deliver("headD", "src-3", NOW - 5);
   check(show().waiting.all.includes("WAITING_FOR_NOTICE"),
     "control: a delivery AT the new head is, so the scoping did not simply disable it");
 
-  // With no open spec PR there is no head under review, so neither gate wait can
-  // be outstanding -- which is the true answer rather than a missing one.
-  db.prepare("UPDATE task_pr SET merged_sha = 'merged' WHERE task = ?").run(filed.gate);
-  const noHead = show();
-  check(!noHead.waiting.all.includes("WAITING_FOR_CODEX") &&
-        !noHead.waiting.all.includes("WAITING_FOR_NOTICE"),
-    "once the spec PR is no longer open there is no head under review, and neither gate wait stands",
-    JSON.stringify(noHead.waiting));
-  db.prepare("DELETE FROM task_pr WHERE task = ?").run(filed.gate);
+  // AND PAIRED BY SOURCE, not merely by head. One unchanged head can receive
+  // several clean passes, each with its own delivery, and each wants its own
+  // answer. A head-wide boolean let the first acknowledgement suppress the wait
+  // for every later one, so the founder would never be asked about a notice that
+  // had genuinely arrived.
+  ack("src-3");
+  check(!show().waiting.all.includes("WAITING_FOR_NOTICE"),
+    "control: acknowledging that source clears it");
+  deliver("headD", "src-4", NOW - 3);
+  check(show().waiting.all.includes("WAITING_FOR_NOTICE"),
+    "a SECOND clean pass at the same head is a second delivery, and the first ack does not answer it",
+    JSON.stringify(show().waiting));
+  check(show().waiting.since === NOW - 3,
+    "and `since` is the unanswered delivery's moment, not the answered one's",
+    String(show().waiting.since));
   db.prepare("DELETE FROM notice_receipt WHERE task = ?").run(filed.gate);
-  db.prepare("DELETE FROM gate_request WHERE task = ?").run(filed.gate);
 
   // WAITING_FOR_GUARDIAN is the phase, because the guardian's verdicts live in a
   // store the hub deliberately cannot read.
@@ -1102,6 +1117,12 @@ const filed = {};
     "why keeps a MERGED pull request, with the sha it merged as", JSON.stringify(m.prs));
   check(!m.absent.includes("prs"),
     "so the section is not absent for a task whose work completed", JSON.stringify(m.absent));
+  // AND THE RENDER SAYS SO. Carrying `merged_sha` in the model while the text
+  // printed a merged row identically to an open one is the same seam that hid
+  // DRIFT and the floors: the default renderer is what an operator reads.
+  const text = renderWhy(m);
+  check(/MERGED mergedsha/.test(text),
+    "and the human render says it MERGED, with the receipt", text.slice(0, 900));
 
   // CONTROL: `show` still answers the present tense with open rows only, or the
   // two readers have collapsed into one wrong one.

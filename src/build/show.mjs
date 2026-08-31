@@ -254,8 +254,13 @@ export function evidenceFor(db, taskId, { now, generation = null }) {
     codexClean: db.prepare(
       `SELECT head_sha, source_id, actor_login_snapshot, observed_at
          FROM approval WHERE task = ? AND kind = 'codex_clean'`).all(taskId),
+    // `clean_source_id` IS SELECTED because it is part of the key. A head can
+    // receive several clean passes, and `notice_receipt` records one row per
+    // (head, source) deliberately -- so an acknowledgement is an answer to ONE
+    // delivery, not to the head.
     notices: db.prepare(
-      `SELECT head_sha, kind, channel, delivered_at FROM notice_receipt WHERE task = ?`).all(taskId),
+      `SELECT head_sha, clean_source_id, kind, channel, delivered_at
+         FROM notice_receipt WHERE task = ?`).all(taskId),
     liveRun: db.prepare(
       `SELECT phase, slice, attempt, status, model_id, cli_version, started_at, heartbeat_at,
               contract_drift
@@ -356,11 +361,19 @@ export function waitingFor(row, ev) {
   const head = specPr?.head_sha ?? null;
 
   if (head !== null) {
-    const acked = ev.notices.some(n => n.kind === "founder_ack" && n.head_sha === head);
-    const delivered = ev.notices.filter(n => n.kind === "delivered" && n.head_sha === head);
-    if (delivered.length && !acked) {
+    // PAIRED BY SOURCE, not by head. `notice_receipt`'s key is
+    // (task, head_sha, clean_source_id), so two clean passes at one unchanged
+    // head produce two deliveries and want two answers. A head-wide boolean let
+    // an acknowledgement of the first suppress the wait for the second, and the
+    // founder would never be asked about a notice that had genuinely arrived.
+    const ackedSources = new Set(ev.notices
+      .filter(n => n.kind === "founder_ack" && n.head_sha === head)
+      .map(n => n.clean_source_id));
+    const unanswered = ev.notices.filter(n =>
+      n.kind === "delivered" && n.head_sha === head && !ackedSources.has(n.clean_source_id));
+    if (unanswered.length) {
       all.push("WAITING_FOR_NOTICE");
-      at.WAITING_FOR_NOTICE = Math.min(...delivered.map(n => n.delivered_at));
+      at.WAITING_FOR_NOTICE = Math.min(...unanswered.map(n => n.delivered_at));
     }
 
     // Asked for review AT THIS HEAD, for THIS generation, with no Codex clean

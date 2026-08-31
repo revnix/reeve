@@ -93,9 +93,11 @@ will read real drift as the expected one.
 
 2. **That cleanup is DONE** and was replaced by a lint rule; see §0. Do not redo it.
 
-3. **Then bring me the decisions in §6 and §8** with options and trade-offs. One is
-   already written up with three options and a recommendation. Do not start the
-   arming question without me.
+3. **Check §6 and §8 for what is still OPEN before bringing me anything.** Most of
+   what those sections once asked is now settled and recorded there; re-opening a
+   settled decision costs a blocking round trip and teaches me that the record cannot
+   be trusted. Bring me only the rows those sections still mark as needing me. Do not
+   start the arming question without me.
 
 4. **Keep a 15-minute watcher on my open pull requests.** It is `tools/watch-prs.sh`
    in the repository — run it, do not rewrite it. It must emit a HEARTBEAT and alarm

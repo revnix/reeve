@@ -95,9 +95,11 @@ will read real drift as the expected one.
    SUPERSEDED — read `docs/2026-08-31-session-handoff.md`, whose §0 records it; the
    handoff this prompt names does not. Do not redo the cleanup.
 
-3. **Then bring me the decisions in §6 and §8** with options and trade-offs. One is
-   already written up with three options and a recommendation. Do not start the
-   arming question without me.
+3. **Check §6 and §8 for what is still OPEN before bringing me anything.** Most of
+   what those sections once asked is now settled and recorded there; re-opening a
+   settled decision costs a blocking round trip and teaches me that the record cannot
+   be trusted. Bring me only the rows those sections still mark as needing me. Do not
+   start the arming question without me.
 
 4. **Keep a 15-minute watcher on my open pull requests.** It is `tools/watch-prs.sh`
    in the repository — run it, do not rewrite it. It must emit a HEARTBEAT and alarm
@@ -184,9 +186,14 @@ what would have to be true for it to fail, and then make that happen.
 
 ## What needs me, so you do not wait on it silently
 
-§0, §6 and §8 have these in full, so this names only what each one IS: whether to
-re-arm, the merge shape, the CI cost decision, the R-05/R-08 decisions, the test
-clock in the live store, the second project, and the ntfy read user.
+§0 is the list, and it is shorter than it was: the CI cost decision, the R-05 and
+R-08 questions, and the reviewer roster were all settled on 2026-08-30 and 31. Do
+not re-ask them.
+
+What is left is whether to re-arm, and that waits on ONE measurement rather than on
+a decision — see §0, and `docs/measured/2026-08-31-subscription-pool-plan.md`. The
+second project, the ntfy read user and the test clock are also §0's, and none is
+urgent.
 
 Work autonomously, tell me when you need something, and do not claim anything is
 verified that you have not run.

@@ -68,14 +68,18 @@ the prose is stale. That includes this section.
 | the durable-effect stages | **1, 2 and 4 have landed. 3 was never merged and is ABANDONED, not deferred** — its pull request was closed on the founder's decision rather than left to resume; §5 says why, and what survived it |
 | the repository is **PUBLIC** | made public 2026-08-27, exposure audited first |
 | codex is a **blocking** reviewer | changed 2026-08-26 |
-| the founder's merge rule | merge on CI green AND zero open threads, and **each merge needs its own grant** — a grant does not carry to the next pull request |
+| the founder's merge rule | merge on CI green AND zero open threads, and **each merge needs its own grant** — a grant does not carry to the next pull request. **Extended 2026-08-30: handed over with `scripts/premerge.mjs`'s verdict and the head SHA**, so a grant names a commit; §7 says what that cost |
 | the R-01 merge authority | **PARTLY done**; `enforce_admins` was enabled and DISABLED again on the founder's instruction, so the admin identity is exempt by design |
 | the R-03 merge shape | **undecided** |
 | the second project | `rextaihq/rext-backend` — **not started** |
 | the ntfy read user | **not created** |
 | what a real dispatch has proven | **nothing under the current contract** |
-| the CI cost decision | **open, and it is the founder's**. §6 has three options and a recommendation |
-| the peer session's lane | the builder lane: S3-A tasks, `src/build/**`, `src/profile/**`, docs generators. They have listed my ground back accurately and stayed off it all day |
+| the CI cost decision | **DECIDED 2026-08-30: widen the sweep.** It was framed as a cost decision and was not one — the repository is public, CI is not billed, and the eighteen minutes cost review latency. The measurement that settled it: 48 entries covering 3 of 106 test files, 26 of them on the sweep's own test |
+| every test file needs a stub | **DECIDED 2026-08-30.** A test file that no manifest entry names and that is not on the frozen `GRANDFATHERED` list fails the sweep. A grandfathered file loses its place the moment it is MODIFIED, and the list may only shrink |
+| reading `.pathname` | **BANNED outright, 2026-08-31**, by a lint rule rather than a text search. The narrow version tried to decide which URLs were FILE urls; that is undecidable, and review found six ways the approximation was wrong. Measured first: 185 files, zero `.pathname` reads |
+| the MANAGED PROJECT's reviewers | **all optional, 2026-08-31** — the roster R-05 measures on `nextlyhq/nextly`. A silent one is not a problem to solve. This does NOT touch the row above about reeve's own workflow, which is a different roster and still blocking. R-08 needs nothing: a detector that has not fired is unproven rather than broken |
+| whether headless and interactive Claude usage share one pool | **UNMEASURED, and it gates arming.** The CLI exposes no usage or quota subcommand (2.1.246), so the measurement is observational and needs the founder. Plan: `docs/measured/2026-08-31-subscription-pool-plan.md` |
+| the other sessions' lanes | **THREE sessions now.** The builder lane holds `src/build/**`, `src/profile/**` and the S3 tasks; a third session took S3 T13, the task read model, touching `bin/reeve` and a new `src/build/taskmodel.mjs`. Both have listed the guardian's ground back accurately and stayed off it |
 
 **Change them HERE and nowhere else**; elsewhere write "see §0". Enforced by
 `test/docs-state-is-single-sourced.test.mjs` and `test/zero-agrees-with-the-code.test.mjs`.
@@ -244,31 +248,28 @@ there; see §0. Was raised on 2026-08-30, still pushed and not yet opened.
 
 ## 6. Unfinished work, and what each piece needs
 
-**The `.pathname` cleanup.** Ten uses across the repository, four in
-`test/stubsweep.test.mjs`. `new URL(...).pathname` leaves a path percent-encoded,
-so any checkout whose path contains a space breaks — and the failure is
-indistinguishable from the staleness those assertions exist to detect, so whoever
-hits it regenerates, sees no diff, and has no next move. `fileURLToPath()` is the
-correct API. Found by the peer in their own file; mechanical, and wants its own
-small change rather than widening something.
-
-**The CI cost decision, and it is the founder's.** A full sweep is about eighteen
-minutes and CI pays it on every push. Three options: leave it; tier by cost
-(rejected — it changes what a green `Stub sweep` MEANS); or gate by what each
-entry guards, which is the recommendation, with each manifest entry declaring the
-paths that make it relevant rather than the workflow carrying a second list.
-
-**R-05 and R-08**, measured 2026-08-29, and the answers differ from what was
-assumed: see §0 for anything since: codex has filed no P0 at all in this store (52 findings, P1→critical,
-P2→major, none unknown), and `greptile-apps` has exactly ONE round, on one pull
-request, on 2026-08-18, which produced zero findings while claiming outcome
-`findings`. Both want a decision from the founder rather than more measurement; see §0 for what is settled.
+Three things that stood here on 2026-08-30 are now settled, and §0 owns each: the
+`.pathname` cleanup, the CI cost decision, and R-05/R-08. What follows is what is
+genuinely left.
 
 **The test clock in the live store.** `reviewer_supply.since` for `greptile-apps`
-is the suite's `NOW` constant, dated five months ahead, as measured 2026-08-30 (see §0). One row,
-one column, confirmed by scanning all 200 integer columns with a positive control.
-Nothing reads `since` today, so it is latent. The recommendation is a guard that
-rejects a future timestamp on write, then the correction.
+carries the suite's `NOW` constant, dated months ahead; see §0 for the reviewers'
+status. Read live from the state database on 2026-08-31, and the other three
+reviewers carry sane dates. Nothing reads `since` as of 2026-08-31, so it is latent. The shape is a guard that refuses a future timestamp on write, and THEN the
+correction — guard first, so it cannot come back.
+
+**Arming.** See §0 for both switches and for the pool question, which is what it
+waits on. The plan (see §0) is
+`docs/measured/2026-08-31-subscription-pool-plan.md`.
+
+**A flake, not a defect.** `test/provider-scheduler.test.mjs` failed once on the
+default branch with one of twenty racing children exiting zero and empty. The builder
+lane established by import graph that the change it landed with could not reach that
+file, and identified a candidate mechanism — the test resolves on the child's `exit`
+event, where `close` is the one that guarantees stdio has drained, a distinction
+`src/supervisor.mjs` already carries for the production path. They could NOT
+reproduce it in 480 children, and said so rather than shipping a fix. Three test
+files share the shape.
 
 **Issue #43** was offered to the peer and taken. **Issue #46** is unclaimed.
 
@@ -331,13 +332,9 @@ arming rests on the shadow projection being trustworthy evidence.
 
 **The order I would take:**
 
-1. **Open and land the two branches in §5**, one at a time so a red CI on one does
-   not obscure the other. The approval fix closes the only unresolved thread in
-   this lane.
-2. **The `.pathname` cleanup** (§6). Small, mechanical, and it removes a failure
-   whose symptom impersonates a different failure.
-3. **The CI cost decision** (§6) — needs the founder, not code.
-4. **Then arming**, which is the founder's call and rests on 1-3.
+Everything in the list this section carried is now settled or done; §0 owns each,
+and a resumed session should read §0 rather than this paragraph. What remains is **arming** (see §0),
+which waits on `docs/measured/2026-08-31-subscription-pool-plan.md`.
 
 **What NOT to do:** do not merge `docs/s3-foundation` to pick up the S3-A plan.
 Measured 2026-08-30: its tracker copy is about 8KB SMALLER than the default

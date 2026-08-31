@@ -68,3 +68,64 @@ export function legacyDashPathFor(home, nwo) {
 export function hubPathFor(home) {
   return join(home, "state", "hub.db");
 }
+
+/**
+ * The artifact each report phase produces. ONE declaration, exported, because
+ * the phase-to-filename map is a fact about the design's per-action table and a
+ * second copy in the artifact store would be a second inventory to drift from.
+ */
+export const ARTIFACT_FILE = Object.freeze({
+  SIZING: "sizing.json", RESEARCH: "research.md", DESIGN: "design.md",
+});
+
+/**
+ * One task's tree.
+ *
+ * The id is sanitised for the same reason a repository name is: it arrives from
+ * a command line, and a separator in it would walk out of the home. `safe`
+ * replaces every character outside [A-Za-z0-9._-], which includes both kinds of
+ * separator, so whatever comes back is a SINGLE path segment and cannot
+ * traverse. It may still contain a literal `..` -- `../../etc` becomes
+ * `--..-etc` -- and that is harmless for exactly that reason: a segment is not a
+ * path. Asserting the absence of the two characters would be testing a proxy;
+ * what matters, and what the test asserts, is that the resolved path stays
+ * inside the tasks directory.
+ *
+ * `bt:<ulid>` is [0-9A-Z] apart from its colon, so the substitution is injective
+ * over real ids and two tasks can never share a directory.
+ */
+export function taskPathFor(home, taskId) {
+  return join(home, "tasks", safe(taskId));
+}
+
+/** Where a report phase's artifact lands, durable before its transition. */
+export function artifactPathFor(home, taskId, phase) {
+  const name = ARTIFACT_FILE[phase];
+  if (!name) throw new Error(`${phase} produces no artifact; its product is a diff, reviewed by reviewDiff`);
+  return join(taskPathFor(home, taskId), "artifacts", name);
+}
+
+/**
+ * A run's durable output. Every field is required: a run file that omits the
+ * attempt overwrites the previous attempt's transcript, which is how a measured
+ * comparison lost two of its three runs.
+ */
+export function runPathFor(home, taskId, { generation, phase, slice, attempt, stream }) {
+  if (![generation, slice, attempt].every(Number.isInteger) || !phase || !stream)
+    throw new Error("a run path needs generation, phase, slice, attempt and stream; none is optional");
+  // EVERY COMPONENT IS A SEGMENT, not just the task id. The id was sanitised and
+  // the rest were only checked for presence, so a phase or stream carrying a
+  // separator escaped the task tree entirely -- `phase: "x/../../../../escape"`
+  // resolved to a file directly under the reeve home. Same defect as the one
+  // `safe` exists to prevent, in the same function, on the arguments beside it.
+  //
+  // These THROW rather than being sanitised. A task id arrives from a command
+  // line and a person can typo it; a phase and a stream are chosen by this
+  // codebase, so a separator in one is a wiring error, and quietly rewriting it
+  // would hide the bug and produce a file nobody can find by name.
+  for (const [name, value] of [["phase", phase], ["stream", stream]])
+    if (String(value) !== safe(value))
+      throw new Error(`a run path's ${name} must be a single path segment; ` +
+                      `${JSON.stringify(String(value))} is not, and would place the file outside the task's tree`);
+  return join(taskPathFor(home, taskId), "runs", `g${generation}-${phase}-s${slice}-a${attempt}.${stream}`);
+}

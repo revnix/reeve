@@ -122,10 +122,23 @@ export function writeArtifact({ dir, phase, bytes }) {
   // directory's contents does not persist the fact that the directory exists.
   // `fresh` runs deepest-first, so the parents are synced from the inside out.
   for (const made of chain) {
+    const parent = dirname(made);
     try {
-      const pfd = openSync(dirname(made), "r");
+      const pfd = openSync(parent, "r");
       try { fsyncSync(pfd); } finally { closeSync(pfd); }
-    } catch { /* above the tree this call owns; not ours to sync */ }
+    } catch (e) {
+      // ONLY A DIRECTORY THIS CALL DOES NOT OWN MAY FAIL SILENTLY. The blanket
+      // catch swallowed everything, so an EIO on a parent INSIDE the task's tree
+      // read the same as a permission error on a directory above it -- and
+      // writeArtifact returned a sha for an artifact whose tree was not durable.
+      // A guard that cannot fail is not a guard, and this one was reporting
+      // success for the storage failures it exists to notice.
+      //
+      // The tree this call owns is the chain it just created plus the leaf; a
+      // parent of one of those failing is a real failure. Anything above is
+      // somebody else's directory and its refusal is not ours to raise.
+      if (chain.includes(parent) || parent === dir) throw e;
+    }
   }
   return { path, sha256: sha(bytes), bytes: bytes.length };
 }
@@ -253,12 +266,29 @@ export function reviewArtifact({ phase, dir, expect }) {
     if (expect.depth === "trivial")
       return { ok: false, why: "RESEARCH is skipped at trivial depth; there is no research artifact to gate",
                findings: [], sha256 };
+    // The caller's declared minimum, when it declares one. The phase helpers
+    // return `{minCitationsPerClaim, minClaims}`; a depth-carrying caller does
+    // not, so the default stands in for it.
+    var minClaims = Number.isInteger(expect.minClaims) ? expect.minClaims : 1;
     // PER CLAIM, not per file. A whole-file test passes as soon as ANY line
     // carries a citation, so an artifact with nine cited claims and one bare
     // assertion reads as clean -- and the bare one is the claim that needed
     // checking.
+    // CLAIMS LIVE UNDER `## Findings` WHEN THE DOCUMENT HAS ONE. The contract
+    // defines a claim as a bullet in that section, and scanning the whole
+    // document made every bullet elsewhere a claim -- so a valid report with a
+    // `## Limitations` note saying the network was unavailable was REFUSED for
+    // failing to cite it. A document with no Findings heading is still scanned
+    // whole, because refusing to look is not better than looking too widely.
+    const scope = (() => {
+      const rows = text.split("\n");
+      const at = rows.findIndex(l => /^##\s+Findings\b/i.test(l));
+      if (at === -1) return rows;
+      const end = rows.findIndex((l, i) => i > at && /^##\s+/.test(l));
+      return rows.slice(at + 1, end === -1 ? rows.length : end);
+    })();
     let claims = 0;
-    for (const line of text.split("\n")) {
+    for (const line of scope) {
       if (!CLAIM.test(line)) continue;
       claims++;
       if (!CITATION.test(withoutUrls(line))) findings.push(`no file:line citation: ${line.trim()}`);
@@ -267,9 +297,9 @@ export function reviewArtifact({ phase, dir, expect }) {
     // and every claim is trivially cited, so an empty artifact -- or one that is
     // all headings and prose -- passed a gate whose whole subject is the claims
     // it does not contain. "Nothing to check" is not "checked".
-    if (claims === 0)
-      findings.push("no claims at all: RESEARCH must produce findings, and an artifact with none " +
-                    "satisfies the citation rule only because there is nothing to cite");
+    if (claims < minClaims)
+      findings.push(`${claims} claim(s) against a minimum of ${minClaims}: RESEARCH must produce findings, ` +
+                    "and an artifact with none satisfies the citation rule only because there is nothing to cite");
   }
   if (phase === "DESIGN") {
     // PER SLICE, not per document -- the same distinction the citation check
@@ -324,6 +354,14 @@ export function reviewArtifact({ phase, dir, expect }) {
         // So: content after the colon, or any non-blank line before the next
         // label or heading. Bounded that way rather than by blank lines, because
         // the documented block is separated from its label by one.
+        const nextBoundary = (rs, from) => {
+          let chars = 0;
+          for (let j = from; j < rs.length; j++) {
+            if (j > from && /^#{2,3}\s+/.test(rs[j])) return chars;
+            chars += rs[j].length + 1;
+          }
+          return chars;
+        };
         const isBoundary = (l) => /^#{2,3}\s+/.test(l) ||
           ["Files:", "Packages:", "Tests:", "Test plan:", "Done when:"].some(n => bare(l).startsWith(n));
         let has = !!bare(rows[at]).slice(label.length).trim();
@@ -331,11 +369,35 @@ export function reviewArtifact({ phase, dir, expect }) {
           if (isBoundary(rows[j])) break;
           if (rows[j].trim()) has = true;
         }
-        if (!has) findings.push(`${heading} has a ${label} line with nothing after it`);
+        if (!has) { findings.push(`${heading} has a ${label} line with nothing after it`); continue; }
+        // A DONE CONDITION IS MACHINE-CHECKABLE WHEN THE CALLER SAYS SO. The
+        // contract defines that as a fenced block inside the slice whose first
+        // line is a command; `Done when: someone approves` satisfies "has a
+        // value" and is not a completion check anybody can run.
+        //
+        // Gated on the caller's declared requirement rather than applied always,
+        // because the phase task that owns this minimum is the one that sets the
+        // flag -- and a caller that has not asked for it is not asking this gate
+        // to invent it. The checker does not RUN the command and does not claim
+        // to; it refuses a slice with no such block.
+        if (label === "Done when:" && expect.requireDoneCondition === true) {
+          const after = rows.slice(at).join("\n");
+          const fence = /^\s*```[^\n]*\n\s*(\S[^\n]*)/m.exec(after.slice(0, nextBoundary(rows, at)));
+          if (!fence) findings.push(`${heading} has no machine-checkable done condition: ` +
+            `the contract asks for a fenced block whose first line is a command`);
+        }
       }
     }
-    if (expect.depth === "trivial" && !/^##\s+Measured context\b/m.test(text))
-      findings.push("at trivial depth design.md stands in for the absent research and needs a Measured context section");
+    // DECLARED REQUIREMENTS FIRST, depth as the fallback. The phase helper
+    // returns `{requireSliceList, requireDoneCondition, requireMeasuredContext,
+    // minSlices}` and carries no depth, so a gate keyed on depth alone ignores
+    // everything its documented caller asked for.
+    const wantsMeasured = "requireMeasuredContext" in expect
+      ? expect.requireMeasuredContext : expect.depth === "trivial";
+    if (Number.isInteger(expect.minSlices) && starts.length < expect.minSlices)
+      findings.push(`${starts.length} slice(s) against a minimum of ${expect.minSlices}`);
+    if (wantsMeasured && !/^##\s+Measured context\b/m.test(text))
+      findings.push("design.md needs a Measured context section: it stands in for the research the depth skipped");
   }
   return findings.length
     ? { ok: false, why: `${ARTIFACT_FILE[phase]} does not meet the minimum for ${phase}`, findings, sha256 }

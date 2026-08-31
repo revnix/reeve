@@ -337,7 +337,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   };
   const empty = gate("# research\n\nprose, and no list items at all.\n");
   check(empty.ok === false, "a research artifact with NO claims is refused", JSON.stringify(empty.findings));
-  check(/no claims at all/.test(empty.findings.join(" ")),
+  // Asserted on the part that carries the MEANING rather than the opening
+  // words: the message gained a count when minClaims became the caller's, and a
+  // test pinned to its first phrase breaks on a rewording that changes nothing.
+  check(/nothing to cite/.test(empty.findings.join(" ")),
     "and says the rule was satisfied only because there was nothing to cite", empty.findings.join(" "));
 
   // CONTROL: one cited claim still passes, so the refusal is about absence
@@ -646,6 +649,83 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   for (const marker of ["+", "1)"])
     check(g(`# r\n\n${marker} a cited claim (src/x.mjs:1)\n`).ok === true,
       `control: a cited claim written with "${marker}" passes`);
+}
+
+// ── The gate applies the requirements it is GIVEN ──────────────────────────
+//
+// The phase helpers return requirement objects -- `{requireSliceList,
+// requireDoneCondition, requireMeasuredContext, minSlices}` and
+// `{minCitationsPerClaim, minClaims}` -- and carry no depth. A gate keyed on
+// depth alone ignores everything its documented caller asked for, which is a
+// quieter failure than refusing it: the checks simply do not run.
+{
+  const slice = "# d\n\n## Slices\n\n### Slice 1: x\n- Files: a\n- Packages: b\n- Test plan: c\n\n";
+  const g = (body, expect) => {
+    const d2 = join(dir, `req${Math.random().toString(36).slice(2, 8)}`);
+    writeArtifact({ dir: d2, phase: "DESIGN", bytes: Buffer.from(body) });
+    return reviewArtifact({ phase: "DESIGN", dir: d2, expect });
+  };
+  const fenced = slice + "Done when:\n\n```bash\npnpm test\n```\n";
+  check(g(fenced, { requireMeasuredContext: true }).ok === false,
+    "requireMeasuredContext true is honoured, with no depth in sight");
+  check(g(fenced, { requireMeasuredContext: false }).ok === true,
+    "control: and requireMeasuredContext false does not demand it");
+  check(g(fenced, { minSlices: 2 }).ok === false, "minSlices is honoured");
+  check(g(fenced, { minSlices: 1 }).ok === true, "control: and a satisfied minSlices passes");
+
+  // THE DONE CONDITION IS MACHINE-CHECKABLE WHEN ASKED FOR. The contract defines
+  // that as a fenced block whose first line is a command. The checker does not
+  // RUN it and does not claim to -- it refuses a slice with no such block.
+  check(g(slice + "Done when: someone approves\n", { requireDoneCondition: true }).ok === false,
+    "a prose done-condition is refused when the caller asks for a checkable one");
+  check(g(fenced, { requireDoneCondition: true }).ok === true,
+    "control: and a fenced command satisfies it");
+  check(g(slice + "Done when: someone approves\n", { depth: "standard" }).ok === true,
+    "control: a caller that did not ask for it is not held to it");
+}
+
+// ── A claim is a bullet under `## Findings` ────────────────────────────────
+//
+// Scanning the whole document made every bullet a claim, so a valid report with
+// a `## Limitations` note saying the network was unavailable was REFUSED for
+// failing to cite it. The gate was rejecting the honest disclosure that research
+// is supposed to carry.
+{
+  const g = (body, expect = { minClaims: 1 }) => {
+    const d2 = join(dir, `sc${Math.random().toString(36).slice(2, 8)}`);
+    writeArtifact({ dir: d2, phase: "RESEARCH", bytes: Buffer.from(body) });
+    return reviewArtifact({ phase: "RESEARCH", dir: d2, expect });
+  };
+  check(g("# Research\n\n## Findings\n\n- a cited claim (src/x.mjs:1)\n\n## Limitations\n\n- no network was available\n").ok === true,
+    "a bullet outside Findings is not a claim and does not need a citation");
+  check(g("# Research\n\n## Findings\n\n- an uncited claim\n").ok === false,
+    "control: an uncited bullet INSIDE Findings is still refused");
+  check(g("# Research\n\n## Findings\n\n").ok === false,
+    "control: and an empty Findings section is refused, not passed for having nothing to check");
+  check(g("# Research\n\n- an uncited claim\n").ok === false,
+    "control: a document with no Findings heading is still scanned whole");
+  // minClaims is the caller's, not a constant here.
+  check(g("# Research\n\n## Findings\n\n- a cited claim (src/x.mjs:1)\n", { minClaims: 2 }).ok === false,
+    "and minClaims is the caller's number, not one fixed here");
+}
+
+// ── A sync failure inside the task's own tree is not swallowed ─────────────
+//
+// The blanket catch made an EIO on a parent INSIDE the tree read the same as a
+// permission error on a directory above it, so writeArtifact returned a sha for
+// an artifact whose tree was not durable. A guard that cannot fail is not a
+// guard; this one was reporting success for exactly the storage failures it
+// exists to notice.
+//
+// What is assertable without a failing disk is the ordinary path: the write
+// succeeds, the artifact reads back, and the chain was walked. The propagation
+// itself is covered by the stub, which is what a manifest entry is for.
+{
+  const deep = join(dir, "propagate", "a", "b", "artifacts");
+  const w = writeArtifact({ dir: deep, phase: "DESIGN",
+    bytes: Buffer.from("# d\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n") });
+  check(readArtifact({ dir: deep, phase: "DESIGN", expectSha: w.sha256 }).ok === true,
+    "control: a write through a new chain still succeeds and reads back");
 }
 
 db.close();

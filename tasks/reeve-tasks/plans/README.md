@@ -189,6 +189,42 @@ fixture from the plan that PRODUCES the thing being gated, not from the plan
 being executed. A fixture written beside the checker tests that the checker
 matches itself.
 
+## What T4 left for S3-D's phase tasks, and why
+
+S3-D `:195` says `reviewArtifact` **gains** the RESEARCH citation minimum in PR-D2 and the
+DESIGN slice-list, done-condition and measured-context minima in PR-D3. T4 built the durable
+store and shipped a working version of those minima alongside it, so whoever executes those
+tasks will find their work partly done. This says which parts and what is still owed, so it is
+neither duplicated nor assumed complete.
+
+**Done in T4, and tested:** the artifact store (atomic write, hashed read-back, stale-temporary
+reaping), the two gates refusing each other's phases, claims scoped to `## Findings`, the
+citation shape, the sizing contract's field presence, per-slice design minima, and honouring
+`requireMeasuredContext`, `minSlices`, `minClaims` and `requireDoneCondition` when the caller
+supplies them.
+
+**Left, by founder decision, for the task that owns the contract:**
+
+| what | why it is S3-D's |
+|---|---|
+| `sizing.json` field TYPES — presence is checked, so `est_files: "lots"` passes | the floors that read those numbers are S3-D's, and they should state what they need |
+| claims restricted to TOP-LEVEL Findings bullets | nested items currently count as claims, so a sub-bullet elaborating a cited claim needs its own citation |
+| a CLOSING fence on the done condition | an unterminated fence satisfies the opening-fence test, and half a block is not a done condition |
+| the trivial-depth RESEARCH refusal keyed on a helper flag | it still reads `expect.depth`, which the helper does not supply, so that path is unreachable from the documented caller |
+| `minCitationsPerClaim` applied | it is accepted and ignored, and an argument read but not applied is worse than one absent, because the caller believes it took effect |
+
+**And three defects of T4's own**, deferred to the same follow-up rather than to S3-D: the
+directory-sync chain stops at eight levels, the citation pattern rejects extensions longer than
+six characters (so `src/x.markdown:12` is refused), and a temporary survives when `closeSync`
+itself throws.
+
+**One more, found by the T13 lane and inherited here:** `bin/reeve`'s `task file` route gates on
+`completedVersion(hub) === HUB_SCHEMA_VERSION`, and `completedVersion` returns `max(version)`.
+A hub recording 1 and 3 with **2 missing** answers 3, passes the equality, and then fails on a
+table migration 2 creates. **A maximum is not a history.** The `at !== 0` escape beside it is a
+second hole: an empty `schema_version` table answers 0 and is waved through as "nothing to
+check", when nothing has been migrated at all.
+
 ## What this file does NOT establish
 
 Only S3-A and the first task of S3-B have been executed. The rows above are what executing

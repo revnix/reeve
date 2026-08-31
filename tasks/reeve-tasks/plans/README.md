@@ -237,3 +237,34 @@ The review that produced the second table read the plans against each other; it 
 execute them. A contradiction between two documents is cheap to see and was found. A plan
 that is self-consistent and wrong about the CODE is not visible that way, and only S3-A and
 the first tasks of S3-B have been checked that way so far.
+
+## Fourth round: what executing S3-E's first pull request found
+
+The rounds above reviewed the plans against the code and against each other. This
+round comes from **running PR-E1**, and it is the first evidence about S3-E of the
+kind the section above says did not exist yet. Each row was established by
+executing the plan's own step and reading what came back.
+
+| the plan says | actually | how it was established |
+|---|---|---|
+| `WAITING_FOR_GUARDIAN` is `guardianQueued > 0 \|\| preempt > 0` | §11.6 defines it as *"VERDICT_WAIT without a verdict at H"*. The plan's version is a fact about the MACHINE, not about the task: any guardian queued anywhere marks every task in the listing as waiting for a guardian, which is not an answer to "why is this task not moving" | `docs/2026-08-21-builder-design.md` §11.6, the substate list |
+| `WAITING_FOR_NOTICE` is `some(kind='delivered') && !some(kind='founder_ack')` | `notice_receipt`'s key is `(task, head_sha, clean_source_id)` and a task REVISES. A task-wide check reports a head delivered-and-unanswered as acknowledged, because an older head was acknowledged. The pairing has to be per `head_sha` | `src/build/hub.sql`, `notice_receipt`; and the stub that makes the check task-wide turns exactly one assertion red |
+| `WAITING_FOR_CODEX` is an open `gate_request` with no `notice_receipt` at that head | a notice receipt is a DELIVERY to the founder, not a review. The row that means "Codex answered" is `approval` with `kind = 'codex_clean'`, which the plan's consumed table never mentions | `src/build/hub.sql:242-264`; `approval.kind` includes `codex_clean` |
+| `taskShow(db, id, { capabilities })`, one map for a whole `task list` | switches live in each project's **own** profile and a listing spans projects, so one map reports one project's switches under another project's name — for the one value whose entire job is to say why a particular task is not moving. The reader has to resolve per project | two projects with different `observe` settings in one listing; with one map the second project's row is wrong |
+| S3-E Task 1 and Task 2's snippets read `r.stdout` from `test/cli-flags.test.mjs`'s `run()` | that helper returns `{ status, out }` and **no `stdout` at all**. `JSON.parse(undefined)` throws into the `catch` and reads as "did not parse"; `prose.stdout.slice(0, 120)` throws and ABORTS the file. Both are indistinguishable in the log from assertions that ran | `grep -n 'const run = ' -A6 test/cli-flags.test.mjs` |
+| `APPLIES.json` includes `build` | the `build` route contains **zero** occurrences of the token `json` across all 447 of its lines, so the flag is accepted and inert on every one of its subcommands. Listing it there asserts a capability that does not exist | count of `json` per route line-range: doctor 2, builder 8, task 8, **build 0** |
+
+**And one that is not S3-E's fault but will bite the next person in that file.**
+`bin/reeve`'s `case "task":` block does `const { openHub } = await import(...)` for
+its `file` subcommand, which shadows the top-level `openHub` import for the
+**whole case block**. A branch added above it that touches `openHub` dies with
+`Cannot access 'openHub' before initialization`. It surfaced here as a stub whose
+twelve red assertions had nothing to do with the property being measured — a
+reading that was thrown away rather than recorded, which is the only correct
+response to a run that failed for the wrong reason.
+
+**What this round says about the remaining plans.** Every finding above is of the
+same kind as the ones already recorded: a "produces" clause nobody ran. Three of
+them are the plan disagreeing with the SPEC it cites, which no amount of reading
+the plans against each other could have found. S3-C, S3-D and S3-F have still
+never been executed.

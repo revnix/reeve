@@ -33,7 +33,12 @@ const dir = mkdtempSync(join(tmpdir(), "reeve-flags-"));
 const run = (...args) => {
   const r = spawnSync(process.execPath, [join(ROOT, "bin", "reeve"), ...args],
     { encoding: "utf8", env: { ...process.env, REEVE_HOME: join(dir, "envhome") } });
-  return { status: r.status, out: (r.stdout ?? "") + (r.stderr ?? "") };
+  // stdout and stderr SEPARATELY, additively. `out` is the concatenation every
+  // existing assertion here reads; the two halves are needed because one contract
+  // asserted below is precisely that the machine shape goes to stdout and the
+  // human one to stderr, and a helper that concatenates them cannot see that.
+  return { status: r.status, out: (r.stdout ?? "") + (r.stderr ?? ""),
+           stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 };
 
 // A repository of our own, for the two drills that run `init`.
@@ -571,6 +576,22 @@ check(existsSync(join(repo, ".git")),
   const t = run("task", "--dry-run");
   check(/reeve task:/.test(t.out) && !/--dry-run is not implemented/.test(t.out),
     "control: the command that implements it still reaches its own body", t.out.split("\n")[0]);
+
+  // AND IT IS THE SAME GATE that refuses an inapplicable `--json`. Two allow-lists
+  // for one rule agree right up until a third flag has to choose which of them to
+  // copy, so the scoping this file already proved for `--dry-run` is asserted here
+  // to be the SAME mechanism rather than a parallel one.
+  const { APPLIES } = await import("../bin/reeve.flags.mjs");
+  check(Array.isArray(APPLIES["dry-run"]) && APPLIES["dry-run"].includes("task file"),
+    "--dry-run is scoped by the same map as --json, not by a second allow-list",
+    JSON.stringify(APPLIES));
+  const BIN2 = readFileSync(new URL("../bin/reeve", import.meta.url), "utf8");
+  check(!/DRY_RUN_COMMANDS/.test(BIN2),
+    "and the allow-list it used to have its own copy of is gone",
+    (BIN2.match(/.*DRY_RUN_COMMANDS.*/) ?? [""])[0]);
+  check(/\binapplicable\(\s*cmd\b/.test(BIN2),
+    "counter-control: the extraction can find the gate that replaced it, so the absence above is real",
+    (BIN2.match(/.*inapplicable\(cmd.*/) ?? [""])[0]);
 }
 
 // ── A bare `-` is a value, not a flag ───────────────────────────────────────
@@ -615,6 +636,207 @@ check(existsSync(join(repo, ".git")),
   const t = run("task", "file", "--title", "");
   check(/--title expects a value/.test(t.out),
     "control: and so is an empty --title", t.out.split("\n")[0]);
+}
+
+
+// ── a flag that cannot apply is refused, not silently ignored ────────────────
+//
+// A flag a command accepts and cannot act on is indistinguishable from a flag
+// that does not exist. Measured before this change: nine read commands accepted
+// --json, three honoured it, and for the other six the output was byte-identical
+// with the flag and without it. The parser already refuses UNKNOWN flags; this is
+// the missing second layer -- known, but not applicable here.
+{
+  const BIN = readFileSync(new URL("../bin/reeve", import.meta.url), "utf8");
+
+  // The denominator is DERIVED from the route table, not written out by hand: a
+  // hand-built list returns the commands the author thought of, and nothing in
+  // the output says it is partial.
+  const ROUTES = [...BIN.matchAll(/^  case "([a-z-]+)":/gm)].map(m => m[1]);
+  check(ROUTES.length >= 12, `control: the route table yields ${ROUTES.length} cases`, ROUTES.join(","));
+  check(ROUTES.includes("doctor") && ROUTES.includes("why"),
+    "control: the extraction finds two routes known by name to exist", ROUTES.join(","));
+
+  const { APPLIES } = await import("../bin/reeve.flags.mjs");
+  check(Array.isArray(APPLIES.json) && APPLIES.json.length > 0,
+    "APPLIES declares which commands --json can change", JSON.stringify(APPLIES.json));
+  const unknown = APPLIES.json.filter(c => !ROUTES.includes(c));
+  check(unknown.length === 0,
+    "every command APPLIES.json names is a real route", `not routes: ${unknown.join(",")}`);
+  check(Object.isFrozen(APPLIES) && Object.isFrozen(APPLIES.json),
+    "and the map cannot be widened at runtime");
+
+  // The refusal, on a command that provably ignored the flag before.
+  const r = run("why", "1", "o/r", "--json");
+  check(r.status === 2, "reeve why --json is refused rather than silently ignored",
+    `rc=${r.status} ${r.out.slice(0, 200)}`);
+  check(/--json/.test(r.out) && /why/.test(r.out),
+    "and says which flag and which command", r.out.slice(0, 240));
+  check(/commands that implement it/.test(r.out) && /doctor/.test(r.out),
+    "and names the commands that do implement it, so the operator is not left guessing",
+    r.out.slice(0, 240));
+
+  // CONTROL: a command that DOES honour it is untouched, or the change is a ban
+  // rather than a contract.
+  const ok = run("doctor", "revnix/reeve", "--json");
+  let parsed = null; try { parsed = JSON.parse(ok.stdout); } catch { /* stays null */ }
+  check(parsed !== null, "control: doctor --json still parses", ok.stdout.slice(0, 200));
+
+  // CONTROL: an unknown flag is still refused by the FIRST layer, with its own
+  // message. If this goes quiet, the new layer has swallowed the old one.
+  const bad = run("why", "1", "o/r", "--nonsense");
+  check(/unknown flag --nonsense/.test(bad.out),
+    "control: an unknown flag is still refused by the parser, not by APPLIES", bad.out.slice(0, 200));
+
+  // CONTROL: --help still describes a command whatever else was typed beside it.
+  // The applicability layer sits BELOW it deliberately: a flag that asks a command
+  // to describe itself must not be answerable with a refusal about another flag.
+  const helped = run("why", "--json", "--help");
+  check(helped.status === 0 && /doctor \[owner\/repo\]/.test(helped.out),
+    "control: --help still wins over an inapplicable flag", helped.out.slice(0, 200));
+}
+
+// ── every refusal names a kind, an exit code, and whether retrying can help ──
+//
+// An exit code with no declaration is three routes agreeing by accident. `3`
+// meant degraded in `doctor`, in `shadow` and in `builder doctor`, and the only
+// statement of what it meant was the usage text -- while the comment that cited a
+// line number for it cited the argv parser.
+{
+  const { EXITS, ERROR_KINDS } = await import("../bin/reeve.flags.mjs");
+  check(EXITS.ok === 0 && EXITS.refused === 1 && EXITS.misuse === 2 && EXITS.degraded === 3,
+    "the four exit codes have one declaration", JSON.stringify(EXITS));
+  check(new Set(Object.values(EXITS)).size === Object.keys(EXITS).length,
+    "and no two names share a code", JSON.stringify(EXITS));
+  check(ERROR_KINDS.length > 0 && ERROR_KINDS.every(k => /^[a-z][a-z0-9_]*$/.test(k)),
+    "every error kind is snake_case", ERROR_KINDS.join(","));
+  check(new Set(ERROR_KINDS).size === ERROR_KINDS.length,
+    "and the list has no duplicate", ERROR_KINDS.join(","));
+
+  // Every kind the source passes to fail() is in the closed list, and every kind
+  // in the list is one the source can emit. BOTH directions: a vocabulary padded
+  // with kinds nothing produces reads as coverage and is not.
+  const BIN = readFileSync(new URL("../bin/reeve", import.meta.url), "utf8");
+  const CALL = /\bfail\(\s*"([a-z0-9_]+)"/g;
+  const used = [...BIN.matchAll(CALL)].map(m => m[1]);
+  check(used.length > 0, `control: the extraction finds ${used.length} fail() call sites`, used.join(","));
+
+  // Paired with a LITERAL counter-control, because a regex over source text that
+  // stops matching after a rename reports PASS while guarding nothing. This one
+  // reads a string it has never seen, so it stays green whatever the source says
+  // -- which is how "the source has no violations" is told apart from "the check
+  // can no longer see one". They are different facts.
+  const FIXTURE = 'fail("some_new_kind", "x");\nfail("flag_not_applicable", "y");';
+  const fromFixture = [...FIXTURE.matchAll(new RegExp(CALL.source, "g"))].map(m => m[1]);
+  check(fromFixture.length === 2 && fromFixture.includes("some_new_kind"),
+    "counter-control: the extraction still finds a kind in a literal it has never seen",
+    fromFixture.join(","));
+
+  const undeclared = [...new Set(used)].filter(k => !ERROR_KINDS.includes(k));
+  check(undeclared.length === 0, "every kind passed to fail() is declared", undeclared.join(","));
+  const unused = ERROR_KINDS.filter(k => !used.includes(k));
+  check(unused.length === 0, "and every declared kind is one the CLI can actually emit", unused.join(","));
+
+  // The JSON shape an operator scripts against.
+  const r = run("why", "1", "o/r", "--json");
+  let j = null; try { j = JSON.parse(r.stdout); } catch { /* stays null */ }
+  check(j !== null, "a refusal under --json is itself JSON on stdout", r.stdout.slice(0, 240));
+  check(j?.ok === false && typeof j?.kind === "string" && typeof j?.retryable === "boolean",
+    "carrying ok, a kind and a retryable bit", JSON.stringify(j));
+  check(j?.format_version === 1, "and the envelope's format_version", JSON.stringify(j));
+  check(r.status === 2, "and the exit code is the misuse one", `rc=${r.status}`);
+  check(r.stderr.trim() === "",
+    "and NOTHING on stderr: the machine shape goes to one stream, never to both", r.stderr.slice(0, 200));
+
+  // Without --json the message is prose on stderr and stdout stays empty, so a
+  // pipeline reading stdout gets nothing rather than half a document.
+  const p = run("why", "1", "o/r", "--nonsense");
+  check(p.stdout.trim() === "", "a refusal without --json writes nothing to stdout", p.stdout.slice(0, 200));
+}
+
+// ── every read command emits parseable JSON, enumerated rather than remembered ─
+//
+// The enumeration is DERIVED from APPLIES.json, which the block above already
+// proves is a subset of the real route table. A hand-written list here would
+// return the commands whoever wrote it thought of, and nothing in the output
+// would say so.
+{
+  const { APPLIES } = await import("../bin/reeve.flags.mjs");
+
+  // `run`, `tick`, `canary`, `backup`, `restore`, `init` and `build run` are
+  // deliberately NOT invoked: they dispatch, spend, or write. Every command below
+  // is a reader, and the list is FILTERED from APPLIES rather than retyped, so a
+  // route added to APPLIES is covered the day it is added.
+  const INVOCATION = {
+    doctor: ["doctor", "revnix/reeve"],
+    status: ["status", "revnix/reeve"],
+    builder: ["builder", "doctor"],
+    build: ["build", "status"],
+    task: ["task", "list"],
+  };
+  const missing = APPLIES.json.filter(c => !INVOCATION[c]);
+  check(missing.length === 0,
+    `every command APPLIES.json names has an invocation here (${APPLIES.json.length} of them)`,
+    `no invocation for: ${missing.join(",")}`);
+
+  let checked = 0;
+  for (const c of APPLIES.json.filter(c => INVOCATION[c])) {
+    const r = run(...INVOCATION[c], "--json");
+    let ok = false; try { JSON.parse(r.stdout); ok = true; } catch { /* stays false */ }
+    // `task list` in a home with no hub answers a TYPED REFUSAL, which is JSON and
+    // is the contract: what is asserted here is the SHAPE, not the verdict.
+    check(ok, `reeve ${INVOCATION[c].join(" ")} --json emits parseable JSON`, r.out.slice(0, 240));
+    checked++;
+  }
+  check(checked === APPLIES.json.length,
+    `all ${checked} read commands were exercised, not a subset`, String(checked));
+
+  // CONTROL: the loop can fail. A command known to emit prose, run through the
+  // same parse, must NOT parse -- otherwise every check above passes on any
+  // output at all.
+  const prose = run("statusline", "revnix/reeve");
+  let proseParsed = false; try { JSON.parse(prose.stdout); proseParsed = true; } catch { /* expected */ }
+  check(!proseParsed, "control: the same parse rejects a command that emits prose", prose.stdout.slice(0, 200));
+}
+
+
+// ── applicability is subcommand-aware where a subcommand is what differs ────
+//
+// `task file` implements --dry-run; `task list`, `task show` and `task why` are
+// readers that never look at it. A route-level entry accepted it there and did
+// nothing -- recreating, INSIDE the gate built to prevent it, exactly the
+// accepted-and-inert flag it exists to refuse.
+{
+  const { APPLIES, inapplicable } = await import("../bin/reeve.flags.mjs");
+  check(APPLIES["dry-run"].every(a => a.includes(" ")),
+    "--dry-run's scope names a subcommand, not a whole route", JSON.stringify(APPLIES["dry-run"]));
+
+  const listed = run("task", "list", "--dry-run");
+  check(listed.status === 2 && /--dry-run is not implemented by/.test(listed.out),
+    "a task READ subcommand refuses --dry-run rather than accepting it and doing nothing",
+    `rc=${listed.status} ${listed.out.split("\n")[0]}`);
+  check(/task list/.test(listed.out),
+    "and names the subcommand, not just the route", listed.out.split("\n")[0]);
+
+  // CONTROL: the subcommand that DOES implement it is untouched. Without this the
+  // change above is satisfied by banning the flag from `task` entirely.
+  const filed = run("task", "file", "--dry-run");
+  check(!/--dry-run is not implemented by/.test(filed.out),
+    "control: `task file` still reaches its own body with --dry-run", filed.out.split("\n")[0]);
+
+  // A route-qualified flag with NO subcommand typed is not decided by this gate:
+  // the route is about to refuse the missing subcommand, and answering the flag
+  // first would report the wrong error for the wrong reason.
+  const bare = run("task", "--dry-run");
+  check(/reeve task:/.test(bare.out) && !/--dry-run is not implemented/.test(bare.out),
+    "control: `reeve task --dry-run` still reports the missing subcommand, not the flag",
+    bare.out.split("\n")[0]);
+
+  // And a route whose entries are NOT subcommand-qualified still reports the bare
+  // route name: `positionals[0]` is an argument there, not a verb.
+  check(inapplicable("why", new Set(["json"]), "1")?.cmd === "why",
+    "a route with no qualified entry is named bare, so `reeve why 1` is not refused as `why 1`",
+    JSON.stringify(inapplicable("why", new Set(["json"]), "1")));
 }
 
 rmSync(dir, { recursive: true, force: true });

@@ -25,6 +25,7 @@
 
 /** The named assertion failed. The only outcome that proves anything. */
 import { createHash } from "node:crypto";
+import { join } from "node:path";
 import { lstatSync, readlinkSync, openSync, readSync, closeSync, fstatSync, constants } from "node:fs";
 
 // At the TOP: this is read by a guard, and a guard goes in early while its constant
@@ -581,4 +582,87 @@ export function listGrowth({ before, after }) {
     added.map(f => `  ${f}`).join("\n") + "\n\n" +
     "The list is frozen debt, not an exemption list. A file with no stub arrives with\n" +
     "one or it does not arrive; a file that already had one does not get to give it up." };
+}
+
+/**
+ * Which manifest anchors no longer resolve, without running a single test.
+ *
+ * PURE, and it reuses `countOccurrences` and `describeMiss` rather than restating
+ * them: the sweep and this check must agree about what "resolves" means, and two
+ * implementations of that would be the very defect being guarded -- a second
+ * inventory of the same fact, correct until one of them moved.
+ *
+ * WHY IT EXISTS SEPARATELY FROM THE SWEEP. The sweep already reports an unresolved
+ * anchor as UNRUNNABLE, and reports it well: the divergence point, the file's current
+ * text, the entry that named it. But it costs about twenty minutes, because it runs
+ * every named test twice. This costs under a second, because reading a file and
+ * counting a substring is all the question needs.
+ *
+ * That gap is not a performance detail, it is the reason anchors rot into the default
+ * branch. Measured 2026-08-30: two entries were verified CAUGHT when written, then
+ * review fixes in the SAME pull request moved the lines they named -- a de-indent of
+ * two spaces, and a condition split across three lines -- and the suite and the linter
+ * both passed, because neither reads an anchor. The only thing that does was too slow
+ * to run again before pushing.
+ *
+ * `read` is injected so this is testable without a filesystem, and so a caller can
+ * decide what an unreadable file means rather than having that decided here.
+ */
+export function unresolvedAnchors(entries, { read, key }) {
+  if (typeof read !== "function" || typeof key !== "function")
+    throw new Error("unresolvedAnchors: needs { read, key }; the two must agree, because `key` is what `read` is given");
+  const bad = [];
+  for (const entry of entries ?? []) {
+    // GROUPED BY FILE AND APPLIED IN ORDER, because that is what the sweep does:
+    // `for (const ed of edits) src = applyEdit(src, ed)` over one in-memory source
+    // per file. Re-reading the pristine file for each edit answers a different
+    // question, and can answer it the opposite way -- an earlier replacement that
+    // creates or removes a later anchor makes the two disagree, and the check would
+    // then pass on a stub the sweep will refuse.
+    // KEYED BY THE RUNNER'S OWN OPERATION, not by a path function that resembles it.
+    // The sweep coalesces targets with `join(ROOT, e.file)` and manifest validation
+    // accepts any non-empty string, so `f.mjs`, `./f.mjs` and `/f.mjs` are ONE file to
+    // it. `normalize` models the first two and NOT the third -- `normalize("/f.mjs")`
+    // stays absolute while `join(ROOT, "/f.mjs")` is the same target as `f.mjs`,
+    // because join treats its later arguments as segments rather than as roots.
+    //
+    // Two spellings that the sweep coalesces and this check separates is a FALSE
+    // GREEN: each group reads the pristine source, blind to what the other replaced.
+    // That is the one failure mode a cheap precondition must not have, so the key is
+    // `join` itself with a stand-in root, which reproduces the runner's equivalence
+    // classes exactly. THE CALLER SUPPLIES BOTH `key` AND `read`, and they must agree:
+    // `key` is what `read` is handed. A default key would have been a trap -- the
+    // first version defaulted to a stand-in root while the test's reader held
+    // unprefixed names, so every synthetic fixture answered ENOENT and four
+    // assertions failed for a reason unrelated to what they measured.
+    const byFile = new Map();
+    for (const edit of entry?.edits ?? []) {
+      const k = key(edit.file);
+      if (!byFile.has(k)) byFile.set(k, []);
+      byFile.get(k).push(edit);
+    }
+    for (const [file, edits] of byFile) {
+      let src;
+      try { src = read(file); }
+      catch (e) { bad.push({ name: entry.name, file, count: null, why: `could not be read: ${e.message}` }); continue; }
+      if (typeof src !== "string") {
+        bad.push({ name: entry.name, file, count: null, why: "could not be read" });
+        continue;
+      }
+      for (const edit of edits) {
+        // `applyEdit` ITSELF, not a reimplementation of its rule. It already refuses
+        // anything but exactly one occurrence and already explains a miss; calling it
+        // is what makes this check and the sweep incapable of disagreeing about what
+        // "resolves" means. A second implementation of that rule would be the second
+        // inventory this whole class of defect is made of.
+        try { src = applyEdit(src, edit); }
+        catch (e) {
+          const n = countOccurrences(src, edit.find);
+          bad.push({ name: entry.name, file, count: n, why: String(e.message) });
+          break;   // later edits are judged against a source this one did not produce
+        }
+      }
+    }
+  }
+  return bad;
 }

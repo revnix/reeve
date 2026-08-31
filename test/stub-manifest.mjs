@@ -898,8 +898,8 @@ export const STUBS = [
     test: "test/task-file.test.mjs",
     expectRed: "a filing proceeds once the dead holder's lock is reaped",
     edits: [{ file: "src/build/taskfile.mjs",
-              find: "      { command: \"reeve task file\", pid, lstart, isAlive },",
-              replace: "      { command: \"reeve task file\", pid, lstart, isAlive: () => true }," }],
+              find: "    { command: \"reeve task file\", pid, lstart, isAlive },",
+              replace: "    { command: \"reeve task file\", pid, lstart, isAlive: () => true }," }],
   },
   {
     name: "taskfile-dry-run-writes-nothing",
@@ -925,8 +925,8 @@ export const STUBS = [
     test: "test/cli-flags.test.mjs",
     expectRed: "an empty valued flag is refused",
     edits: [{ file: "bin/reeve",
-              find: "    if (v === undefined || v === \"\") { errors.push(`reeve: --${name} expects a value: ${FLAGS[name].what}`); continue; }",
-              replace: "    if (false) { continue; }" }],
+              find: "    if (v === undefined || (v === \"\" && !EMPTY_IS_A_VALUE.has(name))) {",
+              replace: "    if (false) {" }],
   },
   {
     name: "cli-task-reaches-its-own-body",
@@ -936,5 +936,14 @@ export const STUBS = [
     edits: [{ file: "bin/reeve",
               find: "  case \"task\": {",
               replace: "  case \"task-disabled\": {" }],
+  },
+  {
+    name: "anchors-resolve-detects-a-rotted-one",
+    why: "stop reporting an anchor that resolves nowhere, so a stub the sweep cannot place reads as a manifest in good order -- the state the default branch was in for two entries while the suite and the linter both passed, because neither reads an anchor",
+    test: "test/anchors-resolve.test.mjs",
+    expectRed: "an anchor that appears NOWHERE is reported",
+    edits: [{ file: "src/stubsweep.mjs",
+              find: "          bad.push({ name: entry.name, file, count: n, why: String(e.message) });",
+              replace: "          void n;" }],
   },
 ];

@@ -717,9 +717,18 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 // guard; this one was reporting success for exactly the storage failures it
 // exists to notice.
 //
-// What is assertable without a failing disk is the ordinary path: the write
-// succeeds, the artifact reads back, and the chain was walked. The propagation
-// itself is covered by the stub, which is what a manifest entry is for.
+// WHAT THIS DOES NOT ESTABLISH, stated rather than implied. The propagation
+// itself is NOT tested: making an fsync fail on a directory inside the tree
+// needs a fault-injection seam that `writeArtifact` does not have, and it takes
+// its filesystem calls directly from node:fs. A manifest entry was written for
+// it and removed again -- the stub made the code stricter, which nothing can
+// observe, so it reported coverage that does not exist. An entry that cannot go
+// red is worse than no entry, because it reads as a guard.
+//
+// What is assertable here is the ordinary path: the write succeeds through a
+// chain of new directories and reads back under its recorded sha. Giving this
+// function an injectable fs seam, as registryIo has for spawn, is the change
+// that would make the failure path testable, and it is not this one.
 {
   const deep = join(dir, "propagate", "a", "b", "artifacts");
   const w = writeArtifact({ dir: deep, phase: "DESIGN",

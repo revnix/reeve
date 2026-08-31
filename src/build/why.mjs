@@ -232,7 +232,15 @@ export function renderWhy(m) {
   out.push("", "  gate rounds");
   if (m.absent.includes("gate")) out.push("    no gate_request rows: review has never been asked for");
   else for (const g of m.gate)
-    out.push(`    round ${g.round}  ${g.head_sha}  codex ${g.codex_clean ? "clean" : "not yet"}` +
+    out.push(`    round ${g.round}  gen ${g.task_generation}  ${g.head_sha}` +
+             `  codex ${g.codex_clean ? "clean" : "not yet"}` +
+             // WHICH clean pass, and where to find it. `codex_clean: true` tells an
+             // operator auditing a merge that a review happened and gives them no
+             // way to locate it, nor to tell which of several passes at one head
+             // governed.
+             (g.codex_evidence
+               ? ` (${g.codex_evidence.actor} ${g.codex_evidence.source_id} at ${g.codex_evidence.observed_at})`
+               : "") +
              `  founder ${g.founder_evidence
                  ? `${g.founder_evidence.kind} ${g.founder_evidence.verdict}`
                  : "not yet"}` +
@@ -265,8 +273,14 @@ export function renderWhy(m) {
 
   out.push("", "  draining");
   if (m.absent.includes("drain")) out.push("    no task_drain rows: nothing is being drained");
+  // `last_known` IS THE POINT OF A FORCED ROW. A force-cancel settles an effect
+  // without confirming external truth, and the last reconciler observation is the
+  // only evidence an operator has for what may still have happened out there.
+  // Printing `(forced)` alone hides exactly the fact the column exists to keep.
   else for (const d of m.drain)
-    out.push(`    outbox ${d.outbox_id}  ${d.settled_at ? "settled" : "OPEN"}${d.forced ? " (forced)" : ""}`);
+    out.push(`    outbox ${d.outbox_id}  ${d.settled_at ? "settled" : "OPEN"}` +
+             (d.forced ? " (forced)" : "") +
+             (d.last_known ? `  last known: ${d.last_known}` : ""));
 
   if (m.unknown.length) out.push("", `  unknown: ${m.unknown.join(", ")}`);
   return out.join("\n");

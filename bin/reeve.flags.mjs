@@ -51,6 +51,12 @@ export const APPLIES = Object.freeze({
   // the gate built to prevent it, exactly the accepted-and-inert flag it exists
   // to refuse. An entry containing a space names `<command> <subcommand>`.
   "dry-run": Object.freeze(["task file"]),
+
+  // `--project` names the registry entry to file against, and the entry to filter
+  // a listing by. `task show` and `task why` take a task id and cannot act on it
+  // at all -- `reeve task show <id> --project other` printed the task regardless,
+  // which is the accepted-and-inert shape this whole file exists to refuse.
+  project: Object.freeze(["task file", "task list"]),
 });
 
 /**
@@ -60,11 +66,15 @@ export const APPLIES = Object.freeze({
  * as a branch. `cmd` may be undefined -- `reeve --json` with no command at all --
  * and that is a usage error the caller already answers, so it is not this one.
  */
-export function inapplicable(cmd, flags, sub = null) {
+export function inapplicable(cmd, flags, sub = null, valued = []) {
   if (!cmd) return null;
-  // Sorted, so the refusal an operator sees does not depend on the order they
-  // happened to type two inapplicable flags in.
-  for (const name of [...flags].sort()) {
+  // BOTH PARSED SETS. The argv walk puts boolean switches in `ARGS.flags` and
+  // VALUED options in `ARGS.values`, so a gate reading only the first could never
+  // see `--project`, `--title` or any other flag that takes a value -- a whole
+  // category of flags exempt from the rule, inside the mechanism written to
+  // enforce it. Sorted, so the refusal an operator sees does not depend on the
+  // order they happened to type two inapplicable flags in.
+  for (const name of [...new Set([...flags, ...valued])].sort()) {
     const allowed = APPLIES[name];
     if (!allowed) continue;
     if (allowed.includes(cmd)) continue;

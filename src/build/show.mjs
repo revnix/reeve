@@ -472,6 +472,27 @@ export const projectsWithTasks = (db) =>
 // release, and anything parsing it is broken by design. `--json` is what a script
 // reads, and its envelope carries the version that says so.
 
+/**
+ * A persisted string, made safe to put in a one-row format.
+ *
+ * A title is FREE TEXT the founder typed, and `normalizeFiling` refuses only an
+ * empty one. A title containing a newline therefore rendered as TWO LINES in
+ * `task list`, and the second read exactly like another task row -- measured:
+ * `first\nbt:fake  DONE  forged` produced a listing in which one task looked like
+ * two, the invented one bearing a plausible id and a terminal phase. An operator
+ * scanning that listing has no way to tell the forged row from a real one.
+ *
+ * Control characters generally, not just newlines: an ESC in a persisted string
+ * repaints the terminal, and every C0 and C1 code is meaningless in a cell of a
+ * table. Replaced with a space rather than stripped, so the text stays readable
+ * and its length still roughly reflects what was written.
+ *
+ * Applied at RENDER rather than at filing, because the rows already in the hub
+ * were written before this existed, and the format is what has the requirement.
+ */
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
+export const oneLine = (v) => String(v ?? "").replace(CONTROL, " ");
+
 const waitingLine = (w) => {
   if (!w.first && w.capability_known) return "nothing";
   if (!w.first) return `nothing that can be read (${w.capability} is unknown: the project's profile could not be read)`;
@@ -482,8 +503,8 @@ const waitingLine = (w) => {
 export function renderShow(m) {
   const lines = [
     `${m.id}  ${m.phase}  gen ${m.generation}  ${m.priority}`,
-    `  ${m.title}`,
-    `  project      ${m.project} (${m.nwo})`,
+    `  ${oneLine(m.title)}`,
+    `  project      ${oneLine(m.project)} (${oneLine(m.nwo)})`,
     `  depth        ${m.depth}`,
     `  model        ${m.model}`,
     `  waiting on   ${waitingLine(m.waiting)}`,
@@ -502,10 +523,10 @@ export function renderShow(m) {
   }
   if (m.draining !== null) lines.push(`  draining     ${m.draining} row(s) still to settle`);
   for (const t of m.territory)
-    lines.push(`  territory    ${t.kind} ${t.path}` +
+    lines.push(`  territory    ${t.kind} ${oneLine(t.path)}` +
                (t.pinned_until ? `  pinned until ${t.pinned_until}` : "") +
                `  expires ${t.expires_at}`);
-  for (const e of m.escalations) lines.push(`  escalation   ${e.why}  x${e.count}`);
+  for (const e of m.escalations) lines.push(`  escalation   ${oneLine(e.why)}  x${e.count}`);
   for (const p of m.prs) lines.push(`  pull request ${p.kind} #${p.pr}  ${p.head_sha}`);
   if (m.unknown.length) lines.push(`  unknown      ${m.unknown.join(", ")}`);
   return lines.join("\n");
@@ -519,5 +540,5 @@ export function renderList(models) {
   // where to look, and while `show` correctly says UNKNOWN about the same task.
   const wait = (m) => m.waiting.first ?? (m.waiting.capability_known ? "-" : UNKNOWN);
   return models.map(m =>
-    `${m.id}  ${m.phase.padEnd(13)} ${wait(m).padEnd(23)} ${m.title}`).join("\n");
+    `${m.id}  ${m.phase.padEnd(13)} ${wait(m).padEnd(23)} ${oneLine(m.title)}`).join("\n");
 }

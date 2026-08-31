@@ -1205,31 +1205,83 @@ const filed = {};
                      'prompt-zq','settings-zq','tools-zq','agents-zq','canary-zq')`)
     .run(t, NOW - 900, NOW - 880, NOW - 600);
 
+  // EVERY row-shaped section gets a row, or the walk below is vacuous for the
+  // ones it cannot see — which is how the first version of this guard covered
+  // `runs` alone and missed `gate` and `drain` entirely.
+  db.prepare(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at,merged_sha)
+              VALUES(?, 'spec', NULL, NULL, 31, 4242, 'head-zq', ?, 'merged-zq')`).run(t, NOW - 700);
+  db.prepare(`INSERT INTO gate_request(task,spec_repo_id,spec_pr,head_sha,round,task_generation,requested_at)
+              VALUES(?,31,4242,'head-zq',6,7,?)`).run(t, NOW - 690);
+  db.prepare(`INSERT INTO approval(task,spec_repo_id,spec_pr,head_sha,actor_id,actor_login_snapshot,
+                                   kind,verdict,observed_at,source_id,task_generation)
+              VALUES(?,31,4242,'head-zq',3,'witness-zq','codex_clean','clean',?, 'source-zq',7)`)
+    .run(t, NOW - 680);
+  db.prepare("INSERT INTO hold_reason(task,reason,detail,at,cleared_at) VALUES(?,?,?,?,?)")
+    .run(t, "reason-zq", "detail-zq", NOW - 670, NOW - 660);
+  db.prepare(`INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+              VALUES(?,?,'drain.fence','RESEARCH','RESEARCH',7,7,'{}')`).run(t, NOW - 665);
+  const fence = db.prepare("SELECT seq FROM phase_event WHERE task = ? ORDER BY seq DESC LIMIT 1").get(t).seq;
+  db.prepare(`INSERT INTO outbox(idempotency_key,kind,task_id,task_generation,fence,args,status,
+                                not_before,created_at,updated_at)
+              VALUES('idem-zq','notify',?,7,?,'{}','done',0,?,?)`).run(t, fence, NOW - 660, NOW - 660);
+  const obId = db.prepare("SELECT id FROM outbox ORDER BY id DESC LIMIT 1").get().id;
+  db.prepare(`INSERT INTO task_drain(task,outbox_id,recorded_at,settled_at,forced,last_known)
+              VALUES(?,?,?,NULL,1,'lastknown-zq')`).run(t, obId, NOW - 650);
+
   const m = whyModel(db, t, { now: NOW });
   const text = renderWhy(m);
   check(m.runs.length === 1, "control: the fixture produced exactly one run row", String(m.runs.length));
 
   // The exclusions, each with a reason. Anything NOT named here must render.
+  // Keyed by section, because a field named `at` means something different in a
+  // hold than in a gate round and a shared list would exempt both.
   const EXCLUDED = {
-    // Rendered as a formatted line of its own further down, not as a raw value.
-    started_at: "a timestamp the render formats elsewhere",
+    runs: { started_at: "a timestamp the render formats elsewhere" },
+    gate: { requested_at: "a timestamp the render formats elsewhere",
+            // Booleans render as WORDS, which is what an operator can read: the
+            // literal `true` never appears and should not.
+            codex_clean: "rendered as the words `clean` or `not yet`",
+            founder_acked: "rendered as the verdict, or the words `not yet`" },
+    drain: { recorded_at: "a timestamp the render formats elsewhere",
+             settled_at: "rendered as the words `settled` or `OPEN`" },
+    prs: { created_at: "a timestamp the render formats elsewhere",
+           generation: "null on a spec row, and carried by the run lines",
+           slice: "null on a spec row, and carried by the run lines",
+           task: "the row's own task, already the first line of the render",
+           repo_id: "the numeric id; the render names the human-readable kind and number" },
+    holds: { at: "a timestamp the render formats elsewhere" },
+  };
+  // EVERY row-shaped section, not only `runs`. The first version of this guard
+  // covered runs alone and the very next review round found the same defect in
+  // `gate` and in `drain` -- a guard narrower than its class is a guard that will
+  // be outflanked by the next instance.
+  const rows = (section) => {
+    const v = m[section];
+    return Array.isArray(v) ? v : (v ? [v] : []);
   };
   const missing = [];
-  for (const [k, v] of Object.entries(m.runs[0])) {
-    if (k in EXCLUDED) continue;
-    if (v === null || v === undefined) continue;
-    if (!text.includes(String(v))) missing.push(`${k}=${JSON.stringify(v)}`);
-  }
+  for (const section of Object.keys(EXCLUDED))
+    for (const row of rows(section))
+      for (const [k, v] of Object.entries(row)) {
+        if (k in EXCLUDED[section]) continue;
+        if (v === null || v === undefined || v === "") continue;
+        if (typeof v === "object") continue;          // nested evidence, asserted by name below
+        if (!text.includes(String(v))) missing.push(`${section}.${k}=${JSON.stringify(v)}`);
+      }
   check(missing.length === 0,
-    "every value a phase_run row carries into the model reaches the human render",
+    "every value a lineage row carries into the model reaches the human render",
     `not rendered: ${missing.join(", ")}\n        ` +
     "Either render it, or name it in EXCLUDED with the reason it is deliberately absent.");
+  check(Object.keys(EXCLUDED).every(sec => rows(sec).length > 0),
+    "control: every section this walks actually has a row in the fixture, so none is vacuous",
+    JSON.stringify(Object.fromEntries(Object.keys(EXCLUDED).map(x => [x, rows(x).length]))));
 
   // COUNTER-CONTROL: the check can FAIL. A value the model does not carry must be
   // reported missing, or the loop above passes on any render at all.
   const probe = [];
   for (const [k, v] of Object.entries({ ...m.runs[0], ghost_field: "ghost-zq" })) {
-    if (k in EXCLUDED || v === null || v === undefined) continue;
+    if (k in EXCLUDED.runs || v === null || v === undefined) continue;
+    if (typeof v === "object") continue;
     if (!text.includes(String(v))) probe.push(k);
   }
   check(probe.length === 1 && probe[0] === "ghost_field",
@@ -1241,6 +1293,13 @@ const filed = {};
   check(/gen 7/.test(text),
     "a run's generation is in the human lineage, so two contract epochs are distinguishable",
     (text.match(/.*SIZING\/3.*/) ?? [""])[0]);
+
+  // The nested evidence objects the walk above skips, asserted BY NAME. A value
+  // the loop cannot reach is a value the loop cannot guard, and saying so here is
+  // cheaper than teaching it to recurse into shapes that are not rows.
+  check(/witness-zq/.test(text) && /source-zq/.test(text),
+    "the governing Codex witness is in the human gate line, not only under --json",
+    (text.match(/.*round 6.*/) ?? [""])[0]);
 }
 
 // ── a founder acknowledgement answers the pass it was given ────────────────
@@ -1276,6 +1335,74 @@ const filed = {};
   check(two.founder_evidence === null,
     "so no founder evidence is claimed for a pass the founder never saw",
     JSON.stringify(two.founder_evidence));
+}
+
+
+// ── a persisted title cannot forge a row in the listing ────────────────────
+//
+// `normalizeFiling` refuses only an EMPTY title, so a newline is accepted and
+// persisted. Measured before this change: filing one task titled
+// "first\nbt:fake  DONE  forged" produced a TWO-LINE listing whose second line
+// carried a plausible id and a terminal phase -- a task that does not exist,
+// indistinguishable from one that does in the view an operator scans first.
+{
+  const forged = "first\nbt:fake  DONE  forged";
+  const f = await file({ title: forged, territory: ["packages/fg"] });
+  check(f?.ok === true,
+    "control: the producer ACCEPTS a title containing a newline, which is why the render must handle it",
+    JSON.stringify(f)?.slice(0, 160));
+  check(db.prepare("SELECT title FROM task WHERE id = ?").get(f.task).title === forged,
+    "control: and stores it verbatim, so this is about rendering and not about filing");
+
+  const rows = taskList(db, { now: NOW, switchesFor: resolver() });
+  const mine = rows.filter(m => m.id === f.task);
+  const line = renderList(mine);
+  check(line.split("\n").length === 1,
+    `one task renders as ONE row (got ${line.split("\n").length})`, JSON.stringify(line));
+  check(!line.includes("\n") && line.includes("bt:fake"),
+    "and the forged text is still shown, on that row, rather than silently dropped",
+    JSON.stringify(line));
+
+  // CONTROL: the sanitiser is about control characters, not about mangling text.
+  // An ordinary title must survive byte for byte.
+  const ordinary = rows.filter(m => m.title === "the capability task");
+  check(ordinary.length === 1, "control: there is an ordinary-titled task to compare against",
+    String(ordinary.length));
+  check(renderList(ordinary).includes("the capability task"),
+    "control: an ordinary title is untouched", JSON.stringify(renderList(ordinary)));
+
+  // An ESC repaints the terminal; every C0 and C1 code is meaningless in a cell.
+  // Built from code points rather than written literally, so the file itself
+  // carries none of what it is testing for.
+  const CTRL = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f]");
+  const titleLine = renderShow(mine[0]).split("\n")[1];
+  check(titleLine.includes("bt:fake") && !CTRL.test(titleLine),
+    "and in `show` the title occupies its own single line, control characters replaced",
+    JSON.stringify(titleLine));
+  check(CTRL.test(forged),
+    "counter-control: the pattern DOES match the raw title, so the absence above is real");
+}
+
+// ── a valued flag is checked by the same gate as a boolean one ─────────────
+//
+// The argv walk puts boolean switches in ARGS.flags and VALUED options in
+// ARGS.values, so a gate reading only the first exempted every flag that takes a
+// value -- a whole category, inside the mechanism written to enforce the rule.
+{
+  const { inapplicable, APPLIES } = await import("../bin/reeve.flags.mjs");
+  check(Array.isArray(APPLIES.project) && APPLIES.project.includes("task file") &&
+        APPLIES.project.includes("task list"),
+    "--project is scoped to the subcommands that read it", JSON.stringify(APPLIES.project));
+
+  check(inapplicable("task", new Set(), "show", ["project"])?.cmd === "task show",
+    "a VALUED flag reaches the gate and is refused where it cannot act",
+    JSON.stringify(inapplicable("task", new Set(), "show", ["project"])));
+  check(inapplicable("task", new Set(), "list", ["project"]) === null,
+    "control: and is allowed where it can");
+  check(inapplicable("task", new Set(), "file", ["project"]) === null,
+    "control: including on the subcommand that files with it");
+  check(inapplicable("doctor", new Set(), "o/r", ["home"]) === null,
+    "control: a valued flag with no entry is unconstrained, as the map promises");
 }
 
 // ── the CLI: compute -> data -> render ───────────────────────────────────────
@@ -1342,6 +1469,18 @@ const filed = {};
     bogus.out.slice(0, 300));
   check(/beta/.test(bogus.out) && /alpha/.test(bogus.out),
     "and the refusal names the projects that do exist", bogus.out.slice(0, 300));
+
+  const withProject = cli("task", "show", filed.full, "--project", "alpha", "--json");
+  const wp = parse(withProject.stdout);
+  check(wp?.ok === false && wp?.kind === "flag_not_applicable",
+    "reeve task show --project is refused through the CLI, not merely by the map",
+    withProject.out.slice(0, 300));
+  check(withProject.status === 2 && /task show/.test(wp?.message ?? ""),
+    "naming the subcommand, and exiting misuse", `rc=${withProject.status} ${wp?.message}`);
+  // CONTROL: the subcommand that DOES read it still works end to end, or the
+  // change is a ban rather than a scoping.
+  check(parse(cli("task", "list", "--project", "beta", "--json").stdout)?.kind === "task.list",
+    "control: and `task list --project` still answers");
 
   const usage = cli("task", "show", "--json");
   check(parse(usage.stdout)?.kind === "usage" && usage.status === 2,

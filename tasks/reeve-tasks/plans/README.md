@@ -160,6 +160,35 @@ limit is accepted though admission would refuse it; escalation keys outside the 
 identity set are accepted; a `JSON.parse` result is inspected without being guarded against
 null; and an acceptance check's failing exit status is lost through a shell pipeline.
 
+## S3-B and S3-D disagree about the artifact gate, found by executing S3-B
+
+Recorded here because the next executor of S3-D's phase tasks will hit it, and
+because it is the first divergence found by running a gate against the artifact
+its own producer is SPECIFIED to write rather than against a fixture.
+
+| what | S3-B (this gate) | S3-D (the producer) |
+|---|---|---|
+| slice heading | `## Slice 1` | `## Slices` holding `### Slice 1: ...` (`2026-08-27-s3d-phases.md:1374-1380`) |
+| test label | `Tests:` | `- Test plan:` |
+| done condition | a value on the same line | `Done when:` alone, with a fenced command beneath it |
+| the `expect` argument | `{depth}` | `researchExpectations(depth) -> {minCitationsPerClaim, minClaims}`, carrying **no** depth (`:986`) |
+
+`reviewArtifact` now accepts **both** forms rather than a third one invented to
+reconcile them. It was shipped accepting only S3-B's, which meant it found **zero
+slices** in the artifact S3-D emits and refused it for "carrying no ordered slice
+list" — correct work rejected — and threw on the documented callers before
+reading anything.
+
+**Every test passed while that was true**, and the reason is the finding rather
+than the fix: every design fixture in the suite had been written to match the
+checker. The checker and its tests agreed with each other and disagreed with the
+artifact. The fixture that exposed it is copied from S3-D's plan verbatim.
+
+**The rule this gives the next executor:** when a task builds a gate, take its
+fixture from the plan that PRODUCES the thing being gated, not from the plan
+being executed. A fixture written beside the checker tests that the checker
+matches itself.
+
 ## What this file does NOT establish
 
 Only S3-A and the first task of S3-B have been executed. The rows above are what executing

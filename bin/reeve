@@ -1164,7 +1164,7 @@ switch (cmd) {
         fail("hub_absent",
              `reeve task ${sub}: no builder hub at ${hub}. Nothing has been filed on this machine.`,
              { exit: EXITS.refused });
-      // THE SCHEMA VERSION, BEFORE THE CONNECTION. A version-1 hub opens
+      // THE WHOLE MIGRATION HISTORY, not its maximum. A version-1 hub opens
       // perfectly and has no `task_pr` -- migration 2 creates it -- so every one
       // of these routes would reach `openPrs` and die on `no such table`, which
       // is the uncaught stack trace this whole surface exists to replace. An
@@ -1176,24 +1176,59 @@ switch (cmd) {
       //
       // The read cannot fix any of this. Migrating is a write, and these routes
       // hold no lease.
-      const at = completedVersion(hub);
-      if (at !== HUB_SCHEMA_VERSION)
-        fail("hub_incompatible",
-             `reeve task ${sub}: the hub at ${hub} is at schema version ${at}, and this reeve ` +
-             `speaks version ${HUB_SCHEMA_VERSION}.\n` +
-             (at === 0
-               ? `-> it is unreadable or was never migrated; \`reeve build status\` reports on it`
-               : at < HUB_SCHEMA_VERSION
-                 ? `-> a reader may not migrate it: run a command that writes, such as \`reeve build run\``
-                 : `-> this reeve is older than the store; upgrade reeve rather than downgrading the hub`),
-             { exit: EXITS.refused });
-
+      //
+      // `completedVersion` answers `max(version)`, and a maximum is not a
+      // history: a damaged or hand-repaired hub recording 1 and 3 but missing 2
+      // passes an equality against the current version and then dies on `no such
+      // table: task_pr`, because migration 2 is what creates it. That is the same
+      // uncaught trace this surface exists to replace, arriving through a second
+      // door. So the check is that every version from 1 to the current one is
+      // PRESENT, and the read cannot fix any of it: migrating is a write and
+      // these routes hold no lease.
       let db = null;
       try { db = new DatabaseSync(hub, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS }); }
       catch (e) {
         fail("hub_unreadable", `reeve task ${sub}: the hub at ${hub} could not be read — ${e.message}`,
-             { exit: EXITS.refused, retryable: true });
+             { exit: EXITS.refused, retryable: faultKind(e) === "operational" });
       }
+      try {
+        let have = new Set();
+        try {
+          have = new Set(db.prepare("SELECT version FROM schema_version").all().map(r => r.version));
+        } catch (e) {
+          fail("hub_unreadable",
+               `reeve task ${sub}: the hub at ${hub} has no readable schema_version — ${e.message}`,
+               { exit: EXITS.refused, retryable: faultKind(e) === "operational" });
+        }
+        const want = Array.from({ length: HUB_SCHEMA_VERSION }, (_, i) => i + 1);
+        const missing = want.filter(v => !have.has(v));
+        const ahead = [...have].filter(v => v > HUB_SCHEMA_VERSION).sort((a, b) => a - b);
+        if (missing.length || ahead.length) {
+          const at = have.size ? Math.max(...have) : 0;
+          fail("hub_incompatible",
+               `reeve task ${sub}: the hub at ${hub} is at schema version ${at}, and this reeve ` +
+               `speaks version ${HUB_SCHEMA_VERSION}.\n` +
+               (ahead.length
+                 ? `-> it records version ${ahead.join(", ")}, which this reeve does not know; ` +
+                   `upgrade reeve rather than downgrading the hub`
+                 : have.size === 0
+                   ? `-> it records no migration at all; \`reeve build status\` reports on it`
+                   : `-> migration ${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} missing, ` +
+                     `so tables they create are absent. A reader may not migrate it: run a command ` +
+                     `that writes, such as \`reeve build run\``),
+               { exit: EXITS.refused });
+        }
+      } finally { /* the outer finally closes db on every path below */ }
+      // SQLITE READS LAZILY, so a hub whose corruption lies outside the pages the
+      // open touches constructs a connection perfectly and fails at the first
+      // real query -- past every guard above, and out through an uncaught stack
+      // trace. `retryable` comes from `faultKind`: a busy or full store is worth
+      // trying again and a damaged one never is, and saying so is the difference
+      // between an operator retrying usefully and retrying for ever.
+      const queryFailed = (e) => fail("hub_unreadable",
+        `reeve task ${sub}: the hub at ${hub} could not be read — ${e.message}`,
+        { exit: EXITS.refused, retryable: faultKind(e) === "operational" });
+
       try {
         const now = Math.floor(Date.now() / 1000);
 
@@ -1241,7 +1276,10 @@ switch (cmd) {
                    `-> known projects: ${[...known].sort().join(", ") || "(none)"}`,
                    { exit: EXITS.refused });
           }
-          const models = inSnapshot(db, () => taskList(db, { now, switchesFor, project: want }));
+          let models;
+          try {
+            models = inSnapshot(db, () => taskList(db, { now, switchesFor, project: want }));
+          } catch (e) { queryFailed(e); }
           console.log(flag("json")
             ? JSON.stringify(envelope("task.list", models), null, 2)
             : renderList(models));
@@ -1250,9 +1288,12 @@ switch (cmd) {
 
         const id = positionals[1];
         if (!id) fail("usage", `usage: reeve task ${sub} <task-id>`, { exit: EXITS.misuse });
-        const model = inSnapshot(db, () => (sub === "show"
-          ? taskShow(db, id, { now, switchesFor })
-          : whyModel(db, id, { now })));
+        let model;
+        try {
+          model = inSnapshot(db, () => (sub === "show"
+            ? taskShow(db, id, { now, switchesFor })
+            : whyModel(db, id, { now })));
+        } catch (e) { queryFailed(e); }
         if (!model) fail("task_not_found", `reeve task ${sub}: no task ${id}`, { exit: EXITS.refused });
         console.log(flag("json")
           ? JSON.stringify(envelope(`task.${sub}`, model), null, 2)

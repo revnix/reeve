@@ -910,6 +910,101 @@ const filed = {};
     renderWhy(whyModel(db, fa, { now: NOW })).slice(0, 700));
 }
 
+
+// ── a founder verdict is a verdict, not merely a row ───────────────────────
+//
+// `changes_requested` is as ordinary a founder answer as `approve`, and an
+// approval can be superseded by a later one. Reading the KIND of the FIRST row
+// reported "approved" for a round the founder had asked for changes on — the one
+// mistake in this surface that could make somebody ship.
+{
+  const fv = (await file({ title: "a contested round", territory: ["packages/v"] })).task;
+  db.prepare(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+              VALUES(?, 'spec', NULL, NULL, 6, 31, 'headV', ?)`).run(fv, NOW - 300);
+  db.prepare(`INSERT INTO gate_request(task,spec_repo_id,spec_pr,head_sha,round,task_generation,requested_at)
+              VALUES(?,6,31,'headV',0,1,?)`).run(fv, NOW - 250);
+  const approval = (sid, verdict, at, superseded = null) => db.prepare(
+    `INSERT INTO approval(task,spec_repo_id,spec_pr,head_sha,actor_id,actor_login_snapshot,
+                          kind,verdict,observed_at,source_id,task_generation,superseded_at)
+     VALUES(?,6,31,'headV',9,'mobeenabdullah','founder_review',?,?,?,1,?)`)
+    .run(fv, verdict, at, sid, superseded);
+
+  approval("rev-a", "changes_requested", NOW - 200);
+  const contested = whyModel(db, fv, { now: NOW }).gate[0];
+  check(contested.founder_acked === false,
+    "a founder_review of changes_requested does NOT read as approved",
+    JSON.stringify(contested));
+  check(contested.founder_evidence?.verdict === "changes_requested",
+    "and the lineage carries the verdict, so the reader can see which answer it was",
+    JSON.stringify(contested.founder_evidence));
+
+  // A later approval supersedes it, and the NEWEST standing row is the answer.
+  approval("rev-b", "approve", NOW - 100);
+  const later = whyModel(db, fv, { now: NOW }).gate[0];
+  check(later.founder_acked === true && later.founder_evidence?.source_id === "rev-b",
+    "a later approval answers the round, and it is the LATEST row that decides",
+    JSON.stringify(later.founder_evidence));
+
+  // And a superseded approval does not answer anything, however recent.
+  db.prepare("UPDATE approval SET superseded_at = ? WHERE source_id = 'rev-b'").run(NOW - 50);
+  const gone = whyModel(db, fv, { now: NOW }).gate[0];
+  check(gone.founder_acked === false,
+    "a SUPERSEDED approval answers nothing, and the changes_requested row beneath it still stands",
+    JSON.stringify(gone.founder_evidence));
+  check(gone.founder_evidence?.source_id === "rev-a",
+    "control: and the row that surfaces is the older one, so the query did not simply return nothing",
+    JSON.stringify(gone.founder_evidence));
+}
+
+// ── the JSON and the render must agree about what was asked ───────────────
+//
+// `floors: []` is a definite answer to a machine, and the definite answer is
+// wrong. The human render already said UNKNOWN; a consumer parsing --json was
+// told "none fired". Two renderers over one model must not disagree about
+// whether a question was even asked.
+{
+  const m = whyModel(db, filed.fresh, { now: NOW });
+  check(m.floors.length === 0, "control: no writer records the floors, so the list is empty", JSON.stringify(m.floors));
+  check(m.unknown.includes("floors"),
+    "and `floors` is named in `unknown`, so an empty list is not read as a fact",
+    JSON.stringify(m.unknown));
+  check(/floors fired: UNKNOWN/.test(renderWhy(m)),
+    "control: the human render says the same thing, so the two agree",
+    renderWhy(m).split("\n")[1]);
+}
+
+// ── the fallback run must not carry a previous generation forward ──────────
+{
+  const gen = (await file({ title: "a regenerated task", territory: ["packages/gn"] })).task;
+  db.prepare(`INSERT INTO phase_run(task,generation,phase,slice,attempt,status,pid,lstart,started_at,
+                                    heartbeat_at,lease_expires_at,out_path,err_path,model_id,cli_version)
+              VALUES(?,1,'SIZING',0,1,'succeeded',500,'L',?,?,?,'/o','/e','model-old','1.0.0')`)
+    .run(gen, NOW - 900, NOW - 880, NOW - 600);
+  const before = taskShow(db, gen, { now: NOW, switchesFor: resolver() });
+  check(before.model === "model-old",
+    "control: with one generation, the fallback reports that generation's model", String(before.model));
+
+  // A regenerate increments the generation. Before the new one dispatches, there
+  // is no run of its own — and the honest answer is UNKNOWN, not the previous
+  // contract epoch's model under a heading that reads as current.
+  db.prepare("UPDATE task SET generation = 2 WHERE id = ?").run(gen);
+  const after = taskShow(db, gen, { now: NOW, switchesFor: resolver() });
+  check(after.model === UNKNOWN && after.cli_version === UNKNOWN,
+    "after a regenerate, a run from the PREVIOUS generation is not reported as this one's",
+    `${after.model} / ${after.cli_version}`);
+  check(after.unknown.includes("model") && after.unknown.includes("cli_version"),
+    "and both are named in the unknown list", JSON.stringify(after.unknown));
+
+  // CONTROL: once the new generation dispatches, its own run is reported — or the
+  // scoping has simply disabled the fallback.
+  db.prepare(`INSERT INTO phase_run(task,generation,phase,slice,attempt,status,pid,lstart,started_at,
+                                    heartbeat_at,lease_expires_at,out_path,err_path,model_id,cli_version)
+              VALUES(?,2,'SIZING',0,1,'succeeded',501,'L',?,?,?,'/o','/e','model-new','2.0.0')`)
+    .run(gen, NOW - 300, NOW - 280, NOW - 100);
+  check(taskShow(db, gen, { now: NOW, switchesFor: resolver() }).model === "model-new",
+    "control: and the new generation's own run IS reported");
+}
+
 // ── the CLI: compute -> data -> render ───────────────────────────────────────
 //
 // The JSON is the interface; the text is not, and it says so in its own comments
@@ -1046,6 +1141,66 @@ const filed = {};
     check(parse(cli("task", "list", "--json").stdout)?.kind === "task.list",
       "control: a hub at the current version still answers");
   }
+
+
+    // A MAXIMUM IS NOT A HISTORY. A damaged or hand-repaired hub recording 1 and
+    // 3 but missing 2 passes an equality against the current version and then
+    // dies on `no such table: task_pr`, because migration 2 is what creates it.
+    // Same uncaught trace, second door.
+    {
+      const holed = join(dir, "holedhub", ".reeve");
+      mkdirSync(join(holed, "state"), { recursive: true });
+      const h = new DatabaseSync(join(holed, "state", "hub.db"));
+      h.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, at INTEGER NOT NULL)");
+      for (const v of [1, HUB_SCHEMA_VERSION]) h.prepare("INSERT INTO schema_version(version,at) VALUES(?,1)").run(v);
+      h.close();
+      check(completedVersion(join(holed, "state", "hub.db")) === HUB_SCHEMA_VERSION,
+        `control: completedVersion answers ${HUB_SCHEMA_VERSION} for this hub, so a maximum check would PASS it`,
+        String(completedVersion(join(holed, "state", "hub.db"))));
+
+      const r = spawnSync(process.execPath, [BIN, "task", "list", "--home", holed, "--json"],
+        { encoding: "utf8", timeout: 60_000 });
+      const j = parse(r.stdout ?? "");
+      check(j?.kind === "hub_incompatible",
+        "a hub missing a migration in the middle is refused, though its maximum is current",
+        ((r.stdout ?? "") + (r.stderr ?? "")).slice(0, 300));
+      check(/migration 2 is missing/.test(j?.message ?? ""),
+        "and the refusal names WHICH migration is missing", String(j?.message));
+      check(!/no such table/.test((r.stdout ?? "") + (r.stderr ?? "")),
+        "and never the `no such table` the maximum check let through",
+        ((r.stdout ?? "") + (r.stderr ?? "")).slice(0, 200));
+    }
+
+    // SQLITE READS LAZILY. A hub whose corruption lies outside the pages the open
+    // touches constructs a connection perfectly and fails at the FIRST REAL
+    // QUERY -- past every guard, and out through an uncaught stack trace.
+    {
+      const rotten = join(dir, "rottenhub", ".reeve");
+      mkdirSync(join(rotten, "state"), { recursive: true });
+      const path = join(rotten, "state", "hub.db");
+      const r0 = new DatabaseSync(path);
+      r0.exec("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, at INTEGER NOT NULL)");
+      for (let v = 1; v <= HUB_SCHEMA_VERSION; v++)
+        r0.prepare("INSERT INTO schema_version(version,at) VALUES(?,1)").run(v);
+      r0.close();
+      // Every version is present and the file opens; the tables the routes query
+      // are simply not there. That is what a query-time failure looks like from
+      // the outside, and it is the shape the open-time guard cannot see.
+      const r = spawnSync(process.execPath, [BIN, "task", "list", "--home", rotten, "--json"],
+        { encoding: "utf8", timeout: 60_000 });
+      const both = (r.stdout ?? "") + (r.stderr ?? "");
+      const j = parse(r.stdout ?? "");
+      check(j?.ok === false && j?.kind === "hub_unreadable",
+        "a hub that fails at QUERY time is a typed refusal, not a stack trace", both.slice(0, 300));
+      check(!/^\s*(Error|TypeError)\b/m.test(both) && !/ at .*\.mjs:/.test(both),
+        "and no stack trace reaches the operator", both.slice(0, 300));
+      check(typeof j?.retryable === "boolean",
+        "carrying a retryable bit, so an operator knows whether trying again can help",
+        JSON.stringify(j));
+      check(j?.retryable === false,
+        "and damage is NOT retryable, because retrying a broken file forever is the wrong advice",
+        JSON.stringify(j));
+    }
 
   // A machine with no builder has no hub, and an open error whose text is a
   // sqlite message is not an answer to "what are my tasks".

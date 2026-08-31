@@ -92,10 +92,22 @@ export function whyModel(db, taskId, { now }) {
   // treating the acknowledgement as the only evidence rendered "founder not yet"
   // about a round the founder had explicitly approved -- while omitting the
   // source that proves it.
+  // THE LATEST VERDICT AT EACH HEAD, and never a superseded row.
+  //
+  // A founder can answer a round with `changes_requested` as readily as with
+  // `approve`, and an approval can be superseded by a later one. Taking the FIRST
+  // row by time and reading its KIND alone reported "approved" for a round the
+  // founder had explicitly asked for changes on -- the one mistake in this whole
+  // surface that could make an operator ship something.
+  //
+  // `superseded_at IS NULL` is the filter and `observed_at DESC` is the order, so
+  // the row that answers each head is the newest one still standing.
   const founderApprovals = db.prepare(
-    `SELECT head_sha, kind, actor_login_snapshot, source_id, observed_at
-       FROM approval WHERE task = ? AND kind IN ('founder_review','founder_cli','founder_silence')
-      ORDER BY observed_at`).all(taskId);
+    `SELECT head_sha, kind, verdict, actor_login_snapshot, source_id, observed_at
+       FROM approval
+      WHERE task = ? AND kind IN ('founder_review','founder_cli','founder_silence')
+        AND superseded_at IS NULL
+      ORDER BY observed_at DESC`).all(taskId);
   const byHead = new Map();
   for (const a of founderApprovals) if (!byHead.has(a.head_sha)) byHead.set(a.head_sha, a);
 
@@ -103,16 +115,22 @@ export function whyModel(db, taskId, { now }) {
   const acked = new Set(ev.notices.filter(n => n.kind === "founder_ack").map(n => n.head_sha));
   const gate = ev.gateRequests.map(g => {
     const approval = byHead.get(g.head_sha) ?? null;
+    // ANSWERED is not APPROVED. `changes_requested` is a founder verdict and it
+    // closes nothing, so it must not read as an acknowledgement.
+    const approved = approval !== null && approval.verdict !== "changes_requested";
     return {
       head_sha: g.head_sha, round: g.round, requested_at: g.requested_at,
       codex_clean: clean.has(g.head_sha),
-      founder_acked: acked.has(g.head_sha) || approval !== null,
+      founder_acked: acked.has(g.head_sha) || approved,
       // WHICH evidence, not merely that there was some. A silence approval and an
       // explicit review are both "approved" and an operator auditing a merge
       // needs to know which one, and where it came from.
       founder_evidence: approval
-        ? { kind: approval.kind, actor: approval.actor_login_snapshot, source_id: approval.source_id }
-        : (acked.has(g.head_sha) ? { kind: "notice_ack", actor: null, source_id: null } : null),
+        ? { kind: approval.kind, verdict: approval.verdict,
+            actor: approval.actor_login_snapshot, source_id: approval.source_id }
+        : (acked.has(g.head_sha)
+            ? { kind: "notice_ack", verdict: "approve", actor: null, source_id: null }
+            : null),
     };
   });
 
@@ -125,6 +143,11 @@ export function whyModel(db, taskId, { now }) {
     unknown: [], absent: [],
   };
   if (model.depth === UNKNOWN) model.unknown.push("depth");
+  // `floors: []` READS AS A FACT to anything parsing this -- an empty list is a
+  // definite answer, and the definite answer here is wrong. The human render
+  // already said UNKNOWN; a machine consumer was told "none fired". Two renderers
+  // over one model must not disagree about whether a question was asked.
+  model.unknown.push("floors");
 
   // ABSENT is per section and computed FROM THE ROWS, never guessed from the
   // phase: a task can reach RESEARCH by adoption and still carry no run of its
@@ -170,7 +193,9 @@ export function renderWhy(m) {
   if (m.absent.includes("gate")) out.push("    no gate_request rows: review has never been asked for");
   else for (const g of m.gate)
     out.push(`    round ${g.round}  ${g.head_sha}  codex ${g.codex_clean ? "clean" : "not yet"}` +
-             `  founder ${g.founder_acked ? (g.founder_evidence?.kind ?? "acked") : "not yet"}` +
+             `  founder ${g.founder_evidence
+                 ? `${g.founder_evidence.kind} ${g.founder_evidence.verdict}`
+                 : "not yet"}` +
              (g.founder_evidence?.source_id ? `  source ${g.founder_evidence.source_id}` : ""));
 
   out.push("", "  provider lease");

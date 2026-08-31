@@ -227,7 +227,7 @@ export const isRunRefOf = (runRef, taskId) =>
  * from an identifier is one metacharacter away from matching more than it was
  * asked to, and the comparison here wants no pattern language at all.
  */
-export function evidenceFor(db, taskId, { now }) {
+export function evidenceFor(db, taskId, { now, generation = null }) {
   const prefix = `${taskId}:`;
   const plen = prefix.length;
   return {
@@ -259,9 +259,16 @@ export function evidenceFor(db, taskId, { now }) {
               contract_drift
          FROM phase_run WHERE task = ? AND status IN ('live','adopted')
         ORDER BY started_at DESC LIMIT 1`).get(taskId) ?? null,
+    // SCOPED TO THE GENERATION, because this is a FALLBACK that fills `model` and
+    // `cli_version` when no run is live. After a regenerate or a redesign
+    // increments the generation, and before the new one dispatches, an unscoped
+    // pick returns the PREVIOUS contract epoch's run -- so `show` reports a model
+    // and a CLI version for work the current generation never did, under a
+    // heading that reads as current.
     lastRun: db.prepare(
       `SELECT phase, slice, attempt, status, model_id, cli_version, started_at
-         FROM phase_run WHERE task = ? ORDER BY started_at DESC LIMIT 1`).get(taskId) ?? null,
+         FROM phase_run WHERE task = ? AND generation = ?
+        ORDER BY started_at DESC LIMIT 1`).get(taskId, generation) ?? null,
     draining: db.prepare(
       `SELECT count(*) c FROM task_drain WHERE task = ? AND settled_at IS NULL`).get(taskId).c,
     territory: db.prepare(
@@ -388,7 +395,8 @@ const orUnknown = v => (v === null || v === undefined || v === "" ? UNKNOWN : v)
 export function taskShow(db, taskId, { now, switchesFor }) {
   const row = db.prepare("SELECT * FROM task WHERE id = ?").get(taskId);
   if (!row) return null;
-  const ev = { ...evidenceFor(db, taskId, { now }), switches: switchesFor(row.project) };
+  const ev = { ...evidenceFor(db, taskId, { now, generation: row.generation }),
+               switches: switchesFor(row.project) };
   const model = {
     id: row.id, project: row.project, nwo: row.nwo_snapshot, title: row.title,
     phase: row.phase, generation: row.generation, priority: row.priority,

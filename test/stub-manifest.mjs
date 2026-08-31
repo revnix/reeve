@@ -898,8 +898,8 @@ export const STUBS = [
     test: "test/task-file.test.mjs",
     expectRed: "a filing proceeds once the dead holder's lock is reaped",
     edits: [{ file: "src/build/taskfile.mjs",
-              find: "      { command: \"reeve task file\", pid, lstart, isAlive },",
-              replace: "      { command: \"reeve task file\", pid, lstart, isAlive: () => true }," }],
+              find: "    { command: \"reeve task file\", pid, lstart, isAlive },",
+              replace: "    { command: \"reeve task file\", pid, lstart, isAlive: () => true }," }],
   },
   {
     name: "taskfile-dry-run-writes-nothing",
@@ -925,8 +925,8 @@ export const STUBS = [
     test: "test/cli-flags.test.mjs",
     expectRed: "an empty valued flag is refused",
     edits: [{ file: "bin/reeve",
-              find: "    if (v === undefined || v === \"\") { errors.push(`reeve: --${name} expects a value: ${FLAGS[name].what}`); continue; }",
-              replace: "    if (false) { continue; }" }],
+              find: "    if (v === undefined || (v === \"\" && !EMPTY_IS_A_VALUE.has(name))) {",
+              replace: "    if (false) {" }],
   },
   {
     name: "cli-task-reaches-its-own-body",

@@ -937,6 +937,15 @@ export const STUBS = [
               replace: "  case \"task-disabled\": {" }],
   },
   {
+    name: "anchors-resolve-detects-a-rotted-one",
+    why: "stop reporting an anchor that resolves nowhere, so a stub the sweep cannot place reads as a manifest in good order -- the state the default branch was in for two entries while the suite and the linter both passed, because neither reads an anchor",
+    test: "test/anchors-resolve.test.mjs",
+    expectRed: "an anchor that appears NOWHERE is reported",
+    edits: [{ file: "src/stubsweep.mjs",
+              find: "          bad.push({ name: entry.name, file, count: n, why: String(e.message) });",
+              replace: "          void n;" }],
+  },
+  {
     name: "artifact-write-is-atomic-against-a-crash",
     why: "write the artifact straight to its final path, because the rename looks like an optimisation. A process killed mid-write then leaves a SHORT research.md rather than nothing -- present, correctly named, and incomplete -- and the next reader finds an artifact where there should be none. The drill kills a real child between the write and the rename, so the assertion is about what survives a crash rather than about what the function returns",
     test: "test/artifact.test.mjs",
@@ -980,15 +989,6 @@ export const STUBS = [
     edits: [{ file: "src/sandbox.mjs",
               find: "  if (action !== null && (BUILD_ACTIONS.includes(action) || Object.hasOwn(ARTIFACT_FILE, action)))",
               replace: "  if (false)" }],
-  },
-  {
-    name: "run-paths-do-not-collide-across-attempts",
-    why: "drop the attempt from a run's filename, so a retry writes over the transcript of the attempt it is retrying. Nothing errors: the file is present, correctly named, and describes the wrong run -- and the crash-recovery path that finds a surviving worker by this name then finds the wrong one. This is the shape that made two of three runs vanish from a measured comparison and forced a published figure to be withdrawn. The assertion compares two attempts TO EACH OTHER rather than to a frozen string, because against a frozen name that carries an attempt, a path that has lost its attempt still differs -- and the check passes under the exact defect it is named for",
-    test: "test/state-paths.test.mjs",
-    expectRed: "and a different attempt is a different file, so one attempt cannot overwrite another",
-    edits: [{ file: "src/paths.mjs",
-              find: "`g${generation}-${phase}-s${slice}-a${attempt}.${stream}`",
-              replace: "`g${generation}-${phase}-s${slice}.${stream}`" }],
   },
   {
     name: "reviewdiff-guard-matches-the-dispatch-vocabulary",

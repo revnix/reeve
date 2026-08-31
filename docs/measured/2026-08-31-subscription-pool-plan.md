@@ -7,7 +7,11 @@ different question convincingly.
 Date written: 2026-08-31. Host: macOS (Darwin 25.6), founder account.
 CLI 2.1.246 (`claude --version`, read 2026-08-31).
 
-This satisfies **V6** in `tasks/reeve-tasks/trackers/s3.md`, whose obligation is
+This is a PLAN for **V6** in `tasks/reeve-tasks/trackers/s3.md` and does NOT satisfy
+it. Nothing here has been run. V6 is satisfied by a measurement with a durable record;
+until that exists the obligation is open, and T16 remains its proving task. The
+distinction matters because a resumed operator who reads this as satisfaction would
+arm on the strength of a document. Its obligation is
 assigned to **T16** in the builder lane. It is written here because arming waits on
 the answer and T16 is far down the S3 chain; whether it lands as part of T16 or
 separately is a coordination question, not a technical one.
@@ -116,9 +120,23 @@ cannot:
 
 1. **Is the CLI reachable at all?** A version query, which touches no allowance. A
    failure here says the fault is not about quota.
-2. **Is the worker's credential still valid?** The cheapest authenticated call that
-   does not consume the pool under test. A failure here says the token expired or was
-   revoked, which is indistinguishable from exhaustion by exit code alone.
+2. **Is the worker's credential still valid?** This probe is NOT YET SPECIFIED, and
+   naming no operation is the same as having no control. It needs a call that is
+   authenticated, that the SERVER validates, and that does not draw on the pool being
+   measured. A local credential-store check fails the second requirement — it proves a
+   token is present, not that the server still accepts it — and an inference fails the
+   third by spending the thing under test.
+
+   The discriminator for any candidate is whether it FAILS when given a revoked token.
+   Candidates worth testing are the CLI's own account and allowance queries, since an
+   allowance read is authenticated and returns metadata rather than consuming quota.
+
+   **This must be settled inside the measurement window, with the founder present, not
+   before it.** Establishing it means running candidate calls against the live account,
+   and that either consumes or perturbs the allowance the experiment reads — designing
+   the control would contaminate the measurement. Until a candidate is confirmed, a
+   failure in arm B is `INCONCLUSIVE` by construction and cannot be resolved to
+   `SEPARATE`; that is a limit of this plan, stated rather than papered over.
 3. **Does it recover after a cooldown?** Recovery says acceleration limiting rather
    than a pool floor. Continued failure with 1 and 2 both healthy is the only shape
    that points at exhaustion.
@@ -146,6 +164,12 @@ the failure was NOT, which is the honest limit of a failure observed once.
 ## What is needed from the founder
 
 1. **A quiet window**, with no other interactive use, or arm A contaminates itself.
-2. **Two readings of the interactive allowance**, verbatim, with wall-clock times —
-   allowances refill on a schedule and a movement across a boundary is not consumption.
+2. **THREE readings of the interactive allowance**, verbatim, with wall-clock times:
+   a baseline before arm A, one between the arms, and one after arm B. Two readings
+   span both workloads and yield a single delta, so arm A's own consumption cannot be
+   told from arm B's — and the reading that would be attributed to arm B is the one
+   that produces `SHARED`, which is the result that gates re-arming. The middle
+   reading is also what demonstrates the display reacts to interactive work at all;
+   without it, arm A calibrates nothing. Allowances refill on a schedule, so record
+   times: a movement across a refill boundary is not consumption.
 3. **Agreement on the caps and the burst size** before anything runs.

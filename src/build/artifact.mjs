@@ -60,8 +60,18 @@ export function writeArtifact({ dir, phase, bytes }) {
   // artifact of the first task -- and each new directory is an entry in ITS
   // parent. Syncing only the deepest one leaves the entries that name it
   // unflushed, so a crash removes the tree the artifact was reported durable in.
-  const fresh = [];
-  for (let d = dir; !existsSync(d) && d !== dirname(d); d = dirname(d)) fresh.push(d);
+  // THE CHAIN IS SYNCED WHETHER OR NOT THIS CALL CREATED IT. Recording only what
+  // this process found missing loses a race: two first writes overlap, the other
+  // creates the tree and is still writing its temporary, this one observes the
+  // directories as existing, records nothing, and returns having synced only the
+  // leaf -- reporting durability for a tree whose entries are still unflushed.
+  //
+  // Syncing an already-durable directory costs one fsync and answers the
+  // question the caller actually asked, which is whether the artifact survives.
+  // The chain stops at the reeve home rather than walking to the filesystem
+  // root, because directories this code did not make are not its to reason about.
+  const chain = [];
+  for (let d = dir; d !== dirname(d) && chain.length < 8; d = dirname(d)) chain.push(d);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, name);
   reapStaleTemporaries(dir, name, Date.now());
@@ -111,9 +121,11 @@ export function writeArtifact({ dir, phase, bytes }) {
   // AND THE PARENT OF EVERY DIRECTORY THIS CALL CREATED. Persisting a
   // directory's contents does not persist the fact that the directory exists.
   // `fresh` runs deepest-first, so the parents are synced from the inside out.
-  for (const made of fresh) {
-    const pfd = openSync(dirname(made), "r");
-    try { fsyncSync(pfd); } finally { closeSync(pfd); }
+  for (const made of chain) {
+    try {
+      const pfd = openSync(dirname(made), "r");
+      try { fsyncSync(pfd); } finally { closeSync(pfd); }
+    } catch { /* above the tree this call owns; not ours to sync */ }
   }
   return { path, sha256: sha(bytes), bytes: bytes.length };
 }
@@ -139,7 +151,11 @@ export function readArtifact({ dir, phase, expectSha }) {
 // A claim is a list item that asserts something. The per-action minimum for
 // research is at least one file:line citation per claim. Prose between the lists
 // is context, not a claim, and is not asked to cite.
-const CLAIM = /^\s*(?:[-*]|\d+\.)\s+\S/;
+// EVERY STANDARD LIST MARKER. `-`, `*` and `1.` were recognised and `+` and
+// `1)` were not, so an uncited claim written with either was not a claim at all
+// and slipped past the citation rule entirely -- the check silently narrowing
+// its own input rather than failing.
+const CLAIM = /^\s*(?:[-*+]|\d+[.)])\s+\S/;
 // A CITATION IS A PATH AND A LINE, not any token with a colon in it.
 // `[\w./-]+:\d+` matched `12:30` and `issue:42` as readily as
 // `src/build/hubaccess.mjs:170`, so a claim mentioning a time or a ticket read
@@ -166,8 +182,20 @@ const withoutUrls = (line) => line.replace(URLS, " ");
 export function reviewArtifact({ phase, dir, expect }) {
   if (!ARTIFACT_FILE[phase])
     throw new Error(`${phase} produces a diff, not an artifact; reviewDiff is its gate`);
-  if (!expect || typeof expect.depth !== "string")
-    throw new Error("reviewArtifact needs `expect` with a depth; expectations adjust by depth and a default would pick one");
+  // `expect` IS REQUIRED; a DEPTH INSIDE IT IS NOT.
+  //
+  // The phase tasks that call this pass `researchExpectations(depth)` and
+  // `designExpectations(depth)`, whose documented result is the requirement set
+  // -- `{minCitationsPerClaim, minClaims}` -- and carries no `depth` field: the
+  // depth is an INPUT to those helpers, not an output. Demanding one here threw
+  // before reading the artifact, so the gate refused its own documented callers
+  // while every test that hand-built an expect object passed.
+  //
+  // So the object is required, because a gate with no expectations is not a
+  // gate, and the depth is used when it is supplied. What depends on it says so
+  // at the point of use rather than being assumed present.
+  if (!expect || typeof expect !== "object")
+    throw new Error("reviewArtifact needs an `expect` object; a gate with nothing to check against is not a check");
 
   // READ AS BYTES, so the digest below is of exactly what was reviewed. An
   // artifact replaced between the write and this gate -- by a recovered attempt,
@@ -255,22 +283,55 @@ export function reviewArtifact({ phase, dir, expect }) {
     // read as that slice's, so an empty final slice followed by a Notes section
     // carrying the four labels passed. The heading that ends a slice is the next
     // heading, whatever it is called.
-    const sections = lines.map((l, i) => (/^##\s+/.test(l) ? i : -1)).filter(i => i !== -1);
-    const starts = lines.map((l, i) => (/^##\s+Slice\b/.test(l) ? i : -1)).filter(i => i !== -1);
+    // BOTH DOCUMENTED SHAPES. This plan writes a slice as a level-two `## Slice
+    // 1`; the phase plan that will actually EMIT design.md writes `## Slices`
+    // holding level-three `### Slice 1: ...`. Matching only the first found zero
+    // slices in the artifact the producer is specified to write, so the gate
+    // would have refused correct work with "carries no ordered slice list" --
+    // the two plans disagree, and a gate that accepts only its own plan's shape
+    // rejects the other's.
+    //
+    // `## Slices` is a CONTAINER and not a slice: `Slice\b` does not match it,
+    // which is what keeps the container heading out of the slice list.
+    const SLICE = /^#{2,3}\s+Slice\b/;
+    const sections = lines.map((l, i) => (/^#{2,3}\s+/.test(l) ? i : -1)).filter(i => i !== -1);
+    const starts = lines.map((l, i) => (SLICE.test(l) ? i : -1)).filter(i => i !== -1);
     if (!starts.length) findings.push("design.md carries no ordered slice list");
     for (let k = 0; k < starts.length; k++) {
       const heading = lines[starts[k]].trim();
       const next = sections.find(i => i > starts[k]) ?? lines.length;
       const body = lines.slice(starts[k] + 1, next).join("\n");
-      for (const need of ["Files:", "Packages:", "Tests:", "Done when:"]) {
+      // The same disagreement in the labels: this plan asks for `Tests:` and the
+      // producing plan writes `Test plan:`. Either satisfies the requirement,
+      // which is that the slice says how it will be tested.
+      for (const need of [["Files:"], ["Packages:"], ["Tests:", "Test plan:"], ["Done when:"]]) {
         // THE LABEL IS NOT THE ANSWER. `includes` passed on the bare scaffold, so
         // a slice carrying the four headings and nothing after them advanced as
         // though it named its files, its tests and its done condition. What the
         // gate is for is the values.
-        const line = body.split("\n").find(l => l.trim().startsWith(need));
-        if (!line) findings.push(`${heading} has no ${need} line`);
-        else if (!line.slice(line.indexOf(need) + need.length).trim())
-          findings.push(`${heading} has a ${need} line with nothing after it`);
+        // A LIST ITEM IS STILL THE LABEL. The producer writes `- Files: ...`, so
+        // the marker is stripped before the label is looked for.
+        const bare = (l) => l.trim().replace(/^(?:[-*+]|\d+[.)])\s+/, "");
+        const rows = body.split("\n");
+        const label = need.find(n => rows.some(l => bare(l).startsWith(n)));
+        if (!label) { findings.push(`${heading} has no ${need[0]} line`); continue; }
+        const at = rows.findIndex(l => bare(l).startsWith(label));
+        // THE VALUE MAY FOLLOW THE LABEL RATHER THAN SIT ON ITS LINE. The
+        // producing plan writes `Done when:` alone with a fenced command beneath
+        // it, so a same-line-only check called the documented artifact empty --
+        // the gate refusing correct work while every hand-written fixture passed.
+        //
+        // So: content after the colon, or any non-blank line before the next
+        // label or heading. Bounded that way rather than by blank lines, because
+        // the documented block is separated from its label by one.
+        const isBoundary = (l) => /^#{2,3}\s+/.test(l) ||
+          ["Files:", "Packages:", "Tests:", "Test plan:", "Done when:"].some(n => bare(l).startsWith(n));
+        let has = !!bare(rows[at]).slice(label.length).trim();
+        for (let j = at + 1; j < rows.length && !has; j++) {
+          if (isBoundary(rows[j])) break;
+          if (rows[j].trim()) has = true;
+        }
+        if (!has) findings.push(`${heading} has a ${label} line with nothing after it`);
       }
     }
     if (expect.depth === "trivial" && !/^##\s+Measured context\b/m.test(text))

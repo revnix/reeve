@@ -1177,6 +1177,107 @@ const filed = {};
     JSON.stringify(m.unknown));
 }
 
+
+// ── every value the lineage MODEL carries must reach the text ──────────────
+//
+// FOUR findings in this branch have been one shape: a field reaches the model
+// and the human renderer drops it. DRIFT, the sizing floors, the merge receipt,
+// and now a run's generation. Each was fixed by hand, and the fourth is the
+// signal that hand-fixing is the wrong response — the next field added will be
+// the fifth.
+//
+// So this is derived, not enumerated: for each row-shaped section, EVERY column
+// the model carries must appear in `renderWhy`'s output. A field added to a
+// projection is covered the day it is added, and leaving one out of the text
+// becomes a deliberate act with a written reason rather than an oversight.
+{
+  const t = (await file({ title: "a fully populated lineage", territory: ["packages/rv"] })).task;
+  setPhase(t, "RESEARCH");
+  // Distinctive values throughout, so a match in the render is this field's and
+  // not a coincidence of some short shared string.
+  db.prepare(`INSERT INTO phase_run(task,generation,phase,slice,attempt,status,pid,lstart,started_at,
+                                    heartbeat_at,lease_expires_at,out_path,err_path,outcome,
+                                    model_id,cli_version,effort,max_turns,max_budget_usd,
+                                    snapshot_hash,contract_drift,argv_hash,prompt_hash,
+                                    settings_hash,tools_hash,agents_hash,canary_id)
+              VALUES(?,7,'SIZING',3,5,'succeeded',777,'L',?,?,?,'/o','/e','OUTCOME-zq',
+                     'model-zq','cli-zq','effort-zq',91,3.5,'snap-zq','drift-zq','argv-zq',
+                     'prompt-zq','settings-zq','tools-zq','agents-zq','canary-zq')`)
+    .run(t, NOW - 900, NOW - 880, NOW - 600);
+
+  const m = whyModel(db, t, { now: NOW });
+  const text = renderWhy(m);
+  check(m.runs.length === 1, "control: the fixture produced exactly one run row", String(m.runs.length));
+
+  // The exclusions, each with a reason. Anything NOT named here must render.
+  const EXCLUDED = {
+    // Rendered as a formatted line of its own further down, not as a raw value.
+    started_at: "a timestamp the render formats elsewhere",
+  };
+  const missing = [];
+  for (const [k, v] of Object.entries(m.runs[0])) {
+    if (k in EXCLUDED) continue;
+    if (v === null || v === undefined) continue;
+    if (!text.includes(String(v))) missing.push(`${k}=${JSON.stringify(v)}`);
+  }
+  check(missing.length === 0,
+    "every value a phase_run row carries into the model reaches the human render",
+    `not rendered: ${missing.join(", ")}\n        ` +
+    "Either render it, or name it in EXCLUDED with the reason it is deliberately absent.");
+
+  // COUNTER-CONTROL: the check can FAIL. A value the model does not carry must be
+  // reported missing, or the loop above passes on any render at all.
+  const probe = [];
+  for (const [k, v] of Object.entries({ ...m.runs[0], ghost_field: "ghost-zq" })) {
+    if (k in EXCLUDED || v === null || v === undefined) continue;
+    if (!text.includes(String(v))) probe.push(k);
+  }
+  check(probe.length === 1 && probe[0] === "ghost_field",
+    "counter-control: a value the render does NOT contain is reported missing",
+    JSON.stringify(probe));
+
+  // And the finding that produced this guard, asserted directly so the reason is
+  // legible without reading the loop.
+  check(/gen 7/.test(text),
+    "a run's generation is in the human lineage, so two contract epochs are distinguishable",
+    (text.match(/.*SIZING\/3.*/) ?? [""])[0]);
+}
+
+// ── a founder acknowledgement answers the pass it was given ────────────────
+{
+  const a = (await file({ title: "an acked round", territory: ["packages/ak"] })).task;
+  db.prepare(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+              VALUES(?, 'spec', NULL, NULL, 12, 61, 'headK', ?)`).run(a, NOW - 400);
+  db.prepare(`INSERT INTO gate_request(task,spec_repo_id,spec_pr,head_sha,round,task_generation,requested_at)
+              VALUES(?,12,61,'headK',0,1,?)`).run(a, NOW - 350);
+  const cleanPass = (src, at) => db.prepare(
+    `INSERT INTO approval(task,spec_repo_id,spec_pr,head_sha,actor_id,actor_login_snapshot,
+                          kind,verdict,observed_at,source_id,task_generation)
+     VALUES(?,12,61,'headK',7,'codex','codex_clean','clean',?,?,1)`).run(a, at, src);
+
+  cleanPass("pass-old", NOW - 300);
+  db.prepare(`INSERT INTO notice_receipt(task,head_sha,clean_source_id,channel,kind,delivered_at)
+              VALUES(?,'headK','pass-old','cli','founder_ack',?)`).run(a, NOW - 250);
+  const one = whyModel(db, a, { now: NOW }).gate[0];
+  check(one.founder_acked === true && one.codex_evidence?.source_id === "pass-old",
+    "control: the founder acknowledged the only clean pass, and the round reads acked",
+    JSON.stringify(one));
+
+  // A NEWER clean pass arrives at the same head. It governs, and the founder has
+  // never seen it — so the round is no longer answered, and reporting `acked`
+  // beside a witness naming the new source is two halves of one answer disagreeing.
+  cleanPass("pass-new", NOW - 100);
+  const two = whyModel(db, a, { now: NOW }).gate[0];
+  check(two.codex_evidence?.source_id === "pass-new",
+    "control: the newer pass governs", JSON.stringify(two.codex_evidence));
+  check(two.founder_acked === false,
+    "and an acknowledgement of the OLDER source does not answer the newer pass",
+    JSON.stringify(two));
+  check(two.founder_evidence === null,
+    "so no founder evidence is claimed for a pass the founder never saw",
+    JSON.stringify(two.founder_evidence));
+}
+
 // ── the CLI: compute -> data -> render ───────────────────────────────────────
 //
 // The JSON is the interface; the text is not, and it says so in its own comments

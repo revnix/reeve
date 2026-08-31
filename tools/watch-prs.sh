@@ -91,14 +91,21 @@ snapshot() {
 }
 
 : > "$STATE"
+STARTUP_FAILED=0
 while read -r n; do
-  if s=$(snapshot "$n"); then echo "$n $s" >> "$STATE"; else echo "$n UNREADABLE" >> "$STATE"; fi
+  if s=$(snapshot "$n"); then echo "$n $s" >> "$STATE"
+  else echo "$n UNREADABLE" >> "$STATE"; STARTUP_FAILED=1; fi
 done < "$LIST"
 echo "watching $REPO PR(s) $(tr '\n' ' ' < "$LIST")every $((INTERVAL / 60)) min; change + heartbeat + failed-probe alarm"
 echo "state: $STATE"
 cat "$STATE"
 
-MISSES=0
+# SEEDED from the startup probe, which is a probe like any other. Counting only
+# scheduled ticks meant a startup failure was recorded as UNREADABLE and then
+# forgotten, so the alarm needed a THIRD failed read and the watch stayed blind
+# for two intervals while claiming a two-probe threshold. The first read is the
+# one most likely to fail -- it runs before anything has warmed up.
+MISSES="$STARTUP_FAILED"
 # Arithmetic, not `seq`. MEASURED on darwin 25.6: `seq 1 0` prints "1 0" -- BSD
 # seq counts DOWN when the second bound is lower, so `WATCH_TICKS=0` ran a tick
 # and then slept for the full interval instead of doing nothing. GNU seq prints

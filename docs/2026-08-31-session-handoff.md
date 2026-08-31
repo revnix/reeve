@@ -99,12 +99,16 @@ grep "shadow:" ~/.reeve/reeve.log | tail -1 \
 # here was an unguarded second copy of it and is gone; do not reintroduce one.
 ./bin/reeve doctor revnix/reeve                       # R-04 answers this
 
-# NOT a pinned number: these two answer about ONE pull request, and a resumed
-# session reading a verdict for the wrong one is the stale-tip merge this block
-# exists to prevent, wearing the costume of a passing gate. Unset is an abort.
-: "${pr:?set pr=<number> for the pull request you are asking about}"
-node scripts/premerge.mjs "$pr"                       # SHOULD a merge happen
-node scripts/verify-merge.mjs "$pr"                   # did a merge carry everything
+# TWO MOMENTS, not one, and their preconditions EXCLUDE each other: premerge gates
+# a pull request that is still OPEN, verify-merge answers only about one already
+# MERGED. Measured 2026-08-31: each exits 22 when handed the other's state. So one
+# variable cannot satisfy both, and running them in sequence always produced
+# one real verdict and one refusal that looks like a verdict. Run the one whose
+# moment you are in. Neither is pinned to a number; unset is an abort.
+: "${open_pr:?set open_pr=<number> of an OPEN pull request}"
+node scripts/premerge.mjs "$open_pr"                  # SHOULD this merge happen
+: "${merged_pr:?set merged_pr=<number> of a MERGED pull request}"
+node scripts/verify-merge.mjs "$merged_pr"            # did that merge carry everything
 # ~4ms; every anchor still resolves. IN FLIGHT when this was written, so check it
 # exists first: a missing file exits MODULE_NOT_FOUND, which is not the same answer
 # as "no anchors rotted".

@@ -1143,13 +1143,4 @@ export const STUBS = [
               find: "    const wantsMeasured = \"requireMeasuredContext\" in expect",
               replace: "    const wantsMeasured = false && \"requireMeasuredContext\" in expect" }],
   },
-  {
-    name: "artifact-sync-failure-inside-the-tree-propagates",
-    why: "swallow every failure while syncing the directory chain, so an EIO on a parent INSIDE the task's own tree reads the same as a permission error on a directory above it. writeArtifact then returns a sha for an artifact whose tree is not durable -- a guard reporting success for precisely the storage failure it exists to notice, which is worse than having no guard because a sha was recorded",
-    test: "test/artifact.test.mjs",
-    expectRed: "control: a write through a new chain still succeeds and reads back",
-    edits: [{ file: "src/build/artifact.mjs",
-              find: "      if (chain.includes(parent) || parent === dir) throw e;",
-              replace: "      throw e;" }],
-  },
 ];

@@ -91,7 +91,9 @@ will read real drift as the expected one.
    times the answer was the same: the platform already computed what the code was
    re-deriving. Delegating removed an inventory; enumerating added a round.
 
-2. **That cleanup is DONE** and was replaced by a lint rule; see §0. Do not redo it.
+2. **That cleanup is DONE** and was replaced by a lint rule. This document is
+   SUPERSEDED — read `docs/2026-08-31-session-handoff.md`, whose §0 records it; the
+   handoff this prompt names does not. Do not redo the cleanup.
 
 3. **Check §6 and §8 for what is still OPEN before bringing me anything.** Most of
    what those sections once asked is now settled and recorded there; re-opening a

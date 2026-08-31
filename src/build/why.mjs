@@ -237,7 +237,13 @@ export function renderWhy(m) {
   out.push("", "  pull requests");
   if (m.absent.includes("prs"))
     out.push("    none open (S3 opens none: no task in S3 performs any GitHub effect)");
-  else for (const p of m.prs) out.push(`    ${p.kind} #${p.pr}  ${p.head_sha}`);
+  // MERGED IS THE FACT THE LINEAGE EXISTS TO CARRY. `allPrs` preserves
+  // `merged_sha` and the render was printing a merged row identically to an open
+  // one, so the human reading `why` could not tell that the work landed, nor
+  // recover the receipt that says where.
+  else for (const p of m.prs)
+    out.push(`    ${p.kind} #${p.pr}  ${p.head_sha}` +
+             (p.merged_sha ? `  MERGED ${p.merged_sha}` : "  open"));
 
   out.push("", "  draining");
   if (m.absent.includes("drain")) out.push("    no task_drain rows: nothing is being drained");

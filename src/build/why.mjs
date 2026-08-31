@@ -12,6 +12,7 @@
 // that reads as "nothing went wrong".
 
 import { evidenceFor, isRunRefOf, UNKNOWN, READ_FORMAT_VERSION } from "./show.mjs";
+import { allPrs } from "./prs.mjs";
 
 const orUnknown = v => (v === null || v === undefined || v === "" ? UNKNOWN : v);
 
@@ -50,6 +51,11 @@ export function whyModel(db, taskId, { now }) {
   // cleared hold erases the reason and the time a human actually stopped the
   // task, and renders "no human has stopped this task" about a task a human
   // stopped and then released.
+  // EVERY pull request, merged ones included. `openPrs` filters `merged_sha IS
+  // NOT NULL`, which is right for `show` and erases from the lineage exactly the
+  // work that completed: the number, the reviewed head and the merge sha of a task
+  // that finished.
+  const prs = allPrs(db, taskId);
   const holds = db.prepare(
     `SELECT reason, detail, at, cleared_at FROM hold_reason WHERE task = ? ORDER BY at`).all(taskId);
   const drain = db.prepare(
@@ -111,6 +117,13 @@ export function whyModel(db, taskId, { now }) {
   const byHead = new Map();
   for (const a of founderApprovals) if (!byHead.has(a.head_sha)) byHead.set(a.head_sha, a);
 
+  // THE GOVERNING CLEAN PASS, not a boolean. `codex_clean: true` tells an operator
+  // auditing why a round advanced that a review happened and gives them no way to
+  // find it; `source_id` is the comment, and several rows can exist at one head.
+  // Newest first, so the row named is the one that governed.
+  const cleanRows = new Map();
+  for (const a of [...ev.codexClean].sort((x, y) => (y.observed_at ?? 0) - (x.observed_at ?? 0)))
+    if (!cleanRows.has(a.head_sha)) cleanRows.set(a.head_sha, a);
   const clean = new Set(ev.codexClean.map(a => a.head_sha));
   const acked = new Set(ev.notices.filter(n => n.kind === "founder_ack").map(n => n.head_sha));
   const gate = ev.gateRequests.map(g => {
@@ -120,7 +133,16 @@ export function whyModel(db, taskId, { now }) {
     const approved = approval !== null && approval.verdict !== "changes_requested";
     return {
       head_sha: g.head_sha, round: g.round, requested_at: g.requested_at,
+      // The generation the round belongs to. Two contract epochs can both have
+      // reviewed heads, and without this a consumer cannot tell which is which —
+      // the same identity loss as dropping `generation` from a phase run.
+      task_generation: g.task_generation,
       codex_clean: clean.has(g.head_sha),
+      codex_evidence: cleanRows.get(g.head_sha)
+        ? { source_id: cleanRows.get(g.head_sha).source_id,
+            actor: cleanRows.get(g.head_sha).actor_login_snapshot,
+            observed_at: cleanRows.get(g.head_sha).observed_at }
+        : null,
       founder_acked: acked.has(g.head_sha) || approved,
       // WHICH evidence, not merely that there was some. A silence approval and an
       // explicit review are both "approved" and an operator auditing a merge
@@ -139,7 +161,7 @@ export function whyModel(db, taskId, { now }) {
     task: row.id, project: row.project, phase: row.phase, generation: row.generation,
     depth: orUnknown(row.depth),
     floors, events, runs, lease, drain, gate,
-    holds, escalations: ev.escalations, prs: ev.openPrs,
+    holds, escalations: ev.escalations, prs,
     unknown: [], absent: [],
   };
   if (model.depth === UNKNOWN) model.unknown.push("depth");
@@ -154,7 +176,7 @@ export function whyModel(db, taskId, { now }) {
   // own, and a phase-based guess would report rows that are not there.
   const rows = {
     events, runs, drain, gate, holds,
-    prs: ev.openPrs, escalations: ev.escalations,
+    prs, escalations: ev.escalations,
     lease: lease ? [lease] : [],
   };
   for (const section of SECTIONS) if (!rows[section].length) model.absent.push(section);

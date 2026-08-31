@@ -14,6 +14,8 @@ import { fileURLToPath } from "node:url";
 import { lstatSync } from "node:fs";
 
 import { openHub, HUB_SCHEMA_VERSION, completedVersion } from "../src/build/hubdb.mjs";
+import { insertLease } from "../src/build/providerdb.mjs";
+import { liveLeases } from "../src/build/territory.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { fileTask } from "../src/build/taskfile.mjs";
 import { isSameProcess, readStart } from "../src/supervisor.mjs";
@@ -844,6 +846,12 @@ const filed = {};
   check(m.running.drift !== null && /model_id/.test(String(m.running.drift)),
     "show reports the run's contract drift rather than dropping the column",
     JSON.stringify(m.running.drift));
+  // AND THE HUMAN RENDER SAYS SO. The default renderer is what an operator
+  // actually reads; carrying drift in the JSON while the text stayed silent left
+  // the drifted run looking ordinary to everyone not parsing --json.
+  check(/DRIFT/.test(renderShow(m)),
+    "and the human render says DRIFT out loud, not only the JSON",
+    renderShow(m).slice(0, 400));
 
   // CONTROL: a run with no drift says null, or the field is not reporting drift
   // so much as reporting that a run exists.
@@ -1003,6 +1011,149 @@ const filed = {};
     .run(gen, NOW - 300, NOW - 280, NOW - 100);
   check(taskShow(db, gen, { now: NOW, switchesFor: resolver() }).model === "model-new",
     "control: and the new generation's own run IS reported");
+}
+
+
+// ── WAITING_FOR_QUOTA: the row this reads, and the row nothing writes ───────
+//
+// THE FIXTURE IS BUILT BY CALLING THE PRODUCER. `insertLease` is what writes a
+// provider_lease row, and a hand-written INSERT is a fixture describing a system
+// that may not exist — which is how the previous version of this block passed
+// while the derivation could never fire.
+{
+  const q = (await file({ title: "a capacity-blocked task", territory: ["packages/q2"] })).task;
+  setPhase(q, "SIZING");
+  const ref = builderRunRef(q, "SIZING");
+  insertLease(db, { owner: "builder", repoId: 1, runRef: ref, pid: 991, lstart: "L",
+                    priority: 0, budgetUsd: null, status: "queued",
+                    at: NOW - 77, expiresAt: NOW + 300, token: "tok-q" });
+  const m = taskShow(db, q, { now: NOW, switchesFor: resolver() });
+  check(m.waiting.all.includes("WAITING_FOR_QUOTA"),
+    "a queued builder lease written by insertLease IS WAITING_FOR_QUOTA", JSON.stringify(m.waiting));
+  check(m.waiting.since === NOW - 77,
+    "and `since` is that row's requested_at", String(m.waiting.since));
+
+  // AND THE GAP, RECORDED RATHER THAN LEFT AS A FALSE GREEN.
+  //
+  // `claimProvider` inserts a queued row at exactly ONE site, inside
+  // `if (owner === "guardian")`. Every builder refusal — cooldown, a queued
+  // guardian, at-limit — returns without writing anything. So no production path
+  // produces the row this derivation reads, and the assertions above prove the
+  // QUERY is correct while proving nothing about whether it can ever fire.
+  //
+  // Recorded here as a tested fact so the task that makes the builder queue finds
+  // this assertion red and knows the reader is already waiting for it.
+  const PROV = readFileSync(new URL("../src/provider.mjs", import.meta.url), "utf8");
+  const queuedInserts = [...PROV.matchAll(/status:\s*"queued"/g)].length;
+  check(queuedInserts === 1,
+    `control: provider.mjs writes a queued lease at exactly one site (${queuedInserts})`,
+    String(queuedInserts));
+  const guardianOnly = /owner === "guardian"[\s\S]*?status: "queued"/.test(PROV);
+  check(guardianOnly,
+    "KNOWN GAP: the only queued-lease writer is the guardian branch, so no builder " +
+    "task can reach WAITING_FOR_QUOTA in production yet", String(guardianOnly));
+  // COUNTER-CONTROL: the extraction finds the shape in a literal it has never
+  // seen, so `guardianOnly` above is a real read rather than a dead regex.
+  check(/owner === "guardian"[\s\S]*?status: "queued"/.test(
+          'if (owner === "guardian") { insertLease({ status: "queued" }) }'),
+    "counter-control: the same pattern matches a literal containing it");
+  db.prepare("DELETE FROM provider_lease WHERE run_ref = ?").run(ref);
+}
+
+// ── a lease whose pin has expired is not this task's territory ──────────────
+{
+  const t = (await file({ title: "a pinned task", territory: ["packages/t2"] })).task;
+  const held = taskShow(db, t, { now: NOW, switchesFor: resolver() });
+  check(held.territory.length === 1,
+    "control: an ordinary task shows the territory it holds", JSON.stringify(held.territory));
+
+  // A HELD phase with a live pin still holds it.
+  db.prepare("UPDATE territory_lease SET pinned_until = ? WHERE task = ?")
+    .run(Math.floor(Date.now() / 1000) + 3600, t);
+  setPhase(t, "BLOCKED");
+  check(taskShow(db, t, { now: NOW, switchesFor: resolver() }).territory.length === 1,
+    "a held task with a LIVE pin still holds its territory");
+
+  // Past the pin, nothing sweeps the row — but `liveLeases` has already stopped
+  // treating it as excluding anyone, so another task may take those paths. Showing
+  // it claims ownership the task no longer has.
+  db.prepare("UPDATE territory_lease SET pinned_until = ? WHERE task = ?")
+    .run(Math.floor(Date.now() / 1000) - 60, t);
+  const expired = taskShow(db, t, { now: NOW, switchesFor: resolver() });
+  check(expired.territory.length === 0,
+    "once the pin has expired the territory is no longer reported as this task's",
+    JSON.stringify(expired.territory));
+  check(db.prepare("SELECT count(*) c FROM territory_lease WHERE task = ?").get(t).c === 1,
+    "control: and the ROW is still there, so the change is the predicate and not a delete");
+
+  // The predicate is the reaper's own, imported rather than restated: the same
+  // row must read the same way to both.
+  check(liveLeases(db, "alpha").filter(l => l.task === t).length === 0,
+    "control: liveLeases agrees the lease is not live, which is the predicate being shared");
+}
+
+// ── the lineage keeps what completed ───────────────────────────────────────
+{
+  const done = (await file({ title: "a finished task", territory: ["packages/dn"] })).task;
+  db.prepare(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at,merged_sha)
+              VALUES(?, 'spec', NULL, NULL, 9, 41, 'headM', ?, 'mergedsha')`).run(done, NOW - 500);
+  const m = whyModel(db, done, { now: NOW });
+  check(m.prs.length === 1 && m.prs[0].merged_sha === "mergedsha",
+    "why keeps a MERGED pull request, with the sha it merged as", JSON.stringify(m.prs));
+  check(!m.absent.includes("prs"),
+    "so the section is not absent for a task whose work completed", JSON.stringify(m.absent));
+
+  // CONTROL: `show` still answers the present tense with open rows only, or the
+  // two readers have collapsed into one wrong one.
+  check(taskShow(db, done, { now: NOW, switchesFor: resolver() }).prs.length === 0,
+    "control: and `show` still reports no OPEN pull request for it");
+}
+
+// ── the gate lineage keeps its generation and names its witness ────────────
+{
+  const w = (await file({ title: "a witnessed round", territory: ["packages/w2"] })).task;
+  db.prepare(`INSERT INTO task_pr(task,kind,generation,slice,repo_id,pr,head_sha,created_at)
+              VALUES(?, 'spec', NULL, NULL, 8, 51, 'headW', ?)`).run(w, NOW - 400);
+  db.prepare(`INSERT INTO gate_request(task,spec_repo_id,spec_pr,head_sha,round,task_generation,requested_at)
+              VALUES(?,8,51,'headW',0,1,?)`).run(w, NOW - 350);
+  db.prepare(`INSERT INTO approval(task,spec_repo_id,spec_pr,head_sha,actor_id,actor_login_snapshot,
+                                   kind,verdict,observed_at,source_id,task_generation)
+              VALUES(?,8,51,'headW',7,'chatgpt-codex-connector','codex_clean','clean',?, 'cmt-900',1)`)
+    .run(w, NOW - 300);
+
+  const g = whyModel(db, w, { now: NOW }).gate[0];
+  check(g.task_generation === 1,
+    "each gate round carries the generation it belongs to", JSON.stringify(g));
+  check(g.codex_clean === true && g.codex_evidence?.source_id === "cmt-900",
+    "and the clean pass names its witness rather than reducing to a boolean",
+    JSON.stringify(g.codex_evidence));
+  check(g.codex_evidence?.actor === "chatgpt-codex-connector",
+    "with the actor that produced it", JSON.stringify(g.codex_evidence));
+
+  // Several clean rows can exist at one head; the GOVERNING one is the newest.
+  db.prepare(`INSERT INTO approval(task,spec_repo_id,spec_pr,head_sha,actor_id,actor_login_snapshot,
+                                   kind,verdict,observed_at,source_id,task_generation)
+              VALUES(?,8,51,'headW',7,'chatgpt-codex-connector','codex_clean','clean',?, 'cmt-901',1)`)
+    .run(w, NOW - 100);
+  check(whyModel(db, w, { now: NOW }).gate[0].codex_evidence?.source_id === "cmt-901",
+    "and when a head has two clean passes the NEWEST is the one named",
+    JSON.stringify(whyModel(db, w, { now: NOW }).gate[0].codex_evidence));
+}
+
+// ── an unreadable profile is unknown even where no switch was needed ───────
+{
+  const b = (await file({ title: "a blocked task", territory: ["packages/bk"] })).task;
+  setPhase(b, "BLOCKED");
+  check(NEEDS_SWITCH.BLOCKED === undefined,
+    "control: BLOCKED needs no switch, so no capability decision is made for it");
+  const m = taskShow(db, b, { now: NOW, switchesFor: switchesResolver({}, readProfile) });
+  check(m.switches === null, "control: and the profile could not be read", JSON.stringify(m.switches));
+  check(m.waiting.capability_known === true,
+    "control: capability_known stays true, because nothing needed a capability",
+    JSON.stringify(m.waiting));
+  check(m.unknown.includes("switches"),
+    "yet `switches` is still named unknown, so the model does not contradict its own null",
+    JSON.stringify(m.unknown));
 }
 
 // ── the CLI: compute -> data -> render ───────────────────────────────────────
@@ -1200,6 +1351,16 @@ const filed = {};
       check(j?.retryable === false,
         "and damage is NOT retryable, because retrying a broken file forever is the wrong advice",
         JSON.stringify(j));
+
+      // THE PROJECT PREFILTER READS THE SAME BROKEN STORE. It ran outside the
+      // guard, so `--project` was the one path that still escaped as a trace.
+      const f = spawnSync(process.execPath, [BIN, "task", "list", "--project", "alpha", "--home", rotten, "--json"],
+        { encoding: "utf8", timeout: 60_000 });
+      const fb = (f.stdout ?? "") + (f.stderr ?? "");
+      check(parse(f.stdout ?? "")?.kind === "hub_unreadable",
+        "and `--project` fails the same typed way, not through the prefilter", fb.slice(0, 300));
+      check(!/ at .*\.mjs:/.test(fb),
+        "with no stack trace either", fb.slice(0, 300));
     }
 
   // A machine with no builder has no hub, and an open error whose text is a

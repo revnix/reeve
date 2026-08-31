@@ -366,7 +366,13 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
                    edits: [{ file: "src/thing.mjs", find: "this text is not in the file", replace: "x" }] }]);
   commit();
   const rotted = run();
-  check(rotted.exit === 1, "a manifest that has rotted against the code fails the sweep", `exit=${rotted.exit}`);
+  // EXIT 2, not 1, since the anchor preflight added in this change refuses BEFORE any
+  // test runs. 1 means "the sweep ran and something was not caught"; 2 means "the
+  // sweep would not start". A rotted anchor is now the second, which is the point of
+  // the preflight: discovering it after twenty minutes of test runs told nobody
+  // anything the first millisecond could not.
+  check(rotted.exit === 2, "a manifest that has rotted against the code REFUSES the sweep before it starts",
+    `exit=${rotted.exit}`);
   check(/UNRUNNABLE|appears 0 time/.test(rotted.out), "and says the anchor matched nothing", rotted.out.slice(-300));
 
   // 6. And it refuses a dirty tree outright, which is the precondition that once
@@ -1102,12 +1108,26 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
 
   const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
     env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  // THIS ASSERTS A STRONGER PROPERTY THAN IT USED TO, and the change is worth stating.
+  //
+  // It was written when a later edit's rotted anchor was discovered DURING
+  // application, so the first file had already been written and the interesting
+  // question was whether it got restored. The anchor preflight now refuses the whole
+  // entry before any file is touched, so nothing is written and there is nothing to
+  // restore -- a better outcome, and a different one.
+  //
+  // The restore path itself is not left uncovered: `sweep-restores-on-signal` and
+  // `process-tree-kill` exercise it for the failures the preflight cannot see, which
+  // are a stub that dies mid-run rather than an anchor that never matched.
   check(readFileSync(join(root, "src", "a.mjs"), "utf8") === A,
-    "the file that WAS written is restored when a later edit's anchor fails",
+    "no file is written at all when a later edit's anchor cannot resolve",
     readFileSync(join(root, "src", "a.mjs"), "utf8"));
   check(execFileSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8" }).trim() === "",
     "and the tree is left clean");
-  check(r.status === 1, "while the entry itself fails the sweep", String(r.status));
+  check(r.status === 2, "and the sweep REFUSES rather than running and reporting", String(r.status));
+  check(/resolve nowhere/.test(r.stdout + r.stderr),
+    "naming the anchor that could not be placed, so the refusal is actionable",
+    (r.stdout + r.stderr).slice(0, 160));
 }
 
 // --- an ignored path git C-QUOTES is still fingerprinted ------------------------

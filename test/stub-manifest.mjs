@@ -937,4 +937,13 @@ export const STUBS = [
               find: "  case \"task\": {",
               replace: "  case \"task-disabled\": {" }],
   },
+  {
+    name: "anchors-resolve-detects-a-rotted-one",
+    why: "stop reporting an anchor that resolves nowhere, so a stub the sweep cannot place reads as a manifest in good order -- the state the default branch was in for two entries while the suite and the linter both passed, because neither reads an anchor",
+    test: "test/anchors-resolve.test.mjs",
+    expectRed: "an anchor that appears NOWHERE is reported",
+    edits: [{ file: "src/stubsweep.mjs",
+              find: "          bad.push({ name: entry.name, file, count: n, why: String(e.message) });",
+              replace: "          void n;" }],
+  },
 ];

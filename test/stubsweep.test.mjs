@@ -1355,6 +1355,41 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
                    observed: { assertionsSeen: 10, namedFailSeen: false, failures: ["something else"] },
                    controlObserved: { assertionsSeen: 48 } }).verdict === UNRUNNABLE,
     "an abort is UNRUNNABLE rather than WRONG_RED, because the run is the problem, not the entry");
+  // NAMES DO NOT DECIDE, and this is the case that settles it. A stub may
+  // legitimately change WHICH assertion runs -- a fixture whose guard picks one
+  // branch or the other -- and that file ran to its end. Refusing it would turn
+  // a correct WRONG_RED into UNRUNNABLE and send the author to fix a good file.
+  check(classify({ controlExit: 0, stubExit: 1, hashChanged: true, restored: true,
+                   expectRed: "the guard holds",
+                   observed: { assertionsSeen: 1, namedFailSeen: false, failures: [],
+                               names: new Map([["something unrelated passed", 1]]), namesTruncated: false },
+                   controlObserved: { assertionsSeen: 1,
+                               names: new Map([["the guard holds", 1]]), namesTruncated: false } }).verdict === WRONG_RED,
+    "a stub that changes WHICH assertion runs is not refused, because the run was not short");
+
+  // The names are still carried, to say what went unmeasured when the run IS
+  // short. "Four fewer" sends a reader hunting; naming them does not.
+  const short2 = classify({ controlExit: 0, stubExit: 1, hashChanged: true, restored: true,
+                   expectRed: "the guard holds",
+                   observed: { assertionsSeen: 1, namedFailSeen: true, failures: ["the guard holds"],
+                               names: new Map([["the guard holds", 1]]), namesTruncated: false },
+                   controlObserved: { assertionsSeen: 3,
+                               names: new Map([["the guard holds", 1], ["the second", 1], ["the third", 1]]),
+                               namesTruncated: false } });
+  check(short2.verdict === UNRUNNABLE && /"the second"/.test(short2.why) && /"the third"/.test(short2.why),
+    "a short run names the assertions it never reached", short2.why);
+
+  // A TRUNCATED list cannot answer the question, so it must not be read as
+  // absence -- that would refuse a good entry for the crime of running long.
+  const trunc = classify({ controlExit: 0, stubExit: 1, hashChanged: true, restored: true,
+                   expectRed: "the guard holds",
+                   observed: { assertionsSeen: 5, namedFailSeen: true, failures: ["the guard holds"],
+                               names: new Map([["the guard holds", 1]]), namesTruncated: true },
+                   controlObserved: { assertionsSeen: 5,
+                               names: new Map([["a", 1]]), namesTruncated: true } });
+  check(trunc.verdict === CAUGHT,
+    "control: a truncated name list is not read as a missing assertion", JSON.stringify(trunc));
+
   // WITHOUT the control's count, the old behaviour stands rather than the branch
   // firing on a comparison it cannot make. `controlObserved` is absent for a
   // caller that did not count, and absent is not zero.

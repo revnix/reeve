@@ -529,7 +529,21 @@ const runTest = (file, expectRed = null) => new Promise(resolve => {
   // apart. Three such runs were found by hand in one morning; each reported
   // CAUGHT while proving a fraction of what its entry claimed. A boolean is a
   // count with its threshold pinned at one, which is where it catches nothing.
-  const observed = { assertionsSeen: 0, namedFailSeen: false, failures: [] };
+  // NAMES AS WELL AS A COUNT, and a multiset rather than a set.
+  //
+  // A total alone can be satisfied by a stub that ADDS assertion lines -- one
+  // that widens a loop, say -- while skipping later ones, which is the same
+  // false green the count exists to stop, reached from the other side. What the
+  // verdict actually needs to know is whether every assertion the CONTROL
+  // reported was reported again, and counts per name answer that even when a
+  // name repeats inside a loop.
+  //
+  // BOUNDED, and the bound is recorded rather than silently applied: a truncated
+  // list cannot answer the question, so `classify` falls back to the total
+  // instead of reading absence as a missing assertion.
+  const MAX_TRACKED_NAMES = 20_000;
+  const observed = { assertionsSeen: 0, namedFailSeen: false, failures: [],
+                     names: new Map(), namesTruncated: false };
   // Enough failures to diagnose a WRONG_RED and not enough to matter. The named
   // failure's PRESENCE is recorded separately, so this bound cannot change a verdict.
   const MAX_REPORTED_FAILURES = 50;
@@ -547,8 +561,14 @@ const runTest = (file, expectRed = null) => new Promise(resolve => {
     // counted without being retained, because the budget is for evidence a human
     // reads and not for the verdict.
     observed.assertionsSeen++;
-    if (m[1] !== "FAIL") return;
     const name = m[2].trim();
+    // A PASS is counted here too: the question is which assertions RAN, and a
+    // control's passing assertion vanishing under a stub is exactly the loss
+    // this is looking for.
+    if (observed.names.has(name)) observed.names.set(name, observed.names.get(name) + 1);
+    else if (observed.names.size < MAX_TRACKED_NAMES) observed.names.set(name, 1);
+    else observed.namesTruncated = true;
+    if (m[1] !== "FAIL") return;
     // KEYED ON FAIL, not on the line matching the protocol at all. A passing
     // assertion whose name contains the expected text used to consume the slot
     // reserved for the failure, and the failure then scrolled out of the tail.

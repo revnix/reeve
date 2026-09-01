@@ -16,7 +16,7 @@
 // complete tick as resolved. An escalation raised only where the measurement
 // happens would therefore announce CLEARED on the next quiet tick, for a sandbox
 // nobody re-measured. That is why several of these run more than one tick.
-import { run } from "./fixtures/tick-harness.mjs";
+import { run, EVAL } from "./fixtures/tick-harness.mjs";
 import { CANARY_PAGE } from "../src/daemon.mjs";
 import { open } from "../src/db/ops.mjs";
 import { rmSync } from "node:fs";
@@ -194,20 +194,40 @@ const has = (x, key) => [...((x.r ?? x).escalations?.keys?.() ?? [])].some(k => 
   const contained = { credentialRead: "closed", why: "contained",
                       canary: { ok: true, id: "cn-7", why: null },
                       keychain: { measured: true, items: [], why: null } };
-  // TWO pull requests, one evaluation. `evaluated.size === prs.length` is what the
-  // tick hands `announceable` as `complete`, so this is a tick that did not finish
-  // looking -- the condition under which absence may not be read as repair.
+  // ONE PULL REQUEST THIS TICK COULD NOT READ. `evaluated.size === prs.length` is
+  // what the tick hands `announceable` as `complete`, so this is a tick that did
+  // not finish looking -- the condition under which absence may not be read as
+  // repair. Two PRs listed is NOT that on its own: the first version of this
+  // scenario listed two and evaluated both, `complete` was true, `announceable`
+  // cleared the row for its own reasons, and the sweep reported the stub
+  // NOT_CAUGHT. The fixture has to make a read FAIL.
   const second = await run({ containment: contained, dbPath: first.dbPath,
-                             openPrs: () => [42, 43], keepDir: true });
-  check(second.log.includes("2 open PR(s)"),
-    "control: the tick really listed two pull requests, so it could not have been complete",
-    second.log.split("\n")[0]);
+                             openPrs: () => [42, 43],
+                             evaluate: ({ pr }) => (pr === 43 ? { ok: false, why: "unreadable in this fixture" } : EVAL),
+                             keepDir: true });
+  // MATCHED ON THE REASON THIS FIXTURE SUPPLIED, not on the daemon's wording. The
+  // override is consulted for the ANCHOR probe before the evaluation proper, so
+  // the refusal surfaces as "could not read" rather than "could not evaluate" --
+  // two branches, one outcome, and a control pinned to one of the two phrasings
+  // fails while the thing it is checking is working.
+  check(second.log.includes("#43") && second.log.includes("unreadable in this fixture"),
+    "control: one pull request really was unreadable, so the tick could not be complete",
+    second.log.split("\n").filter(l => l.includes("#43")).join(" | "));
 
   const store = open(first.dbPath);
-  const row = store.prepare("SELECT why FROM escalation WHERE why = ?").get(PAGE);
+  const rows = store.prepare("SELECT why FROM escalation").all().map(r => r.why);
   store.close();
-  check(!row, "a canary that PASSED retires the page even on a tick that did not finish looking",
-    "the row survived, so the next quiet tick would re-raise it and the page would never clear");
+  // THE CONTROL AND THE ASSERTION ARE THE SAME TICK. `guardian:containment:open`
+  // was raised by the first process and is absent from this one, exactly like the
+  // canary page -- so if `announceable` had been willing to retire on absence here
+  // it would have taken both. It kept that one, which is the proof the tick was
+  // incomplete; the canary page went anyway, which is the explicit retirement.
+  check(rows.includes("guardian:containment:open"),
+    "control: announceable did NOT retire the other absent cause, because the tick was incomplete",
+    `rows were: ${rows.join(" | ")}`);
+  check(!rows.includes(PAGE),
+    "a canary that PASSED retires the page even on a tick that did not finish looking",
+    `the row survived, so the next quiet tick would re-raise it and the page would never clear; rows were: ${rows.join(" | ")}`);
 
   rmSync(first.dir, { recursive: true, force: true });
   rmSync(second.dir, { recursive: true, force: true });

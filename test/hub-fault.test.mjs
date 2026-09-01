@@ -39,6 +39,9 @@ const TABLE = [
   { name: "an invalid marker beats a high version, because it is not a version",
     h: hist({ have: [6], missing: [1, 2, 3, 4, 5], invalid: [-1], version: 6 }), kind: "invalid",
     why: "schema_version is an INTEGER PRIMARY KEY, so a hand-edited -1 stores" },
+  { name: "a gap ABOVE this binary's range is still not a newer hub",
+    h: hist({ have: [1, 2, 3, 4, 5, 7], holed: true, version: 7 }), kind: "ahead-and-holed",
+    why: "missing is about 1..expect and reports none here, so only `holed` sees the gap at 6" },
   { name: "an unreadable history is its own answer",
     h: { readable: false, missing: [], have: [], holed: false, invalid: [], version: 0 }, kind: "unreadable" },
 ];
@@ -46,8 +49,8 @@ for (const row of TABLE) {
   const got = kindOf(row.h);
   check(got === row.kind, row.name, `got ${got}, expected ${row.kind}${row.why ? ` — ${row.why}` : ""}`);
 }
-check(new Set(TABLE.map(r => r.kind)).size === 7,
-  "control: the table covers seven DISTINCT answers, so it is not asserting one branch seven times",
+check(new Set(TABLE.map(r => r.kind)).size === 7 && TABLE.length === 8,
+  "control: eight rows over seven DISTINCT answers, so it is not asserting one branch eight times",
   [...new Set(TABLE.map(r => r.kind))].join(","));
 
 // ── the remedies that must NOT be given ──────────────────────────────────────
@@ -70,6 +73,23 @@ check(new Set(TABLE.map(r => r.kind)).size === 7,
     `openHub creates the file and then runs the DDL, so a reader in that window sees no schema_version on a healthy hub: ${unreadable.remedy}`);
   check(/if it persists/i.test(unreadable.remedy),
     "control: with a restore named only as what a PERSISTENT failure earns", unreadable.remedy);
+
+  // A REMEDY HAS TO BE RUNNABLE. This one told the operator to `reeve restore --hub
+  // --force`, and `restoreHub` refuses a live hub recording a newer version BEFORE
+  // it takes the lock, with `--force` not reaching that check -- so following it
+  // produced the second refusal this module exists to prevent. Upgrading does not
+  // help either: a newer binary reads the same non-contiguous history and refuses
+  // it for the same reason.
+  const ahd = historyFault(hist({ have: [1, 6], missing: [2, 3, 4, 5], holed: true, version: 6 }), { expect: EXPECT });
+  check(/move the hub aside/i.test(ahd.remedy),
+    "an ahead-and-holed hub is told to move the store aside, which is the only thing that unblocks a restore",
+    ahd.remedy);
+  check(/no binary will repair this in place/i.test(ahd.remedy),
+    "control: and it says plainly that neither a restore nor an upgrade repairs it where it stands",
+    ahd.remedy);
+  check(/keep it/i.test(ahd.remedy),
+    "control: and to KEEP the moved file, because it is the evidence of what happened",
+    ahd.remedy);
 
   const holed = historyFault(hist({ have: [1, 3], missing: [2, 4, 5], holed: true, version: 3 }), { expect: EXPECT });
   check(/restore a snapshot/i.test(holed.remedy) && !/reeve build run/.test(holed.remedy),

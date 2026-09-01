@@ -1514,4 +1514,27 @@ export const STUBS = [
       replace: "  if (key === \"\")",
     }],
   },
+
+  {
+    name: "an-escalation-absent-from-a-blind-pass-is-not-retired",
+    why: "retire a standing cause the moment a pass does not produce it. A pass that could not examine a task produces no escalation for it, so retiring on that silence announces RESOLVED for something nobody looked at -- and re-announces it on the next pass that does look, with the reason string identical each time. The guardian paid for this in production rather than reasoning its way to it: on nextly#834 a cause was retired and re-announced twice, four and twenty-five minutes apart, because seven waiting ticks each produced no escalation. Two pushes for one unchanged condition is how a channel earns being muted, and a muted channel is worse than none",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a cause absent from a pass that did NOT examine its task is not retired",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "      const looked = task === null ? complete : (covered === null || covered.has(task));",
+      replace: "      const looked = true;",
+    }],
+  },
+  {
+    name: "the-builder-announcer-refuses-the-guardians-store",
+    why: "announce into whatever store the caller passes. The two processes share exactly three tables -- escalation, inbox and outbox -- so the guardian's store carries an escalation table of the SAME shape: handed one, the builder's announcer writes builder identities into the guardian's escalations, the write succeeds, and nothing anywhere reports that it happened. The guardian half of this symmetry is already structural, because the guest allowlist admits only provider_lease, provider_state, pr_hold and maintenance_lock; the builder half is refused by nothing until this check exists",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "the builder's announcer refuses the guardian's store, which has an escalation table of the same shape and would have taken the write",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  assertHub(db);\n  // EXPLICIT, never defaulted.",
+      replace: "  // EXPLICIT, never defaulted.",
+    }],
+  },
 ];

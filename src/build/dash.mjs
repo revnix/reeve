@@ -200,8 +200,30 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
                    // ten-day wait and outrank every genuine one. Nulls sort last,
                    // so an unknown duration makes no claim on attention rather
                    // than the strongest possible one.
+                   // THE PHASE-ENTRY TIME WHERE THE HOLD LEFT NO ROW. Retry
+                   // exhaustion and the gate's revision cap move a task straight
+                   // to ESCALATED and write no `hold_reason` at all, so the
+                   // founder wait is inferred from the phase and carries no
+                   // moment of its own. Reporting nothing for it sorted the
+                   // oldest escalation below every timed wait -- burying exactly
+                   // the row that had waited longest, in the list whose whole
+                   // purpose is to say what to look at first. `phase_event`
+                   // records when the task entered the held phase, and that IS
+                   // when the wait began.
+                   //
+                   // A CAPABILITY WAIT STILL REPORTS NOTHING, for the reason
+                   // above: the phase age answers a different question there.
                    for_seconds: t.waiting.since !== null
-                     ? Math.max(0, now - t.waiting.since) : null }))
+                     ? Math.max(0, now - t.waiting.since)
+                     : t.waiting.first === "WAITING_FOR_CAPABILITY"
+                       ? null : t.age?.seconds ?? null,
+                   // WHICH MOMENT PRODUCED THE FIGURE. Two clocks can answer
+                   // this and they mean different things; `age` already carries
+                   // its provenance for the same reason.
+                   for_from: t.waiting.since !== null
+                     ? "hold"
+                     : t.waiting.first === "WAITING_FOR_CAPABILITY"
+                       ? null : t.age?.from ?? null }))
       // LONGEST FIRST. `for_seconds` exists to decide what to handle first, and
       // leaving the list in task-creation order means the number is printed and
       // not used. A null elapsed sorts last -- it is the weakest claim on
@@ -293,7 +315,14 @@ export function renderDash(m) {
     ? "never seen"
     : `last seen ${secs(m.alive.last_seen_seconds)} ago`;
   out.push(m.alive.running
-    ? `builder RUNNING  pid ${m.alive.pid}  ${seen}`
+    // A LIVE HOLDER PAST ITS LEASE is a tick that has not come back. The process
+    // is alive, so RUNNING is the honest word for it, and the two facts are kept
+    // apart in the model precisely because collapsing them loses this one. Saying
+    // only RUNNING left the wedged case reading exactly like the healthy one, and
+    // an operator would have had to know the lease interval and infer it from the
+    // last-seen figure.
+    ? `builder RUNNING  pid ${m.alive.pid}  ${seen}` +
+      (m.alive.lease_unexpired ? "" : "  LEASE STALE: this tick has outrun its lease")
     : `builder NOT RUNNING  ${seen}` +
       (m.alive.lease_unexpired ? `  (lease still held by pid ${m.alive.pid}: it crashed)` : ""));
 
@@ -308,7 +337,12 @@ export function renderDash(m) {
   out.push("", `waiting on you (${m.waiting_on_you.length})`);
   if (!m.waiting_on_you.length) out.push("  nothing");
   for (const w of m.waiting_on_you)
-    out.push(`  ${w.id}  ${w.waiting}${w.capability ? ` (${w.capability})` : ""}` +
+    // THE PROJECT, BESIDE THE TASK. A digest spans every project on the machine,
+    // and the switches block names projects without associating any task with
+    // one -- so an operator reading a row could not tell which repository it
+    // belonged to, in the list that tells them what to act on.
+    out.push(`  ${w.id}  ${oneLine(w.project)}  ${w.waiting}` +
+             `${w.capability ? ` (${w.capability})` : ""}` +
              `  for ${secs(w.for_seconds)}  ${oneLine(w.title)}`);
 
   out.push("", `doing (${m.doing.length})`);
@@ -317,8 +351,16 @@ export function renderDash(m) {
     // DRIFT RIDES WITH THE RUN. `show` warns that a run whose frozen contract no
     // longer matches the live environment must not be read as current; printing
     // the run here without it presents exactly that run as an ordinary one.
-    out.push(`  ${d.id}  ${d.phase}` +
+    out.push(`  ${d.id}  ${oneLine(d.project)}  ${d.phase}` +
              (d.running ? `  running ${d.running.phase}/${d.running.slice} attempt ${d.running.attempt}` +
+                          // THE ATTEMPT'S OWN AGE, not the phase's. A retried
+                          // phase keeps its entry time while the live attempt
+                          // began seconds ago, so one figure made a fresh attempt
+                          // look hours old -- and the number an operator needs to
+                          // decide whether a run is wedged is this one.
+                          (d.running.since !== null
+                            ? `  attempt started ${secs(Math.max(0, m.generated_at - d.running.since))} ago`
+                            : "") +
                           (d.running.drift ? `  DRIFT ${oneLine(d.running.drift)}` : "") : "") +
              `  in state ${secs(d.age?.seconds)}  ${oneLine(d.title)}`);
 
@@ -348,8 +390,15 @@ export function renderDash(m) {
     // reviewer is in neither `waiting_on_you` nor `doing` -- correctly, those
     // clear themselves -- and without the substate on its own row it appears as
     // an unexplained phase. Not-yours is not the same as not-diagnosable.
-    out.push(`  ${t.id}  ${t.phase}  ${oneLine(t.title)}` +
+    out.push(`  ${t.id}  ${oneLine(t.project)}  ${t.phase}  ${oneLine(t.title)}` +
              (t.waiting.first ? `  ${t.waiting.first}` : "") +
+             // AND EVERY OTHER WAIT STANDING AGAINST IT. The model keeps the full
+             // set because clearing the headline can leave the task blocked on
+             // something else; printing only the headline told an operator that
+             // one condition stood, and they would act on it and find the task
+             // exactly where they left it.
+             (t.waiting.all.length > 1
+               ? `  also ${t.waiting.all.filter(w => w !== t.waiting.first).join(" ")}` : "") +
              (t.waiting.first === "WAITING_FOR_CAPABILITY" && t.waiting.capability
                ? ` (${t.waiting.capability})` : "") +
              // AGE ON EVERY ROW. A task waiting on quota, the guardian or a

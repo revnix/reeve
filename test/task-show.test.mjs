@@ -1531,7 +1531,12 @@ const filed = {};
       "and never the `no such table: task_pr` the unguarded read produced",
       ((r.stdout ?? "") + (r.stderr ?? "")).slice(0, 300));
     check(r.status === 1, "exiting refused", `rc=${r.status}`);
-    check(/schema version 1/.test(j?.message ?? "") && new RegExp(`version ${HUB_SCHEMA_VERSION}`).test(j?.message ?? ""),
+    // THE PROPERTY, not the wording. This asserted the literal "schema version 1",
+    // which is one phrasing of "says what the store carries". The refusal is now
+    // rendered from `historyFault`, which names what it carries and what this
+    // binary expects; an operator needs both ends and does not need either
+    // sentence.
+    check(/carries 1\b/.test(j?.message ?? "") && new RegExp(`through ${HUB_SCHEMA_VERSION}`).test(j?.message ?? ""),
       "naming both versions, so an operator knows which end is behind", String(j?.message));
 
     // NEWER than the binary, which is the other direction and a different remedy.
@@ -1544,7 +1549,11 @@ const filed = {};
     const a = spawnSync(process.execPath, [BIN, "task", "list", "--home", ahead, "--json"],
       { encoding: "utf8", timeout: 60_000 });
     const aj = parse(a.stdout ?? "");
-    check(aj?.kind === "hub_incompatible" && /upgrade reeve/.test(aj?.message ?? ""),
+    // Both halves, because the direction is the whole point: it must send the
+    // operator at the BINARY and must not suggest changing the store, which for a
+    // forward-only history would be a downgrade that cannot be undone.
+    check(aj?.kind === "hub_incompatible" && /newer binary/.test(aj?.message ?? "")
+          && !/\bdowngrad/i.test(aj?.message ?? ""),
       "a hub newer than this binary is refused too, and says to upgrade reeve rather than the store",
       String(aj?.message));
 
@@ -1587,11 +1596,24 @@ const filed = {};
       check(holes.length > 0,
         "control: the fixture actually creates a hole, so the assertion below is not vacuous",
         `HUB_SCHEMA_VERSION=${HUB_SCHEMA_VERSION} holes=${holes.join(",") || "none"}`);
-      const named = /migration ([\d, ]+?) (?:is|are) missing/.exec(j?.message ?? "");
+      const named = /missing migration\(s\) ([\d, ]+?) \(/.exec(j?.message ?? "");
       const listed = named ? named[1].split(",").map(x => x.trim()).filter(Boolean) : [];
       check(named !== null && listed.length === holes.length
             && holes.every(v => listed.includes(String(v))),
         "and the refusal names WHICH migration is missing", String(j?.message));
+      // THE REMEDY, which is what #121 reported and what nothing here asserted.
+      // A HOLE and a missing TAIL both arrive as a non-empty `missing`, and only
+      // one of them migrates: `openHub` re-runs a tail and refuses a hole
+      // outright, because a migration beneath an applied one cannot be re-run
+      // over a store that has already moved past it. Sending a holed hub to the
+      // writing command sends the operator to a second refusal -- and that second
+      // refusal is the one naming the repair.
+      check(/\bHOLE\b/.test(j?.message ?? "") && /restore a snapshot/i.test(j?.message ?? ""),
+        "and a HOLE is sent to a snapshot restore, not to a command that writes",
+        String(j?.message));
+      check(!/reeve build run/.test(j?.message ?? ""),
+        "and never to `reeve build run`, which refuses a holed history",
+        String(j?.message));
       check(!/no such table/.test((r.stdout ?? "") + (r.stderr ?? "")),
         "and never the `no such table` the maximum check let through",
         ((r.stdout ?? "") + (r.stderr ?? "")).slice(0, 200));

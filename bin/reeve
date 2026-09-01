@@ -50,6 +50,7 @@ import { DatabaseSync } from "node:sqlite";
 import { inapplicable, extraArgs, TASK_ARGS, EXITS, ERROR_KINDS } from "./reeve.flags.mjs";
 import { openHub, HUB_SCHEMA_VERSION, HUB_BUSY_TIMEOUT_MS, completedVersion, missingMigrations,
          migrationStateOf, hubIntegrityError, schemaDefectsAt, faultKind } from "../src/build/hubdb.mjs";
+import { historyFault } from "../src/build/hubfault.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
 import { buildTick } from "../src/build/loop.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
@@ -1305,32 +1306,32 @@ switch (cmd) {
              { exit: EXITS.refused, retryable: faultKind(e) === "operational" });
       }
       try {
-        let have = new Set();
-        try {
-          have = new Set(db.prepare("SELECT version FROM schema_version").all().map(r => r.version));
-        } catch (e) {
+        // THE SAME DECISION THE DRY-RUN PATH MAKES, from the same function.
+        //
+        // This block used to compute the history by hand -- a set subtraction and
+        // an `ahead` filter -- and hand every shape of a non-empty `missing` the
+        // SAME advice: run a command that writes. That is right for a missing
+        // TAIL and wrong for a HOLE, which `openHub` refuses outright because a
+        // migration beneath an applied one cannot be re-run over a store that has
+        // already moved past it. So a hub recording 1 and 3 with 2 absent was sent
+        // to a second refusal, and the second refusal was the one naming the
+        // repair. It was also blind to an INVALID marker, which reads as every
+        // version missing and nothing holed.
+        //
+        // The dry-run path had all three cases right. Copying its branch here
+        // would have made two inventories of one rule, which is how these two
+        // came to disagree; the decision is `historyFault` now and this site only
+        // renders it.
+        const hist = migrationStateOf(db);
+        if (!hist.readable)
           fail("hub_unreadable",
-               `reeve task ${sub}: the hub at ${hub} has no readable schema_version — ${e.message}`,
-               { exit: EXITS.refused, retryable: faultKind(e) === "operational" });
-        }
-        const want = Array.from({ length: HUB_SCHEMA_VERSION }, (_, i) => i + 1);
-        const missing = want.filter(v => !have.has(v));
-        const ahead = [...have].filter(v => v > HUB_SCHEMA_VERSION).sort((a, b) => a - b);
-        if (missing.length || ahead.length) {
-          const at = have.size ? Math.max(...have) : 0;
-          fail("hub_incompatible",
-               `reeve task ${sub}: the hub at ${hub} is at schema version ${at}, and this reeve ` +
-               `speaks version ${HUB_SCHEMA_VERSION}.\n` +
-               (ahead.length
-                 ? `-> it records version ${ahead.join(", ")}, which this reeve does not know; ` +
-                   `upgrade reeve rather than downgrading the hub`
-                 : have.size === 0
-                   ? `-> it records no migration at all; \`reeve build status\` reports on it`
-                   : `-> migration ${missing.join(", ")} ${missing.length === 1 ? "is" : "are"} missing, ` +
-                     `so tables they create are absent. A reader may not migrate it: run a command ` +
-                     `that writes, such as \`reeve build run\``),
+               `reeve task ${sub}: the hub at ${hub} has no readable schema_version`,
+               { exit: EXITS.refused, retryable: false });
+        const fault = historyFault(hist);
+        if (fault)
+          fail(fault.kind === "unreadable" ? "hub_unreadable" : "hub_incompatible",
+               `reeve task ${sub}: the hub at ${hub} — ${fault.detail}.\n-> ${fault.remedy}`,
                { exit: EXITS.refused });
-        }
       } finally { /* the outer finally closes db on every path below */ }
       // SQLITE READS LAZILY, so a hub whose corruption lies outside the pages the
       // open touches constructs a connection perfectly and fails at the first

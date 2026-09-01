@@ -2172,4 +2172,22 @@ export const STUBS = [
       replace: "    const clean = (v) => String(v ?? \"\");",
     }],
   },
+  {
+    name: "a-hole-is-not-sent-to-a-writing-command",
+    why: "give a HOLE the missing-tail remedy, which is the state issue #121 reported. Both faults arrive as a non-empty `missing` and only one migrates: `openHub` re-runs a missing tail and refuses a hole outright, because a migration beneath an applied one cannot be re-run over a store that has already moved past it. The reader then sends the operator to a second refusal, and the second refusal is the one naming the actual repair",
+    test: "test/task-show.test.mjs",
+    expectRed: "a HOLE is sent to a snapshot restore",
+    edits: [{ file: "src/build/hubfault.mjs",
+              find: "  return hist.holed",
+              replace: "  return false" }],
+  },
+  {
+    name: "the-read-route-consults-the-history-fault",
+    why: "answer no fault at all, which is what the read routes did for every shape they did not model. They computed the history by hand and had no branch for an invalid marker or a hole, so the guard passed and the command reached an application query against a store missing the tables it was about to read -- surfacing as a bare `no such table` from a command that had already reported the hub healthy",
+    test: "test/task-show.test.mjs",
+    expectRed: "a hub older than this binary is a typed refusal",
+    edits: [{ file: "bin/reeve",
+              find: "        const fault = historyFault(hist);",
+              replace: "        const fault = null; void historyFault;" }],
+  },
 ];

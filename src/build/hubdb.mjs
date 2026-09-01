@@ -925,10 +925,28 @@ export function openHub(path, { skipIntegrity = false } = {}) {
     // evidence of a damaged file. Only corruption earns the recovery advice.
     const kind = faultKind(e);
     throw new Error(
+      // NAMES THE SNAPSHOT, like the quick_check verdict below does.
+      //
+      // There are TWO damage refusals in this function and only one of them used
+      // to name a path. This one fires when a pragma WRITE hits a damaged page;
+      // the other when `quick_check` reads one. Which of the two an operator gets
+      // depends on where the damage happens to lie, so the weaker message was
+      // reachable by luck -- and "installs the newest usable snapshot" without
+      // naming it is precisely the generic advice `hub-drills` says tells an
+      // operator nothing.
+      //
+      // Found because a new table changed the file's layout: the drill corrupts
+      // the LAST page, which was a page `quick_check` read and became one the
+      // pragma write touches. The behaviour did not regress -- the injury moved,
+      // and the refusal it moved to was weaker than the interface this file
+      // promises.
       kind === "damage"
         ? `the hub at ${path} cannot be read (${e.message}).\n` +
-          `  recover  reeve restore --hub --force installs the newest usable snapshot\n` +
-          `           pass --tail from a durable export-events --hub to carry history forward`
+          (newestHubSnapshot(path)
+            ? `  recover  reeve restore --hub --force --from ${newestHubSnapshot(path)}\n` +
+              `           pass --tail from a durable export-events --hub to carry history forward`
+            : `  recover  reeve restore --hub --force installs the newest usable snapshot\n` +
+              `           pass --tail from a durable export-events --hub to carry history forward`)
         : kind === "full"
         ? `the hub at ${path} could not be written because the store is full (${e.message}).\n` +
           `  the file itself answered, so this is not damage: it ran out of room.\n` +

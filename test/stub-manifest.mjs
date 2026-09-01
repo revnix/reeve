@@ -2235,4 +2235,13 @@ export const STUBS = [
               find: "    if (/no such table/i.test(e?.message ?? \"\")) return null;",
               replace: "    if (false) return null;" }],
   },
+  {
+    name: "both-damage-refusals-name-the-snapshot",
+    why: "let the pragma-damage refusal give generic advice again. There are TWO damage refusals in `openHub` -- one when a pragma WRITE hits a damaged page, one when `quick_check` READS one -- and which an operator gets depends on where the damage happens to lie. `installs the newest usable snapshot` without naming it is the generic advice this drill exists to rule out, and it was reachable by luck: it took a new table changing the file layout for the drill to land on it at all",
+    test: "test/hub-drills.test.mjs",
+    expectRed: "the refusal names the newest usable snapshot by path",
+    edits: [{ file: "src/build/hubdb.mjs",
+              find: "          (newestHubSnapshot(path)",
+              replace: "          (false" }],
+  },
 ];

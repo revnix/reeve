@@ -1729,12 +1729,15 @@ export const STUBS = [
   },
   {
     name: "artifact-anchor-is-resolved-on-the-filesystem",
-    why: "compare the anchor lexically. `resolve` only normalises text, so a SYMLINK anywhere beneath the anchor satisfies startsWith while the write follows the link -- mkdir, the temporary and the rename all land outside the task tree, and the rename replaces whatever artifact it finds there. An anchored path under home/tasks writes outside the home the moment home/tasks is a link",
+    why: "compare the anchor lexically. `resolve` only normalises text, so a SYMLINK beneath the anchor satisfies startsWith while the write follows the link -- mkdir, the temporary and the rename all landing outside the task tree, where the rename replaces whatever artifact it finds. TWO EDITS, because BOTH sides have to be resolved the same way: stubbing one alone makes the comparison disagree with itself and every write is refused, which is a different defect and kills the file rather than exhibiting this one",
     test: "test/artifact.test.mjs",
     expectRed: "a symlinked component beneath the anchor is refused, not followed",
     edits: [{ file: "src/build/artifact.mjs",
               find: "    const top = realOf(anchor);",
-              replace: "    const top = resolve(anchor);" }],
+              replace: "    const top = resolve(anchor);" },
+            { file: "src/build/artifact.mjs",
+              find: "    const start = realOf(dir);",
+              replace: "    const start = resolve(dir);" }],
   },
   {
     name: "hub-a-marker-that-is-not-a-version-is-reported",

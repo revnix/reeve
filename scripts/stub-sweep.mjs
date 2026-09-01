@@ -68,9 +68,20 @@ try {
   die(2, `stub-sweep: cannot ask git whether the tree is clean, so it will not risk your work: ${err.message}`);
 }
 if (dirty)
+  // NEVER "STASH". The stash is per-REPOSITORY, not per-worktree, so a pop in one
+  // lane can take another lane's work -- and this repository is developed across
+  // many worktrees at once, with hooks that stash too. Advice a tool gives at a
+  // refusal is followed, so advising the one operation that can lose a
+  // colleague's uncommitted work is worse than giving no advice at all.
+  //
+  // The two safe answers differ by what is dirty, so both are named: an
+  // UNTRACKED file has somewhere else to be, and a tracked change wants a
+  // commit. `git status --porcelain` marks the untracked ones `??`.
   die(2, "stub-sweep: the working tree has uncommitted changes.\n" +
          "This sweep restores files between entries and cannot tell your work from a stub.\n" +
-         "Commit or stash first. Refusing rather than risking it:\n" + dirty);
+         "Commit tracked changes, or move untracked files (marked `??`) outside the repository.\n" +
+         "Do NOT stash: the stash is shared by every worktree of this repository, so a later\n" +
+         "pop can take work belonging to another lane. Refusing rather than risking it:\n" + dirty);
 
 // A SEAM, so the runner can be driven against a manifest built for a test.
 // Without it the only way to check that this tool FAILS on an uncaught stub would

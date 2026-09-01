@@ -106,14 +106,42 @@ function postViaOsascript({ title, body }) {
   } catch (e) { return { ok: false, why: String(e.message).split("\n")[0] }; }
 }
 
+/**
+ * Read curl's combined output: the response body, then the status code on the
+ * last line.
+ *
+ * SEPARATED FROM THE PROCESS CALL and exported, because this is the half that
+ * can be wrong and the half a test can reach. Everything around it spawns curl,
+ * and logic reachable only by spawning a real process against a real server is
+ * logic nothing measures -- which is how the response body came to be discarded
+ * for as long as it was.
+ *
+ * A REFERENCE IS A BONUS, NEVER A CONDITION. The publish succeeded whatever the
+ * body turned out to be, so an unparseable response reports delivery without a
+ * reference rather than a failure that never happened.
+ */
+export function readNtfyResponse(out) {
+  const text = String(out ?? "");
+  const cut = text.lastIndexOf("\n");
+  const code = (cut === -1 ? text : text.slice(cut + 1)).trim();
+  if (!code.startsWith("2")) return { ok: false, why: `the server answered HTTP ${code}` };
+  let id = null;
+  try { id = JSON.parse(cut === -1 ? "" : text.slice(0, cut))?.id ?? null; } catch { id = null; }
+  return typeof id === "string" && id !== "" ? { ok: true, ref: `ntfy:${id}` } : { ok: true };
+}
+
 function postViaCurl({ url, auth, title, priority, tags, body }) {
   try {
-    const args = ["-s", "-m", "8", "-o", "/dev/null", "-w", "%{http_code}",
+    // THE BODY IS KEPT. `-o /dev/null` discarded the server's response before
+    // anything could read it, and that response is the only place a delivery
+    // reference exists -- so "it was delivered" could be reported and never
+    // looked up afterwards. The status code is appended on its own last line, so
+    // the two are separable without a second request.
+    const args = ["-s", "-m", "8", "-w", "\n%{http_code}",
                   "-u", auth,
                   "-H", `Title: ${title}`, "-H", `Priority: ${priority}`, "-H", `Tags: ${tags}`,
                   "-d", body, url];
-    const code = execFileSync("curl", args, { encoding: "utf8" }).trim();
-    return code.startsWith("2") ? { ok: true } : { ok: false, why: `the server answered HTTP ${code}` };
+    return readNtfyResponse(execFileSync("curl", args, { encoding: "utf8" }));
   } catch (e) { return { ok: false, why: String(e.message).split("\n")[0] }; }
 }
 
@@ -155,11 +183,30 @@ export function notify({ profile, alert, post = postViaCurl, desktop = postViaOs
 
   if (!channels.length) return { ok: false, why: "no notify channel configured", channels };
 
+  // A REFERENCE, OR A SENTENCE SAYING WHY THERE IS NONE -- on every entry, and
+  // never `undefined`. This file has promised since it was written that nothing
+  // declines silently, and until now a caller could not tell "delivered, this
+  // channel issues no id" from "the field was never populated", because both
+  // read as absent.
+  //
+  // `ref_why` rather than reusing `why`: `why` already means "this channel
+  // FAILED", and a successful send carrying no id is not a failure. One field
+  // answering both questions makes `ok` the only way to know which it answered,
+  // so a caller logging `why` would report a delivery failure that never
+  // happened. The invariant is that `ref` is null exactly when `ref_why` is a
+  // string, which makes the pair readable without consulting `ok` at all.
+  const referenced = channels.map(c => (typeof c.ref === "string" && c.ref !== "")
+    ? c
+    : { ...c, ref: null,
+        ref_why: c.ok
+          ? `no reference: the ${c.name} channel reports none`
+          : "no reference: the send did not succeed" });
+
   // Every CONFIGURED channel must have worked. A phone that did not ring is a
   // failure even when the desk did, because the two exist for different moments
   // -- reporting ok because one of them landed is how a dead channel stays dead.
-  const failed = channels.filter(c => !c.ok);
+  const failed = referenced.filter(c => !c.ok);
   return failed.length
-    ? { ok: false, why: failed.map(c => `${c.name}: ${c.why}`).join("; "), channels }
-    : { ok: true, channels };
+    ? { ok: false, why: failed.map(c => `${c.name}: ${c.why}`).join("; "), channels: referenced }
+    : { ok: true, channels: referenced };
 }

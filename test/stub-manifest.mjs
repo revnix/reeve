@@ -2196,7 +2196,7 @@ export const STUBS = [
     test: "test/hub-incarnation.test.mjs",
     expectRed: "an id that is not 128 bits of hex is refused",
     edits: [{ file: "src/build/hubdb.mjs",
-              find: "          id         TEXT    NOT NULL CHECK (length(id) = 32),",
+              find: "          id         TEXT    NOT NULL CHECK (length(id) = 32 AND id NOT GLOB '*[^0-9a-f]*'),",
               replace: "          id         TEXT    NOT NULL," }],
   },
   {
@@ -2216,5 +2216,23 @@ export const STUBS = [
     edits: [{ file: "src/backup.mjs",
               find: "        mintIncarnation(back);",
               replace: "        void mintIncarnation;" }],
+  },
+  {
+    name: "incarnation-id-must-be-hex",
+    why: "check the LENGTH and not the alphabet, which accepts \"z\" repeated 32 times. The writer in this module is not the only way into the table -- an import, a hand repair or a direct statement reaches it too -- and the id is the whole proof a cursor carries, so a value no hexadecimal parser accepts leaves the hub unable to issue one",
+    test: "test/hub-incarnation.test.mjs",
+    expectRed: "32 characters that are not hex are refused",
+    edits: [{ file: "src/build/hubdb.mjs",
+              find: "          id         TEXT    NOT NULL CHECK (length(id) = 32 AND id NOT GLOB '*[^0-9a-f]*'),",
+              replace: "          id         TEXT    NOT NULL CHECK (length(id) = 32)," }],
+  },
+  {
+    name: "incarnation-read-answers-null-before-the-table-exists",
+    why: "let the missing table throw instead of answering null. This function promises null for a hub that predates migration 6 and a caller is told to read that as `cannot prove` -- but on such a hub the prepare throws, so the compatibility path the documentation describes was unreachable. A promise a caller cannot rely on is worse than no promise, because the caller writes no handling for the case that actually occurs",
+    test: "test/hub-incarnation.test.mjs",
+    expectRed: "reading a hub that predates the table does not throw",
+    edits: [{ file: "src/build/hubdb.mjs",
+              find: "    if (/no such table/i.test(e?.message ?? \"\")) return null;",
+              replace: "    if (false) return null;" }],
   },
 ];

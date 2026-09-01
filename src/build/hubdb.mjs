@@ -412,7 +412,15 @@ const MIGRATIONS = [
       db.exec(`
         CREATE TABLE IF NOT EXISTS hub_incarnation (
           only       INTEGER PRIMARY KEY CHECK (only = 1),
-          id         TEXT    NOT NULL CHECK (length(id) = 32),
+          -- 128 BITS OF LOWERCASE HEX, not merely 32 characters. A length check
+          -- alone accepts "z" repeated 32 times, and the writer here is not the
+          -- only way in: an import, a hand repair or a direct statement can store
+          -- one. The id is the whole proof a cursor carries, so a value no
+          -- hexadecimal parser will accept leaves the hub unable to issue one.
+          -- NOT GLOB '*[^0-9a-f]*' is the SQLite idiom for "every character is in
+          -- this class"; a bare GLOB would only constrain the first.
+          -- (No backticks in here: this SQL lives inside a template literal.)
+          id         TEXT    NOT NULL CHECK (length(id) = 32 AND id NOT GLOB '*[^0-9a-f]*'),
           started_at INTEGER NOT NULL CHECK (started_at > 0)
         ) STRICT;
       `);
@@ -464,7 +472,22 @@ export function mintIncarnation(db, { at = null } = {}) {
  * reported rather than inferred either way.
  */
 export function hubIncarnation(db) {
-  const row = db.prepare("SELECT id, started_at FROM hub_incarnation WHERE only = 1").get();
+  let row;
+  try {
+    row = db.prepare("SELECT id, started_at FROM hub_incarnation WHERE only = 1").get();
+  } catch (e) {
+    // THE PRE-v6 CASE THIS FUNCTION PROMISES, and it did not honour it: on a hub
+    // older than migration 6 the table is absent and the prepare THROWS, so a
+    // caller told to expect null for an older hub got an exception instead. The
+    // compatibility path the comment above describes was unreachable.
+    //
+    // ONLY the missing table answers null. A busy store, a damaged page or any
+    // other fault must propagate: rendering those as "no incarnation" would turn
+    // an unreadable hub into a confident "cannot prove", which reads downstream
+    // as an ordinary older store and hides the fault entirely.
+    if (/no such table/i.test(e?.message ?? "")) return null;
+    throw e;
+  }
   return row ? { id: row.id, startedAt: row.started_at } : null;
 }
 

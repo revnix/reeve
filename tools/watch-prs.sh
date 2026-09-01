@@ -104,6 +104,13 @@ snapshot() {
     # An unreadable merge state is a failed probe, not "no reason". Every other
     # read here refuses rather than inventing, and this must too.
     [ -n "$ms" ] || return 1
+    # VERBATIM, and that matters most for UNKNOWN. GitHub reports UNKNOWN for
+    # about a minute after every push while it recomputes mergeability, so it
+    # means "not decided yet" and not "cannot merge" -- mapping states onto a
+    # word would have to choose, and choosing wrong reports a healthy pull
+    # request as blocked once per push. Passing the state through leaves the
+    # distinction with the reader, who can ask again; the watcher's next tick
+    # is fifteen minutes away and the answer will have settled long before.
     ci="none/$ms"
   fi
   printf '%s ci=%s\n' "$threads" "$ci"

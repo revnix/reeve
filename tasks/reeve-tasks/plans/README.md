@@ -271,3 +271,34 @@ same kind as the ones already recorded: a "produces" clause nobody ran. Three of
 them are the plan disagreeing with the SPEC it cites, which no amount of reading
 the plans against each other could have found. S3-C, S3-D and S3-F have still
 never been executed.
+
+## What the artifact gate cannot decide, and which plan can
+
+`reviewArtifact` is given a phase, a directory and a set of expectations. It has
+no repository root, and one of its rules needs one.
+
+**A bare `api.internal:3000` is the same TOKEN as `package.json:3000`** — a
+dotted name, a colon, digits — so no regular expression separates a host and
+port from a citation of a file at the repository root. Every syntactic
+discriminator tried and rejected: a length cap on the extension refuses
+`src/x.markdown:12` (and was removed for exactly that reason); an
+extension whitelist is an inventory that is wrong the first time someone cites a
+file type nobody listed; a TLD list is the same problem inverted, and `.md`,
+`.ts`, `.sh` and `.py` are all real top-level domains.
+
+The gate resolves it towards ACCEPTING, and the test records that as an
+assertion rather than a comment, so reversing it fails a named line. The reason
+is that the two errors are not symmetric: accepting the endpoint lets one claim
+through uncited, while refusing the dotted-name form refuses every citation of a
+root-level file and fails the whole report — and this file has already been
+corrected once for refusing correct work over a bound nobody chose deliberately.
+
+**The durable answer is not syntactic, and it belongs to S3-D.** A phase task
+holds the project checkout, so it can ask whether the cited path EXISTS, which is
+the only thing that actually tells `api.internal` from `package.json`. Any
+S3-D task that gates a research artifact should resolve citations against the
+task's territory rather than re-deriving a better regular expression here.
+
+The endpoint shapes that ARE separable — a protocol-relative `//host:port`, a
+userinfo `user@host:22`, and a `host:port/path` — are removed before the check,
+because each carries a marker no file reference has.

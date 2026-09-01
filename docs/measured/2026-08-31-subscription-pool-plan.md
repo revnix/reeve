@@ -146,8 +146,21 @@ the failure was NOT, which is the honest limit of a failure observed once.
 
 ### Where the result goes
 
-`provider_state` columns with `measured_at`, per V6 — **not** profile keys, which
-`FIELDS` would reject (D22).
+`provider_measurement`, as `kind = "pool-relationship"` with a `result` of `SHARED`,
+`SEPARATE` or `INCONCLUSIVE`, its `evidence`, and the `measured_at` the readings were
+taken at. Written by `recordMeasurement` (`src/build/measurementdb.mjs`), read back by
+`latestMeasurement`, which returns the answer **with its age** because a pool
+relationship depends on how the provider structures plans and a months-old reading can
+be confidently wrong.
+
+**NOT `provider_state`, and not profile keys.** Profile keys are out because `FIELDS`
+would reject them (D22). `provider_state` is out for a sharper reason, and this section
+said the opposite until 2026-09-01: that table's `measured_at` asserts one narrow
+thing — that the concurrency limit and guardian reservation in THAT row were measured —
+so writing this experiment's date there would make `doctor` report the unmeasured
+defaults as measured values. The two facts are not the same fact, and one column cannot
+carry both. `provider_measurement` landed 2026-09-01 for exactly this; the storage is
+built and what remains is the measurement.
 
 ## What this does NOT establish
 

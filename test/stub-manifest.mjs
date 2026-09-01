@@ -1945,6 +1945,234 @@ export const STUBS = [
               replace: "no reason recorded; nothing may dispatch until one passes`);" }],
   },
   {
+    name: "escalation-keys-are-declared-identities",
+    why: "let `escalationKey` mint any well-formed key. A key matching no declared shape is a situation nobody wrote down: the page list cannot decide about it, no announcer can name it and nothing can clear it, so the escalation is raised into a namespace nothing reads. Not hypothetical -- `transition.mjs`'s `blocked_other` branch takes an escalation key straight from its caller and writes it to the table with no check at all, which is the hole this closed set exists to close",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "and a well-formed key nothing declares, which would be raised where nothing reads",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  if (shapeOf(key) === null)",
+      replace: "  if (key === \"\")",
+    }],
+  },
+
+  {
+    name: "an-escalation-absent-from-a-blind-pass-is-not-retired",
+    why: "retire a standing cause the moment a pass does not produce it. A pass that could not examine a task produces no escalation for it, so retiring on that silence announces RESOLVED for something nobody looked at -- and re-announces it on the next pass that does look, with the reason string identical each time. The guardian paid for this in production rather than reasoning its way to it: on nextly#834 a cause was retired and re-announced twice, four and twenty-five minutes apart, because seven waiting ticks each produced no escalation. Two pushes for one unchanged condition is how a channel earns being muted, and a muted channel is worse than none",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a cause absent from a pass that did NOT examine its task is not retired",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "      if (subject === null || examined === null || !examined.has(subject)) continue;",
+      replace: "      if (false) continue;",
+    }],
+  },
+  {
+    name: "the-builder-announcer-refuses-the-guardians-store",
+    why: "announce into whatever store the caller passes. The two processes share exactly three tables -- escalation, inbox and outbox -- so the guardian's store carries an escalation table of the SAME shape: handed one, the builder's announcer writes builder identities into the guardian's escalations, the write succeeds, and nothing anywhere reports that it happened. The guardian half of this symmetry is already structural, because the guest allowlist admits only provider_lease, provider_state, pr_hold and maintenance_lock; the builder half is refused by nothing until this check exists",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "the builder's announcer refuses the guardian's store, which has an escalation table of the same shape and would have taken the write",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  assertHub(db);\n  // EXPLICIT, never defaulted.",
+      replace: "  // EXPLICIT, never defaulted.",
+    }],
+  },
+
+  {
+    name: "a-page-matches-by-shape-not-by-literal-key",
+    why: "compare a concrete escalation key against the page list directly. The list is written in SHAPES, so a literal comparison pages for the one identity that carries no task id and matches no blocked task at all -- every blocked task then goes to the digest in silence, which is the fail-quiet outcome the closed page list exists to prevent. A startsWith is the same defect from the other side: it pages for a key missing its phase. Both are second statements of `which identity is this`, and shapeOf is the first",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "the templated entry pages for any task and any phase",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "export const pages = (key) => PAGES.includes(shapeOf(key));",
+      replace: "export const pages = (key) => PAGES.includes(key);",
+    }],
+  },
+  {
+    name: "a-page-that-was-not-delivered-is-not-reported-as-paged",
+    why: "treat every attempted send as a page. Whether a human was actually reached is the one thing this cannot infer, and reporting a phone call that never happened is worse than reporting none: the escalation still stands in the store, so the operator's own record says somebody was told. A sender that returns ok:false and one that throws are the same fact to a reader who needs to know nobody was reached, and both must land in `declined` rather than in `paged` or in nothing",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a refused send is not reported as paged",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    if (result?.ok || accepted.length)",
+      replace: "    if (true)",
+    }],
+  },
+
+  {
+    name: "a-channel-reports-a-reference-or-a-reason-there-is-none",
+    why: "let an absent delivery reference be `undefined`. notify.mjs has promised since it was written that nothing declines silently, and a caller could not tell `delivered, this channel issues no id` from `the field was never populated` -- both read as absent, and the promise had never been checked because every path needed a real escalation and a real server. Folding the reason into `why` is the same defect wearing a value: `why` already means THIS CHANNEL FAILED, so one field answering both questions makes `ok` the only way to know which it answered, and a caller logging `why` reports a delivery failure that never happened",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "and the absent reference is null WITH a reason, never undefined",
+    edits: [{
+      file: "src/notify.mjs",
+      find: "  const referenced = channels.map(c => (typeof c.ref === \"string\" && c.ref !== \"\")",
+      replace: "  const referenced = channels; const _unused = ((c) => (typeof c.ref === \"string\" && c.ref !== \"\")",
+    }],
+  },
+
+  {
+    name: "a-page-is-marked-announced-only-after-it-is-delivered",
+    why: "write announced_count at the moment the cause is raised. The row then says it has been announced before anything was sent, so a page the sender refused is never offered again: the next pass compares count against announced_count, finds them equal, produces no fresh item, and the operator is never told. The refusal is visible in `declined`, and a returned array scrolls past — the durable row is the only thing that survives the pass, and it was lying",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "the row is NOT marked announced, because nothing was announced",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "                    VALUES(?,?,?,?,0)`).run(why, count, at, at);",
+      replace: "                    VALUES(?,?,?,?,?)`).run(why, count, at, at, count);",
+    }],
+  },
+  {
+    name: "the-announcers-mutations-are-replayable",
+    why: "clear an escalation without appending an event. `escalation` is in the replayed set and `escalation.raised` was its only handler, so a restore whose tail spans a clear replays the raise and resurrects the row — and pages the founder again about something that was resolved before the restore. The durable store is what a restore reconstructs from, so a mutation with no event is a mutation the system forgets while believing it remembers",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "and clearing one appends escalation.cleared",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  hubEvent(db, { kind: \"escalation.cleared\",\n                 task: /^bt:/.test(why) ? subjectOf(why) : null, payload: { why } });",
+      replace: "",
+    }],
+  },
+  {
+    name: "only-a-real-phase-reduces-to-a-phase",
+    why: "reduce any uppercase trailing component to <phase>. A detail component then masquerades as a phase: a key ending in a shouted word matches the declared blocked shape and therefore PAGES, and that is reachable today through `blocked_other`, which writes a caller-supplied escalation key with no validation at all. Membership of PHASES is the whole difference between a phase and a word that is shouting, and the closed page list is only closed if the reduction into it is",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "bt:7:phase:blocked:DETAIL reduces to nothing: DETAIL is not a phase",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  const shape = tail && PHASES.includes(tail[1])",
+      replace: "  const shape = tail",
+    }],
+  },
+  {
+    name: "notify-test-refuses-another-repositorys-profile",
+    why: "send the test through whatever profile `loadProfile` returns. It prefers ./.ops/profile.json over the sidecar and never checks whose it is, so `notify --test owner/B` run inside repository A sends through A's channels while titling the alert B — reporting B's notification setup healthy without having touched it, and putting an unexpected real alert on somebody's phone. A command whose entire purpose is to tell an operator the truth about a channel is the last one that may guess which channel it is talking about",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "asking about another repository from inside this one is refused, not answered",
+    edits: [{
+      file: "bin/reeve",
+      find: "    const declared = profile?.identity?.key;\n    if (declared && declared !== nwo)",
+      replace: "    const declared = null;\n    if (declared && declared !== nwo)",
+    }],
+  },
+
+  {
+    name: "a-clearing-waits-for-its-notification",
+    why: "delete a paged cause's row before its recovery has been delivered. The raise path was already taught to hold `announced_count` until a send landed; the clear path destroyed the only durable record that a clearing was owed, so a channel down for a single pass lost the recovery permanently — the next pass had no standing cause left to classify as cleared. An operator who is only ever told about problems cannot tell resolved from stopped-looking, which is the whole reason clearing is announced at all",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "control: and the row still stands, because nothing has been told yet",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "      if (pages(why) && standing.get(why).announced_count > 0) {",
+      replace: "      if (false) {",
+    }],
+  },
+  {
+    name: "an-alert-is-sanitised-before-it-leaves-the-machine",
+    why: "assemble the outbound message without `redact`. The boundary is two properties, not one, and this is the half that neutralises SECRET SHAPES and applies the length cap — a credential echoed into CI output then leaves the machine in a notification. `buildAlert` applies it and `notify` itself does not, so a second producer of alerts is a second place it has to be applied. The control-character half lives in the per-part `clean`, which is why this entry names the redaction assertion and not the escaping one",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "and a credential shape is redacted rather than sent",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    const message = redact(raw);",
+      replace: "    const message = raw;",
+    }],
+  },
+  {
+    name: "every-alert-names-the-action-that-changes-it",
+    why: "send a page carrying only the identity. The design requires every alert to name the single founder action needed, and a page read at night without the one command that changes it is a notification the reader can only file away — a channel whose alerts cannot be acted on is one that gets muted, which is the outcome the closed page list exists to avoid",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "and the rendered alert carries it, which is the only place a phone shows it",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "        `${action ? `\\n-> ${clean(action)}` : \"\"}${detail}`;",
+      replace: "        `${detail}`;",
+    }],
+  },
+  {
+    name: "notify-test-refuses-a-malformed-repository",
+    why: "scan the positionals for the first token that looks like a repository and discard the rest. A typo then matches nothing, falls through to detectNwo() and sends the test through whatever checkout the operator is standing in — and a second repository argument is dropped in silence. For the one route here that SENDS, a mistyped repository quietly becoming 'the current one' is the same defect as the profile mismatch, arriving through the argument instead of through the lookup",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "notify --test owner/repo/ is refused rather than falling back to this checkout",
+    edits: [{
+      file: "bin/reeve",
+      find: "    if (stray.length || positionals.length > 1)",
+      replace: "    if (false)",
+    }],
+  },
+
+  {
+    name: "the-triage-command-names-the-actual-task",
+    why: "render the identity shape's action with its `<id>` placeholder intact. The alert then hands the founder a command they cannot paste — under a shell `<id>` is input redirection — and makes them reconstruct by hand the identifier the alert is already holding. An action that has to be edited before it can be run is not the single action the design requires; it is a hint",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "and no placeholder survives into something a founder is asked to run",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  return subject === null ? action : action.replaceAll(\"<id>\", subject);",
+      replace: "  return action;",
+    }],
+  },
+  {
+    name: "a-page-is-sent-as-an-interruption",
+    why: "send a page with no priority. `notify` falls back to \"default\" for an alert that names none, so the closed page list — the whole point of which is that these few identities interrupt a human — would deliver ordinary notifications indistinguishable from anything else. `buildAlert`, the existing escalation producer, sets \"high\" explicitly for exactly this reason",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a raised page names high priority, or `notify` falls back to default and the page list promises an interruption it does not deliver",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "        priority: isCleared ? \"default\" : \"high\",",
+      replace: "        priority: undefined,",
+    }],
+  },
+  {
+    name: "one-dead-channel-does-not-repage-the-live-one",
+    why: "treat `notify`'s aggregate ok:false as undelivered. It reports failure when ANY configured channel fails, while the healthy channel has already delivered — so the cause is never marked announced and the working channel is paged again on every pass until the broken one recovers. That is precisely the alert fatigue the closed page list exists to prevent, produced by the deduplication that exists to prevent it. Nothing accepted is still a refusal; the failed channel is not hidden, it rides on `channels`",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a page one channel accepted is paged, not declined",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    const accepted = (result?.channels ?? []).filter(c => c.ok);",
+      replace: "    const accepted = [];",
+    }],
+  },
+
+  {
+    name: "an-alerts-own-line-breaks-are-real",
+    why: "sanitise the FINISHED message rather than its parts. `printable` escapes every control character and a line feed is one, so this surface's own separators become a literal backslash-n and the identity, the action and the detail arrive as a single run-on line with visible escape sequences. The boundary added to protect the alert destroys the layout the action line depends on, and an assertion that the action is PRESENT cannot see the difference — only one about the STRUCTURE can. Sanitising the parts keeps the property that mattered: a newline inside a body is still escaped and cannot forge a line",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "the message is rendered as separate lines, not one run-on string",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    const message = redact(raw);",
+      replace: "    const message = redact(printable(raw));",
+    }],
+  },
+  {
+    name: "no-recovery-notice-for-an-alarm-nobody-heard",
+    why: "queue a clearing for a cause whose page every channel declined. Its `announced_count` is still zero, so the CLEARED notice tells the reader that a situation they were never informed of has ended — which is worse than silence, because it sends them looking for an alert that does not exist. The cause must still be RETIRED, or an undelivered page stands for ever precisely because it was never delivered",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "the cause is retired without a recovery notice, because none was owed",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "      if (pages(why) && standing.get(why).announced_count > 0) {",
+      replace: "      if (pages(why)) {",
+    }],
+  },
+
+  {
+    name: "an-untrusted-part-cannot-forge-a-line",
+    why: "assemble the message from raw parts. `clean` is `printable` applied to each untrusted value BEFORE the trusted separators are added, and it is what stops a body from forging a line: a detail containing a line feed would otherwise render as its own line, indistinguishable from the identity or the action this surface writes. It is the half of the boundary that survived splitting the sanitisation, and it is asserted separately from the redaction half because a stub that removes one leaves the other standing",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a newline inside the body is escaped, so a detail cannot forge a line",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    const clean = (v) => printable(String(v ?? \"\"));",
+      replace: "    const clean = (v) => String(v ?? \"\");",
+    }],
+  },
+  {
     name: "incarnation-is-minted-on-every-hub",
     why: "create the table and leave it empty. A NULL incarnation has to mean `cannot tell`, and a reader that treats that as a match accepts every stale cursor while one that treats it as a difference rejects every good one -- neither is better than the ambiguity this table replaces. The migration mints, so no hub is ever without one",
     test: "test/hub-incarnation.test.mjs",

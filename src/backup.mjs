@@ -28,7 +28,7 @@ import { open as openStore, exportJsonl } from "./db/ops.mjs";
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
 // naming a module that does not exist yet breaks every import of this file.
 import { openHub, isOperational, faultKind, HUB_SCHEMA_VERSION, HUB_TABLES, tablesAt,
-         schemaDefectsAt, isKnownVersion, backfillPinDeadlines,
+         schemaDefectsAt, isKnownVersion, backfillPinDeadlines, historyGaps,
          backfillProjectIdentities, identityReconciliation } from "./build/hubdb.mjs";
 import { IDENTITY_SINCE } from "./build/repoid.mjs";
 // Task 9's additions. `restoreHub` takes the maintenance lock before it refuses,
@@ -251,17 +251,28 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo", de
       // the one moment an operator has nothing to fall back to. A validator that
       // says "usable" about a file the restore will reject is worse than no
       // validator.
+      // "The same contiguity rule" is now the same CODE. This carried its own
+      // copy of the loop directly under a comment saying it applied openHub's
+      // rule, which is the arrangement in which two answers drift apart without
+      // either comment becoming false.
       const versions = probe.prepare("SELECT version FROM schema_version ORDER BY version").all().map(r => r.version);
       const version = versions.length ? versions[versions.length - 1] : 0;
-      const gaps = [];
-      for (let v = 1; v <= version; v++) if (!versions.includes(v)) gaps.push(v);
-      if (!versions.length || gaps.length)
+      // RECORDS NOTHING, then NEWER, then holed -- and the middle one has to
+      // come before the enumeration, exactly as in `openHub`. A snapshot file is
+      // the least trustworthy input this binary has: it is chosen off disk, it
+      // may have been written by another machine, and `schema_version` is one
+      // row an editor can change. Enumerating up to the number it happens to
+      // carry made this validator allocate proportionally to that number, on the
+      // path an operator reaches when everything else has already failed.
+      if (!versions.length)
+        return { ok: false, integrity, version, why: "the snapshot records no schema version at all" };
+      const known = expectVersion ?? HUB_SCHEMA_VERSION;
+      if (version > known)
+        return { ok: false, why: `snapshot is schema version ${version}; this binary knows ${known}`, version, integrity };
+      const gaps = historyGaps(versions, version);
+      if (gaps.length)
         return { ok: false, integrity, version,
-                 why: !versions.length
-                   ? "the snapshot records no schema version at all"
-                   : `the snapshot records version ${version} but is missing migration(s) ${gaps.join(", ")}` };
-      if (expectVersion != null && version > expectVersion)
-        return { ok: false, why: `snapshot is schema version ${version}; this binary knows ${expectVersion}`, version, integrity };
+                 why: `the snapshot records version ${version} but is missing migration(s) ${gaps.join(", ")}` };
       // DERIVED by running the migrations to this version, not looked up in a
       // declared list. A migration that adds a table is covered the day it
       // lands. A version this binary does not know still falls back to the

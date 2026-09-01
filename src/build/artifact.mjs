@@ -6,8 +6,8 @@
 // in memory certifies what was INTENDED, not what survived.
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync, readFileSync,
-         rmSync, existsSync, readdirSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+         rmSync, existsSync, readdirSync, statSync, realpathSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { ARTIFACT_FILE } from "../paths.mjs";
 
 const sha = (buf) => createHash("sha256").update(buf).digest("hex");
@@ -47,7 +47,7 @@ function reapStaleTemporaries(dir, name, now) {
 }
 
 /** tmp + fsync + rename + fsync of the directory. Every step, in that order. */
-export function writeArtifact({ dir, phase, bytes }) {
+export function writeArtifact({ dir, phase, bytes, anchor = null }) {
   const name = ARTIFACT_FILE[phase];
   if (!name) throw new Error(`${phase} produces no artifact; use reviewDiff's path`);
   // THE DIRECTORY MAY NOT EXIST YET, and whether it did decides what has to be
@@ -68,15 +68,63 @@ export function writeArtifact({ dir, phase, bytes }) {
   //
   // Syncing an already-durable directory costs one fsync and answers the
   // question the caller actually asked, which is whether the artifact survives.
-  // The chain stops at the reeve home rather than walking to the filesystem
-  // root, because directories this code did not make are not its to reason about.
+  //
+  // NOT A COUNT, AND NOT THE FILESYSTEM ROOT EITHER. The cap was eight, which
+  // meant a deeper tree silently stopped being synced above that level --
+  // durability reported for entries never flushed, by a bound chosen to stop a
+  // loop rather than because eight meant anything. Removing it walked to `/`,
+  // which is the opposite mistake: every ancestor of the home belongs to the
+  // operator or the OS, this write changes none of their entries, and one of
+  // them being execute-only or on a filesystem whose directories cannot be
+  // opened made the parent-sync loop RETHROW -- reporting a failure for an
+  // artifact that was written and renamed successfully.
+  //
+  // `anchor` is the caller's own root, and the chain stops there. It bounds the
+  // walk by OWNERSHIP rather than by depth, so a deeper tree is still synced to
+  // the top and nothing above the anchor is touched. The race that makes the
+  // whole chain worth syncing -- another process created the tree and has not
+  // flushed its entries yet -- can only involve directories reeve creates, and
+  // every one of those is below the anchor.
   const chain = [];
-  for (let d = dir; d !== dirname(d) && chain.length < 8; d = dirname(d)) chain.push(d);
+  if (anchor === null) {
+    for (let d = dir; d !== dirname(d); d = dirname(d)) chain.push(d);
+  } else {
+    // RESOLVED ON THE FILESYSTEM, not lexically. `resolve` only normalises the
+    // text, so a SYMLINK anywhere beneath the anchor satisfies `startsWith` while
+    // the write lands wherever the link points -- `mkdirSync`, the temporary and
+    // the rename all follow it. An anchored path under `home/tasks` writes
+    // outside the home the moment `home/tasks` is a link, and the rename would
+    // replace whatever design.md it found there.
+    //
+    // The anchor must exist to be resolved at all; `dir` usually does not yet, so
+    // its DEEPEST EXISTING ancestor is resolved instead and the remainder is
+    // appended. That is the part the filesystem can answer -- a component that
+    // does not exist cannot be a link to anywhere.
+    const realOf = (p) => {
+      let head = resolve(p);
+      const tail = [];
+      for (;;) {
+        try { return join(realpathSync(head), ...tail.reverse()); }
+        catch { /* keep climbing */ }
+        const up = dirname(head);
+        if (up === head) return resolve(p);        // nothing on this path exists
+        tail.push(head.slice(up.length + 1));
+        head = up;
+      }
+    };
+    const top = realOf(anchor);
+    const start = realOf(dir);
+    if (start !== top && !start.startsWith(top + sep))
+      throw new Error(`${dir} resolves to ${start}, which is not inside ${anchor} (${top}); ` +
+                      `the sync chain has no anchor to stop at, and a write there would leave the task tree`);
+    for (let d = start; ; d = dirname(d)) { chain.push(d); if (d === top || d === dirname(d)) break; }
+  }
   mkdirSync(dir, { recursive: true });
   const path = join(dir, name);
   reapStaleTemporaries(dir, name, Date.now());
   const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
   const fd = openSync(tmp, "wx");
+  let closed = false;
   try {
     // WRITTEN TO COMPLETION, not merely handed over. `writeSync` may return
     // having written FEWER bytes than it was given, and a partial write that is
@@ -90,16 +138,22 @@ export function writeArtifact({ dir, phase, bytes }) {
       off += n;
     }
     fsyncSync(fd);
+    // CLOSED INSIDE THE GUARDED REGION. `closeSync` can throw in its own right --
+    // a deferred write error surfaces there on some filesystems -- and closing
+    // outside the try left the temporary behind for exactly the failure the
+    // cleanup exists to handle. Third leak in this family: the write was
+    // covered, then the rename, and the close between them was not.
+    closed = true;
+    closeSync(fd);
   } catch (e) {
     // THE TEMPORARY GOES WITH THE FAILURE. A write that throws -- a full disk is
     // the ordinary case -- left its partial file behind, and every retry minted
     // another randomly named one. The space needed to recover is then consumed
     // by the failures, which turns a transient full disk into a permanent one.
-    closeSync(fd);
-    try { rmSync(tmp, { force: true }); } catch { /* the throw above is the real failure */ }
+    if (!closed) { try { closeSync(fd); } catch { /* the throw below is the real failure */ } }
+    try { rmSync(tmp, { force: true }); } catch { /* the throw below is the real failure */ }
     throw e;
   }
-  closeSync(fd);
   // THE RENAME IS INSIDE THE CLEANUP TOO. It was outside it, so a rename that
   // failed -- the destination has become a directory, or the filesystem refuses
   // the metadata update -- left a COMPLETE temporary behind, and every retry
@@ -168,21 +222,51 @@ export function readArtifact({ dir, phase, expectSha }) {
 // `1)` were not, so an uncited claim written with either was not a claim at all
 // and slipped past the citation rule entirely -- the check silently narrowing
 // its own input rather than failing.
-const CLAIM = /^\s*(?:[-*+]|\d+[.)])\s+\S/;
+// CAPTURING, because nesting is measured from the parts. `\s` also matches a
+// newline, which is meaningless on a single line and makes the indent it reports
+// wrong; `[ \t]` is what a Markdown indent is made of.
+const CLAIM = /^([ \t]*)([-*+]|\d+[.)])([ \t]+)\S/;
 // A CITATION IS A PATH AND A LINE, not any token with a colon in it.
 // `[\w./-]+:\d+` matched `12:30` and `issue:42` as readily as
 // `src/build/hubaccess.mjs:170`, so a claim mentioning a time or a ticket read
 // as sourced. The token must therefore carry the shape of a file: either a
 // separator, or a name with an extension immediately before the colon.
-const CITATION = /(?:[\w.-]*\/[\w./-]*|[\w-]+\.[A-Za-z][\w]{0,5}):\d+/;
+// The extension is not length-capped. `{0,5}` refused `src/x.markdown:12` and
+// `a.config.mjs:3` -- a correctly cited claim rejected because its filename was
+// long, which is the gate refusing correct work over a number nobody chose
+// deliberately. What distinguishes a file from a URL port is the DOT, not how
+// many letters follow it.
+const CITATION = /(?:[\w.-]*\/[\w./-]*|[\w-]+\.[A-Za-z][\w-]*):\d+/;
 // A URL's PORT is not a file citation, and research is full of URLs. `[\w./-]+:\d+`
 // matches `localhost:3000` exactly as it matches `src/x.mjs:170`, so a claim
 // supported by a link read as supported by a source line -- the gate accepting
 // precisely the unsupported claims it exists to reject. URLs are removed before
 // the test rather than excluded inside it, because a pattern that has to
 // describe what a URL is not becomes a second, worse URL parser.
-const URLS = /\b[a-z][a-z0-9+.-]*:\/\/\S+/gi;
-const withoutUrls = (line) => line.replace(URLS, " ");
+// AND A SCHEME-LESS ENDPOINT IS NOT ONE EITHER. The URL strip only removes
+// `scheme://...`, so `api.internal:3000/health`, `//api.internal:3000` and
+// `git@host:22` all survived it and their PORT read as a line number. Each of
+// these carries a syntactic marker that a file reference does not -- a
+// protocol-relative prefix, a userinfo `@`, or a path after the port -- so each
+// is removable without guessing.
+//
+// WHAT REMAINS, AND DELIBERATELY. A bare `api.internal:3000`, with no scheme, no
+// userinfo and no path, is byte-for-byte the same SHAPE as `package.json:3000`:
+// a dotted name, a colon, digits. No regex separates them, and the two errors are
+// not symmetric -- accepting the endpoint lets one claim through uncited, while
+// refusing the filename refuses every citation of a root-level file and fails the
+// whole report. This file has already been corrected once for refusing correct
+// work over a rule nobody chose deliberately, so the ambiguity is resolved
+// towards accepting. The durable answer is not syntactic: a phase task holds the
+// repository and can ask whether the cited path EXISTS, which is the only thing
+// that actually tells the two apart.
+const ENDPOINTS = [
+  /\b[a-z][a-z0-9+.-]*:\/\/\S+/gi,             // a full URL
+  /(?:^|[\s(<[])\/\/[\w.-]+:\d+\S*/g,          // a protocol-relative authority
+  /\b[\w.-]+@[\w.-]+:\d+\S*/g,                // userinfo@host:port
+  /\b[\w-]+(?:\.[\w-]+)+:\d+\/\S*/g,          // host:port followed by a path
+];
+const withoutEndpoints = (line) => ENDPOINTS.reduce((s, re) => s.replace(re, " "), line);
 
 /**
  * The gate for a report phase's product. The SIBLING of `reviewDiff`, never a
@@ -254,22 +338,83 @@ export function reviewArtifact({ phase, dir, expect }) {
         // The depth VALUE is still not re-checked here. The transition owns that
         // vocabulary and refuses an unknown depth durably; a copy of the list in
         // this file would be a second inventory of it.
-        for (const field of ["depth", "est_files", "est_weighted_files", "est_packages",
-                             "est_slices", "risk_paths_touched", "rationale"])
-          if (!(field in parsed)) findings.push(`sizing.json omits ${field}`);
-        if ("depth" in parsed && (typeof parsed.depth !== "string" || !parsed.depth.trim()))
-          findings.push("sizing.json's depth is not a name; it is the field the phase machine reads");
+        // PRESENCE AND TYPE. Presence alone let `est_files: "lots"` satisfy the
+        // contract, and the floors that read those numbers compare them -- so a
+        // string passes the gate and then produces a comparison nobody can
+        // reason about. The kinds here are the ones the fields' own names imply,
+        // and each is stated once.
+        // THE TYPES ARE THE SCHEMA'S, not this file's recollection of them.
+        // `build_size.json` declares all four counts as `{"type": "integer",
+        // "minimum": 0}`. Three of them were checked here with `Number.isFinite`
+        // and one with `Number.isInteger` -- so `est_files: 0.5` passed this
+        // gate and was durably approved, while the same document validated
+        // against the schema is refused. One artifact, two verdicts, and the
+        // gate is the one that says the work may proceed.
+        //
+        // The divergence WAS the three copies: a predicate written out four
+        // times, corrected in one of them. It is spelled once now, so the next
+        // correction cannot land in three places out of four.
+        const count = (v) => Number.isInteger(v) && v >= 0;
+        const KIND = {
+          depth: ["a name", (v) => typeof v === "string" && v.trim() !== ""],
+          est_files: ["a whole number", count],
+          est_weighted_files: ["a whole number", count],
+          est_packages: ["a whole number", count],
+          est_slices: ["a whole number", count],
+          // THE ITEMS, not just the container. `Array.isArray` alone admitted
+          // `[3]` and `[""]`, and this list is intersected against the profile's
+          // risk paths to decide whether the sizing floor fires. A non-string
+          // matches no path, so an artifact naming its risk paths as numbers
+          // reads as touching none -- and the floor that exists for exactly that
+          // case does not fire, silently, on the artifact that most needed it.
+          risk_paths_touched: ["a list of non-empty paths",
+            (v) => Array.isArray(v) && v.every((p) => typeof p === "string" && p.trim() !== "")],
+          rationale: ["a non-empty string", (v) => typeof v === "string" && v.trim() !== ""],
+        };
+        for (const [field, [kind, ok]] of Object.entries(KIND)) {
+          if (!(field in parsed)) { findings.push(`sizing.json omits ${field}`); continue; }
+          if (!ok(parsed[field]))
+            findings.push(`sizing.json's ${field} is ${JSON.stringify(parsed[field])}, not ${kind}`);
+        }
       }
     }
   }
   if (phase === "RESEARCH") {
-    if (expect.depth === "trivial")
-      return { ok: false, why: "RESEARCH is skipped at trivial depth; there is no research artifact to gate",
+    // THE CALLER'S FLAG FIRST, depth as the fallback. Keyed on `expect.depth`
+    // alone this branch is unreachable from the documented caller, which passes
+    // the helper's requirement set and no depth -- so the one path the check
+    // exists for could never be taken.
+    // AND AN EXPECTATION THAT SAYS NEITHER IS REFUSED, rather than assumed to
+    // mean "not skipped".
+    //
+    // This branch has now been unreachable twice. First it keyed on
+    // `expect.depth`, which the documented helper does not carry. Reading the
+    // caller's `skipped` flag instead was still one layer short: S3-D's
+    // `researchExpectations(depth)` returns `{minCitationsPerClaim, minClaims}`
+    // and carries NEITHER -- so the ternary fell through to `undefined ===
+    // "trivial"`, false, every time, and the gate would review a research
+    // artifact for a phase that should not have run.
+    //
+    // Guessing in either direction is wrong and the two errors are not
+    // symmetric: assuming NOT skipped gates a phase that should have been
+    // skipped, silently, which is the case this branch exists to prevent.
+    // Assuming skipped refuses work that should be reviewed, loudly. So it
+    // refuses to guess, which also makes the contract enforceable: S3-D's helper
+    // must carry `skipped`, and until it does the refusal says so by name
+    // instead of the branch quietly never running.
+    if (!("skipped" in expect) && !("depth" in expect))
+      return { ok: false, why: "this expectation says neither whether RESEARCH was skipped nor at what depth, " +
+                               "and the two are different artifacts to gate; researchExpectations must carry `skipped`",
+               findings: [], sha256 };
+    const researchSkipped = "skipped" in expect ? expect.skipped : expect.depth === "trivial";
+    if (researchSkipped)
+      return { ok: false, why: "RESEARCH is skipped at this depth; there is no research artifact to gate",
                findings: [], sha256 };
     // The caller's declared minimum, when it declares one. The phase helpers
     // return `{minCitationsPerClaim, minClaims}`; a depth-carrying caller does
     // not, so the default stands in for it.
     var minClaims = Number.isInteger(expect.minClaims) ? expect.minClaims : 1;
+    const minCites = Number.isInteger(expect.minCitationsPerClaim) ? expect.minCitationsPerClaim : 1;
     // PER CLAIM, not per file. A whole-file test passes as soon as ANY line
     // carries a citation, so an artifact with nine cited claims and one bare
     // assertion reads as clean -- and the bare one is the claim that needed
@@ -288,10 +433,56 @@ export function reviewArtifact({ phase, dir, expect }) {
       return rows.slice(at + 1, end === -1 ? rows.length : end);
     })();
     let claims = 0;
+    // NESTING IS RELATIVE, not "carries a leading space".
+    //
+    // A nested bullet elaborating a cited claim must not be counted as a claim of
+    // its own -- the more carefully a finding is broken down, the more the gate
+    // would penalise it. But `/^\s+/` answers a different question: Markdown
+    // keeps a list item TOP-LEVEL at up to three spaces of indent, and nests one
+    // only when it reaches the CONTENT column of the item above it. So ` - an
+    // unsupported claim`, indented by a single space, was skipped entirely -- and
+    // with one properly cited claim elsewhere satisfying `minClaims`, the
+    // artifact passed. One space nobody would notice turned the citation rule off
+    // for that line.
+    //
+    // `open` holds the content column of each list level currently open. A bullet
+    // at or beyond the innermost of them is nested; one to its left closes levels
+    // until it is not.
+    const open = [];
+    // AND A LIST ENDS. `open` described the list currently being read, and
+    // nothing ever closed it -- so a cited list, a blank line, a paragraph, and
+    // then a NEW list starting with one to three spaces had its first item
+    // measured against the OLD list's content column and skipped as nested. The
+    // new list's uncited claim disappeared from the count, and the artifact
+    // passed. Markdown ends a list at a blank line followed by a block that is
+    // not part of it; a paragraph indented into the item is a continuation and
+    // does not.
+    const width = (s) => s.replace(/\t/g, "    ").length;
+    let blank = false;
     for (const line of scope) {
-      if (!CLAIM.test(line)) continue;
+      if (line.trim() === "") { blank = true; continue; }
+      const m = CLAIM.exec(line);
+      if (!m) {
+        const indent = width(/^[ \t]*/.exec(line)[0]);
+        if (blank && (open.length === 0 || indent < open[open.length - 1])) open.length = 0;
+        blank = false;
+        continue;
+      }
+      blank = false;
+      const indent = width(m[1]);
+      while (open.length && indent < open[open.length - 1]) open.pop();
+      const nested = open.length > 0;
+      open.push(indent + m[2].length + width(m[3]));
+      if (nested) continue;
       claims++;
-      if (!CITATION.test(withoutUrls(line))) findings.push(`no file:line citation: ${line.trim()}`);
+      // THE COUNT THE CALLER ASKED FOR. `minCitationsPerClaim` was read and
+      // ignored, so a claim with one citation satisfied a caller asking for two.
+      // An argument accepted and not applied is worse than one absent, because
+      // the caller believes it took effect.
+      const cites = (withoutEndpoints(line).match(new RegExp(CITATION.source, "g")) ?? []).length;
+      if (cites < minCites)
+        findings.push(cites === 0 ? `no file:line citation: ${line.trim()}`
+          : `${cites} citation(s) against a minimum of ${minCites}: ${line.trim()}`);
     }
     // ABSENCE MUST NOT SATISFY THE RULE. With no claims the loop runs zero times
     // and every claim is trivially cited, so an empty artifact -- or one that is
@@ -382,9 +573,54 @@ export function reviewArtifact({ phase, dir, expect }) {
         // to; it refuses a slice with no such block.
         if (label === "Done when:" && expect.requireDoneCondition === true) {
           const after = rows.slice(at).join("\n");
-          const fence = /^\s*```[^\n]*\n\s*(\S[^\n]*)/m.exec(after.slice(0, nextBoundary(rows, at)));
-          if (!fence) findings.push(`${heading} has no machine-checkable done condition: ` +
-            `the contract asks for a fenced block whose first line is a command`);
+          // OPENED AND CLOSED. An unterminated fence satisfied an opening-fence
+          // test, and half a block is not a done condition -- the rest of the
+          // document is then inside it, so what the slice actually asks for is
+          // whatever happens to follow.
+          const within = after.slice(0, nextBoundary(rows, at));
+          // A REGEX CANNOT PAIR FENCES, so this scans lines instead.
+          //
+          // Three defects in one expression, each fixed and the next one
+          // appearing behind it. A bare ``` at both ends let four backticks be
+          // closed by three. A backreference fixed that until the greedy prefix
+          // BACKTRACKED and read the surrendered backtick as the info string.
+          // Narrowing the info string fixed that, and then an EMPTY block --
+          // opener, immediate closer, prose, another delimiter -- matched
+          // starting at the CLOSER, taking it for an opener and the prose for a
+          // command.
+          //
+          // That last one is not a pattern bug. Which delimiters open and which
+          // close is decided by everything before them, and `m` lets a match
+          // begin anywhere; no amount of lookahead recovers the state a scan
+          // from the start carries for free. So the fourth attempt is not
+          // another expression.
+          //
+          // The rules are CommonMark's: a closer is at least as long as its
+          // opener and carries no info string, an empty block holds no command,
+          // and a block that never closes is not a done condition however much
+          // text follows it.
+          const doneCommand = (within) => {
+            let open = null, first = null;
+            for (const line of within.split("\n")) {
+              // AT MOST THREE SPACES. Four or more makes the line an indented CODE
+              // BLOCK, not a fence -- so a `Done when:` written with a
+              // four-space fence renders as literal text and this gate approved
+              // it as a machine-checkable command. `[ \t]*` accepted any
+              // indent; the limit is CommonMark's and a tab is worth four, so
+              // neither is admitted here.
+              const m = /^ {0,3}(`{3,})([^`\n]*)$/.exec(line);
+              if (open === null) { if (m) { open = m[1]; first = null; } continue; }
+              if (m && m[1].length >= open.length && m[2].trim() === "") {
+                if (first !== null) return first;
+                open = null; first = null; continue;
+              }
+              if (first === null && line.trim() !== "") first = line.trim();
+            }
+            return null;
+          };
+          const fence = doneCommand(within);
+          if (fence === null) findings.push(`${heading} has no machine-checkable done condition: ` +
+            `the contract asks for a fenced block, opened AND closed, whose first line is a command`);
         }
       }
     }

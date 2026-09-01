@@ -31,7 +31,7 @@ const SCHEMA_VERSION_DDL = `CREATE TABLE IF NOT EXISTS schema_version (
   applied_at INTEGER NOT NULL
 ) STRICT`;
 
-export const HUB_SCHEMA_VERSION = 4;
+export const HUB_SCHEMA_VERSION = 5;
 
 /**
  * Forward-only. Each entry runs exactly once, in order, in its own transaction,
@@ -61,6 +61,104 @@ export const HUB_SCHEMA_VERSION = 4;
  * deadline whose lease has one, so a v3 tail -- whose claim image already
  * carries the value -- matches nothing.
  */
+/**
+ * Derive every project's identity from the tasks the store holds.
+ *
+ * Used by migration 5 and again by `restoreHub` AFTER the tail is replayed, for
+ * the same reason `backfillPinDeadlines` is: a repair of a projection against
+ * the rows that are already the authority for it, deterministic from data the
+ * store already has.
+ *
+ * THE REPLAY CALL IS NOT OPTIONAL. Migration 5 runs BEFORE `replayHub`, so it
+ * sees only the tasks inside the snapshot. A tail written by a pre-v5 binary
+ * carries `task.filed` and no `project_identity.learned`, so every project
+ * admitted since that snapshot replays its task and gets no identity -- and the
+ * restore reports success while the guardian cannot scope a lease for it.
+ *
+ * AN UPSERT, not a fill. `task.repo_id` and the identity are written from the
+ * same snapshot at the same admission, so the newest task always agrees with the
+ * identity the modern path would have written -- and where a legacy tail carries
+ * a repository recreated under the same key, the newest task is the only record
+ * of the new id. Filling gaps only would leave the old one standing.
+ */
+/**
+ * Which projects a replayed tail leaves without a correct identity.
+ *
+ * PURE, AND EXPORTED, because the version of this that lived inline in
+ * `restoreHub` was WRONG AND UNTESTABLE IN THE SAME WAY. It read
+ * `payload.project` from a `task.transitioned` image; that image carries an
+ * explicit column list which does not include `project`, so the set was always
+ * empty and the reconciliation never ran. Every test passed, because nothing
+ * could reach the logic to ask it anything.
+ *
+ * Two answers, because the two events prove different things:
+ *
+ *   `admitted` — projects FILED in the tail whose identity it did not carry.
+ *     A filing proves an admission, so an identity may be CREATED for it.
+ *   `changed`  — projects a transition touched, resolved THROUGH THE TASK ID
+ *     against the replayed task table. A transition proves only that something
+ *     moved, so an existing identity may be updated and none created.
+ *
+ * `projectOfTask` is injected so this can be asked without a database.
+ */
+export function identityReconciliation(tail, projectOfTask, { legacy = false } = {}) {
+  const payloadOf = (e) => { try { return JSON.parse(e.payload); } catch { return null; } };
+  const projectsIn = (kind) => new Set((tail ?? []).filter(e => e.kind === kind)
+    .map(e => payloadOf(e)?.project).filter(Boolean));
+  const filed = projectsIn("task.filed");
+  const carried = projectsIn("project_identity.learned");
+  const touched = new Set((tail ?? []).filter(e => e.kind === "task.transitioned")
+    // THE EVENT'S OWN `task` COLUMN FIRST, and the image's `id` as the fallback
+    // a supplied tail may arrive with. Never `project`: it is not in the image.
+    .map(e => e.task ?? payloadOf(e)?.id).filter(Boolean)
+    .map(id => projectOfTask(id)).filter(Boolean));
+  return {
+    admitted: [...filed].filter(p => !carried.has(p)),
+    // TRANSITIONS ONLY FOR A LEGACY SNAPSHOT, and `legacy` is passed in because
+    // the tail cannot tell you. An ordinary v5 transition emits no identity
+    // event either -- nothing changed, so nothing is recorded -- so "no identity
+    // event" does not mean "pre-v5". Treating every transition as an identity
+    // change is actively harmful on a v5 restore: an ordinary transition
+    // refreshes an old task's `updated_at`, the backfill then picks that task as
+    // the newest, and a project rebound to a new repository has its CORRECT
+    // identity overwritten with the stale id the old task still carries.
+    //
+    // A v5 snapshot needs no transition repair at all: every identity change
+    // since it was taken carries its own event.
+    changed: legacy ? [...touched].filter(p => !carried.has(p) && !filed.has(p)) : [],
+  };
+}
+
+export function backfillProjectIdentities(db, projects = null, { updateOnly = false } = {}) {
+  // SCOPED WHEN THE CALLER KNOWS WHICH PROJECTS NEED IT. A restore repairs the
+  // ones whose filings could not carry an identity; repairing every project
+  // would also invent identities for tasks that never had one, which is a state
+  // admission does not produce and a restore must not introduce.
+  //
+  // `projects` null means all, which is what the migration wants: it runs over a
+  // whole store whose identities do not exist yet.
+  const list = projects == null ? null : [...new Set(projects)].filter(Boolean);
+  if (list && list.length === 0) return;
+  const where = list ? `AND project IN (${list.map(() => "?").join(",")})` : "";
+  // UPDATE-ONLY is for a project the tail merely CHANGED rather than admitted.
+  // Its identity, if it has one, may now disagree with its task -- but a project
+  // with no identity at all is not a gap this can fill: it was never admitted
+  // under this schema, and inventing one would add a row the snapshot never
+  // held. That is the distinction the restore drill's row-for-row comparison
+  // enforces, and it is why this is a mode rather than a wider project list.
+  const existing = updateOnly ? "AND project IN (SELECT project FROM project_identity)" : "";
+  db.prepare(`
+    INSERT INTO project_identity (project, repo_id, learned_at)
+    SELECT project, repo_id, unixepoch() FROM (
+      SELECT project, repo_id,
+             ROW_NUMBER() OVER (PARTITION BY project ORDER BY updated_at DESC, id DESC) rn
+        FROM task WHERE repo_id IS NOT NULL AND repo_id > 0 ${where} ${existing}
+    ) WHERE rn = 1
+    ON CONFLICT(project) DO UPDATE SET repo_id = excluded.repo_id, learned_at = excluded.learned_at
+     WHERE project_identity.repo_id <> excluded.repo_id
+  `).run(...(list ?? []));
+}
+
 export function backfillPinDeadlines(db) {
   db.exec(`
     UPDATE task_territory AS t
@@ -249,6 +347,52 @@ const MIGRATIONS = [
       // dangerous when something consumes it as the newest current answer -- and
       // it catches rows this database never validated, such as one replayed from
       // a snapshot written by an older binary.
+    } },
+  // ---------------------------------------------------------------- 5
+  // AN IDENTITY THE GUARDIAN MAY READ.
+  //
+  // The guardian scopes every provider_lease on GitHub's numeric repository id,
+  // and it deliberately cannot read `task`: its hub surface is the provider
+  // scheduler and pr_hold, and hubguest.mjs enforces that. So the id reached it
+  // through a privileged handle opened in the CLI and closed after one
+  // statement -- which made the guarantee "the tick is restricted" rather than
+  // "the guardian process is".
+  //
+  // KEYED ON THE PROJECT, never the name. A repository can be renamed or
+  // transferred; its id cannot. That is the same rule repoid.mjs already states,
+  // and it is why an earlier version keyed on `nwo_snapshot` returned null for a
+  // renamed repository whose id the hub was holding all along.
+  //
+  // NO NAME COLUMN, deliberately. A name here could only ever be a snapshot, and
+  // a snapshot in a table called `identity` invites the next reader to treat it
+  // as current -- which is the defect this table exists to remove, not one to
+  // reintroduce in a spare column. `task.nwo_snapshot` and projects.json already
+  // hold names, both with something that keeps them honest.
+  { version: 5, up: (db) => {
+      // RE-RUNNABLE, like every migration here.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS project_identity (
+          project    TEXT    PRIMARY KEY,
+          repo_id    INTEGER NOT NULL,
+          learned_at INTEGER NOT NULL,
+          CHECK (project <> ''),
+          -- NEVER GUESSED. Every id here came from GitHub through the API
+          -- client's snapshot; zero and negative are not ids, and a row that
+          -- cannot be an id must not be storable as one.
+          CHECK (repo_id > 0),
+          CHECK (learned_at > 0)
+        ) STRICT;
+      `);
+      // BACKFILLED FROM `task`, because an existing hub already knows the answer
+      // and a migration that left the table empty would make every guardian on
+      // an established hub fall through to GitHub on its first tick -- turning a
+      // local read into a network dependency at exactly the moment the operator
+      // upgraded.
+      //
+      // The same function `restoreHub` runs after replaying a tail. One copy,
+      // because a migration and a restore disagreeing about how an identity is
+      // derived is a defect nothing would report.
+      backfillProjectIdentities(db);
     } },
 ];
 

@@ -36,6 +36,15 @@ const attempt = (fn) => {
   try { return fn(); }
   catch (e) { return { ok: null, threw: String(e.message), findings: [] }; }
 };
+
+// The same shelter for a bare `writeArtifact` used as SETUP. `artifact-write-is-
+// atomic-against-a-crash` stubs the temporary into being the final path, so
+// every later write hits EEXIST -- the file died 22 assertions into 182. A
+// sentinel here leaves the sha undefined, which fails the assertion that reads
+// it, instead of taking the other 160 down with it. Sites that assert the throw
+// call `writeArtifact` directly.
+const place = (args) => attempt(() => writeArtifact(args));
+const readBack = (args) => attempt(() => readArtifact(args));
 import { reviewDiff } from "../src/sandbox.mjs";
 
 let fail = 0;
@@ -136,7 +145,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 // underneath a known-good sha.
 {
   const adir = join(dir, "readback");
-  const w = writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from("# design\n\n## Slice 1\n") });
+  const w = place({ dir: adir, phase: "DESIGN", bytes: Buffer.from("# design\n\n## Slice 1\n") });
   check(typeof w.sha256 === "string" && w.sha256.length === 64, "a write returns a sha256", w.sha256);
   check(existsSync(w.path) && readdirSync(adir).length === 1,
     "and leaves exactly one file, with no temporary beside it", readdirSync(adir).join(","));
@@ -159,7 +168,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "wholewrite");
   const bytes = Buffer.alloc(8 * 1024 * 1024, 0x62);
-  const w = writeArtifact({ dir: adir, phase: "RESEARCH", bytes });
+  const w = place({ dir: adir, phase: "RESEARCH", bytes });
   check(w.bytes === bytes.length, "a write reports the length it was given", `${w.bytes} vs ${bytes.length}`);
   check(lstatSync(w.path).size === bytes.length,
     "and the file on disk is exactly that long", `${lstatSync(w.path).size} vs ${bytes.length}`);
@@ -194,13 +203,13 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const cited = "# research\n\n- openHub refuses a hub above the schema version " +
                 "(src/build/hubaccess.mjs:170)\n- the guest handle revalidates dev:ino " +
                 "(src/build/hubaccess.mjs:42)\n";
-  writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(cited) });
+  place({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(cited) });
   const good = reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
   check(good.ok === true,
     "control: a research artifact whose every claim carries a file:line citation passes",
     JSON.stringify(good));
 
-  writeArtifact({ dir: adir, phase: "RESEARCH",
+  place({ dir: adir, phase: "RESEARCH",
     bytes: Buffer.from(cited.replace(" (src/build/hubaccess.mjs:170)", "")) });
   const bad = reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
   check(bad.ok === false, "a claim with no file:line citation is refused", JSON.stringify(bad));
@@ -299,9 +308,9 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 // write's sha, so the transition bound to bytes this gate never saw.
 {
   const adir = join(dir, "gatesha");
-  const first = writeArtifact({ dir: adir, phase: "RESEARCH",
+  const first = place({ dir: adir, phase: "RESEARCH",
     bytes: Buffer.from("# research\n\n- a claim (src/x.mjs:1)\n") });
-  const replaced = writeArtifact({ dir: adir, phase: "RESEARCH",
+  const replaced = place({ dir: adir, phase: "RESEARCH",
     bytes: Buffer.from("# research\n\n- a different claim (src/y.mjs:2)\n") });
   check(first.sha256 !== replaced.sha256, "control: the replacement really has a different sha");
 
@@ -313,7 +322,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 
   // AND ON THE REFUSAL PATH TOO, because a refusal that cannot say which bytes
   // it refused cannot be acted on.
-  writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from("# research\n\n- uncited\n") });
+  place({ dir: adir, phase: "RESEARCH", bytes: Buffer.from("# research\n\n- uncited\n") });
   const bad = reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
   check(bad.ok === false && typeof bad.sha256 === "string" && bad.sha256.length === 64,
     "and a refusal names the sha it refused", JSON.stringify({ ok: bad.ok, sha: bad.sha256 }));
@@ -330,6 +339,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   // A Proxy that reports a huge length makes writeSync throw on a real buffer,
   // which is the shape of a write that fails partway rather than a fabricated
   // error thrown before any file was created.
+  // THE REAL FUNCTION HERE, because the throw IS the subject. `place` would
+  // swallow it into a sentinel and this control would report that the write
+  // succeeded -- the shelter that keeps a stubbed run alive must not be applied
+  // where the exception is the thing being measured.
   try {
     writeArtifact({ dir: adir, phase: "DESIGN",
       bytes: new Proxy(Buffer.from("x"), { get: (t, k) => k === "length" ? 1e9 : Reflect.get(t, k) }) });
@@ -350,7 +363,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const adir = join(dir, "minima");
   const gate = (body, phase = "RESEARCH") => {
     return attempt(() => {
-      writeArtifact({ dir: adir, phase, bytes: Buffer.from(body) });
+      place({ dir: adir, phase, bytes: Buffer.from(body) });
       return reviewArtifact({ phase, dir: adir, expect: { depth: "standard" } });
     });
   };
@@ -377,7 +390,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const adir = join(dir, "urls");
   const gate = (body) => {
     return attempt(() => {
-      writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
+      place({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
       return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
     });
   };
@@ -399,7 +412,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const adir = join(dir, "sizing");
   const gate = (body) => {
     return attempt(() => {
-      writeArtifact({ dir: adir, phase: "SIZING", bytes: Buffer.from(body) });
+      place({ dir: adir, phase: "SIZING", bytes: Buffer.from(body) });
       return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
     });
   };
@@ -437,7 +450,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
                  est_slices: 2, risk_paths_touched: ["packages/x"], rationale: "x" };
   const gate = (over) => {
     return attempt(() => {
-      writeArtifact({ dir: adir, phase: "SIZING", bytes: Buffer.from(JSON.stringify({ ...FULL, ...over })) });
+      place({ dir: adir, phase: "SIZING", bytes: Buffer.from(JSON.stringify({ ...FULL, ...over })) });
       return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
     });
   };
@@ -476,7 +489,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const adir = join(dir, "slices");
   const gate = (body) => {
     return attempt(() => {
-      writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
+      place({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
       return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
     });
   };
@@ -501,7 +514,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 // not prove -- stated rather than implied, as with the interrupted-write drill.
 {
   const deep = join(dir, "a", "b", "c", "d", "artifacts");
-  const w = writeArtifact({ dir: deep, phase: "DESIGN", bytes: Buffer.from("# design\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n") });
+  const w = place({ dir: deep, phase: "DESIGN", bytes: Buffer.from("# design\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n") });
   check(existsSync(w.path), "an artifact written into a chain of new directories exists", w.path);
   const back = readArtifact({ dir: deep, phase: "DESIGN", expectSha: w.sha256 });
   check(back.ok === true, "and reads back with the sha it was written under", JSON.stringify(back.why));
@@ -586,7 +599,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "reap");
   const design = "# design\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n";
-  writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) });
+  place({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) });
 
   const stale = join(adir, "design.md.tmp-99999-stale");
   const live  = join(adir, "design.md.tmp-99998-live");
@@ -595,7 +608,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const twoHoursAgo = (Date.now() - 2 * 60 * 60 * 1000) / 1000;
   utimesSync(stale, twoHoursAgo, twoHoursAgo);
 
-  writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) });
+  place({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) });
   const left = readdirSync(adir).filter(f => f.includes(".tmp-"));
   check(!left.includes("design.md.tmp-99999-stale"),
     "a temporary older than the threshold is reaped by the next write", left.join(","));
@@ -606,8 +619,11 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
     "and a RECENT one is left alone, because it may be a live writer's", left.join(","));
 
   // And the artifact itself is unharmed by the reaping.
-  const back = readArtifact({ dir: adir, phase: "DESIGN",
-    expectSha: writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) }).sha256 });
+  // BOTH SHELTERED. Under the crash stub the write returns a sentinel, so the
+  // sha is undefined and `readArtifact` throws on it -- the second half of the
+  // same expression, killing the file one line further along than before.
+  const back = readBack({ dir: adir, phase: "DESIGN",
+    expectSha: place({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) }).sha256 });
   check(back.ok === true, "control: and the artifact still reads back", JSON.stringify(back.why));
 }
 
@@ -616,7 +632,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const adir = join(dir, "trailing");
   const gate = (body) => {
     return attempt(() => {
-      writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
+      place({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
       return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
     });
   };
@@ -644,7 +660,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const adir = join(dir, "citeshape");
   const g = (body) => {
     return attempt(() => {
-      writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
+      place({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
       return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
     });
   };
@@ -664,7 +680,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const adir = join(dir, "labelvalues");
   const g = (body) => {
     return attempt(() => {
-      writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
+      place({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
       return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
     });
   };
@@ -687,7 +703,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const adir = join(dir, "sizingcontract");
   const g = (o) => {
     return attempt(() => {
-      writeArtifact({ dir: adir, phase: "SIZING", bytes: Buffer.from(JSON.stringify(o)) });
+      place({ dir: adir, phase: "SIZING", bytes: Buffer.from(JSON.stringify(o)) });
       return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
     });
   };
@@ -748,7 +764,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
     "Done when:", "", "```bash", "pnpm test -- test/build-sizing.test.mjs", "```", "",
   ].join("\n");
   const adir = join(dir, "documented");
-  writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(documented) });
+  place({ dir: adir, phase: "DESIGN", bytes: Buffer.from(documented) });
 
   // BOTH expect shapes. The phase helpers return the requirement set and carry
   // no depth -- the depth is an INPUT to them -- so a gate demanding one throws
@@ -767,7 +783,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const g = (body) => {
     return attempt(() => {
       const d2 = join(dir, `doc${Math.random().toString(36).slice(2, 8)}`);
-      writeArtifact({ dir: d2, phase: "DESIGN", bytes: Buffer.from(body) });
+      place({ dir: d2, phase: "DESIGN", bytes: Buffer.from(body) });
       return reviewArtifact({ phase: "DESIGN", dir: d2, expect: { depth: "standard" } });
     });
   };
@@ -788,7 +804,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const adir = join(dir, "markers");
   const g = (body) => {
     return attempt(() => {
-      writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
+      place({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
       return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
     });
   };
@@ -816,7 +832,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const g = (body, expect) => {
     return attempt(() => {
       const d2 = join(dir, `req${Math.random().toString(36).slice(2, 8)}`);
-      writeArtifact({ dir: d2, phase: "DESIGN", bytes: Buffer.from(body) });
+      place({ dir: d2, phase: "DESIGN", bytes: Buffer.from(body) });
       return reviewArtifact({ phase: "DESIGN", dir: d2, expect });
     });
   };
@@ -852,7 +868,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const g = (body, expect = { minClaims: 1 }) => {
     return attempt(() => {
       const d2 = join(dir, `sc${Math.random().toString(36).slice(2, 8)}`);
-      writeArtifact({ dir: d2, phase: "RESEARCH", bytes: Buffer.from(body) });
+      place({ dir: d2, phase: "RESEARCH", bytes: Buffer.from(body) });
       return reviewArtifact({ phase: "RESEARCH", dir: d2, expect: { skipped: false, ...expect } });
     });
   };
@@ -891,7 +907,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 // that would make the failure path testable, and it is not this one.
 {
   const deep = join(dir, "propagate", "a", "b", "artifacts");
-  const w = writeArtifact({ dir: deep, phase: "DESIGN",
+  const w = place({ dir: deep, phase: "DESIGN",
     bytes: Buffer.from("# d\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n") });
   check(readArtifact({ dir: deep, phase: "DESIGN", expectSha: w.sha256 }).ok === true,
     "control: a write through a new chain still succeeds and reads back");
@@ -909,7 +925,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const g = (phase, body, expect) => {
     return attempt(() => {
       const d2 = join(dir, `fu${Math.random().toString(36).slice(2, 8)}`);
-      writeArtifact({ dir: d2, phase, bytes: Buffer.from(body) });
+      place({ dir: d2, phase, bytes: Buffer.from(body) });
       const said = phase !== "RESEARCH" || "skipped" in expect || "depth" in expect
         ? expect : { ...expect, skipped: false };
       return reviewArtifact({ phase, dir: d2, expect: said });
@@ -1051,11 +1067,14 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   // through to false every time and a phase that should not have run would have
   // had its artifact reviewed. Refusing to guess is what makes the contract
   // enforceable: the refusal names the field the helper must carry.
-  const ambiguous = reviewArtifact({ phase: "RESEARCH", dir: (() => {
+  // THROUGH `attempt`, like the helpers, and for the same reason: this calls
+  // reviewArtifact directly, so a stub that makes it THROW would kill the file
+  // here and the fifteen assertions after it would read as passes.
+  const ambiguous = attempt(() => {
     const d2 = join(dir, "ambig");
-    writeArtifact({ dir: d2, phase: "RESEARCH", bytes: Buffer.from("# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n") });
-    return d2;
-  })(), expect: { minCitationsPerClaim: 1, minClaims: 1 } });
+    place({ dir: d2, phase: "RESEARCH", bytes: Buffer.from("# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n") });
+    return reviewArtifact({ phase: "RESEARCH", dir: d2, expect: { minCitationsPerClaim: 1, minClaims: 1 } });
+  });
   check(ambiguous.ok === false && /neither whether RESEARCH was skipped/.test(String(ambiguous.why)),
     "an expectation carrying neither skipped nor depth is refused, naming what it must carry",
     JSON.stringify(ambiguous.why));
@@ -1121,7 +1140,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 // filesystems, where a deferred write error surfaces there.
 {
   const adir = join(dir, "closefail");
-  const w = writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from("# d\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n") });
+  const w = place({ dir: adir, phase: "DESIGN", bytes: Buffer.from("# d\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n") });
   check(readdirSync(adir).filter(f => f.includes(".tmp-")).length === 0,
     "control: an ordinary write leaves no temporary", readdirSync(adir).join(","));
   check(existsSync(w.path), "control: and produces the artifact");

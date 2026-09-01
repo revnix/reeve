@@ -523,7 +523,27 @@ const runTest = (file, expectRed = null) => new Promise(resolve => {
   // statement about what survived rather than about what the run reported. Three
   // separate defects came from that single confusion. These three fields are the
   // verdict's inputs; `kept` is only what a human reads afterwards.
-  const observed = { anyAssertionSeen: false, namedFailSeen: false, failures: [] };
+  // COUNTED, not merely noticed. `anyAssertionSeen` was a boolean, so a run that
+  // reported the named failure and then DIED partway satisfied it exactly as a
+  // complete run does -- and `classify` had no other input that could tell them
+  // apart. Three such runs were found by hand in one morning; each reported
+  // CAUGHT while proving a fraction of what its entry claimed. A boolean is a
+  // count with its threshold pinned at one, which is where it catches nothing.
+  // NAMES AS WELL AS A COUNT, and a multiset rather than a set.
+  //
+  // A total alone can be satisfied by a stub that ADDS assertion lines -- one
+  // that widens a loop, say -- while skipping later ones, which is the same
+  // false green the count exists to stop, reached from the other side. What the
+  // verdict actually needs to know is whether every assertion the CONTROL
+  // reported was reported again, and counts per name answer that even when a
+  // name repeats inside a loop.
+  //
+  // BOUNDED, and the bound is recorded rather than silently applied: a truncated
+  // list cannot answer the question, so `classify` falls back to the total
+  // instead of reading absence as a missing assertion.
+  const MAX_TRACKED_NAMES = 20_000;
+  const observed = { assertionsSeen: 0, namedFailSeen: false, failures: [],
+                     names: new Map(), namesTruncated: false };
   // Enough failures to diagnose a WRONG_RED and not enough to matter. The named
   // failure's PRESENCE is recorded separately, so this bound cannot change a verdict.
   const MAX_REPORTED_FAILURES = 50;
@@ -540,9 +560,15 @@ const runTest = (file, expectRed = null) => new Promise(resolve => {
     // only passes, then exited non-zero, from being read as a crash -- and it is
     // counted without being retained, because the budget is for evidence a human
     // reads and not for the verdict.
-    observed.anyAssertionSeen = true;
-    if (m[1] !== "FAIL") return;
+    observed.assertionsSeen++;
     const name = m[2].trim();
+    // A PASS is counted here too: the question is which assertions RAN, and a
+    // control's passing assertion vanishing under a stub is exactly the loss
+    // this is looking for.
+    if (observed.names.has(name)) observed.names.set(name, observed.names.get(name) + 1);
+    else if (observed.names.size < MAX_TRACKED_NAMES) observed.names.set(name, 1);
+    else observed.namesTruncated = true;
+    if (m[1] !== "FAIL") return;
     // KEYED ON FAIL, not on the line matching the protocol at all. A passing
     // assertion whose name contains the expected text used to consume the slot
     // reserved for the failure, and the failure then scrolled out of the tail.
@@ -911,8 +937,11 @@ for (const entry of entries) {
   // `observed` is what the STUBBED run reported, counted line by line as it arrived.
   // `stubOutput` still goes with it, but only so the human-facing text has something
   // to quote; nothing in the verdict is derived from it any more.
+  // THE CONTROL'S COUNT TRAVELS TOO. It is the only thing that knows how many
+  // assertions this file reports on this tree, and without it a stubbed run that
+  // stopped early is indistinguishable from one that ran to the end.
   const verdict = classify({ controlExit: control.exit, stubExit: stub.exit, stubOutput: stub.output,
-                             observed: stub.observed,
+                             observed: stub.observed, controlObserved: control.observed,
                              hashChanged, restored, expectRed: entry.expectRed });
 
   // THE WHOLE TREE, rechecked after every entry.

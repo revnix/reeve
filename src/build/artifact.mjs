@@ -360,6 +360,28 @@ export function reviewArtifact({ phase, dir, expect }) {
     // alone this branch is unreachable from the documented caller, which passes
     // the helper's requirement set and no depth -- so the one path the check
     // exists for could never be taken.
+    // AND AN EXPECTATION THAT SAYS NEITHER IS REFUSED, rather than assumed to
+    // mean "not skipped".
+    //
+    // This branch has now been unreachable twice. First it keyed on
+    // `expect.depth`, which the documented helper does not carry. Reading the
+    // caller's `skipped` flag instead was still one layer short: S3-D's
+    // `researchExpectations(depth)` returns `{minCitationsPerClaim, minClaims}`
+    // and carries NEITHER -- so the ternary fell through to `undefined ===
+    // "trivial"`, false, every time, and the gate would review a research
+    // artifact for a phase that should not have run.
+    //
+    // Guessing in either direction is wrong and the two errors are not
+    // symmetric: assuming NOT skipped gates a phase that should have been
+    // skipped, silently, which is the case this branch exists to prevent.
+    // Assuming skipped refuses work that should be reviewed, loudly. So it
+    // refuses to guess, which also makes the contract enforceable: S3-D's helper
+    // must carry `skipped`, and until it does the refusal says so by name
+    // instead of the branch quietly never running.
+    if (!("skipped" in expect) && !("depth" in expect))
+      return { ok: false, why: "this expectation says neither whether RESEARCH was skipped nor at what depth, " +
+                               "and the two are different artifacts to gate; researchExpectations must carry `skipped`",
+               findings: [], sha256 };
     const researchSkipped = "skipped" in expect ? expect.skipped : expect.depth === "trivial";
     if (researchSkipped)
       return { ok: false, why: "RESEARCH is skipped at this depth; there is no research artifact to gate",
@@ -556,7 +578,13 @@ export function reviewArtifact({ phase, dir, expect }) {
           const doneCommand = (within) => {
             let open = null, first = null;
             for (const line of within.split("\n")) {
-              const m = /^[ \t]*(`{3,})([^`\n]*)$/.exec(line);
+              // AT MOST THREE SPACES. Four or more makes the line an indented CODE
+              // BLOCK, not a fence -- so a `Done when:` written with a
+              // four-space fence renders as literal text and this gate approved
+              // it as a machine-checkable command. `[ \t]*` accepted any
+              // indent; the limit is CommonMark's and a tab is worth four, so
+              // neither is admitted here.
+              const m = /^ {0,3}(`{3,})([^`\n]*)$/.exec(line);
               if (open === null) { if (m) { open = m[1]; first = null; } continue; }
               if (m && m[1].length >= open.length && m[2].trim() === "") {
                 if (first !== null) return first;

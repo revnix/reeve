@@ -731,7 +731,16 @@ export function openHub(path, { skipIntegrity = false } = {}) {
     const rows = db.prepare("SELECT version FROM schema_version ORDER BY version").all().map(r => r.version);
     // The rule itself is `historyGaps`, so the refusal here and the advice the
     // CLI prints are the same judgement rather than two implementations of it.
-    const gaps = historyGaps(rows, seen);
+    // CLOSED ON THE THROW TOO. `historyGaps` refuses a bound it cannot trust,
+    // and `schema_version` is an INTEGER PRIMARY KEY, so a hand-edited marker
+    // may hold a negative number -- which reaches that refusal rather than the
+    // branch below, and left the handle open. A caller that catches and retries
+    // then leaks one SQLite descriptor per attempt until unrelated file
+    // operations start failing, which is a failure nobody would trace back to a
+    // corrupt version marker.
+    let gaps;
+    try { gaps = historyGaps(rows, seen); }
+    catch (e) { closeHub(); throw e; }
     if (gaps.length) {
       closeHub();
       throw new Error(

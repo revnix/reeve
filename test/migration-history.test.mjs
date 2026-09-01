@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { openHub, completedVersion, missingMigrations, historyGaps, hasHistoryHole,
          HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
 // DERIVED, so a fixture cannot be written at a path the binary does not read.
@@ -382,6 +382,53 @@ const HUGE = 1000000000;
   check(digest(newer) !== beforeOpen,
     "control: but only AFTER writing to it, so reaching openHub at all is the defect",
     `${beforeOpen.slice(0, 12)} -> ${digest(newer).slice(0, 12)}`);
+}
+
+// ── A REFUSED MARKER DOES NOT LEAK THE HANDLE ──────────────────────────────
+//
+// `historyGaps` refuses a bound it cannot trust, and `schema_version` is an
+// INTEGER PRIMARY KEY, so a hand-edited marker may hold a NEGATIVE number --
+// which reaches that refusal rather than the hole branch below it, where the
+// close lives. A long-running process that catches and retries the open then
+// leaks one SQLite descriptor per attempt until unrelated file operations start
+// failing, which is a failure nobody would trace back to a corrupt marker.
+//
+// MEASURED AS A RATE, not a total. Descriptor counts move for reasons that have
+// nothing to do with this loop, so the assertion is that the count does not grow
+// in PROPORTION to the attempts -- and the control is the same loop over a
+// healthy hub, which closes properly, so a growing number there would mean the
+// instrument and not the defect.
+{
+  const openFds = () => { try { return readdirSync("/dev/fd").length; } catch { return -1; } };
+  check(openFds() > 0, "control: this platform reports open descriptors, so the leak is observable",
+    String(openFds()));
+  const ATTEMPTS = 120;
+  const drill = (p) => {
+    const before = openFds();
+    for (let i = 0; i < ATTEMPTS; i++) { try { openHub(p).close(); } catch { /* the point */ } }
+    return openFds() - before;
+  };
+  const negative = join(dir, "negative.db");
+  openHub(negative).close();
+  {
+    const q = new DatabaseSync(negative);
+    q.exec("DELETE FROM schema_version");
+    q.exec("INSERT INTO schema_version(version, applied_at) VALUES(-1, unixepoch())");
+    q.close();
+  }
+  let refused = null;
+  try { openHub(negative); } catch (e) { refused = String(e.message); }
+  check(refused !== null, "control: a negative version marker is refused, so the drill exercises the throw",
+    String(refused).slice(0, 120));
+  const leaked = drill(negative);
+  const healthy = join(dir, "healthy-drill.db");
+  openHub(healthy).close();
+  const baseline = drill(healthy);
+  check(leaked < ATTEMPTS / 4,
+    "a refused marker does not leak a descriptor per attempt", `${leaked} over ${ATTEMPTS} attempts`);
+  check(baseline < ATTEMPTS / 4,
+    "control: and neither does the same loop over a healthy hub, so the count is the defect and not the instrument",
+    `${baseline} over ${ATTEMPTS} attempts`);
 }
 
 rmSync(dir, { recursive: true, force: true });

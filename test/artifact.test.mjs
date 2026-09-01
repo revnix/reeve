@@ -19,6 +19,23 @@ import { applyTransition } from "../src/build/transition.mjs";
 import { isSameProcess, readStart } from "../src/supervisor.mjs";
 import { fileTask } from "../src/build/taskfile.mjs";
 import { writeArtifact, readArtifact, reviewArtifact } from "../src/build/artifact.mjs";
+
+// A THROW IS NOT A VERDICT.
+//
+// Under a stub these helpers are handed values the code was not written for, and
+// an exception does not fail an assertion -- it kills the FILE. Every assertion
+// after it never runs, and an assertion that never ran is indistinguishable in
+// the log from one that passed. That is not hypothetical: two entries in this
+// file reported CAUGHT while the run had stopped at 124 of 182.
+//
+// `ok: null` is neither true nor false, so whichever direction the consuming
+// assertion tests it goes red -- a throw is never silently read as a refusal --
+// and the rest of the file still reports. Sites that deliberately assert a throw
+// call the real functions directly and are untouched.
+const attempt = (fn) => {
+  try { return fn(); }
+  catch (e) { return { ok: null, threw: String(e.message), findings: [] }; }
+};
 import { reviewDiff } from "../src/sandbox.mjs";
 
 let fail = 0;
@@ -332,8 +349,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "minima");
   const gate = (body, phase = "RESEARCH") => {
-    writeArtifact({ dir: adir, phase, bytes: Buffer.from(body) });
-    return reviewArtifact({ phase, dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      writeArtifact({ dir: adir, phase, bytes: Buffer.from(body) });
+      return reviewArtifact({ phase, dir: adir, expect: { depth: "standard" } });
+    });
   };
   const empty = gate("# research\n\nprose, and no list items at all.\n");
   check(empty.ok === false, "a research artifact with NO claims is refused", JSON.stringify(empty.findings));
@@ -357,8 +376,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "urls");
   const gate = (body) => {
-    writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+    });
   };
   for (const url of ["http://localhost:3000", "https://example.com:8080", "ftp://host:21/x"]) {
     const r = gate(`# research\n\n- an unsupported claim ${url}\n`);
@@ -377,8 +398,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "sizing");
   const gate = (body) => {
-    writeArtifact({ dir: adir, phase: "SIZING", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      writeArtifact({ dir: adir, phase: "SIZING", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
+    });
   };
   for (const [label, body] of [["null", "null"], ["an array", "[]"], ["a scalar", "7"],
                                ["an empty object", "{}"]]) {
@@ -413,8 +436,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const FULL = { depth: "standard", est_files: 3, est_weighted_files: 4, est_packages: 1,
                  est_slices: 2, risk_paths_touched: ["packages/x"], rationale: "x" };
   const gate = (over) => {
-    writeArtifact({ dir: adir, phase: "SIZING", bytes: Buffer.from(JSON.stringify({ ...FULL, ...over })) });
-    return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      writeArtifact({ dir: adir, phase: "SIZING", bytes: Buffer.from(JSON.stringify({ ...FULL, ...over })) });
+      return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
+    });
   };
   // THE CONTROL FIRST, so every refusal below is caused by the field it changes
   // rather than by the fixture being wrong in some way none of them names.
@@ -450,8 +475,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "slices");
   const gate = (body) => {
-    writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+    });
   };
   const complete = "## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n";
   const bad = gate(`# design\n\n${complete}\n## Slice 2\n`);
@@ -588,8 +615,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "trailing");
   const gate = (body) => {
-    writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+    });
   };
   const one = "## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n";
   const bad = gate(`# design\n\n${one}\n## Slice 2\n\n## Notes\nFiles: x\nPackages: y\nTests: z\nDone when: w\n`);
@@ -614,8 +643,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "citeshape");
   const g = (body) => {
-    writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+    });
   };
   for (const token of ["12:30", "issue:42", "PR:103", "10:00"])
     check(g(`# r\n\n- a claim, observed at ${token}\n`).ok === false,
@@ -632,8 +663,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "labelvalues");
   const g = (body) => {
-    writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+    });
   };
   const bare = g("# d\n\n## Slice 1\nFiles:\nPackages:\nTests:\nDone when:\n");
   check(bare.ok === false, "a slice carrying the bare scaffold is refused", JSON.stringify(bare.findings));
@@ -653,8 +686,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "sizingcontract");
   const g = (o) => {
-    writeArtifact({ dir: adir, phase: "SIZING", bytes: Buffer.from(JSON.stringify(o)) });
-    return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      writeArtifact({ dir: adir, phase: "SIZING", bytes: Buffer.from(JSON.stringify(o)) });
+      return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
+    });
   };
   const full = { depth: "standard", est_files: 3, est_weighted_files: 4, est_packages: 1,
                  est_slices: 2, risk_paths_touched: [], rationale: "because" };
@@ -730,9 +765,11 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   // AND IT STILL REFUSES, so accepting the producer's shape did not make the
   // gate permissive. Each of these is the documented shape with one thing removed.
   const g = (body) => {
-    const d2 = join(dir, `doc${Math.random().toString(36).slice(2, 8)}`);
-    writeArtifact({ dir: d2, phase: "DESIGN", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "DESIGN", dir: d2, expect: { depth: "standard" } });
+    return attempt(() => {
+      const d2 = join(dir, `doc${Math.random().toString(36).slice(2, 8)}`);
+      writeArtifact({ dir: d2, phase: "DESIGN", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "DESIGN", dir: d2, expect: { depth: "standard" } });
+    });
   };
   check(g(documented.replace(/- Files:[^\n]*\n/, "")).ok === false,
     "control: the documented shape missing its Files line is refused");
@@ -750,8 +787,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "markers");
   const g = (body) => {
-    writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+    });
   };
   for (const marker of ["-", "*", "+", "1.", "1)"]) {
     const r = g(`# r\n\n- a cited claim (src/x.mjs:1)\n${marker} an uncited claim\n`);
@@ -775,9 +814,11 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const slice = "# d\n\n## Slices\n\n### Slice 1: x\n- Files: a\n- Packages: b\n- Test plan: c\n\n";
   const g = (body, expect) => {
-    const d2 = join(dir, `req${Math.random().toString(36).slice(2, 8)}`);
-    writeArtifact({ dir: d2, phase: "DESIGN", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "DESIGN", dir: d2, expect });
+    return attempt(() => {
+      const d2 = join(dir, `req${Math.random().toString(36).slice(2, 8)}`);
+      writeArtifact({ dir: d2, phase: "DESIGN", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "DESIGN", dir: d2, expect });
+    });
   };
   const fenced = slice + "Done when:\n\n```bash\npnpm test\n```\n";
   check(g(fenced, { requireMeasuredContext: true }).ok === false,
@@ -805,10 +846,15 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 // failing to cite it. The gate was rejecting the honest disclosure that research
 // is supposed to carry.
 {
+  // `skipped: false` SAID OUT LOUD, because the gate refuses an expectation that
+  // says neither whether the phase was skipped nor at what depth. This block is
+  // about where claims live, not about the skip flag.
   const g = (body, expect = { minClaims: 1 }) => {
-    const d2 = join(dir, `sc${Math.random().toString(36).slice(2, 8)}`);
-    writeArtifact({ dir: d2, phase: "RESEARCH", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "RESEARCH", dir: d2, expect });
+    return attempt(() => {
+      const d2 = join(dir, `sc${Math.random().toString(36).slice(2, 8)}`);
+      writeArtifact({ dir: d2, phase: "RESEARCH", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "RESEARCH", dir: d2, expect: { skipped: false, ...expect } });
+    });
   };
   check(g("# Research\n\n## Findings\n\n- a cited claim (src/x.mjs:1)\n\n## Limitations\n\n- no network was available\n").ok === true,
     "a bullet outside Findings is not a claim and does not need a citation");
@@ -853,10 +899,21 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 
 // ── The eight refinements, each verified in both directions ────────────────
 {
+  // EVERY RESEARCH EXPECTATION SAYS WHETHER THE PHASE WAS SKIPPED, because the
+  // gate refuses to guess. These blocks are about citations and claims, not
+  // about the skip flag, so the helper supplies `skipped: false` for them --
+  // and a caller that means something else says so, which the skip block below
+  // does. Written the other way round, with the gate defaulting, the flag would
+  // be absent from every real call and the branch that reads it unreachable,
+  // which is exactly how it came to be unreachable twice.
   const g = (phase, body, expect) => {
-    const d2 = join(dir, `fu${Math.random().toString(36).slice(2, 8)}`);
-    writeArtifact({ dir: d2, phase, bytes: Buffer.from(body) });
-    return reviewArtifact({ phase, dir: d2, expect });
+    return attempt(() => {
+      const d2 = join(dir, `fu${Math.random().toString(36).slice(2, 8)}`);
+      writeArtifact({ dir: d2, phase, bytes: Buffer.from(body) });
+      const said = phase !== "RESEARCH" || "skipped" in expect || "depth" in expect
+        ? expect : { ...expect, skipped: false };
+      return reviewArtifact({ phase, dir: d2, expect: said });
+    });
   };
   const SZ = { depth: "standard", est_files: 3, est_weighted_files: 4, est_packages: 1,
                est_slices: 2, risk_paths_touched: [], rationale: "x" };
@@ -985,6 +1042,25 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
     "a caller declaring the phase skipped is refused without carrying a depth");
   check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n", { skipped: false }).ok === true,
     "control: and one declaring it not skipped is gated normally");
+  // AND AN EXPECTATION THAT SAYS NEITHER IS REFUSED rather than assumed.
+  //
+  // This branch has been unreachable twice: first keyed on `expect.depth`, which
+  // the documented helper does not carry, then on `expect.skipped`, which
+  // S3-D's `researchExpectations(depth)` does not carry either -- it returns
+  // `{minCitationsPerClaim, minClaims}` and nothing else, so the ternary fell
+  // through to false every time and a phase that should not have run would have
+  // had its artifact reviewed. Refusing to guess is what makes the contract
+  // enforceable: the refusal names the field the helper must carry.
+  const ambiguous = reviewArtifact({ phase: "RESEARCH", dir: (() => {
+    const d2 = join(dir, "ambig");
+    writeArtifact({ dir: d2, phase: "RESEARCH", bytes: Buffer.from("# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n") });
+    return d2;
+  })(), expect: { minCitationsPerClaim: 1, minClaims: 1 } });
+  check(ambiguous.ok === false && /neither whether RESEARCH was skipped/.test(String(ambiguous.why)),
+    "an expectation carrying neither skipped nor depth is refused, naming what it must carry",
+    JSON.stringify(ambiguous.why));
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n", { depth: "standard" }).ok === true,
+    "control: and one carrying a depth instead is unambiguous, and passes");
 
   // A FENCE MUST CLOSE. An unterminated fence satisfied the opening test, and the
   // rest of the document is then inside it.
@@ -1017,6 +1093,16 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   // for a fence that could start lines above where it actually did.
   check(g("DESIGN", sl + "  ```bash\n  pnpm test\n  ```\n", { requireDoneCondition: true }).ok === true,
     "control: and an indented fence is still a fence");
+  check(g("DESIGN", sl + "   ```bash\n   pnpm test\n   ```\n", { requireDoneCondition: true }).ok === true,
+    "control: three spaces is the most an indented fence may carry, and still passes");
+  // FOUR SPACES IS A CODE BLOCK, not a fence. Markdown renders those lines as
+  // literal text, so a done condition written that way has no fenced block at
+  // all -- and the gate approved it as a machine-checkable command. The limit is
+  // CommonMark's, not one chosen to stop a loop.
+  check(g("DESIGN", sl + "    ```bash\n    pnpm test\n    ```\n", { requireDoneCondition: true }).ok === false,
+    "a done condition indented four spaces is an indented code block, not a fence");
+  check(g("DESIGN", sl + "\t```bash\n\tpnpm test\n\t```\n", { requireDoneCondition: true }).ok === false,
+    "and a tab is worth four, so it is not a fence either");
   // AND THE COMMAND IS NOT ITSELF A DELIMITER. An EMPTY block -- an opener and
   // an immediate closer -- put that closing delimiter in the command position,
   // and the lazy scan then found a LATER delimiter to close on. The gate reported

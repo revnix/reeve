@@ -992,6 +992,28 @@ export const STUBS = [
     }],
   },
   {
+    name: "dash-renders-the-pull-requests-it-carries",
+    why: "finish a task row without reading `t.prs`. The model carries every open pull request and --json hands them over, so the machine shape stays right while the DEFAULT rendering -- the one an operator actually reads -- shows a task waiting on a review that already exists as a task waiting on nothing. This is the ninth instance of one shape on this surface, a value carried in the model and dropped by the renderer, and it survived the structural guard built to close that shape: the walk descended objects and treated every ARRAY as an opaque leaf, so each list a row carried was exempt without ever being named as an exception",
+    test: "test/build-dash.test.mjs",
+    expectRed: "every value a digest row carries into the model reaches the human render",
+    edits: [{
+      file: "src/build/dash.mjs",
+      find: "    for (const p of t.prs)\n      out.push(`      pull request ${p.kind} #${p.pr}  ${p.head_sha}`);\n",
+      replace: "",
+    }],
+  },
+  {
+    name: "task-readers-refuse-an-argument-they-do-not-read",
+    why: "let a bare word typed at a task reader be discarded in silence. The argv walk refuses an unknown flag and `inapplicable` refuses a known flag on a command that cannot act on it; a POSITIONAL was governed by neither, so `reeve task dash <cursor>` dropped the cursor, answered from the beginning of the log, printed an empty movement list and exited 0 -- which is byte-identical to a genuinely quiet period and is the one combination nothing downstream can detect. `task show a b c` answered about `a` on the same terms",
+    test: "test/build-dash.test.mjs",
+    expectRed: "a cursor typed as a positional is refused, not discarded",
+    edits: [{
+      file: "bin/reeve.flags.mjs",
+      find: "  return rest.length > spec.takes ? rest.slice(spec.takes) : null;",
+      replace: "  return null;",
+    }],
+  },
+  {
     name: "cli-task-reaches-its-own-body",
     why: "stop the `task` label from matching, so the command falls past its own body. This CLI's case labels share fall-through blocks and `task` sits directly above `build` -- the position that captured status, statusline and dash for a full day when `shadow` landed there. A route that does not reach its body does not error in an obvious way; it runs the NEXT command's body against the operator's arguments, which is how a read command became a write one",
     test: "test/cli-routing.test.mjs",

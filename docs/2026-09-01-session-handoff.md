@@ -31,6 +31,22 @@ set -o pipefail
 export PATH="$HOME/.nvm/versions/node/v24.17.0/bin:$PATH"   # node 24 is a floor
 cd ~/Work/Products/reeve || exit 1
 
+# ONE ACCUMULATOR, and the block exits from it.
+#
+# Three findings in two review rounds were all this shape: a step's non-zero
+# status printed and then overwritten by whatever ran next, so the block reported
+# success while a gate inside it said no. Fixing them one at a time left the twin
+# standing each time -- the sweep was repaired and the merge gates were not, in the
+# same commit. So the read that can be forgotten is gone: every fallible step calls
+# `refused`, and the last line exits from what it accumulated.
+#
+# READS THAT MUST ABORT still abort on the spot, and they are a different thing: a
+# failed fetch or a failed pull-request listing makes every line below it answer
+# from stale or empty data, and continuing would produce confident wrong output
+# rather than an incomplete report.
+blockrc=0
+refused() { blockrc=1; echo "SECTION 0 REFUSES: $*"; }
+
 # CHAINED, because a failed fetch is silent and every read below then answers from the
 # CACHED remote-tracking ref. The line labelled "what `main` is" would report stale
 # state at exactly the moment this block exists to re-measure it.
@@ -129,13 +145,18 @@ grep "shadow:" ~/.reeve/reeve.log | tail -1 \
 # passed over in silence: a gate that did not run and a gate that said yes must not
 # look alike, which is the same rule the rest of this block is built on.
 if [ -n "${open_pr:-}" ]; then
-  node scripts/premerge.mjs "$open_pr"                # SHOULD this merge happen
+  node scripts/premerge.mjs "$open_pr" \
+    || refused "premerge says this merge should not happen (#$open_pr)"   # SHOULD this merge happen
 fi
 if [ -n "${merged_pr:-}" ]; then
-  node scripts/verify-merge.mjs "$merged_pr"          # did that merge carry everything
+  node scripts/verify-merge.mjs "$merged_pr" \
+    || refused "verify-merge says that merge did not carry everything (#$merged_pr)"
 fi
+# NO GATE IS A REFUSAL, not a warning. A block whose exit status cannot tell "no
+# gate ran" from "the gate said yes" is the same defect as one that drops a gate's
+# verdict, and a caller reads the status rather than the text.
 if [ -z "${open_pr:-}${merged_pr:-}" ]; then
-  echo "NO MERGE GATE RAN — set open_pr=<number> of an OPEN pull request, or merged_pr=<number> of a MERGED one"
+  refused "no merge gate ran — set open_pr=<number> of an OPEN pull request, or merged_pr=<number> of a MERGED one"
 fi
 # ~4ms; every anchor still resolves. IN FLIGHT when this was written, so check it
 # exists first: a missing file exits MODULE_NOT_FOUND, which is not the same answer
@@ -143,8 +164,9 @@ fi
 # ABSENT IS NOT CLEAN. `[ -f x ] && node x` skips silently when the file is not there,
 # and the sweep below then runs as though no anchor had failed -- the two outcomes the
 # comment above says must differ, rendered identically.
-if [ -f test/anchors-resolve.test.mjs ]; then node test/anchors-resolve.test.mjs
-else echo "anchors-resolve is ABSENT -- this checkout cannot answer the anchor question"; exit 1; fi
+if [ -f test/anchors-resolve.test.mjs ]; then
+  node test/anchors-resolve.test.mjs || refused "a manifest anchor no longer resolves"
+else refused "anchors-resolve is ABSENT -- this checkout cannot answer the anchor question"; fi
 # ~20 minutes, and run it in an ISOLATED detached worktree at a COMMITTED head. It
 # writes stubbed source and restores a startup snapshot, so an edit made while it runs
 # is silently overwritten — and this checkout is shared by three sessions.
@@ -189,10 +211,12 @@ git worktree remove --force "$sweepdir"
 # exit status came from whatever ran last, so a FAILED sweep left an authoritative
 # block reporting success -- the pre-merge gate treated as passed on a run that said
 # no. Both statuses are named, and either one non-zero fails the block.
-[ "$covrc" -eq 0 ] || echo "COVERAGE READ FAILED (exit $covrc) -- do not read the absence as zero debt"
-[ "$sweeprc" -eq 0 ] || echo "THE SWEEP FAILED (exit $sweeprc) -- read the verdict list, not the exit alone"
+[ "$covrc" -eq 0 ] || refused "the coverage read failed (exit $covrc) -- do not read the absence as zero debt"
+[ "$sweeprc" -eq 0 ] || refused "the sweep failed (exit $sweeprc) -- read the verdict list, not the exit alone"
 echo "sweep exit: $sweeprc; coverage exit: $covrc"
-[ "$covrc" -eq 0 ] && [ "$sweeprc" -eq 0 ] || exit 1
+
+# THE LAST LINE, and the only place this block decides anything.
+exit "$blockrc"
 ```
 
 ### 0.2 Facts no command answers — the ones that need a person

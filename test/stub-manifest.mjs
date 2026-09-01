@@ -1237,4 +1237,13 @@ export const STUBS = [
               find: "      const h = HANDLERS[e.kind];",
               replace: "      const h = e.kind === \"provider_measurement.recorded\" ? undefined : HANDLERS[e.kind];" }],
   },
+  {
+    name: "measurement-checks-the-restore-lock-inside-the-lock",
+    why: "move the maintenance check out of the transaction, back to where it ran before review found it. A top-level SAVEPOINT is DEFERRED and takes no write lock until its first write, so a restore can take `maintenance_lock` and capture its tail in the window after the check passes -- the row and its event then land in the database the restore is about to replace, and the swap drops both while the call reports success. The stub is the weaker ordering, not a deleted check, because the check being ABSENT is not the defect: the defect is the check being true at a moment that no longer holds when the write happens",
+    test: "test/provider-measurement.test.mjs",
+    expectRed: "a write is refused while a restore holds the maintenance lock",
+    edits: [{ file: "src/build/measurementdb.mjs",
+              find: "  const body = () => {\n    assertWritable(db, { isAlive, inTx: true });",
+              replace: "  const body = () => {" }],
+  },
 ];

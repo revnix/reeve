@@ -205,6 +205,39 @@ try {
   for (const col of ["provider", "kind", "result", "evidence", "measured_at"])
     check(payload[col] !== undefined, `and the event carries the whole row image: ${col}`, ev?.payload);
 
+  // ---- THE MAINTENANCE LOCK, which is what a restore holds so writes stop.
+  // The check runs INSIDE the immediate transaction, not before it: a top-level
+  // SAVEPOINT is DEFERRED and takes no write lock until its first write, so a
+  // restore could take the lock and capture its tail in the window after a
+  // pre-transaction check passed. The row and its event would land in the
+  // database the restore was about to replace, and the swap would drop both
+  // while the call reported success.
+  const heldBefore = db.prepare(`SELECT count(*) c FROM provider_measurement`).get().c;
+  // EVERY COLUMN THE DDL DECLARES. `LOCK_COLUMNS` names three and the table has
+  // four; taking the constant for the schema produced a NOT NULL failure on
+  // `acquired_at` that aborted this file after 47 of its assertions.
+  db.prepare(`INSERT INTO maintenance_lock(name,pid,lstart,acquired_at) VALUES('restore',?,?,?)`)
+    .run(process.pid, "fixture", now - 1);
+  refuses(() => recordMeasurement(db, { isAlive: LIVE, kind: KIND, result: "SHARED",
+                                        evidence: "e", measuredAt: now - 1 }),
+          /a restore is in progress/,
+          "a write is refused while a restore holds the maintenance lock");
+  check(db.prepare(`SELECT count(*) c FROM provider_measurement`).get().c === heldBefore,
+        "control: and the refused write left no row behind");
+  const evDuring = db.prepare(
+    `SELECT count(*) c FROM hub_event WHERE kind='provider_measurement.recorded'`).get().c;
+  db.prepare(`DELETE FROM maintenance_lock WHERE name='restore'`).run();
+  // A DIFFERENT TIMESTAMP from the refused write above. Reusing it couples this
+  // step to that write having actually been refused -- and when a stub removes
+  // the lock check, the earlier row DOES land, so this collides on the primary
+  // key and throws, aborting the file two assertions short. A fixture step must
+  // not assume the step before it failed; that is the assumption under test.
+  recordMeasurement(db, { isAlive: LIVE, kind: KIND, result: "SHARED",
+                          evidence: "after the restore released", measuredAt: now - 2 });
+  check(db.prepare(`SELECT count(*) c FROM hub_event WHERE kind='provider_measurement.recorded'`).get().c
+        === evDuring + 1,
+        "control: with the lock released the same write succeeds, so the refusal was the lock and not the data");
+
   // ---- the vocabulary is frozen, so a caller cannot widen it at runtime
   let widened = false;
   try { MEASUREMENT_KINDS[KIND].push("DEFINITELY"); widened = true; } catch { /* frozen */ }

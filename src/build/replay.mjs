@@ -32,6 +32,10 @@ export const COMPARISON_SET = [
   // table that replay writes and the drill does not compare is a projection
   // nothing proves came back.
   "escalation",
+  // And `provider_measurement`, for that same reason. The drill is the only
+  // thing that proves the handler above actually restores the row rather than
+  // merely being registered.
+  "provider_measurement",
 ];
 
 /**
@@ -84,6 +88,11 @@ const HANDLERS = {
   // for. Keyed on `why`, which is the table's primary key, so the upsert is
   // idempotent across a re-replay.
   "escalation.raised":        { table: "escalation", key: ["why"] },
+  // A measurement recorded after the last snapshot exists ONLY in the tail, so
+  // without this handler a normal restore drops it while reporting success --
+  // and what it drops is the answer the arming gate reads, with its evidence.
+  // Keyed on the primary key so a re-replay is idempotent.
+  "provider_measurement.recorded": { table: "provider_measurement", key: ["provider","kind","measured_at"] },
   // A PARTIAL row image, and legitimately so: the upsert is by primary key, so
   // replaying it sets `depth` and leaves every other column as the last full
   // image left it. S2-B's depth override writes this on both the accepted-and-

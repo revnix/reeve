@@ -2066,8 +2066,8 @@ export const STUBS = [
     expectRed: "control: and the row still stands, because nothing has been told yet",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "      if (pages(why)) { clearable.push(why); continue; }",
-      replace: "      if (false) { clearable.push(why); continue; }",
+      find: "      if (pages(why) && standing.get(why).announced_count > 0) {",
+      replace: "      if (false) {",
     }],
   },
   {
@@ -2077,7 +2077,7 @@ export const STUBS = [
     expectRed: "control characters are neutralised before the message leaves",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "    const message = redact(printable(raw));",
+      find: "    const message = redact(raw);",
       replace: "    const message = raw;",
     }],
   },
@@ -2088,7 +2088,7 @@ export const STUBS = [
     expectRed: "and the rendered alert carries it, which is the only place a phone shows it",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "        `${action ? `\\n-> ${action}` : \"\"}${detail}`;",
+      find: "        `${action ? `\\n-> ${clean(action)}` : \"\"}${detail}`;",
       replace: "        `${detail}`;",
     }],
   },

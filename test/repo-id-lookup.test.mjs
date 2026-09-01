@@ -32,18 +32,20 @@ const PROJECT = { name: "o/r", nwo: "o/r" };
 {
   const p = join(dir, "known.db");
   const h = openHub(p);
-  h.exec(`INSERT INTO task(id,project,repo_id,nwo_snapshot,title,phase,generation,source_kind,source_key,
-            repo_path,profile_path,profile_hash,default_branch,visibility,registry_version,created_at,updated_at)
-          VALUES('bt:1','o/r',4242,'o/r','t','FILED',1,'founder','k','/p','/f','h','main','private',1,
-                 unixepoch(),unixepoch())`);
+  // THE IDENTITY, not a task. The lookup reads `project_identity` so the guardian
+  // can answer it through its restricted connection; a fixture that still wrote
+  // only a task would have gone on passing while the read moved, which is the
+  // shape this file exists to catch.
+  h.exec(`INSERT INTO project_identity(project,repo_id,learned_at) VALUES('o/r',4242,unixepoch())`);
   h.close();
   check(await resolveRepoIdAt(p, PROJECT) === 4242,
     "control: a hub holding the id answers with it");
 }
 
 // ── a hub that was never built is BENIGN ──────────────────────────────────
-// `task` arrives with migration 1, so `no such table` on a store recording no
-// completed migration is a machine with no builder on it -- an ordinary state.
+// `project_identity` arrives with migration 5, so `no such table` on a store
+// recording no completed migration is a machine with no builder on it -- an
+// ordinary state.
 {
   const p = join(dir, "unbuilt.db");
   new DatabaseSync(p).close();               // a real SQLite file, zero migrations
@@ -66,12 +68,13 @@ const PROJECT = { name: "o/r", nwo: "o/r" };
   const p = join(dir, "damaged.db");
   openHub(p).close();
   const w = new DatabaseSync(p);
-  w.exec("DROP TABLE task");
+  w.exec("DROP TABLE project_identity");
   w.close();
   check(completedVersion(p) >= 1, "fixture: the store records a completed migration",
     String(completedVersion(p)));
   const err = await threw(() => resolveRepoIdAt(p, PROJECT));
-  check(err != null, "a store that recorded a migration and lost `task` PROPAGATES", "it returned instead of throwing");
+  check(err != null, "a store that recorded a migration and lost `project_identity` PROPAGATES",
+    "it returned instead of throwing");
   check(/no such table/i.test(err?.message ?? ""),
     "and the failure it propagates is the one the store gave", String(err?.message));
 }

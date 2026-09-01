@@ -347,6 +347,33 @@ export function admitTask(db, snapshot, filing, { isAlive = () => true } = {}) {
     hubEvent(db, { kind: "task.filed", task: filing.id,
       payload: db.prepare(`SELECT * FROM task WHERE id = ?`).get(filing.id) });
 
+    // THE IDENTITY, written where the id is already known and trusted.
+    //
+    // `snapshot.repoId` came from the API client, so it is a number GitHub gave
+    // us rather than one derived from a name. Recording it here rather than
+    // deriving it later is what lets the guardian read an identity instead of
+    // the builder's work table: `task` is not on its allowlist and must not be,
+    // and the alternative was a privileged handle opened in the CLI.
+    //
+    // NO FOREIGN KEY, so its position among these events is free -- unlike
+    // `task_territory` above, which must follow its task. It is written next to
+    // the task because that is where the fact is learned, not because the order
+    // matters.
+    //
+    // A CHANGED ID IS RECORDED, not ignored. An id does not change for a rename
+    // or a transfer, which is the whole reason this is keyed on the project --
+    // but a repository deleted and recreated under the same key is a different
+    // repository, and the newest admission is the one that saw it. That is the
+    // rule `repoid.mjs` already states for the read; the write agrees with it.
+    db.prepare(
+      `INSERT INTO project_identity(project, repo_id, learned_at)
+       VALUES(?,?,unixepoch())
+       ON CONFLICT(project) DO UPDATE SET repo_id = excluded.repo_id, learned_at = excluded.learned_at
+        WHERE project_identity.repo_id <> excluded.repo_id`)
+      .run(filing.project, snapshot.repoId);
+    hubEvent(db, { kind: "project_identity.learned", task: filing.id,
+      payload: db.prepare(`SELECT * FROM project_identity WHERE project = ?`).get(filing.project) });
+
     for (const claim of claims) {
       db.prepare(
         `INSERT INTO task_territory(task, kind, path, pinned) VALUES(?,?,?,?)`)

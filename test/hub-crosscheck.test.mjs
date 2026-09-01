@@ -31,7 +31,7 @@ const inDb = new Set(db.prepare(
   "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all().map(r => r.name));
 const declared = new Set(Object.keys(TABLE_OWNERS));
 
-check(inDb.size === 33, `the hub has exactly 33 tables (got ${inDb.size})`, [...inDb].sort().join(","));
+check(inDb.size === 34, `the hub has exactly 34 tables (got ${inDb.size})`, [...inDb].sort().join(","));
 
 // direction 0: HUB_TABLES, the set snapshot validation uses, equals the live one.
 // Task 8's paragraph promised this assertion and no test made it: HUB_TABLES is

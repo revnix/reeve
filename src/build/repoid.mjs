@@ -20,21 +20,26 @@ import { completedVersion, HUB_BUSY_TIMEOUT_MS } from "./hubdb.mjs";
 /**
  * The numeric repository id the hub already knows for a project.
  *
- * `task.repo_id` is written at admission from the snapshot `resolveSnapshot`
- * took through the API client, so it is a value GitHub gave us rather than one
- * derived from a name.
+ * READ FROM `project_identity`, not from `task`. Both are written at admission
+ * from the snapshot `resolveSnapshot` took through the API client, so either is
+ * a value GitHub gave us rather than one derived from a name -- but only one of
+ * them is a table the GUARDIAN may read. `task` is the builder's work table and
+ * is deliberately absent from the guest allowlist, so reading it here forced the
+ * id to reach the guardian through a privileged handle opened in the CLI. The
+ * identity table is the id and nothing else, and the guardian reads it directly.
  *
- * MATCHED ON THE REGISTRY PROJECT KEY, not on the nwo. The first version keyed
- * on `nwo_snapshot` while its own comment said a repository can be renamed and
- * that column is only ever a snapshot -- so the moment a repository was renamed
- * or transferred, `projects.json` supplied the new name, every existing task
- * still carried the old one, and the lookup returned null for a repository whose
- * numeric id the hub was holding all along. The project key is what does not
- * move: `task.project` IS the registry key, written at admission from the same
- * `projects.json` entry this lookup is resolving.
+ * MATCHED ON THE REGISTRY PROJECT KEY, not on the nwo, and the table is keyed on
+ * it for the same reason. An earlier version of this lookup keyed on
+ * `nwo_snapshot` while its own comment said a repository can be renamed and that
+ * column is only ever a snapshot -- so the moment a repository was renamed or
+ * transferred, `projects.json` supplied the new name, every existing task still
+ * carried the old one, and the lookup returned null for a repository whose
+ * numeric id the hub was holding all along.
  *
- * The most recently updated task wins, so if an id ever did change, the newest
- * admission is the one that saw the current repository.
+ * ONE ROW PER PROJECT, so there is no longer an ordering to get right. The
+ * previous version took the most recently updated task, and the writer preserves
+ * that meaning: a changed id updates the row, because the newest admission is
+ * the one that saw the current repository.
  *
  * Returns null for a project the hub has never admitted a task for. That is a
  * real state in S2 -- a registered project with no work yet -- and it is not an
@@ -52,7 +57,7 @@ import { completedVersion, HUB_BUSY_TIMEOUT_MS } from "./hubdb.mjs";
 export function repoIdFromHub(hub, project) {
   if (!hub || !project?.name) return null;
   return hub.prepare(
-    `SELECT repo_id FROM task WHERE project = ? ORDER BY updated_at DESC, id DESC LIMIT 1`)
+    `SELECT repo_id FROM project_identity WHERE project = ?`)
     .get(project.name)?.repo_id ?? null;
 }
 

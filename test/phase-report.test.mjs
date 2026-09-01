@@ -5,9 +5,21 @@
 // empty object is the cheapest possible assertion and it passes against a schema
 // that is almost entirely absent -- the accepting half is what stops this file
 // being green against a validator that refuses everything.
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, lstatSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PHASES, BUILD_ACTION_FOR, BUILD_ACTIONS } from "../src/build/phases.mjs";
 import { ACTIONS, PHASE_FOR_ACTION, schemaFor, validateReport, evidenceFor, badReportPlan }
   from "../src/build/report.mjs";
+// THROUGH `applyTransition`, not `nextPhase` alone. A pure-function assertion
+// cannot see whether a refusal reached the database, and the database is what
+// `task why` renders -- so a refusal that is decided and not recorded is
+// indistinguishable, months later, from a report that was never sent.
+import { openHub } from "../src/build/hubdb.mjs";
+import { applyTransition } from "../src/build/transition.mjs";
+import { isSameProcess, readStart } from "../src/supervisor.mjs";
+import { fileTask } from "../src/build/taskfile.mjs";
+import { writeArtifact } from "../src/build/artifact.mjs";
 
 let fail = 0;
 const check = (ok, name, detail) => {
@@ -182,5 +194,134 @@ const DESIGN_OK = { outcome: "ok", reason: "designed", artifact: "design.md",
   check(missing !== null, "control: and being told nothing is refused rather than assumed", String(missing));
 }
 
+// ── And through the machine, not only through the map ───────────────────────
+//
+// Everything above is a pure function answering about another pure function.
+// This is a real task, in a real phase, with every refusal asserted where it is
+// RECORDED rather than where it is decided.
+const dir = mkdtempSync(join(tmpdir(), "reeve-report-"));
+const repo = join(dir, "repo");
+mkdirSync(join(repo, "packages", "x"), { recursive: true });
+writeFileSync(join(repo, "p.json"), "{}\n");
+const registry = { version: 1, projects: {
+  nextly: { nwo: "nextlyhq/nextly", repoPath: repo, profilePath: join(repo, "p.json") } } };
+const io = { lstat: (p) => lstatSync(p), lsTree: () => null,
+  repoId: async () => 42, profileHash: async () => "ph-1", defaultBranch: async () => "main",
+  visibility: async () => "private", specRepoId: async () => 77,
+  gateDefinitionHash: async () => "gd-1", founderUserId: async () => 9 };
+
+let dbn = 0;
+const inSizing = async (title) => {
+  const db = openHub(join(dir, `h${++dbn}.db`));
+  const f = await fileTask({ db, registry, project: "nextly", title,
+    territory: ["packages/x"], io, isAlive: isSameProcess,
+    pid: process.pid, lstart: readStart(process.pid) });
+  const t = applyTransition(db, { taskId: f.task, expectedPhase: "FILED", expectedGeneration: 1,
+    evidence: { kind: "phase.succeeded", phase: "FILED" }, op: "phase.advanced", isAlive: isSameProcess });
+  check(f.ok === true && t.applied === true, `fixture: ${title} is in SIZING`,
+    JSON.stringify({ filed: f.ok, why: f.why, advanced: t }));
+  return { db, id: f.task };
+};
+const phaseOf = (db, id) => db.prepare("SELECT phase FROM task WHERE id=?").get(id).phase;
+const lastRefusal = (db, id) => db.prepare(
+  "SELECT payload FROM hub_event WHERE task=? AND kind='transition.refused' ORDER BY seq DESC LIMIT 1")
+  .get(id)?.payload ?? "";
+
+// A report that names the wrong phase advances nothing, and the refusal says so.
+{
+  const { db, id } = await inSizing("mis-attributed");
+  const ev = evidenceFor({ action: "BUILD_RESEARCH", report: RESEARCH_OK });
+  const r = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
+    evidence: ev, artifactSha: "a".repeat(64), op: "phase.advanced", isAlive: isSameProcess });
+  check(r.applied === false && r.reason === "refused",
+    "a RESEARCH report against a task in SIZING is refused", JSON.stringify(r));
+  check(/RESEARCH report cannot advance a task in SIZING/.test(String(r.refusal)),
+    "with the machine's own message", String(r.refusal));
+  check(lastRefusal(db, id).includes("cannot advance"),
+    "and the refusal is the reason RECORDED, not merely returned", lastRefusal(db, id));
+  check(phaseOf(db, id) === "SIZING", "and the task did not move", phaseOf(db, id));
+  db.close();
+}
+
+// A SIZING report with no depth is refused with the section 5 message.
+{
+  const { db, id } = await inSizing("no depth");
+  const { depth, ...noDepth } = SIZE_OK;
+  const r = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
+    evidence: evidenceFor({ action: "BUILD_SIZE", report: noDepth }),
+    artifactSha: "b".repeat(64), op: "phase.advanced", isAlive: isSameProcess });
+  check(r.applied === false, "a SIZING report that names no depth is refused", JSON.stringify(r));
+  check(/must name the depth it selected/.test(String(r.refusal)),
+    "with the message that says why the depth is load-bearing", String(r.refusal));
+  // AND THE VALIDATOR IS NOT WHAT REFUSED IT. The schema deliberately does not
+  // require `depth`, so a blocked sizing worker need not invent one -- which
+  // means this refusal has to come from the machine, and only asserting it
+  // through applyTransition can tell the two apart.
+  check(validateReport("BUILD_SIZE", noDepth).ok === true,
+    "control: the schema itself accepts a depth-less report",
+    JSON.stringify(validateReport("BUILD_SIZE", noDepth)));
+  db.close();
+}
+
+// A blocked outcome with no escalation identity reaches no founder, so it is
+// refused rather than held silently.
+{
+  const { db, id } = await inSizing("blocked with no identity");
+  const r = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
+    evidence: evidenceFor({ action: "BUILD_SIZE",
+      report: { outcome: "blocked", reason: "stuck", escalation: "  " } }),
+    op: "hold", isAlive: isSameProcess });
+  check(r.applied === false, "a blocked_other hold with an empty escalation is refused", JSON.stringify(r));
+  check(/no identity reaches no founder/.test(String(r.refusal)),
+    "and says that a hold nobody is told about is not a hold", String(r.refusal));
+  check(phaseOf(db, id) === "SIZING", "and the task did not enter BLOCKED", phaseOf(db, id));
+
+  const ok = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
+    evidence: evidenceFor({ action: "BUILD_SIZE",
+      report: { outcome: "blocked", reason: "stuck", escalation: "bt:x:phase:blocked:SIZING" } }),
+    op: "hold", isAlive: isSameProcess });
+  check(ok.applied === true && phaseOf(db, id) === "BLOCKED",
+    "control: the same hold WITH an identity is accepted", JSON.stringify(ok));
+  db.close();
+}
+
+// Malformed structured output: one resumed retry, then ESCALATED, with the
+// identity the machine mints from the phase.
+{
+  const { db, id } = await inSizing("bad report");
+  check(badReportPlan({ resumedAlready: false }).resume === true,
+    "control: the first malformed report is retried, not escalated");
+  const plan = badReportPlan({ resumedAlready: true });
+  const r = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
+    evidence: plan.evidence, op: "phase.failed", isAlive: isSameProcess });
+  check(r.applied === true && phaseOf(db, id) === "ESCALATED",
+    "a second malformed report exhausts the budget and escalates", JSON.stringify(r));
+  const why = db.prepare("SELECT why FROM escalation").all().map(e => e.why);
+  check(why.includes(`${id}:phase:failed:SIZING`),
+    "raising bt:<id>:phase:failed:<phase>, with the id substituted once", why.join(","));
+  db.close();
+}
+
+// THE ADVANCING CONTROL. Without it every assertion above is satisfied by a
+// machine that refuses everything.
+{
+  const { db, id } = await inSizing("a good report");
+  const w = writeArtifact({ dir: join(dir, "art", id), phase: "SIZING",
+    bytes: Buffer.from(JSON.stringify(SIZE_OK)) });
+  const r = applyTransition(db, { taskId: id, expectedPhase: "SIZING", expectedGeneration: 1,
+    evidence: evidenceFor({ action: "BUILD_SIZE", report: SIZE_OK }),
+    artifactSha: w.sha256, op: "phase.advanced", isAlive: isSameProcess });
+  check(r.applied === true && phaseOf(db, id) === "RESEARCH",
+    "a well-formed report advances the task", JSON.stringify(r));
+  const pe = db.prepare(
+    "SELECT artifact_sha FROM phase_event WHERE task=? ORDER BY seq DESC LIMIT 1").get(id);
+  check(pe.artifact_sha === w.sha256,
+    "and the sha the artifact store computed is what justified it", JSON.stringify(pe));
+  check(db.prepare("SELECT depth FROM task WHERE id=?").get(id).depth === "standard",
+    "and the depth the report selected is now durable on the task");
+  db.close();
+}
+
+rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");
 process.exit(fail ? 1 : 0);

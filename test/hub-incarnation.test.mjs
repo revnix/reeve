@@ -156,6 +156,27 @@ const DEAD = () => false;
     `it answered ${JSON.stringify(danswer)}`);
   check(/no such table/i.test(dthrew ?? ""),
     "control: and the error it propagates is the missing table, not something else", String(dthrew));
+
+  // AND THE SAME RULE ONE ROW DOWN. The table can be absent, or present and
+  // EMPTY, and both mean "no incarnation" without saying why. `DELETE FROM
+  // hub_incarnation` from a hand repair, or a partially applied restore, leaves a
+  // migrated hub with the table and no row -- and answering null there is the
+  // same misclassification as answering it for a missing table.
+  const e6 = join(dir, "empty-v6.db");
+  openHub(e6).close();
+  const eraw = new DatabaseSync(e6);
+  eraw.exec("DELETE FROM hub_incarnation");
+  eraw.close();
+  const ero = new DatabaseSync(e6, { readOnly: true });
+  let ethrew = null, eanswer;
+  try { eanswer = hubIncarnation(ero); } catch (e) { ethrew = e.message; }
+  ero.close();
+  check(ethrew !== null,
+    "a v6 hub whose incarnation ROW is gone propagates too, not only one missing the table",
+    `it answered ${JSON.stringify(eanswer)}`);
+  check(/altered outside reeve/i.test(ethrew ?? ""),
+    "control: and it says the store was altered outside reeve, since nothing in reeve deletes that row",
+    String(ethrew));
 }
 
 // ── minting REPLACES, because a restore must be able to end an incarnation ────

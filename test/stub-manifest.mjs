@@ -2249,7 +2249,16 @@ export const STUBS = [
     test: "test/hub-incarnation.test.mjs",
     expectRed: "a v6 hub that has LOST the table propagates",
     edits: [{ file: "src/build/hubdb.mjs",
-              find: "    if (predatesTheTable) return null;",
-              replace: "    if (true) return null;" }],
+              find: "    if (predatesIncarnation(db)) return null;\n    throw e;",
+              replace: "    if (true) return null;\n    throw e;" }],
+  },
+  {
+    name: "an-empty-incarnation-table-is-damage-too",
+    why: "answer null when the table is present and EMPTY on a migrated hub. It is the same misclassification as answering null for a missing table, one row further down: `DELETE FROM hub_incarnation` from a hand repair, or a partially applied restore, leaves a v6 store with the table and no row -- and a cursor reader downstream files that under `cannot prove` and carries on. Migration 6 mints and nothing removes, so on a hub recording the migration there is no legitimate way to have no row",
+    test: "test/hub-incarnation.test.mjs",
+    expectRed: "a v6 hub whose incarnation ROW is gone propagates too",
+    edits: [{ file: "src/build/hubdb.mjs",
+              find: "  if (predatesIncarnation(db)) return null;\n  throw Object.assign(new Error(",
+              replace: "  if (true) return null;\n  throw Object.assign(new Error(" }],
   },
 ];

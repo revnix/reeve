@@ -481,6 +481,25 @@ export function mintIncarnation(db, { at = null } = {}) {
  * answer it already gives for a cursor carrying no incarnation -- unproven, and
  * reported rather than inferred either way.
  */
+/**
+ * Does this hub PREDATE the incarnation table?
+ *
+ * Stated once, because two callers need it and they are the two halves of one
+ * rule: the table can be absent, or present and empty, and both mean "no
+ * incarnation" without saying WHY. Only `schema_version` says why.
+ *
+ * A POSITIVE READING, never an absence. It must read the column AND find the
+ * migration missing. If the read itself fails, the answer is not "old" -- it is
+ * "cannot tell", and the caller must not turn that into a claim about the hub's
+ * age.
+ */
+function predatesIncarnation(db) {
+  try {
+    return db.prepare("SELECT COUNT(*) n FROM schema_version WHERE version = ?")
+             .get(INCARNATION_SINCE)?.n === 0;
+  } catch { return false; }
+}
+
 export function hubIncarnation(db) {
   let row;
   try {
@@ -488,33 +507,31 @@ export function hubIncarnation(db) {
   } catch (e) {
     // THE PRE-v6 CASE THIS FUNCTION PROMISES, and it did not honour it: on a hub
     // older than migration 6 the table is absent and the prepare THROWS, so a
-    // caller told to expect null for an older hub got an exception instead. The
-    // compatibility path the comment above describes was unreachable.
-    //
-    // A MISSING TABLE IS NOT ENOUGH TO CALL A HUB OLD. A store that RECORDS
-    // migration 6 and does not have the table is DAMAGED -- schema damage, or a
-    // hand repair that dropped it -- and answering null there renders a broken
-    // current hub as an ordinary older one, which suppresses the only evidence
-    // anything has that the table is gone. Review found this, and found it in my
-    // own fixture: the test that asserted the null dropped the table from a v6
-    // hub, so it built the damaged case and certified it as the old one.
-    //
-    // SO THE NULL NEEDS A POSITIVE READING, not an absence. `schema_version` must
-    // be readable AND must not record the migration. If that read fails, or the
-    // migration is there, the original error propagates -- because "I cannot tell
-    // how old this hub is" and "this hub is old" are different answers, and only
-    // one of them is safe to give a caller who will read it as "cannot prove".
+    // caller told to expect null for an older hub got an exception instead.
     if (!/no such table/i.test(e?.message ?? "")) throw e;
-    let predatesTheTable = false;
-    try {
-      const row = db.prepare("SELECT COUNT(*) n FROM schema_version WHERE version = ?")
-                    .get(INCARNATION_SINCE);
-      predatesTheTable = row?.n === 0;
-    } catch { /* schema_version itself is unreadable: not a positive reading */ }
-    if (predatesTheTable) return null;
+    if (predatesIncarnation(db)) return null;
     throw e;
   }
-  return row ? { id: row.id, startedAt: row.started_at } : null;
+  if (row) return { id: row.id, startedAt: row.started_at };
+
+  // AN EMPTY TABLE ON A MIGRATED HUB IS DAMAGE, and this is the same rule as the
+  // catch above, one row further down. Review found both, in that order: the
+  // first fix answered null for a missing TABLE on a v6 hub, this one for a
+  // missing ROW -- `DELETE FROM hub_incarnation` from a hand repair, or a
+  // partially applied restore. Either way a broken current hub reads as an
+  // ordinary older store, and a cursor reader downstream files it under "cannot
+  // prove" and carries on.
+  //
+  // Migration 6 mints, and nothing else ever deletes: `mintIncarnation` replaces
+  // rather than removes. So on a hub that records the migration there is no
+  // legitimate way to have no row.
+  if (predatesIncarnation(db)) return null;
+  throw Object.assign(new Error(
+    `the hub records migration ${INCARNATION_SINCE} but hub_incarnation is empty. ` +
+    `Migration ${INCARNATION_SINCE} mints a row and nothing removes one, so this store has been ` +
+    `altered outside reeve.\n` +
+    `  recover  reeve restore --hub --force installs the newest usable snapshot`),
+    { hubDamaged: true });
 }
 
 /**

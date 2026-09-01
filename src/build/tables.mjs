@@ -64,6 +64,18 @@ export const TABLE_OWNERS = {
   territory_lease: { writer: "intake.mjs, transition.mjs",  reader: "the overlap check",                  replayed: true,  section: "10.2" },
   provider_lease:  { writer: "provider.mjs (both daemons)", reader: "admission, reaper, restore refusal", replayed: false, section: "10.4" },
   provider_state:  { writer: "provider.mjs, measure-provider", reader: "admission, doctor H-5",           replayed: false, section: "10.4" },
+  // NOT REPLAYED, because `replayed` means one specific thing here: replay.mjs
+  // reconstructs the table from event kinds. A measurement is not written
+  // through the event stream and has no such kinds, so claiming otherwise would
+  // assert a handler that does not exist.
+  //
+  // It survives a restore anyway, and by a different mechanism: restoreHub
+  // clears an explicit list of four process-scoped lease tables, and this is not
+  // one of them. That distinction matters -- a measurement is not about this
+  // machine or this run, it was true about the PROVIDER when it was taken, and
+  // losing it would silently re-open an arming question already answered.
+  provider_measurement:
+                   { writer: "measure-provider", reader: "the arming gate, doctor",                replayed: false, section: "10.4" },
 };
 
 export const PROSE_TABLES = [
@@ -74,8 +86,8 @@ export const PROSE_TABLES = [
   "gate_request", "approval", "notice_receipt", "task_pr", "attested_push", "guardian_receipt",
   "ownership_check", "harness_acceptance", "pr_hold", "project_authority", "repo_gate_state",
   "inbox", "outbox", "merge_decision", "singleton_lease", "writer_lease", "maintenance_lock",
-  "directory_lease", "territory_lease", "provider_lease", "provider_state", "intake_event",
-  "escalation", "schema_version",
+  "directory_lease", "territory_lease", "provider_lease", "provider_state", "provider_measurement",
+  "intake_event", "escalation", "schema_version",
 ];
 // task_drain is in TABLE_OWNERS and NOT in PROSE_TABLES: section 11.2 carries
 // drain_set as a column on task, and this plan makes it a child table instead

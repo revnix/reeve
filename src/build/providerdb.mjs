@@ -103,6 +103,84 @@ export const newToken = () =>
   `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 
 /**
+ * What each measurement KIND is allowed to conclude.
+ *
+ * Declared, and consulted with `Object.hasOwn`, because an undeclared name must
+ * THROW rather than answer. A lookup that returns undefined for a typo is
+ * indistinguishable from one that returns undefined for a kind nobody has run
+ * yet, so a misspelling would record silently and read back for ever as "not
+ * measured". Plain property access would also answer for `toString` and
+ * `constructor`, which are not measurement kinds.
+ *
+ * `pool-relationship` is deliberately NOT a number. It does not belong in
+ * provider_state, whose `measured_at` asserts one narrow thing: that the
+ * concurrency limit and the guardian reservation in that row were measured.
+ * Writing that column for this experiment would make doctor report the
+ * unmeasured defaults as measured values.
+ */
+export const MEASUREMENT_KINDS = Object.freeze({
+  "pool-relationship": Object.freeze(["SHARED", "SEPARATE", "INCONCLUSIVE"]),
+});
+
+/**
+ * Record one measurement, refusing anything it cannot stand behind.
+ *
+ * Every refusal here is a defect this repository has already paid for once. An
+ * undeclared kind or an unrecognised result throws rather than being stored,
+ * because the store is what the arming gate reads. Evidence is mandatory: a
+ * result with no provenance is a claim, and a claim outlives whoever made it
+ * looking exactly like a measurement.
+ *
+ * A FUTURE TIMESTAMP IS REFUSED. `reviewer_supply.since` carries 1800000000 --
+ * January 2027 -- written by a test clock that reached a real store, and a
+ * future timestamp is permanently "recent" so nothing downstream ever calls it
+ * stale. Refusing on write is the half that stops it recurring; correcting the
+ * existing row is the other half and does not belong here.
+ */
+export function recordMeasurement(db, { provider = PROVIDER, kind, result, evidence, measuredAt } = {}) {
+  if (!Object.hasOwn(MEASUREMENT_KINDS, kind))
+    throw new Error(`recordMeasurement: ${JSON.stringify(kind)} is not a declared measurement kind; ` +
+                    `declared: ${Object.keys(MEASUREMENT_KINDS).join(", ")}`);
+  const allowed = MEASUREMENT_KINDS[kind];
+  if (!allowed.includes(result))
+    throw new Error(`recordMeasurement: ${kind} cannot conclude ${JSON.stringify(result)}; ` +
+                    `it concludes one of ${allowed.join(", ")}`);
+  if (typeof evidence !== "string" || evidence.trim() === "")
+    throw new Error("recordMeasurement: evidence is required -- a result without its readings " +
+                    "is a claim, and nothing downstream can tell the two apart");
+  if (!Number.isInteger(measuredAt) || measuredAt <= 0)
+    throw new Error(`recordMeasurement: measuredAt must be a positive integer of seconds, got ${JSON.stringify(measuredAt)}`);
+  const now = nowSeconds(db);
+  if (measuredAt > now)
+    throw new Error(`recordMeasurement: measuredAt ${measuredAt} is in the future (now ${now}); ` +
+                    `a future timestamp never becomes stale, so nothing would ever ask for it again`);
+  db.prepare(
+    `INSERT INTO provider_measurement (provider, kind, result, evidence, measured_at)
+     VALUES (?, ?, ?, ?, ?)`).run(provider, kind, result, evidence, measuredAt);
+  return { provider, kind, result, measuredAt };
+}
+
+/**
+ * The most recent measurement of one kind, with its AGE.
+ *
+ * The age travels with the answer because the answer alone is not usable: the
+ * pool relationship depends on how the provider structures plans, so a reading
+ * taken months ago can be confidently wrong. A caller handed only `result` has
+ * no way to ask that question and will not think to.
+ */
+export function latestMeasurement(db, { provider = PROVIDER, kind } = {}) {
+  if (!Object.hasOwn(MEASUREMENT_KINDS, kind))
+    throw new Error(`latestMeasurement: ${JSON.stringify(kind)} is not a declared measurement kind; ` +
+                    `declared: ${Object.keys(MEASUREMENT_KINDS).join(", ")}`);
+  const row = db.prepare(
+    `SELECT result, evidence, measured_at FROM provider_measurement
+      WHERE provider = ? AND kind = ? ORDER BY measured_at DESC LIMIT 1`).get(provider, kind);
+  if (!row) return null;
+  return { provider, kind, result: row.result, evidence: row.evidence,
+           measuredAt: row.measured_at, ageSeconds: nowSeconds(db) - row.measured_at };
+}
+
+/**
  * The scheduler's view of the provider, with the documented defaults applied.
  *
  * Returned as a plain object rather than a row so callers cannot accidentally

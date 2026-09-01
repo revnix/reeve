@@ -40,8 +40,17 @@ const DEAD = () => false;
 {
   const p = join(dir, "fresh.db");
   const db = openHub(p);
-  const inc = hubIncarnation(db);
-  check(inc !== null, "a freshly created hub carries an incarnation");
+  // SURVIVES A HUB WITH NO ROW. Since the empty-table case became damage, a
+  // migration that creates the table without minting makes this read THROW rather
+  // than answer null -- so the stub that removes the mint killed the file instead
+  // of failing the assertion it names, and CI reported CRASHED where a sweep at an
+  // older tree had reported CAUGHT. The entry did not change; the code under it
+  // did, which is why a verification has to be re-run after the tree moves rather
+  // than carried forward.
+  let inc = null, mintThrew = null;
+  try { inc = hubIncarnation(db); } catch (e) { mintThrew = e.message; }
+  check(inc !== null, "a freshly created hub carries an incarnation",
+    mintThrew ?? JSON.stringify(inc));
   check(typeof inc?.id === "string" && /^[0-9a-f]{32}$/.test(inc.id),
     "and it is 128 bits of hex, which is compared for equality and never parsed", JSON.stringify(inc));
   check(inc?.startedAt > 0, "and it records when this incarnation began", JSON.stringify(inc));

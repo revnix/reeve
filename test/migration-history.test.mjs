@@ -20,8 +20,8 @@ import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
-import { openHub, completedVersion, missingMigrations, historyGaps, hasHistoryHole,
-         HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
+import { openHub, completedVersion, missingMigrations, migrationStateOf, schemaDefectsAt,
+         historyGaps, hasHistoryHole, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
 // DERIVED, so a fixture cannot be written at a path the binary does not read.
 import { hubPathFor } from "../src/paths.mjs";
 
@@ -340,6 +340,93 @@ const holeAt = (p, v) => {
   check(!/no such table/.test(shape.out),
     "and the operator gets that sentence rather than SQLite's bare no-such-table",
     shape.out.slice(0, 400));
+
+  // AND A CORRECT CATALOGUE IS NOT AN INTACT FILE. The history says the
+  // migrations ran and `schemaDefectsAt` says the tables are all there; neither
+  // of them reads a data or index PAGE. `openHub` runs `quick_check(1)` for
+  // exactly that reason -- and the dry run, which must not go through `openHub`
+  // because `openHub`'s first act is a write, took the read-only route around
+  // the check as well as around the write. A hub damaged in a page then passed
+  // every probe here and surfaced later out of `liveLeases`, as a raw `database
+  // disk image is malformed` from a command that had already called it healthy.
+  rmSync(hub, { force: true }); rmSync(hub + "-wal", { force: true }); rmSync(hub + "-shm", { force: true });
+  openHub(hub).close();
+  {
+    const q = new DatabaseSync(hub);
+    // DELETE mode, so the damage is in the file the next open reads rather than
+    // in a WAL frame that a checkpoint may or may not have written yet.
+    q.exec("PRAGMA journal_mode=DELETE");
+    for (let i = 0; i < 400; i++)
+      q.prepare("INSERT INTO hub_event(seq, kind, at, payload) VALUES(?,?,?,?)")
+        .run(i + 1, "k".repeat(40), 1, "x".repeat(300));
+    q.close();
+  }
+  {
+    // Page 1 holds `sqlite_schema`, so leaving it alone is what keeps the
+    // CATALOGUE readable while the b-tree beneath it is not -- which is the
+    // whole case. Page 2 is the first table's root.
+    const raw = readFileSync(hub);
+    const pageSize = raw.readUInt16BE(16) || 65536;
+    raw.fill(0xa5, pageSize + 8, pageSize * 2);
+    writeFileSync(hub, raw);
+  }
+  // THE FIXTURE IS CHECKED BEFORE IT IS USED. A corruption that also broke the
+  // catalogue would make the dry run refuse for the PREVIOUS reason, and this
+  // test would pass without ever reaching the integrity check it is here for.
+  {
+    const q = new DatabaseSync(hub, { readOnly: true });
+    let verdict = null;
+    try { verdict = Object.values(q.prepare("PRAGMA quick_check(1)").get() ?? {})[0]; }
+    catch (e) { verdict = `threw ${e.message}`; }
+    let defects = null;
+    try { defects = schemaDefectsAt(q, HUB_SCHEMA_VERSION); } catch (e) { defects = `threw ${e.message}`; }
+    q.close();
+    check(verdict !== "ok", "precondition: the fixture really is damaged in a page", String(verdict).slice(0, 120));
+    check(Array.isArray(defects) && defects.length === 0,
+      "precondition: and its catalogue still reads clean, so the shape check cannot be what refuses it",
+      JSON.stringify(defects).slice(0, 200));
+  }
+  const damaged = dryRun();
+  check(damaged.status === 1 && /is damaged/.test(damaged.out),
+    "a hub damaged in a page is refused by the dry run, on the integrity check openHub would have run",
+    damaged.out.slice(0, 400));
+  // EITHER REMEDY, because which one is right depends on whether a snapshot
+  // exists -- and this fixture has none. Asserting only the restore command
+  // would demand the wrong sentence for the case the fixture actually builds.
+  check(/ {2}recover {2}/.test(damaged.out) &&
+        /reeve restore --hub --force|no snapshot was found/.test(damaged.out),
+    "and the operator is given a remedy in reeve's words",
+    damaged.out.slice(0, 400));
+  check(!/database disk image is malformed/.test(damaged.out),
+    "rather than SQLite's raw malformed-image error", damaged.out.slice(0, 400));
+  check(!/^\s*\{/.test(damaged.out),
+    "control: and no plan is emitted over the damaged store", damaged.out.slice(0, 200));
+
+  // ONE CONNECTION, so the history and the tables describe one store. The
+  // history used to be read through a connection of its own, closed before the
+  // one that read the tables ever opened -- two moments, and a newer reeve
+  // migrating between them made the version check answer about a hub that no
+  // longer existed. `migrationStateOf` reads through the connection it is
+  // handed; that is what lets the route hold one.
+  //
+  // Proven by taking the PATH away: an open handle keeps its inode, so a reader
+  // that goes through the connection still answers, and one that re-opens the
+  // path cannot.
+  {
+    const solo = join(dir, "one-connection.db");
+    openHub(solo).close();
+    { const q = new DatabaseSync(solo); q.exec("PRAGMA journal_mode=DELETE"); q.close(); }
+    const held = new DatabaseSync(solo, { readOnly: true });
+    check(migrationStateOf(held).readable === true,
+      "control: the history reads through a caller's connection");
+    rmSync(solo, { force: true });
+    rmSync(solo + "-wal", { force: true }); rmSync(solo + "-shm", { force: true });
+    check(migrationStateOf(held).readable === true,
+      "and it still reads it once the path is gone, because it reads the CONNECTION");
+    check(missingMigrations(solo).readable === false,
+      "control: while the path form cannot, which is the difference the route depends on");
+    held.close();
+  }
 }
 
 // ── THE RECORDED VERSION IS NOT A LOOP BOUND ────────────────────────────────

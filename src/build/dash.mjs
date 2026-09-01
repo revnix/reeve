@@ -30,7 +30,10 @@ const TERMINAL_SET = new Set(TERMINAL);
  * every project at once, so one map would report one project's settings under
  * another project's name.
  */
-export function dashModel(db, { now, switchesFor, projects = [], since = null }) {
+export function dashModel(db, { now, switchesFor, projects = [], since = null, isAlive }) {
+  if (typeof isAlive !== "function")
+    throw new Error("dashModel needs an isAlive predicate: an unexpired lease is not a running process, " +
+      "and defaulting it here would make the digest's first line a guess");
   const tasks = taskList(db, { now, switchesFor })
     // `age` is decorated HERE rather than added to `taskShow`, and that is a
     // promise being kept rather than a shortcut: `task.show`'s key set is frozen
@@ -46,8 +49,17 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null })
   // what remains of it, and LEASE_SECONDS is IMPORTED rather than written as a
   // number, because the derivation is sound only while the two agree and a copied
   // constant agrees right up until the day it does not.
+  // `lstart` IS SELECTED, and `isAlive` is injected. An unexpired lease is not a
+  // running builder: a crash inside the 120-second window leaves the row intact,
+  // and reading only the clock reports work proceeding for up to two minutes
+  // after everything stopped. `build status` already distinguishes these with
+  // `isSameProcess(pid, lstart)` -- pid AND lstart, because pids are reused and
+  // lstart is what tells this process from whatever inherited its number.
   const lease = db.prepare(
-    "SELECT pid, acquired_at, expires_at FROM singleton_lease WHERE name = 'builder'").get() ?? null;
+    `SELECT pid, lstart, acquired_at, expires_at FROM singleton_lease
+      WHERE name = 'builder'`).get() ?? null;
+  const unexpired = !!lease && lease.expires_at > now;
+  const holderAlive = unexpired && isAlive(lease.pid, lease.lstart);
 
   const byProject = Object.create(null);
   for (const p of projects) byProject[p.name] = switchesFor(p.name);
@@ -68,15 +80,27 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null })
     // when there is none, because never-seen and seen-just-now are different
     // facts and 0 is an answer to the second.
     alive: {
-      running: !!lease && lease.expires_at > now,
+      running: holderAlive,
+      // The two facts kept apart rather than collapsed: a lease that has not
+      // expired but whose holder is gone is a CRASH, and it reads differently
+      // from an orderly stop. Collapsing them into one boolean loses exactly the
+      // distinction an operator needs at the moment it matters most.
+      lease_unexpired: unexpired,
       pid: lease?.pid ?? null,
       last_seen_seconds: lease ? Math.max(0, LEASE_SECONDS - (lease.expires_at - now)) : null,
     },
 
     // 2. WHAT IS IT DOING. A live run, or a task that is moving under its own
     // steam: not terminal, and waiting on nothing.
+    // A RUNNING TASK IS OBSERVED; every other member of this list is INFERRED
+    // from having nothing against it, so the inference must not be made on
+    // unknowns. When a project's profile cannot be read, `capability_known` is
+    // false and there is no headline wait -- not because the task is moving, but
+    // because nobody could tell. Calling that "doing" reports progress on
+    // evidence that is missing.
     doing: tasks
-      .filter(t => t.running || (!TERMINAL_SET.has(t.phase) && !t.waiting.first))
+      .filter(t => t.running ||
+                   (!TERMINAL_SET.has(t.phase) && !t.waiting.first && t.waiting.capability_known))
       .map(t => ({ id: t.id, phase: t.phase, project: t.project, title: t.title,
                    running: t.running, age: t.age })),
 
@@ -93,20 +117,42 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null })
                    waiting: t.waiting.first,
                    capability: t.waiting.capability,
                    for_seconds: t.waiting.since !== null ? Math.max(0, now - t.waiting.since)
-                                                         : (t.age?.seconds ?? null) })),
+                                                         : (t.age?.seconds ?? null) }))
+      // LONGEST FIRST. `for_seconds` exists to decide what to handle first, and
+      // leaving the list in task-creation order means the number is printed and
+      // not used. A null elapsed sorts last -- it is the weakest claim on
+      // attention, not the strongest -- and the id breaks ties so two runs over
+      // one hub produce the same order.
+      .sort((a, b) => (b.for_seconds ?? -1) - (a.for_seconds ?? -1) || a.id.localeCompare(b.id)),
 
     // 4. WHAT DID IT DO SINCE I LAST LOOKED. `since` is the operator's own mark;
     // with none given the answer is an empty list rather than everything, because
     // "everything" is what they were trying not to read.
-    since_you_looked: since === null ? [] : movedSince(db, since, now),
+    // THE CURSOR IS A SEQUENCE, NOT A TIMESTAMP. An operator reusing a previous
+    // digest's `generated_at` as `--since` loses every transition committed in
+    // that same whole second -- and loses it for ever, because the next cursor is
+    // later still. `phase_event.seq` is lossless and monotonic, and
+    // `next_cursor` is handed back so the operator never has to construct one.
+    since_you_looked: since === null ? [] : movedSince(db, since),
+    next_cursor: db.prepare("SELECT COALESCE(max(seq), 0) s FROM phase_event").get().s,
 
     // 5. WHAT DID IT DECLINE, FAIL OR REFUSE. Standing escalations, beside the
     // task that raised them.
-    declined: tasks
-      .filter(t => t.escalations.length)
-      .flatMap(t => t.escalations.map(e => ({
-        id: t.id, project: t.project, why: e.why, count: e.count,
+    // BUILDER-SCOPED ROWS TOO. `evidenceFor` attaches escalations whose key is
+    // prefixed by a task id, which is right for a task's own view and hides the
+    // whole `builder:` family -- `builder:sandbox:canary-failed`,
+    // `builder:backup:failed`, `builder:probe:merged`. Those belong to no task,
+    // and they are the failures that most need an operator: the last of them is
+    // a P0 that also writes the HALT marker. A digest of "what did it decline"
+    // that cannot show them is answering a smaller question than it claims.
+    declined: [
+      ...tasks.filter(t => t.escalations.length).flatMap(t => t.escalations.map(e => ({
+        id: t.id, project: t.project, scope: "task", why: e.why, count: e.count,
         first_seen_at: e.first_seen_at, last_seen_at: e.last_seen_at }))),
+      ...builderEscalations(db).map(e => ({
+        id: null, project: null, scope: "builder", why: e.why, count: e.count,
+        first_seen_at: e.first_seen_at, last_seen_at: e.last_seen_at })),
+    ],
   };
 }
 
@@ -118,11 +164,24 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null })
  * phase -- and a digest of "what happened" built on it reports rows that did
  * nothing.
  */
+/**
+ * Standing escalations that belong to the builder rather than to any task.
+ *
+ * `substr` rather than `LIKE`: a pattern built from an identifier is one
+ * metacharacter away from matching more than it was asked to, and this comparison
+ * wants no pattern language at all.
+ */
+function builderEscalations(db) {
+  return db.prepare(
+    `SELECT why, count, first_seen_at, last_seen_at FROM escalation
+      WHERE substr(why, 1, 8) = 'builder:' ORDER BY first_seen_at`).all();
+}
+
 function movedSince(db, since, now) {
   return db.prepare(
-    `SELECT task, at, op, from_phase, to_phase FROM phase_event
-      WHERE at > ? AND at <= ? ORDER BY at DESC, seq DESC`).all(since, now)
-    .map(e => ({ id: e.task, at: e.at, op: e.op, from: e.from_phase, to: e.to_phase }));
+    `SELECT seq, task, at, op, from_phase, to_phase FROM phase_event
+      WHERE seq > ? ORDER BY seq DESC`).all(since)
+    .map(e => ({ seq: e.seq, id: e.task, at: e.at, op: e.op, from: e.from_phase, to: e.to_phase }));
 }
 
 const secs = (n) => (n === null || n === undefined ? UNKNOWN : `${n}s`);
@@ -130,9 +189,18 @@ const secs = (n) => (n === null || n === undefined ? UNKNOWN : `${n}s`);
 /** THE HUMAN TEXT IS NOT A STABLE INTERFACE. Parse `--json`, never this. */
 export function renderDash(m) {
   const out = [];
+  // LAST-SEEN IS PRINTED WHETHER OR NOT IT IS RUNNING. The state where an
+  // operator most needs to know whether the last heartbeat was seconds or hours
+  // ago is precisely the one where it is NOT running, and the model carried the
+  // figure while the text threw it away. `lease_unexpired` without a live holder
+  // is a crash, and it reads differently from an orderly stop.
+  const seen = m.alive.last_seen_seconds === null
+    ? "never seen"
+    : `last seen ${secs(m.alive.last_seen_seconds)} ago`;
   out.push(m.alive.running
-    ? `builder RUNNING  pid ${m.alive.pid}  last seen ${secs(m.alive.last_seen_seconds)} ago`
-    : "builder NOT RUNNING");
+    ? `builder RUNNING  pid ${m.alive.pid}  ${seen}`
+    : `builder NOT RUNNING  ${seen}` +
+      (m.alive.lease_unexpired ? `  (lease still held by pid ${m.alive.pid}: it crashed)` : ""));
 
   const sw = Object.entries(m.switches);
   out.push("", "switches");
@@ -170,7 +238,13 @@ export function renderDash(m) {
   // territory is pinned and until when, and every UNKNOWN said out loud.
   out.push("", `tasks (${m.tasks.length})`);
   for (const t of m.tasks) {
+    // THE WAIT IS PRINTED HERE TOO. A task waiting on quota, the guardian or a
+    // reviewer is in neither `waiting_on_you` nor `doing` -- correctly, those
+    // clear themselves -- and without the substate on its own row it appears as
+    // an unexplained phase. Not-yours is not the same as not-diagnosable.
     out.push(`  ${t.id}  ${t.phase}  ${oneLine(t.title)}` +
+             (t.waiting.first ? `  ${t.waiting.first}` : "") +
+             (t.waiting.capability ? ` (${t.waiting.capability})` : "") +
              (t.draining !== null ? `  draining ${t.draining}` : ""));
     for (const r of t.territory)
       out.push(`      territory ${r.kind} ${oneLine(r.path)}` +

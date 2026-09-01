@@ -58,8 +58,8 @@ export const APPLIES = Object.freeze({
   // which is the accepted-and-inert shape this whole file exists to refuse.
   project: Object.freeze(["task file", "task list"]),
 
-  // `--since` is the operator's own mark for "what happened while I was away",
-  // and only the digest answers that question.
+  // `--since` is the cursor a previous digest handed back, and only the digest
+  // answers "what moved since then".
   since: Object.freeze(["task dash"]),
 });
 

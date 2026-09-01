@@ -18,7 +18,7 @@ import { LEASE_SECONDS } from "../src/build/locks.mjs";
 import { TERMINAL } from "../src/build/phases.mjs";
 import { TABLE_OWNERS } from "../src/build/tables.mjs";
 import {
-  READ_FORMAT_VERSION, UNKNOWN, HUMAN_WAITS, WAITING, ageInState,
+  READ_FORMAT_VERSION, UNKNOWN, HUMAN_WAITS, WAITING, NEEDS_SWITCH, ageInState,
   taskShow, switchesResolver, switchesFrom, builderRunRef,
 } from "../src/build/show.mjs";
 import { dashModel, renderDash } from "../src/build/dash.mjs";
@@ -80,8 +80,10 @@ const file = async (over) => fileTask({
   io, isAlive: isSameProcess, pid: process.pid, lstart: readStart(process.pid), ...over,
 });
 const setPhase = (id, phase) => db.prepare("UPDATE task SET phase = ? WHERE id = ?").run(phase, id);
+const ALIVE = () => true, DEAD = () => false;
 const dash = (over = {}) =>
-  dashModel(db, { now: NOW, switchesFor: resolver(), projects: PROJECTS, since: null, ...over });
+  dashModel(db, { now: NOW, switchesFor: resolver(), projects: PROJECTS, since: null,
+                  isAlive: ALIVE, ...over });
 
 const T = {};
 {
@@ -125,9 +127,11 @@ const T = {};
   // so "computes nothing show cannot see" is structural rather than hoped for.
   const SRC = readFileSync(new URL("../src/build/dash.mjs", import.meta.url), "utf8");
   const prepares = [...SRC.matchAll(/db\.prepare\(/g)].length;
-  check(prepares === 2,
-    `the dash prepares exactly the two statements it declares (${prepares})`,
-    "the singleton lease, and the event log for --since; everything else comes from taskList");
+  check(prepares === 4,
+    `the dash prepares exactly the four statements it declares (${prepares})`,
+    "the singleton lease, the builder-scoped escalations, the event log for --since, and the " +
+    "cursor high-water mark. NOTHING per task: every task fact comes from taskList, and a fifth " +
+    "statement here means a question the dash is answering that `task show` cannot.");
   check(/db\.prepare\(/.test('x db.prepare( y'),
     "counter-control: the extraction matches a literal containing the call");
 }
@@ -204,7 +208,8 @@ const T = {};
   const m = dash({ since: NOW - 3600 });
   const FIVE = ["alive", "doing", "waiting_on_you", "since_you_looked", "declined"];
   for (const k of FIVE) check(k in m, `the digest answers "${k}"`, Object.keys(m).join(","));
-  const SUPPORTING = ["format_version", "generated_at", "projects", "switches", "tasks", "since"];
+  const SUPPORTING = ["format_version", "generated_at", "projects", "switches", "tasks",
+                      "since", "next_cursor"];
   const extra = Object.keys(m).filter(k => !FIVE.includes(k) && !SUPPORTING.includes(k));
   check(extra.length === 0,
     "and nothing else, so the digest cannot grow a sixth question quietly", extra.join(","));
@@ -328,7 +333,116 @@ const T = {};
   db.prepare("UPDATE singleton_lease SET expires_at = ? WHERE name = 'builder'").run(NOW - 1);
   check(dash().alive.running === false,
     "control: an expired lease row is not a running builder", JSON.stringify(dash().alive));
+
+  // AN UNEXPIRED LEASE IS NOT A RUNNING BUILDER. A crash inside the 120-second
+  // window leaves the row intact, so reading only the clock reports work
+  // proceeding for up to two minutes after everything stopped.
+  db.prepare("UPDATE singleton_lease SET expires_at = ? WHERE name = 'builder'")
+    .run(NOW + LEASE_SECONDS - 20);
+  const crashed = dash({ isAlive: DEAD });
+  check(crashed.alive.running === false,
+    "an unexpired lease whose HOLDER is gone is not running", JSON.stringify(crashed.alive));
+  check(crashed.alive.lease_unexpired === true,
+    "and the two facts stay apart, so a crash reads differently from an orderly stop",
+    JSON.stringify(crashed.alive));
+  check(/crashed/.test(renderDash(crashed)),
+    "and the text says the lease is still held, which is what a crash looks like",
+    renderDash(crashed).split("\n")[0]);
+  check(dash({ isAlive: ALIVE }).alive.running === true,
+    "control: the same row with a live holder IS running, so the change is the predicate");
+
+  // LAST-SEEN IS PRINTED WHEN IT IS NOT RUNNING TOO -- that is the state where an
+  // operator most needs to know whether the heartbeat was seconds or hours ago.
+  check(/last seen 20s ago/.test(renderDash(crashed)),
+    "and last-seen reaches the text in the NOT-RUNNING state, not only in JSON",
+    renderDash(crashed).split("\n")[0]);
   db.prepare("DELETE FROM singleton_lease WHERE name = 'builder'").run();
+  check(/never seen/.test(renderDash(dash())),
+    "with no lease at all the text says never seen, rather than an elapsed figure",
+    renderDash(dash()).split("\n")[0]);
+}
+
+// ── builder-scoped escalations reach the digest ──────────────────────────────
+//
+// `evidenceFor` attaches escalations whose key is prefixed by a TASK id, which is
+// right for a task's own view and hides the whole `builder:` family. Those belong
+// to no task and are the failures that most need an operator -- one of them, the
+// merge probe, is a P0 that also writes the HALT marker.
+{
+  db.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count)
+              VALUES('builder:backup:failed',2,?,?,0)`).run(NOW - 500, NOW - 20);
+  // A TASK-scoped row beside it, so "both kinds arrive" is asserted against a
+  // hub that actually holds both rather than against one that holds neither.
+  db.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count)
+              VALUES(?,1,?,?,0)`).run(`${T.held}:gate:unreviewed`, NOW - 400, NOW - 10);
+  const m = dash();
+  const b = m.declined.find(x => x.why === "builder:backup:failed");
+  check(b, "a builder-scoped escalation is in `declined`",
+    JSON.stringify(m.declined.map(x => x.why)));
+  check(b?.scope === "builder" && b?.id === null,
+    "marked as the builder's rather than attributed to a task that did not raise it",
+    JSON.stringify(b));
+  check(b?.count === 2, "with its count", JSON.stringify(b));
+  check(renderDash(m).includes("builder:backup:failed"), "and it reaches the text",
+    renderDash(m).slice(-600));
+
+  // CONTROL: task-scoped rows still arrive, and are still marked as such -- or
+  // the fix replaced one half of the answer with the other.
+  check(m.declined.some(x => x.scope === "task"),
+    "control: task-scoped escalations are still there", JSON.stringify(m.declined.map(x => x.scope)));
+  check(!m.declined.some(x => x.scope === "builder" && x.id !== null),
+    "and no builder row is attributed to a task");
+  db.prepare("DELETE FROM escalation WHERE why = 'builder:backup:failed'").run();
+  db.prepare("DELETE FROM escalation WHERE why = ?").run(`${T.held}:gate:unreviewed`);
+}
+
+// ── unknown is not a green light ─────────────────────────────────────────────
+{
+  const blind = dashModel(db, { now: NOW, switchesFor: switchesResolver({}, readProfile),
+                                projects: PROJECTS, since: null, isAlive: ALIVE });
+  const active = blind.tasks.filter(t =>
+    NEEDS_SWITCH[t.phase] && !TERMINAL.includes(t.phase) && !t.running);
+  check(active.length > 0, "control: there are active, non-running tasks that NEED a switch",
+    String(active.length));
+  check(active.every(t => t.waiting.capability_known === false),
+    "control: and their switches genuinely could not be read",
+    JSON.stringify(active.map(t => t.waiting.capability_known)));
+  check(!blind.doing.some(t => active.some(a => a.id === t.id)),
+    "a task whose capability is UNKNOWN is not reported as doing: that inference needs evidence",
+    JSON.stringify(blind.doing.map(t => t.id)));
+  // CONTROL: with the switches readable, the same tasks ARE doing -- or the rule
+  // has simply emptied the list.
+  check(dash().doing.length > 0,
+    "control: with readable switches the same tasks are doing again",
+    JSON.stringify(dash().doing.map(t => t.id)));
+}
+
+// ── the longest wait is first ────────────────────────────────────────────────
+{
+  db.prepare("INSERT INTO hold_reason(task,reason,detail,at) VALUES(?,?,?,?)")
+    .run(T.quota, "blocked_founder", "a newer hold", NOW - 60);
+  const last = (await file({ title: "newest, waiting longest", territory: ["packages/nw"] })).task;
+  db.prepare("INSERT INTO hold_reason(task,reason,detail,at) VALUES(?,?,?,?)")
+    .run(last, "blocked_founder", "the oldest wait on the newest task", NOW - 99000);
+
+  const order = dash().tasks.map(t => t.id);
+  check(order.indexOf(last) > order.indexOf(T.held),
+    "control: the newest task is LAST in creation order, so creation order is not duration order",
+    JSON.stringify([order.indexOf(T.held), order.indexOf(last)]));
+
+  const w = dash().waiting_on_you;
+  check(w[0]?.id === last,
+    "the longest wait is first, though it belongs to the most recently created task",
+    JSON.stringify(w.map(x => [x.id, x.for_seconds])));
+  check(w.length >= 2, `control: at least two tasks are waiting on you (${w.length})`,
+    JSON.stringify(w.map(x => [x.id, x.for_seconds])));
+  check(new Set(w.map(x => x.for_seconds)).size === w.length,
+    "control: and they have DIFFERENT elapsed figures, so an order exists to get wrong",
+    JSON.stringify(w.map(x => x.for_seconds)));
+  const secsList = w.map(x => x.for_seconds ?? -1);
+  check(secsList.every((v, i) => i === 0 || secsList[i - 1] >= v),
+    "waiting_on_you is ordered longest-first, because the elapsed figure exists to triage",
+    JSON.stringify(w.map(x => [x.id, x.for_seconds])));
 }
 
 // ── what happened since I last looked ────────────────────────────────────────
@@ -338,18 +452,42 @@ const T = {};
     "with no --since the answer is empty rather than everything, which is what they were avoiding",
     JSON.stringify(none.since_you_looked));
 
-  const recent = dash({ since: NOW - 100 });
-  check(recent.since_you_looked.length > 0,
-    "with a mark, the transitions after it are listed",
-    JSON.stringify(recent.since_you_looked.map(e => e.at)));
-  check(recent.since_you_looked.every(e => e.at > NOW - 100),
-    "and only those after it", JSON.stringify(recent.since_you_looked.map(e => e.at)));
-  check(recent.since_you_looked.some(e => e.op === "resume"),
-    "naming the op that moved", JSON.stringify(recent.since_you_looked.map(e => e.op)));
+  // THE CURSOR IS A SEQUENCE. An integer-second timestamp loses every transition
+  // committed in the same whole second as the cursor, and loses it for ever
+  // because the next cursor is later still. `next_cursor` is handed back so the
+  // operator never constructs one by hand.
+  const all = dash({ since: 0 });
+  check(all.since_you_looked.length > 1,
+    `control: from cursor 0 the whole log is listed (${all.since_you_looked.length})`);
+  check(typeof all.next_cursor === "number" && all.next_cursor > 0,
+    "the digest hands back a cursor for next time", String(all.next_cursor));
 
-  // CONTROL: an older mark returns MORE, or the filter is not a filter.
-  check(dash({ since: NOW - 100000 }).since_you_looked.length > recent.since_you_looked.length,
-    "control: an older mark returns more, so the bound is applied");
+  const mid = all.since_you_looked[1].seq;
+  const recent = dash({ since: mid });
+  check(recent.since_you_looked.every(e => e.seq > mid),
+    "with a cursor, only what came AFTER it is listed",
+    JSON.stringify(recent.since_you_looked.map(e => e.seq)));
+  check(recent.since_you_looked.length < all.since_you_looked.length,
+    "and a later cursor returns strictly less, so the bound is applied",
+    `${recent.since_you_looked.length} vs ${all.since_you_looked.length}`);
+
+  // THE DEFECT THE CURSOR CHANGE EXISTS FOR: two transitions in one whole second.
+  // With a second-resolution cursor the later of them is invisible for ever.
+  const t0 = db.prepare("SELECT max(seq) s FROM phase_event").get().s;
+  for (const op of ["same-second-a", "same-second-b"])
+    db.prepare(`INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+                VALUES(?,?,?,'SIZING','SIZING',1,1,'{}')`).run(T.moving, NOW - 7, op);
+  const both = dash({ since: t0 }).since_you_looked;
+  check(both.filter(e => /same-second/.test(e.op)).length === 2,
+    "two transitions sharing one second are BOTH returned, which a timestamp cursor cannot do",
+    JSON.stringify(both.map(e => e.op)));
+  const afterFirst = dash({ since: both[both.length - 1].seq }).since_you_looked;
+  check(afterFirst.some(e => e.op === "same-second-b") &&
+        !afterFirst.some(e => e.op === "same-second-a"),
+    "and a cursor at the first of them still returns the second, rather than skipping the whole second",
+    JSON.stringify(afterFirst.map(e => e.op)));
+  check(dash({ since: dash({ since: 0 }).next_cursor }).since_you_looked.length === 0,
+    "control: a cursor at the high-water mark returns nothing, so the bound is real");
 }
 
 // ── what it declined ─────────────────────────────────────────────────────────
@@ -381,7 +519,7 @@ const T = {};
 
   // A project whose profile cannot be read is UNKNOWN, never "off".
   const blind = dashModel(db, { now: NOW, switchesFor: switchesResolver({}, readProfile),
-                                projects: PROJECTS, since: null });
+                                projects: PROJECTS, since: null, isAlive: ALIVE });
   check(blind.switches.alpha === null,
     "a project whose profile cannot be read reports null, not a map of falses",
     JSON.stringify(blind.switches));
@@ -401,6 +539,106 @@ const T = {};
   setPhase(T.beta, "FILED");
   check(dash().doing.some(x => x.id === T.beta),
     "control: back in an active phase with nothing waiting, it is doing again");
+}
+
+
+// ── the age is measured from the LATEST visit, by sequence ──────────────────
+//
+// `seq` is INTEGER PRIMARY KEY and is the monotonic order transitions actually
+// happened in. `at` is a clock reading, and a clock can move backwards -- or be
+// restored non-monotonically by a replay. A task that leaves a phase and
+// re-enters it can then carry a smaller `at` on the CURRENT visit than on an
+// earlier one, and `max(at)` measures the age from the wrong visit.
+{
+  const t = (await file({ title: "a revisited task", territory: ["packages/rv"] })).task;
+  setPhase(t, "RESEARCH");
+  const ev = (at, op, to) => db.prepare(
+    `INSERT INTO phase_event(task,at,op,from_phase,to_phase,from_generation,to_generation,detail)
+     VALUES(?,?,?,'SIZING',?,1,1,'{}')`).run(t, at, op, to);
+
+  ev(NOW - 100, "first-visit", "RESEARCH");     // an EARLIER visit with a LATER clock
+  ev(NOW - 900, "second-visit", "RESEARCH");    // the CURRENT visit, clock skewed back
+  const row = db.prepare("SELECT * FROM task WHERE id = ?").get(t);
+  const age = ageInState(db, row, { now: NOW });
+  check(age.seconds === 900,
+    "the age comes from the LATEST row by seq, even when its clock reads earlier",
+    JSON.stringify(age));
+  check(age.seconds !== 100,
+    "and not from the row with the largest `at`, which is a different visit",
+    JSON.stringify(age));
+
+  // CONTROL: with the clocks in order the two answers agree, so the assertion
+  // above is about the skew and not about the query being broken generally.
+  db.prepare("UPDATE phase_event SET at = ? WHERE task = ? AND op = 'second-visit'")
+    .run(NOW - 50, t);
+  check(ageInState(db, row, { now: NOW }).seconds === 50,
+    "control: with monotonic clocks the newest visit is also the latest `at`");
+}
+
+// ── a machine-cleared wait is still diagnosable ────────────────────────────
+{
+  const mq = (await file({ title: "machine-waiting only", territory: ["packages/mw"] })).task;
+  setPhase(mq, "SIZING");
+  db.prepare(`INSERT INTO provider_lease(owner,repo_id,run_ref,pid,lstart,status,requested_at,expires_at)
+              VALUES('builder',1,?,778,'L','queued',?,?)`)
+    .run(builderRunRef(mq, "SIZING"), NOW - 100, NOW + 300);
+
+  const m = dash();
+  const quota = m.tasks.find(x => x.id === mq);
+  check(quota.waiting.first && !HUMAN_WAITS.has(quota.waiting.first),
+    "control: this task waits on the machine, not on you", JSON.stringify(quota.waiting));
+  check(!m.waiting_on_you.some(x => x.id === mq) && !m.doing.some(x => x.id === mq),
+    "control: so it is in neither waiting_on_you nor doing", JSON.stringify(quota.waiting));
+
+  const row = renderDash(m).split("\n").find(l => l.includes(mq) && l.includes(quota.phase));
+  check(row && row.includes(quota.waiting.first),
+    "yet its own row names the substate, so an idle task is never an unexplained phase",
+    JSON.stringify(row));
+}
+
+// ── every value a dash row carries reaches the text ────────────────────────
+//
+// The render guard PR-E1 built walks `why`'s row-shaped sections. This surface
+// had none, and the very first review of it found two fields carried in the model
+// and dropped from the text -- the same shape, in a place the guard could not
+// see. A guard narrower than its class is a guard the next instance walks around.
+{
+  const m = dash({ since: 0 });
+  const text = renderDash(m);
+  const EXCLUDED = {
+    waiting_on_you: { project: "the row names the task; the project is on its `tasks` entry" },
+    doing: { project: "same", running: "rendered as its phase/slice/attempt, not as an object",
+             age: "rendered as `in state Ns`, not as an object" },
+    declined: { last_seen_at: "a timestamp the render formats elsewhere",
+                scope: "rendered as the key's own shape: a `builder:` prefix or a task id",
+                project: "the row names the task" },
+    since_you_looked: { seq: "the cursor, handed back as `next_cursor` rather than per row" },
+  };
+  const missing = [];
+  for (const section of Object.keys(EXCLUDED))
+    for (const row of m[section])
+      for (const [k, v] of Object.entries(row)) {
+        if (k in EXCLUDED[section]) continue;
+        if (v === null || v === undefined || v === "" || typeof v === "object") continue;
+        if (!text.includes(String(v))) missing.push(`${section}.${k}=${JSON.stringify(v)}`);
+      }
+  check(missing.length === 0,
+    "every value a digest row carries into the model reaches the human render",
+    `not rendered: ${missing.join(", ")}\n        ` +
+    "Either render it, or name it in EXCLUDED with the reason it is deliberately absent.");
+  check(Object.keys(EXCLUDED).every(sec => m[sec].length > 0),
+    "control: every section this walks has a row, so none of it is vacuous",
+    JSON.stringify(Object.fromEntries(Object.keys(EXCLUDED).map(x => [x, m[x].length]))));
+
+  // COUNTER-CONTROL: the walk can FAIL. A value the text does not contain must be
+  // reported, or the loop passes on any render at all.
+  const probe = [];
+  for (const [k, v] of Object.entries({ ...m.waiting_on_you[0], ghost_field: "ghost-zq" })) {
+    if (k in EXCLUDED.waiting_on_you || v === null || v === undefined || typeof v === "object") continue;
+    if (!text.includes(String(v))) probe.push(k);
+  }
+  check(probe.length === 1 && probe[0] === "ghost_field",
+    "counter-control: a value the render does NOT contain is reported missing", JSON.stringify(probe));
 }
 
 // ── the CLI ──────────────────────────────────────────────────────────────────
@@ -433,6 +671,14 @@ const T = {};
 
   // `--since` belongs to the digest alone, and the gate that proves it is the one
   // that already refuses an inapplicable flag.
+  const help = cli("--help");
+  for (const sub of ["task list", "task show", "task why", "task dash", "task file"])
+    check(help.stdout.includes(sub),
+      `\`reeve --help\` lists ${sub}, so the read surface is discoverable`,
+      (help.stdout.match(/.*task .*/g) ?? []).slice(0, 6).join(" | "));
+  check(help.stdout.includes("--since"),
+    "and names --since, which nothing else advertises", (help.stdout.match(/.*--since.*/) ?? [""])[0]);
+
   const wrong = cli("task", "list", "--since", String(NOW), "--json");
   check(parse(wrong.stdout)?.kind === "flag_not_applicable" && wrong.status === 2,
     "and --since on another subcommand is refused rather than ignored", wrong.out.slice(0, 200));

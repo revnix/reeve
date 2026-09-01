@@ -93,8 +93,15 @@ export const HUMAN_WAITS = Object.freeze(new Set([
  * which clock produced it and an operator should not have to guess.
  */
 export function ageInState(db, row, { now }) {
+  // ORDERED BY seq, NOT BY at. `seq` is `INTEGER PRIMARY KEY` and is the
+  // monotonic order transitions actually happened in; `at` is a clock reading,
+  // and a clock can move backwards -- or be restored non-monotonically by a
+  // replay. A task that leaves a phase and re-enters it can then carry a smaller
+  // `at` on the CURRENT visit than on an earlier one, so `max(at)` measures the
+  // age from the wrong visit and clamps a future timestamp to zero.
   const entered = db.prepare(
-    `SELECT max(at) at FROM phase_event WHERE task = ? AND to_phase = ?`).get(row.id, row.phase)?.at;
+    `SELECT at FROM phase_event WHERE task = ? AND to_phase = ?
+      ORDER BY seq DESC LIMIT 1`).get(row.id, row.phase)?.at;
   const at = entered ?? row.created_at;
   if (at === null || at === undefined) return null;
   return { seconds: Math.max(0, now - at), from: entered != null ? "phase_event" : "created_at" };

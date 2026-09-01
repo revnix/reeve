@@ -976,7 +976,7 @@ export const STUBS = [
     expectRed: "age-in-state is 600s, from the phase_event that entered this phase",
     edits: [{
       file: "src/build/show.mjs",
-      find: "  const entered = db.prepare(\n    `SELECT max(at) at FROM phase_event WHERE task = ? AND to_phase = ?`).get(row.id, row.phase)?.at;",
+      find: "  const entered = db.prepare(\n    `SELECT at FROM phase_event WHERE task = ? AND to_phase = ?\n      ORDER BY seq DESC LIMIT 1`).get(row.id, row.phase)?.at;",
       replace: "  const entered = row.updated_at;",
     }],
   },
@@ -984,11 +984,11 @@ export const STUBS = [
     name: "dash-aliveness-reads-the-clock-not-the-row",
     why: "report the builder as running because a `singleton_lease` row exists. The row OUTLIVES the process that took it -- that is what makes it a lease -- so a crashed builder leaves a row behind and the digest's first line then tells an operator that work is proceeding while nothing is running at all. The one question a glance surface exists to answer, answered wrongly in the direction that stops anyone looking further",
     test: "test/build-dash.test.mjs",
-    expectRed: "control: an expired lease row is not a running builder",
+    expectRed: "an unexpired lease whose HOLDER is gone is not running",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "      running: !!lease && lease.expires_at > now,",
-      replace: "      running: !!lease,",
+      find: "  const holderAlive = unexpired && isAlive(lease.pid, lease.lstart);",
+      replace: "  const holderAlive = unexpired;",
     }],
   },
   {

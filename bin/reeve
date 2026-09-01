@@ -217,7 +217,7 @@ const FLAGS = {
   priority:           { value: true,  what: "p1 or p2" },
   "idempotency-key":  { value: true,  what: "a key that makes a re-run of this command inert" },
   "pin-territory":    { value: true,  what: "keep the territory while held, for a duration like 48h" },
-  since:              { value: true,  what: "a unix timestamp: what moved since you last looked" },
+  since:              { value: true,  what: "a cursor from a digest's next_cursor: what moved since" },
 
   hub:            { value: false, what: "operate on the builder hub rather than a repository" },
   anyway:         { value: false, what: "file a near-twin of an existing task anyway" },
@@ -1273,13 +1273,16 @@ switch (cmd) {
           let since = null;
           if (raw !== null) {
             since = Number(raw);
-            if (!Number.isFinite(since) || since < 0)
-              fail("usage", `reeve task dash: --since expects a unix timestamp, got ${JSON.stringify(raw)}`,
+            if (!Number.isInteger(since) || since < 0)
+              fail("usage",
+                   `reeve task dash: --since expects a cursor from a previous digest's ` +
+                   `next_cursor, got ${JSON.stringify(raw)}`,
                    { exit: EXITS.misuse });
           }
           let model;
           try {
-            model = inSnapshot(db, () => dashModel(db, { now, switchesFor, projects: named, since }));
+            model = inSnapshot(db, () => dashModel(db, {
+              now, switchesFor, projects: named, since, isAlive: isSameProcess }));
           } catch (e) { queryFailed(e); }
           console.log(flag("json")
             ? JSON.stringify(envelope("task.dash", model), null, 2)
@@ -2126,6 +2129,15 @@ function usage() {
       --hub                 restore the builder hub  (--tail <file> replays events after it)
   export-events --hub <file>
                         write the hub's event log as a replayable JSONL tail
+
+  task list [--json]    every task, with what each is waiting on
+      --project <p>         only this project's tasks
+  task show <id> [--json]
+                        one task: phase, depth, switches, waiting substate
+  task why <id> [--json]
+                        the evidence lineage behind one task, absence included
+  task dash [--json]    the digest: alive, doing, waiting on you, declined
+      --since <seq>         what moved since that cursor (see next_cursor)
 
   task file             file a task, with its territory declared and leased
       --project <p>         the registry project to file against

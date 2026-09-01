@@ -31,7 +31,7 @@ const SCHEMA_VERSION_DDL = `CREATE TABLE IF NOT EXISTS schema_version (
   applied_at INTEGER NOT NULL
 ) STRICT`;
 
-export const HUB_SCHEMA_VERSION = 3;
+export const HUB_SCHEMA_VERSION = 4;
 
 /**
  * Forward-only. Each entry runs exactly once, in order, in its own transaction,
@@ -185,6 +185,70 @@ const MIGRATIONS = [
 
       if (!hasColumn("provider_lease", "token"))
         db.exec("ALTER TABLE provider_lease ADD COLUMN token TEXT");
+    } },
+  // ---------------------------------------------------------------- 4
+  // A MEASUREMENT IS AN EVENT, NOT A COLUMN.
+  //
+  // `provider_state.measured_at` means one specific thing: the numeric limits in
+  // that row were measured. The pool experiment answers a different question --
+  // whether headless work draws on the interactive allowance -- and its answer is
+  // a relationship, not a number. It had nowhere to go, and the available
+  // shortcut was actively wrong: writing `measured_at` alone makes doctor's H-5
+  // skip its "these are unmeasured defaults" note and report the DEFAULT limits
+  // as measured. The cheapest place to put the answer was the one that forges a
+  // health check, and leaving it null loses the record the arming gate needs.
+  //
+  // A ROW PER MEASUREMENT, so the answer keeps its date and its evidence. This
+  // answer is not a fact about the universe; it depends on how the provider
+  // structures plans, so one taken today can be wrong in three months. State
+  // tables can only hold the latest value, and a stale answer in a state table
+  // is indistinguishable from a fresh one -- which is the failure this whole
+  // design exists to refuse. History makes staleness legible.
+  { version: 4, up: (db) => {
+      // RE-RUNNABLE, like every migration here: CREATE ... IF NOT EXISTS only.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS provider_measurement (
+          provider    TEXT    NOT NULL,
+          kind        TEXT    NOT NULL,
+          result      TEXT    NOT NULL,
+          evidence    TEXT    NOT NULL,
+          measured_at INTEGER NOT NULL,
+          PRIMARY KEY (provider, kind, measured_at),
+          -- EVIDENCE IS NOT OPTIONAL, and TRIM because whitespace is not
+          -- provenance. A recorded result with nothing behind it is a claim, and
+          -- a claim that outlives the person who made it reads as a measurement.
+          CHECK (trim(evidence) <> ''),
+          -- THE VOCABULARY, not merely non-emptiness. The writer already refuses
+          -- an undeclared kind or an unrecognised result, but the writer is not
+          -- the only way into the table -- and a caller reaching the store
+          -- directly is exactly the case it cannot see. A row saying 'BAD' would
+          -- be returned by the next read as the newest apparently-current answer
+          -- and consumed by the arming gate.
+          --
+          -- This restates MEASUREMENT_KINDS, which is a second inventory of one
+          -- rule. A test asserts the two agree, because two inventories are only
+          -- safe when something fails loudly the moment they diverge.
+          CHECK (kind IN ('pool-relationship')),
+          CHECK (kind <> 'pool-relationship'
+                 OR result IN ('SHARED','SEPARATE','INCONCLUSIVE')),
+          CHECK (measured_at > 0)
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS provider_measurement_latest
+          ON provider_measurement(provider, kind, measured_at DESC);
+      `);
+      // NO TRIGGER for the future-timestamp rule, deliberately. SQLite forbids
+      // non-deterministic functions in CHECK, so `unixepoch()` can only be
+      // reached from a trigger -- and this schema declares NONE, which is what
+      // lets snapshot validation treat any trigger at all as unexpected. Adding
+      // two to guard one column would trade a schema-wide tampering signal for a
+      // narrower guarantee.
+      //
+      // The rule is enforced where it actually matters instead: `recordMeasurement`
+      // refuses to write one, and `latestMeasurement` refuses to RETURN one. The
+      // read guard is the stronger of the two, because a future-dated row is only
+      // dangerous when something consumes it as the newest current answer -- and
+      // it catches rows this database never validated, such as one replayed from
+      // a snapshot written by an older binary.
     } },
 ];
 

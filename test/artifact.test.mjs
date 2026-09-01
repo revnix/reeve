@@ -737,6 +737,82 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
     "control: a write through a new chain still succeeds and reads back");
 }
 
+// ── The eight refinements, each verified in both directions ────────────────
+{
+  const g = (phase, body, expect) => {
+    const d2 = join(dir, `fu${Math.random().toString(36).slice(2, 8)}`);
+    writeArtifact({ dir: d2, phase, bytes: Buffer.from(body) });
+    return reviewArtifact({ phase, dir: d2, expect });
+  };
+  const SZ = { depth: "standard", est_files: 3, est_weighted_files: 4, est_packages: 1,
+               est_slices: 2, risk_paths_touched: [], rationale: "x" };
+
+  // A SIZING FIELD HAS A KIND, not merely a presence. `est_files: "lots"`
+  // satisfied the contract, and the floors that read those numbers compare them.
+  check(g("SIZING", JSON.stringify(SZ), {}).ok === true, "control: a well-typed sizing passes");
+  for (const [field, bad] of [["est_files", "lots"], ["est_slices", 1.5], ["est_packages", -1],
+                              ["risk_paths_touched", "none"], ["rationale", "  "]]) {
+    const r = g("SIZING", JSON.stringify({ ...SZ, [field]: bad }), {});
+    check(r.ok === false && r.findings.some(f => f.includes(field)),
+      `sizing.json's ${field} as ${JSON.stringify(bad)} is refused, and the finding names it`,
+      JSON.stringify(r.findings));
+  }
+
+  // A CITATION'S EXTENSION IS NOT LENGTH-CAPPED. `{0,5}` refused a correctly
+  // cited claim for having a long filename.
+  for (const cite of ["src/x.markdown:12", "a.config.mjs:3", "x.yml:1", "deep/path/to/thing.mts:99"])
+    check(g("RESEARCH", `# r\n\n## Findings\n\n- a claim (${cite})\n`, {}).ok === true,
+      `${cite} is a citation`);
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim at 12:30\n", {}).ok === false,
+    "control: and a bare time is still not one");
+
+  // A CLAIM IS TOP-LEVEL. A nested bullet elaborating a cited claim was counted
+  // as its own claim, so the more carefully a finding was broken down the more
+  // likely the artifact was refused.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n  - elaboration, uncited\n", {}).ok === true,
+    "a nested bullet is not a claim of its own");
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n- another, uncited\n", {}).ok === false,
+    "control: a second TOP-LEVEL bullet is, and is still required to cite");
+
+  // minCitationsPerClaim IS APPLIED. It was accepted and ignored, so a claim with
+  // one citation satisfied a caller asking for two -- an argument read but not
+  // applied, which is worse than absent because the caller believes it took hold.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n", { minCitationsPerClaim: 2 }).ok === false,
+    "a caller asking for two citations is not satisfied by one");
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1) (src/y.mjs:2)\n", { minCitationsPerClaim: 2 }).ok === true,
+    "control: and two satisfy it");
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n", {}).ok === true,
+    "control: while a caller that asks for nothing still gets the default of one");
+
+  // THE SKIP IS THE CALLER'S FLAG. Keyed on a depth the helper does not supply,
+  // this branch was unreachable from the documented caller.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n", { skipped: true }).ok === false,
+    "a caller declaring the phase skipped is refused without carrying a depth");
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n", { skipped: false }).ok === true,
+    "control: and one declaring it not skipped is gated normally");
+
+  // A FENCE MUST CLOSE. An unterminated fence satisfied the opening test, and the
+  // rest of the document is then inside it.
+  const sl = "# d\n\n## Slices\n\n### Slice 1: x\n- Files: a\n- Packages: b\n- Test plan: c\n\nDone when:\n\n";
+  check(g("DESIGN", sl + "```bash\npnpm test\n", { requireDoneCondition: true }).ok === false,
+    "an unterminated done-condition fence is refused");
+  check(g("DESIGN", sl + "```bash\npnpm test\n```\n", { requireDoneCondition: true }).ok === true,
+    "control: and a closed one passes");
+}
+
+// ── A temporary goes when close itself throws ──────────────────────────────
+//
+// Third leak in this family: the write was covered, then the rename, and the
+// close between them was not. `closeSync` throws in its own right on some
+// filesystems, where a deferred write error surfaces there.
+{
+  const adir = join(dir, "closefail");
+  const w = writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from("# d\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n") });
+  check(readdirSync(adir).filter(f => f.includes(".tmp-")).length === 0,
+    "control: an ordinary write leaves no temporary", readdirSync(adir).join(","));
+  check(existsSync(w.path), "control: and produces the artifact");
+}
+
 db.close();
 rmSync(dir, { recursive: true, force: true });
 console.log(fail ? `\nfailed=${fail}` : "\nall green");

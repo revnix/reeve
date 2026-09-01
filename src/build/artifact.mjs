@@ -70,13 +70,19 @@ export function writeArtifact({ dir, phase, bytes }) {
   // question the caller actually asked, which is whether the artifact survives.
   // The chain stops at the reeve home rather than walking to the filesystem
   // root, because directories this code did not make are not its to reason about.
+  // WALKED TO THE FILESYSTEM ROOT, not to a count I picked. The cap was eight,
+  // which meant a deeper tree silently stopped being synced above that level --
+  // durability reported for entries never flushed, by a bound chosen to stop a
+  // loop rather than because eight meant anything. The loop already terminates
+  // at the root; the count added nothing but a place to be wrong.
   const chain = [];
-  for (let d = dir; d !== dirname(d) && chain.length < 8; d = dirname(d)) chain.push(d);
+  for (let d = dir; d !== dirname(d); d = dirname(d)) chain.push(d);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, name);
   reapStaleTemporaries(dir, name, Date.now());
   const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
   const fd = openSync(tmp, "wx");
+  let closed = false;
   try {
     // WRITTEN TO COMPLETION, not merely handed over. `writeSync` may return
     // having written FEWER bytes than it was given, and a partial write that is
@@ -90,16 +96,22 @@ export function writeArtifact({ dir, phase, bytes }) {
       off += n;
     }
     fsyncSync(fd);
+    // CLOSED INSIDE THE GUARDED REGION. `closeSync` can throw in its own right --
+    // a deferred write error surfaces there on some filesystems -- and closing
+    // outside the try left the temporary behind for exactly the failure the
+    // cleanup exists to handle. Third leak in this family: the write was
+    // covered, then the rename, and the close between them was not.
+    closed = true;
+    closeSync(fd);
   } catch (e) {
     // THE TEMPORARY GOES WITH THE FAILURE. A write that throws -- a full disk is
     // the ordinary case -- left its partial file behind, and every retry minted
     // another randomly named one. The space needed to recover is then consumed
     // by the failures, which turns a transient full disk into a permanent one.
-    closeSync(fd);
-    try { rmSync(tmp, { force: true }); } catch { /* the throw above is the real failure */ }
+    if (!closed) { try { closeSync(fd); } catch { /* the throw below is the real failure */ } }
+    try { rmSync(tmp, { force: true }); } catch { /* the throw below is the real failure */ }
     throw e;
   }
-  closeSync(fd);
   // THE RENAME IS INSIDE THE CLEANUP TOO. It was outside it, so a rename that
   // failed -- the destination has become a directory, or the filesystem refuses
   // the metadata update -- left a COMPLETE temporary behind, and every retry
@@ -174,7 +186,12 @@ const CLAIM = /^\s*(?:[-*+]|\d+[.)])\s+\S/;
 // `src/build/hubaccess.mjs:170`, so a claim mentioning a time or a ticket read
 // as sourced. The token must therefore carry the shape of a file: either a
 // separator, or a name with an extension immediately before the colon.
-const CITATION = /(?:[\w.-]*\/[\w./-]*|[\w-]+\.[A-Za-z][\w]{0,5}):\d+/;
+// The extension is not length-capped. `{0,5}` refused `src/x.markdown:12` and
+// `a.config.mjs:3` -- a correctly cited claim rejected because its filename was
+// long, which is the gate refusing correct work over a number nobody chose
+// deliberately. What distinguishes a file from a URL port is the DOT, not how
+// many letters follow it.
+const CITATION = /(?:[\w.-]*\/[\w./-]*|[\w-]+\.[A-Za-z][\w-]*):\d+/;
 // A URL's PORT is not a file citation, and research is full of URLs. `[\w./-]+:\d+`
 // matches `localhost:3000` exactly as it matches `src/x.mjs:170`, so a claim
 // supported by a link read as supported by a source line -- the gate accepting
@@ -254,22 +271,42 @@ export function reviewArtifact({ phase, dir, expect }) {
         // The depth VALUE is still not re-checked here. The transition owns that
         // vocabulary and refuses an unknown depth durably; a copy of the list in
         // this file would be a second inventory of it.
-        for (const field of ["depth", "est_files", "est_weighted_files", "est_packages",
-                             "est_slices", "risk_paths_touched", "rationale"])
-          if (!(field in parsed)) findings.push(`sizing.json omits ${field}`);
-        if ("depth" in parsed && (typeof parsed.depth !== "string" || !parsed.depth.trim()))
-          findings.push("sizing.json's depth is not a name; it is the field the phase machine reads");
+        // PRESENCE AND TYPE. Presence alone let `est_files: "lots"` satisfy the
+        // contract, and the floors that read those numbers compare them -- so a
+        // string passes the gate and then produces a comparison nobody can
+        // reason about. The kinds here are the ones the fields' own names imply,
+        // and each is stated once.
+        const KIND = {
+          depth: ["a name", (v) => typeof v === "string" && v.trim() !== ""],
+          est_files: ["a number", (v) => Number.isFinite(v) && v >= 0],
+          est_weighted_files: ["a number", (v) => Number.isFinite(v) && v >= 0],
+          est_packages: ["a number", (v) => Number.isFinite(v) && v >= 0],
+          est_slices: ["a whole number", (v) => Number.isInteger(v) && v >= 0],
+          risk_paths_touched: ["a list", (v) => Array.isArray(v)],
+          rationale: ["a non-empty string", (v) => typeof v === "string" && v.trim() !== ""],
+        };
+        for (const [field, [kind, ok]] of Object.entries(KIND)) {
+          if (!(field in parsed)) { findings.push(`sizing.json omits ${field}`); continue; }
+          if (!ok(parsed[field]))
+            findings.push(`sizing.json's ${field} is ${JSON.stringify(parsed[field])}, not ${kind}`);
+        }
       }
     }
   }
   if (phase === "RESEARCH") {
-    if (expect.depth === "trivial")
-      return { ok: false, why: "RESEARCH is skipped at trivial depth; there is no research artifact to gate",
+    // THE CALLER'S FLAG FIRST, depth as the fallback. Keyed on `expect.depth`
+    // alone this branch is unreachable from the documented caller, which passes
+    // the helper's requirement set and no depth -- so the one path the check
+    // exists for could never be taken.
+    const researchSkipped = "skipped" in expect ? expect.skipped : expect.depth === "trivial";
+    if (researchSkipped)
+      return { ok: false, why: "RESEARCH is skipped at this depth; there is no research artifact to gate",
                findings: [], sha256 };
     // The caller's declared minimum, when it declares one. The phase helpers
     // return `{minCitationsPerClaim, minClaims}`; a depth-carrying caller does
     // not, so the default stands in for it.
     var minClaims = Number.isInteger(expect.minClaims) ? expect.minClaims : 1;
+    const minCites = Number.isInteger(expect.minCitationsPerClaim) ? expect.minCitationsPerClaim : 1;
     // PER CLAIM, not per file. A whole-file test passes as soon as ANY line
     // carries a citation, so an artifact with nine cited claims and one bare
     // assertion reads as clean -- and the bare one is the claim that needed
@@ -289,9 +326,21 @@ export function reviewArtifact({ phase, dir, expect }) {
     })();
     let claims = 0;
     for (const line of scope) {
-      if (!CLAIM.test(line)) continue;
+      // TOP-LEVEL, as the contract says. A nested bullet elaborating a cited
+      // claim was counted as a claim of its own and required its own citation,
+      // so the more carefully a finding was broken down the more likely the
+      // artifact was refused -- the gate penalising exactly the structure it
+      // wants.
+      if (!CLAIM.test(line) || /^\s+/.test(line)) continue;
       claims++;
-      if (!CITATION.test(withoutUrls(line))) findings.push(`no file:line citation: ${line.trim()}`);
+      // THE COUNT THE CALLER ASKED FOR. `minCitationsPerClaim` was read and
+      // ignored, so a claim with one citation satisfied a caller asking for two.
+      // An argument accepted and not applied is worse than one absent, because
+      // the caller believes it took effect.
+      const cites = (withoutUrls(line).match(new RegExp(CITATION.source, "g")) ?? []).length;
+      if (cites < minCites)
+        findings.push(cites === 0 ? `no file:line citation: ${line.trim()}`
+          : `${cites} citation(s) against a minimum of ${minCites}: ${line.trim()}`);
     }
     // ABSENCE MUST NOT SATISFY THE RULE. With no claims the loop runs zero times
     // and every claim is trivially cited, so an empty artifact -- or one that is
@@ -382,9 +431,14 @@ export function reviewArtifact({ phase, dir, expect }) {
         // to; it refuses a slice with no such block.
         if (label === "Done when:" && expect.requireDoneCondition === true) {
           const after = rows.slice(at).join("\n");
-          const fence = /^\s*```[^\n]*\n\s*(\S[^\n]*)/m.exec(after.slice(0, nextBoundary(rows, at)));
+          // OPENED AND CLOSED. An unterminated fence satisfied an opening-fence
+          // test, and half a block is not a done condition -- the rest of the
+          // document is then inside it, so what the slice actually asks for is
+          // whatever happens to follow.
+          const within = after.slice(0, nextBoundary(rows, at));
+          const fence = /^\s*```[^\n]*\n\s*(\S[^\n]*)[\s\S]*?^\s*```\s*$/m.exec(within);
           if (!fence) findings.push(`${heading} has no machine-checkable done condition: ` +
-            `the contract asks for a fenced block whose first line is a command`);
+            `the contract asks for a fenced block, opened AND closed, whose first line is a command`);
         }
       }
     }

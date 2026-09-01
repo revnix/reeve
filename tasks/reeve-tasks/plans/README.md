@@ -203,20 +203,23 @@ citation shape, the sizing contract's field presence, per-slice design minima, a
 `requireMeasuredContext`, `minSlices`, `minClaims` and `requireDoneCondition` when the caller
 supplies them.
 
-**Left, by founder decision, for the task that owns the contract:**
+**Fixed in the follow-up, not left for S3-D.** An earlier revision of this file said
+these were deferred to the task that owns the contract; that was a misrecording of the
+founder's decision, which was to fix everything after T4 merged. All of them are done:
 
-| what | why it is S3-D's |
+| what | now |
 |---|---|
-| `sizing.json` field TYPES — presence is checked, so `est_files: "lots"` passes | the floors that read those numbers are S3-D's, and they should state what they need |
-| claims restricted to TOP-LEVEL Findings bullets | nested items currently count as claims, so a sub-bullet elaborating a cited claim needs its own citation |
-| a CLOSING fence on the done condition | an unterminated fence satisfies the opening-fence test, and half a block is not a done condition |
-| the trivial-depth RESEARCH refusal keyed on a helper flag | it still reads `expect.depth`, which the helper does not supply, so that path is unreachable from the documented caller |
-| `minCitationsPerClaim` applied | it is accepted and ignored, and an argument read but not applied is worse than one absent, because the caller believes it took effect |
+| `sizing.json` field TYPES | each field has a declared kind, so `est_files: "lots"` is refused and the finding names the field |
+| claims restricted to TOP-LEVEL Findings bullets | a nested bullet elaborating a cited claim is no longer a claim of its own |
+| a CLOSING fence on the done condition | the fence must open AND close; half a block put the rest of the document inside it |
+| the trivial-depth RESEARCH refusal | reads the caller's `skipped` flag, with depth as the fallback, so the path is reachable from the documented caller |
+| `minCitationsPerClaim` applied | it was accepted and ignored, so a claim with one citation satisfied a caller asking for two |
 
-**And three defects of T4's own**, deferred to the same follow-up rather than to S3-D: the
-directory-sync chain stops at eight levels, the citation pattern rejects extensions longer than
-six characters (so `src/x.markdown:12` is refused), and a temporary survives when `closeSync`
-itself throws.
+**And T4's own three**, also fixed: the directory-sync chain now walks to the filesystem
+root rather than stopping at eight levels, the citation pattern no longer caps a file
+extension at six characters (so `src/x.markdown:12` is a citation), and a temporary is
+removed when `closeSync` itself throws — the third leak in that family, after the write
+and the rename.
 
 **One more, found by the T13 lane and inherited here:** `bin/reeve`'s `task file` route gates on
 `completedVersion(hub) === HUB_SCHEMA_VERSION`, and `completedVersion` returns `max(version)`.

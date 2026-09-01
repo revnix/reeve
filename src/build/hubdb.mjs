@@ -204,6 +204,37 @@ const MIGRATIONS = [
  * completed migration, and `openHub` gives a far better account of a corrupt
  * store than `no such table: singleton_lease` does.
  */
+/**
+ * Which migrations a hub is MISSING, from 1 to the version this binary expects.
+ *
+ * `completedVersion` answers `max(version)`, and a maximum is not a history. A
+ * hub recording 1 and 3 with 2 absent answers 3, satisfies an equality against
+ * the current version, and then fails on a table migration 2 was supposed to
+ * create -- the uncaught trace that every such guard exists to replace,
+ * arriving through the guard itself.
+ *
+ * It lives here rather than in each caller because two routes need it and a
+ * second copy of the query would be a second inventory of the same fact. Read
+ * only: this reports, it never migrates.
+ *
+ * `readable: false` means the file could not be opened or carries no
+ * `schema_version` at all, which is a different answer from "some are missing"
+ * and must not be collapsed into it.
+ */
+export function missingMigrations(path) {
+  if (!existsSync(path)) return { readable: false, missing: [], have: [] };
+  let q;
+  try { q = new DatabaseSync(path, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS }); }
+  catch { return { readable: false, missing: [], have: [] }; }
+  try {
+    const have = new Set(q.prepare("SELECT version FROM schema_version").all().map((r) => r.version));
+    const missing = [];
+    for (let v = 1; v <= HUB_SCHEMA_VERSION; v++) if (!have.has(v)) missing.push(v);
+    return { readable: true, missing, have: [...have].sort((a, b) => a - b) };
+  } catch { return { readable: false, missing: [], have: [] }; }
+  finally { try { q.close(); } catch { /* already gone */ } }
+}
+
 export function completedVersion(path) {
   if (!existsSync(path)) return 0;
   try {

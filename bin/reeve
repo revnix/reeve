@@ -1267,7 +1267,15 @@ switch (cmd) {
         // and a project the registry has lost still has tasks in the hub, which
         // is why the two are unioned rather than one being trusted.
         if (sub === "dash") {
-          const known = [...new Set([...Object.keys(reg.registry.projects), ...projectsWithTasks(db)])].sort();
+          // INSIDE the guard. This reads `task` on the same possibly-broken store
+          // as the model queries, and the schema-version check above touches
+          // different pages -- so a hub that fails here fails AFTER every guard
+          // that ran. The `task list --project` path wraps the same helper for
+          // exactly this reason, and leaving it unwrapped here reintroduced a
+          // defect that was already fixed once.
+          let seen;
+          try { seen = projectsWithTasks(db); } catch (e) { queryFailed(e); }
+          const known = [...new Set([...Object.keys(reg.registry.projects), ...seen])].sort();
           const named = known.map(n => ({ name: n, nwo: reg.registry.projects[n]?.nwo ?? null }));
           const raw = opt("since");
           let since = null;
@@ -1287,7 +1295,11 @@ switch (cmd) {
           console.log(flag("json")
             ? JSON.stringify(envelope("task.dash", model), null, 2)
             : renderDash(model));
-          process.exit(EXITS.ok);
+          // A CURSOR AHEAD OF THE LOG IS NOT A QUIET PERIOD. The answer is printed
+          // either way -- it carries the cursor to resync from -- but the exit
+          // status says the movement list is not an answer, so a script polling
+          // this cannot mistake a restore for nothing having happened.
+          process.exit(model.cursor_rewound ? EXITS.degraded : EXITS.ok);
         }
 
         if (sub === "list") {
@@ -1346,7 +1358,7 @@ switch (cmd) {
       console.error('-> reeve task file --project <p> --title "..." --territory <path>');
       console.error("-> reeve task list [--project <p>] [--json]");
       console.error("-> reeve task show|why <task-id> [--json]");
-      console.error("-> reeve task dash [--since <unix>] [--json]");
+      console.error("-> reeve task dash [--since <cursor>] [--json]");
       process.exit(1);
     }
     const { fileTask, pinSeconds } = await import("../src/build/taskfile.mjs");
@@ -2137,7 +2149,7 @@ function usage() {
   task why <id> [--json]
                         the evidence lineage behind one task, absence included
   task dash [--json]    the digest: alive, doing, waiting on you, declined
-      --since <seq>         what moved since that cursor (see next_cursor)
+      --since <cursor>      what moved since that cursor (the digest prints the next one)
 
   task file             file a task, with its territory declared and leased
       --project <p>         the registry project to file against

@@ -61,6 +61,9 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
   const unexpired = !!lease && lease.expires_at > now;
   const holderAlive = unexpired && isAlive(lease.pid, lease.lstart);
 
+  const highWater = db.prepare("SELECT COALESCE(max(seq), 0) s FROM phase_event").get().s;
+  const rewound = since !== null && since > highWater;
+
   const byProject = Object.create(null);
   for (const p of projects) byProject[p.name] = switchesFor(p.name);
 
@@ -133,8 +136,18 @@ export function dashModel(db, { now, switchesFor, projects = [], since = null, i
     // that same whole second -- and loses it for ever, because the next cursor is
     // later still. `phase_event.seq` is lossless and monotonic, and
     // `next_cursor` is handed back so the operator never has to construct one.
-    since_you_looked: since === null ? [] : movedSince(db, since),
-    next_cursor: db.prepare("SELECT COALESCE(max(seq), 0) s FROM phase_event").get().s,
+    since_you_looked: since === null || rewound ? [] : movedSince(db, since),
+    next_cursor: highWater,
+    // A RESTORE REWINDS THE LOG. `phase_event.seq` is monotonic within one hub,
+    // not across a restore: replacing the store with an older snapshot can put
+    // the high-water mark BELOW a cursor issued before it. Every later
+    // transition is then `seq <= since` and reads as "nothing moved" for ever,
+    // while the digest hands back a smaller cursor the client dutifully saves.
+    //
+    // Nothing readable after the fact distinguishes that from a genuinely quiet
+    // period, which is why it is reported rather than inferred: a cursor ahead of
+    // the log is PROOF the log is not the one that issued it.
+    cursor_rewound: rewound,
 
     // 5. WHAT DID IT DECLINE, FAIL OR REFUSE. Standing escalations, beside the
     // task that raised them.
@@ -219,8 +232,12 @@ export function renderDash(m) {
   out.push("", `doing (${m.doing.length})`);
   if (!m.doing.length) out.push("  nothing");
   for (const d of m.doing)
+    // DRIFT RIDES WITH THE RUN. `show` warns that a run whose frozen contract no
+    // longer matches the live environment must not be read as current; printing
+    // the run here without it presents exactly that run as an ordinary one.
     out.push(`  ${d.id}  ${d.phase}` +
-             (d.running ? `  running ${d.running.phase}/${d.running.slice} attempt ${d.running.attempt}` : "") +
+             (d.running ? `  running ${d.running.phase}/${d.running.slice} attempt ${d.running.attempt}` +
+                          (d.running.drift ? `  DRIFT ${oneLine(d.running.drift)}` : "") : "") +
              `  in state ${secs(d.age?.seconds)}  ${oneLine(d.title)}`);
 
   out.push("", `declined (${m.declined.length})`);
@@ -228,11 +245,18 @@ export function renderDash(m) {
   for (const e of m.declined)
     out.push(`  ${e.id}  ${oneLine(e.why)}  x${e.count}  since ${e.first_seen_at}`);
 
-  out.push("", m.since === null
-    ? "since you looked  (no --since given)"
-    : `since you looked (${m.since_you_looked.length})`);
+  out.push("", m.cursor_rewound
+    ? `since you looked  CURSOR REWOUND: --since ${m.since} is ahead of this hub's log ` +
+      "(it was restored). Resync from the cursor below."
+    : m.since === null
+      ? "since you looked  (no --since given)"
+      : `since you looked (${m.since_you_looked.length})`);
   for (const e of m.since_you_looked)
     out.push(`  ${e.id}  ${e.op}  ${e.from ?? "-"} -> ${e.to ?? "-"}  at ${e.at}`);
+  // THE CURSOR, IN THE TEXT. The model promises to hand one back so the operator
+  // never constructs one; printing it only under --json makes that promise
+  // reachable exclusively by the people who did not need it.
+  out.push(`  next: --since ${m.next_cursor}`);
 
   // Per task, the facts a digest owes beside the state: what is draining, what
   // territory is pinned and until when, and every UNKNOWN said out loud.

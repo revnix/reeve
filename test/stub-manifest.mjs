@@ -982,13 +982,13 @@ export const STUBS = [
   },
   {
     name: "dash-aliveness-reads-the-clock-not-the-row",
-    why: "report the builder as running because a `singleton_lease` row exists. The row OUTLIVES the process that took it -- that is what makes it a lease -- so a crashed builder leaves a row behind and the digest's first line then tells an operator that work is proceeding while nothing is running at all. The one question a glance surface exists to answer, answered wrongly in the direction that stops anyone looking further",
+    why: "make `running` require the lease to be UNEXPIRED as well as its holder alive. `build status` reads liveness from isSameProcess alone, and acquireSingleton refuses a takeover from a live holder even after expiry -- because a busy process can miss a heartbeat and killing its authority mid-effect is the race, not the fix. Requiring both reports a live builder as stopped whenever a tick blocks past the 120-second lease, and disagrees with the authority rule about who holds the hub",
     test: "test/build-dash.test.mjs",
-    expectRed: "an unexpired lease whose HOLDER is gone is not running",
+    expectRed: "an EXPIRED lease whose holder is alive is still running",
     edits: [{
       file: "src/build/dash.mjs",
-      find: "  const holderAlive = unexpired && isAlive(lease.pid, lease.lstart);",
-      replace: "  const holderAlive = unexpired;",
+      find: "  const holderAlive = !!lease && isAlive(lease.pid, lease.lstart);",
+      replace: "  const holderAlive = unexpired && isAlive(lease.pid, lease.lstart);",
     }],
   },
   {

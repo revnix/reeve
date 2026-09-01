@@ -412,6 +412,133 @@ const MIGRATIONS = [
  * completed migration, and `openHub` gives a far better account of a corrupt
  * store than `no such table: singleton_lease` does.
  */
+/**
+ * The versions absent BENEATH the highest one recorded -- a HOLE, as distinct
+ * from a history that is merely short.
+ *
+ * The two are different faults with different repairs, and only one of them
+ * migrates. `openHub` re-runs a missing tail and refuses a hole outright,
+ * because a migration beneath an applied one cannot be re-run over a store that
+ * has already moved past it. A caller that cannot tell them apart prescribes the
+ * wrong remedy for one of them.
+ *
+ * Spelled ONCE, and read by every site that asks: `openHub`'s own refusal, the
+ * snapshot validator in backup.mjs -- whose comment already said it was applying
+ * "the same contiguity rule `openHub` applies" while carrying its own copy of
+ * the loop -- and `missingMigrations` for the CLI. Three literal copies of one
+ * rule is how the answers drift, and the drift is invisible until two of them
+ * disagree in front of an operator.
+ */
+const recorded = (versions) => new Set(versions.filter((v) => Number.isInteger(v) && v >= 1));
+const highest = (set) => { let top = 0; for (const v of set) if (v > top) top = v; return top; };
+
+/**
+ * Is there a hole, ASKED WITHOUT ENUMERATING ANYTHING.
+ *
+ * A contiguous history from 1 has exactly as many distinct entries as its own
+ * maximum, so counting answers the question in one pass and cannot be made
+ * expensive by the value in the file. That matters because the value in the file
+ * is not trusted: `schema_version` is the table an operator is most likely to
+ * have edited by hand, and a store recording 1000000000 made the enumerating
+ * form allocate a billion-entry array. Measured on node v24.17.0: a hub with
+ * that single row killed the process with a V8 heap OOM before `reeve task file
+ * --dry-run` printed anything, so a corrupt marker crashed the command that
+ * exists to REPORT a corrupt marker.
+ */
+export function hasHistoryHole(versions) {
+  const have = recorded(versions);
+  return have.size !== highest(have);
+}
+
+/**
+ * WHICH versions are absent beneath the highest one recorded -- for the message.
+ *
+ * `upTo` is required and is the CALLER'S bound, never the stored maximum, and it
+ * is refused above this binary's own schema version. A store recorded above that
+ * has to be refused for being newer BEFORE anything is enumerated against it:
+ * the versions it carries are ones this binary cannot interpret, so "which are
+ * missing" is not a meaningful question, and asking it is the only way this loop
+ * can be handed an untrusted bound.
+ *
+ * So the check is not defensive tidiness. It is the invariant that makes the
+ * ordering in `openHub` and in `validateSnapshot` load-bearing rather than
+ * incidental, and it fails loudly if either is ever reordered.
+ */
+export function historyGaps(versions, upTo) {
+  if (!Number.isSafeInteger(upTo) || upTo < 0 || upTo > HUB_SCHEMA_VERSION)
+    throw new Error(
+      `historyGaps was asked to enumerate up to ${String(upTo)}; the bound must be a version this ` +
+      `binary knows (0 to ${HUB_SCHEMA_VERSION}). A store recorded above that is refused for being ` +
+      `newer before its history is enumerated, so reaching here means that refusal was skipped.`);
+  const have = recorded(versions);
+  const gaps = [];
+  for (let v = 1; v <= upTo; v++) if (!have.has(v)) gaps.push(v);
+  return gaps;
+}
+
+/**
+ * Which migrations a hub is MISSING, from 1 to the version this binary expects.
+ *
+ * `completedVersion` answers `max(version)`, and a maximum is not a history. A
+ * hub recording 1 and 3 with 2 absent answers 3, satisfies an equality against
+ * the current version, and then fails on a table migration 2 was supposed to
+ * create -- the uncaught trace that every such guard exists to replace,
+ * arriving through the guard itself.
+ *
+ * It lives here rather than in each caller because two routes need it and a
+ * second copy of the query would be a second inventory of the same fact. Read
+ * only: this reports, it never migrates.
+ *
+ * `readable: false` means the file could not be opened or carries no
+ * `schema_version` at all, which is a different answer from "some are missing"
+ * and must not be collapsed into it.
+ *
+ * `holed` says WHICH fault it is, because the remedy differs: a hole needs a
+ * snapshot, a short history needs a migration. Without it every caller reads a
+ * non-empty `missing` as one condition and names one remedy, which is right for
+ * exactly one of the two.
+ *
+ * `version` is the highest version RECORDED, which is a different question from
+ * which expected ones are absent -- and the one a caller needs to refuse a store
+ * from a NEWER binary. A hub carrying a contiguous 1 through 4 while this binary
+ * knows 3 is missing none of what this binary expects, so `missing` is empty and
+ * `holed` is false, and a caller reading only those two proceeds to open it for
+ * writing. `openHub`'s first act is `PRAGMA journal_mode = WAL` and the
+ * `schema_version` DDL, so the command that promised no writes writes to a
+ * future-version database before anything refuses it.
+ */
+export function missingMigrations(path) {
+  // ONE SHAPE FROM EVERY EXIT, `holed` included. A caller reading `.holed` off
+  // an unreadable answer would otherwise get `undefined`, which is falsy, and
+  // "this file cannot be read" would silently answer "no hole".
+  const unreadable = { readable: false, missing: [], have: [], holed: false, version: 0, invalid: [] };
+  if (!existsSync(path)) return unreadable;
+  let q;
+  try { q = new DatabaseSync(path, { readOnly: true, timeout: HUB_BUSY_TIMEOUT_MS }); }
+  catch { return unreadable; }
+  try {
+    const have = new Set(q.prepare("SELECT version FROM schema_version").all().map((r) => r.version));
+    const missing = [];
+    for (let v = 1; v <= HUB_SCHEMA_VERSION; v++) if (!have.has(v)) missing.push(v);
+    // A RECORDED VERSION THAT IS NOT A VERSION IS ITS OWN FAULT, and it has to
+    // be reported rather than filtered away. `schema_version` is an INTEGER
+    // PRIMARY KEY, so `-1` is valid SQLite -- and every rule here quietly
+    // ignored it: `hasHistoryHole` skips anything below 1, so a store recording
+    // only `-1` looked un-holed and merely behind, and the CLI told the operator
+    // to migrate. `openHub` then refuses that same store, because `historyGaps`
+    // will not take a negative bound. The advertised remedy could not work.
+    const all = [...have];
+    const invalid = all.filter((v) => !Number.isSafeInteger(v) || v < 1).sort((a, b) => a - b);
+    const present = all.filter((v) => Number.isSafeInteger(v) && v >= 1).sort((a, b) => a - b);
+    // COUNTED, NOT ENUMERATED. `historyGaps` would answer the same question and
+    // would allocate one entry per absent version -- with the stored maximum as
+    // its bound, which is exactly the untrusted number.
+    return { readable: true, missing, have: present, holed: hasHistoryHole(present), invalid,
+             version: present.length ? present[present.length - 1] : 0 };
+  } catch { return unreadable; }
+  finally { try { q.close(); } catch { /* already gone */ } }
+}
+
 export function completedVersion(path) {
   if (!existsSync(path)) return 0;
   try {
@@ -727,6 +854,24 @@ export function openHub(path, { skipIntegrity = false } = {}) {
   //
   // Read once here only to refuse a NEWER store early with a clear message.
   const seen = db.prepare("SELECT COALESCE(max(version), 0) v FROM schema_version").get().v;
+  // NEWER FIRST, and the order is load-bearing twice over.
+  //
+  // Once for meaning: the versions a newer binary recorded are ones this binary
+  // cannot interpret, so "which of them are missing" is not a question with an
+  // answer, and the honest refusal is that the store is newer.
+  //
+  // Once for cost: the contiguity check below enumerates up to the recorded
+  // maximum, and that maximum comes out of a file an operator may have edited.
+  // Running it first meant a hand-written `schema_version` could make this
+  // function allocate an array with as many entries as the number it found.
+  // `historyGaps` now refuses a bound above this binary's version, so a future
+  // reordering fails with that message instead of silently exhausting memory.
+  if (seen > HUB_SCHEMA_VERSION) {
+    closeHub();
+    throw new Error(
+      `hub store at ${path} is schema version ${seen}; this binary knows ${HUB_SCHEMA_VERSION}. ` +
+      `Migrations are forward-only: run the newer binary, or restore a snapshot taken at ${HUB_SCHEMA_VERSION}.`);
+  }
   // And the history has to be CONTIGUOUS, not merely tall. `max(version)` alone
   // reads a store recording versions 1 and 3 with 2 missing as fully migrated,
   // so the loop below skips every `m.version <= seen` and the store is used with
@@ -737,8 +882,18 @@ export function openHub(path, { skipIntegrity = false } = {}) {
   // cannot be re-run, because the ones above it have already been applied.
   {
     const rows = db.prepare("SELECT version FROM schema_version ORDER BY version").all().map(r => r.version);
-    const gaps = [];
-    for (let v = 1; v <= seen; v++) if (!rows.includes(v)) gaps.push(v);
+    // The rule itself is `historyGaps`, so the refusal here and the advice the
+    // CLI prints are the same judgement rather than two implementations of it.
+    // CLOSED ON THE THROW TOO. `historyGaps` refuses a bound it cannot trust,
+    // and `schema_version` is an INTEGER PRIMARY KEY, so a hand-edited marker
+    // may hold a negative number -- which reaches that refusal rather than the
+    // branch below, and left the handle open. A caller that catches and retries
+    // then leaks one SQLite descriptor per attempt until unrelated file
+    // operations start failing, which is a failure nobody would trace back to a
+    // corrupt version marker.
+    let gaps;
+    try { gaps = historyGaps(rows, seen); }
+    catch (e) { closeHub(); throw e; }
     if (gaps.length) {
       closeHub();
       throw new Error(
@@ -747,13 +902,6 @@ export function openHub(path, { skipIntegrity = false } = {}) {
         `missing migrations cannot be re-run beneath the ones above them. Restore a snapshot.`);
     }
   }
-  if (seen > HUB_SCHEMA_VERSION) {
-    closeHub();
-    throw new Error(
-      `hub store at ${path} is schema version ${seen}; this binary knows ${HUB_SCHEMA_VERSION}. ` +
-      `Migrations are forward-only: run the newer binary, or restore a snapshot taken at ${HUB_SCHEMA_VERSION}.`);
-  }
-
   // A FINAL recheck under the lock, even when nothing is pending. When this
   // binary has already applied every migration it knows, every iteration below
   // takes the `continue` and the locked `applied > HUB_SCHEMA_VERSION` recheck

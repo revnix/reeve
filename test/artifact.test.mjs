@@ -7,7 +7,7 @@
 // one; and the sha recorded must be the sha of the bytes that survived, not of
 // the buffer that was intended.
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, lstatSync,
-         readdirSync, utimesSync } from "node:fs";
+         readdirSync, utimesSync, chmodSync, openSync, closeSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -19,6 +19,32 @@ import { applyTransition } from "../src/build/transition.mjs";
 import { isSameProcess, readStart } from "../src/supervisor.mjs";
 import { fileTask } from "../src/build/taskfile.mjs";
 import { writeArtifact, readArtifact, reviewArtifact } from "../src/build/artifact.mjs";
+
+// A THROW IS NOT A VERDICT.
+//
+// Under a stub these helpers are handed values the code was not written for, and
+// an exception does not fail an assertion -- it kills the FILE. Every assertion
+// after it never runs, and an assertion that never ran is indistinguishable in
+// the log from one that passed. That is not hypothetical: two entries in this
+// file reported CAUGHT while the run had stopped at 124 of 182.
+//
+// `ok: null` is neither true nor false, so whichever direction the consuming
+// assertion tests it goes red -- a throw is never silently read as a refusal --
+// and the rest of the file still reports. Sites that deliberately assert a throw
+// call the real functions directly and are untouched.
+const attempt = (fn) => {
+  try { return fn(); }
+  catch (e) { return { ok: null, threw: String(e.message), findings: [] }; }
+};
+
+// The same shelter for a bare `writeArtifact` used as SETUP. `artifact-write-is-
+// atomic-against-a-crash` stubs the temporary into being the final path, so
+// every later write hits EEXIST -- the file died 22 assertions into 182. A
+// sentinel here leaves the sha undefined, which fails the assertion that reads
+// it, instead of taking the other 160 down with it. Sites that assert the throw
+// call `writeArtifact` directly.
+const place = (args) => attempt(() => writeArtifact(args));
+const readBack = (args) => attempt(() => readArtifact(args));
 import { reviewDiff } from "../src/sandbox.mjs";
 
 let fail = 0;
@@ -119,7 +145,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 // underneath a known-good sha.
 {
   const adir = join(dir, "readback");
-  const w = writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from("# design\n\n## Slice 1\n") });
+  const w = place({ dir: adir, phase: "DESIGN", bytes: Buffer.from("# design\n\n## Slice 1\n") });
   check(typeof w.sha256 === "string" && w.sha256.length === 64, "a write returns a sha256", w.sha256);
   check(existsSync(w.path) && readdirSync(adir).length === 1,
     "and leaves exactly one file, with no temporary beside it", readdirSync(adir).join(","));
@@ -142,7 +168,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "wholewrite");
   const bytes = Buffer.alloc(8 * 1024 * 1024, 0x62);
-  const w = writeArtifact({ dir: adir, phase: "RESEARCH", bytes });
+  const w = place({ dir: adir, phase: "RESEARCH", bytes });
   check(w.bytes === bytes.length, "a write reports the length it was given", `${w.bytes} vs ${bytes.length}`);
   check(lstatSync(w.path).size === bytes.length,
     "and the file on disk is exactly that long", `${lstatSync(w.path).size} vs ${bytes.length}`);
@@ -177,13 +203,13 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const cited = "# research\n\n- openHub refuses a hub above the schema version " +
                 "(src/build/hubaccess.mjs:170)\n- the guest handle revalidates dev:ino " +
                 "(src/build/hubaccess.mjs:42)\n";
-  writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(cited) });
+  place({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(cited) });
   const good = reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
   check(good.ok === true,
     "control: a research artifact whose every claim carries a file:line citation passes",
     JSON.stringify(good));
 
-  writeArtifact({ dir: adir, phase: "RESEARCH",
+  place({ dir: adir, phase: "RESEARCH",
     bytes: Buffer.from(cited.replace(" (src/build/hubaccess.mjs:170)", "")) });
   const bad = reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
   check(bad.ok === false, "a claim with no file:line citation is refused", JSON.stringify(bad));
@@ -282,9 +308,9 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 // write's sha, so the transition bound to bytes this gate never saw.
 {
   const adir = join(dir, "gatesha");
-  const first = writeArtifact({ dir: adir, phase: "RESEARCH",
+  const first = place({ dir: adir, phase: "RESEARCH",
     bytes: Buffer.from("# research\n\n- a claim (src/x.mjs:1)\n") });
-  const replaced = writeArtifact({ dir: adir, phase: "RESEARCH",
+  const replaced = place({ dir: adir, phase: "RESEARCH",
     bytes: Buffer.from("# research\n\n- a different claim (src/y.mjs:2)\n") });
   check(first.sha256 !== replaced.sha256, "control: the replacement really has a different sha");
 
@@ -296,7 +322,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 
   // AND ON THE REFUSAL PATH TOO, because a refusal that cannot say which bytes
   // it refused cannot be acted on.
-  writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from("# research\n\n- uncited\n") });
+  place({ dir: adir, phase: "RESEARCH", bytes: Buffer.from("# research\n\n- uncited\n") });
   const bad = reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
   check(bad.ok === false && typeof bad.sha256 === "string" && bad.sha256.length === 64,
     "and a refusal names the sha it refused", JSON.stringify({ ok: bad.ok, sha: bad.sha256 }));
@@ -313,6 +339,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   // A Proxy that reports a huge length makes writeSync throw on a real buffer,
   // which is the shape of a write that fails partway rather than a fabricated
   // error thrown before any file was created.
+  // THE REAL FUNCTION HERE, because the throw IS the subject. `place` would
+  // swallow it into a sentinel and this control would report that the write
+  // succeeded -- the shelter that keeps a stubbed run alive must not be applied
+  // where the exception is the thing being measured.
   try {
     writeArtifact({ dir: adir, phase: "DESIGN",
       bytes: new Proxy(Buffer.from("x"), { get: (t, k) => k === "length" ? 1e9 : Reflect.get(t, k) }) });
@@ -332,8 +362,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "minima");
   const gate = (body, phase = "RESEARCH") => {
-    writeArtifact({ dir: adir, phase, bytes: Buffer.from(body) });
-    return reviewArtifact({ phase, dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      place({ dir: adir, phase, bytes: Buffer.from(body) });
+      return reviewArtifact({ phase, dir: adir, expect: { depth: "standard" } });
+    });
   };
   const empty = gate("# research\n\nprose, and no list items at all.\n");
   check(empty.ok === false, "a research artifact with NO claims is refused", JSON.stringify(empty.findings));
@@ -357,8 +389,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "urls");
   const gate = (body) => {
-    writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      place({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+    });
   };
   for (const url of ["http://localhost:3000", "https://example.com:8080", "ftp://host:21/x"]) {
     const r = gate(`# research\n\n- an unsupported claim ${url}\n`);
@@ -377,8 +411,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "sizing");
   const gate = (body) => {
-    writeArtifact({ dir: adir, phase: "SIZING", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      place({ dir: adir, phase: "SIZING", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
+    });
   };
   for (const [label, body] of [["null", "null"], ["an array", "[]"], ["a scalar", "7"],
                                ["an empty object", "{}"]]) {
@@ -397,6 +433,53 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   check(good.ok === true, "control: an object carrying the full contract passes", JSON.stringify(good.findings));
 }
 
+// ── The counts are INTEGERS, because the schema says they are ──────────────
+//
+// `build_size.json` declares est_files, est_weighted_files, est_packages and
+// est_slices as `{"type": "integer", "minimum": 0}`. Three of the four were
+// checked here with `Number.isFinite`, so `est_files: 0.5` was durably approved
+// by this gate and refused by the schema -- one artifact, two verdicts, and the
+// gate is the one that says the work may proceed.
+//
+// EVERY COUNT IS EXERCISED, not the one that was reported. The defect was a
+// predicate written out four times and corrected in one of them, so a test
+// naming only est_files would pass against a fix applied only to est_files.
+{
+  const adir = join(dir, "sizing-counts");
+  const FULL = { depth: "standard", est_files: 3, est_weighted_files: 4, est_packages: 1,
+                 est_slices: 2, risk_paths_touched: ["packages/x"], rationale: "x" };
+  const gate = (over) => {
+    return attempt(() => {
+      place({ dir: adir, phase: "SIZING", bytes: Buffer.from(JSON.stringify({ ...FULL, ...over })) });
+      return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
+    });
+  };
+  // THE CONTROL FIRST, so every refusal below is caused by the field it changes
+  // rather than by the fixture being wrong in some way none of them names.
+  const base = gate({});
+  check(base.ok === true, "control: the sizing fixture passes untouched", JSON.stringify(base.findings));
+  for (const field of ["est_files", "est_weighted_files", "est_packages", "est_slices"]) {
+    const r = gate({ [field]: 0.5 });
+    check(r.ok === false, `a fractional ${field} is refused`, JSON.stringify(r.findings));
+    check(r.findings.some(f => f.includes(field)),
+      `and the finding names ${field}, so an operator is told which count is wrong`,
+      JSON.stringify(r.findings));
+  }
+  // AND THE ITEMS OF THE LIST, not only the container. `Array.isArray` alone
+  // admitted both of these, and the sizing floor intersects this list against
+  // the profile's risk paths: a non-string matches nothing, so an artifact
+  // naming its risk paths as numbers reads as touching none, and the floor that
+  // exists for exactly that case does not fire.
+  const numeric = gate({ risk_paths_touched: [3] });
+  check(numeric.ok === false, "a risk path that is not a string is refused", JSON.stringify(numeric.findings));
+  const blank = gate({ risk_paths_touched: ["  "] });
+  check(blank.ok === false, "and so is a blank one, which matches no path either", JSON.stringify(blank.findings));
+  // AND THE EMPTY LIST STILL PASSES. Touching no risk path is an answer, and a
+  // check that refused it would refuse most of the sizings this gate exists for.
+  const empty = gate({ risk_paths_touched: [] });
+  check(empty.ok === true, "control: an empty risk-path list still passes", JSON.stringify(empty.findings));
+}
+
 // ── Every slice, not the document ──────────────────────────────────────────
 //
 // The same per-unit distinction the citation check makes, which was missing
@@ -405,8 +488,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "slices");
   const gate = (body) => {
-    writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      place({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+    });
   };
   const complete = "## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n";
   const bad = gate(`# design\n\n${complete}\n## Slice 2\n`);
@@ -429,10 +514,85 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 // not prove -- stated rather than implied, as with the interrupted-write drill.
 {
   const deep = join(dir, "a", "b", "c", "d", "artifacts");
-  const w = writeArtifact({ dir: deep, phase: "DESIGN", bytes: Buffer.from("# design\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n") });
+  const w = place({ dir: deep, phase: "DESIGN", bytes: Buffer.from("# design\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n") });
   check(existsSync(w.path), "an artifact written into a chain of new directories exists", w.path);
   const back = readArtifact({ dir: deep, phase: "DESIGN", expectSha: w.sha256 });
   check(back.ok === true, "and reads back with the sha it was written under", JSON.stringify(back.why));
+}
+
+// ── The sync chain stops at the caller's own root ───────────────────────────
+//
+// Every ancestor of the reeve home belongs to the operator or the OS. This write
+// changes none of their entries, and one of them being execute-only -- or on a
+// filesystem whose directories cannot be opened -- made the parent-sync loop
+// RETHROW, reporting a failure for an artifact that was written and renamed
+// successfully. `anchor` bounds the walk by OWNERSHIP rather than by depth, so a
+// deeper tree is still synced to the top and nothing above it is touched.
+{
+  const outer = join(dir, "sealed");
+  const home = join(outer, "home");
+  const adir = join(home, "tasks", "t1", "artifacts");
+  mkdirSync(adir, { recursive: true });
+  // THE FIXTURE HAS TO ACTUALLY BE UNOPENABLE, or both branches below pass for
+  // the same uninteresting reason. Running as root, chmod buys nothing -- so the
+  // precondition is measured rather than assumed, and the block is skipped
+  // honestly if the environment cannot produce the condition.
+  chmodSync(outer, 0o111);
+  let sealed = false;
+  try { closeSync(openSync(outer, "r")); } catch { sealed = true; }
+  if (!sealed) {
+    check(true, "SKIPPED: this environment can open an execute-only directory, so the case cannot be built");
+  } else {
+    const body = Buffer.from("# design\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n");
+    let anchored = null, why = null;
+    try { anchored = writeArtifact({ dir: adir, phase: "DESIGN", bytes: body, anchor: home }); }
+    catch (e) { why = String(e.message); }
+    check(anchored !== null && existsSync(anchored.path),
+      "a write anchored at the home succeeds with an unopenable directory above it", why ?? "(threw)");
+    // THE CONTROL, and it is what makes the assertion above mean something: the
+    // same write with no anchor walks past the home and fails on that directory.
+    let unbounded = null, unboundedWhy = null;
+    try { unbounded = writeArtifact({ dir: adir, phase: "DESIGN", bytes: body }); }
+    catch (e) { unboundedWhy = String(e.message); }
+    check(unbounded === null && unboundedWhy !== null,
+      "control: and the same write walking to the root fails on it", unboundedWhy ?? "(succeeded)");
+  }
+  chmodSync(outer, 0o755);
+  // AND THE ANCHOR IS CHECKED, not trusted. A dir outside it would silently walk
+  // to the root again, which is the bug this parameter exists to remove.
+  let outside = null;
+  try { writeArtifact({ dir: join(dir, "elsewhere"), phase: "DESIGN", bytes: Buffer.from("x"), anchor: home }); }
+  catch (e) { outside = String(e.message); }
+  check(outside !== null && /is not inside/.test(outside),
+    "a directory outside the anchor is refused rather than walked past it", String(outside));
+
+  // AND A SYMLINK BENEATH THE ANCHOR DOES NOT ESCAPE IT. The containment test
+  // was lexical, so a link anywhere under the anchor satisfied it while the
+  // write followed the link -- mkdir, the temporary and the rename all land
+  // wherever it points, and the rename would replace whatever artifact it found
+  // there.
+  {
+    const home2 = join(dir, "home2");
+    const elsewhere = join(dir, "outside-the-home");
+    mkdirSync(join(home2, "real"), { recursive: true });
+    mkdirSync(elsewhere, { recursive: true });
+    symlinkSync(elsewhere, join(home2, "tasks"));
+    let escaped = null;
+    try {
+      writeArtifact({ dir: join(home2, "tasks", "t1", "artifacts"), phase: "DESIGN",
+                      bytes: Buffer.from("# design\n"), anchor: home2 });
+    } catch (e) { escaped = String(e.message); }
+    check(escaped !== null && /not inside/.test(escaped),
+      "a symlinked component beneath the anchor is refused, not followed", String(escaped));
+    check(!existsSync(join(elsewhere, "t1", "artifacts", "design.md")),
+      "and nothing was written on the other side of the link",
+      (() => { try { return readdirSync(elsewhere).join(",") || "(empty)"; } catch { return "(gone)"; } })());
+    // CONTROL: the same write with no link in the path is accepted, so the
+    // refusal is about the link and not about the shape of the path.
+    const fine = writeArtifact({ dir: join(home2, "real", "t1", "artifacts"), phase: "DESIGN",
+                                 bytes: Buffer.from("# design\n"), anchor: home2 });
+    check(existsSync(fine.path), "control: and a real directory under the same anchor still writes", fine.path);
+  }
 }
 
 // ── A failed RENAME takes its temporary too ────────────────────────────────
@@ -467,7 +627,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "reap");
   const design = "# design\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n";
-  writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) });
+  place({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) });
 
   const stale = join(adir, "design.md.tmp-99999-stale");
   const live  = join(adir, "design.md.tmp-99998-live");
@@ -476,7 +636,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   const twoHoursAgo = (Date.now() - 2 * 60 * 60 * 1000) / 1000;
   utimesSync(stale, twoHoursAgo, twoHoursAgo);
 
-  writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) });
+  place({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) });
   const left = readdirSync(adir).filter(f => f.includes(".tmp-"));
   check(!left.includes("design.md.tmp-99999-stale"),
     "a temporary older than the threshold is reaped by the next write", left.join(","));
@@ -487,8 +647,11 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
     "and a RECENT one is left alone, because it may be a live writer's", left.join(","));
 
   // And the artifact itself is unharmed by the reaping.
-  const back = readArtifact({ dir: adir, phase: "DESIGN",
-    expectSha: writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) }).sha256 });
+  // BOTH SHELTERED. Under the crash stub the write returns a sentinel, so the
+  // sha is undefined and `readArtifact` throws on it -- the second half of the
+  // same expression, killing the file one line further along than before.
+  const back = readBack({ dir: adir, phase: "DESIGN",
+    expectSha: place({ dir: adir, phase: "DESIGN", bytes: Buffer.from(design) }).sha256 });
   check(back.ok === true, "control: and the artifact still reads back", JSON.stringify(back.why));
 }
 
@@ -496,8 +659,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "trailing");
   const gate = (body) => {
-    writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      place({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+    });
   };
   const one = "## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n";
   const bad = gate(`# design\n\n${one}\n## Slice 2\n\n## Notes\nFiles: x\nPackages: y\nTests: z\nDone when: w\n`);
@@ -522,8 +687,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "citeshape");
   const g = (body) => {
-    writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      place({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+    });
   };
   for (const token of ["12:30", "issue:42", "PR:103", "10:00"])
     check(g(`# r\n\n- a claim, observed at ${token}\n`).ok === false,
@@ -540,8 +707,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "labelvalues");
   const g = (body) => {
-    writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      place({ dir: adir, phase: "DESIGN", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "DESIGN", dir: adir, expect: { depth: "standard" } });
+    });
   };
   const bare = g("# d\n\n## Slice 1\nFiles:\nPackages:\nTests:\nDone when:\n");
   check(bare.ok === false, "a slice carrying the bare scaffold is refused", JSON.stringify(bare.findings));
@@ -561,8 +730,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "sizingcontract");
   const g = (o) => {
-    writeArtifact({ dir: adir, phase: "SIZING", bytes: Buffer.from(JSON.stringify(o)) });
-    return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      place({ dir: adir, phase: "SIZING", bytes: Buffer.from(JSON.stringify(o)) });
+      return reviewArtifact({ phase: "SIZING", dir: adir, expect: { depth: "standard" } });
+    });
   };
   const full = { depth: "standard", est_files: 3, est_weighted_files: 4, est_packages: 1,
                  est_slices: 2, risk_paths_touched: [], rationale: "because" };
@@ -574,6 +745,28 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
     const r = g(missing);
     check(r.ok === false && r.findings.some(f => f.includes(field)),
       `a sizing omitting ${field} is refused, and the finding names it`, JSON.stringify(r.findings));
+  }
+  // AND IT IS REPORTED AS ABSENT, not as a value of the wrong type.
+  //
+  // Every assertion above survives the presence check being removed: `undefined`
+  // then reaches the kind predicate, which refuses it and names the field, so
+  // the artifact is refused for the right reason by the wrong check. That is a
+  // redundant guard reading as a load-bearing one -- and it is measurable only
+  // here, in the WORDING, because the wording is the only thing the presence
+  // check uniquely produces.
+  //
+  // It is not a cosmetic difference to the person reading it: `est_files is
+  // undefined, not a whole number` sends a worker looking for a value they never
+  // wrote, and `omits est_files` tells them what to add.
+  {
+    const gone = { ...full }; delete gone.est_files;
+    const r = g(gone);
+    check(r.findings.some(f => /omits est_files/.test(f)),
+      "an omitted field is reported as omitted, not as a value of the wrong type",
+      JSON.stringify(r.findings));
+    check(!r.findings.some(f => /est_files is undefined/.test(f)),
+      "control: and the kind check does not ALSO describe the value that is not there",
+      JSON.stringify(r.findings));
   }
 }
 
@@ -599,7 +792,7 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
     "Done when:", "", "```bash", "pnpm test -- test/build-sizing.test.mjs", "```", "",
   ].join("\n");
   const adir = join(dir, "documented");
-  writeArtifact({ dir: adir, phase: "DESIGN", bytes: Buffer.from(documented) });
+  place({ dir: adir, phase: "DESIGN", bytes: Buffer.from(documented) });
 
   // BOTH expect shapes. The phase helpers return the requirement set and carry
   // no depth -- the depth is an INPUT to them -- so a gate demanding one throws
@@ -616,9 +809,11 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   // AND IT STILL REFUSES, so accepting the producer's shape did not make the
   // gate permissive. Each of these is the documented shape with one thing removed.
   const g = (body) => {
-    const d2 = join(dir, `doc${Math.random().toString(36).slice(2, 8)}`);
-    writeArtifact({ dir: d2, phase: "DESIGN", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "DESIGN", dir: d2, expect: { depth: "standard" } });
+    return attempt(() => {
+      const d2 = join(dir, `doc${Math.random().toString(36).slice(2, 8)}`);
+      place({ dir: d2, phase: "DESIGN", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "DESIGN", dir: d2, expect: { depth: "standard" } });
+    });
   };
   check(g(documented.replace(/- Files:[^\n]*\n/, "")).ok === false,
     "control: the documented shape missing its Files line is refused");
@@ -636,8 +831,10 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const adir = join(dir, "markers");
   const g = (body) => {
-    writeArtifact({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+    return attempt(() => {
+      place({ dir: adir, phase: "RESEARCH", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "RESEARCH", dir: adir, expect: { depth: "standard" } });
+    });
   };
   for (const marker of ["-", "*", "+", "1.", "1)"]) {
     const r = g(`# r\n\n- a cited claim (src/x.mjs:1)\n${marker} an uncited claim\n`);
@@ -661,9 +858,11 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 {
   const slice = "# d\n\n## Slices\n\n### Slice 1: x\n- Files: a\n- Packages: b\n- Test plan: c\n\n";
   const g = (body, expect) => {
-    const d2 = join(dir, `req${Math.random().toString(36).slice(2, 8)}`);
-    writeArtifact({ dir: d2, phase: "DESIGN", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "DESIGN", dir: d2, expect });
+    return attempt(() => {
+      const d2 = join(dir, `req${Math.random().toString(36).slice(2, 8)}`);
+      place({ dir: d2, phase: "DESIGN", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "DESIGN", dir: d2, expect });
+    });
   };
   const fenced = slice + "Done when:\n\n```bash\npnpm test\n```\n";
   check(g(fenced, { requireMeasuredContext: true }).ok === false,
@@ -691,10 +890,15 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 // failing to cite it. The gate was rejecting the honest disclosure that research
 // is supposed to carry.
 {
+  // `skipped: false` SAID OUT LOUD, because the gate refuses an expectation that
+  // says neither whether the phase was skipped nor at what depth. This block is
+  // about where claims live, not about the skip flag.
   const g = (body, expect = { minClaims: 1 }) => {
-    const d2 = join(dir, `sc${Math.random().toString(36).slice(2, 8)}`);
-    writeArtifact({ dir: d2, phase: "RESEARCH", bytes: Buffer.from(body) });
-    return reviewArtifact({ phase: "RESEARCH", dir: d2, expect });
+    return attempt(() => {
+      const d2 = join(dir, `sc${Math.random().toString(36).slice(2, 8)}`);
+      place({ dir: d2, phase: "RESEARCH", bytes: Buffer.from(body) });
+      return reviewArtifact({ phase: "RESEARCH", dir: d2, expect: { skipped: false, ...expect } });
+    });
   };
   check(g("# Research\n\n## Findings\n\n- a cited claim (src/x.mjs:1)\n\n## Limitations\n\n- no network was available\n").ok === true,
     "a bullet outside Findings is not a claim and does not need a citation");
@@ -731,10 +935,243 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
 // that would make the failure path testable, and it is not this one.
 {
   const deep = join(dir, "propagate", "a", "b", "artifacts");
-  const w = writeArtifact({ dir: deep, phase: "DESIGN",
+  const w = place({ dir: deep, phase: "DESIGN",
     bytes: Buffer.from("# d\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n") });
   check(readArtifact({ dir: deep, phase: "DESIGN", expectSha: w.sha256 }).ok === true,
     "control: a write through a new chain still succeeds and reads back");
+}
+
+// ── The eight refinements, each verified in both directions ────────────────
+{
+  // EVERY RESEARCH EXPECTATION SAYS WHETHER THE PHASE WAS SKIPPED, because the
+  // gate refuses to guess. These blocks are about citations and claims, not
+  // about the skip flag, so the helper supplies `skipped: false` for them --
+  // and a caller that means something else says so, which the skip block below
+  // does. Written the other way round, with the gate defaulting, the flag would
+  // be absent from every real call and the branch that reads it unreachable,
+  // which is exactly how it came to be unreachable twice.
+  const g = (phase, body, expect) => {
+    return attempt(() => {
+      const d2 = join(dir, `fu${Math.random().toString(36).slice(2, 8)}`);
+      place({ dir: d2, phase, bytes: Buffer.from(body) });
+      const said = phase !== "RESEARCH" || "skipped" in expect || "depth" in expect
+        ? expect : { ...expect, skipped: false };
+      return reviewArtifact({ phase, dir: d2, expect: said });
+    });
+  };
+  const SZ = { depth: "standard", est_files: 3, est_weighted_files: 4, est_packages: 1,
+               est_slices: 2, risk_paths_touched: [], rationale: "x" };
+
+  // A SIZING FIELD HAS A KIND, not merely a presence. `est_files: "lots"`
+  // satisfied the contract, and the floors that read those numbers compare them.
+  check(g("SIZING", JSON.stringify(SZ), {}).ok === true, "control: a well-typed sizing passes");
+  for (const [field, bad] of [["est_files", "lots"], ["est_slices", 1.5], ["est_packages", -1],
+                              ["risk_paths_touched", "none"], ["rationale", "  "]]) {
+    const r = g("SIZING", JSON.stringify({ ...SZ, [field]: bad }), {});
+    check(r.ok === false && r.findings.some(f => f.includes(field)),
+      `sizing.json's ${field} as ${JSON.stringify(bad)} is refused, and the finding names it`,
+      JSON.stringify(r.findings));
+  }
+
+  // A CITATION'S EXTENSION IS NOT LENGTH-CAPPED. `{0,5}` refused a correctly
+  // cited claim for having a long filename.
+  // BARE FILENAMES, because that is the only form the cap ever broke. A token
+  // containing a slash matched the path alternative whatever its extension, so
+  // `src/x.markdown:12` passed even while capped -- a fixture that cannot
+  // exhibit the defect it was written for, and the sweep said so.
+  for (const cite of ["x.markdown:12", "thing.typescript:9", "a.config.mjs:3", "x.yml:1"])
+    check(g("RESEARCH", `# r\n\n## Findings\n\n- a claim (${cite})\n`, {}).ok === true,
+      `the bare filename ${cite} is a citation`);
+  // And the pathed form still works, which is the control for the above.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (deep/path/to/thing.mts:99)\n", {}).ok === true,
+    "control: and a pathed citation still is");
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim at 12:30\n", {}).ok === false,
+    "control: and a bare time is still not one");
+
+  // A CLAIM IS TOP-LEVEL. A nested bullet elaborating a cited claim was counted
+  // as its own claim, so the more carefully a finding was broken down the more
+  // likely the artifact was refused.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n  - elaboration, uncited\n", {}).ok === true,
+    "a nested bullet is not a claim of its own");
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n- another, uncited\n", {}).ok === false,
+    "control: a second TOP-LEVEL bullet is, and is still required to cite");
+
+  // NESTING IS RELATIVE, NOT "ANY LEADING SPACE". Markdown keeps a list item
+  // top-level at up to three spaces of indent and nests one only when it reaches
+  // the content column of the item above it. Read as `/^\s+/`, a single space
+  // turned the citation rule off for that line -- and with one cited claim
+  // elsewhere satisfying minClaims, the artifact passed.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n - unsupported\n", {}).ok === false,
+    "a bullet indented one space under a `- ` parent is a SIBLING, and is still required to cite");
+  // AND THE BOUNDARY IS THE PARENT'S CONTENT COLUMN, not a fixed number of
+  // spaces. Under a `1.  ` marker the content starts at column 4, so two and
+  // three spaces are siblings there while they are nested under `- `. A rule
+  // written as "up to three spaces" is right for one marker and wrong for the
+  // other, which is the same near-miss as a derived list that is correct for two
+  // entries out of three.
+  for (const pad of ["  ", "   "]) {
+    check(g("RESEARCH", `# r\n\n## Findings\n\n1.  a claim (src/x.mjs:1)\n${pad}1.  unsupported\n`, {}).ok === false,
+      `under a wide marker, ${pad.length} spaces is still a sibling and must cite`);
+    check(g("RESEARCH", `# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n${pad}- elaboration\n`, {}).ok === true,
+      `control: and the same ${pad.length} spaces under a narrow marker is nested`);
+  }
+  // AND THE ELABORATION CASE STILL HOLDS at every depth it can be written at:
+  // a bullet AT OR BEYOND its parent's content column is nested.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n  - elaboration\n    - deeper\n", {}).ok === true,
+    "control: a bullet at its parent's content column is nested, and so is one below that");
+  // A LEVEL CLOSES WHEN A BULLET APPEARS TO ITS LEFT. Without that, the first
+  // nested bullet would make every later bullet nested too, and the gate would
+  // stop checking the rest of the document.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n  - elaboration\n- uncited sibling\n", {}).ok === false,
+    "a top-level bullet AFTER a nested one is top-level again");
+  // AND AN INDENTED LIST NESTS RELATIVE TO ITSELF, not to column zero.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n   - a claim (src/x.mjs:1)\n     - elaboration\n", {}).ok === true,
+    "control: a list that starts indented still nests relative to its own first item");
+  // AND A LIST ENDS. Nothing ever closed the open levels, so a cited list, a
+  // blank line, a paragraph and then a NEW list had its first item measured
+  // against the OLD list's content column. An uncited claim in the second list
+  // disappeared from the count entirely.
+  check(g("RESEARCH",
+    "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n  - elaboration\n\nSome prose.\n\n  - unsupported\n",
+    {}).ok === false,
+    "a new list after a paragraph is top-level again, however the previous one was indented");
+  // AND A CONTINUATION DOES NOT END IT. A paragraph indented into the item
+  // belongs to the item, so the list is still open and its sub-bullets are still
+  // nested -- ending the list there would make every elaboration a claim again,
+  // which is the defect this whole rule was written to remove.
+  check(g("RESEARCH",
+    "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n\n  more about it\n\n  - elaboration\n",
+    {}).ok === true,
+    "control: a paragraph indented into the item is a continuation, and the list stays open");
+
+  // minCitationsPerClaim IS APPLIED. It was accepted and ignored, so a claim with
+  // one citation satisfied a caller asking for two -- an argument read but not
+  // applied, which is worse than absent because the caller believes it took hold.
+  // A SCHEME-LESS ENDPOINT IS NOT A CITATION EITHER. The URL strip only removed
+  // `scheme://...`, so each of these survived it and its PORT read as a line
+  // number -- the gate accepting precisely the unsupported claim it exists to
+  // reject.
+  for (const [label, token] of [["a host:port with a path", "api.internal:3000/health"],
+                                ["a protocol-relative authority", "//api.internal:3000"],
+                                ["a userinfo endpoint", "git@example.internal:22"]]) {
+    check(g("RESEARCH", `# r\n\n## Findings\n\n- a claim about ${token}\n`, {}).ok === false,
+      `${label} is not a citation`, token);
+  }
+  // CONTROL: the same line WITH a real citation passes, so the strip removes the
+  // endpoint rather than the whole line.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim about api.internal:3000/health (src/x.mjs:1)\n", {}).ok === true,
+    "control: and a claim carrying both an endpoint and a real citation passes");
+  // THE RESIDUAL, RECORDED AS AN ASSERTION RATHER THAN A COMMENT. A bare
+  // `api.internal:3000` is the same SHAPE as `package.json:3000` -- a dotted
+  // name, a colon, digits -- and no regex separates them. Accepting it lets one
+  // claim through uncited; refusing it would refuse every citation of a
+  // root-level file. The choice is deliberate, so it is asserted: if someone
+  // later decides the other way, this line is where the decision is recorded and
+  // it will fail rather than the behaviour changing quietly.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim about api.internal:3000\n", {}).ok === true,
+    "a BARE host:port is accepted, deliberately: it is indistinguishable from package.json:3000");
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (package.json:3000)\n", {}).ok === true,
+    "control: and that is the citation the strict reading would have refused");
+
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n", { minCitationsPerClaim: 2 }).ok === false,
+    "a caller asking for two citations is not satisfied by one");
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1) (src/y.mjs:2)\n", { minCitationsPerClaim: 2 }).ok === true,
+    "control: and two satisfy it");
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n", {}).ok === true,
+    "control: while a caller that asks for nothing still gets the default of one");
+
+  // THE SKIP IS THE CALLER'S FLAG. Keyed on a depth the helper does not supply,
+  // this branch was unreachable from the documented caller.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n", { skipped: true }).ok === false,
+    "a caller declaring the phase skipped is refused without carrying a depth");
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n", { skipped: false }).ok === true,
+    "control: and one declaring it not skipped is gated normally");
+  // AND AN EXPECTATION THAT SAYS NEITHER IS REFUSED rather than assumed.
+  //
+  // This branch has been unreachable twice: first keyed on `expect.depth`, which
+  // the documented helper does not carry, then on `expect.skipped`, which
+  // S3-D's `researchExpectations(depth)` does not carry either -- it returns
+  // `{minCitationsPerClaim, minClaims}` and nothing else, so the ternary fell
+  // through to false every time and a phase that should not have run would have
+  // had its artifact reviewed. Refusing to guess is what makes the contract
+  // enforceable: the refusal names the field the helper must carry.
+  // THROUGH `attempt`, like the helpers, and for the same reason: this calls
+  // reviewArtifact directly, so a stub that makes it THROW would kill the file
+  // here and the fifteen assertions after it would read as passes.
+  const ambiguous = attempt(() => {
+    const d2 = join(dir, "ambig");
+    place({ dir: d2, phase: "RESEARCH", bytes: Buffer.from("# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n") });
+    return reviewArtifact({ phase: "RESEARCH", dir: d2, expect: { minCitationsPerClaim: 1, minClaims: 1 } });
+  });
+  check(ambiguous.ok === false && /neither whether RESEARCH was skipped/.test(String(ambiguous.why)),
+    "an expectation carrying neither skipped nor depth is refused, naming what it must carry",
+    JSON.stringify(ambiguous.why));
+  check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n", { depth: "standard" }).ok === true,
+    "control: and one carrying a depth instead is unambiguous, and passes");
+
+  // A FENCE MUST CLOSE. An unterminated fence satisfied the opening test, and the
+  // rest of the document is then inside it.
+  const sl = "# d\n\n## Slices\n\n### Slice 1: x\n- Files: a\n- Packages: b\n- Test plan: c\n\nDone when:\n\n";
+  check(g("DESIGN", sl + "```bash\npnpm test\n", { requireDoneCondition: true }).ok === false,
+    "an unterminated done-condition fence is refused");
+  check(g("DESIGN", sl + "```bash\npnpm test\n```\n", { requireDoneCondition: true }).ok === true,
+    "control: and a closed one passes");
+
+  // AND THE CLOSER MUST BE AT LEAST AS LONG AS THE OPENER. CommonMark says so,
+  // and a renderer behaves accordingly: a block opened with four backticks is
+  // not closed by three. Matching a bare ``` at both ends, the greedy prefix
+  // took three of the four opening backticks, the fourth was read as the info
+  // string, and the three-backtick line closed it -- so this gate reported a
+  // machine-checkable done condition for a block that swallows the whole rest of
+  // the document. The gate and the renderer disagreed about where the slice
+  // ends, and the gate is the one that says the work may proceed.
+  check(g("DESIGN", sl + "````bash\npnpm test\n```\n", { requireDoneCondition: true }).ok === false,
+    "a done condition opened with four backticks and closed with three is refused");
+  check(g("DESIGN", sl + "````bash\npnpm test\n````\n", { requireDoneCondition: true }).ok === true,
+    "control: and four closed by four passes, so length is matched rather than fixed at three");
+  // A LONGER CLOSER IS STILL A CLOSER, which CommonMark also allows. Written
+  // with an equality instead of a minimum, this would be refused -- a gate
+  // stricter than the format it claims to check refuses correct work, which is
+  // the failure direction nobody looks for.
+  check(g("DESIGN", sl + "```bash\npnpm test\n`````\n", { requireDoneCondition: true }).ok === true,
+    "control: and a closer LONGER than its opener still closes the block");
+  // AND THE OPENER IS STILL FOUND WHEN INDENTED, which the whitespace class
+  // change could have broken: `\s` matched newlines, so this had been looking
+  // for a fence that could start lines above where it actually did.
+  check(g("DESIGN", sl + "  ```bash\n  pnpm test\n  ```\n", { requireDoneCondition: true }).ok === true,
+    "control: and an indented fence is still a fence");
+  check(g("DESIGN", sl + "   ```bash\n   pnpm test\n   ```\n", { requireDoneCondition: true }).ok === true,
+    "control: three spaces is the most an indented fence may carry, and still passes");
+  // FOUR SPACES IS A CODE BLOCK, not a fence. Markdown renders those lines as
+  // literal text, so a done condition written that way has no fenced block at
+  // all -- and the gate approved it as a machine-checkable command. The limit is
+  // CommonMark's, not one chosen to stop a loop.
+  check(g("DESIGN", sl + "    ```bash\n    pnpm test\n    ```\n", { requireDoneCondition: true }).ok === false,
+    "a done condition indented four spaces is an indented code block, not a fence");
+  check(g("DESIGN", sl + "\t```bash\n\tpnpm test\n\t```\n", { requireDoneCondition: true }).ok === false,
+    "and a tab is worth four, so it is not a fence either");
+  // AND THE COMMAND IS NOT ITSELF A DELIMITER. An EMPTY block -- an opener and
+  // an immediate closer -- put that closing delimiter in the command position,
+  // and the lazy scan then found a LATER delimiter to close on. The gate reported
+  // a machine-checkable done condition whose command is three backticks, over an
+  // empty block, with the final delimiter left opening a block that never closes.
+  check(g("DESIGN", sl + "```\n```\nprose\n```\n", { requireDoneCondition: true }).ok === false,
+    "an empty fenced block is not a done condition, whatever follows it");
+  check(g("DESIGN", sl + "```\n```\n", { requireDoneCondition: true }).ok === false,
+    "control: and an empty block on its own is refused too");
+}
+
+// ── A temporary goes when close itself throws ──────────────────────────────
+//
+// Third leak in this family: the write was covered, then the rename, and the
+// close between them was not. `closeSync` throws in its own right on some
+// filesystems, where a deferred write error surfaces there.
+{
+  const adir = join(dir, "closefail");
+  const w = place({ dir: adir, phase: "DESIGN", bytes: Buffer.from("# d\n\n## Slice 1\nFiles: a\nPackages: b\nTests: c\nDone when: d\n") });
+  check(readdirSync(adir).filter(f => f.includes(".tmp-")).length === 0,
+    "control: an ordinary write leaves no temporary", readdirSync(adir).join(","));
+  check(existsSync(w.path), "control: and produces the artifact");
 }
 
 db.close();

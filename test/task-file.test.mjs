@@ -533,7 +533,16 @@ const base = (db, over = {}) => ({
 // without it rather than throwing. No store means no live leases, which is the
 // true answer rather than a missing one.
 {
-  const r = await fileTask(base(null, { title: "no store", dryRun: true }));
+  // A THROW IS NOT A RESULT. This call passes `db: null`, which only makes sense
+  // while the dry-run branch is there to answer before anything touches a store
+  // -- so the stub that removes that branch does not fail this assertion, it
+  // kills the FILE, and the eighteen assertions after it read exactly like
+  // passes. `ok: null` is neither true nor false, so the assertion goes red in
+  // either direction and the rest of the file still reports.
+  const r = await (async () => {
+    try { return await fileTask(base(null, { title: "no store", dryRun: true })); }
+    catch (e) { return { ok: null, threw: String(e.message) }; }
+  })();
   check(r.ok === true && r.dryRun === true, "a dry run with no database returns a plan",
     JSON.stringify(r));
   check(r.plan?.conflicts?.length === 0,

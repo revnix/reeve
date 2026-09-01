@@ -50,13 +50,50 @@ import { HUB_SCHEMA_VERSION } from "./hubdb.mjs";
  */
 export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
                                     migrateWith = "`reeve build run`" } = {}) {
+  // UNKNOWN IS NOT DAMAGED, and this remedy used to say it was.
+  //
+  // A reader can see `no such table: schema_version` on a perfectly healthy hub:
+  // `openHub` creates the file and then runs the schema DDL, and a command that
+  // opens it in that window holds a read transaction whose view has the file and
+  // not the table. Telling that operator to force-restore is telling them to
+  // replace a healthy store that was one moment from being ready.
+  //
+  // So the refusal stands -- nothing may proceed against a history it cannot read
+  // -- and the remedy is to look again before concluding anything. A restore is
+  // named only as what a PERSISTENT failure earns.
   if (!hist || hist.readable !== true)
     return { kind: "unreadable",
              detail: "its schema_version cannot be read, so which migrations it carries is unknown",
-             remedy: "restore a snapshot (`reeve restore --hub --force`), then retry" };
+             remedy: "re-run: a hub being created for the first time reads this way for an instant. " +
+                     "If it persists, the store is damaged and `reeve restore --hub --force` installs " +
+                     "the newest usable snapshot" };
 
-  // NO SNAPSHOT REMEDY FOR A NEWER HUB, and this is the one case where offering
-  // the usual repair is dangerous rather than merely unhelpful.
+  // AN INVALID MARKER COMES FIRST, before the version comparison. `schema_version`
+  // is an INTEGER PRIMARY KEY, so a hand-edited `-1` is valid SQLite -- and a store
+  // recording `[-1, 6]` is not a newer hub, it is a damaged one that also happens
+  // to carry a high number. Comparing versions first declared it healthy.
+  if (hist.invalid.length)
+    return { kind: "invalid",
+             detail: `it records ${hist.invalid.join(", ")} in schema_version, which is not a migration ` +
+                     `number this binary can act on (they run 1 through ${expect})`,
+             remedy: "the marker itself is wrong, so migrating cannot repair it: restore a snapshot " +
+                     "(`reeve restore --hub --force`), then retry" };
+
+  // AHEAD **AND SOUND**. A forward-only history that reached version N carries
+  // every version below it, so a store that is ahead AND missing one of the
+  // versions this binary knows cannot have been produced by migrating. It is
+  // damage wearing a high number, and the healthy-ahead remedy below would tell
+  // an operator not to restore the one kind of store that needs it.
+  if (hist.version > expect && hist.missing.length)
+    return { kind: "ahead-and-holed",
+             detail: `it records version ${hist.version}, which is newer than the ${expect} this binary ` +
+                     `knows, AND is missing migration(s) ${hist.missing.join(", ")} below that. A ` +
+                     "forward-only history cannot be both, so this store has been altered outside reeve",
+             remedy: "restore a snapshot (`reeve restore --hub --force`); do not run a newer binary " +
+                     "against it, because the history it would read is not one migrating produced" };
+
+  // NO SNAPSHOT REMEDY FOR A HEALTHY NEWER HUB, and this is the one case where
+  // offering the usual repair is dangerous rather than merely unhelpful.
   //
   // Every other fault here describes a BROKEN store, where installing a snapshot
   // trades lost recent state for a working hub. A forward-version store is not
@@ -75,13 +112,6 @@ export function historyFault(hist, { expect = HUB_SCHEMA_VERSION,
              remedy: "run the newer binary. Do NOT restore a snapshot over it: this store is " +
                      "healthy and this binary is old, so an older snapshot would discard whatever " +
                      "the newer one wrote to fix nothing" };
-
-  if (hist.invalid.length)
-    return { kind: "invalid",
-             detail: `it records ${hist.invalid.join(", ")} in schema_version, which is not a migration ` +
-                     `number this binary can act on (they run 1 through ${expect})`,
-             remedy: "the marker itself is wrong, so migrating cannot repair it: restore a snapshot " +
-                     "(`reeve restore --hub --force`), then retry" };
 
   if (!hist.missing.length) return null;
 

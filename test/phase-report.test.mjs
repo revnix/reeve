@@ -5,7 +5,8 @@
 // empty object is the cheapest possible assertion and it passes against a schema
 // that is almost entirely absent -- the accepting half is what stops this file
 // being green against a validator that refuses everything.
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, lstatSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, lstatSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PHASES, BUILD_ACTION_FOR, BUILD_ACTIONS } from "../src/build/phases.mjs";
@@ -320,6 +321,32 @@ const lastRefusal = (db, id) => db.prepare(
   check(db.prepare("SELECT depth FROM task WHERE id=?").get(id).depth === "standard",
     "and the depth the report selected is now durable on the task");
   db.close();
+}
+
+// ── The contract is frozen in BOTH of its halves ────────────────────────────
+//
+// A phase schema fails in two ways that are not the same failure. The schema
+// FILES are what a worker is asked for, handed to the CLI as --json-schema and
+// validated against locally. The outcome-to-evidence MAP is what turns a valid
+// report into something the machine accepts. A freeze over the JSON alone stays
+// green while `evidenceFor` starts emitting a phase `nextPhase` refuses -- and
+// then every worker's perfectly good report fails at the transition with a
+// message about attribution, which names neither half.
+{
+  const frozen = JSON.parse(readFileSync(new URL("./fixtures/report-schemas-v1.json", import.meta.url), "utf8"));
+  const sha = (v) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
+  for (const action of ACTIONS) {
+    const now = sha(schemaFor(action));
+    check(now === frozen.schemas[action], `${action}'s schema is frozen`,
+      `${now} vs ${frozen.schemas[action]}\n        ` +
+      "A change here changes what every dispatched worker is asked for.");
+  }
+  const map = sha(ACTIONS.map(a => [a, evidenceFor({ action: a,
+    report: { outcome: "ok", reason: "r", depth: "standard" } })]));
+  check(map === frozen.evidence_map,
+    "and so is the outcome-to-evidence map, which the JSON freeze cannot see",
+    `${map} vs ${frozen.evidence_map}`);
+  check(frozen.version === 1, "and the fixture records which contract it froze", String(frozen.version));
 }
 
 rmSync(dir, { recursive: true, force: true });

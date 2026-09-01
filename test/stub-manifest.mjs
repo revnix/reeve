@@ -1555,6 +1555,15 @@ export const STUBS = [
               replace: "    bound_app_id: required ? (expectedAppId ?? null) : null," }],
   },
   {
+    name: "sweep-refuses-an-orphan-test-file",
+    why: "stop reading the orphan count, which is the state this file was in. `coverage` has always classified a test file that is neither covered by an entry nor grandfathered as an orphan, and its own comment calls that the failure -- a test nobody has shown can fail, and that nobody declared. Nothing read it: the exit was the entry verdicts alone, so a new test file arrived with no entry, the ratio moved by one, and no gate said anything. A rule stated in a comment and not wired is the exact shape this instrument exists to find, which is a poor shape for the instrument",
+    test: "test/stubsweep.test.mjs",
+    expectRed: "a test file with no entry and no grandfathering FAILS the sweep",
+    edits: [{ file: "scripts/stub-sweep.mjs",
+              find: "  if (whole && cov.orphans.length) {",
+              replace: "  if (false) {" }],
+  },
+  {
     name: "escalation-keys-are-declared-identities",
     why: "let `escalationKey` mint any well-formed key. A key matching no declared shape is a situation nobody wrote down: the page list cannot decide about it, no announcer can name it and nothing can clear it, so the escalation is raised into a namespace nothing reads. Not hypothetical -- `transition.mjs`'s `blocked_other` branch takes an escalation key straight from its caller and writes it to the table with no check at all, which is the hole this closed set exists to close",
     test: "test/build-escalations.test.mjs",

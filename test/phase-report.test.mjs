@@ -375,8 +375,18 @@ rmSync(dir, { recursive: true, force: true });
   for (const action of ACTIONS) {
     const text = schemaTextFor(action);
     check(typeof text === "string", `${action}'s schema is available as text`, typeof text);
-    check(JSON.stringify(JSON.parse(text)) === JSON.stringify(schemaFor(action)),
-      `and the text parses to the same schema the validator uses`, action);
+    // THE PARSE IS GUARDED, because this file is measured under a stub that makes
+    // `schemaTextFor` hand back the parsed object. `JSON.parse` then coerces it
+    // to "[object Object]" and THROWS, killing the run 26 assertions early -- and
+    // the assertions that never ran are indistinguishable in the log from
+    // assertions that passed. The sweep reported CAUGHT for it, because the named
+    // assertion did go red; only comparing the assertion COUNT against the
+    // control found it. A test that dies under its own stub measures a prefix of
+    // itself.
+    let parsed = null, why = null;
+    try { parsed = JSON.parse(text); } catch (e) { why = String(e.message); }
+    check(parsed !== null && JSON.stringify(parsed) === JSON.stringify(schemaFor(action)),
+      `and the text parses to the same schema the validator uses`, why ?? action);
     // THROUGH THE REAL ARGV BUILDER, not a claim about it. Passing the object is
     // what produced `[object Object]`, and only the builder can show that.
     const argv = workerArgs({ prompt: "p", settings: "/tmp/s.json", jsonSchema: text });

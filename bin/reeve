@@ -47,7 +47,7 @@ import { resolveHome } from "../src/home.mjs";
 // builder migrates a store it is about to be refused from. Task 9 adds the same
 // import for the export/restore routes; whichever lands first owns it.
 import { DatabaseSync } from "node:sqlite";
-import { inapplicable, EXITS, ERROR_KINDS } from "./reeve.flags.mjs";
+import { inapplicable, extraArgs, TASK_ARGS, EXITS, ERROR_KINDS } from "./reeve.flags.mjs";
 import { openHub, HUB_SCHEMA_VERSION, HUB_BUSY_TIMEOUT_MS, completedVersion, missingMigrations,
          faultKind } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
@@ -218,6 +218,7 @@ const FLAGS = {
   priority:           { value: true,  what: "p1 or p2" },
   "idempotency-key":  { value: true,  what: "a key that makes a re-run of this command inert" },
   "pin-territory":    { value: true,  what: "keep the territory while held, for a duration like 48h" },
+  since:              { value: true,  what: "a cursor from a digest's next_cursor: what moved since" },
 
   hub:            { value: false, what: "operate on the builder hub rather than a repository" },
   anyway:         { value: false, what: "file a near-twin of an existing task anyway" },
@@ -1154,10 +1155,28 @@ switch (cmd) {
     // A HUB THAT IS NOT THERE IS AN ANSWER, not a crash. A machine with no builder
     // has no hub, and `DatabaseSync` on a missing path raises an open error whose
     // text is not an answer to "what are my tasks".
-    if (sub === "list" || sub === "show" || sub === "why") {
+    if (sub === "list" || sub === "show" || sub === "why" || sub === "dash") {
+      // A BARE WORD NOTHING READS. The argv walk refuses an unknown flag and the
+      // gate above refuses a known flag on a command that cannot act on it; an
+      // extra positional was governed by neither, so `reeve task dash <cursor>`
+      // discarded the cursor, answered from the beginning of the log and exited
+      // 0 -- the one combination a script cannot detect. ABOVE the hub, because a
+      // command typed wrongly was not attempted, and whether the store happens to
+      // be readable is not what makes it wrong.
+      const extra = extraArgs(sub, positionals.slice(1));
+      if (extra)
+        fail("usage",
+             `reeve task ${sub}: ${extra.map(a => JSON.stringify(a)).join(", ")} ` +
+             `${extra.length === 1 ? "is not an argument" : "are not arguments"} ` +
+             `this subcommand reads.\n` +
+             `-> refused rather than ignored: a value typed where nothing reads it ` +
+             `would exit 0 with an answer to a question nobody asked.\n` +
+             `-> usage: ${TASK_ARGS[sub].usage}`,
+             { exit: EXITS.misuse });
       const { taskShow, taskList, renderShow, renderList, envelope,
               switchesResolver, projectsWithTasks, inSnapshot } = await import("../src/build/show.mjs");
       const { whyModel, renderWhy } = await import("../src/build/why.mjs");
+      const { dashModel, renderDash, parseCursor } = await import("../src/build/dash.mjs");
       const { loadRegistry } = await import("../src/build/registryio.mjs");
 
       const hub = hubPathFor(HOME);
@@ -1262,6 +1281,58 @@ switch (cmd) {
         // ONE SNAPSHOT for the whole command, so a listing is a moment the hub
         // actually had rather than a row-by-row walk across a live builder's
         // writes.
+        // The digest reads every project, so the registry is what names them --
+        // and a project the registry has lost still has tasks in the hub, which
+        // is why the two are unioned rather than one being trusted.
+        if (sub === "dash") {
+          // INSIDE the guard. This reads `task` on the same possibly-broken store
+          // as the model queries, and the schema-version check above touches
+          // different pages -- so a hub that fails here fails AFTER every guard
+          // that ran. The `task list --project` path wraps the same helper for
+          // exactly this reason, and leaving it unwrapped here reintroduced a
+          // defect that was already fixed once.
+          const raw = opt("since");
+          let since = null;
+          if (raw !== null) {
+            // OPAQUE, and parsed by the module that formats it. A cursor is
+            // `<seq>.<at>` so a restore can be PROVED rather than guessed at; an
+            // operator copies what the digest printed and never builds one.
+            since = parseCursor(raw);
+            if (since === null)
+              fail("usage",
+                   `reeve task dash: --since expects a cursor from a previous digest's ` +
+                   `next_cursor (it looks like 1234.1800000000), got ${JSON.stringify(raw)}`,
+                   { exit: EXITS.misuse });
+          }
+          let model;
+          try {
+            model = inSnapshot(db, () => {
+              // DISCOVERY INSIDE THE SAME SNAPSHOT AS ENUMERATION. Naming the
+              // projects in one read and listing the tasks in another describes
+              // two database moments: a project registered and given its first
+              // task between them put that task in the digest while `projects`
+              // and `switches` had never heard of it, and the row renders under a
+              // project the block above does not name. One moment, one answer.
+              //
+              // A project the registry has lost still has tasks in the hub, which
+              // is why the two are unioned rather than one being trusted.
+              const known = [...new Set(
+                [...Object.keys(reg.registry.projects), ...projectsWithTasks(db)])].sort();
+              const named = known.map(n => ({ name: n, nwo: reg.registry.projects[n]?.nwo ?? null }));
+              return dashModel(db, {
+                now, switchesFor, projects: named, since, isAlive: isSameProcess });
+            });
+          } catch (e) { queryFailed(e); }
+          console.log(flag("json")
+            ? JSON.stringify(envelope("task.dash", model), null, 2)
+            : renderDash(model));
+          // A CURSOR AHEAD OF THE LOG IS NOT A QUIET PERIOD. The answer is printed
+          // either way -- it carries the cursor to resync from -- but the exit
+          // status says the movement list is not an answer, so a script polling
+          // this cannot mistake a restore for nothing having happened.
+          process.exit(model.cursor_rewound ? EXITS.degraded : EXITS.ok);
+        }
+
         if (sub === "list") {
           const want = opt("project");
           // A --project that names nothing ANYWHERE is a refusal, not an empty
@@ -1314,10 +1385,12 @@ switch (cmd) {
     }
 
     if (sub !== "file") {
-      console.error("reeve task: subcommands are `file`, `list`, `show` and `why`");
+      console.error("reeve task: subcommands are `file`, `list`, `show`, `why` and `dash`");
       console.error('-> reeve task file --project <p> --title "..." --territory <path>');
-      console.error("-> reeve task list [--project <p>] [--json]");
-      console.error("-> reeve task show|why <task-id> [--json]");
+      // FROM THE MAP the refusal above reads, so the shape an operator is shown
+      // here and the shape they are corrected with cannot drift apart. `file` is
+      // literal: it belongs to another lane and takes no positional to govern.
+      for (const spec of Object.values(TASK_ARGS)) console.error(`-> ${spec.usage}`);
       process.exit(1);
     }
     const { fileTask, pinSeconds } = await import("../src/build/taskfile.mjs");
@@ -2158,6 +2231,15 @@ function usage() {
       --hub                 restore the builder hub  (--tail <file> replays events after it)
   export-events --hub <file>
                         write the hub's event log as a replayable JSONL tail
+
+  task list [--json]    every task, with what each is waiting on
+      --project <p>         only this project's tasks
+  task show <id> [--json]
+                        one task: phase, depth, switches, waiting substate
+  task why <id> [--json]
+                        the evidence lineage behind one task, absence included
+  task dash [--json]    the digest: alive, doing, waiting on you, declined
+      --since <cursor>      what moved since that cursor (the digest prints the next one)
 
   task file             file a task, with its territory declared and leased
       --project <p>         the registry project to file against

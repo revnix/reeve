@@ -1307,12 +1307,103 @@ const LIB = resolve(fileURLToPath(new URL("../src/stubsweep.mjs", import.meta.ur
   // question about RETENTION and called a run that reported results a crash.
   check(classify({ controlExit: 0, stubExit: 1, hashChanged: true, restored: true,
                    expectRed: "the guard holds",
-                   observed: { anyAssertionSeen: true, namedFailSeen: false, failures: [] } }).verdict === WRONG_RED,
+                   observed: { assertionsSeen: 1, namedFailSeen: false, failures: [] } }).verdict === WRONG_RED,
     "a stubbed run reporting only PASSes is WRONG_RED rather than CRASHED");
   check(classify({ controlExit: 0, stubExit: 1, hashChanged: true, restored: true,
                    expectRed: "the guard holds",
-                   observed: { anyAssertionSeen: false, namedFailSeen: false, failures: [] } }).verdict === CRASHED,
+                   observed: { assertionsSeen: 0, namedFailSeen: false, failures: [] } }).verdict === CRASHED,
     "control: a run reporting NOTHING is still CRASHED, so the two are not merged");
+}
+
+// --- a run SHORTER than its control is UNRUNNABLE, not CAUGHT -------------------
+{
+  // The defect this branch exists for: a stub that makes the named assertion fail
+  // and then ABORTS the file. The named failure has already been printed, the exit
+  // is non-zero, and the assertions after the abort never ran -- which in a log is
+  // indistinguishable from their having passed. Every signal except the count says
+  // CAUGHT. Three such runs were found by hand in one morning, at 23 of 48, 84 of
+  // 357 and 49 of 51.
+  const short = classify({ controlExit: 0, stubExit: 1, hashChanged: true, restored: true,
+                   expectRed: "the guard holds",
+                   observed: { assertionsSeen: 23, namedFailSeen: true, failures: ["the guard holds"] },
+                   controlObserved: { assertionsSeen: 48 } });
+  check(short.verdict === UNRUNNABLE,
+    "a stubbed run shorter than its control is UNRUNNABLE even when the named assertion failed",
+    JSON.stringify(short));
+  check(/23/.test(short.why) && /48/.test(short.why),
+    "and it reports both counts, so the reader can see how much of the file went unmeasured", short.why);
+
+  // CONTROLS, because a branch that fires on everything is worse than one that
+  // fires on nothing: it would refuse every genuine catch in the manifest.
+  check(classify({ controlExit: 0, stubExit: 1, hashChanged: true, restored: true,
+                   expectRed: "the guard holds",
+                   observed: { assertionsSeen: 48, namedFailSeen: true, failures: ["the guard holds"] },
+                   controlObserved: { assertionsSeen: 48 } }).verdict === CAUGHT,
+    "control: an equal-length run with the named failure is still CAUGHT");
+  // A stub may legitimately add assertions -- a loop over a list the stub grows --
+  // and more of the file running is not less of it running.
+  check(classify({ controlExit: 0, stubExit: 1, hashChanged: true, restored: true,
+                   expectRed: "the guard holds",
+                   observed: { assertionsSeen: 51, namedFailSeen: true, failures: ["the guard holds"] },
+                   controlObserved: { assertionsSeen: 48 } }).verdict === CAUGHT,
+    "control: a LONGER run is not refused, because the rule is about stopping early");
+  // The short run is refused BEFORE the named-assertion question is asked, so an
+  // abort cannot be reported as WRONG_RED either -- that would send the reader to
+  // rewrite an entry whose real problem is that the file stopped.
+  check(classify({ controlExit: 0, stubExit: 1, hashChanged: true, restored: true,
+                   expectRed: "the guard holds",
+                   observed: { assertionsSeen: 10, namedFailSeen: false, failures: ["something else"] },
+                   controlObserved: { assertionsSeen: 48 } }).verdict === UNRUNNABLE,
+    "an abort is UNRUNNABLE rather than WRONG_RED, because the run is the problem, not the entry");
+  // WITHOUT the control's count, the old behaviour stands rather than the branch
+  // firing on a comparison it cannot make. `controlObserved` is absent for a
+  // caller that did not count, and absent is not zero.
+  check(classify({ controlExit: 0, stubExit: 1, hashChanged: true, restored: true,
+                   expectRed: "the guard holds",
+                   observed: { assertionsSeen: 23, namedFailSeen: true, failures: ["the guard holds"] } }).verdict === CAUGHT,
+    "control: with no control count the branch cannot fire, and absent is not treated as zero");
+}
+
+// --- an ABORTING run, END TO END: the counters are the only thing that can tell --
+{
+  // The `classify` cases above pass their own counters, so they prove the branch
+  // and not that the RUNNER ever supplies one. That precise gap has shipped here
+  // before: the counting path was computed and never attached to the resolved run,
+  // and every fixture stayed green because none of them disagreed under both paths.
+  //
+  // This fixture disagrees. Stubbed, the file prints the NAMED failure and then
+  // throws, so it reports one assertion where the control reports three. Text and
+  // exit code both say CAUGHT -- the named failure is right there and the exit is
+  // non-zero -- and only the count knows that two assertions never ran.
+  const root = tmpRoot("sweep-abort-");
+  mkdirSync(join(root, "src")); mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "src", "thing.mjs"), `export const guard = true;\n`);
+  writeFileSync(join(root, "test", "thing.test.mjs"),
+    `import { guard } from "../src/thing.mjs";\n` +
+    `console.log(guard ? "PASS  the guard holds" : "FAIL  the guard holds");\n` +
+    // The abort. A stub does not merely make an assertion fail: it changes what the
+    // code DOES, and the file's later steps can stop being reachable.
+    `if (!guard) throw new Error("the file dies here, two assertions short");\n` +
+    `console.log("PASS  the second assertion");\n` +
+    `console.log("PASS  the third assertion");\n`);
+  writeFileSync(join(root, "test", "stub-manifest.mjs"),
+    `export const STUBS = [{ name: "g", why: "flip the guard", test: "test/thing.test.mjs",\n` +
+    `  expectRed: "the guard holds",\n` +
+    `  edits: [{ file: "src/thing.mjs", find: "export const guard = true;", replace: "export const guard = false;" }] }];\n`);
+  const git = (...a) => execFileSync("git", a, { cwd: root, encoding: "utf8" });
+  git("init", "-q"); git("config", "user.email", "s@e.invalid"); git("config", "user.name", "s");
+  git("add", "-A"); git("commit", "-q", "-m", "fixture");
+
+  const r = spawnSync(process.execPath, [RUNNER], { cwd: root, encoding: "utf8",
+    env: { ...process.env, STUB_SWEEP_ROOT: root, STUB_MANIFEST: join(root, "test", "stub-manifest.mjs") } });
+  const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+  check(/UNRUNNABLE/.test(out) && !/CAUGHT/.test(out),
+    "a file that aborts after printing the named failure is UNRUNNABLE end to end, not CAUGHT",
+    out.slice(0, 500));
+  check(/1 assertion\(s\) where the control reported 3/.test(out),
+    "and the runner's own counts reach the verdict, so this proves the wiring and not only the branch",
+    out.slice(0, 500));
+  check(r.status !== 0, "control: and the sweep fails, because anything not CAUGHT fails it", String(r.status));
 }
 
 // --- only-passes, END TO END, is the one case the counters alone can decide ------

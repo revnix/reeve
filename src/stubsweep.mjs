@@ -243,7 +243,8 @@ export function reportedAnyAssertion(output) {
  * parsing still applies, because a caller holding only output is answering a
  * weaker question and should not be forced to lie about having counted.
  */
-export function classify({ controlExit, stubExit, stubOutput = "", hashChanged, restored, expectRed, observed = null }) {
+export function classify({ controlExit, stubExit, stubOutput = "", hashChanged, restored, expectRed,
+                           observed = null, controlObserved = null }) {
   if (controlExit !== 0)
     return { verdict: UNRUNNABLE,
              why: `the test does not pass before stubbing (exit ${controlExit}), so nothing it reports afterwards means anything` };
@@ -275,18 +276,44 @@ export function classify({ controlExit, stubExit, stubOutput = "", hashChanged, 
                   "whatever it printed first is not a verdict" };
 
   const failures = observed ? observed.failures : failedAssertions(stubOutput);
-  const anyAssertion = observed ? observed.anyAssertionSeen : reportedAnyAssertion(stubOutput);
   // COUNTED AT INGESTION when the caller counted. A PASS line is an assertion
   // result even though no PASS line is ever retained, so asking the buffer whether
   // an assertion ran answers a question about RETENTION and reports the run as a
   // crash on the strength of it.
+  const seen = observed ? observed.assertionsSeen : (reportedAnyAssertion(stubOutput) ? 1 : 0);
   const namedFailed = observed
     ? observed.namedFailSeen
     : failures.some(f => f.includes(expectRed));
-  if (!anyAssertion)
+  if (seen === 0)
     return { verdict: CRASHED,
              why: `the test exited ${stubExit} without reporting a single assertion, so it died rather than failed; ` +
                   "a runner reading only the exit code would have called this a pass" };
+  // A SHORTER RUN THAN THE CONTROL IS NOT A READING.
+  //
+  // The TIMED_OUT branch above already refuses a run that did not finish, on the
+  // grounds that an incomplete reading is not evidence. A file that ABORTS is the
+  // same fact arriving through a different exit, and it was not refused: the
+  // named assertion had usually already gone red before the abort, so every other
+  // signal said CAUGHT while the assertions after the abort never ran -- and in a
+  // log an assertion that never ran is indistinguishable from one that passed.
+  //
+  // The comparison is against the CONTROL's count, not a constant. Nothing here
+  // knows how many assertions a file should have, and a threshold would be a
+  // tuned number that stops describing the file the moment it grows. The control
+  // establishes the number for this file, on this tree, minutes earlier.
+  //
+  // STRICTLY FEWER, with no tolerance. A stub makes an assertion fail; it does
+  // not make one disappear, because a failing `check` returns rather than throws.
+  // If the count drops, execution left the path the control took, and what the
+  // remaining assertions would have said is unknown. A stub that legitimately
+  // shortens its file cannot be compared against its control at all, which is a
+  // reason to rewrite the entry rather than to widen the rule.
+  if (controlObserved && seen < controlObserved.assertionsSeen)
+    return { verdict: UNRUNNABLE,
+             why: `the stubbed run reported ${seen} assertion(s) where the control reported ` +
+                  `${controlObserved.assertionsSeen}, so the file stopped early and the ` +
+                  `${controlObserved.assertionsSeen - seen} it did not reach are unmeasured — ` +
+                  "an assertion that never ran reads exactly like one that passed" };
   if (!namedFailed)
     return { verdict: WRONG_RED,
              why: `something failed, but not the named assertion — the property is still unmeasured. Failed: ` +

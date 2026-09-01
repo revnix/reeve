@@ -1576,7 +1576,21 @@ const filed = {};
       check(j?.kind === "hub_incompatible",
         "a hub missing a migration in the middle is refused, though its maximum is current",
         ((r.stdout ?? "") + (r.stderr ?? "")).slice(0, 300));
-      check(/migration 2 is missing/.test(j?.message ?? ""),
+      // DERIVED from the fixture, not written down beside it. The fixture records
+      // 1 and the current maximum, so the hole is every version in between --
+      // which was exactly {2} while the maximum was 3, and became {2,3} the first
+      // time the schema gained a migration. A hardcoded "migration 2" then stopped
+      // describing the hub this block builds, and the assertion failed for a
+      // reason with nothing to do with the refusal it exists to test.
+      const holes = [];
+      for (let v = 2; v < HUB_SCHEMA_VERSION; v++) holes.push(v);
+      check(holes.length > 0,
+        "control: the fixture actually creates a hole, so the assertion below is not vacuous",
+        `HUB_SCHEMA_VERSION=${HUB_SCHEMA_VERSION} holes=${holes.join(",") || "none"}`);
+      const named = /migration ([\d, ]+?) (?:is|are) missing/.exec(j?.message ?? "");
+      const listed = named ? named[1].split(",").map(x => x.trim()).filter(Boolean) : [];
+      check(named !== null && listed.length === holes.length
+            && holes.every(v => listed.includes(String(v))),
         "and the refusal names WHICH migration is missing", String(j?.message));
       check(!/no such table/.test((r.stdout ?? "") + (r.stderr ?? "")),
         "and never the `no such table` the maximum check let through",

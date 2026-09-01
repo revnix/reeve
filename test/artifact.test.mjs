@@ -1003,6 +1003,19 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
   // elsewhere satisfying minClaims, the artifact passed.
   check(g("RESEARCH", "# r\n\n## Findings\n\n- a claim (src/x.mjs:1)\n - unsupported\n", {}).ok === false,
     "a bullet indented one space under a `- ` parent is a SIBLING, and is still required to cite");
+
+  // AND A TAB STOP IS COUNTED FROM WHERE THE TAB IS. Markdown advances a tab to
+  // the next multiple-of-four column, so the tab in `-\tparent` -- which sits at
+  // column 1, after the marker -- reaches column 4, and the content column is 4.
+  // Read as "a tab is four wide wherever it appears", the marker was counted
+  // first and the tab added to it for a content column of 5. A child indented
+  // four spaces, a perfectly ordinary nested elaboration, then fell to the LEFT
+  // of its own parent: counted as a top-level claim and refused for carrying no
+  // citation. The artifact was correct and the gate was not.
+  check(g("RESEARCH", "# r\n\n## Findings\n\n-\ta claim (src/x.mjs:1)\n    - elaboration, uncited\n", {}).ok === true,
+    "a tab after the marker reaches column 4, so a four-space child is nested under it");
+  check(g("RESEARCH", "# r\n\n## Findings\n\n-\ta claim (src/x.mjs:1)\n   - unsupported\n", {}).ok === false,
+    "control: three spaces is still left of that tab stop, so it is a SIBLING and must cite");
   // AND THE BOUNDARY IS THE PARENT'S CONTENT COLUMN, not a fixed number of
   // spaces. Under a `1.  ` marker the content starts at column 4, so two and
   // three spaces are siblings there while they are nested under `- `. A rule
@@ -1159,6 +1172,20 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
     "an empty fenced block is not a done condition, whatever follows it");
   check(g("DESIGN", sl + "```\n```\n", { requireDoneCondition: true }).ok === false,
     "control: and an empty block on its own is refused too");
+
+  // AND THE BLOCK HAS TO BELONG TO THIS FIELD. The scan was bounded at the next
+  // HEADING while the presence check beside it stopped at the next heading OR
+  // the next label -- two answers to "where does this field end", and they
+  // disagreed exactly where it mattered. A slice whose `Done when:` holds only
+  // prose, followed by a `Tests:` carrying a fenced command, had the TEST
+  // field's block read as its done condition: `Done when: someone approves`
+  // reported as machine-checkable, over a command belonging to another field.
+  const other = "# d\n\n## Slices\n\n### Slice 1: x\n- Files: a\n- Packages: b\n" +
+                "- Done when: someone approves\n- Tests:\n\n```bash\npnpm test\n```\n";
+  check(g("DESIGN", other, { requireDoneCondition: true }).ok === false,
+    "a fenced command under a LATER field is not this field's done condition");
+  check(g("DESIGN", sl + "```bash\npnpm test\n```\n\n- Tests: t\n", { requireDoneCondition: true }).ok === true,
+    "control: and a block under Done when itself still is, with a later field after it");
 }
 
 // ── A temporary goes when close itself throws ──────────────────────────────

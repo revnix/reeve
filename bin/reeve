@@ -49,7 +49,7 @@ import { resolveHome } from "../src/home.mjs";
 import { DatabaseSync } from "node:sqlite";
 import { inapplicable, extraArgs, TASK_ARGS, EXITS, ERROR_KINDS } from "./reeve.flags.mjs";
 import { openHub, HUB_SCHEMA_VERSION, HUB_BUSY_TIMEOUT_MS, completedVersion, missingMigrations,
-         schemaDefectsAt, faultKind } from "../src/build/hubdb.mjs";
+         migrationStateOf, hubIntegrityError, schemaDefectsAt, faultKind } from "../src/build/hubdb.mjs";
 import { acquireSingleton, heartbeatSingleton, releaseSingleton } from "../src/build/locks.mjs";
 import { buildTick } from "../src/build/loop.mjs";
 import { readStart, isSameProcess } from "../src/supervisor.mjs";
@@ -1494,6 +1494,24 @@ switch (cmd) {
     // is the true answer rather than a missing one.
     const hubPath = hubPathFor(HOME);
     let db = null;
+    // Whether a read transaction is open on `db`, so the exit below ends it
+    // rather than leaving `close` to do it silently.
+    let snapshot = false;
+    // ONE WAY OUT OF THE DRY RUN'S CHECKS.
+    //
+    // Eight refusals below reach it and three of them closed the handle they
+    // had been reading through; five did not. Nothing could see the difference,
+    // because exiting closes the connection regardless -- and that is exactly
+    // why the count drifted to three out of eight without anyone noticing. It
+    // stops being invisible the moment a check is added that reports rather
+    // than exits, and the fix for that is not to remember harder at eight call
+    // sites: it is to have one exit, which ends the read and closes the handle
+    // because there is no other way through.
+    const stop = () => {
+      if (snapshot) { try { db.exec("ROLLBACK"); } catch { /* the close ends it anyway */ } }
+      try { db?.close(); } catch { /* already gone */ }
+      process.exit(1);
+    };
     if (flag("dry-run")) {
       // AN ABSENT HUB IS NOT THE ONLY WAY A DRY RUN WRITES. `openHub` applies
       // forward migrations, so a preview against a hub older than this binary
@@ -1511,62 +1529,27 @@ switch (cmd) {
       // check", when in fact nothing had been migrated at all. An ABSENT file is
       // the only case that legitimately skips this, and it is asked separately.
       if (existsSync(hubPath)) {
-        const hist = missingMigrations(hubPath);
-        if (!hist.readable) {
-          console.error(`reeve task: the hub at ${hubPath} exists but its schema_version cannot be read, ` +
-                        `so which migrations it carries is unknown.`);
-          process.exit(1);
-        }
-        // NEWER BEFORE MISSING, and while still holding only the READ-ONLY
-        // probe. A hub carrying a contiguous 1 through 4 while this binary knows
-        // 3 is missing none of what this binary expects, so `missing` is empty
-        // and `holed` is false -- and the guard fell through to `openHub`, whose
-        // first acts are `PRAGMA journal_mode = WAL` and the `schema_version`
-        // DDL. Both are writes, to a database written by a NEWER binary, from
-        // the command whose entire purpose here is to write nothing. `openHub`
-        // does refuse the newer version, but only after those writes.
-        if (hist.version > HUB_SCHEMA_VERSION) {
-          console.error(`reeve task: the hub at ${hubPath} is schema version ${hist.version}, and this ` +
-                        `binary knows ${HUB_SCHEMA_VERSION}. Migrations are forward-only, so this binary ` +
-                        `cannot read it and a dry run will not open it.`);
-          console.error(`-> run the newer binary, or restore a snapshot taken at ${HUB_SCHEMA_VERSION}`);
-          process.exit(1);
-        }
-        // AN INVALID MARKER IS ITS OWN FAULT, and it comes BEFORE the missing
-        // check because it is invisible to it. `schema_version` is an INTEGER
-        // PRIMARY KEY, so a hand-edited `-1` is valid SQLite: every expected
-        // version reads as missing, nothing reads as a hole, and the branch
-        // below would tell the operator to migrate -- which `openHub` refuses,
-        // because `historyGaps` will not take a negative bound. Migrating cannot
-        // repair a marker that is not a version.
-        if (hist.invalid.length) {
-          console.error(`reeve task: the hub at ${hubPath} records ${hist.invalid.join(", ")} in ` +
-                        `schema_version, which is not a migration number this binary can act on ` +
-                        `(they run 1 through ${HUB_SCHEMA_VERSION}).`);
-          console.error(`-> the marker itself is wrong, so migrating cannot repair it: restore a snapshot ` +
-                        `(\`reeve restore --hub --force\`), then retry`);
-          process.exit(1);
-        }
-        if (hist.missing.length) {
-          console.error(`reeve task: the hub at ${hubPath} is missing migration(s) ` +
-                        `${hist.missing.join(", ")} (it carries ${hist.have.join(", ") || "none"}, and this ` +
-                        `binary expects 1 through ${HUB_SCHEMA_VERSION}). A dry run will not migrate it, ` +
-                        `because migrating is a write and this command promises none.`);
-          // THE REMEDY HAS TO BE ONE THAT WORKS ON THIS FAULT. Both faults
-          // arrive here as a non-empty `missing`, and only one of them
-          // migrates: `openHub` re-runs a missing TAIL, and refuses a HOLE
-          // outright, because a migration beneath an applied one cannot be
-          // re-run over a store that has already moved past it. Sending an
-          // operator with a holed hub to the writing command sends them to a
-          // second refusal -- and that second refusal is the one that names the
-          // repair, so the first message cost them a round trip to reach it.
-          console.error(hist.holed
-            ? `-> this is a HOLE, not a missing tail, so migrating cannot repair it: the migrations ` +
-              `beneath the ones already applied cannot be re-run. Restore a snapshot ` +
-              `(\`reeve restore --hub --force\`), then retry`
-            : `-> run a command that writes (for example \`reeve task file\` without --dry-run) to migrate, then retry`);
-          process.exit(1);
-        }
+        // ONE CONNECTION, AND ONE READ SNAPSHOT ACROSS EVERY CHECK.
+        //
+        // The history was read through a connection of its own, closed before
+        // this one opened; the shape check and the application reads then ran on
+        // a third view of the store. Three reads, three moments -- and a dry run
+        // is precisely the command whose answer is a claim ABOUT the hub, so a
+        // hub that changed between them makes the plan describe a store that no
+        // longer exists. A newer reeve migrating in that window is the case that
+        // matters: the version check passed against the old history, and a
+        // migration that only ADDS a table is invisible to the shape check that
+        // follows, so the binary emitted a plan from exactly the schema it had
+        // just promised to refuse.
+        //
+        // So the read-only handle is opened FIRST, a read transaction is begun on
+        // it, and the history, the integrity check, the shape check and
+        // `fileTask`'s own reads all run inside it. In WAL -- which is every hub
+        // `openHub` has ever touched -- a read transaction costs a writer
+        // nothing. A hub still in DELETE mode, which is how `VACUUM INTO` writes
+        // a snapshot, holds a SHARED lock instead and a concurrent writer waits
+        // for the dry run; that is the correct trade, because the alternative is
+        // a preview of a store that was never in the state it describes.
         // READ-ONLY, and this is the last write the dry run had left.
         //
         // The version checks above stop `openHub` from MIGRATING, which was the
@@ -1610,7 +1593,88 @@ switch (cmd) {
           console.error(`-> reading a WAL database creates ${basename(hubPath)}-wal and -shm beside it, so ` +
                         `the directory holding the hub has to be writable even for a dry run; check the ` +
                         `permissions on ${dirname(hubPath)}`);
-          process.exit(1);
+          stop();
+        }
+        // BEGUN, not merely opened. Two reads on one connection are still two
+        // moments without this: SQLite gives a stable view only inside a
+        // transaction. Deferred, so the snapshot is taken by the first read
+        // below rather than at this line, and no lock is held for longer than
+        // the reads need it.
+        try { db.exec("BEGIN"); snapshot = true; }
+        catch (e) {
+          console.error(`reeve task: the hub at ${hubPath} could not be read consistently ` +
+                        `(${e.message}).`);
+          console.error(`-> a dry run reads the history and the tables as one snapshot, so it needs a ` +
+                        `read transaction; another process may hold the hub`);
+          stop();
+        }
+        // AND THE FILE ITSELF IS CHECKED, on this connection and inside this
+        // snapshot. Taking the read-only route around `openHub` took it around
+        // `openHub`'s `quick_check(1)` too, so a hub with a complete history and
+        // a correct catalogue but a damaged data or index page passed every
+        // probe here -- and the damage surfaced later, out of `liveLeases`, as a
+        // raw `database disk image is malformed` from a command that had already
+        // reported the hub healthy.
+        const damaged = hubIntegrityError(db, hubPath);
+        if (damaged) {
+          console.error(`reeve task: ${damaged.message}`);
+          stop();
+        }
+        const hist = migrationStateOf(db);
+        if (!hist.readable) {
+          console.error(`reeve task: the hub at ${hubPath} exists but its schema_version cannot be read, ` +
+                        `so which migrations it carries is unknown.`);
+          stop();
+        }
+        // NEWER BEFORE MISSING, and while still holding only the READ-ONLY
+        // probe. A hub carrying a contiguous 1 through 4 while this binary knows
+        // 3 is missing none of what this binary expects, so `missing` is empty
+        // and `holed` is false -- and the guard fell through to `openHub`, whose
+        // first acts are `PRAGMA journal_mode = WAL` and the `schema_version`
+        // DDL. Both are writes, to a database written by a NEWER binary, from
+        // the command whose entire purpose here is to write nothing. `openHub`
+        // does refuse the newer version, but only after those writes.
+        if (hist.version > HUB_SCHEMA_VERSION) {
+          console.error(`reeve task: the hub at ${hubPath} is schema version ${hist.version}, and this ` +
+                        `binary knows ${HUB_SCHEMA_VERSION}. Migrations are forward-only, so this binary ` +
+                        `cannot read it and a dry run will not open it.`);
+          console.error(`-> run the newer binary, or restore a snapshot taken at ${HUB_SCHEMA_VERSION}`);
+          stop();
+        }
+        // AN INVALID MARKER IS ITS OWN FAULT, and it comes BEFORE the missing
+        // check because it is invisible to it. `schema_version` is an INTEGER
+        // PRIMARY KEY, so a hand-edited `-1` is valid SQLite: every expected
+        // version reads as missing, nothing reads as a hole, and the branch
+        // below would tell the operator to migrate -- which `openHub` refuses,
+        // because `historyGaps` will not take a negative bound. Migrating cannot
+        // repair a marker that is not a version.
+        if (hist.invalid.length) {
+          console.error(`reeve task: the hub at ${hubPath} records ${hist.invalid.join(", ")} in ` +
+                        `schema_version, which is not a migration number this binary can act on ` +
+                        `(they run 1 through ${HUB_SCHEMA_VERSION}).`);
+          console.error(`-> the marker itself is wrong, so migrating cannot repair it: restore a snapshot ` +
+                        `(\`reeve restore --hub --force\`), then retry`);
+          stop();
+        }
+        if (hist.missing.length) {
+          console.error(`reeve task: the hub at ${hubPath} is missing migration(s) ` +
+                        `${hist.missing.join(", ")} (it carries ${hist.have.join(", ") || "none"}, and this ` +
+                        `binary expects 1 through ${HUB_SCHEMA_VERSION}). A dry run will not migrate it, ` +
+                        `because migrating is a write and this command promises none.`);
+          // THE REMEDY HAS TO BE ONE THAT WORKS ON THIS FAULT. Both faults
+          // arrive here as a non-empty `missing`, and only one of them
+          // migrates: `openHub` re-runs a missing TAIL, and refuses a HOLE
+          // outright, because a migration beneath an applied one cannot be
+          // re-run over a store that has already moved past it. Sending an
+          // operator with a holed hub to the writing command sends them to a
+          // second refusal -- and that second refusal is the one that names the
+          // repair, so the first message cost them a round trip to reach it.
+          console.error(hist.holed
+            ? `-> this is a HOLE, not a missing tail, so migrating cannot repair it: the migrations ` +
+              `beneath the ones already applied cannot be re-run. Restore a snapshot ` +
+              `(\`reeve restore --hub --force\`), then retry`
+            : `-> run a command that writes (for example \`reeve task file\` without --dry-run) to migrate, then retry`);
+          stop();
         }
         // AND THE SHAPE IS CHECKED BEFORE ANY APPLICATION QUERY. A complete
         // version history says which migrations RAN, not that the tables they
@@ -1621,13 +1685,12 @@ switch (cmd) {
         // reported the hub healthy.
         const defects = schemaDefectsAt(db, hist.version);
         if (defects.length) {
-          try { db.close(); } catch { /* already gone */ }
           console.error(`reeve task: the hub at ${hubPath} records schema version ${hist.version} but its ` +
                         `tables do not match it: ${defects.slice(0, 3).join("; ")}` +
                         `${defects.length > 3 ? ` (and ${defects.length - 3} more)` : ""}.`);
           console.error(`-> the history says the migrations ran, so this is damage after the fact rather ` +
                         `than a missing migration: restore a snapshot (\`reeve restore --hub --force\`)`);
-          process.exit(1);
+          stop();
         }
       }
     } else {
@@ -1654,6 +1717,8 @@ switch (cmd) {
       isAlive: isSameProcess,
       pid: process.pid, lstart: readStart(process.pid),
     });
+    // ROLLBACK, not commit: nothing was written, and this only ends the read.
+    if (snapshot) { try { db.exec("ROLLBACK"); } catch { /* the close ends it anyway */ } }
     db?.close();
     if (flag("json")) console.log(JSON.stringify(r, null, 2));
     else if (!r.ok) console.error(`reeve task: ${r.refusal}`);

@@ -121,10 +121,16 @@ const DEAD = () => false;
 // hub the table is absent and the prepare THROWS, so the compatibility path the
 // documentation describes was unreachable. Found in review.
 {
+  // GENUINELY PRE-v6: the table is gone AND the migration is not recorded. The
+  // first version of this fixture dropped the table and left `schema_version`
+  // saying 6 -- which is the DAMAGED case, not the old one. It asserted null and
+  // passed, so the fixture built the misclassification and certified it. Review
+  // found that, not the suite.
   const p = join(dir, "prev6.db");
   openHub(p).close();
   const raw = new DatabaseSync(p);
   raw.exec("DROP TABLE hub_incarnation");
+  raw.prepare("DELETE FROM schema_version WHERE version = ?").run(6);
   raw.close();
   const ro = new DatabaseSync(p, { readOnly: true });
   let threw = null, answer;
@@ -132,6 +138,24 @@ const DEAD = () => false;
   ro.close();
   check(threw === null, "reading a hub that predates the table does not throw", String(threw));
   check(answer === null, "it answers null, which a caller reads as `cannot prove`", JSON.stringify(answer));
+
+  // AND THE DAMAGED CASE MUST NOT LOOK LIKE IT. A hub that RECORDS migration 6
+  // and has lost the table is broken, and null there suppresses the only evidence
+  // a caller has.
+  const d = join(dir, "damaged-v6.db");
+  openHub(d).close();
+  const draw = new DatabaseSync(d);
+  draw.exec("DROP TABLE hub_incarnation");
+  draw.close();
+  const dro = new DatabaseSync(d, { readOnly: true });
+  let dthrew = null, danswer;
+  try { danswer = hubIncarnation(dro); } catch (e) { dthrew = e.message; }
+  dro.close();
+  check(dthrew !== null,
+    "a v6 hub that has LOST the table propagates, rather than reading as an older store",
+    `it answered ${JSON.stringify(danswer)}`);
+  check(/no such table/i.test(dthrew ?? ""),
+    "control: and the error it propagates is the missing table, not something else", String(dthrew));
 }
 
 // ── minting REPLACES, because a restore must be able to end an incarnation ────

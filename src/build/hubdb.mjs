@@ -34,6 +34,16 @@ const SCHEMA_VERSION_DDL = `CREATE TABLE IF NOT EXISTS schema_version (
 export const HUB_SCHEMA_VERSION = 6;
 
 /**
+ * The migration that created `hub_incarnation`.
+ *
+ * Named rather than spelled `6` at the one site that needs it, because that site
+ * is asking a question about THIS table and a bare number there reads as a
+ * coincidence. `IDENTITY_SINCE` in `repoid.mjs` is the same shape for the same
+ * reason.
+ */
+export const INCARNATION_SINCE = 6;
+
+/**
  * Forward-only. Each entry runs exactly once, in order, in its own transaction,
  * and records itself. Never edit a merged entry -- add the next number.
  */
@@ -481,11 +491,27 @@ export function hubIncarnation(db) {
     // caller told to expect null for an older hub got an exception instead. The
     // compatibility path the comment above describes was unreachable.
     //
-    // ONLY the missing table answers null. A busy store, a damaged page or any
-    // other fault must propagate: rendering those as "no incarnation" would turn
-    // an unreadable hub into a confident "cannot prove", which reads downstream
-    // as an ordinary older store and hides the fault entirely.
-    if (/no such table/i.test(e?.message ?? "")) return null;
+    // A MISSING TABLE IS NOT ENOUGH TO CALL A HUB OLD. A store that RECORDS
+    // migration 6 and does not have the table is DAMAGED -- schema damage, or a
+    // hand repair that dropped it -- and answering null there renders a broken
+    // current hub as an ordinary older one, which suppresses the only evidence
+    // anything has that the table is gone. Review found this, and found it in my
+    // own fixture: the test that asserted the null dropped the table from a v6
+    // hub, so it built the damaged case and certified it as the old one.
+    //
+    // SO THE NULL NEEDS A POSITIVE READING, not an absence. `schema_version` must
+    // be readable AND must not record the migration. If that read fails, or the
+    // migration is there, the original error propagates -- because "I cannot tell
+    // how old this hub is" and "this hub is old" are different answers, and only
+    // one of them is safe to give a caller who will read it as "cannot prove".
+    if (!/no such table/i.test(e?.message ?? "")) throw e;
+    let predatesTheTable = false;
+    try {
+      const row = db.prepare("SELECT COUNT(*) n FROM schema_version WHERE version = ?")
+                    .get(INCARNATION_SINCE);
+      predatesTheTable = row?.n === 0;
+    } catch { /* schema_version itself is unreadable: not a positive reading */ }
+    if (predatesTheTable) return null;
     throw e;
   }
   return row ? { id: row.id, startedAt: row.started_at } : null;

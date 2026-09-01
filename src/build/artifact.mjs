@@ -455,7 +455,28 @@ export function reviewArtifact({ phase, dir, expect }) {
           // document is then inside it, so what the slice actually asks for is
           // whatever happens to follow.
           const within = after.slice(0, nextBoundary(rows, at));
-          const fence = /^\s*```[^\n]*\n\s*(\S[^\n]*)[\s\S]*?^\s*```\s*$/m.exec(within);
+          // THE CLOSER MUST BE AT LEAST AS LONG AS THE OPENER, which is what
+          // CommonMark says and what a renderer does. Matching a bare ``` at
+          // both ends let a block opened with four backticks be "closed" by a
+          // line of three: the greedy prefix took three, the fourth was read as
+          // the info string, and the gate reported a machine-checkable done
+          // condition for a block that is still open -- with the whole remainder
+          // of design.md inside it. The backreference is the fix; the trailing
+          // `* allows the longer closer CommonMark also permits.
+          //
+          // AND THE INFO STRING CARRIES NO BACKTICKS, which is also
+          // CommonMark's rule and is what makes the backreference bite.
+          // Written as `[^\n]*`, the greedy prefix simply BACKTRACKED: it
+          // gave back the fourth opening backtick, matched three, read the
+          // one it surrendered as the start of the info string, and closed
+          // the block on three again -- the defect intact, with the
+          // backreference still in the pattern. Measured: the four-open,
+          // three-close fixture stayed green until this class was narrowed.
+          //
+          // And the leading whitespace is spaces and tabs, not \s: `\s` matches
+          // newlines, so `^\s*` could start a "fence" several blank lines above
+          // the backticks it then matched.
+          const fence = /^[ \t]*(`{3,})[^`\n]*\n[ \t]*(\S[^\n]*)[\s\S]*?^[ \t]*\1`*[ \t]*$/m.exec(within);
           if (!fence) findings.push(`${heading} has no machine-checkable done condition: ` +
             `the contract asks for a fenced block, opened AND closed, whose first line is a command`);
         }

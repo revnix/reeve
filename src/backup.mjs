@@ -255,14 +255,22 @@ export function validateSnapshot(path, { expectVersion = null, kind = "repo", de
       // either comment becoming false.
       const versions = probe.prepare("SELECT version FROM schema_version ORDER BY version").all().map(r => r.version);
       const version = versions.length ? versions[versions.length - 1] : 0;
-      const gaps = historyGaps(versions);
-      if (!versions.length || gaps.length)
+      // RECORDS NOTHING, then NEWER, then holed -- and the middle one has to
+      // come before the enumeration, exactly as in `openHub`. A snapshot file is
+      // the least trustworthy input this binary has: it is chosen off disk, it
+      // may have been written by another machine, and `schema_version` is one
+      // row an editor can change. Enumerating up to the number it happens to
+      // carry made this validator allocate proportionally to that number, on the
+      // path an operator reaches when everything else has already failed.
+      if (!versions.length)
+        return { ok: false, integrity, version, why: "the snapshot records no schema version at all" };
+      const known = expectVersion ?? HUB_SCHEMA_VERSION;
+      if (version > known)
+        return { ok: false, why: `snapshot is schema version ${version}; this binary knows ${known}`, version, integrity };
+      const gaps = historyGaps(versions, version);
+      if (gaps.length)
         return { ok: false, integrity, version,
-                 why: !versions.length
-                   ? "the snapshot records no schema version at all"
-                   : `the snapshot records version ${version} but is missing migration(s) ${gaps.join(", ")}` };
-      if (expectVersion != null && version > expectVersion)
-        return { ok: false, why: `snapshot is schema version ${version}; this binary knows ${expectVersion}`, version, integrity };
+                 why: `the snapshot records version ${version} but is missing migration(s) ${gaps.join(", ")}` };
       // DERIVED by running the migrations to this version, not looked up in a
       // declared list. A migration that adds a table is covered the day it
       // lands. A version this binary does not know still falls back to the

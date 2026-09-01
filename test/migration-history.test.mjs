@@ -18,7 +18,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { openHub, completedVersion, missingMigrations, HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { openHub, completedVersion, missingMigrations, historyGaps, hasHistoryHole,
+         HUB_SCHEMA_VERSION } from "../src/build/hubdb.mjs";
 // DERIVED, so a fixture cannot be written at a path the binary does not read.
 import { hubPathFor } from "../src/paths.mjs";
 
@@ -214,6 +217,142 @@ const holeAt = (p, v) => {
     tailRun.out.slice(0, 500));
   check(!/\bHOLE\b/.test(tailRun.out),
     "and a short history is not called a hole", tailRun.out.slice(0, 500));
+
+  // AND A NEWER HUB IS REFUSED WITHOUT BEING OPENED AT ALL.
+  //
+  // This is the case neither `missing` nor `holed` can see: a contiguous history
+  // one version above this binary is missing nothing it expects and has no hole,
+  // so the guard fell through to `openHub` -- which writes before it refuses.
+  // The byte comparison is the assertion that matters; the message is only how
+  // the operator learns why.
+  rmSync(hub, { force: true });
+  openHub(hub).close();
+  {
+    const q = new DatabaseSync(hub);
+    q.exec(`INSERT INTO schema_version(version, applied_at) VALUES(${HUB_SCHEMA_VERSION + 1}, unixepoch())`);
+    q.exec("PRAGMA journal_mode = DELETE");   // the state a restored snapshot is in; see below
+    q.close();
+  }
+  const digestOf = (p) => createHash("sha256").update(readFileSync(p)).digest("hex");
+  const beforeRun = digestOf(hub);
+  const newerRun = dryRun();
+  check(newerRun.status === 1 && /schema version/.test(newerRun.out) && /newer binary/.test(newerRun.out),
+    "the route refuses a hub NEWER than this binary and names the remedy", newerRun.out.slice(0, 500));
+  check(digestOf(hub) === beforeRun,
+    "and leaves it byte-identical, which is the whole promise of --dry-run",
+    `${beforeRun.slice(0, 12)} -> ${digestOf(hub).slice(0, 12)}`);
+}
+
+// ── THE RECORDED VERSION IS NOT A LOOP BOUND ────────────────────────────────
+//
+// `schema_version` is the one table an operator is most likely to have edited by
+// hand, and the contiguity rule read its maximum as the number of iterations to
+// perform. Measured on node v24.17.0: a hub whose only row is version 1000000000
+// killed `missingMigrations` with a V8 heap OOM -- so `reeve task file --dry-run`
+// crashed on the corrupt marker it exists to REPORT.
+//
+// RUN IN A CHILD WITH A HARD TIMEOUT, not inline. A regression here does not
+// fail, it exhausts memory: inline, it would take the whole suite down with a
+// V8 fatal error and no assertion line at all. In a child, the kill is the
+// answer.
+const HUGE = 1000000000;
+{
+  // EVERY PROBE THAT TOUCHES THE LARGE VALUE RUNS IN THE CHILD, none in this
+  // process. A regression here does not fail an assertion, it exhausts memory --
+  // so run inline it would abort this file with a V8 fatal error partway
+  // through, and the assertions that never ran would be indistinguishable in the
+  // log from assertions that passed. In the child, the kill IS the answer.
+  const probe = join(dir, "huge.db");
+  openHub(probe).close();
+  {
+    const q = new DatabaseSync(probe);
+    q.exec("DELETE FROM schema_version");
+    q.exec(`INSERT INTO schema_version(version, applied_at) VALUES(${HUGE}, unixepoch())`);
+    q.close();
+  }
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e",
+    `import { missingMigrations, hasHistoryHole, historyGaps } from ${JSON.stringify(new URL("../src/build/hubdb.mjs", import.meta.url).href)};
+     const r = missingMigrations(${JSON.stringify(probe)});
+     const holed = hasHistoryHole([${HUGE}]);
+     let bound = null;
+     try { historyGaps([1, ${HUGE}], ${HUGE}); } catch (e) { bound = String(e.message); }
+     process.stdout.write(JSON.stringify({ version: r.version, holed: r.holed, missing: r.missing.length,
+                                           direct: holed, bound }));`],
+    { encoding: "utf8", timeout: 20000, maxBuffer: 1 << 20 });
+  check(child.status === 0,
+    "missingMigrations returns on a hub recording a very large version, rather than exhausting memory",
+    `status=${child.status} signal=${child.signal} ${String(child.stderr).slice(-300)}`);
+  let answer = null;
+  try { answer = JSON.parse(child.stdout); } catch { /* reported by the check above */ }
+  check(answer !== null && answer.version === HUGE && answer.holed === true
+        && answer.missing === HUB_SCHEMA_VERSION,
+    "and it reports the recorded version, the hole, and every expected migration as absent",
+    JSON.stringify(answer));
+  check(answer !== null && answer.direct === true,
+    "and hasHistoryHole answers the same question directly without enumerating", JSON.stringify(answer));
+  // THE ENUMERATING FORM REFUSES AN UNTRUSTED BOUND. `historyGaps` still
+  // enumerates, because a message has to NAME the missing versions. What changed
+  // is that the bound is the CALLER'S and is refused above this binary's own
+  // version -- which is what makes the ordering in `openHub` and in
+  // `validateSnapshot`, both of which refuse a newer store first, load-bearing
+  // rather than incidental. A future reordering fails with this message instead
+  // of silently exhausting memory.
+  check(answer !== null && answer.bound !== null
+        && new RegExp(`0 to ${HUB_SCHEMA_VERSION}`).test(String(answer.bound)),
+    "historyGaps refuses to enumerate up to a version this binary does not know",
+    JSON.stringify(answer && answer.bound));
+
+  // The ordinary cases, in this process, where they cost nothing.
+  check(hasHistoryHole([1, 2, 3]) === false && hasHistoryHole([1, 3]) === true,
+    "control: and it still answers ordinary histories correctly");
+  check(JSON.stringify(historyGaps([1, HUB_SCHEMA_VERSION], HUB_SCHEMA_VERSION)) ===
+        JSON.stringify(Array.from({ length: HUB_SCHEMA_VERSION - 2 }, (_, i) => i + 2)),
+    "control: and within its own bound it still names exactly the absent versions",
+    JSON.stringify(historyGaps([1, HUB_SCHEMA_VERSION], HUB_SCHEMA_VERSION)));
+}
+
+// ── A NEWER hub is refused before anything is opened for writing ────────────
+//
+// A contiguous history one version above this binary is missing none of what
+// this binary expects, so `missing` is empty and `holed` is false. The dry-run
+// guard read only those two and fell through to `openHub` -- whose first acts
+// are `PRAGMA journal_mode = WAL` and the `schema_version` DDL. Both are writes,
+// to a database written by a NEWER binary, from the command whose whole promise
+// here is that it writes nothing.
+{
+  const newer = join(dir, "newer.db");
+  openHub(newer).close();
+  {
+    const q = new DatabaseSync(newer);
+    q.exec(`INSERT INTO schema_version(version, applied_at) VALUES(${HUB_SCHEMA_VERSION + 1}, unixepoch())`);
+    q.close();
+  }
+  const h = missingMigrations(newer);
+  check(h.missing.length === 0 && h.holed === false && h.version === HUB_SCHEMA_VERSION + 1,
+    "a contiguous hub one version NEWER is missing nothing and is not holed -- only `version` says so",
+    JSON.stringify(h));
+
+  // IN DELETE JOURNAL MODE, because that is the state the write is visible in
+  // and it is not a contrived one: `VACUUM INTO` writes a snapshot in delete
+  // mode, so a restored hub is in delete mode until `openHub` converts it. On a
+  // store already in WAL, openHub's opening pragma and its `CREATE TABLE IF NOT
+  // EXISTS` are both no-ops, and a byte comparison would report no write while
+  // the file was still opened read-write -- a control that passes for the wrong
+  // reason on the fixture that happens to be handy.
+  {
+    const q = new DatabaseSync(newer);
+    q.exec("PRAGMA journal_mode = DELETE");
+    q.close();
+  }
+  const digest = (p) => createHash("sha256").update(readFileSync(p)).digest("hex");
+  const beforeOpen = digest(newer);
+  let refused = null;
+  try { openHub(newer).close(); } catch (e) { refused = String(e.message); }
+  check(refused !== null && /is schema version/.test(refused),
+    "control: openHub does refuse a newer store", String(refused));
+  check(digest(newer) !== beforeOpen,
+    "control: but only AFTER writing to it, so reaching openHub at all is the defect",
+    `${beforeOpen.slice(0, 12)} -> ${digest(newer).slice(0, 12)}`);
 }
 
 rmSync(dir, { recursive: true, force: true });

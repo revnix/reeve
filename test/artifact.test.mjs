@@ -872,6 +872,30 @@ check(toSizing.applied === true, "fixture: and advanced to SIZING", JSON.stringi
     "an unterminated done-condition fence is refused");
   check(g("DESIGN", sl + "```bash\npnpm test\n```\n", { requireDoneCondition: true }).ok === true,
     "control: and a closed one passes");
+
+  // AND THE CLOSER MUST BE AT LEAST AS LONG AS THE OPENER. CommonMark says so,
+  // and a renderer behaves accordingly: a block opened with four backticks is
+  // not closed by three. Matching a bare ``` at both ends, the greedy prefix
+  // took three of the four opening backticks, the fourth was read as the info
+  // string, and the three-backtick line closed it -- so this gate reported a
+  // machine-checkable done condition for a block that swallows the whole rest of
+  // the document. The gate and the renderer disagreed about where the slice
+  // ends, and the gate is the one that says the work may proceed.
+  check(g("DESIGN", sl + "````bash\npnpm test\n```\n", { requireDoneCondition: true }).ok === false,
+    "a done condition opened with four backticks and closed with three is refused");
+  check(g("DESIGN", sl + "````bash\npnpm test\n````\n", { requireDoneCondition: true }).ok === true,
+    "control: and four closed by four passes, so length is matched rather than fixed at three");
+  // A LONGER CLOSER IS STILL A CLOSER, which CommonMark also allows. Written
+  // with an equality instead of a minimum, this would be refused -- a gate
+  // stricter than the format it claims to check refuses correct work, which is
+  // the failure direction nobody looks for.
+  check(g("DESIGN", sl + "```bash\npnpm test\n`````\n", { requireDoneCondition: true }).ok === true,
+    "control: and a closer LONGER than its opener still closes the block");
+  // AND THE OPENER IS STILL FOUND WHEN INDENTED, which the whitespace class
+  // change could have broken: `\s` matched newlines, so this had been looking
+  // for a fence that could start lines above where it actually did.
+  check(g("DESIGN", sl + "  ```bash\n  pnpm test\n  ```\n", { requireDoneCondition: true }).ok === true,
+    "control: and an indented fence is still a fence");
 }
 
 // ── A temporary goes when close itself throws ──────────────────────────────

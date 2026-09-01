@@ -1444,6 +1444,21 @@ switch (cmd) {
                         `so which migrations it carries is unknown.`);
           process.exit(1);
         }
+        // NEWER BEFORE MISSING, and while still holding only the READ-ONLY
+        // probe. A hub carrying a contiguous 1 through 4 while this binary knows
+        // 3 is missing none of what this binary expects, so `missing` is empty
+        // and `holed` is false -- and the guard fell through to `openHub`, whose
+        // first acts are `PRAGMA journal_mode = WAL` and the `schema_version`
+        // DDL. Both are writes, to a database written by a NEWER binary, from
+        // the command whose entire purpose here is to write nothing. `openHub`
+        // does refuse the newer version, but only after those writes.
+        if (hist.version > HUB_SCHEMA_VERSION) {
+          console.error(`reeve task: the hub at ${hubPath} is schema version ${hist.version}, and this ` +
+                        `binary knows ${HUB_SCHEMA_VERSION}. Migrations are forward-only, so this binary ` +
+                        `cannot read it and a dry run will not open it.`);
+          console.error(`-> run the newer binary, or restore a snapshot taken at ${HUB_SCHEMA_VERSION}`);
+          process.exit(1);
+        }
         if (hist.missing.length) {
           console.error(`reeve task: the hub at ${hubPath} is missing migration(s) ` +
                         `${hist.missing.join(", ")} (it carries ${hist.have.join(", ") || "none"}, and this ` +

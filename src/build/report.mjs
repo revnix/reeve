@@ -41,7 +41,9 @@ function load(action) {
   if (!ACTIONS.includes(action)) throw new Error(`no report schema for ${JSON.stringify(action)}`);
   if (!CACHE.has(action)) {
     const text = readFileSync(new URL(`./schemas/${action.toLowerCase()}.json`, import.meta.url), "utf8");
-    CACHE.set(action, { text, schema: deepFreeze(JSON.parse(text)) });
+    const schema = JSON.parse(text);
+    assertKnownKeywords(schema, "");
+    CACHE.set(action, { text, schema: deepFreeze(schema) });
   }
   return CACHE.get(action);
 }
@@ -70,18 +72,54 @@ export const schemaTextFor = (action) => load(action).text;
 // not added for it, and a validator that silently ignores a keyword it does not
 // implement would make a schema look stricter than it is -- so an unknown
 // keyword is an error here rather than a shrug.
-const KNOWN = new Set(["$schema", "title", "type", "enum", "required", "properties",
-                       "additionalProperties", "items", "minItems", "minLength", "minimum"]);
+const KNOWN = new Set(["$schema", "title", "type", "enum", "const", "required", "properties",
+                       "additionalProperties", "items", "minItems", "minLength", "minimum",
+                       "pattern", "if", "then"]);
+
+/**
+ * Every keyword in the whole schema, checked ONCE when it is loaded.
+ *
+ * Checked during validation instead, the recursion follows only the properties a
+ * REPORT happens to carry -- so an unimplemented keyword added beneath an
+ * optional property was never visited by a report that omitted it, and the
+ * schema silently enforced less than it declares. A schema using a keyword this
+ * validator does not implement is a defect in the SCHEMA, not in the report, so
+ * it throws where the schema is read rather than appearing in some report's
+ * error list.
+ *
+ * EXPORTED FOR ITS TEST, deliberately. The property that matters is that it
+ * visits branches no report reaches, and the only way to demonstrate that is to
+ * hand it a schema whose unknown keyword sits under an optional property. A
+ * guard that cannot be shown to fire is the shape this repository keeps finding.
+ */
+export function assertKnownKeywords(node, where = "") {
+  if (Array.isArray(node)) { node.forEach((n, i) => assertKnownKeywords(n, `${where}${i}.`)); return; }
+  if (!node || typeof node !== "object") return;
+  for (const [k, v] of Object.entries(node)) {
+    if (!KNOWN.has(k)) throw new Error(`${where}${k}: schema uses unimplemented keyword ${k}`);
+    // `properties` names are the report's, not the vocabulary's, so its values
+    // are schemas and its keys are never keywords.
+    if (k === "properties") for (const [p, sub] of Object.entries(v)) assertKnownKeywords(sub, `${where}${p}.`);
+    else if (k === "enum" || k === "required" || k === "const") continue;
+    else assertKnownKeywords(v, `${where}${k}.`);
+  }
+}
+
 function walk(schema, value, path, errors) {
-  for (const k of Object.keys(schema))
-    if (!KNOWN.has(k)) errors.push(`${path}: schema uses unimplemented keyword ${k}`);
   if (schema.enum && !schema.enum.includes(value))
     errors.push(`${path}: ${JSON.stringify(value)} is not one of ${schema.enum.join(", ")}`);
-  if (schema.type === "object") {
-    if (value === null || typeof value !== "object" || Array.isArray(value)) {
-      errors.push(`${path}: expected an object`);
-      return errors;
-    }
+  // THE SHAPE CHECKS ARE NOT GATED ON `type`. Nested inside `type === "object"`,
+  // `required` and `properties` were invisible to any subschema that does not
+  // declare a type -- which is every `if` and every `then`, since a conditional
+  // constrains the same object its parent already typed. So the conditional
+  // requirement silently applied nothing: `if` matched everything, `then`
+  // required nothing, and an `ok` SIZING report with no estimates validated.
+  const isObject = value !== null && typeof value === "object" && !Array.isArray(value);
+  if (schema.type === "object" && !isObject) {
+    errors.push(`${path}: expected an object`);
+    return errors;
+  }
+  if (isObject) {
     for (const r of schema.required ?? [])
       if (!Object.prototype.hasOwnProperty.call(value, r)) errors.push(`${path}${r}: required and missing`);
     for (const [k, v] of Object.entries(value)) {
@@ -89,7 +127,8 @@ function walk(schema, value, path, errors) {
       if (!sub) { if (schema.additionalProperties === false) errors.push(`${path}${k}: not declared by this schema`); continue; }
       walk(sub, v, `${path}${k}.`, errors);
     }
-  } else if (schema.type === "array") {
+  }
+  if (schema.type === "array") {
     if (!Array.isArray(value)) { errors.push(`${path}: expected an array`); return errors; }
     if (schema.minItems !== undefined && value.length < schema.minItems)
       errors.push(`${path}: needs at least ${schema.minItems} item(s), got ${value.length}`);
@@ -100,6 +139,26 @@ function walk(schema, value, path, errors) {
   } else if (schema.type === "string") {
     if (typeof value !== "string") { errors.push(`${path}: expected a string`); return errors; }
     if (schema.minLength !== undefined && value.length < schema.minLength) errors.push(`${path}: is empty`);
+    // `minLength` counts CHARACTERS, so a reason of " " satisfied it and was
+    // accepted as an explanation nobody can read. `nextPhase` then refuses an
+    // infeasible on exactly that ground -- so validation passed, the transition
+    // refused, and the BAD_REPORT retry path that exists for a malformed report
+    // was never reached.
+    if (schema.pattern !== undefined && !new RegExp(schema.pattern).test(value))
+      errors.push(`${path}: ${JSON.stringify(value)} does not match ${schema.pattern}`);
+  }
+  if (schema.const !== undefined && value !== schema.const)
+    errors.push(`${path}: ${JSON.stringify(value)} is not ${JSON.stringify(schema.const)}`);
+  // WHAT AN `ok` REPORT MUST CARRY, applied only when it IS one. Required
+  // unconditionally, a blocked or infeasible worker would have to invent a depth
+  // and a slice list, which is how a stop becomes a fabricated success. Left out
+  // entirely, a SIZING success carrying only a depth advanced the task and the
+  // deterministic floors read `est_packages` and `est_weighted_files` as absent,
+  // comparing against nothing and preserving a depth the estimates never
+  // supported.
+  if (schema.if !== undefined) {
+    const matched = walk(schema.if, value, path, []).length === 0;
+    if (matched && schema.then !== undefined) walk(schema.then, value, path, errors);
   }
   return errors;
 }
@@ -152,8 +211,26 @@ export function validateReport(action, value) {
  */
 const EVIDENCE = {
   infeasible: ({ report }) => ({ kind: "founder.infeasible", reason: report.reason }),
-  blocked: ({ report }) => ({ kind: "hold", reason: "blocked_other",
-                              detail: report.reason, escalation: report.escalation }),
+  // THE IDENTITY IS MINTED FROM STATE REEVE OWNS, never taken from the report.
+  //
+  // `nextPhase` checks only that the string is non-blank, and `applyTransition`
+  // persists it as the hub's escalation KEY -- the thing notification and
+  // retirement are routed by. Forwarded from the worker, a report could name
+  // another task's key or a builder-wide cause, by accident or deliberately, and
+  // reeve would file the hold under it.
+  //
+  // `<id>` is the placeholder `applyTransition` substitutes with the task id
+  // (`src/build/transition.mjs:803`), and the phase is this map's own. So the
+  // identity is derived from two facts reeve holds and none the worker supplies.
+  //
+  // This is NOT the default I refused to add earlier. That was about supplying a
+  // value when the worker omitted one, which would have put the machine's
+  // "a blocked_other must reach a founder" rule in a second place. Here nothing
+  // is defaulted: the worker never had a say. Its explanation still travels, as
+  // `detail`, which is what the DDL's detail column is for.
+  blocked: ({ phase, report }) => ({ kind: "hold", reason: "blocked_other",
+                                     detail: report.reason,
+                                     escalation: `bt:<id>:phase:blocked:${phase}` }),
   // The depth is SIZING's alone: `nextPhase` requires it there and nowhere else.
   ok: ({ action, phase, report }) => action === "BUILD_SIZE"
     ? { kind: "phase.succeeded", phase, depth: report.depth }

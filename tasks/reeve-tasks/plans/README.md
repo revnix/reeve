@@ -318,3 +318,32 @@ plan whose *code* is wrong in ways its *own tests cannot see* — the non-object
 case is invisible to a test suite that only ever passes objects. A plan that
 ships both the implementation and the assertions can be internally consistent and
 still wrong, and reading it against itself will never say so.
+
+## Two decisions PR-B3 took that the plan did not anticipate
+
+**The escalation identity is MINTED, not forwarded.** The plan's `evidenceFor`
+passes the worker's `escalation` string through, and PR-B3's own comment argued
+that supplying a default here would put the machine's "a `blocked_other` must
+reach a founder" rule in a second place. That argument is about ABSENCE and it
+still holds. It says nothing about the value when the worker supplies one --
+and `nextPhase` checks only that the string is non-blank, while
+`applyTransition` (`src/build/transition.mjs:803`) persists it as the hub's
+escalation KEY, which notification and retirement are routed by. A report could
+therefore file its hold under another task's cause. `evidenceFor` now mints
+`bt:<id>:phase:blocked:<phase>` from the phase it already knows and the task id
+`applyTransition` substitutes, and **`escalation` is removed from all three
+schemas** so a worker that supplies one is refused rather than ignored. Its
+explanation still travels, as `detail`, which is what the DDL's column is for.
+
+**An `ok` report must carry what its phase produces, conditionally.** The plan
+argues at length that the sizing shape and the slice list are not `required`,
+because a blocked or infeasible worker has none to give and forcing them is how
+a stop becomes a fabricated success. That is right, and it left the other half
+open: `required: ["outcome", "reason"]` also admits an `ok` SIZING report with
+no estimates at all, which advances the task while the deterministic floors read
+`est_packages` and `est_weighted_files` as absent and compare against nothing.
+The requirement is now conditional on `outcome`, so both halves hold. The
+validator gained `if`/`then`/`const` and `pattern` for it, and `pattern: "\\S"`
+on every non-empty string, because `minLength` counts CHARACTERS -- a reason of
+`" "` validated and was then refused by `nextPhase`, so validation and the
+transition disagreed and the BAD_REPORT retry path was never reached.

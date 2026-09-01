@@ -3,12 +3,50 @@
   "title": "BUILD_RESEARCH",
   "type": "object",
   "additionalProperties": false,
-  "required": ["outcome", "reason"],
+  "required": [
+    "outcome",
+    "reason"
+  ],
   "properties": {
-    "outcome": { "enum": ["ok", "blocked", "infeasible"] },
-    "reason": { "type": "string", "minLength": 1 },
-    "escalation": { "type": "string", "minLength": 1 },
-    "artifact": { "enum": ["research.md"] },
-    "open_questions": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+    "outcome": {
+      "enum": [
+        "ok",
+        "blocked",
+        "infeasible"
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "artifact": {
+      "enum": [
+        "research.md"
+      ]
+    },
+    "open_questions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      }
+    }
+  },
+  "if": {
+    "required": [
+      "outcome"
+    ],
+    "properties": {
+      "outcome": {
+        "const": "ok"
+      }
+    }
+  },
+  "then": {
+    "required": [
+      "artifact"
+    ]
   }
 }

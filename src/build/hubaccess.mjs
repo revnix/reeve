@@ -11,6 +11,7 @@ import { openHubAsGuest, ALLOWED } from "./hubguest.mjs";
 import { SCHEDULER_MIN_HUB_VERSION, HUB_SCHEMA_VERSION, HUB_BUSY_TIMEOUT_MS } from "./hubdb.mjs";
 import { SCHEDULER_COLUMNS } from "./providerdb.mjs";
 import { HOLD_COLUMNS } from "./holds.mjs";
+import { IDENTITY_COLUMNS, IDENTITY_SINCE } from "./repoid.mjs";
 import { LOCK_COLUMNS } from "./locks.mjs";
 
 /**
@@ -117,7 +118,8 @@ export function hubAccess(hubPath) {
       // columns are the ones the scheduler's SQL names. One home each.
       const present = new Set(q.prepare(
         `SELECT name FROM sqlite_master WHERE type = 'table'`).all().map(r => r.name));
-      const needCols = { ...SCHEDULER_COLUMNS, pr_hold: HOLD_COLUMNS, maintenance_lock: LOCK_COLUMNS };
+      const needCols = { ...SCHEDULER_COLUMNS, pr_hold: HOLD_COLUMNS, maintenance_lock: LOCK_COLUMNS,
+                         project_identity: IDENTITY_COLUMNS };
       // NAME AND DECLARED TYPE. Reducing `pragma_table_info` to names made this
       // gate a fail-open: every one of these tables is STRICT, so a column whose
       // declared type is wrong passes the check and then REFUSES THE WRITE. A hub
@@ -131,6 +133,17 @@ export function hubAccess(hubPath) {
       // recovery: "provider_lease.token is INTEGER, want TEXT" is actionable and
       // "the scheduler is unusable" is not.
       for (const t of Object.keys(ALLOWED)) {
+        // A TABLE A MIGRATION HAS NOT REACHED YET IS NOT A DEFECT. The identity
+        // arrives with migration 5, and the guardian is expected to run beside a
+        // builder whose hub is still older -- SCHEDULER_MIN_HUB_VERSION is 3, and
+        // the lookup answers from `task` below that. Reporting it missing made
+        // `hubAccess` return no hub at all on a v3 or v4 store, which refuses the
+        // guardian outright and takes away the compatibility the lookup provides.
+        //
+        // Only the ARRIVAL is version-gated. Once the table exists its columns
+        // are checked exactly as every other allowed table's are; a v5 hub that
+        // has lost it is damage and still a defect.
+        if (t === "project_identity" && version < IDENTITY_SINCE && !present.has(t)) continue;
         if (!present.has(t)) { defects.push(`${t} is missing`); continue; }
         const have = new Map(q.prepare(`SELECT name, type FROM pragma_table_info(?)`).all(t)
           .map(r => [r.name, String(r.type ?? "").toUpperCase()]));

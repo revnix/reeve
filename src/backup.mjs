@@ -28,7 +28,9 @@ import { open as openStore, exportJsonl } from "./db/ops.mjs";
 // `restoreHub` needs them, and not before -- ESM resolves at instantiation, so
 // naming a module that does not exist yet breaks every import of this file.
 import { openHub, isOperational, faultKind, HUB_SCHEMA_VERSION, HUB_TABLES, tablesAt,
-         schemaDefectsAt, isKnownVersion, backfillPinDeadlines } from "./build/hubdb.mjs";
+         schemaDefectsAt, isKnownVersion, backfillPinDeadlines,
+         backfillProjectIdentities, identityReconciliation } from "./build/hubdb.mjs";
+import { IDENTITY_SINCE } from "./build/repoid.mjs";
 // Task 9's additions. `restoreHub` takes the maintenance lock before it refuses,
 // enumerates live writers to name them, and replays the tail -- and it needs
 // `replayableKinds`/`NON_REPLAYED_KINDS` to refuse a tail exported by a NEWER
@@ -1919,6 +1921,42 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // store holds, and it matches nothing when the tail was written by a
         // binary that records the deadline on the claim.
         backfillPinDeadlines(back);
+        // AND THE IDENTITIES, but only for a tail that cannot carry them.
+        //
+        // Migration 5 runs BEFORE this replay, so it saw only the tasks inside
+        // the snapshot. A tail written by a pre-v5 binary carries `task.filed`
+        // and no `project_identity.learned`, so every project admitted since
+        // that snapshot comes back with its task and without its identity --
+        // and the restore reports success while the guardian cannot scope a
+        // provider lease for it.
+        //
+        // PER PROJECT, not per tail. A tail can SPAN the upgrade: a pre-v5
+        // filing, then a post-v5 filing carrying its own identity event. A
+        // tail-wide test then sees an identity event, calls the whole tail
+        // modern, and skips the repair -- leaving the earlier project with a
+        // task and no identity, which is the case this exists for.
+        //
+        // So: every project FILED in the tail whose identity the tail did not
+        // also carry. Scoped rather than global because running it over every
+        // project repairs states no admission produces -- a task whose project
+        // never had an identity at all -- and a restore that adds rows the
+        // snapshot never held is no longer restoring it. The drill that compares
+        // row for row is what said so.
+        // The decision is a pure function so it can be asked without a restore.
+        // Inline, it read `payload.project` off a transition image that has no
+        // such field, so the set was always empty and this never ran -- and no
+        // test could reach it to say so.
+        const projectOfTask = back.prepare(`SELECT project FROM task WHERE id = ?`);
+        // THE SNAPSHOT'S OWN VERSION decides whether transitions need repairing,
+        // not anything in the tail. `validateSnapshot` read it above, and it is
+        // the only fact that distinguishes "this tail predates identities" from
+        // "this tail changed nothing about them".
+        const legacy = typeof v.version === "number" && v.version < IDENTITY_SINCE;
+        const { admitted, changed } = identityReconciliation(tail, (id) => {
+          try { return projectOfTask.get(id)?.project ?? null; } catch { return null; }
+        }, { legacy });
+        if (admitted.length) backfillProjectIdentities(back, admitted);
+        if (changed.length) backfillProjectIdentities(back, changed, { updateOnly: true });
         releaseMaintenanceLock(back, { pid, lstart });
       } finally { back.close(); }
     }

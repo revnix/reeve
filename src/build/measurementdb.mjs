@@ -13,7 +13,7 @@
 // breaking that invariant or leaving the measurement unreplayable; it is here
 // instead, written by a CLI command on the full hub connection, and
 // `providerdb.mjs` keeps the property its comment claims for it.
-import { hubEvent } from "./hubdb.mjs";
+import { hubEvent, hubTx } from "./hubdb.mjs";
 import { assertWritable } from "./locks.mjs";
 
 export const PROVIDER = "claude";
@@ -64,10 +64,20 @@ const known = (kind) => Object.hasOwn(MEASUREMENT_KINDS, kind);
  * success. For a table the arming gate reads, that is the answer and its
  * evidence disappearing silently.
  *
- * A SAVEPOINT rather than a transaction, so the row and its event are atomic
- * whether or not the caller already opened one. `hubEvent` deliberately does not
- * open its own: an event left behind by a rolled-back write would rebuild a fact
- * that never happened.
+ * THE MAINTENANCE CHECK IS INSIDE THE LOCK. It used to run before the write, and
+ * a top-level SAVEPOINT is DEFERRED -- it takes no write lock until its first
+ * write. So a restore could take `maintenance_lock` and capture its tail in the
+ * window after the check passed, this function would then insert the row and its
+ * event into the live database the restore was about to replace, and the swap
+ * would drop both while every call reported success. `providerTx` solves the same
+ * race the same way, and the ordering it documents is the reason: the check runs
+ * before argument validation, because a caller missing an identity during a
+ * restore should be told about the restore -- that is the bigger fact and the one
+ * still true a second later.
+ *
+ * The nested path is kept only for a caller that already holds an immediate
+ * transaction. A SAVEPOINT inside one is atomic with it; a SAVEPOINT opened at
+ * the top level only looks like it is.
  */
 export function recordMeasurement(db, { provider = PROVIDER, kind, result, evidence, measuredAt,
                                         isAlive, inTx = false } = {}) {
@@ -79,26 +89,25 @@ export function recordMeasurement(db, { provider = PROVIDER, kind, result, evide
   if (typeof isAlive !== "function")
     throw new Error("recordMeasurement: isAlive is required -- the maintenance lock is what stops " +
                     "a write from racing a restore, and it can only be evaluated by the caller");
-  assertWritable(db, { isAlive, inTx });
-  if (!known(kind))
-    throw new Error(`recordMeasurement: ${JSON.stringify(kind)} is not a declared measurement kind; ` +
-                    `declared: ${Object.keys(MEASUREMENT_KINDS).join(", ")}`);
-  const allowed = MEASUREMENT_KINDS[kind];
-  if (!allowed.includes(result))
-    throw new Error(`recordMeasurement: ${kind} cannot conclude ${JSON.stringify(result)}; ` +
-                    `it concludes one of ${allowed.join(", ")}`);
-  if (typeof evidence !== "string" || evidence.trim() === "")
-    throw new Error("recordMeasurement: evidence is required -- a result without its readings " +
-                    "is a claim, and nothing downstream can tell the two apart");
-  if (!Number.isInteger(measuredAt) || measuredAt <= 0)
-    throw new Error(`recordMeasurement: measuredAt must be a positive integer of seconds, got ${JSON.stringify(measuredAt)}`);
-  const now = db.prepare("SELECT unixepoch() n").get().n;
-  if (measuredAt > now)
-    throw new Error(`recordMeasurement: measuredAt ${measuredAt} is in the future (now ${now}); ` +
-                    `a future timestamp never becomes stale, so nothing would ever ask for it again`);
 
-  db.exec("SAVEPOINT record_measurement");
-  try {
+  const body = () => {
+    assertWritable(db, { isAlive, inTx: true });
+    if (!known(kind))
+      throw new Error(`recordMeasurement: ${JSON.stringify(kind)} is not a declared measurement kind; ` +
+                      `declared: ${Object.keys(MEASUREMENT_KINDS).join(", ")}`);
+    const allowed = MEASUREMENT_KINDS[kind];
+    if (!allowed.includes(result))
+      throw new Error(`recordMeasurement: ${kind} cannot conclude ${JSON.stringify(result)}; ` +
+                      `it concludes one of ${allowed.join(", ")}`);
+    if (typeof evidence !== "string" || evidence.trim() === "")
+      throw new Error("recordMeasurement: evidence is required -- a result without its readings " +
+                      "is a claim, and nothing downstream can tell the two apart");
+    if (!Number.isInteger(measuredAt) || measuredAt <= 0)
+      throw new Error(`recordMeasurement: measuredAt must be a positive integer of seconds, got ${JSON.stringify(measuredAt)}`);
+    const now = db.prepare("SELECT unixepoch() n").get().n;
+    if (measuredAt > now)
+      throw new Error(`recordMeasurement: measuredAt ${measuredAt} is in the future (now ${now}); ` +
+                      `a future timestamp never becomes stale, so nothing would ever ask for it again`);
     db.prepare(
       `INSERT INTO provider_measurement (provider, kind, result, evidence, measured_at)
        VALUES (?, ?, ?, ?, ?)`).run(provider, kind, result, evidence, measuredAt);
@@ -110,13 +119,17 @@ export function recordMeasurement(db, { provider = PROVIDER, kind, result, evide
       payload: db.prepare(
         `SELECT provider, kind, result, evidence, measured_at FROM provider_measurement
           WHERE provider = ? AND kind = ? AND measured_at = ?`).get(provider, kind, measuredAt) });
-    db.exec("RELEASE record_measurement");
-  } catch (e) {
+    return { provider, kind, result, measuredAt };
+  };
+
+  if (!inTx) return hubTx(db, body);
+  db.exec("SAVEPOINT record_measurement");
+  try { const r = body(); db.exec("RELEASE record_measurement"); return r; }
+  catch (e) {
     db.exec("ROLLBACK TO record_measurement");
     db.exec("RELEASE record_measurement");
     throw e;
   }
-  return { provider, kind, result, measuredAt };
 }
 
 /**

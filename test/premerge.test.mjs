@@ -59,7 +59,12 @@ const resolved = n => Array.from({ length: n }, () => ({ isResolved: true }));
                                      reviews: [{ state: "APPROVED", author: { login: "r" }, commit: { oid: SHA_A } }],
                                      reviewsTotal: 1 } });
   check(g.verifiedHead === SHA_A, "a clear verdict names the FULL head it verified", g.verifiedHead);
-  check(g.verifiedHead.length === 40,
+  // OPTIONAL ON THE READ, not only in the detail beside it. The detail already
+  // guarded; the expression did not, so when the assertion above fails because
+  // `verifiedHead` came back null this line THREW and took the remaining seventy
+  // assertions with it. The manifest entry that induces exactly that null
+  // reported CAUGHT for as long as nothing counted how much of the file ran.
+  check(g.verifiedHead?.length === 40,
     "control: in full, because --match-head-commit does not take an abbreviation",
     String(g.verifiedHead?.length));
 }

@@ -1942,12 +1942,27 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // snapshot never held is no longer restoring it. The drill that compares
         // row for row is what said so.
         const payloadOf = (e) => { try { return JSON.parse(e.payload); } catch { return null; } };
-        const filed = new Set(tail.filter(e => e.kind === "task.filed")
+        const projectsIn = (kind) => new Set(tail.filter(e => e.kind === kind)
           .map(e => payloadOf(e)?.project).filter(Boolean));
-        const carried = new Set(tail.filter(e => e.kind === "project_identity.learned")
-          .map(e => payloadOf(e)?.project).filter(Boolean));
-        const unreconciled = [...filed].filter(p => !carried.has(p));
-        if (unreconciled.length) backfillProjectIdentities(back, unreconciled);
+        const filed = projectsIn("task.filed");
+        const carried = projectsIn("project_identity.learned");
+        // A LEGACY ADOPTION IS NOT A FILING. `adopt-snapshot` moves
+        // `task.repo_id` when a repository is recreated or a project rebound,
+        // and it rides on `task.transitioned` -- so a pre-v5 tail containing one
+        // never appears in `filed`. Migration 5 backfilled the snapshot's OLD
+        // id, replay moves the task to the new one, and no legacy event moves
+        // the identity: the restore reports success while the guardian scopes
+        // to the repository that was replaced.
+        //
+        // UPDATE-ONLY for these, because a transition proves the project changed
+        // and not that it was admitted. A project the tail merely touched, with
+        // no identity, is not a gap to fill -- it was never admitted under this
+        // schema, and creating one adds a row the snapshot never held.
+        const changed = [...projectsIn("task.transitioned")]
+          .filter(p => !carried.has(p) && !filed.has(p));
+        const admitted = [...filed].filter(p => !carried.has(p));
+        if (admitted.length) backfillProjectIdentities(back, admitted);
+        if (changed.length) backfillProjectIdentities(back, changed, { updateOnly: true });
         releaseMaintenanceLock(back, { pid, lstart });
       } finally { back.close(); }
     }

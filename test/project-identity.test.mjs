@@ -202,6 +202,20 @@ try {
     backfillProjectIdentities(r2, []);
     check(r2.prepare(`SELECT count(*) c FROM project_identity`).get().c === 1,
       "control: an EMPTY list repairs nothing, rather than everything");
+
+    // UPDATE-ONLY, for a project the tail CHANGED rather than admitted. A legacy
+    // `adopt-snapshot` moves task.repo_id and rides on `task.transitioned`, so
+    // it never appears among filings -- but a project with no identity is not a
+    // gap this may fill, because it was never admitted under this schema and
+    // creating one adds a row the snapshot never held.
+    backfillProjectIdentities(r2, ["leave-alone"], { updateOnly: true });
+    check(r2.prepare(`SELECT count(*) c FROM project_identity WHERE project='leave-alone'`).get().c === 0,
+      "update-only creates nothing for a project that has no identity");
+    // And it DOES move one that exists and disagrees, which is the adoption case.
+    r2.prepare(`UPDATE task SET repo_id = 999 WHERE project = 'needs-it'`).run();
+    backfillProjectIdentities(r2, ["needs-it"], { updateOnly: true });
+    check(r2.prepare(`SELECT repo_id FROM project_identity WHERE project='needs-it'`).get()?.repo_id === 999,
+      "and it DOES move an existing identity whose task now names a different repository");
     r2.close();
   }
 

@@ -81,7 +81,7 @@ export const HUB_SCHEMA_VERSION = 5;
  * a repository recreated under the same key, the newest task is the only record
  * of the new id. Filling gaps only would leave the old one standing.
  */
-export function backfillProjectIdentities(db, projects = null) {
+export function backfillProjectIdentities(db, projects = null, { updateOnly = false } = {}) {
   // SCOPED WHEN THE CALLER KNOWS WHICH PROJECTS NEED IT. A restore repairs the
   // ones whose filings could not carry an identity; repairing every project
   // would also invent identities for tasks that never had one, which is a state
@@ -92,12 +92,19 @@ export function backfillProjectIdentities(db, projects = null) {
   const list = projects == null ? null : [...new Set(projects)].filter(Boolean);
   if (list && list.length === 0) return;
   const where = list ? `AND project IN (${list.map(() => "?").join(",")})` : "";
+  // UPDATE-ONLY is for a project the tail merely CHANGED rather than admitted.
+  // Its identity, if it has one, may now disagree with its task -- but a project
+  // with no identity at all is not a gap this can fill: it was never admitted
+  // under this schema, and inventing one would add a row the snapshot never
+  // held. That is the distinction the restore drill's row-for-row comparison
+  // enforces, and it is why this is a mode rather than a wider project list.
+  const existing = updateOnly ? "AND project IN (SELECT project FROM project_identity)" : "";
   db.prepare(`
     INSERT INTO project_identity (project, repo_id, learned_at)
     SELECT project, repo_id, unixepoch() FROM (
       SELECT project, repo_id,
              ROW_NUMBER() OVER (PARTITION BY project ORDER BY updated_at DESC, id DESC) rn
-        FROM task WHERE repo_id IS NOT NULL AND repo_id > 0 ${where}
+        FROM task WHERE repo_id IS NOT NULL AND repo_id > 0 ${where} ${existing}
     ) WHERE rn = 1
     ON CONFLICT(project) DO UPDATE SET repo_id = excluded.repo_id, learned_at = excluded.learned_at
      WHERE project_identity.repo_id <> excluded.repo_id

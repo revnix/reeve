@@ -162,12 +162,29 @@ try {
       "fixture: a transition image genuinely carries no project, which is why the id must resolve it");
 
     const byId = (id) => (id === "bt:9" ? "rebound-project" : null);
-    const r = identityReconciliation([transition], byId);
+    const r = identityReconciliation([transition], byId, { legacy: true });
     check(r.changed.includes("rebound-project"),
       "a legacy adoption is found by resolving the event's task id, not by reading a project it never had",
       JSON.stringify(r));
     check(r.admitted.length === 0,
       "and it is NOT treated as an admission, so no identity is created for it", JSON.stringify(r));
+
+    // ONLY FOR A LEGACY SNAPSHOT. On a v5 restore every identity change since
+    // the snapshot carries its own event, so nothing needs repairing -- and
+    // repairing anyway is actively harmful: an ordinary transition refreshes an
+    // old task's `updated_at`, the backfill then picks that task as the newest,
+    // and a project rebound to a new repository has its CORRECT identity
+    // overwritten with the stale id that old task still carries.
+    //
+    // The tail cannot answer this. An ordinary v5 transition emits no identity
+    // event either, because nothing changed -- so "no identity event" does not
+    // mean "pre-v5", and only the snapshot's schema version does.
+    const modern = identityReconciliation([transition], byId, { legacy: false });
+    check(modern.changed.length === 0,
+      "a v5 snapshot's transitions are NOT reconciled, because its identity changes carry their own events",
+      JSON.stringify(modern));
+    check(identityReconciliation([transition], byId).changed.length === 0,
+      "control: and the default is the safe one, so a caller that forgets cannot overwrite a good identity");
 
     // A FILING is the other half, and it may create.
     const filing = ev("task.filed", { id: "bt:10", project: "admitted-project", repo_id: 888 }, "bt:10");
@@ -186,7 +203,7 @@ try {
     // before the upgrade, another filed after with its identity. A tail-wide
     // test called this modern and skipped the first.
     const other = ev("task.filed", { id: "bt:11", project: "pre-upgrade", repo_id: 999 }, "bt:11");
-    const r4 = identityReconciliation([other, filing, carried], byId);
+    const r4 = identityReconciliation([other, filing, carried], byId, { legacy: true });
     check(r4.admitted.length === 1 && r4.admitted[0] === "pre-upgrade",
       "a tail SPANNING the upgrade still repairs the project whose identity it did not carry",
       JSON.stringify(r4));

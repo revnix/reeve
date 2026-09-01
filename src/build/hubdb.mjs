@@ -101,7 +101,7 @@ export const HUB_SCHEMA_VERSION = 5;
  *
  * `projectOfTask` is injected so this can be asked without a database.
  */
-export function identityReconciliation(tail, projectOfTask) {
+export function identityReconciliation(tail, projectOfTask, { legacy = false } = {}) {
   const payloadOf = (e) => { try { return JSON.parse(e.payload); } catch { return null; } };
   const projectsIn = (kind) => new Set((tail ?? []).filter(e => e.kind === kind)
     .map(e => payloadOf(e)?.project).filter(Boolean));
@@ -114,7 +114,18 @@ export function identityReconciliation(tail, projectOfTask) {
     .map(id => projectOfTask(id)).filter(Boolean));
   return {
     admitted: [...filed].filter(p => !carried.has(p)),
-    changed: [...touched].filter(p => !carried.has(p) && !filed.has(p)),
+    // TRANSITIONS ONLY FOR A LEGACY SNAPSHOT, and `legacy` is passed in because
+    // the tail cannot tell you. An ordinary v5 transition emits no identity
+    // event either -- nothing changed, so nothing is recorded -- so "no identity
+    // event" does not mean "pre-v5". Treating every transition as an identity
+    // change is actively harmful on a v5 restore: an ordinary transition
+    // refreshes an old task's `updated_at`, the backfill then picks that task as
+    // the newest, and a project rebound to a new repository has its CORRECT
+    // identity overwritten with the stale id the old task still carries.
+    //
+    // A v5 snapshot needs no transition repair at all: every identity change
+    // since it was taken carries its own event.
+    changed: legacy ? [...touched].filter(p => !carried.has(p) && !filed.has(p)) : [],
   };
 }
 

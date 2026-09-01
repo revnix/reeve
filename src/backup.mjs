@@ -30,6 +30,7 @@ import { open as openStore, exportJsonl } from "./db/ops.mjs";
 import { openHub, isOperational, faultKind, HUB_SCHEMA_VERSION, HUB_TABLES, tablesAt,
          schemaDefectsAt, isKnownVersion, backfillPinDeadlines,
          backfillProjectIdentities, identityReconciliation } from "./build/hubdb.mjs";
+import { IDENTITY_SINCE } from "./build/repoid.mjs";
 // Task 9's additions. `restoreHub` takes the maintenance lock before it refuses,
 // enumerates live writers to name them, and replays the tail -- and it needs
 // `replayableKinds`/`NON_REPLAYED_KINDS` to refuse a tail exported by a NEWER
@@ -1946,9 +1947,14 @@ export function restoreHub(snapshotPath, dbPath, { isAlive, pid, lstart, force =
         // such field, so the set was always empty and this never ran -- and no
         // test could reach it to say so.
         const projectOfTask = back.prepare(`SELECT project FROM task WHERE id = ?`);
+        // THE SNAPSHOT'S OWN VERSION decides whether transitions need repairing,
+        // not anything in the tail. `validateSnapshot` read it above, and it is
+        // the only fact that distinguishes "this tail predates identities" from
+        // "this tail changed nothing about them".
+        const legacy = typeof v.version === "number" && v.version < IDENTITY_SINCE;
         const { admitted, changed } = identityReconciliation(tail, (id) => {
           try { return projectOfTask.get(id)?.project ?? null; } catch { return null; }
-        });
+        }, { legacy });
         if (admitted.length) backfillProjectIdentities(back, admitted);
         if (changed.length) backfillProjectIdentities(back, changed, { updateOnly: true });
         releaseMaintenanceLock(back, { pid, lstart });

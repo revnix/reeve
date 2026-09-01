@@ -28,6 +28,11 @@ const check = (ok, name, detail) => {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}`);
   if (!ok) { if (detail) console.log("        " + detail); fail++; }
 };
+// EVERY READ HERE SURVIVES A NULL, on purpose. `hubIncarnation` returns null for a
+// hub that predates the table, and a test that dereferences it dies rather than
+// failing -- which the sweep reports as UNRUNNABLE, and which leaves every
+// assertion after it unmeasured. Measured: with the mint removed, this file
+// reported 9 of 18 assertions before the repair and 18 of 18 after.
 const dir = mkdtempSync(join(tmpdir(), "reeve-incarn-"));
 const DEAD = () => false;
 
@@ -100,10 +105,10 @@ const DEAD = () => false;
 // ── minting REPLACES, because a restore must be able to end an incarnation ────
 {
   const db = openHub(join(dir, "remint.db"));
-  const first = hubIncarnation(db);
+  const first = hubIncarnation(db) ?? { id: null };
   const second = mintIncarnation(db);
   check(second.id !== first.id, "minting again yields a DIFFERENT id");
-  check(hubIncarnation(db).id === second.id,
+  check((hubIncarnation(db) ?? {}).id === second.id,
     "and the store now answers with the new one, not the old", JSON.stringify(hubIncarnation(db)));
   check(db.prepare("SELECT count(*) n FROM hub_incarnation").get().n === 1,
     "control: replacing rather than appending, so there is still exactly one row");
@@ -114,7 +119,7 @@ const DEAD = () => false;
 {
   const p = join(dir, "live.db");
   const db = openHub(p);
-  const beforeSnapshot = hubIncarnation(db).id;
+  const beforeSnapshot = (hubIncarnation(db) ?? {}).id ?? null;
   const snap = snapshot(db, join(dir, "snaps"), "hub", Math.floor(Date.now() / 1000), { keep: Infinity });
   check(snap.ok === true, "control: the snapshot was actually taken", JSON.stringify(snap));
   db.close();
@@ -123,7 +128,7 @@ const DEAD = () => false;
   // was taken. This is the whole trap: that id is also the id a reader's cursor
   // would carry, so a restore that does not re-mint hands back a MATCH.
   const snapDb = openHub(snap.path);
-  const inSnapshot = hubIncarnation(snapDb).id;
+  const inSnapshot = (hubIncarnation(snapDb) ?? {}).id ?? null;
   snapDb.close();
   check(inSnapshot === beforeSnapshot,
     "control: the snapshot carries the incarnation that was live when it was taken -- which is why re-minting is the fix",
@@ -133,7 +138,7 @@ const DEAD = () => false;
   check(r.ok === true, "control: the restore succeeded, so what follows is about the restored store", JSON.stringify(r).slice(0, 300));
 
   const after = openHub(p);
-  const restored = hubIncarnation(after).id;
+  const restored = (hubIncarnation(after) ?? {}).id ?? null;
   after.close();
   check(restored !== inSnapshot,
     "a restore begins a NEW incarnation, so a cursor issued before it can no longer prove it belongs to this log",

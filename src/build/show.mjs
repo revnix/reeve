@@ -59,6 +59,55 @@ export const WAITING = Object.freeze([
 ]);
 
 /**
+ * The substates only a HUMAN can clear, derived from the order above rather than
+ * restated.
+ *
+ * The other three clear themselves: a quota frees, a guardian reaches a verdict,
+ * a reviewer answers. Listing those beside these makes the one list an operator
+ * scans a list of everything, which is the same as not having the list -- and the
+ * degradation is silent, because a surface nobody reads still renders.
+ *
+ * `WAITING_FOR_CAPABILITY` is in the set, and the reason is written above in the
+ * precedence comment: a switch that is off never clears by itself. Only the
+ * founder flips it, so a task behind one is waiting on a person exactly as surely
+ * as one behind a hold.
+ */
+export const HUMAN_WAITS = Object.freeze(new Set([
+  "WAITING_FOR_FOUNDER", "WAITING_FOR_CAPABILITY", "WAITING_FOR_NOTICE",
+]));
+
+/**
+ * How long this task has been in the phase it is in, and WHICH column said so.
+ *
+ * NEVER `task.updated_at`. That column is written by transition compensations
+ * that change no phase, so a task stuck for ten minutes reads as zero seconds the
+ * moment anything unrelated touches the row. The measured instance of the class
+ * is that a pull request's `updated_at` does not move when a review thread is
+ * resolved (`docs/measured/2026-08-22-the-shadow-compared-two-moments.md`); the
+ * class is general -- a column touched by writes unrelated to the change being
+ * measured is not a change signal.
+ *
+ * So: the newest `phase_event` that ENTERED the current phase. A task that has
+ * never transitioned has none, and falls back to `created_at` -- reporting
+ * `from` either way, because "600 seconds" means different things depending on
+ * which clock produced it and an operator should not have to guess.
+ */
+export function ageInState(db, row, { now }) {
+  // ORDERED BY seq, NOT BY at. `seq` is `INTEGER PRIMARY KEY` and is the
+  // monotonic order transitions actually happened in; `at` is a clock reading,
+  // and a clock can move backwards -- or be restored non-monotonically by a
+  // replay. A task that leaves a phase and re-enters it can then carry a smaller
+  // `at` on the CURRENT visit than on an earlier one, so `max(at)` measures the
+  // age from the wrong visit and clamps a future timestamp to zero.
+  const entered = db.prepare(
+    `SELECT at FROM phase_event WHERE task = ? AND to_phase = ?
+      ORDER BY seq DESC LIMIT 1`).get(row.id, row.phase)?.at;
+  const at = entered ?? row.created_at;
+  if (at === null || at === undefined) return null;
+  return { seconds: Math.max(0, now - at), from: entered != null ? "phase_event" : "created_at" };
+}
+
+/**
  * Which capability the NEXT move out of each phase would need.
  *
  * A phase whose next move is nobody's -- terminal, held, or waiting on a human --

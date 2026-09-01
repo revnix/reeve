@@ -1537,4 +1537,27 @@ export const STUBS = [
       replace: "  // EXPLICIT, never defaulted.",
     }],
   },
+
+  {
+    name: "a-page-matches-by-shape-not-by-literal-key",
+    why: "compare a concrete escalation key against the page list directly. The list is written in SHAPES, so a literal comparison pages for the one identity that carries no task id and matches no blocked task at all -- every blocked task then goes to the digest in silence, which is the fail-quiet outcome the closed page list exists to prevent. A startsWith is the same defect from the other side: it pages for a key missing its phase. Both are second statements of `which identity is this`, and shapeOf is the first",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "the templated entry pages for any task and any phase",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "export const pages = (key) => PAGES.includes(shapeOf(key));",
+      replace: "export const pages = (key) => PAGES.includes(key);",
+    }],
+  },
+  {
+    name: "a-page-that-was-not-delivered-is-not-reported-as-paged",
+    why: "treat every attempted send as a page. Whether a human was actually reached is the one thing this cannot infer, and reporting a phone call that never happened is worse than reporting none: the escalation still stands in the store, so the operator's own record says somebody was told. A sender that returns ok:false and one that throws are the same fact to a reader who needs to know nobody was reached, and both must land in `declined` rather than in `paged` or in nothing",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a refused send is not reported as paged",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    if (result?.ok) return { why, count, kind, channels: result.channels ?? [] };",
+      replace: "    return { why, count, kind, channels: result?.channels ?? [] };",
+    }],
+  },
 ];

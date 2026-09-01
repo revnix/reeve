@@ -278,3 +278,69 @@ export function builderAnnounceable(db, escalations, {
     return { fresh, cleared };
   });
 }
+
+/**
+ * Does this identity interrupt a human?
+ *
+ * Answered by REDUCING the key to its declared shape rather than by matching it
+ * against a second list of patterns. A page list of literal keys would fire for
+ * exactly one task id and send every other blocked task silently to the digest;
+ * a `startsWith` would page for `bt:7:phase:blocked` with no phase at all. Both
+ * are second statements of "which identity is this", and `shapeOf` is the first
+ * one -- so this asks it, and there is one rule to get wrong instead of two.
+ */
+export const pages = (key) => PAGES.includes(shapeOf(key));
+
+/**
+ * Record every escalation, and interrupt a human about the few that earn it.
+ *
+ * FAIL-CLOSED IS NEVER FAIL-QUIET, and the two halves of that are separate here.
+ * Every identity becomes a durable row that stops work and is read by `task
+ * show`, `task why` and `task dash` -- nothing stops being recorded. Only the
+ * page list reaches a phone.
+ *
+ * `declined` is the third answer and it is the one that keeps this honest. A
+ * page that was owed and could not be delivered is neither paged nor digested,
+ * and collapsing it into either would report a phone call that never happened or
+ * hide one that was needed. The row still stands in the store either way.
+ *
+ * Clearing is dispatched too, for the identities that page. An operator who is
+ * only ever told about problems cannot tell "resolved" from "reeve stopped
+ * looking", and computing `cleared` without sending it implements half of that
+ * sentence.
+ */
+export function announce(db, {
+  escalations, at = Math.floor(Date.now() / 1000), isAlive, send,
+  profile = null, covered = null, complete = true } = {}) {
+  if (typeof send !== "function")
+    throw refuse("not_writable",
+      "announce needs a send function: whether a page reached anyone is the one thing this " +
+      "cannot infer, and a default that silently succeeded would report delivery it never made.");
+
+  const { fresh, cleared } = builderAnnounceable(db, escalations, { at, isAlive, covered, complete });
+  const paged = [], digested = [], declined = [];
+
+  const dispatch = (why, count, kind) => {
+    // THE SENDER'S OWN VERDICT, never an assumption. A throw and an `ok: false`
+    // are the same fact to a reader who needs to know a human was not reached.
+    let result = null, failure = null;
+    try { result = send({ title: `reeve: ${why}`, message: `${why} (x${count})`, kind, profile }); }
+    catch (e) { failure = e.message; }
+    if (result?.ok) return { why, count, kind, channels: result.channels ?? [] };
+    declined.push({ why, count, kind,
+      not_sent: failure ?? result?.why ?? "the sender returned no reason" });
+    return null;
+  };
+
+  for (const f of fresh) {
+    if (!pages(f.why)) { digested.push(f); continue; }
+    const sent = dispatch(f.why, f.count, "raised");
+    if (sent) paged.push(sent);
+  }
+  for (const why of cleared) {
+    if (!pages(why)) continue;
+    const sent = dispatch(why, 0, "cleared");
+    if (sent) paged.push(sent);
+  }
+  return { paged, digested, declined, cleared };
+}

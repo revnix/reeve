@@ -99,7 +99,39 @@ const DEAD = () => false;
   try { db.prepare("INSERT OR REPLACE INTO hub_incarnation(only,id,started_at) VALUES(1,?,1)").run("short"); }
   catch (e) { badId = e.message; }
   check(badId !== null, "an id that is not 128 bits of hex is refused rather than stored", String(badId));
+
+  // THE RIGHT LENGTH IS NOT THE RIGHT ALPHABET, and a length check alone accepts
+  // this. The writer here is not the only way in -- an import, a hand repair or a
+  // direct statement reaches the table too -- and the id is the whole proof a
+  // cursor carries, so a value no hexadecimal parser accepts leaves the hub
+  // unable to issue one.
+  let notHex = null;
+  try { db.prepare("INSERT OR REPLACE INTO hub_incarnation(only,id,started_at) VALUES(1,?,1)").run("z".repeat(32)); }
+  catch (e) { notHex = e.message; }
+  check(notHex !== null, "and 32 characters that are not hex are refused too", String(notHex));
+  check((() => { try { db.prepare("INSERT OR REPLACE INTO hub_incarnation(only,id,started_at) VALUES(1,?,1)").run("a1b2".repeat(8)); return true; } catch { return false; } })(),
+    "control: a well-formed id still stores, so the constraint is not simply refusing everything");
   db.close();
+}
+
+// ── a hub older than the table answers NULL, as documented ───────────────────
+//
+// `hubIncarnation` promises null for a hub that predates migration 6, and a
+// caller is told to read that as "cannot prove". It did not honour that: on such a
+// hub the table is absent and the prepare THROWS, so the compatibility path the
+// documentation describes was unreachable. Found in review.
+{
+  const p = join(dir, "prev6.db");
+  openHub(p).close();
+  const raw = new DatabaseSync(p);
+  raw.exec("DROP TABLE hub_incarnation");
+  raw.close();
+  const ro = new DatabaseSync(p, { readOnly: true });
+  let threw = null, answer;
+  try { answer = hubIncarnation(ro); } catch (e) { threw = e.message; }
+  ro.close();
+  check(threw === null, "reading a hub that predates the table does not throw", String(threw));
+  check(answer === null, "it answers null, which a caller reads as `cannot prove`", JSON.stringify(answer));
 }
 
 // ── minting REPLACES, because a restore must be able to end an incarnation ────

@@ -90,10 +90,33 @@ export const PAGES = Object.freeze(["builder:backup:failed", "bt:<id>:phase:bloc
 const raised = (db, why) => hubEvent(db, {
   kind: "escalation.raised",
   task: /^bt:/.test(why) ? subjectOf(why) : null,
+  // `body` IS IN THE IMAGE. `escalation` is replayed from this event, so a
+  // column absent here is a column a restore silently empties -- and what it
+  // would empty is the only durable record of what the alert actually said.
   payload: db.prepare(
-    "SELECT why, count, first_seen_at, last_seen_at, announced_count FROM escalation WHERE why = ?")
+    "SELECT why, count, first_seen_at, last_seen_at, announced_count, body FROM escalation WHERE why = ?")
     .get(why),
 });
+
+/**
+ * The report, as the column stores it, or null where there is none.
+ *
+ * CANONICAL JSON, matching what `hub_event.payload` holds, so a reader learns
+ * one serialisation rather than two. The column carries a `json_valid` CHECK, so
+ * a value that cannot be serialised is refused HERE with a name rather than at
+ * the write, where the error names a constraint and not the caller's mistake.
+ */
+const serialiseBody = (body) => {
+  if (body === null || body === undefined) return null;
+  let text;
+  try { text = JSON.stringify(body); }
+  catch (e) { text = undefined; }
+  if (typeof text !== "string")
+    throw refuse("escalation_body_shape",
+      `an escalation body must serialise to JSON; ${typeof body} did not. Detail belongs in the ` +
+      `body precisely because the key refuses it, so a body that cannot be stored loses the report.`);
+  return text;
+};
 
 /** A refusal that says WHICH rule it broke, so a caller can tell them apart. */
 const refuse = (kind, message) => Object.assign(new Error(message), { kind });
@@ -267,7 +290,7 @@ export function assertHub(db) {
  * @returns {{fresh: {why: string, count: number}[], cleared: string[]}}
  */
 export function builderAnnounceable(db, escalations, {
-  at = Math.floor(Date.now() / 1000), isAlive, examined = null } = {}) {
+  at = Math.floor(Date.now() / 1000), isAlive, examined = null, bodies = null } = {}) {
   assertHub(db);
   // EXPLICIT, never defaulted. `assertWritable` reads the restore lock and asks
   // whether its holder is alive; a predicate that always answered true would
@@ -295,12 +318,22 @@ export function builderAnnounceable(db, escalations, {
         // never told, while `declined` had already scrolled past. 0 is also what
         // `applyTransition` raises with, so a cause raised by a transition and
         // one raised here are the same row to this function.
-        db.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count)
-                    VALUES(?,?,?,?,0)`).run(why, count, at, at);
+        db.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count,body)
+                    VALUES(?,?,?,?,0,?)`).run(why, count, at, at, serialiseBody(bodies?.get(why)));
         raised(db, why);
         fresh.push({ why, count });
       } else {
-        db.prepare("UPDATE escalation SET count=?, last_seen_at=? WHERE why=?").run(count, at, why);
+        // THE REPORT IS REFRESHED, THE COUNTERS ARE NOT RESET. A standing cause
+        // measured again carries a newer report -- a different path, a later
+        // error -- and the row should say what is true now. A caller that offers
+        // no body leaves the stored one alone rather than erasing it: absence of
+        // a report in this pass is not evidence that the report is gone.
+        const body = serialiseBody(bodies?.get(why));
+        if (body === null)
+          db.prepare("UPDATE escalation SET count=?, last_seen_at=? WHERE why=?").run(count, at, why);
+        else
+          db.prepare("UPDATE escalation SET count=?, last_seen_at=?, body=? WHERE why=?")
+            .run(count, at, body, why);
         raised(db, why);
         // The count is the SHAPE of a shared cause: one task blocked at RESEARCH
         // and four blocked there are different situations, and both deserve
@@ -462,7 +495,25 @@ export function announce(db, {
       "announce needs a send function: whether a page reached anyone is the one thing this " +
       "cannot infer, and a default that silently succeeded would report delivery it never made.");
 
-  const { fresh, cleared, clearable } = builderAnnounceable(db, escalations, { at, isAlive, examined });
+  const { fresh, cleared, clearable } =
+    builderAnnounceable(db, escalations, { at, isAlive, examined, bodies });
+
+  /**
+   * The report for a cause: this pass's, else the one the row already holds.
+   *
+   * A cause raised by `applyTransition` carries no body through this call at
+   * all, so reading only the caller's map would page it bare while the durable
+   * row had the report all along.
+   */
+  const bodyFor = (why) => {
+    if (bodies?.has(why)) return bodies.get(why);
+    const stored = db.prepare("SELECT body FROM escalation WHERE why = ?").get(why)?.body ?? null;
+    if (stored === null) return null;
+    // A row that cannot be parsed is reported as having no body rather than
+    // throwing: the alert is the thing that matters, and losing it because its
+    // detail is malformed would be the wrong trade.
+    try { return JSON.parse(stored); } catch { return null; }
+  };
   const paged = [], digested = [], declined = [];
 
   /**
@@ -564,7 +615,7 @@ export function announce(db, {
   };
 
   for (const f of fresh) {
-    const body = bodies?.get(f.why) ?? null;
+    const body = bodyFor(f.why);
     if (!pages(f.why)) {
       // THE DIGEST CANNOT DECLINE. It is the durable row itself, which is
       // already written, so surfacing there is complete the moment it exists.
@@ -584,7 +635,7 @@ export function announce(db, {
   // of losing it.
   const retired = [...cleared];
   for (const why of clearable) {
-    const sent = dispatch(why, 0, "cleared", bodies?.get(why) ?? null);
+    const sent = dispatch(why, 0, "cleared", bodyFor(why));
     if (!sent) continue;
     clearEscalation(db, why, { isAlive, at });
     paged.push(sent);

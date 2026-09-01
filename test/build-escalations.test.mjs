@@ -1237,6 +1237,101 @@ const freshHub = () => {
     JSON.stringify(sent.map(x => x.title)));
 }
 
+
+// ── the report is durable, not just delivered ──────────────────────────────
+//
+// The identity is the bare cause by design; the report is what a bare key makes
+// possible rather than an addition to it. Until the column existed the detail
+// reached the phone and nothing else, so `task show` and `task why` could not
+// recover afterwards what an alert had said — and a process-scoped cause could
+// not name the repository it was about, which is what decides whose channel
+// pages for it.
+{
+  const hub = freshHub();
+  const sent = [];
+  const send = (a) => { sent.push(a); return { ok: true, channels: [{ name: "t", ok: true }] }; };
+  const key = escalationKey({ kind: "backup:failed" });
+  const b = body({ type: "FAILED", store: "/var/reeve/o-a.db", detail: "checksum mismatch" });
+
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE, send,
+                  bodies: new Map([[key, b]]) });
+
+  const stored = hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? null;
+  check(typeof stored === "string", "the report is stored on the row, not only sent",
+    JSON.stringify(stored));
+  check(JSON.stringify(JSON.parse(stored)) === JSON.stringify(b),
+    "and round-trips as the same value", String(stored));
+
+  // IN THE ROW IMAGE, or a restore empties the column while reporting success.
+  const image = JSON.parse(hub.prepare(
+    "SELECT payload FROM hub_event WHERE kind='escalation.raised' ORDER BY seq DESC LIMIT 1").get().payload);
+  check(image.body === stored,
+    "and rides in the escalation.raised image, so a replay restores what the alert said",
+    JSON.stringify(image.body));
+
+  // THE CASE THAT MATTERS MOST: a pass that offers no bodies at all. That is
+  // every cause `applyTransition` raises, which is most of them.
+  sent.length = 0;
+  announce(hub, { escalations: new Map([[key, 4]]), at: NOW + 60, isAlive: ALIVE, send });
+  check(/checksum mismatch/.test(nth(sent, 0)?.message ?? ""),
+    "a later pass with no bodies map still renders the stored report",
+    JSON.stringify(nth(sent, 0)?.message ?? null));
+  check(/var\/reeve\/o-a\.db/.test(nth(sent, 0)?.message ?? ""),
+    "including the subject a process-scoped cause cannot put in its key",
+    JSON.stringify(nth(sent, 0)?.message ?? null));
+
+  // A LATER REPORT REPLACES AN EARLIER ONE, because the row should say what is
+  // true now — but a pass that offers none leaves the stored one alone, since
+  // absence of a report this pass is not evidence the report is gone.
+  const b2 = body({ type: "FAILED", store: "/var/reeve/o-a.db", detail: "disk full" });
+  announce(hub, { escalations: new Map([[key, 9]]), at: NOW + 120, isAlive: ALIVE, send,
+                  bodies: new Map([[key, b2]]) });
+  check(/disk full/.test(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body),
+    "a newer report replaces the stored one",
+    hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body);
+  announce(hub, { escalations: new Map([[key, 11]]), at: NOW + 180, isAlive: ALIVE, send });
+  check(/disk full/.test(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body),
+    "control: and a pass offering none does not erase it",
+    hub.prepare("SELECT body FROM escalation WHERE why=?").get(key).body);
+}
+
+// ── a body that cannot be stored is refused by name ────────────────────────
+//
+// The column carries a `json_valid` CHECK, so an unserialisable body would fail
+// at the write with a message naming a constraint rather than the caller's
+// mistake — and the report, which exists precisely because the key refuses
+// detail, would be lost at the moment it mattered.
+{
+  const hub = freshHub();
+  const key = escalationKey({ kind: "backup:failed" });
+  const cyclic = { type: "FAILED" }; cyclic.self = cyclic;
+  let kind = null;
+  try {
+    announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                    send: () => ({ ok: true, channels: [] }), bodies: new Map([[key, cyclic]]) });
+  } catch (e) { kind = e.kind ?? "threw"; }
+  check(kind === "escalation_body_shape",
+    "a body that cannot serialise is refused with its own kind, not a constraint error",
+    String(kind));
+
+  // CONTROL: the refusal is about serialisability, not about bodies. A plain one
+  // is stored.
+  const ok = body({ type: "FAILED", detail: "fine" });
+  announce(hub, { escalations: new Map([[key, 1]]), at: NOW, isAlive: ALIVE,
+                  send: () => ({ ok: true, channels: [] }), bodies: new Map([[key, ok]]) });
+  check(/fine/.test(hub.prepare("SELECT body FROM escalation WHERE why=?").get(key)?.body ?? ""),
+    "control: a serialisable body is stored");
+
+  // AND THE DATABASE REFUSES NONSENSE INDEPENDENTLY, so the guard above is a
+  // better error rather than the only one.
+  let dbRefused = false;
+  try {
+    hub.prepare(`INSERT INTO escalation(why,count,first_seen_at,last_seen_at,announced_count,body)
+                 VALUES('bt:zz:infeasible',1,1,1,0,'not json')`).run();
+  } catch { dbRefused = true; }
+  check(dbRefused, "control: the column's own CHECK refuses a body that is not JSON");
+}
+
 hub.close();
 guardian.close();
 rmSync(dir, { recursive: true, force: true });

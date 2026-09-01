@@ -2021,8 +2021,8 @@ export const STUBS = [
     expectRed: "the row is NOT marked announced, because nothing was announced",
     edits: [{
       file: "src/build/announce.mjs",
-      find: "                    VALUES(?,?,?,?,0)`).run(why, count, at, at);",
-      replace: "                    VALUES(?,?,?,?,?)`).run(why, count, at, at, count);",
+      find: "                    VALUES(?,?,?,?,0,?)`).run(why, count, at, at, serialiseBody(bodies?.get(why)));",
+      replace: "                    VALUES(?,?,?,?,?,?)`).run(why, count, at, at, count, serialiseBody(bodies?.get(why)));",
     }],
   },
   {
@@ -2170,6 +2170,51 @@ export const STUBS = [
       file: "src/build/announce.mjs",
       find: "    const clean = (v) => printable(String(v ?? \"\"));",
       replace: "    const clean = (v) => String(v ?? \"\");",
+    }],
+  },
+
+  {
+    name: "an-escalations-report-is-durable",
+    why: "send the report and store nothing. The identity is the bare cause by design, so the report is what makes a bare key affordable rather than an addition to it — and until it is on the row, `task show` and `task why` cannot recover afterwards what an alert said, and a process-scoped cause cannot name the repository it is about, which is what decides whose channel pages for it. The detail reaching a phone and nothing else is the half that scrolls past",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "the report is stored on the row, not only sent",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "VALUES(?,?,?,?,0,?)`).run(why, count, at, at, serialiseBody(bodies?.get(why)));",
+      replace: "VALUES(?,?,?,?,0,?)`).run(why, count, at, at, null);",
+    }],
+  },
+  {
+    name: "the-report-rides-in-the-replayed-row-image",
+    why: "leave `body` out of the `escalation.raised` payload. `escalation` is replayed from that event, so a column absent from the image is a column a restore silently empties — and what it empties is the only durable record of what the alert said. The row would come back looking intact, with its counters and timestamps restored and its report gone, which is worse than a row that failed to restore at all",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "and rides in the escalation.raised image, so a replay restores what the alert said",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    \"SELECT why, count, first_seen_at, last_seen_at, announced_count, body FROM escalation WHERE why = ?\")",
+      replace: "    \"SELECT why, count, first_seen_at, last_seen_at, announced_count FROM escalation WHERE why = ?\")",
+    }],
+  },
+  {
+    name: "a-stored-report-is-recalled-when-the-pass-offers-none",
+    why: "read the report only from the caller's map. Every cause `applyTransition` raises arrives through no map at all — which is most of them — so a pass that did not itself measure the fault would page it bare while the durable row held the report the whole time. The map is this pass's knowledge; the row is what the system knows",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a later pass with no bodies map still renders the stored report",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "    if (bodies?.has(why)) return bodies.get(why);",
+      replace: "    if (true) return bodies?.get(why) ?? null;",
+    }],
+  },
+  {
+    name: "an-unstorable-report-is-refused-by-name",
+    why: "hand an unserialisable body to the write. The column carries a json_valid CHECK, so it fails there with a message naming a constraint rather than the caller's mistake — and the report, which exists precisely because the key refuses detail, is lost at the moment it mattered. A named refusal at the boundary tells the caller what to fix; a constraint error tells them where it broke",
+    test: "test/build-escalations.test.mjs",
+    expectRed: "a body that cannot serialise is refused with its own kind, not a constraint error",
+    edits: [{
+      file: "src/build/announce.mjs",
+      find: "  if (typeof text !== \"string\")",
+      replace: "  if (false)",
     }],
   },
 ];
